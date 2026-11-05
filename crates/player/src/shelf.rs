@@ -375,6 +375,15 @@ impl Shelf {
                     );
                     println!("{line}");
                     log::info!("{line}");
+                    match self.library.unlisted() {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            let line = format!("library: {n} charts of other modes are not listed");
+                            println!("{line}");
+                            log::info!("{line}");
+                        }
+                        Err(e) => log::warn!("library: {}", Chain(&e)),
+                    }
                 }
                 let b = r.bests;
                 if b.catch_up || b.retried > 0 {
@@ -764,7 +773,7 @@ mod tests {
 
     fn chart(dir: &Path, name: &str) {
         std::fs::create_dir_all(dir).unwrap();
-        let text = format!("#TITLE {name}\n#BPM 120\n#00111:01\n");
+        let text = format!("#TITLE {name}\n#BPM 120\n#00138:01\n#00111:01\n");
         std::fs::write(dir.join(name), text).unwrap();
     }
 

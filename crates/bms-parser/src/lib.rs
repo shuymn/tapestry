@@ -169,12 +169,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use bms_model::{
-    Chart, ChartIdentity, ChartTimeline, MAX_TIMELINE_POINTS, ModelError, NoteKind, ScrollMap,
-    SoundId, SoundRef, Speed, TimeUs,
+    Chart, ChartIdentity, ChartSummary, ChartTimeline, MAX_TIMELINE_POINTS, ModelError, NoteKind,
+    ScrollMap, SoundId, SoundRef, Speed, TimeUs,
 };
 
 pub use error::{LoadError, Warning, WarningKind};
-pub use header::{Header, read_header};
+pub use header::{ChartMode, Header, Listing, read_header, read_listing};
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
 pub const LOADER_VERSION: u32 = 9;
@@ -272,26 +272,98 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let mut warnings = Vec::new();
-    let mut source = {
-        let text = decode(bytes, &mut warnings);
-        parse::parse(&text, limits, opts.seed, &mut warnings)?
+    let text = decode(bytes, &mut warnings);
+    build(&text, Some((bytes, chart_dir)), opts, warnings)
+}
+
+/// A chart's listing and, as far as the loader takes its seed-0 branch, its
+/// summary, from one decoding of its text (design.md "Loading and Song
+/// Selection", Summaries).
+#[derive(Clone, Debug)]
+pub struct Scanned {
+    /// What the header pass found.
+    pub listing: Listing,
+    /// The seed-0 branch's summary, or why it is refused.
+    pub summary: Result<ChartSummary, LoadError>,
+}
+
+/// Reads what a song list stores of a chart: [`read_listing`] and
+/// [`summarize`] over one decoding.
+///
+/// # Errors
+///
+/// [`LoadError::FileTooLarge`] for more than [`Limits::max_file_bytes`]
+/// bytes, the loader's cap.
+pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError> {
+    if bytes.len() > limits.max_file_bytes {
+        return Err(LoadError::FileTooLarge { bytes: bytes.len() });
+    }
+    let text = decode(bytes, &mut Vec::new());
+    Ok(Scanned {
+        listing: header::listing(&text),
+        summary: summary_of(&text, limits),
+    })
+}
+
+/// The summary of a chart's seed-0 branch at 1×, by [`load_bms`]'s pipeline
+/// with no file system: sound names are checked but not resolved, and a
+/// declared sound keeps its events. [`ChartSummary::of`] [`load_bms`]'s result
+/// equals it, except that the refusals needing the file system
+/// ([`LoadError::ChartDir`], [`LoadError::SoundPathEscapes`]) do not arise.
+///
+/// # Errors
+///
+/// What [`load_bms`] refuses, but for those.
+pub fn summarize(bytes: &[u8], limits: &Limits) -> Result<ChartSummary, LoadError> {
+    if bytes.len() > limits.max_file_bytes {
+        return Err(LoadError::FileTooLarge { bytes: bytes.len() });
+    }
+    summary_of(&decode(bytes, &mut Vec::new()), limits)
+}
+
+fn summary_of(text: &str, limits: &Limits) -> Result<ChartSummary, LoadError> {
+    let opts = LoadOptions {
+        limits: *limits,
+        ..LoadOptions::default()
     };
+    build(text, None, &opts, Vec::new()).map(|loaded| ChartSummary::of(&loaded.chart))
+}
+
+/// [`load_bms`]'s pipeline over the decoded `text`. `files` gives the file's
+/// bytes and folder, from which its hashes and its sounds' paths come; with
+/// none the chart has neither, which [`summarize`] does not read.
+fn build(
+    text: &str,
+    files: Option<(&[u8], &Path)>,
+    opts: &LoadOptions,
+    mut warnings: Vec<Warning>,
+) -> Result<Loaded, LoadError> {
+    let limits = &opts.limits;
+    let mut source = parse::parse(text, limits, opts.seed, &mut warnings)?;
     let mut timeline = timing::compute(&source, limits, opts.speed, &mut warnings)?;
 
-    let dir = chart_dir
-        .canonicalize()
-        .map_err(|e| LoadError::ChartDir { kind: e.kind() })?;
+    let dir = match files {
+        Some((_, chart_dir)) => Some(
+            chart_dir
+                .canonicalize()
+                .map_err(|e| LoadError::ChartDir { kind: e.kind() })?,
+        ),
+        None => None,
+    };
     let mut ids = BTreeMap::new();
     let wavs = std::mem::take(&mut source.wavs);
     let labels = std::mem::take(&mut source.labels);
     let mut sounds = Vec::with_capacity(wavs.len());
     for (id, wav) in wavs {
-        let path = if wav.value.is_empty() {
-            None
-        } else {
-            sound::resolve(&wav.value, wav.line, &dir)?
+        let path = match &dir {
+            _ if wav.value.is_empty() => None,
+            Some(dir) => sound::resolve(&wav.value, wav.line, dir)?,
+            None => {
+                sound::check_name(&wav.value, wav.line)?;
+                None
+            }
         };
-        if path.is_none() {
+        if path.is_none() && dir.is_some() {
             warnings.push(Warning {
                 line: Some(wav.line),
                 kind: WarningKind::MissingSoundFile,
@@ -323,7 +395,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
         });
     }
 
-    let (sha256, md5) = hash::file_hashes(bytes);
+    let (sha256, md5) = files.map_or(([0; 32], [0; 16]), |(bytes, _)| hash::file_hashes(bytes));
     let measure = timeline.last_measure;
     let compile = |initial_rate, segments| {
         ScrollMap::from_segments(initial_rate, segments).map_err(|e| match e {
@@ -363,8 +435,10 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     chart
         .validate_presentation_links()
         .map_err(|e| LoadError::Links(Box::new(e)))?;
-    chart.identity.resolved_hash = hash::resolved_hash(&chart);
-    chart.identity.played_hash = chart.identity.resolved_hash;
+    if files.is_some() {
+        chart.identity.resolved_hash = hash::resolved_hash(&chart);
+        chart.identity.played_hash = chart.identity.resolved_hash;
+    }
     // Then, at another speed, the same objects and rows at their real
     // times, on the real timeline's scroll map. The rows are rewritten in
     // place, so one table is held.

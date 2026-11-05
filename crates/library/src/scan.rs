@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use bms_parser::{Header, Limits, read_header};
+use bms_parser::{Header, Limits, read_scanned};
 use md5::Md5;
 use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
@@ -440,7 +440,12 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
     if stamp(&file.metadata().ok()?) != before {
         return None;
     }
-    let mut header = read_header(&bytes, limits).ok()?;
+    let scanned = read_scanned(&bytes, limits).ok()?;
+    let bms_parser::Listing {
+        mut header,
+        mode,
+        random,
+    } = scanned.listing;
     let Header {
         title,
         subtitle,
@@ -464,6 +469,9 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         sha256: Sha256::digest(&bytes).into(),
         md5: Md5::digest(&bytes).into(),
         header,
+        mode,
+        random,
+        summary: scanned.summary.ok(),
     })
 }
 

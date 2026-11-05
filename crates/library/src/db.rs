@@ -9,7 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bms_parser::Header;
+use bms_model::{ChartSummary, Tempo, TimeUs};
+use bms_parser::{ChartMode, Header};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::search::Keys;
@@ -66,6 +67,8 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    // For a level's array of folders, which may pass the limit on parameters.
+    rusqlite::vtab::array::load_module(&conn)?;
     let mode: String =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -112,10 +115,21 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              norm_text TEXT NOT NULL,
              title_key TEXT,
              artist_key TEXT,
-             folder TEXT NOT NULL
+             folder TEXT NOT NULL,
+             mode INTEGER NOT NULL,
+             random INTEGER NOT NULL,
+             loader INTEGER NOT NULL,
+             taps INTEGER,
+             longs INTEGER,
+             mines INTEGER,
+             length_us INTEGER,
+             tempo_start BLOB,
+             tempo_min BLOB,
+             tempo_max BLOB
          );
          CREATE INDEX charts_root ON charts(root);
-         CREATE INDEX charts_title ON charts(title_key IS NULL, title_key, path);
+         CREATE INDEX charts_title ON charts(mode, title_key IS NULL, title_key, path);
+         CREATE INDEX charts_browse ON charts(mode, folder);
          CREATE VIRTUAL TABLE charts_fts USING fts5(
              norm_text,
              content = 'charts',
@@ -301,6 +315,18 @@ pub struct Row {
     pub sha256: [u8; 32],
     pub md5: [u8; 16],
     pub header: Header,
+    pub mode: ChartMode,
+    pub random: bool,
+    pub summary: Option<ChartSummary>,
+}
+
+/// A mode as `charts.mode` stores it; the lists read 0 alone.
+const fn mode_value(mode: ChartMode) -> i64 {
+    match mode {
+        ChartMode::SevenKey => 0,
+        ChartMode::FiveKey => 1,
+        ChartMode::TwoPlayer => 2,
+    }
 }
 
 /// What a scan starts from.
@@ -344,8 +370,14 @@ pub fn prepare(conn: &mut Connection, roots: &[PathBuf]) -> rusqlite::Result<Pre
         tx.execute("DELETE FROM roots WHERE id = ?1", [id])?;
     }
     {
-        let mut stmt = tx.prepare("SELECT path, size, mtime_ns FROM charts")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+        // A row another loader version wrote matches no file's stamp, so it
+        // is read again: its summary is that version's.
+        let mut stmt = tx.prepare(
+            "SELECT path, CASE WHEN loader = ?1 THEN size ELSE -1 END, mtime_ns FROM charts",
+        )?;
+        let rows = stmt.query_map([i64::from(bms_parser::LOADER_VERSION)], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?;
         for row in rows {
             let (path, stamp) = row?;
             prepared.known.insert(path, stamp);
@@ -368,9 +400,10 @@ pub fn commit(
         let mut upsert = tx.prepare(
             "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, subtitle,
                  artist, subartist, genre, playlevel, difficulty, bpm, norm_text, title_key,
-                 artist_key, folder)
+                 artist_key, folder, mode, random, loader, taps, longs, mines, length_us,
+                 tempo_start, tempo_min, tempo_max)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -378,11 +411,16 @@ pub fn commit(
                  genre = excluded.genre, playlevel = excluded.playlevel,
                  difficulty = excluded.difficulty, bpm = excluded.bpm,
                  norm_text = excluded.norm_text, title_key = excluded.title_key,
-                 artist_key = excluded.artist_key",
+                 artist_key = excluded.artist_key, mode = excluded.mode,
+                 random = excluded.random, loader = excluded.loader, taps = excluded.taps,
+                 longs = excluded.longs, mines = excluded.mines,
+                 length_us = excluded.length_us, tempo_start = excluded.tempo_start,
+                 tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max",
         )?;
         for row in upserts {
             let h = &row.header;
             let keys = Keys::of(h);
+            let summary = row.summary.as_ref();
             upsert.execute(params![
                 row.root,
                 row.path,
@@ -405,6 +443,16 @@ pub fn commit(
                     .parent()
                     .and_then(Path::to_str)
                     .unwrap_or_default(),
+                mode_value(row.mode),
+                row.random,
+                i64::from(bms_parser::LOADER_VERSION),
+                summary.map(|s| s.taps),
+                summary.map(|s| s.longs),
+                summary.map(|s| s.mines),
+                summary.map(|s| s.length.0),
+                summary.map(|s| tempo_bytes(s.tempo_start)),
+                summary.map(|s| tempo_bytes(s.tempo_min)),
+                summary.map(|s| tempo_bytes(s.tempo_max)),
             ])?;
         }
         let mut delete = tx.prepare("DELETE FROM charts WHERE path = ?1")?;
@@ -418,7 +466,44 @@ pub fn commit(
 
 /// The columns [`entry`] reads, of `charts` as `c`.
 pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.title, \
-     c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm";
+     c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm, c.random, \
+     c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max";
+
+/// A tempo as a summary column stores it: `u128` does not fit an integer.
+const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
+    tempo.units().to_be_bytes()
+}
+
+/// The summary in the columns from `first` of [`ENTRY_COLUMNS`]; none when any
+/// is missing or a tempo is out of range, which no row this build wrote holds.
+fn summary(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<ChartSummary>> {
+    let tempo = |i: usize| -> rusqlite::Result<Option<Tempo>> {
+        let bytes: Option<[u8; 16]> = r.get(first + i)?;
+        Ok(bytes.and_then(|b| Tempo::from_units(u128::from_be_bytes(b))))
+    };
+    let counts: (Option<u32>, Option<u32>, Option<u32>, Option<i64>) = (
+        r.get(first)?,
+        r.get(first + 1)?,
+        r.get(first + 2)?,
+        r.get(first + 3)?,
+    );
+    let (Some(taps), Some(longs), Some(mines), Some(length)) = counts else {
+        return Ok(None);
+    };
+    let (Some(tempo_start), Some(tempo_min), Some(tempo_max)) = (tempo(4)?, tempo(5)?, tempo(6)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ChartSummary {
+        taps,
+        longs,
+        mines,
+        length: TimeUs(length),
+        tempo_start,
+        tempo_min,
+        tempo_max,
+    }))
+}
 
 /// A chart from a row of [`ENTRY_COLUMNS`].
 pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
@@ -439,6 +524,8 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
             difficulty: r.get(11)?,
             bpm: r.get(12)?,
         },
+        random: r.get(13)?,
+        summary: summary(r, 14)?,
     })
 }
 

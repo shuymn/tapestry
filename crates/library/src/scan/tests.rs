@@ -114,6 +114,36 @@ fn write_charts(root: &Path, count: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A row another loader version wrote is read again, its size and time
+/// unchanged, and only such a row.
+#[test]
+fn a_row_of_another_loader_version_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let pass = |lib: &Library| {
+        lib.scan(std::slice::from_ref(&root), ScanOptions::default())
+            .unwrap()
+            .finish()
+            .unwrap()
+    };
+    assert_eq!(pass(&lib).read, 3);
+    assert_eq!(pass(&lib).read, 0);
+    lib.reader()
+        .execute(
+            "UPDATE charts SET loader = loader - 1, taps = 99
+             WHERE path = (SELECT MIN(path) FROM charts)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(lib.charts().unwrap()[0].summary.unwrap().taps, 99);
+    let again = pass(&lib);
+    assert_eq!((again.read, again.unchanged), (1, 2));
+    assert_eq!(lib.charts().unwrap()[0].summary.unwrap().taps, 1);
+    assert_eq!(pass(&lib).read, 0);
+}
+
 fn indexed(lib: &Library) -> Vec<PathBuf> {
     lib.charts().unwrap().into_iter().map(|c| c.path).collect()
 }
