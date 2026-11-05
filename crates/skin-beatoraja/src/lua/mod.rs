@@ -60,6 +60,8 @@ pub mod limits;
 mod loader;
 pub(crate) mod residual;
 #[cfg(test)]
+mod residual_tests;
+#[cfg(test)]
 mod root_tests;
 mod sandbox;
 mod schema;

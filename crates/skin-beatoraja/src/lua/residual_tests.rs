@@ -1,0 +1,995 @@
+//! Partial evaluation into the expressions ([`super::residual`]) through
+//! the production path: the two passes, admission and the consumer that
+//! lowers each callback, with the crate's witnesses (the lowered sources,
+//! each charge site's units and work, and a forced failure at a site),
+//! and a Lua 5.4 oracle that runs each callback as the source calls it,
+//! its result converted as the consumer converts it.
+
+use std::collections::HashMap;
+
+use skin_model::{ErrorKind, PLAY, Scope, State, Ty, compile};
+
+use super::callback_tests::{folder, image, skin};
+use super::residual::LIMITS;
+use super::root_tests::{analysis, configured};
+use super::tests::{fail_next, site};
+use super::{Cancel, Disposition, LuaLimit, LuaWhy, Unsupported, read_lua_header};
+use crate::error::ImportError;
+use crate::import::Config;
+use crate::import::CriticalPart;
+use crate::import::callback::{LOWERED, LOWERED_META, TRIED};
+
+/// What importing a skin gave: its refusal, each callable's disposition,
+/// the sources lowered with their guards, parts and deviations, and the
+/// report's notes when it imported.
+struct Run {
+    r: Result<(), ImportError>,
+    callbacks: Vec<Disposition>,
+    lowered: Vec<String>,
+    meta: Vec<(Vec<&'static str>, Option<CriticalPart>, bool)>,
+    notes: Vec<crate::import::NoteKind>,
+}
+
+/// Imports `entry` with the configuration `config` makes from its header.
+fn run_with(entry: &str, config: impl FnOnce(&crate::header::Header) -> Config) -> Run {
+    let d = folder(entry);
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = super::facts::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+    let config = config(h.header());
+    LOWERED.with(|l| l.borrow_mut().clear());
+    LOWERED_META.with(|l| l.borrow_mut().clear());
+    let o = h.complete(&config, &facts, &cancel);
+    let (r, notes) = match o.result {
+        Ok(i) => (Ok(()), i.report.notes.iter().map(|n| n.kind).collect()),
+        Err(super::ledger::Stop::Fault(e)) => (Err(e), Vec::new()),
+        Err(super::ledger::Stop::Pending(p)) => panic!("{p:?}"),
+    };
+    Run {
+        r,
+        callbacks: o.callbacks,
+        lowered: LOWERED.with(|l| l.borrow().clone()),
+        meta: LOWERED_META.with(|l| l.borrow().clone()),
+        notes,
+    }
+}
+
+/// [`run_with`] in the default configuration.
+fn run(entry: &str) -> Run {
+    run_with(entry, Config::defaults)
+}
+
+/// Whether admission found `entry`'s candidate closed.
+fn closed(entry: &str) -> bool {
+    let def = configured(entry);
+    super::callback::admit(&def.arena).unwrap();
+    analysis(&def).open.get().is_none()
+}
+
+/// A number drawing `value`, after `pre`.
+fn number(pre: &str, value: &str) -> String {
+    skin(
+        &format!(
+            "{pre}\nskin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 9,\n\
+               value = {value} }} }}"
+        ),
+        "{ id = \"v\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },",
+    )
+}
+
+/// Numbers drawing each of `values`, in order, after `pre`.
+fn numbers(pre: &str, values: &[&str]) -> String {
+    let defs: String = values
+        .iter()
+        .enumerate()
+        .map(|(k, v)| {
+            format!(
+                "{{ id = \"v{k}\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 9, value = {v} }},\n"
+            )
+        })
+        .collect();
+    let dst: String = (0..values.len())
+        .map(|k| format!("{{ id = \"v{k}\", dst = {{ {{ x = {k}, y = 0, w = 6, h = 6 }} }} }},"))
+        .collect();
+    skin(&format!("{pre}\nskin.value = {{ {defs} }}"), &dst)
+}
+
+/// Images drawn under each of `draws`, in order.
+fn images(draws: &[&str]) -> String {
+    draws.iter().map(|d| image(d)).collect()
+}
+
+/// The reads the oracle and the lowered expressions are given: numbers
+/// by id with their model fields, options by id with theirs, timers by id
+/// with theirs.
+const NUMBERS: [(i64, &str); 4] = [
+    (101, "ex_score"),
+    (106, "notes"),
+    (110, "count.perfect"),
+    (111, "count.great"),
+];
+const OPTIONS: [(i64, &str); 2] = [(271, "cover.enabled"), (272, "lift.enabled")];
+const TIMERS: [(i64, &str); 2] = [(41, "play"), (143, "last_note")];
+
+/// One frame's reads.
+#[derive(Clone, Debug, Default)]
+struct Reads {
+    numbers: HashMap<i64, i64>,
+    options: HashMap<i64, bool>,
+    /// The timers on.
+    on: Vec<i64>,
+}
+
+/// The oracle: the skin's configured construction replayed in a plain Lua
+/// 5.4 VM with test host providers, its callbacks called as the source
+/// calls them and converted as their consumer converts them.
+struct Oracle {
+    lua: mlua::Lua,
+    draws: Vec<mlua::Function>,
+    values: Vec<mlua::Function>,
+}
+
+impl Oracle {
+    /// `entry` with `skin_config.option` holding `options`.
+    fn new(entry: &str, options: &[(&str, i64)]) -> Self {
+        let lua = mlua::Lua::new();
+        let setup = "values, options, timers, kind = {}, {}, {}, 0\n\
+            local ms = { timer_off_value = math.mininteger }\n\
+            function ms.number(id) return values[id] or 0 end\n\
+            function ms.option(id) return options[id] == true end\n\
+            function ms.timer(id) return timers[id] or math.mininteger end\n\
+            function ms.gauge_type() return kind end\n\
+            skin_config = { option = {}, offset = {} }\n\
+            local plain = require\n\
+            require = function(n) if n == \"main_state\" then return ms end return plain(n) end";
+        lua.load(setup).exec().unwrap();
+        let cfg: mlua::Table = lua.globals().get("skin_config").unwrap();
+        let option: mlua::Table = cfg.get("option").unwrap();
+        for &(k, v) in options {
+            option.set(k, v).unwrap();
+        }
+        let skin: mlua::Table = lua.load(entry).eval().unwrap();
+        let mut draws = Vec::new();
+        let dst: mlua::Table = skin.get("destination").unwrap();
+        for d in dst.sequence_values::<mlua::Table>() {
+            if let Ok(f) = d.unwrap().get::<mlua::Function>("draw") {
+                draws.push(f);
+            }
+        }
+        let mut values = Vec::new();
+        if let Ok(t) = skin.get::<mlua::Table>("value") {
+            for v in t.sequence_values::<mlua::Table>() {
+                values.push(v.unwrap().get("value").unwrap());
+            }
+        }
+        Self { lua, draws, values }
+    }
+
+    fn set(&self, reads: &Reads) {
+        let g = self.lua.globals();
+        let values: mlua::Table = g.get("values").unwrap();
+        let options: mlua::Table = g.get("options").unwrap();
+        let timers: mlua::Table = g.get("timers").unwrap();
+        values.clear().unwrap();
+        options.clear().unwrap();
+        timers.clear().unwrap();
+        for (&k, &v) in &reads.numbers {
+            values.set(k, v).unwrap();
+        }
+        for (&k, &v) in &reads.options {
+            options.set(k, v).unwrap();
+        }
+        for &t in &reads.on {
+            timers.set(t, 1_000).unwrap();
+        }
+    }
+
+    /// Each `draw` as Lua's truthiness.
+    fn draws(&self, reads: &Reads) -> Vec<bool> {
+        self.set(reads);
+        self.draws
+            .iter()
+            .map(|f| {
+                !matches!(
+                    f.call::<mlua::Value>(()).unwrap(),
+                    mlua::Value::Nil | mlua::Value::Boolean(false)
+                )
+            })
+            .collect()
+    }
+
+    /// Each `value` as the source's integer: nil and booleans 0.
+    fn values(&self, reads: &Reads) -> Vec<i64> {
+        self.set(reads);
+        self.values
+            .iter()
+            .map(|f| match f.call::<mlua::Value>(()).unwrap() {
+                mlua::Value::Nil | mlua::Value::Boolean(_) => 0,
+                mlua::Value::Integer(n) => n,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+}
+
+/// The model state the same reads give.
+fn state(reads: &Reads) -> (Vec<i32>, Vec<i32>) {
+    let mut fields = vec![0_i32; PLAY.fields.len()];
+    for (id, name) in NUMBERS {
+        let (slot, _) = PLAY.field(name).unwrap();
+        fields[usize::from(slot)] =
+            i32::try_from(reads.numbers.get(&id).copied().unwrap_or(0)).unwrap();
+    }
+    for (id, name) in OPTIONS {
+        let (slot, _) = PLAY.field(name).unwrap();
+        fields[usize::from(slot)] = i32::from(reads.options.get(&id).copied().unwrap_or(false));
+    }
+    let mut timers = vec![skin_model::TIMER_OFF; PLAY.timers.len()];
+    for (id, name) in TIMERS {
+        let (slot, _) = PLAY.timer(name).unwrap();
+        if reads.on.contains(&id) {
+            timers[usize::from(slot)] = 1;
+        }
+    }
+    (fields, timers)
+}
+
+/// Lowered sources `srcs` evaluated as `ty` with `reads`.
+fn evaluate(srcs: &[String], ty: Ty, reads: &Reads) -> Vec<i64> {
+    let (fields, timers) = state(reads);
+    let st = State {
+        fields: &fields,
+        timers: &timers,
+    };
+    srcs.iter()
+        .map(|s| {
+            let p = compile(s, &Scope::new(&PLAY), ty).unwrap_or_else(|e| panic!("{s}: {e:?}"));
+            match ty {
+                Ty::Bool => i64::from(p.eval_bool(&st)),
+                _ => i64::from(p.eval(&st)),
+            }
+        })
+        .collect()
+}
+
+/// Every combination of the counts `counts` takes, of options 271 and
+/// 272, and of the two timers on or off.
+fn grid(counts: &[i64]) -> Vec<Reads> {
+    let mut out = Vec::new();
+    for &ex in counts {
+        for &pg in counts {
+            for o in 0..4 {
+                for t in 0..4 {
+                    let mut r = Reads::default();
+                    r.numbers.insert(101, ex);
+                    r.numbers.insert(110, pg);
+                    r.numbers.insert(111, (ex + pg) % 7);
+                    r.numbers.insert(106, ex + pg + 3);
+                    r.options.insert(271, o & 1 != 0);
+                    r.options.insert(272, o & 2 != 0);
+                    if t & 1 != 0 {
+                        r.on.push(41);
+                    }
+                    if t & 2 != 0 {
+                        r.on.push(143);
+                    }
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Checks that each lowered source agrees with the oracle over `grid`:
+/// the draws when `draws`, else the values.
+#[track_caller]
+fn agrees(entry: &str, options: &[(&str, i64)], lowered: &[String], draws: bool, counts: &[i64]) {
+    let oracle = Oracle::new(entry, options);
+    for reads in grid(counts) {
+        if draws {
+            let want: Vec<i64> = oracle.draws(&reads).into_iter().map(i64::from).collect();
+            assert_eq!(evaluate(lowered, Ty::Bool, &reads), want, "{reads:?}");
+        } else {
+            assert_eq!(
+                evaluate(lowered, Ty::Int, &reads),
+                oracle.values(&reads),
+                "{reads:?} {lowered:?}"
+            );
+        }
+    }
+}
+
+const MAX: i64 = skin_model::MAX_COUNT as i64;
+
+/// Rm's helper shape, written fresh: 0 until the EX score is 1, else the
+/// number its argument names.
+const DUMMY: &str =
+    "local function dummy(n) if ms.number(101) < 1 then return 0 else return ms.number(n) end end";
+
+#[test]
+fn a_helper_with_known_arguments_lowers_as_a_conditional() {
+    for arg in [110, 101] {
+        let entry = number(DUMMY, &format!("function() return dummy({arg}) end"));
+        assert!(closed(&entry));
+        fail_next(None);
+        let r = run(&entry);
+        r.r.unwrap();
+        assert_eq!(r.callbacks, [Disposition::Lowered]);
+        let [src] = r.lowered.as_slice() else {
+            panic!("{:?}", r.lowered)
+        };
+        assert!(
+            src.starts_with("(if ((ex_score) < 1) then 0 else "),
+            "{src}"
+        );
+        // Critical: the EX score it reads.
+        assert_eq!(r.meta[0].1, Some(CriticalPart::ExScore));
+        agrees(&entry, &[], &r.lowered, false, &[0, 1, 2, MAX]);
+        // One helper call inlined: the inline stack scanned at one entry
+        // and one parameter bound (the root's empty stack and none).
+        assert_eq!(site("scan").0, 1);
+        assert_eq!(site("bind").0, 1);
+    }
+}
+
+#[test]
+fn r4_conditionals_need_all_four_proofs() {
+    use Disposition::{Lowered, Replaced};
+    // int-or-bool: a string value, and a raw timer value.
+    for value in [
+        "function() return ms.text(1) end",
+        "function() return ms.timer(41) end",
+    ] {
+        let entry = number("", value);
+        assert!(closed(&entry), "{value}");
+        assert_eq!(
+            run(&entry).callbacks,
+            [Replaced(Unsupported::Type)],
+            "{value}"
+        );
+    }
+    // total: a definite Lua error on a reached path; control: behind a
+    // condition folded false.
+    let r = run(&number("", "function() local x = nil return x + 1 end"));
+    assert_eq!(
+        r.callbacks,
+        [Replaced(Unsupported::Construct("a Lua error"))]
+    );
+    let r = run(&number(
+        "",
+        "function() if false then return nil + 1 end return 0 end",
+    ));
+    assert_eq!(
+        (r.callbacks, r.lowered),
+        (vec![Lowered], vec!["0".to_owned()])
+    );
+    // pure: a library call.
+    let entry = number("", "function() return math.max(ms.number(110), 0) end");
+    assert!(closed(&entry));
+    assert_eq!(
+        run(&entry).callbacks,
+        [Replaced(Unsupported::Construct("library call"))]
+    );
+    // range: an arm whose interval leaves `i32`.
+    let (_, notes) = PLAY.field("notes").unwrap();
+    assert!(
+        matches!(notes.ty, skin_model::FieldTy::Int { hi, .. } if i64::from(hi) * i64::from(hi) > i64::from(i32::MAX))
+    );
+    let entry = number(
+        "",
+        "function() if ms.option(271) then return ms.number(106) * ms.number(106) end return 0 end",
+    );
+    assert!(closed(&entry));
+    assert_eq!(run(&entry).callbacks, [Replaced(Unsupported::Range)]);
+    // range: 17 nested integer conditionals, within the bytes, the ops
+    // and the nesting, past R4's stack.
+    let arms: String = (0..17)
+        .map(|k| {
+            let cond = match k % 3 {
+                0 => format!("ms.option({})", 270 + k % 4),
+                1 => format!("ms.number(110) > {k}"),
+                _ => format!("ms.option({}) and ms.number(111) < {k}", 270 + k % 4),
+            };
+            let kw = if k == 0 { "if" } else { "elseif" };
+            format!(
+                "{kw} {cond} then return ms.number({}) ",
+                if k % 2 == 0 { 110 } else { 111 }
+            )
+        })
+        .collect();
+    let value = format!("function() {arms}else return 0 end end");
+    let entry = number("", &value);
+    assert!(closed(&entry));
+    TRIED.with(|t| *t.borrow_mut() = None);
+    assert_eq!(run(&entry).callbacks, [Replaced(LIMITS)]);
+    let (src, kind) = TRIED.with(|t| t.borrow().clone()).unwrap();
+    assert!(src.len() < skin_model::MAX_SOURCE_BYTES, "{}", src.len());
+    let ops = src
+        .matches(['(', '+', '-', '*', '<', '>', '=', '!', '&', '|'])
+        .count();
+    assert!(ops < skin_model::MAX_OPS, "{ops}");
+    let mut depth = 0_usize;
+    let mut deepest = 0;
+    for c in src.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    assert!(deepest < skin_model::MAX_NESTING, "{deepest}");
+    assert!(
+        matches!(kind, Some(ErrorKind::StackTooDeep { .. })),
+        "{kind:?}"
+    );
+    // Critical, the same shape refuses at its definition.
+    let critical = number(
+        "",
+        &value.replace("return 0 end end", "return ms.number(101) end end"),
+    );
+    match run(&critical).r {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "value",
+                    why,
+                },
+            ..
+        }) => assert_eq!(why, LIMITS),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn and_or_keep_lua_values() {
+    let values = [
+        "function() return ms.number(110) or 5 end",
+        "function() return ms.option(271) and 7 end",
+        "function() return true end",
+    ];
+    let entry = numbers("", &values);
+    assert!(closed(&entry));
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Lowered; 3]);
+    assert_eq!(r.lowered[2], "0");
+    agrees(&entry, &[], &r.lowered, false, &[0, 1, MAX]);
+    let draws = [
+        "function() return 0 and ms.option(271) end",
+        "function() return \"\" and ms.option(271) end",
+        "function() if ms.option(271) then return true end end",
+    ];
+    let entry = skin("", &images(&draws));
+    assert!(closed(&entry));
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Lowered; 3]);
+    agrees(&entry, &[], &r.lowered, true, &[0, 1]);
+}
+
+/// A play skin with an option `x` (items 905 and 906, 905 the default).
+fn optioned(body: &str, dst: &str) -> String {
+    skin(body, dst).replacen(
+        "h = 1080 }",
+        "h = 1080, property = { { name = \"x\", item = { { name = \"a\", op = 905 }, { name = \"b\", op = 906 } } } } }",
+        1,
+    )
+}
+
+#[test]
+fn configuration_integers_lower() {
+    let value = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 9,\n\
+        value = function() return skin_config.option[\"x\"] * 10 + ms.number(110) end } }";
+    let entry = optioned(
+        value,
+        "{ id = \"v\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },",
+    );
+    assert!(closed(&entry));
+    for x in [905, 906] {
+        let r = run_with(&entry, |_| Config {
+            options: vec![Some(x)],
+            ..Config::default()
+        });
+        assert_eq!(r.callbacks, [Disposition::Lowered], "{x}");
+        assert_eq!(r.lowered, [format!("({} + (count.perfect))", x * 10)]);
+        agrees(
+            &entry,
+            &[("x", i64::from(x))],
+            &r.lowered,
+            false,
+            &[0, 1, MAX],
+        );
+    }
+}
+
+#[test]
+fn timers_compare_with_a_captured_off_value() {
+    let entry = skin(
+        "local OFF = ms.timer_off_value",
+        &image("function() return ms.timer(41) == OFF or ms.timer(143) ~= OFF end"),
+    );
+    assert!(closed(&entry));
+    // The marker: one declaration recorded at parse, its bytes rewritten,
+    // its record copied.
+    fail_next(None);
+    let def = configured(&entry);
+    let an = analysis(&def);
+    let [(key, true)] = an.marks.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()[..] else {
+        panic!("{:?}", an.marks)
+    };
+    assert_eq!(site("mark"), (1, 1));
+    let bytes = format!("tapestry_tag0({key},").len() + ",nil,true)".len();
+    assert_eq!(site("mark bytes"), (u64::try_from(bytes).unwrap(), 1));
+    assert_eq!(site("mark copy"), (1, 1));
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(r.lowered, ["((!on(play)) || on(last_note))"]);
+    agrees(&entry, &[], &r.lowered, true, &[0]);
+    // Control: an integer that is no off value is a timer's value.
+    let entry = skin(
+        "local K = 5",
+        &image("function() return ms.timer(41) == K end"),
+    );
+    assert_eq!(
+        run(&entry).callbacks,
+        [Disposition::Replaced(Unsupported::Type)]
+    );
+}
+
+#[test]
+fn host_arguments_fold_from_upvalues() {
+    for (op, want) in [
+        (271, Disposition::Lowered),
+        (
+            2244,
+            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 2244 }),
+        ),
+        (
+            33,
+            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 33 }),
+        ),
+    ] {
+        let entry = skin(
+            &format!("local op = {op}"),
+            &image("function() return ms.option(op) end"),
+        );
+        assert!(closed(&entry));
+        let r = run(&entry);
+        assert_eq!(r.callbacks, [want], "{op}");
+        if op == 271 {
+            assert_eq!(r.lowered, ["(cover.enabled)"]);
+        }
+    }
+}
+
+#[test]
+fn branches_merge_locals_and_returns() {
+    let values = [
+        "function() local x = 1 if ms.option(271) then x = 2 end return x end",
+        "function() if ms.option(271) then return 1 end return 2 end",
+        "function() if ms.option(271) then if ms.option(272) then return 1 end end return 2 end",
+        "function() local a, b = 1, 2 if ms.option(271) then a, b = b, a end return a end",
+        "function() local a = 1 do local a = 2 end return a end",
+        "function() local a, a = 1, 2 return a end",
+    ];
+    let entry = numbers("", &values);
+    assert!(closed(&entry));
+    let r = run(&entry);
+    assert_eq!(r.callbacks, [Disposition::Lowered; 6]);
+    assert_eq!(r.lowered[0], "(if (cover.enabled) then 2 else 1)");
+    assert_eq!(
+        r.lowered[2],
+        "(if ((cover.enabled) && (lift.enabled)) then 1 else 2)"
+    );
+    assert_eq!((r.lowered[4].as_str(), r.lowered[5].as_str()), ("1", "2"));
+    agrees(&entry, &[], &r.lowered, false, &[0]);
+    // A target assigned twice follows the role.
+    let twice = "function() local a = 0 a, a = 1, 2 return a end";
+    let why = Unsupported::Construct("a target assigned twice");
+    assert_eq!(
+        run(&number("", twice)).callbacks,
+        [Disposition::Replaced(why)]
+    );
+    let critical =
+        "function() local a = 0 a, a = 1, 2 if a == 1 then return ms.number(101) end return 0 end";
+    match run(&number("", critical)).r {
+        Err(ImportError::Lua {
+            why: LuaWhy::Critical { why: w, .. },
+            ..
+        }) => assert_eq!(w, why),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn conversion_keeps_its_reads() {
+    // A BPM read a draw converts to true: its guard and D4 kept.
+    let r = run(&skin("", &image("function() return ms.number(160) end")));
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(r.lowered, ["bpm.current_valid && true"]);
+    assert!(r.meta[0].2);
+    assert!(r.notes.contains(&crate::import::NoteKind::Deviation(
+        crate::import::DeviationId::D4
+    )));
+    // An unmapped read a conversion or a fold drops is still refused.
+    let unmapped = Disposition::Replaced(Unsupported::Unmapped { api: 1, id: 425 });
+    for draw in [
+        "function() return ms.number(425) end",
+        "function() return ms.number(425) == nil end",
+    ] {
+        assert_eq!(run(&skin("", &image(draw))).callbacks, [unmapped], "{draw}");
+    }
+    // A read in either arm joins its guard.
+    let r = run(&number(
+        "",
+        "function() if ms.option(271) then return 1 else return ms.number(160) end end",
+    ));
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(r.meta[0].0, ["bpm.current_valid"]);
+}
+
+#[test]
+fn integers_follow_the_source_s_double_model() {
+    use Disposition::{Lowered, Replaced};
+    let range = Replaced(Unsupported::Range);
+    // Numerals, literal-only: where LuaJ and Lua 5.4 read another value.
+    for (draw, want) in [
+        ("function() return 0xffffffffffffffff < 0 end", range),
+        (
+            "function() return 9007199254740992 == 9007199254740993 end",
+            range,
+        ),
+        (
+            "function() return 9007199254740992 == 9007199254740992 end",
+            Lowered,
+        ),
+    ] {
+        assert_eq!(run(&skin("", &image(draw))).callbacks, [want], "{draw}");
+    }
+    // Captures past 2^53, and off values without their provenance; and
+    // the controls with it.
+    let wraps = "9007199254740992 * 1024";
+    let timer = "function() return ms.timer(41) == K end";
+    let count = "function() return ms.number(110) == K end";
+    for (body, draw, want) in [
+        ("local K = 9007199254740993".to_owned(), count, range),
+        (format!("local K = {wraps}"), timer, range),
+        ("K = 9007199254740993".to_owned(), count, range),
+        (
+            "local t = { k = 9007199254740993 }".to_owned(),
+            "function() return ms.number(110) == t.k end",
+            range,
+        ),
+        (
+            format!("local fake = {{ timer_off_value = {wraps} }}\nlocal K = fake.timer_off_value"),
+            timer,
+            range,
+        ),
+        (
+            "local K = ms.timer_off_value\nK = ms.timer_off_value".to_owned(),
+            timer,
+            range,
+        ),
+        // Under the construction premise, a value construction wrapped
+        // into range folds.
+        ("local K = 0xffffffffffffffff".to_owned(), count, Lowered),
+        ("local K = ms.timer_off_value".to_owned(), timer, Lowered),
+        (
+            String::new(),
+            "function() return ms.timer(41) == ms.timer_off_value end",
+            Lowered,
+        ),
+    ] {
+        let entry = skin(&body, &image(draw));
+        assert!(closed(&entry), "{body}");
+        assert_eq!(run(&entry).callbacks, [want], "{body} / {draw}");
+    }
+}
+
+#[test]
+fn the_marker_takes_the_conjunction_over_executions() {
+    use Disposition::{Lowered, Replaced};
+    let range = Replaced(Unsupported::Range);
+    let fake = "local fake = { timer_off_value = 9007199254740992 * 1024 }\n\
+        local function mk(x) local OFF = x.timer_off_value return function() return ms.timer(41) == OFF end end";
+    // The same declaration run twice; the retained instance's own read
+    // was the module's or the fake's, the provenance the conjunction.
+    for (made, want) in [
+        ("local _ = mk(fake)\nlocal f = mk(ms)", range),
+        ("local f = mk(ms)\nlocal _ = mk(fake)", range),
+        ("local _ = mk(ms)\nlocal f = mk(ms)", Lowered),
+    ] {
+        let entry = skin(&format!("{fake}\n{made}"), &image("f"));
+        assert!(closed(&entry), "{made}");
+        assert_eq!(run(&entry).callbacks, [want], "{made}");
+    }
+    // Two shadowed declarations are independent.
+    let entry = skin(
+        &format!(
+            "{fake}\nlocal OFF = fake.timer_off_value\nlocal g = function() return ms.timer(41) == OFF end\n\
+             local h\ndo local OFF = ms.timer_off_value h = function() return ms.timer(41) == OFF end end"
+        ),
+        &format!("{}{}", image("g"), image("h")),
+    );
+    assert!(closed(&entry));
+    assert_eq!(run(&entry).callbacks, [range, Lowered]);
+    // `X` a global read through an `_ENV` rebound to a table holding the
+    // fake, or the module.
+    for (module, want) in [("fake", range), ("ms", Lowered)] {
+        let entry = skin(
+            &format!(
+                "{fake}\nlocal _ENV = {{ main_state = {module} }}\nlocal OFF = main_state.timer_off_value"
+            ),
+            &image("function() return ms.timer(41) == OFF end"),
+        );
+        assert!(closed(&entry), "{module}");
+        assert_eq!(run(&entry).callbacks, [want], "{module}");
+    }
+    // A fake with `__eq` is still not the module.
+    let entry = skin(
+        "local fake = setmetatable({ timer_off_value = 9007199254740992 * 1024 }, { __eq = function() return true end })\n\
+         local OFF = fake.timer_off_value",
+        &image("function() return ms.timer(41) == OFF end"),
+    );
+    assert!(closed(&entry));
+    assert_eq!(run(&entry).callbacks, [range]);
+}
+
+#[test]
+fn residual_height_and_distribution() {
+    // A chain of 65 locals, each one deeper: an integer a draw converts
+    // to true, so the height is checked as each node is made, before any
+    // is emitted.
+    let mut locals = String::from("local a1 = ms.number(110) ");
+    for k in 2..=65 {
+        locals.push_str(&format!("local a{k} = a{} + 1 ", k - 1));
+    }
+    let entry = skin("", &image(&format!("function() {locals}return a65 end")));
+    assert!(closed(&entry));
+    fail_next(None);
+    assert_eq!(run(&entry).callbacks, [Disposition::Replaced(LIMITS)]);
+    assert_eq!(site("emit"), (0, 0));
+    // A mixed kind distributes into the arms.
+    let entry = skin(
+        "",
+        &image("function() return (ms.option(271) and ms.number(110)) == 5 end"),
+    );
+    assert!(closed(&entry));
+    fail_next(None);
+    let r = run(&entry);
+    assert_eq!(r.lowered, ["((cover.enabled) && ((count.perfect) == 5))"]);
+    // W12: the truthiness of `and`'s operand, the equality and its two
+    // arms, and the draw's conversion.
+    assert_eq!(site("visit").0, 5);
+}
+
+#[test]
+fn what_partial_evaluation_leaves_follows_the_role() {
+    let c = Unsupported::Construct;
+    for (body, draw, why) in [
+        (
+            "",
+            "function() while false do end return true end",
+            c("while"),
+        ),
+        ("", "function() return ms.number(110) > 1.5 end", c("float")),
+        (
+            "",
+            "function() return math.max(1, 2) > 0 end",
+            c("library call"),
+        ),
+        (
+            "",
+            "function() return (\"\"):len() > 0 end",
+            c("method call"),
+        ),
+        ("", "function() return {} end", c("table")),
+        ("", "function() return \"a\" .. \"b\" end", c("..")),
+        ("", "function() return #\"ab\" > 0 end", c("#")),
+        ("", "function() return ms.number(110) / 2 > 0 end", c("/")),
+        ("", "function() return 3 // 2 > 0 end", c("//")),
+        ("", "function() return ms.number(110) % 2 > 0 end", c("%")),
+        (
+            "local function r(n) return r(n) end",
+            "function() return r(1) end",
+            Unsupported::Recursion,
+        ),
+    ] {
+        let r = run(&skin(body, &image(draw)));
+        assert_eq!(r.callbacks, [Disposition::Replaced(why)], "{draw}");
+    }
+}
+
+#[test]
+fn a_helper_with_arguments_is_void_while_the_analysis_is_open() {
+    super::root_tests::interferes(
+        &super::root_tests::opened(
+            "local function h(x) return ms.number(110) > x end",
+            "function() return h(1) end",
+        ),
+        super::root_tests::script("draw"),
+    );
+    // A literal-only callback still lowers.
+    let entry = super::root_tests::opened("", "function() return 1 + 2 > 2 end");
+    assert_eq!(run(&entry).callbacks[0], Disposition::Lowered);
+}
+
+/// The line of `entry` that lists the destinations: where a lowering's
+/// fatal stop is located.
+fn destinations(entry: &str) -> u32 {
+    let k = entry
+        .lines()
+        .position(|l| l.starts_with("skin.destination"))
+        .unwrap();
+    u32::try_from(k + 1).unwrap()
+}
+
+/// Checks charge site `site`: `entry` charges `units` there, and with the
+/// charge made to fail the import stops fatally for `why` at `line` of
+/// `s.luaskin` with the site's work never started.
+#[track_caller]
+fn witness(name: &'static str, entry: &str, units: u64, why: LuaWhy, line: u32) {
+    fail_next(None);
+    let r = run(entry);
+    r.r.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    assert_eq!(site(name).0, units, "{name}");
+    fail_next(Some(name));
+    let r = run(entry);
+    let started = site(name).1;
+    fail_next(None);
+    match r.r {
+        Err(ImportError::Lua { why: w, at }) => {
+            assert_eq!(w, why, "{name}");
+            let at = at.unwrap();
+            assert_eq!((at.file.as_str(), at.line), ("s.luaskin", line), "{name}");
+        }
+        other => panic!("{name}: {other:?}"),
+    }
+    assert_eq!(started, 0, "{name}: its work started");
+}
+
+#[test]
+fn every_new_charge_is_made_before_its_work() {
+    let work = LuaWhy::Limit(LuaLimit::AnalysisWork);
+    let at = |entry: &str| destinations(entry);
+    // W1, at the parser's phase and file.
+    let entry = skin("local wide, exact = 9007199254740993, 9007199254740992", "");
+    witness("wide", &entry, 1, LuaWhy::Limit(LuaLimit::AstNodes), 0);
+    // W2: the marked declaration, its rewrite and its record.
+    let entry = skin(
+        "local OFF = ms.timer_off_value",
+        &image("function() return ms.timer(41) == OFF end"),
+    );
+    let key = *analysis(&configured(&entry)).marks.keys().next().unwrap();
+    let bytes = units(&format!("tapestry_tag0({key},,nil,true)"));
+    witness("mark", &entry, 1, LuaWhy::Limit(LuaLimit::AstNodes), 0);
+    witness(
+        "mark bytes",
+        &entry,
+        bytes,
+        LuaWhy::Limit(LuaLimit::Generated),
+        0,
+    );
+    witness("mark copy", &entry, 1, LuaWhy::Limit(LuaLimit::Captures), 0);
+    // W3: ten statements.
+    let body: String = (0..9).map(|k| format!("local a{k} = {k} ")).collect();
+    let entry = skin(
+        "",
+        &image(&format!("function() {body}return ms.number(110) > a8 end")),
+    );
+    witness("stmt", &entry, 10, work, at(&entry));
+    // W4: a helper chain three deep, each level of the walk.
+    let entry = skin(
+        "local function h3() return ms.number(110) > 0 end\n\
+         local function h2() return h3() end\nlocal function h1() return h2() end",
+        &image("function() return h1() end"),
+    );
+    witness(
+        "depth",
+        &entry,
+        16,
+        LuaWhy::Limit(LuaLimit::AstDepth),
+        at(&entry),
+    );
+    // W5: the module, the key, the host function, the argument, the
+    // read, the bound, the comparison and its negation.
+    let entry = skin("", &image("function() return not (ms.number(110) > 0) end"));
+    witness(
+        "node",
+        &entry,
+        8,
+        LuaWhy::Limit(LuaLimit::Expansion),
+        at(&entry),
+    );
+    // W7: two reads.
+    let entry = skin(
+        "",
+        &image("function() return ms.number(110) == ms.number(111) end"),
+    );
+    witness("read", &entry, 2, work, at(&entry));
+    // W8: fifty helpers deep, each call scanning the stack before it.
+    let mut chain = String::from("local function h50() return ms.number(110) > 0 end\n");
+    for k in (1..50).rev() {
+        chain.push_str(&format!("local function h{k}() return h{}() end\n", k + 1));
+    }
+    let entry = skin(&chain, &image("function() return h1() end"));
+    witness("scan", &entry, (0..=50).sum(), work, at(&entry));
+    // W9: two hundred parameters bound, none passed.
+    let params: Vec<String> = (0..200).map(|k| format!("p{k}")).collect();
+    let entry = skin(
+        &format!(
+            "local function many({}) return ms.number(110) > 0 end",
+            params.join(", ")
+        ),
+        &image("function() return many() end"),
+    );
+    witness("bind", &entry, 200, work, at(&entry));
+    // W10: five locals copied and merged at three residual `if`s.
+    let entry = skin(
+        "",
+        &image(
+            "function() local a, b, c, d, e = 1, 2, 3, 4, 5 \
+             if ms.option(271) then a = 6 end if ms.option(272) then b = 7 end if ms.option(273) then c = 8 end \
+             return a == 6 or b == 7 or c == 8 or d == e end",
+        ),
+    );
+    witness("env", &entry, 30, work, at(&entry));
+    // W11: a thousand-byte equality.
+    let s = "a".repeat(1_000);
+    let entry = skin(
+        "",
+        &image(&format!("function() return \"{s}\" == \"{s}\" end")),
+    );
+    witness("str", &entry, 1_000, work, at(&entry));
+    // W12.
+    let entry = skin(
+        "",
+        &image("function() return (ms.option(271) and ms.number(110)) == 5 end"),
+    );
+    witness("visit", &entry, 5, work, at(&entry));
+    // W13: one read attached.
+    let entry = skin("", &image("function() return ms.number(160) end"));
+    witness("attach", &entry, 1, work, at(&entry));
+    // W14: six nodes emitted.
+    let entry = skin(
+        "",
+        &image("function() return not (ms.number(110) + ms.number(111) > 0) end"),
+    );
+    witness("emit", &entry, 6, work, at(&entry));
+    // W15: the root's source copied out of the memo, a read shared twice.
+    let entry = skin(
+        "",
+        &image("function() local a = ms.number(110) return a + a > 0 end"),
+    );
+    let src = "(((count.perfect) + (count.perfect)) > 0)";
+    witness("memo", &entry, units(src), work, at(&entry));
+    // W16 and W17: the generated bytes, and the trial compile of the
+    // source.
+    let entry = skin("", &image("function() return ms.option(271) end"));
+    let src = "(cover.enabled)";
+    witness("text", &entry, 2 * units(src), work, at(&entry));
+    witness("compile", &entry, units(src), work, at(&entry));
+}
+
+fn units(s: &str) -> u64 {
+    u64::try_from(s.len()).unwrap()
+}
+
+#[test]
+fn the_caps_are_fatal_at_the_callable() {
+    // 201 nested calls, through global helpers: the depth cap.
+    let mut chain = String::from("function h201() return true end\n");
+    for k in (1..201).rev() {
+        chain.push_str(&format!("function h{k}() return h{}() end\n", k + 1));
+    }
+    let entry = skin(&chain, &image("function() return h1() end"));
+    assert!(matches!(
+        run(&entry).r,
+        Err(ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::AstDepth),
+            ..
+        })
+    ));
+}
