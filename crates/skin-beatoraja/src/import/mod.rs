@@ -1719,13 +1719,13 @@ impl<'d> Cx<'d> {
             ImportError::Model { at, source }
         })?;
         #[cfg(feature = "dev-tools")]
-        let located = self
+        let notes = self
             .located
             .take()
-            .filter(|n| n.len() == self.notes.list.len());
+            .filter(|n| n.len() == self.notes.list.len())
+            .unwrap_or_else(|| report::locate(&self.def.arena, &self.notes.list));
         #[cfg(not(feature = "dev-tools"))]
-        let located = None;
-        let notes = located.unwrap_or_else(|| report::locate(&self.def.arena, &self.notes.list));
+        let notes = report::locate(&self.def.arena, &self.notes.list);
         let report = Report {
             sources: self.def.arena.sources(),
             files,
