@@ -2,9 +2,9 @@
 //! Skins", per-frame closures; docs/stage3.md §3, per-frame functions):
 //! an element's `op` functions and `draw` after its role and its numeric
 //! ops are decided, and a number's `value` where a `value` field is
-//! resolved, before `ref`. A function at a field whose consumer takes
-//! none (a `timer`, a text's or an image set's `value`) follows its
-//! element's role ([`Cx::unconsumed`]).
+//! or an image set's `value` where a `value` field is resolved, before
+//! `ref`. A function at a field whose consumer takes none (a `timer`, a
+//! text's `value`) follows its element's role ([`Cx::unconsumed`]).
 //!
 //! A write-free root is partially evaluated into its residual
 //! ([`crate::lua::residual`], taking the analysis only through the
@@ -25,6 +25,8 @@
 //!
 //! - `number(n)`: the value property `n` ([`property::int_by_id`]), its
 //!   range that of its fields;
+//! - `judge(n)`: the count of judge index `n` ([`property::judge_count`]),
+//!   0 for any other known integer, as the source's is;
 //! - `option(n)`: the built-in boolean property `n` ([`ops::numeric`] with
 //!   no option items, as the source's function reads only the factory),
 //!   one it does not know `false`, as the source's is;
@@ -34,7 +36,8 @@
 //! - `gauge_type()` against a known `k`, `==` and `~=`: `gauge.kind`
 //!   against the look `k` selects (0 to 5, `assist_easy` to `hazard`; any
 //!   other `k` matches no look), under `gauge.valid`, as JSON's gauge
-//!   conditions.
+//!   conditions; and an image set's whole value, by
+//!   [`property::IndexProp::GaugeKind`]'s selector.
 //!
 //! The rest maps as it reads: integers, booleans, `-`, `!`, `+ - *` and
 //! comparisons, every integer node bounded from the ranges of what it
@@ -70,7 +73,7 @@ use skin_model::{MAX_SOURCE_BYTES, PLAY, Scope, Ty};
 
 use super::ops::{self, Cond};
 use super::policy::{CriticalPart, Role};
-use super::property::{self, IntProp};
+use super::property::{self, IndexProp, IntProp};
 use super::report::{NoteKind, Span};
 use super::timer::{Custom, Timer};
 use super::{Cx, Prop};
@@ -298,19 +301,33 @@ impl Lower<'_> {
                 self.mapped.insert(r, m);
             }
         }
-        self.emit(res, res.root)?;
         #[cfg(feature = "dev-tools")]
         {
             self.out.constant = matches!(res.node(res.root), Node::Known(_));
         }
-        let (src, ty) = match (self.memo.get(&res.root), conv) {
-            (Some(V::Bool(s)), Conv::Truthy) => (s, Ty::Bool),
-            (Some(V::Int { src, .. }), Conv::Int) => (src, Ty::Int),
-            _ => return Err(Stop::Unsupported(Unsupported::Type)),
+        let gauge =
+            conv == Conv::Index && matches!(self.mapped.get(&res.root), Some(Mapped::Gauge));
+        let src = if gauge {
+            IndexProp::GaugeKind
+                .selector()
+                .ok_or(Stop::Unsupported(Unsupported::Type))?
+                .to_owned()
+        } else {
+            self.emit(res, res.root)?;
+            let src = match (self.memo.get(&res.root), conv) {
+                (Some(V::Bool(s)), Conv::Truthy) => s,
+                (Some(V::Int { src, .. }), Conv::Int | Conv::Index) => src,
+                _ => return Err(Stop::Unsupported(Unsupported::Type)),
+            };
+            charge(self.an, "memo", units(src.len()))?;
+            did("memo");
+            src.clone()
         };
-        charge(self.an, "memo", units(src.len()))?;
-        did("memo");
-        let src = src.clone();
+        let ty = if conv == Conv::Truthy {
+            Ty::Bool
+        } else {
+            Ty::Int
+        };
         charge(self.an, "compile", units(src.len()))?;
         did("compile");
         let tried = skin_model::compile(&src, &Scope::new(&PLAY), ty);
@@ -351,6 +368,19 @@ impl Lower<'_> {
                 }
                 self.out.deviates |= v.deviates();
                 self.out.part = self.out.part.or(v.part());
+                let (lo, hi) = v.range();
+                let src = Self::text(self.an, &["(", v.expr(), ")"])?;
+                Ok(Mapped::Int { src, lo, hi })
+            }
+            "judge" => {
+                let n = arg.ok_or_else(unmapped)?;
+                let Some(v) = property::judge_count(n) else {
+                    return Ok(Mapped::Int {
+                        src: Self::text(self.an, &["0"])?,
+                        lo: 0,
+                        hi: 0,
+                    });
+                };
                 let (lo, hi) = v.range();
                 let src = Self::text(self.an, &["(", v.expr(), ")"])?;
                 Ok(Mapped::Int { src, lo, hi })
@@ -1325,9 +1355,10 @@ impl Cx<'_> {
         at: Span,
         id: u32,
         base: Role,
+        conv: Conv,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, scan) = match self.lower(id, Conv::Int) {
+        let (why, scan) = match self.lower(id, conv) {
             Ok(Lowering::Lowered(l)) => {
                 self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
                 #[cfg(test)]
