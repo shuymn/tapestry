@@ -193,6 +193,10 @@ impl Skin {
     fn quad_source(&self, uvs: &UvTable, layer: u16, uv: [f32; 4]) -> QuadSource {
         let [l, t, r, b] = uv;
         let (x, y) = (f32::midpoint(l, r), f32::midpoint(t, b));
+        // The frame holding the uv's centre. A uv that spans past its cell's
+        // edge, into the gutter the atlas fills by repeating that edge, maps
+        // to file coordinates outside the cell: a stated limit (the
+        // reference tool's design, section 3).
         let found = uvs.frames().iter().enumerate().find(|(_, f)| {
             let [fl, ft, fr, fb] = f.uv;
             f.layer == layer && fl <= x && x <= fr && ft <= y && y <= fb
@@ -210,17 +214,11 @@ impl Skin {
                 let across = |u: f32| cx + (u - fl) / (fr - fl) * cw;
                 let down = |v: f32| cy + (v - ft) / (fb - ft) * ch;
                 let (x0, x1, y0, y1) = (across(l), across(r), down(t), down(b));
-                // To a thousandth of a pixel, the most an `f32` uv says.
-                let round = |v: f32| (v * 1000.0).round() / 1000.0;
+                // At full precision, so parts a texel apart stay apart.
                 QuadSource::File {
                     frame,
                     name,
-                    rect: [
-                        round(x0.min(x1)),
-                        round(y0.min(y1)),
-                        round((x1 - x0).abs()),
-                        round((y1 - y0).abs()),
-                    ],
+                    rect: [x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()],
                     flip: [x1 < x0, y1 < y0],
                 }
             }

@@ -284,6 +284,47 @@ fn a_listed_source_is_the_part_sampled_and_its_mirroring() {
     assert_eq!(flip, [true, false]);
 }
 
+/// A part sampled a fraction of a thousandth of a texel further in is
+/// listed apart: the source keeps the uv's full precision.
+#[test]
+fn a_listed_source_keeps_sub_texel_differences() {
+    let mut h = harness(outcomes());
+    h.frame(250, &[]);
+    let first = h.batch.quads()[0];
+    let [l, t, r, b] = first.uv;
+    let QuadSource::File { rect: whole, .. } = h
+        .skin
+        .display_list(&h.batch, &h.uvs, &ChartText::default(), &|_| None)
+        .quads[0]
+        .source
+        .clone()
+    else {
+        panic!();
+    };
+    // 0.0004 of a texel in from the left edge.
+    let nudge = (r - l) / whole[2] * 0.0004;
+    let key = RunKey {
+        blend: Blend::Alpha,
+        clip: None,
+    };
+    h.batch.open_reserve();
+    assert!(h.batch.push(
+        key,
+        Quad {
+            uv: [l + nudge, t, r, b],
+            ..first
+        }
+    ));
+    let list = h
+        .skin
+        .display_list(&h.batch, &h.uvs, &ChartText::default(), &|_| None);
+    let QuadSource::File { rect, .. } = list.quads.last().unwrap().source.clone() else {
+        panic!();
+    };
+    assert!(rect[0] > whole[0], "{rect:?} {whole:?}");
+    assert!(rect[2] < whole[2], "{rect:?} {whole:?}");
+}
+
 /// A quad's fixed clip is listed with the rectangle the installation that
 /// drew it gives that clip: one clip id, two tables, one of them empty.
 #[test]
