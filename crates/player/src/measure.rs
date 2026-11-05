@@ -467,6 +467,30 @@ pub struct ViewStamp {
     /// Its attempt's READY on the chart's axis, its opening and its end;
     /// `None` before an attempt is committed.
     pub ready: Option<(TimeUs, TimeUs)>,
+    /// The running totals.
+    pub tally: eval::Tally,
+    /// The shown gauge, by its index in the preset.
+    pub shown_gauge: usize,
+    /// The gauges' values, in the preset's order, as far as they fit.
+    pub gauges: [Option<i64>; MAX_STAMPED_GAUGES],
+    /// The shown gauge's look; `None` before an attempt is committed.
+    pub look: Option<skin_model::GaugeLook>,
+}
+
+/// The gauges a [`ViewStamp`] holds; a preset has six.
+#[cfg(feature = "dev-tools")]
+pub const MAX_STAMPED_GAUGES: usize = 8;
+
+/// `gauges`' values, in order, as far as a stamp holds them. Allocates
+/// nothing.
+#[cfg(feature = "dev-tools")]
+#[must_use]
+pub fn gauge_values(gauges: &[eval::GaugeState]) -> [Option<i64>; MAX_STAMPED_GAUGES] {
+    let mut values = [None; MAX_STAMPED_GAUGES];
+    for (v, g) in values.iter_mut().zip(gauges) {
+        *v = Some(g.value.0);
+    }
+    values
 }
 
 /// What a loading frame sampled (dev-tools).

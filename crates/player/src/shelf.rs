@@ -35,8 +35,8 @@ use audio::{Gain, SoundBank};
 use bms_model::Chart;
 use game::{Chain, DataRoot};
 use library::{
-    BestWriter, ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, ScanReport, Score,
-    Search,
+    BestWriter, ChartEntry, FolderKey, FolderRow, Level, Library, LibraryError, Opened, Scan,
+    ScanOptions, ScanReport, Score, Search, Sort,
 };
 
 use crate::background::{Job, Queued, Worker};
@@ -158,8 +158,8 @@ pub struct Shelf {
     /// The background measurement of charts whose load was cancelled
     /// during theirs; none when its thread could not start.
     background: Option<Worker>,
-    /// Passes completed (dev-tools).
-    #[cfg(feature = "dev-tools")]
+    /// Passes completed (dev-tools and tests).
+    #[cfg(any(test, feature = "dev-tools"))]
     passes: u64,
     /// When the running pass started (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -235,7 +235,7 @@ impl Shelf {
             status: String::new(),
             loudness: Loudness::default(),
             background,
-            #[cfg(feature = "dev-tools")]
+            #[cfg(any(test, feature = "dev-tools"))]
             passes: 0,
             #[cfg(feature = "dev-tools")]
             pass_started: None,
@@ -287,6 +287,24 @@ impl Shelf {
     /// Why the database refused the query.
     pub fn search(&self, search: &Search<'_>) -> Result<Vec<ChartEntry>, LibraryError> {
         self.library.search(search)
+    }
+
+    /// The rows of the roots that have listed charts.
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn top(&self) -> Result<Vec<FolderRow>, LibraryError> {
+        self.library.top()
+    }
+
+    /// A folder's level, at most `limit` rows.
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn level(&self, key: &FolderKey, sort: Sort, limit: usize) -> Result<Level, LibraryError> {
+        self.library.level(key, sort, limit)
     }
 
     fn start_pass(&mut self) {
@@ -408,7 +426,7 @@ impl Shelf {
                     log::info!("{line}");
                 }
                 self.status = String::new();
-                #[cfg(feature = "dev-tools")]
+                #[cfg(any(test, feature = "dev-tools"))]
                 {
                     self.passes += 1;
                 }
@@ -624,9 +642,9 @@ impl Shelf {
         self.loudness.gain()
     }
 
-    /// How many passes have completed (dev-tools): what a search lists is
+    /// How many passes have completed (dev-tools and tests): what a search lists is
     /// the whole library's once one has.
-    #[cfg(feature = "dev-tools")]
+    #[cfg(any(test, feature = "dev-tools"))]
     pub const fn passes(&self) -> u64 {
         self.passes
     }

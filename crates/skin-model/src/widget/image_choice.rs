@@ -135,4 +135,15 @@ impl ImageChoice {
             (None, PastTable::First) => self.parts.first()?.as_ref(),
         }
     }
+
+    /// The index of `part`, an entry [`select`](Self::select) returned,
+    /// found by identity: its value is not evaluated again.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn index_of(&self, part: &ChoicePart) -> Option<u32> {
+        let at = self
+            .parts
+            .iter()
+            .position(|p| p.as_ref().is_some_and(|p| std::ptr::eq(p, part)))?;
+        u32::try_from(at).ok()
+    }
 }

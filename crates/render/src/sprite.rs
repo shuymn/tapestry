@@ -152,6 +152,13 @@ impl SpriteBatch {
         &mut self.quads
     }
 
+    /// The batch as the runtime model's, to read (dev-tools: a capture).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn quads(&self) -> &QuadBatch {
+        &self.quads
+    }
+
     /// Whether another push would be dropped.
     #[must_use]
     pub fn is_full(&self) -> bool {
