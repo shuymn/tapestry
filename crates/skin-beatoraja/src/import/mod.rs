@@ -1230,6 +1230,12 @@ impl<'d> Cx<'d> {
             }
         }
         let mut track = track;
+        // At rest the source's colour is the key's, so an alpha offset adds
+        // to it even where the colour animates (`SkinObject.java:493-519`).
+        let settled = untimed && matches!(role, Role::Critical(_)) && policy::settles(&track);
+        if settled {
+            track.keep_last_from_start();
+        }
         if o.neutral && !alpha.is_empty() {
             self.ignored(
                 at,
@@ -1250,10 +1256,6 @@ impl<'d> Cx<'d> {
                 let [a, ..] = &mut k.color;
                 *a = i32::try_from((i64::from(*a) + sum).clamp(0, 255)).unwrap_or(255);
             }
-        }
-        let settled = untimed && matches!(role, Role::Critical(_)) && policy::settles(&track);
-        if settled {
-            track.keep_last_from_start();
         }
 
         // Blend (`Skin.java:654-665`). A neutral outer destination draws

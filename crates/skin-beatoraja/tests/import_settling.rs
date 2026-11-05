@@ -5,9 +5,9 @@
 mod common;
 
 use common::lanes::{NOTES, body, hidden, hidden_object, lift_object, note, with};
-use common::play::{Drawn, judged};
+use common::play::{Drawn, judged, tally};
 use common::{Loaded, d3_notes, import_body, import_config};
-use rules::Judgment;
+use rules::{GaugeValue, Judgment};
 use skin_beatoraja::{
     Config, CriticalPart, DeviationId, ImportError, NoteKind, OffsetValue, Severity, TimerWhy,
     TrackWhy,
@@ -37,6 +37,7 @@ fn d20(l: &Loaded) -> usize {
 fn rects(l: &Loaded, ms: i64) -> Vec<[i32; 4]> {
     let mut d = Drawn::new(l.ok().skin.clone(), 100);
     d.view.cover = 500;
+    d.tally = tally(0, 12);
     d.frame(ms, &[judged(ms, Judgment::Perfect, 12)]);
     d.shown(ms + 1)
 }
@@ -66,6 +67,7 @@ fn assert_held(settling: &Loaded, still: &Loaded, case: &str) {
         Some(Severity::Deviation),
         "{case}"
     );
+    assert!(note.is_some_and(|n| n.at.is_some()), "{case}");
     for ms in [0, 250, 501, 5_000] {
         let held = rects(settling, ms);
         assert!(!held.is_empty(), "{case} at {ms}");
@@ -103,6 +105,9 @@ fn not_settling(kind: fn(&str) -> Loaded, part: CriticalPart) {
 fn timed(kind: fn(&str) -> Loaded) {
     let l = kind(&format!(r#""timer": 41, {}"#, moving(500)));
     assert_eq!((d20(&l), d3_notes(&l)), (0, 0));
+    let (play_start, moved) = (rects(&l, 100), rects(&l, 5_000));
+    assert!(!moved.is_empty());
+    assert_ne!(play_start, moved);
 }
 
 /// A gauge's images and record.
@@ -228,11 +233,7 @@ fn a_colour_channel_settles_as_a_move_does() {
         format!(r#""loop": 100, "dst": [{{"time": 0, {B}}}, {{"time": 100, {B}, "r": 0}}]"#);
     let l = number(&tinted);
     assert_eq!((d20(&l), d3_notes(&l)), (1, 0));
-    let red: Vec<f32> = number(&tinted)
-        .quads(0)
-        .iter()
-        .map(|q| q.color[0])
-        .collect();
+    let red: Vec<f32> = l.quads(0).iter().map(|q| q.color[0]).collect();
     assert_eq!(red, [0.0]);
     let looping = tinted.replace(r#""loop": 100"#, r#""loop": 50"#);
     assert_eq!(
@@ -293,14 +294,71 @@ fn an_offset_applies_to_the_key_it_is_held_at() {
     let alpha: Vec<f32> = settled.quads(0).iter().map(|q| q.color[3]).collect();
     assert_eq!(alpha, [0.6; 10]);
 
-    // An alpha offset on a colour that changes still refuses.
+    // The source adds an alpha offset at rest even where the colour
+    // animates: −102 on 255 is 153.
     let fading = format!(
         r#""loop": 500, "dst": [{{"time": 0, {A}, "a": 0}}, {{"time": 500, {B}, "a": 255}}]"#
     );
+    let l = offset_gauge(&fading, v);
+    assert_eq!(d20(&l), 1);
+    let alpha: Vec<f32> = l.quads(0).iter().map(|q| q.color[3]).collect();
+    assert_eq!(alpha, [153.0 / 255.0; 10]);
+    // The same colour still looping refuses as it did.
+    let looping = fading.replace(r#""loop": 500"#, r#""loop": 200"#);
     assert_eq!(
-        refusal(offset_gauge(&fading, v)),
+        refusal(offset_gauge(&looping, v)),
         (CriticalPart::Gauge, NoteKind::OffsetAlpha)
     );
+}
+
+/// A gauge's lit segments follow the live value under a held pose.
+#[test]
+fn a_held_gauge_shows_the_live_value() {
+    let skin = |track: &str| {
+        import_body(&format!(
+            r#""image": [{{"id": "n0", "src": "a", "x": 0, "w": 8, "h": 8}},
+                         {{"id": "n1", "src": "a", "x": 8, "w": 8, "h": 8}},
+                         {{"id": "n2", "src": "a", "x": 16, "w": 8, "h": 8}},
+                         {{"id": "n3", "src": "a", "x": 24, "w": 8, "h": 8}}],
+               "gauge": {{"id": "g", "nodes": ["n0", "n1", "n2", "n3"], "parts": 10}},
+               "destination": [{{"id": "g", {track}}}]"#
+        ))
+    };
+    let (settled, plain) = (skin(&moving(500)), skin(&still()));
+    assert_eq!(d20(&settled), 1);
+    let at = |l: &Loaded, percent: i64| {
+        let mut d = Drawn::new(l.ok().skin.clone(), 100);
+        d.gauges[0].value = GaugeValue(percent * GaugeValue::PERCENT);
+        d.frame(1_000, &[])
+    };
+    assert_ne!(at(&settled, 20), at(&settled, 80));
+    for percent in [0, 20, 80, 100] {
+        assert_eq!(at(&settled, percent), at(&plain, percent), "{percent}");
+    }
+}
+
+/// A last key of alpha 0 or of no size shows nothing from the start, as at
+/// the source's rest, where its entrance alone would have shown it.
+#[test]
+fn a_final_pose_nothing_shows_stays_invisible() {
+    for (name, last) in [
+        ("alpha", r#""x": 20, "y": 700, "w": 430, "h": 500, "a": 0"#),
+        ("height", r#""x": 20, "y": 700, "w": 430, "h": 0"#),
+        ("width", r#""x": 20, "y": 700, "w": 0, "h": 500"#),
+    ] {
+        let track = format!(r#""loop": 500, "dst": [{{"time": 0, {A}}}, {{"time": 500, {last}}}]"#);
+        let l = gauge(&track);
+        assert_eq!(d20(&l), 1, "{name}");
+        for ms in [0, 250, 5_000] {
+            let mut d = Drawn::new(l.ok().skin.clone(), 100);
+            let seen = d.frame(ms, &[]);
+            assert!(
+                seen.iter()
+                    .all(|q| q.color[3] == 0.0 || q.rect[2] <= 0.0 || q.rect[3] <= 0.0),
+                "{name} at {ms}: {seen:?}"
+            );
+        }
+    }
 }
 
 /// Stretch is judged on the last key alone, whatever branch the others
@@ -388,6 +446,17 @@ fn one_note_per_destination_beside_d3() {
     let dsts = format!(r#"{{"id": "g", {t}}}, {{"id": "g", {t}}}"#, t = moving(500));
     let l = import_body(&format!(r#"{GAUGE}, "destination": [{dsts}]"#));
     assert_eq!(d20(&l), 2);
+    // Each stands at its own destination, where the gauge's D10 is.
+    let at = |kind: DeviationId| -> Vec<_> {
+        l.report()
+            .notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::Deviation(kind))
+            .map(|n| n.at)
+            .collect()
+    };
+    assert_eq!(at(DeviationId::D20), at(DeviationId::D10));
+    assert_ne!(at(DeviationId::D20)[0], at(DeviationId::D20)[1]);
 
     let cycling = import_body(&format!(
         r#""value": [{{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 20, "digit": 4,
