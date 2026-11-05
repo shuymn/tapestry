@@ -1,10 +1,11 @@
 //! The Lua conversion report (docs/stage3.md §3, the conversion report),
 //! for the developer's PC:
 //! `lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none]
-//! [--level <n>|pending] [--local] <root> <entry> [<root> <entry>]...`
+//! [--level <n>|pending] [--option <name> <item>]... [--file <name>
+//! <candidate>]... [--local] <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin, `entry` relative to its skin folder `root`,
-//! with its default configuration on the scene of the kind its header
-//! names, against import facts with autoplay, the rank the preset read
+//! with its default configuration, but for what `--option` and `--file`
+//! name, on the scene of the kind its header names, against import facts with autoplay, the rank the preset read
 //! and the chart's play level as given (`none` for a chart with no rank
 //! header, `pending` for a level the base snapshot has pending; each
 //! unavailable when not given), and prints its kind, what did not convert
@@ -20,7 +21,9 @@
 //! followed by a `local` line with its file, the destination it was
 //! consumed for (its index, the kind its `id` names and that `id`) and,
 //! when it lowered, whether its generated expression is a constant, that
-//! expression and its guards. That output stays on the developer's PC.
+//! expression and its guards, and the report adds the configuration as
+//! resolved and a `destination` line per destination with what the import
+//! made of it and its notes. That output stays on the developer's PC.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -28,11 +31,12 @@ use std::path::PathBuf;
 
 use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{ChartRank, Fact, ImportFacts};
-use skin_beatoraja::lua::survey::{Local, Survey, survey};
+use skin_beatoraja::lua::survey::{Choice, DestinationEntry, Local, Survey, survey_with};
 use skin_model::ScreenKind;
 
 const USAGE: &str = "usage: lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none] \
-                     [--level <n>|pending] [--local] <root> <entry> [<root> <entry>]...";
+                     [--level <n>|pending] [--option <name> <item>]... \
+                     [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -40,13 +44,23 @@ fn usage() -> ! {
 }
 
 /// The snapshot the flags at the front of `args` give, its scene each
-/// skin's own, whether `--local` asks for the developer-local detail, and
-/// the arguments after them; `None` for a flag it does not read.
-fn facts(mut args: &[String]) -> Option<(ImportFacts, bool, &[String])> {
+/// skin's own, the configuration they name, whether `--local` asks for the
+/// developer-local detail, and the arguments after them; `None` for a flag
+/// it does not read.
+fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> {
     let mut facts = ImportFacts::unavailable(ScreenKind::Play);
+    let mut choice = Choice::default();
     let mut local = false;
     loop {
         match args {
+            [flag, name, item, rest @ ..] if flag == "--option" => {
+                choice.options.push((name.clone(), item.clone()));
+                args = rest;
+            }
+            [flag, name, candidate, rest @ ..] if flag == "--file" => {
+                choice.files.push((name.clone(), candidate.clone()));
+                args = rest;
+            }
             [flag, rest @ ..] if flag == "--local" => {
                 local = true;
                 args = rest;
@@ -81,7 +95,7 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, bool, &[String])> {
                 args = rest;
             }
             [flag, ..] if flag.starts_with("--") => return None,
-            _ => return Some((facts, local, args)),
+            _ => return Some((facts, choice, local, args)),
         }
     }
 }
@@ -106,6 +120,30 @@ fn local_line(l: &Local) -> String {
         if !l.guards.is_empty() {
             let _ = write!(s, " guards {:?}", l.guards.join(" && "));
         }
+    }
+    s
+}
+
+/// A destination's `destination` line and its `note` lines.
+fn destination_lines(e: &DestinationEntry) -> String {
+    let id =
+        e.id.as_deref()
+            .map_or_else(|| "-".to_owned(), |i| format!("{i:?}"));
+    let kind = e.kind.as_deref().unwrap_or("-");
+    let mut s = format!("  destination {} {id} {kind} {:?}", e.index, e.became);
+    if !e.elements.is_empty() {
+        let _ = write!(s, " elements {}..{}", e.elements.start, e.elements.end);
+    }
+    if e.suppressed > 0 {
+        let _ = write!(s, " suppressed {}", e.suppressed);
+    }
+    s.push('\n');
+    for n in &e.notes {
+        let _ = write!(s, "    note {:?} {}", n.severity, n.kind);
+        if let Some((file, line, col)) = &n.at {
+            let _ = write!(s, " file {file:?} line {line} column {col}");
+        }
+        s.push('\n');
     }
     s
 }
@@ -183,6 +221,19 @@ fn report(index: usize, survey: &Survey) -> String {
     for (kind, n) in &survey.notes {
         line(&format!("  note {kind}: {n}"));
     }
+    if let Some(r) = &survey.resolved {
+        for (name, item, op) in &r.options {
+            line(&format!("  resolved option {name:?} {item:?} {op:?}"));
+        }
+        for (name, candidate) in &r.files {
+            line(&format!("  resolved file {name:?} {candidate:?}"));
+        }
+    }
+    for e in &survey.destinations {
+        for l in destination_lines(e).lines() {
+            line(l);
+        }
+    }
     for (label, n) in &survey.facts {
         line(&format!("  fact {label}: {n}"));
     }
@@ -194,7 +245,7 @@ fn report(index: usize, survey: &Survey) -> String {
 
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
-    let Some((facts, local, args)) = facts(&all) else {
+    let Some((facts, choice, local, args)) = facts(&all) else {
         usage()
     };
     if args.is_empty() || !args.len().is_multiple_of(2) {
@@ -204,7 +255,7 @@ fn main() {
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
-        let survey = survey(&PathBuf::from(root), entry, &facts, &cancel, local);
+        let survey = survey_with(&PathBuf::from(root), entry, &facts, &cancel, local, &choice);
         print!("{}", report(index, &survey));
         let kind = survey
             .kind
@@ -219,7 +270,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use skin_beatoraja::lua::facts::{ChartRank, Fact};
-    use skin_beatoraja::lua::survey::{Consumer, Element, Local, Lowered, Survey};
+    use skin_beatoraja::lua::survey::{
+        Became, Consumer, DestinationEntry, DestinationNote, Element, Local, Lowered, Resolved,
+        Survey,
+    };
+    use skin_beatoraja::{NoteKind, PropertyKind, Severity};
 
     use super::{facts, report};
 
@@ -230,14 +285,14 @@ mod tests {
     #[test]
     fn the_flags_set_the_snapshot_and_leave_the_skins() {
         let a = args("--autoplay off --rank 2 --level 12 root s.luaskin");
-        let (f, local, rest) = facts(&a).unwrap();
+        let (f, _, local, rest) = facts(&a).unwrap();
         assert_eq!(f.autoplay, Fact::Known(false));
         assert_eq!(f.chart_rank, Fact::Known(Some(ChartRank::Rank(2))));
         assert_eq!(f.play_level, Fact::Known(12));
         assert!(!local);
         assert_eq!(rest, ["root", "s.luaskin"]);
         let a = args("--level pending root s.luaskin");
-        let (f, _, _) = facts(&a).unwrap();
+        let (f, ..) = facts(&a).unwrap();
         assert_eq!(f.play_level, Fact::Pending);
         assert_eq!(f.chart_rank, Fact::Unavailable);
         let a = args("root s.luaskin");
@@ -248,10 +303,21 @@ mod tests {
     fn local_is_a_flag_of_its_own_among_the_others() {
         for a in ["--local root s", "--autoplay on --local --level 3 root s"] {
             let a = args(a);
-            let (_, local, rest) = facts(&a).unwrap();
+            let (_, _, local, rest) = facts(&a).unwrap();
             assert!(local);
             assert_eq!(rest, ["root", "s"]);
         }
+    }
+
+    #[test]
+    fn options_and_files_are_named_in_pairs() {
+        let a = args("--option fc on --local --file frame x --option g y root s");
+        let (_, choice, local, rest) = facts(&a).unwrap();
+        assert!(local);
+        assert_eq!(rest, ["root", "s"]);
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        assert_eq!(choice.options, [pair("fc", "on"), pair("g", "y")]);
+        assert_eq!(choice.files, [pair("frame", "x")]);
     }
 
     #[test]
@@ -311,6 +377,73 @@ mod tests {
              ast nodes 0 captures 0 expanded 0\n  \
              root script: 0\n  root unread: 0\n  \
              consumer module 1, line 7: draw decorative lowered\n"
+        );
+    }
+
+    #[test]
+    fn local_detail_lists_the_configuration_and_each_destination() {
+        let s = Survey {
+            resolved: Some(Resolved {
+                options: vec![(Some("fc".to_owned()), Some("on".to_owned()), Some(906))],
+                files: vec![("frame".to_owned(), "x".to_owned())],
+            }),
+            destinations: vec![
+                DestinationEntry {
+                    index: 3,
+                    id: Some("lv".to_owned()),
+                    kind: Some("Value".to_owned()),
+                    became: Became::Dropped,
+                    elements: 1..1,
+                    notes: vec![DestinationNote {
+                        at: Some(("play.lua".to_owned(), 0, 601)),
+                        severity: Severity::Dropped,
+                        kind: NoteKind::UnsupportedProperty {
+                            kind: PropertyKind::Integer,
+                            id: Some(96),
+                        },
+                    }],
+                    suppressed: 0,
+                },
+                DestinationEntry {
+                    index: 4,
+                    id: Some("i".to_owned()),
+                    kind: Some("Image".to_owned()),
+                    became: Became::Retained,
+                    elements: 1..3,
+                    notes: Vec::new(),
+                    suppressed: 2,
+                },
+                DestinationEntry {
+                    index: 5,
+                    id: None,
+                    kind: None,
+                    became: Became::NotReached,
+                    elements: 3..3,
+                    notes: Vec::new(),
+                    suppressed: 0,
+                },
+            ],
+            ..Survey::default()
+        };
+        let out = report(0, &s);
+        let got: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.starts_with("  resolved")
+                    || l.starts_with("  destination")
+                    || l.starts_with("    note")
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "  resolved option Some(\"fc\") Some(\"on\") Some(906)",
+                "  resolved file \"frame\" \"x\"",
+                "  destination 3 \"lv\" Value Dropped",
+                "    note Dropped an unsupported Integer property 96 file \"play.lua\" line 0 column 601",
+                "  destination 4 \"i\" Image Retained elements 1..3 suppressed 2",
+                "  destination 5 - - NotReached",
+            ]
         );
     }
 
