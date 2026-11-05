@@ -256,6 +256,7 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
             Started {
                 play: None,
                 notice: Some(format!("リザルトのスキンは使えません（内蔵画面）: {why}")),
+                pending: None,
             }
         );
     }
@@ -339,51 +340,62 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
     link.exit();
 }
 
-/// A Lua play skin whose base import reads a chart fact ends pending, and
-/// startup still refuses it with the reason it gave before a chart is
-/// chosen: on the song selection path no chart is admitted, and the
-/// direct path fails; nothing is selected either way.
+/// A Lua play skin whose base import reads a chart fact ends pending:
+/// startup marks it pending on the render thread and admits charts, on
+/// the song selection path and on the direct path, which goes on to the
+/// result kind's build. Nothing is installed for play, the marker
+/// refuses an attempt without a specialization, and the line says what
+/// the skin reads.
 #[test]
-fn a_pending_play_skin_is_refused_at_startup() {
+fn a_pending_play_skin_is_marked_pending_at_startup() {
     let _serial = serial();
     for (body, fact) in [
         (
             "if ms.option(180) then x = 500 end",
-            "the chart's judgment class",
+            skin_beatoraja::FactId::JudgeClass,
         ),
-        ("x = ms.number(96)", "the chart's play level"),
+        ("x = ms.number(96)", skin_beatoraja::FactId::PlayLevel),
     ] {
         let dir = super::lua_skin(body);
+        let (_result_dir, result) = skins(&[ScreenKind::Result]);
         let choices = SkinChoices {
             play: Some(choice(dir.path(), "play.luaskin")),
-            ..SkinChoices::default()
+            ..result
         };
-        let why = format!(
-            "the skin reads {fact} as it is built, which is known only once a chart is \
-             chosen; such skins are not installed yet"
-        );
-        let build: Build = Arc::new(build);
-        let screens = Installers::default();
-        let link = screens.spawn_bare();
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        let builds = Builds::default();
+        let build = builds.of(move |kind, c, a, t, cancel| match kind {
+            ScreenKind::Play => build(kind, c, a, t, cancel),
+            _ => bundled(kind, c, a, t, cancel),
+        });
+        for launch in [Launch::Selection, Launch::Direct] {
+            let screens = Installers::default();
+            let link = screens.spawn_bare();
+            let started = startup(&link, &choices, launch, false, &build, || false).unwrap();
+            assert_eq!(started.play, None, "{launch:?}");
+            assert_eq!(started.notice, None, "{launch:?}");
+            assert!(started.pending.is_some(), "{launch:?}");
+            // Only the result kind's skin is installed; play is pending,
+            // so an attempt with the skin in use is refused unasked.
+            assert_eq!(
+                screens.log(),
+                ["1 install Result 2", "1 commit 2"],
+                "{launch:?}"
+            );
+            let why = crate::render_side::tests::in_use_attempt(&link);
+            assert_eq!(why, "the play skin awaits its specialization", "{launch:?}");
+            assert!(logged(&screens, "prepare").is_empty(), "{launch:?}");
+            link.exit();
+        }
         assert_eq!(
-            started,
-            Started {
-                play: Some(format!("スキンを使えません: {why}")),
-                notice: None,
-            }
+            builds.events(),
+            ["build Play", "build Result", "build Play", "build Result"]
         );
-        let failure = failed(startup(
-            &link,
-            &choices,
-            Launch::Direct,
-            false,
-            &build,
-            || false,
-        ));
-        assert_eq!(failure, format!("the play skin cannot be used: {why}"));
-        assert!(screens.log().is_empty(), "{:?}", screens.log());
-        link.exit();
+        let line = crate::imports::line(ScreenKind::Play, &crate::imports::Shown::Pending(fact));
+        assert!(
+            line.starts_with("skin: play: pending: reads the chart's ")
+                && line.ends_with(" as it is built; built for each chart before its play"),
+            "{line}"
+        );
     }
 }
 

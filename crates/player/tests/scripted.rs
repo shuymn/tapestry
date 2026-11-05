@@ -2009,3 +2009,153 @@ fn all_events(chart: &bms_model::Chart, rec: &PlayRecord) -> Vec<eval::JudgeEven
     .unwrap()
     .events
 }
+
+/// A Lua play skin in `skin` whose configured pass reads the chart's
+/// judgment class (option 183, easy) and draws `blue.png` over the whole
+/// canvas for an easy chart, `red.png` otherwise; `body` runs after the
+/// read. `player.toml` under `appdata` chooses it for play.
+fn configure_class_skin(skin: &Path, appdata: &Path, body: &str) {
+    fs::create_dir_all(skin).unwrap();
+    for (name, rgb) in [("blue.png", [0, 0, 255]), ("red.png", [255, 0, 0])] {
+        let file = fs::File::create(skin.join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let data: Vec<u8> = (0..16 * 16)
+            .flat_map(|_| [rgb[0], rgb[1], rgb[2], 255])
+            .collect();
+        e.write_header().unwrap().write_image_data(&data).unwrap();
+    }
+    fs::write(
+        skin.join("play.luaskin"),
+        format!(
+            "local skin = {{ type = 0, name = \"class\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             local path = \"red.png\"\n\
+             if ms.option(183) then path = \"blue.png\" end\n\
+             {body}\n\
+             skin.source = {{ {{ id = \"b\", path = path }} }}\n\
+             skin.image = {{ {{ id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 }} }}\n\
+             skin.destination = {{ {{ id = \"b\", dst = {{ {{ x = 0, y = 0, w = 1920, h = 1080 }} }} }} }}\n\
+             return skin\n"
+        ),
+    )
+    .unwrap();
+    let root = appdata.join("tapestry");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The lines of `stdout` starting with `prefix`.
+fn starting<'a>(stdout: &'a str, prefix: &str) -> Vec<&'a str> {
+    stdout.lines().filter(|l| l.starts_with(prefix)).collect()
+}
+
+/// `tapestry play` with a play skin reading the chart's judgment class:
+/// startup reports it pending, the attempt builds it for the chart, whose
+/// play draws the class's colour (blue for `#RANK 3`, red for `#RANK 2`),
+/// and the play is recorded. Inside the child, the job's thread has ended
+/// and no VM is open before the render thread prepares the attempt, and
+/// from recording's open to the play's end no job, Lua pass or
+/// instruction step runs and no VM is open; the counters at the open
+/// (startup's job and two passes, the specialization's job and pass)
+/// show they move.
+#[test]
+fn a_pending_play_skin_is_built_for_the_direct_chart() {
+    for (rank, rgb) in [("3", [0, 0, 255]), ("2", [255, 0, 0])] {
+        let Fixture {
+            dir,
+            chart_path,
+            log,
+            appdata,
+            ..
+        } = fixture_of(&format!("{CHART}#RANK {rank}\n"));
+        configure_class_skin(&dir.path().join("skin"), &appdata, "");
+        let frames = dir.path().join("frames");
+        let out = scripted_play(&chart_path, &log, &appdata)
+            .arg("--dev-frames")
+            .arg(&frames)
+            .output()
+            .expect("run tapestry");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+        let order = [
+            "skin: play: pending: reads the chart's judgment class as it is built; \
+             built for each chart before its play",
+            "skin: play: specialized",
+            "dev: specialization ended: live 0 joined 2 of 2",
+            "play started",
+        ];
+        let at: Vec<usize> = order
+            .iter()
+            .map(|l| stdout.find(l).unwrap_or_else(|| panic!("{l}: {stdout}")))
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{stdout}");
+        let open = starting(&stdout, "dev: lua at open: ");
+        let end = starting(&stdout, "dev: lua at play end: ");
+        assert_eq!(open.len(), 1, "{stdout}");
+        assert!(
+            open[0].starts_with("dev: lua at open: live 0 jobs 2 passes 3 steps "),
+            "{stdout}"
+        );
+        assert_eq!(
+            &open[0]["dev: lua at open: ".len()..],
+            end.first()
+                .map_or("", |l| &l["dev: lua at play end: ".len()..]),
+            "{stdout}"
+        );
+        assert!(stdout.contains("play 1:"), "{stdout}");
+        assert_eq!(records(&appdata).len(), 1);
+        let (w, h, rgba) = png_pixels(&frames.join("play.png"));
+        let i = ((h / 2) * w + w / 2) * 4;
+        assert_eq!(&rgba[i..i + 3], rgb, "#RANK {rank}: {stdout}");
+    }
+}
+
+/// `tapestry play` with a pending play skin that cannot be built for the
+/// chart (its configured pass loads a missing module) fails with exit 1
+/// and the reason, after the pending line, and records nothing; the skin
+/// in use never stands in.
+#[test]
+fn a_refused_specialization_fails_the_direct_path() {
+    let Fixture {
+        dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture();
+    configure_class_skin(
+        &dir.path().join("skin"),
+        &appdata,
+        "local m = require(\"missing\")",
+    );
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("skin: play: pending: reads the chart's judgment class"),
+        "{stdout}"
+    );
+    let refused = starting(&stdout, "skin: play: refused for the chart: ");
+    assert_eq!(refused.len(), 1, "{stdout}");
+    assert!(refused[0].contains("missing"), "{stdout}");
+    assert!(
+        stderr.contains("the play skin cannot be built for this chart: "),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("play started"), "{stdout}");
+    assert!(!appdata.join("tapestry").join("records").exists());
+}

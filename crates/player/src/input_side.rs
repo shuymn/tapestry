@@ -402,6 +402,13 @@ impl InputLink {
         self.state.gone.load(Ordering::Acquire)
     }
 
+    /// Marks the input thread gone, as its hook's end does, so the game
+    /// thread sees its failure (dev-tools: a script's input failure).
+    #[cfg(feature = "dev-tools")]
+    pub fn fail_for_script(&self) {
+        self.state.gone.store(true, Ordering::Release);
+    }
+
     /// Asks the input thread to seal the cancelled READY candidate's
     /// opening and open the next at its next boundary ([`Rearm`]), and
     /// waits for the answer as [`open`](Self::open) does. Allocates

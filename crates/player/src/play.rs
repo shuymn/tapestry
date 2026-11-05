@@ -10,7 +10,7 @@
 //! logic step, woken by the input thread after each publication.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
@@ -32,7 +32,7 @@ use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
     process_page_faults, to_toml,
 };
-use crate::render_side::{EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{AttemptSkin, EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError};
 
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
@@ -131,6 +131,10 @@ pub struct PlayerRig<'a> {
     /// The play skin's installation: charts are admitted once it is
     /// ready.
     pub skin: crate::render_side::SkinState,
+    /// The pending play skin, when startup marked it pending: each
+    /// attempt is prepared with its specialization for the attempt's
+    /// facts ([`crate::imports::PendingSkin`]).
+    pub pending: Option<crate::imports::PendingSkin>,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`
@@ -270,6 +274,118 @@ pub struct PlayerRig<'a> {
 }
 
 impl PlayerRig<'_> {
+    /// The play skin the attempt at `loaded` is prepared with: the skin in
+    /// use, or the pending play skin's specialization for the attempt's
+    /// facts ([`crate::imports::PendingSkin::attempt`]), reused while the
+    /// facts it read hold. A job's wait shows the stage line on the
+    /// loading state, or the preparation page without one (a retry, a
+    /// round). The quit key cancels the job and waits for its thread's
+    /// end; the window's close and a failure of the input or audio thread
+    /// end it within the stop bound. The adjustments and the dev presses
+    /// are served meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// The attempt's preparation instead: cancelled once a signal came,
+    /// or refused with the reason the skin cannot be built.
+    fn attempt_skin(&mut self, loaded: &Loaded) -> Result<AttemptSkin, Preparation> {
+        let Some(mut pending) = self.pending.take() else {
+            return Ok(AttemptSkin::InUse);
+        };
+        let facts = crate::imports::facts::attempt_facts(loaded, self.autoplay);
+        let mut adjust = self.adjust.take();
+        let rig = &*self;
+        let wait = || {
+            println!("skin: play: building for the chart");
+            match rig.selection.as_ref() {
+                Some(sel) if sel.loading.is_some() => crate::selection::show_stage(
+                    &rig.render,
+                    sel.loading.as_ref(),
+                    crate::loading_text::Stage::Skin,
+                ),
+                // The wait in the page's notice line.
+                Some(sel) => {
+                    let mut page = sel.screen.page("");
+                    if let Some(notice) = page
+                        .lines
+                        .iter_mut()
+                        .find(|l| l.style == crate::menu_screen::LineStyle::Notice)
+                    {
+                        crate::loading_text::SKIN_WAIT.clone_into(&mut notice.text);
+                    }
+                    rig.render.send(RenderMsg::Menu(Box::new(page)));
+                }
+                None => {
+                    let page = crate::menu_screen::MenuPage {
+                        lines: vec![crate::menu_screen::MenuLine {
+                            text: crate::loading_text::SKIN_WAIT.to_owned(),
+                            style: crate::menu_screen::LineStyle::Notice,
+                        }],
+                        caret: None,
+                    };
+                    rig.render.send(RenderMsg::Menu(Box::new(page)));
+                }
+            }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::specialization_began();
+        };
+        let quit = || {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
+            rig.controls.leaving()
+        };
+        let end_run = || {
+            // A script's step on the specialization (dev-tools), asked at
+            // every look of the wait, an attempt's quit included.
+            #[cfg(feature = "dev-tools")]
+            crate::dev::specialization_signal(rig.controls, || rig.input.fail_for_script());
+            rig.controls.quitting()
+                || rig.input_failure().is_some()
+                || rig.audio_failure().is_some()
+        };
+        let (skin, how) = pending.attempt(facts, wait, quit, end_run);
+        #[cfg(feature = "dev-tools")]
+        println!("dev: specialization wait left");
+        self.adjust = adjust;
+        self.pending = Some(pending);
+        skin.report(&how);
+        // The job's thread has ended, and its VMs with it, before the
+        // render thread prepares the attempt (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: specialization ended: live {} joined {} of {}",
+            skin_beatoraja::lua::vm_hooks::live(),
+            crate::imports::jobs_joined(),
+            crate::imports::jobs_started()
+        );
+        match skin {
+            crate::imports::ForAttempt::Ready(bundle) => Ok(AttemptSkin::Specialized(bundle)),
+            crate::imports::ForAttempt::Cancelled => Err(Preparation::Cancelled),
+            crate::imports::ForAttempt::Refused(reason) => {
+                Err(Preparation::Refused(game::PreparationRefusal {
+                    location: None,
+                    reason,
+                }))
+            }
+        }
+    }
+
+    /// The Lua sandbox's counters at `when` (dev-tools): its VMs open, the
+    /// jobs started, the passes and the instruction steps run, which stay
+    /// still from recording's open to the play's end.
+    #[cfg(feature = "dev-tools")]
+    fn print_lua(when: &str) {
+        use skin_beatoraja::lua::vm_hooks;
+        println!(
+            "dev: lua at {when}: live {} jobs {} passes {} steps {}",
+            vm_hooks::live(),
+            crate::imports::jobs_started(),
+            vm_hooks::passes(),
+            vm_hooks::steps()
+        );
+    }
+
     /// One drain of the adjustments' driver ([`serve_adjustments`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn serve_adjustments(&mut self) {
@@ -836,9 +952,17 @@ impl Rig for PlayerRig<'_> {
     /// it does stops the wait ([`preparation_stops`]), and the game looks
     /// at the threads for a failure's cause.
     ///
-    /// The loading lifetime's gauge descriptor is replaced first from the
-    /// preset the play refreshed, with the gauge the attempt shows.
+    /// A pending play skin is built for the attempt first
+    /// ([`attempt_skin`](Self::attempt_skin)), and the attempt prepared
+    /// with its specialization, staged with it. The loading lifetime's
+    /// gauge descriptor is replaced from the preset the play refreshed,
+    /// with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        let skin = match self.attempt_skin(loaded) {
+            Ok(skin) => skin,
+            Err(stopped) => return Ok(stopped),
+        };
+        let specialized = matches!(skin, AttemptSkin::Specialized(_));
         self.attempt_gauge = loaded.displayed().0;
         refresh_loading_gauge(
             &self.render,
@@ -854,7 +978,8 @@ impl Rig for PlayerRig<'_> {
         // adjustment then is published before the preparation ends.
         let mut adjust = self.adjust.take();
         let rig = &*self;
-        let prepared = rig.render.prepare_attempt(attempt, || {
+        let staging = Instant::now();
+        let prepared = rig.render.prepare_attempt_with(attempt, skin, || {
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
@@ -866,6 +991,11 @@ impl Rig for PlayerRig<'_> {
             )
         });
         self.adjust = adjust;
+        // The render thread's staging and upload of the specialization,
+        // apart from the job's time.
+        if specialized {
+            crate::imports::log_staged(staging.elapsed(), &prepared);
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("preparing", self.adjust.as_ref());
         prepared
@@ -881,12 +1011,17 @@ impl Rig for PlayerRig<'_> {
         // A round's opening is not the full play's READY state: READY
         // and a scenario's `until` run from it.
         self.lead_in = lead_in;
-        self.input.open(Request::Open {
+        let opened = self.input.open(Request::Open {
             lead_in,
             logic: thread::current(),
             recorded: self.recorded.clone(),
             gate: None,
-        })
+        });
+        #[cfg(feature = "dev-tools")]
+        if opened.is_ok() {
+            Self::print_lua("open");
+        }
+        opened
     }
 
     fn gated(&self) -> bool {
@@ -945,6 +1080,10 @@ impl Rig for PlayerRig<'_> {
             recorded: self.recorded.clone(),
             gate: Some(generation),
         })?;
+        #[cfg(feature = "dev-tools")]
+        if opened.is_some() {
+            Self::print_lua("open");
+        }
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
             gate.opened(generation, opening);
             gate.end_paused_loading(&self.render);
@@ -1170,6 +1309,8 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        #[cfg(feature = "dev-tools")]
+        Self::print_lua("play end");
         #[cfg(feature = "dev-tools")]
         self.scenario_over();
         // The tail is over: nothing reads the input thread's publications

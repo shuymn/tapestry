@@ -1423,3 +1423,430 @@ fn no_skin_is_imported_after_startup() {
     let loading = dumped_rgba(&frames.join("loading.png"));
     assert_eq!(centre_rgb(&loading), [0, 0, 255]);
 }
+
+/// A Lua play skin in `dir`, `play.luaskin`, whose configured pass reads
+/// the chart's judgment class (option 183, easy) and draws `blue.png`
+/// over the whole canvas for an easy chart, `red.png` otherwise; `body`
+/// runs after the read. `player.toml` chooses it for play.
+fn write_class_skin(fx: &Fixture, body: &str) {
+    let dir = fx.appdata.join("skin");
+    write_blue_skin(&dir);
+    let file = fs::File::create(dir.join("red.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let red: Vec<u8> = (0..16 * 16).flat_map(|_| [255, 0, 0, 255]).collect();
+    e.write_header().unwrap().write_image_data(&red).unwrap();
+    fs::write(
+        dir.join("play.luaskin"),
+        format!(
+            "local skin = {{ type = 0, name = \"class\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             local path = \"red.png\"\n\
+             if ms.option(183) then path = \"blue.png\" end\n\
+             {body}\n\
+             skin.source = {{ {{ id = \"b\", path = path }} }}\n\
+             skin.image = {{ {{ id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 }} }}\n\
+             skin.destination = {{ {{ id = \"b\", dst = {{ {{ x = 0, y = 0, w = 1920, h = 1080 }} }} }} }}\n\
+             return skin\n"
+        ),
+    )
+    .unwrap();
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    fs::write(
+        root.player_settings(),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// [`write_chart`] declaring `#RANK rank` when given.
+fn write_ranked(fx: &Fixture, folder: &str, name: &str, rank: Option<u8>) {
+    let path = write_chart(&fx.library, folder, name, name, 8_000);
+    if let Some(rank) = rank {
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("#RANK {rank}\n"));
+        fs::write(&path, text).unwrap();
+    }
+}
+
+/// The `skin: play:` lines after startup's.
+fn attempt_lines(stdout: &str) -> Vec<&str> {
+    lines(stdout, "skin: play: ")
+        .into_iter()
+        .filter(|l| {
+            !l.starts_with("skin: play: pending: ") && *l != "skin: play: building for the chart"
+        })
+        .collect()
+}
+
+/// A play skin reading the judgment class is pending at startup and
+/// admits charts; each chart's play builds it for the chart's class
+/// before its preparation, and the one kept is reused while the class
+/// holds: a retry, and another chart of the class, run no job or Lua
+/// pass; a chart of another class (no rank is the normal class's) runs
+/// one more. The first play draws its class's image (blue for easy; the
+/// frame dump keeps the run's first play frame).
+#[test]
+fn a_pending_skin_is_reused_while_its_class_holds() {
+    let fx = fixture();
+    write_ranked(&fx, "a", "a.bms", Some(3));
+    write_ranked(&fx, "b", "b.bms", Some(3));
+    write_ranked(&fx, "c", "c.bms", None);
+    write_class_skin(&fx, "");
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,enter,retry,back,wait=b.bms,pick=b.bms,enter,back,\
+         wait=c.bms,pick=c.bms,enter,back,close",
+        &["--dev-frames", &frames_arg],
+    );
+    assert_eq!(
+        lines(&stdout, "skin: play: pending: "),
+        [
+            "skin: play: pending: reads the chart's judgment class as it is built; \
+          built for each chart before its play"
+        ],
+        "{stdout}"
+    );
+    assert_eq!(
+        attempt_lines(&stdout),
+        [
+            "skin: play: specialized",
+            "skin: play: reused",
+            "skin: play: reused",
+            "skin: play: specialized"
+        ],
+        "{stdout}"
+    );
+    assert_eq!(lines(&stdout, "play started").len(), 4, "{stdout}");
+    // Startup's job and two passes, and one job and pass per class.
+    assert_eq!(
+        lines(&stdout, "dev: skin imports "),
+        ["dev: skin imports 3 lua passes 4"],
+        "{stdout}"
+    );
+    let play = dumped_rgba(&frames.join("play.png"));
+    assert_eq!(centre_rgb(&play), [0, 0, 255], "{stdout}");
+}
+
+/// A retry after the play preset's file was edited so that the chart's
+/// class changes (`#DEFEXRANK 120` with `#RANK 1`: hard under the
+/// tapestry policy, very easy under the beatoraja-style one) builds the
+/// pending skin again in the retry, which has no loading state, so the
+/// wait shows as the preparation page's notice; the retry's play draws
+/// the new class's image (blue for very easy) where the first drew red.
+#[test]
+fn a_retry_after_a_preset_edit_builds_the_skin_again() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let fx = fixture();
+    let chart = write_chart(&fx.library, "a", "a.bms", "a.bms", 8_000);
+    let mut text = fs::read_to_string(&chart).unwrap();
+    text.push_str("#DEFEXRANK 120\n#RANK 1\n");
+    fs::write(&chart, text).unwrap();
+    write_class_skin(&fx, "if ms.option(184) then path = \"blue.png\" end");
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    let settings = fs::read_to_string(root.player_settings()).unwrap();
+    fs::write(
+        root.player_settings(),
+        format!("preset = 'mine'\n{settings}"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.presets()).unwrap();
+    let mine = root.presets().join("mine.toml");
+    fs::write(&mine, game::preset_to_toml(&rules::tapestry())).unwrap();
+    let frames = fx.appdata.join("frames");
+    let frames_arg = frames.display().to_string();
+    let mut child = select(
+        &fx,
+        "pick=a.bms,enter,drawn,slow-specializing=1500,retry,back,close",
+        &["--dev-frames", &frames_arg],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut stdout = String::new();
+    let mut edited = false;
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => {
+                // During the first play: the preset's file is edited.
+                if line == "play started" && !edited {
+                    fs::write(&mine, game::preset_to_toml(&rules::beatoraja_style())).unwrap();
+                    edited = true;
+                }
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("the run did not end in time:\n{stdout}");
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        attempt_lines(&stdout),
+        ["skin: play: specialized", "skin: play: specialized"],
+        "{stdout}"
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let first = at(0, "play started");
+    let building = at(first, "skin: play: building for the chart");
+    let page = at(building, "dev: drawn notice: スキンを準備しています");
+    let again = at(page, "skin: play: specialized");
+    at(again, "play started");
+    // The retry's stage is no loading state's.
+    assert_eq!(
+        lines(&stdout, "load: building the play skin").len(),
+        1,
+        "{stdout}"
+    );
+    let mut plays: Vec<_> = fs::read_dir(&frames)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("play-"))
+        })
+        .collect();
+    plays.sort();
+    assert_eq!(plays.len(), 2, "{plays:?}: {stdout}");
+    assert_eq!(centre_rgb(&dumped_rgba(&plays[0])), [255, 0, 0], "{stdout}");
+    assert_eq!(centre_rgb(&dumped_rgba(&plays[1])), [0, 0, 255], "{stdout}");
+}
+
+/// The quit key while a pending skin's specialization loops cancels it
+/// and returns to selection only once the job's thread has ended (inside
+/// the child: no VM open, every job started joined), with no play opened;
+/// the chart is admitted again after.
+#[test]
+fn the_quit_key_during_a_specialization_returns_after_the_job() {
+    let fx = fixture();
+    write_ranked(&fx, "a", "a.bms", Some(2));
+    write_class_skin(&fx, "if ms.option(183) == false then while true do end end");
+    let (_, stdout) = run(
+        &fx,
+        "quit-specializing,pick=a.bms,enter,wait=a.bms,close",
+        &[],
+    );
+    let at = |from: usize, line: &str| {
+        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
+    };
+    let quit = at(0, "dev: quit pressed while specializing");
+    let left = at(quit, "dev: specialization wait left");
+    let ended = at(left, "dev: specialization ended: live 0 joined 2 of 2");
+    at(ended, "select: 1 charts listed");
+    assert!(attempt_lines(&stdout).is_empty(), "{stdout}");
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(lines(&stdout, "dev: lua at open").is_empty(), "{stdout}");
+}
+
+/// The select harness with `steps`, its stdout read line by line as it
+/// comes, each line with when it came, and its stderr whole: the run's
+/// status, its lines and its stderr. A run not ended within 600 s is
+/// killed, and the test fails naming `what` with the lines so far.
+fn timed_run(
+    fx: &Fixture,
+    steps: &str,
+    what: &str,
+) -> (
+    std::process::ExitStatus,
+    Vec<(std::time::Instant, String)>,
+    String,
+) {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let mut child = select(fx, steps, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || std::io::read_to_string(err).unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send((Instant::now(), line)).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut seen: Vec<(Instant, String)> = Vec::new();
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(l) => seen.push(l),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                panic!("{what}: the run did not end in time: {seen:?}");
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    (status, seen, errors.join().unwrap())
+}
+
+/// The window's close while a pending skin's specialization loops, and
+/// while a quit waits for a job whose VM is held past the stop bound,
+/// leaves the job's wait within the stop bound and ends the run: no
+/// selection is entered again and no play opens.
+#[test]
+fn a_close_during_a_specialization_ends_the_run() {
+    use std::time::Duration;
+    for step in ["close-specializing", "escalate-specializing"] {
+        let fx = fixture();
+        write_ranked(&fx, "a", "a.bms", Some(2));
+        write_class_skin(&fx, "while true do end");
+        let (status, seen, stderr) =
+            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
+        let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
+        assert_eq!(status.code(), Some(0), "{step}: {stdout}\n{stderr}");
+        let when = |line: &str| {
+            seen.iter()
+                .find(|(_, l)| l == line)
+                .map(|(t, _)| *t)
+                .unwrap_or_else(|| panic!("{step}: no {line}: {stdout}"))
+        };
+        let closed = when("dev: closed while specializing");
+        let left = when("dev: specialization wait left");
+        // The stop bound (2 s) and a slice, with room for a loaded machine.
+        assert!(
+            left.duration_since(closed) < Duration::from_secs(3),
+            "{step}: {:?}",
+            left.duration_since(closed)
+        );
+        if step == "escalate-specializing" {
+            let quit = when("dev: quit pressed while specializing");
+            assert!(
+                closed.duration_since(quit) >= Duration::from_secs(2),
+                "{stdout}"
+            );
+        }
+        assert!(
+            lines(&stdout, "play started").is_empty(),
+            "{step}: {stdout}"
+        );
+        assert!(
+            lines(&stdout, "dev: lua at open").is_empty(),
+            "{step}: {stdout}"
+        );
+        let listed = stdout.rfind("select: 1 charts listed");
+        let chose = stdout.find("select: chose a.bms").unwrap();
+        assert!(listed.is_none_or(|l| l < chose), "{step}: {stdout}");
+    }
+}
+
+/// A failure of the input thread while a pending skin's specialization
+/// loops, and while a quit waits for a job whose VM is held past the stop
+/// bound, leaves the job's wait within the stop bound and ends the run
+/// with the failure's cause: no selection is entered again and no play
+/// opens.
+#[test]
+fn an_input_failure_during_a_specialization_ends_the_run() {
+    use std::time::Duration;
+    for step in [
+        "input-failure-specializing",
+        "escalate-input-failure-specializing",
+    ] {
+        let fx = fixture();
+        write_ranked(&fx, "a", "a.bms", Some(2));
+        write_class_skin(&fx, "while true do end");
+        let (status, seen, stderr) =
+            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
+        let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
+        assert_eq!(status.code(), Some(1), "{step}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains("the input thread is gone"),
+            "{step}: {stdout}\n{stderr}"
+        );
+        let when = |line: &str| {
+            seen.iter()
+                .find(|(_, l)| l == line)
+                .map(|(t, _)| *t)
+                .unwrap_or_else(|| panic!("{step}: no {line}: {stdout}"))
+        };
+        let failed = when("dev: input failed while specializing");
+        let left = when("dev: specialization wait left");
+        // The stop bound (2 s) and a slice, with room for a loaded machine.
+        assert!(
+            left.duration_since(failed) < Duration::from_secs(3),
+            "{step}: {:?}",
+            left.duration_since(failed)
+        );
+        if step.starts_with("escalate") {
+            let quit = when("dev: quit pressed while specializing");
+            assert!(
+                failed.duration_since(quit) >= Duration::from_secs(2),
+                "{stdout}"
+            );
+        }
+        assert!(
+            lines(&stdout, "play started").is_empty(),
+            "{step}: {stdout}"
+        );
+        assert!(
+            lines(&stdout, "dev: lua at open").is_empty(),
+            "{step}: {stdout}"
+        );
+        let listed = stdout.rfind("select: 1 charts listed");
+        let chose = stdout.find("select: chose a.bms").unwrap();
+        assert!(listed.is_none_or(|l| l < chose), "{step}: {stdout}");
+    }
+}
+
+/// A pending skin that cannot be built for the chosen chart shows its
+/// reason on the select screen, the skin in use never standing in, and
+/// the chart stays admitted: the next choice builds it again.
+#[test]
+fn a_refused_specialization_shows_its_reason_on_the_select_screen() {
+    let fx = fixture();
+    write_ranked(&fx, "a", "a.bms", Some(2));
+    write_class_skin(&fx, "local m = require(\"missing\")");
+    let (_, stdout) = run(
+        &fx,
+        "pick=a.bms,enter,wait=a.bms,pick=a.bms,enter,wait=a.bms,close",
+        &[],
+    );
+    let refused = lines(&stdout, "skin: play: refused for the chart: ");
+    assert_eq!(refused.len(), 2, "{stdout}");
+    assert!(refused[0].contains("missing"), "{stdout}");
+    let notices = lines(&stdout, "dev: drawn notice: ");
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("the play skin cannot be built for this chart: ")),
+        "{stdout}"
+    );
+    assert!(
+        lines(&stdout, "select: not admitted").is_empty(),
+        "{stdout}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+}

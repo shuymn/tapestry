@@ -534,12 +534,14 @@ impl Selection {
                 Some(SelectStep::QuitLoading) => {
                     script.slow_load.get_or_insert_default().quit = true
                 }
+                Some(SelectStep::Specializing(s)) => crate::dev::specializing(s),
                 Some(SelectStep::CloseLoading) => {
                     script.slow_load.get_or_insert_default().close = true;
                 }
                 Some(SelectStep::SlowMeasuring(ms)) => crate::dev::slow_measuring(ms),
                 Some(SelectStep::SlowDecoding(ms)) => crate::dev::slow_decoding(ms),
                 Some(SelectStep::SlowPreparing(ms)) => crate::dev::slow_preparing(ms),
+                Some(SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
                 Some(SelectStep::SlowChartLoad(ms)) => crate::dev::slow_chart_load(ms),
                 Some(SelectStep::PressLoading(ms)) => crate::dev::press_loading(ms),
                 Some(SelectStep::HoldBackground) => crate::dev::hold_background(),
@@ -668,6 +670,8 @@ pub fn script_result(
                     c.arm(k);
                 }
             }
+            // Holds the retry's specialization.
+            Some(&SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
             Some(SelectStep::Drawn) => {
                 if !render.wait_end_drawn(crate::dev::STEP_TIMEOUT) {
                     script.fail("the result's page was not drawn".to_owned());
@@ -815,6 +819,13 @@ fn drive_practice(
         Some(SelectStep::Rounds(_)) => {
             let why = match screen.notice() {
                 Some(why) => format!("the practice was refused: {why}"),
+                // The armed quit cancelled the Start's specialization, and
+                // the page shows again: the rounds' expected end.
+                None if sc.rounds == 0 && crate::dev::take_specialization_quit() => {
+                    println!("dev: the rounds ended at the Start's cancelled specialization");
+                    script.done();
+                    return Driven::Wait;
+                }
                 None if sc.rounds > 0 => "the rounds ended before their last".to_owned(),
                 None if script.expired() => "no round started".to_owned(),
                 None => return Driven::Wait,
@@ -1001,7 +1012,7 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
 
 /// Shows the load's lines of `page` at `stage` on the play screen, and
 /// says so on the console; nothing without them.
-fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
+pub(crate) fn show_stage(render: &RenderLink, page: Option<&LoadingText>, stage: Stage) {
     let Some(page) = page else {
         return;
     };
