@@ -20,7 +20,9 @@
 //!   `#RANK 2` window in every shipped preset, so its class is
 //!   [`JudgeClass::Normal`], the class of `#RANK 2`;
 //! - 290, course mode (`:526-527`): a constant `false`, as there are no
-//!   courses.
+//!   courses;
+//! - 1008, `table_song` (`:351-352`): a constant `false`, as there are no
+//!   difficulty tables.
 //!
 //! `main_state.number` and `main_state.text` answer these ids, the rest
 //! being play state:
@@ -286,7 +288,7 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
     };
     let fact = match id {
         AUTOPLAY_OFF | AUTOPLAY_ON if facts.scene != ScreenKind::Play => return constant(false),
-        COURSE_MODE => return constant(false),
+        COURSE_MODE | crate::import::ops::TABLE_SONG => return constant(false),
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
         _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
         _ => return OptionRead::LiveState,
@@ -374,7 +376,8 @@ mod tests {
     #[test]
     fn the_scene_s_constants_hold_off_play() {
         // Autoplay (32, 33) is false off the play scene whatever the
-        // snapshot, and course mode (290) is false on every scene.
+        // snapshot, and course mode (290) and `table_song` (1008) are false
+        // on every scene.
         for scene in [
             ScreenKind::Selection,
             ScreenKind::Decision,
@@ -389,6 +392,8 @@ mod tests {
                 (-33, true),
                 (290, false),
                 (-290, true),
+                (1_008, false),
+                (-1_008, true),
             ] {
                 assert_eq!(
                     option(&f, n),

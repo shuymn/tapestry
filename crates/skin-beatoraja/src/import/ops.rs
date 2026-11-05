@@ -266,6 +266,11 @@ const HIDDEN_ON: i32 = 273;
 /// reads the play context's exact BPM-change fact (D4).
 const CHART_NO_BPM_CHANGE: i32 = 176;
 const CHART_BPM_CHANGE: i32 = 177;
+/// `table_song` (`BooleanPropertyFactory.java:351-352`), whether the chart
+/// came from a difficulty table: a scene constant, false, as there are no
+/// difficulty tables and outside one the source's table name is empty
+/// (`PlayerResource.java:128-129`).
+pub(crate) const TABLE_SONG: i32 = 1_008;
 
 /// A condition as the importer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,7 +283,8 @@ pub(crate) enum Cond {
     },
     /// A built-in the model has no value for.
     Unsupported(i32),
-    /// A declared option item, folded: whether it holds.
+    /// A declared option item or a scene constant, folded: whether it
+    /// holds.
     Fold(bool),
     /// Neither built in nor declared: never drawn.
     Undefined(i32),
@@ -356,6 +362,9 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 /// state whichever widget draws it, where the source reads it from a
 /// judge region its judge widget makes (`JudgeManager.java:129, 686`).
 fn built_in_cond(id: i32, negative: bool) -> Cond {
+    if id == TABLE_SONG {
+        return Cond::Fold(negative);
+    }
     match builtin(id) {
         Some((body, display_deviation)) => {
             let mut src = String::with_capacity(MAX_COND_BYTES);
@@ -637,5 +646,16 @@ mod tests {
         assert_eq!(numeric(40, &items), Cond::Unsupported(40));
         assert_eq!(numeric(-41, &items), Cond::Unsupported(-41));
         assert_eq!(named("!bgaon"), Some(Cond::Unsupported(-41)));
+    }
+
+    /// `table_song` is a scene constant, false, by number and by name, and
+    /// wins over an item declared with its number.
+    #[test]
+    fn the_table_song_condition_is_a_constant_false() {
+        let items = BTreeMap::from([(TABLE_SONG, true)]);
+        assert_eq!(numeric(1_008, &items), Cond::Fold(false));
+        assert_eq!(numeric(-1_008, &items), Cond::Fold(true));
+        assert_eq!(named("table_song"), Some(Cond::Fold(false)));
+        assert_eq!(named("!table_song"), Some(Cond::Fold(true)));
     }
 }

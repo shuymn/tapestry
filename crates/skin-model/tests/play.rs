@@ -50,6 +50,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     }
 }
 
@@ -526,6 +527,7 @@ fn targets_match_the_evaluators() {
         last_note_end: TimeUs(0),
         bpm_range: None,
         bpm_whole_change: None,
+        play_level: None,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),

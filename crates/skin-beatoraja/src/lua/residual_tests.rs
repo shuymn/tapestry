@@ -610,6 +610,30 @@ fn branches_merge_locals_and_returns() {
     }
 }
 
+/// A frame's `number(96)` reads the chart's play level under its validity,
+/// through the same mapping as a `ref`, and no fact: nothing makes the skin
+/// pending. What could leave `i32` stays unsupported.
+#[test]
+fn a_frames_play_level_read_lowers_under_its_validity() {
+    let r = run(&number("", "function() return ms.number(96) end"));
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(r.lowered, ["(chart.level)"]);
+    assert_eq!(r.meta[0].0, ["chart.level_valid"]);
+    assert!(!r.meta[0].2);
+    let r = run(&skin(
+        "",
+        &image("function() return ms.number(96) >= 12 end"),
+    ));
+    assert_eq!(r.callbacks, [Disposition::Lowered]);
+    assert_eq!(r.lowered, ["chart.level_valid && ((chart.level) >= 12)"]);
+    let r = run(&number("", "function() return ms.number(96) + 2 end"));
+    assert!(
+        matches!(r.callbacks[..], [Disposition::Replaced(_)]),
+        "{:?}",
+        r.callbacks
+    );
+}
+
 #[test]
 fn conversion_keeps_its_reads() {
     // A BPM read a draw converts to true: its guard and D4 kept.

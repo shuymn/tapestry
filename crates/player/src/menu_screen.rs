@@ -217,7 +217,9 @@ const LOADING_TOP: f32 = 400.0;
 /// The renderer, with the select screen's text when it draws menus.
 pub struct MenuScreen {
     renderer: Renderer,
-    /// The font, when the screen draws menus; read once per screen.
+    /// The font, read once per screen: when it is built on a screen that
+    /// draws menus, and on a screen for plays only when its first page
+    /// comes.
     fonts: Option<Fonts>,
     /// The text prepared for this renderer, and the page it shows.
     text: Option<MenuText>,
@@ -330,7 +332,9 @@ fn fields_changed(old: &ChosenChart, new: &ChosenChart) -> TextSlots {
 }
 
 impl MenuScreen {
-    /// `renderer`, drawing menus in `fonts` if given.
+    /// `renderer`, drawing menus in `fonts`; a screen for plays only has
+    /// none, draws a black launch screen, and reads the font when it first
+    /// has a page to draw.
     pub const fn new(renderer: Renderer, fonts: Option<Fonts>) -> Self {
         Self {
             renderer,
@@ -450,13 +454,15 @@ impl MenuScreen {
 
     /// Lays `page` out from `left` and `top` and prepares it as this
     /// renderer's text.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's text, and [`Fonts::runtime`] on a screen for plays
+    /// only, whose first page is the first that needs a font.
     fn prepare(&mut self, page: &MenuPage, left: f32, top: f32) -> Result<(), RenderError> {
-        let Some(fonts) = self.fonts.as_mut() else {
-            // A screen made for plays only: no font was looked for.
-            return Err(render::text::TextError::NoFont {
-                dir: render::text::fonts_dir(),
-            }
-            .into());
+        let fonts = match &mut self.fonts {
+            Some(fonts) => fonts,
+            none => none.insert(Fonts::runtime()?),
         };
         let blocks: Vec<TextBlock> = page
             .lines
@@ -912,8 +918,15 @@ mod tests {
             artist: Some("a".to_owned()),
             subartist: None,
             genre: Some("g".to_owned()),
+            play_level: Some(12),
         };
         assert_eq!(fields_changed(&chart, &chart.clone()), TextSlots::NONE);
+        // The play level is no text: it names no slot.
+        let level = ChosenChart {
+            play_level: None,
+            ..chart.clone()
+        };
+        assert_eq!(fields_changed(&chart, &level), TextSlots::NONE);
         let artist = ChosenChart {
             artist: Some("b".to_owned()),
             ..chart.clone()
@@ -1032,6 +1045,45 @@ mod tests {
         assert!(sent.1.load(Ordering::Acquire));
         let mut screen = MenuScreen::new(warp(), None);
         assert!(screen.splash(Duration::ZERO).is_none());
+    }
+
+    /// A screen for plays only draws the skin's wait and the load's lines
+    /// on the cleared canvas: it reads the font for the first page it has.
+    #[test]
+    fn a_screen_for_plays_only_draws_its_pages() {
+        let lit = |screen: &MenuScreen| {
+            screen
+                .renderer
+                .read_back()
+                .chunks(4)
+                .filter(|p| p[0] > 200 || p[1] > 200)
+                .count()
+        };
+        let mut screen = MenuScreen::new(warp(), None);
+        let wait = crate::loading_text::skin_wait_page();
+        screen.menu(&wait, true).unwrap();
+        assert!(lit(&screen) > 100);
+
+        let mut screen = MenuScreen::new(warp(), None);
+        screen.pending_loading(&wait, true).unwrap();
+        assert!(lit(&screen) > 100);
+    }
+
+    /// A screen for plays only opens no font for what shows no page, its
+    /// launch screen and its text frames: only its first page does.
+    #[test]
+    fn a_screen_for_plays_only_opens_no_font_without_a_page() {
+        use std::time::Duration;
+        let mut screen = MenuScreen::new(warp(), None).with_sink(Box::new(Sent::default()));
+        assert!(matches!(
+            screen.splash(Duration::from_millis(750)),
+            Some(Ok(true))
+        ));
+        screen.text(&["play"]).unwrap();
+        assert!(screen.fonts.is_none());
+        let wait = crate::loading_text::skin_wait_page();
+        screen.menu(&wait, true).unwrap();
+        assert!(screen.fonts.is_some());
     }
 
     /// Fading the launch screen lays nothing out again: once its glyphs are

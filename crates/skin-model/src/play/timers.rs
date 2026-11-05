@@ -75,7 +75,7 @@ fn rate_bp(ex: u32, targets: u64) -> i32 {
 
 /// The readout fields of one frame, `field::BPM_CURRENT_X100` to
 /// `field::DURATION_VALID` and from `field::DURATION_VARIANTS` to
-/// `field::BPM_CHANGE_VALID`, validated before anything is applied.
+/// `field::CHART_LEVEL_VALID`, validated before anything is applied.
 #[derive(Clone, Copy)]
 struct Readouts {
     /// Per variant in slot order: ms, green and validity.
@@ -88,6 +88,8 @@ struct Readouts {
     bpm_range_valid: i32,
     bpm_change: i32,
     bpm_change_valid: i32,
+    level: i32,
+    level_valid: i32,
     remaining_s: i32,
     elapsed_s: i32,
     covers: Covers,
@@ -196,6 +198,17 @@ fn readout(v: Option<u32>) -> Option<(i32, i32)> {
         None => Some((0, 0)),
         Some(v) if v <= READOUT_MAX_U32 => Some((i32::try_from(v).ok()?, 1)),
         Some(_) => None,
+    }
+}
+
+/// The play level's fields, a play's and a loading frame's alike: its value
+/// and whether it is known, and 0 and false for what a source number widget
+/// reserves and never draws, `i32::MIN` and `i32::MAX`
+/// (`skin/SkinNumber.java:139`).
+pub(crate) const fn level_fields(level: Option<i32>) -> (i32, i32) {
+    match level {
+        Some(l) if l != i32::MIN && l != i32::MAX => (l, 1),
+        _ => (0, 0),
     }
 }
 
@@ -378,6 +391,7 @@ impl Play {
                 1,
             ))
         })?;
+        let (level, level_valid) = level_fields(self.play_level);
         let now = i128::from(frame.now.0);
         let start = i128::from(self.play_at.0);
         let end = i128::from(self.readout_end.0);
@@ -391,6 +405,8 @@ impl Play {
             bpm_range_valid,
             bpm_change: i32::from(self.bpm_whole_change == Some(true)),
             bpm_change_valid: i32::from(self.bpm_whole_change.is_some()),
+            level,
+            level_valid,
             remaining_s: seconds(end - now.max(start), true),
             elapsed_s: seconds(now - start, false),
             covers,
@@ -536,7 +552,7 @@ impl Play {
             .into_iter()
             .chain(r.variants.into_iter().flatten())
             .chain(native)
-            .chain([r.bpm_change, r.bpm_change_valid]);
+            .chain([r.bpm_change, r.bpm_change_valid, r.level, r.level_valid]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
