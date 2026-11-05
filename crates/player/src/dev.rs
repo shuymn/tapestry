@@ -248,6 +248,16 @@ static SPECIALIZING: Mutex<Option<(Specializing, u64, Option<Instant>)>> = Mutex
 /// executing.
 const SPECIALIZING_STEPS: u64 = 20;
 
+/// The armed quit was pressed during a specialization, until a practice's
+/// rounds take it as their expected end.
+static SPECIALIZATION_QUIT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the armed quit was pressed during a specialization, taken: a
+/// practice's rounds, back on their page, end there.
+pub fn take_specialization_quit() -> bool {
+    SPECIALIZATION_QUIT.swap(false, Ordering::AcqRel)
+}
+
 /// Arms `s` for the next specialization.
 pub fn specializing(s: Specializing) {
     *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, u64::MAX, None));
@@ -303,6 +313,7 @@ pub fn specialization_signal(controls: &crate::controls::Controls, fail_input: i
     match (*s, *quit_at) {
         (Specializing::Quit, _) => {
             quit();
+            SPECIALIZATION_QUIT.store(true, Ordering::Release);
             *armed = None;
         }
         (Specializing::Close, _) => {

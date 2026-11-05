@@ -819,6 +819,13 @@ fn drive_practice(
         Some(SelectStep::Rounds(_)) => {
             let why = match screen.notice() {
                 Some(why) => format!("the practice was refused: {why}"),
+                // The armed quit cancelled the Start's specialization, and
+                // the page shows again: the rounds' expected end.
+                None if sc.rounds == 0 && crate::dev::take_specialization_quit() => {
+                    println!("dev: the rounds ended at the Start's cancelled specialization");
+                    script.done();
+                    return Driven::Wait;
+                }
                 None if sc.rounds > 0 => "the rounds ended before their last".to_owned(),
                 None if script.expired() => "no round started".to_owned(),
                 None => return Driven::Wait,

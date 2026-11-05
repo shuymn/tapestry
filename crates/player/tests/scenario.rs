@@ -926,8 +926,8 @@ fn a_refused_specialization_returns_to_the_practice_page() {
 /// The quit key while a pending skin's specialization loops, started from
 /// a practice Start, cancels it and returns to the practice page only once
 /// the job's thread has ended (inside the child: no VM open, every job
-/// started joined), with no round opened; the scenario's rounds then fail
-/// for want of one.
+/// started joined), with no round and no recording opened; the
+/// scenario's rounds end there, and the run leaves the page and quits.
 #[test]
 fn the_quit_key_during_a_practice_specialization_returns_to_the_page() {
     let fx = Fixture::new();
@@ -974,7 +974,7 @@ fn the_quit_key_during_a_practice_specialization_returns_to_the_page() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let at = |from: usize, line: &str| {
         stdout[from..]
             .find(line)
@@ -985,12 +985,13 @@ fn the_quit_key_during_a_practice_specialization_returns_to_the_page() {
     let quit = at(page, "dev: quit pressed while specializing");
     let left = at(quit, "dev: specialization wait left");
     let ended = at(left, "dev: specialization ended: live 0 joined 2 of 2");
-    at(ended, "practice: on the practice screen");
-    assert!(
-        format!("{stdout}{stderr}").contains("no round started"),
-        "{stdout}\n{stderr}"
+    let back = at(ended, "practice: on the practice screen");
+    at(
+        back,
+        "dev: the rounds ended at the Start's cancelled specialization",
     );
     assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(lines(&stdout, "dev: lua at open").is_empty(), "{stdout}");
     assert!(lines(&stdout, "skin: play: refused").is_empty(), "{stdout}");
     assert!(fx.records().is_empty());
 }
