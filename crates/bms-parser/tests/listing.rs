@@ -1,7 +1,7 @@
 //! A chart's mode and summary as a song list stores them (design.md "Loading
 //! and Song Selection"), against the loader.
 
-use bms_model::{ChartSummary, TimeUs};
+use bms_model::{ChartSummary, Tempo, TimeUs};
 use bms_parser::{
     ChartMode, Limits, LoadError, LoadOptions, load_bms, read_header, read_listing, read_scanned,
     summarize,
@@ -170,6 +170,42 @@ fn a_summary_counts_and_times_the_chart() {
     assert_eq!(s.tempo_start, s.tempo_min);
     assert!(s.tempo_max > s.tempo_min);
     assert_eq!(s, ChartSummary::of(&load(CHART, 0).unwrap().chart));
+}
+
+/// The length ends at a final long note's tail, and each tempo is its exact
+/// value: both written out here, not read through another summary.
+#[test]
+fn a_summary_ends_at_a_long_notes_tail_with_exact_tempos() {
+    // 120 BPM to measure 1, 240 to measure 2, 60 from there: measures 1, 2 and
+    // 3 start at 2 s, 3 s and 7 s. The long note holds from 2 s to 7 s, and the
+    // last tap is at 3 s.
+    let text = "\
+#BPM 120
+#LNTYPE 1
+#WAV01 a.wav
+#BPM01 240
+#BPM02 60
+#00108:01
+#00208:02
+#00151:01
+#00212:01
+#00351:01
+";
+    let exact = |bpm: u128| Tempo::from_units(bpm * Tempo::UNITS_PER_BPM).unwrap();
+    let expected = ChartSummary {
+        taps: 1,
+        longs: 1,
+        mines: 0,
+        length: TimeUs(7_000_000),
+        tempo_start: exact(120),
+        tempo_min: exact(60),
+        tempo_max: exact(240),
+    };
+    assert_eq!(
+        summarize(text.as_bytes(), &Limits::default()).unwrap(),
+        expected
+    );
+    assert_eq!(ChartSummary::of(&load(text, 0).unwrap().chart), expected);
 }
 
 /// The BGM counts toward the length, only when its sound is declared.
