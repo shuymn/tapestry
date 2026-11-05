@@ -460,7 +460,7 @@ pub struct ViewStamp {
     pub complete: bool,
     /// Where it entered Closing, once it has.
     pub closing: Option<TimeUs>,
-    /// Its attempt's READY on the chart's axis, its origin and its end;
+    /// Its attempt's READY on the chart's axis, its opening and its end;
     /// `None` before an attempt is committed.
     pub ready: Option<(TimeUs, TimeUs)>,
 }

@@ -7345,6 +7345,11 @@ pub(crate) mod tests {
 
         /// A render thread on these installers, nothing loaded or chosen.
         pub(crate) fn spawn_bare(&self) -> super::RenderLink {
+            self.spawn_with(Box::new(NoFrames))
+        }
+
+        /// [`spawn_bare`](Self::spawn_bare) with the frame sink `frames`.
+        pub(crate) fn spawn_with(&self, frames: Box<dyn super::FrameSink>) -> super::RenderLink {
             let shared = self.clone();
             let make: MakeScreen = Box::new(move || {
                 let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
@@ -7358,7 +7363,8 @@ pub(crate) mod tests {
                     held: None,
                 }) as Box<dyn Screen>)
             });
-            spawn_empty(make)
+            let clock = QpcClock::start();
+            spawn(make, None, None, clock, view(), measure(clock), frames).unwrap()
         }
 
         pub(crate) fn log(&self) -> Vec<String> {
@@ -7637,6 +7643,51 @@ pub(crate) mod tests {
         );
         link.commit_attempt().unwrap();
         assert!(wait_until(|| skin() >= s + 3));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A loading frame's stamp says which presentation it drew: not settled
+    /// on the pending placeholder, settled on the skin's after a commit in
+    /// its lifetime.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_loading_stamp_says_which_branch_drew() {
+        struct Stamps(Arc<std::sync::Mutex<Vec<bool>>>);
+        impl super::FrameSink for Stamps {
+            fn frame(&mut self, _screen: &dyn Screen, drawn: &super::Drawn<'_>) {
+                if let Some(l) = drawn.loading_stamp {
+                    self.0.lock().unwrap().push(l.settled);
+                }
+            }
+        }
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let stamps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let link = screens.spawn_with(Box::new(Stamps(Arc::clone(&stamps))));
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.pend(ScreenKind::Play).wait().unwrap(),
+            Preparation::Ready
+        );
+        let (pending, skin) = (&screens.pending, &screens.loading);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending.load(Ordering::Acquire) >= 3));
+        assert_eq!(skin.load(Ordering::Acquire), 0);
+        // The sink runs after each frame: a frame in flight may not be in yet.
+        assert!(wait_until(|| stamps.lock().unwrap().len() >= 2));
+        assert!(stamps.lock().unwrap().iter().all(|settled| !settled));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert!(wait_until(|| skin.load(Ordering::Acquire) >= 3));
+        assert!(wait_until(|| stamps
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|settled| *settled)));
         link.end_loading().unwrap();
         link.exit();
     }

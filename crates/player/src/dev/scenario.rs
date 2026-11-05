@@ -1391,24 +1391,18 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
     )
 }
 
-/// The phase `drawn`'s acquired state is in: the view's own, which may lag
-/// the frame's time. A view past READY that stopped playing, the tail's,
-/// the ring-out's and a stop's, is `tail`.
+/// The phase `drawn` was drawn in, by what the screens choose from: Closing
+/// from the view, READY from the frame's time against where play starts,
+/// and playing from the view; a frame past READY its view no longer plays
+/// is the tail's, the ring-out's or a stop's.
 fn phase(drawn: &Drawn<'_>) -> &'static str {
     match (drawn.play, drawn.view) {
         (Some(_), Some(v)) if v.closing.is_some() => "closing",
+        (Some(t), Some(v)) if v.ready.is_some_and(|(_, end)| t < end) => "ready",
         (Some(_), Some(v)) if v.playing => "play",
-        (Some(_), Some(v))
-            if v.complete
-                || v.ready
-                    .zip(v.finalized)
-                    .is_some_and(|((_, end), finalized)| finalized >= end) =>
-        {
-            "tail"
-        }
-        (Some(_), _) => "ready",
+        (Some(_), Some(_)) => "tail",
         (None, _) if drawn.loading => "loading",
-        (None, _) => "other",
+        _ => "other",
     }
 }
 
@@ -2267,7 +2261,6 @@ mod tests {
             (view(true, false, Some(TimeUs(1))), "play"),
             (view(false, true, Some(TimeUs(1))), "tail"),
             (view(false, false, Some(TimeUs(1))), "tail"),
-            (view(false, false, Some(TimeUs(-1))), "ready"),
             (
                 crate::measure::ViewStamp {
                     closing: Some(TimeUs(1)),
@@ -2279,6 +2272,19 @@ mod tests {
             d.view = Some(v);
             assert_eq!(super::phase(&d), want, "{v:?}");
         }
+    }
+
+    /// A frame before play is READY's, as the screens draw it, however far
+    /// a negative input offset put the watermark.
+    #[test]
+    fn a_phase_before_play_is_ready() {
+        let mut d = drawn(1, -5);
+        d.view = Some(crate::measure::ViewStamp {
+            playing: false,
+            finalized: Some(TimeUs(9_000)),
+            ..drawn_view()
+        });
+        assert_eq!(super::phase(&d), "ready");
     }
 
     /// Captures of one frame share its number, and later frames count on;

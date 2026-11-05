@@ -799,19 +799,14 @@ fn a_ready_capture_follows_a_practices_lead_in_and_start() {
         assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
         let side = fs::read_to_string(fx.base.join("out").join("r.json")).unwrap();
         assert_eq!(side_value(&side, "phase"), "ready", "{side}");
-        assert_eq!(
-            side_num(&side, "ready_origin_us"),
-            start - 2_000_000,
-            "{side}"
-        );
+        // A round's READY begins 200 ms before its lead-in (design.md
+        // "Mid-Chart Start and Section Repeat").
+        let origin = start - 2_000_000 - 200_000;
+        assert_eq!(side_num(&side, "ready_origin_us"), origin, "{side}");
         assert_eq!(side_num(&side, "play_at_us"), start, "{side}");
         let elapsed = side_num(&side, "ready_us");
-        assert!((1_500_000..2_000_000).contains(&elapsed), "{side}");
-        assert_eq!(
-            elapsed,
-            side_num(&side, "chart_us") - (start - 2_000_000),
-            "{side}"
-        );
+        assert!((1_500_000..2_200_000).contains(&elapsed), "{side}");
+        assert_eq!(elapsed, side_num(&side, "chart_us") - origin, "{side}");
     }
 }
 
@@ -864,7 +859,7 @@ fn a_closing_frames_sidecar_says_closing() {
 
 /// A loading capture says where on its loading axis it was sampled: the
 /// origin and the elapsed time agree, and the completion time comes later.
-/// The frame's settledness is said too.
+/// Without a pending skin it draws its presentation: settled.
 #[test]
 fn a_loading_frames_sidecar_has_its_sampled_time() {
     let fx = Fixture::new();
@@ -886,10 +881,34 @@ fn a_loading_frames_sidecar_has_its_sampled_time() {
         side_num(&side, "completed_us") >= origin + elapsed,
         "{side}"
     );
-    assert!(
-        ["true", "false"].contains(&side_value(&side, "settled").as_str()),
-        "{side}"
-    );
+    assert_eq!(side_value(&side, "settled"), "true", "{side}");
+}
+
+/// With a negative input offset the evaluation's watermark passes chart
+/// time 0 while the frames are still READY's, and the phase stays `ready`.
+#[test]
+fn a_negative_input_offset_keeps_a_ready_frame_ready() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    write_log(&fx.base.join("logs").join("none.tprl"), &[], 1);
+    fs::create_dir_all(fx.data()).unwrap();
+    let device = DeviceSettings {
+        input_offset_us: -400_000,
+        ..DeviceSettings::default()
+    };
+    game::save_settings(&fx.data().join("device.toml"), &device).unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { ready_at = 800, file = \"r.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/none.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let side = fs::read_to_string(fx.base.join("out").join("r.json")).unwrap();
+    assert!(side_num(&side, "chart_us") < 0, "{side}");
+    assert!(side_num(&side, "finalized_us") > 0, "{side}");
+    assert_eq!(side_value(&side, "phase"), "ready", "{side}");
 }
 
 /// A file taken by a folder on a capture's sidecar fails the run, its PNG
