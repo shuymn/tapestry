@@ -1,10 +1,12 @@
 //! The select screen's state on the game thread (design.md "Play
-//! Lifecycle", "Loading and Song Selection"): the charts a library search
-//! found, grouped by folder, the cursor, the search box and the order, and
-//! the page the render thread draws from them ([`MenuPage`]).
+//! Lifecycle", "Loading and Song Selection"): the place in the library's
+//! folders, or the all-chart list, or a search's results, what it lists, the
+//! cursor, the search box and the order, and the page the render thread draws
+//! from them ([`MenuPage`]).
 //!
 //! The keyboard's input comes through winit: the navigation keys move the
-//! cursor, Enter chooses, F11 and F12 step the play preset, which the game
+//! cursor, Enter enters a folder or chooses a chart, Escape and Backspace go
+//! back one place, F11 and F12 step the play preset, which the game
 //! thread's flow applies, Tab gives the search box focus, and text typed
 //! or committed through the IME goes into the search box only while it
 //! has focus. The keyboard's lane keys type nothing into the list. The
@@ -21,7 +23,7 @@ use std::sync::{Mutex, PoisonError};
 use eval::ControlId;
 use input::hid::{HidProduct, is_axis};
 use input::{MenuAction, MenuBindings, MenuEvent};
-use library::{ChartEntry, Score, Search, Sort};
+use library::{ChartEntry, FolderKey, FolderRow, Level, Score, Search, Sort};
 use rules::RulePreset;
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
@@ -51,7 +53,11 @@ pub enum MenuKey {
     Right,
     Enter,
     Tab,
+    /// The first press of Backspace.
     Backspace,
+    /// Backspace repeating while held: only the search box reads it, so a
+    /// held key never climbs the folders.
+    BackspaceHeld,
     Escape,
     /// P: the practice screen of the chart under the cursor.
     Practice,
@@ -221,7 +227,7 @@ pub enum Acted {
     Nothing,
     /// What the page shows changed.
     Changed,
-    /// The search or the order changed: the library is searched again.
+    /// The place, the search or the order changed: the list is read again.
     Search,
     /// The search box gained or lost focus: the IME is allowed only while
     /// it has it.
@@ -246,22 +252,115 @@ const SORTS: [(Sort, &str); 4] = [
 /// One line of the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Row {
-    /// The heading of the folder of chart `.0`, the first in it.
+    /// The "all charts" row.
+    All,
+    /// Folder row `.0`.
     Folder(usize),
+    /// The heading of the folder of chart `.0`, the first in it.
+    Heading(usize),
     /// Chart `.0`.
     Chart(usize),
+}
+
+/// A selectable row's identity, which outlives the list it was read in.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum RowId {
+    All,
+    Folder(FolderKey),
+    Chart(PathBuf),
+}
+
+/// A list as the cursor left it: its selectable rows in order, the cursor's
+/// index among them and the line it showed on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Saved {
+    order: Vec<RowId>,
+    at: usize,
+    line: usize,
+}
+
+impl Saved {
+    /// The one rule of restoration: the first row of `order` from `at` onward
+    /// that the fresh list holds, else the nearest before `at`, else the
+    /// fresh list's first row. A new row is never picked by it.
+    fn resolve(&self, fresh: &HashMap<RowId, usize>) -> usize {
+        let find = |id: &RowId| fresh.get(id).copied();
+        let after = self.order.get(self.at..).unwrap_or_default();
+        let before = self.order.get(..self.at).unwrap_or_default();
+        after
+            .iter()
+            .find_map(find)
+            .or_else(|| before.iter().rev().find_map(find))
+            .unwrap_or(0)
+    }
+}
+
+/// A place in the library, which a query's results cover without leaving.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Place {
+    /// The "all charts" row, then the one root's level or the roots' rows.
+    #[default]
+    Top,
+    /// A folder's level. A root stays a level while it has rows; any other
+    /// folder also stops being one when it becomes a song folder.
+    Folder {
+        key: FolderKey,
+        name: String,
+        root: bool,
+    },
+    /// The all-chart list.
+    All,
+}
+
+/// Where the cursor goes when the next list arrives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Arrival {
+    /// To its row by the rule, over the list it is on.
+    #[default]
+    Keep,
+    /// To the first row: a place just entered.
+    First,
+    /// To this saved list's row by the rule, at its line.
+    Restore(Saved),
+}
+
+/// How the current list is read: the caller reads it from the library and
+/// hands it to the method named.
+#[derive(Clone, Debug)]
+pub enum ListQuery<'a> {
+    /// A search: [`SelectScreen::set_entries`].
+    Search(Search<'a>),
+    /// Top: [`SelectScreen::set_top`], of the one root's level when `one_root`
+    /// and the library has rows of it, else of the rows of the roots.
+    Top { one_root: bool, sort: Sort },
+    /// A folder's level: [`SelectScreen::set_level`].
+    Level { key: FolderKey, sort: Sort },
 }
 
 /// The select screen.
 #[derive(Debug, Default)]
 pub struct SelectScreen {
-    /// The charts found, grouped by folder, at most [`LIMIT`].
+    /// The place, and those it was entered from, each as the cursor left it.
+    place: Place,
+    stack: Vec<(Place, Saved)>,
+    /// The place as it was when the query became non-empty.
+    under_query: Option<Saved>,
+    /// Where the cursor goes when the next list arrives.
+    arrival: Arrival,
+    /// Whether the list starts with the "all charts" row, and its count.
+    all_row: Option<u64>,
+    /// The folder rows, after it.
+    folders: Vec<FolderRow>,
+    /// Whether Top's folder rows are the roots.
+    top_lists_roots: bool,
+    /// The charts listed, after them; with the folder rows at most [`LIMIT`].
     entries: Vec<ChartEntry>,
-    /// Whether the search found more than [`LIMIT`].
+    /// Whether there were more rows than [`LIMIT`].
     more: bool,
     /// The list's lines.
     rows: Vec<Row>,
-    /// The chart under the cursor, by index into `entries`.
+    /// The selectable row under the cursor: the "all charts" row, the folder
+    /// rows and the charts, in that order.
     cursor: usize,
     /// The first of `rows` the list shows.
     top: usize,
@@ -281,7 +380,7 @@ pub struct SelectScreen {
     preset_error: Option<String>,
     /// Why `player.toml` could not be written, until it is.
     save_error: Option<String>,
-    /// The library roots, for folder names.
+    /// The library roots as configured, for folder names and how many.
     roots: Vec<PathBuf>,
     /// The chosen preset, whose bests the list shows.
     bests_preset: Option<RulePreset>,
@@ -298,8 +397,25 @@ impl SelectScreen {
         }
     }
 
-    /// The search that fills the list: one more than [`LIMIT`], to tell
-    /// when there are more.
+    /// How the current list is read.
+    pub fn list_query(&self) -> ListQuery<'_> {
+        let sort = self.sort_key();
+        match &self.place {
+            _ if !self.query.is_empty() => ListQuery::Search(self.search()),
+            Place::All => ListQuery::Search(self.search()),
+            Place::Top => ListQuery::Top {
+                one_root: self.roots.len() == 1,
+                sort,
+            },
+            Place::Folder { key, .. } => ListQuery::Level {
+                key: key.clone(),
+                sort,
+            },
+        }
+    }
+
+    /// The search of the all-chart list or of a query's results: one more
+    /// than [`LIMIT`], to tell when there are more.
     pub fn search(&self) -> Search<'_> {
         Search {
             text: &self.query,
@@ -324,42 +440,150 @@ impl SelectScreen {
         &self.query
     }
 
-    /// The charts a search or a scan's pass found, in its order. The cursor
-    /// stays on its chart; when that chart is no longer listed, it moves to
-    /// the nearest chart after it in the old list that still is, else the
-    /// nearest before it, else the first chart. The list scrolls so the
-    /// cursor stays on its line where the list allows.
-    pub fn set_entries(&mut self, mut entries: Vec<ChartEntry>) {
-        let line = self.cursor_line();
-        self.more = entries.len() > LIMIT;
-        entries.truncate(LIMIT);
-        let old = std::mem::replace(&mut self.entries, entries);
+    /// The charts a search or a scan's pass found, in its order, under their
+    /// folders' headings. See [`arrive`](Self::arrive) for the cursor.
+    pub fn set_entries(&mut self, entries: Vec<ChartEntry>) {
+        self.arrive(None, Vec::new(), entries, false, true);
+    }
+
+    /// Top's list: the "all charts" row of the library's `charts` listed, then
+    /// `level`, which is the one root's or the rows of the roots.
+    pub fn set_top(&mut self, level: Level, charts: u64, lists_roots: bool) {
+        self.top_lists_roots = lists_roots;
+        self.arrive(Some(charts), level.folders, level.charts, level.more, false);
+    }
+
+    /// A folder's level, read for [`ListQuery::Level`]: `true` when it is
+    /// listed. `false` when that folder is no longer a level: nothing listed
+    /// remains under it, or it has become a song folder, its own charts and
+    /// nothing listed below them. Selection is then one place up, restored by
+    /// that place's saved list, and the list is to be read again.
+    pub fn set_level(&mut self, level: Level) -> bool {
+        let navigable = match &self.place {
+            Place::Folder { key, root, .. } => {
+                let folder = key.path();
+                let own = |c: &ChartEntry| c.path.parent() == Some(folder.as_path());
+                let song_folder = !*root
+                    && level.folders.is_empty()
+                    && !level.more
+                    && level.charts.iter().all(own);
+                !song_folder && !(level.folders.is_empty() && level.charts.is_empty())
+            }
+            _ => true,
+        };
+        if !navigable {
+            self.go_back_a_place();
+            return false;
+        }
+        self.arrive(None, level.folders, level.charts, level.more, false);
+        true
+    }
+
+    /// Puts a new list in place. The cursor goes where [`Arrival`] says, by
+    /// [`Saved::resolve`] unless the place was just entered, and the list
+    /// scrolls so it stays on its line where the list allows.
+    fn arrive(
+        &mut self,
+        all_row: Option<u64>,
+        mut folders: Vec<FolderRow>,
+        mut entries: Vec<ChartEntry>,
+        more: bool,
+        headings: bool,
+    ) {
+        let saved = match std::mem::take(&mut self.arrival) {
+            Arrival::Keep => Some(self.saved()),
+            Arrival::First => None,
+            Arrival::Restore(saved) => Some(saved),
+        };
+        let rows = folders.len() + entries.len();
+        self.more = more || rows > LIMIT;
+        folders.truncate(LIMIT);
+        entries.truncate(LIMIT - folders.len());
+        self.all_row = all_row;
+        self.folders = folders;
+        self.entries = entries;
         self.rows.clear();
+        if self.all_row.is_some() {
+            self.rows.push(Row::All);
+        }
+        self.rows.extend((0..self.folders.len()).map(Row::Folder));
         let mut folder: Option<&Path> = None;
         for (i, e) in self.entries.iter().enumerate() {
             let parent = e.path.parent();
-            if folder != parent {
+            if headings && folder != parent {
                 folder = parent;
-                self.rows.push(Row::Folder(i));
+                self.rows.push(Row::Heading(i));
             }
             self.rows.push(Row::Chart(i));
         }
-        let listed: HashMap<&Path, usize> = self
-            .entries
+        match saved {
+            Some(saved) => {
+                let fresh = self.row_ids().enumerate().map(|(i, id)| (id, i)).collect();
+                self.cursor = saved.resolve(&fresh);
+                self.scroll(saved.line);
+            }
+            None => {
+                self.cursor = 0;
+                self.scroll(CURSOR_LINE);
+            }
+        }
+    }
+
+    /// How many selectable rows come before the charts.
+    fn lead(&self) -> usize {
+        usize::from(self.all_row.is_some()) + self.folders.len()
+    }
+
+    /// The selectable rows' identities, in order.
+    fn row_ids(&self) -> impl Iterator<Item = RowId> + '_ {
+        self.all_row
             .iter()
-            .enumerate()
-            .map(|(i, e)| (e.path.as_path(), i))
-            .collect();
-        let find = |e: &ChartEntry| listed.get(e.path.as_path()).copied();
-        // From the cursor's own chart on, then back from the one before it.
-        let after = old.get(self.cursor..).unwrap_or_default();
-        let before = old.get(..self.cursor).unwrap_or_default();
-        self.cursor = after
-            .iter()
-            .find_map(find)
-            .or_else(|| before.iter().rev().find_map(find))
-            .unwrap_or(0);
-        self.scroll(line.unwrap_or(CURSOR_LINE));
+            .map(|_| RowId::All)
+            .chain(self.folders.iter().map(|f| RowId::Folder(f.key.clone())))
+            .chain(self.entries.iter().map(|e| RowId::Chart(e.path.clone())))
+    }
+
+    /// The list as the cursor leaves it.
+    fn saved(&self) -> Saved {
+        Saved {
+            order: self.row_ids().collect(),
+            at: self.cursor,
+            line: self.cursor_line().unwrap_or(CURSOR_LINE),
+        }
+    }
+
+    /// Goes one place up, restored by that place's saved list: `false` at Top.
+    fn go_back_a_place(&mut self) -> bool {
+        let Some((place, saved)) = self.stack.pop() else {
+            return false;
+        };
+        self.place = place;
+        self.arrival = Arrival::Restore(saved);
+        true
+    }
+
+    /// Enters `place` from the current one, the cursor on its first row.
+    fn enter(&mut self, place: Place) -> Acted {
+        let left = std::mem::replace(&mut self.place, place);
+        self.stack.push((left, self.saved()));
+        self.arrival = Arrival::First;
+        Acted::Search
+    }
+
+    /// Opens on the all-chart list, as "all charts" entered from Top does
+    /// (dev-tools scripts and the tests that run in that list).
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn show_all(&mut self) {
+        self.place = Place::All;
+        self.stack.clear();
+        self.stack.push((
+            Place::Top,
+            Saved {
+                order: vec![RowId::All],
+                ..Saved::default()
+            },
+        ));
+        self.arrival = Arrival::First;
     }
 
     /// Puts the cursor on the chart at `path`; `false` when it is not
@@ -368,8 +592,9 @@ impl SelectScreen {
     pub fn select_path(&mut self, path: &Path) -> bool {
         match self.entries.iter().position(|e| e.path == path) {
             Some(i) => {
-                if i != self.cursor {
-                    self.cursor = i;
+                let at = self.lead() + i;
+                if at != self.cursor {
+                    self.cursor = at;
                     self.scroll(CURSOR_LINE);
                 }
                 true
@@ -378,10 +603,24 @@ impl SelectScreen {
         }
     }
 
-    /// The row of the chart under the cursor; none while nothing is
-    /// listed.
+    /// The list's row of the selectable row under the cursor; none while
+    /// nothing is listed.
     fn cursor_row(&self) -> Option<usize> {
-        self.rows.iter().position(|r| *r == Row::Chart(self.cursor))
+        let row = self.row_at_cursor()?;
+        self.rows.iter().position(|r| *r == row)
+    }
+
+    /// The selectable row under the cursor; none while nothing is listed.
+    fn row_at_cursor(&self) -> Option<Row> {
+        let all = usize::from(self.all_row.is_some());
+        if self.cursor < all {
+            Some(Row::All)
+        } else if self.cursor < self.lead() {
+            Some(Row::Folder(self.cursor - all))
+        } else {
+            let i = self.cursor - self.lead();
+            (i < self.entries.len()).then_some(Row::Chart(i))
+        }
     }
 
     /// The line of the list the cursor shows on; none while nothing is
@@ -399,20 +638,54 @@ impl SelectScreen {
         self.top = at.saturating_sub(line).min(last);
     }
 
-    /// The chart under the cursor.
+    /// The chart under the cursor; none on another row.
     pub fn selected(&self) -> Option<&ChartEntry> {
-        self.entries.get(self.cursor)
+        self.cursor
+            .checked_sub(self.lead())
+            .and_then(|i| self.entries.get(i))
     }
 
-    /// How many charts are listed.
+    /// How many charts are under the current place: its folder rows' counts
+    /// and its chart rows.
     pub fn listed(&self) -> usize {
-        self.entries.len()
+        let below: u64 = self.folders.iter().map(|f| f.charts).sum();
+        usize::try_from(below).unwrap_or(usize::MAX) + self.entries.len()
     }
 
-    /// The index of the chart under the cursor (dev-tools scripts).
+    /// The selectable row under the cursor (dev-tools scripts): charts and the
+    /// rows before them count together, as [`chart_row`](Self::chart_row) and
+    /// [`folder_row`](Self::folder_row) do.
     #[cfg(feature = "dev-tools")]
     pub const fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The selectable row of chart `i` of [`entries`](Self::entries)
+    /// (dev-tools scripts).
+    #[cfg(feature = "dev-tools")]
+    pub fn chart_row(&self, i: usize) -> usize {
+        self.lead() + i
+    }
+
+    /// The selectable row of the folder row of this name (dev-tools scripts).
+    #[cfg(feature = "dev-tools")]
+    pub fn folder_row(&self, name: &str) -> Option<usize> {
+        let at = self.folders.iter().position(|f| f.name == name)?;
+        Some(usize::from(self.all_row.is_some()) + at)
+    }
+
+    /// What the row under the cursor names (dev-tools scripts): `all`, a
+    /// folder's name or a chart's file name.
+    #[cfg(feature = "dev-tools")]
+    pub fn cursor_name(&self) -> Option<String> {
+        Some(match self.row_at_cursor()? {
+            Row::All => "all".to_owned(),
+            Row::Folder(i) => self.folders.get(i)?.name.clone(),
+            Row::Chart(i) | Row::Heading(i) => {
+                let path = &self.entries.get(i)?.path;
+                path.file_name()?.to_string_lossy().into_owned()
+            }
+        })
     }
 
     /// The charts listed, in order (dev-tools scripts).
@@ -478,7 +751,7 @@ impl SelectScreen {
             // lane keys type letters.
             return Acted::Nothing;
         };
-        let last = self.entries.len().saturating_sub(1);
+        let last = (self.lead() + self.entries.len()).saturating_sub(1);
         let to = match key {
             MenuKey::Up => self.cursor.saturating_sub(1),
             MenuKey::Down => (self.cursor + 1).min(last),
@@ -499,24 +772,11 @@ impl SelectScreen {
                 self.searching = true;
                 return Acted::Focus(true);
             }
-            MenuKey::Enter | MenuKey::Practice => {
-                return match self.selected() {
-                    Some(e) => {
-                        let path = e.path.clone();
-                        self.notice = None;
-                        if key == MenuKey::Practice {
-                            Acted::Practice(path)
-                        } else {
-                            Acted::Choose(path)
-                        }
-                    }
-                    None => Acted::Nothing,
-                };
-            }
+            MenuKey::Enter | MenuKey::Practice => return self.act_on_row(key),
             MenuKey::PrevPreset => return Acted::Preset(game::PresetStep::Prev),
             MenuKey::NextPreset => return Acted::Preset(game::PresetStep::Next),
-            // The retry and quit keys mean nothing here.
-            MenuKey::Backspace | MenuKey::Escape => return Acted::Nothing,
+            MenuKey::Backspace | MenuKey::Escape => return self.back(),
+            MenuKey::BackspaceHeld => return Acted::Nothing,
         };
         if to == self.cursor {
             return Acted::Nothing;
@@ -526,9 +786,70 @@ impl SelectScreen {
         Acted::Changed
     }
 
+    /// Enter or P on the row under the cursor: a chart is chosen or practiced;
+    /// Enter enters a folder or the all-chart list.
+    fn act_on_row(&mut self, key: MenuKey) -> Acted {
+        match (self.row_at_cursor(), key) {
+            (Some(Row::Chart(i)), _) => {
+                let Some(path) = self.entries.get(i).map(|e| e.path.clone()) else {
+                    return Acted::Nothing;
+                };
+                self.notice = None;
+                if key == MenuKey::Practice {
+                    Acted::Practice(path)
+                } else {
+                    Acted::Choose(path)
+                }
+            }
+            (Some(Row::All), MenuKey::Enter) => self.enter(Place::All),
+            (Some(Row::Folder(i)), MenuKey::Enter) => {
+                let Some(row) = self.folders.get(i) else {
+                    return Acted::Nothing;
+                };
+                let place = Place::Folder {
+                    key: row.key.clone(),
+                    name: row.name.clone(),
+                    root: self.place == Place::Top && self.top_lists_roots,
+                };
+                self.enter(place)
+            }
+            _ => Acted::Nothing,
+        }
+    }
+
+    /// Back, outside the search box: results clear their query, a place
+    /// returns to the one it was entered from, and Top stays.
+    fn back(&mut self) -> Acted {
+        if !self.query.is_empty() {
+            self.query.clear();
+            self.return_from_query();
+            return Acted::Search;
+        }
+        if self.go_back_a_place() {
+            Acted::Search
+        } else {
+            Acted::Nothing
+        }
+    }
+
+    /// The query is empty: the place returns as it was saved.
+    fn return_from_query(&mut self) {
+        if let Some(saved) = self.under_query.take() {
+            self.arrival = Arrival::Restore(saved);
+        }
+    }
+
     fn search_input(&mut self, input: MenuInput) -> Acted {
         match input {
             MenuInput::Text(text) => {
+                if self.query.is_empty() && !text.is_empty() {
+                    // A query retyped before the emptied one's list was read
+                    // keeps the place saved then.
+                    self.under_query = Some(match std::mem::take(&mut self.arrival) {
+                        Arrival::Restore(saved) => saved,
+                        Arrival::Keep | Arrival::First => self.saved(),
+                    });
+                }
                 self.query.push_str(&text);
                 Acted::Search
             }
@@ -538,8 +859,11 @@ impl SelectScreen {
             }
             // While the IME composes, its keys are its own.
             MenuInput::Key(_) if !self.preedit.is_empty() => Acted::Nothing,
-            MenuInput::Key(MenuKey::Backspace) => {
+            MenuInput::Key(MenuKey::Backspace | MenuKey::BackspaceHeld) => {
                 if self.query.pop().is_some() {
+                    if self.query.is_empty() {
+                        self.return_from_query();
+                    }
                     Acted::Search
                 } else {
                     Acted::Nothing
@@ -559,10 +883,19 @@ impl SelectScreen {
         let line = |text: String, style| MenuLine { text, style };
         let sort = SORTS.get(self.sort).map_or("", |&(_, label)| label);
         let more = if self.more { "以上" } else { "" };
+        let place = if self.query.is_empty() {
+            match &self.place {
+                Place::Top => String::new(),
+                Place::Folder { name, .. } => format!("{name}  "),
+                Place::All => "全譜面  ".to_owned(),
+            }
+        } else {
+            "検索結果  ".to_owned()
+        };
         let mut lines = vec![line(
             format!(
-                "曲選択  {}{more} 譜面  並び順: {sort}  プリセット: {}  {status}",
-                self.entries.len(),
+                "曲選択  {place}{}{more} 譜面  並び順: {sort}  プリセット: {}  {status}",
+                self.listed(),
                 self.preset
             ),
             LineStyle::Title,
@@ -588,20 +921,26 @@ impl SelectScreen {
                 .unwrap_or_default(),
             LineStyle::Notice,
         ));
+        let at = self.row_at_cursor();
         for row in self.rows.iter().skip(self.top).take(LIST_LINES) {
-            lines.push(match *row {
-                Row::Folder(i) => line(self.folder_name(i), LineStyle::Folder),
-                Row::Chart(i) => {
-                    let style = if i == self.cursor {
-                        LineStyle::Cursor
-                    } else {
-                        LineStyle::Chart
-                    };
-                    line(self.chart_line(i), style)
+            let style = |other| {
+                if Some(*row) == at {
+                    LineStyle::Cursor
+                } else {
+                    other
                 }
+            };
+            lines.push(match *row {
+                Row::All => line(
+                    format!("  ▶ 全譜面  ({})", self.all_row.unwrap_or(0)),
+                    style(LineStyle::Folder),
+                ),
+                Row::Folder(i) => line(self.folder_line(i), style(LineStyle::Folder)),
+                Row::Heading(i) => line(self.folder_name(i), LineStyle::Folder),
+                Row::Chart(i) => line(self.chart_line(i), style(LineStyle::Chart)),
             });
         }
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && self.folders.is_empty() {
             lines.push(line(
                 if self.query.is_empty() {
                     "譜面がありません (device.toml の [library] roots)".to_owned()
@@ -615,11 +954,18 @@ impl SelectScreen {
             lines.push(line(String::new(), LineStyle::Chart));
         }
         lines.push(line(
-            "↑↓ 選択  Enter 決定  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
+            "↑↓ 選択  Enter 決定  Esc 戻る  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
                 .to_owned(),
             LineStyle::Help,
         ));
         MenuPage { lines, caret }
+    }
+
+    /// Folder row `i`: its directory's name and the charts under it.
+    fn folder_line(&self, i: usize) -> String {
+        self.folders
+            .get(i)
+            .map_or_else(String::new, |f| format!("  ▶ {}  ({})", f.name, f.charts))
     }
 
     /// The heading of chart `i`'s folder: its path under its root.
@@ -889,7 +1235,7 @@ mod tests {
         assert_eq!(s.input(key(MenuKey::Left)), Acted::Search);
         assert_eq!(s.search().sort, Sort::Modified);
         assert!(s.search().by_folder);
-        // The retry and quit keys do nothing here.
+        // At Top, Back has nowhere to go.
         assert_eq!(s.input(key(MenuKey::Backspace)), Acted::Nothing);
         assert_eq!(s.input(key(MenuKey::Escape)), Acted::Nothing);
     }
@@ -1112,6 +1458,55 @@ mod tests {
         assert!(s.selected().is_none());
         s.set_entries(listing(&[("m", 30)], &[]));
         assert_eq!(drawn(&s), ("m00".to_owned(), 1));
+    }
+
+    /// The rule of restoration over rows of any kind: with `[a, b, c]` saved on
+    /// `b`, `b` gone and `bb` new, `c`; a new row is never picked; before the
+    /// saved row when nothing after it remains; else the first.
+    #[test]
+    fn a_saved_list_finds_its_row_by_the_one_rule() {
+        use std::collections::HashMap;
+
+        use super::{RowId, Saved};
+        let chart = |n: &str| RowId::Chart(PathBuf::from(n));
+        let saved = Saved {
+            order: vec![RowId::All, chart("a"), chart("b"), chart("c")],
+            at: 2,
+            line: 0,
+        };
+        let fresh = |ids: Vec<RowId>| -> HashMap<RowId, usize> {
+            ids.into_iter().enumerate().map(|(i, id)| (id, i)).collect()
+        };
+        for (ids, at) in [
+            (vec![RowId::All, chart("a"), chart("b"), chart("c")], 2),
+            (vec![RowId::All, chart("a"), chart("bb"), chart("c")], 3),
+            (vec![RowId::All, chart("a"), chart("bb")], 1),
+            (vec![chart("z"), RowId::All], 1),
+            (vec![chart("z")], 0),
+            (Vec::new(), 0),
+        ] {
+            assert_eq!(saved.resolve(&fresh(ids.clone())), at, "{ids:?}");
+        }
+    }
+
+    /// Past [`LIMIT`](super::LIMIT) rows a level lists the first and says so,
+    /// its count naming what is under it.
+    #[test]
+    fn a_top_past_the_limit_says_so() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let charts = (0..=super::LIMIT)
+            .map(|i| entry(&format!(r"C:\charts\{i}.bms"), "t"))
+            .collect();
+        s.set_top(
+            library::Level {
+                charts,
+                ..library::Level::default()
+            },
+            5_001,
+            false,
+        );
+        assert_eq!(s.listed(), super::LIMIT);
+        assert!(s.page("").lines[0].text.contains("5000以上 譜面"));
     }
 
     /// Each chart line starts with the chart's lamp and best EX under the

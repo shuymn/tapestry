@@ -40,7 +40,7 @@ use crate::log_file;
 use crate::play::{PlayerRig, since};
 use crate::render_side::{LoadingSink, RenderLink, RenderMsg, ScreenError, SkinState};
 use crate::result_input::{Owner, Pad, ResultInput};
-use crate::select::{Acted, MenuInput, MenuKey, MenuQueue, SelectScreen};
+use crate::select::{Acted, ListQuery, MenuInput, MenuKey, MenuQueue, SelectScreen};
 #[cfg(feature = "dev-tools")]
 use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
 
@@ -181,11 +181,49 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// Searches the library again for the screen's list.
+    /// Reads the screen's list from the library, climbing past a place that
+    /// is no longer a level. Each climb leaves one place fewer on the screen's
+    /// stack, and Top and the searches always list.
+    fn read_list(&mut self) -> Result<(), library::LibraryError> {
+        let limit = crate::select::LIMIT + 1;
+        loop {
+            match self.screen.list_query() {
+                ListQuery::Search(search) => {
+                    let found = self.shelf.search(&search)?;
+                    self.screen.set_entries(found);
+                    return Ok(());
+                }
+                ListQuery::Top { one_root, sort } => {
+                    let roots = self.shelf.top()?;
+                    let charts = roots.iter().map(|r| r.charts).sum();
+                    let (level, lists_roots) = match roots.as_slice() {
+                        [root] if one_root => (self.shelf.level(&root.key, sort, limit)?, false),
+                        _ => (
+                            library::Level {
+                                folders: roots,
+                                ..library::Level::default()
+                            },
+                            true,
+                        ),
+                    };
+                    self.screen.set_top(level, charts, lists_roots);
+                    return Ok(());
+                }
+                ListQuery::Level { key, sort } => {
+                    let level = self.shelf.level(&key, sort, limit)?;
+                    if self.screen.set_level(level) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads the screen's list from the library again.
     fn refresh(&mut self) {
         self.search_pending = false;
-        match self.shelf.search(&self.screen.search()) {
-            Ok(found) => self.screen.set_entries(found),
+        match self.read_list() {
+            Ok(()) => {}
             Err(e) => {
                 let line = format!("library: {}", Chain(&e));
                 eprintln!("{line}");
@@ -258,7 +296,12 @@ impl Selection {
                 input,
                 MenuInput::Text(_)
                     | MenuInput::Preedit(_)
-                    | MenuInput::Key(MenuKey::Left | MenuKey::Right | MenuKey::Backspace)
+                    | MenuInput::Key(
+                        MenuKey::Left
+                            | MenuKey::Right
+                            | MenuKey::Backspace
+                            | MenuKey::BackspaceHeld
+                    )
             );
             if self.search_pending && !edit {
                 self.refresh();
@@ -357,13 +400,10 @@ impl Selection {
             // Where the cursor shows, for a script's checks (dev-tools).
             #[cfg(feature = "dev-tools")]
             if self.script.is_some()
-                && let (Some(line), Some(chart)) =
-                    (self.screen.cursor_line(), self.screen.selected())
+                && let (Some(line), Some(row)) =
+                    (self.screen.cursor_line(), self.screen.cursor_name())
             {
-                println!(
-                    "dev: select cursor: line {line}: {}",
-                    file_name(&chart.path)
-                );
+                println!("dev: select cursor: line {line}: {row}");
             }
             // The notice line the page shows, for a script's checks
             // (dev-tools).
@@ -412,8 +452,36 @@ impl Selection {
                         }
                         return false;
                     };
+                    if move_to(&self.screen, &self.menu, self.screen.chart_row(at)) {
+                        return true;
+                    }
+                }
+                Some(SelectStep::Folder(name)) => {
+                    let Some(at) = self.screen.folder_row(&name) else {
+                        script.scanning(self.shelf.has_scan());
+                        if !script.waiting() {
+                            controls.close();
+                        }
+                        return false;
+                    };
                     if move_to(&self.screen, &self.menu, at) {
                         return true;
+                    }
+                    typed.push(MenuInput::Key(MenuKey::Enter));
+                }
+                Some(SelectStep::AllCharts) => {
+                    if move_to(&self.screen, &self.menu, 0) {
+                        return true;
+                    }
+                    typed.push(MenuInput::Key(MenuKey::Enter));
+                }
+                Some(SelectStep::Up) => typed.push(MenuInput::Key(MenuKey::Escape)),
+                Some(SelectStep::Row(name)) => {
+                    let row = self.screen.cursor_name();
+                    if row.as_deref() != Some(name.as_str()) {
+                        script.fail(format!("the cursor is on {row:?}, not on {name}"));
+                        controls.close();
+                        return false;
                     }
                 }
                 Some(SelectStep::PickPath(target)) => {
@@ -434,7 +502,7 @@ impl Selection {
                     else {
                         return false;
                     };
-                    if move_to(&self.screen, &self.menu, at) {
+                    if move_to(&self.screen, &self.menu, self.screen.chart_row(at)) {
                         return true;
                     }
                 }
@@ -479,7 +547,7 @@ impl Selection {
                         controls.close();
                         return false;
                     }
-                    if move_to(&self.screen, &self.menu, 0) {
+                    if move_to(&self.screen, &self.menu, self.screen.chart_row(0)) {
                         return true;
                     }
                 }
@@ -938,9 +1006,9 @@ fn start_key(screen: &PracticeScreen) -> MenuKey {
     row_key(screen, game::PracticeRow::Start).unwrap_or(MenuKey::Enter)
 }
 
-/// Moves the cursor toward entry `at` with the arrow keys, a batch the
+/// Moves the cursor toward selectable row `at` with the arrow keys, a batch the
 /// queue holds at a time: `true` while it queued keys, `false` once the
-/// entry is selected (dev-tools).
+/// row is selected (dev-tools).
 #[cfg(feature = "dev-tools")]
 fn move_to(screen: &SelectScreen, menu: &MenuQueue, at: usize) -> bool {
     let cursor = screen.cursor();
@@ -2188,9 +2256,11 @@ mod tests {
         }
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
         let shelf = shelf(library, vec![charts.clone()]);
+        let mut screen = SelectScreen::new(vec![charts]);
+        screen.show_all();
         Selection {
             shelf,
-            screen: SelectScreen::new(vec![charts]),
+            screen,
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
             preset_refusal: false,
@@ -2813,10 +2883,11 @@ mod tests {
         assert_eq!(hook.wake(&mut set, TimeUs(3_000)), input::Phase::Idle);
         assert_eq!(sel.drain_owned(&mut menus), None);
         assert!(sel.preset_steps.is_empty());
-        // A black key goes back, which means nothing here.
+        // A black key goes back: from the all-chart list to Top.
         press(&mut set, &mut hook, key2, 4_000);
         assert_eq!(sel.drain_owned(&mut menus), None);
         assert!(sel.preset_steps.is_empty());
+        assert_eq!(sel.screen.selected().map(|c| &c.path), None);
         // Key 7 steps.
         press(&mut set, &mut hook, key7, 5_000);
         assert_eq!(sel.drain_owned(&mut menus), None);
@@ -2824,7 +2895,10 @@ mod tests {
             Vec::from(std::mem::take(&mut sel.preset_steps)),
             [game::PresetStep::Next]
         );
+        // A white key confirms: the "all charts" row, then a chart.
         press(&mut set, &mut hook, key1, 6_000);
+        assert_eq!(sel.drain_owned(&mut menus), None);
+        press(&mut set, &mut hook, key1, 6_500);
         assert!(sel.drain_owned(&mut menus).is_some());
         assert!(sel.preset_steps.is_empty());
         // The practice page takes it as Confirm.
@@ -3254,5 +3328,497 @@ mod tests {
             let failure = sel.script.as_ref().unwrap().failure().unwrap();
             assert!(failure.contains(what), "{failure}");
         }
+    }
+
+    /// Listed charts, one per relative path under one root, or several roots,
+    /// on a shelf that scans again at once, opened as a run opens (on Top) and
+    /// with every chart listed. A file named `hidden*` is 5-key-shaped.
+    fn tree(dir: &std::path::Path, roots: &[&[&str]]) -> (Selection, Vec<std::path::PathBuf>) {
+        let roots: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, files)| {
+                let root = dir.join(format!("root{i}"));
+                for file in *files {
+                    write_chart(&root, file);
+                }
+                root
+            })
+            .collect();
+        let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
+        let shelf = Shelf::new(library, roots.clone(), Duration::ZERO, None);
+        let mut sel = Selection {
+            shelf,
+            screen: SelectScreen::new(roots.clone()),
+            menu: Arc::new(MenuQueue::default()),
+            dropped: 0,
+            preset_refusal: false,
+            ime: None,
+            rate: 48_000,
+            chosen_at: TimeUs(0),
+            loading: None,
+            practicing: false,
+            entered_at: TimeUs(0),
+            dirty: false,
+            search_pending: false,
+            preset_steps: std::collections::VecDeque::new(),
+            #[cfg(feature = "dev-tools")]
+            script: None,
+        };
+        let listed: usize = roots.iter().map(|r| walk_count(r)).sum();
+        until(&mut sel, |s| s.screen.listed() == listed);
+        (sel, roots)
+    }
+
+    /// The listed charts under `dir`.
+    fn walk_count(dir: &std::path::Path) -> usize {
+        let mut n = 0;
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                n += walk_count(&path);
+            } else if !path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("hidden")
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Writes the chart at `file` under `root`, titled by its file's stem.
+    fn write_chart(root: &std::path::Path, file: &str) {
+        let path = root.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let lane = if stem.starts_with("hidden") {
+            "11"
+        } else {
+            "38"
+        };
+        std::fs::write(&path, format!("#TITLE {stem}\n#BPM 120\n#001{lane}:01\n")).unwrap();
+    }
+
+    /// Reads the list, as a scan's batch does, until `done`. The bound only
+    /// catches a pass that never gets there on a loaded machine.
+    fn until(sel: &mut Selection, done: impl Fn(&Selection) -> bool) {
+        let begun = Instant::now();
+        loop {
+            sel.shelf.poll(Instant::now());
+            sel.refresh();
+            if done(sel) {
+                return;
+            }
+            assert!(
+                begun.elapsed() < Duration::from_secs(600),
+                "never: {:?}",
+                list(sel)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn keys(sel: &mut Selection, pressed: &[MenuKey]) -> Option<game::Pick> {
+        for key in pressed {
+            sel.menu.push(MenuInput::Key(*key));
+        }
+        sel.drain(&mut Pad::default())
+    }
+
+    /// The list's lines as drawn, a chart's by its title's end of line, the
+    /// cursor's with `>`.
+    fn list(sel: &Selection) -> Vec<String> {
+        let page = sel.screen.page("");
+        page.lines[3..page.lines.len() - 1]
+            .iter()
+            .filter(|l| !l.text.is_empty())
+            .map(|l| {
+                let text = l.text.trim_start();
+                let name = text.rsplit("☆-").next().unwrap().trim();
+                if l.style == crate::menu_screen::LineStyle::Cursor {
+                    format!(">{name}")
+                } else {
+                    name.to_owned()
+                }
+            })
+            .collect()
+    }
+
+    /// The cursor's row as [`list`] names it, without its mark, and its line.
+    fn cursor(sel: &Selection) -> (String, usize) {
+        let lines = list(sel);
+        let at = lines.iter().position(|l| l.starts_with('>')).unwrap();
+        (lines[at][1..].to_owned(), at)
+    }
+
+    const ALL: &str = "▶ 全譜面";
+
+    fn all_row(n: u64) -> String {
+        format!("{ALL}  ({n})")
+    }
+
+    fn folder_row(name: &str, n: u64) -> String {
+        format!("▶ {name}  ({n})")
+    }
+
+    /// Selection opens on Top with the "all charts" row first under the
+    /// cursor, then the one root's level: its subfolders' rows, then its own
+    /// charts and those of the song folders directly under it. It has no
+    /// heading, and a hidden chart has no row.
+    #[test]
+    fn selection_opens_on_top_with_the_all_charts_row_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(
+            dir.path(),
+            &[&[
+                "s1/song/a.bms",
+                "s2/song/b.bms",
+                "d.bms",
+                "song/c.bms",
+                "hidden/hidden.bms",
+            ]],
+        );
+        assert_eq!(
+            list(&sel),
+            [
+                format!(">{}", all_row(4)),
+                folder_row("s1", 1),
+                folder_row("s2", 1),
+                "c".to_owned(),
+                "d".to_owned(),
+            ]
+        );
+    }
+
+    /// With several roots, Top holds a row per root, and entering one lists
+    /// it. A root holding only charts stays a level, though any other such
+    /// folder would be a song folder, until it has no rows.
+    #[test]
+    fn several_roots_are_rows_and_a_root_of_charts_stays_a_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(dir.path(), &[&["a.bms", "b.bms"], &["s/song/c.bms"]]);
+        assert_eq!(
+            list(&sel),
+            [
+                format!(">{}", all_row(3)),
+                folder_row("root0", 2),
+                folder_row("root1", 1),
+            ]
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(list(&sel), [">a", "b"]);
+        until(&mut sel, |s| list(s) == [">a", "b"]);
+        std::fs::remove_file(roots[0].join("a.bms")).unwrap();
+        std::fs::remove_file(roots[0].join("b.bms")).unwrap();
+        until(&mut sel, |s| cursor(s).0 == folder_row("root1", 1));
+        assert_eq!(
+            list(&sel),
+            [all_row(1), format!(">{}", folder_row("root1", 1))]
+        );
+    }
+
+    /// Enter enters a folder with the cursor on its first row; Back returns
+    /// to the row left, on its line, by Escape or Backspace; at Top it does
+    /// nothing. A chart's row chooses, as it does in the all-chart list, and
+    /// the controller's events act as those keys.
+    #[test]
+    fn a_folder_is_entered_and_returned_from_on_its_row_and_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(
+            dir.path(),
+            &[&[
+                "s1/song/a.bms",
+                "s2/song/b.bms",
+                "s2/song2/c.bms",
+                "s3/song/d.bms",
+            ]],
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Down]);
+        let left = cursor(&sel);
+        assert_eq!(left, (folder_row("s2", 2), 2));
+        for back in [
+            MenuKey::Escape,
+            MenuKey::Backspace,
+            crate::select::event_key(input::MenuEvent::Back),
+        ] {
+            let enter = crate::select::event_key(input::MenuEvent::Confirm);
+            keys(&mut sel, &[enter]);
+            assert_eq!(list(&sel), [">b", "c"]);
+            keys(&mut sel, &[MenuKey::Down]);
+            assert_eq!(cursor(&sel), ("c".to_owned(), 1));
+            keys(&mut sel, &[back]);
+            assert_eq!(cursor(&sel), left, "{back:?}");
+        }
+        keys(&mut sel, &[MenuKey::Enter, MenuKey::Down]);
+        let chosen = keys(&mut sel, &[MenuKey::Enter]).expect("a chart is chosen");
+        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Home]);
+        let before = list(&sel);
+        assert!(keys(&mut sel, &[MenuKey::Escape]).is_none());
+        assert_eq!(list(&sel), before, "Top stays");
+    }
+
+    /// The "all charts" row enters today's list, with its headings, and Back
+    /// returns to it.
+    #[test]
+    fn the_all_charts_row_enters_the_list_and_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["s1/song/a.bms", "s2/song/b.bms"]]);
+        keys(&mut sel, &[MenuKey::Enter]);
+        let lines = list(&sel);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with('▼'), "{lines:?}");
+        assert_eq!(lines[1], ">a");
+        assert_eq!(sel.screen.listed(), 2);
+        keys(&mut sel, &[MenuKey::Backspace]);
+        assert_eq!(cursor(&sel), (all_row(2), 0));
+    }
+
+    /// P does nothing on a folder row or the "all charts" row, and picks a
+    /// chart's row.
+    #[test]
+    fn practice_acts_only_on_a_chart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["s/song/a.bms", "b.bms"]]);
+        assert!(keys(&mut sel, &[MenuKey::Practice]).is_none());
+        assert_eq!(cursor(&sel).0, all_row(2));
+        assert!(keys(&mut sel, &[MenuKey::Down, MenuKey::Practice]).is_none());
+        assert_eq!(cursor(&sel).0, folder_row("s", 1));
+        let picked = keys(&mut sel, &[MenuKey::Down, MenuKey::Practice]).expect("practiced");
+        assert!(matches!(picked, game::Pick::Practice(_)), "{picked:?}");
+    }
+
+    /// A held Backspace never climbs; in the search box it erases, as its
+    /// first press does, and the box keeps Escape and Backspace inside a
+    /// folder.
+    #[test]
+    fn the_search_box_keeps_its_keys_and_a_held_backspace_does_not_climb() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["s/song/ab.bms", "s/song/cd.bms", "e.bms"]]);
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(list(&sel), [">ab", "cd"]);
+        keys(&mut sel, &[MenuKey::BackspaceHeld]);
+        assert_eq!(list(&sel), [">ab", "cd"], "held, it does not climb");
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("abc".to_owned()));
+        keys(&mut sel, &[MenuKey::BackspaceHeld]);
+        assert_eq!(sel.screen.search().text, "ab");
+        keys(&mut sel, &[MenuKey::Backspace]);
+        assert_eq!(sel.screen.search().text, "a");
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert!(!sel.screen.searching(), "Escape left the box");
+        assert_eq!(sel.screen.search().text, "a");
+        assert_eq!(sel.screen.listed(), 1, "the results stay");
+    }
+
+    /// A query lists the whole library whatever the place under it, and when
+    /// it empties, by Backspace in the box or Back in results, the place
+    /// returns on its row and line.
+    #[test]
+    fn a_query_covers_the_place_and_returns_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(
+            dir.path(),
+            &[&["s/x/xa.bms", "s/x/xb.bms", "s/x/xc.bms", "t/u/xz.bms"]],
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter, MenuKey::Down]);
+        let place = cursor(&sel);
+        assert_eq!(place, ("xb".to_owned(), 1));
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("x".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(sel.screen.listed(), 4, "the whole library");
+        assert!(sel.screen.page("").lines[0].text.contains("検索結果"));
+        // Back in results: the query clears, the place stays.
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(sel.screen.search().text, "");
+        assert_eq!(cursor(&sel), place);
+        // Emptied in the box.
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("x".to_owned()));
+        keys(&mut sel, &[MenuKey::Backspace, MenuKey::Enter]);
+        assert_eq!(cursor(&sel), place);
+        // A place typed over before its list was read keeps what was saved.
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("x".to_owned()));
+        sel.menu.push(MenuInput::Key(MenuKey::Backspace));
+        sel.menu.push(MenuInput::Text("x".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter, MenuKey::Escape]);
+        assert_eq!(cursor(&sel), place);
+    }
+
+    /// The rule over a query's end: on `b` of `[a, b, c]`, with `b` removed
+    /// and `bb` added while the query showed, the place returns on `c`.
+    #[test]
+    fn a_querys_end_finds_the_row_by_the_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(
+            dir.path(),
+            &[&["s/x/a.bms", "s/x/b.bms", "s/x/c.bms", "t/u/z.bms"]],
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter, MenuKey::Down]);
+        assert_eq!(cursor(&sel).0, "b");
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("b".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter]);
+        std::fs::remove_file(roots[0].join("s/x/b.bms")).unwrap();
+        write_chart(&roots[0], "s/x/bb.bms");
+        until(&mut sel, |s| {
+            s.screen
+                .selected()
+                .is_some_and(|c| c.path.ends_with("bb.bms"))
+        });
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(cursor(&sel).0, "c");
+        assert_eq!(list(&sel), ["a", "bb", ">c"]);
+    }
+
+    /// A scan's refresh keeps the cursor on its row and line: charts added
+    /// above and below in a folder; its row removed, the nearest after, then
+    /// before. The same for a parent restored by a return.
+    #[test]
+    fn a_refresh_keeps_a_folders_cursor_by_the_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(
+            dir.path(),
+            &[&["s/x/m.bms", "s/x/n.bms", "s/x/o.bms", "t/u/z.bms"]],
+        );
+        let root = &roots[0];
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter, MenuKey::Down]);
+        assert_eq!(cursor(&sel), ("n".to_owned(), 1));
+        write_chart(root, "s/y/a.bms");
+        write_chart(root, "s/y/z.bms");
+        until(&mut sel, |s| list(s).len() == 5);
+        assert_eq!(list(&sel), ["a", "m", ">n", "o", "z"]);
+        std::fs::remove_file(root.join("s/x/n.bms")).unwrap();
+        until(&mut sel, |s| list(s).len() == 4);
+        assert_eq!(list(&sel), ["a", "m", ">o", "z"]);
+        std::fs::remove_file(root.join("s/x/o.bms")).unwrap();
+        std::fs::remove_file(root.join("s/y/z.bms")).unwrap();
+        until(&mut sel, |s| list(s).len() == 2);
+        assert_eq!(list(&sel), ["a", ">m"]);
+        // Back in the parent, a new folder above and a removed one below leave
+        // the cursor on its row.
+        keys(&mut sel, &[MenuKey::Escape]);
+        std::fs::remove_dir_all(root.join("t")).unwrap();
+        write_chart(root, "r/q/k.bms");
+        until(&mut sel, |s| {
+            let rows = list(s);
+            rows.contains(&folder_row("r", 1)) && !rows.contains(&folder_row("t", 1))
+        });
+        assert_eq!(
+            list(&sel),
+            [
+                all_row(3),
+                folder_row("r", 1),
+                format!(">{}", folder_row("s", 2))
+            ]
+        );
+    }
+
+    /// A place that stops being a level goes up to its nearest ancestor that
+    /// still is: a mixed folder whose subfolder emptied has become a song
+    /// folder, its chart now its parent's row. The same when a query covered
+    /// it, and when a whole branch emptied.
+    #[test]
+    fn a_place_no_longer_a_level_goes_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(
+            dir.path(),
+            &[&[
+                "a/x.bms",
+                "a/b/y.bms",
+                "p/q/r/deep.bms",
+                "p/q/r2/deep2.bms",
+                "p/t/u/w.bms",
+            ]],
+        );
+        let root = &roots[0];
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(list(&sel), [">x", "y"]);
+        std::fs::remove_file(root.join("a/b/y.bms")).unwrap();
+        until(&mut sel, |s| {
+            s.screen.listed() == 3 + 1 && list(s).contains(&"x".to_owned())
+        });
+        assert_eq!(cursor(&sel).0, folder_row("p", 3));
+        // Under a query: seen when it ends.
+        write_chart(root, "a/b/y.bms");
+        until(&mut sel, |s| list(s).contains(&folder_row("a", 2)));
+        keys(
+            &mut sel,
+            &[MenuKey::Home, MenuKey::Down, MenuKey::Enter, MenuKey::Tab],
+        );
+        assert_eq!(sel.screen.listed(), 2);
+        sel.menu.push(MenuInput::Text("y".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter]);
+        std::fs::remove_file(root.join("a/b/y.bms")).unwrap();
+        until(&mut sel, |s| s.screen.listed() == 0);
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(cursor(&sel).0, folder_row("p", 3));
+        // Two levels down: a branch emptied climbs to what is left of it.
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(cursor(&sel).0, folder_row("q", 2));
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(list(&sel), [">deep", "deep2"]);
+        std::fs::remove_dir_all(root.join("p/q")).unwrap();
+        until(&mut sel, |s| s.screen.listed() == 1);
+        // `p` itself is left with `t`, so the climb stops there.
+        assert_eq!(list(&sel), [format!(">{}", folder_row("t", 1))]);
+    }
+
+    /// A song folder that gains a listed subfolder becomes a folder row at
+    /// the next refresh, and the rule moves the cursor off its charts' rows.
+    #[test]
+    fn a_song_folder_gaining_a_subfolder_becomes_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(dir.path(), &[&["s/a.bms", "z.bms"]]);
+        keys(&mut sel, &[MenuKey::Down]);
+        assert_eq!(cursor(&sel).0, "a");
+        write_chart(&roots[0], "s/t/u/b.bms");
+        until(&mut sel, |s| s.screen.listed() == 3);
+        assert_eq!(
+            list(&sel),
+            [all_row(3), folder_row("s", 2), ">z".to_owned()]
+        );
+    }
+
+    /// Nothing derives from a title: two folders' charts with equal titles
+    /// stay two folders' rows, and an order applies to chart rows, folders
+    /// staying by name.
+    #[test]
+    fn a_folder_is_its_directory_and_an_order_moves_only_charts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, roots) = tree(
+            dir.path(),
+            &[&["b/x/same.bms", "a/y/same.bms", "n.bms", "m.bms"]],
+        );
+        std::fs::write(roots[0].join("m.bms"), "#TITLE m\n#ARTIST z\n#00138:01\n").unwrap();
+        std::fs::write(roots[0].join("n.bms"), "#TITLE n\n#ARTIST a\n#00138:01\n").unwrap();
+        until(&mut sel, |s| {
+            s.screen
+                .page("")
+                .lines
+                .iter()
+                .any(|l| l.text.ends_with("/ z"))
+        });
+        let names = |sel: &Selection| -> Vec<String> {
+            let page = sel.screen.page("");
+            page.lines[4..8]
+                .iter()
+                .map(|l| l.text.trim().to_owned())
+                .collect()
+        };
+        let by_title = names(&sel);
+        assert_eq!(by_title[0], folder_row("a", 1));
+        assert_eq!(by_title[1], folder_row("b", 1));
+        assert!(by_title[2].contains(" m "), "{by_title:?}");
+        keys(&mut sel, &[MenuKey::Right]);
+        let by_artist = names(&sel);
+        assert_eq!(by_artist[..2], by_title[..2]);
+        assert!(by_artist[2].contains(" n "), "{by_artist:?}");
     }
 }

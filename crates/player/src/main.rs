@@ -1471,9 +1471,16 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     rig.window = window_thread.as_ref().map(window::WindowThread::shown);
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
+    #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
+    let mut screen = select::SelectScreen::new(roots);
+    // A script opens on the all-chart list, where its steps pick by name.
+    #[cfg(feature = "dev-tools")]
+    if s.dev.script.is_some() {
+        screen.show_all();
+    }
     rig.selection = Some(selection::Selection {
         shelf,
-        screen: select::SelectScreen::new(roots),
+        screen,
         menu,
         dropped: 0,
         preset_refusal: false,

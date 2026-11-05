@@ -35,8 +35,8 @@ use audio::{Gain, SoundBank};
 use bms_model::Chart;
 use game::{Chain, DataRoot};
 use library::{
-    BestWriter, ChartEntry, Library, LibraryError, Opened, Scan, ScanOptions, ScanReport, Score,
-    Search,
+    BestWriter, ChartEntry, FolderKey, FolderRow, Level, Library, LibraryError, Opened, Scan,
+    ScanOptions, ScanReport, Score, Search, Sort,
 };
 
 use crate::background::{Job, Queued, Worker};
@@ -287,6 +287,24 @@ impl Shelf {
     /// Why the database refused the query.
     pub fn search(&self, search: &Search<'_>) -> Result<Vec<ChartEntry>, LibraryError> {
         self.library.search(search)
+    }
+
+    /// The rows of the roots that have listed charts.
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn top(&self) -> Result<Vec<FolderRow>, LibraryError> {
+        self.library.top()
+    }
+
+    /// A folder's level, at most `limit` rows.
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn level(&self, key: &FolderKey, sort: Sort, limit: usize) -> Result<Level, LibraryError> {
+        self.library.level(key, sort, limit)
     }
 
     fn start_pass(&mut self) {

@@ -761,6 +761,16 @@ pub enum SelectStep {
     PickPath(scenario::Target),
     /// Wait until the chart of this file name is listed.
     Wait(String),
+    /// Wait until the folder row of this name is listed, then enter it with
+    /// the arrow keys and Enter.
+    Folder(String),
+    /// On Top: enter the all-chart list with the arrow keys and Enter.
+    AllCharts,
+    /// Press Escape on the select screen: back one place.
+    Up,
+    /// Fail unless the cursor is on this row: `all`, a folder's name or a
+    /// chart's file name.
+    Row(String),
     /// Type into the search box: Tab, the text, Enter.
     Search(String),
     /// Replace the search text with this one, as typing does, and wait
@@ -957,6 +967,8 @@ impl SelectScript {
             .map(|s| match s.split_once('=') {
                 Some(("pick", f)) => Ok(SelectStep::Pick(f.to_owned())),
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
+                Some(("folder", f)) => Ok(SelectStep::Folder(f.to_owned())),
+                Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
                     format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, <quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
@@ -995,6 +1007,8 @@ impl SelectScript {
                 Some(("background", "running")) => Ok(SelectStep::Background(true)),
                 Some(("background", "idle")) => Ok(SelectStep::Background(false)),
                 None if s == "enter" => Ok(SelectStep::Enter),
+                None if s == "all" => Ok(SelectStep::AllCharts),
+                None if s == "up" => Ok(SelectStep::Up),
                 None if s == "prev-preset" => Ok(SelectStep::PrevPreset),
                 None if s == "next-preset" => Ok(SelectStep::NextPreset),
                 None if s == "drawn" => Ok(SelectStep::Drawn),
