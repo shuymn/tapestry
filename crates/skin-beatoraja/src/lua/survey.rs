@@ -21,7 +21,7 @@ use super::{
     Cancel, Disposition, HOST_APIS, LAST_FACTS, LuaUsage, LuaWhy, Unsupported, header_pass,
 };
 use crate::error::{ImportError, Loc};
-use crate::import::{Config, NoteKind};
+use crate::import::{Config, DeviationId, NoteKind};
 use crate::tree::{Arena, CallableKind};
 
 /// One import's outcome under allowlisted labels.
@@ -310,6 +310,7 @@ fn note(kind: &NoteKind) -> String {
         NoteKind::Ignored { field } => format!("Ignored {field}"),
         NoteKind::Callback { field, why } => format!("Callback {field} {}", unsupported(why)),
         NoteKind::OverCap { cap } => format!("OverCap {cap}"),
+        NoteKind::Deviation(DeviationId::D20) => "Deviation D20 entrance lost".to_owned(),
         other => variant(other),
     }
 }
@@ -800,6 +801,46 @@ return { type = 0 }",
         assert_eq!(s.effects, "open Capture not a skin closure");
         assert_eq!(s.effects_at.map(|(m, line, _)| (m, line)), Some((0, 0)));
         assert_eq!(s.outcomes.get("classified only"), Some(&4));
+    }
+
+    #[test]
+    fn an_entrance_lost_has_its_label_and_a_looping_track_stops() {
+        let entry = |gauge_loop: i32| {
+            format!(
+                "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+                 if not skin_config then return skin end\n\
+                 skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+                 skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 1, h = 1 }} }}\n\
+                 skin.gauge = {{ id = \"g\", nodes = {{ \"i\", \"i\", \"i\", \"i\" }}, parts = 10 }}\n\
+                 skin.destination = {{\n\
+                   {{ id = \"g\", loop = {gauge_loop}, dst = {{ {{ w = 64, h = 0 }},\n\
+                     {{ time = 250, h = 24 }} }} }},\n\
+                   {{ id = \"g\", loop = 1700, dst = {{ {{ w = 64, h = 64, y = 2160 }},\n\
+                     {{ time = 1700, y = 1080 }} }} }},\n\
+                 }}\n\
+                 return skin\n"
+            )
+        };
+        let run = |text: &str| {
+            let d = folder(&[("s.luaskin", text)]);
+            let mut png = Vec::new();
+            image::RgbaImage::new(1, 1)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            std::fs::write(d.path().join("a.png"), png).unwrap();
+            survey(
+                d.path(),
+                "s.luaskin",
+                &ImportFacts::unavailable(ScreenKind::Play),
+                &Cancel::new(),
+                false,
+            )
+        };
+        let settled = run(&entry(250));
+        assert_eq!(settled.outcome, "imported");
+        assert_eq!(settled.notes.get("Deviation D20 entrance lost"), Some(&2));
+        let looping = run(&entry(100));
+        assert_eq!(looping.outcome, "critical Gauge: Timer");
     }
 
     #[test]
