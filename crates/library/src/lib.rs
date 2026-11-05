@@ -675,13 +675,12 @@ fn one_spelling(root: &Path) -> PathBuf {
     spelled
 }
 
-#[cfg(test)]
+/// Only Windows has these spellings.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
-    /// The spellings of a drive and a share, each to its one spelling. Only
-    /// Windows has them.
-    #[cfg(windows)]
+    /// The spellings of a drive and a share, each to its one spelling.
     #[test]
     fn a_root_has_one_spelling() {
         let table = [
@@ -716,7 +715,6 @@ mod tests {
 
     /// A chart directly in a share root has the root's own text as its folder,
     /// which is what a level and a count read.
-    #[cfg(windows)]
     #[test]
     fn a_share_roots_spelling_is_its_charts_folder() {
         let root = one_spelling(Path::new("//server/share"));
