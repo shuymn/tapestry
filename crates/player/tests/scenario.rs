@@ -1634,8 +1634,8 @@ fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
 
 /// A play skin with a full-canvas image on the last note's timer, a read of
 /// the combo break its condition, opaque from 750 to 1250 ms on that timer:
-/// the shape of a skin's end-of-play image, and an untimed corner on the
-/// same read. A play ends with its audio, so the chart's BGM lasts through
+/// the shape of a skin's end-of-play image, in blue, and an untimed red
+/// corner on the same read. A play ends with its audio, so the chart's BGM lasts through
 /// the capture: a miss has the image inside its window, a perfect play has
 /// none. A retry of the miss starts from a clean snapshot: its first READY
 /// frame has no corner, with no tally set by hand.
@@ -1658,25 +1658,25 @@ fn a_missed_note_draws_the_finish_window() {
     );
     let skin = fx.base.join("skin");
     fs::create_dir_all(&skin).unwrap();
-    let file = fs::File::create(skin.join("blue.png")).unwrap();
+    let file = fs::File::create(skin.join("white.png")).unwrap();
     let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
     e.set_color(png::ColorType::Rgba);
     e.set_depth(png::BitDepth::Eight);
-    let blue: Vec<u8> = (0..16 * 16).flat_map(|_| [0, 0, 255, 255]).collect();
-    e.write_header().unwrap().write_image_data(&blue).unwrap();
+    let white: Vec<u8> = (0..16 * 16).flat_map(|_| [255; 4]).collect();
+    e.write_header().unwrap().write_image_data(&white).unwrap();
     fs::write(
         skin.join("play.luaskin"),
         "local skin = { type = 0, name = \"finish\", w = 1920, h = 1080 }\n\
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
-         skin.source = { { id = \"b\", path = \"blue.png\" } }\n\
+         skin.source = { { id = \"b\", path = \"white.png\" } }\n\
          skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
          skin.destination = { { id = \"b\", timer = 143, loop = -1,\n\
            draw = function() local cb = ms.number(425) return cb > 0 end, dst = {\n\
-             { time = 500, x = 0, y = 0, w = 1920, h = 1080, a = 0 },\n\
+             { time = 500, x = 0, y = 0, w = 1920, h = 1080, a = 0, r = 0, g = 0 },\n\
              { time = 750, a = 255 }, { time = 1250, a = 255 }, { time = 1450, a = 0 } } },\n\
            { id = \"b\", draw = function() return ms.number(425) > 0 end,\n\
-             dst = { { x = 0, y = 0, w = 192, h = 108 } } } }\n\
+             dst = { { x = 0, y = 0, w = 192, h = 108, g = 0, b = 0 } } } }\n\
          return skin\n",
     )
     .unwrap();
@@ -1720,7 +1720,7 @@ fn a_missed_note_draws_the_finish_window() {
     let out = fx.base.join("out");
     let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
     assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
-    assert_eq!(corner(&out.join("miss.png")), [0, 0, 255]);
+    assert_eq!(corner(&out.join("miss.png")), [255, 0, 0]);
     assert_eq!(
         corner(&out.join("retry.png")),
         [0, 0, 0],
