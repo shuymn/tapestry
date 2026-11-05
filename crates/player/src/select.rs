@@ -689,6 +689,8 @@ mod tests {
                 title: Some(title.to_owned()),
                 ..Header::default()
             },
+            random: false,
+            summary: None,
         }
     }
 
