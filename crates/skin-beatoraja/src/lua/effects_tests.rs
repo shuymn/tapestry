@@ -529,9 +529,11 @@ fn a_protected_format_s_bytes_are_charged() {
 
 #[test]
 fn every_name_a_statement_lists_is_charged() {
-    // 100 local names and 100 assignment targets, which the walk visits
-    // in their statements and the targets again in its reassignment
-    // pass, against one of each.
+    // 100 local names and 100 assignment targets, against one of each:
+    // the walk visits the names and the targets in their statements and
+    // the targets again in its reassignment pass, and the role scan of the
+    // replaced callback each statement's lists, each extra item charged
+    // five times.
     let names = |n: usize| {
         let list = (0..n)
             .map(|k| format!("a{k}"))
@@ -545,7 +547,7 @@ fn every_name_a_statement_lists_is_charged() {
         )
     };
     let (one, many) = (work(&names(1)), work(&names(100)));
-    assert!(many - one >= 3 * 99, "{one} {many}");
+    assert!(many - one >= 5 * 99, "{one} {many}");
 }
 
 #[test]
