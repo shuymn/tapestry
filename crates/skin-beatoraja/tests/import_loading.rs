@@ -5,6 +5,7 @@
 
 mod common;
 
+use bms_model::TimeUs;
 use common::import_body;
 use common::play::{Loader, round};
 use skin_beatoraja::{DeviationId, NoteKind};
@@ -101,6 +102,49 @@ fn untimed_elements_run_from_the_loading_origin() {
     assert_eq!(d.play.timer(timer::SCREEN), d.play.timer(timer::READY));
     let rects = d.rects(ready + 500);
     assert_eq!(of_width(&rects, 12).map(|r| r[0]), Some(500));
+}
+
+/// Op 80 holds in every loading frame, whatever the load's progress, and
+/// op 81 from READY's first frame on, through the play: each the other's
+/// complement, a negative id negating it. Told apart by width: 10 on 80,
+/// 11 on 81, 12 on -80, 13 on -81.
+#[test]
+fn now_loading_and_loaded_follow_the_loading_state() {
+    let body = format!(
+        r#"{IMAGES}, "destination": [
+            {{"id": "i", "op": [80], "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}},
+            {{"id": "i", "op": [81], "dst": [{{"x": 0, "y": 0, "w": 11, "h": 10}}]}},
+            {{"id": "i", "op": [-80], "dst": [{{"x": 0, "y": 0, "w": 12, "h": 10}}]}},
+            {{"id": "i", "op": [-81], "dst": [{{"x": 0, "y": 0, "w": 13, "h": 10}}]}}
+        ]"#
+    );
+    let widths = |rects: &[[i32; 4]]| -> Vec<i32> {
+        let mut w: Vec<i32> = rects.iter().map(|r| r[2]).collect();
+        w.sort_unstable();
+        w
+    };
+    let mut l = import_body(&body).loading();
+    assert_eq!(widths(&l.rects(0)), [10, 13]);
+    l.percent = 100;
+    assert_eq!(
+        widths(&l.rects(5_000)),
+        [10, 13],
+        "progress does not end it"
+    );
+
+    let mut d = import_body(&body).drawn();
+    d.frame(0, &[]);
+    let ready = d.play.timer(timer::READY).expect("ready has started").0 / 1_000;
+    assert_eq!(widths(&d.rects(ready)), [11, 12], "READY at elapsed zero");
+    assert_eq!(widths(&d.rects(ready + 3_000)), [11, 12], "in the play");
+    d.playing = false;
+    assert_eq!(
+        widths(&d.rects(ready + 4_000)),
+        [11, 12],
+        "in the audio tail"
+    );
+    d.closing = Some(TimeUs((ready + 4_500) * 1_000));
+    assert_eq!(widths(&d.rects(ready + 5_000)), [11, 12], "in Closing");
 }
 
 /// The descriptor of a preset's gauge 0 with `look`, its border at 80 %.

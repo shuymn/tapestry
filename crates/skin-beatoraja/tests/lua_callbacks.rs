@@ -10,7 +10,7 @@ use common::play::Drawn;
 use rules::GaugeValue;
 use skin_beatoraja::lua::{Disposition, Unsupported};
 use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
-use skin_model::GaugeLook;
+use skin_model::{ChartText, GaugeLook, Layout, MAX_TEXT_BYTES};
 use tempfile::TempDir;
 
 /// A skin folder whose `s.luaskin` is `entry`, with a 64×64 `a.png`.
@@ -217,6 +217,316 @@ fn a_critical_callback_that_does_not_convert_refuses() {
     ));
     let i = import(&d, 905).unwrap();
     assert_eq!(counts(&i), [0, 1, 0, 0]);
+}
+
+/// A skin with one text in a font file, `ref` 10 beside its `value`, drawn
+/// with `timer`.
+fn text_folder(value: &str, timer: &str) -> TempDir {
+    let d = folder(&skin(&format!(
+        "skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.text = {{ {{ id = \"t\", font = \"f\", size = 10, ref = 10, value = {value} }} }}\n\
+         table.insert(skin.destination, {{ id = \"t\", {timer} dst = {{ {{ w = 64, h = 10 }} }} }})"
+    )));
+    common::font(d.path(), "f.ttf");
+    d
+}
+
+/// The lines a text of `value` asks for over `chart`, once imported.
+fn text_lines(value: &str, chart: &ChartText<'_>) -> Vec<String> {
+    let i = import(&text_folder(value, ""), 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0], "{value}");
+    i.imported
+        .skin
+        .text_requests(chart, [1_920, 1_080], &Layout::AUTHOR)
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
+}
+
+const FULL: ChartText<'static> = ChartText {
+    title: "T",
+    subtitle: "S",
+    artist: "A",
+    subartist: "B",
+    genre: "G",
+};
+const NO_TEXT: ChartText<'static> = ChartText {
+    title: "",
+    subtitle: "",
+    artist: "",
+    subartist: "",
+    genre: "",
+};
+
+/// `main_state.text(n)` as a whole value is that field, not its `ref`.
+#[test]
+fn a_direct_text_value_is_its_field() {
+    for (id, want) in [
+        (10, "T"),
+        (11, "S"),
+        (12, "T S"),
+        (13, "G"),
+        (14, "A"),
+        (15, "B"),
+        (16, "A B"),
+    ] {
+        let value = format!("function() return ms.text({id}) end");
+        assert_eq!(text_lines(&value, &FULL), [want], "{id}");
+        assert_eq!(text_lines(&value, &NO_TEXT), [] as [&str; 0], "{id}");
+    }
+}
+
+/// Both written forms of a field's string for when it is empty, a full
+/// field's emptiness after its join, a string captured or literal.
+#[test]
+fn a_text_fallback_shows_for_an_empty_field() {
+    for value in [
+        "function() local tx = ms.text(12)\n\
+           if not tx or tx == \"\" then return \"none\" else return tx end end",
+        "function() local tx = ms.text(12)\n\
+           if tx ~= \"\" then return tx else return \"none\" end end",
+    ] {
+        assert_eq!(text_lines(value, &FULL), ["T S"], "{value}");
+        assert_eq!(text_lines(value, &NO_TEXT), ["none"], "{value}");
+        let subtitle = ChartText {
+            subtitle: "S",
+            ..NO_TEXT
+        };
+        assert_eq!(text_lines(value, &subtitle), [" S"], "{value}");
+    }
+    // A string captured from the chunk, cleaned as a literal is.
+    let d = folder(&skin(
+        "local none = \"no\\7ne\"\n\
+         skin.font = { { id = \"f\", path = \"f.ttf\" } }\n\
+         skin.text = { { id = \"t\", font = \"f\", size = 10, value = function()\n\
+           local tx = ms.text(13)\n\
+           if tx == \"\" then return none else return tx end end } }\n\
+         table.insert(skin.destination, { id = \"t\", dst = { { w = 64, h = 10 } } })",
+    ));
+    common::font(d.path(), "f.ttf");
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    let lines = i
+        .imported
+        .skin
+        .text_requests(&NO_TEXT, [1_920, 1_080], &Layout::AUTHOR);
+    assert_eq!(lines[0].text, "none");
+    // An empty string for the empty field is the field alone.
+    let value = "function() local tx = ms.text(10)\n\
+       if tx == \"\" then return \"\" else return tx end end";
+    assert_eq!(text_lines(value, &FULL), ["T"]);
+    assert_eq!(text_lines(value, &NO_TEXT), [] as [&str; 0]);
+}
+
+/// The scene's constants fold in a text's value and record no read: a
+/// table line written as the source's table skins write it folds to its
+/// last string, its concatenation and course arms never evaluated.
+#[test]
+fn a_table_line_folds_to_its_literal() {
+    let value = "function()\n\
+       if not ms.option(290) then\n\
+         local tx1, tx2 = ms.text(1001), ms.text(1002)\n\
+         if not tx1 or tx1 == \"\" and not tx2 or tx2 == \"\" then\n\
+           local tx3 = ms.text(1003)\n\
+           if not tx3 or tx3 == \"\" then return \"no table\" else return tx3 end\n\
+         else return tx1 .. \" > \" .. tx2 end\n\
+       elseif ms.option(289) then return \"last\"\n\
+       else return \"course\" end end";
+    assert_eq!(text_lines(value, &NO_TEXT), ["no table"]);
+    let negated = "function() if ms.option(-1008) then return \"x\" else return \"y\" end end";
+    assert_eq!(text_lines(negated, &NO_TEXT), ["x"]);
+}
+
+/// A field's string for when it is empty is charged as the field in a
+/// bitmap font: a quad per byte of its cap.
+#[test]
+fn a_text_fallback_is_charged_as_its_field() {
+    let d = folder(&skin(
+        "skin.font = { { id = \"f\", path = \"f.fnt\" } }\n\
+         skin.text = { { id = \"t\", font = \"f\", size = 16, value = function()\n\
+           local tx = ms.text(10)\n\
+           if tx == \"\" then return \"a\" else return tx end end } }\n\
+         table.insert(skin.destination, { id = \"t\", dst = { { w = 64, h = 16 } } })",
+    ));
+    common::write(
+        d.path(),
+        "f.fnt",
+        b"info face=\"t\" size=16 padding=0,0,0,0\n\
+          common lineHeight=16 base=16 scaleW=64 scaleH=64 pages=1\n\
+          page id=0 file=\"a.png\"\nchars count=1\n\
+          char id=97 x=0 y=0 width=16 height=16 xoffset=0 yoffset=0 xadvance=16 page=0 chnl=15\n",
+    );
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    assert_eq!(
+        i.imported.report.usage.widget_quads,
+        u32::try_from(MAX_TEXT_BYTES).unwrap()
+    );
+}
+
+/// An empty result draws nothing, as an empty constant.
+#[test]
+fn an_empty_text_value_is_ignored() {
+    for value in [
+        "function() return \"\" end",
+        "function() return ms.text(1003) end",
+    ] {
+        let i = import(&text_folder(value, ""), 905).unwrap();
+        assert_eq!(counts(&i), [1, 0, 0, 0], "{value}");
+        assert_eq!(i.imported.report.usage.texts, 0, "{value}");
+        assert!(
+            i.imported
+                .report
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Ignored { field: "value" }),
+            "{value}"
+        );
+    }
+}
+
+/// `value`'s expected disposition `why`: a decorative text is replaced
+/// with that reason in its note, never its `ref`, and failure presentation
+/// refuses with it.
+#[track_caller]
+fn text_follows_its_role(value: &str, why: Unsupported) {
+    let i = import(&text_folder(value, ""), 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(why)], "{value}");
+    assert!(
+        i.imported.report.notes.iter().any(|n| n.kind
+            == NoteKind::Callback {
+                field: "value",
+                why
+            }),
+        "{value}"
+    );
+    assert_eq!(i.imported.report.usage.texts, 0, "no `ref`: {value}");
+    match import(&text_folder(value, "timer = 3,"), 905) {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "value",
+                    why: w,
+                },
+            ..
+        }) => assert_eq!(w, why, "{value}"),
+        other => panic!("{value}: {other:?}"),
+    }
+}
+
+/// A result with no shape a text takes has no consumer.
+#[test]
+fn other_text_shapes_follow_the_role() {
+    let consumer = Unsupported::Consumer("text value");
+    for value in [
+        "function() return 1 end",
+        "function() return nil end",
+        "function() return ms.text(1) end",
+        "function() local n = ms.number(110) return \"x\" end",
+        "function() return ms.number(110) == 0 and \"a\" or \"b\" end",
+        "function() if ms.option(289) then return ms.text(10) else return ms.text(11) end end",
+        "function() local tx = ms.text(10)\n\
+           if tx == \"\" then return tx else return \"x\" end end",
+        "function() local a, b = ms.text(10), ms.text(11)\n\
+           if a == \"\" then return \"x\" else return b end end",
+        "function() local tx = ms.text(12) return tx ~= \"\" and tx or \"none\" end",
+    ] {
+        text_follows_its_role(value, consumer);
+    }
+}
+
+/// A value whose reads show a critical part is critical, whatever else it
+/// is: it refuses, by the reason it did not fold for, never its `ref`.
+#[test]
+fn a_text_value_reading_a_critical_part_refuses() {
+    let consumer = Unsupported::Consumer("text value");
+    for (value, why) in [
+        (
+            "function() return ms.number(101) == 0 and \"a\" or \"b\" end",
+            consumer,
+        ),
+        (
+            "function() local n = ms.number(101) return \"a\" end",
+            consumer,
+        ),
+        (
+            "function() return ms.number(101) .. \"a\" end",
+            Unsupported::Construct(".."),
+        ),
+    ] {
+        match import(&text_folder(value, ""), 905) {
+            Err(ImportError::Lua {
+                why:
+                    LuaWhy::Critical {
+                        field: "value",
+                        why: w,
+                    },
+                ..
+            }) => assert_eq!(w, why, "{value}"),
+            other => panic!("{value}: {other:?}"),
+        }
+    }
+}
+
+/// Under failure presentation a value that folds is drawn, as anywhere.
+#[test]
+fn a_failure_presentation_text_folds() {
+    let value = "function() local tx = ms.text(10)\n\
+       if tx == \"\" then return \"none\" else return tx end end";
+    let i = import(&text_folder(value, "timer = 3,"), 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    let lines = i
+        .imported
+        .skin
+        .text_requests(&NO_TEXT, [1_920, 1_080], &Layout::AUTHOR);
+    assert_eq!(lines[0].text, "none");
+}
+
+/// An evaluation that stopped gives its own reason.
+#[test]
+fn a_stopped_text_value_keeps_its_reason() {
+    for (value, why) in [
+        (
+            "function() return ms.text(12) .. \"x\" end",
+            Unsupported::Construct(".."),
+        ),
+        (
+            "function() return string.upper(ms.text(12)) end",
+            Unsupported::Construct("library call"),
+        ),
+        (
+            "function() local tx = ms.text(12)\n\
+               if tx == \"x\" then return \"y\" else return tx end end",
+            Unsupported::Type,
+        ),
+    ] {
+        text_follows_its_role(value, why);
+    }
+}
+
+/// Reading a text in another consumer keeps its result: the comparison
+/// and the scene's constants are the text's alone.
+#[test]
+fn other_consumers_keep_their_text_reads() {
+    for draw in [
+        "function() return ms.text(12) == \"\" end",
+        "function() return ms.text(1003) == \"\" end",
+    ] {
+        let d = folder(&skin(&image_at(0, &format!("draw = {draw},"))));
+        let i = import(&d, 905).unwrap();
+        assert_eq!(
+            i.callbacks,
+            [Disposition::Replaced(Unsupported::Type)],
+            "{draw}"
+        );
+    }
+    let d = folder(&skin(
+        "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() if ms.text(12) == \"\" then return 1 else return 0 end end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(Unsupported::Type)]);
 }
 
 /// A play skin whose gauge flash, drawn from x 500, is a `draw` in a part
