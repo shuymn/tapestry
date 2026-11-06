@@ -169,7 +169,13 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                     let deviation = (judgment != Judgment::Poor).then_some(TimeUs(0));
                     out.push(ev(t, judged(judgment, deviation, None)));
                     if judgment == Judgment::Poor {
-                        out.push(ev(t + 10 * MS, JudgeEventKind::EmptyPoor { lane }));
+                        out.push(ev(
+                            t + 10 * MS,
+                            JudgeEventKind::EmptyPoor {
+                                lane,
+                                deviation: TimeUs(10 * MS),
+                            },
+                        ));
                     }
                 }
                 NoteKind::Long { end, .. } => {
@@ -190,9 +196,36 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                                 deviation: TimeUs(0),
                             },
                         ));
-                        out.push(ev(end.0, JudgeEventKind::LnHoldEnded { lane, note: n }));
-                        let done = judged(Judgment::Perfect, Some(TimeUs(0)), Some(TimeUs(0)));
-                        out.push(ev(end.0, done));
+                        // With breaks, the recent timing's long-note arms:
+                        // a head 40 ms early farther than a release 30 ms
+                        // early (+40), and a release 130 ms early leaving
+                        // the note BAD (+130, not the head's +140); each
+                        // 30 ms clear of the next judgment, so a frame
+                        // reads it (`Witness::recent`).
+                        let (at, done) = match (t / (200 * MS)) % 3 {
+                            1 if !clean => (
+                                end.0 - 30 * MS,
+                                judged(
+                                    Judgment::Good,
+                                    Some(TimeUs(-40 * MS)),
+                                    Some(TimeUs(-30 * MS)),
+                                ),
+                            ),
+                            2 if !clean => (
+                                end.0 - 130 * MS,
+                                judged(
+                                    Judgment::Bad,
+                                    Some(TimeUs(-140 * MS)),
+                                    Some(TimeUs(-130 * MS)),
+                                ),
+                            ),
+                            _ => (
+                                end.0,
+                                judged(Judgment::Perfect, Some(TimeUs(0)), Some(TimeUs(0))),
+                            ),
+                        };
+                        out.push(ev(at, JudgeEventKind::LnHoldEnded { lane, note: n }));
+                        out.push(ev(at, done));
                     }
                 }
             }
@@ -1279,6 +1312,10 @@ struct Witness {
     /// empty value, and each gauge kind read.
     rates_apart: bool,
     kinds: [bool; GaugeLook::COUNT],
+    /// The frames whose recent timing read +40 (a long note's head
+    /// farther than its release) and +130 (an early release leaving it
+    /// BAD).
+    recent: [u32; 2],
     empty_frames_after_ready: u32,
     /// Whether a quad showed a frame other than an image's first.
     later_frame: bool,
@@ -1397,6 +1434,7 @@ impl Witness {
             drawn: [false; timer::BUILTIN as usize],
             when_started: false,
             rates_apart: false,
+            recent: [0; 2],
             kinds: [false; GaugeLook::COUNT],
             empty_frames_after_ready: 0,
             later_frame: false,
@@ -1653,6 +1691,14 @@ fn stretch(
         let read = |slot: u16| fields.get(usize::from(slot)).copied();
         let (current, whole) = (read(field::RATE_CURRENT_BP), read(field::RATE_WHOLE_BP));
         w.rates_apart |= current != whole && current != Some(10_000);
+        match (
+            read(field::JUDGE_RECENT_MS),
+            read(field::JUDGE_RECENT_IMPERFECT),
+        ) {
+            (Some(40), Some(1)) => w.recent[0] += 1,
+            (Some(130), Some(1)) => w.recent[1] += 1,
+            _ => {}
+        }
         if let Some(seen) = read(field::GAUGE_KIND)
             .and_then(|k| usize::try_from(k).ok())
             .and_then(|k| w.kinds.get_mut(k))
@@ -1820,6 +1866,13 @@ fn build_does_not_allocate() {
         assert_eq!(at_21_9 - at_16_9, 320.0, "{name}");
         beams.push(at_16_9);
         let fc = usize::from(timer::FULL_COMBO);
+        if matches!(*name, "play" | "round") {
+            assert!(
+                w.recent.iter().all(|&n| n > 0),
+                "{name}: a long note's timing arm never read: {:?}",
+                w.recent
+            );
+        }
         if matches!(*name, "clean round" | "autoplay") {
             assert!(w.on[fc], "{name}: `full_combo` never started");
             assert!(w.drawn[fc], "{name}: its elements were never drawn");

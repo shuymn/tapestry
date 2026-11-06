@@ -595,6 +595,7 @@ fn a_skin_frame_reads_one_view() {
         origin: None,
         kind: eval::JudgeEventKind::EmptyPoor {
             lane: common::lane(1),
+            deviation: bms_model::TimeUs(0),
         },
     }];
     let f = render::FrameInput {

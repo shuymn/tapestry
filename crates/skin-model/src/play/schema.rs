@@ -202,6 +202,15 @@ pub static PLAY: Schema = Schema {
         },
         flag("chart.level_valid", T),
         flag("autoplay", T),
+        Field {
+            name: "judge.recent_ms",
+            ty: FieldTy::Int {
+                lo: -READOUT_MAX,
+                hi: READOUT_MAX,
+            },
+            export: T,
+        },
+        flag("judge.recent_imperfect", T),
     ],
     timers: &[
         timer("ready", E),
@@ -413,8 +422,14 @@ pub mod field {
     pub const CHART_LEVEL_VALID: u16 = 89;
     /// Whether the attempt is autoplay, known while loading too.
     pub const AUTOPLAY: u16 = 90;
+    /// The latest judgment's timing as the source shows it: note time
+    /// minus press, in ms truncated toward 0 (early positive), over the
+    /// judgments and empty POORs the source takes; 0 before any.
+    pub const JUDGE_RECENT_MS: u16 = 91;
+    /// Whether that judgment is worse than PERFECT; false before any.
+    pub const JUDGE_RECENT_IMPERFECT: u16 = 92;
     /// The number of fields.
-    pub const COUNT: usize = 91;
+    pub const COUNT: usize = 93;
 
     /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
     /// current, main, min, max), `covered` or not; `.green` and `.valid`
@@ -682,7 +697,12 @@ mod tests {
         assert_eq!(slot("chart.level"), Some(field::CHART_LEVEL));
         assert_eq!(slot("chart.level_valid"), Some(field::CHART_LEVEL_VALID));
         assert_eq!(slot("autoplay"), Some(field::AUTOPLAY));
-        assert_eq!(field::COUNT, 91);
+        assert_eq!(slot("judge.recent_ms"), Some(field::JUDGE_RECENT_MS));
+        assert_eq!(
+            slot("judge.recent_imperfect"),
+            Some(field::JUDGE_RECENT_IMPERFECT)
+        );
+        assert_eq!(field::COUNT, 93);
     }
 
     #[test]

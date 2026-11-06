@@ -984,7 +984,8 @@ fn scratch_uses_its_own_windows() {
     let e = play(&chart, both_at(T + 215 * MS));
     assert_eq!(judged_on(&e, 0), [Bad]);
     assert_eq!(judged_on(&e, 1), [Poor]);
-    // An empty POOR 155 ms after a judged note.
+    // An empty POOR 155 ms after a judged note, carrying its deviation
+    // from it.
     let mut presses = both_at(T);
     presses.extend(both_at(T + 155 * MS));
     let e = play(&chart, presses);
@@ -992,11 +993,11 @@ fn scratch_uses_its_own_windows() {
         .events
         .iter()
         .filter_map(|ev| match ev.kind {
-            JudgeEventKind::EmptyPoor { lane } => Some(lane.index()),
+            JudgeEventKind::EmptyPoor { lane, deviation } => Some((lane.index(), deviation)),
             _ => None,
         })
         .collect();
-    assert_eq!(empty, [0]);
+    assert_eq!(empty, [(0, TimeUs(155 * MS))]);
     // A long note's end, released 95 ms before it.
     let end = T + 1_000 * MS;
     let chart = ChartBuilder::new(BPM)

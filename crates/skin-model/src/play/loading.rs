@@ -155,6 +155,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Chosen, // chart.level_valid
         // Whether the attempt is autoplay: the frame's.
         Live, // autoplay
+        // The recent timing, 91 and 92: the reducer's, which a loading
+        // state does not have.
+        Unavailable, // judge.recent_ms
+        Unavailable, // judge.recent_imperfect
     ]
 };
 
@@ -510,7 +514,12 @@ mod tests {
             }
         }
         assert_eq!(loading_field(field::GAUGE), Some(LoadingField::Unavailable));
-        for slot in [field::BPM_CHANGE, field::BPM_CHANGE_VALID] {
+        for slot in [
+            field::BPM_CHANGE,
+            field::BPM_CHANGE_VALID,
+            field::JUDGE_RECENT_MS,
+            field::JUDGE_RECENT_IMPERFECT,
+        ] {
             assert_eq!(loading_field(slot), Some(LoadingField::Unavailable));
         }
         assert_eq!(loading_field(u16::try_from(field::COUNT).unwrap()), None);
