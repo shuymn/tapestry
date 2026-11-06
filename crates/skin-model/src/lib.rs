@@ -148,8 +148,8 @@ pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
 pub use selection::{
-    ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowKey, RowKind, RowScore, RowView,
-    SelectedChart, SelectionPlace, SelectionView,
+    ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowFeatures, RowKey, RowKind,
+    RowScore, RowView, SelectedChart, SelectionLabels, SelectionPlace, SelectionView,
 };
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
