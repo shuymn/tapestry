@@ -1864,3 +1864,70 @@ fn a_play_skin_reads_the_attempts_autoplay() {
         assert_eq!(corner(&png), [255, 0, 0], "{name}");
     }
 }
+
+/// A play skin reads the recent timing a log's play publishes: a
+/// full-canvas blue image on op 1242 (worse than PERFECT, early) and a red
+/// corner on op 1243 (late). The first note pressed 30 ms early shows the
+/// blue, the second on time neither, the third 30 ms late the corner.
+#[test]
+fn a_play_skin_reads_the_recent_timing() {
+    let fx = Fixture::new();
+    let chart = write_chart(&fx.library(), "a", "譜面A");
+    let mut events = hits(&chart, |t| t < TimeUs(3_200_000));
+    // Each note is a press and its release: the first early, the third
+    // late.
+    for (i, shift) in [(0, -30_000), (1, -30_000), (4, 30_000), (5, 30_000)] {
+        events[i].received = TimeUs(events[i].received.0 + shift);
+    }
+    write_log(&fx.base.join("logs").join("timing.tprl"), &events, 1);
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("white.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let white: Vec<u8> = (0..16 * 16).flat_map(|_| [255; 4]).collect();
+    e.write_header().unwrap().write_image_data(&white).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"timing\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"b\", path = \"white.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.destination = {\n\
+           { id = \"b\", op = { 1242 }, dst = { { x = 0, y = 0, w = 1920, h = 1080, r = 0, g = 0 } } },\n\
+           { id = \"b\", op = { 1243 }, dst = { { x = 0, y = 0, w = 192, h = 108, g = 0, b = 0 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 2200, file = \"early.png\" }",
+        "capture = { at = 2700, file = \"perfect.png\" }",
+        "capture = { at = 3150, file = \"late.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/timing.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out = fx.base.join("out");
+    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
+    for (name, want_centre, want_corner) in [
+        ("early", [0, 0, 255], [0, 0, 255]),
+        ("perfect", [0, 0, 0], [0, 0, 0]),
+        ("late", [0, 0, 0], [255, 0, 0]),
+    ] {
+        let png = out.join(format!("{name}.png"));
+        assert_eq!(centre(&png), want_centre, "{name}");
+        assert_eq!(corner(&png), want_corner, "{name}");
+    }
+}
