@@ -193,6 +193,31 @@ fn a_lua_draw_known_false_folds_as_json_does() {
     }
     // One reading a live option is kept.
     import_lua(&lua_skin("draw = function() return ms.option(2) end,", "")).unwrap();
+    // A composed one that folds false (`not` of a constant true), on the
+    // selected row, the title and the list element alike.
+    let composed = "function() return not ms.option(50) end";
+    for (on, more, part) in [
+        (
+            format!("draw = {composed},"),
+            String::new(),
+            skin_beatoraja::EssentialPart::SelectedRow,
+        ),
+        (
+            String::new(),
+            format!("skin.songlist.text[1].draw = {composed}"),
+            skin_beatoraja::EssentialPart::RowTitle,
+        ),
+        (
+            String::new(),
+            format!("skin.destination[1].draw = {composed}"),
+            skin_beatoraja::EssentialPart::SongList,
+        ),
+    ] {
+        match import_lua(&lua_skin(&on, &more)) {
+            Err(skin_beatoraja::ImportError::Essential { part: p, .. }) => assert_eq!(p, part),
+            other => panic!("{part:?}: {:?}", other.map(|i| i.callbacks)),
+        }
+    }
 }
 
 /// A Lua timer read takes the selection profile's timers: 11 is the

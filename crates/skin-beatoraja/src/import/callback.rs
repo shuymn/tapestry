@@ -103,6 +103,10 @@ pub(crate) struct Lowered {
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
     pub(crate) deviates: bool,
+    /// The value its expression folds to when it compiles to a constant,
+    /// its guards aside: a visibility known false folds as a JSON
+    /// condition does.
+    pub(crate) known: Option<i32>,
     /// Whether its residual folded to a known value, for the conversion
     /// report.
     #[cfg(feature = "dev-tools")]
@@ -254,6 +258,7 @@ impl<'a> Lower<'a> {
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
+                known: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
             },
@@ -362,8 +367,9 @@ impl Lower<'_> {
         TRIED.with(|t| {
             *t.borrow_mut() = Some((src.clone(), tried.as_ref().err().map(|e| e.kind.clone())));
         });
-        if tried.is_err() {
-            return Err(Stop::Unsupported(LIMITS));
+        match tried {
+            Ok(p) => self.out.known = p.constant(),
+            Err(_) => return Err(Stop::Unsupported(LIMITS)),
         }
         Ok(src)
     }
@@ -1415,6 +1421,7 @@ impl Cx<'_> {
                         guards: Vec::new(),
                         part: None,
                         deviates: false,
+                        known: None,
                         #[cfg(feature = "dev-tools")]
                         constant: matches!(fold, TextFold::Literal(_)),
                     }),
@@ -1536,9 +1543,7 @@ impl Cx<'_> {
                 // On a selection skin a visibility known to be false folds
                 // as a JSON condition of the same id does: never drawn, so
                 // an essential part is missing rather than kept invisible.
-                if self.kind == ScreenKind::Selection
-                    && l.src.trim_matches(|c| c == '(' || c == ')') == "false"
-                {
+                if self.kind == ScreenKind::Selection && l.known == Some(0) {
                     self.ignored(at, NoteKind::Ignored { field: "op" });
                     return Ok(false);
                 }
