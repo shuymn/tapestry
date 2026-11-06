@@ -12,7 +12,7 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 4
+//! version = 5
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
 //!
@@ -23,7 +23,8 @@
 //! [[step]]
 //! capture = { at = 3000, file = "a.png" }   # chart ms, the next play's
 //! # or { ready_at = 500, file = … }: ms since its first candidate's READY
-//! # state began; or
+//! # state began; or { closing_at = 300, file = … }: ms since its Closing
+//! # began, which no frame is guaranteed to show; or
 //! # { loading = true, file = … }: its loading state's first frame. Beside
 //! # each PNG, a JSON file of the same name says what the frame was, and a
 //! # play frame of an imported skin a JSON lines file its display list.
@@ -81,7 +82,7 @@ use crate::measure::Drawn;
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -441,6 +442,7 @@ enum ResultKind {
 struct CaptureSpec {
     at: Option<i64>,
     ready_at: Option<i64>,
+    closing_at: Option<i64>,
     loading: Option<bool>,
     file: PathBuf,
 }
@@ -591,20 +593,22 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     })
 }
 
-/// The axis a `capture` step names: exactly one of `at`, `ready_at` and
-/// `loading = true`.
+/// The axis a `capture` step names: exactly one of `at`, `ready_at`,
+/// `closing_at` and `loading = true`.
 fn capture_axis(c: &CaptureSpec) -> Result<Axis, String> {
     let ms = |v: i64, name: &str| {
         v.checked_mul(1_000)
             .map(TimeUs)
             .ok_or_else(|| format!("{name} is too large"))
     };
-    match (c.at, c.ready_at, c.loading) {
-        (Some(at), None, None) => Ok(Axis::Chart(ms(at, "at")?)),
-        (None, Some(r), None) if r < 0 => Err("ready_at must be 0 or more".to_owned()),
-        (None, Some(r), None) => Ok(Axis::Ready(ms(r, "ready_at")?)),
-        (None, None, Some(true)) => Ok(Axis::Loading),
-        _ => Err("give one of at, ready_at and loading = true".to_owned()),
+    match (c.at, c.ready_at, c.closing_at, c.loading) {
+        (Some(at), None, None, None) => Ok(Axis::Chart(ms(at, "at")?)),
+        (None, Some(r), None, None) if r < 0 => Err("ready_at must be 0 or more".to_owned()),
+        (None, Some(r), None, None) => Ok(Axis::Ready(ms(r, "ready_at")?)),
+        (None, None, Some(c), None) if c < 0 => Err("closing_at must be 0 or more".to_owned()),
+        (None, None, Some(c), None) => Ok(Axis::Closing(ms(c, "closing_at")?)),
+        (None, None, None, Some(true)) => Ok(Axis::Loading),
+        _ => Err("give one of at, ready_at, closing_at and loading = true".to_owned()),
     }
 }
 
@@ -1085,6 +1089,10 @@ pub enum Axis {
     /// state began, of the attempt's first candidate: a frame past READY
     /// or of a rearmed candidate fails it (design.md "Play Lifecycle").
     Ready(TimeUs),
+    /// The first presented frame at or after this time since Closing
+    /// began, as the frame's view gives Closing's start (design.md "Play
+    /// Lifecycle", Closing): no presented frame is guaranteed.
+    Closing(TimeUs),
     /// The first presented frame of its loading state.
     Loading,
 }
@@ -1094,13 +1102,14 @@ impl Axis {
         match self {
             Self::Chart(_) => "chart",
             Self::Ready(_) => "ready",
+            Self::Closing(_) => "closing",
             Self::Loading => "loading",
         }
     }
 
     const fn target(self) -> i64 {
         match self {
-            Self::Chart(t) | Self::Ready(t) => t.0,
+            Self::Chart(t) | Self::Ready(t) | Self::Closing(t) => t.0,
             Self::Loading => 0,
         }
     }
@@ -1424,6 +1433,10 @@ fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<Due> {
             }
             (t.0 - origin.0 >= since.0).then_some(Due::Save(generation))
         }
+        Axis::Closing(since) => {
+            let start = drawn.view?.closing?;
+            (t.0 - start.0 >= since.0).then_some(Due::Save(generation))
+        }
         Axis::Loading => None,
     }
 }
@@ -1434,11 +1447,12 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let view = drawn.view;
     let ready = view.and_then(|v| v.ready);
+    let closing = view.and_then(|v| v.closing);
     let loading = drawn.loading_stamp;
     format!(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
-         \"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"completed_us\":{},\
+         \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"completed_us\":{},\
          \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{}}}\n",
         axis.name(),
         axis.target(),
@@ -1447,6 +1461,8 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
         opt(drawn.play.zip(ready).map(|(t, (origin, _))| t.0 - origin.0)),
         opt(ready.map(|(origin, _)| origin.0)),
         opt(ready.map(|(_, end)| end.0)),
+        opt(drawn.play.zip(closing).map(|(t, start)| t.0 - start.0)),
+        opt(closing.map(|start| start.0)),
         opt(loading.map(|l| l.sampled.0 - l.origin.0)),
         opt(loading.map(|l| l.origin.0)),
         loading.map_or_else(|| "null".to_owned(), |l| l.settled.to_string()),
@@ -1500,7 +1516,7 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
         let gauges: Vec<String> = v.gauges.iter().map(|g| opt(*g)).collect();
         format!(
             ",\"counts\":[{},{},{},{},{}],\"empty_poor\":{},\"ex_score\":{},\"combo\":{},\
-             \"max_combo\":{},\"shown_gauge\":{},\"gauges\":[{}],\"look\":{}",
+             \"max_combo\":{},\"shown_gauge\":{},\"gauges\":[{}],\"look\":{},\"closing_start_us\":{}",
             c.perfect,
             c.great,
             c.good,
@@ -1514,6 +1530,7 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
             gauges.join(","),
             v.look
                 .map_or_else(|| "null".to_owned(), |l| json_string(&format!("{l:?}"))),
+            opt(v.closing.map(|start| start.0)),
         )
     });
     let _ = writeln!(
@@ -1925,7 +1942,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 4\n".to_owned();
+        let mut text = "version = 5\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -2418,7 +2435,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 4\nstep = [".to_owned();
+        let mut text = "version = 5\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -2466,7 +2483,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 4\n".to_owned();
+        let mut text = "version = 5\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -2486,16 +2503,16 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 4\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 5\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 4"
+            "version 1 is not supported; this build reads version 5"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 4"
+            "no version; this build reads version 5"
         );
     }
 
@@ -2507,7 +2524,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 4\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 5\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
@@ -2523,14 +2540,24 @@ mod tests {
             let e = capture(bad).unwrap_err();
             assert!(e.contains("give one of"), "{bad}: {e}");
         }
+        assert_eq!(
+            capture("closing_at = 3, "),
+            Ok(super::Axis::Closing(TimeUs(3_000)))
+        );
+        for bad in ["closing_at = 1, at = 1, ", "closing_at = 1, ready_at = 1, "] {
+            let e = capture(bad).unwrap_err();
+            assert!(e.contains("give one of"), "{bad}: {e}");
+        }
         let e = capture("ready_at = -1, ").unwrap_err();
         assert!(e.contains("ready_at must be 0 or more"), "{e}");
+        let e = capture("closing_at = -1, ").unwrap_err();
+        assert!(e.contains("closing_at must be 0 or more"), "{e}");
         assert!(capture("at = -9223372036854775808, ").is_err());
 
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 4\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 5\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
@@ -2598,6 +2625,53 @@ mod tests {
                 assert_eq!(super::phase(&d), want, "{start}: {why}");
             }
         }
+    }
+
+    /// A Closing capture waits for a frame whose view has Closing started,
+    /// then for its time since that start; its sidecar and the list's
+    /// state line say where Closing started.
+    #[test]
+    fn a_closing_capture_waits_for_its_views_closing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Captures::of(vec![(TimeUs(0), dir.path().join("c.png"))]);
+        c.set_axis(0, super::Axis::Closing(TimeUs(300_000)));
+        c.arm(0);
+        c.bind(1);
+        let closing = |ms: i64, start: Option<i64>| {
+            let mut d = drawn(1, ms);
+            d.view = Some(crate::measure::ViewStamp {
+                playing: false,
+                closing: start.map(|s| TimeUs(s * 1_000)),
+                ..drawn_view()
+            });
+            d
+        };
+        let due = |d: &crate::measure::Drawn<'_>| {
+            let list = c.0.lock().unwrap();
+            matches!(super::capture_due(&list[0], d), Some(super::Due::Save(1)))
+        };
+        // Past its time on the chart, but no Closing in the view: none.
+        assert!(!due(&closing(9_000, None)));
+        // 200 ms into Closing: not yet; 300 ms: due.
+        assert!(!due(&closing(5_200, Some(5_000))));
+        assert!(due(&closing(5_300, Some(5_000))));
+        let side = super::sidecar(
+            super::Axis::Closing(TimeUs(300_000)),
+            4,
+            &closing(5_300, Some(5_000)),
+        );
+        assert!(side.contains("\"closing_us\":300000,"), "{side}");
+        assert!(side.contains("\"closing_start_us\":5000000,"), "{side}");
+        assert!(side.contains("\"phase\":\"closing\""), "{side}");
+        let list = skin_model::DisplayList {
+            element_count: 0,
+            elements: Vec::new(),
+            quads: Vec::new(),
+            quads_dropped: 0,
+            observations_dropped: 0,
+        };
+        let lines = super::display_list_lines(&list, &closing(5_300, Some(5_000))).unwrap();
+        assert!(lines.contains("\"closing_start_us\":5000000"), "{lines}");
     }
 
     /// Captures of one frame share its number, and later frames count on;
