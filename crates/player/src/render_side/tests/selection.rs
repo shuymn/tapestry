@@ -40,6 +40,9 @@ fn update(lifetime: u64, revision: u64) -> SelectionUpdate {
     update_of(lifetime, revision, SelectionView::default())
 }
 
+/// How long a fence on the render thread is waited for.
+const FENCE: Duration = Duration::from_secs(5);
+
 fn seen(screens: &Installers) -> Vec<SelectionSeen> {
     screens.selections.lock().unwrap().clone()
 }
@@ -104,6 +107,36 @@ fn the_slot_holds_the_newest_and_a_left_lifetime_is_never_drawn() {
     let drawn: Vec<u64> = seen(&screens).iter().map(|s| s.revision).collect();
     assert!(!drawn.contains(&102), "{drawn:?}");
     assert!(!drawn.contains(&103), "{drawn:?}");
+    link.exit();
+}
+
+/// An update taken while the launch screen shows, whose lifetime ends
+/// during the frame wait in which the launch screen's time runs out, is
+/// never built: the launch screen hands over to selection, and the
+/// lifetime is checked after that, right before the build.
+#[test]
+fn a_lifetime_left_as_the_launch_screen_hands_over_is_never_drawn() {
+    let screens = Installers::default();
+    screens.splash.store(true, Ordering::Release);
+    let started = std::time::Instant::now();
+    let link = screens.spawn_bare();
+    link.enter_selection(1);
+    link.show_selection(update(1, 1));
+    // Taken while the launch screen shows; then held in the frame wait.
+    assert!(link.fence(FENCE));
+    screens.pace.store(true, Ordering::Release);
+    assert!(wait_until(|| screens.held.load(Ordering::Acquire)));
+    assert!(started.elapsed() < crate::menu_screen::SPLASH);
+    assert!(seen(&screens).is_empty());
+    // The launch screen's time runs out during the wait; selection is
+    // left; the frame granted.
+    std::thread::sleep(
+        crate::menu_screen::SPLASH.saturating_sub(started.elapsed()) + Duration::from_millis(300),
+    );
+    link.leave_selection();
+    screens.permits.store(1, Ordering::Release);
+    assert!(link.fence(FENCE));
+    assert!(seen(&screens).is_empty(), "{:?}", seen(&screens));
     link.exit();
 }
 

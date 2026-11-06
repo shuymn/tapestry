@@ -640,6 +640,10 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
+    /// Answer when taken (tests): the render thread has taken every
+    /// message before it, and drawn the frame that followed them, if any.
+    #[cfg(test)]
+    Fence(mpsc::SyncSender<()>),
     /// Draw the select screen from the newest update in the slot
     /// ([`RenderLink::show_selection`]), if it is newer than the one held
     /// and its lifetime current.
@@ -1126,6 +1130,16 @@ impl RenderLink {
         *wake = Some(self.tx.clone());
         extent.queued.store(false, Ordering::Release);
         self.send(RenderMsg::Follow(Arc::clone(extent)));
+    }
+
+    /// Whether the render thread answered a fence within `deadline`
+    /// (tests): it took every message sent before it, and drew the frame
+    /// that followed them, if any ([`RenderMsg::Fence`]).
+    #[cfg(test)]
+    pub(crate) fn fence(&self, deadline: Duration) -> bool {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Fence(tx));
+        rx.recv_timeout(deadline).is_ok()
     }
 
     /// Selection lifetime `lifetime` begins: updates of it are taken from
@@ -2475,6 +2489,13 @@ impl Run {
                     mode = after_preparing(mode);
                     continue;
                 }
+                // A test's fence: every message before it was taken, and
+                // the frame after them drawn.
+                #[cfg(test)]
+                Ok(RenderMsg::Fence(reply)) => {
+                    let _ = reply.send(());
+                    continue;
+                }
                 Ok(RenderMsg::Menu(page)) => {
                     mode = match mode {
                         // The launch screen shows out its time.
@@ -2710,19 +2731,6 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
-            // Selection was left during the wait: nothing of its update is
-            // built or presented, and nothing is drawn until what comes
-            // next, which takes the frame granted.
-            if matches!(mode, Mode::Selection)
-                && self
-                    .selection
-                    .as_ref()
-                    .is_none_or(|s| !self.shared.selection_current(s.update.lifetime))
-            {
-                self.selection = None;
-                mode = Mode::Idle;
-                continue;
-            }
             let loading_frame = match mode {
                 Mode::Menu { loading, .. } => loading,
                 _ => None,
@@ -2742,6 +2750,20 @@ impl Run {
                 } else if self.selection.is_some() {
                     mode = Mode::Selection;
                 }
+            }
+            // Selection was left during the wait: nothing of its update is
+            // built or presented, and nothing is drawn until what comes
+            // next, which takes the frame granted. Checked here, after the
+            // launch screen handed over and right before the build.
+            if matches!(mode, Mode::Selection)
+                && self
+                    .selection
+                    .as_ref()
+                    .is_none_or(|s| !self.shared.selection_current(s.update.lifetime))
+            {
+                self.selection = None;
+                mode = Mode::Idle;
+                continue;
             }
             #[cfg(feature = "dev-tools")]
             let mut view_stamp = None;
@@ -7519,6 +7541,12 @@ pub(crate) mod tests {
         fn paced(&self) -> bool {
             self.shared.pace.load(Ordering::Acquire)
         }
+        fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
+            self.shared
+                .splash
+                .load(Ordering::Acquire)
+                .then_some(Ok(true))
+        }
         fn selection(
             &mut self,
             update: &crate::selection_skin::SelectionUpdate,
@@ -7680,6 +7708,8 @@ pub(crate) mod tests {
         pub(crate) waits: Arc<AtomicU32>,
         /// Set while a wait holds for want of a permit.
         pub(crate) held: Arc<AtomicBool>,
+        /// The screens draw a launch screen while set; none otherwise.
+        pub(crate) splash: Arc<AtomicBool>,
         /// Each selection frame: its update's lifetime and revision, the
         /// skin state's number (none without one), whether it was laid out
         /// again, and its timers.
