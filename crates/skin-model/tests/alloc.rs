@@ -779,7 +779,10 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
         judges: vec![judge(true), judge(false)],
         texts: vec![
             text(
-                TextValue::Field(TextField::Title),
+                TextValue::FieldOr {
+                    field: TextField::Title,
+                    empty: "NONE".into(),
+                },
                 Align::Center,
                 Overflow::Shrink,
             ),

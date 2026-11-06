@@ -759,6 +759,69 @@ fn loading_bitmap_text_is_replaced_and_cleared() {
     assert_eq!(when(&l), (Some(100 * MS), 400));
 }
 
+/// A field's string for when it is empty belongs to the field's slot: the
+/// field names it, and a composite's parts, the literals do not; it draws
+/// while the field is empty, an unavailable one included, and gives way to
+/// the field's text when that comes.
+#[test]
+fn a_fields_empty_string_is_the_fields_loading_slot() {
+    let (_dir, sheet) = image_support::ab_fonts();
+    let value = TextValue::FieldOr {
+        field: TextField::FullTitle,
+        empty: "A".to_owned(),
+    };
+    let def = TextDef {
+        value,
+        font: skin_model::FontRef::Bitmap(0),
+        align: Align::Left,
+        overflow: skin_model::Overflow::Spill,
+    };
+    let mut l = Loader::new(
+        Skin::new(SkinDef {
+            fit: Fit::Adapt,
+            regions: play_support::REGIONS,
+            whens: Vec::new(),
+            sheet,
+            lanes: None,
+            elements: vec![untimed(Source::Text(0), [0, 0, 200, 20], Place::SCREEN)],
+            widgets: WidgetDefs {
+                texts: vec![def],
+                ..WidgetDefs::default()
+            },
+            bomb_up_to: Some(skin_model::Grade::Bad),
+            close: None,
+        })
+        .unwrap(),
+    );
+    for (which, named) in [
+        (TextSlots::field(TextField::FullTitle), true),
+        (TextSlots::field(TextField::Title), true),
+        (TextSlots::field(TextField::Subtitle), true),
+        (TextSlots::field(TextField::Genre), false),
+        (TextSlots::LITERALS, false),
+    ] {
+        assert_eq!(l.skin.names_text_slot(which, 0), named, "{which:?}");
+    }
+    let title = TextSlots::field(TextField::Title);
+    let install = |l: &mut Loader, title_text| {
+        let chart = skin_model::ChartText {
+            title: title_text,
+            ..skin_model::ChartText::default()
+        };
+        l.skin
+            .install_loading_bitmap_text(&mut l.loading, title, &chart);
+    };
+    install(&mut l, "");
+    l.build(100);
+    assert_eq!(l.batch.quads().len(), 1, "the string");
+    install(&mut l, "AB");
+    l.build(200);
+    assert_eq!(l.batch.quads().len(), 2, "the field");
+    l.skin.clear_loading_text(&mut l.loading, title);
+    l.build(300);
+    assert_eq!(l.batch.quads().len(), 0, "cleared");
+}
+
 /// Bitmap lines laid out ahead (`loading_bitmap_lines`) draw nothing until
 /// installed, then only in the slots named, the others kept; their
 /// storage is counted while they wait; lines of another length install

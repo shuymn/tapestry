@@ -107,6 +107,9 @@ pub struct Drawn {
     pub play: skin_model::Play,
     pub tally: Tally,
     pub gauges: Vec<GaugeState>,
+    /// Whether the play is still playing, for every frame
+    /// ([`SkinFrame::playing`]): off in its audio tail.
+    pub playing: bool,
     /// Where the play entered Closing, for every frame
     /// ([`SkinFrame::closing`]).
     pub closing: Option<TimeUs>,
@@ -268,6 +271,19 @@ impl Drawn {
         d
     }
 
+    /// `skin` played over `chart`, its notes' end at `last_note_end`.
+    #[allow(dead_code, reason = "not every test binary ends its notes")]
+    pub fn over_ending(skin: Skin, chart: &bms_model::Chart, last_note_end: TimeUs) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                last_note_end,
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over a chart of `notes` notes by an attempt that is
     /// autoplay when `autoplay`.
     #[allow(dead_code, reason = "not every test binary autoplays")]
@@ -328,6 +344,7 @@ impl Drawn {
                 reference: GAUGES[0].start,
                 failed_at: None,
             }],
+            playing: true,
             closing: None,
             batch,
             // 600 ms of 150 BPM over the original lane.
@@ -403,7 +420,7 @@ impl Drawn {
             target: self.target,
             layout: &Layout::AUTHOR,
             lanes: self.view,
-            playing: true,
+            playing: self.playing,
             closing: self.closing,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };

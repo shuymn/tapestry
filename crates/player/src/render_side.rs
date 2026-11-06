@@ -2784,6 +2784,10 @@ impl Run {
                                 ..
                             }
                         ),
+                        #[cfg(feature = "dev-tools")]
+                        skin_loading: loading_frame.filter(|&l| {
+                            !pending_presentation(&self.committed, self.specialized_in, l)
+                        }),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),

@@ -550,6 +550,18 @@ fn bitmap_texts_fill_the_widget_quads() {
     let accented = text(literal("AÀA"), 0, Align::Left, Overflow::Spill);
     let skin = load(s.clone(), vec![(accented, [0, 0, 10, 10])]).unwrap();
     assert_eq!(skin.quad_capacity(), 3);
+    // A field reserves its cap, with or without its string for when it is
+    // empty.
+    let or = TextValue::FieldOr {
+        field: TextField::Title,
+        empty: "A".to_owned(),
+    };
+    let skin = load(
+        s.clone(),
+        vec![(text(or, 0, Align::Left, Overflow::Spill), [0, 0, 10, 10])],
+    )
+    .unwrap();
+    assert_eq!(skin.quad_capacity(), u32::try_from(MAX_TEXT_BYTES).unwrap());
     // An unknown bitmap font.
     let bad = text(literal("A"), 1, Align::Left, Overflow::Spill);
     assert!(matches!(

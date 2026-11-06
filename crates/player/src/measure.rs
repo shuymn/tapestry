@@ -427,6 +427,10 @@ pub struct Drawn<'a> {
     /// Whether it was the play screen's loading state (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub loading: bool,
+    /// The loading lifetime whose frame the skin drew: not the pending
+    /// presentation (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub skin_loading: Option<u64>,
     /// The generation of the play whose figures the frame counts in, until
     /// they are taken (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
@@ -1327,6 +1331,8 @@ mod frame_tests {
             menu: false,
             #[cfg(feature = "dev-tools")]
             loading: false,
+            #[cfg(feature = "dev-tools")]
+            skin_loading: None,
             #[cfg(feature = "dev-tools")]
             generation: Some(1),
             timing: FrameTiming {

@@ -286,6 +286,12 @@ const HIDDEN_ON: i32 = 273;
 /// reads the play context's exact BPM-change fact (D4).
 const CHART_NO_BPM_CHANGE: i32 = 176;
 const CHART_BPM_CHANGE: i32 = 177;
+/// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
+/// source's preload state and its complement: entering READY flips them
+/// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
+/// The loading timer runs in loading frames only.
+const NOW_LOADING: i32 = 80;
+const LOADED: i32 = 81;
 /// `table_song` (`BooleanPropertyFactory.java:351-352`), whether the chart
 /// came from a difficulty table: a scene constant, false, as there are no
 /// difficulty tables and outside one the source's table name is empty
@@ -366,6 +372,8 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
             Body::Kinds(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
         ),
+        NOW_LOADING => (Body::Text("on(loading)"), false),
+        LOADED => (Body::Text("!on(loading)"), false),
         GREAT_EXIST => (Body::Text("count.great > 0"), false),
         GOOD_EXIST => (Body::Text("count.good > 0"), false),
         BAD_EXIST => (Body::Text("count.bad > 0"), false),
@@ -642,6 +650,8 @@ mod tests {
                 true,
             ),
             (177, "chart_bpmchange", "bpm.change", true),
+            (80, "now_loading", "on(loading)", false),
+            (81, "loaded", "!on(loading)", false),
             (270, "lanecover1_changing", "cover.adjusting", false),
             (271, "lanecover1_on", "cover.enabled", false),
             (272, "lift1_on", "lift.enabled", false),
