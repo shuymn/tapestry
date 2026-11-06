@@ -1255,6 +1255,7 @@ impl PlayerRig<'_> {
         // The selection skin refused at runtime: the page draws from now
         // on, and says why.
         if let Some(why) = self.render.take_selection_refusal() {
+            log::warn!("select: the selection skin was refused, the built-in page draws: {why}");
             let notice = crate::imports::notice(skin_model::ScreenKind::Selection, &why);
             sel.screen.set_notice(Some(notice));
             sel.dirty = true;
@@ -3669,6 +3670,88 @@ mod tests {
         let lines = list(sel);
         let at = lines.iter().position(|l| l.starts_with('>')).unwrap();
         (lines[at][1..].to_owned(), at)
+    }
+
+    /// The skin's update: its view is the installed song list's window
+    /// (three rows above the cursor, three below, no heading), with the
+    /// player's labels; timer `change` starts at the entry and again when
+    /// the cursor's row or the place changes, not on a refresh keeping the
+    /// row; each entry is a new lifetime with its own starts; a preset step
+    /// reaches the strip with the preset's name.
+    #[test]
+    fn the_skins_update_follows_the_cursor_and_the_place() {
+        use crate::selection_skin::SkinFeed;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(
+            dir.path(),
+            &[&["s1/song/a.bms", "s2/song/b.bms", "d.bms", "song/c.bms"]],
+        );
+        sel.feed = SkinFeed::default();
+        sel.feed.window = Some((3, 7));
+        let at = |sel: &mut Selection, t: i64| {
+            let page = sel.screen.page("");
+            sel.feed.update(&sel.screen, page, TimeUs(t))
+        };
+        sel.feed.enter(TimeUs(100));
+        let u = at(&mut sel, 100);
+        assert_eq!((u.lifetime, u.revision), (1, 1));
+        assert_eq!(u.labels, crate::select::labels());
+        // Top: the all-charts row, s1, s2, c, d; three below the cursor.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert_eq!(
+            (u.events.entered, u.events.changed),
+            (TimeUs(100), TimeUs(100))
+        );
+        keys(&mut sel, &[MenuKey::Down]);
+        let u = at(&mut sel, 200);
+        assert_eq!((u.view.rows.len(), u.view.cursor), (5, Some(1)));
+        assert_eq!(u.events.changed, TimeUs(200));
+        // A refresh keeping the cursor's row: no restart, a new list.
+        let lists = u.list_revision;
+        sel.refresh();
+        let u = at(&mut sel, 300);
+        assert_eq!(u.events.changed, TimeUs(200));
+        assert!(u.list_revision > lists);
+        // Into folder s1: the place changes.
+        keys(&mut sel, &[MenuKey::Enter]);
+        let u = at(&mut sel, 400);
+        assert_eq!(
+            u.view.place,
+            skin_model::SelectionPlace::Folder(vec!["s1".to_owned()])
+        );
+        assert_eq!(u.events.changed, TimeUs(400));
+        // Back, onto the all-charts row, into the all-chart list: rows by
+        // folder, none of them a heading.
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Home, MenuKey::Enter]);
+        let u = at(&mut sel, 500);
+        assert_eq!(u.view.place, skin_model::SelectionPlace::All);
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert!(
+            u.view
+                .rows
+                .iter()
+                .all(|r| r.kind == skin_model::RowKind::Chart)
+        );
+        assert_eq!(u.events.changed, TimeUs(500));
+        // A preset step: the strip names the preset.
+        sel.screen.set_preset("ベータ".to_owned(), None);
+        sel.feed.preset_step = Some(TimeUs(550));
+        let u = at(&mut sel, 550);
+        assert_eq!(u.strip.preset, "ベータ");
+        assert_eq!(u.events.preset_step, Some(TimeUs(550)));
+        // The next entry: another lifetime, its own starts.
+        sel.feed.enter(TimeUs(600));
+        let u = at(&mut sel, 600);
+        assert_eq!((u.lifetime, u.revision), (2, 1));
+        assert_eq!(
+            (u.events.entered, u.events.changed),
+            (TimeUs(600), TimeUs(600))
+        );
+        assert_eq!(u.events.preset_step, None);
+        // Without a skin the view is the cursor's row alone; the keys act
+        // the same.
+        sel.feed.window = None;
+        assert_eq!(at(&mut sel, 700).view.rows.len(), 1);
     }
 
     const ALL: &str = "▶ 全譜面";

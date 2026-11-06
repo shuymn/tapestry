@@ -522,3 +522,65 @@ fn a_close_during_a_lua_job_ends_startup() {
         link.exit();
     }
 }
+
+/// A selection skin installed gives the select screen its song list's
+/// window and no notice; one the renderer refuses leaves the built-in page
+/// with its notice and no window; none configured, neither.
+#[test]
+fn a_selection_skin_installs_with_its_window_or_leaves_a_notice() {
+    let _serial = serial();
+    let dir = crate::selection_skin::fixture();
+    let choices = SkinChoices {
+        selection: Some(choice(dir.path(), "s.json")),
+        ..SkinChoices::default()
+    };
+    let build: Build = Arc::new(build);
+    for refuse in [false, true] {
+        let screens = Installers::default();
+        screens.refuse_install.store(refuse, Ordering::Release);
+        let link = screens.spawn_bare();
+        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        if refuse {
+            assert_eq!(started.selection, None);
+            let notice = started.notice.unwrap();
+            assert!(notice.contains("the skin cannot be installed"), "{notice}");
+        } else {
+            assert_eq!(started.selection, Some((3, 7)));
+            assert_eq!(started.notice, None);
+        }
+        link.exit();
+    }
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let none = SkinChoices::default();
+    let started = startup(&link, &none, Launch::Selection, false, &build, || false).unwrap();
+    assert_eq!(started, Started::default());
+    link.exit();
+}
+
+/// A Lua selection skin keeps the built-in select screen with its reason
+/// after its header pass: its configured pass, which would fail, never
+/// runs.
+#[test]
+fn a_lua_selection_skin_stays_built_in_before_its_configured_pass() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("s.luaskin"),
+        "local skin = { type = 5, name = \"t\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         error(\"the configured pass ran\")\n",
+    )
+    .unwrap();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = ImportTarget {
+        limits: r.atlas_limits(),
+        size: [1_920, 1_080],
+        default_font: || Ok(crate::render_outline::default_font()),
+    };
+    let c = choice(dir.path(), "s.luaskin");
+    match build(ScreenKind::Selection, &c, false, &t, &Cancel::new()) {
+        KindOutcome::BuiltIn(why) => assert_eq!(why, crate::imports::LUA_SELECTION),
+        other => panic!("{other:?}"),
+    }
+}

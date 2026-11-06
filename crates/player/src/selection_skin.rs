@@ -382,8 +382,8 @@ pub(crate) fn fixture() -> tempfile::TempDir {
     dir
 }
 
-/// [`fixture`] built as the selection kind for `r` (tests).
-#[cfg(test)]
+/// [`fixture`] built as the selection kind for `r` (dev-tools tests).
+#[cfg(all(test, feature = "dev-tools"))]
 pub(crate) fn fixture_bundle(r: &render::Renderer, dir: &std::path::Path) -> Arc<SkinBundle> {
     let choice = game::SkinChoice {
         root: dir.to_owned(),

@@ -2979,11 +2979,9 @@ impl Run {
                         // screen and from what a screen built again
                         // restores, and the game thread's next look shows
                         // why; this frame drew the page.
-                        let line = format!(
+                        eprintln!(
                             "render: the selection skin was refused, the built-in page draws from now on: {why}"
                         );
-                        eprintln!("{line}");
-                        log::warn!("{line}");
                         screen.remove(ScreenKind::Selection);
                         self.committed.clear(ScreenKind::Selection);
                         shown.logic = None;

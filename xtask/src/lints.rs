@@ -429,7 +429,14 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::resize",
             "MenuScreen::target",
             "MenuScreen::minimized",
+            "MenuScreen::build_selection_frame",
+            "strip_sprites",
         ],
+    ),
+    // The selection frame's timers and the strip's preset line.
+    Site::Fns(
+        "crates/player/src/selection_skin.rs",
+        &["SelectionEvents::timers", "SelectionEvents::preset_shown"],
     ),
     // The development builds' counting allocator, which every allocation
     // calls, and the render thread's app region marks.

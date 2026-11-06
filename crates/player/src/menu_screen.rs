@@ -1449,4 +1449,7 @@ mod tests {
         screen.menu(&page, true).unwrap();
         assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
     }
+
+    #[cfg(feature = "dev-tools")]
+    mod skinned;
 }
