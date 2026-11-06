@@ -1706,9 +1706,15 @@ fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
 /// the combo break its condition, opaque from 750 to 1250 ms on that timer:
 /// the shape of a skin's end-of-play image, in blue, and an untimed red
 /// corner on the same read. A play ends with its audio, so the chart's BGM lasts through
-/// the capture: a miss has the image inside its window, a perfect play has
-/// none. A retry of the miss starts from a clean snapshot: its first READY
-/// frame has no corner, with no tally set by hand.
+/// the captures. A frame shows the corner exactly when the view it drew
+/// from holds the miss, its sidecar's event count: a frame may draw from a
+/// view older than its time, so no time alone decides it, and none is
+/// required to hold it here: the renderer's own test draws a view that
+/// does. After a perfect play there is no corner. A
+/// retry of the miss starts from a clean snapshot: its first READY frame
+/// has no corner, with no tally set by hand. The blue window runs on the
+/// last-note timer, which only a frame at an exact time shows for certain:
+/// `lua_bridges` and the renderer's tests test it at those times.
 #[test]
 fn a_missed_note_draws_the_finish_window() {
     let fx = Fixture::new();
@@ -1761,6 +1767,8 @@ fn a_missed_note_draws_the_finish_window() {
     .unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
         "capture = { at = 2900, file = \"miss.png\" }",
+        "capture = { at = 3600, file = \"miss2.png\" }",
+        "capture = { at = 4300, file = \"miss3.png\" }",
         "select = { path = \"library/tail/tail.bms\" }",
         "play = { input = \"logs/miss.tprl\", until = \"end\" }",
         "capture = { ready_at = 0, file = \"retry.png\" }",
@@ -1788,15 +1796,31 @@ fn a_missed_note_draws_the_finish_window() {
         assert!(play.contains(score), "{stdout}");
     }
     let out = fx.base.join("out");
-    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
-    assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
-    assert_eq!(corner(&out.join("miss.png")), [255, 0, 0]);
+    let corner = |p: &Path| pixel(p, 20, 700);
+    // The events the frame's view had published: the miss is the play's
+    // only one.
+    let events = |name: &str| {
+        let side = fs::read_to_string(out.join(format!("{name}.json"))).unwrap();
+        let rest = side.split("\"events\":").nth(1).unwrap();
+        rest.split(['}', ','])
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    for name in ["miss", "miss2", "miss3"] {
+        let expected = if events(name) > 0 {
+            [255, 0, 0]
+        } else {
+            [0, 0, 0]
+        };
+        assert_eq!(corner(&out.join(format!("{name}.png"))), expected, "{name}");
+    }
     assert_eq!(
         corner(&out.join("retry.png")),
         [0, 0, 0],
         "the retry's first frame"
     );
-    assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
     assert_eq!(corner(&out.join("hit.png")), [0, 0, 0]);
 }
 

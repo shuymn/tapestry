@@ -5,6 +5,8 @@
 
 #![cfg(feature = "dev-tools")]
 
+mod text_skin;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -594,6 +596,58 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         stdout.contains("adjust: hi-speed 4.50 floating"),
         "{stdout}"
     );
+}
+
+/// A skin built per chart on the direct path, its READY cancelled by a hold
+/// and rearmed: the candidate keeps the attempt's prepared text, so the play
+/// that opens shows the title in its op-less and op-81 texts and nothing in
+/// its op-80 one.
+#[test]
+fn a_rearmed_candidate_keeps_a_per_chart_skins_text() {
+    use text_skin::{Band, bars};
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture_of(&CHART.replace("#TITLE scripted", "#TITLE aa"));
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+    text_skin::write(&dir.path().join("skin"), &appdata);
+    let frames = dir.path().join("frames");
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-frames")
+        .arg(&frames)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let saved = records(&appdata);
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.history.openings.len(), 1, "a candidate was cancelled");
+    let shown = |name: &str| {
+        [Band::Always, Band::Loading, Band::Loaded].map(|b| bars(&frames.join(name), b))
+    };
+    assert_eq!(shown("ready.png"), [2, 0, 2], "{stdout}");
+    assert_eq!(shown("play.png"), [2, 0, 2], "{stdout}");
 }
 
 /// Quit on Q (0x10), the default START, is refused with the collision

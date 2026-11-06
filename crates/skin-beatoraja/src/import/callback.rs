@@ -3,8 +3,10 @@
 //! an element's `op` functions and `draw` after its role and its numeric
 //! ops are decided, and a number's `value` where a `value` field is
 //! or an image set's `value` where a `value` field is resolved, before
-//! `ref`. A function at a field whose consumer takes none (a `timer`, a
-//! text's `value`) follows its element's role ([`Cx::unconsumed`]).
+//! `ref`. A function at a field whose consumer takes none (a `timer`)
+//! follows its element's role ([`Cx::unconsumed`]). A text's `value` folds
+//! into a prepared value ([`Cx::text_callback`]), or follows the element's
+//! role.
 //!
 //! A write-free root is partially evaluated into its residual
 //! ([`crate::lua::residual`], taking the analysis only through the
@@ -12,7 +14,7 @@
 //! converts it, and emitted here as an expression's source, compiled
 //! through the importer's compile path and its budget like any condition
 //! or value. The conversion comes first, so a result of a kind its
-//! consumer does not take is refused as that (a `text(1)` value is a
+//! consumer does not take is refused as that (a `text(1)` number is a
 //! type the number does not take) before its reads are looked at; the
 //! reads the residual recorded are kept apart from the result, so a
 //! conversion or a fold never drops one. Every recorded read is then
@@ -105,6 +107,17 @@ pub(crate) struct Lowered {
     /// report.
     #[cfg(feature = "dev-tools")]
     pub(crate) constant: bool,
+}
+
+/// A text's value as a callback folded it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TextFold {
+    /// A string.
+    Literal(String),
+    /// Chart field `id`, 10 to 16.
+    Field(i32),
+    /// Chart field `id`, or the string where it is empty.
+    FieldOr(i32, String),
 }
 
 /// A number's resolved value: a property's or a callback's.
@@ -1004,6 +1017,68 @@ enum Lowering {
     Unsupported(Unsupported, Scan),
 }
 
+/// The string `v` when it is one: valid UTF-8, its bytes charged.
+fn known_string(an: &Analysis, v: Val) -> R<Option<String>> {
+    let Val::Str(s) = v else {
+        return Ok(None);
+    };
+    let bytes: Option<&[u8]> = match s {
+        residual::S::Empty => Some(b""),
+        residual::S::Lit { file, id } => an.ast(file).map(|a| a.str(id)),
+        residual::S::Name(n) => {
+            charge(an, "str", units(an.names.len()))?;
+            did("str");
+            an.names.iter().find_map(|(b, &i)| (i == n).then_some(&**b))
+        }
+    };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    charge(an, "str", units(bytes.len()))?;
+    did("str");
+    Ok(std::str::from_utf8(bytes).ok().map(str::to_owned))
+}
+
+/// What residual `res` folds to as a text's value (docs/stage3.md §3): a
+/// known string, a read of a chart field, or a select on that read against
+/// `""` with the read and a known string as its arms. Every read must be
+/// of a chart field, as a text has nowhere to put a guard; `None` otherwise.
+fn text_fold(an: &Analysis, res: &Residual) -> R<Option<TextFold>> {
+    let field = |r: u32| match res.node(r) {
+        Node::Read { api, arg: Some(n) } if residual::is_text(api) && (10..=16).contains(&n) => {
+            i32::try_from(n).ok()
+        }
+        _ => None,
+    };
+    if res.reads.iter().any(|&r| field(r).is_none()) {
+        return Ok(None);
+    }
+    if let Some(id) = field(res.root) {
+        return Ok(Some(TextFold::Field(id)));
+    }
+    Ok(match res.node(res.root) {
+        Node::Known(v) => known_string(an, v)?.map(TextFold::Literal),
+        Node::Select { cond, then, other } => {
+            let Node::Cmp(op, read, _) = res.node(cond) else {
+                return Ok(None);
+            };
+            let (read_arm, known_arm) = match op {
+                Bin::Eq => (other, then),
+                Bin::Ne => (then, other),
+                _ => return Ok(None),
+            };
+            let (Some(id), Node::Known(v)) = (field(read), res.node(known_arm)) else {
+                return Ok(None);
+            };
+            if field(read_arm) != Some(id) {
+                return Ok(None);
+            }
+            known_string(an, v)?.map(|s| TextFold::FieldOr(id, s))
+        }
+        _ => None,
+    })
+}
+
 impl Cx<'_> {
     /// Field `f` as a property, a callable kept as its node.
     pub(super) fn callback_prop(
@@ -1111,19 +1186,29 @@ impl Cx<'_> {
     /// Lowers the callable at node `id`, converted by `conv`, a phase of
     /// the analysis's time budget located at it.
     fn lower(&mut self, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
+        self.lower_phase(id, |cx| cx.lower_in(id, conv))
+    }
+
+    /// `work` on the callable at node `id`, a phase of the analysis's time
+    /// budget located at it.
+    fn lower_phase<T>(
+        &mut self,
+        id: u32,
+        work: impl FnOnce(&mut Self) -> Result<T, ImportError>,
+    ) -> Result<T, ImportError> {
         let at = self.def.loc(id);
         let fatal = |why| ImportError::Lua {
             at: Some(at.clone()),
             why,
         };
         let Some(an) = self.analysis() else {
-            return self.lower_in(id, conv);
+            return work(self);
         };
         let phase = crate::lua::callback::Phase::Lower;
         an.clock
             .enter(phase, Some(id))
             .map_err(|w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime))))?;
-        let r = self.lower_in(id, conv);
+        let r = work(self);
         let left = self
             .analysis()
             .map_or(Ok(()), |an| an.clock.leave())
@@ -1229,6 +1314,19 @@ impl Cx<'_> {
         } else {
             Unsupported::Consumer(consumer)
         };
+        self.follows_role(role, (c, id), field, why)
+    }
+
+    /// Callable `c` at node `id`, for `why` not consumed in `field`, for an
+    /// element of `role`: a critical one refuses the candidate, a decorative
+    /// one is replaced, the note to drop its element with returned.
+    fn follows_role(
+        &self,
+        role: Role,
+        (c, id): (u32, u32),
+        field: &'static str,
+        why: Unsupported,
+    ) -> Result<NoteKind, ImportError> {
         if role != Role::Decorative {
             self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, field, why));
@@ -1240,6 +1338,72 @@ impl Cx<'_> {
             (Disposition::Replaced(why), Some(why)),
         );
         Ok(NoteKind::Callback { field, why })
+    }
+
+    /// A text's `value` callback at node `id`, for an element of `role`:
+    /// what it folded to, or the note to drop the element with. A result
+    /// with no shape a text takes is unconsumed; an evaluation that stopped
+    /// carries its own reason.
+    pub(super) fn text_callback(
+        &mut self,
+        role: Role,
+        id: u32,
+    ) -> Result<Result<TextFold, NoteKind>, ImportError> {
+        let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
+        // Its reads decide its role before it folds.
+        let role = self.callback_role(id, "value", role)?;
+        match self.lower_phase(id, |cx| cx.fold_text(id))? {
+            Ok(Some(fold)) => {
+                self.record(
+                    (c, id),
+                    "value",
+                    role,
+                    (Disposition::Lowered, None),
+                    Some(&Lowered {
+                        src: format!("{fold:?}"),
+                        guards: Vec::new(),
+                        part: None,
+                        deviates: false,
+                        #[cfg(feature = "dev-tools")]
+                        constant: matches!(fold, TextFold::Literal(_)),
+                    }),
+                );
+                Ok(Ok(fold))
+            }
+            Ok(None) => self.unconsumed(role, id, "value", "text value").map(Err),
+            Err(why) => self.follows_role(role, (c, id), "value", why).map(Err),
+        }
+    }
+
+    /// What the callable at node `id` folds to as a text's value (`None`
+    /// for a result with no shape a text takes), or why evaluation stopped.
+    fn fold_text(&self, id: u32) -> Result<Result<Option<TextFold>, Unsupported>, ImportError> {
+        let def: &crate::resolve::Definition = self.def;
+        let (Some((_, inst)), Some(an)) = (
+            self.callable_at(id).filter(|&(_, i)| i != NONE),
+            def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()),
+        ) else {
+            return Ok(Err(Unsupported::Capture("an untagged closure")));
+        };
+        let Some(adm) = an.admitted() else {
+            return Ok(Err(Unsupported::Capture("an unadmitted callback")));
+        };
+        let an = adm.analysis();
+        // A root whose reach writes never lowers.
+        if an.writes(inst) {
+            return Ok(Err(Unsupported::Writes));
+        }
+        let cancelled = || def.cancelled(|| None).is_err();
+        match residual::evaluate(adm, inst, Conv::Text, &cancelled)
+            .and_then(|res: Residual| text_fold(an, &res))
+        {
+            Ok(fold) => Ok(Ok(fold)),
+            Err(Stop::Unsupported(why)) => Ok(Err(why)),
+            Err(Stop::Fatal(why)) => Err(ImportError::Lua {
+                at: Some(self.def.loc(id)),
+                why,
+            }),
+        }
     }
 
     /// The role of the callable at node `id`, read as an element's value
