@@ -464,24 +464,64 @@ fn cut(src: &str, dst: &str) -> common::Loaded {
 /// each destination drawing it.
 #[test]
 fn a_cut_past_the_file_s_edge_is_stretched_with_a_note() {
+    // `j` is a real 800-wide cut of the same file: never noted, whichever
+    // destination reads it.
     let loaded = common::import_sized(
         [1_920, 1_080],
         r#""source": [{"id": "b", "path": "b.png"}],
-           "image": [{"id": "i", "src": "b", "w": 810, "h": 60}],
+           "image": [{"id": "i", "src": "b", "w": 810, "h": 60},
+                     {"id": "j", "src": "b", "w": 800, "h": 60}],
            "destination": [{"id": "i", "dst": [{"w": 810, "h": 60}]},
-                           {"id": "i", "dst": [{"y": 100, "w": 810, "h": 60}]}]"#,
+                           {"id": "i", "dst": [{"y": 100, "w": 810, "h": 60}]},
+                           {"id": "j", "dst": [{"y": 200, "w": 800, "h": 60}]},
+                           {"id": "j", "dst": [{"y": 300, "w": 800, "h": 60}]}]"#,
         &[("b.png", 800, 300)],
     );
     assert_eq!(
         common::kinds(loaded.report()),
         [NoteKind::Deviation(DeviationId::D22); 2]
     );
+    // The file's last ten columns red: the stretched frame samples red at
+    // its right end and not at its middle, the file's 800 columns spread
+    // over the frame's 810.
+    common::png_with(loaded.dir.path(), "b.png", 800, 300, |x, _| {
+        if x >= 790 {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 255, 255]
+        }
+    });
+    let skin = loaded.ok().skin.clone();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
     let quads = loaded.quads(0);
-    assert_eq!(quads.len(), 2);
-    assert!(
-        quads
-            .iter()
-            .all(|q| q.rect[2] == 810.0 && q.rect[3] == 60.0)
+    assert_eq!(quads.len(), 4);
+    let q = quads[0];
+    assert_eq!((q.rect[2], q.rect[3]), (810.0, 60.0));
+    let at = |fu| common::play::texel_at(&atlas, &q, fu, 0.5)[0];
+    assert_eq!((at(0.5), at(0.995)), (0, 255));
+    // At 791/810 across, the file's column 791 · 800/810 ≈ 781: not red,
+    // where an unstretched cut would sample column 791.
+    assert_eq!(at(791.0 / 810.0), 0);
+}
+
+/// An image set's entry cut past its file's edge is noted for each
+/// destination drawing the set, its cached image reused.
+#[test]
+fn a_set_entry_past_the_file_s_edge_is_noted_each_time() {
+    let loaded = common::import_sized(
+        [1_920, 1_080],
+        r#""source": [{"id": "b", "path": "b.png"}],
+           "image": [{"id": "i", "src": "b", "w": 810, "h": 60}],
+           "imageset": [{"id": "s", "images": ["i"]}],
+           "destination": [{"id": "s", "dst": [{"w": 810, "h": 60}]},
+                           {"id": "s", "dst": [{"y": 100, "w": 810, "h": 60}]}]"#,
+        &[("b.png", 800, 300)],
+    );
+    assert_eq!(
+        common::kinds(loaded.report()),
+        [NoteKind::Deviation(DeviationId::D22); 2]
     );
 }
 

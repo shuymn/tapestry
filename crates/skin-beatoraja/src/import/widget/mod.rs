@@ -225,7 +225,7 @@ impl Cx<'_> {
         if let Some((def, cell)) = self.assets.base(key) {
             let rect = def.rect.unwrap_or_default();
             // Each destination drawing a cut past its file's edge is noted.
-            if self.overruns.contains(&(def.file, rect)) {
+            if self.overruns.contains(&key) {
                 self.overrun_note(at);
             }
             let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {
@@ -254,6 +254,9 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
+        if self.cut_overran {
+            self.overruns.insert(key);
+        }
         let def = ImageDef {
             file,
             rect: Some(rect),
@@ -306,6 +309,7 @@ impl Cx<'_> {
         grid: [u32; 2],
         holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
+        self.cut_overran = false;
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
             Ok(Err(Unplaced {
@@ -388,8 +392,9 @@ impl Cx<'_> {
             return refused(NoteKind::SourceRect);
         };
         let rect = [x, y, w, h];
-        if ox || oy {
-            self.overruns.insert((file, rect));
+        // Its caller records the overrun with the image's cache key.
+        self.cut_overran = ox || oy;
+        if self.cut_overran {
             self.overrun_note(at);
         }
         Ok(Ok((file, rect, cell)))

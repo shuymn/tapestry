@@ -137,10 +137,24 @@ fn a_bar_cut_past_its_file_s_edge_is_stretched() {
         &i.report,
         NoteKind::Deviation(skin_beatoraja::DeviationId::D22)
     ));
+    // The file's last ten columns red, painted before the atlas is built:
+    // the bar samples red at its right end, not at 791/810 across, where
+    // an unstretched cut would.
+    common::png_with(d.path(), "w.png", 800, 300, |x, _| {
+        if x >= 790 {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 255, 255]
+        }
+    });
     let mut s = Sel::new(i.skin);
     s.view(&view(vec![chart("a")], Some(0), None, None));
-    let rects: Vec<[f32; 4]> = s.frame(0).iter().map(|q| q.rect).collect();
+    let quads = s.frame(0);
+    let rects: Vec<[f32; 4]> = quads.iter().map(|q| q.rect).collect();
     assert_eq!(rects, [[0.0, 520.0, 810.0, 60.0]]);
+    let q = quads[0];
+    let at = |fu| common::play::texel_at(&s.atlas, &q, fu, 0.5)[0];
+    assert_eq!((at(0.5), at(0.995), at(791.0 / 810.0)), (0, 255, 0));
 }
 
 /// The selected row's image file missing: refused as the selected row,
