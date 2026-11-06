@@ -2995,6 +2995,15 @@ impl Run {
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
                         self.menu_stats.frame(d.timing.cpu, after - before, changed);
+                        // What a refusal put on the screen, once drawn.
+                        if changed
+                            && let Some(notice) = shown.update.page.lines.iter().find(|l| {
+                                l.style == crate::menu_screen::LineStyle::Notice
+                                    && !l.text.is_empty()
+                            })
+                        {
+                            println!("dev: drawn notice: {}", notice.text);
+                        }
                     }
                     drawn.map(|d| (d.timing, None))
                 }
@@ -3025,7 +3034,7 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
-                        menu: matches!(mode, Mode::Menu { .. }),
+                        menu: matches!(mode, Mode::Menu { .. } | Mode::Selection),
                         #[cfg(feature = "dev-tools")]
                         loading: matches!(
                             mode,
