@@ -347,14 +347,16 @@ mod tests {
             other => panic!("gauge {i}: {other:?}"),
         };
         let looks = |p: &rules::RulePreset| -> Vec<(String, GaugeLook)> {
-            (0..p.gauges.len())
-                .map(|i| (p.gauges[i].id.clone(), look_of(p, i)))
+            p.gauges
+                .iter()
+                .enumerate()
+                .map(|(i, g)| (g.id.clone(), look_of(p, i)))
                 .collect()
         };
         let named = |pairs: &[(&str, GaugeLook)]| -> Vec<(String, GaugeLook)> {
             pairs.iter().map(|&(id, l)| (id.to_owned(), l)).collect()
         };
-        let six = named(&[
+        let mut want = named(&[
             ("normal", GaugeLook::Normal),
             ("assist_easy", GaugeLook::AssistEasy),
             ("easy", GaugeLook::Easy),
@@ -367,7 +369,6 @@ mod tests {
             v.sort_by(|a, b| a.0.cmp(&b.0));
             v
         };
-        let mut want = six.clone();
         want.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(by_id(&rules::beatoraja_style()), want);
         assert_eq!(by_id(&rules::lr2_style()), want);
