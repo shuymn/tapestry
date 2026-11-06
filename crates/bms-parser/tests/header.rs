@@ -127,6 +127,35 @@ fn the_loaders_labels_come_from_the_taken_branches() {
     assert!(!listing.bga);
 }
 
+/// A `#DIFFICULTY` the reference decoder's `Integer.parseInt` cannot read
+/// keeps the one before it, in the loader and the listing alike; one it
+/// reads replaces it, whatever its value.
+#[test]
+fn an_unreadable_difficulty_keeps_the_one_before() {
+    let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
+    let read = |text: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded =
+            bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+        let header = read_header(text.as_bytes(), &Limits::default()).unwrap();
+        (loaded.labels.difficulty, header.difficulty)
+    };
+    let some = |s: &str| (s.to_owned(), Some(s.to_owned()));
+    for (defs, want) in [
+        ("#DIFFICULTY 4\n#DIFFICULTY broken", some("4")),
+        ("#DIFFICULTY 4\n#DIFFICULTY 9", some("9")),
+        ("#DIFFICULTY 4\n#DIFFICULTY -1", some("-1")),
+        ("#DIFFICULTY 4\n#DIFFICULTY 99999999999", some("4")),
+        ("#DIFFICULTY broken", (String::new(), None)),
+    ] {
+        assert_eq!(read(&chart(defs)), want, "{defs:?}");
+    }
+    assert_eq!(bms_parser::java_int("+\u{FF13}"), Some(3));
+    assert_eq!(bms_parser::java_int("-2147483648"), Some(i32::MIN));
+    assert_eq!(bms_parser::java_int("2147483648"), None);
+    assert_eq!(bms_parser::java_int("-"), None);
+}
+
 /// A chart has a BGA when a `#BMPxx` with an object id and a path stands
 /// in what is read: the loader's taken branches, the listing's top level.
 /// Whether a channel shows it does not matter; an empty definition or a

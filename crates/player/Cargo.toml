@@ -24,6 +24,7 @@ dev-tools = ["game/dev-tools", "render/dev-tools", "skin-beatoraja/dev-tools", "
 anyhow.workspace = true
 audio.workspace = true
 bms-model.workspace = true
+bms-parser.workspace = true
 eval.workspace = true
 game.workspace = true
 input.workspace = true
@@ -50,7 +51,6 @@ windows = { workspace = true, features = [
 winit.workspace = true
 
 [dev-dependencies]
-bms-parser.workspace = true
 png.workspace = true
 rusqlite.workspace = true
 # The render tests' shared helpers wait on the device.

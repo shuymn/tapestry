@@ -51,7 +51,8 @@ pub struct Header {
     pub genre: Option<String>,
     /// `#PLAYLEVEL`.
     pub playlevel: Option<String>,
-    /// `#DIFFICULTY`.
+    /// `#DIFFICULTY`, the last one [`java_int`](crate::java_int) reads, as
+    /// the loader keeps it.
     pub difficulty: Option<String>,
     /// `#BPM`, the start tempo as written.
     pub bpm: Option<String>,
@@ -144,7 +145,7 @@ pub(crate) fn listing(text: &str) -> Listing {
             "SUBARTIST" => &mut header.subartist,
             "GENRE" => &mut header.genre,
             "PLAYLEVEL" => &mut header.playlevel,
-            "DIFFICULTY" => &mut header.difficulty,
+            "DIFFICULTY" if crate::parse::sets_difficulty(value) => &mut header.difficulty,
             "BPM" => &mut header.bpm,
             _ => continue,
         };

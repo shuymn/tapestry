@@ -177,6 +177,7 @@ use bms_model::{
 
 pub use error::{LoadError, Warning, WarningKind};
 pub use header::{ChartMode, Header, Listing, read_header, read_listing};
+pub use parse::java_int;
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
 pub const LOADER_VERSION: u32 = 9;
@@ -248,7 +249,8 @@ pub struct Labels {
     pub genre: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
-    /// `#DIFFICULTY`, as text: a reader parses it by its own rules.
+    /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
+    /// reference decoder keeps its last readable value; empty when none.
     pub difficulty: String,
     /// Whether it defines a BGA image: a `#BMPxx` with a value, whether or
     /// not a channel shows it, as the reference decoder lists them.
