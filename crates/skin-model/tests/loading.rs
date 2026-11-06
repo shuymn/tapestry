@@ -137,6 +137,7 @@ impl Loader {
         self.batch.clear();
         let layout = Layout::AUTHOR;
         let frame = LoadingFrame {
+            autoplay: false,
             now: TimeUs(now_us),
             load: LoadState {
                 since: self.since,

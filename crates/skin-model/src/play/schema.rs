@@ -201,6 +201,7 @@ pub static PLAY: Schema = Schema {
             export: T,
         },
         flag("chart.level_valid", T),
+        flag("autoplay", T),
     ],
     timers: &[
         timer("ready", E),
@@ -410,8 +411,10 @@ pub mod field {
     /// Whether the chart's play level is known and a number can show it:
     /// a source number widget reserves `i32::MIN` and `i32::MAX`.
     pub const CHART_LEVEL_VALID: u16 = 89;
+    /// Whether the attempt is autoplay, known while loading too.
+    pub const AUTOPLAY: u16 = 90;
     /// The number of fields.
-    pub const COUNT: usize = 90;
+    pub const COUNT: usize = 91;
 
     /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
     /// current, main, min, max), `covered` or not; `.green` and `.valid`
@@ -678,7 +681,8 @@ mod tests {
         assert_eq!(slot("bpm.change_valid"), Some(87));
         assert_eq!(slot("chart.level"), Some(field::CHART_LEVEL));
         assert_eq!(slot("chart.level_valid"), Some(field::CHART_LEVEL_VALID));
-        assert_eq!(field::COUNT, 90);
+        assert_eq!(slot("autoplay"), Some(field::AUTOPLAY));
+        assert_eq!(field::COUNT, 91);
     }
 
     #[test]

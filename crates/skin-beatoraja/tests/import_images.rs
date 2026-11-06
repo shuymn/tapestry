@@ -125,7 +125,7 @@ fn group_refs_resolve_as_image_indices() {
     };
     // A group and an image set alike.
     for id in [
-        10, 42, 90, 170, 302, 342, 386, 450, 459, 466, 469, 500, 507, 1_510,
+        10, 43, 90, 170, 302, 342, 386, 450, 459, 466, 469, 500, 507, 1_510,
     ] {
         let fields = format!(r#", "ref": {id}"#);
         for l in [group(2, &fields), set(r#"["i0", "i2"]"#, &fields)] {
@@ -153,7 +153,7 @@ fn set(images: &str, set: &str) -> common::Loaded {
                      {{"id": "far", "src": "far", "w": 16, "h": 16}},
                      {{"id": "lost", "src": "lost", "w": 16, "h": 16}},
                      {{"id": "wide", "src": "wide", "w": 16, "h": 16}},
-                     {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 42}},
+                     {{"id": "i1", "src": "a", "x": 16, "w": 16, "h": 16, "len": 4, "ref": 43}},
                      {{"id": "i2", "src": "a", "x": 32, "w": 16, "h": 16}},
                      {{"id": "mv", "src": "m"}},
                      {{"id": "gone", "src": "lost"}}],
@@ -213,7 +213,7 @@ fn an_image_set_selects_by_value_then_by_ref() {
             r#", "value": "myscript", "ref": 40"#,
             prop(PropertyKind::Integer, None),
         ),
-        (r#", "ref": 42"#, prop(PropertyKind::ImageIndex, Some(42))),
+        (r#", "ref": 43"#, prop(PropertyKind::ImageIndex, Some(43))),
     ] {
         let l = set(three, fields);
         assert_eq!(common::kinds(l.report()), [why], "{fields}");
