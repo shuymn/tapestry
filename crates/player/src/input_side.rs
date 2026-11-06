@@ -762,6 +762,8 @@ impl Drop for Hook {
     /// Runs when the input thread ends, and while it unwinds from a panic.
     fn drop(&mut self) {
         self.state.gone.store(true, Ordering::Release);
+        #[cfg(feature = "dev-tools")]
+        self.controls.script_fence().end();
     }
 }
 
@@ -913,6 +915,11 @@ impl Hook {
             logic.unpark();
         }
         self.menu(sources);
+        // A scripted READY's commit waits for a wake past it.
+        #[cfg(feature = "dev-tools")]
+        self.controls
+            .script_fence()
+            .woke(matches!(self.mode, Mode::Script(_)));
         self.phase
     }
 
