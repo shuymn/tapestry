@@ -124,64 +124,62 @@ impl Cx<'_> {
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
         // `SkinText.java:102`). A function folds or follows the role, and
         // it never falls back to `ref`.
-        let mut folded = None;
-        let resolved = match self.callback_prop(value, "value")? {
-            Prop::Id(n) => property::str_by_id(n),
-            Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
-            Prop::Callable(id) => match self.text_callback(role, id)? {
-                Ok(fold) => {
-                    folded = Some(fold);
-                    StrProp::Null
+        let text = 'text: {
+            let resolved = match self.callback_prop(value, "value")? {
+                Prop::Id(n) => property::str_by_id(n),
+                Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
+                Prop::Callable(id) => {
+                    let fold = match self.text_callback(role, id)? {
+                        Ok(fold) => fold,
+                        Err(why) => {
+                            self.drop_el(role, at, why)?;
+                            return Ok(());
+                        }
+                    };
+                    // An empty result draws nothing (`SkinText.java:106-107`).
+                    let Some(value) = self.folded_text(at, fold) else {
+                        self.ignored(at, NoteKind::Ignored { field: "value" });
+                        return Ok(());
+                    };
+                    break 'text value;
                 }
-                Err(why) => {
+                Prop::Null => StrProp::Null,
+            };
+            let resolved = match resolved {
+                StrProp::Null => property::str_by_id(self.int_or(r, "ref", 0)?),
+                p => p,
+            };
+            match resolved {
+                StrProp::Field(id) => match field(id) {
+                    Some(f) => TextValue::Field(f),
+                    None => {
+                        self.ignored(at, NoteKind::Ignored { field: "value" });
+                        return Ok(());
+                    }
+                },
+                StrProp::Unsupported(id) => {
+                    let why = NoteKind::UnsupportedProperty {
+                        kind: PropertyKind::String,
+                        id,
+                    };
                     self.drop_el(role, at, why)?;
                     return Ok(());
                 }
-            },
-            Prop::Null => StrProp::Null,
-        };
-        let resolved = match (resolved, &folded) {
-            (StrProp::Null, None) => property::str_by_id(self.int_or(r, "ref", 0)?),
-            (p, _) => p,
-        };
-        let text = match (folded, resolved) {
-            (Some(fold), _) => {
-                // An empty result draws nothing (`SkinText.java:106-107`).
-                let Some(value) = self.folded_text(at, fold) else {
-                    self.ignored(at, NoteKind::Ignored { field: "value" });
-                    return Ok(());
-                };
-                value
-            }
-            (None, StrProp::Field(id)) => match field(id) {
-                Some(f) => TextValue::Field(f),
-                None => {
-                    self.ignored(at, NoteKind::Ignored { field: "value" });
-                    return Ok(());
+                StrProp::Null => {
+                    let literal = self
+                        .opt_string(constant, "constantText")?
+                        .unwrap_or_default();
+                    let Some(cleaned) = self.cleaned(at, &literal) else {
+                        self.ignored(
+                            at,
+                            NoteKind::Ignored {
+                                field: "constantText",
+                            },
+                        );
+                        return Ok(());
+                    };
+                    TextValue::Literal(cleaned)
                 }
-            },
-            (None, StrProp::Unsupported(id)) => {
-                let why = NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::String,
-                    id,
-                };
-                self.drop_el(role, at, why)?;
-                return Ok(());
-            }
-            (None, StrProp::Null) => {
-                let literal = self
-                    .opt_string(constant, "constantText")?
-                    .unwrap_or_default();
-                let Some(cleaned) = self.cleaned(at, &literal) else {
-                    self.ignored(
-                        at,
-                        NoteKind::Ignored {
-                            field: "constantText",
-                        },
-                    );
-                    return Ok(());
-                };
-                TextValue::Literal(cleaned)
             }
         };
         let (shift, align) = match self.int_or(align, "align", 0)? {
