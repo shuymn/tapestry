@@ -19,14 +19,15 @@ use std::sync::{Arc, OnceLock};
 
 use bms_model::{ChartBuilder, TimeUs};
 use common::{GAUGES, attempt, context, input, offscreen, view};
-use decl_support::{Look, solid_bundle, solid_cells_bundle};
+use decl_support::{Look, shared_limit_bundle, solid_bundle, solid_cells_bundle};
 use render::{
     CommitError, PreparedToken, RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS,
 };
 use skin_model::{AtlasLimits, ScreenKind};
 
 /// Big's cell: past a 4 096-texel page with its gutter, so its one page
-/// is 8 192 texels a side, beside the reserved layer.
+/// is 8 192 texels a side, beside the reserved layer (and, for big, the
+/// text layer).
 const BIG: [u32; 2] = [4_096, 3_072];
 /// Tiny's atlas array: one 256-texel page beside the reserved layer.
 const TINY: u64 = 256 * 256 * 2;
@@ -42,7 +43,7 @@ const LEFT: (u32, u32) = (480, 540);
 fn big(r: &Renderer) -> Arc<SkinBundle> {
     static BIG_BUNDLE: OnceLock<(AtlasLimits, Arc<SkinBundle>)> = OnceLock::new();
     let (limits, b) = BIG_BUNDLE.get_or_init(|| {
-        let b = solid_bundle(r, &Look::left([0, 0, 255, 255]), BIG);
+        let b = shared_limit_bundle(r, [0, 0, 255, 255]);
         (r.atlas_limits(), b)
     });
     assert_eq!(
@@ -329,16 +330,16 @@ fn a_removal_drops_only_its_kinds_staging() {
     assert!(r.installed(ScreenKind::Selection).is_none());
 }
 
-/// A candidate's text layer is charged with its pages: three 4 096-texel
-/// pages, the reserved layer and the text layer are 80 Mi texels. With
+/// A candidate's text layer is charged with its pages: one 8 192-texel
+/// page, the reserved layer and the text layer are 192 Mi texels. With
 /// play's tiny skin and two other kinds each keeping a VM committed, and
 /// the candidate keeping one too, 48 Mi texels and four tiny atlases are
 /// charged beside it: with its text layer it passes the limit and is
-/// refused, before anything is staged; without the layer (64 Mi) it would
-/// fit.
+/// refused, before anything is staged; without the layer (128 Mi) it
+/// would fit.
 #[test]
 fn a_candidate_s_text_layer_is_charged() {
-    const PAGE: u64 = 4_096 * 4_096;
+    const PAGE: u64 = 8_192 * 8_192;
     let mut r = offscreen(1_920, 1_080);
     let t = tiny(&r, RED);
     play(&mut r, &t, 1);
@@ -346,22 +347,20 @@ fn a_candidate_s_text_layer_is_charged() {
     let (d, re) = (vm(&r), vm(&r));
     commit(&mut r, ScreenKind::Decision, &d, 2);
     commit(&mut r, ScreenKind::Result, &re, 3);
-    let cell = [4_000, 3_000];
     let look = Look {
         text: true,
         ..Look::left(RED)
     };
-    let cells = [(cell, RED), (cell, GREEN), (cell, [0, 0, 255, 255])];
-    let candidate = solid_cells_bundle(&r, &look, &cells);
-    assert_eq!((candidate.side(), candidate.text_layer()), (4_096, Some(4)));
+    let candidate = solid_cells_bundle(&r, &look, &[(BIG, RED)]);
+    assert_eq!((candidate.side(), candidate.text_layer()), (8_192, Some(2)));
     let candidate = Arc::new(Arc::try_unwrap(candidate).unwrap().keeping_vm());
     let committed = TINY + 2 * (TINY + VM_TEXELS);
-    let needed = committed + 5 * PAGE + VM_TEXELS;
+    let needed = committed + 3 * PAGE + VM_TEXELS;
     assert!(needed > SHARED_TEXELS && needed - PAGE <= SHARED_TEXELS);
     let e = r.admit(ScreenKind::Selection, &candidate).unwrap_err();
     refused(&e, ScreenKind::Selection, needed);
     let e = r.install(ScreenKind::Selection, &candidate, 4).unwrap_err();
     refused(&e, ScreenKind::Selection, needed);
     assert!(r.staged().is_none());
-    assert_eq!(candidate.atlas_texels(), 5 * PAGE);
+    assert_eq!(candidate.atlas_texels(), 3 * PAGE);
 }

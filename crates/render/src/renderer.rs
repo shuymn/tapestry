@@ -3357,12 +3357,7 @@ mod tests {
             .install(skin_model::ScreenKind::Selection, &tiny, 4)
             .unwrap();
         r.commit(token).unwrap();
-        let big = crate::test_decl::solid_bundle(
-            &r,
-            &crate::test_decl::Look::left([0, 0, 255, 255]),
-            [4_096, 3_072],
-        );
-        assert_eq!(big.atlas_texels(), super::SHARED_TEXELS);
+        let big = crate::test_decl::shared_limit_bundle(&r, [0, 0, 255, 255]);
         let e = stage_labels(&mut r, &big, &labels("t", "", ""), 5).unwrap_err();
         assert!(matches!(e, RenderError::Admission { .. }), "{e:?}");
         assert_eq!(r.text_report().upload_bytes, 0);

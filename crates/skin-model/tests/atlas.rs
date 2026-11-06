@@ -308,19 +308,21 @@ fn atlas_reserves_a_text_layer() {
         "{err:?}"
     );
     // The texel cap counts the layer: a frame past 4096 wide needs a page
-    // of 8192, whose two layers make 128 Mi texels; the text layer is a
-    // third.
+    // of 8192, which with two reserved layers makes three layers, the
+    // 192 Mi texel cap; the text layer is a fourth.
     save(d.path(), "wide.png", &solid(4_100, 8, WHITE));
     let wide = load(d.path(), vec![file("wide.png")], vec![whole(0)]).unwrap();
-    let a = wide
-        .atlas(Variant::Lo, limits(8_192, 16), &|| false)
-        .unwrap();
+    let two_reserved = AtlasLimits {
+        reserved_layers: 2,
+        ..limits(8_192, 16)
+    };
+    let a = wide.atlas(Variant::Lo, two_reserved, &|| false).unwrap();
     assert_eq!(a.side(), 8_192);
     let err = wide
-        .atlas_reserving(Variant::Lo, limits(8_192, 16), true, &|| false)
+        .atlas_reserving(Variant::Lo, two_reserved, true, &|| false)
         .unwrap_err();
     assert!(
-        matches!(err, skin_model::AtlasError::AtlasTooLarge { texels } if texels == 3 << 26),
+        matches!(err, skin_model::AtlasError::AtlasTooLarge { texels } if texels == 1 << 28),
         "{err:?}"
     );
     // A sheet without frames still gets the layer, on no page.

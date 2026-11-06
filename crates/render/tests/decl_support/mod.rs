@@ -642,6 +642,21 @@ pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle
     solid_cells_bundle(r, look, &[(size, look.rgba)])
 }
 
+/// A bundle of [`Look::left`] in `rgba` with a text element, for `r`'s
+/// device of 8192-texel pages, whose atlas array is exactly
+/// [`render::SHARED_TEXELS`]: a generated 4096×3072 cell needs a page of
+/// 8192, which with the reserved layer and the text layer makes three
+/// layers. Meant to be admitted alone or refused, not drawn.
+pub fn shared_limit_bundle(r: &Renderer, rgba: [u8; 4]) -> Arc<SkinBundle> {
+    let look = Look {
+        text: true,
+        ..Look::left(rgba)
+    };
+    let b = solid_bundle(r, &look, [4_096, 3_072]);
+    assert_eq!(b.atlas_texels(), render::SHARED_TEXELS);
+    b
+}
+
 /// [`solid_bundle`] with one generated cell per `(size, colour)` of
 /// `cells`, image 0 the first, and with its text element's producer
 /// ([`Text`]) when `look` has one: its atlas then has the text layer.
