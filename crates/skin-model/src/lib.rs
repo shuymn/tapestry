@@ -139,8 +139,8 @@ pub use play::loading::{
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
     COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade,
-    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer,
-    timer,
+    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX,
+    field, lane_timer, timer,
 };
 pub use play::timers::native_values;
 pub use play::{
@@ -167,7 +167,9 @@ pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
-pub use widget::cover_paint::{CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim};
+pub use widget::cover_paint::{
+    CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, Slider, SliderRate,
+};
 pub use widget::digits::{
     Align, DigitOffset, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, MAX_DIGIT_OFFSETS, NumberDef,
     NumberError, Pad,

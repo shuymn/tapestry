@@ -33,6 +33,10 @@ pub enum LoadingField {
     /// Available while the frame gives this datum of the chosen chart:
     /// its play level, its difficulty or whether it has a BGA.
     Chosen,
+    /// Known before the play starts: it reads its READY value, which a
+    /// program may read: `time.progress_ppm`, 0 (the source's
+    /// `TIMER_PLAY` is off).
+    Before,
     /// Not read: a program reading it is rejected for loading.
     Unavailable,
 }
@@ -48,7 +52,7 @@ pub enum LoadingTimer {
 
 /// Every PLAY field's class while loading, in slot order (`field::*`).
 const FIELDS: [LoadingField; field::COUNT] = {
-    use LoadingField::{Chosen, Descriptor, Live, Setting, Unavailable};
+    use LoadingField::{Before, Chosen, Descriptor, Live, Setting, Unavailable};
     [
         Unavailable, // combo
         Unavailable, // max_combo
@@ -169,7 +173,9 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // judge.lane.5
         Unavailable, // judge.lane.6
         Unavailable, // judge.lane.7
-        // The chart's metadata, 101 to 108: its difficulty and whether it
+        // The progress, 101: 0 until the play starts, as in READY.
+        Before, // time.progress_ppm
+        // The chart's metadata, 102 to 109: its difficulty and whether it
         // has a BGA are the chosen chart's, from the frame; its class and
         // its total come from its ingestion and the play preset, which a
         // loading frame does not have.
@@ -236,7 +242,7 @@ impl Need {
         p.into_iter()
             .flat_map(Program::fields)
             .fold(Self::default(), |need, slot| match loading_field(slot) {
-                Some(LoadingField::Live | LoadingField::Setting) => need,
+                Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => need,
                 Some(LoadingField::Descriptor) => Self {
                     descriptor: true,
                     ..need
@@ -594,8 +600,16 @@ mod tests {
         for name in settings {
             assert_eq!(class(name), Some(LoadingField::Setting), "{name}");
         }
+        assert_eq!(class("time.progress_ppm"), Some(LoadingField::Before));
         for f in PLAY.fields {
-            let named = ["load.percent", "autoplay", "gauge.kind", "gauge.valid"].contains(&f.name)
+            let named = [
+                "load.percent",
+                "autoplay",
+                "gauge.kind",
+                "gauge.valid",
+                "time.progress_ppm",
+            ]
+            .contains(&f.name)
                 || chosen.contains(&f.name)
                 || settings.contains(&f.name);
             if !named {

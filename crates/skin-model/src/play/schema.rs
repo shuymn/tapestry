@@ -26,6 +26,8 @@ pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
 /// The largest lane visual state, `judge.lane.N`: an empty POOR at or
 /// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
 pub const LANE_JUDGE_MAX: i32 = 11;
+/// The whole attempt in `time.progress_ppm`'s unit, parts per million.
+pub const PROGRESS_FULL: i32 = 1_000_000;
 /// The largest `chart.difficulty`: `#DIFFICULTY` 5.
 pub const DIFFICULTY_MAX: i32 = 5;
 /// The largest `chart.judge_class`: the easiest of the five classes.
@@ -226,6 +228,7 @@ pub static PLAY: Schema = Schema {
         int("judge.lane.5", LANE_JUDGE_MAX, T),
         int("judge.lane.6", LANE_JUDGE_MAX, T),
         int("judge.lane.7", LANE_JUDGE_MAX, T),
+        int("time.progress_ppm", PROGRESS_FULL, T),
         int("chart.difficulty", DIFFICULTY_MAX, T),
         flag("chart.difficulty_valid", T),
         int("chart.judge_class", JUDGE_CLASS_MAX, T),
@@ -455,29 +458,34 @@ pub mod field {
     /// `93 + N` for [`Lane::index`](bms_model::Lane::index) `N`; see
     /// [`lane_judge`].
     pub const JUDGE_LANES: u16 = 93;
+    /// The attempt's progress in parts per million, rounded down: 0 before
+    /// the attempt's start (READY), [`PROGRESS_FULL`](super::PROGRESS_FULL)
+    /// at and after the end `time.remaining_s` counts to, and between them
+    /// the share of the way from the start to that end.
+    pub const TIME_PROGRESS_PPM: u16 = 101;
     /// The chart's difficulty: its `#DIFFICULTY` from 1 to 5, and 0 for
     /// any other or none; 0 while `chart.difficulty_valid` is false.
-    pub const CHART_DIFFICULTY: u16 = 101;
+    pub const CHART_DIFFICULTY: u16 = 102;
     /// Whether the chart's difficulty is known.
-    pub const CHART_DIFFICULTY_VALID: u16 = 102;
+    pub const CHART_DIFFICULTY_VALID: u16 = 103;
     /// The chart's judgment class from the play preset's reading of its
     /// rank, 0 the hardest to 4 the easiest; 0 while
     /// `chart.judge_class_valid` is false.
-    pub const CHART_JUDGE_CLASS: u16 = 103;
+    pub const CHART_JUDGE_CLASS: u16 = 104;
     /// Whether the chart has a judgment class.
-    pub const CHART_JUDGE_CLASS_VALID: u16 = 104;
+    pub const CHART_JUDGE_CLASS_VALID: u16 = 105;
     /// The chart's gauge total, whole; 0 while `chart.total_valid` is
     /// false.
-    pub const CHART_TOTAL: u16 = 105;
+    pub const CHART_TOTAL: u16 = 106;
     /// Whether the chart's gauge total is known and a number can show it.
-    pub const CHART_TOTAL_VALID: u16 = 106;
+    pub const CHART_TOTAL_VALID: u16 = 107;
     /// Whether the chart defines a BGA image; false while
     /// `chart.bga_valid` is false.
-    pub const CHART_BGA: u16 = 107;
+    pub const CHART_BGA: u16 = 108;
     /// Whether that is known.
-    pub const CHART_BGA_VALID: u16 = 108;
+    pub const CHART_BGA_VALID: u16 = 109;
     /// The number of fields.
-    pub const COUNT: usize = 109;
+    pub const COUNT: usize = 110;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -771,6 +779,18 @@ mod tests {
             );
         }
         assert_eq!(field::lane_judge(Lane::SCRATCH), 93);
+        assert_eq!(slot("time.progress_ppm"), Some(field::TIME_PROGRESS_PPM));
+        assert_eq!(
+            PLAY.field("time.progress_ppm")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: 1_000_000
+                },
+                T
+            ))
+        );
         let chart = [
             ("chart.difficulty", field::CHART_DIFFICULTY, Some(5)),
             (
@@ -790,7 +810,7 @@ mod tests {
             ("chart.bga_valid", field::CHART_BGA_VALID, None),
         ];
         for (i, (name, s, hi)) in chart.into_iter().enumerate() {
-            assert_eq!(usize::from(s), 101 + i, "{name}");
+            assert_eq!(usize::from(s), 102 + i, "{name}");
             assert_eq!(slot(name), Some(s), "{name}");
             let ty = hi.map_or(FieldTy::Bool, |hi| FieldTy::Int { lo: 0, hi });
             assert_eq!(
@@ -799,7 +819,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(field::COUNT, 109);
+        assert_eq!(field::COUNT, 110);
     }
 
     #[test]

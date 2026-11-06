@@ -13,7 +13,8 @@
 //! 139-151`, `skin/SkinSlider.java:116-120`); both add. Nothing cuts the
 //! paint to the lanes or replaces it (`skin/SkinImage.java:136-149`,
 //! `skin/SkinSlider.java:109-120`), and the logical coverage never
-//! depends on it.
+//! depends on it. A type-6 slider paints no cover: it takes the same path,
+//! moved by the play's progress instead.
 //!
 //! LIFT's and HIDDEN+'s paint rise by the lift, HIDDEN+'s by its own share
 //! too: the source lists offset 3 on LIFT and offsets 3 and 5 on HIDDEN+
@@ -30,7 +31,8 @@
 //! leave off, is dropped with a note unless it is failure presentation.
 
 use skin_model::{
-    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, Source, Track,
+    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, Slider,
+    SliderDirection, SliderRate, Source, Track,
 };
 
 use super::super::geom::{HEIGHT, Q, Rect};
@@ -44,6 +46,9 @@ use crate::error::ImportError;
 /// The rate a `slider` of this `type` shows: SUDDEN+'s share of the whole
 /// lane (`skin/property/FloatPropertyFactory.java:139-151`).
 const RATE_LANECOVER: i32 = 4;
+/// The rate a `slider` of this `type` shows: the play's progress
+/// (`skin/property/FloatPropertyFactory.java:128-136`, `musicprogress`).
+const RATE_MUSIC_PROGRESS: i32 = 6;
 /// The slider direction that moves down (`skin/SkinSlider.java:116-120`).
 const DOWN: i32 = 2;
 
@@ -75,7 +80,7 @@ impl Cx<'_> {
     ) -> Result<(), ImportError> {
         let def = CoverPaintDef {
             image,
-            slider_range: range,
+            slider: range.map(Slider::sudden),
             motion: CoverMotion::None,
             trim: CoverTrim::None,
             gate_track: None,
@@ -268,7 +273,7 @@ impl Cx<'_> {
         }
         let def = CoverPaintDef {
             image: CoverImage::Image(image),
-            slider_range: None,
+            slider: None,
             motion,
             trim,
             gate_track,
@@ -289,15 +294,22 @@ impl Cx<'_> {
             .ok_or_else(|| self.range(at, "disapearLine"))
     }
 
-    /// A `slider` (`skin/json/JsonSkinObjectLoader.java:393-417`): one of
-    /// type 4 moving down, without a value property or a numeric
-    /// reference, is SUDDEN+'s paint, play-critical unless it is proven
-    /// outside the lanes as an offset-4 image is; `changeable` needs
-    /// nothing, since the play has no pointer, and `event` is unused on
-    /// that path. Its range is scaled from the skin's height to 1 080
-    /// reference pixels and truncated once, exactly. Any other slider is
-    /// dropped with a note, or refuses the skin when it is failure
-    /// presentation.
+    /// A `slider` (`skin/json/JsonSkinObjectLoader.java:393-417`), without
+    /// a value property or a numeric reference: one of type 4 moving down
+    /// is SUDDEN+'s paint, play-critical unless it is proven outside the
+    /// lanes as an offset-4 image is; one of type 6 (`musicprogress`,
+    /// `skin/property/FloatPropertyFactory.java:128-136`) in any of the
+    /// four directions (`skin/SkinSlider.java:116-120`: 0 up, 1 right, 2
+    /// down, 3 left, the source's y up) is a decorative paint moved by
+    /// `time.progress_ppm`, with a D4 note: the progress ends at the last
+    /// resolved object, where the source's adds 5 s (stage3.md R3).
+    /// `changeable` needs nothing, since the play has no pointer, and
+    /// `event` is unused on that path. Its range is scaled from the skin's
+    /// height to 1 080 reference pixels, the same ratio as from its width
+    /// to 1 920 for a horizontal one (`:398-415`, every accepted size being
+    /// 16:9), and truncated once, exactly. Any
+    /// other slider is dropped with a note, or refuses the skin when it is
+    /// failure presentation.
     pub(in super::super) fn slider(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let [ty, angle, range, value, ref_num, changeable, event] = self.def.fields(
@@ -324,25 +336,40 @@ impl Cx<'_> {
             self.def.bool(f, "changeable")?;
         }
         let field = |field| NoteKind::UnsupportedField { field };
-        let why = if value != Prop::Null {
-            Some(field("value"))
-        } else if ref_num {
-            Some(field("isRefNum"))
-        } else if ty != RATE_LANECOVER {
-            Some(NoteKind::Unsupported {
-                object: Object::Slider,
-            })
-        } else if angle != DOWN {
-            Some(field("angle"))
-        } else if range < 0 {
-            Some(field("range"))
-        } else {
-            None
+        let rate = match ty {
+            RATE_LANECOVER => Some(SliderRate::Sudden),
+            RATE_MUSIC_PROGRESS => Some(SliderRate::Progress),
+            _ => None,
         };
-        if let Some(why) = why {
-            return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why);
-        }
-        // `⌊1080 · range / height⌋`, at most `MAX_COORD`.
+        let direction = match angle {
+            0 => Some(SliderDirection::Up),
+            1 => Some(SliderDirection::Right),
+            DOWN => Some(SliderDirection::Down),
+            3 => Some(SliderDirection::Left),
+            _ => None,
+        };
+        let checked = if value != Prop::Null {
+            Err(field("value"))
+        } else if ref_num {
+            Err(field("isRefNum"))
+        } else {
+            match (rate, direction) {
+                (None, _) => Err(NoteKind::Unsupported {
+                    object: Object::Slider,
+                }),
+                (Some(SliderRate::Sudden), _) if angle != DOWN => Err(field("angle")),
+                (Some(_), None) => Err(field("angle")),
+                _ if range < 0 => Err(field("range")),
+                (Some(rate), Some(direction)) => Ok((rate, direction)),
+            }
+        };
+        let (rate, direction) = match checked {
+            Ok(v) => v,
+            Err(why) => return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why),
+        };
+        // `⌊1080 · range / height⌋`, at most `MAX_COORD`. Every size the
+        // importer takes is 16:9, so the source's width scale for a
+        // horizontal slider is the same ratio.
         let r = (HEIGHT * i128::from(range))
             .checked_div(i128::from(self.height))
             .and_then(|r| u32::try_from(r).ok())
@@ -352,11 +379,53 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "event" });
         }
         let s = self.src_image(rec)?;
+        if rate == SliderRate::Progress {
+            let slider = Slider {
+                range: r,
+                rate,
+                direction,
+            };
+            return self.progress_slider(dst, rec, &s, slider);
+        }
         let role = if self.offset4_outside(&dst)? {
             Role::Decorative.or_failure(dst.failure)
         } else {
             Role::Critical(CriticalPart::Cover)
         };
         self.cover_paint_image(dst, rec, &s, role, Some(r))
+    }
+
+    /// A progress slider's paint from image record `rec` (`s`):
+    /// decorative, its keys charged as a paint's, moved by `slider`, with a
+    /// D4 note when retained.
+    fn progress_slider(
+        &mut self,
+        dst: Dst,
+        rec: u32,
+        s: &SrcImage,
+        slider: Slider,
+    ) -> Result<(), ImportError> {
+        let at = dst.span;
+        self.budget
+            .keys(dst.keys.len())
+            .map_err(|l| self.limit(at, l))?;
+        let role = Role::Decorative.or_failure(dst.failure);
+        let Some(mut c) = self.image_common(&dst, true, role)? else {
+            return Ok(());
+        };
+        // The progress ends at the last resolved object (D4).
+        c.display_deviation = true;
+        let Some((image, rects, native)) = self.paint_image(&c, rec, s)? else {
+            return Ok(());
+        };
+        let t = self.model_track(&c, &rects)?;
+        let def = CoverPaintDef {
+            image: CoverImage::Image(image),
+            slider: Some(slider),
+            motion: CoverMotion::None,
+            trim: CoverTrim::None,
+            gate_track: None,
+        };
+        self.push_paint_def(c, def, t, native)
     }
 }

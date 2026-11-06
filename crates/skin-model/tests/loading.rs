@@ -487,6 +487,43 @@ fn programs_reading_unavailable_fields_draw_nothing() {
     assert_eq!(l.digits(), [1]);
 }
 
+/// The progress reads 0 while loading, as in READY (stage3.md R3; the
+/// source's `TIMER_PLAY` is off, `skin/property/FloatPropertyFactory.java:
+/// 128-136`): a program reading it is evaluated, and a progress slider
+/// draws where it stands, not moved.
+#[test]
+fn the_progress_reads_zero_while_loading() {
+    let slider = skin_model::CoverPaintDef {
+        image: skin_model::CoverImage::Image(MARK),
+        slider: Some(skin_model::Slider {
+            range: 400,
+            rate: skin_model::SliderRate::Progress,
+            direction: skin_model::SliderDirection::Right,
+        }),
+        motion: skin_model::CoverMotion::None,
+        trim: skin_model::CoverTrim::None,
+        gate_track: None,
+    };
+    let mut l = Loader::new(skin(
+        Vec::new(),
+        None,
+        vec![
+            untimed(Source::CoverPaint(0), [100, 300, 20, 10], Place::SCREEN),
+            untimed(Source::Number(0), [0, 200, 80, 20], Place::SCREEN),
+            shown_when(OTHER, [0, 0, 10, 10], "time.progress_ppm == 0"),
+        ],
+        WidgetDefs {
+            numbers: vec![number("time.progress_ppm")],
+            cover_paints: vec![slider],
+            ..WidgetDefs::default()
+        },
+    ));
+    l.build(100);
+    assert_eq!(l.rects(MARK), [[100.0, 300.0, 20.0, 10.0]]);
+    assert_eq!(l.digits(), [0]);
+    assert_eq!(l.count(OTHER), 1);
+}
+
 /// The family conditions an imported skin's gauge-type images use.
 const GROOVE: &str = "gauge.valid && (gauge.kind == assist_easy || gauge.kind == easy \
                       || gauge.kind == normal)";
