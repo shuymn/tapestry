@@ -495,10 +495,19 @@ fn an_invalid_key_config_exits_nonzero() {
 /// all sounding, as a play without the hold does. The rearm is answered
 /// at least 30 ms after the release (design.md "Shortening Launch-Based
 /// Checks", scripted input), and every press still lands on its note. The
-/// saved record keeps
-/// the cancelled opening, Q's press in it, and the winning READY's input
-/// alone; F2, pressed during the play, reaches the adjustments and no
-/// record, and the winning capture re-evaluates equal to the live play.
+/// saved record keeps the cancelled opening, Q's press in it, and the
+/// winning READY's input alone.
+///
+/// An input thread starved past the commit reads the hold only after it:
+/// the design makes that an ordinary in-play adjustment, so the play is
+/// not restarted and the record has no cancelled opening, Q's press in its
+/// input. Either way F2, pressed during the play, reaches the adjustments
+/// and no record, and the record re-evaluates equal to the live play.
+/// The exact outcomes are the controlled tests':
+/// `a_late_rearm_opens_at_the_scripted_release` and
+/// `a_hold_and_its_release_in_one_wake_hold_the_script_at_the_release`
+/// (src/input_side.rs), and `a_hold_after_the_commit_is_an_ordinary_adjustment`
+/// (game's tests/start_gate.rs).
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
@@ -541,6 +550,36 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("{stdout}{stderr}");
     assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout.contains("re-evaluation matches live: true"),
+        "{stdout}"
+    );
+    let saved = records(&appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
+    let h = &rec.history;
+    let q_press = |e: &eval::PhysicalInputEvent| {
+        e.kind
+            == eval::InputKind::Control {
+                control: eval::ControlId(Q),
+                value: 1,
+            }
+    };
+    // F2 is in no opening.
+    let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
+    assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
+    assert!(
+        stdout.contains("adjust: hi-speed 4.50 floating"),
+        "{stdout}"
+    );
+    let Some(o) = h.openings.first() else {
+        // The hold was read after the commit: no restart, Q's press in the
+        // played input.
+        assert!(rec.events.iter().any(q_press), "{:?}", rec.events);
+        return;
+    };
+    assert_eq!(h.openings.len(), 1, "{h:?}");
     // The same sounds as the play without the hold: the key sounds, and the BGM,
     // which starts only once the rearmed candidate's transport commits.
     // Where they fall is the real threads' timing, which the stepped
@@ -555,14 +594,6 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         )),
         "{stdout}"
     );
-
-    let saved = records(&appdata);
-    assert_eq!(saved.len(), 1, "{saved:?}");
-    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
-    assert_eq!(rec.status.end, EndStatus::PlayedToEnd);
-    let h = &rec.history;
-    assert_eq!(h.openings.len(), 1, "{h:?}");
-    let o = &h.openings[0];
     assert_eq!(o.reason, replay::CancelReason::Held);
     // On the clock the next READY's chart time 0 lies 1.2 s after the
     // first's and at least the rearm's delay more; how much more is the
@@ -577,11 +608,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         .collect();
     assert!(late.is_empty(), "{late:?}");
     let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
-    assert!(cancelled.iter().any(|e| e.kind
-        == eval::InputKind::Control {
-            control: eval::ControlId(Q),
-            value: 1
-        }));
+    assert!(cancelled.iter().any(q_press));
     // The winning READY's input: every note's press and release.
     let lanes = rec
         .events
@@ -589,13 +616,6 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
         .count();
     assert_eq!(lanes, 2 * NOTES);
-    // F2 is in no opening.
-    let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
-    assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
-    assert!(
-        stdout.contains("adjust: hi-speed 4.50 floating"),
-        "{stdout}"
-    );
 }
 
 /// A skin built per chart on the direct path, its READY cancelled by a hold
