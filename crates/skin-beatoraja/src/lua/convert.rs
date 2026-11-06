@@ -99,7 +99,7 @@ pub const MAX_CONVERTED_BYTES: u64 = MAX_NODES as u64
 /// The fields a callable's location names; any other is `other`. The
 /// format's own field names, never a skin's.
 #[cfg(feature = "dev-tools")]
-pub(crate) const FIELDS: [&str; 24] = [
+pub(crate) const FIELDS: [&str; 34] = [
     "draw",
     "value",
     "timer",
@@ -124,6 +124,16 @@ pub(crate) const FIELDS: [&str; 24] = [
     "isRefNum",
     "mouseRect",
     "customTimers",
+    "customEvents",
+    "songlist",
+    "liston",
+    "listoff",
+    "level",
+    "lamp",
+    "playerlamp",
+    "rivallamp",
+    "trophy",
+    "label",
 ];
 
 /// The functions a converted table holds, in conversion order: each

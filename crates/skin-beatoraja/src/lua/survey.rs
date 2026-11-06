@@ -281,6 +281,14 @@ fn label(e: &ImportError) -> String {
         ImportError::Resolution { w, h, .. } => format!("size {w}x{h}"),
         ImportError::Limit { limit, .. } => format!("limit {limit:?}"),
         ImportError::Critical { part, why, .. } => format!("critical {part:?}: {}", note(why)),
+        ImportError::Essential {
+            part,
+            why: Some(why),
+            ..
+        } => format!("essential {part:?}: {}", note(why)),
+        ImportError::Essential {
+            part, why: None, ..
+        } => format!("essential {part:?} missing"),
         ImportError::Expr { .. } => "expression".into(),
         ImportError::Asset { .. } => "critical asset".into(),
         ImportError::Model { .. } => "model".into(),
@@ -357,6 +365,7 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
         | ImportError::Resolution { at, .. }
         | ImportError::Limit { at, .. }
         | ImportError::Model { at, .. }
+        | ImportError::Essential { at, .. }
         | ImportError::Lua { at, .. } => at.as_ref(),
         ImportError::Syntax { at, .. }
         | ImportError::IncludeCycle { at, .. }
@@ -1229,7 +1238,7 @@ return { type = 0 }",
         let (module, line, _) = s.at.unwrap();
         assert_eq!((module, line), (0, 0));
         for (ty, kind, label) in [
-            (5, ScreenKind::Selection, "no importer for Selection"),
+            (5, ScreenKind::Selection, "essential SongList missing"),
             (6, ScreenKind::Decision, "no importer for Decision"),
             (7, ScreenKind::Result, "no importer for Result"),
         ] {

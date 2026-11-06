@@ -6,9 +6,9 @@ use std::fmt;
 
 use skin_model::{
     Charge, MAX_BAR_GROUPS, MAX_DIGIT_OFFSETS, MAX_ELEMENTS, MAX_FILES, MAX_FONTS,
-    MAX_IMAGE_CHOICE_REFS, MAX_IMAGES, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS, MAX_SKIN_FRAMES,
-    MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_FONT_BYTES,
-    MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
+    MAX_IMAGE_CHOICE_REFS, MAX_IMAGES, MAX_PLACEMENTS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
+    MAX_SKIN_FRAMES, MAX_SKIN_KEYS, MAX_SKIN_OPS, MAX_TEXT_ELEMENTS, MAX_TOTAL_FILE_BYTES,
+    MAX_TOTAL_FONT_BYTES, MAX_TRACK_KEYS, MAX_WHEN_TIMERS, MAX_WIDGET_QUADS, Program, SkinOps,
 };
 
 use super::report::Usage;
@@ -52,6 +52,9 @@ pub enum ImportLimit {
     /// More than [`MAX_DIGIT_OFFSETS`] digit offsets across the numbers
     /// and combos, each copy counted.
     DigitOffsets,
+    /// More than [`MAX_PLACEMENTS`] song list placements, the row text
+    /// table's slots.
+    Placements,
 }
 
 impl fmt::Display for ImportLimit {
@@ -73,6 +76,7 @@ impl fmt::Display for ImportLimit {
             Self::ChoiceRefs => write!(f, "more than {MAX_IMAGE_CHOICE_REFS} image choice entries"),
             Self::BarGroups => write!(f, "more than {MAX_BAR_GROUPS} bar line groups"),
             Self::DigitOffsets => write!(f, "more than {MAX_DIGIT_OFFSETS} digit offsets"),
+            Self::Placements => write!(f, "more than {MAX_PLACEMENTS} song list placements"),
         }
     }
 }
@@ -152,9 +156,28 @@ impl Budget {
 
     /// A compiled program's operations, before it is stored.
     pub(crate) fn ops(&mut self, program: &Program) -> Result<(), ImportLimit> {
-        self.ops.charge(program).map_err(|_| ImportLimit::Ops)?;
+        self.ops_times(program, 1)
+    }
+
+    /// A program's operations `n` times over: a song list element
+    /// evaluates a part's visibility once per slot.
+    pub(crate) fn ops_times(&mut self, program: &Program, n: usize) -> Result<(), ImportLimit> {
+        for _ in 0..n {
+            self.ops.charge(program).map_err(|_| ImportLimit::Ops)?;
+        }
         self.usage.ops = u32::try_from(self.ops.total()).unwrap_or(u32::MAX);
         Ok(())
+    }
+
+    /// The song list's `n` placements, the row text table's slots, before
+    /// any placement is read.
+    pub(crate) fn placements(&mut self, n: usize) -> Result<(), ImportLimit> {
+        charge(
+            &mut self.usage.placements,
+            n,
+            MAX_PLACEMENTS,
+            ImportLimit::Placements,
+        )
     }
 
     /// One image of `frames` frames, before its file is admitted.

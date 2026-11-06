@@ -1,6 +1,11 @@
 //! Effective number and text properties: what the source's
 //! property factories return for an id or a name, and which of those the
-//! model shows.
+//! model shows, on each kind of screen.
+
+use skin_model::{ScreenKind, SelectionText};
+
+use super::selection::profile::{Class, SelText, SelValue};
+use super::selection::{self};
 
 /// The ids of `IntegerPropertyFactory.ValueType` with their names
 /// (`IntegerPropertyFactory.java:64-~490` at `0.8.9`), sorted by id.
@@ -355,6 +360,9 @@ pub(crate) enum Value {
     /// information on a direct launch too (`PlayerResource.java:175`,
     /// `song/SongData.java:130-139`, `:219`).
     SongTotal,
+    /// A selection number, over the selection schema
+    /// ([`super::selection::profile::number`]).
+    Selection(SelValue),
 }
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
@@ -446,6 +454,7 @@ impl Value {
             Self::PlayLevel => "chart.level",
             Self::RecentTiming => "judge.recent_ms",
             Self::SongTotal => "chart.total",
+            Self::Selection(v) => v.expr(),
             Self::DurationVariant(n) => DURATION_VARIANTS
                 .get(usize::from(n))
                 .copied()
@@ -464,6 +473,7 @@ impl Value {
             Self::PlayLevel => Some("chart.level_valid"),
             Self::SongTotal => Some("chart.total_valid"),
             Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
+            Self::Selection(v) => Some(v.availability()),
             _ => None,
         }
     }
@@ -486,6 +496,7 @@ impl Value {
                 | Self::PlayLevel
                 | Self::RecentTiming
                 | Self::SongTotal
+                | Self::Selection(_)
         )
     }
 
@@ -510,7 +521,11 @@ impl Value {
         }
         let e = self.expr();
         let (name, op) = e.split_once(' ').map_or((e, None), |(n, r)| (n, Some(r)));
-        let (lo, hi) = match skin_model::PLAY.field(name).map(|(_, f)| f.ty) {
+        let schema = match self {
+            Self::Selection(_) => &skin_model::SELECTION,
+            _ => &skin_model::PLAY,
+        };
+        let (lo, hi) = match schema.field(name).map(|(_, f)| f.ty) {
             Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
             // Never met (a test reads every value); the widest range is
             // the safe one.
@@ -538,16 +553,48 @@ pub(crate) enum IntProp {
     Shown(Value),
     /// A property the model has no value for, by id when it has one.
     Unsupported(Option<i32>),
+    /// A selection property bridged only with the native settings (class
+    /// E of the selection profile): it draws nothing until then.
+    Unavailable(i32),
 }
 
-/// A `value` field as the value-property factory resolves it
-/// (`JsonSkinSerializer.java:103-104`): an id or a name; a name the
-/// factory does not know is a script, which the model does not run.
-pub(crate) fn value_prop(value: &super::Prop) -> IntProp {
+/// A `value` field as the value-property factory resolves it on a `kind`
+/// screen (`JsonSkinSerializer.java:103-104`): an id or a name; a name
+/// the factory does not know is a script, which the model does not run.
+pub(crate) fn value_prop(kind: ScreenKind, value: &super::Prop) -> IntProp {
     match value {
-        super::Prop::Id(n) => int_by_id(*n),
-        super::Prop::Name(s) => int_by_name(s).unwrap_or(IntProp::Unsupported(None)),
+        super::Prop::Id(n) => int_in(kind, *n),
+        super::Prop::Name(s) => name_id(s).map_or_else(
+            || int_by_name(s).unwrap_or(IntProp::Unsupported(None)),
+            |id| int_in(kind, id),
+        ),
         super::Prop::Null | super::Prop::Callable(_) => IntProp::Null,
+    }
+}
+
+/// The id of integer property `name`, when the factory names one.
+fn name_id(name: &str) -> Option<i32> {
+    VALUE_TYPES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|&(id, _)| id)
+}
+
+/// Integer property `id` on a `kind` screen: play's mapping, or the
+/// selection profile's ([`selection::profile::number`]), an id outside
+/// it as the factory knows it ([`int_by_id`]) but shown by nothing.
+pub(crate) fn int_in(kind: ScreenKind, id: i32) -> IntProp {
+    if kind != ScreenKind::Selection {
+        return int_by_id(id);
+    }
+    match selection::profile::number(id) {
+        Some(Class::Bridge(v)) => IntProp::Shown(Value::Selection(v)),
+        Some(Class::Unavailable) => IntProp::Unavailable(id),
+        Some(Class::Omit) => IntProp::Unsupported(Some(id)),
+        None => match int_by_id(id) {
+            IntProp::Shown(_) => IntProp::Unsupported(Some(id)),
+            p => p,
+        },
     }
 }
 
@@ -697,6 +744,12 @@ pub(crate) enum IndexProp {
     /// scratch, 1-7 the keys, as [`bms_model::Lane::index`] numbers them
     /// (`play/LaneProperty.java:50`). Read from `judge.lane.N`.
     LaneJudge(u8),
+    /// A selection image index's selector over the selection schema
+    /// ([`selection::profile::image_index`]).
+    Selection(&'static str),
+    /// A selection setting or action button, bridged only with the native
+    /// settings: it draws nothing until then.
+    Unavailable(i32),
     /// A property the model has no value for.
     Unsupported(i32),
 }
@@ -731,7 +784,8 @@ impl IndexProp {
             Self::HiddenEnabled => "if hidden.enabled then 1 else 0",
             Self::RandomOption => "0",
             Self::LaneJudge(n) => LANE_JUDGES.get(usize::from(n))?,
-            Self::Unsupported(_) => return None,
+            Self::Selection(src) => src,
+            Self::Unsupported(_) | Self::Unavailable(_) => return None,
         })
     }
 
@@ -741,8 +795,32 @@ impl IndexProp {
     pub(crate) fn deviates(self) -> bool {
         !matches!(
             self,
-            Self::Null | Self::RandomOption | Self::LaneJudge(_) | Self::Unsupported(_)
+            Self::Null
+                | Self::RandomOption
+                | Self::LaneJudge(_)
+                | Self::Unsupported(_)
+                | Self::Selection(_)
+                | Self::Unavailable(_)
         )
+    }
+}
+
+/// Image-index property `id` on a `kind` screen: play's mapping, or the
+/// selection profile's ([`selection::profile::image_index`]), an id
+/// outside it unsupported where the factory knows it and selecting entry
+/// 0 where it does not.
+pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
+    if kind != ScreenKind::Selection {
+        return index_by_id(id);
+    }
+    match selection::profile::image_index(id) {
+        Some(Class::Bridge(src)) => IndexProp::Selection(src),
+        Some(Class::Unavailable) => IndexProp::Unavailable(id),
+        Some(Class::Omit) => IndexProp::Unsupported(id),
+        None => match index_by_id(id) {
+            IndexProp::Null => IndexProp::Null,
+            _ => IndexProp::Unsupported(id),
+        },
     }
 }
 
@@ -795,7 +873,33 @@ pub(crate) enum StrProp {
     Null,
     /// A chart header field, by id 10–16.
     Field(i32),
+    /// A selection screen's own string.
+    Screen(SelectionText),
     Unsupported(Option<i32>),
+}
+
+/// String property `id` on a `kind` screen: play's mapping, or the
+/// selection profile's ([`selection::profile::text`]), an id outside it
+/// as the factory knows it ([`str_by_id`]).
+pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
+    if kind != ScreenKind::Selection {
+        return str_by_id(id);
+    }
+    match selection::profile::text(id) {
+        Some(Class::Bridge(SelText::Field(_))) => str_by_id(id),
+        Some(Class::Bridge(SelText::Screen(s))) => StrProp::Screen(s),
+        Some(Class::Unavailable | Class::Omit) => StrProp::Unsupported(Some(id)),
+        None => str_by_id(id),
+    }
+}
+
+/// String property `name` on a `kind` screen ([`str_by_name`] through
+/// [`str_in`]).
+pub(crate) fn str_by_name_in(kind: ScreenKind, name: &str) -> Option<StrProp> {
+    match STRING_TYPES.iter().find(|(_, n)| *n == name) {
+        Some(&(id, _)) => Some(str_in(kind, id)),
+        None => str_by_name(name),
+    }
 }
 
 /// `getStringProperty(int)`.

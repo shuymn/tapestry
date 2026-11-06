@@ -1127,11 +1127,44 @@ fn play_skin(body: &str) -> Vec<u8> {
 }
 
 /// `skin_json` seeds that import: images, numbers, text, bitmap text,
-/// tracks, ops, offsets, a default file choice, the play objects and
-/// digit offsets.
+/// tracks, ops, offsets, a default file choice, the play objects, digit
+/// offsets, and a selection skin with its song list, its styles, a ratio
+/// bar and the selection profile's numbers and options.
 #[must_use]
 pub fn skin_imports() -> Vec<Seed> {
     vec![
+        (
+            "selection",
+            skin_input(&[r#"{"type": 5, "w": 1920, "h": 1080,
+                "source": [{"id": "strip", "path": "strip.png"}],
+                "font": [{"id": "f", "path": "font.ttf"}],
+                "image": [
+                    {"id": "b0", "src": "strip", "x": 0, "w": 10, "h": 10},
+                    {"id": "b1", "src": "strip", "x": 10, "w": 10, "h": 10},
+                    {"id": "lamp", "src": "strip", "x": 20, "w": 10, "h": 10}],
+                "imageset": [{"id": "set", "images": ["b0", "b1"]}],
+                "value": [{"id": "lv", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "ref": 96},
+                          {"id": "ex", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4, "ref": 71}],
+                "text": [{"id": "t", "font": "f", "ref": 10}],
+                "graph": [{"id": "rate", "src": "strip", "x": 30, "w": 10, "h": 10, "type": 147}],
+                "slider": [{"id": "pos", "src": "strip", "x": 40, "w": 10, "h": 10, "type": 1, "angle": 2, "range": 300}],
+                "songlist": {"id": "list", "center": 1,
+                    "liston": [{"id": "set", "dst": [{"x": 0, "y": 700, "w": 400, "h": 40}]},
+                               {"id": "set", "dst": [{"x": 20, "y": 650, "w": 400, "h": 40}]},
+                               {"id": "set", "dst": [{"x": 0, "y": 600, "w": 400, "h": 40}]}],
+                    "listoff": [{"id": "set", "dst": [{"x": 0, "y": 700, "w": 400, "h": 40}]},
+                                {"id": "set", "dst": [{"x": 0, "y": 650, "w": 400, "h": 40}]},
+                                {"id": "set", "dst": [{"x": 0, "y": 600, "w": 400, "h": 40}]}],
+                    "text": [{"id": "t", "dst": [{"x": 50, "y": 10, "w": 300, "h": 20}]}],
+                    "level": [{"id": "lv", "dst": [{"x": 360, "y": 10, "w": 10, "h": 10}]}],
+                    "lamp": [{"id": "lamp", "dst": [{"x": 0, "y": 0, "w": 10, "h": 40}]}]},
+                "destination": [
+                    {"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]},
+                    {"id": "ex", "op": [2], "dst": [{"x": 500, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "rate", "dst": [{"x": 500, "y": 400, "w": 100, "h": 10}]},
+                    {"id": "pos", "dst": [{"x": 900, "y": 700, "w": 10, "h": 10}]},
+                    {"id": "b0", "op": [21], "timer": 11, "dst": [{"x": 600, "y": 300, "w": 10, "h": 10}]}]}"#]),
+        ),
         (
             "images",
             play_skin(

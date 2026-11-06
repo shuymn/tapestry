@@ -89,7 +89,8 @@ impl Cx<'_> {
             let Some(id) = id.filter(|id| !ops_negative(id)) else {
                 continue;
             };
-            let Ok(found) = self.objects.lookup(self.def, &self.tables, &id) else {
+            let play = skin_model::ScreenKind::Play;
+            let Ok(found) = self.objects.lookup(self.def, &self.tables, &id, play) else {
                 return SpanHint::Undetermined;
             };
             let Some((object, note)) = found else {

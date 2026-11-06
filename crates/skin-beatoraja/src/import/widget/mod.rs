@@ -13,9 +13,7 @@ pub(super) mod number;
 pub(super) mod system;
 pub(super) mod text;
 
-use skin_model::{
-    CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, TimerRef, Track, timer as slot,
-};
+use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
@@ -55,8 +53,29 @@ pub(super) struct SrcImage {
     rect: [i32; 4],
     /// Columns and rows, a division of 0 or less read as 1.
     pub(super) div: [u32; 2],
-    timer: Prop,
-    cycle: i32,
+    pub(super) timer: Prop,
+    pub(super) cycle: i32,
+    /// The records its timer and its cycle come from: its own, or a song
+    /// list placement's set's ([`ImageKey`]).
+    pub(super) timing: [u32; 2],
+}
+
+impl Cx<'_> {
+    /// Notes D22 once for the destination at `at`: a source cut that runs
+    /// past its file's edge, its in-file part stretched to the frame.
+    fn overrun_note(&mut self, at: Span) {
+        if self.overrun_at.insert(at) {
+            let d22 = NoteKind::Deviation(super::DeviationId::D22);
+            self.note(Some(at), super::Severity::Deviation, d22);
+        }
+    }
+}
+
+impl SrcImage {
+    /// The `source` id its `src` names.
+    pub(super) fn src_name(&self) -> Option<&str> {
+        self.src.as_deref()
+    }
 }
 
 impl Cx<'_> {
@@ -82,7 +101,7 @@ impl Cx<'_> {
     /// note once `c` is retained, when the cycle has no timer: only an
     /// untimed cycle runs on `screen`.
     pub(super) fn cycle_kept(&mut self, c: &Common, cycle: Option<&CycleDef>) {
-        if cycle.is_some_and(|y| y.timer == TimerRef::Builtin(slot::SCREEN)) {
+        if cycle.is_some_and(|y| y.timer == self.screen()) {
             self.cycled.insert(c.span);
         }
     }
@@ -159,6 +178,7 @@ impl Cx<'_> {
             ],
             timer: self.callback_prop(timer, "timer")?,
             cycle: self.int_or(cycle, "cycle", 0)?,
+            timing: [rec, rec],
         })
     }
 
@@ -201,9 +221,13 @@ impl Cx<'_> {
             }
         };
         let linear = c.filter == skin_model::Filter::Linear;
-        let key = (rec, linear, grid, false);
+        let key = (rec, linear, grid, false, s.timing);
         if let Some((def, cell)) = self.assets.base(key) {
             let rect = def.rect.unwrap_or_default();
+            // Each destination drawing a cut past its file's edge is noted.
+            if self.overruns.contains(&key) {
+                self.overrun_note(at);
+            }
             let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {
                 return Ok(None);
             };
@@ -230,6 +254,9 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
+        if self.cut_overran {
+            self.overruns.insert(key);
+        }
         let def = ImageDef {
             file,
             rect: Some(rect),
@@ -282,6 +309,7 @@ impl Cx<'_> {
         grid: [u32; 2],
         holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
+        self.cut_overran = false;
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
             Ok(Err(Unplaced {
@@ -319,6 +347,8 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
+            // A play-critical image's failure is its own error; an
+            // essential part's is refused as that part, with its note.
             Err(Failed::File { refused })
                 if matches!(role, Role::Critical(_)) && (refused || !holes) =>
             {
@@ -355,13 +385,19 @@ impl Cx<'_> {
         };
         let [dx, dy] = s.div;
         let cell = [w / dx, h / dy];
-        let (Some([x, w]), Some([y, h])) = (
+        let (Some(([x, w], ox)), Some(([y, h], oy))) = (
             cut_axis(x, cell[0], grid[0], fw),
             cut_axis(y, cell[1], grid[1], fh),
         ) else {
             return refused(NoteKind::SourceRect);
         };
-        Ok(Ok((file, [x, y, w, h], cell)))
+        let rect = [x, y, w, h];
+        // Its caller records the overrun with the image's cache key.
+        self.cut_overran = ox || oy;
+        if self.cut_overran {
+            self.overrun_note(at);
+        }
+        Ok(Ok((file, rect, cell)))
     }
 
     /// Adds `def` cut to `crop` under `key`: a failure refuses a critical
@@ -416,6 +452,10 @@ impl Cx<'_> {
     /// keys then charged once, and what it lowers to: SUDDEN+'s paint
     /// unless it cannot reach the lanes, where it follows SUDDEN+.
     fn lowered(&mut self, dst: &Dst) -> Result<(bool, Lowered), ImportError> {
+        // Only a play skin has SUDDEN+.
+        if self.kind != skin_model::ScreenKind::Play {
+            return Ok((false, Lowered::Image));
+        }
         let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
         let lowered = if charged && !self.offset4_outside(dst)? {
             Lowered::Paint
@@ -435,12 +475,10 @@ impl Cx<'_> {
         // a `len` of 1 or less is an ordinary image whatever its `ref`.
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
-        let index = property::index_by_id(self.int_or(r, "ref", 0)?);
+        let index = property::index_in(self.kind, self.int_or(r, "ref", 0)?);
         let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role(dst.failure);
-        if act.is_some() {
-            self.ignored(at, NoteKind::Ignored { field: "act" });
-        }
+        self.actions(at, act)?;
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
         }
@@ -449,11 +487,11 @@ impl Cx<'_> {
         }
         if group {
             let Some(src) = index.selector() else {
-                let id = match index {
-                    IndexProp::Unsupported(id) => id,
-                    _ => 0,
+                let why = match index {
+                    IndexProp::Unavailable(id) => image_choice::index_unavailable(id),
+                    IndexProp::Unsupported(id) => image_choice::index_unsupported(id),
+                    _ => image_choice::index_unsupported(0),
                 };
-                let why = image_choice::index_unsupported(id);
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
@@ -536,7 +574,10 @@ impl Cx<'_> {
                 track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
             };
             shared &= b;
-            rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
+            rects.push(
+                r.model_from(self.flip)
+                    .ok_or_else(|| self.range(at, "dst"))?,
+            );
         }
         Ok(track::one_branch(shared).then_some((rects, native)))
     }
@@ -552,7 +593,7 @@ impl Cx<'_> {
         let [r, value, images, act] = self.def.fields(rec, ["ref", "value", "images", "act"]);
         let r = self.int_or(r, "ref", 0)?;
         let value = self.callback_prop(value, "value")?;
-        let selector = image_choice::set_selector(&value, r);
+        let selector = image_choice::set_selector(self.kind, &value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
         let (src, deviates) = if let Prop::Callable(id) = value {
@@ -576,33 +617,69 @@ impl Cx<'_> {
                 SetSelector::Expr { src, deviates, .. } => (src, deviates),
             }
         };
-        if act.is_some() {
-            self.ignored(at, NoteKind::Ignored { field: "act" });
-        }
+        self.actions(at, act)?;
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         self.image_set_choices(dst, images, &src, deviates, charged, (lowered, role))
     }
+
+    /// An image's or an image set's `act`: no action has a hit target. On
+    /// play it is ignored; on selection its id is noted by its class
+    /// ([`super::selection::profile::event`]), an E action as unavailable
+    /// until the native actions exist and any other as ignored.
+    fn actions(&mut self, at: Span, act: Option<u32>) -> Result<(), ImportError> {
+        let Some(f) = act else {
+            return Ok(());
+        };
+        let event = if self.kind == skin_model::ScreenKind::Selection {
+            match self.callback_prop(Some(f), "act")? {
+                Prop::Id(id) => super::selection::profile::event(id)
+                    .filter(|c| *c == super::selection::profile::Class::Unavailable)
+                    .map(|_| id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let why = match event {
+            Some(id) => NoteKind::Unavailable {
+                kind: super::PropertyKind::Event,
+                id,
+            },
+            None => NoteKind::Ignored { field: "act" },
+        };
+        self.ignored(at, why);
+        Ok(())
+    }
 }
 
 /// One axis of a source cut: `grid` frames of `cell` texels from `at` in
-/// a file `extent` texels long, as its model rect's offset and length.
-/// The source cuts it unchecked from a texture clamped to its edge
-/// (`JsonSkinObjectLoader.java:601-621`, libGDX 1.9.9 `GLTexture`
-/// defaults), so a single frame lying wholly at or past the far edge
-/// samples that edge's last texel line, which is cut in its place.
-/// `None` for any other cut leaving the file, and for one whose frame
-/// coordinates leave the source's `int` sums, where its coordinates wrap
-/// and it draws no edge line.
-fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<[u32; 2]> {
+/// a file `extent` texels long, as its model rect's offset and length, and
+/// whether it overruns the file's edge. The source cuts it unchecked from
+/// a texture clamped to its edge (`JsonSkinObjectLoader.java:601-621`,
+/// libGDX 1.9.9 `GLTexture` defaults): a single frame lying wholly at or
+/// past the far edge samples that edge's last texel line, which is cut in
+/// its place; a single frame partly past it repeats the edge's texels over
+/// the overrun, which the model cannot sample, so its in-file part is cut
+/// and stretched to the frame (D22). `None` for any other cut leaving the
+/// file (several frames on the axis), and for one whose frame coordinates
+/// leave the source's `int` sums, where its coordinates wrap and it draws
+/// no edge line.
+fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<([u32; 2], bool)> {
     let len = cell.checked_mul(grid)?;
     let end = at.checked_add(len)?;
     i32::try_from(end).ok()?;
     if end <= extent {
-        return Some([at, len]);
+        return Some(([at, len], false));
     }
-    (at >= extent && cell > 0 && extent > 0 && grid == 1).then(|| [extent - 1, 1])
+    if cell == 0 || extent == 0 || grid != 1 {
+        return None;
+    }
+    if at >= extent {
+        return Some(([extent - 1, 1], false));
+    }
+    Some(([at, extent - at], true))
 }
 
 /// The rect of `grid` frames of `cell` that model rect `rect` stands

@@ -1,15 +1,17 @@
 //! Numbers: the effective property, the glyph set and its cut, and
 //! the strip's layout from each key's exact geometry.
 
-use skin_model::{Align, DigitsDef, GlyphSet, MAX_COORD, NumberDef, Pad, Source, Ty};
+use skin_model::{
+    Align, DigitsDef, GlyphSet, MAX_COORD, Native, NumberDef, Pad, Program, Source, Track, Ty,
+};
 
 use super::super::callback::NumberValue;
-use super::super::geom::{HEIGHT, Q, Rect};
+use super::super::geom::{Q, Rect};
 use super::super::policy::Role;
 use super::super::property::{self, IntProp};
 use super::super::report::{NoteKind, PropertyKind};
 use super::super::track::{self, Stretch};
-use super::super::{Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 use crate::lua::residual::Conv;
 
@@ -68,8 +70,8 @@ impl Cx<'_> {
     /// The effective integer property (`JsonSkinObjectLoader.java:
     /// 104-160`): `value` when it resolves, else `ref`.
     fn int_prop(&mut self, value: &Prop, r: i32) -> IntProp {
-        match property::value_prop(value) {
-            IntProp::Null => property::int_by_id(r),
+        match property::value_prop(self.kind, value) {
+            IntProp::Null => property::int_in(self.kind, r),
             p => p,
         }
     }
@@ -77,18 +79,7 @@ impl Cx<'_> {
     /// A number object.
     pub(in super::super) fn number(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let [value, r, digit, padding, zeropadding, space, align] = self.def.fields(
-            rec,
-            [
-                "value",
-                "ref",
-                "digit",
-                "padding",
-                "zeropadding",
-                "space",
-                "align",
-            ],
-        );
+        let [value, r] = self.def.fields(rec, ["value", "ref"]);
         let value = self.callback_prop(value, "value")?;
         let r = self.int_or(r, "ref", 0)?;
         // Its role when what it shows has none of its own.
@@ -113,10 +104,56 @@ impl Cx<'_> {
                     self.drop_el(base, at, why)?;
                     return Ok(());
                 }
+                IntProp::Unavailable(id) => {
+                    let why = NoteKind::Unavailable {
+                        kind: PropertyKind::Integer,
+                        id,
+                    };
+                    self.drop_el(base, at, why)?;
+                    return Ok(());
+                }
                 IntProp::Shown(v) => NumberValue::of(v),
             }
         };
         let role = shown.role.or_failure(dst.failure);
+        let Some(DigitsStyle {
+            mut c,
+            digits,
+            track: t,
+            native,
+            program,
+        }) = self.digits_style(role, &dst, rec, Some(&shown))?
+        else {
+            return Ok(());
+        };
+        // One D4 note for the value and the conditions.
+        c.display_deviation |= shown.deviates;
+        let index = u32::try_from(self.widgets.numbers.len()).unwrap_or(u32::MAX);
+        self.widgets.numbers.push(NumberDef {
+            digits,
+            value: program.ok_or_else(|| self.range(at, "value"))?,
+        });
+        self.push_native(c, Source::Number(index), t, native)?;
+        Ok(())
+    }
+
+    /// Number record `rec`'s glyph strip for destination `dst` of `role`:
+    /// its glyph set, padding, cells, layout and track, its digit offsets
+    /// charged and kept, and with `value` its value compiled and its cells
+    /// charged as widget quads; `None` when the element was dropped or is
+    /// never drawn. A song list's level style shows the row's level, so it
+    /// compiles no value and its quads are charged with its song list.
+    pub(in super::super) fn digits_style(
+        &mut self,
+        role: Role,
+        dst: &Dst,
+        rec: u32,
+        value: Option<&NumberValue>,
+    ) -> Result<Option<DigitsStyle>, ImportError> {
+        let at = dst.span;
+        let [digit, padding, zeropadding, space, align] = self
+            .def
+            .fields(rec, ["digit", "padding", "zeropadding", "space", "align"]);
         let digit = self.int_or(digit, "digit", 0)?;
         let padding = self.int_or(padding, "padding", 0)?;
         let zeropadding = self.int_or(zeropadding, "zeropadding", 0)?;
@@ -130,15 +167,26 @@ impl Cx<'_> {
         };
         if digit < 0 {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "digit" })?;
-            return Ok(());
+            return Ok(None);
         }
         if digit == 0 {
             self.ignored(at, NoteKind::Ignored { field: "digit" });
-            return Ok(());
+            return Ok(None);
         }
         let s = self.src_image(rec)?;
         let frames = self.grid_frames(at, s.div)?;
-        let (set, pad, d) = if frames.is_multiple_of(24) {
+        // A song list's level (no value given) takes the selection loader's
+        // strip: ten glyphs blank-padded when the frames are a multiple of
+        // ten, else eleven padded with the eleventh, its `padding` and
+        // `zeropadding` unread and no digit offsets
+        // (`JsonSelectSkinObjectLoader.java:181-196`).
+        let (set, pad, d) = if value.is_none() {
+            if frames.is_multiple_of(10) {
+                (GlyphSet::Ten, Pad::Blank, 10)
+            } else {
+                (GlyphSet::Eleven, Pad::Glyph, 11)
+            }
+        } else if frames.is_multiple_of(24) {
             let pad = match zeropadding {
                 ..=0 => Pad::Blank,
                 2 => Pad::Glyph,
@@ -151,7 +199,7 @@ impl Cx<'_> {
                 // The padding glyph of a ten-glyph set is out of range.
                 2 => {
                     self.drop_el(role, at, NoteKind::UnsupportedField { field: "padding" })?;
-                    return Ok(());
+                    return Ok(None);
                 }
                 _ => Pad::Blank,
             };
@@ -162,36 +210,39 @@ impl Cx<'_> {
         let sets = frames / d;
         if sets == 0 {
             self.ignored(at, NoteKind::Ignored { field: "src" });
-            return Ok(());
+            return Ok(None);
         }
         let Some(grid) = glyphs(sets * d, frames, s.div) else {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "divx" })?;
-            return Ok(());
+            return Ok(None);
         };
         let Some((cells, extra)) = cells(digit, pad) else {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "digit" })?;
-            return Ok(());
+            return Ok(None);
         };
         if set == GlyphSet::TwentyFour && pad != Pad::Blank && cells < 2 {
             self.drop_el(role, at, NoteKind::UnsupportedField { field: "digit" })?;
-            return Ok(());
+            return Ok(None);
         }
         let stretch = Stretch::of(dst.stretch);
         if stretch == Stretch::Trimmed {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
-            return Ok(());
+            return Ok(None);
         }
         let o = Opts {
             follow: true,
-            guard: shown.guard.as_deref(),
+            guard: value.and_then(|v| v.guard.as_deref()),
             ..Opts::default()
         };
-        let Some(mut c) = self.common_with(role, &dst, o)? else {
-            return Ok(());
+        let Some(c) = self.common_with(role, dst, o)? else {
+            return Ok(None);
         };
-        let program = self.compile(&shown.expr, Ty::Int, at)?;
+        let program = match value {
+            Some(v) => Some(self.compile(&v.expr, Ty::Int, at)?),
+            None => None,
+        };
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, grid)? else {
-            return Ok(());
+            return Ok(None);
         };
 
         // Layout, from each key's offset geometry.
@@ -203,8 +254,10 @@ impl Cx<'_> {
         // offset (`skin/SkinNumber.java:191-205`); any other mode must
         // leave each key's cell, moved by each row, as it is.
         let native = c.stretch.native(cell);
-        let rows_kept =
-            c.stretch == Stretch::Identity || self.digit_rows_keep_aspect(rec, extra, cells, cell);
+        // A level reads no digit offsets, so it has no rows to keep.
+        let rows_kept = c.stretch == Stretch::Identity
+            || value.is_none()
+            || self.digit_rows_keep_aspect(rec, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = self.key_rect(&c, k)?;
@@ -212,7 +265,7 @@ impl Cx<'_> {
                 track::stretch(c.stretch, rect, cell).ok_or_else(|| range(self))?;
             if native.is_none() && (stretched != rect || !rows_kept) {
                 self.drop_el(role, at, NoteKind::Stretch(c.stretch_mode))?;
-                return Ok(());
+                return Ok(None);
             }
             let p = rect.w.add(sr).ok_or_else(|| range(self))?;
             let shift = match align {
@@ -228,7 +281,7 @@ impl Cx<'_> {
         let mut rects = Vec::with_capacity(keys.len());
         for (x, rect, p) in &keys {
             let w = rect.w.round().ok_or_else(|| range(self))?;
-            let h = Q::int(HEIGHT);
+            let h = self.flip;
             let top = h
                 .sub(rect.y.add(rect.h).ok_or_else(|| range(self))?)
                 .and_then(Q::round)
@@ -256,28 +309,43 @@ impl Cx<'_> {
                 .ok_or_else(|| range(self))?;
             rects.push(v);
         }
-        let t = self.model_track(&c, &rects)?;
-        let quads = u32::try_from(cells).unwrap_or(u32::MAX);
-        self.budget
-            .widget_quads(quads)
-            .map_err(|l| self.limit(at, l))?;
-        let offsets = self.digit_offsets(at, rec, extra, cells)?;
-        // One D4 note for the value and the conditions.
-        c.display_deviation |= shown.deviates;
-        let index = u32::try_from(self.widgets.numbers.len()).unwrap_or(u32::MAX);
-        self.widgets.numbers.push(NumberDef {
-            digits: DigitsDef {
-                image,
-                set,
-                cells: u8::try_from(cells).unwrap_or(u8::MAX),
-                align,
-                pad,
-                space: i32::try_from(space).map_err(|_| range(self))?,
-                offsets,
-            },
-            value: program,
-        });
-        self.push_native(c, Source::Number(index), t, native)?;
-        Ok(())
+        let track = self.model_track(&c, &rects)?;
+        if value.is_some() {
+            let quads = u32::try_from(cells).unwrap_or(u32::MAX);
+            self.budget
+                .widget_quads(quads)
+                .map_err(|l| self.limit(at, l))?;
+        }
+        let offsets = if value.is_some() {
+            self.digit_offsets(at, rec, extra, cells)?
+        } else {
+            Default::default()
+        };
+        let digits = DigitsDef {
+            image,
+            set,
+            cells: u8::try_from(cells).unwrap_or(u8::MAX),
+            align,
+            pad,
+            space: i32::try_from(space).map_err(|_| range(self))?,
+            offsets,
+        };
+        Ok(Some(DigitsStyle {
+            c,
+            digits,
+            track,
+            native,
+            program,
+        }))
     }
+}
+
+/// A number record's glyph strip ([`Cx::digits_style`]).
+pub(in super::super) struct DigitsStyle {
+    pub(in super::super) c: Common,
+    pub(in super::super) digits: DigitsDef,
+    pub(in super::super) track: Track,
+    pub(in super::super) native: Option<Native>,
+    /// The value, compiled when one was given.
+    pub(in super::super) program: Option<Program>,
 }

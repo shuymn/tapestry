@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use skin_model::{MAX_SOURCE_BYTES, PLAY, Scope, Ty};
+use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, Ty};
 
 use super::ops::{self, Cond};
 use super::policy::{CriticalPart, Role};
@@ -112,6 +112,10 @@ pub(crate) struct Lowered {
     /// condition is [`Cond::Expr`]'s `unreproduced`): why such an element
     /// refuses it.
     pub(crate) unreproduced: Option<Unsupported>,
+    /// The value its expression folds to when it compiles to a constant,
+    /// its guards aside: a visibility known false folds as a JSON
+    /// condition does.
+    pub(crate) known: Option<i32>,
     /// Whether its residual folded to a known value, for the conversion
     /// report.
     #[cfg(feature = "dev-tools")]
@@ -123,7 +127,8 @@ pub(crate) struct Lowered {
 pub(crate) enum TextFold {
     /// A string.
     Literal(String),
-    /// Chart field `id`, 10 to 16.
+    /// Chart field `id`, 10 to 16, or on a selection skin a screen's own
+    /// string (30, 1000).
     Field(i32),
     /// Chart field `id`, or the string where it is empty.
     FieldOr(i32, String),
@@ -206,9 +211,17 @@ impl V {
     }
 }
 
-/// The JSON mapping's timer name of model slot `slot`.
-fn timer_name(slot: u16) -> Option<&'static str> {
-    PLAY.timers.get(usize::from(slot)).map(|t| t.name)
+/// The schema a `kind` screen's expressions read.
+fn schema(kind: ScreenKind) -> &'static skin_model::Schema {
+    match kind {
+        ScreenKind::Selection => &SELECTION,
+        ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => &PLAY,
+    }
+}
+
+/// The JSON mapping's timer name of model slot `slot` on a `kind` screen.
+fn timer_name(kind: ScreenKind, slot: u16) -> Option<&'static str> {
+    schema(kind).timers.get(usize::from(slot)).map(|t| t.name)
 }
 
 /// The R4 symbol of comparison or arithmetic operator `op`.
@@ -231,6 +244,9 @@ fn symbol(op: Bin) -> &'static str {
 struct Lower<'a> {
     an: &'a Analysis,
     custom: &'a Custom,
+    /// The screen whose profile maps every host read: a Lua read and a
+    /// JSON field of the same id go through the same function.
+    kind: ScreenKind,
     out: Lowered,
     /// Each read's mapping, by its node.
     mapped: HashMap<u32, Mapped>,
@@ -239,17 +255,20 @@ struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
-    /// A lowering of `an`'s callbacks with `custom`'s timers.
-    fn new(an: &'a Analysis, custom: &'a Custom) -> Self {
+    /// A lowering of `an`'s callbacks with `custom`'s timers on a `kind`
+    /// screen.
+    fn new(an: &'a Analysis, custom: &'a Custom, kind: ScreenKind) -> Self {
         Self {
             an,
             custom,
+            kind,
             out: Lowered {
                 src: String::new(),
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
                 unreproduced: None,
+                known: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
             },
@@ -353,13 +372,14 @@ impl Lower<'_> {
         };
         charge(self.an, "compile", units(src.len()))?;
         did("compile");
-        let tried = skin_model::compile(&src, &Scope::new(&PLAY), ty);
+        let tried = skin_model::compile(&src, &Scope::new(schema(self.kind)), ty);
         #[cfg(test)]
         TRIED.with(|t| {
             *t.borrow_mut() = Some((src.clone(), tried.as_ref().err().map(|e| e.kind.clone())));
         });
-        if tried.is_err() {
-            return Err(Stop::Unsupported(LIMITS));
+        match tried {
+            Ok(p) => self.out.known = p.constant(),
+            Err(_) => return Err(Stop::Unsupported(LIMITS)),
         }
         Ok(src)
     }
@@ -376,14 +396,29 @@ impl Lower<'_> {
             })
         };
         let id = arg.and_then(|a| i32::try_from(a).ok());
+        let play = self.kind == ScreenKind::Play;
         match name {
+            // The gauge and the judgments are play's alone.
+            "gauge_type" | "judge" if !play => Err(unmapped()),
+            // An image index the selection profile bridges, as an image's
+            // or an image set's `ref` reads it: -1 (nothing) to 10.
+            "event_index" if !play => match property::index_in(self.kind, id.ok_or_else(unmapped)?)
+            {
+                IndexProp::Selection(src) => Ok(Mapped::Int {
+                    src: Self::text(self.an, &["(", src, ")"])?,
+                    lo: -1,
+                    hi: 10,
+                }),
+                _ => Err(unmapped()),
+            },
             "gauge_type" => {
                 self.guard("gauge.valid");
                 self.out.deviates = true;
                 Ok(Mapped::Gauge)
             }
             "number" => {
-                let IntProp::Shown(v) = property::int_by_id(id.ok_or_else(unmapped)?) else {
+                let IntProp::Shown(v) = property::int_in(self.kind, id.ok_or_else(unmapped)?)
+                else {
                     return Err(unmapped());
                 };
                 if let Some(g) = v.availability() {
@@ -418,14 +453,14 @@ impl Lower<'_> {
                     api,
                     id: i64::from(id),
                 };
-                self.option(ops::numeric(id, &BTreeMap::new()), why)
+                self.option(ops::numeric_in(self.kind, id, &BTreeMap::new()), why)
             }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
-                match self.custom.resolve(id) {
-                    Timer::Builtin(slot) => {
-                        Ok(Mapped::Timer(Some(timer_name(slot).ok_or_else(unmapped)?)))
-                    }
+                match self.custom.resolve_in(self.kind, id) {
+                    Timer::Builtin(slot) => Ok(Mapped::Timer(Some(
+                        timer_name(self.kind, slot).ok_or_else(unmapped)?,
+                    ))),
                     Timer::Unset => Ok(Mapped::Timer(None)),
                     Timer::Rank(_) | Timer::Unsupported => Err(unmapped()),
                 }
@@ -664,6 +699,11 @@ impl Lower<'_> {
     /// helper is scanned again only when a parameter's join grows, which
     /// it does at most twice a parameter.
     fn scan(&self, i: u32) -> R<Scan> {
+        // Only play has critical parts: elsewhere every read is decorative,
+        // so nothing is scanned.
+        if self.kind != ScreenKind::Play {
+            return Ok(Scan::default());
+        }
         let open = self.an.open.get().is_some();
         let mut out = Scan::default();
         // Each scanned instance's parameters' joins: one hash a check.
@@ -1062,13 +1102,30 @@ fn known_string(an: &Analysis, v: Val) -> R<Option<String>> {
 /// known string, a read of a chart field, or a select on that read against
 /// `""` with the read and a known string as its arms. Every read must be
 /// of a chart field, as a text has nowhere to put a guard; `None` otherwise.
-fn text_fold(an: &Analysis, res: &Residual) -> R<Option<TextFold>> {
+/// On a selection skin the root may also be a whole read of a screen's
+/// own string (30, the query; 1000, the place), as its JSON `ref` is.
+fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFold>> {
     let field = |r: u32| match res.node(r) {
         Node::Read { api, arg: Some(n) } if residual::is_text(api) && (10..=16).contains(&n) => {
             i32::try_from(n).ok()
         }
         _ => None,
     };
+    let screen = |r: u32| match res.node(r) {
+        Node::Read { api, arg: Some(n) }
+            if kind == ScreenKind::Selection && residual::is_text(api) =>
+        {
+            i32::try_from(n)
+                .ok()
+                .filter(|&n| matches!(property::str_in(kind, n), property::StrProp::Screen(_)))
+        }
+        _ => None,
+    };
+    if let Some(id) = screen(res.root)
+        && res.reads.iter().all(|&r| r == res.root)
+    {
+        return Ok(Some(TextFold::Field(id)));
+    }
     if res.reads.iter().any(|&r| field(r).is_none()) {
         return Ok(None);
     }
@@ -1168,7 +1225,7 @@ impl Cx<'_> {
                 field,
                 part: match role {
                     Role::Critical(p) => Some(p),
-                    Role::Decorative => None,
+                    Role::Essential(_) | Role::Decorative => None,
                 },
                 disposition: d,
                 why,
@@ -1262,7 +1319,7 @@ impl Cx<'_> {
         };
         let an = adm.analysis();
         let cancelled = || def.cancelled(|| None).is_err();
-        let mut l = Lower::new(an, &self.custom);
+        let mut l = Lower::new(an, &self.custom, self.kind);
         let scan = |l: &Lower<'_>| match l.scan(inst) {
             Ok(s) => Ok(s),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
@@ -1364,7 +1421,7 @@ impl Cx<'_> {
             role,
             (Disposition::Replaced(why), Some(why)),
         );
-        Ok(NoteKind::Callback { field, why })
+        Ok(self.callback_note(field, why))
     }
 
     /// A text's `value` callback at node `id`, for an element of `role`:
@@ -1392,6 +1449,7 @@ impl Cx<'_> {
                         part: None,
                         deviates: false,
                         unreproduced: None,
+                        known: None,
                         #[cfg(feature = "dev-tools")]
                         constant: matches!(fold, TextFold::Literal(_)),
                     }),
@@ -1423,7 +1481,7 @@ impl Cx<'_> {
         }
         let cancelled = || def.cancelled(|| None).is_err();
         match residual::evaluate(adm, inst, Conv::Text, &cancelled)
-            .and_then(|res: Residual| text_fold(an, &res))
+            .and_then(|res: Residual| text_fold(an, &res, self.kind))
         {
             Ok(fold) => Ok(Ok(fold)),
             Err(Stop::Unsupported(why)) => Ok(Err(why)),
@@ -1460,7 +1518,7 @@ impl Cx<'_> {
         an.clock
             .enter(crate::lua::callback::Phase::Scan, Some(id))
             .map_err(time)?;
-        let r = Lower::new(an, &self.custom).scan(inst);
+        let r = Lower::new(an, &self.custom, self.kind).scan(inst);
         let left = an.clock.leave().map_err(time);
         let scan = match r {
             Ok(s) => s,
@@ -1515,6 +1573,13 @@ impl Cx<'_> {
                     }
                 }
                 *deviates |= l.deviates;
+                // On a selection skin a visibility known to be false folds
+                // as a JSON condition of the same id does: never drawn, so
+                // an essential part is missing rather than kept invisible.
+                if self.kind == ScreenKind::Selection && l.known == Some(0) {
+                    self.ignored(at, NoteKind::Ignored { field: "op" });
+                    return Ok(false);
+                }
                 if !conds.contains(&l.src) {
                     conds.push(l.src);
                 }
@@ -1536,7 +1601,8 @@ impl Cx<'_> {
             role,
             (Disposition::Replaced(why), Some(why)),
         );
-        self.drop_el(Role::Decorative, at, NoteKind::Callback { field, why })?;
+        let note = self.callback_note(field, why);
+        self.drop_el(Role::Decorative, at, note)?;
         Ok(false)
     }
 
@@ -1601,14 +1667,43 @@ impl Cx<'_> {
             Role::Decorative,
             (Disposition::Replaced(why), Some(why)),
         );
-        self.drop_el(
-            Role::Decorative,
-            at,
-            NoteKind::Callback {
-                field: "value",
-                why,
-            },
-        )?;
+        let note = self.callback_note("value", why);
+        self.drop_el(Role::Decorative, at, note)?;
         Ok(None)
+    }
+
+    /// The note of a decorative callback in `field` replaced for `why`.
+    /// On a selection skin a read the profile does not bridge is noted as
+    /// the JSON field of the same id is: the profile's own treatment, so
+    /// the two paths cannot differ (docs/stage3.md §3, Selection).
+    fn callback_note(&self, field: &'static str, why: Unsupported) -> NoteKind {
+        if self.kind == ScreenKind::Selection
+            && let Unsupported::Unmapped { api, id } = why
+            && let Ok(id) = i32::try_from(id)
+        {
+            let name = HOST_APIS.get(usize::from(api)).map_or("", |&(_, n)| n);
+            match name {
+                "number" => {
+                    return match property::int_in(self.kind, id) {
+                        IntProp::Unavailable(id) => NoteKind::Unavailable {
+                            kind: super::PropertyKind::Integer,
+                            id,
+                        },
+                        _ => NoteKind::UnsupportedProperty {
+                            kind: super::PropertyKind::Integer,
+                            id: Some(id),
+                        },
+                    };
+                }
+                "option" => {
+                    return NoteKind::UnsupportedProperty {
+                        kind: super::PropertyKind::Boolean,
+                        id: Some(id),
+                    };
+                }
+                _ => {}
+            }
+        }
+        NoteKind::Callback { field, why }
     }
 }

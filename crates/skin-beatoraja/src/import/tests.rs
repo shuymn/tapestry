@@ -594,11 +594,7 @@ fn a_skin_in_another_slot_refuses_before_anything_is_read() {
 
 #[test]
 fn a_kind_with_no_importer_refuses_before_anything_is_read() {
-    for (ty, kind) in [
-        (5, ScreenKind::Selection),
-        (6, ScreenKind::Decision),
-        (7, ScreenKind::Result),
-    ] {
+    for (ty, kind) in [(6, ScreenKind::Decision), (7, ScreenKind::Result)] {
         let (r, admits) = into_slot(ty, kind, false);
         match r {
             Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
@@ -606,4 +602,83 @@ fn a_kind_with_no_importer_refuses_before_anything_is_read() {
         }
         assert_eq!(admits, 0, "{ty}");
     }
+}
+
+/// Imports selection skin `body` (beside a 64×64 `a.png` and a font
+/// `f.ttf`) into the selection slot, with this thread's witnesses reset.
+fn run_selection(body: &str) -> (Result<Imported, ImportError>, Vec<Event>, u32) {
+    let d = tempfile::tempdir().unwrap();
+    let json = format!(
+        r#"{{"type": 5, "w": 1920, "h": 1080,
+            "source": [{{"id": "a", "path": "a.png"}}],
+            "font": [{{"id": "f", "path": "f.ttf"}}],
+            "image": [{{"id": "b", "src": "a", "w": 8, "h": 8}}],
+            "text": [{{"id": "t", "font": "f", "ref": 10}}], {body}}}"#
+    );
+    std::fs::write(d.path().join("s.json"), json).unwrap();
+    std::fs::write(d.path().join("f.ttf"), [0, 1, 0, 0, 0]).unwrap();
+    png(d.path(), "a.png", 64, 64);
+    TRACE.with(|t| t.borrow_mut().clear());
+    ADMITS.with(|n| n.set(0));
+    let (mut def, h) = crate::read_header(d.path(), "s.json").unwrap();
+    let r = import(&mut def, &h, &Config::defaults(&h), ScreenKind::Selection);
+    (
+        r,
+        TRACE.with(|t| t.take()),
+        ADMITS.with(std::cell::Cell::get),
+    )
+}
+
+/// A song list of one placement drawing image set `set` (whose `images`
+/// are `images`), titled by `t`, drawn `lists` times.
+fn listed(images: &str, lists: usize) -> String {
+    let dsts = vec![r#"{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#; lists];
+    format!(
+        r#""imageset": [{{"id": "set", "images": [{images}]}}],
+           "songlist": {{"id": "list", "center": 0,
+               "liston": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
+               "listoff": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
+               "text": [{{"id": "t", "dst": [{{"x": 0, "y": 0, "w": 100, "h": 10}}]}}]}},
+           "destination": [{}]"#,
+        dsts.join(",")
+    )
+}
+
+/// Each song list charge comes before the work it bounds: the placements
+/// before any arm is read, an arm's image set entries before any is read
+/// or admitted, and each element's quads and visibilities before it is
+/// kept. A failing charge leaves its work undone.
+#[test]
+fn song_list_charges_come_before_their_work() {
+    use Event::{Admit, Charge};
+    let (r, trace, admits) = run_selection(&listed(r#""b""#, 1));
+    r.unwrap();
+    // The destination, the placements, the selected arm's set, its image
+    // before its file, the unselected arm's set (its image shared), the
+    // title's keys again for the folder and "all charts" rows that share
+    // it, then the element.
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|e| matches!(e, Charge | Admit))
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            Charge, Charge, Charge, Charge, Admit, Charge, Charge, Charge, Charge
+        ]
+    );
+    assert_eq!(admits, 1);
+    // An image set past the entry cap: refused at its charge, nothing of
+    // it read or admitted, no text compiled.
+    let names = vec![r#""b""#; skin_model::MAX_IMAGE_CHOICE_REFS + 1].join(",");
+    let (r, trace, admits) = run_selection(&listed(&names, 1));
+    assert!(matches!(
+        r,
+        Err(ImportError::Limit {
+            limit: super::ImportLimit::ChoiceRefs,
+            ..
+        })
+    ));
+    assert_eq!(admits, 0);
+    assert!(!trace.contains(&Admit));
 }

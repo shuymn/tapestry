@@ -261,7 +261,7 @@ impl Cx<'_> {
         let t = self.model_track(&c, &rects)?;
         let part = match role {
             Role::Critical(part) => part,
-            Role::Decorative => CriticalPart::Cover,
+            Role::Decorative | Role::Essential(_) => CriticalPart::Cover,
         };
         if motion == CoverMotion::Hidden && !c.track.fixed_color() {
             self.lane_approx(at, part, LaneApprox::HiddenDisable)?;

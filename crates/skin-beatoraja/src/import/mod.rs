@@ -22,6 +22,7 @@ pub(crate) mod ops;
 mod policy;
 mod property;
 mod report;
+mod selection;
 mod timer;
 mod track;
 mod widget;
@@ -31,12 +32,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
-    LanesError, LoadError, MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef, Scope,
-    ScreenKind, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
+    LanesError, LoadError, MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef,
+    SELECTION, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty,
+    WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
-pub use policy::CriticalPart;
+pub use policy::{CriticalPart, EssentialPart};
 pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
     DeviationId, FileChoice, LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, PartWhy,
@@ -200,7 +202,8 @@ const OFFSET_MAX: i32 = 199;
 /// Imports `def`, whose header `header` was read from it, with `config`
 /// into the `slot` kind's slot. A header of another kind than `slot`, or
 /// a slot no importer maps yet, refuses before anything is resolved or
-/// read; the play kind is mapped.
+/// read; the play and selection kinds are mapped, selection through its
+/// profile ([`selection`]).
 ///
 /// # Errors
 ///
@@ -210,7 +213,8 @@ const OFFSET_MAX: i32 = 199;
 /// budget or aggregate asset limit ([`ImportError::Limit`]); geometry
 /// outside the model ([`ImportError::Range`]); a play-critical element
 /// the importer cannot reproduce ([`ImportError::Critical`],
-/// [`ImportError::Asset`]); a skin the model refuses
+/// [`ImportError::Asset`]); a selection skin's essential part missing or
+/// not reproduced ([`ImportError::Essential`]); a skin the model refuses
 /// ([`ImportError::Model`]).
 pub fn import(
     def: &mut Definition,
@@ -225,7 +229,7 @@ pub fn import(
             found: header.kind,
         });
     }
-    if slot != ScreenKind::Play {
+    if !matches!(slot, ScreenKind::Play | ScreenKind::Selection) {
         return Err(ImportError::NoImporter { kind: slot });
     }
     let enabled = config.enabled();
@@ -248,9 +252,13 @@ pub fn import(
         w: i32::try_from(size[0]).unwrap_or(i32::MAX),
         h: i32::try_from(size[1]).unwrap_or(i32::MAX),
     })?;
-    let mut cx = Cx::new(def, header, config, tables, choices, r, size[1])?;
+    let mut cx = Cx::new(def, header, config, tables, choices, (r, size[1]), slot)?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
-    cx.span_hint = cx.lane_span_hint(&destinations);
+    if slot == ScreenKind::Play {
+        cx.span_hint = cx.lane_span_hint(&destinations);
+    } else {
+        cx.selection_tables()?;
+    }
     for (index, rec) in destinations.into_iter().enumerate() {
         #[cfg(feature = "dev-tools")]
         ledger.begin(&mut cx);
@@ -386,6 +394,14 @@ pub(crate) struct Cx<'d> {
     def: &'d mut Definition,
     header: &'d Header,
     config: &'d Config,
+    /// The screen the skin is imported for: its profile reads every id.
+    kind: ScreenKind,
+    /// The y the source's y-up rects are reflected about: the reference
+    /// height for an element, 0 for a song list part, whose keys are
+    /// offsets from its placement's bottom-left corner.
+    flip: Q,
+    /// The selection widgets, on a selection skin.
+    sel: selection::State,
     tables: Tables,
     /// The scale from the skin's pixels to reference pixels.
     r: Q,
@@ -424,6 +440,12 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
+    /// The cached images, by key, whose cut runs past its file's edge
+    /// (D22); whether the cut placed last did; and the destinations noted
+    /// for one.
+    overruns: BTreeSet<self::asset::ImageKey>,
+    cut_overran: bool,
+    overrun_at: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -469,8 +491,8 @@ impl<'d> Cx<'d> {
         config: &'d Config,
         tables: Tables,
         choices: Choices,
-        r: Q,
-        height: u32,
+        (r, height): (Q, u32),
+        kind: ScreenKind,
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
@@ -485,6 +507,9 @@ impl<'d> Cx<'d> {
             def,
             header,
             config,
+            kind,
+            flip: Q::int(geom::HEIGHT),
+            sel: selection::State::default(),
             tables,
             r,
             height,
@@ -510,6 +535,9 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
+            overruns: BTreeSet::new(),
+            cut_overran: false,
+            overrun_at: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]
@@ -859,7 +887,8 @@ impl<'d> Cx<'d> {
     /// timer whose numeric chain reaches it ([`Custom::fails`]). A null,
     /// negative or script timer does not.
     fn failure_timed(&self, timer: &Prop) -> bool {
-        matches!(*timer, Prop::Id(n) if n >= 0 && self.custom.fails(n))
+        self.kind == ScreenKind::Play
+            && matches!(*timer, Prop::Id(n) if n >= 0 && self.custom.fails(n))
     }
 
     /// Whether a destination of `ops` can still draw once the configured
@@ -880,7 +909,7 @@ impl<'d> Cx<'d> {
     /// Numeric op `n`'s condition: none for 0, else built-ins first, then
     /// the declared items folded ([`ops::numeric`]).
     fn op_cond(&self, n: i32) -> Option<Cond> {
-        (n != 0).then(|| ops::numeric(n, &self.items))
+        (n != 0).then(|| ops::numeric_in(self.kind, n, &self.items))
     }
 
     /// One destination, in source order.
@@ -915,10 +944,20 @@ impl<'d> Cx<'d> {
             return self.system(dst, n);
         }
         let role = Role::Decorative.or_failure(dst.failure);
-        let Some((object, orec)) = self.objects.lookup(self.def, &self.tables, &id)? else {
+        let Some((object, orec)) = self
+            .objects
+            .lookup(self.def, &self.tables, &id, self.kind)?
+        else {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
+        if self.kind == ScreenKind::Selection {
+            #[cfg(feature = "dev-tools")]
+            if let Some(e) = &mut self.element {
+                e.kind = Some(format!("{object:?}"));
+            }
+            return self.selection_destination(dst, object, orec);
+        }
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
@@ -1133,7 +1172,7 @@ impl<'d> Cx<'d> {
                     };
                     c
                 }
-                Op::Name(s) => match ops::named(s) {
+                Op::Name(s) => match ops::named_in(self.kind, s) {
                     Some(c) => c,
                     None => {
                         let why = NoteKind::UnsupportedProperty {
@@ -1176,7 +1215,7 @@ impl<'d> Cx<'d> {
         match &dst.draw {
             Prop::Null => {}
             Prop::Id(n) => {
-                if let Some(c) = draw_cond(*n) {
+                if let Some(c) = draw_cond(self.kind, *n) {
                     if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
@@ -1185,7 +1224,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Name(s) => {
-                let Some(c) = ops::named(s) else {
+                let Some(c) = ops::named_in(self.kind, s) else {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::Boolean,
                         id: None,
@@ -1206,8 +1245,8 @@ impl<'d> Cx<'d> {
 
         // Timer.
         let (timer, untimed) = match dst.timer {
-            Prop::Null => (TimerRef::Builtin(slot::SCREEN), true),
-            Prop::Id(n) if n < 0 => (TimerRef::Builtin(slot::SCREEN), true),
+            Prop::Null => (self.screen(), true),
+            Prop::Id(n) if n < 0 => (self.screen(), true),
             Prop::Name(_) => {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
@@ -1217,7 +1256,7 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, why)?;
                 return Ok(None);
             }
-            Prop::Id(n) => match self.custom.resolve(n) {
+            Prop::Id(n) => match self.custom.resolve_in(self.kind, n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));
                     return Ok(None);
@@ -1263,9 +1302,12 @@ impl<'d> Cx<'d> {
         // (`skin/SkinObject.java:404-428`), are not reproduced. That holds
         // for the ids a cover consumes, listed or added by the source, and
         // for 3 and 4 on a follower or a relative part.
+        // Only the play sets them: on another screen the run-time offsets
+        // are undefined, ignored with a note.
+        let play = self.kind == ScreenKind::Play;
         let reserved = |id: i32| {
-            o.allow.contains(&id)
-                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative))
+            play && (o.allow.contains(&id)
+                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative)))
         };
         let moved = o.allow.iter().chain(&ids).copied().find(|&id| {
             reserved(id)
@@ -1285,6 +1327,10 @@ impl<'d> Cx<'d> {
                     lift |= id == OFFSET_LIFT;
                     cover |= id == OFFSET_LANECOVER;
                 }
+                continue;
+            }
+            if RUNTIME_OFFSETS.contains(&id) && !play {
+                self.ignored(at, NoteKind::RuntimeOffset(id));
                 continue;
             }
             if RUNTIME_OFFSETS.contains(&id) {
@@ -1458,26 +1504,43 @@ impl<'d> Cx<'d> {
                 Ok(false)
             }
             Cond::Undefined(id) => {
-                match role {
-                    Role::Critical(_) => {
-                        self.drop_el(role, at, NoteKind::UndefinedOp(id))?;
-                    }
-                    Role::Decorative => self.ignored(at, NoteKind::UndefinedOp(id)),
+                if role.refuses() {
+                    self.drop_el(role, at, NoteKind::UndefinedOp(id))?;
+                } else {
+                    self.ignored(at, NoteKind::UndefinedOp(id));
                 }
                 Ok(false)
             }
         }
     }
 
-    /// Compiles `src` against the play schema and charges its operations
-    /// before it is kept.
+    /// The schema the skin's expressions read: its screen's.
+    fn schema(&self) -> &'static skin_model::Schema {
+        match self.kind {
+            ScreenKind::Selection => &SELECTION,
+            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => &PLAY,
+        }
+    }
+
+    /// The screen's own `screen` timer, which an element without a timer
+    /// runs on.
+    fn screen(&self) -> TimerRef {
+        TimerRef::Builtin(match self.kind {
+            ScreenKind::Selection => skin_model::selection_timer::SCREEN,
+            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => slot::SCREEN,
+        })
+    }
+
+    /// Compiles `src` against the screen's schema and charges its
+    /// operations before it is kept.
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
         trace(Event::Compile);
-        let p = compile(src, &Scope::new(&PLAY), want).map_err(|source| ImportError::Expr {
-            at: self.loc(at),
-            source,
-        })?;
+        let p =
+            compile(src, &Scope::new(self.schema()), want).map_err(|source| ImportError::Expr {
+                at: self.loc(at),
+                source,
+            })?;
         self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
         Ok(p)
     }
@@ -1523,11 +1586,11 @@ impl<'d> Cx<'d> {
             return Ok(Err(NoteKind::Timer(TimerWhy::Cycle)));
         }
         let timer = match *t {
-            Prop::Null => TimerRef::Builtin(slot::SCREEN),
-            Prop::Id(n) if n < 0 => TimerRef::Builtin(slot::SCREEN),
+            Prop::Null => self.screen(),
+            Prop::Id(n) if n < 0 => self.screen(),
             Prop::Name(_) => return Ok(Err(NoteKind::Timer(TimerWhy::Script))),
             Prop::Callable(id) => return Ok(Err(self.unconsumed(role, id, "timer", "timer")?)),
-            Prop::Id(n) => match self.custom.resolve(n) {
+            Prop::Id(n) => match self.custom.resolve_in(self.kind, n) {
                 Timer::Unset => {
                     self.ignored(at, NoteKind::Timer(TimerWhy::Unset(n)));
                     return Ok(Ok(None));
@@ -1667,7 +1730,7 @@ impl<'d> Cx<'d> {
         }
         let part = match c.role {
             Role::Critical(part) => part,
-            Role::Decorative => CriticalPart::Cover,
+            Role::Decorative | Role::Essential(_) => CriticalPart::Cover,
         };
         self.lane_approx(c.span, part, LaneApprox::CoverMotion)
     }
@@ -1717,8 +1780,15 @@ impl<'d> Cx<'d> {
     }
 
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
-        let bomb_up_to = self.bomb_up_to()?;
-        let close = self.close()?;
+        let selection = self.kind == ScreenKind::Selection;
+        if selection {
+            self.selection_essentials()?;
+        }
+        let (bomb_up_to, close) = if selection {
+            (None, None)
+        } else {
+            (self.bomb_up_to()?, self.close()?)
+        };
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
         // The lanes' groups move to the skin; the rest is copied.
@@ -1740,7 +1810,16 @@ impl<'d> Cx<'d> {
             bomb_up_to,
             close,
         };
-        let skin = Skin::new(def).map_err(|source| {
+        let loaded = if selection {
+            let widgets = SelectionDefs {
+                song_list: self.sel.list.take(),
+                ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
+            };
+            Skin::new_selection(def, widgets)
+        } else {
+            Skin::new(def)
+        };
+        let skin = loaded.map_err(|source| {
             let at = self.load_loc(&source);
             ImportError::Model { at, source }
         })?;
@@ -1783,7 +1862,10 @@ impl<'d> Cx<'d> {
             | LoadError::Number { element, .. }
             | LoadError::Gauge { element, .. }
             | LoadError::Judge { element, .. }
-            | LoadError::Text { element, .. } => Some(self.element_spans.get(element)?),
+            | LoadError::Text { element, .. }
+            | LoadError::SourceKind { element, .. } => Some(self.element_spans.get(element)?),
+            LoadError::SongList(_) => Some(self.sel.span.as_ref()?),
+            LoadError::RatioBar { bar, .. } => Some(self.sel.bar_spans.get(bar)?),
             LoadError::WhenNotBool { when } => Some(self.when_spans.get(when)?),
             LoadError::Lanes(LanesError::BarGroup { group, .. }) => {
                 Some(self.lanes.as_ref()?.bar_spans.get(group)?)
@@ -1809,9 +1891,9 @@ impl Common {
 /// (`JsonSkinObjectLoader.java:734-737`), so a built-in only; anything
 /// else, an option item among them, has no effect (`None`) and never
 /// folds.
-fn draw_cond(n: i32) -> Option<Cond> {
+fn draw_cond(kind: ScreenKind, n: i32) -> Option<Cond> {
     ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0))
-        .then(|| ops::numeric(n, &BTreeMap::new()))
+        .then(|| ops::numeric_in(kind, n, &BTreeMap::new()))
 }
 
 /// The pivot of `center` (`SkinObject.java:80-81, 228-233`): honoured
