@@ -225,7 +225,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 3\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 4\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -628,18 +628,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 4\nwhat_v4_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 5\nwhat_v5_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 4 is not supported; this build reads version 3"),
+        stderr.contains("version 5 is not supported; this build reads version 4"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v4_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v5_adds"), "{stderr}");
+    assert!(!fx.data().join("library.db").exists());
+    // The previous version too: its files are refused, never read.
+    let old = scenario(&["quit = {}"]).replacen("version = 4", "version = 3", 1);
+    let (out, _, stderr) = fx.run(&old);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("version 3 is not supported; this build reads version 4"),
+        "{stderr}"
+    );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 3"),
+        stderr.contains("no version; this build reads version 4"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1630,6 +1639,131 @@ fn restart_keeps_the_chosen_preset() {
         decoded.preset.sha256,
         replay::preset_hash(&rules::lr2_style())
     );
+}
+
+/// Input generated to press nothing, with the HAZARD gauge shown and a
+/// failure closing the play, played and saved as a log's play is: one
+/// keyboard, nothing held at the start, no press, its re-evaluation the
+/// live result. Its outcome is any the real clock permits (design.md "Play
+/// Lifecycle"): only POORs, as many as the notes missed by its end; the
+/// gauge's failure aborts it and enters Closing, or a late wake completes
+/// it first, all four notes missed and no Closing; or a pause before its
+/// transport commits lets that wake cancel it before playback, nothing
+/// recorded and no played record. The exact count and Closing are the unit
+/// test's on a virtual clock
+/// (`generated_no_press_input_misses_into_closing_on_the_play_path`); a
+/// frame of Closing is not asserted: none is guaranteed to be presented.
+#[test]
+fn a_generated_no_press_play_misses_into_closing() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        "displayed_gauge = 5\non_failure = \"close\"\n",
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let [play] = lines(&stdout, "play 1: ")[..] else {
+        panic!("{stdout}");
+    };
+    let (records, _) = fx.played_records();
+    let closing = lines(&stdout, "closing: ").len();
+    if play == "play 1: Completed; nothing recorded" {
+        // Its first scoring wake came before its transport committed, so
+        // the candidate was cancelled before playback.
+        assert_eq!(closing, 0, "{stdout}");
+        assert!(records.is_empty(), "{records:?}");
+        return;
+    }
+    // Only misses, and the re-evaluation agrees.
+    let poor: u32 = play
+        .split_once("; perfect 0 great 0 good 0 bad 0 poor ")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("{play}"));
+    assert!(play.contains("re-evaluation matches live: true"), "{play}");
+    if play.starts_with("play 1: Aborted(GaugeFailed);") {
+        // Every miss the wake that failed it finalized, then Closing.
+        assert!((1..=4).contains(&poor), "{play}");
+        assert_eq!(closing, 1, "{stdout}");
+    } else {
+        assert!(play.starts_with("play 1: Completed;"), "{play}");
+        assert_eq!(poor, 4, "{play}");
+        assert_eq!(closing, 0, "{stdout}");
+    }
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert!(
+        rec.events
+            .iter()
+            .all(|e| !matches!(e.kind, eval::InputKind::Control { value, .. } if value != 0)),
+        "{:?}",
+        rec.events.first()
+    );
+    assert_eq!(rec.devices.sources.len(), 1);
+    assert_eq!(rec.devices.sources[0].kind, replay::DeviceKind::Keyboard);
+    assert!(rec.start.held.is_empty(), "{:?}", rec.start);
+}
+
+/// A chart with no judgeable note is refused, generated input or not
+/// (design.md "The tapestry Preset", zero judgeable notes: nothing to
+/// play): the library never lists it, so its `play` never starts and
+/// nothing is saved.
+#[test]
+fn a_generated_no_press_play_of_a_chart_without_notes_is_refused() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let dir = fx.library().join("tail");
+    fs::write(
+        dir.join("tail.bms"),
+        "#PLAYER 1\n#TITLE none\n#BPM 120\n#WAV02 bgm.wav\n#00101:02\n",
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("tail.bms was not listed"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(fx.records().is_empty());
+}
+
+/// A generated input is no input file: an unknown word is refused by its
+/// line, and a `play` of it after one of autoplay needs the chart again.
+#[test]
+fn a_generated_input_is_checked() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, _, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = { miss = \"some\" }, until = \"end\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    // The `play` step's own line.
+    assert!(stderr.contains("line 8"), "{stderr}");
+    let (out, _, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = { at_ms = 1, command = \"retry\" } }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("input differs from step 2's"), "{stderr}");
 }
 
 /// A log that presses nothing, played with the HAZARD gauge shown: its
