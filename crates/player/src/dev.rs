@@ -567,9 +567,6 @@ pub struct Options {
     /// Keys held on a scripted play's keyboard while it loads, before its
     /// first opening (`--dev-loading`): each by scan code with its press and
     /// release times after loading starts, fed only to the adjustment tap.
-    /// The first release is fed only once an opening was deferred, so the
-    /// keys pressed before it defer the first opening however long the
-    /// load takes.
     pub loading_keys: Vec<(u32, TimeUs, TimeUs)>,
     /// How long after a cancelled READY's release a scripted play's rearm
     /// is answered at the earliest (`--dev-rearm-delay <ms>`): a game thread
@@ -1509,8 +1506,7 @@ pub fn loading_keys(list: &str) -> Result<Vec<(u32, TimeUs, TimeUs)>, String> {
 
 /// The keys held while a scripted play loads ([`loading_keys`]), as a
 /// script on the log's first keyboard, which it connects: its times are
-/// after loading starts; with the time of its first release. `None`
-/// without keys.
+/// after loading starts. `None` without keys.
 ///
 /// # Errors
 ///
@@ -1518,10 +1514,10 @@ pub fn loading_keys(list: &str) -> Result<Vec<(u32, TimeUs, TimeUs)>, String> {
 pub fn loading_script(
     log: &Path,
     keys: &[(u32, TimeUs, TimeUs)],
-) -> anyhow::Result<Option<(ScriptedInput, TimeUs)>> {
-    let Some(release) = keys.iter().map(|&(_, _, up)| up).min() else {
+) -> anyhow::Result<Option<ScriptedInput>> {
+    if keys.is_empty() {
         return Ok(None);
-    };
+    }
     let limits = DecodeLimits::default();
     let bytes = read_bounded(log, limits.max_compressed)?;
     let rec = replay::decode(&bytes, &limits).with_context(|| log.display().to_string())?;
@@ -1556,7 +1552,7 @@ pub fn loading_script(
             action: packet(code, 0),
         });
     }
-    Ok(Some((ScriptedInput::new(items), release)))
+    Ok(Some(ScriptedInput::new(items)))
 }
 
 /// The speed keys of `list`, comma-separated: `F1` and `F2`.
