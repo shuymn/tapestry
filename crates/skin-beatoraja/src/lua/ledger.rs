@@ -22,6 +22,16 @@ use super::limits::{
 use crate::error::{ImportError, Loc};
 use crate::lua::LuaLimit;
 
+/// The candidate's time cap: [`MAX_LUA_TIME`], or in a unit test the one
+/// the test set on its thread (`tests::TIME_LIMIT`).
+fn time_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(limit) = super::tests::TIME_LIMIT.with(Cell::get) {
+        return limit;
+    }
+    MAX_LUA_TIME
+}
+
 /// A cooperative cancellation request, shared with the thread that may
 /// cancel: the import checks it between instruction steps, at every host
 /// call, before and after each source read and compilation, and every
@@ -214,7 +224,7 @@ impl Ledger {
         if self.cancel.is_cancelled() {
             return Err(self.fail_lua(lua, LuaWhy::Cancelled));
         }
-        if self.spent() > MAX_LUA_TIME {
+        if self.spent() > time_limit() {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
         }
         Ok(())
