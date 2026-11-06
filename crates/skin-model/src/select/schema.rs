@@ -60,7 +60,7 @@ pub static SELECTION: Schema = Schema {
         flag("selected.max_ex_valid"),
         value("selected.max_ex"),
         flag("selected.rate_valid"),
-        int("selected.rate_percent", 0, 100),
+        value("selected.rate_percent"),
         int("selected.rate_hundredths", 0, 99),
         int("selected.rank", 0, 7),
         value("selected.next_rank"),

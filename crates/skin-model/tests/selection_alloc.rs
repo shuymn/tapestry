@@ -192,9 +192,16 @@ fn a_selection_build_allocates_nothing() {
             fx.timers.panels[0] = (ms > 1_000).then_some(TimeUs(1_000_000));
             total += counted(|| {
                 fx.frame(ms);
-                let _ = fx.skin.slider_at(&fx.sel, [910.0, 30.0], fx.target);
+                std::hint::black_box(fx.skin.slider_at(&fx.sel, [910.0, 30.0], fx.target));
             });
         }
     }
     assert_eq!(total, 0);
+    // The positive control: the counter sees an allocation on this thread
+    // (design.md "Scope of No Allocation").
+    assert!(
+        counted(|| {
+            std::hint::black_box(vec![0_u8; 1]);
+        }) > 0
+    );
 }

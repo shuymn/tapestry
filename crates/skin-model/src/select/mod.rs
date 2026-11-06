@@ -94,6 +94,8 @@ impl Strings {
 pub struct Selection {
     /// Whether a selection skin made it.
     pub(crate) live: bool,
+    /// The identity of the skin that made it.
+    pub(crate) skin: u64,
     fields: [i32; field::COUNT],
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
@@ -118,6 +120,7 @@ impl Selection {
     /// `rows` song list slots and `sliders` slider elements; `live` when a
     /// selection skin makes it.
     pub(crate) fn new(
+        skin: u64,
         live: bool,
         whens: usize,
         text_slots: usize,
@@ -127,6 +130,7 @@ impl Selection {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
             live,
+            skin,
             fields: [0; field::COUNT],
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
@@ -475,6 +479,19 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
 #[cfg(test)]
 mod tests {
     use super::{next_rank, rank};
+
+    /// Every rank threshold, at it and one point below it.
+    #[test]
+    fn every_rank_threshold_is_exact() {
+        // 27 notes at 2 a note: a 27th is 2 points.
+        for (k, low) in [6_u64, 9, 12, 15, 18, 21, 24].into_iter().enumerate() {
+            let k = i32::try_from(k).unwrap() + 1;
+            assert_eq!(rank(2 * low, 54), k, "at {low}/27");
+            assert_eq!(rank(2 * low - 1, 54), k - 1, "below {low}/27");
+        }
+        // Above the largest, as the source's rate is never clamped.
+        assert_eq!(rank(81, 54), 7);
+    }
 
     /// Ranks are exact over 27ths: each threshold at, just below and just
     /// above it.

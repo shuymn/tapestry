@@ -62,8 +62,19 @@ fn root() -> &'static Path {
                 panic!("{path:?}: {e}");
             }
         }
+        // A font file the sheet admits by its header alone.
+        std::fs::write(dir.join("o.ttf"), [0, 1, 0, 0]).unwrap();
         dir
     })
+}
+
+/// [`sheet`] with the outline font file `o.ttf` as font 0.
+pub fn sheet_with_font() -> Sheet {
+    sheet()
+        .with_fonts(vec![skin_model::FontDef {
+            path: "o.ttf".to_owned(),
+        }])
+        .unwrap()
 }
 
 /// The sheet: image `i` is file `i`, cut into its frames.
@@ -108,6 +119,11 @@ pub fn frame_of(uvs: &UvTable, q: &Quad) -> Option<(u32, u16)> {
 
 /// A track of `keys`, each `(ms, [x, y, w, h])`, linear, holding after.
 pub fn keys(keys: &[(i64, [i32; 4])]) -> Track {
+    keys_ending(keys, End::Hold)
+}
+
+/// A track of `keys` ending as `end`.
+pub fn keys_ending(keys: &[(i64, [i32; 4])], end: End) -> Track {
     let defs: Vec<KeyDef> = keys
         .iter()
         .map(|&(ms, [x, y, w, h])| {
@@ -119,7 +135,7 @@ pub fn keys(keys: &[(i64, [i32; 4])]) -> Track {
             }
         })
         .collect();
-    Track::new(&defs, Ease::Linear, End::Hold).unwrap()
+    Track::new(&defs, Ease::Linear, end).unwrap()
 }
 
 /// A still track over `r`.

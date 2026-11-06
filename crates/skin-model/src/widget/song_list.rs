@@ -375,62 +375,53 @@ pub(crate) struct ListDraw<'a> {
 }
 
 impl SongList {
-    /// The anchor of each slot that draws this frame: its placement's
-    /// sampled bottom-left corner, in reference pixels with y down.
-    fn anchors(&self, d: &ListDraw<'_>) -> [Option<[f32; 2]>; MAX_PLACEMENTS] {
+    /// Each slot's placement as this frame draws it, its brush and rect,
+    /// sampled once: its visibility runs once per slot, as
+    /// [`Skin::new_selection`](crate::Skin::new_selection) charges it. `None`
+    /// for a slot without a row or whose placement does not draw.
+    fn placed(&self, d: &ListDraw<'_>) -> [Option<(Brush, [f32; 4])>; MAX_PLACEMENTS] {
         let mut out = [None; MAX_PLACEMENTS];
-        for (i, (anchor, p)) in out.iter_mut().zip(self.placements.iter()).enumerate() {
-            let shown = d.rows.get(i).and_then(|r| r.style);
-            if shown.is_none() {
+        for (i, (placed, p)) in out.iter_mut().zip(self.placements.iter()).enumerate() {
+            if d.rows.get(i).and_then(|r| r.style).is_none() {
                 continue;
             }
             let [off, on] = p;
             let p = if i == self.center { on } else { off };
-            if let Some((_, s)) = sample(
-                d.starts,
-                d.now,
-                d.state,
-                p.slot,
-                p.visible.as_ref(),
-                &p.track,
-            ) {
-                let [x, y, _, h] = s.rect;
-                *anchor = Some([x, y + h]);
-            }
+            *placed = self.place(d, p, None);
         }
         out
     }
 
     /// Draws every slot's parts, pass by pass. Allocates nothing.
     pub(crate) fn draw(&self, d: &ListDraw<'_>, out: &mut QuadBatch) {
-        let anchors = self.anchors(d);
+        let placed = self.placed(d);
         let at = Frame {
             starts: d.starts,
             now: d.now,
             uvs: d.uvs,
         };
+        // A slot's anchor: its placement's bottom-left corner.
         let slots = || {
-            anchors
+            placed
                 .iter()
                 .zip(d.rows.iter())
                 .enumerate()
-                .filter_map(|(i, (a, r))| a.map(|a| (i, a, r)))
+                .filter_map(|(i, (p, r))| p.map(|(_, [x, y, _, h])| (i, [x, y + h], r)))
         };
         // The bars.
-        for (i, _, row) in slots() {
-            let Some(style) = row.style else { continue };
+        for (i, (p, row)) in placed.iter().zip(d.rows.iter()).enumerate() {
+            let (Some((brush, rect)), Some(style)) = (p, row.style) else {
+                continue;
+            };
             let Some([off, on]) = self.placements.get(i) else {
                 continue;
             };
             let p = if i == self.center { on } else { off };
-            let Some((brush, rect)) = self.place(d, p, None) else {
-                continue;
-            };
             let Some(image) = p.content.get(style.index()).copied().flatten() else {
                 continue;
             };
             if let Some(f) = image.frame(d.starts, d.now, d.uvs) {
-                brush.push(out, rect, f, image.filter);
+                brush.push(out, *rect, f, image.filter);
             }
         }
         // The row texts.

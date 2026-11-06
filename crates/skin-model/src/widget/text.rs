@@ -341,6 +341,9 @@ impl TextSlots {
 pub enum TextTableError {
     #[error("the table has {got} slots for {expected} text elements")]
     Len { expected: usize, got: usize },
+    /// The state is not one this skin made.
+    #[error("the state is not this skin's")]
+    Foreign,
 }
 
 /// Whether a literal is 1 to [`MAX_TEXT_BYTES`] bytes with no control

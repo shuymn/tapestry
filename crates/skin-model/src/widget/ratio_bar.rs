@@ -84,17 +84,22 @@ pub struct SliderCommand {
 /// The denominator of a slider command's value: a millionth of the travel.
 pub const SLIDER_STEPS: u64 = 1_000_000;
 
-/// `r` as a fraction in `[0, 1]`, divided once.
+/// `r` as a fraction, divided once and never clamped: the source's graph
+/// draws its rate as it is (`skin/SkinGraph.java:86-106`,
+/// `skin/property/FloatPropertyFactory.java:58-61`).
 #[expect(
     clippy::cast_precision_loss,
     reason = "a ratio's terms below 2^53 are exact; a fraction is the intent"
 )]
 pub(crate) fn fraction(r: Ratio) -> f32 {
     let f = r.numerator as f64 / r.denominator as f64;
-    f32_of(f.clamp(0.0, 1.0))
+    f32_of(f)
 }
 
-/// The rect and uv of a bar showing `f` of `[x, y, w, h]` with frame `uv`.
+/// The rect and uv of a bar showing `f` of `[x, y, w, h]` with frame `uv`:
+/// the rect as long as `f` makes it, past the box above 1, and the uv cut
+/// at the frame's edge, since the atlas holds nothing of the image past
+/// it.
 pub(crate) fn cut(
     vertical: bool,
     [x, y, w, h]: [f32; 4],
@@ -102,13 +107,14 @@ pub(crate) fn cut(
     f: f32,
 ) -> ([f32; 4], FrameUv) {
     let [u0, v0, u1, v1] = frame.uv;
+    let g = f.min(1.0);
     let (rect, uv) = if vertical {
         (
             [x, y + h * (1.0 - f), w, h * f],
-            [u0, v1 - (v1 - v0) * f, u1, v1],
+            [u0, v1 - (v1 - v0) * g, u1, v1],
         )
     } else {
-        ([x, y, w * f, h], [u0, v0, u0 + (u1 - u0) * f, v1])
+        ([x, y, w * f, h], [u0, v0, u0 + (u1 - u0) * g, v1])
     };
     (rect, FrameUv { uv, ..frame })
 }

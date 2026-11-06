@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, LANE_COUNT, TimeUs};
 use eval::{GaugeState, NoteFacts};
@@ -411,7 +412,13 @@ pub struct Skin {
     ratio_bars: Box<[RatioBar]>,
     /// The slider elements that take a press.
     sliders: usize,
+    /// This skin's identity, which a selection state it makes carries: a
+    /// clone keeps it, another load takes the next.
+    id: u64,
 }
+
+/// The next skin's identity.
+static NEXT_SKIN: AtomicU64 = AtomicU64::new(0);
 
 /// A table index from a definition's `u32`, past every table when it
 /// does not fit.
@@ -1314,7 +1321,6 @@ impl Skin {
     /// selection widgets `sel`.
     #[expect(clippy::too_many_lines, reason = "one ordered list of checks")]
     fn load(mut def: SkinDef, kind: ScreenKind, sel: SelectionDefs) -> Result<Self, LoadError> {
-        check_kind(&def, kind)?;
         let builtin = usize::from(match kind {
             ScreenKind::Selection => selection_timer::BUILTIN,
             ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => BUILTIN,
@@ -1325,6 +1331,15 @@ impl Skin {
         if elements.len() > MAX_ELEMENTS {
             return Err(LoadError::TooManyElements { n: elements.len() });
         }
+        if let Some(n) = sel
+            .song_list
+            .as_ref()
+            .map(|l| l.placements.len())
+            .filter(|&n| n > MAX_PLACEMENTS)
+        {
+            return Err(LoadError::SongList(SongListError::TooManyPlacements { n }));
+        }
+        check_kind(&def, kind)?;
         if whens.len() > MAX_WHEN_TIMERS {
             return Err(LoadError::TooManyWhenTimers { n: whens.len() });
         }
@@ -1815,6 +1830,7 @@ impl Skin {
             song_list,
             ratio_bars,
             sliders,
+            id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -1856,24 +1872,32 @@ impl Skin {
             .atlas_reserving(variant, limits, self.has_outline_text(), cancel)
     }
 
-    /// Whether some text element is rasterized: set in the default font or
-    /// a font file, not a bitmap font.
+    /// Whether some text element or song list row style is rasterized: set
+    /// in the default font or a font file, not a bitmap font.
     #[must_use]
     pub fn has_outline_text(&self) -> bool {
-        self.texts
-            .iter()
-            .any(|t| matches!(t.font, FontRef::Default | FontRef::File(_)))
+        self.text_fonts()
+            .any(|f| matches!(f, FontRef::Default | FontRef::File(_)))
     }
 
-    /// The font files the rasterized text elements are set in, each once,
+    /// The font of every text element and every song list row style.
+    fn text_fonts(&self) -> impl Iterator<Item = FontRef> + '_ {
+        self.texts.iter().map(|t| t.font).chain(
+            self.song_list
+                .iter()
+                .flat_map(|l| l.text.iter().flatten().map(|t| t.content.1)),
+        )
+    }
+
+    /// The font files the rasterized text elements and song list row
+    /// styles are set in, each once,
     /// in index order: the ones a [`FontReader`](crate::FontReader) reads
     /// for installation.
     #[must_use]
     pub fn outline_fonts(&self) -> Vec<u32> {
         let mut fonts: Vec<u32> = self
-            .texts
-            .iter()
-            .filter_map(|t| match t.font {
+            .text_fonts()
+            .filter_map(|f| match f {
                 FontRef::File(f) => Some(f),
                 FontRef::Default | FontRef::Bitmap(_) => None,
             })
@@ -2190,6 +2214,9 @@ impl Skin {
     /// timer off and every text slot empty until a build or an install.
     #[must_use]
     pub fn prepare_loading(&self, scratch: Side) -> Loading {
+        if self.kind != ScreenKind::Play {
+            return Loading::inert(scratch);
+        }
         Loading::new(self.whens.len(), self.text_slots(), scratch)
     }
 
@@ -2526,6 +2553,7 @@ impl Skin {
     pub fn prepare_selection(&self) -> Selection {
         let live = self.kind == ScreenKind::Selection;
         Selection::new(
+            self.id,
             live,
             self.whens.len(),
             self.text_slots(),
@@ -2538,6 +2566,7 @@ impl Skin {
     fn owns(&self, sel: &Selection) -> bool {
         self.kind == ScreenKind::Selection
             && sel.live
+            && sel.skin == self.id
             && sel.slots() == usize::from(selection_timer::BUILTIN) + self.whens.len()
             && sel.rows.len() == self.song_list_slots()
             && sel.hits.len() == self.sliders
@@ -2671,6 +2700,9 @@ impl Skin {
         texts: TextTable,
         rows: TextTable,
     ) -> Result<(), TextTableError> {
+        if !self.owns(sel) {
+            return Err(TextTableError::Foreign);
+        }
         for (expected, got) in [
             (self.text_slots(), texts.len()),
             (self.song_list_slots(), rows.len()),
@@ -2761,13 +2793,13 @@ impl Skin {
         if self.kind != ScreenKind::Selection {
             return Err(BuildError::Kind);
         }
+        if !self.owns(sel) {
+            return Ok(());
+        }
         for h in &sel.hits {
             h.set(None);
         }
-        if !self.owns(sel)
-            || uvs.sheet_id() != self.sheet_id
-            || uvs.frames().len() != self.frame_count
-        {
+        if uvs.sheet_id() != self.sheet_id || uvs.frames().len() != self.frame_count {
             return Ok(());
         }
         let canvas = self.canvas(frame.target);

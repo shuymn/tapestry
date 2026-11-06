@@ -124,6 +124,7 @@ fn parts_draw_pass_by_pass() {
     def.lamp = lamps([0, -10, 10, 10]);
     def.level = levels([0, -20, 10, 10], 1);
     def.label = labels([0, -30, 10, 10]);
+    def.text = [Some(row_text([0, -40, 10, 10])), None, None];
     let mut fx = list_skin(def);
     let mut a = chart("a");
     a.level_value = 3;
@@ -132,13 +133,251 @@ fn parts_draw_pass_by_pass() {
     b.level_value = 4;
     b.features = features(true, false);
     fx.view(&view(vec![a, b], Some(0)));
+    let texts = TextTable::new(vec![None; fx.skin.text_slots()]);
+    fx.skin
+        .attach_selection_text(&mut fx.sel, texts, TextTable::new(vec![line(); 2]))
+        .unwrap();
     fx.frame(0);
     let digits = selection_support::DIGITS;
+    // A text line is no sheet image: it shows as `TEXT`.
+    const TEXT: u32 = u32::MAX;
+    let order: Vec<u32> = fx
+        .drawn()
+        .into_iter()
+        .map(|(f, _)| f.map_or(TEXT, |(i, _)| i))
+        .collect();
     assert_eq!(
-        fx.images(),
-        [1, 0, 2, 2, digits, digits, 12, 10],
-        "bars, lamps, levels, then labels"
+        order,
+        [1, 0, TEXT, TEXT, 2, 2, digits, digits, 12, 10],
+        "bars, texts, lamps, levels, then labels"
     );
+}
+
+/// A rasterized line of one em.
+fn line() -> Option<TextImage> {
+    TextImage::new(
+        FrameUv {
+            uv: [0.0, 0.0, 0.5, 0.5],
+            layer: 0,
+        },
+        [0.0, 0.0, 1.0, 1.0],
+        1.0,
+    )
+}
+
+/// A slot whose placement's track has ended and hides draws nothing of its
+/// own.
+#[test]
+fn a_placement_past_its_hiding_end_draws_no_part() {
+    let mut def = list(2, 0);
+    def.lamp = lamps([0, -10, 10, 10]);
+    def.placements[1][0].part.track = selection_support::keys_ending(
+        &[(0, [10, 100, 200, 50]), (100, [10, 100, 200, 50])],
+        skin_model::End::Hide,
+    );
+    let mut fx = list_skin(def);
+    fx.view(&view(vec![chart("a"), chart("b")], Some(0)));
+    fx.frame(50);
+    assert_eq!(fx.images(), [1, 0, 2, 2]);
+    fx.frame(150);
+    assert_eq!(fx.images(), [1, 2]);
+}
+
+/// Placement visibilities on every slot and destination are charged once
+/// per arm, as each slot evaluates one placement once a frame; at the
+/// budget's edge the skin still loads and draws.
+#[test]
+fn placement_visibilities_are_charged_as_they_run() {
+    let mut def = list(60, 0);
+    let condition = (0..16)
+        .map(|_| "cursor.chart")
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let program = boolean(&condition);
+    let cost = program.op_count();
+    for p in &mut def.placements {
+        for arm in p.iter_mut() {
+            arm.part.visible = Some(program.clone());
+        }
+    }
+    let n = skin_model::MAX_SKIN_OPS / (120 * cost);
+    let skin = load(
+        (0..n).map(|_| list_element()).collect(),
+        WidgetDefs::default(),
+        SelectionDefs {
+            song_list: Some(def),
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(skin.ops().total(), n * 120 * cost);
+    let mut fx = Fx::new(skin);
+    fx.view(&three(0));
+    fx.frame(0);
+    assert_eq!(fx.images().len(), 3 * n);
+}
+
+/// Several song list elements draw the same rows from one row text table.
+#[test]
+fn song_list_elements_share_one_row_text_table() {
+    let mut def = list(2, 0);
+    def.text = [Some(row_text([0, -40, 10, 10])), None, None];
+    let mut fx = Fx::new(
+        load(
+            vec![list_element(), list_element()],
+            WidgetDefs::default(),
+            SelectionDefs {
+                song_list: Some(def),
+                ..SelectionDefs::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(fx.skin.song_list_slots(), 2);
+    fx.view(&view(vec![chart("a"), chart("b")], Some(0)));
+    let req = fx
+        .skin
+        .selection_text_requests(&fx.sel, fx.target, &fx.layout);
+    assert_eq!(req.rows.len(), 2);
+    let texts = TextTable::new(vec![None; fx.skin.text_slots()]);
+    fx.skin
+        .attach_selection_text(&mut fx.sel, texts, TextTable::new(vec![line(); 2]))
+        .unwrap();
+    fx.frame(0);
+    let lines = fx.drawn().into_iter().filter(|(f, _)| f.is_none()).count();
+    assert_eq!(lines, 4);
+}
+
+/// Row text in a bitmap font is laid out per row slot from its row's string
+/// and drawn glyph by glyph; each slot charges a field's glyphs to the
+/// quad budget.
+#[test]
+fn bitmap_row_text_lays_out_each_row() {
+    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([255; 4]))
+        .save_with_format(dir.path().join("0.png"), image::ImageFormat::Png)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("f.fnt"),
+        "info face=\"t\" size=10 padding=0,0,0,0\n\
+         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+         page id=0 file=\"f.png\"\n\
+         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
+         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
+    )
+    .unwrap();
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([255; 4]))
+        .save_with_format(dir.path().join("f.png"), image::ImageFormat::Png)
+        .unwrap();
+    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
+    let file = b
+        .admit_file(FileDef {
+            path: "0.png".into(),
+            hi: None,
+        })
+        .unwrap();
+    let image = b
+        .add_image(ImageDef {
+            file,
+            rect: None,
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        })
+        .unwrap();
+    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
+    b.add_bitmap_font(f, &[]).unwrap();
+    let mut def = list(3, 0);
+    for p in &mut def.placements {
+        for arm in p.iter_mut() {
+            arm.images = [Some(image); 3];
+        }
+    }
+    let mut style = row_text([0, -20, 100, 10]);
+    style.font = skin_model::FontRef::Bitmap(0);
+    def.text = [Some(style), None, None];
+    let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
+    sd.sheet = b.finish();
+    let skin = Skin::new_selection(
+        sd,
+        SelectionDefs {
+            song_list: Some(def),
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    // Per slot: the bar, a field's 256 glyphs, a lamp and the labels.
+    assert_eq!(skin.quad_capacity(), 3 * (2 + 256 + 3));
+    assert!(!skin.has_outline_text());
+    let mut fx = Fx::new(skin);
+    fx.view(&view(
+        vec![chart("A"), chart("AB"), folder("B", 1)],
+        Some(0),
+    ));
+    // A bitmap row asks for no raster line.
+    let req = fx
+        .skin
+        .selection_text_requests(&fx.sel, fx.target, &fx.layout);
+    assert!(req.rows.is_empty());
+    fx.skin.attach_selection_bitmap_text(&mut fx.sel);
+    fx.frame(0);
+    let quads = fx.batch.quads();
+    // Three bars, then the glyphs of "A" and "AB"; the folder row has no
+    // style of its own, so it shows no text.
+    assert_eq!(quads.len(), 3 + 1 + 2);
+    let glyph_x: Vec<f32> = quads[3..].iter().map(|q| q.rect[0]).collect();
+    assert_eq!(glyph_x, [10.0, 10.0, 15.0]);
+    let glyph_y: Vec<f32> = quads[3..].iter().map(|q| q.rect[1]).collect();
+    assert_eq!(glyph_y[0] + 100.0, glyph_y[1]);
+}
+
+/// Room for a text layer beside the sheet's pages.
+const TEXT_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
+    max_side: 2_048,
+    max_layers: 4,
+    reserved_layers: 1,
+};
+
+/// A skin whose only outline text is its song list's row text reserves the
+/// atlas's text layer and names its row text's font file.
+#[test]
+fn row_text_reserves_the_text_layer_and_names_its_font() {
+    let mut def = list(1, 0);
+    def.text = [Some(row_text([0, -20, 100, 10])), None, None];
+    let skin = load(
+        vec![list_element()],
+        WidgetDefs::default(),
+        SelectionDefs {
+            song_list: Some(def.clone()),
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, TEXT_LIMITS, &|| false)
+        .unwrap();
+    assert!(atlas.text_layer().is_some());
+    assert!(skin.outline_fonts().is_empty());
+    let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
+    sd.sheet = selection_support::sheet_with_font();
+    let mut def = def;
+    if let Some(t) = def.text[0].as_mut() {
+        t.font = skin_model::FontRef::File(0);
+    }
+    let skin = Skin::new_selection(
+        sd,
+        SelectionDefs {
+            song_list: Some(def),
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(skin.outline_fonts(), [0]);
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, TEXT_LIMITS, &|| false)
+        .unwrap();
+    assert!(atlas.text_layer().is_some());
 }
 
 /// A chart row draws its bar and text in the chart style, a folder row in
@@ -159,14 +398,7 @@ fn each_row_kind_takes_its_style() {
     ];
     let mut fx = list_skin(def);
     fx.view(&view(vec![chart("a"), folder("f", 2), all(9)], Some(0)));
-    let line = TextImage::new(
-        FrameUv {
-            uv: [0.0, 0.0, 0.5, 0.5],
-            layer: 0,
-        },
-        [0.0, 0.0, 1.0, 1.0],
-        1.0,
-    );
+    let line = line();
     let texts = TextTable::new(vec![None; fx.skin.text_slots()]);
     fx.skin
         .attach_selection_text(&mut fx.sel, texts, TextTable::new(vec![line; 3]))
@@ -643,6 +875,115 @@ fn chart_facts_come_from_the_summary() {
     assert!(shown(&fx).is_empty());
 }
 
+/// The source never clamps a rate: an EX above the largest the summary
+/// allows draws its bar past its box and its rate above 100 %
+/// (`skin/SkinGraph.java:86-106`, `ScoreDataProperty.java:94-96`).
+#[test]
+fn a_rate_above_the_largest_is_not_clamped() {
+    let mut row = chart("a");
+    row.score = RowScore::Best {
+        plays: 1,
+        ex: 81,
+        bp: 0,
+        lamp: OwnLamp::Failed,
+    };
+    let mut v = view(vec![row], Some(0));
+    v.selected.as_mut().unwrap().max_ex = Some(54);
+    let mut fx = bar_skin(vec![bar(
+        RatioForm::Bar { vertical: false },
+        RatioSource::ExRate,
+    )]);
+    fx.view(&v);
+    fx.frame(0);
+    let q = fx.batch.quads()[0];
+    assert_eq!(q.rect, [100.0, 100.0, 60.0, 20.0]);
+    // The uv stops at the frame's edge.
+    assert_eq!(q.uv, fx.uvs.get(3).unwrap().uv);
+    let mut fx = number_skin("selected.rate_percent", "selected.rate_valid");
+    fx.view(&v);
+    fx.frame(0);
+    assert_eq!(shown(&fx), [1, 5, 0]);
+}
+
+/// Of overlapping sliders, the one drawn last takes the press.
+#[test]
+fn the_topmost_slider_takes_the_press() {
+    let slider = RatioForm::Slider {
+        direction: SliderDirection::Right,
+        range: 300,
+        changeable: true,
+    };
+    let mut fx = bar_skin(vec![
+        bar(slider, RatioSource::ListPosition),
+        bar(slider, RatioSource::ExRate),
+    ]);
+    let mut row = chart("a");
+    row.score = RowScore::Best {
+        plays: 1,
+        ex: 27,
+        bp: 0,
+        lamp: OwnLamp::Failed,
+    };
+    let mut v = view(vec![row], Some(0));
+    v.selected.as_mut().unwrap().max_ex = Some(54);
+    v.position = ratio(1, 2);
+    fx.view(&v);
+    fx.frame(0);
+    let got = fx
+        .skin
+        .slider_at(&fx.sel, [200.0, 110.0], fx.target)
+        .unwrap();
+    assert_eq!(got.source, RatioSource::ExRate);
+}
+
+/// A selection state belongs to the skin that made it: another skin with
+/// the same tables refuses it, draws nothing of it and reads none of its
+/// sliders; a clone of its skin is the same skin.
+#[test]
+fn a_state_belongs_to_its_skin() {
+    let slider = RatioForm::Slider {
+        direction: SliderDirection::Right,
+        range: 300,
+        changeable: true,
+    };
+    let make = || bar_skin(vec![bar(slider, RatioSource::ListPosition)]);
+    let mut a = make();
+    let b = make();
+    let mut v = view(Vec::new(), None);
+    v.position = ratio(1, 2);
+    a.view(&v);
+    a.frame(0);
+    assert!(a.skin.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
+    assert_eq!(b.skin.slider_at(&a.sel, [200.0, 110.0], a.target), None);
+    assert_eq!(
+        b.skin.update_selection(&mut a.sel, &v, &labels_of()),
+        Err(SelectionError::Kind)
+    );
+    assert_eq!(
+        b.skin.attach_selection_text(
+            &mut a.sel,
+            TextTable::new(Vec::new()),
+            TextTable::new(Vec::new())
+        ),
+        Err(skin_model::TextTableError::Foreign)
+    );
+    let layout = skin_model::Layout::AUTHOR;
+    let frame = skin_model::SelectionFrame {
+        now: TimeUs(0),
+        target: a.target,
+        layout: &layout,
+        timers: a.timers,
+    };
+    let mut out = skin_model::QuadBatch::with_capacity(8, 8);
+    b.skin
+        .build_selection(&mut a.sel, &frame, &b.uvs, &mut out)
+        .unwrap();
+    assert!(out.quads().is_empty());
+    // A clone keeps its skin's identity.
+    let clone = a.skin.clone();
+    assert!(clone.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
+}
+
 /// The cursor's row kind and a folder's count read as fields.
 #[test]
 fn the_cursor_row_reads_as_fields() {
@@ -983,12 +1324,31 @@ fn the_other_kinds_entry_points_draw_nothing() {
         Err(BuildError::Kind)
     );
     assert!(out.quads().is_empty());
+    // A selection skin's loading state is inert: no timer, no text slot.
+    assert!(loading.state().timers.is_empty());
+    assert!(loading.state().fields.iter().all(|&f| f == 0));
     // A play skin's selection state is inert.
     let play = Skin::new(plain_play_def(
         vec![element(Source::Image(0), [0, 0, 10, 10])],
         WidgetDefs::default(),
     ))
     .unwrap();
+    // A play skin attaches nothing to a selection skin's state, nor lays
+    // out its bitmap text.
+    let mut live = skin.prepare_selection();
+    skin.update_selection(&mut live, &three(0), &labels_of())
+        .unwrap();
+    let before = format!("{live:?}");
+    assert_eq!(
+        play.attach_selection_text(
+            &mut live,
+            TextTable::new(Vec::new()),
+            TextTable::new(Vec::new())
+        ),
+        Err(skin_model::TextTableError::Foreign)
+    );
+    play.attach_selection_bitmap_text(&mut live);
+    assert_eq!(format!("{live:?}"), before);
     let mut sel = play.prepare_selection();
     assert_eq!(
         play.update_selection(&mut sel, &view(Vec::new(), None), &labels_of()),
@@ -1031,6 +1391,28 @@ fn the_song_lists_bounds_are_checked() {
         )
     };
     assert!(with(list(60, 59)).is_ok());
+    // The counts come first: before the kinds and the keys are read.
+    assert!(matches!(
+        load(
+            vec![element(Source::Lanes, [0, 0, 1, 1])],
+            WidgetDefs::default(),
+            SelectionDefs {
+                song_list: Some(list(61, 0)),
+                ..SelectionDefs::default()
+            },
+        ),
+        Err(LoadError::SongList(SongListError::TooManyPlacements {
+            n: 61
+        }))
+    ));
+    assert!(matches!(
+        load(
+            vec![element(Source::Lanes, [0, 0, 1, 1]); skin_model::MAX_ELEMENTS + 1],
+            WidgetDefs::default(),
+            SelectionDefs::default(),
+        ),
+        Err(LoadError::TooManyElements { .. })
+    ));
     assert!(matches!(
         with(list(61, 0)),
         Err(LoadError::SongList(SongListError::TooManyPlacements {
