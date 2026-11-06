@@ -885,6 +885,7 @@ fn judged_us(
         deviation: deviation.map(TimeUs),
         release: release.map(TimeUs),
         combo: 0,
+        presses: 0,
     }
 }
 
@@ -942,19 +943,30 @@ fn the_recent_timing_follows_the_sources_judgments() {
     let empty = |d| JudgeEventKind::EmptyPoor {
         lane: lane(1),
         deviation: TimeUs(d),
+        presses: 0,
     };
     assert_eq!(at(3_300, empty(-1_500)), (1, true));
     assert_eq!(at(3_400, empty(i64::MIN)), (i32::MAX - 1, true));
     assert_eq!(at(3_500, empty(i64::MAX)), (-(i32::MAX - 1), true));
 }
 
+/// `kind` carrying `n` presses of its lane before it in its µs.
+fn stamped(mut kind: JudgeEventKind, n: u32) -> JudgeEventKind {
+    match &mut kind {
+        JudgeEventKind::Judged { presses, .. }
+        | JudgeEventKind::LnHeld { presses, .. }
+        | JudgeEventKind::EmptyPoor { presses, .. } => *presses = n,
+        _ => {}
+    }
+    kind
+}
+
 /// Every lane's visual state (stage3.md R3, the source's per-lane judge
 /// value) after each effect and press: a judgment sets `j == 0 ? 1 : 2j +
 /// late` with on time late, an empty POOR as index 5; a miss leaves it; a
-/// held long note is 8; a press with no effect at its time clears it, a
-/// press with one keeps that one's, and a press at the time of a release's
-/// judgment clears it when it came after the release, not before it; a
-/// rearm reads 0 on every lane.
+/// held long note is 8. A press clears it unless the effect that set it
+/// counted that press: a later press, or one in the same µs past the
+/// effect's count (`presses`). A rearm reads 0 on every lane.
 #[test]
 fn each_lane_follows_its_judgments_and_presses() {
     use Judgment::{Bad, Good, Great, Perfect, Poor};
@@ -966,13 +978,12 @@ fn each_lane_follows_its_judgments_and_presses() {
         .build()
         .unwrap();
     let mut h = Harness::empty(&chart, &full(0));
-    // An event at `us` caused by an input at `us`, or by a deadline
-    // (`origin` `None`).
-    let at = |us: i64, input: bool, kind| JudgeEvent {
+    // An event at `us` counting `n` presses of its lane before it there.
+    let at = |us: i64, n: u32, kind| JudgeEvent {
         seq: 0,
         time: TimeUs(us),
-        origin: input.then_some(TimeUs(us)),
-        kind,
+        origin: None,
+        kind: stamped(kind, n),
     };
     let step = |h: &mut Harness, us: i64, e: Option<JudgeEvent>| -> Vec<i32> {
         h.frame_us(us, e.as_slice());
@@ -981,7 +992,8 @@ fn each_lane_follows_its_judgments_and_presses() {
             .collect()
     };
     assert_eq!(step(&mut h, 0, None), [0; 8], "before any");
-    // Lane 1's judgments at presses: the code and its timing's side.
+    // Lane 1's judgments, each at its press: the code and its timing's
+    // side.
     for (ms, judgment, dev, code) in [
         (1_000, Perfect, 1_999, 1),
         (1_010, Great, -30_000, 2),
@@ -993,7 +1005,8 @@ fn each_lane_follows_its_judgments_and_presses() {
         (1_070, Bad, 200_000, 7),
     ] {
         let us = ms * MS;
-        let e = at(us, true, judged_us(1, 0, judgment, Some(dev), None));
+        h.input.press(lane(1), TimeUs(us));
+        let e = at(us, 1, judged_us(1, 0, judgment, Some(dev), None));
         assert_eq!(
             step(&mut h, us, Some(e)),
             [0, code, 0, 0, 0, 0, 0, 0],
@@ -1002,10 +1015,11 @@ fn each_lane_follows_its_judgments_and_presses() {
     }
     // A miss leaves it, a deadline's and a passed note's at a press.
     let miss = judged_us(1, 0, Poor, None, None);
-    let e = at(1_200 * MS, false, miss);
+    let e = at(1_200 * MS, 0, miss);
     assert_eq!(step(&mut h, 1_200 * MS, Some(e))[1], 7);
-    let e = at(1_210 * MS, true, miss);
-    assert_eq!(step(&mut h, 1_210 * MS, Some(e))[1], 7);
+    h.input.press(lane(1), TimeUs(1_210 * MS));
+    let e = at(1_210 * MS, 1, miss);
+    assert_eq!(step(&mut h, 1_210 * MS, Some(e))[1], 0, "the press clears");
     // Empty POORs, each with its press: before the note 10, at or after
     // it 11.
     for (ms, dev, code) in [(1_300, -1_500, 10), (1_310, 0, 11), (1_320, 500, 11)] {
@@ -1014,47 +1028,61 @@ fn each_lane_follows_its_judgments_and_presses() {
         let e = JudgeEventKind::EmptyPoor {
             lane: lane(1),
             deviation: TimeUs(dev),
+            presses: 0,
         };
-        assert_eq!(step(&mut h, us, Some(at(us, true, e)))[1], code, "{dev}");
+        assert_eq!(step(&mut h, us, Some(at(us, 1, e)))[1], code, "{dev}");
     }
     // A press with no effect clears its lane only.
     h.input.press(lane(1), TimeUs(1_400 * MS));
     assert_eq!(step(&mut h, 1_400 * MS, None)[1], 0, "unmatched press");
-    // The long note's head held: 8, while lane 1 stays 0; its press came
-    // with its effect, which it keeps.
+    // The long note's head held: 8, while lane 1 stays 0.
     h.input.press(lane(2), TimeUs(1_990 * MS));
-    let head = at(1_990 * MS, true, ln_held(2, 0, Great));
+    let head = at(1_990 * MS, 1, ln_held(2, 0, Great));
     assert_eq!(
         step(&mut h, 1_990 * MS, Some(head)),
         [0, 0, 8, 0, 0, 0, 0, 0]
     );
-    // Its release 50 ms early, farther than the head's 10 ms late: GOOD,
-    // early, at the release; the earlier press leaves it.
+    // A release judging it GOOD, early, with no press before it in its
+    // µs; then a press in that µs, after it: cleared.
     let release = judged_us(2, 0, Good, Some(10_000), Some(-50_000));
     h.input.release(lane(2), TimeUs(2_250 * MS));
-    let e = at(2_250 * MS, true, release);
-    assert_eq!(step(&mut h, 2_250 * MS, Some(e))[2], 4);
-    // A press and then the release in that µs: the press came first, and
-    // the release's judgment stays.
+    assert_eq!(
+        step(&mut h, 2_250 * MS, Some(at(2_250 * MS, 0, release)))[2],
+        4
+    );
     h.input.press(lane(2), TimeUs(2_250 * MS));
-    h.input.release(lane(2), TimeUs(2_250 * MS));
-    assert_eq!(step(&mut h, 2_251 * MS, None)[2], 4, "press, release");
-    // The release and then a press in that µs, a reversal: the press
-    // came after it, cleared.
-    h.input.release(lane(2), TimeUs(2_250 * MS));
-    h.input.press(lane(2), TimeUs(2_250 * MS));
-    assert_eq!(step(&mut h, 2_252 * MS, None)[2], 0, "reversal");
-    // A later release leaves it cleared.
+    assert_eq!(step(&mut h, 2_251 * MS, None)[2], 0, "release, press");
+    // A press, then a release judging it in that µs: the release counted
+    // the press, and its code stays.
+    h.input.press(lane(2), TimeUs(2_260 * MS));
     h.input.release(lane(2), TimeUs(2_260 * MS));
-    assert_eq!(step(&mut h, 2_260 * MS, None)[2], 0, "reversal, release");
-    // Held to its end, judged by the deadline, the head 20 ms late: GREAT,
-    // late, though the lane's press came before it.
+    let e = at(2_260 * MS, 1, release);
+    assert_eq!(step(&mut h, 2_260 * MS, Some(e))[2], 4, "press, release");
+    // A press judged BAD, a release and a second press in that µs: the
+    // second press is past the judgment's count, cleared.
+    h.input.press(lane(2), TimeUs(2_270 * MS));
+    let bad = at(2_270 * MS, 1, judged_us(2, 0, Bad, Some(200_000), None));
+    assert_eq!(step(&mut h, 2_270 * MS, Some(bad))[2], 7);
+    h.input.release(lane(2), TimeUs(2_270 * MS));
+    h.input.press(lane(2), TimeUs(2_270 * MS));
+    assert_eq!(
+        step(&mut h, 2_271 * MS, None)[2],
+        0,
+        "press, release, press"
+    );
+    // A deadline's judgment after a press of its µs counts it: GREAT,
+    // late, the head 20 ms late.
+    h.input.release(lane(2), TimeUs(2_280 * MS));
+    h.input.press(lane(2), TimeUs(2_300 * MS));
     let held = judged_us(2, 0, Great, Some(20_000), Some(0));
-    let e = at(2_300 * MS, false, held);
-    assert_eq!(step(&mut h, 2_300 * MS, Some(e))[2], 3);
+    assert_eq!(
+        step(&mut h, 2_300 * MS, Some(at(2_300 * MS, 1, held)))[2],
+        3
+    );
     // The scratch's PERFECT; then a rearm reads 0 everywhere, the earlier
     // presses notwithstanding.
-    let scratch = at(3_000 * MS, true, judged_us(0, 0, Perfect, Some(0), None));
+    h.input.press(lane(0), TimeUs(3_000 * MS));
+    let scratch = at(3_000 * MS, 1, judged_us(0, 0, Perfect, Some(0), None));
     assert_eq!(
         step(&mut h, 3_000 * MS, Some(scratch)),
         [1, 0, 3, 0, 0, 0, 0, 0]

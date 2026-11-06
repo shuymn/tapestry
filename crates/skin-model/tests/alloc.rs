@@ -123,8 +123,18 @@ fn ev(time: i64, kind: JudgeEventKind) -> JudgeEvent {
     }
 }
 
-/// An event caused by an input at `time`: a press, or a release.
-fn by_input(time: i64, kind: JudgeEventKind) -> JudgeEvent {
+/// An event caused by an input at `time`: a press, which it counts as
+/// the one press of its lane in its µs, or a release, after none.
+fn by_input(time: i64, mut kind: JudgeEventKind) -> JudgeEvent {
+    match &mut kind {
+        JudgeEventKind::Judged {
+            release: Some(_), ..
+        } => {}
+        JudgeEventKind::Judged { presses, .. }
+        | JudgeEventKind::LnHeld { presses, .. }
+        | JudgeEventKind::EmptyPoor { presses, .. } => *presses = 1,
+        _ => {}
+    }
     JudgeEvent {
         origin: Some(TimeUs(time)),
         ..ev(time, kind)
@@ -155,6 +165,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                 deviation,
                 release,
                 combo: 0,
+                presses: 0,
             };
             match note.kind {
                 NoteKind::Mine { .. } => {
@@ -189,6 +200,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                             JudgeEventKind::EmptyPoor {
                                 lane,
                                 deviation: TimeUs(10 * MS),
+                                presses: 0,
                             },
                         ));
                     }
@@ -209,6 +221,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                                 note: n,
                                 judgment: Judgment::Great,
                                 deviation: TimeUs(0),
+                                presses: 0,
                             },
                         ));
                         // With breaks, the recent timing's long-note arms:
@@ -1331,8 +1344,9 @@ enum LaneArm {
     EmptyPoor,
     /// 0, after a press later than the effect that set it.
     LaterPress,
-    /// 0, after a press in the µs of the release that set it.
-    PressAfterRelease,
+    /// 0, after a press in the µs of the effect that set it, past the
+    /// presses it counted (a reversal's press after its release).
+    PressLaterInItsUs,
 }
 
 impl LaneArm {
@@ -1341,11 +1355,11 @@ impl LaneArm {
 
 /// One lane's input and effects as the frames feed them: when its press
 /// is released, and the time of the effect that last set its visual
-/// state, with whether a release caused it.
+/// state, with the presses before it in its µs.
 struct LaneTrack {
     lane: Lane,
     release_at: Option<i64>,
-    set: Option<(TimeUs, bool)>,
+    set: Option<(TimeUs, u32)>,
 }
 
 struct Witness {
@@ -1683,15 +1697,18 @@ fn stretch(
                     note,
                     judgment,
                     release,
+                    presses,
                     ..
                 } => {
                     let released = e.origin.is_some() && release.is_some();
                     let pressed = e.origin.is_some() && release.is_none();
-                    let sets = (judgment != Judgment::Poor).then_some(release.is_some());
+                    let sets = (judgment != Judgment::Poor).then_some(presses);
                     (lane, pressed, released, sets, note % 2 == 0)
                 }
-                JudgeEventKind::LnHeld { lane, .. } => (lane, true, false, Some(false), false),
-                JudgeEventKind::EmptyPoor { lane, .. } => (lane, true, false, Some(false), false),
+                JudgeEventKind::LnHeld { lane, presses, .. }
+                | JudgeEventKind::EmptyPoor { lane, presses, .. } => {
+                    (lane, true, false, Some(presses), false)
+                }
                 _ => continue,
             };
             let Some(l) = lanes.get_mut(lane.index()) else {
@@ -1712,8 +1729,8 @@ fn stretch(
                     l.release_at = Some(at.0 + 5 * MS);
                 }
             }
-            if let Some(by_release) = sets {
-                l.set = Some((at, by_release));
+            if let Some(presses) = sets {
+                l.set = Some((at, presses));
             }
         }
         if frame_no.is_multiple_of(11) {
@@ -1827,10 +1844,13 @@ fn stretch(
                 10 | 11 => arm(LaneArm::EmptyPoor),
                 _ => {}
             }
+            let presses = input.lane(l.lane).presses;
             match (v, l.set, pressed) {
-                (1.., Some((at, false)), Some(p)) if p == at => arm(LaneArm::KeptAtPress),
+                (1.., Some((at, 1..)), Some(p)) if p == at => arm(LaneArm::KeptAtPress),
                 (0, Some((at, _)), Some(p)) if p > at => arm(LaneArm::LaterPress),
-                (0, Some((at, true)), Some(p)) if p == at => arm(LaneArm::PressAfterRelease),
+                (0, Some((at, n)), Some(p)) if p == at && presses > n => {
+                    arm(LaneArm::PressLaterInItsUs);
+                }
                 _ => {}
             }
         }
@@ -3495,6 +3515,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         ),
     ];

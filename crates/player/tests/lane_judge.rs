@@ -81,6 +81,11 @@ fn chart() -> Chart {
         .long(lane(0), TimeUs(6_500 * MS), TimeUs(7_000 * MS))
         .long(lane(5), TimeUs(7_500 * MS), TimeUs(8_000 * MS))
         .tap(lane(4), TimeUs(8_500 * MS))
+        .tap(lane(6), TimeUs(9_000 * MS))
+        .long(lane(7), TimeUs(9_500 * MS), TimeUs(10_000 * MS))
+        .long(lane(7), TimeUs(10_500 * MS), TimeUs(11_000 * MS))
+        .tap(lane(6), TimeUs(12_000 * MS))
+        .tap(lane(6), TimeUs(12_000 * MS))
         .build()
         .unwrap()
 }
@@ -406,6 +411,61 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     assert_eq!(s, [0, 0, 4, 6, 0, 6, 0, 0], "effects pending");
     let s = r.frame(&skin, &uvs, TimeUs(8_490 * MS), emitted);
     assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 0], "effects delivered");
+    // Key 6 pressed 200 ms late, judged BAD, then released and pressed
+    // again in that µs, the second press past the empty POOR range: it
+    // matches nothing and clears the BAD.
+    r.set(9_200, 6, 1);
+    r.set(9_200, 6, 0);
+    r.set(9_200, 6, 1);
+    let s = r.step(&skin, &uvs, 9_200);
+    let lane6 = Lane::new(6).unwrap();
+    assert!(
+        r.effects.iter().any(|e| matches!(
+            e.kind,
+            eval::JudgeEventKind::Judged { lane, judgment: rules::Judgment::Bad, .. } if lane == lane6
+        )),
+        "{:?}",
+        r.effects
+    );
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 0], "BAD, release, press");
+    r.set(9_210, 6, 0);
+    // Key 7's head on time, held (8); 100 ms before its end a release that
+    // judges it, an unmatched press and a release, all in one µs: the
+    // press came after the judgment, so 0, though the lane ends released.
+    r.set(9_500, 7, 1);
+    let s = r.step(&skin, &uvs, 9_500);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 8], "held");
+    r.set(9_900, 7, 0);
+    r.set(9_900, 7, 1);
+    r.set(9_900, 7, 0);
+    let s = r.step(&skin, &uvs, 9_900);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 0], "release, press, release");
+    // Key 7's next long note held through its end: the deadline judges it
+    // PERFECT (1); a press after it clears it.
+    r.set(10_500, 7, 1);
+    let s = r.step(&skin, &uvs, 10_600);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 8], "held again");
+    let s = r.step(&skin, &uvs, 11_000);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 1], "held to its end");
+    r.set(11_100, 7, 0);
+    let s = r.step(&skin, &uvs, 11_100);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 1], "released after");
+    r.tap(11_200, 7);
+    let s = r.step(&skin, &uvs, 11_200);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 0], "a press after it");
+    // Key 6's two taps at 12 s, each judged by a press in that µs: the
+    // second press's PERFECT, which counted both presses, stays (1).
+    r.set(12_000, 6, 1);
+    r.set(12_000, 6, 0);
+    r.set(12_000, 6, 1);
+    let s = r.step(&skin, &uvs, 12_000);
+    let judged = r
+        .effects
+        .iter()
+        .filter(|e| matches!(e.kind, eval::JudgeEventKind::Judged { lane, .. } if lane == lane6))
+        .count();
+    assert_eq!(judged, 2, "{:?}", r.effects);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 1, 0], "two presses, two judgments");
     // A retry: a fresh attempt and preparation.
     let mut r = Rig::new(&chart, &rule, &dev, &skin, &ctx);
     assert_eq!(r.step(&skin, &uvs, 500), [0; 8], "retried");

@@ -9163,6 +9163,7 @@ pub(crate) mod tests {
                     deviation: Some(TimeUs(0)),
                     release: None,
                     combo: 1,
+                    presses: 0,
                 },
             }];
             let effects: &[eval::JudgeEvent] = if self.judge.load(Ordering::Acquire) {

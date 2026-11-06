@@ -162,16 +162,37 @@ impl NoteFacts {
 
 /// One lane's input as conversion left it: whether a control holds it
 /// now, and the evaluation times of its latest press and release edges
-/// (receive time less the source's input offset). A lane held at the
-/// play's opening is held with no press: the opening has no edge.
+/// (receive time less the source's input offset), with how many press
+/// edges came at the latest press's µs. A lane held at the play's opening
+/// is held with no press: the opening has no edge.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaneInput {
     /// Whether some control holds the lane.
     pub held: bool,
     /// The latest press edge.
     pub pressed: Option<TimeUs>,
+    /// The press edges at `pressed`'s µs so far, from 1, saturating at
+    /// `u32::MAX`; 0 with no press. An event of this lane carries the
+    /// count at its own µs when it came ([`JudgeEventKind::Judged`]'s
+    /// `presses`), so a press after it in the same µs reads greater.
+    ///
+    /// [`JudgeEventKind::Judged`]: crate::JudgeEventKind::Judged
+    pub presses: u32,
     /// The latest release edge.
     pub released: Option<TimeUs>,
+}
+
+impl LaneInput {
+    /// The press edges at `at` so far: [`presses`](Self::presses) when the
+    /// latest press is at `at`, else 0.
+    #[must_use]
+    pub fn presses_at(&self, at: TimeUs) -> u32 {
+        if self.pressed == Some(at) {
+            self.presses
+        } else {
+            0
+        }
+    }
 }
 
 /// Every lane's input ([`LaneInput`]) and how far conversion took it:
@@ -193,6 +214,7 @@ impl InputFacts {
         lanes: [LaneInput {
             held: false,
             pressed: None,
+            presses: 0,
             released: None,
         }; LANE_COUNT],
         converted: None,
@@ -217,16 +239,23 @@ impl InputFacts {
             *slot = LaneInput {
                 held: held(l),
                 pressed: None,
+                presses: 0,
                 released: None,
             };
         }
         self.converted = None;
     }
 
-    /// A press edge of `lane` at `at`.
+    /// A press edge of `lane` at `at`: counted after the earlier ones at
+    /// that µs, or the first.
     pub fn press(&mut self, lane: Lane, at: TimeUs) {
         if let Some(slot) = self.lanes.get_mut(lane.index()) {
             slot.held = true;
+            slot.presses = if slot.pressed == Some(at) {
+                slot.presses.saturating_add(1)
+            } else {
+                1
+            };
             slot.pressed = Some(at);
         }
     }

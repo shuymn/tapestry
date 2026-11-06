@@ -291,6 +291,7 @@ fn judged_note_disappears() {
             deviation: Some(TimeUs(-210 * MS)),
             release: None,
             combo: 1,
+            presses: 0,
         },
     };
     let v = common::with_notes(v, &chart, &[judged]);
@@ -331,6 +332,7 @@ fn a_rearm_draws_a_judged_note_again() {
             deviation: Some(TimeUs(-210 * MS)),
             release: None,
             combo: 1,
+            presses: 0,
         },
     };
     let judged_view = common::with_notes(view(1, 2), &chart, &[judged]);
@@ -380,6 +382,7 @@ fn a_rearmed_practice_round_draws_only_its_targets() {
             deviation: Some(TimeUs(-210 * MS)),
             release: None,
             combo: 1,
+            presses: 0,
         },
     };
     let judged_view = common::with_notes(view(1, 2), &chart, &[judged]);

@@ -196,6 +196,7 @@ mod tests {
                 deviation: deviation.map(TimeUs),
                 release: None,
                 combo: 0,
+                presses: 0,
             },
         }
     }

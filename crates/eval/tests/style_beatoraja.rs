@@ -993,7 +993,11 @@ fn scratch_uses_its_own_windows() {
         .events
         .iter()
         .filter_map(|ev| match ev.kind {
-            JudgeEventKind::EmptyPoor { lane, deviation } => Some((lane.index(), deviation)),
+            JudgeEventKind::EmptyPoor {
+                lane,
+                deviation,
+                presses: _,
+            } => Some((lane.index(), deviation)),
             _ => None,
         })
         .collect();

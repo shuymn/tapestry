@@ -80,6 +80,13 @@ pub enum JudgeEventKind {
         release: Option<TimeUs>,
         /// The combo after this judgment.
         combo: u32,
+        /// The presses of its lane at its own µs that came before it, its
+        /// own press included ([`LaneInput::presses`]); 0 with none. A press
+        /// later in that µs counts one more, so presentation can tell it
+        /// came after this event.
+        ///
+        /// [`LaneInput::presses`]: crate::LaneInput::presses
+        presses: u32,
     },
     /// A long note's head was pressed before its end and graded GOOD or
     /// better, and the long note is held now. Feedback only: it changes no
@@ -96,6 +103,13 @@ pub enum JudgeEventKind {
         judgment: Judgment,
         /// Press time minus note time.
         deviation: TimeUs,
+        /// The presses of its lane at its own µs that came before it, its
+        /// own press included ([`LaneInput::presses`]); 0 with none. A press
+        /// later in that µs counts one more, so presentation can tell it
+        /// came after this event.
+        ///
+        /// [`LaneInput::presses`]: crate::LaneInput::presses
+        presses: u32,
     },
     /// The visual hold of a long note whose head press started or decided
     /// it before its end ended: its lane was released (at or before the
@@ -115,6 +129,13 @@ pub enum JudgeEventKind {
         /// Press time minus the time of the note the empty POOR is
         /// against.
         deviation: TimeUs,
+        /// The presses of its lane at its own µs that came before it, its
+        /// own press included ([`LaneInput::presses`]); 0 with none. A press
+        /// later in that µs counts one more, so presentation can tell it
+        /// came after this event.
+        ///
+        /// [`LaneInput::presses`]: crate::LaneInput::presses
+        presses: u32,
     },
     /// A press on `lane` plays `sound`.
     PlaySound {
@@ -1104,20 +1125,19 @@ impl<'a> Evaluator<'a> {
             return;
         };
         let edges = self.conversion.apply(&ev, t);
-        // Every edge, judged or not, in its order: a reversal's release
-        // then its press, at one time.
+        let acceptance = self.acceptance(t);
+        let lead_in = acceptance == Acceptance::LeadIn;
+        // Every edge, judged or not, in its order (a reversal's release
+        // then its press, at one time): its lane's input, then its
+        // judgment, so each event carries the presses before it.
         for &edge in edges.as_slice() {
             match edge {
                 LaneEdge::Press(lane) => self.input.press(lane, t),
                 LaneEdge::Release(lane) => self.input.release(lane, t),
             }
-        }
-        let acceptance = self.acceptance(t);
-        if acceptance == Acceptance::ConversionOnly {
-            return;
-        }
-        let lead_in = acceptance == Acceptance::LeadIn;
-        for &edge in edges.as_slice() {
+            if acceptance == Acceptance::ConversionOnly {
+                continue;
+            }
             match edge {
                 LaneEdge::Press(lane) => self.press(lane.index(), t, ev.received, lead_in, out),
                 LaneEdge::Release(lane) => self.release(lane.index(), t, Some(ev.received), out),
@@ -1368,6 +1388,7 @@ impl<'a> Evaluator<'a> {
                 note: index,
                 judgment,
                 deviation,
+                presses: self.input.lane(lane_of(lane)).presses_at(t),
             };
             self.emit(t, Some(origin), kind, out);
             return;
@@ -1396,6 +1417,7 @@ impl<'a> Evaluator<'a> {
                 JudgeEventKind::EmptyPoor {
                     lane: lane_of(lane),
                     deviation,
+                    presses: self.input.lane(lane_of(lane)).presses_at(t),
                 },
                 out,
             );
@@ -1538,6 +1560,7 @@ impl<'a> Evaluator<'a> {
             deviation,
             release,
             combo: self.tally.combo,
+            presses: self.input.lane(lane_of(lane)).presses_at(time),
         };
         self.emit(time, origin, kind, out);
         self.change_gauges(Cause::Judged(judgment), time, origin, out);

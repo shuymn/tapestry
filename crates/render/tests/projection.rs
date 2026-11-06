@@ -573,6 +573,7 @@ fn one_renderer_resized_minimized_and_restored() {
             deviation: Some(TimeUs(-210 * MS)),
             release: None,
             combo: 1,
+            presses: 0,
         },
     };
     let v = common::with_notes(v, &chart, &[judged]);
