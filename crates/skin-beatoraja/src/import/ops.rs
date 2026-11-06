@@ -619,7 +619,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 54);
+        assert_eq!(exprs.len(), 58);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
