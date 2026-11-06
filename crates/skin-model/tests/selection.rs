@@ -217,6 +217,26 @@ fn placement_visibilities_are_charged_as_they_run() {
     assert_eq!(fx.images().len(), 3 * n);
 }
 
+/// A frame evaluates each populated slot's placement visibility once,
+/// however many parts hang from it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_frame_runs_each_slots_placement_once() {
+    let mut def = list(60, 0);
+    for p in &mut def.placements {
+        for arm in p.iter_mut() {
+            arm.part.visible = Some(boolean("cursor.chart && !cursor.folder"));
+        }
+    }
+    def.lamp = lamps([0, -10, 10, 10]);
+    def.label = labels([0, -20, 10, 10]);
+    let mut fx = list_skin(def);
+    fx.view(&three(0));
+    let before = skin_model::evaluations();
+    fx.frame(0);
+    assert_eq!(skin_model::evaluations() - before, 3);
+}
+
 /// Several song list elements draw the same rows from one row text table.
 #[test]
 fn song_list_elements_share_one_row_text_table() {
@@ -253,60 +273,7 @@ fn song_list_elements_share_one_row_text_table() {
 /// quad budget.
 #[test]
 fn bitmap_row_text_lays_out_each_row() {
-    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
-    let dir = tempfile::tempdir().unwrap();
-    image::RgbaImage::from_pixel(2, 2, image::Rgba([255; 4]))
-        .save_with_format(dir.path().join("0.png"), image::ImageFormat::Png)
-        .unwrap();
-    std::fs::write(
-        dir.path().join("f.fnt"),
-        "info face=\"t\" size=10 padding=0,0,0,0\n\
-         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-         page id=0 file=\"f.png\"\n\
-         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
-         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
-    )
-    .unwrap();
-    image::RgbaImage::from_pixel(16, 16, image::Rgba([255; 4]))
-        .save_with_format(dir.path().join("f.png"), image::ImageFormat::Png)
-        .unwrap();
-    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    let file = b
-        .admit_file(FileDef {
-            path: "0.png".into(),
-            hi: None,
-        })
-        .unwrap();
-    let image = b
-        .add_image(ImageDef {
-            file,
-            rect: None,
-            grid: [1, 1],
-            cycle: None,
-            filter: Filter::Linear,
-        })
-        .unwrap();
-    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
-    b.add_bitmap_font(f, &[]).unwrap();
-    let mut def = list(3, 0);
-    for p in &mut def.placements {
-        for arm in p.iter_mut() {
-            arm.images = [Some(image); 3];
-        }
-    }
-    let mut style = row_text([0, -20, 100, 10]);
-    style.font = skin_model::FontRef::Bitmap(0);
-    def.text = [Some(style), None, None];
-    let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
-    sd.sheet = b.finish();
-    let skin = Skin::new_selection(
-        sd,
-        SelectionDefs {
-            song_list: Some(def),
-            ..SelectionDefs::default()
-        },
-    )
-    .unwrap();
+    let (_dir, skin) = selection_support::bitmap_list(3, 0);
     // Per slot: the bar, a field's 256 glyphs, a lamp and the labels.
     assert_eq!(skin.quad_capacity(), 3 * (2 + 256 + 3));
     assert!(!skin.has_outline_text());
@@ -894,14 +861,78 @@ fn a_rate_above_the_largest_is_not_clamped() {
     )]);
     fx.view(&v);
     fx.frame(0);
-    let q = fx.batch.quads()[0];
-    assert_eq!(q.rect, [100.0, 100.0, 60.0, 20.0]);
-    // The uv stops at the frame's edge.
-    assert_eq!(q.uv, fx.uvs.get(3).unwrap().uv);
+    // At the image's own scale: the whole frame in the box, then its
+    // right edge column stretched over the 20 past it.
+    let [u0, v0, u1, v1] = fx.uvs.get(3).unwrap().uv;
+    let quads: Vec<([f32; 4], [f32; 4])> =
+        fx.batch.quads().iter().map(|q| (q.rect, q.uv)).collect();
+    assert_eq!(
+        quads,
+        [
+            ([100.0, 100.0, 40.0, 20.0], [u0, v0, u1, v1]),
+            ([140.0, 100.0, 20.0, 20.0], [u1, v0, u1, v1]),
+        ]
+    );
+    // Vertical: the frame from the bottom, then its top row above it.
+    let mut fx = bar_skin(vec![bar(
+        RatioForm::Bar { vertical: true },
+        RatioSource::ExRate,
+    )]);
+    fx.view(&v);
+    fx.frame(0);
+    let quads: Vec<([f32; 4], [f32; 4])> =
+        fx.batch.quads().iter().map(|q| (q.rect, q.uv)).collect();
+    assert_eq!(
+        quads,
+        [
+            ([100.0, 100.0, 40.0, 20.0], [u0, v0, u1, v1]),
+            ([100.0, 90.0, 40.0, 10.0], [u0, v0, u1, v0]),
+        ]
+    );
     let mut fx = number_skin("selected.rate_percent", "selected.rate_valid");
     fx.view(&v);
     fx.frame(0);
     assert_eq!(shown(&fx), [1, 5, 0]);
+}
+
+/// A rate past the field's range saturates at its largest, never wrapping
+/// or reading 0.
+#[test]
+fn a_huge_rate_saturates() {
+    let rate = |ex: u32| {
+        let mut row = chart("a");
+        row.score = RowScore::Best {
+            plays: 1,
+            ex,
+            bp: 0,
+            lamp: OwnLamp::Failed,
+        };
+        let mut v = view(vec![row], Some(0));
+        v.selected.as_mut().unwrap().max_ex = Some(2);
+        let mut e = element(Source::Number(0), [0, 0, 10, 10]);
+        e.visible = Some(boolean("selected.rate_valid"));
+        let mut fx = Fx::new(
+            load(
+                vec![e],
+                WidgetDefs {
+                    numbers: vec![NumberDef {
+                        digits: digits(10),
+                        value: int("selected.rate_percent"),
+                    }],
+                    ..WidgetDefs::default()
+                },
+                SelectionDefs::default(),
+            )
+            .unwrap(),
+        );
+        fx.view(&v);
+        fx.frame(0);
+        shown(&fx)
+    };
+    // 100 · 42 949 672 / 2 is 2 147 483 600, within the range.
+    assert_eq!(rate(42_949_672), [2, 1, 4, 7, 4, 8, 3, 6, 0, 0]);
+    // 100 · 42 949 673 / 2 is past it: the largest, 2 147 483 646.
+    assert_eq!(rate(42_949_673), [2, 1, 4, 7, 4, 8, 3, 6, 4, 6]);
 }
 
 /// Of overlapping sliders, the one drawn last takes the press.
@@ -1332,6 +1363,8 @@ fn the_other_kinds_entry_points_draw_nothing() {
         WidgetDefs::default(),
     ))
     .unwrap();
+    let inert = play.prepare_selection();
+    assert!(inert.state().timers.is_empty());
     // A play skin attaches nothing to a selection skin's state, nor lays
     // out its bitmap text.
     let mut live = skin.prepare_selection();

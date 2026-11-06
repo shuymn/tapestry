@@ -97,6 +97,8 @@ pub use atlas::{
     Page, Variant, cell_fits_page, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
+#[cfg(feature = "dev-tools")]
+pub use expr::evaluations;
 pub use expr::{
     CompileError, ErrorKind, MAX_ELAPSED_MS, MAX_NAME_BYTES, MAX_NESTING, MAX_OPS, MAX_SKIN_OPS,
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,

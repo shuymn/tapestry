@@ -96,27 +96,35 @@ pub(crate) fn fraction(r: Ratio) -> f32 {
     f32_of(f)
 }
 
-/// The rect and uv of a bar showing `f` of `[x, y, w, h]` with frame `uv`:
-/// the rect as long as `f` makes it, past the box above 1, and the uv cut
-/// at the frame's edge, since the atlas holds nothing of the image past
-/// it.
+/// The quads of a bar showing `f` of `[x, y, w, h]` with frame `frame`, at
+/// the image's own scale as the source samples it: the part within the
+/// frame, cut to `f` of it; and above 1 the overflow past the box, which
+/// the source draws from the texels beyond its region
+/// (`skin/SkinGraph.java:100-105`), clamped at the image's edge: here the
+/// frame's edge column (or row) stretched over it, since the atlas holds
+/// nothing of the image past the frame.
 pub(crate) fn cut(
     vertical: bool,
     [x, y, w, h]: [f32; 4],
     frame: FrameUv,
     f: f32,
-) -> ([f32; 4], FrameUv) {
+) -> [Option<([f32; 4], FrameUv)>; 2] {
     let [u0, v0, u1, v1] = frame.uv;
     let g = f.min(1.0);
-    let (rect, uv) = if vertical {
-        (
-            [x, y + h * (1.0 - f), w, h * f],
-            [u0, v1 - (v1 - v0) * g, u1, v1],
-        )
+    let over = f - g;
+    let uv = |uv| FrameUv { uv, ..frame };
+    if vertical {
+        let inside = (
+            [x, y + h * (1.0 - g), w, h * g],
+            uv([u0, v1 - (v1 - v0) * g, u1, v1]),
+        );
+        let past = (over > 0.0).then(|| ([x, y - h * over, w, h * over], uv([u0, v0, u1, v0])));
+        [Some(inside), past]
     } else {
-        ([x, y, w * f, h], [u0, v0, u0 + (u1 - u0) * g, v1])
-    };
-    (rect, FrameUv { uv, ..frame })
+        let inside = ([x, y, w * g, h], uv([u0, v0, u0 + (u1 - u0) * g, v1]));
+        let past = (over > 0.0).then(|| ([x + w, y, w * over, h], uv([u1, v0, u1, v1])));
+        [Some(inside), past]
+    }
 }
 
 /// A slider's rect `[x, y, w, h]` moved by `f` of `range`.

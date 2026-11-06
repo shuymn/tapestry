@@ -147,6 +147,15 @@ impl Selection {
         }
     }
 
+    /// A state with no timer, text, row or slider slot, which a skin of
+    /// another kind gives: nothing accepts it.
+    pub(crate) fn inert(skin: u64) -> Self {
+        let mut s = Self::new(skin, false, 0, 0, 0, 0);
+        s.starts = Box::default();
+        s.ms = Box::default();
+        s
+    }
+
     /// The fields and timer readings as of the last view and build.
     #[must_use]
     pub fn state(&self) -> State<'_> {
@@ -437,7 +446,7 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
             set(field::SELECTED_RATE_VALID, 1);
             set(
                 field::SELECTED_RATE_PERCENT,
-                i32::try_from(100 * e / m).unwrap_or(0),
+                value(u64::try_from(100 * e / m).unwrap_or(u64::MAX)),
             );
             set(
                 field::SELECTED_RATE_HUNDREDTHS,

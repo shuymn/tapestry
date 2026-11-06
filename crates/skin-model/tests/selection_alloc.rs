@@ -197,6 +197,28 @@ fn a_selection_build_allocates_nothing() {
         }
     }
     assert_eq!(total, 0);
+    // Row text in a bitmap font: laid out at the view, drawn glyph by
+    // glyph without allocating.
+    let (_dir, skin) = selection_support::bitmap_list(5, 2);
+    let mut fx = Fx::new(skin);
+    let mut bitmap_total = 0;
+    for cursor in [0_usize, 2, 4] {
+        let rows = vec![
+            chart("AB"),
+            chart("BA"),
+            chart("ABAB"),
+            chart("B"),
+            chart("A"),
+        ];
+        fx.view(&view(rows, Some(cursor)));
+        fx.skin.attach_selection_bitmap_text(&mut fx.sel);
+        fx.frame(0);
+        assert!(fx.batch.quads().len() > 5);
+        for ms in (0..500).step_by(16) {
+            bitmap_total += counted(|| fx.frame(ms));
+        }
+    }
+    assert_eq!(bitmap_total, 0);
     // The positive control: the counter sees an allocation on this thread
     // (design.md "Scope of No Allocation").
     assert!(

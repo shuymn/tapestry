@@ -265,6 +265,68 @@ pub fn row_text(r: [i32; 4]) -> RowTextDef {
     }
 }
 
+/// A song list of `slots` placements centered at `center` over a sheet of
+/// one image and a bitmap font (`A` and `B`, 4 wide and advancing 5), its
+/// chart rows' text in that font 20 above each placement's bottom; the
+/// folder must live while the skin draws.
+pub fn bitmap_list(slots: usize, center: u8) -> (tempfile::TempDir, Skin) {
+    use skin_model::{Root, SheetBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
+        .save_with_format(dir.path().join("0.png"), ImageFormat::Png)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("f.fnt"),
+        "info face=\"t\" size=10 padding=0,0,0,0\n\
+         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+         page id=0 file=\"f.png\"\n\
+         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
+         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
+    )
+    .unwrap();
+    RgbaImage::from_pixel(16, 16, Rgba([255; 4]))
+        .save_with_format(dir.path().join("f.png"), ImageFormat::Png)
+        .unwrap();
+    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
+    let file = b
+        .admit_file(FileDef {
+            path: "0.png".into(),
+            hi: None,
+        })
+        .unwrap();
+    let image = b
+        .add_image(ImageDef {
+            file,
+            rect: None,
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        })
+        .unwrap();
+    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
+    b.add_bitmap_font(f, &[]).unwrap();
+    let mut def = list(slots, center);
+    for p in &mut def.placements {
+        for arm in p.iter_mut() {
+            arm.images = [Some(image); 3];
+        }
+    }
+    let mut style = row_text([0, -20, 100, 10]);
+    style.font = FontRef::Bitmap(0);
+    def.text = [Some(style), None, None];
+    let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
+    sd.sheet = b.finish();
+    let skin = Skin::new_selection(
+        sd,
+        SelectionDefs {
+            song_list: Some(def),
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    (dir, skin)
+}
+
 /// A selection skin of `elements` with `widgets` and `sel`.
 pub fn load(
     elements: Vec<ElementDef>,

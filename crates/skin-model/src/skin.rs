@@ -759,7 +759,14 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs) -> u32 {
         | Source::Lanes
         | Source::ImageChoice(_)
         | Source::CoverPaint(_)
-        | Source::RatioBar(_) => 0,
+        | Source::RatioBar(_) => match source {
+            // A bar's overflow past its box: one more quad.
+            Source::RatioBar(i) => sel
+                .ratio_bars
+                .get(index(i))
+                .map_or(0, |b| u32::from(matches!(b.form, RatioForm::Bar { .. }))),
+            _ => 0,
+        },
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1210,8 +1217,9 @@ fn draw_ratio(
     let fr = ratio_bar::fraction(v);
     match b.form {
         RatioForm::Bar { vertical } => {
-            let (r, f) = ratio_bar::cut(vertical, rect, f, fr);
-            brush.push(out, r, f, image.filter);
+            for (r, f) in ratio_bar::cut(vertical, rect, f, fr).into_iter().flatten() {
+                brush.push(out, r, f, image.filter);
+            }
         }
         RatioForm::Slider {
             direction, range, ..
@@ -2551,10 +2559,12 @@ impl Skin {
     /// table. One a play skin makes is inert: it draws nothing.
     #[must_use]
     pub fn prepare_selection(&self) -> Selection {
-        let live = self.kind == ScreenKind::Selection;
+        if self.kind != ScreenKind::Selection {
+            return Selection::inert(self.id);
+        }
         Selection::new(
             self.id,
-            live,
+            true,
             self.whens.len(),
             self.text_slots(),
             self.song_list_slots(),
