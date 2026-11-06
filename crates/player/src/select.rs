@@ -31,6 +31,7 @@ use skin_model::{
 };
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
+use crate::ui_text::{Label, Message};
 
 /// The most charts one search lists; a search that finds more says so.
 pub const LIMIT: usize = 5_000;
@@ -246,11 +247,11 @@ pub enum Acted {
 }
 
 /// The orders, in the order Left and Right cycle them, with their labels.
-const SORTS: [(Sort, &str); 4] = [
-    (Sort::Title, "タイトル"),
-    (Sort::Artist, "アーティスト"),
-    (Sort::Level, "レベル"),
-    (Sort::Modified, "更新日"),
+const SORTS: [(Sort, Label); 4] = [
+    (Sort::Title, Label::SortTitle),
+    (Sort::Artist, Label::SortArtist),
+    (Sort::Level, Label::SortLevel),
+    (Sort::Modified, Label::SortModified),
 ];
 
 /// One line of the list.
@@ -885,28 +886,30 @@ impl SelectScreen {
     /// title.
     pub fn page(&self, status: &str) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };
-        let sort = SORTS.get(self.sort).map_or("", |&(_, label)| label);
-        let more = if self.more { "以上" } else { "" };
+        let sort = SORTS
+            .get(self.sort)
+            .map_or(Label::SortTitle, |&(_, label)| label);
         let place = if self.query.is_empty() {
             match &self.place {
-                Place::Top => String::new(),
-                Place::Folder { name, .. } => format!("{name}  "),
-                Place::All => "全譜面  ".to_owned(),
+                Place::Top => None,
+                Place::Folder { name, .. } => Some(name.as_str()),
+                Place::All => Some(Label::AllCharts.text()),
             }
         } else {
-            "検索結果  ".to_owned()
+            Some(Label::SearchResults.text())
         };
-        let mut lines = vec![line(
-            format!(
-                "曲選択  {place}{}{more} 譜面  並び順: {sort}  プリセット: {}  {status}",
-                self.listed(),
-                self.preset
-            ),
-            LineStyle::Title,
-        )];
+        let title = Message::SelectTitle {
+            place,
+            listed: self.listed(),
+            more: self.more,
+            sort,
+            preset: &self.preset,
+            status,
+        };
+        let mut lines = vec![line(title.text(), LineStyle::Title)];
         let mut caret = None;
         lines.push(if self.searching {
-            let text = format!("検索: {}", self.query);
+            let text = Message::SearchEditing { query: &self.query }.text();
             let start = text.len();
             caret = Some(Caret {
                 line: lines.len(),
@@ -915,7 +918,10 @@ impl SelectScreen {
             });
             line(format!("{text}{}_", self.preedit), LineStyle::Search)
         } else {
-            line(format!("検索 (Tab): {}", self.query), LineStyle::Search)
+            line(
+                Message::SearchIdle { query: &self.query }.text(),
+                LineStyle::Search,
+            )
         });
         lines.push(line(
             self.notice
@@ -940,9 +946,13 @@ impl SelectScreen {
                 }
             };
             lines.push(match row.kind {
-                RowKind::All { charts } => {
-                    line(format!("  ▶ 全譜面  ({charts})"), style(LineStyle::Folder))
-                }
+                RowKind::All { charts } => line(
+                    Message::AllChartsRow {
+                        charts: charts.into(),
+                    }
+                    .text(),
+                    style(LineStyle::Folder),
+                ),
                 RowKind::Folder { charts } => line(
                     format!("  ▶ {}  ({charts})", row.title),
                     style(LineStyle::Folder),
@@ -954,21 +964,19 @@ impl SelectScreen {
         if self.entries.is_empty() && self.folders.is_empty() {
             lines.push(line(
                 if self.query.is_empty() {
-                    "譜面がありません (device.toml の [library] roots)".to_owned()
+                    Label::NoCharts
                 } else {
-                    "見つかりません".to_owned()
-                },
+                    Label::NotFound
+                }
+                .text()
+                .to_owned(),
                 LineStyle::Chart,
             ));
         }
         while lines.len() < PAGE_LINES - 1 {
             lines.push(line(String::new(), LineStyle::Chart));
         }
-        lines.push(line(
-            "↑↓ 選択  Enter 決定  Esc 戻る  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
-                .to_owned(),
-            LineStyle::Help,
-        ));
+        lines.push(line(Label::SelectHelp.text().to_owned(), LineStyle::Help));
         MenuPage { lines, caret }
     }
 
@@ -1659,7 +1667,51 @@ mod tests {
             5_001,
         );
         assert_eq!(s.listed(), super::LIMIT);
-        assert!(s.page("").lines[0].text.contains("5000以上 譜面"));
+        assert_eq!(
+            s.page("").lines[0].text,
+            "曲選択  5000以上 譜面  並び順: タイトル  プリセット:   "
+        );
+    }
+
+    /// The page's fixed wording in full: the title with each order and
+    /// the library's status, the idle and the editing search line with a
+    /// non-ASCII query, the results' title, both empty lists and the keys.
+    #[test]
+    fn page_wording() {
+        let mut s = SelectScreen::new(Vec::new());
+        s.set_preset("自作".to_owned(), None);
+        let page = s.page("スキャン中");
+        assert_eq!(
+            page.lines[0].text,
+            "曲選択  0 譜面  並び順: タイトル  プリセット: 自作  スキャン中"
+        );
+        assert_eq!(page.lines[1].text, "検索 (Tab): ");
+        assert_eq!(
+            page.lines[3].text,
+            "譜面がありません (device.toml の [library] roots)"
+        );
+        assert_eq!(
+            page.lines[super::PAGE_LINES - 1].text,
+            "↑↓ 選択  Enter 決定  Esc 戻る  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
+        );
+        for order in ["アーティスト", "レベル", "更新日", "タイトル"] {
+            s.input(key(MenuKey::Right));
+            assert_eq!(
+                s.page("").lines[0].text,
+                format!("曲選択  0 譜面  並び順: {order}  プリセット: 自作  ")
+            );
+        }
+        s.input(key(MenuKey::Tab));
+        s.input(MenuInput::Text("日本".to_owned()));
+        let page = s.page("");
+        assert_eq!(page.lines[1].text, "検索: 日本_");
+        assert_eq!(
+            page.lines[0].text,
+            "曲選択  検索結果  0 譜面  並び順: タイトル  プリセット: 自作  "
+        );
+        assert_eq!(page.lines[3].text, "見つかりません");
+        s.input(key(MenuKey::Enter));
+        assert_eq!(s.page("").lines[1].text, "検索 (Tab): 日本");
     }
 
     /// Each chart line starts with the chart's lamp and best EX under the

@@ -838,6 +838,10 @@ pub enum SelectStep {
     PickSearched(String),
     /// Wait this many milliseconds on the select screen.
     Sleep(u64),
+    /// Wait on the select screen until this file exists, at most
+    /// [`STEP_WATCHDOG`]: a test's signal that it changed something the
+    /// run must not see yet.
+    File(PathBuf),
     /// Wait this many milliseconds on the select screen and print how often
     /// the input thread woke meanwhile.
     Idle(u64),
@@ -949,7 +953,7 @@ pub struct SlowLoad {
 }
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
-/// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
+/// `pick=<file>`, `wait=<file>`, `file=<path>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
 /// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
@@ -1024,6 +1028,7 @@ impl SelectScript {
             .map(|s| match s.split_once('=') {
                 Some(("pick", f)) => Ok(SelectStep::Pick(f.to_owned())),
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
+                Some(("file", f)) => Ok(SelectStep::File(PathBuf::from(f))),
                 Some(("folder", f)) => Ok(SelectStep::Folder(f.to_owned())),
                 Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),

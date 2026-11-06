@@ -1090,6 +1090,66 @@ fn choosing_a_preset_writes_player_toml() {
     );
 }
 
+/// The language is read once, at startup (design.md "Settings Files"): a
+/// `player.toml` whose language is changed to one that does not exist
+/// while selection shows neither stops the run nor is read, and the
+/// preset step's write puts the startup language back. The run waits for
+/// the edit (`file=`) before the preset step, and the page's own words
+/// stay those of the startup language before and after it.
+#[test]
+fn a_language_changed_after_startup_is_not_read() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let player = DataRoot::new(fx.appdata.join("tapestry")).player_settings();
+    let go = fx.appdata.join("edited");
+    let steps = format!("file={},next-preset,close", go.display());
+    let mut child = select(&fx, &steps, &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let help = "dev: select page: ↑↓ 選択  Enter 決定  Esc 戻る  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了";
+    let mut stdout = String::new();
+    let mut edited_at = None;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        stdout.push_str(&line);
+        stdout.push('\n');
+        // Once the first page shows; the run waits for `go` meanwhile.
+        if edited_at.is_none() && line == help {
+            fs::write(&player, "language = \"xx\"\n").unwrap();
+            fs::write(&go, "").unwrap();
+            edited_at = Some(stdout.len());
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let edited_at = edited_at.unwrap_or_else(|| panic!("no page:\n{stdout}"));
+    let (before, after) = stdout.split_at(edited_at);
+    // The title's own words, whatever the place and the count a pending
+    // scan shows.
+    for (when, part, preset) in [("before", before, ""), ("after", after, "lr2-style")] {
+        assert!(part.lines().any(|l| l == help), "{when}:\n{stdout}");
+        let labels = format!(" 譜面  並び順: タイトル  プリセット: {preset}");
+        assert!(
+            part.lines()
+                .any(|l| l.starts_with("dev: select page: 曲選択  ") && l.contains(&labels)),
+            "{when}:\n{stdout}"
+        );
+    }
+    assert_eq!(
+        lines(&stdout, "select: preset ").first().copied(),
+        Some("select: preset lr2-style"),
+        "{stdout}"
+    );
+    let saved = fs::read_to_string(&player).unwrap();
+    assert!(
+        saved.lines().any(|l| l == "language = \"ja\""),
+        "{saved}\n{stdout}"
+    );
+}
+
 /// A `player.toml` that cannot be replaced (read-only): the step still
 /// chooses the preset, which the chart then plays, the failure is
 /// reported, and the file keeps what it held.

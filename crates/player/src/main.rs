@@ -51,6 +51,7 @@ mod selection;
 mod shelf;
 mod start_gate;
 mod tuning;
+mod ui_text;
 mod window;
 
 // The render crate's WARP helpers and its declarative, imported and
@@ -328,7 +329,9 @@ fn settings(root: &DataRoot) -> anyhow::Result<Settings> {
         save_settings(&device, &DeviceSettings::default())
             .with_context(|| device.display().to_string())?;
     }
-    Settings::load(root).with_context(|| root.path().display().to_string())
+    let settings = Settings::load(root).with_context(|| root.path().display().to_string())?;
+    ui_text::init(settings.player.language);
+    Ok(settings)
 }
 
 /// How a session's input is received, chosen once from the command line.
