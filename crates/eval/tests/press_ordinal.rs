@@ -8,7 +8,10 @@ mod common;
 
 use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use common::{MS, device, lane, press, release};
-use eval::{EvalInput, Evaluator, InputStart, JudgeEvent, JudgeEventKind, Section, evaluate};
+use eval::{
+    AxisBinding, AxisMode, ControlId, EvalInput, Evaluator, InputKind, InputStart, JudgeEvent,
+    JudgeEventKind, PhysicalInputEvent, ScratchSettings, Section, SourceId, evaluate,
+};
 use rules::Judgment;
 
 /// Key 1's tap at 1 s; key 2's two taps at 2 s; key 3's long notes from
@@ -164,5 +167,61 @@ fn a_section_counts_alike_from_its_full_log_and_its_opening() {
     assert!(
         counted.contains(&(2, 2_000, Some(Judgment::Perfect), 2)),
         "{counted:?}"
+    );
+}
+
+/// The scratch's axis, 256 positions a revolution.
+const AXIS: ControlId = ControlId(0x1_0030);
+
+fn report(received: i64, value: i32) -> PhysicalInputEvent {
+    PhysicalInputEvent {
+        received: TimeUs(received),
+        source: SourceId(0),
+        kind: InputKind::Control {
+            control: AXIS,
+            value,
+        },
+    }
+}
+
+/// A scratch reversal, one input giving a release then a press: the
+/// release judges the held long note before the press reaches the lane
+/// input, so its judgment counts no press, and the facts one after it.
+#[test]
+fn a_reversal_judges_its_release_before_its_press() {
+    let chart = ChartBuilder::new(150_000)
+        .long(Lane::SCRATCH, TimeUs(1_000 * MS), TimeUs(1_500 * MS))
+        .build()
+        .unwrap();
+    let mut dev = device(&[0]);
+    dev.sources[0].bindings.retain(|b| b.lane != Lane::SCRATCH);
+    dev.sources[0].axes.push(AxisBinding {
+        control: AXIS,
+        lane: Lane::SCRATCH,
+        scratch: ScratchSettings {
+            mode: AxisMode::Absolute { wrap: 256 },
+            ..ScratchSettings::DEFAULT
+        },
+    });
+    let rule = rules::tapestry();
+    let mut ev = Evaluator::new(&chart, &rule, &dev, &InputStart::default(), None, 64).unwrap();
+    // At rest, +2 on the head, a step forward every 60 ms, then back by 2.
+    let mut inputs = vec![report(900 * MS, 100), report(1_000 * MS, 102)];
+    inputs.extend((0..6).map(|k| report((1_060 + 60 * k) * MS, 103 + i32::try_from(k).unwrap())));
+    inputs.push(report(1_400 * MS, 106));
+    for i in inputs {
+        ev.push_input(i).unwrap();
+    }
+    let mut out = Vec::new();
+    ev.advance_to(TimeUs(1_400 * MS), &mut out).unwrap();
+    let events = lane_events(&out);
+    assert_eq!(events.first(), Some(&(0, 1_000, None, 1)), "{events:?}");
+    let last = events.last().copied().unwrap();
+    assert_eq!((last.0, last.1, last.3), (0, 1_400, 0), "{events:?}");
+    assert!(last.2.is_some(), "{events:?}");
+    let facts = ev.input().lane(Lane::SCRATCH);
+    assert_eq!(
+        (facts.pressed, facts.presses),
+        (Some(TimeUs(1_400 * MS)), 1)
     );
 }
