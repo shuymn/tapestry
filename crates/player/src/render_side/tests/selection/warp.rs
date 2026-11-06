@@ -341,7 +341,9 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
         }));
         let why = why.into_inner().unwrap().unwrap();
         assert_eq!(why.contains("development fault"), text, "{why}");
-        // The refused frame, the first drawn, presented the page.
+        // The refused frame, the first drawn, presented the page: its
+        // refusal is said before the frame sink sees it.
+        assert!(wait_until(|| !frames.0.lock().unwrap().is_empty()));
         let (_, _, device, presented, lit) = frames.0.lock().unwrap()[0].clone();
         assert!(presented, "{text}");
         assert!(lit.is_some_and(|n| n > 500), "{text}: {lit:?}");
