@@ -225,7 +225,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 4\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 5\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -628,27 +628,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 5\nwhat_v5_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 6\nwhat_v6_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 5 is not supported; this build reads version 4"),
+        stderr.contains("version 6 is not supported; this build reads version 5"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v5_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v6_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     // The previous version too: its files are refused, never read.
-    let old = scenario(&["quit = {}"]).replacen("version = 4", "version = 3", 1);
+    let old = scenario(&["quit = {}"]).replacen("version = 5", "version = 4", 1);
     let (out, _, stderr) = fx.run(&old);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 3 is not supported; this build reads version 4"),
+        stderr.contains("version 4 is not supported; this build reads version 5"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 4"),
+        stderr.contains("no version; this build reads version 5"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
