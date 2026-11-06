@@ -6,8 +6,10 @@
 //! ordinary element with its own track, timer, visibility, blend, clip and
 //! placement, showing an image or an image choice's entry, moved by the
 //! cover it paints ([`CoverMotion`]), by the covers it follows
-//! ([`Follow`](crate::Follow)) and, as a slider, down by its range times
-//! the effective SUDDEN+ share of the whole lane. A trim line
+//! ([`Follow`](crate::Follow)) and, as a slider ([`Slider`]), by its range
+//! times a rate in one direction: the effective SUDDEN+ share of the whole
+//! lane, or the attempt's progress, which makes a paint that paints no
+//! cover (a progress bar's knob, drawn as the source's slider). A trim line
 //! ([`CoverTrim`]) gates and clips it against its unstretched, unrotated
 //! destination. An invisible, transparent, missing or timer-off paint
 //! draws nothing and leaves the coverage and the notes as they are;
@@ -17,8 +19,10 @@
 
 use super::ImageRef;
 use super::lanes::{LaneFrameGeometry, LaneView};
+use super::ratio_bar::SliderDirection;
 use crate::canvas::f32_of;
 use crate::place::{Affine, LaneMap};
+use crate::play::schema::PROGRESS_FULL;
 use crate::quad::ClipRect;
 use crate::track::Track;
 
@@ -76,13 +80,10 @@ pub enum CoverTrim {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverPaintDef {
     pub image: CoverImage,
-    /// A slider's range in reference pixels, at most
-    /// [`MAX_COORD`](crate::MAX_COORD): the paint moves down by it times
-    /// the effective SUDDEN+ share of the whole lane,
-    /// `R · cover · (1000 − lift) / 10⁶`, also for a range of 0. `None`
-    /// adds no motion of its own. Only a paint without motion, trim and
-    /// gate track has one.
-    pub slider_range: Option<u32>,
+    /// A slider: the paint moves by its range times its rate in its
+    /// direction, also for a range of 0. `None` adds no motion of its own.
+    /// Only a paint without motion, trim and gate track has one.
+    pub slider: Option<Slider>,
     pub motion: CoverMotion,
     pub trim: CoverTrim,
     /// The unstretched destination the trim is tested against, when it is
@@ -90,6 +91,40 @@ pub struct CoverPaintDef {
     /// paint has one. A gate track that does not draw at the element's time
     /// draws nothing.
     pub gate_track: Option<Track>,
+}
+
+/// A paint's slider (`skin/SkinSlider.java:116-120` at `0.8.9`): moved by
+/// `range` reference pixels, at most [`MAX_COORD`](crate::MAX_COORD), times
+/// its rate, from 0 to 1, toward `direction`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Slider {
+    pub range: u32,
+    pub rate: SliderRate,
+    pub direction: SliderDirection,
+}
+
+impl Slider {
+    /// SUDDEN+'s slider: down by `range` times SUDDEN+'s share.
+    #[must_use]
+    pub const fn sudden(range: u32) -> Self {
+        Self {
+            range,
+            rate: SliderRate::Sudden,
+            direction: SliderDirection::Down,
+        }
+    }
+}
+
+/// The rate a slider moves by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderRate {
+    /// The effective SUDDEN+ share of the whole lane,
+    /// `cover · (1000 − lift) / 10⁶` of the frame's lane view
+    /// (`skin/property/FloatPropertyFactory.java:139-151`).
+    Sudden,
+    /// The attempt's progress, `time.progress_ppm / 10⁶`
+    /// (`skin/property/FloatPropertyFactory.java:128-136`).
+    Progress,
 }
 
 /// Why a cover paint definition was refused.
@@ -125,7 +160,7 @@ pub(crate) enum PaintImage {
 #[derive(Clone, Debug)]
 pub(crate) struct CoverPaint {
     pub(crate) image: PaintImage,
-    pub(crate) slider: Option<u32>,
+    pub(crate) slider: Option<Slider>,
     pub(crate) motion: CoverMotion,
     pub(crate) trim: CoverTrim,
     pub(crate) gate: Option<Track>,
@@ -143,21 +178,36 @@ pub(crate) enum TrimOutcome {
 }
 
 impl CoverPaint {
-    /// The slider's displacement this frame in reference pixels, y down:
-    /// `R · c · (1000 − l) / 10⁶` of the view's effective amounts, each
-    /// at most 1 000 ‰ (`skin/property/FloatPropertyFactory.java:139-151`,
-    /// `skin/SkinSlider.java:116-120` at `0.8.9`). The numerator is exact
-    /// in `u64` and `f64` (below 2^41); only the division rounds.
-    pub(crate) fn slider_dy(&self, view: LaneView) -> f64 {
-        let Some(r) = self.slider else {
-            return 0.0;
+    /// The slider's displacement `[dx, dy]` this frame in reference
+    /// pixels, y down: `R` times its rate toward its direction
+    /// (`skin/SkinSlider.java:116-120` at `0.8.9`). SUDDEN+'s rate is
+    /// `c · (1000 − l) / 10⁶` of the view's effective amounts, each at most
+    /// 1 000 ‰ (`skin/property/FloatPropertyFactory.java:139-151`); the
+    /// progress's `p / 10⁶` of `progress`, `time.progress_ppm` clamped to
+    /// 0..=10⁶. Each numerator is exact in `u64` and `f64` (below 2^41);
+    /// only the division rounds.
+    pub(crate) fn slider_offset(&self, view: LaneView, progress: i32) -> [f64; 2] {
+        let Some(s) = self.slider else {
+            return [0.0, 0.0];
         };
-        let c = u64::from(view.cover.min(1_000));
-        let l = u64::from(view.lift.min(1_000));
-        let n = u64::from(r) * c * (1_000 - l);
+        let rate = match s.rate {
+            SliderRate::Sudden => {
+                let c = u64::from(view.cover.min(1_000));
+                let l = u64::from(view.lift.min(1_000));
+                c * (1_000 - l)
+            }
+            SliderRate::Progress => u64::from(progress.clamp(0, PROGRESS_FULL).unsigned_abs()),
+        };
+        let n = u64::from(s.range) * rate;
         #[expect(clippy::cast_precision_loss, reason = "below 2^41, exact in f64")]
         let n = n as f64;
-        n / 1_000_000.0
+        let d = n / 1_000_000.0;
+        match s.direction {
+            SliderDirection::Up => [0.0, -d],
+            SliderDirection::Right => [d, 0.0],
+            SliderDirection::Down => [0.0, d],
+            SliderDirection::Left => [-d, 0.0],
+        }
     }
 
     /// The motion's displacement this frame, y down: 0, `−L` or `−L − K`

@@ -20,8 +20,8 @@ use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union};
 use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
-use crate::play::schema::Grade;
 use crate::play::schema::timer::BUILTIN;
+use crate::play::schema::{Grade, field};
 use crate::play::timers::level_fields;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
@@ -478,6 +478,16 @@ fn track_moved_outside(t: &Track, up: i64, down: i64) -> bool {
     })
 }
 
+/// Whether a key of `t` leaves ±[`MAX_COORD`] on x when moved `left` left
+/// or `right` right.
+fn track_moved_outside_x(t: &Track, left: i64, right: i64) -> bool {
+    let max = i64::from(MAX_COORD);
+    t.rects().any(|[x, ..]| {
+        let x = i64::from(x);
+        x - left < -max || x + right > max
+    })
+}
+
 /// The places checks of [`Skin::new`], in element order.
 fn check_places(def: &SkinDef) -> Result<(), LoadError> {
     let fixed = def.fit == Fit::Fixed;
@@ -564,8 +574,9 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 /// paint following SUDDEN+ alone, and every key of a follower or a moving
 /// paint, its gate's among them, and of a followed grade of a judge an
 /// element draws, its attachment's among them, keeps its y within ±[`MAX_COORD`] when moved `reach`
-/// either way; a slider paint's keys keep it moved down by its range as
-/// well, and a linked trim line stays within it raised by `reach`.
+/// either way; a slider paint's keys keep it, their x or y, moved by its
+/// range toward its direction as well, and a linked trim line stays
+/// within it raised by `reach`.
 fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
     let moved_out = |t: &Track| track_moved_outside(t, reach, reach);
     for (element, e) in def.elements.iter().enumerate() {
@@ -574,7 +585,17 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             Source::CoverPaint(p) => def.widgets.cover_paints.get(index(p)),
             _ => None,
         };
-        let slider = paint.and_then(|p| p.slider_range);
+        let slider = paint.and_then(|p| p.slider);
+        // The slider's reach toward each side: up, down, left, right.
+        let [s_up, s_down, s_left, s_right] = slider.map_or([0; 4], |s| {
+            let r = i64::from(s.range);
+            match s.direction {
+                SliderDirection::Up => [r, 0, 0, 0],
+                SliderDirection::Down => [0, r, 0, 0],
+                SliderDirection::Left => [0, 0, r, 0],
+                SliderDirection::Right => [0, 0, 0, r],
+            }
+        });
         let motion = paint.map_or(CoverMotion::None, |p| p.motion);
         if motion != CoverMotion::None && matches!(follow, Follow::Lift | Follow::LiftAndCover) {
             return Err(LoadError::UnsupportedFollow { element });
@@ -585,13 +606,16 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             }
             let moves = follow != Follow::None || motion != CoverMotion::None;
             let follows = if moves { reach } else { 0 };
-            let (up, down) = (follows, follows + slider.map_or(0, i64::from));
-            if track_moved_outside(&e.track, up, down)
+            let (up, down) = (follows + s_up, follows + s_down);
+            let out = |t: &Track| {
+                track_moved_outside(t, up, down) || track_moved_outside_x(t, s_left, s_right)
+            };
+            if out(&e.track)
                 || choice_of(def, e.source)
                     .into_iter()
                     .flat_map(ImageChoiceDef::tracks)
                     .chain(paint.and_then(|p| p.gate_track.as_ref()))
-                    .any(|t| track_moved_outside(t, up, down))
+                    .any(out)
             {
                 return Err(LoadError::Coordinates { element });
             }
@@ -923,8 +947,8 @@ fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
             }
             CoverImage::Image(_) | CoverImage::Choice(_) => None,
         };
-        let range = p.slider_range.is_some_and(|r| i64::from(r) > max);
-        let slider_moves = p.slider_range.is_some()
+        let range = p.slider.is_some_and(|s| i64::from(s.range) > max);
+        let slider_moves = p.slider.is_some()
             && (p.motion != CoverMotion::None
                 || p.trim != CoverTrim::None
                 || p.gate_track.is_some());
@@ -1643,7 +1667,7 @@ impl Skin {
                     CoverImage::Image(i) => PaintImage::Image(image(i)),
                     CoverImage::Choice(i) => PaintImage::Choice(index(i)),
                 },
-                slider: p.slider_range,
+                slider: p.slider,
                 motion: p.motion,
                 trim: p.trim,
                 gate: p.gate_track,
@@ -1750,6 +1774,8 @@ impl Skin {
                         }
                         _ => None,
                     };
+                    // A progress slider reads `time.progress_ppm`, which
+                    // loading knows (0) and nothing else needs.
                     Need::of(e.visible.as_ref()).and(Need::of(value))
                 },
                 kind: match e.source {
@@ -3019,7 +3045,13 @@ impl Skin {
                 Some(p) => {
                     let [x, y, w, h] = s.rect;
                     let g = lanes.as_ref();
-                    let dy = e.follow.dy(g) + p.motion_dy(g) + p.slider_dy(scene.lanes);
+                    let progress = state
+                        .fields
+                        .get(usize::from(field::TIME_PROGRESS_PPM))
+                        .copied()
+                        .unwrap_or(0);
+                    let [dx, slide] = p.slider_offset(scene.lanes, progress);
+                    let dy = e.follow.dy(g) + p.motion_dy(g) + slide;
                     let gate = match &p.gate {
                         Some(gate) => match gate.sample(t) {
                             Some(gs) => gs.rect,
@@ -3040,7 +3072,10 @@ impl Skin {
                         TrimOutcome::Unclipped => None,
                         TrimOutcome::Clipped(c) => Some(c),
                     };
-                    ([x, f32_of(f64::from(y) + dy), w, h], clip)
+                    (
+                        [f32_of(f64::from(x) + dx), f32_of(f64::from(y) + dy), w, h],
+                        clip,
+                    )
                 }
                 None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };

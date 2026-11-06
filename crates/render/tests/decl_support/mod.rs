@@ -522,7 +522,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
         if look.full_lanes {
             let paint = |image: Part, motion, trim| CoverPaintDef {
                 image: CoverImage::Image(image.image()),
-                slider_range: None,
+                slider: None,
                 motion,
                 trim,
                 gate_track: None,

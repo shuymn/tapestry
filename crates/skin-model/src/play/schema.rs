@@ -26,6 +26,8 @@ pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
 /// The largest lane visual state, `judge.lane.N`: an empty POOR at or
 /// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
 pub const LANE_JUDGE_MAX: i32 = 11;
+/// The whole attempt in `time.progress_ppm`'s unit, parts per million.
+pub const PROGRESS_FULL: i32 = 1_000_000;
 /// A cover setting's full amount, ‰.
 pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
@@ -222,6 +224,7 @@ pub static PLAY: Schema = Schema {
         int("judge.lane.5", LANE_JUDGE_MAX, T),
         int("judge.lane.6", LANE_JUDGE_MAX, T),
         int("judge.lane.7", LANE_JUDGE_MAX, T),
+        int("time.progress_ppm", PROGRESS_FULL, T),
     ],
     timers: &[
         timer("ready", E),
@@ -443,8 +446,13 @@ pub mod field {
     /// `93 + N` for [`Lane::index`](bms_model::Lane::index) `N`; see
     /// [`lane_judge`].
     pub const JUDGE_LANES: u16 = 93;
+    /// The attempt's progress in parts per million, rounded down: 0 before
+    /// the attempt's start (READY), [`PROGRESS_FULL`](super::PROGRESS_FULL)
+    /// at and after the end `time.remaining_s` counts to, and between them
+    /// the share of the way from the start to that end.
+    pub const TIME_PROGRESS_PPM: u16 = 101;
     /// The number of fields.
-    pub const COUNT: usize = 101;
+    pub const COUNT: usize = 102;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -738,7 +746,19 @@ mod tests {
             );
         }
         assert_eq!(field::lane_judge(Lane::SCRATCH), 93);
-        assert_eq!(field::COUNT, 101);
+        assert_eq!(slot("time.progress_ppm"), Some(field::TIME_PROGRESS_PPM));
+        assert_eq!(
+            PLAY.field("time.progress_ppm")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: 1_000_000
+                },
+                T
+            ))
+        );
+        assert_eq!(field::COUNT, 102);
     }
 
     #[test]
