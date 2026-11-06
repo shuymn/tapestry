@@ -117,6 +117,32 @@ fn the_selected_row_must_draw_after_folding() {
     import_selection_with(d.path(), |c| c.options = vec![Some(901)]).unwrap();
 }
 
+/// A bar image cut 10 texels wider than its 800-wide file: the selected
+/// row draws it, the file's columns stretched over the bar, with a D22
+/// note, rather than refusing the row.
+#[test]
+fn a_bar_cut_past_its_file_s_edge_is_stretched() {
+    let body = format!(
+        r#""source": [{{"id": "s", "path": "s.png"}}, {{"id": "w", "path": "w.png"}}],
+           "image": [{{"id": "wide", "src": "w", "w": 810, "h": 60}}],
+           "imageset": [{{"id": "set", "images": ["wide"]}}], "text": [{TEXT_T}],
+           {},
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}]"#,
+        song_list(&[&at(0, 500, 810, 60)], &[&at(0, 500, 810, 60)], 0, TITLE)
+    );
+    let d = folder(&body);
+    common::png(d.path(), "w.png", 800, 300);
+    let i = import_selection(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(common::has(
+        &i.report,
+        NoteKind::Deviation(skin_beatoraja::DeviationId::D22)
+    ));
+    let mut s = Sel::new(i.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let rects: Vec<[f32; 4]> = s.frame(0).iter().map(|q| q.rect).collect();
+    assert_eq!(rects, [[0.0, 520.0, 810.0, 60.0]]);
+}
+
 /// The selected row's image file missing: refused as the selected row,
 /// naming the missing file, not as a play-critical image.
 #[test]

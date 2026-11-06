@@ -440,6 +440,10 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
+    /// The admitted cuts, by file and rect, that run past their file's
+    /// edge (D22), and the destinations noted for one.
+    overruns: BTreeSet<(u32, [u32; 4])>,
+    overrun_at: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -529,6 +533,8 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
+            overruns: BTreeSet::new(),
+            overrun_at: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]
