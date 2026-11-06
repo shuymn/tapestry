@@ -386,10 +386,19 @@ mod tests {
                 max: 256
             })
         ));
-        // 8192² × 3 layers: 192 Mi texels, past 128 Mi.
+        // 8192² × 4 layers: 256 Mi texels, past 192 Mi; 3 layers are the
+        // cap itself, so their bytes are checked next.
+        assert!(matches!(
+            check_pages(&some(8_192, 3), &limits()),
+            Err(UploadError::Texels { texels }) if texels == 1 << 28
+        ));
         assert!(matches!(
             check_pages(&some(8_192, 2), &limits()),
-            Err(UploadError::Texels { texels }) if texels == 3 << 26
+            Err(UploadError::Level {
+                page: 0,
+                level: 0,
+                ..
+            })
         ));
         // Within the limits, the bytes are checked: level 0 of page 0 is
         // 256 × 256 × 4.

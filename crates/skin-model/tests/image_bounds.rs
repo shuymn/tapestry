@@ -296,20 +296,18 @@ fn headers_are_checked_before_pixels() {
         write(root, name, &at_cap);
         load_small(root, &[name]).unwrap();
     }
-    // Ten at the cap and one of 8 Mi fill the total; one texel more
-    // passes it.
-    write(root, "rest.png", &png_header(4_096, 2_048));
+    // Sixteen at the cap fill the total; one texel more passes it.
     write(root, "one.png", &png_header(1, 1));
-    assert_eq!(10 * MAX_IMAGE_TEXELS + 4_096 * 2_048, MAX_TOTAL_TEXELS);
-    let mut names = vec!["cap.png"; 10];
-    names.extend(["rest.png", "one.png"]);
-    load_small(root, &names[..11]).unwrap();
+    assert_eq!(16 * MAX_IMAGE_TEXELS, MAX_TOTAL_TEXELS);
+    let mut names = vec!["cap.png"; 16];
+    names.push("one.png");
+    load_small(root, &names[..16]).unwrap();
     let err = load_small(root, &names).unwrap_err();
     assert!(matches!(
         err,
         ImageError::TotalTooLarge {
             at: FileAt {
-                file: 11,
+                file: 16,
                 hi: false
             }
         }
@@ -713,7 +711,7 @@ fn many_tall_thin_cells_route_within_the_bound() {
         })
         .collect();
     let sheet = load(d.path(), vec![file("thin.png")], images).unwrap();
-    // Two pages of 8 192 and no reserved layer: the 128 Mi texel cap.
+    // Two pages of 8 192 and no reserved layer: 128 Mi texels.
     let limits = AtlasLimits {
         max_side: 8_192,
         max_layers: 2,
@@ -801,7 +799,7 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
     let build = |files: [&str; 2], many: u32, deep: u32| {
         let sheet = load(d.path(), files.map(file).to_vec(), images(many, deep)).unwrap();
         assert_eq!(sheet.frame_count(), 32_770);
-        // Two pages of 8 192 and no reserved layer: the 128 Mi texel cap.
+        // Two pages of 8 192 and no reserved layer: 128 Mi texels.
         let limits = AtlasLimits {
             max_side: 8_192,
             max_layers: 2,

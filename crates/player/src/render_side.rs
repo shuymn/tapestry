@@ -4488,7 +4488,7 @@ pub(crate) mod tests {
     /// reported), and one within the limit is ready and commits.
     #[test]
     fn a_specialization_past_the_shared_texels_is_refused() {
-        use crate::render_decl::{Look, solid_bundle};
+        use crate::render_decl::{Look, shared_limit_bundle, solid_bundle};
         let make: MakeScreen = Box::new(|| {
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -4501,8 +4501,7 @@ pub(crate) mod tests {
         });
         // Built for WARP's limits, as the render thread's screen.
         let r = crate::render_common::offscreen(1_920, 1_080);
-        let big = solid_bundle(&r, &Look::left([0, 0, 255, 255]), [4_096, 3_072]);
-        assert_eq!(big.atlas_texels(), render::SHARED_TEXELS);
+        let big = shared_limit_bundle(&r, [0, 0, 255, 255]);
         let (result, play) = (
             solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
             solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
