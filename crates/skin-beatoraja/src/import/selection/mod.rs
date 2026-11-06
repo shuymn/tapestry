@@ -640,7 +640,11 @@ impl Cx<'_> {
             if self.source_rec(s.src_name())?.is_none() {
                 continue;
             }
-            if timer.is_none() && s.timer != Prop::Null {
+            // A negative id is no timer: the source's factory makes none
+            // of it (`TimerPropertyFactory.java:7-8`), so the search goes
+            // on.
+            let given = !matches!(s.timer, Prop::Null | Prop::Id(i32::MIN..=-1));
+            if timer.is_none() && given {
                 timer = Some((s.timer.clone(), r));
             }
             if cycle.is_none() && s.cycle != -1 {

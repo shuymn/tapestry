@@ -317,3 +317,26 @@ fn placements_take_their_set_s_timing() {
         assert_eq!(frames, [(0.0, [4, 20]), (500.0, [12, 20])], "{first}");
     }
 }
+
+/// A negative timer id is no timer (`TimerPropertyFactory.java:7-8`) and
+/// a cycle of -1 none: the set's search passes both, so image 0's two
+/// frames run on image 1's timer 11 and its 100 ms cycle.
+#[test]
+fn a_set_s_timing_passes_absent_timers_and_cycles() {
+    let images = r#""image": [
+        {"id": "m0", "src": "s", "x": 0, "y": 16, "w": 16, "h": 8, "divx": 2, "timer": -1, "cycle": -1},
+        {"id": "m1", "src": "s", "x": 16, "y": 16, "w": 8, "h": 8, "timer": 11, "cycle": 100}]"#;
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    let body = format!(
+        r#""imageset": [{{"id": "set", "images": ["m0", "m1"]}}], "text": [{TEXT_T}], {list},
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}], {images}"#
+    );
+    let d = folder(&body);
+    let mut s = Sel::of(d.path());
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    // The change at 125 ms: at 150 ms 25 ms into the cycle (frame 0), at
+    // 180 ms 55 ms (frame 1).
+    s.timers.change = Some(bms_model::TimeUs(125_000));
+    assert_eq!(s.images(150), [[4, 20]]);
+    assert_eq!(s.images(180), [[12, 20]]);
+}
