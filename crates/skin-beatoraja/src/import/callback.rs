@@ -1359,7 +1359,7 @@ impl Cx<'_> {
             role,
             (Disposition::Replaced(why), Some(why)),
         );
-        Ok(NoteKind::Callback { field, why })
+        Ok(self.callback_note(field, why))
     }
 
     /// A text's `value` callback at node `id`, for an element of `role`:
@@ -1525,7 +1525,8 @@ impl Cx<'_> {
             role,
             (Disposition::Replaced(why), Some(why)),
         );
-        self.drop_el(Role::Decorative, at, NoteKind::Callback { field, why })?;
+        let note = self.callback_note(field, why);
+        self.drop_el(Role::Decorative, at, note)?;
         Ok(false)
     }
 
@@ -1584,14 +1585,43 @@ impl Cx<'_> {
             Role::Decorative,
             (Disposition::Replaced(why), Some(why)),
         );
-        self.drop_el(
-            Role::Decorative,
-            at,
-            NoteKind::Callback {
-                field: "value",
-                why,
-            },
-        )?;
+        let note = self.callback_note("value", why);
+        self.drop_el(Role::Decorative, at, note)?;
         Ok(None)
+    }
+
+    /// The note of a decorative callback in `field` replaced for `why`.
+    /// On a selection skin a read the profile does not bridge is noted as
+    /// the JSON field of the same id is: the profile's own treatment, so
+    /// the two paths cannot differ (docs/stage3.md §3, Selection).
+    fn callback_note(&self, field: &'static str, why: Unsupported) -> NoteKind {
+        if self.kind == ScreenKind::Selection
+            && let Unsupported::Unmapped { api, id } = why
+            && let Ok(id) = i32::try_from(id)
+        {
+            let name = HOST_APIS.get(usize::from(api)).map_or("", |&(_, n)| n);
+            match name {
+                "number" => {
+                    return match property::int_in(self.kind, id) {
+                        IntProp::Unavailable(id) => NoteKind::Unavailable {
+                            kind: super::PropertyKind::Integer,
+                            id,
+                        },
+                        _ => NoteKind::UnsupportedProperty {
+                            kind: super::PropertyKind::Integer,
+                            id: Some(id),
+                        },
+                    };
+                }
+                "option" => {
+                    return NoteKind::UnsupportedProperty {
+                        kind: super::PropertyKind::Boolean,
+                        id: Some(id),
+                    };
+                }
+                _ => {}
+            }
+        }
+        NoteKind::Callback { field, why }
     }
 }

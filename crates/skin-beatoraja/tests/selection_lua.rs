@@ -99,20 +99,20 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
         .filter(|d| **d == Disposition::Lowered)
         .count();
     assert_eq!(lowered, 3, "{:?}", lua.callbacks);
-    assert!(common::has(
-        &json.report,
-        NoteKind::UnsupportedProperty {
-            kind: PropertyKind::Integer,
-            id: Some(410)
-        }
-    ));
-    assert!(lua.imported.report.notes.iter().any(|n| matches!(
-        n.kind,
-        NoteKind::Callback {
-            field: "value",
-            why: skin_beatoraja::lua::Unsupported::Unmapped { id: 410, .. }
-        }
-    )));
+    // The same note on both paths, at the same severity.
+    let dropped = |r: &skin_beatoraja::Report| -> Vec<_> {
+        r.notes
+            .iter()
+            .filter(|n| n.severity == skin_beatoraja::Severity::Dropped)
+            .map(|n| n.kind)
+            .collect()
+    };
+    let note = NoteKind::UnsupportedProperty {
+        kind: PropertyKind::Integer,
+        id: Some(410),
+    };
+    assert_eq!(dropped(&json.report), [note]);
+    assert_eq!(dropped(&lua.imported.report), [note]);
     let mut a = Sel::new(json.skin);
     let mut b = Sel::new(lua.imported.skin);
     let mut row = chart("a");
