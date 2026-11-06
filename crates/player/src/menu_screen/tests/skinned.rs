@@ -230,6 +230,58 @@ fn a_preset_step_through_the_flow_names_the_preset_for_three_seconds() {
     );
 }
 
+/// A preset step the flow takes gives the next update the newly chosen
+/// preset's displayed gauge, as an attempt resolves it.
+#[test]
+fn a_preset_step_gives_the_update_the_new_presets_gauge() {
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let mut shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    let screens = crate::render_side::tests::Installers::default();
+    let render = screens.spawn_bare();
+    let gauge_of = |p: &rules::RulePreset, displayed: usize| {
+        let policy = game::DefaultPolicy {
+            displayed,
+            on_failure: game::FailureAction::default(),
+        };
+        skin_model::GaugeLook::of(&p.gauges[game::resolve_displayed(&policy, p).0])
+    };
+    let (first, stepped, displayed) =
+        crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+            // The second gauge shows: the tapestry preset's survival gauge,
+            // the next preset's assist-easy one.
+            rig.gauge = 1;
+            rig.presets_changed(Ok(&shelf));
+            let latest = || screens.updates.lock().unwrap().last().cloned().unwrap();
+            assert!(crate::render_side::tests::wait_until(|| latest()
+                .settings
+                .is_some_and(|s| s.gauge.is_some())));
+            let first = latest();
+            rig.selection
+                .as_mut()
+                .unwrap()
+                .preset_steps
+                .push_back(game::PresetStep::Next);
+            let step = rig.take_preset_step().unwrap();
+            shelf.step(step);
+            rig.presets_changed(Ok(&shelf));
+            let revision = first.revision;
+            assert!(crate::render_side::tests::wait_until(
+                || latest().revision > revision
+            ));
+            (first, latest(), rig.gauge)
+        });
+    assert_ne!(shelf.chosen_name(), "tapestry");
+    let was = gauge_of(&rules::tapestry(), displayed);
+    let now = gauge_of(shelf.chosen(), displayed);
+    assert_eq!(first.settings.unwrap().gauge, Some(was));
+    assert_eq!(stepped.settings.unwrap().gauge, Some(now));
+    assert_ne!(was, now, "the step must change the gauge shown");
+}
+
 /// The memory witness counts the selection screen's lines held in its
 /// text layer and the skin's state its owner keeps beside the renderer
 /// (design §6): the lines once prepared, none once the installation is

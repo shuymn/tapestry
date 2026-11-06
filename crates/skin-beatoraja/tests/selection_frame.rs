@@ -690,6 +690,42 @@ fn placements_past_sixty_are_ignored() {
     let _ = json;
 }
 
+/// A negative display offset draws number 12 negative, through the
+/// production path: with a strip of 24 glyphs (4×8 from row 40, glyph `k`
+/// at column `4k`), the negative half's digits after its sign, as play's
+/// signed numbers do.
+#[test]
+fn a_negative_display_offset_draws_number_12_negative() {
+    let d = folder(&minimal(
+        r#""value": [{"id": "n", "src": "s", "x": 0, "y": 40, "w": 96, "h": 8, "divx": 24, "digit": 5, "ref": 12}],
+           "destination": [{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]},
+               {"id": "n", "dst": [{"x": 0, "y": 0, "w": 4, "h": 8}]}]"#,
+    ));
+    let mut s = Sel::of(d.path());
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let glyphs = |s: &mut Sel| -> Vec<u8> {
+        s.images(0)
+            .into_iter()
+            .filter(|t| t[1] == 44)
+            .map(|t| (t[0] - 2) / 4)
+            .collect()
+    };
+    // The negative half is glyphs 12 to 23, its sign the last; a positive
+    // value takes the first half's "+" (11).
+    for (ms, want) in [(-37, vec![23, 15, 19]), (37, vec![11, 3, 7])] {
+        let set = settings(
+            ms,
+            1.0,
+            skin_model::SpeedView::Classic,
+            skin_model::SelectionOrder::Title,
+            None,
+            [false; 3],
+        );
+        s.skin.update_selection_settings(&mut s.sel, &set).unwrap();
+        assert_eq!(glyphs(&mut s), want, "{ms} ms");
+    }
+}
+
 /// The settings' numbers of the settings fixture, one a row.
 const SETTING_NUMBERS: [i32; 4] = [12, 57, 312, 313];
 
