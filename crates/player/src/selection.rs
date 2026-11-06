@@ -131,11 +131,7 @@ impl crate::loudness::Host for LoadHost<'_> {
     fn cancelled(&mut self) -> bool {
         // Every block of the measurement serves the adjustments.
         #[cfg(feature = "dev-tools")]
-        crate::dev::press_due(
-            self.controls,
-            crate::dev::LoadPhase::Measuring,
-            self.adjust.as_deref(),
-        );
+        crate::dev::press_due(self.controls, crate::dev::LoadPhase::Measuring);
         crate::play::serve_adjustments(
             self.adjust.as_deref_mut(),
             self.input,
@@ -1804,7 +1800,7 @@ impl AppRig for PlayerRig<'_> {
             let worker = s.spawn(decode);
             while !worker.is_finished() {
                 #[cfg(feature = "dev-tools")]
-                crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding, adjust.as_ref());
+                crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
                 crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
                 std::thread::park_timeout(crate::play::MARKER_PARK);
             }
@@ -1907,7 +1903,7 @@ impl AppRig for PlayerRig<'_> {
         screen
             .wait_serving(&self.render, || {
                 #[cfg(feature = "dev-tools")]
-                crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad, adjust.as_ref());
+                crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
                 crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
             })
             .map_err(ChartLoadError::Screen)?;
