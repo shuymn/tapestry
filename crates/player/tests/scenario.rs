@@ -842,7 +842,10 @@ fn a_tail_frames_sidecar_says_tail() {
 }
 
 /// A frame of Closing says so: a log that presses nothing fails the HAZARD
-/// gauge at its first miss, and Closing lasts at least a second.
+/// gauge at its first miss, and the first frame drawn from a view with
+/// Closing's start names that phase. Which chart time first shows Closing
+/// is the real threads' timing; the phase for each view is fixed in
+/// `a_phase_is_one_decision_over_its_inputs` (src/dev/scenario.rs).
 #[test]
 fn a_closing_frames_sidecar_says_closing() {
     let fx = Fixture::new();
@@ -855,7 +858,7 @@ fn a_closing_frames_sidecar_says_closing() {
     )
     .unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
-        "capture = { at = 2800, file = \"c.png\" }",
+        "capture = { closing_at = 0, file = \"c.png\" }",
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = \"logs/none.tprl\", until = \"end\" }",
         "result = \"back\"",
