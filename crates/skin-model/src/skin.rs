@@ -24,6 +24,9 @@ use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
+use crate::result::schema::timer as result_timer;
+use crate::result::view::{ResultLabels, ResultView};
+use crate::result::{ResultError, ResultFrame, ResultScreen};
 use crate::schema::Ty;
 use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
@@ -375,6 +378,8 @@ enum Phase<'a> {
     },
     /// A selection frame: its rows, ratios and slider hits.
     Selection { sel: &'a Selection },
+    /// A result frame.
+    Result,
 }
 
 /// A loaded skin.
@@ -1049,9 +1054,22 @@ fn check_bar_groups(
     Ok(())
 }
 
-/// The kind checks of [`Skin::new`] and [`Skin::new_selection`], first:
-/// a play skin draws no song list, ratio bar or selection text; a
-/// selection skin no lanes, gauge, judge or cover paint.
+/// Whether `source` is a text showing a selection screen's string.
+fn selection_text(def: &SkinDef, source: Source) -> bool {
+    match source {
+        Source::Text(i) => def
+            .widgets
+            .texts
+            .get(index(i))
+            .is_some_and(|t| matches!(t.value, TextValue::Selection(_))),
+        _ => false,
+    }
+}
+
+/// The kind checks of [`Skin::new`], [`Skin::new_selection`] and
+/// [`Skin::new_result`], first: a play skin draws no song list, ratio bar
+/// or selection text; a selection skin no lanes, gauge, judge or cover
+/// paint; a result skin none of these.
 fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
     for (element, e) in def.elements.iter().enumerate() {
         let ok = match kind {
@@ -1059,16 +1077,21 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                 e.source,
                 Source::Lanes | Source::Gauge(_) | Source::Judge(_) | Source::CoverPaint(_)
             ),
-            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => {
-                let selection_text = match e.source {
-                    Source::Text(i) => def
-                        .widgets
-                        .texts
-                        .get(index(i))
-                        .is_some_and(|t| matches!(t.value, TextValue::Selection(_))),
-                    _ => false,
-                };
-                !selection_text && !matches!(e.source, Source::SongList | Source::RatioBar(_))
+            ScreenKind::Result => {
+                !selection_text(def, e.source)
+                    && !matches!(
+                        e.source,
+                        Source::Lanes
+                            | Source::Gauge(_)
+                            | Source::Judge(_)
+                            | Source::CoverPaint(_)
+                            | Source::SongList
+                            | Source::RatioBar(_)
+                    )
+            }
+            ScreenKind::Play | ScreenKind::Decision => {
+                !selection_text(def, e.source)
+                    && !matches!(e.source, Source::SongList | Source::RatioBar(_))
             }
         };
         if !ok {
@@ -1340,13 +1363,27 @@ impl Skin {
         Self::load(def, ScreenKind::Selection, widgets)
     }
 
+    /// Loads a result skin: the checks of [`new`](Self::new) over the
+    /// result schema and its timers. An element may draw an image, an
+    /// image choice, a number or a text of the chart; the lanes, a gauge, a
+    /// judge, a cover paint, the song list, a ratio bar or a selection
+    /// text is refused ([`LoadError::SourceKind`]).
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails.
+    pub fn new_result(def: SkinDef) -> Result<Self, LoadError> {
+        Self::load(def, ScreenKind::Result, SelectionDefs::default())
+    }
+
     /// The checks of [`new`](Self::new) for a skin of `kind`, with the
     /// selection widgets `sel`.
     #[expect(clippy::too_many_lines, reason = "one ordered list of checks")]
     fn load(mut def: SkinDef, kind: ScreenKind, sel: SelectionDefs) -> Result<Self, LoadError> {
         let builtin = usize::from(match kind {
             ScreenKind::Selection => selection_timer::BUILTIN,
-            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => BUILTIN,
+            ScreenKind::Result => result_timer::BUILTIN,
+            ScreenKind::Play | ScreenKind::Decision => BUILTIN,
         });
         let elements = &def.elements;
         let whens = &def.whens;
@@ -2201,6 +2238,12 @@ impl Skin {
     /// visibility folds to false, or whose line has a value beyond
     /// ±[`MAX_TEXT_EM`](crate::MAX_TEXT_EM) em, gets no line.
     pub fn attach_bitmap_text(&self, play: &mut Play, chart: &ChartText<'_>) {
+        play.set_bitmap(self.bitmap_lines(chart));
+    }
+
+    /// The bitmap lines of `chart`, one per text slot, as
+    /// [`attach_bitmap_text`](Self::attach_bitmap_text) lays them out.
+    fn bitmap_lines(&self, chart: &ChartText<'_>) -> Box<[Option<GlyphLine>]> {
         let mut lines = vec![None; self.text_slots()];
         for e in &self.elements {
             let Kind::Text(i, t) = e.kind else {
@@ -2217,7 +2260,7 @@ impl Skin {
                 *slot = glyphs::layout(&self.sheet, font, &s);
             }
         }
-        play.set_bitmap(lines.into_boxed_slice());
+        lines.into_boxed_slice()
     }
 
     /// Attaches the rasterized lines of `play`'s attempt, one per text
@@ -2897,6 +2940,161 @@ impl Skin {
             .find_map(|h| h.at(point))
     }
 
+    /// A fresh result state ([`ResultScreen`]): every timer off, every
+    /// field 0 and every validity false, every text slot empty until a
+    /// view and a text table. One a skin of another kind makes is inert: it
+    /// draws nothing.
+    #[must_use]
+    pub fn prepare_result(&self) -> ResultScreen {
+        if self.kind != ScreenKind::Result {
+            return ResultScreen::inert(self.id);
+        }
+        ResultScreen::new(self.id, true, self.whens.len(), self.text_slots())
+    }
+
+    /// Whether `res` is a state this result skin made.
+    fn owns_result(&self, res: &ResultScreen) -> bool {
+        self.kind == ScreenKind::Result
+            && res.live
+            && res.skin == self.id
+            && res.slots() == usize::from(result_timer::BUILTIN) + self.whens.len()
+            && res.text.len() == self.text_slots()
+    }
+
+    /// Fills `res` from `view` and the chart's `labels`: the fields, the
+    /// timing statistics, the timelines and the strings its text shows.
+    /// The chart's fields follow the view under every status; the result's,
+    /// the timing's and the best's are valid only while the view is ready,
+    /// and the best's only while it is known; a hidden best value reads
+    /// `i32::MIN`. For a view change, not a frame: it may allocate, at most
+    /// the strings' growth and the timelines' copy. The texts stay as
+    /// attached until a new table is.
+    ///
+    /// # Errors
+    ///
+    /// [`ResultError::Kind`] when this is not a result skin or `res` is not
+    /// its state; nothing changes.
+    pub fn update_result(
+        &self,
+        res: &mut ResultScreen,
+        view: &ResultView,
+        labels: &ResultLabels,
+    ) -> Result<(), ResultError> {
+        if !self.owns_result(res) {
+            return Err(ResultError::Kind);
+        }
+        res.update(view, labels);
+        Ok(())
+    }
+
+    /// The lines to rasterize for `res`'s strings on a `target`-pixel
+    /// target with `layout`: each text element's, as
+    /// [`text_requests`](Self::text_requests) makes them, with the chart's
+    /// strings of the last view. A slot in a bitmap font gives none. For a
+    /// view change, not a frame: it allocates. A state this skin did not
+    /// make gives none.
+    #[must_use]
+    pub fn result_text_requests(
+        &self,
+        res: &ResultScreen,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
+        if !self.owns_result(res) {
+            return Vec::new();
+        }
+        self.text_requests(&res.strings.chart(), target, layout)
+    }
+
+    /// Attaches the rasterized lines for `res`'s text elements; a slot in a
+    /// bitmap font draws its bitmap line instead.
+    ///
+    /// # Errors
+    ///
+    /// A state this skin did not make, or a table whose length is not the
+    /// text slots; nothing changes.
+    pub fn attach_result_text(
+        &self,
+        res: &mut ResultScreen,
+        table: TextTable,
+    ) -> Result<(), TextTableError> {
+        if !self.owns_result(res) {
+            return Err(TextTableError::Foreign);
+        }
+        let expected = self.text_slots();
+        if table.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: table.len(),
+            });
+        }
+        res.text = table;
+        Ok(())
+    }
+
+    /// Lays out `res`'s lines in bitmap fonts, chosen and cleaned as
+    /// [`result_text_requests`](Self::result_text_requests) does. For a
+    /// view change, not a frame: it allocates.
+    pub fn attach_result_bitmap_text(&self, res: &mut ResultScreen) {
+        if !self.owns_result(res) {
+            return;
+        }
+        res.bitmap = self.bitmap_lines(&res.strings.chart());
+    }
+
+    /// Builds one result frame of `res`, which must come from this skin's
+    /// [`prepare_result`](Self::prepare_result): starts the built-in timers
+    /// from the frame's starts and the `when` timers over the fields,
+    /// places the regions, then appends each drawn element's quads to `out`
+    /// in draw order (the caller clears `out`): images, image choices,
+    /// numbers and text. A number draws nothing for `i32::MIN` or
+    /// `i32::MAX`. Allocates nothing.
+    ///
+    /// A state this skin did not make, or a uv table of another sheet or
+    /// length, draws nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a result skin; nothing
+    /// is appended.
+    pub fn build_result(
+        &self,
+        res: &mut ResultScreen,
+        frame: &ResultFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Result {
+            return Err(BuildError::Kind);
+        }
+        if !self.owns_result(res)
+            || uvs.sheet_id() != self.sheet_id
+            || uvs.frames().len() != self.frame_count
+        {
+            return Ok(());
+        }
+        let canvas = self.canvas(frame.target);
+        let placement = self.placement(&canvas, frame.layout, Side::Left);
+        res.fill(frame.now, &frame.timers, &self.whens);
+        let res = &*res;
+        let rt = Runtime {
+            starts: res.starts(),
+            state: res.state(),
+            text: &res.text,
+            bitmap: &res.bitmap,
+        };
+        let scene = Scene {
+            now: frame.now,
+            display: frame.now,
+            lanes: LaneView::NONE,
+            complete: false,
+            hidden_enabled: false,
+            phase: Phase::Result,
+        };
+        self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
+        Ok(())
+    }
+
     /// The elements of a build once its state is filled, the lanes drawing
     /// their bar groups with `bars`.
     #[expect(
@@ -2923,11 +3121,11 @@ impl Skin {
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
         let play = match scene.phase {
             Phase::Play { play, notes, .. } => Some((play, notes)),
-            Phase::Loading { .. } | Phase::Selection { .. } => None,
+            Phase::Loading { .. } | Phase::Selection { .. } | Phase::Result => None,
         };
         let sel = match scene.phase {
             Phase::Selection { sel } => Some(sel),
-            Phase::Play { .. } | Phase::Loading { .. } => None,
+            Phase::Play { .. } | Phase::Loading { .. } | Phase::Result => None,
         };
         #[cfg(feature = "dev-tools")]
         let mut element = 0_u32;
@@ -3135,7 +3333,13 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        n.digits.draw(v, rect, &brush, &at, out);
+                        // On result, a number draws nothing for the values
+                        // a source number reserves: a hidden value reads
+                        // `i32::MIN`. Play's values never reach them.
+                        let reserved = v == i32::MIN || v == i32::MAX;
+                        if !(reserved && matches!(scene.phase, Phase::Result)) {
+                            n.digits.draw(v, rect, &brush, &at, out);
+                        }
                     }
                 }
                 Kind::Gauge(i) => {
@@ -3154,7 +3358,7 @@ impl Skin {
                                 border: g.border,
                                 value: GaugeValue(0),
                             }),
-                            Phase::Selection { .. } => None,
+                            Phase::Selection { .. } | Phase::Result => None,
                         };
                         let d = GaugeDraw { at, shown, t };
                         g.draw(&d, rect, &brush, out);
