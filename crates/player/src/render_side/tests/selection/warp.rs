@@ -1,7 +1,7 @@
 //! The selection skin on a real screen, on WARP through the render thread
 //! (dev-tools: the screen reports its selection frames and text).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use game::Preparation;
@@ -43,12 +43,53 @@ impl FrameSink for Frames {
     }
 }
 
+/// The pacing of a [`Lossy`] screen: while `pace` is set, each frame wait
+/// takes one of `permits`, holding until there is one.
+#[derive(Default)]
+struct Gate {
+    pace: AtomicBool,
+    permits: AtomicU32,
+    /// The waits begun.
+    waits: AtomicU32,
+    /// Set while a wait holds for want of a permit.
+    held: AtomicBool,
+}
+
+impl Gate {
+    /// Holds the render thread in its next frame wait.
+    fn hold(&self) {
+        self.pace.store(true, Ordering::Release);
+        self.check(wait_until(|| self.held.load(Ordering::Acquire)));
+    }
+
+    /// Grants the held render thread one frame and waits until it holds
+    /// in the frame wait after it.
+    fn step(&self) {
+        let before = self.waits.load(Ordering::Acquire);
+        self.permits.store(1, Ordering::Release);
+        self.check(wait_until(|| {
+            self.waits.load(Ordering::Acquire) > before
+                && self.held.load(Ordering::Acquire)
+                && self.permits.load(Ordering::Acquire) == 0
+        }));
+    }
+
+    /// Releases the render thread before failing, so that it can exit.
+    fn check(&self, held: bool) {
+        if !held {
+            self.pace.store(false, Ordering::Release);
+        }
+        assert!(held, "the render thread did not hold in its frame wait");
+    }
+}
+
 /// A [`MenuScreen`] whose next selection frame fails as a lost device
 /// while `lose` is set (a real device loss: the screen is built again on a
-/// new device).
+/// new device), and whose frames `gate` paces.
 struct Lossy {
     menu: MenuScreen,
     lose: Arc<AtomicBool>,
+    gate: Arc<Gate>,
 }
 
 impl Screen for Lossy {
@@ -90,10 +131,24 @@ impl Screen for Lossy {
         self.menu.remove(kind);
     }
     fn wait(&self) -> bool {
-        self.menu.wait()
+        let gate = &self.gate;
+        gate.waits.fetch_add(1, Ordering::AcqRel);
+        while gate.pace.load(Ordering::Acquire) {
+            if gate
+                .permits
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                break;
+            }
+            gate.held.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        gate.held.store(false, Ordering::Release);
+        !self.menu.paced() || self.menu.wait()
     }
     fn paced(&self) -> bool {
-        self.menu.paced()
+        self.gate.pace.load(Ordering::Acquire) || self.menu.paced()
     }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         self.menu.build(f)
@@ -178,6 +233,7 @@ fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>) {
         Ok(Box::new(Lossy {
             menu: s,
             lose: Arc::clone(&flag),
+            gate: Arc::default(),
         }) as Box<dyn Screen>)
     });
     let frames = Frames::default();
@@ -431,8 +487,8 @@ impl FrameSink for SettingsFrames {
 /// settings keys' values, the select screen's update and the render
 /// thread's frame on WARP, a loaded `master_volume` shows the source's
 /// number of the `f32` that plays and its exact ratio, the gain playing
-/// unchanged; F4, F6 and F5 on selection show at the next frames with no
-/// view taken.
+/// unchanged; F4, F6 and F5 on selection each show in the one frame
+/// granted after the key, with no view taken.
 #[test]
 fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
     use game::{Adjust, AppRig as _};
@@ -447,7 +503,9 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
         (0.45, 45, (7_549_747, 1 << 24)),
     ] {
         let frames = SettingsFrames::default();
-        let make: MakeScreen = Box::new(|| {
+        let gate = Arc::new(Gate::default());
+        let paced = Arc::clone(&gate);
+        let make: MakeScreen = Box::new(move || {
             let r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
@@ -455,10 +513,11 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
                 },
                 render::AdapterChoice::Warp,
             )?;
-            Ok(
-                Box::new(MenuScreen::new(r, Some(render::text::Fonts::runtime()?)))
-                    as Box<dyn Screen>,
-            )
+            Ok(Box::new(Lossy {
+                menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
+                lose: Arc::default(),
+                gate: Arc::clone(&paced),
+            }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
         let link = spawn(
@@ -507,21 +566,39 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
             if gain != 0.7649 {
                 return;
             }
+            // Each key pressed while the render thread holds in its frame
+            // wait, before it reads the settings, then exactly one frame
+            // granted: that frame shows the key.
+            gate.hold();
             let views = seen().last().unwrap().views;
-            // F4: 76 + 5, the f32 0.81.
-            assert!(tuning.adjust(Adjust::VolumeUp));
-            assert!(
-                shows([81, 0], width(13_589_545, 1 << 24)),
-                "{:?}",
-                seen().last()
-            );
-            // F6, then F5: the display offset 1 ms, then 0.
-            assert!(tuning.adjust(Adjust::DisplayOffsetUp));
-            assert!(shows([81, 1], width(13_589_545, 1 << 24)));
-            assert!(tuning.adjust(Adjust::DisplayOffsetDown));
-            assert!(shows([81, 0], width(13_589_545, 1 << 24)));
-            // No view was taken for any of them.
-            assert_eq!(seen().last().unwrap().views, views);
+            let mut next = |key| {
+                let before = seen().len();
+                let pressed = tuning.adjust(key);
+                gate.step();
+                let after = seen();
+                (pressed, after.len() - before, after.last().cloned())
+            };
+            // F4: 76 + 5, the f32 0.81; then F6 and F5: the display offset
+            // 1 ms, then 0.
+            let steps = [
+                (next(Adjust::VolumeUp), [81, 0]),
+                (next(Adjust::DisplayOffsetUp), [81, 1]),
+                (next(Adjust::DisplayOffsetDown), [81, 0]),
+            ];
+            gate.pace.store(false, Ordering::Release);
+            let graph = width(13_589_545, 1 << 24);
+            for ((pressed, drawn, frame), numbers) in steps {
+                assert!(pressed, "{numbers:?}");
+                assert_eq!(drawn, 1, "{numbers:?}: {frame:?}");
+                let frame = frame.unwrap();
+                assert_eq!(frame.numbers, numbers, "{frame:?}");
+                assert!(
+                    frame.graph.is_some_and(|g| (g - graph).abs() < 0.01),
+                    "{frame:?}"
+                );
+                // No view was taken for any of them.
+                assert_eq!(frame.views, views, "{frame:?}");
+            }
         });
     }
 }
