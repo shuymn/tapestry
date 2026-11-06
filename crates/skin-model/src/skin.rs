@@ -2144,20 +2144,26 @@ impl Skin {
             if s.is_empty() {
                 continue;
             }
-            let h = e.track.rects().map(|[.., h]| h).max().unwrap_or(0);
-            let h = u128::try_from(h).unwrap_or(0);
-            let scale = self.regions.effective(e.region, layout).scale;
-            let em = Ratio(h, 1).mul(fit).mul(Ratio(u128::from(scale), 100));
-            // Both terms are below 2^60; rounding them to f64 is the intent.
-            let em_px = f32_of(em.0 as f64 / em.1 as f64).min(MAX_TEXT_EM_PX);
             out.push(TextRequest {
                 slot: t.slot,
                 text: s,
                 font: def.font,
-                em_px,
+                em_px: self.em_px(&e.track, e.region, fit, layout),
             });
         }
         out
+    }
+
+    /// A line's em in pixels: `track`'s largest key height times the canvas
+    /// scale `fit` and `region`'s effective scale under `layout`, at most
+    /// [`MAX_TEXT_EM_PX`].
+    fn em_px(&self, track: &Track, region: Region, fit: Ratio, layout: &Layout) -> f32 {
+        let h = track.rects().map(|[.., h]| h).max().unwrap_or(0);
+        let h = u128::try_from(h).unwrap_or(0);
+        let scale = self.regions.effective(region, layout).scale;
+        let em = Ratio(h, 1).mul(fit).mul(Ratio(u128::from(scale), 100));
+        // Both terms are below 2^60; rounding them to f64 is the intent.
+        f32_of(em.0 as f64 / em.1 as f64).min(MAX_TEXT_EM_PX)
     }
 
     /// Lays out `play`'s bitmap lines for `chart`, one per text slot in a
@@ -2618,16 +2624,7 @@ impl Skin {
             return out;
         }
         let (fit, ..) = self.fit(target);
-        let em = |track: &Track, region: Region| {
-            let h = track.rects().map(|[.., h]| h).max().unwrap_or(0);
-            let h = u128::try_from(h).unwrap_or(0);
-            let scale = self.regions.effective(region, layout).scale;
-            let em = Ratio(h, 1).mul(fit).mul(Ratio(u128::from(scale), 100));
-            // Both terms are below 2^60; rounding them to f64 is the intent.
-            #[expect(clippy::cast_precision_loss, reason = "as `text_requests`")]
-            let px = f32_of(em.0 as f64 / em.1 as f64).min(MAX_TEXT_EM_PX);
-            px
-        };
+        let em = |track: &Track, region: Region| self.em_px(track, region, fit, layout);
         let strings = &sel.strings;
         let chart = strings.chart();
         for e in &self.elements {
@@ -2659,7 +2656,7 @@ impl Skin {
         for (i, (row, s)) in sel.rows.iter().zip(sel.row_strings.iter()).enumerate() {
             let Some(t) = row
                 .style
-                .and_then(|s| list.text.get(s as usize))
+                .and_then(|s| list.text.get(s.index()))
                 .and_then(Option::as_ref)
             else {
                 continue;
@@ -2760,7 +2757,7 @@ impl Skin {
             .map(|(row, s)| {
                 let t = row
                     .style
-                    .and_then(|s| list.text.get(s as usize))
+                    .and_then(|s| list.text.get(s.index()))
                     .and_then(Option::as_ref)?;
                 let font = t.content.0.bitmap?;
                 glyphs::layout(&self.sheet, font, &clean(s))
