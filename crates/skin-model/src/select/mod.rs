@@ -193,7 +193,8 @@ impl Selection {
 
     /// Fills the fields, strings, rows and ratios from `view`, the rows
     /// placed around the cursor at `center`. Allocates only to grow a
-    /// string past its capacity.
+    /// string past its capacity, each string at most twice
+    /// [`MAX_TEXT_BYTES`].
     pub(crate) fn update(&mut self, view: &SelectionView, labels: &SelectionLabels, center: usize) {
         let cursor = view.cursor.and_then(|c| view.rows.get(c));
         self.fields = fields(view, cursor);
@@ -219,7 +220,8 @@ impl Selection {
             .selected
             .as_ref()
             .and_then(|c| match (c.score, c.max_ex) {
-                (RowScore::Best { ex, .. }, Some(max)) if max > 0 => Ratio::new(u64::from(ex), max),
+                // A largest of 0 makes no ratio.
+                (RowScore::Best { ex, .. }, Some(max)) => Ratio::new(u64::from(ex), max),
                 _ => None,
             });
     }
@@ -314,8 +316,9 @@ impl Selection {
     }
 }
 
-/// `src` appended to `out`, which stays within [`MAX_TEXT_BYTES`] past
-/// what it held: the text requests cut every string to it anyway.
+/// `src` appended to `out` up to twice [`MAX_TEXT_BYTES`] in all, cut at a
+/// character boundary: the text requests cut every string to
+/// [`MAX_TEXT_BYTES`] anyway.
 fn push(out: &mut String, src: &str) {
     let room = (MAX_TEXT_BYTES * 2).saturating_sub(out.len());
     let mut end = src.len().min(room);

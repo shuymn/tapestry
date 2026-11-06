@@ -1335,6 +1335,7 @@ impl Skin {
             w.texts.len(),
             w.image_choices.len(),
             w.cover_paints.len(),
+            sel.ratio_bars.len(),
         ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });

@@ -1054,6 +1054,22 @@ fn the_song_lists_bounds_are_checked() {
         with(bad),
         Err(LoadError::SongList(SongListError::UnknownImage))
     ));
+    // The ratio bar table is bounded as every widget table.
+    let bars = |n| {
+        load(
+            Vec::new(),
+            WidgetDefs::default(),
+            SelectionDefs {
+                song_list: None,
+                ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate); n],
+            },
+        )
+    };
+    assert!(bars(skin_model::MAX_ELEMENTS).is_ok());
+    assert!(matches!(
+        bars(skin_model::MAX_ELEMENTS + 1),
+        Err(LoadError::TooManyWidgets { n }) if n == skin_model::MAX_ELEMENTS + 1
+    ));
     // Keys: 120 arms of 256 keys and image elements of 256 keys up to the
     // skin's limit exactly; one key past it is refused.
     let many = |n: i32| {
