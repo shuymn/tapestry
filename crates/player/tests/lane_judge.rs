@@ -8,8 +8,8 @@
 
 use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
 use eval::{
-    Binding, ControlId, DeviceProfile, InputKind, InputStart, JudgeEvent, PhysicalInputEvent,
-    SourceId, SourceProfile,
+    AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, InputKind, InputStart, JudgeEvent,
+    PhysicalInputEvent, ScratchSettings, SourceId, SourceProfile,
 };
 use game::{Logic, LogicConfig, RenderSide};
 use input::{SourceReader, SourceWriter, source_queue};
@@ -37,7 +37,11 @@ fn lane(n: u8) -> Lane {
     Lane::new(n).unwrap()
 }
 
-/// One source binding control `n` to lane `n`.
+/// The scratch's axis, 256 positions a revolution.
+const AXIS: u8 = 8;
+
+/// One source binding control `n` to lane `n`, and the axis to the
+/// scratch.
 fn device() -> DeviceProfile {
     DeviceProfile {
         sources: vec![SourceProfile {
@@ -48,13 +52,21 @@ fn device() -> DeviceProfile {
                     lane: l,
                 })
                 .collect(),
-            axes: Vec::new(),
+            axes: vec![AxisBinding {
+                control: ControlId(u32::from(AXIS)),
+                lane: Lane::SCRATCH,
+                scratch: ScratchSettings {
+                    mode: AxisMode::Absolute { wrap: 256 },
+                    ..ScratchSettings::DEFAULT
+                },
+            }],
         }],
     }
 }
 
-/// The scratch's tap at 1 s; key 1's taps at 1, 2 and 3 s; key 2's long
-/// note from 4 to 4.5 s; key 3's taps at 5 and 5.5 s.
+/// The scratch's tap at 1 s and long note from 6.5 to 7 s; key 1's taps
+/// at 1, 2 and 3 s; key 2's long note from 4 to 4.5 s; key 3's taps at 5
+/// and 5.5 s; key 4's tap at 6 s.
 fn chart() -> Chart {
     ChartBuilder::new(150_000)
         .tap(lane(0), TimeUs(1_000 * MS))
@@ -64,6 +76,8 @@ fn chart() -> Chart {
         .long(lane(2), TimeUs(4_000 * MS), TimeUs(4_500 * MS))
         .tap(lane(3), TimeUs(5_000 * MS))
         .tap(lane(3), TimeUs(5_500 * MS))
+        .tap(lane(4), TimeUs(6_000 * MS))
+        .long(lane(0), TimeUs(6_500 * MS), TimeUs(7_000 * MS))
         .build()
         .unwrap()
 }
@@ -266,7 +280,11 @@ impl<'a> Rig<'a> {
 /// press 400 ms after it, matching nothing (0); key 2's head 10 ms early,
 /// held (8); its release 140 ms before its end, GOOD by the release,
 /// early (4); key 3 100 ms late, GOOD (5), then 150 ms early, BAD (6). A
-/// retry starts at 0 and takes its own first judgment.
+/// key 4 40 ms early, GREAT (2), then a press on its note's time, an
+/// empty POOR on time, which is late (11); the scratch's long note held
+/// by its axis (8), then a reversal 100 ms before its end, whose release
+/// judges it and whose press, at the same µs and after it, matches nothing
+/// (0). A retry starts at 0 and takes its own first judgment.
 #[test]
 fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     let dir = tempfile::tempdir().unwrap();
@@ -327,6 +345,35 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     r.tap(5_350, 3);
     let s = r.step(&skin, &uvs, 5_350);
     assert_eq!(s, [1, 0, 4, 6, 0, 0, 0, 0], "early BAD");
+    r.tap(5_960, 4);
+    let s = r.step(&skin, &uvs, 5_960);
+    assert_eq!(s, [1, 0, 4, 6, 2, 0, 0, 0], "early GREAT");
+    r.tap(6_000, 4);
+    let s = r.step(&skin, &uvs, 6_000);
+    assert_eq!(s, [1, 0, 4, 6, 11, 0, 0, 0], "empty POOR on time");
+    // The axis at rest, then +2, a press on the head's time.
+    r.set(6_200, AXIS, 100);
+    r.set(6_500, AXIS, 102);
+    let s = r.step(&skin, &uvs, 6_500);
+    assert_eq!(s, [8, 0, 4, 6, 11, 0, 0, 0], "scratch held");
+    // Held by a step forward every 60 ms, inside the release time.
+    for (k, ms) in (6_560..=6_860).step_by(60).enumerate() {
+        r.set(ms, AXIS, 103 + i32::try_from(k).unwrap());
+    }
+    let s = r.step(&skin, &uvs, 6_880);
+    assert_eq!(s, [8, 0, 4, 6, 11, 0, 0, 0], "still held");
+    // Back by 2: a release, which judges the long note, then a press, in
+    // one µs.
+    r.set(6_900, AXIS, 106);
+    let s = r.step(&skin, &uvs, 6_900);
+    assert!(
+        r.effects.iter().any(
+            |e| matches!(e.kind, eval::JudgeEventKind::Judged { lane, .. } if lane == Lane::SCRATCH)
+        ),
+        "{:?}",
+        r.effects
+    );
+    assert_eq!(s, [0, 0, 4, 6, 11, 0, 0, 0], "reversal");
     // A retry: a fresh attempt and preparation.
     let mut r = Rig::new(&chart, &rule, &dev, &skin, &ctx);
     assert_eq!(r.step(&skin, &uvs, 500), [0; 8], "retried");
