@@ -913,13 +913,13 @@ fn practice_goal(
     if p.input == "auto" {
         return Err("input cannot be auto: an autoplay session cannot practice".to_owned());
     }
-    let file = resolve(base, Path::new(&p.input))?;
-    let path = LogKey::Path(file.clone());
-    let k = match log_paths.iter().position(|l| *l == path) {
+    let path = resolve(base, Path::new(&p.input))?;
+    let key = LogKey::Path(path.clone());
+    let k = match log_paths.iter().position(|l| *l == key) {
         Some(k) => k,
         None => {
-            logs.push(super::script(&file, &[]).map_err(|e| format!("{e:#}"))?);
-            log_paths.push(path);
+            logs.push(super::script(&path, &[]).map_err(|e| format!("{e:#}"))?);
+            log_paths.push(key);
             log_paths.len() - 1
         }
     };
