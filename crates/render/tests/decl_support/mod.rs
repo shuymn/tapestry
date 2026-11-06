@@ -100,6 +100,9 @@ pub struct Look {
     /// `last_note` timer started: from the notes' end, at the first playing
     /// frame at or past it.
     pub finish: bool,
+    /// A marker drawing the image unclipped over [`MISS_MARKER`] while the
+    /// view's tally counts a POOR.
+    pub miss: bool,
     /// Three loading elements drawing the image unclipped: over
     /// [`BACKGROUND`] on the untimed `screen` timer, over a 100×100 square
     /// moving right from [`ANIMATION`] at 1 canvas pixel per ms of the
@@ -273,6 +276,8 @@ pub const GAUGE_MARKER: [i32; 4] = [1_200, 100, 100, 100];
 pub const JUDGE_MARKER: [i32; 4] = [1_500, 100, 100, 100];
 /// Where the finish marker draws.
 pub const FINISH_MARKER: [i32; 4] = [1_700, 100, 100, 100];
+/// Where the miss marker draws.
+pub const MISS_MARKER: [i32; 4] = [1_700, 300, 100, 100];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -287,6 +292,7 @@ impl Look {
             text_on_screen: false,
             markers: false,
             finish: false,
+            miss: false,
             loading: false,
             structure: false,
             chart_text: false,
@@ -408,6 +414,14 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
         elements.push(ElementDef {
             timer: TimerRef::Builtin(skin_model::timer::JUDGE),
             ..image(JUDGE_MARKER, false)
+        });
+    }
+    if look.miss {
+        let scope = Scope::new(&PLAY);
+        let poor = compile("count.poor > 0", &scope, Ty::Bool).unwrap();
+        elements.push(ElementDef {
+            visible: Some(poor),
+            ..image(MISS_MARKER, false)
         });
     }
     if look.finish {

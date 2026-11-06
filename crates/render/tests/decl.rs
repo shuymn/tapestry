@@ -667,6 +667,33 @@ fn a_playing_frame_past_the_notes_end_starts_the_finish() {
     assert_eq!(shown(&mut r, &v, 2_500), BLACK);
 }
 
+/// A miss the view holds reaches the skin through the renderer's frame
+/// (`skin_frame`): the marker on its POOR count shows, and the same view
+/// without the miss shows none.
+#[test]
+fn a_miss_in_the_view_shows_through_the_frame() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let look = Look {
+        miss: true,
+        ..red()
+    };
+    let (b, _) = bundle(&r, dir.path(), &look);
+    let ctx = context(&GAUGES, false);
+    let token = r.stage(&b, &attempt(&r, &chart, &ctx), 1).unwrap();
+    r.commit(token).unwrap();
+    let marker = (1_750, 350);
+    let mut v = view(0, 0);
+    v.playing = true;
+    v.tally.counts.poor = 1;
+    r.frame(&input(&v, TimeUs(1_000), TimeUs(0), &[])).unwrap();
+    assert_eq!(px(&read_back(&r), marker), RED);
+    v.tally.counts.poor = 0;
+    r.frame(&input(&v, TimeUs(1_100), TimeUs(0), &[])).unwrap();
+    assert_eq!(px(&read_back(&r), marker), BLACK);
+}
+
 /// The simple skin's attempt state counts what it copies of the chart, so
 /// the first replacement by a declarative skin counts it beside the staged
 /// attempt's until the commit, which leaves the declarative attempt's.
