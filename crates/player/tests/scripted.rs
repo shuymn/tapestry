@@ -1807,11 +1807,15 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 
 /// The loading script on the real threads (`--dev-loading`; design.md
 /// "Play Adjustments"): START (Q) held from the start of loading for
-/// 1.5 s, with recording closed, defers the opening; the loading script
-/// goes on feeding through the deferral, so its release opens it, and the
-/// play's script takes over on the same devices. Nothing of the loading
-/// script is recorded, and the play opened about 1.5 s after it was first
-/// asked for.
+/// 1.5 s, with recording closed, defers an opening asked meanwhile; the
+/// loading script goes on feeding through the deferral, so its release
+/// opens it, and the play's script takes over on the same devices.
+/// Nothing of the loading script is recorded. A load that outlasts the
+/// hold opens without a deferral; either way nothing is cancelled and the
+/// play keeps the timeline of the opening first asked for, so every
+/// recorded press is the log's, shifted by one amount of zero or more.
+/// The exact shift is
+/// `a_deferred_opening_keeps_the_scripts_timeline` (src/input_side.rs).
 #[test]
 fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     const Q: u32 = 0x10;
@@ -1834,13 +1838,22 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     let saved = records(&appdata);
     assert_eq!(saved.len(), 1, "{saved:?}");
     let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
-    // No cancelled candidate: the opening was deferred, not cancelled.
+    // No cancelled candidate: an opening was deferred, not cancelled.
     assert!(rec.history.openings.is_empty(), "{:?}", rec.history);
-    // The script keeps the timeline of the opening first asked for; the
-    // play opened about 1.5 s later, at the release, so the log's presses
-    // land that much earlier on its chart time.
-    let early = events[0].received.0 - rec.events[0].received.0;
-    assert!((1_400_000..1_700_000).contains(&early), "{early} {stderr}");
+    // The script keeps the timeline of the opening first asked for; a
+    // play opened later, at the release, has the log's presses that much
+    // earlier on its chart time. A shift large enough to put the first
+    // presses before the opening leaves them out of the record.
+    let kept = &events[events.len() - rec.events.len()..];
+    let early = kept[0].received.0 - rec.events[0].received.0;
+    assert!(early >= 0, "{early} {stderr}");
+    assert!(
+        kept.iter()
+            .zip(&rec.events)
+            .all(|(e, r)| e.kind == r.kind && e.received.0 - r.received.0 == early),
+        "{early} {kept:?} {:?}",
+        rec.events
+    );
     assert!(!rec.events.iter().any(|e| matches!(
         e.kind,
         eval::InputKind::Control { control, .. } if control.0 == Q
