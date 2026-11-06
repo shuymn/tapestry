@@ -3104,6 +3104,114 @@ mod gate_tests {
         (sources, hook, link, gate, opening)
     }
 
+    /// A loading script holding START from the start of loading to 600 ms
+    /// (`--dev-loading`), on a scripted play whose log presses Z at 1.7 s
+    /// and releases it at 1.75 s: the opening asked at 400 ms is deferred,
+    /// the release is fed at 610 ms, and the opening asked again at 650 ms
+    /// opens on the timeline of the one first asked, so Z lands 250 ms
+    /// earlier on its chart time. Asked again later, the log's items before
+    /// the opening are fed before recording opens and stay out of it: past
+    /// Z's press only its release is recorded, past both nothing.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_deferred_opening_keeps_the_scripts_timeline() {
+        let us = |ms: &[i64]| ms.iter().map(|&m| TimeUs(m * MS)).collect::<Vec<_>>();
+        assert_eq!(deferred_opening(650), us(&[1_450, 1_500]));
+        // Opened at 1.72 s on the script's timeline: its chart time 0 is
+        // at 2.72 s.
+        assert_eq!(deferred_opening(3_120), us(&[-970]));
+        assert_eq!(deferred_opening(3_200), us(&[]));
+    }
+
+    /// The times of Z's events recorded in
+    /// [`a_deferred_opening_keeps_the_scripts_timeline`] with the opening
+    /// asked again `reopen` ms after loading started.
+    #[cfg(feature = "dev-tools")]
+    fn deferred_opening(reopen: i64) -> Vec<TimeUs> {
+        use input::{Action, ScriptItem, ScriptedInput};
+
+        const LOADING: i64 = 10_000 * MS;
+        let config = SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        };
+        let item = |ms: i64, action| ScriptItem {
+            at: TimeUs(ms * MS),
+            action,
+        };
+        let key = |ms, control, value| item(ms, Action::Packet(packet(1, control, value)));
+        let script = ScriptedInput::new(vec![
+            item(-5_000, Action::Connect(DeviceId(1), DeviceKind::Keyboard)),
+            key(1_700, Z, 1),
+            key(1_750, Z, 0),
+        ])
+        .with_recorded(DeviceId(1), vec![Q, Z]);
+        let loading = ScriptedInput::new(vec![
+            item(0, Action::Connect(DeviceId(1), DeviceKind::Keyboard)),
+            key(0, Q, 1),
+            key(600, Q, 0),
+        ]);
+        let mode = Mode::Script(Box::new(super::Script {
+            log: script.clone(),
+            current: script,
+            sources: config.clone(),
+            loading: Some(loading),
+            rearm_delay: TimeUs(0),
+        }));
+        let mut sources = SourceSet::new(config).unwrap();
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (mut hook, link) = link(controls, mode, Waker::new().unwrap());
+        let (tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        link.tap(tap);
+        let ask = |hook: &mut Hook, sources: &mut SourceSet, ms: i64| {
+            link.requests
+                .send(Request::Open {
+                    lead_in: LEAD_IN,
+                    logic: std::thread::current(),
+                    recorded: recorded(),
+                    gate: Some(1),
+                })
+                .unwrap();
+            hook.wake(sources, TimeUs(LOADING + ms * MS));
+            link.replies.try_recv().unwrap()
+        };
+        link.loading_script(TimeUs(LOADING));
+        hook.wake(&mut sources, TimeUs(LOADING));
+        hook.wake(&mut sources, TimeUs(LOADING + 100 * MS));
+        assert!(sources.holding());
+        assert!(matches!(ask(&mut hook, &mut sources, 400), Reply::Deferred));
+        hook.wake(&mut sources, TimeUs(LOADING + 610 * MS));
+        assert!(!sources.holding());
+        let Reply::Opened(opening, _) = ask(&mut hook, &mut sources, reopen) else {
+            panic!("the opening asked again did not open");
+        };
+        // The script's time 0 is the first opening's chart time 0.
+        let first_origin = LOADING + 400 * MS + LEAD_IN.0;
+        let opened = LOADING + reopen * MS;
+        for ms in [1_700, 1_760, 2_000] {
+            let at = first_origin + ms * MS;
+            if at > opened {
+                hook.wake(&mut sources, TimeUs(at));
+            }
+        }
+        let mut readers = opening.readers;
+        readers
+            .iter_mut()
+            .flat_map(|r| std::iter::from_fn(move || r.pop()))
+            .filter(|e| matches!(e.kind, InputKind::Control { control, .. } if control == Z))
+            .map(|e| e.received)
+            .collect()
+    }
+
     /// The player's gate admits what its exchange with the input side
     /// keeps, by the capacities reserved at the opening: an attempt whose
     /// recording fills the reservation exactly with the history and the

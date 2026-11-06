@@ -842,7 +842,13 @@ fn a_tail_frames_sidecar_says_tail() {
 }
 
 /// A frame of Closing says so: a log that presses nothing fails the HAZARD
-/// gauge at its first miss, and Closing lasts at least a second.
+/// gauge at its first miss, and the first frame drawn from a view with
+/// Closing's start names that phase. No frame of Closing is guaranteed: a
+/// render thread starved through all of it draws none, and the capture
+/// then fails the run, which still reports the play's Closing. Which
+/// chart time first shows Closing is the real threads' timing; the phase
+/// for each view is fixed in `a_phase_is_one_decision_over_its_inputs`
+/// (src/dev/scenario.rs).
 #[test]
 fn a_closing_frames_sidecar_says_closing() {
     let fx = Fixture::new();
@@ -855,12 +861,23 @@ fn a_closing_frames_sidecar_says_closing() {
     )
     .unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
-        "capture = { at = 2800, file = \"c.png\" }",
+        "capture = { closing_at = 0, file = \"c.png\" }",
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = \"logs/none.tprl\", until = \"end\" }",
         "result = \"back\"",
         "quit = {}",
     ]));
+    assert_eq!(lines(&stdout, "closing: ").len(), 1, "{stdout}");
+    if out.status.code() == Some(1) {
+        let missed = "dev: scenario: step 1 (capture): \
+                      the play ended before a frame at 0 ms on its closing axis";
+        assert!(
+            stdout.lines().chain(stderr.lines()).any(|l| l == missed),
+            "{stdout}\n{stderr}"
+        );
+        assert!(!fx.base.join("out").join("c.json").exists());
+        return;
+    }
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let side = fs::read_to_string(fx.base.join("out").join("c.json")).unwrap();
     assert_eq!(side_value(&side, "phase"), "closing", "{side}");
