@@ -155,3 +155,57 @@ fn image_set_entries_are_charged_before_they_are_read() {
     // Both arms charged.
     assert_eq!(i.report.usage.choice_refs as usize, MAX_IMAGE_CHOICE_REFS);
 }
+
+/// A bitmap row text charges a field's glyphs a slot: song list elements
+/// of one slot (its bar, 256 glyphs, its lamp and three labels) and
+/// numbers filling the rest reach the widget quad cap exactly, and one
+/// cell more refuses.
+#[test]
+fn bitmap_row_text_quads_count_to_the_cap() {
+    let per_list = 2 + u32::try_from(skin_model::MAX_TEXT_BYTES).unwrap() + 3;
+    let lists = MAX_WIDGET_QUADS / per_list;
+    let rest = MAX_WIDGET_QUADS - lists * per_list;
+    let body = |extra: u32| {
+        let total = rest + extra;
+        let mut cells = vec![11; usize::try_from(total / 11).unwrap()];
+        if !total.is_multiple_of(11) {
+            cells.push(total % 11);
+        }
+        let values: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    r#"{{"id": "n{i}", {}, "digit": {c}, "ref": 71}}"#,
+                    common::selection::DIGITS
+                )
+            })
+            .collect();
+        let fillers: Vec<String> = (0..cells.len())
+            .map(|i| format!(r#"{{"id": "n{i}", "dst": [{}]}}"#, at(0, 0, 4, 8)))
+            .collect();
+        let text = format!(r#""text": [{{"id": "tb", "dst": [{}]}}]"#, at(0, 0, 100, 4));
+        let more = format!(
+            r#""value": [{}], "font": [{{"id": "b", "path": "b.fnt"}}]"#,
+            values.join(",")
+        );
+        skin(
+            &at(0, 900, 300, 40),
+            &fillers,
+            usize::try_from(lists).unwrap(),
+            &text,
+            &more,
+        )
+        .replace(TEXT_T, r#"{"id": "tb", "font": "b", "size": 4, "ref": 10}"#)
+    };
+    let run = |extra: u32| {
+        let d = folder(&body(extra));
+        common::big_fnt(d.path(), "b.fnt", 4, 0, 0);
+        import_selection(d.path())
+    };
+    let i = run(0).unwrap();
+    assert_eq!(i.report.usage.widget_quads, MAX_WIDGET_QUADS);
+    assert_eq!(i.report.usage.fonts, 1);
+    let (l, _) = limit(run(1));
+    assert_eq!(l, ImportLimit::WidgetQuads);
+}

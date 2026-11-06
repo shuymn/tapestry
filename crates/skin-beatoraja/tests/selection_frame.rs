@@ -412,6 +412,10 @@ fn panels_and_the_change_timer_follow_the_frame() {
         .chain([
             r#"{"id": "lab", "timer": 11, "dst": [{"time": 0, "x": 0, "y": 0, "w": 8, "h": 8}]}"#
                 .to_owned(),
+            // Drawn from 100 ms after the change.
+            r#"{"id": "lamp", "timer": 11, "loop": 100,
+                "dst": [{"time": 100, "x": 0, "y": 0, "w": 8, "h": 8}]}"#
+                .to_owned(),
         ])
         .collect();
     let d = folder(&minimal(&format!(
@@ -438,9 +442,15 @@ fn panels_and_the_change_timer_follow_the_frame() {
     // The change-timed label: off before its start, then drawn at its
     // start plus its key.
     let label = |s: &mut Sel, ms| s.images(ms).contains(&LABEL);
-    assert!(!label(&mut s, 500));
+    let late = |s: &mut Sel, ms| s.images(ms).contains(&LAMP);
+    assert!(!label(&mut s, 500) && !late(&mut s, 500));
+    // A change at 200 ms: before it, the timer reads as just started (a
+    // start after `now` ages to 0), so the label at key 0 draws and the
+    // one at key 100 does not; from its start plus 100 ms it does.
     s.timers.change = Some(TimeUs(200_000));
-    assert!(label(&mut s, 200));
+    assert!(label(&mut s, 150) && !late(&mut s, 150));
+    assert!(label(&mut s, 200) && !late(&mut s, 299));
+    assert!(late(&mut s, 300));
 }
 
 /// C1 (importer half): a play timer and a LIFT offset on a selection skin
