@@ -10,6 +10,7 @@ use game::{BestScore, BestView, Chain, LocalRecords, RecordRef, RecordSink, Save
 use library::{Best, BestWriter, Contribution, Ineligible, Ingested, PlayId, Score, Verified};
 use replay::PlayRecord;
 use rules::RulePreset;
+use skin_model::{OwnLamp, RowScore};
 
 /// Saves records as [`LocalRecords`] does, and counts each saved play into
 /// the bests through `bests`, the library's live writer. A play that
@@ -141,11 +142,11 @@ pub fn shown(score: &Score, preset: &RulePreset) -> BestScore {
     }
 }
 
-/// The lamp of `best` under `preset`: `FC` for a FULL COMBO, else the
-/// cleared gauge with the highest `lamp` rank, uppercased, else `FAILED`.
-pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
+/// The lamp of `best` under `preset`: a FULL COMBO, else the cleared gauge
+/// with the highest `lamp` rank, else failed.
+pub fn own_lamp(best: &Best, preset: &RulePreset) -> OwnLamp {
     if best.full_combo {
-        return "FC".to_owned();
+        return OwnLamp::FullCombo;
     }
     preset
         .gauges
@@ -153,7 +154,49 @@ pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
         .enumerate()
         .filter(|&(i, _)| best.cleared(i))
         .max_by_key(|(_, g)| g.lamp)
-        .map_or_else(|| "FAILED".to_owned(), |(_, g)| g.id.to_uppercase())
+        .and_then(|(i, g)| {
+            Some(OwnLamp::Cleared {
+                gauge: u16::try_from(i).ok()?,
+                rank: g.lamp,
+            })
+        })
+        .unwrap_or(OwnLamp::Failed)
+}
+
+/// A lamp's text under `preset`: `FC`, the cleared gauge's ID uppercased, or
+/// `FAILED`.
+pub fn lamp_name(lamp: OwnLamp, preset: &RulePreset) -> String {
+    match lamp {
+        OwnLamp::FullCombo => "FC".to_owned(),
+        OwnLamp::Failed => "FAILED".to_owned(),
+        OwnLamp::Cleared { gauge, .. } => preset
+            .gauges
+            .get(usize::from(gauge))
+            .map_or_else(String::new, |g| g.id.to_uppercase()),
+    }
+}
+
+/// The text of `best`'s lamp under `preset` ([`own_lamp`], [`lamp_name`]).
+pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
+    lamp_name(own_lamp(best, preset), preset)
+}
+
+/// A chart's stored score under `preset` as a row shows it: unplayed when
+/// there is none.
+pub fn row_score(score: Option<&Score>, preset: &RulePreset) -> RowScore {
+    match score {
+        None => RowScore::Unplayed,
+        Some(Score { plays, best: None }) => RowScore::NoBest { plays: *plays },
+        Some(Score {
+            plays,
+            best: Some(b),
+        }) => RowScore::Best {
+            plays: *plays,
+            ex: b.ex,
+            bp: b.bp,
+            lamp: own_lamp(b, preset),
+        },
+    }
 }
 
 /// The end screen's line about the play's best: the best with the play's
@@ -199,14 +242,14 @@ pub fn best_line(view: &BestView) -> String {
 /// `ASSIST_EASY`; a longer one is cut.
 pub const LAMP_COLUMNS: usize = 11;
 
-/// The select screen's cell for a chart: its lamp in [`LAMP_COLUMNS`] and
-/// its best EX in 5; blank when it was never played under the preset, `-`
-/// when it was but no play set a best.
-pub fn chart_cell(score: Option<&Score>, preset: &RulePreset) -> String {
-    let (lamp, ex) = match score {
-        None => (String::new(), String::new()),
-        Some(Score { best: None, .. }) => ("-".to_owned(), "-".to_owned()),
-        Some(Score { best: Some(b), .. }) => (lamp_text(b, preset), b.ex.to_string()),
+/// The select screen's cell for a chart's row score: its lamp in
+/// [`LAMP_COLUMNS`] under `preset` and its best EX in 5; blank when it was
+/// never played under the preset, `-` when it was but no play set a best.
+pub fn chart_cell(score: &RowScore, preset: Option<&RulePreset>) -> String {
+    let (lamp, ex) = match (score, preset) {
+        (RowScore::NoBest { .. }, _) => ("-".to_owned(), "-".to_owned()),
+        (RowScore::Best { ex, lamp, .. }, Some(p)) => (lamp_name(*lamp, p), ex.to_string()),
+        (RowScore::Unplayed | RowScore::Best { .. }, _) => (String::new(), String::new()),
     };
     let lamp: String = lamp.chars().take(LAMP_COLUMNS).collect();
     format!("{lamp:LAMP_COLUMNS$} {ex:>5}")
@@ -266,6 +309,27 @@ mod tests {
         assert_eq!(lamp_text(&cleared(&[0, 3], false), &p), "HARD");
         assert_eq!(lamp_text(&cleared(&[0, 2], true), &p), "FC");
         assert_eq!(lamp_text(&cleared(&[], false), &p), "FAILED");
+    }
+
+    /// The typed lamp agrees with its text in every case of
+    /// [`lamp_text_follows_rank_not_vector_order`], and keeps the rank.
+    #[test]
+    fn own_lamp_agrees_with_lamp_text() {
+        use skin_model::OwnLamp;
+
+        use super::{lamp_name, own_lamp};
+        let p = ranked();
+        for (gauges, fc, want) in [
+            (&[0, 2][..], false, OwnLamp::Cleared { gauge: 0, rank: 2 }),
+            (&[1, 2][..], false, OwnLamp::Cleared { gauge: 2, rank: 1 }),
+            (&[0, 3][..], false, OwnLamp::Cleared { gauge: 3, rank: 3 }),
+            (&[0, 2][..], true, OwnLamp::FullCombo),
+            (&[][..], false, OwnLamp::Failed),
+        ] {
+            let best = cleared(gauges, fc);
+            assert_eq!(own_lamp(&best, &p), want, "{gauges:?}");
+            assert_eq!(lamp_name(want, &p), lamp_text(&best, &p), "{gauges:?}");
+        }
     }
 
     #[test]
@@ -333,16 +397,17 @@ mod tests {
             plays: 2,
             best: Some(cleared(&[3], false)),
         };
-        assert_eq!(chart_cell(Some(&scored), &p), "HARD           10");
+        let cell = |score: Option<&Score>, p| chart_cell(&super::row_score(score, p), Some(p));
+        assert_eq!(cell(Some(&scored), &p), "HARD           10");
         let no_best = Score {
             plays: 2,
             best: None,
         };
-        assert_eq!(chart_cell(Some(&no_best), &p), "-               -");
-        assert_eq!(chart_cell(None, &p), " ".repeat(17));
+        assert_eq!(cell(Some(&no_best), &p), "-               -");
+        assert_eq!(cell(None, &p), " ".repeat(17));
         let mut long = p.clone();
         long.gauges[3].id = "much_harder_than_hard".to_owned();
-        assert_eq!(chart_cell(Some(&scored), &long), "MUCH_HARDER    10");
+        assert_eq!(cell(Some(&scored), &long), "MUCH_HARDER    10");
     }
 
     /// The sink over the fixture's records and library.
