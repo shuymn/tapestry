@@ -12,7 +12,7 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 3
+//! version = 4
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
 //!
@@ -33,7 +33,10 @@
 //!
 //! [[step]]
 //! play = { input = "auto", until = "end" }
-//! # input = "auto" | "<input log, relative to this file>"
+//! # input = "auto" | "<input log, relative to this file>" | { miss = "all" }
+//! # { miss = "all" }: generated for the chart, no key pressed, played
+//! # and saved as a log's play is: its judgeable notes are missed, and it
+//! # ends as such a play does
 //! # until = "end" | { at_ms = 2250, command = "retry" | "quit" | "skip" }
 //! # "quit": the quit key before the play completes, which ends it midway
 //! # on its result; "skip": the quit key once it is complete, its tail
@@ -78,7 +81,7 @@ use crate::measure::Drawn;
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -370,8 +373,30 @@ struct SelectSpec {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlaySpec {
-    input: String,
+    input: InputSpec,
     until: Until,
+}
+
+/// A `play` step's input: autoplay or a log by its path, or input made for
+/// the chart.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InputSpec {
+    Named(String),
+    Generated(GeneratedSpec),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedSpec {
+    miss: MissWord,
+}
+
+/// Which notes generated input leaves unpressed.
+#[derive(Deserialize)]
+enum MissWord {
+    #[serde(rename = "all")]
+    All,
 }
 
 #[derive(Deserialize)]
@@ -639,8 +664,8 @@ enum Seq {
 fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Compiled, String> {
     let mut steps = Vec::new();
     let mut logs = Vec::new();
-    // Each log decoded once, by its path.
-    let mut log_paths: Vec<PathBuf> = Vec::new();
+    // Each log decoded once, by its path; a generated one by what it is.
+    let mut log_paths: Vec<LogKey> = Vec::new();
     let mut captures: Vec<(PathBuf, Axis, Origin)> = Vec::new();
     // Captures no play has followed yet.
     let mut waiting: Vec<Origin> = Vec::new();
@@ -677,14 +702,21 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 Seq::Chosen
             }
             (Seq::Chosen | Seq::Replay, Step::Play(p)) => {
-                // A log by its path: the index it has, or gets once read.
-                let log = if p.input == "auto" {
-                    None
-                } else {
-                    let path = resolve(base, Path::new(&p.input)).map_err(at)?;
-                    let k = log_paths.iter().position(|l| *l == path);
-                    Some((k.unwrap_or(log_paths.len()), k.is_none().then_some(path)))
+                // A log by its path, or one generated: the index it has, or
+                // gets once made.
+                let key = match &p.input {
+                    InputSpec::Named(name) if name == "auto" => None,
+                    InputSpec::Named(name) => {
+                        Some(LogKey::Path(resolve(base, Path::new(name)).map_err(at)?))
+                    }
+                    InputSpec::Generated(GeneratedSpec {
+                        miss: MissWord::All,
+                    }) => Some(LogKey::NoPress),
                 };
+                let log = key.map(|key| {
+                    let k = log_paths.iter().position(|l| *l == key);
+                    (k.unwrap_or(log_paths.len()), k.is_none().then_some(key))
+                });
                 let input = match &log {
                     None => InputRef::Auto,
                     // Below the step count, itself within u16.
@@ -702,9 +734,20 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     Some(_) => {}
                     None => chart_input = Some((input, o)),
                 }
-                if let Some((_, Some(path))) = log {
-                    logs.push(super::script(&path, &[]).map_err(|e| at(format!("{e:#}")))?);
-                    log_paths.push(path);
+                if let Some((_, Some(key))) = log {
+                    logs.push(match &key {
+                        LogKey::Path(path) => {
+                            super::script(path, &[]).map_err(|e| at(format!("{e:#}")))?
+                        }
+                        // One keyboard that presses nothing, as a log of no
+                        // events plays.
+                        LogKey::NoPress => ScriptedInput::from_log(
+                            &eval::InputStart::default(),
+                            &[],
+                            &[input::DeviceKind::Keyboard],
+                        ),
+                    });
+                    log_paths.push(key);
                 }
                 let until = match &p.until {
                     Until::End(EndWord::End) => None,
@@ -818,6 +861,14 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     })
 }
 
+/// A compiled log: read from its path, or made for the chart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LogKey {
+    Path(PathBuf),
+    /// No key pressed.
+    NoPress,
+}
+
 /// A `practice` step's page settings and input, checked: measures from 1
 /// with `to ≥ from`, a speed on the ladder in percent, a lead-in on the
 /// page's grid, a gauge value in percent, repeat on, and an input log (an
@@ -825,7 +876,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
 fn practice_goal(
     p: &PracticeSpec,
     base: &Path,
-    log_paths: &mut Vec<PathBuf>,
+    log_paths: &mut Vec<LogKey>,
     logs: &mut Vec<ScriptedInput>,
 ) -> Result<PracticeGoal, String> {
     let from = p
@@ -863,11 +914,12 @@ fn practice_goal(
         return Err("input cannot be auto: an autoplay session cannot practice".to_owned());
     }
     let path = resolve(base, Path::new(&p.input))?;
-    let k = match log_paths.iter().position(|l| *l == path) {
+    let key = LogKey::Path(path.clone());
+    let k = match log_paths.iter().position(|l| *l == key) {
         Some(k) => k,
         None => {
             logs.push(super::script(&path, &[]).map_err(|e| format!("{e:#}"))?);
-            log_paths.push(path);
+            log_paths.push(key);
             log_paths.len() - 1
         }
     };
@@ -1873,7 +1925,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 3\n".to_owned();
+        let mut text = "version = 4\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -2009,6 +2061,117 @@ mod tests {
         );
         let after_quit = parse(&file(None, &[select, &quit, "quit = {}"]), dir.path());
         assert!(after_quit.is_ok(), "{:?}", after_quit.err());
+    }
+
+    /// The input `{ miss = "all" }` compiles to played on the session's
+    /// play path on a virtual clock (design.md "Play Lifecycle"), with the
+    /// HAZARD gauge shown and a failure closing the play: its first miss
+    /// fails the gauge at that wake, so the play is aborted by it with
+    /// exactly one POOR and nothing else, and enters Closing. Autoplay in
+    /// its place compiles to no log, and plays every note.
+    #[test]
+    fn generated_no_press_input_misses_into_closing_on_the_play_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("library").join("a");
+        fs::create_dir_all(&a).unwrap();
+        // Four notes, 500 ms apart from 2 s.
+        let chart = a.join("a.bms");
+        fs::write(&chart, "#PLAYER 1\n#TITLE a\n#BPM 120\n#00111:01010101\n").unwrap();
+        let s = parse(
+            &file(
+                None,
+                &[
+                    "select = { path = \"library/a/a.bms\" }",
+                    "play = { input = { miss = \"all\" }, until = \"end\" }",
+                    "result = \"back\"",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        let mut script = s.script;
+        let mut input = None;
+        while let Some(step) = script.front().cloned() {
+            if let SelectStep::Play(p) = step {
+                input = Some(p.input);
+            }
+            script.done();
+        }
+        let Some(InputRef::Log(k)) = input else {
+            panic!("{input:?}");
+        };
+        let mut logs = s.session.logs;
+        let log = logs.swap_remove(usize::from(k));
+
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                // HAZARD.
+                displayed_gauge: 5,
+                on_failure: game::FailureAction::Close,
+                ..game::PlayerSettings::default()
+            },
+        };
+        let parts = game::Parts::unsaved(&settings.player);
+        let config = game::SessionConfig {
+            lead_in: TimeUs(1_000_000),
+            step: TimeUs(1_000),
+            start: TimeUs(0),
+            effects: 64,
+            seed: 1,
+            speed: bms_model::Speed::NORMAL,
+            app_version: "0.0.0-test".to_owned(),
+            provenance: replay::BuildProvenance::Development,
+            receive: replay::ReceiveMethod::Scripted,
+            autoplay: None,
+        };
+        let root = game::DataRoot::new(dir.path().join("root"));
+        let loaded = game::Loaded::load(root, settings, &chart, config, parts).unwrap();
+        let bank = std::sync::Arc::new(audio::SoundBank::from_sounds(48_000, Vec::new()));
+        let engine = audio::AudioEngine::new(
+            bank,
+            &loaded.chart().bgm,
+            48_000,
+            480,
+            audio::MAX_VOICES,
+            64,
+        )
+        .unwrap();
+        let device = audio::SimDevice::new(audio::SimConfig::steady(48_000, 480, TimeUs(0)));
+        let runner = game::RunnerAudio::new(engine, audio::RecordingOutput::new(device, 0));
+        let mut session = loaded.start(
+            runner,
+            input::SourceSet::new(crate::source_config()).unwrap(),
+        );
+        let report = session
+            .play(game::PlayScript {
+                input: log,
+                commands: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            report.end,
+            game::PlayEnd::Aborted(game::AbortCause::GaugeFailed)
+        );
+        let c = report.tally.counts;
+        assert_eq!(
+            (c.perfect, c.great, c.good, c.bad, c.poor),
+            (0, 0, 0, 0, 1),
+            "{c:?}"
+        );
+        assert!(report.closing.is_some(), "{:?}", report.closing);
+        let result = report.result.as_ref().unwrap();
+        assert!(result.matches_live);
+        let record = report.record.as_ref().unwrap();
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|e| !matches!(e.kind, eval::InputKind::Control { value, .. } if value != 0)),
+            "{:?}",
+            record.events
+        );
     }
 
     /// A step where its screen does not show is refused, naming it and the
@@ -2255,7 +2418,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 3\nstep = [".to_owned();
+        let mut text = "version = 4\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -2303,7 +2466,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 3\n".to_owned();
+        let mut text = "version = 4\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -2323,16 +2486,16 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 3\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 4\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 3"
+            "version 1 is not supported; this build reads version 4"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 3"
+            "no version; this build reads version 4"
         );
     }
 
@@ -2344,7 +2507,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 3\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 4\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
@@ -2367,7 +2530,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 3\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 4\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
