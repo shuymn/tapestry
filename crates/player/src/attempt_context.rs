@@ -40,12 +40,14 @@ pub struct AttemptContext {
     /// The presentation epoch the attempt was attached as: a snapshot of
     /// another epoch gives its frames no gain.
     epoch: u64,
+    /// Whether the attempt is autoplay.
+    autoplay: bool,
 }
 
 impl AttemptContext {
     /// `attempt` as a skin takes it, with the lanes laid out for `scratch`,
-    /// attached as presentation epoch `epoch`.
-    pub fn new(attempt: Attempt, scratch: Side, epoch: u64) -> Self {
+    /// attached as presentation epoch `epoch`, autoplay when `autoplay`.
+    pub fn new(attempt: Attempt, scratch: Side, epoch: u64, autoplay: bool) -> Self {
         Self {
             gauges: attempt.gauges.iter().map(GaugeDesc::from_rule).collect(),
             kind: attempt.kind,
@@ -58,6 +60,7 @@ impl AttemptContext {
             labels: attempt.labels,
             tempo: attempt.tempo,
             epoch,
+            autoplay,
         }
     }
 
@@ -107,6 +110,7 @@ impl AttemptContext {
     /// The borrowed context a skin prepares with, for one call.
     pub fn context(&self) -> PlayContext<'_> {
         PlayContext {
+            autoplay: self.autoplay,
             gauges: &self.gauges,
             attempt: match &self.kind {
                 AttemptKind::Full { lead_in } => skin_model::Attempt::Full { lead_in: *lead_in },
@@ -194,7 +198,7 @@ mod tests {
             &chart,
         );
         let tempo = attempt.tempo.clone();
-        let owned = AttemptContext::new(attempt, Side::Right, 7);
+        let owned = AttemptContext::new(attempt, Side::Right, 7, true);
         assert_eq!(owned.epoch(), 7);
         assert_eq!(owned.tempo(), &tempo);
         assert_eq!(
@@ -215,6 +219,7 @@ mod tests {
         assert_eq!(ctx.scratch, Side::Right);
         assert_eq!(ctx.last_note_end, TimeUs(1_000_000));
         assert_eq!(ctx.bpm_whole_change, Some(false));
+        assert!(ctx.autoplay);
         assert_eq!(ctx.play_level, Some(12));
         assert_eq!(
             ctx.bpm_range,
@@ -256,7 +261,7 @@ mod tests {
                 &ChartLabels::default(),
                 &chart,
             );
-            let owned = AttemptContext::new(attempt, Side::Left, 0);
+            let owned = AttemptContext::new(attempt, Side::Left, 0, false);
             let ctx = owned.context();
             (ctx.bpm_whole_change, ctx.bpm_range)
         };

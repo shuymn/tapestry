@@ -1867,15 +1867,16 @@ fn loading_frame_of(
             skin_model::FrameReadouts::UNAVAILABLE.covers,
         ),
     };
-    let (since, percent, gauge, play_level, text) = match update {
+    let (since, percent, gauge, play_level, text, autoplay) = match update {
         Some(u) => (
             u.origin,
             i32::from(u.percent),
             u.gauge,
             u.chart.play_level,
             u.revision,
+            u.autoplay,
         ),
-        None => (now, 0, None, None, 0),
+        None => (now, 0, None, None, 0, false),
     };
     LoadingFrame {
         lifetime,
@@ -1888,6 +1889,7 @@ fn loading_frame_of(
         covers,
         gauge,
         play_level,
+        autoplay,
         text,
     }
 }
@@ -7744,6 +7746,29 @@ pub(crate) mod tests {
         assert_eq!(level(2, Some(&update(2, None))), None);
     }
 
+    /// A loading frame says whether the play its lifetime loads is
+    /// autoplay, as its text gave it, down to the model's frame; with no
+    /// publication yet, not.
+    #[test]
+    fn a_loading_frame_carries_its_lifetimes_autoplay() {
+        let update = |autoplay| {
+            let text = LoadingText {
+                autoplay,
+                ..LoadingText::default()
+            };
+            crate::loading_state::LifetimeState::new(1, TimeUs(0), &text, None)
+                .apply(LoadInput::Stage(Stage::Chart))
+        };
+        let autoplay = |u: Option<&LoadingUpdate>| {
+            super::loading_frame_of(1, TimeUs(1_000), u, None)
+                .model()
+                .autoplay
+        };
+        assert!(!autoplay(None));
+        assert!(autoplay(Some(&update(true))));
+        assert!(!autoplay(Some(&update(false))));
+    }
+
     /// Counts the frames the render thread finished.
     struct Frames(Arc<std::sync::atomic::AtomicU32>);
 
@@ -10468,7 +10493,7 @@ pub(crate) mod tests {
             &labels,
             chart,
         );
-        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH, 1)
+        AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH, 1, false)
     }
 
     /// The selection installs the bundle, uploading it once, and its

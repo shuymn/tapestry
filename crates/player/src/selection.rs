@@ -1627,6 +1627,7 @@ impl AppRig for PlayerRig<'_> {
             artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
             preset: sel.screen.preset().to_owned(),
             practice: sel.practicing,
+            autoplay: self.autoplay,
             chart: header.map_or_else(ChosenChart::default, chosen_chart),
         };
         println!("load: the play screen loads {}", file_name(chart));

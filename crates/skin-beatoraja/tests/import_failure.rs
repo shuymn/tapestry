@@ -26,7 +26,7 @@ const IMAGES: &str = r#""image": [
     {"id": "still", "src": "a", "w": 64, "h": 32, "divx": 2},
     {"id": "gone", "src": "m", "w": 8, "h": 8},
     {"id": "bad", "src": "x", "w": 8, "h": 8},
-    {"id": "grp", "src": "a", "w": 64, "h": 16, "divx": 4, "len": 2, "ref": 42}]"#;
+    {"id": "grp", "src": "a", "w": 64, "h": 16, "divx": 4, "len": 2, "ref": 43}]"#;
 
 /// Options 900 (selected by default) and 901.
 const HEADER: &str = r#""property": [
@@ -344,7 +344,7 @@ fn a_failure_image_refuses_a_file_it_cannot_load() {
 fn image_choices_refuse_but_keep_genuine_holes() {
     // A group by an unsupported index, a set by an unsupported value.
     let r = images("", &[&fail("grp", "")]);
-    refused_as_failure(r, &at("grp"), prop(PropertyKind::ImageIndex, Some(42)));
+    refused_as_failure(r, &at("grp"), prop(PropertyKind::ImageIndex, Some(43)));
     let set = r#""imageset": [{"id": "s", "images": ["i"], "value": 150}]"#;
     let r = images(set, &[&fail("s", "")]);
     refused_as_failure(r, &at("s"), prop(PropertyKind::Integer, Some(150)));

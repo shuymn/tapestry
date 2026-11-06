@@ -73,6 +73,8 @@ pub struct LoadingUpdate {
     pub preset: String,
     /// Whether it is a practice's Start.
     pub practice: bool,
+    /// Whether the play loaded is autoplay.
+    pub autoplay: bool,
 }
 
 /// One loading lifetime's state, accumulated from its typed inputs.
@@ -92,6 +94,7 @@ pub struct LifetimeState {
     revision: u64,
     preset: String,
     practice: bool,
+    autoplay: bool,
 }
 
 impl LifetimeState {
@@ -118,6 +121,7 @@ impl LifetimeState {
             revision: 1,
             preset: text.preset.clone(),
             practice: text.practice,
+            autoplay: text.autoplay,
         }
     }
 
@@ -157,6 +161,7 @@ impl LifetimeState {
             revision: self.revision,
             preset: self.preset.clone(),
             practice: self.practice,
+            autoplay: self.autoplay,
         }
     }
 
