@@ -596,8 +596,37 @@ fn level_strips_follow_the_selection_loader() {
     let mut s = Sel::new(i.skin);
     let mut row = chart("a");
     row.level_value = 7;
-    s.view(&view(vec![row], Some(0), None, None));
+    s.view(&view(vec![row.clone()], Some(0), None, None));
     assert_eq!(s.digits(0), "7");
+    // A stretch that keeps the glyph's box and an offset that would change
+    // its rows: the offsets unread, the level still draws.
+    let level = |value: &str, dst: &str| {
+        let list = song_list(
+            &[&at(0, 500, 300, 40)],
+            &[&at(0, 500, 300, 40)],
+            0,
+            &format!(r#"{TITLE}, "level": [{{"id": "lv", {dst}}}]"#),
+        );
+        folder(&with_list(&list, &format!(r#""value": [{value}]"#)))
+    };
+    let d = level(
+        &format!(r#"{{"id": "lv", {DIGITS}, "digit": 1, "ref": 96, "offset": [{{"w": 1}}]}}"#),
+        &format!(r#""stretch": 1, "dst": [{}]"#, at(0, 0, 4, 8)),
+    );
+    let mut s = Sel::of(d.path());
+    s.view(&view(vec![row.clone()], Some(0), None, None));
+    assert_eq!(s.digits(0), "7");
+    // An eleven-glyph strip pads with its eleventh glyph, whatever its
+    // `zeropadding`.
+    let d = level(
+        r#"{"id": "lv", "src": "s", "x": 0, "y": 32, "w": 44, "h": 8, "divx": 11, "digit": 2,
+            "zeropadding": 0, "ref": 96}"#,
+        &format!(r#""dst": [{}]"#, at(0, 0, 4, 8)),
+    );
+    let mut s = Sel::of(d.path());
+    s.view(&view(vec![row], Some(0), None, None));
+    let glyphs: Vec<[u8; 2]> = s.images(0).into_iter().filter(|t| t[1] == 36).collect();
+    assert_eq!(glyphs, [[42, 36], [30, 36]]);
 }
 
 /// C7: a chart row draws its level in its difficulty's style; the

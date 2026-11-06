@@ -254,8 +254,10 @@ impl Cx<'_> {
         // offset (`skin/SkinNumber.java:191-205`); any other mode must
         // leave each key's cell, moved by each row, as it is.
         let native = c.stretch.native(cell);
-        let rows_kept =
-            c.stretch == Stretch::Identity || self.digit_rows_keep_aspect(rec, extra, cells, cell);
+        // A level reads no digit offsets, so it has no rows to keep.
+        let rows_kept = c.stretch == Stretch::Identity
+            || value.is_none()
+            || self.digit_rows_keep_aspect(rec, extra, cells, cell);
         let mut keys = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let rect = self.key_rect(&c, k)?;
