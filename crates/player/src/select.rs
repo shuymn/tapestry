@@ -1118,15 +1118,11 @@ impl SelectScreen {
     /// ([`crate::bests::chart_cell`]), level, title, subtitle and artist, or
     /// its file name when it has no title.
     fn chart_line(&self, row: &RowView) -> String {
-        let title = if row.title.is_empty() {
-            match &row.key {
-                RowKey::Chart(path) => path
-                    .file_name()
-                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-                _ => String::new(),
-            }
-        } else {
-            row.title.clone()
+        let title = match &row.key {
+            RowKey::Chart(path) if row.title.is_empty() => path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            _ => row.title.clone(),
         };
         let cell = crate::bests::chart_cell(&row.score, self.bests_preset.as_ref());
         let level = if row.level.is_empty() {
