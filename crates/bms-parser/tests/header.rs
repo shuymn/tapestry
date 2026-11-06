@@ -86,16 +86,20 @@ fn the_loaders_labels_come_from_the_taken_branches() {
 #SUBTITLE First
 #SUBTITLE [ANOTHER]
 #PLAYLEVEL 12
+#DIFFICULTY 2
 #BPM 120
 #SETRANDOM 2
 #IF 1
 #GENRE Untaken
 #PLAYLEVEL 3
+#DIFFICULTY 5
+#BMP01 untaken.bmp
 #ENDIF
 #IF 2
 #ARTIST Branch two
 #SUBARTIST Two
 #PLAYLEVEL \u{3000}9a \t
+#DIFFICULTY 4
 #ENDIF
 #ENDRANDOM
 #00111:01
@@ -112,8 +116,42 @@ fn the_loaders_labels_come_from_the_taken_branches() {
             subartist: "Two".to_owned(),
             genre: String::new(),
             playlevel: "9a".to_owned(),
+            difficulty: "4".to_owned(),
+            bga: false,
         }
     );
     let header = read_header(text.as_bytes(), &Limits::default()).unwrap();
     assert_eq!(header.artist.as_deref(), Some("Someone"));
+    assert_eq!(header.difficulty.as_deref(), Some("2"));
+    let listing = bms_parser::read_listing(text.as_bytes(), &Limits::default()).unwrap();
+    assert!(!listing.bga);
+}
+
+/// A chart has a BGA when a `#BMPxx` with an object id and a path stands
+/// in what is read: the loader's taken branches, the listing's top level.
+/// Whether a channel shows it does not matter; an empty definition or a
+/// name that is no object id defines nothing.
+#[test]
+fn a_bmp_definition_with_a_path_is_a_bga() {
+    let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
+    let read = |text: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded =
+            bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+        let listing = bms_parser::read_listing(text.as_bytes(), &Limits::default()).unwrap();
+        (loaded.labels.bga, listing.bga)
+    };
+    for (defs, want) in [
+        ("#BMP00 poor.bmp", (true, true)),
+        ("#bmpZZ  a.png ", (true, true)),
+        ("#BMP01", (false, false)),
+        ("#BMP01 ", (false, false)),
+        ("#BMP0! a.bmp", (false, false)),
+        ("#BMP001 a.bmp", (false, false)),
+        ("#BGA01 01 0 0 10 10 0 0", (false, false)),
+        ("#SETRANDOM 1\n#IF 1\n#BMP01 a.bmp\n#ENDIF", (true, false)),
+        ("#SETRANDOM 1\n#IF 2\n#BMP01 a.bmp\n#ENDIF", (false, false)),
+    ] {
+        assert_eq!(read(&chart(defs)), want, "{defs:?}");
+    }
 }

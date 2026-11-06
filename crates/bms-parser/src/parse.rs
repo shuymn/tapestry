@@ -75,7 +75,6 @@ pub struct Source {
 /// Headers read and ignored without a warning: descriptive ones, and ones
 /// for what stage 1 does not show or use.
 const IGNORED_HEADERS: &[&str] = &[
-    "DIFFICULTY",
     "STAGEFILE",
     "BANNER",
     "BACKBMP",
@@ -165,6 +164,20 @@ pub fn parse(
     // One entry per declaring line, held at its exact size.
     source.meta.judgment_headers.shrink_to_fit();
     Ok(source)
+}
+
+/// Whether the header `upper` (its name in upper case) with `value` defines
+/// a BGA image as the reference decoder lists one (jbms-parser
+/// `BMSDecoder`): `#BMPxx` with an object id and a path. Its list holds
+/// every definition, whether or not a channel shows it, and a chart with
+/// one has a BGA (beatoraja `song/SongData.java:216`).
+pub(crate) fn defines_bga(upper: &str, value: &str) -> bool {
+    !value.is_empty()
+        && upper
+            .strip_prefix("BMP")
+            .filter(|rest| rest.len() == 2)
+            .and_then(|rest| parse_base36(rest.as_bytes()))
+            .is_some()
 }
 
 /// Splits `NAME value`, trimming the value.
@@ -327,6 +340,7 @@ fn parse_header(
         "SUBARTIST" => source.labels.subartist = value.to_owned(),
         "GENRE" => source.labels.genre = value.to_owned(),
         "PLAYLEVEL" => source.labels.playlevel = value.to_owned(),
+        "DIFFICULTY" => source.labels.difficulty = value.to_owned(),
         "BPM" => {
             source.bpm = Some(bpm(value, line, "#BPM")?);
         }
@@ -404,6 +418,8 @@ fn parse_header(
                 });
             }
         }
+        // The image is not shown; that one is defined is a label.
+        _ if defined_id("BMP").is_some() => source.labels.bga |= defines_bga(upper, value),
         _ if IGNORED_HEADERS.contains(&upper)
             || IGNORED_DEFINITIONS
                 .iter()

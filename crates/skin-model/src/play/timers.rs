@@ -9,12 +9,12 @@ use eval::Tally;
 use rules::GaugeValue;
 
 use super::schema::{
-    COVER_PERMILLE, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX,
-    RATE_BASIS_POINTS, READOUT_MAX_U32, field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT,
+    NATIVE_TARGET_MAX, RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field, lane_timer, timer,
 };
 use super::{
-    BuildError, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play, RoundedDuration,
-    SkinFrame,
+    BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
+    RoundedDuration, SkinFrame,
 };
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::widget::gauge::GaugeLook;
@@ -231,6 +231,46 @@ pub(crate) const fn level_fields(level: Option<i32>) -> (i32, i32) {
         Some(l) if l != i32::MIN && l != i32::MAX => (l, 1),
         _ => (0, 0),
     }
+}
+
+/// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
+pub(crate) const CHART_FIELDS: usize = 8;
+
+/// The `chart.*` fields of `meta` from `field::CHART_DIFFICULTY`, in slot
+/// order, a play's and a loading frame's alike: each value with its
+/// validity, 0 and false for what is unknown or out of its range, the
+/// total also for what a source number widget reserves and never draws
+/// (`skin/SkinNumber.java:139`).
+pub(crate) const fn chart_fields(meta: ChartMetadata) -> [i32; CHART_FIELDS] {
+    const fn known(v: Option<i32>, max: i32) -> [i32; 2] {
+        match v {
+            Some(v) if v >= 0 && v <= max => [v, 1],
+            _ => [0, 0],
+        }
+    }
+    const fn small(v: Option<u8>) -> Option<i32> {
+        match v {
+            Some(v) => Some(v as i32),
+            None => None,
+        }
+    }
+    let [difficulty, difficulty_valid] = known(small(meta.difficulty), DIFFICULTY_MAX);
+    let [class, class_valid] = known(small(meta.judge_class), JUDGE_CLASS_MAX);
+    let [total, total_valid] = known(meta.total, READOUT_MAX);
+    let [bga, bga_valid] = match meta.bga {
+        Some(b) => [b as i32, 1],
+        None => [0, 0],
+    };
+    [
+        difficulty,
+        difficulty_valid,
+        class,
+        class_valid,
+        total,
+        total_valid,
+        bga,
+        bga_valid,
+    ]
 }
 
 /// `d` in ms rounded half up, exactly: `⌊n / d⌋`, plus 1 when the
@@ -585,7 +625,8 @@ impl Play {
                 Lane::all()
                     .zip(self.reducer.lanes)
                     .map(|(lane, j)| j.read(frame.input.lane(lane))),
-            );
+            )
+            .chain(self.chart_fields);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

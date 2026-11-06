@@ -6,7 +6,7 @@
 
 use game::Loaded;
 use rules::JudgeRank;
-use skin_beatoraja::{ChartRank, Fact, ImportFacts};
+use skin_beatoraja::{ChartRank, Fact, ImportFacts, JudgeClass};
 use skin_model::ScreenKind;
 
 /// The facts of an attempt at `loaded`'s chart with autoplay as
@@ -18,16 +18,48 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
         .preset()
         .headers
         .read(&loaded.chart().meta.judgment_headers);
-    let rank = read.rank.map(|r| match r {
-        JudgeRank::Rank(r) => ChartRank::Rank(r),
-        JudgeRank::DefExRankMilli(m) => ChartRank::DefExRankMilli(m),
-    });
     ImportFacts {
         scene: ScreenKind::Play,
         autoplay: Fact::Known(autoplay),
-        chart_rank: Fact::Known(rank),
+        chart_rank: Fact::Known(read.rank.map(chart_rank)),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
     }
+}
+
+/// A rank the play preset's header policy reads, as the importer takes it.
+const fn chart_rank(rank: JudgeRank) -> ChartRank {
+    match rank {
+        JudgeRank::Rank(r) => ChartRank::Rank(r),
+        JudgeRank::DefExRankMilli(m) => ChartRank::DefExRankMilli(m),
+    }
+}
+
+/// The judgment class of `rank`, the play preset's reading of the chart,
+/// as `chart.judge_class` reads it: 0 the hardest to 4 the easiest, by the
+/// bands the import facts use ([`JudgeClass::of`]), so options 180 to 184
+/// read at a frame what they read when the skin was specialized; `None`
+/// for a rank in no band.
+pub fn class_of(rank: Option<JudgeRank>) -> Option<u8> {
+    Some(match JudgeClass::of(rank.map(chart_rank))? {
+        JudgeClass::VeryHard => 0,
+        JudgeClass::Hard => 1,
+        JudgeClass::Normal => 2,
+        JudgeClass::Easy => 3,
+        JudgeClass::VeryEasy => 4,
+    })
+}
+
+/// The difficulty `text` gives as `chart.difficulty` reads it: the
+/// source's integer, `#DIFFICULTY` read by `Integer.parseInt` as the play
+/// level is ([`level_of`], jbms-parser `CommandWord`, an unreadable one
+/// leaving 0), from 1 to 5, and 0 for any other
+/// (`BooleanPropertyFactory.java:442-447`, option 150 holding for
+/// `d <= 0 || d > 5`).
+pub fn difficulty_of(text: &str) -> u8 {
+    u8::try_from(level_of(text))
+        .ok()
+        .filter(|d| (1..=5).contains(d))
+        .unwrap_or(0)
 }
 
 /// The first code point of each run of ten decimal digits, zero to nine,

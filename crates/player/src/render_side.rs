@@ -1888,6 +1888,8 @@ fn loading_frame_of(
         None => (now, 0, None, None, 0, false),
     };
     LoadingFrame {
+        difficulty: None,
+        bga: None,
         lifetime,
         now,
         load: skin_model::LoadState { since, percent },

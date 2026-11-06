@@ -96,6 +96,36 @@ pub struct PlayContext<'a> {
     pub play_level: Option<i32>,
     /// Whether the attempt is autoplay, which `autoplay` reads.
     pub autoplay: bool,
+    /// The chart's metadata the `chart.*` fields read.
+    pub meta: ChartMetadata,
+}
+
+/// A chart's metadata as the `chart.*` fields read it, each `None` when
+/// the caller does not know it, which clears its validity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChartMetadata {
+    /// Its difficulty, `chart.difficulty`: `#DIFFICULTY` from 1 to 5, 0
+    /// for any other or none. A value above 5 is unknown.
+    pub difficulty: Option<u8>,
+    /// Its judgment class, `chart.judge_class`: 0 the hardest to 4 the
+    /// easiest; `None` also for a rank in no class. A value above 4 is
+    /// none.
+    pub judge_class: Option<u8>,
+    /// Its gauge total, whole, `chart.total`; a negative value or one a
+    /// number widget reserves (`i32::MAX`) is unknown.
+    pub total: Option<i32>,
+    /// Whether it defines a BGA image, `chart.bga`.
+    pub bga: Option<bool>,
+}
+
+impl ChartMetadata {
+    /// Nothing known.
+    pub const UNKNOWN: Self = Self {
+        difficulty: None,
+        judge_class: None,
+        total: None,
+        bga: None,
+    };
 }
 
 /// A chart's BPM range in floored hundredths of a BPM.
@@ -403,6 +433,9 @@ pub struct Play {
     bpm_whole_change: Option<bool>,
     /// The context's [`PlayContext::play_level`].
     play_level: Option<i32>,
+    /// The `chart.*` fields of the context's [`PlayContext::meta`], from
+    /// `field::CHART_DIFFICULTY` on.
+    chart_fields: [i32; timers::CHART_FIELDS],
     /// The context's [`PlayContext::autoplay`].
     pub(crate) autoplay: bool,
     scratch: Side,
@@ -553,6 +586,7 @@ impl Play {
             bpm_range: ctx.bpm_range,
             bpm_whole_change: ctx.bpm_whole_change,
             play_level: ctx.play_level,
+            chart_fields: timers::chart_fields(ctx.meta),
             autoplay: ctx.autoplay,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
@@ -797,6 +831,7 @@ mod tests {
             border: GaugeValue(80 * GaugeValue::PERCENT),
         }];
         let ctx = PlayContext {
+            meta: crate::ChartMetadata::UNKNOWN,
             autoplay: false,
             gauges: &gauges,
             attempt: Attempt::Full { lead_in: TimeUs(0) },

@@ -29,6 +29,9 @@ pub struct Listing {
     pub mode: ChartMode,
     /// Whether it declares `#RANDOM` or `#SETRANDOM`, in any branch.
     pub random: bool,
+    /// Whether it defines a BGA image at the top level, as
+    /// [`Labels::bga`](crate::Labels::bga) reads one.
+    pub bga: bool,
 }
 
 /// The descriptive header values of a chart, as written (trimmed), each
@@ -98,7 +101,7 @@ const fn key_6_or_7(channel: [u8; 2]) -> bool {
 /// [`read_listing`]'s one pass over the decoded text.
 pub(crate) fn listing(text: &str) -> Listing {
     let mut header = Header::default();
-    let (mut two, mut seven, mut random) = (false, false, false);
+    let (mut two, mut seven, mut random, mut bga) = (false, false, false, false);
     // Open `#IF` and `#SWITCH` blocks; the closers saturate, so a stray one
     // does not hide the rest of the file.
     let mut depth = 0_usize;
@@ -131,6 +134,10 @@ pub(crate) fn listing(text: &str) -> Listing {
                 continue;
             }
             _ if depth > 0 => continue,
+            _ if crate::parse::defines_bga(&upper, value) => {
+                bga = true;
+                continue;
+            }
             "TITLE" => &mut header.title,
             "SUBTITLE" => &mut header.subtitle,
             "ARTIST" => &mut header.artist,
@@ -154,5 +161,6 @@ pub(crate) fn listing(text: &str) -> Listing {
         header,
         mode,
         random,
+        bga,
     }
 }

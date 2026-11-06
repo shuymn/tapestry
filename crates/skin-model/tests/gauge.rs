@@ -35,6 +35,7 @@ fn skin_of(g: GaugeDef) -> Result<Skin, LoadError> {
 fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
     let descs: &'static [GaugeDesc] = Box::leak(descs.to_vec().into_boxed_slice());
     let ctx = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: descs,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
@@ -440,6 +441,7 @@ fn narrow_and_degenerate_gauges_keep_their_cells() {
         )
         .unwrap();
         let ctx = PlayContext {
+            meta: skin_model::ChartMetadata::UNKNOWN,
             autoplay: false,
             gauges: &[desc(GaugeLook::Normal, 80)],
             attempt: Attempt::Full { lead_in: TimeUs(0) },

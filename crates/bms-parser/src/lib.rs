@@ -246,6 +246,11 @@ pub struct Labels {
     pub genre: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
+    /// `#DIFFICULTY`, as text: a reader parses it by its own rules.
+    pub difficulty: String,
+    /// Whether it defines a BGA image: a `#BMPxx` with a value, whether or
+    /// not a channel shows it, as the reference decoder lists them.
+    pub bga: bool,
 }
 
 /// A loaded chart and what the loader skipped or assumed.

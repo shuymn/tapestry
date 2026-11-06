@@ -6,21 +6,22 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 6
+//! # Schema version 7
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
 //! - `roots(id, path UNIQUE)`: the roots of the latest scan.
 //! - `charts(id, root, path UNIQUE, size, mtime_ns, sha256, md5, title,
 //!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
-//!   norm_text, title_key, artist_key, folder, mode, random, loader, taps,
-//!   longs, mines, length_us, tempo_start, tempo_min, tempo_max)`: the header
-//!   values as [`bms_parser::read_scanned`] reads them, `NULL` when
+//!   norm_text, title_key, artist_key, folder, mode, random, bga, loader,
+//!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max)`: the
+//!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
 //!   undeclared; the searched fields normalized and joined ([`Search`]); the
 //!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
 //!   order; the folder of the path, by which [`Search::by_folder`] groups; the
 //!   mode ([`ChartMode`]), of which only 7-key is ever listed; the flag of
-//!   `#RANDOM`; the loader version that wrote the row, and a row of another is
+//!   `#RANDOM`; the flag of a top-level BGA image definition
+//!   ([`bms_parser::Listing::bga`]); the loader version that wrote the row, and a row of another is
 //!   read again; and the seed-0 branch's summary ([`ChartSummary`]), `NULL`
 //!   when the loader refuses it, its tempos 16 big-endian bytes.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
@@ -112,7 +113,7 @@ pub use scan::{
 pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +218,9 @@ pub struct ChartEntry {
     pub header: Header,
     /// Whether it declares `#RANDOM` or `#SETRANDOM`, in any branch.
     pub random: bool,
+    /// Whether it defines a BGA image at the top level
+    /// ([`bms_parser::Listing::bga`]).
+    pub bga: bool,
     /// Its seed-0 branch's summary; `None` when the loader refuses that
     /// branch.
     pub summary: Option<ChartSummary>,

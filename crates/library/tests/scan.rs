@@ -376,6 +376,43 @@ fn schema_4_reads_shift_jis_titles_again() {
     );
 }
 
+/// A chart's BGA flag is its top-level `#BMPxx` definitions'. A library
+/// of schema 6 has no such column: opening it under this version rebuilds
+/// it, so the next scan reads every chart, its flag included, again.
+#[test]
+fn schema_6_reads_bga_flags_again() {
+    let fx = Fixture::new();
+    let with = fx.write(
+        "with.bms",
+        format!("{}#BMP01 back.bmp\n", chart_text("With")).as_bytes(),
+    );
+    let without = fx.write("without.bms", chart_text("Without").as_bytes());
+    let flags = |lib: &Library| -> Vec<(PathBuf, bool)> {
+        lib.charts()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.path, c.bga))
+            .collect()
+    };
+    let want = vec![(with, true), (without, false)];
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+        assert_eq!(flags(&lib), want);
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch("ALTER TABLE charts DROP COLUMN bga; PRAGMA user_version = 6;")
+            .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 6 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (2, 2), "a full scan");
+    assert_eq!(flags(&lib), want);
+}
+
 /// A loudness row is found by its whole key, and by nothing less: a change
 /// of any part misses. Storing a row of other versions removes every row of
 /// the old ones, and a row survives reopening and rescanning.

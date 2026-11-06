@@ -445,6 +445,7 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         mut header,
         mode,
         random,
+        bga,
     } = scanned.listing;
     let Header {
         title,
@@ -471,6 +472,7 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         header,
         mode,
         random,
+        bga,
         summary: scanned.summary.ok(),
     })
 }

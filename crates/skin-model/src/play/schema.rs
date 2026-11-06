@@ -26,6 +26,10 @@ pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
 /// The largest lane visual state, `judge.lane.N`: an empty POOR at or
 /// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
 pub const LANE_JUDGE_MAX: i32 = 11;
+/// The largest `chart.difficulty`: `#DIFFICULTY` 5.
+pub const DIFFICULTY_MAX: i32 = 5;
+/// The largest `chart.judge_class`: the easiest of the five classes.
+pub const JUDGE_CLASS_MAX: i32 = 4;
 /// A cover setting's full amount, ‰.
 pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
@@ -222,6 +226,14 @@ pub static PLAY: Schema = Schema {
         int("judge.lane.5", LANE_JUDGE_MAX, T),
         int("judge.lane.6", LANE_JUDGE_MAX, T),
         int("judge.lane.7", LANE_JUDGE_MAX, T),
+        int("chart.difficulty", DIFFICULTY_MAX, T),
+        flag("chart.difficulty_valid", T),
+        int("chart.judge_class", JUDGE_CLASS_MAX, T),
+        flag("chart.judge_class_valid", T),
+        int("chart.total", READOUT_MAX, T),
+        flag("chart.total_valid", T),
+        flag("chart.bga", T),
+        flag("chart.bga_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -443,8 +455,29 @@ pub mod field {
     /// `93 + N` for [`Lane::index`](bms_model::Lane::index) `N`; see
     /// [`lane_judge`].
     pub const JUDGE_LANES: u16 = 93;
+    /// The chart's difficulty: its `#DIFFICULTY` from 1 to 5, and 0 for
+    /// any other or none; 0 while `chart.difficulty_valid` is false.
+    pub const CHART_DIFFICULTY: u16 = 101;
+    /// Whether the chart's difficulty is known.
+    pub const CHART_DIFFICULTY_VALID: u16 = 102;
+    /// The chart's judgment class from the play preset's reading of its
+    /// rank, 0 the hardest to 4 the easiest; 0 while
+    /// `chart.judge_class_valid` is false.
+    pub const CHART_JUDGE_CLASS: u16 = 103;
+    /// Whether the chart has a judgment class.
+    pub const CHART_JUDGE_CLASS_VALID: u16 = 104;
+    /// The chart's gauge total, whole; 0 while `chart.total_valid` is
+    /// false.
+    pub const CHART_TOTAL: u16 = 105;
+    /// Whether the chart's gauge total is known and a number can show it.
+    pub const CHART_TOTAL_VALID: u16 = 106;
+    /// Whether the chart defines a BGA image; false while
+    /// `chart.bga_valid` is false.
+    pub const CHART_BGA: u16 = 107;
+    /// Whether that is known.
+    pub const CHART_BGA_VALID: u16 = 108;
     /// The number of fields.
-    pub const COUNT: usize = 101;
+    pub const COUNT: usize = 109;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -738,7 +771,35 @@ mod tests {
             );
         }
         assert_eq!(field::lane_judge(Lane::SCRATCH), 93);
-        assert_eq!(field::COUNT, 101);
+        let chart = [
+            ("chart.difficulty", field::CHART_DIFFICULTY, Some(5)),
+            (
+                "chart.difficulty_valid",
+                field::CHART_DIFFICULTY_VALID,
+                None,
+            ),
+            ("chart.judge_class", field::CHART_JUDGE_CLASS, Some(4)),
+            (
+                "chart.judge_class_valid",
+                field::CHART_JUDGE_CLASS_VALID,
+                None,
+            ),
+            ("chart.total", field::CHART_TOTAL, Some(i32::MAX - 1)),
+            ("chart.total_valid", field::CHART_TOTAL_VALID, None),
+            ("chart.bga", field::CHART_BGA, None),
+            ("chart.bga_valid", field::CHART_BGA_VALID, None),
+        ];
+        for (i, (name, s, hi)) in chart.into_iter().enumerate() {
+            assert_eq!(usize::from(s), 101 + i, "{name}");
+            assert_eq!(slot(name), Some(s), "{name}");
+            let ty = hi.map_or(FieldTy::Bool, |hi| FieldTy::Int { lo: 0, hi });
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((ty, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::COUNT, 109);
     }
 
     #[test]

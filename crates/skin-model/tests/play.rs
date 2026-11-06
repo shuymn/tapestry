@@ -41,6 +41,7 @@ fn section(start_ms: i64, end_ms: i64, lead_in_ms: i64) -> Section {
 
 fn in_section(s: &Section) -> PlayContext<'_> {
     PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Section(s),
@@ -519,6 +520,7 @@ fn targets_match_the_evaluators() {
         ..section(10_000, 20_000, 2_000)
     };
     let full_ctx = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },

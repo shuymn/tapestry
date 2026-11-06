@@ -1249,6 +1249,7 @@ mod tests {
                 ..Header::default()
             },
             random: false,
+            bga: false,
             summary: None,
         }
     }

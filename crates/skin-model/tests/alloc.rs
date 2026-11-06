@@ -1892,6 +1892,7 @@ fn build_does_not_allocate() {
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
     let full = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full {
@@ -2219,6 +2220,8 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            difficulty: None,
+            bga: None,
             autoplay: false,
             now: TimeUs(ms * MS),
             load: LoadState {
@@ -2258,6 +2261,8 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        difficulty: None,
+        bga: None,
         autoplay: no.is_multiple_of(2),
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
@@ -3806,6 +3811,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
     };
     let full = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: descs,
         attempt: Attempt::Full {

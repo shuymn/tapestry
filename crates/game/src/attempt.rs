@@ -4,9 +4,9 @@
 //! ended. Everything here is ordinary game data: the player translates it
 //! into whatever a skin takes, so the game depends on no skin crate.
 
-use bms_model::{Chart, Speed, TimeUs};
+use bms_model::{Chart, NoteKind, Speed, TimeUs};
 use eval::Section;
-use rules::{GaugeRule, LnMode, RulePreset};
+use rules::{GaugeRule, HeaderPolicy, JudgeRank, LnMode, RulePreset};
 
 use crate::policy::GaugeIndex;
 use crate::practice::mapped;
@@ -92,6 +92,12 @@ pub struct Attempt {
     pub last_note_end: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
+    /// The rank the play preset's header policy reads from the chart, which
+    /// the evaluator judges with; `None` when it reads none.
+    pub rank: Option<JudgeRank>,
+    /// The chart's gauge total as the reference player's song information
+    /// gives it ([`song_total`]).
+    pub song_total: i32,
     /// The tempo provider and reference tempos, from the chart as loaded
     /// at the attempt's speed over its section.
     pub tempo: AttemptTempo,
@@ -162,9 +168,52 @@ impl Attempt {
             kind,
             last_note_end,
             labels: labels.clone(),
+            rank: preset.headers.read(&chart.meta.judgment_headers).rank,
+            song_total: song_total(chart),
             tempo: AttemptTempo::prepare(chart, section),
         }
     }
+}
+
+/// `chart`'s gauge total as the reference player's song information gives
+/// it, whatever the play preset (beatoraja `IntegerPropertyFactory.java:
+/// 389-394`, `(int) getTotal()`): its `#TOTAL` read as the reference decoder
+/// reads it, a number above 0 ([`HeaderPolicy::DefExRankFirst`]), else the
+/// default the reference sets for an absent one, `max(260, 7.605 n /
+/// (0.01 n + 6.5))` (`play/BMSPlayerRule.java:68-80`). `n` is the whole
+/// chart's notes as the reference counts them in its default long-note
+/// mode, each tap and each long note once and no mine (jbms-parser
+/// `TimeLine.getTotalNotes`). The default is computed in `f64` in the
+/// reference's order of operations, so its truncation is the reference's
+/// (an exact quotient differs at 4 420 notes: 663 exactly, 662 in `f64`);
+/// a `#TOTAL` is truncated exactly, and past `i32` saturates, as the
+/// reference's cast does.
+#[must_use]
+pub fn song_total(chart: &Chart) -> i32 {
+    if let Some(milli) = HeaderPolicy::DefExRankFirst
+        .read(&chart.meta.judgment_headers)
+        .total_milli
+    {
+        return i32::try_from(milli / 1_000).unwrap_or(i32::MAX);
+    }
+    let notes = chart
+        .lanes
+        .iter()
+        .flatten()
+        .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }))
+        .count();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a note count is far below 2^53, where f64 is exact"
+    )]
+    let n = notes as f64;
+    let total = f64::max(260.0, 7.605 * n / (0.01 * n + 6.5));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the reference truncates (`(int)`); the value is at most 760.5"
+    )]
+    let total = total as i32;
+    total
 }
 
 #[cfg(test)]

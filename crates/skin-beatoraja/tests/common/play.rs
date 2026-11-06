@@ -205,6 +205,7 @@ fn context_with(
     bpm_whole_change: Option<bool>,
 ) -> PlayContext<'static> {
     PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
@@ -537,6 +538,8 @@ impl Loader {
         let mut covers = readouts_for(view).covers;
         covers.adjusting = self.adjusting;
         let frame = LoadingFrame {
+            difficulty: None,
+            bga: None,
             autoplay: self.autoplay,
             now: TimeUs(ms * MS),
             load: LoadState {
