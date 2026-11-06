@@ -114,7 +114,8 @@ pub(crate) struct Lowered {
 pub(crate) enum TextFold {
     /// A string.
     Literal(String),
-    /// Chart field `id`, 10 to 16.
+    /// Chart field `id`, 10 to 16, or on a selection skin a screen's own
+    /// string (30, 1000).
     Field(i32),
     /// Chart field `id`, or the string where it is empty.
     FieldOr(i32, String),
@@ -383,6 +384,17 @@ impl Lower<'_> {
         match name {
             // The gauge and the judgments are play's alone.
             "gauge_type" | "judge" if !play => Err(unmapped()),
+            // An image index the selection profile bridges, as an image's
+            // or an image set's `ref` reads it: -1 (nothing) to 10.
+            "event_index" if !play => match property::index_in(self.kind, id.ok_or_else(unmapped)?)
+            {
+                IndexProp::Selection(src) => Ok(Mapped::Int {
+                    src: Self::text(self.an, &["(", src, ")"])?,
+                    lo: -1,
+                    hi: 10,
+                }),
+                _ => Err(unmapped()),
+            },
             "gauge_type" => {
                 self.guard("gauge.valid");
                 self.out.deviates = true;
@@ -1065,13 +1077,30 @@ fn known_string(an: &Analysis, v: Val) -> R<Option<String>> {
 /// known string, a read of a chart field, or a select on that read against
 /// `""` with the read and a known string as its arms. Every read must be
 /// of a chart field, as a text has nowhere to put a guard; `None` otherwise.
-fn text_fold(an: &Analysis, res: &Residual) -> R<Option<TextFold>> {
+/// On a selection skin the root may also be a whole read of a screen's
+/// own string (30, the query; 1000, the place), as its JSON `ref` is.
+fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFold>> {
     let field = |r: u32| match res.node(r) {
         Node::Read { api, arg: Some(n) } if residual::is_text(api) && (10..=16).contains(&n) => {
             i32::try_from(n).ok()
         }
         _ => None,
     };
+    let screen = |r: u32| match res.node(r) {
+        Node::Read { api, arg: Some(n) }
+            if kind == ScreenKind::Selection && residual::is_text(api) =>
+        {
+            i32::try_from(n)
+                .ok()
+                .filter(|&n| matches!(property::str_in(kind, n), property::StrProp::Screen(_)))
+        }
+        _ => None,
+    };
+    if let Some(id) = screen(res.root)
+        && res.reads.iter().all(|&r| r == res.root)
+    {
+        return Ok(Some(TextFold::Field(id)));
+    }
     if res.reads.iter().any(|&r| field(r).is_none()) {
         return Ok(None);
     }
@@ -1417,7 +1446,7 @@ impl Cx<'_> {
         }
         let cancelled = || def.cancelled(|| None).is_err();
         match residual::evaluate(adm, inst, Conv::Text, &cancelled)
-            .and_then(|res: Residual| text_fold(an, &res))
+            .and_then(|res: Residual| text_fold(an, &res, self.kind))
         {
             Ok(fold) => Ok(Ok(fold)),
             Err(Stop::Unsupported(why)) => Ok(Err(why)),
@@ -1504,6 +1533,15 @@ impl Cx<'_> {
                     }
                 }
                 *deviates |= l.deviates;
+                // On a selection skin a visibility known to be false folds
+                // as a JSON condition of the same id does: never drawn, so
+                // an essential part is missing rather than kept invisible.
+                if self.kind == ScreenKind::Selection
+                    && l.src.trim_matches(|c| c == '(' || c == ')') == "false"
+                {
+                    self.ignored(at, NoteKind::Ignored { field: "op" });
+                    return Ok(false);
+                }
                 if !conds.contains(&l.src) {
                     conds.push(l.src);
                 }

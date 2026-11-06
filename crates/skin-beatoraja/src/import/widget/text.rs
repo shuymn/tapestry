@@ -87,7 +87,10 @@ impl Cx<'_> {
     fn folded_text(&mut self, at: Span, fold: TextFold) -> Option<TextValue> {
         match fold {
             TextFold::Literal(s) => self.cleaned(at, &s).map(TextValue::Literal),
-            TextFold::Field(id) => field(id).map(TextValue::Field),
+            TextFold::Field(id) => match property::str_in(self.kind, id) {
+                StrProp::Screen(s) => Some(TextValue::Selection(s)),
+                _ => field(id).map(TextValue::Field),
+            },
             TextFold::FieldOr(id, s) => {
                 let field = field(id)?;
                 Some(match self.cleaned(at, &s) {

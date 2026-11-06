@@ -123,11 +123,118 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
     ] {
         a.view(&v);
         b.view(&v);
-        assert_eq!(a.drawn(0), b.drawn(0));
+        // Every quad whole (rect, uv, layer, colour, rotation) and every
+        // run (blend, clip).
+        assert_eq!(a.frame(0), b.frame(0));
+        assert_eq!(a.batch.runs(), b.batch.runs());
     }
     // The chart shows its EX score and the op-2 image; the folder neither.
     let mut row = chart("a");
     row.score = best(321, 0, 1);
     a.view(&view(vec![row], Some(0), Some(500), None));
     assert_eq!(a.digits(0), "321");
+}
+
+/// The configured pass of Lua selection skin `entry` in `l` (beside the
+/// selection fixtures' sheet and font), on a selection scene.
+fn import_lua_in(
+    l: &tempfile::TempDir,
+    entry: &str,
+) -> Result<skin_beatoraja::LuaImported, skin_beatoraja::ImportError> {
+    common::write(l.path(), "s.luaskin", entry.as_bytes());
+    let cancel = Cancel::new();
+    let h = read_lua_header(l.path(), "s.luaskin", &cancel)?;
+    let facts = ImportFacts::unavailable(ScreenKind::Selection);
+    match h.import(&Config::defaults(h.header()), &facts, &cancel)? {
+        LuaOutcome::Imported(i) => Ok(i),
+        LuaOutcome::Pending(p) => panic!("{p:?}"),
+    }
+}
+
+/// [`import_lua_in`] a folder of its own, dropped after.
+fn import_lua(entry: &str) -> Result<skin_beatoraja::LuaImported, skin_beatoraja::ImportError> {
+    import_lua_in(&common::selection::folder(""), entry)
+}
+
+/// A Lua selection skin: one placement whose `liston` holds `on` besides
+/// its keys, the title, and `more` statements before it returns.
+fn lua_skin(on: &str, more: &str) -> String {
+    format!(
+        "local skin = {{ type = 5, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
+         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.image = {{ {{ id = \"b0\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }},\n\
+           {{ id = \"b1\", src = \"s\", x = 8, y = 0, w = 8, h = 8 }} }}\n\
+         skin.imageset = {{ {{ id = \"set\", images = {{ \"b0\" }} }} }}\n\
+         skin.text = {{ {{ id = \"t\", font = \"f\", size = 10, ref = 10 }} }}\n\
+         skin.songlist = {{ id = \"list\", center = 0,\n\
+           liston = {{ {{ id = \"set\", {on} dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
+           listoff = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
+           text = {{ {{ id = \"t\", dst = {{ {{ x = 0, y = 0, w = 100, h = 10 }} }} }} }} }}\n\
+         skin.destination = {{ {{ id = \"list\", dst = {{ {{ x = 0, y = 0, w = 0, h = 0 }} }} }} }}\n\
+         {more}\n\
+         return skin\n"
+    )
+}
+
+/// A Lua `draw` that lowers to a constant false folds as the JSON
+/// condition of the same id does: on the selected row it refuses.
+#[test]
+fn a_lua_draw_known_false_folds_as_json_does() {
+    let entry = lua_skin("draw = function() return ms.option(625) end,", "");
+    match import_lua(&entry) {
+        Err(skin_beatoraja::ImportError::Essential {
+            part: skin_beatoraja::EssentialPart::SelectedRow,
+            ..
+        }) => {}
+        other => panic!("{:?}", other.map(|i| i.callbacks)),
+    }
+    // One reading a live option is kept.
+    import_lua(&lua_skin("draw = function() return ms.option(2) end,", "")).unwrap();
+}
+
+/// Lua text and image index reads take the selection bridges as their
+/// JSON `ref`s do: text 30 (the query) and image index 370 (the selected
+/// row's clear type).
+#[test]
+fn lua_reads_take_the_selection_text_and_index_bridges() {
+    let more = "table.insert(skin.text, { id = \"q\", font = \"f\", size = 10,\n\
+                  value = function() return ms.text(30) end })\n\
+                table.insert(skin.imageset, { id = \"ct\",\n\
+                  images = { \"b0\", \"b0\", \"b0\", \"b0\", \"b0\", \"b1\" },\n\
+                  value = function() return ms.event_index(370) end })\n\
+                table.insert(skin.destination, { id = \"q\", dst = { { x = 0, y = 0, w = 100, h = 10 } } })\n\
+                table.insert(skin.destination, { id = \"ct\", dst = { { x = 700, y = 0, w = 8, h = 8 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", more)).unwrap();
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        2,
+        "{:?}",
+        i.callbacks
+    );
+    let mut s = Sel::new(i.imported.skin);
+    let mut row = chart("a");
+    row.score = best(1, 0, 1);
+    let mut v = view(vec![row], Some(0), None, None);
+    v.query = "Q".to_owned();
+    s.view(&v);
+    let (texts, _) = s.requests();
+    assert!(texts.iter().any(|(_, t)| t == "Q"), "{texts:?}");
+    // A normal clear: the source's clear type 5, image 5 of the set.
+    let at_700: Vec<[u8; 2]> = s
+        .drawn(0)
+        .into_iter()
+        .filter(|(_, r)| r[0] == 700.0)
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(at_700, [common::selection::B1]);
+    // An unplayed chart: no clear type, nothing drawn.
+    s.view(&view(vec![chart("u")], Some(0), None, None));
+    assert!(s.drawn(0).iter().all(|(_, r)| r[0] != 700.0));
 }
