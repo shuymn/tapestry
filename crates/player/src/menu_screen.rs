@@ -344,6 +344,10 @@ pub struct MenuScreen {
     /// The caret's area of the fallback page prepared with the selection
     /// skin, sent when a refusal draws the page.
     page_caret: Option<[f32; 4]>,
+    /// A frame's app work allocates once while set (tests: the allocation
+    /// guards' positive control).
+    #[cfg(all(test, feature = "dev-tools"))]
+    alloc_probe: bool,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -461,6 +465,8 @@ impl MenuScreen {
             strip_underline: None,
             selection_key: None,
             page_caret: None,
+            #[cfg(all(test, feature = "dev-tools"))]
+            alloc_probe: false,
         }
     }
 
@@ -521,6 +527,8 @@ impl MenuScreen {
         logic: &mut SelectionLogic,
         now: bms_model::TimeUs,
     ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
         let mut sprites = [Sprite::default(); render::STRIP_SPRITES];
         let n = strip_sprites(
             self.strip_lines,
@@ -1087,38 +1095,55 @@ impl MenuScreen {
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LEFT, TOP)?;
         }
-        let cursor = self.cursor;
-        let underline = self.underline;
+        let start = self.build_page_frame();
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        self.renderer.menu_frame(
-            |b| {
-                if let Some(i) = cursor {
-                    b.push(
-                        Blend::Alpha,
-                        Sprite {
-                            rect: [LEFT - 20.0, line_top(i) - 3.0, 1_840.0, LINE_STEP - 2.0],
-                            uv: solid_uv(),
-                            color: [0.15, 0.3, 0.6, 1.0],
-                            ..Sprite::default()
-                        },
-                    );
-                }
-                if let Some(rect) = underline {
-                    b.push(
-                        Blend::Alpha,
-                        Sprite {
-                            rect,
-                            uv: solid_uv(),
-                            color: [1.0; 4],
-                            ..Sprite::default()
-                        },
-                    );
-                }
-            },
-            text,
-        )
+        self.renderer.submit_menu(start, text)
+    }
+
+    /// The app's share of a frame of the page prepared last: its cursor
+    /// and composition sprites staged, with no call into wgpu. Allocates
+    /// nothing. Returns when the frame's work began.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_page_frame(&mut self) -> std::time::Instant {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        let cursor = self.cursor;
+        let underline = self.underline;
+        self.renderer.build_menu(|b| {
+            if let Some(i) = cursor {
+                b.push(
+                    Blend::Alpha,
+                    Sprite {
+                        rect: [LEFT - 20.0, line_top(i) - 3.0, 1_840.0, LINE_STEP - 2.0],
+                        uv: solid_uv(),
+                        color: [0.15, 0.3, 0.6, 1.0],
+                        ..Sprite::default()
+                    },
+                );
+            }
+            if let Some(rect) = underline {
+                b.push(
+                    Blend::Alpha,
+                    Sprite {
+                        rect,
+                        uv: solid_uv(),
+                        color: [1.0; 4],
+                        ..Sprite::default()
+                    },
+                );
+            }
+        })
+    }
+
+    /// Allocates once when the probe is set (tests): the positive control
+    /// of the allocation guards over a frame's app work.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn probe_alloc(&self) {
+        if self.alloc_probe {
+            drop(std::hint::black_box(Box::new(0_u8)));
+        }
     }
 }
 

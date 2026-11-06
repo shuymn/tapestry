@@ -430,6 +430,7 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::target",
             "MenuScreen::minimized",
             "MenuScreen::build_selection_frame",
+            "MenuScreen::build_page_frame",
             "strip_sprites",
         ],
     ),

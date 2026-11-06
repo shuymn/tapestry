@@ -2146,8 +2146,35 @@ impl Renderer {
         if text.owner() != self.id {
             return Err(RenderError::OtherRenderersText);
         }
+        let start = self.build_menu(sprites);
+        self.submit_menu(start, text)
+    }
+
+    /// The app's share of a menu frame: the sprites `sprites` pushes,
+    /// staged with no call into wgpu, allocating nothing of its own.
+    /// Returns when the frame's work began, for
+    /// [`submit_menu`](Self::submit_menu).
+    pub fn build_menu(&mut self, sprites: impl FnOnce(&mut SpriteBatch)) -> Instant {
         let start = Instant::now();
         self.staging.fill(sprites);
+        start
+    }
+
+    /// Submits and presents the menu frame
+    /// [`build_menu`](Self::build_menu) staged at `start`, with `text`
+    /// over it.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_menu(
+        &mut self,
+        start: Instant,
+        text: &MenuText,
+    ) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
         self.draw(start, Some(text), Projection::fixed(self.target()))
     }
 

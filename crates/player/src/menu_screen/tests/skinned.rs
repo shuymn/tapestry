@@ -259,8 +259,11 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
 }
 
 /// A selection frame's app work (the timers, the skin's build and the
-/// strip's sprites) allocates nothing, from the first frame after an
-/// update on, after a resize prepared outside the count, and refused.
+/// strip's sprites) allocates nothing: the first build after the update's
+/// preparation, each later one, the first after a resize prepared outside
+/// the count, and refused, with the fallback page's own build; each is
+/// counted apart from the GPU submission that follows it. An allocation
+/// put into that work (the probe) is counted.
 #[test]
 fn selection_frame_alloc() {
     let (_dir, mut screen, mut logic, _) = skinned();
@@ -270,29 +273,53 @@ fn selection_frame_alloc() {
     s.set_notice(Some("refused".to_owned()));
     feed.preset_step = Some(TimeUs(0));
     let u = update(&mut feed, &s, 0);
-    let count = |screen: &mut MenuScreen, logic: &mut SelectionLogic| {
+    let counted = |f: &mut dyn FnMut()| {
         let before = crate::alloc_count::this_thread();
-        for k in 0..100 {
+        f();
+        crate::alloc_count::this_thread() - before
+    };
+    let build = |screen: &mut MenuScreen, logic: &mut SelectionLogic, k: i64| {
+        let n = counted(&mut || {
             screen
                 .build_selection_frame(&u, logic, TimeUs(k * 16_667))
                 .unwrap();
-        }
-        crate::alloc_count::this_thread() - before
+        });
+        screen.renderer.submit_selection(&[]).unwrap();
+        n
     };
-    screen
-        .selection(&u, Some(&mut logic), true, TimeUs(0))
-        .unwrap();
-    assert_eq!(count(&mut screen, &mut logic), 0);
+    let prepare = |screen: &mut MenuScreen, logic: &mut SelectionLogic, changed: bool| {
+        screen
+            .prepare_selection(&u, logic, changed)
+            .unwrap()
+            .unwrap();
+    };
+    prepare(&mut screen, &mut logic, true);
+    assert_eq!(build(&mut screen, &mut logic, 0), 0, "first");
+    for k in 1..100 {
+        assert_eq!(build(&mut screen, &mut logic, k), 0, "{k}");
+    }
     screen.resize(1_280, 720);
-    screen
-        .selection(&u, Some(&mut logic), false, TimeUs(0))
-        .unwrap();
-    assert_eq!(count(&mut screen, &mut logic), 0);
+    prepare(&mut screen, &mut logic, false);
+    assert_eq!(build(&mut screen, &mut logic, 0), 0, "after the resize");
+    // Refused: the skin's build, then the page's own.
     screen.renderer.refuse_next_selection(false);
-    let before = crate::alloc_count::this_thread();
-    let refused = screen.build_selection_frame(&u, &mut logic, TimeUs(0));
-    assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    let mut refused = Ok(());
+    let n = counted(&mut || refused = screen.build_selection_frame(&u, &mut logic, TimeUs(0)));
     assert!(refused.is_err());
+    assert_eq!(n, 0, "refused");
+    let mut start = None;
+    let n = counted(&mut || start = Some(screen.build_page_frame()));
+    assert_eq!(n, 0, "the page");
+    let text = screen.text.as_ref().unwrap();
+    screen.renderer.submit_menu(start.unwrap(), text).unwrap();
+    // The positive control: the same work with an allocation in it.
+    screen.alloc_probe = true;
+    assert!(build(&mut screen, &mut logic, 0) > 0);
+    assert!(
+        counted(&mut || {
+            screen.build_page_frame();
+        }) > 0
+    );
 }
 
 /// The rows a cursor at `at` shows: seven around it of `n`, each a long
