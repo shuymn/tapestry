@@ -1388,7 +1388,7 @@ impl<'a> Evaluator<'a> {
                 note: index,
                 judgment,
                 deviation,
-                presses: self.input.lane(lane_of(lane)).presses_at(t),
+                presses: self.presses_at(lane, t),
             };
             self.emit(t, Some(origin), kind, out);
             return;
@@ -1417,7 +1417,7 @@ impl<'a> Evaluator<'a> {
                 JudgeEventKind::EmptyPoor {
                     lane: lane_of(lane),
                     deviation,
-                    presses: self.input.lane(lane_of(lane)).presses_at(t),
+                    presses: self.presses_at(lane, t),
                 },
                 out,
             );
@@ -1560,7 +1560,7 @@ impl<'a> Evaluator<'a> {
             deviation,
             release,
             combo: self.tally.combo,
-            presses: self.input.lane(lane_of(lane)).presses_at(time),
+            presses: self.presses_at(lane, time),
         };
         self.emit(time, origin, kind, out);
         self.change_gauges(Cause::Judged(judgment), time, origin, out);
@@ -1589,6 +1589,14 @@ impl<'a> Evaluator<'a> {
             };
             self.emit(time, origin, kind, out);
         }
+    }
+
+    /// The presses of lane `lane` at `t` so far, which an event of that
+    /// lane at `t` carries ([`LaneInput::presses_at`]).
+    ///
+    /// [`LaneInput::presses_at`]: crate::LaneInput::presses_at
+    fn presses_at(&self, lane: usize, t: TimeUs) -> u32 {
+        self.input.lane(lane_of(lane)).presses_at(t)
     }
 
     fn emit(
