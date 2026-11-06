@@ -1927,10 +1927,11 @@ fn write_text_chart(fx: &Fixture, name: &str, text: &str) -> bms_model::Chart {
         .chart
 }
 
-/// A play skin reads the recent timing the player publishes, through its
-/// adapters, on the game's real threads: number 525's digits and the
-/// images on ops 1242 (early) and 1243 (late), from a log's play under the
-/// default beatoraja-style preset.
+/// A play skin's recent timing agrees with the view each captured frame
+/// drew, on the game's real threads (a consistency check: which judgment a
+/// frame shows depends on when it acquired its view, so none is required):
+/// number 525's digits and the images on ops 1242 (early) and 1243
+/// (late), from a log's play under the default beatoraja-style preset.
 ///
 /// The play: key 1's note at 125 ms missed (−210, its late BAD edge); 4 s
 /// pressed 30 ms early (+30, early); 6 s on time, then a press 140 ms
@@ -2070,32 +2071,85 @@ fn a_play_skin_reads_the_recent_timing() {
         timing_shown(&list)
     };
     let side = |name: &str| fs::read_to_string(out.join(format!("{name}.json"))).unwrap();
-    for (name, want) in [
-        ("miss", (Some(-210), false, true)),
-        ("early", (Some(30), true, false)),
-        ("empty", (Some(-140), false, true)),
-        ("late", (Some(-30), false, true)),
-        ("held", (Some(-30), false, true)),
-        ("release", (Some(40), false, false)),
-        ("retry", (Some(0), false, false)),
-        ("rearmed", (Some(0), false, false)),
-    ] {
-        assert_eq!(shown(name), want, "{name}: {}", side(name));
-    }
-    // The rearm's capture is the rearmed candidate's frame, its long note
-    // held.
-    assert_eq!(side_num(&side("rearmed"), "view_generation"), 1);
-    // The cancelled READY took its empty POOR: the record keeps it in its
-    // cancelled opening.
+    // Each play's events, re-evaluated from its record: the main play,
+    // its retry, then the rearm's winning candidate.
     let (records, _) = fx.played_records();
-    let rec = replay::decode(
-        &fs::read(records.last().unwrap()).unwrap(),
-        &DecodeLimits::default(),
-    )
-    .unwrap();
-    assert_eq!(rec.history.openings.len(), 1, "{:?}", rec.history);
-    assert!(
-        stdout.contains("play 1: Completed; perfect 1 great 0 good 0 bad 0 poor 0"),
-        "{stdout}"
-    );
+    assert_eq!(records.len(), 3, "{records:?}");
+    let played: Vec<(PlayRecord, Vec<eval::JudgeEvent>)> = records
+        .iter()
+        .zip([&chart, &chart, &rearm_chart])
+        .map(|(path, chart)| {
+            let rec = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::default()).unwrap();
+            let input = eval::EvalInput {
+                events: rec.events.clone(),
+                device: eval::DeviceProfile {
+                    sources: rec
+                        .devices
+                        .sources
+                        .iter()
+                        .map(|s| s.profile.clone())
+                        .collect(),
+                },
+                start: rec.start.clone(),
+                ..eval::EvalInput::default()
+            };
+            let events = eval::evaluate(chart, &input, &rules::beatoraja_style())
+                .unwrap()
+                .events;
+            (rec, events)
+        })
+        .collect();
+    assert_eq!(played[2].0.history.openings.len(), 1, "the rearm");
+    // What a frame shows after `events`' first `n`: the latest event the
+    // timing takes, each named by its note in the scripted play; `None`
+    // where the play's own timing decides it (the rearm's long note).
+    let expected = |events: &[eval::JudgeEvent], n: usize, rearm: bool| {
+        let mut want = Some((Some(0), false, false));
+        for e in &events[..n] {
+            want = match e.kind {
+                eval::JudgeEventKind::Judged { .. } if rearm => None,
+                eval::JudgeEventKind::Judged { lane, note, .. } => match (lane.index(), note) {
+                    (1, 0) => Some((Some(-210), false, true)),
+                    (1, 1) => Some((Some(30), true, false)),
+                    (1, 2) => Some((Some(0), false, false)),
+                    (1, 3) => Some((Some(-30), false, true)),
+                    (2, 0) => Some((Some(40), false, false)),
+                    other => panic!("{other:?}"),
+                },
+                eval::JudgeEventKind::EmptyPoor { .. } => Some((Some(-140), false, true)),
+                _ => want,
+            };
+        }
+        want
+    };
+    // Every capture against what its own frame drew from: its play's
+    // generation and candidate, and the events its view had published,
+    // all of which the frame applied (the fixture's few events fit the
+    // frame's effect buffer and queue, 2^14 each, so none is split or
+    // dropped). No capture must show a judgment: a frame may draw a view
+    // older than its time (the deterministic test,
+    // `tests/recent_timing.rs`, checks each value).
+    let mut judged = 0;
+    for name in [
+        "miss", "early", "empty", "late", "held", "release", "retry", "rearmed",
+    ] {
+        let s = side(name);
+        let generation = usize::try_from(side_num(&s, "generation")).unwrap();
+        let candidate = side_num(&s, "view_generation");
+        let n = usize::try_from(side_num(&s, "events")).unwrap();
+        let (_, events) = &played[generation - 1];
+        assert!(n <= events.len() && n < 1 << 14, "{name}: {s}");
+        if let Some(t) = events[..n].last() {
+            assert!(t.time.0 <= side_num(&s, "finalized_us"), "{name}: {s}");
+        }
+        // The rearm's cancelled candidate is not its record's.
+        if generation == 3 && candidate == 0 {
+            continue;
+        }
+        if let Some(want) = expected(events, n, generation == 3) {
+            assert_eq!(shown(name), want, "{name}: {s}");
+            judged += usize::from(want != (Some(0), false, false));
+        }
+    }
+    println!("captures that showed a judgment: {judged}");
 }
