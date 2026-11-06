@@ -563,12 +563,10 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     let o = &h.openings[0];
     assert_eq!(o.reason, replay::CancelReason::Held);
     // On the clock the next READY's chart time 0 lies 1.2 s after the
-    // first's and the rearm's delay more.
-    assert!(
-        (-2_200_000..=-1_230_000).contains(&o.origin.0),
-        "{:?}",
-        o.origin
-    );
+    // first's and at least the rearm's delay more; how much more is the
+    // scheduling's (the exact times are the unit test's,
+    // `a_late_rearm_opens_at_the_scripted_release`).
+    assert!(o.origin.0 <= -1_230_000, "{:?}", o.origin);
     // On the chart, every press is on its note: the rearm opened at the
     // release, not where it was answered.
     let late: Vec<_> = all_events(&chart, &rec)

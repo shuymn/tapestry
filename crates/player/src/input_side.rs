@@ -1203,33 +1203,40 @@ impl Hook {
 /// Feeds `script` up to `now` on its timeline, as far as the batch where a
 /// cancelled READY candidate's hold reads released (design.md "Shortening
 /// Launch-Based Checks", scripted input): that batch's time, which the
-/// script is then held at for the rearm to open there. While the hold
-/// lasts the items go one batch at a time, so the release is found at its
-/// own time; a cancellation and its release within one feed stop it at
-/// `now` (dev-tools).
+/// script is then held at for the rearm to open there. While the
+/// candidate can still be cancelled, or waits cancelled, the items go one
+/// batch at a time, so a hold and its release are found at their own
+/// times even when one wake reaches both (dev-tools).
 #[cfg(feature = "dev-tools")]
 fn feed_to_release(
     script: &mut input::ScriptedInput,
     now: TimeUs,
     sources: &mut SourceSet,
 ) -> Option<TimeUs> {
-    fn cancelled(sources: &mut SourceSet) -> bool {
+    fn phase(sources: &mut SourceSet) -> Option<input::GatePhase> {
         sources
             .adjustment_mut()
-            .is_some_and(|t| t.start_gate().state().phase == input::GatePhase::Cancelled)
+            .map(|t| t.start_gate().state().phase)
     }
-    let released_before = cancelled(sources) && !sources.holding();
-    while cancelled(sources)
-        && sources.holding()
-        && let Some(at) = script.next_at().filter(|&at| at <= now)
+    // Cancelled with both roles released: where a rearm may open.
+    fn free(sources: &mut SourceSet) -> bool {
+        phase(sources) == Some(input::GatePhase::Cancelled) && !sources.holding()
+    }
+    let mut was_free = free(sources);
+    while matches!(
+        phase(sources),
+        Some(input::GatePhase::Armed | input::GatePhase::Cancelled)
+    ) && let Some(at) = script.next_at().filter(|&at| at <= now)
     {
         input::InputAdapter::poll(script, at, sources);
-        if !sources.holding() {
+        let is_free = free(sources);
+        if is_free && !was_free {
             return Some(at);
         }
+        was_free = is_free;
     }
     input::InputAdapter::poll(script, now, sources);
-    (!released_before && cancelled(sources) && !sources.holding()).then_some(now)
+    None
 }
 
 /// A gated opening's snapshot, with the storage the input side reserved for
@@ -2884,6 +2891,162 @@ mod gate_tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_late_rearm_opens_at_the_scripted_release() {
+        let (mut sources, mut hook, mut link, gate, opening) = scripted();
+        // START held: READY is cancelled.
+        hook.wake(&mut sources, script_clock(-299_500));
+        assert_eq!(gate.state().phase, GatePhase::Cancelled);
+        let mut readers = opening.readers;
+        let mut sealed: Vec<_> = readers
+            .iter_mut()
+            .flat_map(|r| std::iter::from_fn(move || r.pop()))
+            .collect();
+        // Released at 200 ms, seen 0.5 ms later at a heartbeat.
+        hook.wake(&mut sources, script_clock(100_000));
+        hook.wake(&mut sources, script_clock(200_500));
+        // The game thread asks 15 ms later; the delay holds the answer
+        // until 30 ms after the release was seen.
+        link.rearms
+            .push(rearm_buffers(readers, opening.start.held.capacity()))
+            .unwrap();
+        hook.wake(&mut sources, script_clock(215_000));
+        assert!(link.rearmed.pop().is_err(), "answered before the delay");
+        hook.wake(&mut sources, script_clock(240_000));
+        let rearm = link.rearmed.pop().unwrap();
+        assert_eq!(
+            rearm.outcome,
+            RearmOutcome::Opened {
+                origin: TimeUs(script_clock(240_000).0 + LEAD_IN.0),
+                closed: TimeUs(240_000),
+            }
+        );
+        assert_eq!(rearm.start.opened_at, TimeUs(-LEAD_IN.0));
+        sealed.extend(rearm.leftover.iter().copied());
+        // Z at 1.7 s on the script's timeline, now 40 ms later on the clock.
+        let mut readers = rearm.readers;
+        let next = feed_z(&mut hook, &mut sources, &mut readers, 40_000);
+        // On the script's timeline (the sealed opening's chart time 0 at
+        // its 0, the next one's at 1.2 s), every stamp of the sealed
+        // opening lies at or before the release and every one of the next
+        // after it.
+        let release = TimeUs(200 * MS);
+        assert!(
+            sealed.iter().any(|e| e.kind
+                == InputKind::Control {
+                    control: Q,
+                    value: 1
+                }),
+            "{sealed:?}"
+        );
+        assert!(sealed.iter().all(|e| e.received <= release), "{sealed:?}");
+        assert!(
+            next.iter().all(|e| e.received.0 + 1_200 * MS >= release.0),
+            "{next:?}"
+        );
+    }
+
+    /// The same with START's press and release reached by one wake, the
+    /// first after the opening, at 215 ms: the script is still fed one
+    /// batch at a time, so it is held at the release's own 200 ms.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_hold_and_its_release_in_one_wake_hold_the_script_at_the_release() {
+        let (mut sources, mut hook, mut link, gate, opening) = scripted();
+        hook.wake(&mut sources, script_clock(215_000));
+        assert_eq!(gate.state().phase, GatePhase::Cancelled);
+        assert_eq!(
+            hook.released,
+            Some((TimeUs(200 * MS), script_clock(215_000)))
+        );
+        let mut readers = opening.readers;
+        for r in &mut readers {
+            while r.pop().is_some() {}
+        }
+        link.rearms
+            .push(rearm_buffers(readers, opening.start.held.capacity()))
+            .unwrap();
+        hook.wake(&mut sources, script_clock(250_000));
+        let rearm = link.rearmed.pop().unwrap();
+        assert!(
+            matches!(rearm.outcome, RearmOutcome::Opened { .. }),
+            "{:?}",
+            rearm.outcome
+        );
+        let mut readers = rearm.readers;
+        feed_z(&mut hook, &mut sources, &mut readers, 50_000);
+    }
+
+    /// A rearm that opens nothing leaves the script's timeline as it was:
+    /// the release is let go, the presentation offset is the script's
+    /// origin again, and Z is fed at 1.7 s on the old timeline.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_refused_scripted_rearm_keeps_the_scripts_timeline() {
+        let (mut sources, mut hook, mut link, _gate, _opening) = scripted();
+        hook.wake(&mut sources, script_clock(-299_500));
+        hook.wake(&mut sources, script_clock(200_500));
+        assert!(hook.released.is_some());
+        // No readers: the reopening is refused after the offset moved.
+        link.rearms.push(rearm_buffers(Vec::new(), 4)).unwrap();
+        hook.wake(&mut sources, script_clock(240_000));
+        let rearm = link.rearmed.pop().unwrap();
+        assert_eq!(rearm.outcome, RearmOutcome::Refused);
+        assert_eq!(hook.released, None);
+        assert_eq!(hook.script_origin, Some(script_clock(0)));
+        assert_eq!(sources.presentation_time(TimeUs(0)), script_clock(0));
+        hook.wake(&mut sources, script_clock(1_700_000));
+        let Mode::Script(script) = &hook.mode else {
+            panic!("not a script");
+        };
+        assert_eq!(script.current.next_at(), Some(TimeUs(1_750 * MS)));
+    }
+
+    /// Where the scripted play of [`scripted`] opens on the clock: 10 s.
+    #[cfg(feature = "dev-tools")]
+    const SCRIPT_OPENED: i64 = 10_000 * MS;
+
+    /// Script time `us` on the clock: its 0 one lead-in after the opening.
+    #[cfg(feature = "dev-tools")]
+    const fn script_clock(us: i64) -> TimeUs {
+        TimeUs(SCRIPT_OPENED + LEAD_IN.0 + us)
+    }
+
+    /// Feeds the script until Z's release on the clock, its timeline moved
+    /// `moved` µs by the rearm, and checks that Z landed as the log has it:
+    /// pressed at 500 ms and released at 550 ms of the rearmed READY.
+    /// Returns what the readers held.
+    #[cfg(feature = "dev-tools")]
+    fn feed_z(
+        hook: &mut Hook,
+        sources: &mut SourceSet,
+        readers: &mut [input::SourceReader],
+        moved: i64,
+    ) -> Vec<eval::PhysicalInputEvent> {
+        for at in [1_700_000, 1_705_000 + moved, 1_755_000 + moved] {
+            hook.wake(sources, script_clock(at));
+        }
+        let next: Vec<_> = readers
+            .iter_mut()
+            .flat_map(|r| std::iter::from_fn(move || r.pop()))
+            .collect();
+        let z = |value| InputKind::Control { control: Z, value };
+        let at = |kind| next.iter().find(|e| e.kind == kind).map(|e| e.received);
+        assert_eq!(at(z(1)), Some(TimeUs(500 * MS)), "{next:?}");
+        assert_eq!(at(z(0)), Some(TimeUs(550 * MS)), "{next:?}");
+        next
+    }
+
+    /// A scripted play's hook, opened at [`SCRIPT_OPENED`] on a keyboard
+    /// that holds START at −300 ms and releases it at 200 ms, then presses
+    /// Z at 1.7 s and releases it at 1.75 s, with a rearm delay of 30 ms;
+    /// its START tap's gate, and the first opening.
+    #[cfg(feature = "dev-tools")]
+    fn scripted() -> (
+        SourceSet,
+        Hook,
+        InputLink,
+        StartGate,
+        game::Opening<input::SourceReader>,
+    ) {
         use input::{Action, ScriptItem, ScriptedInput};
 
         let config = SourceConfig {
@@ -2916,7 +3079,7 @@ mod gate_tests {
         let mut sources = SourceSet::new(config).unwrap();
         let controls = Arc::new(Controls::new(QpcClock::start()));
         controls.set_latch(sources.gate().handle());
-        let (mut hook, mut link) = link(controls, mode, Waker::new().unwrap());
+        let (mut hook, link) = link(controls, mode, Waker::new().unwrap());
         let (tap, _rx) = adjustment_queue(AdjustmentBindings {
             controls: vec![(TapControl::Key(Q), 0)],
             latched: 1,
@@ -2925,9 +3088,7 @@ mod gate_tests {
         .unwrap();
         let gate = tap.start_gate();
         link.tap(tap);
-        // Opened at 10 s on the clock: the script's 0 at 11 s.
-        let opened_at = TimeUs(10_000 * MS);
-        hook.wake(&mut sources, TimeUs(opened_at.0 - MS));
+        hook.wake(&mut sources, TimeUs(SCRIPT_OPENED - MS));
         link.requests
             .send(Request::Open {
                 lead_in: LEAD_IN,
@@ -2936,83 +3097,11 @@ mod gate_tests {
                 gate: Some(1),
             })
             .unwrap();
-        hook.wake(&mut sources, opened_at);
+        hook.wake(&mut sources, TimeUs(SCRIPT_OPENED));
         let Ok(Reply::Opened(opening, _)) = link.replies.try_recv() else {
             panic!("the first READY did not open");
         };
-        let clock = |script_us: i64| TimeUs(opened_at.0 + LEAD_IN.0 + script_us);
-        // START held: READY is cancelled.
-        hook.wake(&mut sources, clock(-299_500));
-        assert_eq!(gate.state().phase, GatePhase::Cancelled);
-        let mut readers = opening.readers;
-        let mut sealed: Vec<_> = readers
-            .iter_mut()
-            .flat_map(|r| std::iter::from_fn(move || r.pop()))
-            .collect();
-        // Released at 200 ms, seen 0.5 ms later at a heartbeat.
-        hook.wake(&mut sources, clock(100_000));
-        hook.wake(&mut sources, clock(200_500));
-        // The game thread asks 15 ms later; the delay holds the answer
-        // until 30 ms after the release was seen.
-        link.rearms
-            .push(Box::new(Rearm {
-                readers,
-                lead_in: LEAD_IN,
-                generation: 2,
-                start: InputStart {
-                    opened_at: TimeUs(0),
-                    held: Vec::with_capacity(opening.start.held.capacity()),
-                },
-                arrivals: Vec::with_capacity(16),
-                leftover: Vec::with_capacity(64),
-                room: 64,
-                outcome: RearmOutcome::Pending,
-            }))
-            .unwrap();
-        hook.wake(&mut sources, clock(215_000));
-        assert!(link.rearmed.pop().is_err(), "answered before the delay");
-        hook.wake(&mut sources, clock(240_000));
-        let rearm = link.rearmed.pop().unwrap();
-        assert_eq!(
-            rearm.outcome,
-            RearmOutcome::Opened {
-                origin: TimeUs(clock(240_000).0 + LEAD_IN.0),
-                closed: TimeUs(240_000),
-            }
-        );
-        assert_eq!(rearm.start.opened_at, TimeUs(-LEAD_IN.0));
-        sealed.extend(rearm.leftover.iter().copied());
-        // Z at 1.7 s on the script's timeline, now 40 ms later on the clock.
-        let mut readers = rearm.readers;
-        hook.wake(&mut sources, clock(1_700_000));
-        hook.wake(&mut sources, clock(1_745_000));
-        hook.wake(&mut sources, clock(1_795_000));
-        let next: Vec<_> = readers
-            .iter_mut()
-            .flat_map(|r| std::iter::from_fn(move || r.pop()))
-            .collect();
-        let z = |value| InputKind::Control { control: Z, value };
-        let at = |kind| next.iter().find(|e| e.kind == kind).map(|e| e.received);
-        assert_eq!(at(z(1)), Some(TimeUs(500 * MS)), "{next:?}");
-        assert_eq!(at(z(0)), Some(TimeUs(550 * MS)), "{next:?}");
-        // On the script's timeline (the sealed opening's chart time 0 at
-        // its 0, the next one's at 1.2 s), every stamp of the sealed
-        // opening lies at or before the release and every one of the next
-        // after it.
-        let release = TimeUs(200 * MS);
-        assert!(
-            sealed.iter().any(|e| e.kind
-                == InputKind::Control {
-                    control: Q,
-                    value: 1
-                }),
-            "{sealed:?}"
-        );
-        assert!(sealed.iter().all(|e| e.received <= release), "{sealed:?}");
-        assert!(
-            next.iter().all(|e| e.received.0 + 1_200 * MS >= release.0),
-            "{next:?}"
-        );
+        (sources, hook, link, gate, opening)
     }
 
     /// The player's gate admits what its exchange with the input side
