@@ -1790,8 +1790,12 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 /// 1.5 s, with recording closed, defers the opening; the loading script
 /// goes on feeding through the deferral, so its release opens it, and the
 /// play's script takes over on the same devices. Nothing of the loading
-/// script is recorded, and the play opened about 1.5 s after it was first
-/// asked for.
+/// script is recorded, and the play opened later than it was first asked
+/// for. Its release is fed only once the opening was deferred, so the
+/// deferral happens however long the load takes; how much later the play
+/// opens is the real threads' timing, which
+/// `a_deferred_opening_keeps_the_scripts_timeline` (src/input_side.rs)
+/// fixes exactly.
 #[test]
 fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     const Q: u32 = 0x10;
@@ -1817,10 +1821,10 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     // No cancelled candidate: the opening was deferred, not cancelled.
     assert!(rec.history.openings.is_empty(), "{:?}", rec.history);
     // The script keeps the timeline of the opening first asked for; the
-    // play opened about 1.5 s later, at the release, so the log's presses
-    // land that much earlier on its chart time.
+    // play opened later, after the release, so the log's presses land that
+    // much earlier on its chart time.
     let early = events[0].received.0 - rec.events[0].received.0;
-    assert!((1_400_000..1_700_000).contains(&early), "{early} {stderr}");
+    assert!(early > 0, "{early} {stderr}");
     assert!(!rec.events.iter().any(|e| matches!(
         e.kind,
         eval::InputKind::Control { control, .. } if control.0 == Q

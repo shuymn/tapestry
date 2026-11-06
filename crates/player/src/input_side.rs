@@ -661,8 +661,12 @@ pub struct Script {
     /// The source set's sizes, for a fresh one at each play.
     pub sources: input::SourceConfig,
     /// The keys held while the play loads, before its first opening
-    /// ([`Request::LoadingScript`]), if any.
-    pub loading: Option<input::ScriptedInput>,
+    /// ([`Request::LoadingScript`]), if any, with the time of its first
+    /// release on its timeline: it is fed no further than to just before
+    /// that until an opening was deferred, so a key held from the start
+    /// of loading is held when the first opening is asked, however long
+    /// the load takes.
+    pub loading: Option<(input::ScriptedInput, TimeUs)>,
     /// How long after the release the script is held at a rearm is
     /// answered at the earliest (`--dev-rearm-delay`): a late game thread,
     /// made on purpose.
@@ -701,10 +705,11 @@ pub struct Hook {
     handed: rtrb::Producer<Box<Handoff>>,
     /// The open recording's handoff storage, reserved at its opening.
     handoff: Option<Box<Handoff>>,
-    /// The loading script being fed, with its time 0 on the clock
-    /// (dev-tools).
+    /// The loading script being fed, with its time 0 on the clock and,
+    /// until an opening was deferred, the time on its timeline it is fed
+    /// no further than (dev-tools).
     #[cfg(feature = "dev-tools")]
-    loading: Option<(input::ScriptedInput, TimeUs)>,
+    loading: Option<(input::ScriptedInput, TimeUs, Option<TimeUs>)>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -786,9 +791,8 @@ impl Hook {
             // runs on its own.
             #[cfg(feature = "dev-tools")]
             (Mode::Script(script), origin) => {
-                if let Some((loading, at)) = &mut self.loading {
-                    sources.set_presentation_offset(*at);
-                    input::InputAdapter::poll(loading, TimeUs(now.0 - at.0), sources);
+                if let Some(loading) = &mut self.loading {
+                    feed_loading(loading, now, sources);
                 } else if let Some((released, _)) = self.released {
                     input::InputAdapter::poll(&mut script.current, released, sources);
                 } else if let Some(origin) = self.script_origin.or(origin)
@@ -812,7 +816,15 @@ impl Hook {
                         self.phase = Phase::Open;
                         Reply::Opened(opening, lines)
                     }
-                    None => Reply::Deferred,
+                    None => {
+                        // Deferred: the loading script goes on to its
+                        // release.
+                        #[cfg(feature = "dev-tools")]
+                        if let Some((_, _, cap)) = &mut self.loading {
+                            *cap = None;
+                        }
+                        Reply::Deferred
+                    }
                 },
                 Request::Tap(tap) => {
                     sources.set_presentation_focus(self.controls.presentation_focus().clone());
@@ -822,10 +834,14 @@ impl Hook {
                 #[cfg(feature = "dev-tools")]
                 Request::LoadingScript { at } => {
                     if let Mode::Script(script) = &self.mode
-                        && let Some(loading) = &script.loading
+                        && let Some((loading, release)) = &script.loading
                         && self.origin.is_none()
                     {
-                        self.loading = Some((loading.clone(), at));
+                        // Fed at once, so its keys due now are held for an
+                        // opening asked in this same wake.
+                        let mut feeding = (loading.clone(), at, Some(TimeUs(release.0 - 1)));
+                        feed_loading(&mut feeding, now, sources);
+                        self.loading = Some(feeding);
                     }
                     continue;
                 }
@@ -905,8 +921,10 @@ impl Hook {
         }
         // A loading script wakes the thread for its next item, Idle or not.
         #[cfg(feature = "dev-tools")]
-        if let Some((loading, at)) = &self.loading {
-            sources.set_wake_at(loading.next_at().map(|t| TimeUs(t.0.saturating_add(at.0))));
+        if let Some((loading, at, cap)) = &self.loading {
+            // Held before its release, it waits for the opening's request.
+            let next = loading.next_at().filter(|&t| cap.is_none_or(|c| t <= c));
+            sources.set_wake_at(next.map(|t| TimeUs(t.0.saturating_add(at.0))));
         }
         self.publish(sources);
         if self.origin.is_some()
@@ -1205,6 +1223,21 @@ impl Hook {
         self.handoff = None;
         (closed, lines)
     }
+}
+
+/// Feeds a loading script, with its time 0 on the clock and the time it is
+/// fed no further than, up to `now` on its timeline (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn feed_loading(
+    (script, at, cap): &mut (input::ScriptedInput, TimeUs, Option<TimeUs>),
+    now: TimeUs,
+    sources: &mut SourceSet,
+) {
+    sources.set_presentation_offset(*at);
+    // A wake whose clock was read before the script was asked for still
+    // feeds its start.
+    let t = TimeUs((now.0 - at.0).max(0));
+    input::InputAdapter::poll(script, cap.map_or(t, |c| TimeUs(t.0.min(c.0))), sources);
 }
 
 /// Feeds `script` up to `now` on its timeline, as far as the batch where a
@@ -3109,6 +3142,97 @@ mod gate_tests {
             panic!("the first READY did not open");
         };
         (sources, hook, link, gate, opening)
+    }
+
+    /// A loading script holding START from the start of loading
+    /// (`--dev-loading`), on a scripted play whose log presses Z at 1.7 s:
+    /// its release, due at 150 ms, is not fed before an opening was
+    /// deferred, however late the opening is asked. Asked at 400 ms, in
+    /// the wake that starts the loading script, the opening is deferred;
+    /// the release is fed at the next wake, and the opening asked again at
+    /// 450 ms opens on the timeline of the one first asked, so Z lands
+    /// 50 ms earlier on its chart time.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_deferred_opening_keeps_the_scripts_timeline() {
+        use input::{Action, ScriptItem, ScriptedInput};
+
+        const LOADING: i64 = 10_000 * MS;
+        let config = SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        };
+        let item = |ms: i64, action| ScriptItem {
+            at: TimeUs(ms * MS),
+            action,
+        };
+        let key = |ms, control, value| item(ms, Action::Packet(packet(1, control, value)));
+        let script = ScriptedInput::new(vec![
+            item(-5_000, Action::Connect(DeviceId(1), DeviceKind::Keyboard)),
+            key(1_700, Z, 1),
+            key(1_750, Z, 0),
+        ])
+        .with_recorded(DeviceId(1), vec![Q, Z]);
+        let loading = ScriptedInput::new(vec![
+            item(0, Action::Connect(DeviceId(1), DeviceKind::Keyboard)),
+            key(0, Q, 1),
+            key(150, Q, 0),
+        ]);
+        let mode = Mode::Script(Box::new(super::Script {
+            log: script.clone(),
+            current: script,
+            sources: config.clone(),
+            loading: Some((loading, TimeUs(150 * MS))),
+            rearm_delay: TimeUs(0),
+        }));
+        let mut sources = SourceSet::new(config).unwrap();
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (mut hook, link) = link(controls, mode, Waker::new().unwrap());
+        let (tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        link.tap(tap);
+        let ask = |hook: &mut Hook, sources: &mut SourceSet, ms: i64| {
+            link.requests
+                .send(Request::Open {
+                    lead_in: LEAD_IN,
+                    logic: std::thread::current(),
+                    recorded: recorded(),
+                    gate: Some(1),
+                })
+                .unwrap();
+            hook.wake(sources, TimeUs(LOADING + ms * MS));
+            link.replies.try_recv().unwrap()
+        };
+        // The load takes past the release's time: the script and the
+        // opening reach the input thread in one wake.
+        link.loading_script(TimeUs(LOADING));
+        assert!(matches!(ask(&mut hook, &mut sources, 400), Reply::Deferred));
+        hook.wake(&mut sources, TimeUs(LOADING + 410 * MS));
+        assert!(!sources.holding());
+        let Reply::Opened(opening, _) = ask(&mut hook, &mut sources, 450) else {
+            panic!("the opening asked again did not open");
+        };
+        // The script's time 0 is the first opening's chart time 0.
+        let first_origin = LOADING + 400 * MS + LEAD_IN.0;
+        for ms in [1_700, 1_760] {
+            hook.wake(&mut sources, TimeUs(first_origin + ms * MS));
+        }
+        let mut readers = opening.readers;
+        let fed: Vec<_> = readers
+            .iter_mut()
+            .flat_map(|r| std::iter::from_fn(move || r.pop()))
+            .filter(|e| matches!(e.kind, InputKind::Control { control, .. } if control == Z))
+            .map(|e| e.received)
+            .collect();
+        assert_eq!(fed, [TimeUs(1_650 * MS), TimeUs(1_700 * MS)]);
     }
 
     /// The player's gate admits what its exchange with the input side
