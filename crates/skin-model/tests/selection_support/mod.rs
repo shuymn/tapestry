@@ -305,6 +305,10 @@ pub fn labels_of() -> SelectionLabels {
     }
 }
 
+/// A drawn quad: its image and frame, `None` for a text line, and its
+/// rect.
+pub type Drawn = (Option<(u32, u16)>, [f32; 4]);
+
 /// A selection skin with its state, uv table and batch.
 pub struct Fx {
     pub skin: Skin,
@@ -355,7 +359,7 @@ impl Fx {
     }
 
     /// The quads drawn: image, frame and rect.
-    pub fn drawn(&self) -> Vec<(Option<(u32, u16)>, [f32; 4])> {
+    pub fn drawn(&self) -> Vec<Drawn> {
         self.batch
             .quads()
             .iter()

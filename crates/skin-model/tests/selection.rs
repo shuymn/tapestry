@@ -361,7 +361,6 @@ fn row_text_reserves_the_text_layer_and_names_its_font() {
     assert!(skin.outline_fonts().is_empty());
     let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
     sd.sheet = selection_support::sheet_with_font();
-    let mut def = def;
     if let Some(t) = def.text[0].as_mut() {
         t.font = skin_model::FontRef::File(0);
     }
