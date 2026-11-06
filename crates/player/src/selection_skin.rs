@@ -573,9 +573,11 @@ mod tests {
             display_offset_us: -12_000,
             input_offset_us: 0,
         });
-        let mut hispeed = game::HiSpeedSettings::default();
-        hispeed.reference = game::HiSpeedReference::Main;
-        hispeed.green_target = 450;
+        let hispeed = game::HiSpeedSettings {
+            reference: game::HiSpeedReference::Main,
+            green_target: 450,
+            ..game::HiSpeedSettings::default()
+        };
         let mut covers = game::Covers::default();
         covers.lift.on = true;
         let options = game::PlayOptions::new(hispeed, covers).unwrap();
