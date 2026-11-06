@@ -1866,11 +1866,16 @@ fn a_play_skin_reads_the_attempts_autoplay() {
 }
 
 /// The recent timing's chart at 120 BPM (a measure is 2 s): key 1 at
-/// 125 ms (the rearm's), at 2.0 s and at 2.5 s, key 2's long note from 3.0
-/// to 3.5 s, and a sound at 4.0 s the play lasts to.
+/// 125 ms, 4, 6 and 8 s, key 2's long note from 10 to 12 s, and a sound at
+/// 14 s the play lasts to. Every capture is a second or more from the
+/// next judgment, so a late frame still shows the one it names.
 const TIMING_CHART: &str = "#PLAYER 1\n#TITLE timing\n#BPM 120\n#WAV01 key.wav\n#LNTYPE 1\n#00138:01\n\
-    #00011:00010000000000000000000000000000\n\
-    #00111:01010000\n#00152:00000101\n#00201:01\n";
+    #00011:00010000000000000000000000000000\n#00211:01\n#00311:01\n#00411:01\n\
+    #00552:01\n#00652:01\n#00701:01\n";
+
+/// The rearm's chart: key 2's long note from 0 to 3 s.
+const REARM_CHART: &str = "#PLAYER 1\n#TITLE rearm\n#BPM 120\n#WAV01 key.wav\n#LNTYPE 1\n#00138:01\n\
+    #00052:01\n#00152:00000100\n";
 
 /// What a captured frame of the recent-timing skin shows, read from its
 /// display list: number 525's value from its glyphs (`n.png`, 24 glyphs
@@ -1911,49 +1916,57 @@ fn timing_shown(list: &str) -> (Option<i32>, bool, bool) {
     (ms, wide(30), wide(40))
 }
 
+/// Writes chart `name` of `text` into the library, with its sound.
+fn write_text_chart(fx: &Fixture, name: &str, text: &str) -> bms_model::Chart {
+    let dir = fx.library().join(name);
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    fs::write(dir.join(format!("{name}.bms")), text).unwrap();
+    bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart
+}
+
 /// A play skin reads the recent timing the player publishes, through its
 /// adapters, on the game's real threads: number 525's digits and the
 /// images on ops 1242 (early) and 1243 (late), from a log's play under the
 /// default beatoraja-style preset.
 ///
-/// The play: key 1's note at 125 ms missed (−210, its late BAD edge); 2.0 s
-/// pressed 30 ms early (+30, early); a press at 2.2 s, an empty POOR 300 ms
-/// before 2.5 s (+300, early); 2.5 s pressed 30 ms late (−30, late); the
-/// long note's head 10 ms late, held, which leaves −30; its release 40 ms
-/// before its end, PERFECT (+40, neither). A retry's READY reads 0. Then a
-/// play whose first READY takes an empty POOR 475 ms before the 125 ms note
-/// (+475) and is cancelled by START held before chart time 0, its release
-/// rearming a fresh READY: that candidate reads 0 until its own miss.
+/// The play: key 1's note at 125 ms missed (−210, its late BAD edge); 4 s
+/// pressed 30 ms early (+30, early); 6 s on time, then a press 140 ms
+/// after it, an empty POOR against it (−140, late); 8 s pressed 30 ms late
+/// (−30, late); the long note's head 10 ms late, held, which leaves −30;
+/// its release 40 ms before its end, PERFECT (+40, neither). A retry's
+/// READY reads 0. Then the rearm's chart: its first READY takes an empty
+/// POOR 480 ms before the long note's head and is cancelled by START held
+/// before chart time 0, its release rearming a fresh READY, which holds
+/// the long note: a held head leaves the timing, so that candidate reads 0
+/// only if the rearm started it over.
 #[test]
 fn a_play_skin_reads_the_recent_timing() {
     const Q: u32 = 0x10;
     let fx = Fixture::new();
-    let dir = fx.library().join("t");
-    fs::create_dir_all(&dir).unwrap();
-    write_wav(&dir.join("key.wav"));
-    fs::write(dir.join("t.bms"), TIMING_CHART).unwrap();
-    let chart = bms_parser::load_bms(TIMING_CHART.as_bytes(), &dir, &Default::default())
-        .unwrap()
-        .chart;
-    // Each note is a press and its release, in note order: key 1 at
-    // 125 ms, 2.0 s and 2.5 s, then the long note.
-    let all = hits(&chart, |_| true);
-    assert_eq!(all.len(), 8);
+    let chart = write_text_chart(&fx, "t", TIMING_CHART);
+    let rearm_chart = write_text_chart(&fx, "r", REARM_CHART);
     let at = |e: PhysicalInputEvent, ms: i64| PhysicalInputEvent {
         received: TimeUs(ms * 1_000),
         ..e
     };
-    let key1 = (all[0], all[1]);
-    let key2 = (all[6], all[7]);
+    // Each note is a press and its release, in note order.
+    let all = hits(&chart, |_| true);
+    assert_eq!(all.len(), 10);
+    let (key1, key2) = ((all[0], all[1]), (all[8], all[9]));
     let played = [
-        at(key1.0, 1_970),
-        at(key1.1, 1_990),
-        at(key1.0, 2_200),
-        at(key1.1, 2_220),
-        at(key1.0, 2_530),
-        at(key1.1, 2_550),
-        at(key2.0, 3_010),
-        at(key2.1, 3_460),
+        at(key1.0, 3_970),
+        at(key1.1, 3_990),
+        at(key1.0, 6_000),
+        at(key1.1, 6_020),
+        at(key1.0, 6_140),
+        at(key1.1, 6_150),
+        at(key1.0, 8_030),
+        at(key1.1, 8_050),
+        at(key2.0, 10_010),
+        at(key2.1, 11_960),
     ];
     write_log(&fx.base.join("logs").join("timing.tprl"), &played, 1);
     let q = |ms: i64, value: i32| PhysicalInputEvent {
@@ -1964,16 +1977,23 @@ fn a_play_skin_reads_the_recent_timing() {
             value,
         },
     };
-    // START held as in
-    // `the_start_gate_cancels_and_rearms_ready_on_the_real_threads`: the
-    // rearmed READY's chart time 0 lies about 1.2 s after the first's, and
-    // the log is finalized as far later.
-    let rearmed = [at(key1.0, -350), at(key1.1, -330), q(-300, 1), q(200, 0)];
+    let held = hits(&rearm_chart, |_| true);
+    assert_eq!(held.len(), 2);
+    // START released 250 ms before chart time 0 rearms a READY whose chart
+    // time 0 lies about 1 s later on the log's clock (the lead-in after
+    // the release, as in
+    // `the_start_gate_cancels_and_rearms_ready_on_the_real_threads`): the
+    // long note is pressed there and held to its end.
+    let rearmed = [
+        at(held[0], -480),
+        at(held[1], -470),
+        q(-450, 1),
+        q(-250, 0),
+        at(held[0], 760),
+        at(held[1], 3_760),
+    ];
     let path = fx.base.join("logs").join("rearm.tprl");
     write_log(&path, &rearmed, 1);
-    let mut rec = replay::decode(&fs::read(&path).unwrap(), &DecodeLimits::default()).unwrap();
-    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
-    fs::write(&path, replay::encode(&rec)).unwrap();
     let skin = fx.base.join("skin");
     fs::create_dir_all(&skin).unwrap();
     let image = |name: &str, w: u32| {
@@ -2014,11 +2034,11 @@ fn a_play_skin_reads_the_recent_timing() {
     .unwrap();
     let captures = [
         ("miss", 1_000),
-        ("early", 2_100),
-        ("empty", 2_300),
-        ("late", 2_600),
-        ("held", 3_200),
-        ("release", 3_600),
+        ("early", 4_500),
+        ("empty", 6_700),
+        ("late", 8_500),
+        ("held", 10_500),
+        ("release", 12_500),
     ];
     let mut steps: Vec<String> = captures
         .iter()
@@ -2032,13 +2052,8 @@ fn a_play_skin_reads_the_recent_timing() {
             "result = \"retry\"",
             "play = { input = \"logs/timing.tprl\", until = \"end\" }",
             "result = \"back\"",
-            // The cancelled READY after its empty POOR and START's press;
-            // the rearmed candidate past where the cancelled one's frames
-            // stop, before its miss at 335 ms; and after it.
-            "capture = { ready_at = 800, file = \"cancelled.png\" }",
-            "capture = { at = 300, file = \"rearmed.png\" }",
-            "capture = { at = 1000, file = \"rearmed_miss.png\" }",
-            "select = { path = \"library/t/t.bms\" }",
+            "capture = { at = 1500, file = \"rearmed.png\" }",
+            "select = { path = \"library/r/r.bms\" }",
             "play = { input = \"logs/rearm.tprl\", until = \"end\" }",
             "result = \"back\"",
             "quit = {}",
@@ -2058,19 +2073,29 @@ fn a_play_skin_reads_the_recent_timing() {
     for (name, want) in [
         ("miss", (Some(-210), false, true)),
         ("early", (Some(30), true, false)),
-        ("empty", (Some(300), true, false)),
+        ("empty", (Some(-140), false, true)),
         ("late", (Some(-30), false, true)),
         ("held", (Some(-30), false, true)),
         ("release", (Some(40), false, false)),
         ("retry", (Some(0), false, false)),
-        ("cancelled", (Some(475), true, false)),
         ("rearmed", (Some(0), false, false)),
-        ("rearmed_miss", (Some(-210), false, true)),
     ] {
         assert_eq!(shown(name), want, "{name}: {}", side(name));
     }
-    // The rearmed captures are the rearmed candidate's frames.
-    for name in ["rearmed", "rearmed_miss"] {
-        assert_eq!(side_num(&side(name), "view_generation"), 1, "{name}");
-    }
+    // The rearm's capture is the rearmed candidate's frame, its long note
+    // held.
+    assert_eq!(side_num(&side("rearmed"), "view_generation"), 1);
+    // The cancelled READY took its empty POOR: the record keeps it in its
+    // cancelled opening.
+    let (records, _) = fx.played_records();
+    let rec = replay::decode(
+        &fs::read(records.last().unwrap()).unwrap(),
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(rec.history.openings.len(), 1, "{:?}", rec.history);
+    assert!(
+        stdout.contains("play 1: Completed; perfect 1 great 0 good 0 bad 0 poor 0"),
+        "{stdout}"
+    );
 }
