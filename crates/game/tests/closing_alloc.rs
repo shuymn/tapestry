@@ -109,6 +109,7 @@ impl Counted {
 impl Rig for Counted {
     type Reader = SourceReader;
     type ScreenError = std::convert::Infallible;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         TimeUs(self.now)

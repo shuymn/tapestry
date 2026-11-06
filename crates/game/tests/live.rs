@@ -227,6 +227,38 @@ struct Fake {
     output_fails_at: i64,
     /// The last device is gone from this clock time on.
     disconnected_at: i64,
+    /// While set and not released, each result preparation stays pending,
+    /// each poll one wait.
+    prep_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A command pressed during the next preparation's first poll.
+    in_first_poll: Option<Command>,
+    /// Each preparation begun, with its clock time.
+    preps: Vec<i64>,
+    /// Preparations dropped unfinished.
+    withdrawn: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Result commands pressed from another thread, as the window's keys:
+    /// those pressed before a preparation begins are dropped there, as the
+    /// player's result input drops what was queued before the result.
+    menu_pressed: std::sync::Arc<std::sync::Mutex<Vec<game::MenuCommand>>>,
+}
+
+/// [`Fake`]'s result preparation: dropped before it was found ready, it
+/// counts as withdrawn.
+#[derive(Default)]
+struct FakePrep {
+    withdrawn: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    polls: usize,
+    ready: bool,
+}
+
+impl Drop for FakePrep {
+    fn drop(&mut self) {
+        if let Some(w) = &self.withdrawn
+            && !self.ready
+        {
+            w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 impl Fake {
@@ -303,6 +335,11 @@ impl Fake {
             closing_taken: Vec::new(),
             output_fails_at: i64::MAX,
             disconnected_at: i64::MAX,
+            prep_gate: None,
+            in_first_poll: None,
+            preps: Vec::new(),
+            withdrawn: std::sync::Arc::default(),
+            menu_pressed: std::sync::Arc::default(),
         }
     }
 
@@ -316,6 +353,7 @@ impl Fake {
 impl Rig for Fake {
     type Reader = SourceReader;
     type ScreenError = SurfaceLost;
+    type ResultPrep = FakePrep;
 
     fn now(&self) -> TimeUs {
         self.reads.set(self.reads.get() + self.read_cost);
@@ -375,6 +413,10 @@ impl Rig for Fake {
     }
 
     fn take_menu(&mut self) -> Option<game::MenuCommand> {
+        let pressed = self.menu_pressed.lock().unwrap().pop();
+        if pressed.is_some() {
+            return pressed;
+        }
         let now = self.clock.now().0;
         if let Some(i) = self.menu.iter().position(|&(at, _)| at <= now) {
             return Some(self.menu.remove(i).1);
@@ -674,6 +716,35 @@ impl Rig for Fake {
                     .push((e.seq, o.0, delivered.0));
             }
         }
+    }
+
+    fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) -> FakePrep {
+        self.preps.push(self.clock.now().0);
+        self.menu_pressed.lock().unwrap().clear();
+        FakePrep {
+            withdrawn: Some(std::sync::Arc::clone(&self.withdrawn)),
+            polls: 0,
+            ready: false,
+        }
+    }
+
+    fn poll_result(&mut self, prep: &mut FakePrep, _deadline: TimeUs) -> game::Polled {
+        prep.polls += 1;
+        if prep.polls == 1
+            && let Some(c) = self.in_first_poll.take()
+        {
+            self.commands.push((i64::MIN, c));
+        }
+        let held = self
+            .prep_gate
+            .as_ref()
+            .is_some_and(|g| !g.load(std::sync::atomic::Ordering::SeqCst));
+        if held {
+            self.wait();
+            return game::Polled::Pending;
+        }
+        prep.ready = true;
+        game::Polled::Ready
     }
 
     fn show_end(&mut self, _report: &PlayReport, screen: &ResultScreen) {
@@ -2832,6 +2903,247 @@ fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
         "{end:?}: {}",
         rig.clock.now().0
     );
+}
+
+/// A record sink whose save tells its test it began, then blocks until the
+/// test releases it: a slow save, with the test acting while it waits.
+struct BlockedSave {
+    began: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl game::RecordSink for BlockedSave {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.began.send(()).unwrap();
+        self.release.recv().unwrap();
+        Ok(game::RecordRef {
+            path: "blocked.tprl".into(),
+        })
+    }
+}
+
+/// Where the commands of the ResultPreparing tests arrive, after the
+/// first play's save (its chart ends near 10 s on the clock), and where the
+/// result they show is left.
+const FRESH_AT: i64 = 12_000_000;
+const LEAVE_AT: i64 = 20_000_000;
+
+/// [`chart`] played on `rig` through [`run_chart`](game::live::run_chart)
+/// with every save blocked: while the first one waits, `during_save` runs
+/// on another thread, then each save is released. How the chart was left,
+/// and the session's events.
+fn with_blocked_save(
+    rig: &mut Fake,
+    during_save: impl FnOnce() + Send,
+) -> (game::Leave, Vec<SessionEvent>) {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let (began, saving) = std::sync::mpsc::sync_channel(0);
+    let (release, released) = std::sync::mpsc::sync_channel(0);
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            saving.recv().unwrap();
+            during_save();
+            release.send(()).unwrap();
+            // Every later save, released at once.
+            while saving.recv().is_ok() {
+                release.send(()).unwrap();
+            }
+        });
+        let mut loaded = closing_loaded_with(
+            dir.path(),
+            chart(),
+            0,
+            FailureAction::PlayToEnd,
+            &events,
+            None,
+            TimeUs(1_000 * MS),
+            |p| Parts {
+                records: Some(Box::new(BlockedSave {
+                    began,
+                    release: released,
+                })),
+                ..p
+            },
+        );
+        let left = game::live::run_chart(&mut loaded, rig).unwrap();
+        (left, events.all())
+    })
+}
+
+/// Whether `events` hold a result shown for `attempt`.
+fn result_of(events: &[SessionEvent], attempt: u32) -> bool {
+    events.contains(&SessionEvent::Result { attempt })
+}
+
+fn saved(report: &PlayReport) -> bool {
+    matches!(report.saved, Some(Ok(_)))
+}
+
+fn withdrawn(rig: &Fake) -> usize {
+    rig.withdrawn.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The quit key, or the result's back, pressed while the save blocks
+/// belongs to the play (design.md "State Model", ResultPreparing): the
+/// save completes, the result's preparation follows, and the result shows
+/// once, its event emitted, until the quit at 20 s leaves it.
+#[test]
+fn a_quit_during_a_blocked_save_completes_it_and_shows_the_result() {
+    for case in ["quit", "back"] {
+        let mut rig = Fake::new(Vec::new(), &[(LEAVE_AT, Command::Quit)], i64::MAX);
+        let pressed = std::sync::Arc::clone(&rig.pressed);
+        let menu = std::sync::Arc::clone(&rig.menu_pressed);
+        let (left, events) = with_blocked_save(&mut rig, move || {
+            if case == "quit" {
+                pressed.lock().unwrap().push(Command::Quit);
+            } else {
+                menu.lock().unwrap().push(game::MenuCommand::Back);
+            }
+        });
+        assert_eq!(left, game::Leave::Back, "{case}");
+        let [one] = &rig.reports[..] else {
+            panic!("{case}: {} plays", rig.reports.len());
+        };
+        assert!(saved(one), "{case}: {:?}", one.saved);
+        assert_eq!(rig.preps.len(), 1, "{case}");
+        assert_eq!(rig.shows, 1, "{case}");
+        assert_eq!(withdrawn(&rig), 0, "{case}");
+        assert_eq!(
+            events.last(),
+            Some(&SessionEvent::Result { attempt: 1 }),
+            "{case}"
+        );
+        assert!(rig.clock.now().0 >= LEAVE_AT, "{case}");
+    }
+}
+
+/// Retry pressed while the save blocks belongs to the play: the save
+/// completes and the next attempt is prepared, with no preparation, no
+/// end screen and no result event for the first play; the second play's
+/// result is the only one.
+#[test]
+fn a_retry_during_a_blocked_save_completes_it_and_retries() {
+    let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+    let pressed = std::sync::Arc::clone(&rig.pressed);
+    let (left, events) = with_blocked_save(&mut rig, move || {
+        pressed.lock().unwrap().push(Command::Retry);
+    });
+    assert_eq!(left, game::Leave::Back);
+    let [one, two] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert!(saved(one) && saved(two));
+    assert_eq!(one.end, PlayEnd::Completed);
+    assert_eq!(rig.attempts.len(), 2);
+    assert_eq!((rig.preps.len(), rig.shows), (1, 1));
+    assert!(!result_of(&events, 1));
+    assert!(result_of(&events, 2));
+}
+
+/// After the save, while the result's preparation is pending, a fresh
+/// quit, back or retry withdraws it (design.md "State Model",
+/// ResultPreparing): no result event and no end screen for that play;
+/// quit and back leave the chart, retry plays the next attempt, whose
+/// result shows. A quit pressed during the save comes before and is the
+/// play's, never the fresh one.
+#[test]
+fn a_fresh_command_during_the_preparation_withdraws_it() {
+    use game::MenuCommand::Back;
+    for case in ["quit after a quit in the save", "back", "retry"] {
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut commands = vec![(LEAVE_AT, Command::Quit)];
+        match case {
+            "back" => {}
+            "retry" => commands.push((FRESH_AT, Command::Retry)),
+            _ => commands.push((FRESH_AT, Command::Quit)),
+        }
+        let mut rig = Fake::new(Vec::new(), &commands, i64::MAX);
+        rig.prep_gate = Some(std::sync::Arc::clone(&gate));
+        if case == "back" {
+            rig.menu = vec![(FRESH_AT, Back)];
+        }
+        if case == "retry" {
+            // The next attempt's preparation finishes.
+            let open = std::sync::Arc::clone(&gate);
+            rig.at.push((
+                FRESH_AT + 1,
+                Box::new(move || open.store(true, std::sync::atomic::Ordering::SeqCst)),
+            ));
+        }
+        let pressed = std::sync::Arc::clone(&rig.pressed);
+        let quit_in_save = case.starts_with("quit");
+        let (left, events) = with_blocked_save(&mut rig, move || {
+            if quit_in_save {
+                pressed.lock().unwrap().push(Command::Quit);
+            }
+        });
+        assert_eq!(left, game::Leave::Back, "{case}");
+        assert!(saved(&rig.reports[0]), "{case}");
+        assert!(!result_of(&events, 1), "{case}");
+        assert_eq!(withdrawn(&rig), 1, "{case}");
+        // The preparation began after the save and before the fresh
+        // command.
+        assert!(rig.preps[0] < FRESH_AT, "{case}");
+        if case == "retry" {
+            assert_eq!((rig.reports.len(), rig.attempts.len()), (2, 2));
+            assert!(saved(&rig.reports[1]));
+            assert_eq!((rig.preps.len(), rig.shows), (2, 1));
+            assert!(result_of(&events, 2));
+            assert!(rig.screens[0].0 > FRESH_AT);
+        } else {
+            assert_eq!(rig.reports.len(), 1, "{case}");
+            assert_eq!(rig.shows, 0, "{case}");
+            // Left by the fresh command, before the result's quit.
+            let now = rig.clock.now().0;
+            assert!((FRESH_AT..LEAVE_AT).contains(&now), "{case}: {now}");
+        }
+    }
+}
+
+/// A fresh command taken during the poll that finds the preparation
+/// ready is still served before the result shows: a quit leaves with no
+/// result, a retry plays the next attempt with the first play's result
+/// never shown.
+#[test]
+fn a_command_during_the_ready_poll_is_served_before_the_result() {
+    for (pressed, plays) in [(Command::Quit, 1), (Command::Retry, 2)] {
+        let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+        rig.in_first_poll = Some(pressed);
+        let (left, events) = with_blocked_save(&mut rig, || {});
+        assert_eq!(left, game::Leave::Back, "{pressed:?}");
+        assert_eq!(rig.reports.len(), plays, "{pressed:?}");
+        assert!(!result_of(&events, 1), "{pressed:?}");
+        assert_eq!(rig.shows, plays - 1, "{pressed:?}");
+        assert_eq!(result_of(&events, 2), plays == 2, "{pressed:?}");
+    }
+}
+
+/// A preset step during the preparation is dropped: the result opens on
+/// the played preset, as it does with no step.
+#[test]
+fn a_preset_step_during_the_preparation_is_dropped() {
+    use game::MenuCommand::{NextPreset, PrevPreset};
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut rig = Fake::new(Vec::new(), &[(LEAVE_AT, Command::Quit)], i64::MAX);
+    rig.prep_gate = Some(std::sync::Arc::clone(&gate));
+    rig.menu = vec![
+        (FRESH_AT, NextPreset),
+        (FRESH_AT, PrevPreset),
+        (FRESH_AT, NextPreset),
+    ];
+    rig.at.push((
+        FRESH_AT + 1,
+        Box::new(move || gate.store(true, std::sync::atomic::Ordering::SeqCst)),
+    ));
+    let (left, events) = with_blocked_save(&mut rig, || {});
+    assert_eq!(left, game::Leave::Back);
+    assert!(result_of(&events, 1));
+    assert_eq!(rig.shows, 1);
+    let (at, first) = &rig.screens[0];
+    assert!(*at > FRESH_AT);
+    assert_eq!(viewed(first), EntryId::BuiltIn("tapestry".to_owned()));
+    assert_eq!(withdrawn(&rig), 0);
 }
 
 /// Before each opening: the device, then the preset refreshed, then audio
