@@ -95,6 +95,7 @@ use crate::loading_text::Stage;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
 use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionSlot, SelectionUpdate};
+use crate::tuning::LiveTuning;
 use crate::ui_text::{Label, Message};
 
 /// What draws: the renderer, or a double in tests.
@@ -318,6 +319,19 @@ pub trait Screen: Send {
     #[cfg(all(test, feature = "dev-tools"))]
     fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
         None
+    }
+    /// What the selection frame last built observed of the skin's
+    /// elements (dev-tools tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_observations(&self) -> Option<Vec<skin_model::ElementObservation>> {
+        None
+    }
+    /// How many views the selection skin has taken
+    /// ([`skin_model::Skin::update_selection`]) on this screen (dev-tools
+    /// tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_views(&self) -> u64 {
+        0
     }
     /// Draws the play screen while a chart loads before READY:
     /// the skin's loading frame `frame`, then `page`, the load's lines,
@@ -579,6 +593,9 @@ pub enum RenderMsg {
     /// snapshots every play and loading frame is drawn from. Sent once, at
     /// the start.
     Presentation(Box<game::adjustment::PresentationReader>),
+    /// The settings keys' values, which every selection frame reads the
+    /// volume and the display offset from. Sent once, at the start.
+    Tuning(Arc<LiveTuning>),
     /// Make sure the screen can draw, building it again if it failed (the
     /// device's recovery, for a play and the menus alike), and answer when
     /// it can. It prepares no attempt.
@@ -1355,6 +1372,12 @@ impl RenderLink {
         }
     }
 
+    /// Hands the render thread the settings keys' values, which every
+    /// selection frame reads the volume and the display offset from.
+    pub fn tuning(&self, tuning: Arc<LiveTuning>) {
+        self.send(RenderMsg::Tuning(tuning));
+    }
+
     /// Hands the render thread the adjustments' snapshots, which every
     /// play and loading frame is drawn from from now on.
     pub fn presentation(&self, reader: game::adjustment::PresentationReader) {
@@ -1915,6 +1938,7 @@ pub fn spawn(
                 attempt: None,
                 prepared: None,
                 presentation: None,
+                tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
                 ready: None,
@@ -2351,6 +2375,8 @@ struct Run {
     prepared: Option<Prepared>,
     /// The adjustments' snapshots ([`RenderMsg::Presentation`]).
     presentation: Option<game::adjustment::PresentationReader>,
+    /// The settings keys' values ([`RenderMsg::Tuning`]).
+    tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,
@@ -2649,6 +2675,10 @@ impl Run {
                 }
                 Ok(RenderMsg::Presentation(reader)) => {
                     self.presentation = Some(*reader);
+                    continue;
+                }
+                Ok(RenderMsg::Tuning(tuning)) => {
+                    self.tuning = Some(tuning);
                     continue;
                 }
                 Ok(RenderMsg::Commit { request, reply }) => {
@@ -3031,6 +3061,13 @@ impl Run {
                     Self::selection_logic(&self.committed, shown, &mut self.selection_states);
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
+                    // The settings the skin shows, the volume and the
+                    // display offset as they are now: F3 to F6 show at the
+                    // next frame, with no view of the game thread's.
+                    if let Some(logic) = shown.logic.as_mut() {
+                        logic
+                            .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
+                    }
                     let now = self.clock.now();
                     let changed = std::mem::replace(&mut shown.changed, false);
                     let drawn = screen.selection(&shown.update, shown.logic.as_mut(), changed, now);

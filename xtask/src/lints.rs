@@ -382,6 +382,11 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/play/timers.rs"),
     Site::File("crates/skin-model/src/select/mod.rs"),
     Site::File("crates/skin-model/src/select/schema.rs"),
+    // The master gain a selection frame shows, from the gain that plays.
+    Site::Fns(
+        "crates/skin-model/src/selection.rs",
+        &["Ratio::of_f32", "MasterVolume::of_gain"],
+    ),
     // A frame of an image from its cycle and its place in the atlas.
     Site::File("crates/skin-model/src/atlas/uv.rs"),
     // The canvas, the regions' placement and the widgets.
@@ -434,14 +439,16 @@ pub const IN_PLAY: &[Site] = &[
             "strip_sprites",
         ],
     ),
-    // The selection frame's timers, the strip's preset line, and the
-    // lifetime check before the frame's build.
+    // The selection frame's timers, the strip's preset line, the
+    // lifetime check before the frame's build and the live settings.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
         &[
             "SelectionEvents::timers",
             "SelectionEvents::preset_shown",
             "SelectionSlot::current",
+            "live_settings",
+            "SelectionLogic::apply_settings",
         ],
     ),
     // The development builds' counting allocator, which every allocation

@@ -348,6 +348,9 @@ pub struct MenuScreen {
     /// guards' positive control).
     #[cfg(all(test, feature = "dev-tools"))]
     alloc_probe: bool,
+    /// The views the selection skin has taken (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    selection_views: u64,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -467,6 +470,8 @@ impl MenuScreen {
             page_caret: None,
             #[cfg(all(test, feature = "dev-tools"))]
             alloc_probe: false,
+            #[cfg(all(test, feature = "dev-tools"))]
+            selection_views: 0,
         }
     }
 
@@ -501,6 +506,10 @@ impl MenuScreen {
         self.page_caret = self.prepare_page(&u.page, LEFT, TOP)?;
         self.prepare_strip(&u.strip)?;
         let skin = Arc::clone(logic.bundle.skin());
+        #[cfg(all(test, feature = "dev-tools"))]
+        {
+            self.selection_views += 1;
+        }
         if let Err(e) = skin.update_selection(&mut logic.sel, &u.view, &u.labels) {
             return Ok(Err(e.to_string()));
         }
@@ -1013,6 +1022,16 @@ impl Screen for MenuScreen {
     #[cfg(all(test, feature = "dev-tools"))]
     fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.renderer.selection_quads()
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_observations(&self) -> Option<Vec<skin_model::ElementObservation>> {
+        self.renderer.selection_observations()
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_views(&self) -> u64 {
+        self.selection_views
     }
 
     /// A new size invalidates the text prepared: the page shown, or the

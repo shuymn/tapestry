@@ -437,6 +437,16 @@ impl SelectScreen {
         self.sort
     }
 
+    /// The order the list is in, as a selection skin shows it.
+    pub fn order_view(&self) -> skin_model::SelectionOrder {
+        match self.sort_key() {
+            Sort::Title => skin_model::SelectionOrder::Title,
+            Sort::Artist => skin_model::SelectionOrder::Artist,
+            Sort::Level => skin_model::SelectionOrder::Level,
+            Sort::Modified => skin_model::SelectionOrder::Modified,
+        }
+    }
+
     /// Whether the search box has focus.
     pub const fn searching(&self) -> bool {
         self.searching

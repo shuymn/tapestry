@@ -2,7 +2,9 @@
 //! S10-09d): the song list's slots with every part and its row text, the
 //! ratio bars and a slider's travel and press, numbers and
 //! text over the selection fields, and every timer, frame after frame as
-//! the timers move, over views that change between frames.
+//! the timers move, over views that change between frames; and the
+//! settings applied every frame (docs/stage3.md S10-09e), the volume's
+//! number and ratio bar drawing them.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -20,8 +22,9 @@ use selection_support::{
     list_element, load, ratio, row_text, view,
 };
 use skin_model::{
-    FontRef, FrameUv, GaugeLook, NumberDef, OwnLamp, RatioBarDef, RatioForm, RatioSource, RowScore,
-    SelectionDefs, SliderDirection, Source, TextDef, TextField, TextImage, TextTable, TextValue,
+    FontRef, FrameUv, GaugeLook, MasterVolume, NumberDef, OwnLamp, RatioBarDef, RatioForm,
+    RatioSource, RowScore, SelectionDefs, SelectionOrder, SelectionSettings, SliderDirection,
+    Source, SpeedReference, SpeedView, TextDef, TextField, TextImage, TextTable, TextValue,
     WidgetDefs,
 };
 
@@ -88,6 +91,8 @@ fn skin() -> Fx {
         element(Source::Text(1), [500, 80, 200, 20]),
         element(Source::RatioBar(0), [800, 0, 20, 200]),
         element(Source::RatioBar(1), [900, 0, 20, 20]),
+        element(Source::Number(1), [500, 120, 10, 10]),
+        element(Source::RatioBar(2), [1000, 0, 200, 20]),
     ];
     let text = |value| TextDef {
         value,
@@ -98,10 +103,16 @@ fn skin() -> Fx {
     let skin = load(
         elements,
         WidgetDefs {
-            numbers: vec![NumberDef {
-                digits: digits(6),
-                value: int("selected.ex"),
-            }],
+            numbers: vec![
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.ex"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("settings.volume"),
+                },
+            ],
             texts: vec![
                 text(TextValue::Field(TextField::FullTitle)),
                 text(TextValue::Selection(skin_model::SelectionText::Place)),
@@ -125,11 +136,41 @@ fn skin() -> Fx {
                     },
                     source: RatioSource::ListPosition,
                 },
+                RatioBarDef {
+                    image: 3,
+                    form: RatioForm::Bar { vertical: false },
+                    source: RatioSource::MasterVolume,
+                },
             ],
         },
     )
     .unwrap();
     Fx::new(skin)
+}
+
+/// The settings of the frame at `ms`: every one moving with it.
+fn settings(ms: i64) -> SelectionSettings {
+    let k = u32::try_from(ms / 16).unwrap();
+    SelectionSettings {
+        display_offset_ms: i32::try_from(ms).unwrap() - 1_000,
+        master_volume: MasterVolume::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        speed: if k % 2 == 0 {
+            SpeedView::Classic
+        } else {
+            SpeedView::Floating {
+                reference: SpeedReference::Main,
+                green: 1 + k,
+            }
+        },
+        order: [
+            SelectionOrder::Title,
+            SelectionOrder::Artist,
+            SelectionOrder::Level,
+            SelectionOrder::Modified,
+        ][usize::try_from(k % 4).unwrap()],
+        gauge: (k % 3 > 0).then_some(GaugeLook::Normal),
+        covers_on: [k % 2 == 0, k % 3 == 0, k % 5 == 0],
+    }
 }
 
 #[test]
@@ -191,6 +232,9 @@ fn a_selection_build_allocates_nothing() {
             fx.timers.change = Some(TimeUs(0));
             fx.timers.panels[0] = (ms > 1_000).then_some(TimeUs(1_000_000));
             total += counted(|| {
+                fx.skin
+                    .update_selection_settings(&mut fx.sel, &settings(ms))
+                    .unwrap();
                 fx.frame(ms);
                 std::hint::black_box(fx.skin.slider_at(&fx.sel, [910.0, 30.0], fx.target));
             });

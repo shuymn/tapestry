@@ -193,6 +193,13 @@ impl SettingsFiles {
         self.options = Some(options);
     }
 
+    /// The play adjustments' settings `player.toml` is to hold: as set,
+    /// else as loaded; `None` only for loaded ones out of range, which
+    /// startup refuses.
+    pub fn play_options(&self) -> Option<game::PlayOptions> {
+        self.options.or_else(|| self.written.player.options().ok())
+    }
+
     /// The play preset `player.toml` is to hold.
     pub fn preset(&self) -> &str {
         &self.preset

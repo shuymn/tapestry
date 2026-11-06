@@ -858,6 +858,8 @@ fn rig<'a>(
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
+    // What a selection skin shows of the settings keys, read each frame.
+    rig.render.tuning(Arc::clone(controls.tuning()));
     Ok(rig)
 }
 
