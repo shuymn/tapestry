@@ -1226,6 +1226,75 @@ fn the_clocks_follow_the_attempt_not_the_display() {
     assert_eq!(clocks(&h), (0, 0));
 }
 
+/// The progress (stage3.md R3, `skin/property/FloatPropertyFactory.java:
+/// 128-136`) runs over the remaining time's own span, from the attempt's
+/// start to the last resolved object, a background sound past the last
+/// note here: 0 in READY and at the start, the share rounded down in
+/// between, the whole at and after the end; neither the display offset nor
+/// completion moves it.
+#[test]
+fn the_progress_runs_to_the_last_object() {
+    let chart = ChartBuilder::new(BPM_150)
+        .sound("bgm.wav")
+        .tap(lane(1), TimeUs(10_000 * MS))
+        .bgm(TimeUs(16_000 * MS), bms_model::SoundId(0))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(2_000));
+    let progress = |h: &Harness| h.field(field::TIME_PROGRESS_PPM);
+    for (now_us, want) in [
+        (-2_000 * MS, 0),
+        (-1, 0),
+        (0, 0),
+        (15, 0),
+        (16, 1),
+        (4_000 * MS, 250_000),
+        (8_000 * MS + 7, 500_000),
+        (16_000 * MS - 1, 999_999),
+        (16_000 * MS, 1_000_000),
+        (30_000 * MS, 1_000_000),
+    ] {
+        h.frame_us(now_us, &[]);
+        assert_eq!(progress(&h), want, "{now_us} µs");
+    }
+    h.offset = TimeUs(-700 * MS);
+    h.complete = true;
+    h.frame(12_000, &[]);
+    assert_eq!(progress(&h), 750_000);
+}
+
+/// A section's progress runs over its real-time span, so a practice speed
+/// scales the time it takes, not the share: [10 s, 20 s) at 50 % is
+/// [20 s, 40 s), halfway at 30 s. READY reads 0, each round starts over,
+/// and an empty section is whole from its start.
+#[test]
+fn a_sections_progress_runs_over_its_real_time() {
+    let chart = practice_chart();
+    let s = section(20_000, 40_000, 2_000);
+    let mut h = Harness::empty(&chart, &full(0));
+    let progress = |h: &Harness| h.field(field::TIME_PROGRESS_PPM);
+    for _round in 0..2 {
+        h.play = h.skin.prepare(&chart, &in_section(&s)).unwrap();
+        for (now_ms, want) in [
+            (18_500, 0),
+            (20_000, 0),
+            (25_000, 250_000),
+            (30_000, 500_000),
+            (40_000, 1_000_000),
+            (45_000, 1_000_000),
+        ] {
+            h.frame(now_ms, &[]);
+            assert_eq!(progress(&h), want, "{now_ms} ms");
+        }
+    }
+    let empty = section(5_000, 5_000, 1_000);
+    h.play = h.skin.prepare(&chart, &in_section(&empty)).unwrap();
+    h.frame(4_500, &[]);
+    assert_eq!(progress(&h), 0);
+    h.frame(5_000, &[]);
+    assert_eq!(progress(&h), 1_000_000);
+}
+
 /// A section ending before its start, or a BPM range out of order or
 /// past the readout maximum, is refused after the existing checks.
 #[test]

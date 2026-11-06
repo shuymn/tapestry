@@ -1897,16 +1897,14 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         show_stage(&self.render, page.as_ref(), Stage::Screen);
-        // The chart loads on the render thread: the adjustments are served
-        // through the wait.
-        let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
-        screen
-            .wait_serving(&self.render, || {
-                #[cfg(feature = "dev-tools")]
-                crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
-                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-            })
-            .map_err(ChartLoadError::Screen)?;
+        wait_chart_load(
+            screen,
+            &self.render,
+            self.adjust.as_mut(),
+            &self.input,
+            self.controls,
+        )
+        .map_err(ChartLoadError::Screen)?;
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("chart-load", self.adjust.as_ref());
         let ready = self.clock.now();
@@ -2099,6 +2097,27 @@ impl Selection {
     }
 }
 
+/// Waits for the chart's load on the render thread, `screen`, serving the
+/// adjustments through the wait (design.md "Play Adjustments"), so one made
+/// meanwhile is published before the load ends.
+///
+/// # Errors
+///
+/// As [`PendingLoad::wait_serving`](crate::render_side::PendingLoad::wait_serving).
+fn wait_chart_load(
+    screen: crate::render_side::PendingLoad,
+    render: &RenderLink,
+    mut adjust: Option<&mut game::AdjustDriver>,
+    input: &crate::input_side::InputLink,
+    controls: &crate::controls::Controls,
+) -> Result<(), ScreenError> {
+    screen.wait_serving(render, || {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
+        crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2111,6 +2130,101 @@ mod tests {
     use crate::result_input::{Pad, ResultInput};
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
+
+    /// The chart's load waits on the render thread serving the adjustments
+    /// (design.md "Play Adjustments"): F2 pressed while the load is pending
+    /// steps a Classic hi-speed of 3.20 to 3.45, published before the load
+    /// is answered, which the answer waits for.
+    #[test]
+    fn an_adjustment_during_the_charts_load_is_published_before_it_ends() {
+        use eval::ControlId;
+        use game::{
+            AdjustDriver, AdjustmentConfig, Covers, DeviceSettings, HiSpeedSettings, KeyConfigs,
+            PlayOptions, SpeedMode,
+        };
+        use input::{DeviceId, DeviceKind, Packet, PresentationFocus, SourceConfig, SourceSet};
+
+        const F2: u32 = 0x3C;
+        let device = DeviceSettings::default();
+        let keys = KeyConfigs {
+            keyboard: device.keyboard.clone(),
+            controller: device.controller.clone(),
+            controller_device: None,
+        };
+        let plan = AdjustmentConfig::default().plan(&keys, None, None).unwrap();
+        let options = PlayOptions::new(
+            HiSpeedSettings {
+                mode: SpeedMode::Classic,
+                classic_hispeed_x100: 320,
+                green_target: 300,
+                ..HiSpeedSettings::default()
+            },
+            Covers::default(),
+        )
+        .unwrap();
+        let (mut driver, tap, mut reader) = AdjustDriver::new(&plan, options, 0).unwrap();
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 2,
+            max_sources: 2,
+            max_held: 8,
+            queue_capacity: 64,
+            max_arrivals: 2,
+        })
+        .unwrap();
+        set.set_presentation_focus(PresentationFocus::new());
+        set.begin_batch(TimeUs(0));
+        set.connect(DeviceId(1), DeviceKind::Keyboard);
+        set.end_batch(TimeUs(1));
+        set.set_adjustment(tap);
+
+        let controls = Arc::new(crate::controls::Controls::new(input::QpcClock::start()));
+        let (_hook, input) = crate::input_side::link(
+            Arc::clone(&controls),
+            crate::input_side::Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        let mut render = crate::render_side::tests::Installers::default().spawn_bare();
+        // The load's own bound past the input side's, which decides.
+        render.set_timeouts(Duration::from_secs(120), Duration::from_secs(5));
+        let (answer, rx) = std::sync::mpsc::sync_channel(1);
+        let load = crate::render_side::PendingLoad::answered_on(rx);
+        // The input side: F2 pressed and released while the load is
+        // pending, its group closed a millisecond later; the load is
+        // answered only once the step is published, or past a bound that
+        // only catches a wait that never serves.
+        let side = std::thread::spawn(move || {
+            let packet = |value| Packet {
+                device: DeviceId(1),
+                control: ControlId(F2),
+                value,
+                background: false,
+            };
+            set.begin_batch(TimeUs(10_000));
+            set.packet(&packet(1));
+            set.packet(&packet(0));
+            set.end_batch(TimeUs(10_001));
+            set.tick_presentation(TimeUs(11_000));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let published = loop {
+                if reader.read().options.hispeed().classic_hispeed_x100 == 345 {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            answer.send(Ok(())).unwrap();
+            published
+        });
+        super::wait_chart_load(load, &render, Some(&mut driver), &input, &controls).unwrap();
+        assert!(side.join().unwrap(), "not published while the load waited");
+        assert_eq!(
+            driver.snapshot().options.hispeed().classic_hispeed_x100,
+            345
+        );
+        render.exit();
+    }
 
     /// A chosen chart's level is its library entry's `#PLAYLEVEL`, parsed as
     /// an attempt's is: a missing or unreadable one a known 0.

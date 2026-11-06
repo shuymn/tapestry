@@ -340,7 +340,7 @@ pub fn paint(index: u32, r: [i32; 4], follow: Follow) -> ElementDef {
 pub fn cover_image(range: Option<u32>) -> CoverPaintDef {
     CoverPaintDef {
         image: CoverImage::Image(COVER),
-        slider_range: range,
+        slider: range.map(skin_model::Slider::sudden),
         motion: CoverMotion::None,
         trim: CoverTrim::None,
         gate_track: None,
@@ -352,7 +352,7 @@ pub fn cover_image(range: Option<u32>) -> CoverPaintDef {
 pub fn moving(image: u32, motion: CoverMotion, trim: CoverTrim) -> CoverPaintDef {
     CoverPaintDef {
         image: CoverImage::Image(image),
-        slider_range: None,
+        slider: None,
         motion,
         trim,
         gate_track: None,

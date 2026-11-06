@@ -359,7 +359,9 @@ const FLICKER: u16 = LOOKS + 12;
 /// The image choices' own images: 12, 20 and 24 frames, each with a sheet
 /// cycle the choices do not use.
 const CHOICES: u16 = FLICKER + 6;
-const IMAGES: u16 = CHOICES + 3;
+/// The progress slider's image.
+const PROGRESS: u16 = CHOICES + 3;
+const IMAGES: u16 = PROGRESS + 1;
 /// The reserved layers of the atlas.
 const RESERVED: u16 = 1;
 
@@ -1134,6 +1136,7 @@ fn skin() -> Loaded {
         Follow::LiftAndCover,
     ));
     elements.push(lanes_support::paint(4, [160, 940, 544, 120], Follow::None));
+    elements.push(lanes_support::paint(5, [160, 1_040, 24, 24], Follow::None));
     let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
         blend: Blend::Add,
@@ -1151,18 +1154,26 @@ fn cover_paints() -> Vec<CoverPaintDef> {
     vec![
         lanes_support::moving(u32::from(SUDDEN), CoverMotion::None, CoverTrim::None),
         CoverPaintDef {
-            slider_range: Some(300),
+            slider: Some(skin_model::Slider::sudden(300)),
             ..lanes_support::moving(u32::from(LIFT), CoverMotion::None, CoverTrim::None)
         },
         CoverPaintDef {
             image: CoverImage::Choice(0),
-            slider_range: Some(0),
+            slider: Some(skin_model::Slider::sudden(0)),
             ..lanes_support::moving(0, CoverMotion::None, CoverTrim::None)
         },
         lanes_support::moving(u32::from(SUDDEN), CoverMotion::Hidden, CoverTrim::Lift(880)),
         CoverPaintDef {
             gate_track: Some(lanes_support::rect([160, 960, 544, 80])),
             ..lanes_support::moving(u32::from(LIFT), CoverMotion::Lift, CoverTrim::Fixed(960))
+        },
+        CoverPaintDef {
+            slider: Some(skin_model::Slider {
+                range: 400,
+                rate: skin_model::SliderRate::Progress,
+                direction: skin_model::SliderDirection::Right,
+            }),
+            ..lanes_support::moving(u32::from(PROGRESS), CoverMotion::None, CoverTrim::None)
         },
     ]
 }
@@ -1411,6 +1422,12 @@ struct Witness {
     paint: bool,
     slider: Option<f32>,
     slider_moved: bool,
+    /// The progress slider's x at the first target and the author's
+    /// layout, whether it moved there, and whether the progress read 0,
+    /// a share between and the whole.
+    progress: Option<f32>,
+    progress_moved: bool,
+    progress_reads: [bool; 3],
     /// The widgets': a combo drew and the shifting judge's grade lay apart
     /// from the other's; the full-gauge PERFECT showed; a sign glyph drew;
     /// the flicker's tip was pushed; each shown gauge drew its own look.
@@ -1519,6 +1536,9 @@ impl Witness {
             paint: false,
             slider: None,
             slider_moved: false,
+            progress: None,
+            progress_moved: false,
+            progress_reads: [false; 3],
         }
     }
 }
@@ -1801,6 +1821,10 @@ fn stretch(
                 if let Some(d) = w.drawn.get_mut(usize::from(image)) {
                     *d = true;
                 }
+                if image == PROGRESS && target_no == 0 && layout_no == 0 {
+                    let x = *w.progress.get_or_insert(q.rect[0]);
+                    w.progress_moved |= x != q.rect[0];
+                }
                 if let Some(c) = image
                     .checked_sub(CHOICES)
                     .and_then(|c| w.choices.get_mut(usize::from(c)))
@@ -1862,6 +1886,13 @@ fn stretch(
             .and_then(|k| w.kinds.get_mut(k))
         {
             *seen = true;
+        }
+        // The progress's arms: before the start, between, at the end.
+        match read(field::TIME_PROGRESS_PPM) {
+            Some(0) => w.progress_reads[0] = true,
+            Some(skin_model::PROGRESS_FULL) => w.progress_reads[2] = true,
+            Some(_) => w.progress_reads[1] = true,
+            None => {}
         }
         frame_no += 1;
         now += 16 * MS;
@@ -2007,6 +2038,7 @@ fn build_does_not_allocate() {
         assert!(w.literal_moved, "{name}: the covers never moved a follower");
         assert!(w.paint, "{name}: SUDDEN+'s paint never drew");
         assert!(w.slider_moved, "{name}: the slider paint never moved");
+        assert!(w.progress_moved, "{name}: the progress slider never moved");
         assert_eq!(w.choices, [true; 3], "{name}: an image choice never drew");
         assert!(w.choice_later, "{name}: no image choice entry animated");
         assert!(w.rates_apart, "{name}: the rates never moved apart");
@@ -2048,10 +2080,17 @@ fn build_does_not_allocate() {
         for (a, b) in seen.drawn.iter_mut().zip(w.drawn) {
             *a |= b;
         }
+        for (a, b) in seen.progress_reads.iter_mut().zip(w.progress_reads) {
+            *a |= b;
+        }
         seen.widgets.merge(w.widgets);
     }
     // The widgets' witnesses, seen inside the counted stretches.
     let ws = seen.widgets;
+    assert_eq!(
+        seen.progress_reads, [true; 3],
+        "the progress never read 0, a share or the whole"
+    );
     assert!(ws.combo, "no combo drew");
     assert!(ws.shifted, "no grade shifted");
     assert!(ws.at_max, "PERFECT at a full gauge never showed");

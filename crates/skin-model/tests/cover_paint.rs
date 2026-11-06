@@ -20,7 +20,7 @@ use skin_model::{
     Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, CycleDef,
     ElementDef, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
     LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, Native, PLAY, Place, Scope,
-    Skin, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
+    Skin, Slider, SliderDirection, SliderRate, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
 };
 
 /// A skin over `REGIONS` with `lanes`, `elements` and `widgets`.
@@ -87,6 +87,60 @@ fn offsets_and_sliders_add_their_motion() {
     // At rest nothing moves.
     let h = shown(motion_skin(), [0, 0, 0]);
     assert_eq!(ys(&h), [-320.0, 0.0, 0.0]);
+}
+
+/// A slider of `range` moved by the progress toward `direction`.
+fn progress_paint(range: u32, direction: SliderDirection) -> CoverPaintDef {
+    CoverPaintDef {
+        slider: Some(Slider {
+            range,
+            rate: SliderRate::Progress,
+            direction,
+        }),
+        ..cover_image(None)
+    }
+}
+
+/// A progress slider moves by its range times `time.progress_ppm / 10⁶`
+/// toward its direction (`skin/SkinSlider.java:116-120`): nothing in
+/// READY or at the start, half of 400 at half the attempt (the chart's
+/// last object at 1.3 s), the whole range at and after the end, whatever
+/// the lane covers.
+#[test]
+fn a_progress_slider_moves_toward_its_direction() {
+    let dirs = [
+        SliderDirection::Up,
+        SliderDirection::Right,
+        SliderDirection::Down,
+        SliderDirection::Left,
+    ];
+    let skin = skin(
+        (0..4)
+            .map(|i| paint(i, [600, 500, 40, 20], Follow::None))
+            .collect(),
+        dirs.map(|d| progress_paint(400, d)).to_vec(),
+    );
+    let mut h = Harness::new(skin, &tap_chart(), &full(1_000));
+    h.view.cover = 500;
+    let moved = |d: f32| {
+        vec![
+            [600.0, 500.0 - d, 40.0, 20.0],
+            [600.0 + d, 500.0, 40.0, 20.0],
+            [600.0, 500.0 + d, 40.0, 20.0],
+            [600.0 - d, 500.0, 40.0, 20.0],
+        ]
+    };
+    for (ms, d) in [
+        (-500, 0.0),
+        (0, 0.0),
+        (325, 100.0),
+        (650, 200.0),
+        (1_300, 400.0),
+        (5_000, 400.0),
+    ] {
+        h.frame(ms, &[]);
+        assert_eq!(rects(&h, COVER), moved(d), "{ms} ms");
+    }
 }
 
 #[test]
@@ -170,7 +224,7 @@ fn paint_never_changes_the_notes() {
     let by_choice = || {
         vec![CoverPaintDef {
             image: CoverImage::Choice(0),
-            slider_range: Some(200),
+            slider: Some(skin_model::Slider::sudden(200)),
             ..cover_image(None)
         }]
     };
@@ -447,7 +501,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
         image_choices: vec![table],
         cover_paints: vec![CoverPaintDef {
             image: CoverImage::Choice(0),
-            slider_range: Some(800),
+            slider: Some(skin_model::Slider::sudden(800)),
             ..cover_image(None)
         }],
         ..WidgetDefs::default()
@@ -522,6 +576,33 @@ fn paints_are_checked_at_load() {
         load(vec![p(1)], range(limit)),
         Err(LoadError::Coordinates { element: 0 })
     ));
+    // A progress slider's range counts toward its own direction, x for a
+    // horizontal one.
+    let at = |x: i32, y: i32| paint(0, [x, y, 10, 10], Follow::None);
+    let slides = |d| one(progress_paint(limit, d));
+    for (d, fits, out) in [
+        (SliderDirection::Right, at(0, 0), at(1, 0)),
+        (SliderDirection::Left, at(0, 0), at(-1, 0)),
+        (SliderDirection::Up, at(0, 0), at(0, -1)),
+        (SliderDirection::Down, at(0, 0), at(0, 1)),
+    ] {
+        assert!(load(vec![fits], slides(d)).is_ok(), "{d:?}");
+        assert!(
+            matches!(
+                load(vec![out], slides(d)),
+                Err(LoadError::Coordinates { element: 0 })
+            ),
+            "{d:?}"
+        );
+    }
+    assert!(load(vec![at(1, 1)], slides(SliderDirection::Left)).is_ok());
+    assert_eq!(
+        paint_err(load(
+            Vec::new(),
+            one(progress_paint(limit + 1, SliderDirection::Up))
+        )),
+        (0, CoverPaintError::Range)
+    );
     assert!(matches!(
         load(vec![paint(1, [0; 4], Follow::None)], one(cover_image(None))),
         Err(LoadError::UnknownWidget { element: 0 })

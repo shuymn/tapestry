@@ -62,7 +62,7 @@ pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
 /// The most texels across one variant's files.
-pub const MAX_TOTAL_TEXELS: u64 = 128 << 20;
+pub const MAX_TOTAL_TEXELS: u64 = 192 << 20;
 
 /// A file of the skin: a name relative to the skin folder, and an optional
 /// file at exactly twice its size for high-resolution targets.

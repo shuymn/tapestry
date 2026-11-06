@@ -1490,6 +1490,12 @@ impl RenderLink {
 pub struct PendingLoad(Receiver<Result<(), RenderError>>);
 
 impl PendingLoad {
+    /// A load answered on `rx`, in place of the render thread's (tests).
+    #[cfg(test)]
+    pub(crate) const fn answered_on(rx: Receiver<Result<(), RenderError>>) -> Self {
+        Self(rx)
+    }
+
     /// Waits for the answer, at most the answer's bound from here, calling
     /// `serve` every [`CANCEL_POLL`] at most meanwhile: the game thread
     /// serves the adjustments through the chart's load on the render
@@ -4482,7 +4488,7 @@ pub(crate) mod tests {
     /// reported), and one within the limit is ready and commits.
     #[test]
     fn a_specialization_past_the_shared_texels_is_refused() {
-        use crate::render_decl::{Look, solid_bundle};
+        use crate::render_decl::{Look, shared_limit_bundle, solid_bundle};
         let make: MakeScreen = Box::new(|| {
             let renderer = render::Renderer::new(
                 render::Target::Offscreen {
@@ -4495,8 +4501,7 @@ pub(crate) mod tests {
         });
         // Built for WARP's limits, as the render thread's screen.
         let r = crate::render_common::offscreen(1_920, 1_080);
-        let big = solid_bundle(&r, &Look::left([0, 0, 255, 255]), [4_096, 3_072]);
-        assert_eq!(big.atlas_texels(), render::SHARED_TEXELS);
+        let big = shared_limit_bundle(&r, [0, 0, 255, 255]);
         let (result, play) = (
             solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
             solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
@@ -8184,12 +8189,20 @@ pub(crate) mod tests {
         assert!(frames() >= from + 3);
         link.commit_attempt().unwrap();
 
+        // The render thread dropped the held preparation on its discard
+        // (the screen's `discard`, logged): released only then, so no
+        // render thread late to the discard prepares it afresh.
+        let discarded = |n: usize| {
+            wait_until(|| screens.log().iter().filter(|l| *l == "1 discard").count() == n)
+        };
+
         // Cancelled while held, then released: the late answer never
         // comes, and nothing commits.
         screens.hold.store(true, Ordering::Release);
         let from = frames();
         let cancelled = link.prepare_attempt(titled(&chart), || frames() >= from + 3);
         assert_eq!(cancelled.unwrap(), Preparation::Cancelled);
+        assert!(discarded(1));
         screens.hold.store(false, Ordering::Release);
         let from = frames();
         assert!(wait_until(|| frames() >= from + 3));
@@ -8200,10 +8213,11 @@ pub(crate) mod tests {
         screens.hold.store(true, Ordering::Release);
         let late = link.prepare_attempt(titled(&chart), || false);
         assert!(matches!(late, Err(ScreenError::NoAnswer)), "{late:?}");
+        assert!(discarded(2));
         screens.hold.store(false, Ordering::Release);
         let from = frames();
         assert!(wait_until(|| frames() >= from + 3));
-        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        link.set_timeouts(super::LOAD_TIMEOUT, super::EXIT_TIMEOUT);
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
         link.exit();
         assert_eq!(
