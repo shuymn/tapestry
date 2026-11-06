@@ -1865,38 +1865,141 @@ fn a_play_skin_reads_the_attempts_autoplay() {
     }
 }
 
-/// A play skin reads the recent timing a log's play publishes: a
-/// full-canvas blue image on op 1242 (worse than PERFECT, early) and a red
-/// corner on op 1243 (late). The first note pressed 30 ms early shows the
-/// blue, the second on time neither, the third 30 ms late the corner.
+/// The recent timing's chart at 120 BPM (a measure is 2 s): key 1 at
+/// 125 ms (the rearm's), at 2.0 s and at 2.5 s, key 2's long note from 3.0
+/// to 3.5 s, and a sound at 4.0 s the play lasts to.
+const TIMING_CHART: &str = "#PLAYER 1\n#TITLE timing\n#BPM 120\n#WAV01 key.wav\n#LNTYPE 1\n#00138:01\n\
+    #00011:00010000000000000000000000000000\n\
+    #00111:01010000\n#00152:00000101\n#00201:01\n";
+
+/// What a captured frame of the recent-timing skin shows, read from its
+/// display list: number 525's value from its glyphs (`n.png`, 24 glyphs
+/// 10 wide: digits, padding, a sign, then the same for a negative), `None`
+/// when undrawn, and whether the 1242 (30 wide) and 1243 (40 wide)
+/// images drew.
+fn timing_shown(list: &str) -> (Option<i32>, bool, bool) {
+    let nums = |line: &str, key: &str| -> Vec<i64> {
+        let rest = line.split(&format!("\"{key}\":[")).nth(1).unwrap();
+        rest.split(']')
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|n| n.trim().parse::<f64>().unwrap().round() as i64)
+            .collect()
+    };
+    let quads: Vec<&str> = list.lines().filter(|l| l.contains("\"src\":[")).collect();
+    let mut cells: Vec<(i64, i64)> = quads
+        .iter()
+        .filter(|l| l.contains("\"file\":\"n.png\""))
+        .map(|l| (nums(l, "rect")[0], nums(l, "src")[0] / 10))
+        .collect();
+    cells.sort_unstable();
+    let ms = (!cells.is_empty()).then(|| {
+        let (sign, digits) = cells.split_first().unwrap();
+        assert_eq!(sign.1 % 12, 11, "{cells:?}");
+        let magnitude = digits.iter().fold(0, |v, &(_, g)| {
+            assert!(g % 12 < 10 && g / 12 == sign.1 / 12, "{cells:?}");
+            v * 10 + i32::try_from(g % 12).unwrap()
+        });
+        if sign.1 >= 12 { -magnitude } else { magnitude }
+    });
+    let wide = |w: i64| {
+        quads
+            .iter()
+            .any(|l| l.contains("\"file\":\"white.png\"") && nums(l, "rect")[2] == w)
+    };
+    (ms, wide(30), wide(40))
+}
+
+/// A play skin reads the recent timing the player publishes, through its
+/// adapters, on the game's real threads: number 525's digits and the
+/// images on ops 1242 (early) and 1243 (late), from a log's play under the
+/// default beatoraja-style preset.
+///
+/// The play: key 1's note at 125 ms missed (−210, its late BAD edge); 2.0 s
+/// pressed 30 ms early (+30, early); a press at 2.2 s, an empty POOR 300 ms
+/// before 2.5 s (+300, early); 2.5 s pressed 30 ms late (−30, late); the
+/// long note's head 10 ms late, held, which leaves −30; its release 40 ms
+/// before its end, PERFECT (+40, neither). A retry's READY reads 0. Then a
+/// play whose first READY takes an empty POOR 475 ms before the 125 ms note
+/// (+475) and is cancelled by START held before chart time 0, its release
+/// rearming a fresh READY: that candidate reads 0 until its own miss.
 #[test]
 fn a_play_skin_reads_the_recent_timing() {
+    const Q: u32 = 0x10;
     let fx = Fixture::new();
-    let chart = write_chart(&fx.library(), "a", "譜面A");
-    let mut events = hits(&chart, |t| t < TimeUs(3_200_000));
-    // Each note is a press and its release: the first early, the third
-    // late.
-    for (i, shift) in [(0, -30_000), (1, -30_000), (4, 30_000), (5, 30_000)] {
-        events[i].received = TimeUs(events[i].received.0 + shift);
-    }
-    write_log(&fx.base.join("logs").join("timing.tprl"), &events, 1);
+    let dir = fx.library().join("t");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    fs::write(dir.join("t.bms"), TIMING_CHART).unwrap();
+    let chart = bms_parser::load_bms(TIMING_CHART.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart;
+    // Each note is a press and its release, in note order: key 1 at
+    // 125 ms, 2.0 s and 2.5 s, then the long note.
+    let all = hits(&chart, |_| true);
+    assert_eq!(all.len(), 8);
+    let at = |e: PhysicalInputEvent, ms: i64| PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        ..e
+    };
+    let key1 = (all[0], all[1]);
+    let key2 = (all[6], all[7]);
+    let played = [
+        at(key1.0, 1_970),
+        at(key1.1, 1_990),
+        at(key1.0, 2_200),
+        at(key1.1, 2_220),
+        at(key1.0, 2_530),
+        at(key1.1, 2_550),
+        at(key2.0, 3_010),
+        at(key2.1, 3_460),
+    ];
+    write_log(&fx.base.join("logs").join("timing.tprl"), &played, 1);
+    let q = |ms: i64, value: i32| PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    // START held as in
+    // `the_start_gate_cancels_and_rearms_ready_on_the_real_threads`: the
+    // rearmed READY's chart time 0 lies about 1.2 s after the first's, and
+    // the log is finalized as far later.
+    let rearmed = [at(key1.0, -350), at(key1.1, -330), q(-300, 1), q(200, 0)];
+    let path = fx.base.join("logs").join("rearm.tprl");
+    write_log(&path, &rearmed, 1);
+    let mut rec = replay::decode(&fs::read(&path).unwrap(), &DecodeLimits::default()).unwrap();
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&path, replay::encode(&rec)).unwrap();
     let skin = fx.base.join("skin");
     fs::create_dir_all(&skin).unwrap();
-    let file = fs::File::create(skin.join("white.png")).unwrap();
-    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
-    e.set_color(png::ColorType::Rgba);
-    e.set_depth(png::BitDepth::Eight);
-    let white: Vec<u8> = (0..16 * 16).flat_map(|_| [255; 4]).collect();
-    e.write_header().unwrap().write_image_data(&white).unwrap();
+    let image = |name: &str, w: u32| {
+        let file = fs::File::create(skin.join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, 20);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let white: Vec<u8> = (0..w * 20).flat_map(|_| [255; 4]).collect();
+        e.write_header().unwrap().write_image_data(&white).unwrap();
+    };
+    image("white.png", 16);
+    image("n.png", 240);
     fs::write(
         skin.join("play.luaskin"),
         "local skin = { type = 0, name = \"timing\", w = 1920, h = 1080 }\n\
          if not skin_config then return skin end\n\
-         skin.source = { { id = \"b\", path = \"white.png\" } }\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = { { id = \"b\", path = \"white.png\" }, { id = \"n\", path = \"n.png\" } }\n\
          skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.value = { { id = \"v\", src = \"n\", x = 0, y = 0, w = 240, h = 20, divx = 24, digit = 4,\n\
+           value = function() return ms.number(525) end } }\n\
          skin.destination = {\n\
-           { id = \"b\", op = { 1242 }, dst = { { x = 0, y = 0, w = 1920, h = 1080, r = 0, g = 0 } } },\n\
-           { id = \"b\", op = { 1243 }, dst = { { x = 0, y = 0, w = 192, h = 108, g = 0, b = 0 } } } }\n\
+           { id = \"v\", dst = { { x = 0, y = 500, w = 12, h = 20 } } },\n\
+           { id = \"b\", op = { 1242 }, dst = { { x = 0, y = 100, w = 30, h = 10 } } },\n\
+           { id = \"b\", draw = function() return ms.option(1243) end,\n\
+             dst = { { x = 0, y = 200, w = 40, h = 10 } } } }\n\
          return skin\n",
     )
     .unwrap();
@@ -1909,25 +2012,65 @@ fn a_play_skin_reads_the_recent_timing() {
         ),
     )
     .unwrap();
-    let (out, stdout, stderr) = fx.run(&scenario(&[
-        "capture = { at = 2200, file = \"early.png\" }",
-        "capture = { at = 2700, file = \"perfect.png\" }",
-        "capture = { at = 3150, file = \"late.png\" }",
-        "select = { path = \"library/a/a.bms\" }",
-        "play = { input = \"logs/timing.tprl\", until = \"end\" }",
-        "result = \"back\"",
-        "quit = {}",
-    ]));
+    let captures = [
+        ("miss", 1_000),
+        ("early", 2_100),
+        ("empty", 2_300),
+        ("late", 2_600),
+        ("held", 3_200),
+        ("release", 3_600),
+    ];
+    let mut steps: Vec<String> = captures
+        .iter()
+        .map(|(name, ms)| format!("capture = {{ at = {ms}, file = \"{name}.png\" }}"))
+        .collect();
+    steps.extend(
+        [
+            "select = { path = \"library/t/t.bms\" }",
+            "play = { input = \"logs/timing.tprl\", until = \"end\" }",
+            "capture = { ready_at = 0, file = \"retry.png\" }",
+            "result = \"retry\"",
+            "play = { input = \"logs/timing.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            // The cancelled READY after its empty POOR and START's press;
+            // the rearmed candidate past where the cancelled one's frames
+            // stop, before its miss at 335 ms; and after it.
+            "capture = { ready_at = 800, file = \"cancelled.png\" }",
+            "capture = { at = 300, file = \"rearmed.png\" }",
+            "capture = { at = 1000, file = \"rearmed_miss.png\" }",
+            "select = { path = \"library/t/t.bms\" }",
+            "play = { input = \"logs/rearm.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]
+        .map(str::to_owned),
+    );
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    let (out, stdout, stderr) = fx.run(&scenario(&steps));
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let out = fx.base.join("out");
-    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
-    for (name, want_centre, want_corner) in [
-        ("early", [0, 0, 255], [0, 0, 255]),
-        ("perfect", [0, 0, 0], [0, 0, 0]),
-        ("late", [0, 0, 0], [255, 0, 0]),
+    let shown = |name: &str| {
+        let list = fs::read_to_string(out.join(format!("{name}.jsonl")))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        timing_shown(&list)
+    };
+    let side = |name: &str| fs::read_to_string(out.join(format!("{name}.json"))).unwrap();
+    for (name, want) in [
+        ("miss", (Some(-210), false, true)),
+        ("early", (Some(30), true, false)),
+        ("empty", (Some(300), true, false)),
+        ("late", (Some(-30), false, true)),
+        ("held", (Some(-30), false, true)),
+        ("release", (Some(40), false, false)),
+        ("retry", (Some(0), false, false)),
+        ("cancelled", (Some(475), true, false)),
+        ("rearmed", (Some(0), false, false)),
+        ("rearmed_miss", (Some(-210), false, true)),
     ] {
-        let png = out.join(format!("{name}.png"));
-        assert_eq!(centre(&png), want_centre, "{name}");
-        assert_eq!(corner(&png), want_corner, "{name}");
+        assert_eq!(shown(name), want, "{name}: {}", side(name));
+    }
+    // The rearmed captures are the rearmed candidate's frames.
+    for name in ["rearmed", "rearmed_miss"] {
+        assert_eq!(side_num(&side(name), "view_generation"), 1, "{name}");
     }
 }
