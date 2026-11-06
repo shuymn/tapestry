@@ -1125,12 +1125,14 @@ fn a_language_changed_after_startup_is_not_read() {
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     let edited_at = edited_at.unwrap_or_else(|| panic!("no page:\n{stdout}"));
     let (before, after) = stdout.split_at(edited_at);
-    let title = "dev: select page: 曲選択  全譜面  1 譜面  並び順: タイトル  プリセット: ";
+    // The title's own words, whatever the place and the count a pending
+    // scan shows.
     for (when, part, preset) in [("before", before, ""), ("after", after, "lr2-style")] {
         assert!(part.lines().any(|l| l == help), "{when}:\n{stdout}");
+        let labels = format!(" 譜面  並び順: タイトル  プリセット: {preset}");
         assert!(
             part.lines()
-                .any(|l| l.starts_with(&format!("{title}{preset}"))),
+                .any(|l| l.starts_with("dev: select page: 曲選択  ") && l.contains(&labels)),
             "{when}:\n{stdout}"
         );
     }
