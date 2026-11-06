@@ -49,7 +49,8 @@ fn drawn(body: &str, notes: u32) -> Drawn {
 /// A skin's end-of-play image on the last-note timer (143), drawn only
 /// after a combo break (425 above 0): its window 500 to 1450 ms after the
 /// notes' end, opaque from 750 to 1250, read at exact frame times. The
-/// first playing frame at the end starts the timer.
+/// first playing frame past the end starts the timer at the end itself,
+/// not at that frame: its first frame comes 600 ms late.
 #[test]
 fn a_finish_window_runs_from_the_notes_end_after_a_break() {
     let body = "skin.destination = { { id = \"i0\", timer = 143, loop = -1,\n\
@@ -65,8 +66,13 @@ fn a_finish_window_runs_from_the_notes_end_after_a_break() {
     let mut missed = Drawn::over_ending(skin.clone(), &chart, end);
     missed.tally = counts(0, [1, 0], 0);
     assert_eq!(alpha(&mut missed, 999), None);
-    assert_eq!(alpha(&mut missed, 1_000), None);
+    // 600 ms from the end, rising from 500 to 750: 0.4.
+    let rising = alpha(&mut missed, 1_600).unwrap();
+    assert!((rising - 0.4).abs() < 1e-3, "{rising}");
     assert_eq!(alpha(&mut missed, 1_900), Some(1.0));
+    // 1300 ms from the end, falling from 1250 to 1450: 0.75.
+    let falling = alpha(&mut missed, 2_300).unwrap();
+    assert!((falling - 0.75).abs() < 1e-3, "{falling}");
     assert_eq!(alpha(&mut missed, 2_600), None);
     // A perfect play: nothing at the same time.
     let mut perfect = Drawn::over_ending(skin, &chart, end);

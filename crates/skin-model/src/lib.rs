@@ -26,6 +26,11 @@
 //!
 //! A [`ScreenKind`] names the screen a skin is made for.
 //!
+//! A [`SelectionView`] is selection's snapshot: a bounded window of rows
+//! around the cursor, each with its identity, kind, text, level and typed
+//! score, the cursor's exact position, the place, the query and the selected
+//! chart's labels, summary and score.
+//!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
 //! gauge, a judgment display, a line of text or the lanes widget on a
 //! keyframe [`Track`] on a timer, placed in one of seven [`Region`]s, and
@@ -79,6 +84,7 @@ mod play;
 mod quad;
 mod schema;
 mod screen;
+mod selection;
 mod skin;
 mod track;
 mod widget;
@@ -141,6 +147,10 @@ pub use play::{
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
+pub use selection::{
+    ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowKey, RowKind, RowScore, RowView,
+    SelectedChart, SelectionPlace, SelectionView,
+};
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
     MAX_WIDGET_QUADS, Skin, SkinDef, Source, TimerRef, WidgetDefs,

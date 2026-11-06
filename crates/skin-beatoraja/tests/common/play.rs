@@ -201,6 +201,7 @@ fn context_with(
     bpm_whole_change: Option<bool>,
 ) -> PlayContext<'static> {
     PlayContext {
+        autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
@@ -278,6 +279,19 @@ impl Drawn {
                 ..context_with(None, None)
             },
         )
+    }
+
+    /// `skin` played over a chart of `notes` notes by an attempt that is
+    /// autoplay when `autoplay`.
+    #[allow(dead_code, reason = "not every test binary autoplays")]
+    pub fn with_autoplay(skin: Skin, notes: u32, autoplay: bool) -> Self {
+        let mut d = Self::new(skin, notes);
+        let ctx = PlayContext {
+            autoplay,
+            ..context()
+        };
+        d.play = d.skin.prepare(&d.chart, &ctx).unwrap();
+        d
     }
 
     /// `skin` played over `chart`.
@@ -485,6 +499,8 @@ pub struct Loader {
     pub percent: i32,
     /// Whether the stored covers are being adjusted: START or SELECT held.
     pub adjusting: bool,
+    /// Whether the attempt being loaded is autoplay: by default not.
+    pub autoplay: bool,
 }
 
 impl Loader {
@@ -505,6 +521,7 @@ impl Loader {
             play_level: None,
             percent: 0,
             adjusting: false,
+            autoplay: false,
         }
     }
 
@@ -515,6 +532,7 @@ impl Loader {
         let mut covers = readouts_for(view).covers;
         covers.adjusting = self.adjusting;
         let frame = LoadingFrame {
+            autoplay: self.autoplay,
             now: TimeUs(ms * MS),
             load: LoadState {
                 since: TimeUs(0),

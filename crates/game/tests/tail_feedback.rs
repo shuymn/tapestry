@@ -287,7 +287,7 @@ fn held_keys_and_the_scratch_carry_on_across_the_handoff() {
     assert!(!logic.view().input.lane(lane(3)).held);
 }
 
-/// Autoplay's generated release after the completion (its 50 ms tap hold
+/// Autoplay's generated release after the completion (its 80 ms tap hold
 /// past a 45 ms late BAD edge) goes through the tail's feedback: the lane
 /// is released at its generated time, and a sink that sends no key sounds
 /// (autoplay's are on the engine's schedule) accepts nothing.
@@ -334,7 +334,7 @@ fn autoplays_pending_release_goes_through_the_tail() {
     assert_eq!(logic.feedback_to(), Some(TimeUs(2_000 * MS)));
     assert_eq!(
         logic.view().input.lane(lane(1)),
-        input(false, Some(1_000 * MS), Some(1_050 * MS))
+        input(false, Some(1_000 * MS), Some(1_080 * MS))
     );
     assert_eq!(sounds.accepted(), 0);
 }
