@@ -1088,6 +1088,48 @@ fn choosing_a_preset_writes_player_toml() {
     );
 }
 
+/// The language is read once, at startup (design.md "Settings Files"): a
+/// `player.toml` whose language is changed to one that does not exist
+/// while selection shows neither stops the run nor is read, and the
+/// preset step's write puts the startup language back.
+#[test]
+fn a_language_changed_after_startup_is_not_read() {
+    let fx = fixture();
+    write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
+    let player = DataRoot::new(fx.appdata.join("tapestry")).player_settings();
+    let mut child = select(&fx, "sleep=2000,next-preset,sleep=500,close", &[])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = String::new();
+    let mut changed = false;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        // Once selection lists, during the sleep step before the preset.
+        if !changed && line.starts_with("select: ") && line.ends_with(" charts listed") {
+            fs::write(&player, "language = \"xx\"\n").unwrap();
+            changed = true;
+        }
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(changed, "{stdout}");
+    assert_eq!(
+        lines(&stdout, "select: preset ").first().copied(),
+        Some("select: preset lr2-style"),
+        "{stdout}"
+    );
+    let saved = fs::read_to_string(&player).unwrap();
+    assert!(
+        saved.lines().any(|l| l == "language = \"ja\""),
+        "{saved}\n{stdout}"
+    );
+}
+
 /// A `player.toml` that cannot be replaced (read-only): the step still
 /// chooses the preset, which the chart then plays, the failure is
 /// reported, and the file keeps what it held.

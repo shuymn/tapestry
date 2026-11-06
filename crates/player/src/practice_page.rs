@@ -10,6 +10,7 @@ use rules::GaugeValue;
 
 use crate::menu_screen::{LineStyle, MenuLine, MenuPage, PAGE_LINES};
 use crate::select::MenuKey;
+use crate::ui_text::{Label, Message};
 
 /// The page's input for a window key: the arrows, Enter and Escape; every
 /// other key means nothing there.
@@ -52,32 +53,47 @@ pub fn percent(v: GaugeValue) -> String {
 fn row(screen: &PracticeScreen, row: PracticeRow) -> (String, String) {
     let n = screen.measures().len();
     match row {
-        PracticeRow::From => ("開始小節".to_owned(), format!("{}", screen.from() + 1)),
+        PracticeRow::From => (
+            Label::PracticeFrom.text().to_owned(),
+            format!("{}", screen.from() + 1),
+        ),
         PracticeRow::To => (
-            "終了小節".to_owned(),
+            Label::PracticeTo.text().to_owned(),
             if screen.to() == n {
-                format!("{} (最後まで)", screen.to())
+                Message::PracticeToEnd { to: screen.to() }.text()
             } else {
                 format!("{} / {n}", screen.to())
             },
         ),
         PracticeRow::Speed => (
-            "速度".to_owned(),
+            Label::PracticeSpeed.text().to_owned(),
             format!("{}%", screen.speed().twentieths() * 5),
         ),
         PracticeRow::LeadIn => (
-            "リードイン".to_owned(),
-            format!("{} 秒", seconds(screen.lead_in().0)),
+            Label::PracticeLeadIn.text().to_owned(),
+            Message::PracticeLeadInValue {
+                seconds: &seconds(screen.lead_in().0),
+            }
+            .text(),
         ),
         PracticeRow::Gauge => (
-            format!("初期ゲージ ({})", screen.gauge_name().unwrap_or("-")),
+            Message::PracticeGauge {
+                gauge: screen.gauge_name().unwrap_or("-"),
+            }
+            .text(),
             format!("{}%", percent(screen.value())),
         ),
         PracticeRow::Repeat => (
-            "リピート".to_owned(),
-            if screen.repeat() { "オン" } else { "オフ" }.to_owned(),
+            Label::PracticeRepeat.text().to_owned(),
+            if screen.repeat() {
+                Label::On
+            } else {
+                Label::Off
+            }
+            .text()
+            .to_owned(),
         ),
-        PracticeRow::Start => ("開始".to_owned(), String::new()),
+        PracticeRow::Start => (Label::PracticeStart.text().to_owned(), String::new()),
     }
 }
 
@@ -86,7 +102,10 @@ fn row(screen: &PracticeScreen, row: PracticeRow) -> (String, String) {
 /// and the keys.
 pub fn page(screen: &PracticeScreen, name: &str) -> MenuPage {
     let line = |text: String, style| MenuLine { text, style };
-    let mut lines = vec![line(format!("練習  {name}"), LineStyle::Title)];
+    let mut lines = vec![line(
+        Message::PracticeTitle { name }.text(),
+        LineStyle::Title,
+    )];
     for r in PracticeRow::ALL {
         let (label, value) = row(screen, r);
         let cursor = r == screen.row();
@@ -114,10 +133,7 @@ pub fn page(screen: &PracticeScreen, name: &str) -> MenuPage {
     while lines.len() < PAGE_LINES - 1 {
         lines.push(line(String::new(), LineStyle::Chart));
     }
-    lines.push(line(
-        "↑↓ 選択  ←→ 変更  Enter 編集・開始  Esc 戻る  ウィンドウを閉じて終了".to_owned(),
-        LineStyle::Help,
-    ));
+    lines.push(line(Label::PracticeHelp.text().to_owned(), LineStyle::Help));
     MenuPage { lines, caret: None }
 }
 

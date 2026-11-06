@@ -312,7 +312,7 @@ impl PlayerRig<'_> {
                         .iter_mut()
                         .find(|l| l.style == crate::menu_screen::LineStyle::Notice)
                     {
-                        crate::loading_text::SKIN_WAIT.clone_into(&mut notice.text);
+                        crate::loading_text::skin_wait().clone_into(&mut notice.text);
                     }
                     rig.render.send(RenderMsg::Menu(Box::new(page)));
                 }

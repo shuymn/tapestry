@@ -41,6 +41,7 @@ use library::{
 
 use crate::background::{Job, Queued, Worker};
 use crate::loudness::{Host, Loudness};
+use crate::ui_text::{Label, Message};
 
 /// How often a load's wait for its chart's background measurement looks
 /// whether it was cancelled: a measurement asks about as often, before
@@ -253,9 +254,14 @@ impl Shelf {
             Some(scan) => {
                 let bests = scan.report().bests;
                 if bests.running {
-                    Cow::Owned(format!("ベスト再構築中 {}", bests.counted))
+                    Cow::Owned(
+                        Message::BestsRebuilding {
+                            counted: bests.counted,
+                        }
+                        .text(),
+                    )
                 } else {
-                    Cow::Borrowed("スキャン中")
+                    Cow::Borrowed(Label::Scanning.text())
                 }
             }
             None => Cow::Borrowed(&self.status),
@@ -309,7 +315,7 @@ impl Shelf {
 
     fn start_pass(&mut self) {
         if self.roots.is_empty() {
-            self.status = "device.toml に [library] roots がありません".to_owned();
+            self.status = Label::NoRoots.text().to_owned();
             return;
         }
         match self.library.scan(&self.roots, self.options.clone()) {
@@ -326,7 +332,7 @@ impl Shelf {
                 let line = format!("library: the scan cannot start: {}", Chain(&e));
                 eprintln!("{line}");
                 log::warn!("{line}");
-                self.status = "スキャンできません".to_owned();
+                self.status = Label::ScanCannotStart.text().to_owned();
                 self.ended = Some(Instant::now());
             }
         }
@@ -435,7 +441,7 @@ impl Shelf {
                 let line = format!("library: the scan failed: {}", Chain(&e));
                 eprintln!("{line}");
                 log::warn!("{line}");
-                self.status = "スキャンに失敗しました".to_owned();
+                self.status = Label::ScanFailed.text().to_owned();
             }
         }
     }

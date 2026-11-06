@@ -49,6 +49,7 @@ use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
 #[cfg(feature = "dev-tools")]
 type Feed = (input::AutoplayInput, usize, Vec<eval::ControlId>);
 use crate::shelf::{Shelf, file_name};
+use crate::ui_text::{Label, Message};
 use crate::window::ImeSwitch;
 
 /// Arrow keys a scripted pick queues at a time: fewer than the queue holds
@@ -363,7 +364,7 @@ impl Selection {
             self.preset_refusal = false;
         }
         self.screen
-            .set_save_error(error.map(|e| format!("player.toml を保存できません: {e}")));
+            .set_save_error(error.map(|why| Message::SaveFailed { why }.text()));
         self.dirty = true;
     }
 
@@ -1261,7 +1262,7 @@ impl PlayerRig<'_> {
             // A chart to play enters the play screen's loading state at once
             // (`entered_loading`); the practice page reads it first.
             if sel.practicing {
-                sel.show(&self.render, Some(&format!("読み込み中: {name}")));
+                sel.show(&self.render, Some(&Message::Reading { name: &name }.text()));
             }
         } else {
             sel.show(&self.render, None);
@@ -1299,7 +1300,7 @@ impl PlayerRig<'_> {
                 if loading.is_some() {
                     show_stage(render, loading.as_ref(), Stage::Scan);
                 } else {
-                    let page = screen.page("ライブラリのスキャンの一時停止を待っています");
+                    let page = screen.page(Label::ScanPauseWait.text());
                     render.send(RenderMsg::Menu(Box::new(page)));
                 }
             },

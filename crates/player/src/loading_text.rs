@@ -6,6 +6,7 @@
 //! here runs before recording opens, where allocation is allowed.
 
 use crate::menu_screen::{LineStyle, MenuLine, MenuPage};
+use crate::ui_text::{Label, Message};
 
 /// What the load is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +32,9 @@ pub enum Stage {
 
 /// The wait for a pending play skin's specialization on a page other than
 /// the loading state's (a retry, a practice round).
-pub const SKIN_WAIT: &str = "スキンを準備しています";
+pub fn skin_wait() -> &'static str {
+    Label::SkinPreparing.text()
+}
 
 impl Stage {
     /// The sounds done and the files to decode, while their count is
@@ -59,13 +62,13 @@ impl Stage {
     /// The stage on the play screen.
     fn text(self) -> String {
         match self {
-            Self::Chart => "譜面を読み込んでいます".to_owned(),
-            Self::Sounds { files: 0, .. } => "音を読み込んでいます".to_owned(),
-            Self::Sounds { done, files } => format!("音を読み込んでいます  {done} / {files}"),
-            Self::Loudness => "音量を測定しています".to_owned(),
-            Self::Screen => "画面を準備しています".to_owned(),
-            Self::Scan => "ライブラリのスキャンの一時停止を待っています".to_owned(),
-            Self::Skin => SKIN_WAIT.to_owned(),
+            Self::Chart => Label::ReadingChart.text().to_owned(),
+            Self::Sounds { files: 0, .. } => Label::LoadingSounds.text().to_owned(),
+            Self::Sounds { done, files } => Message::SoundsProgress { done, files }.text(),
+            Self::Loudness => Label::MeasuringLoudness.text().to_owned(),
+            Self::Screen => Label::PreparingScreen.text().to_owned(),
+            Self::Scan => Label::ScanPauseWait.text().to_owned(),
+            Self::Skin => skin_wait().to_owned(),
         }
     }
 }
@@ -75,7 +78,7 @@ impl Stage {
 pub fn skin_wait_page() -> MenuPage {
     MenuPage {
         lines: vec![MenuLine {
-            text: SKIN_WAIT.to_owned(),
+            text: skin_wait().to_owned(),
             style: LineStyle::Notice,
         }],
         caret: None,
@@ -126,16 +129,20 @@ impl LoadingText {
     pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };
         let heading = if self.practice {
-            "NOW LOADING (練習)"
+            Label::NowLoadingPractice
         } else {
-            "NOW LOADING"
-        };
+            Label::NowLoading
+        }
+        .text();
         MenuPage {
             lines: vec![
                 line(heading.to_owned(), LineStyle::Folder),
                 line(self.title.clone(), LineStyle::Title),
                 line(self.artist.clone(), LineStyle::Chart),
-                line(format!("プリセット: {}", self.preset), LineStyle::Chart),
+                line(
+                    Message::Preset { name: &self.preset }.text(),
+                    LineStyle::Chart,
+                ),
                 line(stage.text(), LineStyle::Search),
             ],
             caret: None,
