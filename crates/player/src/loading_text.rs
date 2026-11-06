@@ -30,12 +30,6 @@ pub enum Stage {
     Skin,
 }
 
-/// The wait for a pending play skin's specialization on a page other than
-/// the loading state's (a retry, a practice round).
-pub fn skin_wait() -> &'static str {
-    Label::SkinPreparing.text()
-}
-
 impl Stage {
     /// The sounds done and the files to decode, while their count is
     /// known: `None` for any other stage, and for the sounds' stage
@@ -68,7 +62,7 @@ impl Stage {
             Self::Loudness => Label::MeasuringLoudness.text().to_owned(),
             Self::Screen => Label::PreparingScreen.text().to_owned(),
             Self::Scan => Label::ScanPauseWait.text().to_owned(),
-            Self::Skin => skin_wait().to_owned(),
+            Self::Skin => Label::SkinPreparing.text().to_owned(),
         }
     }
 }
@@ -78,7 +72,7 @@ impl Stage {
 pub fn skin_wait_page() -> MenuPage {
     MenuPage {
         lines: vec![MenuLine {
-            text: skin_wait().to_owned(),
+            text: Label::SkinPreparing.text().to_owned(),
             style: LineStyle::Notice,
         }],
         caret: None,

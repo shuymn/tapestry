@@ -260,11 +260,14 @@ mod ja {
                 preset,
                 status,
             } => {
-                let place = place.map_or_else(String::new, |p| format!("{p}  "));
+                out.push_str("曲選択  ");
+                if let Some(place) = place {
+                    let _ = write!(out, "{place}  ");
+                }
                 let more = if more { label(Label::OrMore) } else { "" };
                 write!(
                     out,
-                    "曲選択  {place}{listed}{more} 譜面  並び順: {}  プリセット: {preset}  {status}",
+                    "{listed}{more} 譜面  並び順: {}  プリセット: {preset}  {status}",
                     label(sort)
                 )
             }
