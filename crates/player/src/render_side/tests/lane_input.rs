@@ -553,7 +553,7 @@ fn lane_input_reaches_both_skins() {
     }
 }
 
-/// Autoplay's generated stream: a tap held 50 ms, a soundless tap, and a
+/// Autoplay's generated stream: a tap held 80 ms, a soundless tap, and a
 /// long note held to its end each light their beam whole while held and
 /// fade from the generated release.
 #[test]
@@ -581,12 +581,12 @@ fn autoplays_stream_lights_the_beams() {
             close_second: false,
         },
         Step {
-            events: upto(1_020, 1_080),
-            watermark: 1_080,
+            events: upto(1_020, 1_110),
+            watermark: 1_110,
             close_second: false,
         },
         Step {
-            events: upto(1_080, 1_600),
+            events: upto(1_110, 1_600),
             watermark: 1_600,
             close_second: false,
         },
@@ -623,7 +623,7 @@ fn autoplays_stream_lights_the_beams() {
                 s.beams
             );
         }
-        assert_eq!(seen[1].keys[1], (None, at(1_050)));
+        assert_eq!(seen[1].keys[1], (None, at(1_080)));
         assert_eq!(seen[1].keys[3], (at(1_000), None));
         assert_eq!(seen[2].keys[3], (None, at(1_500)));
     }
