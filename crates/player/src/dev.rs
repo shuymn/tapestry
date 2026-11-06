@@ -46,7 +46,8 @@ pub fn slow_measuring(ms: u64) {
     SLOW_MEASURING.store(ms, Ordering::Relaxed);
 }
 
-/// Holds a measurement as `slow-measuring` says, asking `stop` every
+/// Holds a measurement as `slow-measuring` says, and on until a
+/// `press-loading` press in it is made and published, asking `stop` every
 /// 10 ms as a measurement asks before each block: `false` once it says
 /// to stop.
 pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
@@ -62,11 +63,31 @@ pub fn hold_measuring(stop: &mut dyn FnMut() -> bool) -> bool {
             return false;
         }
         let held = began.elapsed();
-        if held >= total {
+        if held >= total && (!press_pending(LoadPhase::Measuring) || held >= total + PRESS_BOUND) {
             return true;
         }
-        std::thread::sleep((total - held).min(Duration::from_millis(10)));
+        std::thread::sleep(
+            total
+                .saturating_sub(held)
+                .clamp(Duration::from_millis(1), Duration::from_millis(10)),
+        );
     }
+}
+
+/// How long a held phase waits past its own time for its `press-loading`
+/// press to be made and published: a bound that only catches a game
+/// thread that never serves the adjustments.
+const PRESS_BOUND: Duration = Duration::from_secs(60);
+
+/// Whether `phase`'s `press-loading` press is still to be made, or made
+/// and not yet seen published: the phase holds on until it is, so the
+/// press lands in the phase however late the game thread gets to it.
+fn press_pending(phase: LoadPhase) -> bool {
+    PRESS_LOADING.load(Ordering::Relaxed) == phase as u8
+        || PRESSED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|(p, _)| p == phase)
 }
 
 /// How long the next load's decode holds at its first decoded file, ms
@@ -150,8 +171,9 @@ pub fn slow_chart_load(ms: u64) {
     SLOW_CHART_LOAD.store(ms, Ordering::Relaxed);
 }
 
-/// Holds `phase` on the thread running it as its `slow-` step says, once.
-/// Only a phase the render thread runs holds here.
+/// Holds `phase` on the thread running it as its `slow-` step says, once,
+/// and on until its `press-loading` press is made and published. Only a
+/// phase the render thread or the decode runs holds here.
 pub fn hold(phase: LoadPhase) {
     let (slow, what) = match phase {
         LoadPhase::ChartLoad => (&SLOW_CHART_LOAD, "the chart's load"),
@@ -164,6 +186,10 @@ pub fn hold(phase: LoadPhase) {
         println!("dev: {what} holds {ms} ms");
         let _stall = Stall::begin();
         std::thread::sleep(Duration::from_millis(ms));
+        let bound = Instant::now() + PRESS_BOUND;
+        while press_pending(phase) && Instant::now() < bound {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -186,9 +212,24 @@ pub fn press_loading(phase: LoadPhase) {
     PRESS_LOADING.store(phase as u8, Ordering::Relaxed);
 }
 
+/// A `press-loading` press made and not yet seen published: its phase and
+/// the hi-speed the adjustments published before it.
+static PRESSED: Mutex<Option<(LoadPhase, Option<game::Ratio>)>> = Mutex::new(None);
+
 /// Presses F2 on the window when a `press-loading` press is due in
-/// `phase`, the load's phase now, while that phase holds.
-pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
+/// `phase`, the load's phase now, while that phase holds; asked before
+/// each serving of the adjustments, `driver`'s, it also sees a press made
+/// before published once the hi-speed changed.
+pub fn press_due(
+    controls: &crate::controls::Controls,
+    phase: LoadPhase,
+    driver: Option<&game::AdjustDriver>,
+) {
+    let hispeed = driver.map(|d| d.snapshot().hispeed);
+    let mut pressed = PRESSED.lock().unwrap_or_else(PoisonError::into_inner);
+    if pressed.is_some_and(|(_, before)| hispeed.is_some_and(|h| h != before)) {
+        *pressed = None;
+    }
     if !STALLED.load(Ordering::SeqCst) {
         return;
     }
@@ -196,6 +237,8 @@ pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
         .compare_exchange(phase as u8, u8::MAX, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok();
     if due {
+        // Without the adjustments nothing will publish it.
+        *pressed = hispeed.map(|h| (phase, h));
         controls.window_key(1, input::WindowKeyEvent::Press, false);
         controls.window_key(1, input::WindowKeyEvent::Release, false);
         println!("dev: F2 pressed while {phase:?}");

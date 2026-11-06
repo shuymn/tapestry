@@ -327,7 +327,11 @@ impl PlayerRig<'_> {
         };
         let quit = || {
             #[cfg(feature = "dev-tools")]
-            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
+            crate::dev::press_due(
+                rig.controls,
+                crate::dev::LoadPhase::Preparing,
+                adjust.as_ref(),
+            );
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             rig.controls.leaving()
         };
@@ -982,7 +986,11 @@ impl Rig for PlayerRig<'_> {
         let staging = Instant::now();
         let prepared = rig.render.prepare_attempt_with(attempt, skin, || {
             #[cfg(feature = "dev-tools")]
-            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
+            crate::dev::press_due(
+                rig.controls,
+                crate::dev::LoadPhase::Preparing,
+                adjust.as_ref(),
+            );
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             preparation_stops(
                 rig.quitting(),
