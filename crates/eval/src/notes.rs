@@ -278,7 +278,7 @@ impl InputFacts {
 mod tests {
     use bms_model::{ChartBuilder, Lane, TimeUs};
 
-    use super::{NoteFacts, NoteHold};
+    use super::{InputFacts, NoteFacts, NoteHold};
 
     fn lane(n: u8) -> Lane {
         Lane::new(n).unwrap()
@@ -323,5 +323,23 @@ mod tests {
         f.reset();
         assert_eq!((f.hold(lane(2)), f.revision()), (None, 3));
         assert!(!f.is_done(lane(1), 129));
+    }
+
+    /// The presses at one µs stop at `u32::MAX` and stay there; a press at
+    /// a later µs counts from 1 again.
+    #[test]
+    fn presses_at_one_microsecond_saturate() {
+        let mut f = InputFacts::NONE;
+        let (l, t) = (lane(3), TimeUs(1_000));
+        f.press(l, t);
+        f.lanes[3].presses = u32::MAX - 1;
+        f.press(l, t);
+        assert_eq!(f.lane(l).presses, u32::MAX);
+        f.press(l, t);
+        assert_eq!(f.lane(l).presses, u32::MAX);
+        assert_eq!(f.lane(l).presses_at(t), u32::MAX);
+        f.press(l, TimeUs(1_001));
+        assert_eq!(f.lane(l).presses, 1);
+        assert_eq!(f.lane(l).presses_at(t), 0);
     }
 }
