@@ -163,7 +163,28 @@ pub(crate) fn read_timers(
     whens: &[Program],
     admit: impl Fn(usize) -> bool,
 ) {
-    let builtin = usize::from(timer::BUILTIN);
+    read_screen_timers(
+        usize::from(timer::BUILTIN),
+        now,
+        fields,
+        starts,
+        ms,
+        whens,
+        admit,
+    );
+}
+
+/// [`read_timers`] over a screen's `builtin` built-in timers: the play
+/// screen's, or another screen's schema's.
+pub(crate) fn read_screen_timers(
+    builtin: usize,
+    now: TimeUs,
+    fields: &[i32],
+    starts: &mut [Option<TimeUs>],
+    ms: &mut [i32],
+    whens: &[Program],
+    admit: impl Fn(usize) -> bool,
+) {
     for (ms, start) in ms.iter_mut().zip(starts.iter()).take(builtin) {
         *ms = reading(now, *start);
     }

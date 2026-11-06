@@ -4,6 +4,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::cell::Cell;
+
 use bms_model::{Chart, LANE_COUNT, TimeUs};
 use eval::{GaugeState, NoteFacts};
 use rules::GaugeValue;
@@ -23,6 +25,10 @@ use crate::play::timers::level_fields;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::schema::Ty;
+use crate::screen::ScreenKind;
+use crate::select::schema::timer as selection_timer;
+use crate::select::{Selection, SelectionError, SelectionFrame};
+use crate::selection::{SelectionLabels, SelectionView};
 use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
@@ -41,6 +47,15 @@ use crate::widget::judge::{
 };
 use crate::widget::lanes::LaneView;
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
+use crate::widget::ratio_bar::{
+    self, Hit, RatioBar, RatioBarDef, RatioBarError, RatioForm, RatioSource, SliderCommand,
+    SliderDirection,
+};
+use crate::widget::song_list::{
+    ImagePartDef, LevelDef, ListDraw, MAX_PLACEMENTS, Part, PartDef, PlacementDef, RowTextDef,
+    SongList, SongListDef, SongListError,
+};
+use crate::widget::text::clean;
 use crate::widget::text::{
     self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, Text, TextDef,
     TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
@@ -93,6 +108,20 @@ pub enum Source {
     /// by its motion, the covers it follows and its slider, and gated and
     /// clipped by its trim line.
     CoverPaint(u32),
+    /// The selection skin's song list ([`SelectionDefs::song_list`]). Its
+    /// track gives only color and alpha; its placements place themselves.
+    SongList,
+    /// The ratio bar at this index of [`SelectionDefs::ratio_bars`]: its
+    /// image cut to, or moved by, its ratio from the element's rect.
+    RatioBar(u32),
+}
+
+/// The widgets only a selection skin draws.
+#[derive(Clone, Debug, Default)]
+pub struct SelectionDefs {
+    /// The song list [`Source::SongList`] draws.
+    pub song_list: Option<SongListDef>,
+    pub ratio_bars: Vec<RatioBarDef>,
 }
 
 /// The widgets elements draw by index.
@@ -250,6 +279,16 @@ pub enum LoadError {
     },
     #[error("element {element}'s trimmed cover paint has a negative width or height")]
     CoverGate { element: usize },
+    #[error("element {element} draws what a {kind} skin cannot")]
+    SourceKind { element: usize, kind: ScreenKind },
+    #[error("the song list")]
+    SongList(#[source] SongListError),
+    #[error("ratio bar {bar}")]
+    RatioBar {
+        bar: usize,
+        #[source]
+        error: RatioBarError,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -265,6 +304,10 @@ enum Kind {
     ImageChoice(usize),
     /// The cover paint's index.
     CoverPaint(usize),
+    SongList,
+    /// The ratio bar's index, and its hit slot when it is a changeable
+    /// slider.
+    RatioBar(usize, Option<usize>),
 }
 
 #[derive(Clone, Debug)]
@@ -330,6 +373,8 @@ enum Phase<'a> {
         gauge: Option<LoadingGauge>,
         level: bool,
     },
+    /// A selection frame: its rows, ratios and slider hits.
+    Selection { sel: &'a Selection },
 }
 
 /// A loaded skin.
@@ -360,6 +405,12 @@ pub struct Skin {
     widget_quads: u32,
     bomb_up_to: Option<Grade>,
     close: Option<TimeUs>,
+    /// The screen the skin is made for: play, or selection.
+    kind: ScreenKind,
+    song_list: Option<SongList>,
+    ratio_bars: Box<[RatioBar]>,
+    /// The slider elements that take a press.
+    sliders: usize,
 }
 
 /// A table index from a definition's `u32`, past every table when it
@@ -371,7 +422,11 @@ fn index(i: u32) -> usize {
 /// The slot `timer` reads with `whens` `when` timers: a built-in slot, or
 /// `BUILTIN` plus the `when` index.
 fn slot_of(timer: TimerRef, whens: usize) -> Option<usize> {
-    let builtin = usize::from(BUILTIN);
+    screen_slot_of(timer, whens, usize::from(BUILTIN))
+}
+
+/// [`slot_of`] over a screen's `builtin` built-in timers.
+fn screen_slot_of(timer: TimerRef, whens: usize, builtin: usize) -> Option<usize> {
     match timer {
         TimerRef::Builtin(s) if usize::from(s) < builtin => Some(usize::from(s)),
         TimerRef::When(i) if usize::from(i) < whens => Some(builtin + usize::from(i)),
@@ -435,7 +490,10 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
         if track_outside(&e.track) {
             return Err(LoadError::Coordinates { element });
         }
-        let widget = matches!(e.source, Source::Lanes | Source::Judge(_));
+        let widget = matches!(
+            e.source,
+            Source::Lanes | Source::Judge(_) | Source::SongList
+        );
         if widget && !e.track.is_still() {
             return Err(LoadError::WidgetGeometry { element });
         }
@@ -621,7 +679,12 @@ fn check_widget_images(
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => {}
+        Source::Image(_)
+        | Source::Lanes
+        | Source::ImageChoice(_)
+        | Source::CoverPaint(_)
+        | Source::SongList
+        | Source::RatioBar(_) => {}
     }
     Ok(())
 }
@@ -668,7 +731,12 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
                 return Err(LoadError::Text { element, error });
             }
         }
-        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => {}
+        Source::Image(_)
+        | Source::Lanes
+        | Source::ImageChoice(_)
+        | Source::CoverPaint(_)
+        | Source::SongList
+        | Source::RatioBar(_) => {}
     }
     Ok(())
 }
@@ -678,9 +746,14 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// counts apart; for a
 /// text, 1, or with a bitmap font one per character: a literal's
 /// characters, or [`MAX_TEXT_BYTES`] for a field.
-fn worst(source: Source, w: &WidgetDefs) -> u32 {
+fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs) -> u32 {
     match source {
-        Source::Image(_) | Source::Lanes | Source::ImageChoice(_) | Source::CoverPaint(_) => 0,
+        Source::Image(_)
+        | Source::Lanes
+        | Source::ImageChoice(_)
+        | Source::CoverPaint(_)
+        | Source::RatioBar(_) => 0,
+        Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
             .numbers
@@ -692,7 +765,7 @@ fn worst(source: Source, w: &WidgetDefs) -> u32 {
 }
 
 /// The regions' boxes from the elements' keys and the lanes' rect.
-fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
+fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions {
     let mut out = Regions {
         fit: def.fit,
         defs: def.regions,
@@ -719,8 +792,17 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
             | Source::Judge(_)
             | Source::Text(_)
             | Source::ImageChoice(_)
-            | Source::CoverPaint(_) => {
+            | Source::CoverPaint(_)
+            | Source::SongList
+            | Source::RatioBar(_) => {
                 let b = match e.source {
+                    Source::SongList => sel.song_list.as_ref().and_then(|l| {
+                        l.placements
+                            .iter()
+                            .flat_map(|p| p.iter())
+                            .filter_map(|p| p.part.track.bounds())
+                            .reduce(|a, b| union(Some(a), b))
+                    }),
                     Source::Number(i) => def
                         .widgets
                         .numbers
@@ -738,9 +820,11 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>) -> Regions {
                         }
                     }
                     // A text's box only: spilled ink does not count.
-                    Source::Image(_) | Source::Gauge(_) | Source::Text(_) | Source::Lanes => {
-                        e.track.bounds()
-                    }
+                    Source::Image(_)
+                    | Source::Gauge(_)
+                    | Source::Text(_)
+                    | Source::Lanes
+                    | Source::RatioBar(_) => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -779,6 +863,7 @@ fn check_image_choices(
     w: &WidgetDefs,
     frames: &impl Fn(u32) -> Option<u16>,
     whens: usize,
+    builtin: usize,
 ) -> Result<(), LoadError> {
     for (table, d) in w.image_choices.iter().enumerate() {
         let fail = |error| Err(LoadError::ImageChoice { table, error });
@@ -803,7 +888,7 @@ fn check_image_choices(
                 if !(1..=MAX_KEY_US).contains(&cycle.period.0) {
                     return fail(ImageChoiceError::Cycle { choice });
                 }
-                if slot_of(cycle.timer, whens).is_none() {
+                if screen_slot_of(cycle.timer, whens, builtin).is_none() {
                     return fail(ImageChoiceError::UnknownTimer { choice });
                 }
             }
@@ -934,6 +1019,206 @@ fn check_bar_groups(
     Ok(())
 }
 
+/// The kind checks of [`Skin::new`] and [`Skin::new_selection`], first:
+/// a play skin draws no song list, ratio bar or selection text; a
+/// selection skin no lanes, gauge, judge or cover paint.
+fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
+    for (element, e) in def.elements.iter().enumerate() {
+        let ok = match kind {
+            ScreenKind::Selection => !matches!(
+                e.source,
+                Source::Lanes | Source::Gauge(_) | Source::Judge(_) | Source::CoverPaint(_)
+            ),
+            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => {
+                let selection_text = match e.source {
+                    Source::Text(i) => def
+                        .widgets
+                        .texts
+                        .get(index(i))
+                        .is_some_and(|t| matches!(t.value, TextValue::Selection(_))),
+                    _ => false,
+                };
+                !selection_text && !matches!(e.source, Source::SongList | Source::RatioBar(_))
+            }
+        };
+        if !ok {
+            return Err(LoadError::SourceKind { element, kind });
+        }
+    }
+    Ok(())
+}
+
+/// The selection widget checks of [`Skin::new_selection`]: the song list's
+/// placements, center, parts' timers, visibilities, keys, images, fonts and
+/// strips, and each ratio bar's image and range. `frames` gives an
+/// image's frame count; the timers are `builtin` built-ins and `whens`.
+fn check_selection_widgets(
+    sel: &SelectionDefs,
+    frames: &impl Fn(u32) -> Option<u16>,
+    whens: usize,
+    builtin: usize,
+    sheet: &Sheet,
+) -> Result<(), LoadError> {
+    if let Some(l) = &sel.song_list {
+        let fail = |e| Err(LoadError::SongList(e));
+        let n = l.placements.len();
+        if n == 0 {
+            return fail(SongListError::NoPlacements);
+        }
+        if n > MAX_PLACEMENTS {
+            return fail(SongListError::TooManyPlacements { n });
+        }
+        if usize::from(l.center) >= n {
+            return fail(SongListError::Center { center: l.center });
+        }
+        for p in l.parts() {
+            if screen_slot_of(p.timer, whens, builtin).is_none() {
+                return fail(SongListError::UnknownTimer);
+            }
+            if p.visible.as_ref().is_some_and(|v| v.ty() != Ty::Bool) {
+                return fail(SongListError::VisibleNotBool);
+            }
+            if track_outside(&p.track) {
+                return fail(SongListError::Coordinates);
+            }
+        }
+        if l.images().any(|i| frames(i).is_none()) {
+            return fail(SongListError::UnknownImage);
+        }
+        let [fonts, bitmaps] = [sheet.font_count(), sheet.bitmap_font_count()];
+        for t in l.text.iter().flatten() {
+            let known = match t.font {
+                FontRef::File(f) => index(f) < fonts,
+                FontRef::Bitmap(f) => index(f) < bitmaps,
+                FontRef::Default => true,
+            };
+            if !known {
+                return fail(SongListError::UnknownFont);
+            }
+            if t.part.track.rects().any(|[_, _, w, h]| h <= 0 || w < 0) {
+                return fail(SongListError::TextSize);
+            }
+        }
+        for v in l.level.iter().flatten() {
+            let level = |e| LoadError::SongList(SongListError::Level(e));
+            v.digits
+                .check_image(frames(v.digits.image))
+                .map_err(level)?;
+            v.digits.check().map_err(level)?;
+        }
+    }
+    for (bar, b) in sel.ratio_bars.iter().enumerate() {
+        let error = if frames(b.image).is_none() {
+            Some(RatioBarError::UnknownImage)
+        } else if matches!(b.form, RatioForm::Slider { range, .. } if range > MAX_COORD.unsigned_abs())
+        {
+            Some(RatioBarError::Range)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(LoadError::RatioBar { bar, error });
+        }
+    }
+    Ok(())
+}
+
+/// The song list `l` as a build draws it, its images from `image` and its
+/// timers' slots from `slot`.
+fn song_list_of(
+    l: SongListDef,
+    image: &impl Fn(u32) -> ImageRef,
+    slot: &impl Fn(TimerRef) -> usize,
+) -> SongList {
+    let part = |p: PartDef| {
+        let s = slot(p.timer);
+        (p, s)
+    };
+    let picture = |v: ImagePartDef| {
+        let (p, s) = part(v.part);
+        Part::new(p, s, image(v.image))
+    };
+    SongList {
+        placements: l
+            .placements
+            .into_iter()
+            .map(|arms| {
+                arms.map(|a: PlacementDef| {
+                    let (p, s) = part(a.part);
+                    Part::new(p, s, a.images.map(|i| i.map(image)))
+                })
+            })
+            .collect(),
+        center: usize::from(l.center),
+        text: l.text.map(|t| {
+            t.map(|t: RowTextDef| {
+                let (p, s) = part(t.part);
+                let bitmap = match t.font {
+                    FontRef::Bitmap(f) => Some(f),
+                    FontRef::Default | FontRef::File(_) => None,
+                };
+                let text = Text {
+                    slot: 0,
+                    align: t.align,
+                    overflow: t.overflow,
+                    bitmap,
+                };
+                Part::new(p, s, (text, t.font))
+            })
+        }),
+        level: l.level.map(|v| {
+            v.map(|v: LevelDef| {
+                let (p, s) = part(v.part);
+                Part::new(p, s, Digits::new(v.digits, image))
+            })
+        }),
+        lamp: l.lamp.map(|v| v.map(picture)),
+        label: l.label.map(|v| v.map(picture)),
+    }
+}
+
+/// The lines a selection skin rasterizes for a view: its text elements',
+/// by text slot, and its song list's rows', by row slot
+/// ([`Skin::selection_text_requests`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectionRequests {
+    pub texts: Vec<TextRequest>,
+    pub rows: Vec<TextRequest>,
+}
+
+/// Draws ratio bar `b` with `image` at `v` over `rect`: the frame the
+/// image's cycle shows, cut to or moved by `v`.
+fn draw_ratio(
+    b: &RatioBarDef,
+    image: ImageRef,
+    v: crate::selection::Ratio,
+    rect: [f32; 4],
+    brush: &Brush,
+    at: &Frame<'_>,
+    out: &mut QuadBatch,
+) {
+    let Some(f) = image.frame(at.starts, at.now, at.uvs) else {
+        return;
+    };
+    let fr = ratio_bar::fraction(v);
+    match b.form {
+        RatioForm::Bar { vertical } => {
+            let (r, f) = ratio_bar::cut(vertical, rect, f, fr);
+            brush.push(out, r, f, image.filter);
+        }
+        RatioForm::Slider {
+            direction, range, ..
+        } => {
+            brush.push(
+                out,
+                ratio_bar::slide(direction, range, rect, fr),
+                f,
+                image.filter,
+            );
+        }
+    }
+}
+
 /// A magnification as an exact fraction.
 #[derive(Clone, Copy)]
 struct Ratio(u128, u128);
@@ -1002,7 +1287,38 @@ impl Skin {
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new(mut def: SkinDef) -> Result<Self, LoadError> {
+    pub fn new(def: SkinDef) -> Result<Self, LoadError> {
+        Self::load(def, ScreenKind::Play, SelectionDefs::default())
+    }
+
+    /// Loads a selection skin: the checks of [`new`](Self::new) over the
+    /// selection schema and its timers, and its widgets in `widgets`. An
+    /// element may draw an image, an image choice, a number, a text, the
+    /// song list or a ratio bar; the lanes, a gauge, a judge or a cover
+    /// paint is refused ([`LoadError::SourceKind`]). The song list has 1 to
+    /// [`MAX_PLACEMENTS`] placements and its center among them, every
+    /// part's image, timer, font and strip exists, each visibility is a
+    /// bool and each key lies within ±[`MAX_COORD`]; every ratio bar's
+    /// image exists and a slider's range is at most [`MAX_COORD`]. Each
+    /// song list element is charged its parts' visibilities once per slot,
+    /// and its worst quads per slot.
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails.
+    pub fn new_selection(def: SkinDef, widgets: SelectionDefs) -> Result<Self, LoadError> {
+        Self::load(def, ScreenKind::Selection, widgets)
+    }
+
+    /// The checks of [`new`](Self::new) for a skin of `kind`, with the
+    /// selection widgets `sel`.
+    #[expect(clippy::too_many_lines, reason = "one ordered list of checks")]
+    fn load(mut def: SkinDef, kind: ScreenKind, sel: SelectionDefs) -> Result<Self, LoadError> {
+        check_kind(&def, kind)?;
+        let builtin = usize::from(match kind {
+            ScreenKind::Selection => selection_timer::BUILTIN,
+            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => BUILTIN,
+        });
         let elements = &def.elements;
         let whens = &def.whens;
         let w = &def.widgets;
@@ -1066,6 +1382,12 @@ impl Skin {
                     .iter()
                     .flat_map(|l| l.bar_groups.iter().map(|g| &g.track)),
             )
+            .chain(
+                sel.song_list
+                    .iter()
+                    .flat_map(SongListDef::parts)
+                    .map(|p| &p.track),
+            )
             .fold(0_usize, |n, t| n.saturating_add(t.key_count()));
         if keys > MAX_SKIN_KEYS {
             return Err(LoadError::TooManyKeys { n: keys });
@@ -1107,12 +1429,15 @@ impl Skin {
                 | Source::Gauge(_)
                 | Source::Text(_)
                 | Source::ImageChoice(_)
-                | Source::CoverPaint(_) => {}
+                | Source::CoverPaint(_)
+                | Source::SongList
+                | Source::RatioBar(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
         for (element, e) in elements.iter().enumerate() {
-            let slot = slot_of(e.timer, whens.len()).ok_or(LoadError::UnknownTimer { element })?;
+            let slot = screen_slot_of(e.timer, whens.len(), builtin)
+                .ok_or(LoadError::UnknownTimer { element })?;
             slots.push(slot);
             if let Source::Judge(i) = e.source
                 && let Some((part, _)) = w
@@ -1120,7 +1445,7 @@ impl Skin {
                     .get(index(i))
                     .into_iter()
                     .flat_map(JudgeDef::timers)
-                    .find(|&(_, t)| slot_of(t, whens.len()).is_none())
+                    .find(|&(_, t)| screen_slot_of(t, whens.len(), builtin).is_none())
             {
                 let error = JudgeError::UnknownTimer { part };
                 return Err(LoadError::Judge { element, error });
@@ -1137,6 +1462,8 @@ impl Skin {
             Source::Judge(i) => w.judges.get(index(i)).is_none(),
             Source::Text(i) => w.texts.get(index(i)).is_none(),
             Source::ImageChoice(i) => w.image_choices.get(index(i)).is_none(),
+            Source::SongList => sel.song_list.is_none(),
+            Source::RatioBar(i) => sel.ratio_bars.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -1148,15 +1475,18 @@ impl Skin {
             | Source::Judge(_)
             | Source::Text(_)
             | Source::ImageChoice(_)
-            | Source::CoverPaint(_) => false,
+            | Source::CoverPaint(_)
+            | Source::SongList
+            | Source::RatioBar(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
+        check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
         for (element, e) in elements.iter().enumerate() {
             let fonts = [def.sheet.font_count(), def.sheet.bitmap_font_count()];
             check_widget_images(element, e.source, w, &frames, fonts)?;
         }
-        check_image_choices(w, &frames, whens.len())?;
+        check_image_choices(w, &frames, whens.len(), builtin)?;
         check_cover_paints(w, images.len())?;
         if let Some((part, _)) = def
             .lanes
@@ -1171,7 +1501,7 @@ impl Skin {
             let cycle = match d.cycle {
                 Some(c) => Some(Cycle {
                     period: c.period.0,
-                    slot: slot_of(c.timer, whens.len())
+                    slot: screen_slot_of(c.timer, whens.len(), builtin)
                         .ok_or(LoadError::UnknownImageTimer { image })?,
                 }),
                 None => None,
@@ -1229,9 +1559,36 @@ impl Skin {
         {
             ops.charge(program).map_err(LoadError::Ops)?;
         }
+        if let Some(list) = &sel.song_list {
+            let lists = elements
+                .iter()
+                .filter(|e| e.source == Source::SongList)
+                .count();
+            let slots = list.placements.len();
+            let arms = list
+                .placements
+                .iter()
+                .flat_map(|p| p.iter())
+                .filter_map(|p| p.part.visible.as_ref());
+            let styles: Vec<&Program> = list
+                .parts()
+                .skip(2 * slots)
+                .filter_map(|p| p.visible.as_ref())
+                .collect();
+            for _ in 0..lists {
+                for program in arms.clone() {
+                    ops.charge(program).map_err(LoadError::Ops)?;
+                }
+                for &program in &styles {
+                    for _ in 0..slots {
+                        ops.charge(program).map_err(LoadError::Ops)?;
+                    }
+                }
+            }
+        }
         let widget_quads = elements
             .iter()
-            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w)));
+            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w, &sel)));
         if widget_quads > u64::from(MAX_WIDGET_QUADS) {
             return Err(LoadError::TooManyWidgetQuads { n: widget_quads });
         }
@@ -1247,14 +1604,14 @@ impl Skin {
         };
         let n_whens = whens.len();
         // A timer only an unreferenced judge names reads off.
-        let slot = |t: TimerRef| slot_of(t, n_whens).unwrap_or(usize::MAX);
+        let slot = |t: TimerRef| screen_slot_of(t, n_whens, builtin).unwrap_or(usize::MAX);
         let checked = lanes.is_some();
         let lanes = def
             .lanes
             .take()
             .filter(|_| checked)
             .map(|l| Lanes::new(l, image, slot));
-        let regions = regions(&def, lanes.as_ref());
+        let regions = regions(&def, lanes.as_ref(), &sel);
         let WidgetDefs {
             numbers,
             gauges,
@@ -1346,6 +1703,19 @@ impl Skin {
             .collect();
         // Text slots in draw order; at most `MAX_TEXT_ELEMENTS`.
         let mut text_slots = 0_u16;
+        let mut sliders = 0_usize;
+        let SelectionDefs {
+            song_list,
+            ratio_bars,
+        } = sel;
+        let song_list = song_list.map(|l| song_list_of(l, &image, &slot));
+        let ratio_bars: Box<[RatioBar]> = ratio_bars
+            .into_iter()
+            .map(|def| RatioBar {
+                def,
+                image: image(def.image),
+            })
+            .collect();
         let elements = def
             .elements
             .into_iter()
@@ -1374,6 +1744,21 @@ impl Skin {
                     Source::Judge(i) => Kind::Judge(index(i)),
                     Source::ImageChoice(i) => Kind::ImageChoice(index(i)),
                     Source::CoverPaint(p) => Kind::CoverPaint(index(p)),
+                    Source::SongList => Kind::SongList,
+                    Source::RatioBar(i) => {
+                        let changeable = matches!(
+                            ratio_bars.get(index(i)).map(|b| b.def.form),
+                            Some(RatioForm::Slider {
+                                changeable: true,
+                                ..
+                            })
+                        );
+                        let hit = changeable.then(|| {
+                            sliders += 1;
+                            sliders - 1
+                        });
+                        Kind::RatioBar(index(i), hit)
+                    }
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -1425,6 +1810,10 @@ impl Skin {
             widget_quads,
             bomb_up_to: def.bomb_up_to,
             close: def.close,
+            kind,
+            song_list,
+            ratio_bars,
+            sliders,
         })
     }
 
@@ -1545,7 +1934,8 @@ impl Skin {
     }
 
     /// The quads a frame can push: one per image element (an image choice
-    /// element and a cover paint included, however long its table), each
+    /// element, a cover paint and a ratio bar included, however long its
+    /// table), each
     /// widget
     /// element's worst case (a number's cells, a gauge's segments and its
     /// flicker's tip, a judge's largest slot with its combo's cells, a
@@ -1559,7 +1949,10 @@ impl Skin {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    Kind::Image(_) | Kind::ImageChoice(_) | Kind::CoverPaint(_)
+                    Kind::Image(_)
+                        | Kind::ImageChoice(_)
+                        | Kind::CoverPaint(_)
+                        | Kind::RatioBar(..)
                 )
             })
             .count();
@@ -1940,6 +2333,9 @@ impl Skin {
     /// A negative lead-in, a READY state start outside the time range, or a
     /// section whose initial gauges do not match the context's gauges.
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
+        if self.kind != ScreenKind::Play {
+            return Err(PrepareError::Kind);
+        }
         Play::new(
             chart,
             ctx,
@@ -1996,6 +2392,9 @@ impl Skin {
         uvs: &UvTable,
         out: &mut QuadBatch,
     ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Play {
+            return Err(BuildError::Kind);
+        }
         play.check()?;
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
             || play.bar_capacity() != self.bar_group_count()
@@ -2064,6 +2463,9 @@ impl Skin {
         uvs: &UvTable,
         out: &mut QuadBatch,
     ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Play {
+            return Err(BuildError::Kind);
+        }
         if let Some(e) = loading.refused() {
             return Err(e);
         }
@@ -2097,6 +2499,324 @@ impl Skin {
         Ok(())
     }
 
+    /// The screen this skin is made for: play, or selection.
+    #[must_use]
+    pub fn kind(&self) -> ScreenKind {
+        self.kind
+    }
+
+    /// The song list's slots: the rows a selection view places around
+    /// its cursor. 0 without a song list.
+    #[must_use]
+    pub fn song_list_slots(&self) -> usize {
+        self.song_list.as_ref().map_or(0, |l| l.placements.len())
+    }
+
+    /// The song list's center slot, where the cursor's row shows.
+    #[must_use]
+    pub fn song_list_center(&self) -> usize {
+        self.song_list.as_ref().map_or(0, |l| l.center)
+    }
+
+    /// A fresh selection state ([`Selection`]): every timer off, every
+    /// field 0, every row and text slot empty until a view and a text
+    /// table. One a play skin makes is inert: it draws nothing.
+    #[must_use]
+    pub fn prepare_selection(&self) -> Selection {
+        let live = self.kind == ScreenKind::Selection;
+        Selection::new(
+            live,
+            self.whens.len(),
+            self.text_slots(),
+            self.song_list_slots(),
+            self.sliders,
+        )
+    }
+
+    /// Whether `sel` is a state this selection skin made.
+    fn owns(&self, sel: &Selection) -> bool {
+        self.kind == ScreenKind::Selection
+            && sel.live
+            && sel.slots() == usize::from(selection_timer::BUILTIN) + self.whens.len()
+            && sel.rows.len() == self.song_list_slots()
+            && sel.hits.len() == self.sliders
+            && sel.text.len() == self.text_slots()
+    }
+
+    /// Fills `sel` from `view` and the player's `labels`: the fields, the
+    /// strings its text shows, each song list slot's row (slot `i` shows
+    /// row `cursor + i − center` of the view, a slot past the view's rows
+    /// none) and the ratios. For a view change, not a frame: it may
+    /// allocate, at most the strings' growth. The texts stay as attached
+    /// until a new table is.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectionError::Kind`] when this is not a selection skin or `sel`
+    /// is not its state; nothing changes.
+    pub fn update_selection(
+        &self,
+        sel: &mut Selection,
+        view: &SelectionView,
+        labels: &SelectionLabels,
+    ) -> Result<(), SelectionError> {
+        if !self.owns(sel) {
+            return Err(SelectionError::Kind);
+        }
+        sel.update(view, labels, self.song_list_center());
+        Ok(())
+    }
+
+    /// The lines to rasterize for `sel`'s strings on a `target`-pixel
+    /// target with `layout`: each text element's, as
+    /// [`text_requests`](Self::text_requests) makes them, with the
+    /// selection's strings; and each song list row's, in its row style's
+    /// font, its em from that style's keys under the song list's region.
+    /// A slot in a bitmap font gives none. For a view change, not a frame:
+    /// it allocates. A state this skin did not make gives none.
+    #[must_use]
+    pub fn selection_text_requests(
+        &self,
+        sel: &Selection,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> SelectionRequests {
+        let mut out = SelectionRequests::default();
+        if !self.owns(sel) {
+            return out;
+        }
+        let (fit, ..) = self.fit(target);
+        let em = |track: &Track, region: Region| {
+            let h = track.rects().map(|[.., h]| h).max().unwrap_or(0);
+            let h = u128::try_from(h).unwrap_or(0);
+            let scale = self.regions.effective(region, layout).scale;
+            let em = Ratio(h, 1).mul(fit).mul(Ratio(u128::from(scale), 100));
+            // Both terms are below 2^60; rounding them to f64 is the intent.
+            #[expect(clippy::cast_precision_loss, reason = "as `text_requests`")]
+            let px = f32_of(em.0 as f64 / em.1 as f64).min(MAX_TEXT_EM_PX);
+            px
+        };
+        let strings = &sel.strings;
+        let chart = strings.chart();
+        for e in &self.elements {
+            let Kind::Text(i, t) = e.kind else {
+                continue;
+            };
+            let Some(def) = self.texts.get(i) else {
+                continue;
+            };
+            if t.bitmap.is_some() || e.visible.as_ref().and_then(Program::constant) == Some(0) {
+                continue;
+            }
+            let s = clean(
+                &def.value
+                    .resolve_with(&chart, &strings.query, &strings.place),
+            );
+            if !s.is_empty() {
+                out.texts.push(TextRequest {
+                    slot: t.slot,
+                    text: s,
+                    font: def.font,
+                    em_px: em(&e.track, e.region),
+                });
+            }
+        }
+        let (Some(list), Some(region)) = (&self.song_list, self.song_list_region()) else {
+            return out;
+        };
+        for (i, (row, s)) in sel.rows.iter().zip(sel.row_strings.iter()).enumerate() {
+            let Some(t) = row
+                .style
+                .and_then(|s| list.text.get(s as usize))
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let (text, font) = t.content;
+            if text.bitmap.is_some() {
+                continue;
+            }
+            let s = clean(s);
+            if !s.is_empty() {
+                out.rows.push(TextRequest {
+                    slot: u16::try_from(i).unwrap_or(u16::MAX),
+                    text: s,
+                    font,
+                    em_px: em(&t.track, region),
+                });
+            }
+        }
+        out
+    }
+
+    /// The region the first song list element draws in.
+    fn song_list_region(&self) -> Option<Region> {
+        self.elements
+            .iter()
+            .find(|e| matches!(e.kind, Kind::SongList))
+            .map(|e| e.region)
+    }
+
+    /// Attaches the rasterized lines for `sel`'s text elements and song
+    /// list rows; a slot in a bitmap font draws its bitmap line instead.
+    ///
+    /// # Errors
+    ///
+    /// A table whose length is not the text slots, or the song list's
+    /// slots; nothing changes.
+    pub fn attach_selection_text(
+        &self,
+        sel: &mut Selection,
+        texts: TextTable,
+        rows: TextTable,
+    ) -> Result<(), TextTableError> {
+        for (expected, got) in [
+            (self.text_slots(), texts.len()),
+            (self.song_list_slots(), rows.len()),
+        ] {
+            if got != expected {
+                return Err(TextTableError::Len { expected, got });
+            }
+        }
+        sel.text = texts;
+        sel.row_text = rows;
+        Ok(())
+    }
+
+    /// Lays out `sel`'s lines in bitmap fonts: each text element's and
+    /// each song list row's in its style's font, chosen and cleaned as
+    /// [`selection_text_requests`](Self::selection_text_requests) does.
+    /// For a view change, not a frame: it allocates.
+    pub fn attach_selection_bitmap_text(&self, sel: &mut Selection) {
+        if !self.owns(sel) {
+            return;
+        }
+        let mut lines = vec![None; self.text_slots()];
+        {
+            let strings = &sel.strings;
+            let chart = strings.chart();
+            for e in &self.elements {
+                let Kind::Text(i, t) = e.kind else {
+                    continue;
+                };
+                let (Some(font), Some(def)) = (t.bitmap, self.texts.get(i)) else {
+                    continue;
+                };
+                if e.visible.as_ref().and_then(Program::constant) == Some(0) {
+                    continue;
+                }
+                let s = clean(
+                    &def.value
+                        .resolve_with(&chart, &strings.query, &strings.place),
+                );
+                if let Some(slot) = lines.get_mut(usize::from(t.slot)) {
+                    *slot = glyphs::layout(&self.sheet, font, &s);
+                }
+            }
+        }
+        sel.bitmap = lines.into_boxed_slice();
+        let Some(list) = &self.song_list else {
+            return;
+        };
+        let rows: Vec<_> = sel
+            .rows
+            .iter()
+            .zip(sel.row_strings.iter())
+            .map(|(row, s)| {
+                let t = row
+                    .style
+                    .and_then(|s| list.text.get(s as usize))
+                    .and_then(Option::as_ref)?;
+                let font = t.content.0.bitmap?;
+                glyphs::layout(&self.sheet, font, &clean(s))
+            })
+            .collect();
+        sel.row_bitmap = rows.into_boxed_slice();
+    }
+
+    /// Builds one selection frame of `sel`, which must come from this
+    /// skin's [`prepare_selection`](Self::prepare_selection): starts the
+    /// built-in timers from the frame's starts and the `when` timers over
+    /// the fields, places the regions, then appends each drawn element's
+    /// quads to `out` in draw order (the caller clears `out`): images,
+    /// image choices, numbers, text, the song list's slots and the ratio
+    /// bars, recording each changeable slider's travel for
+    /// [`slider_at`](Self::slider_at). Allocates nothing.
+    ///
+    /// A state this skin did not make, or a uv table of another sheet or
+    /// length, draws nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a selection skin;
+    /// nothing is appended.
+    pub fn build_selection(
+        &self,
+        sel: &mut Selection,
+        frame: &SelectionFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Selection {
+            return Err(BuildError::Kind);
+        }
+        for h in &sel.hits {
+            h.set(None);
+        }
+        if !self.owns(sel)
+            || uvs.sheet_id() != self.sheet_id
+            || uvs.frames().len() != self.frame_count
+        {
+            return Ok(());
+        }
+        let canvas = self.canvas(frame.target);
+        let placement = self.placement(&canvas, frame.layout, Side::Left);
+        sel.fill(frame.now, &frame.timers, &self.whens);
+        let sel = &*sel;
+        let rt = Runtime {
+            starts: sel.starts(),
+            state: sel.state(),
+            text: &sel.text,
+            bitmap: &sel.bitmap,
+        };
+        let scene = Scene {
+            now: frame.now,
+            display: frame.now,
+            lanes: LaneView::NONE,
+            complete: false,
+            hidden_enabled: false,
+            phase: Phase::Selection { sel },
+        };
+        self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
+        Ok(())
+    }
+
+    /// What a press at `point` (target pixels) on a `target`-pixel target
+    /// asks of a changeable slider drawn by the last
+    /// [`build_selection`](Self::build_selection) of `sel`: the ratio under
+    /// it on the topmost such slider's travel, as the source reads it
+    /// (`skin/SkinSlider.java:124-178`), the ends snapped within one
+    /// reference pixel. `None` off every travel, for a slider that did not
+    /// draw in that build, or when that build was at another target size.
+    /// Changes nothing.
+    #[must_use]
+    pub fn slider_at(
+        &self,
+        sel: &Selection,
+        point: [f32; 2],
+        target: [u32; 2],
+    ) -> Option<SliderCommand> {
+        if !self.owns(sel) {
+            return None;
+        }
+        sel.hits
+            .iter()
+            .rev()
+            .filter_map(Cell::get)
+            .filter(|h| h.target == target)
+            .find_map(|h| h.at(point))
+    }
+
     /// The elements of a build once its state is filled, the lanes drawing
     /// their bar groups with `bars`.
     #[expect(
@@ -2123,7 +2843,11 @@ impl Skin {
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
         let play = match scene.phase {
             Phase::Play { play, notes, .. } => Some((play, notes)),
-            Phase::Loading { .. } => None,
+            Phase::Loading { .. } | Phase::Selection { .. } => None,
+        };
+        let sel = match scene.phase {
+            Phase::Selection { sel } => Some(sel),
+            Phase::Play { .. } | Phase::Loading { .. } => None,
         };
         #[cfg(feature = "dev-tools")]
         let mut element = 0_u32;
@@ -2139,6 +2863,37 @@ impl Skin {
             if let Phase::Loading { gauge, level } = scene.phase
                 && !e.loading.met(gauge.is_some(), level)
             {
+                continue;
+            }
+            if let (Kind::SongList, Some(sel), Some(list)) = (e.kind, sel, &self.song_list) {
+                if !placement.region(e.region).visible {
+                    continue;
+                }
+                let Some((_t, s)) =
+                    sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
+                else {
+                    continue;
+                };
+                let d = ListDraw {
+                    starts: rt.starts,
+                    now,
+                    state,
+                    rows: &sel.rows,
+                    text: &sel.row_text,
+                    bitmap: &sel.row_bitmap,
+                    uvs,
+                    brush: Brush {
+                        key: e.key,
+                        affine: placement.affine(e.region, e.fill),
+                        map: placement.bind(e.bind),
+                        pivot: e.pivot,
+                        angle: 0.0,
+                        color: s.color,
+                        native: None,
+                        scale: canvas.scale(),
+                    },
+                };
+                list.draw(&d, out);
                 continue;
             }
             if let Kind::Lanes = e.kind {
@@ -2310,6 +3065,7 @@ impl Skin {
                                 border: g.border,
                                 value: GaugeValue(0),
                             }),
+                            Phase::Selection { .. } => None,
                         };
                         let d = GaugeDraw { at, shown, t };
                         g.draw(&d, rect, &brush, out);
@@ -2343,7 +3099,46 @@ impl Skin {
                         t.draw(image, rect, &brush, out);
                     }
                 }
-                Kind::Lanes => {}
+                Kind::RatioBar(i, hit) => {
+                    if let (Some(b), Some(sel)) = (self.ratio_bars.get(i), sel) {
+                        let image = b.image;
+                        let b = &b.def;
+                        let value = match b.source {
+                            RatioSource::ListPosition => sel.position,
+                            RatioSource::ExRate => sel.ex_rate,
+                        };
+                        if let Some(v) = value {
+                            draw_ratio(b, image, v, rect, &brush, &at, out);
+                            if let (
+                                Some(h),
+                                RatioForm::Slider {
+                                    direction, range, ..
+                                },
+                            ) = (hit.and_then(|h| sel.hits.get(h)), b.form)
+                            {
+                                let [ox, oy] = canvas.origin();
+                                let sc = canvas.scale();
+                                let [x, y, w, h_] = affine.rect(rect);
+                                let [sx, sy] = affine.scale;
+                                let axis = match direction {
+                                    SliderDirection::Up | SliderDirection::Down => sy,
+                                    SliderDirection::Right | SliderDirection::Left => sx,
+                                } * sc;
+                                #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
+                                let range = range as f32 * axis;
+                                h.set(Some(Hit {
+                                    source: b.source,
+                                    direction,
+                                    rect: [ox + x * sc, oy + y * sc, w * sc, h_ * sc],
+                                    range,
+                                    scale: axis,
+                                    target: canvas.target(),
+                                }));
+                            }
+                        }
+                    }
+                }
+                Kind::Lanes | Kind::SongList => {}
             }
         }
         #[cfg(feature = "dev-tools")]
