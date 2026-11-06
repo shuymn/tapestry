@@ -3,11 +3,13 @@
 //! cursor, each with its identity, kind, text, level and typed score, the
 //! cursor's position as an exact ratio, the place and the query, and what is
 //! known of the selected chart. The player fills it; whatever draws the
-//! screen reads it.
+//! screen reads it, with the player's own strings in [`SelectionLabels`].
 
 use std::path::{Path, PathBuf};
 
 use bms_model::ChartSummary;
+
+use crate::GaugeLook;
 
 /// The most rows a [`SelectionView`] holds.
 pub const MAX_VISIBLE_ROWS: usize = 64;
@@ -58,8 +60,9 @@ pub enum SelectionPlace {
     /// The "all charts" row, then the library's roots or the one root's level.
     #[default]
     Top,
-    /// A folder's level, by its directory's name.
-    Folder(String),
+    /// A folder's level: the directory names of the folders entered from
+    /// Top's level to this one, outermost first.
+    Folder(Vec<String>),
     /// The all-chart list.
     All,
     /// A query's results, whatever the place under them.
@@ -121,10 +124,38 @@ pub struct RowView {
     pub artist: String,
     /// `#PLAYLEVEL` as stored; empty when there is none.
     pub level: String,
+    /// `level` as a number, as a skin draws it: what Java's
+    /// `Integer.parseInt` reads, 0 when it reads none; 0 on a row that is
+    /// not a chart.
+    pub level_value: i32,
     /// `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,
     /// Under the chosen preset; `Unplayed` on a row that is not a chart.
     pub score: RowScore,
+    /// What the chart's summary tells of its notes; `None` without a
+    /// summary and on a row that is not a chart.
+    pub features: Option<RowFeatures>,
+    /// Whether the chart declares `#RANDOM` or `#SETRANDOM`; false on a row
+    /// that is not a chart.
+    pub random: bool,
+}
+
+/// What a chart's summary (the draw with seed 0) tells of its notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowFeatures {
+    pub long_notes: bool,
+    pub mines: bool,
+}
+
+impl RowFeatures {
+    /// The features `summary` shows.
+    #[must_use]
+    pub const fn of(summary: &ChartSummary) -> Self {
+        Self {
+            long_notes: summary.longs > 0,
+            mines: summary.mines > 0,
+        }
+    }
 }
 
 /// A chart's best under the chosen preset.
@@ -147,10 +178,12 @@ pub enum RowScore {
 pub enum OwnLamp {
     Failed,
     /// The cleared gauge of the highest lamp rank: its index in the preset's
-    /// gauges and that rank.
+    /// gauges, that rank, and the gauge's look ([`GaugeLook::of`]), which a
+    /// skin's lamp images are chosen by.
     Cleared {
         gauge: u16,
         rank: u16,
+        look: GaugeLook,
     },
     FullCombo,
 }
@@ -164,8 +197,21 @@ pub struct ChartLabels {
     pub subartist: String,
     pub genre: String,
     pub level: String,
+    /// `level` as a number, as [`RowView::level_value`].
+    pub level_value: i32,
     /// `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,
+}
+
+/// The player's own strings a skin draws on selection, in the player's
+/// language: never chart, folder or query text, and never a literal of the
+/// skin's or of this crate's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectionLabels {
+    /// The "all charts" row's and place's name.
+    pub all_charts: String,
+    /// The name of a query's results.
+    pub search_results: String,
 }
 
 /// The chart under the cursor.
@@ -185,7 +231,29 @@ pub struct SelectedChart {
 
 #[cfg(test)]
 mod tests {
-    use super::Ratio;
+    use bms_model::{ChartSummary, Tempo, TimeUs};
+
+    use super::{Ratio, RowFeatures};
+
+    /// A summary's long notes and mines show as features, each on its own.
+    #[test]
+    fn features_read_long_notes_and_mines() {
+        let tempo = Tempo::from_units(Tempo::UNITS_PER_BPM).unwrap();
+        let summary = |longs, mines| ChartSummary {
+            taps: 1,
+            longs,
+            mines,
+            length: TimeUs(1),
+            tempo_start: tempo,
+            tempo_min: tempo,
+            tempo_max: tempo,
+        };
+        let f = |long_notes, mines| RowFeatures { long_notes, mines };
+        assert_eq!(RowFeatures::of(&summary(0, 0)), f(false, false));
+        assert_eq!(RowFeatures::of(&summary(1, 0)), f(true, false));
+        assert_eq!(RowFeatures::of(&summary(0, 1)), f(false, true));
+        assert_eq!(RowFeatures::of(&summary(5, 9)), f(true, true));
+    }
 
     #[test]
     fn a_ratio_has_a_denominator() {
