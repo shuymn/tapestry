@@ -797,6 +797,10 @@ struct Shared {
     /// Why the selection skin was refused at runtime, until the game
     /// thread takes it for its notice ([`RenderLink::take_selection_refusal`]).
     selection_refused: Mutex<Option<String>>,
+    /// How long the launch screen has shown, in place of the clock's
+    /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
+    #[cfg(test)]
+    launch_elapsed: Mutex<Option<Duration>>,
 }
 
 impl Shared {
@@ -1140,6 +1144,17 @@ impl RenderLink {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Fence(tx));
         rx.recv_timeout(deadline).is_ok()
+    }
+
+    /// Makes the render thread read the launch screen's time as `elapsed`
+    /// from now on, or from its clock again with `None` (tests).
+    #[cfg(test)]
+    pub(crate) fn set_launch_elapsed(&self, elapsed: Option<Duration>) {
+        *self
+            .shared
+            .launch_elapsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = elapsed;
     }
 
     /// Selection lifetime `lifetime` begins: updates of it are taken from
@@ -1848,6 +1863,8 @@ pub fn spawn(
         packing: Mutex::new(None),
         selection: Mutex::new(SelectionSlot::default()),
         selection_refused: Mutex::new(None),
+        #[cfg(test)]
+        launch_elapsed: Mutex::new(None),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -2357,6 +2374,22 @@ struct Run {
 }
 
 impl Run {
+    /// How long the launch screen has shown: since the render thread
+    /// started (in tests, the time a test set instead, if any).
+    fn launch_elapsed(shared: &Shared, started: Instant) -> Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = *shared
+            .launch_elapsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return elapsed;
+        }
+        #[cfg(not(test))]
+        let _ = shared;
+        started.elapsed()
+    }
+
     /// Takes the newest selection update from the slot, if it is newer than
     /// the one held and its lifetime current: the lifetime's first starts
     /// the skin's state afresh.
@@ -2499,9 +2532,13 @@ impl Run {
                 Ok(RenderMsg::Menu(page)) => {
                     mode = match mode {
                         // The launch screen shows out its time.
-                        Mode::Splash { .. } if self.started.elapsed() < SPLASH => Mode::Splash {
-                            pending: Some(page),
-                        },
+                        Mode::Splash { .. }
+                            if Self::launch_elapsed(&self.shared, self.started) < SPLASH =>
+                        {
+                            Mode::Splash {
+                                pending: Some(page),
+                            }
+                        }
                         _ => Mode::Menu {
                             page,
                             update: None,
@@ -2515,7 +2552,9 @@ impl Run {
                     mode = match mode {
                         // The launch screen shows out its time, the
                         // select screen after it.
-                        Mode::Splash { .. } if self.started.elapsed() < SPLASH => {
+                        Mode::Splash { .. }
+                            if Self::launch_elapsed(&self.shared, self.started) < SPLASH =>
+                        {
                             Mode::Splash { pending: None }
                         }
                         _ if self.selection.is_some() => Mode::Selection,
@@ -2736,7 +2775,7 @@ impl Run {
                 _ => None,
             };
             // The launch screen's time is over: the page waiting replaces it.
-            let elapsed = self.started.elapsed();
+            let elapsed = Self::launch_elapsed(&self.shared, self.started);
             if elapsed >= SPLASH
                 && let Mode::Splash { pending } = &mut mode
             {
@@ -7542,10 +7581,11 @@ pub(crate) mod tests {
             self.shared.pace.load(Ordering::Acquire)
         }
         fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
-            self.shared
-                .splash
-                .load(Ordering::Acquire)
-                .then_some(Ok(true))
+            let shown = self.shared.splash.load(Ordering::Acquire);
+            if shown {
+                self.shared.splashes.fetch_add(1, Ordering::AcqRel);
+            }
+            shown.then_some(Ok(true))
         }
         fn selection(
             &mut self,
@@ -7710,6 +7750,8 @@ pub(crate) mod tests {
         pub(crate) held: Arc<AtomicBool>,
         /// The screens draw a launch screen while set; none otherwise.
         pub(crate) splash: Arc<AtomicBool>,
+        /// The launch screen frames drawn.
+        pub(crate) splashes: Arc<AtomicU32>,
         /// Each selection frame: its update's lifetime and revision, the
         /// skin state's number (none without one), whether it was laid out
         /// again, and its timers.
