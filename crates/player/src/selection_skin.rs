@@ -511,12 +511,54 @@ fn fixture_of(settings: bool) -> tempfile::TempDir {
     dir
 }
 
-/// [`fixture`] built as the selection kind for `r` (dev-tools tests).
+/// [`fixture`] with the same skin in Lua beside it as `s.luaskin`, its
+/// place and search texts read through callbacks that lower (tests).
+#[cfg(test)]
+pub(crate) fn lua_fixture() -> tempfile::TempDir {
+    let dir = fixture();
+    let lua = r#"local skin = { type = 5, name = "t", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require("main_state")
+skin.source = { { id = "s", path = "s.png" } }
+skin.font = { { id = "f", path = "f.ttf" } }
+skin.image = { { id = "b", src = "s", x = 0, y = 0, w = 8, h = 8 } }
+skin.imageset = { { id = "set", images = { "b", "b", "b", "b", "b", "b" } } }
+skin.text = {
+  { id = "t", font = "f", size = 30, ref = 10 },
+  { id = "place", font = "f", size = 30, value = function() return ms.text(1000) end },
+  { id = "q", font = "f", size = 30, value = function() return ms.text(30) end },
+}
+local function slots()
+  local s = {}
+  for i = 0, 6 do
+    s[#s + 1] = { id = "set", dst = { { x = 1000, y = 900 - i * 100, w = 800, h = 80 } } }
+  end
+  return s
+end
+skin.songlist = { id = "list", center = 3, liston = slots(), listoff = slots(),
+  text = { { id = "t", dst = { { x = 10, y = 10, w = 700, h = 40 } } } } }
+skin.destination = {
+  { id = "list", dst = { { x = 0, y = 0, w = 0, h = 0 } } },
+  { id = "place", dst = { { x = 100, y = 1000, w = 800, h = 40 } } },
+  { id = "q", dst = { { x = 100, y = 950, w = 800, h = 40 } } },
+}
+return skin
+"#;
+    std::fs::write(dir.path().join("s.luaskin"), lua).unwrap();
+    dir
+}
+
+/// The fixture's skin `entry` in `dir` built as the selection kind for `r`
+/// (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
-pub(crate) fn fixture_bundle(r: &render::Renderer, dir: &std::path::Path) -> Arc<SkinBundle> {
+pub(crate) fn fixture_bundle(
+    r: &render::Renderer,
+    dir: &std::path::Path,
+    entry: &str,
+) -> Arc<SkinBundle> {
     let choice = game::SkinChoice {
         root: dir.to_owned(),
-        entry: "s.json".to_owned(),
+        entry: entry.to_owned(),
         options: Default::default(),
         files: Default::default(),
     };
