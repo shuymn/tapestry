@@ -3995,7 +3995,7 @@ pub(crate) mod tests {
                 let sel = rig.selection.as_mut().unwrap();
                 sel.dirty = true;
                 sel.show(&rig.render, None, rig.clock.now());
-                std::thread::sleep(Duration::from_millis(200));
+                assert!(rig.render.fence(Duration::from_secs(5)));
                 screens
                     .selections
                     .lock()

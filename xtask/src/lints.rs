@@ -434,10 +434,15 @@ pub const IN_PLAY: &[Site] = &[
             "strip_sprites",
         ],
     ),
-    // The selection frame's timers and the strip's preset line.
+    // The selection frame's timers, the strip's preset line, and the
+    // lifetime check before the frame's build.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
-        &["SelectionEvents::timers", "SelectionEvents::preset_shown"],
+        &[
+            "SelectionEvents::timers",
+            "SelectionEvents::preset_shown",
+            "SelectionSlot::current",
+        ],
     ),
     // The development builds' counting allocator, which every allocation
     // calls, and the render thread's app region marks.

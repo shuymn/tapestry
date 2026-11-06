@@ -103,7 +103,7 @@ fn the_slot_holds_the_newest_and_a_left_lifetime_is_never_drawn() {
     // Made after the end: dropped at the slot.
     link.show_selection(update(1, 103));
     screens.pace.store(false, Ordering::Release);
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(link.fence(FENCE));
     let drawn: Vec<u64> = seen(&screens).iter().map(|s| s.revision).collect();
     assert!(!drawn.contains(&102), "{drawn:?}");
     assert!(!drawn.contains(&103), "{drawn:?}");
@@ -217,7 +217,7 @@ fn an_older_update_is_never_drawn_after_a_newer_one() {
         .iter()
         .any(|s| s.revision == 2)));
     link.show_selection(update(1, 1));
-    std::thread::sleep(Duration::from_millis(100));
+    assert!(link.fence(FENCE));
     let drawn: Vec<u64> = seen(&screens).iter().map(|s| s.revision).collect();
     assert!(drawn.iter().all(|r| *r == 2), "{drawn:?}");
     link.exit();

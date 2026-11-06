@@ -210,8 +210,10 @@ impl SelectionSlot {
         self.value = None;
     }
 
-    /// Whether `lifetime` is the current one.
+    /// Whether `lifetime` is the current one. Allocates nothing: the
+    /// render thread asks it right before a selection frame's build.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn current(&self, lifetime: u64) -> bool {
         lifetime != 0 && self.active == lifetime
     }
