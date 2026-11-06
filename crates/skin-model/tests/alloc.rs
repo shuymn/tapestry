@@ -1316,6 +1316,12 @@ struct Witness {
     /// farther than its release) and +130 (an early release leaving it
     /// BAD).
     recent: [u32; 2],
+    /// The frames where a lane's visual state read a judgment's code (1
+    /// to 7), a held long note's (8) and an empty POOR's (10 or 11), and
+    /// where one that read a code before read 0 after a press; and each
+    /// lane's state in the frame before.
+    lane_states: [u32; 4],
+    last_lanes: [i32; 8],
     empty_frames_after_ready: u32,
     /// Whether a quad showed a frame other than an image's first.
     later_frame: bool,
@@ -1435,6 +1441,8 @@ impl Witness {
             when_started: false,
             rates_apart: false,
             recent: [0; 2],
+            lane_states: [0; 4],
+            last_lanes: [0; 8],
             kinds: [false; GaugeLook::COUNT],
             empty_frames_after_ready: 0,
             later_frame: false,
@@ -1699,6 +1707,21 @@ fn stretch(
             (Some(130), Some(1)) => w.recent[1] += 1,
             _ => {}
         }
+        let mut seen = [false; 4];
+        for lane in bms_model::Lane::all() {
+            let now = read(field::lane_judge(lane)).unwrap_or(0);
+            let before = std::mem::replace(&mut w.last_lanes[lane.index()], now);
+            match now {
+                1..=7 => seen[0] = true,
+                8 => seen[1] = true,
+                10 | 11 => seen[2] = true,
+                0 if before != 0 => seen[3] = true,
+                _ => {}
+            }
+        }
+        for (n, s) in w.lane_states.iter_mut().zip(seen) {
+            *n += u32::from(s);
+        }
         if let Some(seen) = read(field::GAUGE_KIND)
             .and_then(|k| usize::try_from(k).ok())
             .and_then(|k| w.kinds.get_mut(k))
@@ -1871,6 +1894,11 @@ fn build_does_not_allocate() {
                 w.recent.iter().all(|&n| n > 0),
                 "{name}: a long note's timing arm never read: {:?}",
                 w.recent
+            );
+            assert!(
+                w.lane_states.iter().all(|&n| n > 0),
+                "{name}: a lane state's arm never read: {:?}",
+                w.lane_states
             );
         }
         if matches!(*name, "clean round" | "autoplay") {
