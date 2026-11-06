@@ -3504,6 +3504,40 @@ mod tests {
         );
     }
 
+    /// Each place's title in full up to the preset, a non-ASCII folder's
+    /// name shown as stored on its row, its heading and its title, and the
+    /// all-chart list's.
+    #[test]
+    fn each_place_is_named_in_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["曲集/x/a.bms", "曲集/y/b.bms"]]);
+        let title = |sel: &Selection| sel.screen.page("").lines[0].text.clone();
+        let order = "  並び順: タイトル  プリセット: ";
+        assert!(title(&sel).starts_with(&format!("曲選択  2 譜面{order}")));
+        assert_eq!(
+            list(&sel),
+            [format!(">{}", all_row(2)), folder_row("曲集", 2)]
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert!(
+            title(&sel).starts_with(&format!("曲選択  曲集  2 譜面{order}")),
+            "{}",
+            title(&sel)
+        );
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Up, MenuKey::Enter]);
+        assert!(
+            title(&sel).starts_with(&format!("曲選択  全譜面  2 譜面{order}")),
+            "{}",
+            title(&sel)
+        );
+        let page = sel.screen.page("");
+        assert!(
+            page.lines.iter().any(|l| l.text == r"▼ 曲集\x"),
+            "{:?}",
+            page.lines
+        );
+    }
+
     /// With several roots, Top holds a row per root, and entering one lists
     /// it. A root holding only charts stays a level, though any other such
     /// folder would be a song folder, until it has no rows.

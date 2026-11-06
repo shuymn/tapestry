@@ -1659,7 +1659,51 @@ mod tests {
             5_001,
         );
         assert_eq!(s.listed(), super::LIMIT);
-        assert!(s.page("").lines[0].text.contains("5000以上 譜面"));
+        assert_eq!(
+            s.page("").lines[0].text,
+            "曲選択  5000以上 譜面  並び順: タイトル  プリセット:   "
+        );
+    }
+
+    /// The page's fixed wording in full: the title with each order and
+    /// the library's status, the idle and the editing search line with a
+    /// non-ASCII query, the results' title, both empty lists and the keys.
+    #[test]
+    fn page_wording() {
+        let mut s = SelectScreen::new(Vec::new());
+        s.set_preset("自作".to_owned(), None);
+        let page = s.page("スキャン中");
+        assert_eq!(
+            page.lines[0].text,
+            "曲選択  0 譜面  並び順: タイトル  プリセット: 自作  スキャン中"
+        );
+        assert_eq!(page.lines[1].text, "検索 (Tab): ");
+        assert_eq!(
+            page.lines[3].text,
+            "譜面がありません (device.toml の [library] roots)"
+        );
+        assert_eq!(
+            page.lines[super::PAGE_LINES - 1].text,
+            "↑↓ 選択  Enter 決定  Esc 戻る  P 練習  Tab 検索  ←→ 並び順  F11/F12 プリセット  F1-F8 設定  ウィンドウを閉じて終了"
+        );
+        for order in ["アーティスト", "レベル", "更新日", "タイトル"] {
+            s.input(key(MenuKey::Right));
+            assert_eq!(
+                s.page("").lines[0].text,
+                format!("曲選択  0 譜面  並び順: {order}  プリセット: 自作  ")
+            );
+        }
+        s.input(key(MenuKey::Tab));
+        s.input(MenuInput::Text("日本".to_owned()));
+        let page = s.page("");
+        assert_eq!(page.lines[1].text, "検索: 日本_");
+        assert_eq!(
+            page.lines[0].text,
+            "曲選択  検索結果  0 譜面  並び順: タイトル  プリセット: 自作  "
+        );
+        assert_eq!(page.lines[3].text, "見つかりません");
+        s.input(key(MenuKey::Enter));
+        assert_eq!(s.page("").lines[1].text, "検索 (Tab): 日本");
     }
 
     /// Each chart line starts with the chart's lamp and best EX under the

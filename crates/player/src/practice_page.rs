@@ -204,6 +204,43 @@ mod tests {
         );
     }
 
+    /// The wording of the lines the other tests check only by style: the
+    /// keys, repeat off, a preset without a gauge, and the title naming a
+    /// non-ASCII file as it is.
+    #[test]
+    fn practice_page_wording() {
+        let mut s = screen();
+        let p = page(&s, "曲.bms");
+        assert_eq!(p.lines[0].text, "練習  曲.bms");
+        assert_eq!(
+            p.lines[PAGE_LINES - 1].text,
+            "↑↓ 選択  ←→ 変更  Enter 編集・開始  Esc 戻る  ウィンドウを閉じて終了"
+        );
+        for _ in 0..5 {
+            s.input(PracticeInput::Down);
+        }
+        s.input(PracticeInput::Right);
+        assert_eq!(page(&s, "").lines[6].text, "    リピート: オフ");
+        let chart = bms_parser::load_bms(
+            b"#BPM 120\n#00111:01\n",
+            std::path::Path::new("."),
+            &Default::default(),
+        )
+        .unwrap()
+        .chart;
+        let mut preset = rules::tapestry();
+        preset.gauges.clear();
+        let none = PracticeScreen::new(&chart, &preset, 0);
+        assert!(
+            page(&none, "")
+                .lines
+                .iter()
+                .any(|l| l.text.starts_with("    初期ゲージ (-): ")),
+            "{:?}",
+            page(&none, "").lines
+        );
+    }
+
     /// The keyboard's arrows, Enter and Escape are the page's inputs and
     /// nothing else is, F11 and F12 among them; the controller's scratch
     /// moves, its white keys (7 included) confirm and its black keys go

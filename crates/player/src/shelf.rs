@@ -834,6 +834,24 @@ mod tests {
         listed(shelf).iter().any(|n| n == name)
     }
 
+    /// The status in full: a pass running until it is polled to its end,
+    /// and no roots configured.
+    #[test]
+    fn the_status_says_what_the_library_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let charts = dir.path().join("charts");
+        chart(&charts, "a.bms");
+        let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
+        let shelf = Shelf::new(library, vec![charts], Duration::from_millis(20), None);
+        assert_eq!(shelf.status(), "スキャン中");
+        let (library, _) = open(&DataRoot::new(dir.path().join("none"))).unwrap();
+        let shelf = Shelf::new(library, Vec::new(), Duration::from_millis(20), None);
+        assert_eq!(
+            shelf.status(),
+            "device.toml に [library] roots がありません"
+        );
+    }
+
     /// While a chart's choice pauses the scan no pass starts, however long
     /// the select screen waits; once released, a chart added meanwhile is
     /// listed by the next pass.

@@ -190,4 +190,60 @@ mod tests {
             assert!(p.lines.iter().all(|l| l.style != LineStyle::Cursor));
         }
     }
+
+    /// Every line's whole text: the heading of a play and of a practice,
+    /// the chart's and the preset's as stored (non-ASCII ones included),
+    /// each stage's words, and the skin wait's page.
+    #[test]
+    fn the_lines_say_each_stage_in_full() {
+        let mut text = LoadingText {
+            title: "曲名".to_owned(),
+            artist: "作者".to_owned(),
+            preset: "自作プリセット".to_owned(),
+            practice: false,
+            autoplay: false,
+            chart: super::ChosenChart::default(),
+        };
+        let strings = |text: &LoadingText, stage| {
+            text.lines(stage)
+                .lines
+                .iter()
+                .map(|l| l.text.clone())
+                .collect::<Vec<_>>()
+        };
+        for (stage, words) in [
+            (Stage::Chart, "譜面を読み込んでいます"),
+            (Stage::Sounds { done: 0, files: 0 }, "音を読み込んでいます"),
+            (
+                Stage::Sounds { done: 3, files: 12 },
+                "音を読み込んでいます  3 / 12",
+            ),
+            (Stage::Loudness, "音量を測定しています"),
+            (Stage::Screen, "画面を準備しています"),
+            (Stage::Scan, "ライブラリのスキャンの一時停止を待っています"),
+            (Stage::Skin, "スキンを準備しています"),
+        ] {
+            assert_eq!(
+                strings(&text, stage),
+                [
+                    "NOW LOADING",
+                    "曲名",
+                    "作者",
+                    "プリセット: 自作プリセット",
+                    words
+                ],
+                "{stage:?}"
+            );
+        }
+        text.practice = true;
+        assert_eq!(strings(&text, Stage::Chart)[0], "NOW LOADING (練習)");
+        assert_eq!(
+            super::skin_wait_page()
+                .lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>(),
+            ["スキンを準備しています"]
+        );
+    }
 }
