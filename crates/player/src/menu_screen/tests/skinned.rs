@@ -173,6 +173,34 @@ fn a_preset_step_through_the_flow_names_the_preset_for_three_seconds() {
     );
 }
 
+/// The memory witness counts the selection screen's lines held in its
+/// text layer and the skin's state its owner keeps beside the renderer
+/// (design §6): the lines once prepared, none once the installation is
+/// removed; the state as it reports itself, only when given.
+#[test]
+fn the_memory_witness_counts_the_selection_lines_and_state() {
+    let (_dir, mut screen, mut logic, _) = skinned();
+    let before = screen.renderer.memory_with(Some(&logic.sel));
+    assert_eq!(before.selection_text, 0);
+    assert_eq!(before.selection_state, logic.sel.resident_bytes());
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let s = SelectScreen::new(Vec::new());
+    let mut u = update(&mut feed, &s, 0);
+    u.view = rows_at(3, 10);
+    drawn(&mut screen, &mut logic, &u, true, 0);
+    let without = screen.renderer.memory();
+    let with = screen.renderer.memory_with(Some(&logic.sel));
+    assert!(with.selection_text > 0, "{with:?}");
+    assert_eq!(without.selection_text, with.selection_text);
+    assert!(with.selection_state > 0);
+    assert_eq!(with.selection_state, logic.sel.resident_bytes());
+    assert_eq!(without.selection_state, 0);
+    assert_eq!(with.total(), without.total() + with.selection_state);
+    screen.renderer.remove(ScreenKind::Selection);
+    assert_eq!(screen.renderer.memory().selection_text, 0);
+}
+
 /// A selection frame's app work (the timers, the skin's build and the
 /// strip's sprites) allocates nothing, from the first frame after an
 /// update on, after a resize prepared outside the count, and refused.

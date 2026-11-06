@@ -478,7 +478,8 @@ impl Admission {
 /// replacement reaches (design.md "Memory Budget"): the installed
 /// resources and the staged ones live together until the commit. The
 /// other kinds' committed installations are reported only through
-/// [`Renderer::admission`].
+/// [`Renderer::admission`], but for the selection screen's lines and the
+/// selection skin's state, which change with each update it draws.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryWitness {
     /// The installed bundle's CPU description, kept for recovery.
@@ -531,6 +532,12 @@ pub struct MemoryWitness {
     /// The staged resources' text cache, when they are new, and the staged
     /// attempt's holder.
     pub staged_text_cache: u64,
+    /// The committed selection installation's lines held in its text
+    /// layer's cache: the holder of the lines its frames draw.
+    pub selection_text: u64,
+    /// The selection skin's state the render thread keeps for the screen's
+    /// lifetime, apart from the renderer ([`Renderer::memory_with`]).
+    pub selection_state: u64,
 }
 
 impl MemoryWitness {
@@ -555,6 +562,8 @@ impl MemoryWitness {
             .saturating_add(self.text_upload)
             .saturating_add(self.text_cache)
             .saturating_add(self.staged_text_cache)
+            .saturating_add(self.selection_text)
+            .saturating_add(self.selection_state)
     }
 }
 
@@ -1631,6 +1640,18 @@ impl Renderer {
     /// presentation.
     #[must_use]
     pub fn memory(&self) -> MemoryWitness {
+        self.memory_with(None)
+    }
+
+    /// [`memory`](Self::memory) with `selection`, the selection skin's
+    /// state its owner keeps beside the renderer (the render thread, for
+    /// the screen's lifetime), counted.
+    #[must_use]
+    pub fn memory_with(&self, selection: Option<&Selection>) -> MemoryWitness {
+        let selection_text = Self::screen(ScreenKind::Selection)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+            .map_or(0, |slot| slot.text.bytes());
         let staged = self.pending.as_ref().map(|p| (p, p.skin.installation()));
         let installed = self.installed.as_ref();
         let cpu = staged
@@ -1677,6 +1698,8 @@ impl Renderer {
             staged_batch: res.map_or(0, |r| r.staging.bytes()),
             attempt: self.skin.attempt_bytes(),
             staged_attempt: staged.map_or(0, |p| p.skin.attempt_bytes()),
+            selection_text: bytes(selection_text),
+            selection_state: selection.map_or(0, Selection::resident_bytes),
         }
     }
 
