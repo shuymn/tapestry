@@ -854,7 +854,8 @@ fn settings(
 /// `update_selection` and `update_selection_settings`, `build_selection`)
 /// each bridged settings id draws the player's value, each constant its
 /// constant and each unavailable id nothing, at two values of each
-/// setting; 312, 313 and 55 in Classic and Floating; the volume's number,
+/// setting; 312, 313 and 55 in Classic and Floating, the duration
+/// truncated; the volume's number,
 /// slider and graph at the gains 0, 0.45 and 1; and a later view leaves
 /// the settings as they were.
 #[test]
@@ -991,4 +992,23 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     for id in [78, 340, 341, 342] {
         assert!(!f.indices.contains_key(&id), "{id}");
     }
+
+    // The duration truncates: 5 · 301 / 3 is 501.67, drawn 501.
+    let d = settings(
+        0,
+        0.0,
+        SpeedView::Floating {
+            reference: SpeedReference::Start,
+            green: 301,
+        },
+        SelectionOrder::Modified,
+        None,
+        [false; 3],
+    );
+    s.skin.update_selection_settings(&mut s.sel, &d).unwrap();
+    let f = settings_frame(&mut s);
+    assert_eq!(
+        (f.numbers.get(&312), f.numbers.get(&313)),
+        (Some(&"501".to_owned()), Some(&"301".to_owned()))
+    );
 }
