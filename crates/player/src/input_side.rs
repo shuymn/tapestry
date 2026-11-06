@@ -3105,13 +3105,29 @@ mod gate_tests {
     }
 
     /// A loading script holding START from the start of loading to 600 ms
-    /// (`--dev-loading`), on a scripted play whose log presses Z at 1.7 s:
-    /// the opening asked at 400 ms is deferred, the release is fed at
-    /// 610 ms, and the opening asked again at 650 ms opens on the timeline
-    /// of the one first asked, so Z lands 250 ms earlier on its chart time.
+    /// (`--dev-loading`), on a scripted play whose log presses Z at 1.7 s
+    /// and releases it at 1.75 s: the opening asked at 400 ms is deferred,
+    /// the release is fed at 610 ms, and the opening asked again at 650 ms
+    /// opens on the timeline of the one first asked, so Z lands 250 ms
+    /// earlier on its chart time. Asked again later, the log's items before
+    /// the opening are fed before recording opens and stay out of it: past
+    /// Z's press only its release is recorded, past both nothing.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_deferred_opening_keeps_the_scripts_timeline() {
+        let us = |ms: &[i64]| ms.iter().map(|&m| TimeUs(m * MS)).collect::<Vec<_>>();
+        assert_eq!(deferred_opening(650), us(&[1_450, 1_500]));
+        // Opened at 1.72 s on the script's timeline: its chart time 0 is
+        // at 2.72 s.
+        assert_eq!(deferred_opening(3_120), us(&[-970]));
+        assert_eq!(deferred_opening(3_200), us(&[]));
+    }
+
+    /// The times of Z's events recorded in
+    /// [`a_deferred_opening_keeps_the_scripts_timeline`] with the opening
+    /// asked again `reopen` ms after loading started.
+    #[cfg(feature = "dev-tools")]
+    fn deferred_opening(reopen: i64) -> Vec<TimeUs> {
         use input::{Action, ScriptItem, ScriptedInput};
 
         const LOADING: i64 = 10_000 * MS;
@@ -3175,22 +3191,25 @@ mod gate_tests {
         assert!(matches!(ask(&mut hook, &mut sources, 400), Reply::Deferred));
         hook.wake(&mut sources, TimeUs(LOADING + 610 * MS));
         assert!(!sources.holding());
-        let Reply::Opened(opening, _) = ask(&mut hook, &mut sources, 650) else {
+        let Reply::Opened(opening, _) = ask(&mut hook, &mut sources, reopen) else {
             panic!("the opening asked again did not open");
         };
         // The script's time 0 is the first opening's chart time 0.
         let first_origin = LOADING + 400 * MS + LEAD_IN.0;
-        for ms in [1_700, 1_760] {
-            hook.wake(&mut sources, TimeUs(first_origin + ms * MS));
+        let opened = LOADING + reopen * MS;
+        for ms in [1_700, 1_760, 2_000] {
+            let at = first_origin + ms * MS;
+            if at > opened {
+                hook.wake(&mut sources, TimeUs(at));
+            }
         }
         let mut readers = opening.readers;
-        let fed: Vec<_> = readers
+        readers
             .iter_mut()
             .flat_map(|r| std::iter::from_fn(move || r.pop()))
             .filter(|e| matches!(e.kind, InputKind::Control { control, .. } if control == Z))
             .map(|e| e.received)
-            .collect();
-        assert_eq!(fed, [TimeUs(1_450 * MS), TimeUs(1_500 * MS)]);
+            .collect()
     }
 
     /// The player's gate admits what its exchange with the input side

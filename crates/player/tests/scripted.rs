@@ -1843,17 +1843,21 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     // The script keeps the timeline of the opening first asked for; a
     // play opened later, at the release, has the log's presses that much
     // earlier on its chart time. A shift large enough to put the first
-    // presses before the opening leaves them out of the record.
+    // presses before the opening leaves them out of the record, all of
+    // them when the play opened past the log's last one.
+    assert!(rec.events.len() <= events.len(), "{:?}", rec.events);
     let kept = &events[events.len() - rec.events.len()..];
-    let early = kept[0].received.0 - rec.events[0].received.0;
-    assert!(early >= 0, "{early} {stderr}");
-    assert!(
-        kept.iter()
-            .zip(&rec.events)
-            .all(|(e, r)| e.kind == r.kind && e.received.0 - r.received.0 == early),
-        "{early} {kept:?} {:?}",
-        rec.events
-    );
+    if let (Some(e), Some(r)) = (kept.first(), rec.events.first()) {
+        let early = e.received.0 - r.received.0;
+        assert!(early >= 0, "{early} {stderr}");
+        assert!(
+            kept.iter()
+                .zip(&rec.events)
+                .all(|(e, r)| e.kind == r.kind && e.received.0 - r.received.0 == early),
+            "{early} {kept:?} {:?}",
+            rec.events
+        );
+    }
     assert!(!rec.events.iter().any(|e| matches!(
         e.kind,
         eval::InputKind::Control { control, .. } if control.0 == Q
