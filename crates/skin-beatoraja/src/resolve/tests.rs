@@ -217,3 +217,71 @@ fn malformed_groups_are_refused() {
         Err(("dst", "an object"))
     );
 }
+
+/// The `songlist` record of a selection skin `src` resolved with option
+/// 901 enabled under `limits`: each of its `liston` destinations' `dst`
+/// key counts.
+fn song_list(src: &str, limits: Limits) -> Result<Vec<usize>, ImportError> {
+    let d = skin(src);
+    let mut def = Definition::read_with(d.path(), "s.json", limits)?;
+    let enabled = BTreeSet::from([901]);
+    let t = resolve(&mut def, &enabled).and_then(|mut r| r.tables(&enabled))?;
+    let list = t.records[4].unwrap();
+    let [on] = def.fields(list, ["liston"]);
+    let on = on
+        .and_then(|f| t.nested.get(&f))
+        .cloned()
+        .unwrap_or_default();
+    Ok(on
+        .iter()
+        .map(|&p| {
+            let [dst] = def.fields(p, ["dst"]);
+            dst.and_then(|f| t.nested.get(&f)).map_or(0, Vec::len)
+        })
+        .collect())
+}
+
+/// The song list resolves through a conditional wrapper at the record, at
+/// its `liston` field, at a placement and at a placement's `dst`, as the
+/// source's serializers read them (D11); a play skin leaves it unread.
+#[test]
+fn the_song_list_resolves_through_wrappers_at_each_level() {
+    let src = r#"{"type": 5, "songlist": [{"if": 902}, {"if": 901, "value": {"id": "l",
+        "liston": [{"if": 901, "values": [
+            {"if": 901, "value": {"id": "p", "dst": [{"if": 901, "values": [{}, {}]}]}},
+            {"if": 902, "value": {"id": "q", "dst": [{}]}},
+            {"id": "r", "dst": [{"if": 901, "value": {}}, {"if": 902, "value": {}}]}
+        ]}]}}]}"#;
+    assert_eq!(song_list(src, Limits::STANDARD).unwrap(), [2, 1]);
+    let d = skin(&src.replace("\"type\": 5", "\"type\": 0"));
+    let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+    let enabled = BTreeSet::from([901]);
+    let t = resolve(&mut def, &enabled)
+        .and_then(|mut r| r.tables(&enabled))
+        .unwrap();
+    assert_eq!(t.records[4], None);
+}
+
+/// The song list's records and keys count against the expanded values, at
+/// the cap and one past it.
+#[test]
+fn the_song_list_s_values_count_against_the_expanded_cap() {
+    let src = |keys: &str| {
+        format!(
+            r#"{{"type": 5, "songlist": {{"id": "l", "liston": [{{"id": "p", "dst": [{keys}]}}]}}}}"#
+        )
+    };
+    // Its placement and two keys: three values.
+    let limits = Limits {
+        expanded: 3,
+        ..Limits::STANDARD
+    };
+    assert_eq!(song_list(&src("{}, {}"), limits).unwrap(), [2]);
+    match song_list(&src("{}, {}, {}"), limits) {
+        Err(ImportError::Input {
+            limit: InputLimit::Expanded,
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}

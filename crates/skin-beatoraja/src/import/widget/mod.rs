@@ -13,9 +13,7 @@ pub(super) mod number;
 pub(super) mod system;
 pub(super) mod text;
 
-use skin_model::{
-    CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, TimerRef, Track, timer as slot,
-};
+use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
@@ -55,8 +53,15 @@ pub(super) struct SrcImage {
     rect: [i32; 4],
     /// Columns and rows, a division of 0 or less read as 1.
     pub(super) div: [u32; 2],
-    timer: Prop,
-    cycle: i32,
+    pub(super) timer: Prop,
+    pub(super) cycle: i32,
+}
+
+impl SrcImage {
+    /// The `source` id its `src` names.
+    pub(super) fn src_name(&self) -> Option<&str> {
+        self.src.as_deref()
+    }
 }
 
 impl Cx<'_> {
@@ -82,7 +87,7 @@ impl Cx<'_> {
     /// note once `c` is retained, when the cycle has no timer: only an
     /// untimed cycle runs on `screen`.
     pub(super) fn cycle_kept(&mut self, c: &Common, cycle: Option<&CycleDef>) {
-        if cycle.is_some_and(|y| y.timer == TimerRef::Builtin(slot::SCREEN)) {
+        if cycle.is_some_and(|y| y.timer == self.screen()) {
             self.cycled.insert(c.span);
         }
     }
@@ -319,9 +324,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File { refused })
-                if matches!(role, Role::Critical(_)) && (refused || !holes) =>
-            {
+            Err(Failed::File { refused }) if role.refuses() && (refused || !holes) => {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),
@@ -382,12 +385,10 @@ impl Cx<'_> {
                 self.drop_el(role, at, NoteKind::CellTooLarge { w, h })?;
                 Ok(None)
             }
-            Err(NotAdded::Image(e)) if matches!(role, Role::Critical(_)) => {
-                Err(ImportError::Asset {
-                    at: self.loc(at),
-                    source: e,
-                })
-            }
+            Err(NotAdded::Image(e)) if role.refuses() => Err(ImportError::Asset {
+                at: self.loc(at),
+                source: e,
+            }),
             Err(NotAdded::Image(_)) => {
                 self.drop_el(role, at, NoteKind::MissingAsset)?;
                 Ok(None)
@@ -416,6 +417,10 @@ impl Cx<'_> {
     /// keys then charged once, and what it lowers to: SUDDEN+'s paint
     /// unless it cannot reach the lanes, where it follows SUDDEN+.
     fn lowered(&mut self, dst: &Dst) -> Result<(bool, Lowered), ImportError> {
+        // Only a play skin has SUDDEN+.
+        if self.kind != skin_model::ScreenKind::Play {
+            return Ok((false, Lowered::Image));
+        }
         let charged = dst.offsets.contains(&super::OFFSET_LANECOVER);
         let lowered = if charged && !self.offset4_outside(dst)? {
             Lowered::Paint
@@ -435,12 +440,10 @@ impl Cx<'_> {
         // a `len` of 1 or less is an ordinary image whatever its `ref`.
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
-        let index = property::index_by_id(self.int_or(r, "ref", 0)?);
+        let index = property::index_in(self.kind, self.int_or(r, "ref", 0)?);
         let (charged, lowered) = self.lowered(&dst)?;
         let role = lowered.role(dst.failure);
-        if act.is_some() {
-            self.ignored(at, NoteKind::Ignored { field: "act" });
-        }
+        self.actions(at, act)?;
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
         }
@@ -449,11 +452,11 @@ impl Cx<'_> {
         }
         if group {
             let Some(src) = index.selector() else {
-                let id = match index {
-                    IndexProp::Unsupported(id) => id,
-                    _ => 0,
+                let why = match index {
+                    IndexProp::Unavailable(id) => image_choice::index_unavailable(id),
+                    IndexProp::Unsupported(id) => image_choice::index_unsupported(id),
+                    _ => image_choice::index_unsupported(0),
                 };
-                let why = image_choice::index_unsupported(id);
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
@@ -536,7 +539,10 @@ impl Cx<'_> {
                 track::stretch(c.stretch, r, cell).ok_or_else(|| self.range(at, "dst"))?
             };
             shared &= b;
-            rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
+            rects.push(
+                r.model_from(self.flip)
+                    .ok_or_else(|| self.range(at, "dst"))?,
+            );
         }
         Ok(track::one_branch(shared).then_some((rects, native)))
     }
@@ -552,7 +558,7 @@ impl Cx<'_> {
         let [r, value, images, act] = self.def.fields(rec, ["ref", "value", "images", "act"]);
         let r = self.int_or(r, "ref", 0)?;
         let value = self.callback_prop(value, "value")?;
-        let selector = image_choice::set_selector(&value, r);
+        let selector = image_choice::set_selector(self.kind, &value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
         let (src, deviates) = if let Prop::Callable(id) = value {
@@ -576,13 +582,40 @@ impl Cx<'_> {
                 SetSelector::Expr { src, deviates, .. } => (src, deviates),
             }
         };
-        if act.is_some() {
-            self.ignored(at, NoteKind::Ignored { field: "act" });
-        }
+        self.actions(at, act)?;
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         self.image_set_choices(dst, images, &src, deviates, charged, (lowered, role))
+    }
+
+    /// An image's or an image set's `act`: no action has a hit target. On
+    /// play it is ignored; on selection its id is noted by its class
+    /// ([`super::selection::profile::event`]), an E action as unavailable
+    /// until the native actions exist and any other as ignored.
+    fn actions(&mut self, at: Span, act: Option<u32>) -> Result<(), ImportError> {
+        let Some(f) = act else {
+            return Ok(());
+        };
+        let event = if self.kind == skin_model::ScreenKind::Selection {
+            match self.callback_prop(Some(f), "act")? {
+                Prop::Id(id) => super::selection::profile::event(id)
+                    .filter(|c| *c == super::selection::profile::Class::Unavailable)
+                    .map(|_| id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let why = match event {
+            Some(id) => NoteKind::Unavailable {
+                kind: super::PropertyKind::Event,
+                id,
+            },
+            None => NoteKind::Ignored { field: "act" },
+        };
+        self.ignored(at, why);
+        Ok(())
     }
 }
 

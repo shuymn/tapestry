@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use skin_model::{TimerRef, timer};
+use skin_model::{ScreenKind, TimerRef, timer};
 
 /// The built-in timer namespace (`TimerManager.java:20, 59-64` at
 /// `0.8.9`): ids at or below it are the player's.
@@ -147,6 +147,27 @@ impl Custom {
             id == FAILED
         } else {
             self.failing.contains(&id)
+        }
+    }
+
+    /// Timer `id` (non-negative) on a `kind` screen, resolved through the
+    /// custom timers: play's ([`Self::resolve`]), or the selection
+    /// profile's ([`super::selection::profile::timer`]), where any other
+    /// built-in, play's among them, is undefined and 0 is never set.
+    pub(crate) fn resolve_in(&self, kind: ScreenKind, id: i32) -> Timer {
+        if kind != ScreenKind::Selection {
+            return self.resolve(id);
+        }
+        let builtin = |id: i32| match id {
+            0 => Timer::Unset,
+            _ => super::selection::profile::timer(id).map_or(Timer::Unsupported, Timer::Builtin),
+        };
+        if id <= BUILTIN_MAX {
+            return builtin(id);
+        }
+        match self.aliases.get(&id) {
+            Some(&Some(target)) if (0..=BUILTIN_MAX).contains(&target) => builtin(target),
+            _ => Timer::Unsupported,
         }
     }
 

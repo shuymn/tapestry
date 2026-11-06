@@ -8,6 +8,10 @@
 
 use std::collections::BTreeMap;
 
+use skin_model::ScreenKind;
+
+use super::selection::profile::{self, Class, SelOption};
+
 /// The ids `BooleanPropertyFactory.getBooleanProperty(int)` knows, with
 /// their names (`BooleanPropertyFactory.java:349-~720`, the `BooleanType`
 /// entries), sorted by id. The practice-item patterns
@@ -444,6 +448,64 @@ pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
         return Cond::Fold(on == (op > 0));
     }
     Cond::Undefined(op)
+}
+
+/// Numeric op `op` (non-zero) on a `kind` screen: play's [`numeric`], or
+/// the selection profile's built-ins ([`profile::option`]) before the
+/// declared items, a built-in outside the profile unsupported.
+pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
+    if kind != ScreenKind::Selection {
+        return numeric(op, items);
+    }
+    let Ok(id) = i32::try_from(op.unsigned_abs()) else {
+        return Cond::Undefined(op);
+    };
+    if is_builtin(id) {
+        return selection_cond(id, op < 0);
+    }
+    if let Some(&on) = items.get(&id) {
+        return Cond::Fold(on == (op > 0));
+    }
+    Cond::Undefined(op)
+}
+
+/// Selection built-in `id`, negated for `negative`: its bridge, built in
+/// one allocation of [`MAX_COND_BYTES`], or its constant folded.
+fn selection_cond(id: i32, negative: bool) -> Cond {
+    match profile::option(id) {
+        Some(Class::Bridge(SelOption::Constant(on))) => Cond::Fold(on != negative),
+        Some(Class::Bridge(SelOption::Expr(e))) => {
+            let mut src = String::with_capacity(MAX_COND_BYTES);
+            if negative {
+                src.push_str("!(");
+            }
+            src.push_str(e);
+            if negative {
+                src.push(')');
+            }
+            Cond::Expr {
+                src,
+                display_deviation: false,
+            }
+        }
+        _ => Cond::Unsupported(if negative { -id } else { id }),
+    }
+}
+
+/// A boolean property named `name` on a `kind` screen ([`named`] through
+/// [`numeric_in`]'s built-ins).
+pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
+    if kind != ScreenKind::Selection {
+        return named(name);
+    }
+    let mut negative = false;
+    let mut rest = name;
+    while let Some(r) = rest.strip_prefix('!') {
+        negative = !negative;
+        rest = r;
+    }
+    let id = named_id(rest)?;
+    Some(selection_cond(id, negative))
 }
 
 /// The id of boolean property `name`, without `!` prefixes.

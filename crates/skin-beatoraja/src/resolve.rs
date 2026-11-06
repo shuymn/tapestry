@@ -622,7 +622,7 @@ pub fn resolve<'d>(
 /// Every one has an array serializer (JsonSkinSerializer.java:73-97)
 /// except `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`, which are
 /// read literally ([`LITERAL`]).
-pub(crate) const ARRAYS: [&str; 21] = [
+pub(crate) const ARRAYS: [&str; 22] = [
     "source",
     "font",
     "image",
@@ -643,6 +643,7 @@ pub(crate) const ARRAYS: [&str; 21] = [
     "judge",
     "pmchara",
     "customTimers",
+    "customEvents",
     "destination",
 ];
 
@@ -652,7 +653,26 @@ const LITERAL: [&str; 4] = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
 
 /// The top-level records the import reads (`ObjectSerializer`), in
 /// [`Tables::records`] order.
-pub(crate) const RECORDS: [&str; 4] = ["gauge", "practice", "bga", "note"];
+pub(crate) const RECORDS: [&str; 5] = ["gauge", "practice", "bga", "note", "songlist"];
+
+/// The fields of [`ARRAYS`] and [`RECORDS`] only a selection skin's import
+/// reads.
+const SELECTION_ONLY: [&str; 2] = ["customEvents", "songlist"];
+
+/// The `Destination[]` fields of the `songlist` record
+/// (`JsonSkin.java:437-451`), each resolved with every destination's
+/// `dst` as the note record's lists are.
+pub(crate) const SONG_LIST_FIELDS: [&str; 9] = [
+    "listoff",
+    "liston",
+    "text",
+    "level",
+    "lamp",
+    "playerlamp",
+    "rivallamp",
+    "trophy",
+    "label",
+];
 
 /// The definition's fields the import reads, resolved for one set of
 /// options: each array field's records, each record field's record, and
@@ -696,7 +716,14 @@ impl Resolved<'_> {
             strict: None,
         };
         let mut t = Tables::default();
+        // Only the selection loader reads these (`JsonSelectSkinObjectLoader.java`,
+        // `JSONSkinLoader.java:378-383`): another kind leaves them unread.
+        let read =
+            |name: &str| self.kind == ScreenKind::Selection || !SELECTION_ONLY.contains(&name);
         for (name, out) in ARRAYS.iter().zip(&mut t.arrays) {
+            if !read(name) {
+                continue;
+            }
             let Some(id) = r.def.arena.last_member(top, name) else {
                 continue;
             };
@@ -715,6 +742,9 @@ impl Resolved<'_> {
             }
         }
         for (name, out) in RECORDS.iter().zip(&mut t.records) {
+            if !read(name) {
+                continue;
+            }
             if let Some(id) = r.def.arena.last_member(top, name) {
                 *out = r.record(id, 2)?;
             }
@@ -734,6 +764,15 @@ impl Resolved<'_> {
             }
             for list in [bpm, stop, time].into_iter().flatten() {
                 r.nested_destinations(list, 3, &mut t.nested)?;
+            }
+        }
+        if let Some(list) = RECORDS
+            .iter()
+            .position(|n| *n == "songlist")
+            .and_then(|i| t.records.get(i).copied().flatten())
+        {
+            for field in r.def.fields(list, SONG_LIST_FIELDS).into_iter().flatten() {
+                r.nested_destinations(field, 3, &mut t.nested)?;
             }
         }
         if let Some(values) = ARRAYS

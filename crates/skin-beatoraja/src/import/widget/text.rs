@@ -4,6 +4,7 @@
 
 use skin_model::{
     Align, FontRef, MAX_FALLBACKS, MAX_TEXT_BYTES, Overflow, Source, TextDef, TextField, TextValue,
+    Track,
 };
 
 use super::super::asset::{self, FntFailure, Font};
@@ -13,9 +14,19 @@ use super::super::geom::{Q, coords};
 use super::super::policy::Role;
 use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
-use super::super::{Cx, Dst, Opts, Prop};
+use super::super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 use crate::tree::Scalar;
+
+/// A text record's style ([`Cx::text_style`]): its element's common
+/// part, its box track, font, alignment and overflow.
+pub(in super::super) struct TextStyle {
+    pub(in super::super) c: Common,
+    pub(in super::super) track: Track,
+    pub(in super::super) font: FontRef,
+    pub(in super::super) align: Align,
+    pub(in super::super) overflow: Overflow,
+}
 
 /// A text's font as the model draws it.
 enum TextFont {
@@ -91,43 +102,16 @@ impl Cx<'_> {
     pub(in super::super) fn text(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let role = Role::Decorative.or_failure(dst.failure);
-        let [
-            font,
-            size,
-            align,
-            r,
-            value,
-            constant,
-            editable,
-            wrapping,
-            overflow,
-            outline,
-            sx,
-            sy,
-        ] = self.def.fields(
-            rec,
-            [
-                "font",
-                "size",
-                "align",
-                "ref",
-                "value",
-                "constantText",
-                "editable",
-                "wrapping",
-                "overflow",
-                "outlineWidth",
-                "shadowOffsetX",
-                "shadowOffsetY",
-            ],
-        );
+        let [r, value, constant] = self.def.fields(rec, ["ref", "value", "constantText"]);
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
         // `SkinText.java:102`). A function folds or follows the role, and
         // it never falls back to `ref`.
         let text = 'text: {
             let resolved = match self.callback_prop(value, "value")? {
-                Prop::Id(n) => property::str_by_id(n),
-                Prop::Name(s) => property::str_by_name(&s).unwrap_or(StrProp::Unsupported(None)),
+                Prop::Id(n) => property::str_in(self.kind, n),
+                Prop::Name(s) => {
+                    property::str_by_name_in(self.kind, &s).unwrap_or(StrProp::Unsupported(None))
+                }
                 Prop::Callable(id) => {
                     let fold = match self.text_callback(role, id)? {
                         Ok(fold) => fold,
@@ -146,10 +130,11 @@ impl Cx<'_> {
                 Prop::Null => StrProp::Null,
             };
             let resolved = match resolved {
-                StrProp::Null => property::str_by_id(self.int_or(r, "ref", 0)?),
+                StrProp::Null => property::str_in(self.kind, self.int_or(r, "ref", 0)?),
                 p => p,
             };
             match resolved {
+                StrProp::Screen(s) => TextValue::Selection(s),
                 StrProp::Field(id) => match field(id) {
                     Some(f) => TextValue::Field(f),
                     None => {
@@ -182,13 +167,84 @@ impl Cx<'_> {
                 }
             }
         };
+        let Some(TextStyle {
+            mut c,
+            track: t,
+            font,
+            align,
+            overflow,
+        }) = self.text_style(role, &dst, rec)?
+        else {
+            return Ok(());
+        };
+        // A bitmap line pushes a quad per character at most.
+        let quads = match (font, &text) {
+            (FontRef::Bitmap(_), TextValue::Literal(s)) => s.chars().count(),
+            (
+                FontRef::Bitmap(_),
+                TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
+            ) => MAX_TEXT_BYTES,
+            _ => 1,
+        };
+        self.budget
+            .text(u32::try_from(quads).unwrap_or(u32::MAX))
+            .map_err(|l| self.limit(at, l))?;
+        let index = u32::try_from(self.widgets.texts.len()).unwrap_or(u32::MAX);
+        self.widgets.texts.push(TextDef {
+            value: text,
+            font,
+            align,
+            overflow,
+        });
+        // D5: text always blends normally.
+        c.blend = skin_model::Blend::Alpha;
+        self.push(c, Source::Text(index), t)?;
+        Ok(())
+    }
+
+    /// Text record `rec`'s style for destination `dst` of `role`: its
+    /// alignment, overflow, font and box track, with the D6, D12 and D13
+    /// notes; `None` when the element was dropped or is never drawn. A
+    /// text's string is its caller's; a song list's row text style draws
+    /// the row's title whatever it names.
+    pub(in super::super) fn text_style(
+        &mut self,
+        role: Role,
+        dst: &Dst,
+        rec: u32,
+    ) -> Result<Option<TextStyle>, ImportError> {
+        let at = dst.span;
+        let [
+            font,
+            size,
+            align,
+            editable,
+            wrapping,
+            overflow,
+            outline,
+            sx,
+            sy,
+        ] = self.def.fields(
+            rec,
+            [
+                "font",
+                "size",
+                "align",
+                "editable",
+                "wrapping",
+                "overflow",
+                "outlineWidth",
+                "shadowOffsetX",
+                "shadowOffsetY",
+            ],
+        );
         let (shift, align) = match self.int_or(align, "align", 0)? {
             0 => (Q::ZERO, Align::Left),
             1 => (Q::new(1, 2).unwrap_or(Q::ZERO), Align::Center),
             2 => (Q::int(1), Align::Right),
             _ => {
                 self.drop_el(role, at, NoteKind::UnsupportedField { field: "align" })?;
-                return Ok(());
+                return Ok(None);
             }
         };
         let overflow = match self.int_or(overflow, "overflow", 0)? {
@@ -204,7 +260,7 @@ impl Cx<'_> {
             }
             _ => {
                 self.drop_el(role, at, NoteKind::UnsupportedField { field: "overflow" })?;
-                return Ok(());
+                return Ok(None);
             }
         };
         let wraps = wrapping.map_or(Ok(false), |f| self.def.bool(f, "wrapping"))?;
@@ -238,7 +294,7 @@ impl Cx<'_> {
         let font_rec = font_name.and_then(|n| self.fonts.as_ref().and_then(|m| m.get(&n)).copied());
         let Some(font_rec) = font_rec else {
             self.ignored(at, NoteKind::Ignored { field: "font" });
-            return Ok(());
+            return Ok(None);
         };
         let [path] = self.def.fields(font_rec, ["path"]);
         let path = self.opt_string(path, "path")?.unwrap_or_default();
@@ -248,8 +304,8 @@ impl Cx<'_> {
             follow: true,
             ..Opts::default()
         };
-        let Some(mut c) = self.common_with(role, &dst, o)? else {
-            return Ok(());
+        let Some(c) = self.common_with(role, dst, o)? else {
+            return Ok(None);
         };
         if dst.stretch > 0 {
             self.ignored(at, NoteKind::Ignored { field: "stretch" });
@@ -262,11 +318,11 @@ impl Cx<'_> {
             // negative size mirrors the text, which is not reproduced.
             if size == 0 {
                 self.ignored(at, NoteKind::Ignored { field: "size" });
-                return Ok(());
+                return Ok(None);
             }
             if size < 0 {
                 self.drop_el(role, at, NoteKind::UnsupportedField { field: "size" })?;
-                return Ok(());
+                return Ok(None);
             }
             let em = Q::int(size)
                 .mul(self.r)
@@ -282,7 +338,7 @@ impl Cx<'_> {
                 TextFont::Fixed(FontRef::Default, em)
             } else {
                 let Some(font) = self.bitmap_font(role, at, font_rec, &path)? else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 // D12: the size is rounded to a whole reference pixel.
                 if em.round().map(Q::int) != Some(em) {
@@ -304,7 +360,7 @@ impl Cx<'_> {
                 Font::File(i) => TextFont::Model(FontRef::File(u32::from(i))),
                 Font::Failed => {
                     self.drop_el(role, at, NoteKind::MissingAsset)?;
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
@@ -320,9 +376,9 @@ impl Cx<'_> {
                 .ok_or_else(|| self.range(at, "dst"))?;
             let moved = super::super::geom::Rect { x, ..rect };
             let v = match &tf {
-                TextFont::Model(_) => moved.model(),
+                TextFont::Model(_) => moved.model_from(self.flip),
                 TextFont::Fixed(_, em) => moved
-                    .edges()
+                    .edges_from(self.flip)
                     .and_then(|[l, t, r, _]| coords([l, t, r.checked_sub(l)?, em.round()?])),
             }
             .ok_or_else(|| self.range(at, "dst"))?;
@@ -330,30 +386,17 @@ impl Cx<'_> {
             // refusal, located at this element.
             rects.push(v);
         }
-        let t = self.model_track(&c, &rects)?;
+        let track = self.model_track(&c, &rects)?;
         let font = match tf {
             TextFont::Model(f) | TextFont::Fixed(f, _) => f,
         };
-        // A bitmap line pushes a quad per character at most.
-        let quads = match (font, &text) {
-            (FontRef::Bitmap(_), TextValue::Literal(s)) => s.chars().count(),
-            (FontRef::Bitmap(_), TextValue::Field(_) | TextValue::FieldOr { .. }) => MAX_TEXT_BYTES,
-            _ => 1,
-        };
-        self.budget
-            .text(u32::try_from(quads).unwrap_or(u32::MAX))
-            .map_err(|l| self.limit(at, l))?;
-        let index = u32::try_from(self.widgets.texts.len()).unwrap_or(u32::MAX);
-        self.widgets.texts.push(TextDef {
-            value: text,
+        Ok(Some(TextStyle {
+            c,
+            track,
             font,
             align,
             overflow,
-        });
-        // D5: text always blends normally.
-        c.blend = skin_model::Blend::Alpha;
-        self.push(c, Source::Text(index), t)?;
-        Ok(())
+        }))
     }
 
     /// The bitmap font of `.fnt` font record `rec` with primary `path`:
@@ -375,7 +418,7 @@ impl Cx<'_> {
             Some((o, lost)) => {
                 // A fallback the source draws that this importer lost when
                 // the font was made refuses a critical text.
-                if let (Some(failure), Role::Critical(_)) = (lost, role) {
+                if let Some(failure) = lost.filter(|_| role.refuses()) {
                     self.drop_el(role, at, failure_note(failure))?;
                 }
                 o

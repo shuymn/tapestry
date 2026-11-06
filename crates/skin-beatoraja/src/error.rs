@@ -4,7 +4,7 @@ use std::fmt;
 
 use skin_model::{CompileError, ImageError, LoadError, RootError, ScreenKind};
 
-use crate::import::{CriticalPart, ImportLimit, NoteKind};
+use crate::import::{CriticalPart, EssentialPart, ImportLimit, NoteKind};
 use crate::lua::LuaWhy;
 
 use crate::limits::{
@@ -208,6 +208,15 @@ pub enum ImportError {
         part: CriticalPart,
         why: NoteKind,
     },
+    /// A selection skin's essential part is missing (`why` is `None`) or
+    /// cannot be reproduced (`why` is what it met), judged after the
+    /// configured options are folded; `at` is where it was met, when one
+    /// place was.
+    Essential {
+        at: Option<Loc>,
+        part: EssentialPart,
+        why: Option<NoteKind>,
+    },
     /// An expression the importer built did not compile.
     Expr {
         at: Loc,
@@ -286,6 +295,16 @@ impl fmt::Display for ImportError {
             Self::Critical { at, part, why } => {
                 write!(f, "{at}: the {part} cannot be imported: {why}")
             }
+            Self::Essential {
+                at,
+                part,
+                why: Some(why),
+            } => write!(f, "{}the {part} cannot be imported: {why}", At(at)),
+            Self::Essential {
+                at,
+                part,
+                why: None,
+            } => write!(f, "{}the skin has no {part}", At(at)),
             Self::Expr { at, .. } => write!(f, "{at}: an imported expression"),
             Self::Asset { at, .. } => write!(f, "{at}: a play-critical image"),
             Self::Model { at, .. } => write!(f, "{}the skin model refused the skin", At(at)),

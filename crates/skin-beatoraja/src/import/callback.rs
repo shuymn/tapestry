@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use skin_model::{MAX_SOURCE_BYTES, PLAY, Scope, Ty};
+use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, Ty};
 
 use super::ops::{self, Cond};
 use super::policy::{CriticalPart, Role};
@@ -197,9 +197,17 @@ impl V {
     }
 }
 
-/// The JSON mapping's timer name of model slot `slot`.
-fn timer_name(slot: u16) -> Option<&'static str> {
-    PLAY.timers.get(usize::from(slot)).map(|t| t.name)
+/// The schema a `kind` screen's expressions read.
+fn schema(kind: ScreenKind) -> &'static skin_model::Schema {
+    match kind {
+        ScreenKind::Selection => &SELECTION,
+        ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => &PLAY,
+    }
+}
+
+/// The JSON mapping's timer name of model slot `slot` on a `kind` screen.
+fn timer_name(kind: ScreenKind, slot: u16) -> Option<&'static str> {
+    schema(kind).timers.get(usize::from(slot)).map(|t| t.name)
 }
 
 /// The R4 symbol of comparison or arithmetic operator `op`.
@@ -222,6 +230,9 @@ fn symbol(op: Bin) -> &'static str {
 struct Lower<'a> {
     an: &'a Analysis,
     custom: &'a Custom,
+    /// The screen whose profile maps every host read: a Lua read and a
+    /// JSON field of the same id go through the same function.
+    kind: ScreenKind,
     out: Lowered,
     /// Each read's mapping, by its node.
     mapped: HashMap<u32, Mapped>,
@@ -230,11 +241,13 @@ struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
-    /// A lowering of `an`'s callbacks with `custom`'s timers.
-    fn new(an: &'a Analysis, custom: &'a Custom) -> Self {
+    /// A lowering of `an`'s callbacks with `custom`'s timers on a `kind`
+    /// screen.
+    fn new(an: &'a Analysis, custom: &'a Custom, kind: ScreenKind) -> Self {
         Self {
             an,
             custom,
+            kind,
             out: Lowered {
                 src: String::new(),
                 guards: Vec::new(),
@@ -343,7 +356,7 @@ impl Lower<'_> {
         };
         charge(self.an, "compile", units(src.len()))?;
         did("compile");
-        let tried = skin_model::compile(&src, &Scope::new(&PLAY), ty);
+        let tried = skin_model::compile(&src, &Scope::new(schema(self.kind)), ty);
         #[cfg(test)]
         TRIED.with(|t| {
             *t.borrow_mut() = Some((src.clone(), tried.as_ref().err().map(|e| e.kind.clone())));
@@ -366,14 +379,18 @@ impl Lower<'_> {
             })
         };
         let id = arg.and_then(|a| i32::try_from(a).ok());
+        let play = self.kind == ScreenKind::Play;
         match name {
+            // The gauge and the judgments are play's alone.
+            "gauge_type" | "judge" if !play => Err(unmapped()),
             "gauge_type" => {
                 self.guard("gauge.valid");
                 self.out.deviates = true;
                 Ok(Mapped::Gauge)
             }
             "number" => {
-                let IntProp::Shown(v) = property::int_by_id(id.ok_or_else(unmapped)?) else {
+                let IntProp::Shown(v) = property::int_in(self.kind, id.ok_or_else(unmapped)?)
+                else {
                     return Err(unmapped());
                 };
                 if let Some(g) = v.availability() {
@@ -404,14 +421,14 @@ impl Lower<'_> {
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
                 did("work:option");
-                self.option(ops::numeric(id, &BTreeMap::new()), unmapped)
+                self.option(ops::numeric_in(self.kind, id, &BTreeMap::new()), unmapped)
             }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
-                match self.custom.resolve(id) {
-                    Timer::Builtin(slot) => {
-                        Ok(Mapped::Timer(Some(timer_name(slot).ok_or_else(unmapped)?)))
-                    }
+                match self.custom.resolve_in(self.kind, id) {
+                    Timer::Builtin(slot) => Ok(Mapped::Timer(Some(
+                        timer_name(self.kind, slot).ok_or_else(unmapped)?,
+                    ))),
                     Timer::Unset => Ok(Mapped::Timer(None)),
                     Timer::Rank(_) | Timer::Unsupported => Err(unmapped()),
                 }
@@ -645,6 +662,11 @@ impl Lower<'_> {
     /// helper is scanned again only when a parameter's join grows, which
     /// it does at most twice a parameter.
     fn scan(&self, i: u32) -> R<Scan> {
+        // Only play has critical parts: elsewhere every read is decorative,
+        // so nothing is scanned.
+        if self.kind != ScreenKind::Play {
+            return Ok(Scan::default());
+        }
         let open = self.an.open.get().is_some();
         let mut out = Scan::default();
         // Each scanned instance's parameters' joins: one hash a check.
@@ -1149,7 +1171,7 @@ impl Cx<'_> {
                 field,
                 part: match role {
                     Role::Critical(p) => Some(p),
-                    Role::Decorative => None,
+                    Role::Essential(_) | Role::Decorative => None,
                 },
                 disposition: d,
                 why,
@@ -1243,7 +1265,7 @@ impl Cx<'_> {
         };
         let an = adm.analysis();
         let cancelled = || def.cancelled(|| None).is_err();
-        let mut l = Lower::new(an, &self.custom);
+        let mut l = Lower::new(an, &self.custom, self.kind);
         let scan = |l: &Lower<'_>| match l.scan(inst) {
             Ok(s) => Ok(s),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
@@ -1432,7 +1454,7 @@ impl Cx<'_> {
         an.clock
             .enter(crate::lua::callback::Phase::Scan, Some(id))
             .map_err(time)?;
-        let r = Lower::new(an, &self.custom).scan(inst);
+        let r = Lower::new(an, &self.custom, self.kind).scan(inst);
         let left = an.clock.leave().map_err(time);
         let scan = match r {
             Ok(s) => s,

@@ -59,9 +59,9 @@ mod tree;
 pub use error::{ImportError, InputLimit, Loc, Syntax};
 pub use header::{FileSpec, Header, OffsetSpec, OptionItem, OptionSpec, SIZES, read_header};
 pub use import::{
-    Config, CriticalPart, DeviationId, FileChoice, ImportLimit, Imported, LaneApprox, Note,
-    NoteFallback, NoteKind, NoteLoc, Object, OffsetValue, PartWhy, PropertyKind, Report, Rule,
-    Severity, TimerWhy, TrackWhy, Usage, import,
+    Config, CriticalPart, DeviationId, EssentialPart, FileChoice, ImportLimit, Imported,
+    LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, OffsetValue, PartWhy, PropertyKind,
+    Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
 };
 pub use lua::facts::{
     ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass,

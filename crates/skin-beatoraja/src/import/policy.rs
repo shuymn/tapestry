@@ -122,14 +122,47 @@ impl fmt::Display for CriticalPart {
     }
 }
 
+/// A selection skin's essential parts (docs/stage3.md §3, Selection), the
+/// counterpart of play's critical parts, judged after the configured
+/// options are folded: missing or not reproduced, the skin is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EssentialPart {
+    /// A `songlist` that a retained destination names, with a slot whose
+    /// active placement imports.
+    SongList,
+    /// The center slot's selected placement (`liston[center]`), drawn,
+    /// with an image for every listed row kind.
+    SelectedRow,
+    /// A title style for every listed row kind: chart, folder and "all
+    /// charts".
+    RowTitle,
+}
+
+impl fmt::Display for EssentialPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SongList => "song list",
+            Self::SelectedRow => "selected row",
+            Self::RowTitle => "row title",
+        })
+    }
+}
+
 /// An element's role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Critical(CriticalPart),
+    /// A selection skin's essential part.
+    Essential(EssentialPart),
     Decorative,
 }
 
 impl Role {
+    /// Whether what it cannot reproduce refuses the skin.
+    pub(crate) fn refuses(self) -> bool {
+        !matches!(self, Self::Decorative)
+    }
+
     /// The role of an element that is failure presentation when `failure`
     /// (owner decision 16): a decorative one becomes play-critical, and a
     /// content part keeps its own.
@@ -156,6 +189,11 @@ pub(crate) fn unsupported(
             at: arena.loc_at(at.file, at.offset),
             part,
             why,
+        }),
+        Role::Essential(part) => Err(ImportError::Essential {
+            at: Some(arena.loc_at(at.file, at.offset)),
+            part,
+            why: Some(why),
         }),
         Role::Decorative => {
             notes.push(Some(at), Severity::Dropped, why);

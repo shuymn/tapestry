@@ -303,21 +303,27 @@ impl Rect {
         })
     }
 
-    /// The edges reflected to y down and rounded half up: left, top,
-    /// right, bottom.
-    pub(crate) fn edges(self) -> Option<[i128; 4]> {
-        let h = Q::int(HEIGHT);
+    /// The edges reflected to y down about `flip` and rounded half up:
+    /// left, top, right, bottom. `flip` is the reference height for an
+    /// element, and 0 for a song list part, whose top is then `−(y + h)`
+    /// below its placement's bottom-left corner.
+    pub(crate) fn edges_from(self, flip: Q) -> Option<[i128; 4]> {
         let left = self.x.round()?;
         let right = self.x.add(self.w)?.round()?;
-        let top = h.sub(self.y.add(self.h)?)?.round()?;
-        let bottom = h.sub(self.y)?.round()?;
+        let top = flip.sub(self.y.add(self.h)?)?.round()?;
+        let bottom = flip.sub(self.y)?.round()?;
         Some([left, top, right, bottom])
     }
 
     /// The model rect `[x, y, w, h]` (y down) from the rounded edges,
     /// every value within ±[`MAX_COORD`].
     pub(crate) fn model(self) -> Option<[i32; 4]> {
-        let [l, t, r, b] = self.edges()?;
+        self.model_from(Q::int(HEIGHT))
+    }
+
+    /// [`Self::model`] reflected about `flip` ([`Self::edges_from`]).
+    pub(crate) fn model_from(self, flip: Q) -> Option<[i32; 4]> {
+        let [l, t, r, b] = self.edges_from(flip)?;
         coords([l, t, r.checked_sub(l)?, b.checked_sub(t)?])
     }
 }
@@ -481,7 +487,7 @@ mod tests {
             w: Q::int(2),
             h: q(4, 3),
         };
-        assert_eq!(r.edges(), Some([0, 1077, 2, 1079]));
+        assert_eq!(r.edges_from(Q::int(HEIGHT)), Some([0, 1077, 2, 1079]));
         assert_eq!(r.model(), Some([0, 1077, 2, 2]));
     }
 }
