@@ -570,6 +570,36 @@ fn labels_follow_the_row_s_features() {
     }
 }
 
+/// A level's strip follows the selection loader
+/// (`JsonSelectSkinObjectLoader.java:181-196`): a ten-glyph strip pads
+/// with blanks whatever its `padding`, and its digit offsets are unread.
+#[test]
+fn level_strips_follow_the_selection_loader() {
+    let list = song_list(
+        &[&at(0, 500, 300, 40)],
+        &[&at(0, 500, 300, 40)],
+        0,
+        &format!(
+            r#"{TITLE}, "level": [{{"id": "lv", "dst": [{}]}}]"#,
+            at(0, 0, 4, 8)
+        ),
+    );
+    let d = folder(&with_list(
+        &list,
+        &format!(
+            r#""value": [{{"id": "lv", {DIGITS}, "digit": 2, "padding": 1, "ref": 96,
+                "offset": [{{"x": 1}}, {{"x": 1}}]}}]"#
+        ),
+    ));
+    let i = import_selection(d.path()).unwrap();
+    assert_eq!(i.report.usage.digit_offsets, 0);
+    let mut s = Sel::new(i.skin);
+    let mut row = chart("a");
+    row.level_value = 7;
+    s.view(&view(vec![row], Some(0), None, None));
+    assert_eq!(s.digits(0), "7");
+}
+
 /// C7: a chart row draws its level in its difficulty's style; the
 /// seventh source style is dropped with a note.
 #[test]

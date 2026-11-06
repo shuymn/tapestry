@@ -159,12 +159,14 @@ fn a_skin_without_a_drawn_list_refuses() {
 #[test]
 fn ratio_bars_draw_their_ratios() {
     let d = folder(&minimal(
-        r#""graph": [{"id": "g", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 147},
+        r#""graph": [{"id": "g", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 147, "angle": 0},
+                     {"id": "gv", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 147},
                      {"id": "dist", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": -1}],
            "slider": [{"id": "pos", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 200},
                       {"id": "vol", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 17}],
            "destination": [{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]},
                {"id": "g", "dst": [{"x": 0, "y": 0, "w": 90, "h": 10}]},
+               {"id": "gv", "dst": [{"x": 300, "y": 0, "w": 10, "h": 90}]},
                {"id": "dist", "dst": [{"x": 0, "y": 0, "w": 90, "h": 10}]},
                {"id": "pos", "dst": [{"x": 0, "y": 100, "w": 10, "h": 10}]},
                {"id": "vol", "dst": [{"x": 0, "y": 200, "w": 10, "h": 10}]}]"#,
@@ -193,15 +195,22 @@ fn ratio_bars_draw_their_ratios() {
     let bars: Vec<[f32; 4]> = s
         .drawn(0)
         .into_iter()
-        // The cut graph's middle texel lies left of the whole image's.
-        .filter(|(t, _)| t[1] == BAR[1] && (40..48).contains(&t[0]))
+        // A cut graph's middle texel lies off the whole image's middle.
+        .filter(|(t, _)| t[1] < 8 && (40..48).contains(&t[0]))
         .map(|(_, r)| r)
         .collect();
-    // 90 × 50/150 wide; the slider 200 × 1/2 to the right.
+    // 90 × 50/150 wide from the left; with no `angle` a graph is vertical
+    // (`JsonSkin.java:236`), 90 × 50/150 high from the bottom; the slider
+    // 200 × 1/2 to the right.
     assert_eq!(
         bars,
-        [[0.0, 1070.0, 30.0, 10.0], [100.0, 970.0, 10.0, 10.0]]
+        [
+            [0.0, 1070.0, 30.0, 10.0],
+            [300.0, 1050.0, 10.0, 30.0],
+            [100.0, 970.0, 10.0, 10.0]
+        ]
     );
+    let _ = BAR;
     let hit = s
         .skin
         .slider_at(&s.sel, [150.0, 975.0], [1_920, 1_080])
@@ -222,5 +231,63 @@ fn decision_and_result_skins_have_no_importer() {
         let (mut def, h) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
         let r = skin_beatoraja::import(&mut def, &h, &skin_beatoraja::Config::defaults(&h), kind);
         assert!(matches!(r, Err(ImportError::NoImporter { kind: k }) if k == kind));
+    }
+}
+
+/// An active `listoff` the list does not give: slot 1's unselected arm
+/// with only slot 0's `listoff` written refuses the song list, where
+/// the inactive `listoff` of the center slot missing is only noted.
+#[test]
+fn a_missing_active_listoff_refuses() {
+    let place = [at(0, 900, 300, 40), at(0, 800, 300, 40)];
+    let list = song_list(&[&place[0], &place[1]], &[&place[0]], 0, TITLE);
+    let d = folder(&with_option(&list, TEXT_T));
+    assert_eq!(refused(import_selection(d.path())), EssentialPart::SongList);
+    // Center 1: slot 0's `listoff` is active and given, slot 1's (the
+    // center's) inactive and absent.
+    let list = song_list(&[&place[0], &place[1]], &[&place[0]], 1, TITLE);
+    let d = folder(&with_option(&list, TEXT_T));
+    let i = import_selection(d.path()).unwrap();
+    assert!(common::has(
+        &i.report,
+        NoteKind::Ignored { field: "listoff" }
+    ));
+}
+
+/// A placement's images run on the set's timing, as the source takes it
+/// (`JsonSelectSkinObjectLoader.java:47-66`): the first loadable image's
+/// cycle and the first timer given, here image 1's timer 11 for image 0's
+/// two frames. The same image drawn on its own keeps its own timing,
+/// whichever is read first.
+#[test]
+fn placements_take_their_set_s_timing() {
+    let images = r#""image": [
+        {"id": "b0", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8},
+        {"id": "m0", "src": "s", "x": 0, "y": 16, "w": 16, "h": 8, "divx": 2, "cycle": 100},
+        {"id": "m1", "src": "s", "x": 16, "y": 16, "w": 8, "h": 8, "timer": 11}]"#;
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    for first in [true, false] {
+        let plain = r#"{"id": "m0", "dst": [{"x": 500, "y": 0, "w": 8, "h": 8}]}"#;
+        let listed = r#"{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#;
+        let dsts = if first {
+            format!("{plain}, {listed}")
+        } else {
+            format!("{listed}, {plain}")
+        };
+        let body = format!(
+            r#""imageset": [{{"id": "set", "images": ["m0", "m1"]}}], "text": [{TEXT_T}], {list},
+               "destination": [{dsts}], {images}"#
+        );
+        let d = folder(&body);
+        let mut s = Sel::of(d.path());
+        s.view(&view(vec![chart("a")], Some(0), None, None));
+        // Two frames over a 100 ms cycle; the change at 125 ms: at 150 ms
+        // the placement is 25 ms into its cycle (frame 0), the image on its
+        // own 150 ms (frame 1).
+        s.timers.change = Some(bms_model::TimeUs(125_000));
+        let mut frames: Vec<(f32, [u8; 2])> =
+            s.drawn(150).into_iter().map(|(t, r)| (r[0], t)).collect();
+        frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(frames, [(0.0, [4, 20]), (500.0, [12, 20])], "{first}");
     }
 }

@@ -175,7 +175,18 @@ impl Cx<'_> {
         }
         let s = self.src_image(rec)?;
         let frames = self.grid_frames(at, s.div)?;
-        let (set, pad, d) = if frames.is_multiple_of(24) {
+        // A song list's level (no value given) takes the selection loader's
+        // strip: ten glyphs blank-padded when the frames are a multiple of
+        // ten, else eleven padded with the eleventh, its `padding` and
+        // `zeropadding` unread and no digit offsets
+        // (`JsonSelectSkinObjectLoader.java:181-196`).
+        let (set, pad, d) = if value.is_none() {
+            if frames.is_multiple_of(10) {
+                (GlyphSet::Ten, Pad::Blank, 10)
+            } else {
+                (GlyphSet::Eleven, Pad::Glyph, 11)
+            }
+        } else if frames.is_multiple_of(24) {
             let pad = match zeropadding {
                 ..=0 => Pad::Blank,
                 2 => Pad::Glyph,
@@ -303,7 +314,11 @@ impl Cx<'_> {
                 .widget_quads(quads)
                 .map_err(|l| self.limit(at, l))?;
         }
-        let offsets = self.digit_offsets(at, rec, extra, cells)?;
+        let offsets = if value.is_some() {
+            self.digit_offsets(at, rec, extra, cells)?
+        } else {
+            Default::default()
+        };
         let digits = DigitsDef {
             image,
             set,

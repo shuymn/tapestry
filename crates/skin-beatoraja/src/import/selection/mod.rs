@@ -195,7 +195,9 @@ impl Cx<'_> {
             ],
         );
         let ty = self.int_or(ty, "type", 0)?;
-        let angle = self.int_or(angle, "angle", 0)?;
+        // A graph's direction defaults to vertical, a slider's to up
+        // (`JsonSkin.java:214, 236`).
+        let angle = self.int_or(angle, "angle", i32::from(graph))?;
         let range = self.int_or(range, "range", 0)?;
         let value = self.callback_prop(value, "value")?;
         let ref_num = match ref_num {
@@ -506,6 +508,12 @@ impl Cx<'_> {
                 continue;
             };
             let Some(rec) = rec else {
+                // An active `listoff` the source would read past its list
+                // (`JsonSelectSkinObjectLoader.java:68-69`): the slot's
+                // geometry is missing.
+                if active {
+                    return Err(self.essential(Some(at), essential, None));
+                }
                 self.ignored(at, NoteKind::Ignored { field: "listoff" });
                 continue;
             };
@@ -616,13 +624,27 @@ impl Cx<'_> {
                 None => None,
             });
         }
-        // The cycle and timer of the first image whose source resolves.
-        let mut first = None;
+        // The set's timing, as the source takes it over the images that
+        // load, in order (`JsonSelectSkinObjectLoader.java:47-66`): the
+        // first timer that is given, and the first cycle other than -1,
+        // each with the record it comes from. An image loads here when its
+        // source resolves; a file missing for the source too is not told
+        // apart.
+        let mut timer: Option<(Prop, u32)> = None;
+        let mut cycle: Option<(i32, u32)> = None;
         for &r in recs.iter().flatten() {
-            let s = self.src_image(r)?;
-            if self.source_rec(s.src_name())?.is_some() {
-                first = Some((s.timer.clone(), s.cycle));
+            if timer.is_some() && cycle.is_some() {
                 break;
+            }
+            let s = self.src_image(r)?;
+            if self.source_rec(s.src_name())?.is_none() {
+                continue;
+            }
+            if timer.is_none() && s.timer != Prop::Null {
+                timer = Some((s.timer.clone(), r));
+            }
+            if cycle.is_none() && s.cycle != -1 {
+                cycle = Some((s.cycle, r));
             }
         }
         let mut image = [None; 6];
@@ -634,10 +656,14 @@ impl Cx<'_> {
                 continue;
             };
             let mut s = self.src_image(r)?;
-            if let Some((timer, cycle)) = &first {
-                s.timer = timer.clone();
-                s.cycle = *cycle;
-            }
+            s.timer = timer.as_ref().map_or(Prop::Null, |(t, _)| t.clone());
+            s.cycle = cycle.map_or(0, |(c, _)| c);
+            // The image runs on that timing: cached apart from the record
+            // drawn on its own.
+            s.timing = [
+                timer.as_ref().map_or(u32::MAX, |&(_, r)| r),
+                cycle.map_or(u32::MAX, |(_, r)| r),
+            ];
             // Image 0 is the arm's own; a later one falls back.
             let own = c.role;
             if j != 0 {
@@ -702,24 +728,24 @@ impl Cx<'_> {
                     }
                 }
                 if let Some(Some(Some(def))) = read.get(k) {
-                    found = Some((k, def.clone()));
+                    found = Some((k, def.part.track.key_count()));
                     break;
                 }
             }
-            let Some((k, def)) = found else {
+            let Some((k, keys)) = found else {
                 return Err(self.essential(Some(at), EssentialPart::RowTitle, None));
             };
             // A style another row kind takes too is the model's copy: its
-            // keys are charged again before it is kept.
+            // keys are charged again before it is made.
             if let Some(u) = used.get_mut(k) {
                 if *u {
-                    let n = def.part.track.key_count();
-                    self.charged(at, |b| b.keys(n).map(|_| ()), |_| Ok(()))?;
+                    self.charged(at, |b| b.keys(keys).map(|_| ()), |_| Ok(()))?;
                 }
                 *u = true;
             }
+            let def = read.get(k).cloned().flatten().flatten();
             if let Some(t) = titles.get_mut(style) {
-                *t = Some(def);
+                *t = def;
             }
         }
         for (k, &rec) in text.iter().enumerate() {

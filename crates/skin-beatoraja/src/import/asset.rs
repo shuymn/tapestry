@@ -240,8 +240,10 @@ pub(crate) enum FntFailure {
 
 /// An image cache key: the source object, a linear filter, the cut
 /// (columns and rows kept), and whether an image choice uses it, without
-/// the sheet-level cycle its entries replace.
-pub(crate) type ImageKey = (u32, bool, [u32; 2], bool);
+/// the sheet-level cycle its entries replace, and the records whose timer
+/// and cycle it runs on: its own, or for a song list placement those its
+/// image set takes.
+pub(crate) type ImageKey = (u32, bool, [u32; 2], bool, [u32; 2]);
 
 /// The source rows an image keeps of its single frame: the first row and
 /// the count.

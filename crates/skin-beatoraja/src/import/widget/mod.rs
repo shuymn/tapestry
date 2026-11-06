@@ -55,6 +55,9 @@ pub(super) struct SrcImage {
     pub(super) div: [u32; 2],
     pub(super) timer: Prop,
     pub(super) cycle: i32,
+    /// The records its timer and its cycle come from: its own, or a song
+    /// list placement's set's ([`ImageKey`]).
+    pub(super) timing: [u32; 2],
 }
 
 impl SrcImage {
@@ -164,6 +167,7 @@ impl Cx<'_> {
             ],
             timer: self.callback_prop(timer, "timer")?,
             cycle: self.int_or(cycle, "cycle", 0)?,
+            timing: [rec, rec],
         })
     }
 
@@ -206,7 +210,7 @@ impl Cx<'_> {
             }
         };
         let linear = c.filter == skin_model::Filter::Linear;
-        let key = (rec, linear, grid, false);
+        let key = (rec, linear, grid, false, s.timing);
         if let Some((def, cell)) = self.assets.base(key) {
             let rect = def.rect.unwrap_or_default();
             let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {

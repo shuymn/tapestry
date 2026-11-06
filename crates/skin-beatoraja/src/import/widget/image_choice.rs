@@ -148,7 +148,13 @@ struct Entry {
 
 /// The cache key of record `rec`'s image for an image choice of `c`.
 fn choice_key(c: &Common, rec: u32, s: &SrcImage) -> ImageKey {
-    (rec, c.filter == skin_model::Filter::Linear, s.div, true)
+    (
+        rec,
+        c.filter == skin_model::Filter::Linear,
+        s.div,
+        true,
+        s.timing,
+    )
 }
 
 /// A choice's image the sheet would not take, as a refusal no hole stands
