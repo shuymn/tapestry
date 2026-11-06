@@ -1544,13 +1544,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             }
             // A pending play skin admits charts, each built for.
             rig.pending = started.pending;
-            if let (Some(notice), Some(sel)) = (started.notice, &mut rig.selection) {
-                sel.screen.set_notice(Some(notice));
-            }
-            // The select screen's view is made for the installed skin's
-            // song list.
             if let Some(sel) = &mut rig.selection {
-                sel.feed.window = started.selection;
+                sel.started(started.notice, started.selection);
             }
             (true, None)
         }

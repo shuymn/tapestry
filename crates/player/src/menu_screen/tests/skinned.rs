@@ -119,6 +119,37 @@ fn the_preset_name_shows_three_seconds_from_its_step() {
     );
 }
 
+/// A selection frame submits the skin's frame from the selection
+/// installation's own staging, every quad it built, and the strip's
+/// text over it: the preset's name changes the pixels drawn while it
+/// shows.
+#[test]
+fn a_selection_frame_draws_the_skins_staging_and_the_strips_text() {
+    let (_dir, mut screen, mut logic, _) = skinned();
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let mut s = SelectScreen::new(Vec::new());
+    s.set_preset("ベータ".to_owned(), None);
+    let t = 5_000_000;
+    feed.preset_step = Some(TimeUs(t));
+    let named = update(&mut feed, &s, t);
+    let d = screen
+        .selection(&named, Some(&mut logic), true, TimeUs(t))
+        .unwrap();
+    let quads = screen.renderer.selection_quads().unwrap().len();
+    assert!(quads > 0);
+    assert_eq!(d.timing.sprites, quads);
+    let with_name = screen.read_back().unwrap();
+    s.set_preset(String::new(), None);
+    let unnamed = update(&mut feed, &s, t);
+    screen
+        .selection(&unnamed, Some(&mut logic), true, TimeUs(t))
+        .unwrap();
+    let without = screen.read_back().unwrap();
+    assert_eq!(screen.renderer.selection_quads().unwrap().len(), quads);
+    assert_ne!(with_name.2, without.2);
+}
+
 /// A preset step the flow takes reaches the strip through the game
 /// thread's update: the update names the preset the step chose, stamped
 /// with the time the step was taken (`t`), and the frames of that update

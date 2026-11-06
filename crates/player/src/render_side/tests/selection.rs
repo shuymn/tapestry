@@ -172,6 +172,58 @@ fn the_skin_state_follows_the_lifetime_and_a_refusal_is_for_the_run() {
     link.exit();
 }
 
+/// The render thread takes only a newer update of a lifetime: one older
+/// than the update it drew, offered after it, is never drawn.
+#[test]
+fn an_older_update_is_never_drawn_after_a_newer_one() {
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    link.enter_selection(1);
+    link.show_selection(update(1, 2));
+    assert!(wait_until(|| seen(&screens)
+        .iter()
+        .any(|s| s.revision == 2)));
+    link.show_selection(update(1, 1));
+    std::thread::sleep(Duration::from_millis(100));
+    let drawn: Vec<u64> = seen(&screens).iter().map(|s| s.revision).collect();
+    assert!(drawn.iter().all(|r| *r == 2), "{drawn:?}");
+    link.exit();
+}
+
+/// Another selection skin installed within a lifetime draws from a
+/// fresh state of its own, not the one the skin before it filled.
+#[test]
+fn a_new_installation_starts_a_fresh_skin_state() {
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let install = |skin| {
+        assert_eq!(
+            link.select(ScreenKind::Selection, Some(skin))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+    };
+    install(bundle());
+    link.enter_selection(1);
+    link.show_selection(update(1, 1));
+    assert!(wait_until(|| seen(&screens)
+        .iter()
+        .any(|s| s.state.is_some())));
+    let first = seen(&screens).iter().find_map(|s| s.state).unwrap();
+    install(bundle());
+    link.show_selection(update(1, 2));
+    assert!(wait_until(|| seen(&screens)
+        .iter()
+        .any(|s| s.revision == 2)));
+    let again = seen(&screens)
+        .into_iter()
+        .find(|s| s.revision == 2)
+        .unwrap();
+    assert!(again.state.is_some_and(|n| n != first), "{again:?}");
+    link.exit();
+}
+
 /// A self-made selection skin of one image on a `when` timer whose
 /// condition always holds, moving right 1 px per ms from the timer's
 /// start: a frame's quad is at x = the time since the start, in ms.

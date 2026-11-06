@@ -339,6 +339,16 @@ impl Selection {
         self.drain(&mut menus.pad)
     }
 
+    /// What startup left the select screen: a skin's refusal `notice`, and
+    /// the installed selection skin's song list (`window`, its center slot
+    /// and its placements), which the screen's view is made for.
+    pub fn started(&mut self, notice: Option<String>, window: Option<(usize, usize)>) {
+        if let Some(notice) = notice {
+            self.screen.set_notice(Some(notice));
+        }
+        self.feed.window = window;
+    }
+
     /// Shows on the page that `chart` was refused, and why (`text`);
     /// `preset` when the refusal was the shelf's, which cannot open.
     fn refused(&mut self, chart: &std::path::Path, text: String, preset: bool) {
@@ -3755,6 +3765,22 @@ pub(crate) mod tests {
         // the same.
         sel.feed.window = None;
         assert_eq!(at(&mut sel, 700).view.rows.len(), 1);
+    }
+
+    /// What startup leaves the select screen reaches its updates: the
+    /// installed skin's window makes the view, and a refusal is the
+    /// notice.
+    #[test]
+    fn startup_gives_the_updates_the_skins_window_and_the_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["a.bms", "b.bms", "c.bms"]]);
+        sel.started(Some("refused".to_owned()), Some((3, 7)));
+        sel.feed.enter(TimeUs(0));
+        let page = sel.screen.page("");
+        let u = sel.feed.update(&sel.screen, page, TimeUs(0));
+        // Top: the all-charts row and the three charts, the cursor first.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert_eq!(u.strip.notice.as_deref(), Some("refused"));
     }
 
     /// `f` on a rig of the game's threads whose render thread is `render`,
