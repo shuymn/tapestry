@@ -490,7 +490,10 @@ fn an_invalid_key_config_exits_nonzero() {
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// all sounding, as a play without the hold does. The saved record keeps
+/// all sounding, as a play without the hold does. The rearm is answered
+/// at least 30 ms after the release (design.md "Shortening Launch-Based
+/// Checks", scripted input), and every press still lands on its note. The
+/// saved record keeps
 /// the cancelled opening, Q's press in it, and the winning READY's input
 /// alone; F2, pressed during the play, reaches the adjustments and no
 /// record, and the winning capture re-evaluates equal to the live play.
@@ -499,6 +502,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
     let Fixture {
         dir,
+        chart,
         chart_path,
         log,
         appdata,
@@ -528,6 +532,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
 
     let out = scripted_play(&chart_path, &log, &appdata)
         .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .args(["--dev-rearm-delay", "30"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -557,13 +562,20 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     assert_eq!(h.openings.len(), 1, "{h:?}");
     let o = &h.openings[0];
     assert_eq!(o.reason, replay::CancelReason::Held);
-    // The release was seen at an input boundary just after 200 ms: the
-    // next READY's chart time 0 lies about 1.2 s after the first's.
+    // On the clock the next READY's chart time 0 lies 1.2 s after the
+    // first's and the rearm's delay more.
     assert!(
-        (-1_250_000..=-1_199_000).contains(&o.origin.0),
+        (-2_200_000..=-1_230_000).contains(&o.origin.0),
         "{:?}",
         o.origin
     );
+    // On the chart, every press is on its note: the rearm opened at the
+    // release, not where it was answered.
+    let late: Vec<_> = all_events(&chart, &rec)
+        .into_iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 != 0))
+        .collect();
+    assert!(late.is_empty(), "{late:?}");
     let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
     assert!(cancelled.iter().any(|e| e.kind
         == eval::InputKind::Control {
@@ -1863,7 +1875,9 @@ const MIX_CHART: &str = "#PLAYER 1\n#TITLE mix\n#BPM 120\n#WAV01 click.wav\n#LNT
 /// release, so a separate CN mode adds nothing here), an empty POOR and a
 /// scratch hit, with START, SELECT and the auxiliary keys pressed during
 /// it, which are recorded, and F2, which is not. The cancelled opening
-/// keeps START's press.
+/// keeps START's press. The rearm is answered at least 30 ms after the
+/// release, and each press keeps its offset from its note (design.md
+/// "Shortening Launch-Based Checks", scripted input).
 #[test]
 fn the_winning_capture_reevaluates_equal_to_live() {
     const Q: u32 = 0x10;
@@ -1926,6 +1940,7 @@ fn the_winning_capture_reevaluates_equal_to_live() {
 
     let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
         .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .args(["--dev-rearm-delay", "30"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1971,6 +1986,12 @@ fn the_winning_capture_reevaluates_equal_to_live() {
             .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
             .count()
     };
+    // Each press as far from its note as the log has it: on time, and key
+    // 2 40 ms early.
+    let off = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 != 0 && d.0 != -40_000)
+    });
+    assert!(!off, "{judged:?}");
     assert!(count(Judgment::Perfect) >= 1, "{judged:?}");
     assert_eq!(count(Judgment::Great), 1, "{judged:?}");
     assert_eq!(count(Judgment::Poor), 1, "{judged:?}");

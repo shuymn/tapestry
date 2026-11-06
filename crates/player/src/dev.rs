@@ -568,6 +568,11 @@ pub struct Options {
     /// first opening (`--dev-loading`): each by scan code with its press and
     /// release times after loading starts, fed only to the adjustment tap.
     pub loading_keys: Vec<(u32, TimeUs, TimeUs)>,
+    /// How long after a cancelled READY's release a scripted play's rearm
+    /// is answered at the earliest (`--dev-rearm-delay <ms>`): a game thread
+    /// late to ask, made on purpose, which the script's chart times do not
+    /// follow.
+    pub rearm_delay: TimeUs,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
     /// The result screen's input, scripted (`--dev-result`): `next`,
@@ -646,6 +651,7 @@ impl Options {
                     log,
                     speed: self.speed_keys.iter().map(|&k| (k, at)).collect(),
                     loading: self.loading_keys.clone(),
+                    rearm_delay: self.rearm_delay,
                 })
             })),
         }
@@ -689,6 +695,11 @@ impl Options {
             "dev-size" => self.size = Some(size(p)?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-start" => self.start = Some(start(p)?),
+            "dev-rearm-delay" => {
+                let bad = || UsageError::Usage("--dev-rearm-delay takes milliseconds".to_owned());
+                let ms: u32 = p.value()?.to_string_lossy().parse().map_err(|_| bad())?;
+                self.rearm_delay = TimeUs(i64::from(ms) * 1_000);
+            }
             "dev-result" => {
                 let steps = p.value()?;
                 self.result =
@@ -1455,6 +1466,9 @@ pub struct ScriptInput {
     pub speed: Vec<(u32, TimeUs)>,
     /// Keys held while loading, with their press and release times.
     pub loading: Vec<(u32, TimeUs, TimeUs)>,
+    /// How long a rearm waits at the least after the release
+    /// ([`Options::rearm_delay`]).
+    pub rearm_delay: TimeUs,
 }
 
 /// The keys of `list` held while loading, comma-separated as
