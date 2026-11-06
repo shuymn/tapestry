@@ -28,7 +28,7 @@ use crate::schema::Ty;
 use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
 use crate::select::{Selection, SelectionError, SelectionFrame};
-use crate::selection::{SelectionLabels, SelectionView};
+use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
 use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
@@ -2630,6 +2630,29 @@ impl Skin {
         Ok(())
     }
 
+    /// Fills `sel`'s settings' fields and the master volume's ratio from
+    /// `settings`, apart from the view, which a later
+    /// [`update_selection`](Self::update_selection) leaves as they are.
+    /// Writes fields only: no string, no allocation, so a frame may call
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectionError::Kind`] when this is not a selection skin or `sel`
+    /// is not its state; nothing changes.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn update_selection_settings(
+        &self,
+        sel: &mut Selection,
+        settings: &SelectionSettings,
+    ) -> Result<(), SelectionError> {
+        if !self.owns(sel) {
+            return Err(SelectionError::Kind);
+        }
+        sel.settings(settings);
+        Ok(())
+    }
+
     /// The lines to rasterize for `sel`'s strings on a `target`-pixel
     /// target with `layout`: each text element's, as
     /// [`text_requests`](Self::text_requests) makes them, with the
@@ -3172,6 +3195,7 @@ impl Skin {
                         let value = match b.source {
                             RatioSource::ListPosition => sel.position,
                             RatioSource::ExRate => sel.ex_rate,
+                            RatioSource::MasterVolume => sel.master_volume,
                         };
                         if let Some(v) = value {
                             draw_ratio(b, image, v, rect, &brush, &at, out);

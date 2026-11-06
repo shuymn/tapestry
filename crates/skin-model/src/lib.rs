@@ -154,8 +154,9 @@ pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};
 pub use select::schema::{field as selection_field, timer as selection_timer};
 pub use select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 pub use selection::{
-    ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowFeatures, RowKey, RowKind,
-    RowScore, RowView, SelectedChart, SelectionLabels, SelectionPlace, SelectionView,
+    ChartLabels, FolderId, MAX_VISIBLE_ROWS, MasterVolume, OwnLamp, Ratio, RowFeatures, RowKey,
+    RowKind, RowScore, RowView, SelectedChart, SelectionLabels, SelectionOrder, SelectionPlace,
+    SelectionSettings, SelectionView, SpeedReference, SpeedView,
 };
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,

@@ -20,6 +20,10 @@ pub enum RatioSource {
     /// The selected chart's best EX score over the largest its summary
     /// allows; none without both or with a largest of 0.
     ExRate,
+    /// The master gain that plays, exactly
+    /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
+    /// the settings.
+    MasterVolume,
 }
 
 /// Which way a slider moves as its ratio grows, on the screen.

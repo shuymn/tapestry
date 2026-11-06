@@ -689,3 +689,270 @@ fn placements_past_sixty_are_ignored() {
     assert_eq!(s.images(0).len(), 60);
     let _ = json;
 }
+
+/// The settings' numbers of the settings fixture, one a row.
+const SETTING_NUMBERS: [i32; 4] = [12, 57, 312, 313];
+
+/// The image indices of the settings fixture, each on its own column.
+const SETTING_INDICES: [i32; 38] = [
+    11, 12, 15, 16, 19, 40, 42, 43, 54, 55, 72, 75, 77, 78, 301, 302, 303, 304, 305, 306, 307, 308,
+    315, 316, 317, 318, 330, 331, 332, 340, 341, 342, 1, 1, 1, 1, 1, 1,
+];
+
+/// The settings fixture: a number per id of [`SETTING_NUMBERS`] on row
+/// `i` (y up `10 · i`), an image of eleven entries per id of
+/// [`SETTING_INDICES`] at x `10 · i` (its first 32), the master volume's
+/// slider (range 100 to the right, at y 600) and graph (100 wide, at
+/// y 500).
+fn settings_skin() -> String {
+    let values: Vec<String> = SETTING_NUMBERS
+        .iter()
+        .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 5, "ref": {id}}}"#))
+        .collect();
+    let images: Vec<String> = SETTING_INDICES[..32]
+        .iter()
+        .map(|id| {
+            format!(
+                r#"{{"id": "i{id}", "src": "s", "x": 0, "y": 64, "w": 88, "h": 8, "divx": 11, "len": 11, "ref": {id}}}"#
+            )
+        })
+        .collect();
+    let mut dsts: Vec<String> = SETTING_NUMBERS
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                r#"{{"id": "n{id}", "dst": [{}]}}"#,
+                at(0, 10 * i as i32, 4, 8)
+            )
+        })
+        .collect();
+    dsts.extend(SETTING_INDICES[..32].iter().enumerate().map(|(i, id)| {
+        format!(
+            r#"{{"id": "i{id}", "dst": [{}]}}"#,
+            at(10 * i as i32, 800, 8, 8)
+        )
+    }));
+    dsts.push(format!(
+        r#"{{"id": "vs", "dst": [{}]}}"#,
+        at(0, 600, 10, 10)
+    ));
+    dsts.push(format!(
+        r#"{{"id": "vg", "dst": [{}]}}"#,
+        at(0, 500, 100, 10)
+    ));
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}], "value": [{}], {list},
+           "image": [{}, {}],
+           "slider": [{{"id": "vs", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 100}}],
+           "graph": [{{"id": "vg", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 0}}],
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        values.join(","),
+        common::selection::IMAGES,
+        images.join(","),
+        dsts.join(",")
+    )
+}
+
+/// What a settings frame shows: each number's digits by its id, each
+/// image index's entry by its id, and the volume slider's and graph's
+/// rects.
+struct SettingsFrame {
+    numbers: BTreeMap<i32, String>,
+    indices: BTreeMap<i32, u8>,
+    slider: Option<[f32; 4]>,
+    graph: Option<[f32; 4]>,
+}
+
+fn settings_frame(s: &mut Sel) -> SettingsFrame {
+    let mut f = SettingsFrame {
+        numbers: BTreeMap::new(),
+        indices: BTreeMap::new(),
+        slider: None,
+        graph: None,
+    };
+    for (t, r) in s.drawn(0) {
+        if let Some(d) = digit_of(t) {
+            let i = ((1072.0 - r[1]) / 10.0) as usize;
+            f.numbers
+                .entry(SETTING_NUMBERS[i])
+                .or_default()
+                .push(char::from(b'0' + d));
+        } else if t[1] == 68 {
+            let id = SETTING_INDICES[(r[0] / 10.0) as usize];
+            assert!(f.indices.insert(id, (t[0] - 4) / 8).is_none(), "{id}");
+        } else if t[1] < 8 && (40..48).contains(&t[0]) {
+            // y down: the slider's top at 1080 − 610, the graph's at 570.
+            if r[1] == 470.0 {
+                f.slider = Some(r);
+            } else if r[1] == 570.0 {
+                f.graph = Some(r);
+            }
+        }
+    }
+    f
+}
+
+/// Settings of `display_offset_ms`, `gain`, `speed`, `order`, `gauge` and
+/// `covers_on`.
+fn settings(
+    display_offset_ms: i32,
+    gain: f32,
+    speed: skin_model::SpeedView,
+    order: skin_model::SelectionOrder,
+    gauge: Option<skin_model::GaugeLook>,
+    covers_on: [bool; 3],
+) -> skin_model::SelectionSettings {
+    skin_model::SelectionSettings {
+        display_offset_ms,
+        master_volume: skin_model::MasterVolume::of_gain(gain),
+        speed,
+        order,
+        gauge,
+        covers_on,
+    }
+}
+
+/// C13: through the production path (`import`, `prepare_selection`,
+/// `update_selection` and `update_selection_settings`, `build_selection`)
+/// each bridged settings id draws the player's value, each constant its
+/// constant and each unavailable id nothing, at two values of each
+/// setting; 312, 313 and 55 in Classic and Floating; the volume's number,
+/// slider and graph at the gains 0, 0.45 and 1; and a later view leaves
+/// the settings as they were.
+#[test]
+fn the_settings_draw_the_players_values_through_the_production_path() {
+    use skin_model::{GaugeLook, SelectionOrder, SpeedReference, SpeedView};
+    let d = folder(&settings_skin());
+    let i = import_selection(d.path()).unwrap();
+    // Only the ids with no native equivalent are noted unavailable.
+    let unavailable: Vec<i32> = common::kinds(&i.report)
+        .into_iter()
+        .filter_map(|k| match k {
+            skin_beatoraja::NoteKind::Unavailable { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unavailable, [78, 340, 341, 342]);
+    let mut s = Sel::new(i.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    // Before any settings: no volume ratio, so neither bar draws.
+    let f = settings_frame(&mut s);
+    assert_eq!((f.slider, f.graph), (None, None));
+    let constants = |f: &SettingsFrame| -> BTreeMap<i32, u8> {
+        f.indices
+            .iter()
+            .filter(|(id, _)| ![12, 40, 55, 330, 331, 332].contains(*id))
+            .map(|(&id, &k)| (id, k))
+            .collect()
+    };
+    // The truthful constants: 7-key and no BGA (2), every other 0.
+    let mut want_constants: BTreeMap<i32, u8> = [
+        11, 15, 16, 19, 42, 43, 54, 72, 75, 77, 301, 302, 303, 304, 305, 306, 307, 308, 315, 316,
+        317, 318,
+    ]
+    .into_iter()
+    .map(|id| (id, 0))
+    .collect();
+    want_constants.insert(11, 2);
+    want_constants.insert(72, 2);
+
+    let a = settings(
+        7,
+        0.45,
+        SpeedView::Classic,
+        SelectionOrder::Title,
+        Some(GaugeLook::Hard),
+        [true, false, true],
+    );
+    s.skin.update_selection_settings(&mut s.sel, &a).unwrap();
+    let f = settings_frame(&mut s);
+    assert_eq!(
+        f.numbers,
+        BTreeMap::from([(12, "7".to_owned()), (57, "45".to_owned())]),
+        "Classic: no duration"
+    );
+    assert_eq!(constants(&f), want_constants);
+    let settable =
+        |f: &SettingsFrame| [12, 40, 55, 330, 331, 332].map(|id| f.indices.get(&id).copied());
+    assert_eq!(
+        settable(&f),
+        [Some(0), Some(3), Some(0), Some(1), Some(0), Some(1)]
+    );
+    // 0.45 as the f32 gain: 7 549 747 / 2^24 of the travel and width.
+    let x = (100.0 * f64::from(7_549_747_u32) / f64::from(1_u32 << 24)) as f32;
+    assert!((f.slider.unwrap()[0] - x).abs() < 1e-3, "{:?}", f.slider);
+    assert!((f.graph.unwrap()[2] - x).abs() < 1e-3, "{:?}", f.graph);
+
+    let b = settings(
+        120,
+        1.0,
+        SpeedView::Floating {
+            reference: SpeedReference::Minimum,
+            green: 1_200,
+        },
+        SelectionOrder::Level,
+        Some(GaugeLook::AssistEasy),
+        [false, true, false],
+    );
+    s.skin.update_selection_settings(&mut s.sel, &b).unwrap();
+    let f = settings_frame(&mut s);
+    // ⌊5 · 1200 / 3⌋ ms and the green number.
+    assert_eq!(
+        f.numbers,
+        BTreeMap::from([
+            (12, "120".to_owned()),
+            (57, "100".to_owned()),
+            (312, "2000".to_owned()),
+            (313, "1200".to_owned()),
+        ])
+    );
+    assert_eq!(constants(&f), want_constants);
+    assert_eq!(
+        settable(&f),
+        [Some(4), Some(0), Some(4), Some(0), Some(1), Some(0)]
+    );
+    assert_eq!(f.slider.unwrap()[0], 100.0);
+    assert_eq!(f.graph.unwrap()[2], 100.0);
+    // A view keeps the settings.
+    s.view(&view(vec![chart("b")], Some(0), None, None));
+    assert_eq!(
+        settings_frame(&mut s).numbers.get(&57).map(String::as_str),
+        Some("100")
+    );
+
+    // Floating from the start tempo, the modification order (no sorter:
+    // nothing), no gauge (nothing), a silent gain.
+    let c = settings(
+        0,
+        0.0,
+        SpeedView::Floating {
+            reference: SpeedReference::Start,
+            green: 300,
+        },
+        SelectionOrder::Modified,
+        None,
+        [false; 3],
+    );
+    s.skin.update_selection_settings(&mut s.sel, &c).unwrap();
+    let f = settings_frame(&mut s);
+    assert_eq!(
+        f.numbers,
+        BTreeMap::from([
+            (12, "0".to_owned()),
+            (57, "0".to_owned()),
+            (312, "500".to_owned()),
+            (313, "300".to_owned()),
+        ])
+    );
+    assert_eq!(
+        settable(&f),
+        [None, None, Some(1), Some(0), Some(0), Some(0)]
+    );
+    assert_eq!(f.slider.unwrap()[0], 0.0);
+    // The unavailable ones never draw.
+    for id in [78, 340, 341, 342] {
+        assert!(!f.indices.contains_key(&id), "{id}");
+    }
+}

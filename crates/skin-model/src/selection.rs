@@ -52,6 +52,136 @@ impl Ratio {
             })
         }
     }
+
+    /// `x`'s exact binary value `m / 2^k` in lowest terms, for a finite
+    /// `x` from 0 to 1; one whose denominator would pass 2^63, which only
+    /// a value below 2^-40 (−240 dB) can need, reads as 0, and anything
+    /// else (negative, above 1, not finite) as `None`. Reads the bits
+    /// only: no float arithmetic.
+    #[must_use]
+    pub fn of_f32(x: f32) -> Option<Self> {
+        const ZERO: Ratio = Ratio {
+            numerator: 0,
+            denominator: 1,
+        };
+        let bits = x.to_bits();
+        let biased = (bits >> 23) & 0xff;
+        let fraction = u64::from(bits & 0x7f_ffff);
+        if bits << 1 == 0 {
+            // ±0.
+            return Some(ZERO);
+        }
+        if bits >> 31 != 0 || biased == 0xff {
+            return None;
+        }
+        // x = m / 2^k: a normal value has its implicit bit, a subnormal
+        // the smallest exponent.
+        let (m, k) = if biased == 0 {
+            (fraction, 149)
+        } else {
+            (fraction | 1 << 23, 150 - i64::from(biased))
+        };
+        // k < 0 is past 2^24.
+        let k = u32::try_from(k).ok()?;
+        let twos = m.trailing_zeros().min(k);
+        let (m, k) = (m >> twos, k - twos);
+        match 1_u64.checked_shl(k) {
+            Some(d) if m > d => None,
+            Some(d) => Some(Self {
+                numerator: m,
+                denominator: d,
+            }),
+            // Below 2^24 / 2^64.
+            None => Some(ZERO),
+        }
+    }
+}
+
+/// The master gain as a selection skin shows it: the gain that plays,
+/// as an exact ratio for the sliders and graphs, and the number the
+/// source's system volume number draws, `(int)(gain · 100f)`: the `f32`
+/// product truncated toward zero, which is not always the exact floor
+/// (0.01 shows 1, 0.53 shows 52).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MasterVolume {
+    /// The gain, exactly ([`Ratio::of_f32`]).
+    pub ratio: Ratio,
+    /// `(int)(gain · 100f)`.
+    pub number: i32,
+}
+
+impl MasterVolume {
+    /// The volume of `gain`, a gain from 0 to 1 (`device.toml`'s range);
+    /// one outside it reads as 0.
+    #[must_use]
+    pub fn of_gain(gain: f32) -> Self {
+        let Some(ratio) = Ratio::of_f32(gain) else {
+            return Self {
+                ratio: Ratio {
+                    numerator: 0,
+                    denominator: 1,
+                },
+                number: 0,
+            };
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the source's `(int)` cast: a gain from 0 to 1 gives 0 to 100"
+        )]
+        let number = (gain * 100.0) as i32;
+        Self { ratio, number }
+    }
+}
+
+/// How the hi-speed follows the settings, as a selection skin shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeedView {
+    /// A saved multiplier: no travel duration without a chart's tempo.
+    Classic,
+    /// Solved from the target green number `green` (1 to 6 000) at the
+    /// tempo `reference` names.
+    Floating {
+        reference: SpeedReference,
+        green: u32,
+    },
+}
+
+/// The chart tempo Floating solves from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeedReference {
+    Start,
+    Maximum,
+    Main,
+    Minimum,
+}
+
+/// The order the list is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionOrder {
+    Title,
+    Artist,
+    Level,
+    /// By the file's change, newest first: no source sorter has it.
+    Modified,
+}
+
+/// The player's settings a selection skin shows, read-only (docs/stage3.md
+/// §3, Selection): applied to the state apart from the view
+/// ([`Skin::update_selection_settings`](crate::Skin::update_selection_settings)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionSettings {
+    /// The display offset in whole ms, its sign the settings': a positive
+    /// one draws the chart as if later, as the source's judge timing.
+    pub display_offset_ms: i32,
+    /// The master gain that plays.
+    pub master_volume: MasterVolume,
+    pub speed: SpeedView,
+    pub order: SelectionOrder,
+    /// The chosen preset's displayed gauge's look; `None` without a
+    /// preset.
+    pub gauge: Option<GaugeLook>,
+    /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
+    pub covers_on: [bool; 3],
 }
 
 /// Where selection is.
@@ -265,5 +395,78 @@ mod tests {
                 denominator: 3
             })
         );
+    }
+
+    fn ratio(numerator: u64, denominator: u64) -> Ratio {
+        Ratio {
+            numerator,
+            denominator,
+        }
+    }
+
+    /// A gain's ratio is its `f32`'s exact binary value in lowest terms,
+    /// with the bits read only; below 2^-40 it reads 0, and outside 0 to
+    /// 1 it is none.
+    #[test]
+    fn a_gain_reads_as_its_exact_binary_value() {
+        for (x, want) in [
+            (0.0_f32, Some(ratio(0, 1))),
+            (-0.0, Some(ratio(0, 1))),
+            (1.0, Some(ratio(1, 1))),
+            (0.5, Some(ratio(1, 2))),
+            // 0x3f4f5c29, 0x3f43d07d, 0x3ee66666 and 0x3c23d70a.
+            (0.81, Some(ratio(13_589_545, 16_777_216))),
+            (0.7649, Some(ratio(12_832_893, 16_777_216))),
+            (0.45, Some(ratio(7_549_747, 16_777_216))),
+            (0.01, Some(ratio(5_368_709, 536_870_912))),
+            (2.0_f32.powi(-40), Some(ratio(1, 1 << 40))),
+            // 2^-40 · (1 + 2^-23): the denominator 2^63.
+            (
+                f32::from_bits(2.0_f32.powi(-40).to_bits() + 1),
+                Some(ratio((1 << 23) + 1, 1 << 63)),
+            ),
+            // Below 2^-40, exact while lowest terms fit: 1.5 · 2^-41.
+            (2.0_f32.powi(-41) * 1.5, Some(ratio(3, 1 << 42))),
+            // 2^-41 · (1 + 2^-23) would need 2^64.
+            (
+                f32::from_bits(2.0_f32.powi(-41).to_bits() + 1),
+                Some(ratio(0, 1)),
+            ),
+            (f32::from_bits(1), Some(ratio(0, 1))),
+            (1.000_000_1, None),
+            (2.0, None),
+            (-0.5, None),
+            (f32::NAN, None),
+            (f32::INFINITY, None),
+        ] {
+            assert_eq!(Ratio::of_f32(x), want, "{x:e}");
+        }
+    }
+
+    /// The volume's number is the source's `(int)(gain · 100f)`, as its
+    /// own runtime gives it for each gain (a run of the source's
+    /// expression): not the exact floor where the `f32` product rounds up
+    /// to a whole number, nor where it rounds down below one.
+    #[test]
+    fn the_volume_number_is_the_sources_truncated_f32_product() {
+        for (gain, number) in [
+            (0.0_f32, 0),
+            (0.01, 1),
+            (0.07, 7),
+            (0.29, 29),
+            (0.45, 45),
+            (0.5, 50),
+            (0.53, 52),
+            (0.57, 57),
+            (0.59, 58),
+            (0.7649, 76),
+            (0.81, 81),
+            (1.0, 100),
+        ] {
+            let v = super::MasterVolume::of_gain(gain);
+            assert_eq!(v.number, number, "{gain}");
+            assert_eq!(Some(v.ratio), Ratio::of_f32(gain), "{gain}");
+        }
+        assert_eq!(super::MasterVolume::of_gain(1.5).number, 0);
     }
 }

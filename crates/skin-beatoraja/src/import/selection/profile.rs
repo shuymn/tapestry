@@ -1,9 +1,10 @@
 //! The selection profile (docs/stage3.md §3, Selection): one explicit
 //! `match` per id space over every id the surveyed selection skins read,
-//! each classified. **N** ids are bridged from the selection schema; **E**
-//! ids (settings, capabilities, actions) are unavailable until their
-//! native bridge exists, drawing nothing with a note; **D** ids are a
-//! truthful constant or an omission with a note. An id outside the survey
+//! each classified. **N** ids are bridged from the selection schema, the
+//! player's settings among them (read-only); **E** ids (actions, and
+//! settings with no native equivalent) are unavailable, drawing nothing
+//! with a note; **D** ids are a truthful constant or an omission with a
+//! note. An id outside the survey
 //! follows the existing rules of its space: an option the source's
 //! factory knows is unsupported, one neither built in nor declared never
 //! draws, and an unknown number, text or image index is unsupported by
@@ -19,8 +20,8 @@ use skin_model::{RatioSource, SelectionText, TextField, selection_timer};
 pub(crate) enum Class<T> {
     /// Needed: bridged from the selection schema.
     Bridge(T),
-    /// Needed, but bridged only with the native settings, capabilities
-    /// and actions: until then it draws nothing, with a note.
+    /// Needed, but with no native equivalent or action yet: it draws
+    /// nothing, with a note.
     Unavailable,
     /// Decorative: omitted with a note.
     Omit,
@@ -43,6 +44,13 @@ pub(crate) enum SelValue {
     Charts,
     LengthMin,
     LengthSec,
+    /// The settings' display offset, whole ms.
+    DisplayOffset,
+    /// The master gain's number.
+    Volume,
+    /// Floating's travel duration and its green number.
+    Duration,
+    Green,
 }
 
 impl SelValue {
@@ -63,6 +71,10 @@ impl SelValue {
             Self::Charts => "cursor.charts",
             Self::LengthMin => "selected.length_min",
             Self::LengthSec => "selected.length_sec",
+            Self::DisplayOffset => "settings.display_offset",
+            Self::Volume => "settings.volume",
+            Self::Duration => "settings.duration",
+            Self::Green => "settings.green",
         }
     }
 
@@ -79,13 +91,16 @@ impl SelValue {
             Self::Level => "cursor.chart",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
+            Self::DisplayOffset | Self::Volume => "true",
+            // A duration needs the chart's tempo in Classic.
+            Self::Duration | Self::Green => "settings.floating",
         }
     }
 }
 
 /// The selection number `id` (`main_state.number` and a value's `ref`).
 pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match id {
         71 | 150 => Bridge(SelValue::Ex),
         72 => Bridge(SelValue::MaxEx),
@@ -101,9 +116,13 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         300 => Bridge(SelValue::Charts),
         1163 => Bridge(SelValue::LengthMin),
         1164 => Bridge(SelValue::LengthSec),
-        // The judge timing, the master volume, the travel duration and
-        // its green number: native settings.
-        12 | 57 | 312 | 313 => Unavailable,
+        // The display offset (the source's judge timing, of the same
+        // sign), the master gain standing for the source's system volume,
+        // and Floating's travel duration and its green number.
+        12 => Bridge(SelValue::DisplayOffset),
+        57 => Bridge(SelValue::Volume),
+        312 => Bridge(SelValue::Duration),
+        313 => Bridge(SelValue::Green),
         // The clock, session and global statistics; the volumes without
         // their own channel; what the bests do not keep; rivals and IR;
         // per-lane-class note counts the summary does not split; density
@@ -290,25 +309,27 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
     use Class::{Bridge, Omit, Unavailable};
     Some(match id {
         370 => Bridge(CLEAR_TYPE),
-        // Settings and action buttons.
-        11
-        | 12
-        | 15
-        | 16
-        | 19
-        | 40
-        | 42
-        | 43
-        | 54
-        | 55
-        | 72
-        | 75
-        | 77
-        | 78
-        | 301..=308
-        | 315..=318
-        | 330..=332
-        | 340..=342 => Unavailable,
+        // The settings: the source's sorter index (none for the
+        // modification order), the displayed gauge's look, the fixed
+        // hi-speed index and the covers' switches.
+        12 => Bridge("settings.order"),
+        40 => Bridge("settings.gauge"),
+        55 => Bridge("settings.fix_hispeed"),
+        330 => Bridge("if settings.sudden then 1 else 0"),
+        331 => Bridge("if settings.lift then 1 else 0"),
+        332 => Bridge("if settings.hidden then 1 else 0"),
+        // Truthful constants, at the source's value for what tapestry has
+        // or lacks: only 7-key charts are listed (`BEAT_7K`), no BGA is
+        // drawn (`BGA_OFF`), no lane option, display-timing auto
+        // adjustment or assist option exists, and long notes are LN.
+        11 | 72 => Bridge("2"),
+        42 | 43 | 54 | 75 | 301..=308 => Bridge("0"),
+        // No image-index property on selection: the source's image draws
+        // its entry 0.
+        15 | 16 | 19 | 77 | 315..=318 => Bridge("0"),
+        // The gauge auto shift, the judge algorithm, the bottom-shiftable
+        // gauge and the hi-speed auto adjustment: no native equivalent.
+        78 | 340..=342 => Unavailable,
         // The target's clear type.
         371 => Omit,
         _ => return None,
@@ -317,11 +338,11 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
 
 /// The selection slider of `type` `ty`.
 pub(crate) fn slider(ty: i32) -> Option<Class<RatioSource>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match ty {
         1 => Bridge(RatioSource::ListPosition),
-        // The master volume.
-        17 => Unavailable,
+        // The source's system volume: the master gain.
+        17 => Bridge(RatioSource::MasterVolume),
         // The key and background volumes: no channel of their own.
         18 | 19 => Omit,
         _ => return None,
@@ -330,10 +351,10 @@ pub(crate) fn slider(ty: i32) -> Option<Class<RatioSource>> {
 
 /// The selection graph of `type` `ty`.
 pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match ty {
         147 => Bridge(RatioSource::ExRate),
-        17 => Unavailable,
+        17 => Bridge(RatioSource::MasterVolume),
         // Folder distributions, the other volumes and the judgment splits
         // the bests do not keep.
         -2 | -1 | 18 | 19 | 140..=144 => Omit,
@@ -368,6 +389,17 @@ mod tests {
         N,
         E,
         D,
+        /// A truthful constant (class D with its value).
+        K(i32),
+    }
+
+    /// An image index's class: a bridge that is a whole number is a
+    /// constant.
+    fn of_index(c: Option<Class<&'static str>>) -> Option<C> {
+        match c {
+            Some(Class::Bridge(e)) => Some(e.parse().map_or(C::N, C::K)),
+            c => of(c),
+        }
     }
 
     fn of<T>(c: Option<Class<T>>) -> Option<C> {
@@ -387,9 +419,9 @@ mod tests {
     }
 
     const NUMERIC: &[(i32, i32, C)] = &[
-        (12, 12, C::E),
+        (12, 12, C::N),
         (17, 31, C::D),
-        (57, 57, C::E),
+        (57, 57, C::N),
         (58, 59, C::D),
         (71, 72, C::N),
         (74, 74, C::N),
@@ -410,7 +442,7 @@ mod tests {
         (271, 271, C::D),
         (283, 284, C::D),
         (300, 300, C::N),
-        (312, 313, C::E),
+        (312, 313, C::N),
         (333, 333, C::D),
         (350, 354, C::D),
         (360, 360, C::D),
@@ -434,19 +466,23 @@ mod tests {
         (1020, 1020, C::D),
     ];
 
+    /// The image indices: N, E, D (omitted) or a truthful constant `K`.
     const IMAGE_INDEX: &[(i32, i32, C)] = &[
-        (11, 12, C::E),
-        (15, 16, C::E),
-        (19, 19, C::E),
-        (40, 40, C::E),
-        (42, 43, C::E),
-        (54, 55, C::E),
-        (72, 72, C::E),
-        (75, 75, C::E),
-        (77, 78, C::E),
-        (301, 308, C::E),
-        (315, 318, C::E),
-        (330, 332, C::E),
+        (11, 11, C::K(2)),
+        (12, 12, C::N),
+        (15, 16, C::K(0)),
+        (19, 19, C::K(0)),
+        (40, 40, C::N),
+        (42, 43, C::K(0)),
+        (54, 54, C::K(0)),
+        (55, 55, C::N),
+        (72, 72, C::K(2)),
+        (75, 75, C::K(0)),
+        (77, 77, C::K(0)),
+        (78, 78, C::E),
+        (301, 308, C::K(0)),
+        (315, 318, C::K(0)),
+        (330, 332, C::N),
         (340, 342, C::E),
         (370, 370, C::N),
         (371, 371, C::D),
@@ -516,7 +552,7 @@ mod tests {
                 (|id| of(number(id))) as fn(i32) -> Option<C>,
             ),
             ("text", TEXT, |id| of(text(id))),
-            ("image index", IMAGE_INDEX, |id| of(image_index(id))),
+            ("image index", IMAGE_INDEX, |id| of_index(image_index(id))),
             ("event", EVENT, |id| of(event(id))),
         ] {
             let want = rows(table);
@@ -548,13 +584,13 @@ mod tests {
         }
         assert_eq!((0..3_000).filter(|&id| timer(id).is_some()).count(), 4);
         assert_eq!(slider(1), Some(Class::Bridge(RatioSource::ListPosition)));
-        assert_eq!(slider(17), Some(Class::Unavailable));
+        assert_eq!(slider(17), Some(Class::Bridge(RatioSource::MasterVolume)));
         assert_eq!(
             (slider(18), slider(19)),
             (Some(Class::Omit), Some(Class::Omit))
         );
         assert_eq!(graph(147), Some(Class::Bridge(RatioSource::ExRate)));
-        assert_eq!(graph(17), Some(Class::Unavailable));
+        assert_eq!(graph(17), Some(Class::Bridge(RatioSource::MasterVolume)));
         for ty in [-2, -1, 18, 19, 140, 141, 142, 143, 144] {
             assert_eq!(graph(ty), Some(Class::Omit), "{ty}");
         }
@@ -572,6 +608,9 @@ mod tests {
             if let Some(Class::Bridge(SelOption::Expr(e))) = option(id) {
                 compile(e, &scope, Ty::Bool).unwrap();
                 compile(&format!("!({e})"), &scope, Ty::Bool).unwrap();
+            }
+            if let Some(Class::Bridge(e)) = image_index(id) {
+                compile(e, &scope, Ty::Int).unwrap();
             }
         }
         compile(CLEAR_TYPE, &scope, Ty::Int).unwrap();

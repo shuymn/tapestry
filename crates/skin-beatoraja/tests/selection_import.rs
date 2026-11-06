@@ -194,8 +194,9 @@ fn a_skin_without_a_drawn_list_refuses() {
 
 /// C9 and C10 through the importer: the EX-rate graph cuts its image to
 /// the ratio, the position slider moves by it and gives the ratio under
-/// the pointer; the master volume slider is unavailable, a folder
-/// distribution graph omitted, each with its note.
+/// the pointer; a folder distribution graph is omitted with its note; the
+/// master volume slider is bridged, with no note, and draws nothing before
+/// the settings.
 #[test]
 fn ratio_bars_draw_their_ratios() {
     let d = folder(&minimal(
@@ -212,7 +213,7 @@ fn ratio_bars_draw_their_ratios() {
                {"id": "vol", "dst": [{"x": 0, "y": 200, "w": 10, "h": 10}]}]"#,
     ));
     let i = import_selection(d.path()).unwrap();
-    assert!(common::has(
+    assert!(!common::has(
         &i.report,
         NoteKind::Unavailable {
             kind: PropertyKind::Slider,

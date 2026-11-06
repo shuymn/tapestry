@@ -16,10 +16,12 @@ use std::cell::Cell;
 use bms_model::{Tempo, TimeUs};
 
 use self::schema::{VALUE_MAX, field, timer};
+use crate::GaugeLook;
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::selection::{
-    ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionPlace, SelectionView,
+    ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionOrder,
+    SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
 };
 use crate::widget::Starts;
 use crate::widget::glyphs::{self, GlyphLine};
@@ -111,6 +113,8 @@ pub struct Selection {
     pub(crate) row_bitmap: Box<[Option<GlyphLine>]>,
     pub(crate) position: Option<Ratio>,
     pub(crate) ex_rate: Option<Ratio>,
+    /// The master gain, as of the last settings; `None` before any.
+    pub(crate) master_volume: Option<Ratio>,
     /// Per slider element in draw order: its travel as last built.
     pub(crate) hits: Box<[Cell<Option<Hit>>]>,
 }
@@ -143,6 +147,7 @@ impl Selection {
             row_bitmap: vec![None; rows].into_boxed_slice(),
             position: None,
             ex_rate: None,
+            master_volume: None,
             hits: vec![Cell::new(None); sliders].into_boxed_slice(),
         }
     }
@@ -210,7 +215,13 @@ impl Selection {
     /// [`MAX_TEXT_BYTES`].
     pub(crate) fn update(&mut self, view: &SelectionView, labels: &SelectionLabels, center: usize) {
         let cursor = view.cursor.and_then(|c| view.rows.get(c));
-        self.fields = fields(view, cursor);
+        let mut fields = fields(view, cursor);
+        // The settings' fields stay as the settings left them.
+        let from = usize::from(field::SETTINGS);
+        if let (Some(to), Some(kept)) = (fields.get_mut(from..), self.fields.get(from..)) {
+            to.copy_from_slice(kept);
+        }
+        self.fields = fields;
         self.strings_from(view, labels, cursor);
         let at = view.cursor;
         for (i, (bind, s)) in self
@@ -299,6 +310,59 @@ impl Selection {
                 push(&mut s.place, " > ");
             }
         }
+    }
+
+    /// Fills the settings' fields and the master volume's ratio from `s`,
+    /// leaving the view's as they are. Allocates nothing.
+    pub(crate) fn settings(&mut self, s: &SelectionSettings) {
+        let mut set = |slot: u16, v: i32| {
+            if let Some(f) = self.fields.get_mut(usize::from(slot)) {
+                *f = v;
+            }
+        };
+        set(
+            field::SETTINGS_DISPLAY_OFFSET,
+            s.display_offset_ms.clamp(-VALUE_MAX, VALUE_MAX),
+        );
+        set(field::SETTINGS_VOLUME, s.master_volume.number.clamp(0, 100));
+        let (floating, duration, green, fix) = match s.speed {
+            SpeedView::Classic => (0, 0, 0, 0),
+            SpeedView::Floating { reference, green } => {
+                let g = i32::try_from(green).unwrap_or(VALUE_MAX).min(VALUE_MAX);
+                // ⌊5 · G / 3⌋ ms: the duration whose green number is G
+                // (`T = 5 · g / 3`).
+                let ms = value(u64::from(green) * 5 / 3);
+                let fix = match reference {
+                    SpeedReference::Start => 1,
+                    SpeedReference::Maximum => 2,
+                    SpeedReference::Main => 3,
+                    SpeedReference::Minimum => 4,
+                };
+                (1, ms, g, fix)
+            }
+        };
+        set(field::SETTINGS_FLOATING, floating);
+        set(field::SETTINGS_DURATION, duration);
+        set(field::SETTINGS_GREEN, green);
+        set(field::SETTINGS_FIX_HISPEED, fix);
+        set(
+            field::SETTINGS_ORDER,
+            match s.order {
+                SelectionOrder::Title => 0,
+                SelectionOrder::Artist => 1,
+                SelectionOrder::Level => 4,
+                SelectionOrder::Modified => -1,
+            },
+        );
+        set(
+            field::SETTINGS_GAUGE,
+            s.gauge.map_or(-1, GaugeLook::schema_value),
+        );
+        let [sudden, lift, hidden] = s.covers_on;
+        set(field::SETTINGS_SUDDEN, i32::from(sudden));
+        set(field::SETTINGS_LIFT, i32::from(lift));
+        set(field::SETTINGS_HIDDEN, i32::from(hidden));
+        self.master_volume = Some(s.master_volume.ratio);
     }
 
     /// Fills this frame's timers: the built-in ones from `timers`, then

@@ -72,6 +72,17 @@ pub static SELECTION: Schema = Schema {
         int("selected.level", -VALUE_MAX, VALUE_MAX),
         value("selected.length_min"),
         int("selected.length_sec", 0, 59),
+        int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
+        int("settings.volume", 0, 100),
+        flag("settings.floating"),
+        value("settings.duration"),
+        value("settings.green"),
+        int("settings.fix_hispeed", 0, 4),
+        int("settings.order", -1, 4),
+        int("settings.gauge", -1, 5),
+        flag("settings.sudden"),
+        flag("settings.lift"),
+        flag("settings.hidden"),
     ],
     timers: &[
         timer("screen"),
@@ -138,8 +149,34 @@ pub mod field {
     /// Its length's whole minutes, and the seconds past them.
     pub const SELECTED_LENGTH_MIN: u16 = 23;
     pub const SELECTED_LENGTH_SEC: u16 = 24;
+    /// The settings' fields, from here on, which a view leaves as they are
+    /// ([`SelectionSettings`](crate::SelectionSettings)).
+    pub const SETTINGS: u16 = 25;
+    /// The display offset in whole ms.
+    pub const SETTINGS_DISPLAY_OFFSET: u16 = 25;
+    /// The master gain's number, `(int)(gain · 100f)`.
+    pub const SETTINGS_VOLUME: u16 = 26;
+    /// Whether the hi-speed is Floating.
+    pub const SETTINGS_FLOATING: u16 = 27;
+    /// In Floating, the travel duration of the target green number `G`,
+    /// `⌊5 · G / 3⌋` ms, and `G`; 0 in Classic.
+    pub const SETTINGS_DURATION: u16 = 28;
+    pub const SETTINGS_GREEN: u16 = 29;
+    /// The source's fixed hi-speed index: 0 in Classic; in Floating 1 to
+    /// 4 by the reference tempo, start, maximum, main and minimum.
+    pub const SETTINGS_FIX_HISPEED: u16 = 30;
+    /// The source's sorter index of the order: title 0, artist 1, level 4;
+    /// −1 for an order it has no sorter for.
+    pub const SETTINGS_ORDER: u16 = 31;
+    /// The displayed gauge's look, assist-easy 0 to hazard 5; −1 without
+    /// one.
+    pub const SETTINGS_GAUGE: u16 = 32;
+    /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
+    pub const SETTINGS_SUDDEN: u16 = 33;
+    pub const SETTINGS_LIFT: u16 = 34;
+    pub const SETTINGS_HIDDEN: u16 = 35;
     /// The number of fields.
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 36;
 }
 
 /// The built-in timer slots of [`SELECTION`]; `when` timers follow from
@@ -173,6 +210,11 @@ mod tests {
             (field::SELECTED_RANK, "selected.rank"),
             (field::SELECTED_LEVEL, "selected.level"),
             (field::SELECTED_LENGTH_SEC, "selected.length_sec"),
+            (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
+            (field::SETTINGS_VOLUME, "settings.volume"),
+            (field::SETTINGS_GREEN, "settings.green"),
+            (field::SETTINGS_ORDER, "settings.order"),
+            (field::SETTINGS_HIDDEN, "settings.hidden"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
