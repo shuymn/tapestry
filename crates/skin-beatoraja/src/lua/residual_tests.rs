@@ -553,8 +553,8 @@ fn host_arguments_fold_from_upvalues() {
             Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 289 }),
         ),
         (
-            33,
-            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 33 }),
+            2_246,
+            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 2_246 }),
         ),
     ] {
         let entry = skin(

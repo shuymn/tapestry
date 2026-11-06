@@ -41,6 +41,7 @@ fn section(start_ms: i64, end_ms: i64, lead_in_ms: i64) -> Section {
 
 fn in_section(s: &Section) -> PlayContext<'_> {
     PlayContext {
+        autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Section(s),
         empty_poor_breaks_combo: false,
@@ -518,6 +519,7 @@ fn targets_match_the_evaluators() {
         ..section(10_000, 20_000, 2_000)
     };
     let full_ctx = PlayContext {
+        autoplay: false,
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,

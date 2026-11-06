@@ -1685,6 +1685,7 @@ fn build_does_not_allocate() {
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
     let full = PlayContext {
+        autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in),
@@ -1711,8 +1712,8 @@ fn build_does_not_allocate() {
     };
     // (name, context, effects, first frame): the whole chart with breaks,
     // a practice round with breaks after a retry with the scratch on the
-    // right, and a round played to a full combo on the left again, its
-    // empty POORs counted.
+    // right, a round played to a full combo on the left again, its
+    // empty POORs counted, and the whole chart again by autoplay.
     let attempts = [
         ("play", full, effects(&chart, None, false), -lead_in),
         (
@@ -1734,6 +1735,15 @@ fn build_does_not_allocate() {
             },
             effects(&chart, Some(&clean_round), true),
             8_000 * MS,
+        ),
+        (
+            "autoplay",
+            PlayContext {
+                autoplay: true,
+                ..full
+            },
+            effects(&chart, None, true),
+            -lead_in,
         ),
     ];
     let mut seen = Witness::new();
@@ -1807,7 +1817,7 @@ fn build_does_not_allocate() {
         assert_eq!(at_21_9 - at_16_9, 320.0, "{name}");
         beams.push(at_16_9);
         let fc = usize::from(timer::FULL_COMBO);
-        if *name == "clean round" {
+        if matches!(*name, "clean round" | "autoplay") {
             assert!(w.on[fc], "{name}: `full_combo` never started");
             assert!(w.drawn[fc], "{name}: its elements were never drawn");
         } else {
@@ -1833,7 +1843,7 @@ fn build_does_not_allocate() {
     assert!(ws.text_squeezed, "the title never drew squeezed");
     // The beam follows the scratch: authored at 152 on the left, 600 with
     // the scratch on the right (tests/lanes.rs).
-    assert_eq!(beams, [152.0, 600.0, 152.0]);
+    assert_eq!(beams, [152.0, 600.0, 152.0, 152.0]);
     // Every built-in timer turned on, and an element on it was drawn, in
     // some attempt: the lanes' key-on and key-off from the fed input.
     // `loading` runs only in the loading runtime, which draws an element
@@ -1990,6 +2000,7 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            autoplay: false,
             now: TimeUs(ms * MS),
             load: LoadState {
                 since: TimeUs(0),
@@ -2019,7 +2030,7 @@ fn build_does_not_allocate() {
 /// The loading frame `no` of a lifetime begun at `since`: the clock, the
 /// progress, the target, the layout, the lanes and the covers moving, the
 /// descriptor of either gauge given on two frames of three, the chosen
-/// chart's play level on four of five.
+/// chart's play level on four of five, the play autoplay on every other.
 fn loading_frame<'a>(
     views: &'a Views,
     descs: &[GaugeDesc],
@@ -2028,6 +2039,7 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        autoplay: no.is_multiple_of(2),
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
             since,
@@ -3574,6 +3586,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
     };
     let full = PlayContext {
+        autoplay: false,
         gauges: descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),

@@ -298,19 +298,19 @@ fn offset_four_elements_that_may_reach_the_lanes_are_sudden_plus() {
         }
     }
     // Frames selected by an expression: an image group and image sets.
-    // A `ref` is an image-index property, 40 the shown gauge's type and 42
+    // A `ref` is an image-index property, 40 the shown gauge's type and 43
     // one the model cannot read; a `value` of 40 is no value property, so
     // the `ref` chooses. Over the lanes each is SUDDEN+'s paint showing
     // its choice, but the unreadable one refuses; off them each draws but
     // the unreadable one.
-    let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 42},
+    let selectors = r#""imageset": [{"id": "byref", "images": ["cover"], "ref": 43},
                                     {"id": "byvalue", "images": ["cover"], "value": 71},
                                     {"id": "bykind", "images": ["cover"], "value": 40, "ref": 40}]"#;
     let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2},
                    {"id": "kindgroup", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2, "ref": 40}"#;
     let unreadable = NoteKind::UnsupportedProperty {
         kind: PropertyKind::ImageIndex,
-        id: Some(42),
+        id: Some(43),
     };
     for (id, why) in [
         ("byref", vec![unreadable]),

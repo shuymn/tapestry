@@ -668,6 +668,9 @@ pub(crate) enum IndexProp {
     CoverEnabled,
     LiftEnabled,
     HiddenEnabled,
+    /// `option_1p` (42, `IntegerPropertyFactory.java:1136-1143`): the lane
+    /// option, 0 (OFF), as tapestry applies none.
+    RandomOption,
     /// A property the model has no value for.
     Unsupported(i32),
 }
@@ -688,6 +691,7 @@ impl IndexProp {
             Self::CoverEnabled => "if cover.enabled then 1 else 0",
             Self::LiftEnabled => "if lift.enabled then 1 else 0",
             Self::HiddenEnabled => "if hidden.enabled then 1 else 0",
+            Self::RandomOption => "0",
             Self::Unsupported(_) => return None,
         })
     }
@@ -696,7 +700,7 @@ impl IndexProp {
     /// way (D4): the gauge's type projected onto the six looks, and the
     /// switches read from the play rather than the configuration.
     pub(crate) fn deviates(self) -> bool {
-        !matches!(self, Self::Null | Self::Unsupported(_))
+        !matches!(self, Self::Null | Self::RandomOption | Self::Unsupported(_))
     }
 }
 
@@ -707,7 +711,7 @@ impl IndexProp {
 /// 1510-1699 (`SkinProperty.java:1054-1067`).
 const INDEX_KNOWN: &[(i32, i32)] = &[
     (10, 12),
-    (42, 43),
+    (43, 43),
     (54, 55),
     (61, 63),
     (72, 72),
@@ -733,6 +737,7 @@ const INDEX_KNOWN: &[(i32, i32)] = &[
 pub(crate) fn index_by_id(id: i32) -> IndexProp {
     match id {
         40 => IndexProp::GaugeKind,
+        42 => IndexProp::RandomOption,
         330 => IndexProp::CoverEnabled,
         331 => IndexProp::LiftEnabled,
         332 => IndexProp::HiddenEnabled,
@@ -942,7 +947,8 @@ mod tests {
         assert_eq!(int_by_id(40), IntProp::Null);
         assert_eq!(int_by_name("gaugetype_1p"), None);
         assert_eq!(index_by_id(40), IndexProp::GaugeKind);
-        assert_eq!(index_by_id(42), IndexProp::Unsupported(42));
+        assert_eq!(index_by_id(42), IndexProp::RandomOption);
+        assert_eq!(index_by_id(43), IndexProp::Unsupported(43));
         assert_eq!(
             int_by_name("maxcombo2"),
             Some(IntProp::Shown(Value::MaxCombo))

@@ -94,6 +94,8 @@ pub struct PlayContext<'a> {
     /// The chart's play level, which `chart.level` reads; `None` when the
     /// caller has no chart, which clears `chart.level_valid`.
     pub play_level: Option<i32>,
+    /// Whether the attempt is autoplay, which `autoplay` reads.
+    pub autoplay: bool,
 }
 
 /// A chart's BPM range in floored hundredths of a BPM.
@@ -394,6 +396,8 @@ pub struct Play {
     bpm_whole_change: Option<bool>,
     /// The context's [`PlayContext::play_level`].
     play_level: Option<i32>,
+    /// The context's [`PlayContext::autoplay`].
+    pub(crate) autoplay: bool,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -542,6 +546,7 @@ impl Play {
             bpm_range: ctx.bpm_range,
             bpm_whole_change: ctx.bpm_whole_change,
             play_level: ctx.play_level,
+            autoplay: ctx.autoplay,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -785,6 +790,7 @@ mod tests {
             border: GaugeValue(80 * GaugeValue::PERCENT),
         }];
         let ctx = PlayContext {
+            autoplay: false,
             gauges: &gauges,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,

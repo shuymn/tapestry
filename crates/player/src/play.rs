@@ -967,7 +967,12 @@ impl Rig for PlayerRig<'_> {
         // The attempt attached last is the one prepared: its epoch is
         // the frames'.
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
-        let attempt = AttemptContext::new(loaded.attempt(), SIMPLE_SCRATCH, epoch.unwrap_or(0));
+        let attempt = AttemptContext::new(
+            loaded.attempt(),
+            SIMPLE_SCRATCH,
+            epoch.unwrap_or(0),
+            self.autoplay,
+        );
         // The adjustments are served while the screen prepares, so an
         // adjustment then is published before the preparation ends.
         let mut adjust = self.adjust.take();

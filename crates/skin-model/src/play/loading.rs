@@ -153,6 +153,8 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // The play level, 88 and 89: the chosen chart's, from the frame.
         Chosen, // chart.level
         Chosen, // chart.level_valid
+        // Whether the attempt is autoplay: the frame's.
+        Live, // autoplay
     ]
 };
 
@@ -275,6 +277,8 @@ pub struct LoadingFrame<'a> {
     /// The chosen chart's play level, never a previous attempt's; `None`
     /// leaves what depends on it undrawn.
     pub play_level: Option<i32>,
+    /// Whether the attempt being loaded is autoplay.
+    pub autoplay: bool,
 }
 
 /// The loading runtime's state as of its last build: every timer's start
@@ -432,6 +436,7 @@ impl Loading {
         let (level, level_valid) = level_fields(frame.play_level);
         set(field::CHART_LEVEL, level);
         set(field::CHART_LEVEL_VALID, level_valid);
+        set(field::AUTOPLAY, i32::from(frame.autoplay));
         self.fields = fields;
         for (slot, start) in (0..timer::BUILTIN).zip(self.starts.iter_mut()) {
             *start = match loading_timer(slot) {
@@ -467,7 +472,9 @@ mod tests {
     fn every_field_and_timer_has_a_loading_class() {
         assert_eq!(FIELDS.len(), PLAY.fields.len());
         let class = |name: &str| PLAY.field(name).and_then(|(s, _)| loading_field(s));
-        assert_eq!(class("load.percent"), Some(LoadingField::Live));
+        for name in ["load.percent", "autoplay"] {
+            assert_eq!(class(name), Some(LoadingField::Live), "{name}");
+        }
         for name in ["chart.level", "chart.level_valid"] {
             assert_eq!(class(name), Some(LoadingField::Chosen), "{name}");
         }
@@ -490,6 +497,7 @@ mod tests {
         for f in PLAY.fields {
             let named = [
                 "load.percent",
+                "autoplay",
                 "gauge.kind",
                 "gauge.valid",
                 "chart.level",
