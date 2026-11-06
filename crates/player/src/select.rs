@@ -26,8 +26,8 @@ use input::{MenuAction, MenuBindings, MenuEvent};
 use library::{ChartEntry, FolderKey, FolderRow, Level, Score, Search, Sort};
 use rules::RulePreset;
 use skin_model::{
-    ChartLabels, FolderId, MAX_VISIBLE_ROWS, Ratio, RowKey, RowKind, RowScore, RowView,
-    SelectedChart, SelectionPlace, SelectionView,
+    ChartLabels, FolderId, MAX_VISIBLE_ROWS, Ratio, RowFeatures, RowKey, RowKind, RowScore,
+    RowView, SelectedChart, SelectionLabels, SelectionPlace, SelectionView,
 };
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
@@ -935,7 +935,7 @@ impl SelectScreen {
         let view = self
             .cursor_line()
             .map_or_else(SelectionView::default, |at| {
-                self.view(at, LIST_LINES.saturating_sub(at + 1))
+                self.view(at, LIST_LINES.saturating_sub(at + 1), true)
             });
         for (i, row) in view.rows.iter().enumerate() {
             let style = |other| {
@@ -983,20 +983,29 @@ impl SelectScreen {
     /// The snapshot of the list: the cursor's row with up to `before` rows
     /// above it and `after` below it that the list has, at most
     /// [`MAX_VISIBLE_ROWS`] together, and what is known of the place, the
-    /// query and the chart under the cursor.
-    pub fn view(&self, before: usize, after: usize) -> SelectionView {
-        let at = self.cursor_row();
+    /// query and the chart under the cursor. Without `headings` the list's
+    /// heading rows are left out, so `before` and `after` count selectable
+    /// rows only: a skin's song list shows no headings, which group the
+    /// built-in page's lines.
+    pub fn view(&self, before: usize, after: usize, headings: bool) -> SelectionView {
+        let lines = || {
+            self.rows
+                .iter()
+                .copied()
+                .filter(move |r| headings || !matches!(r, Row::Heading(_)))
+        };
+        let at = self
+            .row_at_cursor()
+            .and_then(|row| lines().position(|r| r == row));
         let (start, end) = at.map_or((0, 0), |at| {
             let before = before.min(MAX_VISIBLE_ROWS - 1).min(at);
             let after = after.min(MAX_VISIBLE_ROWS - 1 - before);
-            (at - before, (at + after + 1).min(self.rows.len()))
+            (at - before, at + after + 1)
         });
-        let rows = self
-            .rows
-            .get(start..end)
-            .unwrap_or_default()
-            .iter()
-            .map(|&row| self.row_view(row))
+        let rows = lines()
+            .skip(start)
+            .take(end - start)
+            .map(|row| self.row_view(row))
             .collect();
         let selectable = self.lead() + self.entries.len();
         let position = (selectable > 1)
@@ -1005,7 +1014,7 @@ impl SelectScreen {
         let place = match &self.place {
             _ if !self.query.is_empty() => SelectionPlace::Results,
             Place::Top => SelectionPlace::Top,
-            Place::Folder { name, .. } => SelectionPlace::Folder(name.clone()),
+            Place::Folder { .. } => SelectionPlace::Folder(self.breadcrumb()),
             Place::All => SelectionPlace::All,
         };
         SelectionView {
@@ -1018,6 +1027,20 @@ impl SelectScreen {
         }
     }
 
+    /// The names of the folders entered from Top's level to the current
+    /// place, outermost first: with several roots, the root's row first.
+    fn breadcrumb(&self) -> Vec<String> {
+        self.stack
+            .iter()
+            .map(|(place, _)| place)
+            .chain(std::iter::once(&self.place))
+            .filter_map(|place| match place {
+                Place::Folder { name, .. } => Some(name.clone()),
+                Place::Top | Place::All => None,
+            })
+            .collect()
+    }
+
     /// A row of the list as the snapshot shows it.
     fn row_view(&self, row: Row) -> RowView {
         let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
@@ -1028,8 +1051,11 @@ impl SelectScreen {
             subtitle: String::new(),
             artist: String::new(),
             level: String::new(),
+            level_value: 0,
             difficulty: None,
             score: RowScore::Unplayed,
+            features: None,
+            random: false,
         };
         match row {
             Row::All => blank(
@@ -1075,8 +1101,11 @@ impl SelectScreen {
                         subtitle: text(&h.subtitle),
                         artist: text(&h.artist),
                         level: text(&h.playlevel),
+                        level_value: level_value(h.playlevel.as_deref()),
                         difficulty: difficulty(h.difficulty.as_deref()),
                         score: self.score_of(e),
+                        features: e.summary.as_ref().map(RowFeatures::of),
+                        random: e.random,
                     }
                 },
             ),
@@ -1102,6 +1131,7 @@ impl SelectScreen {
                 subartist: text(&h.subartist),
                 genre: text(&h.genre),
                 level: text(&h.playlevel),
+                level_value: level_value(h.playlevel.as_deref()),
                 difficulty: difficulty(h.difficulty.as_deref()),
             },
             summary: e.summary,
@@ -1149,6 +1179,27 @@ impl SelectScreen {
         }
         text
     }
+}
+
+/// The player's strings a selection skin draws, in the chosen language
+/// (docs/stage3.md S10-09d, #176 C10): the results' name holds no query,
+/// which a skin reads as data.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no selection skin is drawn until S10-09e")
+)]
+pub fn labels() -> SelectionLabels {
+    SelectionLabels {
+        all_charts: Label::AllCharts.text().to_owned(),
+        search_results: Label::SearchResults.text().to_owned(),
+    }
+}
+
+/// `#PLAYLEVEL` as a number, as a skin draws it: what Java's
+/// `Integer.parseInt` reads ([`crate::imports::facts::level_of`]), 0 when
+/// it is absent or reads none.
+fn level_value(text: Option<&str>) -> i32 {
+    text.map_or(0, crate::imports::facts::level_of)
 }
 
 /// `#DIFFICULTY` when it is 1 to 5.
@@ -1787,14 +1838,14 @@ mod tests {
     #[test]
     fn the_view_is_a_bounded_window_around_the_cursor() {
         use skin_model::{MAX_VISIBLE_ROWS, Ratio, RowKey, RowKind};
-        let empty = SelectScreen::new(Vec::new()).view(10, 10);
+        let empty = SelectScreen::new(Vec::new()).view(10, 10, true);
         assert_eq!(
             (empty.rows.len(), empty.cursor, empty.position),
             (0, None, None)
         );
         let mut one = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
         one.set_entries(folder("a", 1));
-        let v = one.view(10, 10);
+        let v = one.view(10, 10, true);
         assert_eq!(view_keys(&v), [r"heading C:\charts\a", "a00.bms"]);
         assert_eq!(v.rows[0].kind, RowKind::Heading);
         assert_eq!(v.rows[0].title, "a");
@@ -1803,7 +1854,7 @@ mod tests {
         let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
         s.set_entries(names.iter().flat_map(|f| folder(f, 10)).collect());
         // At the start: the first heading, then the cursor's chart.
-        let v = s.view(100, 100);
+        let v = s.view(100, 100, true);
         assert_eq!(v.rows.len(), MAX_VISIBLE_ROWS);
         assert_eq!(v.cursor, Some(1));
         assert_eq!(v.position, Ratio::new(0, 99));
@@ -1811,7 +1862,7 @@ mod tests {
         for _ in 0..45 {
             s.input(key(MenuKey::Down));
         }
-        let v = s.view(2, 3);
+        let v = s.view(2, 3, true);
         assert_eq!(
             view_keys(&v),
             [
@@ -1821,7 +1872,7 @@ mod tests {
         assert_eq!((v.cursor, v.position), (Some(2), Ratio::new(45, 99)));
         // At the end.
         s.input(key(MenuKey::End));
-        let v = s.view(100, 100);
+        let v = s.view(100, 100, true);
         assert_eq!(v.rows.len(), MAX_VISIBLE_ROWS);
         assert_eq!(v.cursor, Some(MAX_VISIBLE_ROWS - 1));
         assert_eq!(
@@ -1909,9 +1960,12 @@ mod tests {
                 best: None,
             },
         )]));
-        assert_eq!(s.view(1, 1).rows[1].score, RowScore::NoBest { plays: 2 });
+        assert_eq!(
+            s.view(1, 1, true).rows[1].score,
+            RowScore::NoBest { plays: 2 }
+        );
         s.set_bests_preset(Some(rules::lr2_style()));
-        assert_eq!(s.view(1, 1).rows[1].score, RowScore::Unplayed);
+        assert_eq!(s.view(1, 1, true).rows[1].score, RowScore::Unplayed);
     }
 
     /// A row's difficulty is `#DIFFICULTY` when it is 1 to 5, spaces aside.
@@ -1928,7 +1982,7 @@ mod tests {
             e.header.difficulty = Some(text.to_owned());
             let mut s = SelectScreen::new(Vec::new());
             s.set_entries(vec![e]);
-            let v = s.view(1, 1);
+            let v = s.view(1, 1, true);
             assert_eq!(v.rows[1].difficulty, want, "{text:?}");
             assert_eq!(v.selected.unwrap().labels.difficulty, want, "{text:?}");
         }
@@ -1970,7 +2024,7 @@ mod tests {
                     }),
                 },
             )]));
-            s.view(0, 0).selected.unwrap().max_ex
+            s.view(0, 0, true).selected.unwrap().max_ex
         };
         assert_eq!(max(&e, Some(rules::tapestry())), Some(30));
         let mut heavier = rules::tapestry();
@@ -1993,5 +2047,131 @@ mod tests {
         let mut refused = e;
         refused.summary = None;
         assert_eq!(max(&refused, Some(rules::tapestry())), None);
+    }
+
+    /// Without headings the window holds the selectable rows alone, and
+    /// counts the rows asked for above and below the cursor among them;
+    /// with headings it is the built-in page's window.
+    #[test]
+    fn a_view_without_headings_counts_selectable_rows() {
+        let mut s = screen();
+        assert_eq!(
+            view_keys(&s.view(10, 10, false)),
+            ["1.bms", "2.bms", "3.bms"]
+        );
+        s.input(key(MenuKey::Down));
+        s.input(key(MenuKey::Down));
+        let v = s.view(1, 0, false);
+        assert_eq!(view_keys(&v), ["2.bms", "3.bms"]);
+        assert_eq!(v.cursor, Some(1));
+        let v = s.view(1, 0, true);
+        assert_eq!(view_keys(&v), [r"heading C:\charts\b", "3.bms"]);
+        assert_eq!(v.cursor, Some(1));
+        let v = s.view(10, 10, false);
+        assert_eq!(
+            (view_keys(&v), v.cursor),
+            (
+                vec!["1.bms".to_owned(), "2.bms".to_owned(), "3.bms".to_owned()],
+                Some(2)
+            )
+        );
+    }
+
+    /// A chart row carries its level as a skin draws it, as the source's
+    /// `Integer.parseInt` reads `#PLAYLEVEL` (0 when it reads none), its
+    /// summary's long notes and mines, unknown without a summary, and
+    /// whether it draws; the chart under the cursor carries the same level.
+    #[test]
+    fn a_chart_row_carries_its_level_value_features_and_random() {
+        use bms_model::{ChartSummary, Tempo, TimeUs};
+        use skin_model::RowFeatures;
+        let tempo = Tempo::from_units(120 * Tempo::UNITS_PER_BPM).unwrap();
+        let summary = |longs, mines| ChartSummary {
+            taps: 1,
+            longs,
+            mines,
+            length: TimeUs(1),
+            tempo_start: tempo,
+            tempo_min: tempo,
+            tempo_max: tempo,
+        };
+        let chart = |i: usize, level: Option<&str>, sum: Option<ChartSummary>, random| {
+            let mut e = entry(&format!(r"C:\charts\a\{i}.bms"), "t");
+            e.header.playlevel = level.map(str::to_owned);
+            e.summary = sum;
+            e.random = random;
+            e
+        };
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(vec![
+            chart(0, Some("12"), Some(summary(1, 0)), false),
+            chart(1, Some("+7"), Some(summary(0, 2)), true),
+            chart(2, Some(" 7"), Some(summary(3, 4)), false),
+            chart(3, Some("12+"), None, true),
+            chart(4, None, Some(summary(0, 0)), false),
+            chart(5, Some("-3"), None, false),
+            chart(6, Some("2147483648"), None, false),
+        ]);
+        let v = s.view(0, 10, false);
+        let read: Vec<_> = v
+            .rows
+            .iter()
+            .map(|r| (r.level_value, r.features, r.random))
+            .collect();
+        let f = |long_notes, mines| Some(RowFeatures { long_notes, mines });
+        assert_eq!(
+            read,
+            [
+                (12, f(true, false), false),
+                (7, f(false, true), true),
+                (0, f(true, true), false),
+                (0, None, true),
+                (0, f(false, false), false),
+                (-3, None, false),
+                (0, None, false),
+            ]
+        );
+        assert_eq!(v.selected.unwrap().labels.level_value, 12);
+        s.input(key(MenuKey::Down));
+        let v = s.view(0, 0, false);
+        assert_eq!(v.selected.unwrap().labels.level_value, 7);
+    }
+
+    /// The rows that are not charts carry no level, features or draws.
+    #[test]
+    fn rows_that_are_not_charts_carry_no_chart_facts() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let mut e = entry(r"C:\charts\a\1.bms", "t");
+        e.header.playlevel = Some("9".to_owned());
+        e.random = true;
+        s.set_top(
+            library::Level {
+                charts: vec![e],
+                ..library::Level::default()
+            },
+            1,
+        );
+        let v = s.view(0, 10, false);
+        let all = &v.rows[0];
+        assert_eq!(all.kind, skin_model::RowKind::All { charts: 1 });
+        assert_eq!(
+            (all.level_value, all.features, all.random),
+            (0, None, false)
+        );
+        assert_eq!((v.rows[1].level_value, v.rows[1].random), (9, true));
+    }
+
+    /// The labels a skin draws are the player's own strings in its
+    /// language: the "all charts" name and the results' name, without the
+    /// query.
+    #[test]
+    fn the_skin_labels_are_the_players_strings() {
+        assert_eq!(
+            super::labels(),
+            skin_model::SelectionLabels {
+                all_charts: "全譜面".to_owned(),
+                search_results: "検索結果".to_owned(),
+            }
+        );
     }
 }

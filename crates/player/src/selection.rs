@@ -4059,6 +4059,37 @@ mod tests {
         }
     }
 
+    /// A nested place names every folder entered from Top's level,
+    /// outermost first, and a return drops the last; with several roots the
+    /// root's row is the first name.
+    #[test]
+    fn a_nested_place_names_every_folder_entered() {
+        use skin_model::SelectionPlace;
+        let place = |sel: &Selection| sel.screen.view(0, 0, false).place;
+        let names = |n: &[&str]| SelectionPlace::Folder(n.iter().map(|&s| s.to_owned()).collect());
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["A/B/x/1.bms", "A/B/y/2.bms", "A/z/3.bms"]]);
+        settle(&mut sel);
+        assert_eq!(place(&sel), SelectionPlace::Top);
+        // Top: the "all charts" row, then A.
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(place(&sel), names(&["A"]));
+        // A: B first, then z's chart.
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(place(&sel), names(&["A", "B"]));
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(place(&sel), names(&["A"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["a/x/1.bms", "a/y/2.bms"], &["b/z/3.bms"]]);
+        settle(&mut sel);
+        // Top: the "all charts" row, then each root's row.
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert_eq!(place(&sel), names(&["root0"]));
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(place(&sel), names(&["root0", "a"]));
+    }
+
     /// A stand-in consumer reads every needed fact of the Selection table's
     /// groups from a view the player filled from a scanned library: each
     /// row's identity, kind, text, level, difficulty and score, the cursor
@@ -4124,6 +4155,7 @@ mod tests {
             lamp: OwnLamp::Cleared {
                 gauge: 0,
                 rank: rules::tapestry().gauges[0].lamp,
+                look: skin_model::GaugeLook::Easy,
             },
         };
         let chart = |score| RowRead {
@@ -4156,6 +4188,7 @@ mod tests {
                 subartist: "sa".to_owned(),
                 genre: "g".to_owned(),
                 level: "7".to_owned(),
+                level_value: 7,
                 difficulty: Some(4),
             },
             notes: Some((3, 0, 1)),
@@ -4166,12 +4199,12 @@ mod tests {
             score: best,
             max_ex: Some(6),
         };
-        assert_eq!(read(&sel.screen.view(5, 5)), want);
+        assert_eq!(read(&sel.screen.view(5, 5, true)), want);
         // A query: its text, and the place is its results.
         keys(&mut sel, &[MenuKey::Tab]);
         sel.menu.push(MenuInput::Text("c".to_owned()));
         keys(&mut sel, &[MenuKey::Enter]);
-        let view = sel.screen.view(5, 5);
+        let view = sel.screen.view(5, 5, true);
         let got = read(&view);
         // The root's own charts are headed by the root's path; the list read
         // again read the library's bests too, which hold no play.

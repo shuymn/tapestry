@@ -10,7 +10,7 @@ use game::{BestScore, BestView, Chain, LocalRecords, RecordRef, RecordSink, Save
 use library::{Best, BestWriter, Contribution, Ineligible, Ingested, PlayId, Score, Verified};
 use replay::PlayRecord;
 use rules::RulePreset;
-use skin_model::{OwnLamp, RowScore};
+use skin_model::{GaugeLook, OwnLamp, RowScore};
 
 /// Saves records as [`LocalRecords`] does, and counts each saved play into
 /// the bests through `bests`, the library's live writer. A play that
@@ -143,7 +143,7 @@ pub fn shown(score: &Score, preset: &RulePreset) -> BestScore {
 }
 
 /// The lamp of `best` under `preset`: a FULL COMBO, else the cleared gauge
-/// with the highest `lamp` rank, else failed.
+/// with the highest `lamp` rank, with its look, else failed.
 pub fn own_lamp(best: &Best, preset: &RulePreset) -> OwnLamp {
     if best.full_combo {
         return OwnLamp::FullCombo;
@@ -158,6 +158,7 @@ pub fn own_lamp(best: &Best, preset: &RulePreset) -> OwnLamp {
             Some(OwnLamp::Cleared {
                 gauge: u16::try_from(i).ok()?,
                 rank: g.lamp,
+                look: GaugeLook::of(g),
             })
         })
         .unwrap_or(OwnLamp::Failed)
@@ -270,6 +271,8 @@ mod tests {
     use game::{BestScore, BestView, RecordSink as _};
     use library::{Best, Score};
 
+    use skin_model::{GaugeLook, OwnLamp};
+
     use super::{best_line, chart_cell, lamp_text, relative};
 
     /// A preset of four gauges listed out of rank order.
@@ -315,14 +318,13 @@ mod tests {
     /// [`lamp_text_follows_rank_not_vector_order`], and keeps the rank.
     #[test]
     fn own_lamp_agrees_with_lamp_text() {
-        use skin_model::OwnLamp;
-
         use super::{lamp_name, own_lamp};
         let p = ranked();
+        let cleared_as = |gauge, rank, look| OwnLamp::Cleared { gauge, rank, look };
         for (gauges, fc, want) in [
-            (&[0, 2][..], false, OwnLamp::Cleared { gauge: 0, rank: 2 }),
-            (&[1, 2][..], false, OwnLamp::Cleared { gauge: 2, rank: 1 }),
-            (&[0, 3][..], false, OwnLamp::Cleared { gauge: 3, rank: 3 }),
+            (&[0, 2][..], false, cleared_as(0, 2, GaugeLook::Normal)),
+            (&[1, 2][..], false, cleared_as(2, 1, GaugeLook::Easy)),
+            (&[0, 3][..], false, cleared_as(3, 3, GaugeLook::Hard)),
             (&[0, 2][..], true, OwnLamp::FullCombo),
             (&[][..], false, OwnLamp::Failed),
         ] {
@@ -330,6 +332,56 @@ mod tests {
             assert_eq!(own_lamp(&best, &p), want, "{gauges:?}");
             assert_eq!(lamp_name(want, &p), lamp_text(&best, &p), "{gauges:?}");
         }
+    }
+
+    /// A cleared lamp carries its gauge's look: each built-in preset's
+    /// gauges by their ids, and a gauge of another id by its kind.
+    #[test]
+    fn own_lamp_carries_the_gauge_look() {
+        use super::own_lamp;
+        let look_of = |p: &rules::RulePreset, i: usize| match own_lamp(&cleared(&[i], false), p) {
+            OwnLamp::Cleared { gauge, look, .. } => {
+                assert_eq!(usize::from(gauge), i);
+                look
+            }
+            other => panic!("gauge {i}: {other:?}"),
+        };
+        let looks = |p: &rules::RulePreset| -> Vec<(String, GaugeLook)> {
+            (0..p.gauges.len())
+                .map(|i| (p.gauges[i].id.clone(), look_of(p, i)))
+                .collect()
+        };
+        let named = |pairs: &[(&str, GaugeLook)]| -> Vec<(String, GaugeLook)> {
+            pairs.iter().map(|&(id, l)| (id.to_owned(), l)).collect()
+        };
+        let six = named(&[
+            ("normal", GaugeLook::Normal),
+            ("assist_easy", GaugeLook::AssistEasy),
+            ("easy", GaugeLook::Easy),
+            ("hard", GaugeLook::Hard),
+            ("ex_hard", GaugeLook::ExHard),
+            ("hazard", GaugeLook::Hazard),
+        ]);
+        let by_id = |p: &rules::RulePreset| {
+            let mut v = looks(p);
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let mut want = six.clone();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(by_id(&rules::beatoraja_style()), want);
+        assert_eq!(by_id(&rules::lr2_style()), want);
+        assert_eq!(
+            looks(&rules::tapestry()),
+            named(&[("normal", GaugeLook::Normal), ("survival", GaugeLook::Hard)])
+        );
+        // Other ids: by kind, an end threshold as normal, survival as hard.
+        let mut custom = rules::tapestry();
+        for g in &mut custom.gauges {
+            g.id = format!("custom_{}", g.id);
+        }
+        assert_eq!(look_of(&custom, 0), GaugeLook::Normal);
+        assert_eq!(look_of(&custom, 1), GaugeLook::Hard);
     }
 
     #[test]
