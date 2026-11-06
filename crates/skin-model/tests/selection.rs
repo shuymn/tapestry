@@ -842,7 +842,7 @@ fn chart_facts_come_from_the_summary() {
 }
 
 /// The source never clamps a rate: an EX above the largest the summary
-/// allows draws its bar past its box and its rate above 100 %
+/// allows shows its rate above 100 %, while its bar draws its whole box
 /// (`skin/SkinGraph.java:86-106`, `ScoreDataProperty.java:94-96`).
 #[test]
 fn a_rate_above_the_largest_is_not_clamped() {
@@ -861,19 +861,12 @@ fn a_rate_above_the_largest_is_not_clamped() {
     )]);
     fx.view(&v);
     fx.frame(0);
-    // At the image's own scale: the whole frame in the box, then its
-    // right edge column stretched over the 20 past it.
-    let [u0, v0, u1, v1] = fx.uvs.get(3).unwrap().uv;
+    // The bar draws its whole box once, the frame's whole uv: a deviation
+    // from the source, which extends its region past the image.
+    let whole = fx.uvs.get(3).unwrap().uv;
     let quads: Vec<([f32; 4], [f32; 4])> =
         fx.batch.quads().iter().map(|q| (q.rect, q.uv)).collect();
-    assert_eq!(
-        quads,
-        [
-            ([100.0, 100.0, 40.0, 20.0], [u0, v0, u1, v1]),
-            ([140.0, 100.0, 20.0, 20.0], [u1, v0, u1, v1]),
-        ]
-    );
-    // Vertical: the frame from the bottom, then its top row above it.
+    assert_eq!(quads, [([100.0, 100.0, 40.0, 20.0], whole)]);
     let mut fx = bar_skin(vec![bar(
         RatioForm::Bar { vertical: true },
         RatioSource::ExRate,
@@ -882,13 +875,7 @@ fn a_rate_above_the_largest_is_not_clamped() {
     fx.frame(0);
     let quads: Vec<([f32; 4], [f32; 4])> =
         fx.batch.quads().iter().map(|q| (q.rect, q.uv)).collect();
-    assert_eq!(
-        quads,
-        [
-            ([100.0, 100.0, 40.0, 20.0], [u0, v0, u1, v1]),
-            ([100.0, 90.0, 40.0, 10.0], [u0, v0, u1, v0]),
-        ]
-    );
+    assert_eq!(quads, [([100.0, 100.0, 40.0, 20.0], whole)]);
     let mut fx = number_skin("selected.rate_percent", "selected.rate_valid");
     fx.view(&v);
     fx.frame(0);

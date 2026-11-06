@@ -759,14 +759,7 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs) -> u32 {
         | Source::Lanes
         | Source::ImageChoice(_)
         | Source::CoverPaint(_)
-        | Source::RatioBar(_) => match source {
-            // A bar's overflow past its box: one more quad.
-            Source::RatioBar(i) => sel
-                .ratio_bars
-                .get(index(i))
-                .map_or(0, |b| u32::from(matches!(b.form, RatioForm::Bar { .. }))),
-            _ => 0,
-        },
+        | Source::RatioBar(_) => 0,
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1217,9 +1210,8 @@ fn draw_ratio(
     let fr = ratio_bar::fraction(v);
     match b.form {
         RatioForm::Bar { vertical } => {
-            for (r, f) in ratio_bar::cut(vertical, rect, f, fr).into_iter().flatten() {
-                brush.push(out, r, f, image.filter);
-            }
+            let (r, f) = ratio_bar::cut(vertical, rect, f, fr);
+            brush.push(out, r, f, image.filter);
         }
         RatioForm::Slider {
             direction, range, ..
