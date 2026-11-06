@@ -1791,7 +1791,9 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 }
 
 /// Writes frames as PNG files: `select.png` at the first select screen
-/// frame, `loading.png` at the first loading state frame, `ready.png` at
+/// frame, `loading.png` at the first loading state frame,
+/// `loading-skin-<lifetime>.png` at each loading lifetime's first frame the
+/// skin drew, `ready.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
 /// after `play_at` (and each play's own as `play-<generation>.png`),
 /// and `end.png` at the first end screen frame.
@@ -1803,6 +1805,9 @@ pub struct FrameDump {
     end: bool,
     select: bool,
     loading: bool,
+    /// The loading lifetime whose `loading-skin-<lifetime>.png` was written
+    /// last.
+    skin_loading: Option<u64>,
     /// The generation of the play whose `play-<generation>.png` was
     /// written last.
     numbered: Option<u64>,
@@ -1819,6 +1824,7 @@ impl FrameDump {
             end: false,
             select: false,
             loading: false,
+            skin_loading: None,
             numbered: None,
         }
     }
@@ -1863,6 +1869,12 @@ impl FrameSink for FrameDump {
         {
             self.numbered = Some(g);
             names.push(format!("play-{g}.png"));
+        }
+        if let Some(l) = drawn.skin_loading
+            && self.skin_loading != Some(l)
+        {
+            self.skin_loading = Some(l);
+            names.push(format!("loading-skin-{l}.png"));
         }
         match drawn.play {
             Some(t) if t.0 < 0 && !self.ready_state => {

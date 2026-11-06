@@ -340,7 +340,7 @@ fn every_condition_together_passes_the_source_limit() {
     // One sign of every supported built-in, the longer negated one, on a
     // number with an availability guard: refused at the destination too.
     let ops = (230..=241)
-        .chain([42, 43, 1_046, 270, 271, 272, 273, 176, 177, 32, 33])
+        .chain([42, 43, 1_046, 270, 271, 272, 273, 176, 177, 32, 33, 80, 81])
         .chain(2_242..=2_245)
         .map(|id| (-id).to_string())
         .collect::<Vec<_>>()
