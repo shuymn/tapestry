@@ -90,7 +90,9 @@
 //! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
 //!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
-//!   other unknown header is a warning.
+//!   other unknown header is a warning. Of these, `#DIFFICULTY` and whether
+//!   a `#BMPxx` with a path is defined are kept as labels ([`Labels`]),
+//!   which the chart does not hold.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
 //!   earlier position. The end plays no sound. An empty `#LNOBJ` is

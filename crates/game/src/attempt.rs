@@ -279,4 +279,68 @@ mod tests {
         };
         assert_eq!(practice.of(&empty), TimeUs(4_000 * MS));
     }
+
+    /// A chart of `taps` taps on key 1, one long note on key 2 and one mine
+    /// on key 3, with `headers` declared.
+    fn counted(taps: i64, headers: &[bms_model::HeaderValue]) -> bms_model::Chart {
+        let lane = |i| Lane::new(i).unwrap();
+        let mut b = ChartBuilder::new(150_000)
+            .long(lane(2), TimeUs(0), TimeUs(500 * MS))
+            .mine(lane(3), TimeUs(0), 1);
+        for t in 0..taps {
+            b = b.tap(lane(1), TimeUs(t * MS));
+        }
+        let mut chart = b.build().unwrap();
+        chart.meta.judgment_headers = headers
+            .iter()
+            .map(|&value| bms_model::JudgmentHeader {
+                name: bms_model::JudgmentHeaderName::Total,
+                value,
+            })
+            .collect();
+        chart
+    }
+
+    /// The song total is the `#TOTAL` the reference decoder reads (above 0,
+    /// the last such one), truncated, else `(int) max(260, 7.605 n /
+    /// (0.01 n + 6.5))` in `f64` over the taps and long notes, each once,
+    /// no mine: 260 to 337 notes, the reference's truncation at 4 420 notes
+    /// (662, where the exact quotient is 663), whatever the preset.
+    #[test]
+    fn the_song_total_is_the_references() {
+        use bms_model::HeaderValue;
+        let total = |taps, headers: &[HeaderValue]| super::song_total(&counted(taps, headers));
+        assert_eq!(total(3, &[]), 260);
+        // 336 taps and the long note: 337 notes; one more passes 260.
+        assert_eq!(total(336, &[]), 260);
+        assert_eq!(total(337, &[]), 260);
+        // 1 000 notes: 460.909.
+        assert_eq!(total(999, &[]), 460);
+        assert_eq!(total(4_419, &[]), 662);
+        assert_eq!(total(4_418, &[]), 662);
+        assert_eq!(total(4_420, &[]), 663);
+        assert_eq!(
+            total(3, &[HeaderValue::decimal_milli(300_700)]),
+            300,
+            "truncated"
+        );
+        assert_eq!(total(3, &[HeaderValue::decimal_milli(500)]), 0);
+        for refused in [
+            HeaderValue::integer(0),
+            HeaderValue::integer(-5),
+            HeaderValue::NotANumber,
+        ] {
+            assert_eq!(
+                total(3, &[HeaderValue::integer(200), refused]),
+                200,
+                "{refused:?} keeps the earlier one"
+            );
+            assert_eq!(total(3, &[refused]), 260, "{refused:?} alone");
+        }
+        assert_eq!(
+            total(3, &[HeaderValue::Integer(10_i128.pow(29))]),
+            i32::MAX,
+            "saturates"
+        );
+    }
 }

@@ -168,6 +168,9 @@ fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod meta_tests;
+
+#[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
     use game::{Attempt, ChartLabels};

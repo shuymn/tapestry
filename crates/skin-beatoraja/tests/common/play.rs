@@ -316,6 +316,22 @@ impl Drawn {
         )
     }
 
+    /// `skin` played over `chart` whose metadata is `meta`.
+    pub fn over_meta(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        meta: skin_model::ChartMetadata,
+    ) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                meta,
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over `chart` whose BPM range is `bpm_range` and
     /// BPM-change fact `bpm_whole_change`.
     pub fn over_with(
@@ -502,6 +518,10 @@ pub struct Loader {
     pub gauge: Option<LoadingGauge>,
     /// The chosen chart's play level each frame gives: by default none.
     pub play_level: Option<i32>,
+    /// The chosen chart's difficulty and BGA flag each frame gives: by
+    /// default none.
+    pub difficulty: Option<u8>,
+    pub bga: Option<bool>,
     pub percent: i32,
     /// Whether the stored covers are being adjusted: START or SELECT held.
     pub adjusting: bool,
@@ -525,6 +545,8 @@ impl Loader {
             batch,
             gauge: Some(LoadingGauge::of(0, &GAUGES[0])),
             play_level: None,
+            difficulty: None,
+            bga: None,
             percent: 0,
             adjusting: false,
             autoplay: false,
@@ -538,8 +560,8 @@ impl Loader {
         let mut covers = readouts_for(view).covers;
         covers.adjusting = self.adjusting;
         let frame = LoadingFrame {
-            difficulty: None,
-            bga: None,
+            difficulty: self.difficulty,
+            bga: self.bga,
             autoplay: self.autoplay,
             now: TimeUs(ms * MS),
             load: LoadState {

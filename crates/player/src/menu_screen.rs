@@ -924,11 +924,16 @@ mod tests {
             subartist: None,
             genre: Some("g".to_owned()),
             play_level: Some(12),
+            difficulty: Some(4),
+            bga: Some(true),
         };
         assert_eq!(fields_changed(&chart, &chart.clone()), TextSlots::NONE);
-        // The play level is no text: it names no slot.
+        // The play level, the difficulty and the BGA flag are no text: they
+        // name no slot.
         let level = ChosenChart {
             play_level: None,
+            difficulty: None,
+            bga: None,
             ..chart.clone()
         };
         assert_eq!(fields_changed(&chart, &level), TextSlots::NONE);

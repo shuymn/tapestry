@@ -1887,9 +1887,10 @@ fn loading_frame_of(
         ),
         None => (now, 0, None, None, 0, false),
     };
+    let (difficulty, bga) = update.map_or((None, None), |u| (u.chart.difficulty, u.chart.bga));
     LoadingFrame {
-        difficulty: None,
-        bga: None,
+        difficulty,
+        bga,
         lifetime,
         now,
         load: skin_model::LoadState { since, percent },
@@ -7755,6 +7756,127 @@ pub(crate) mod tests {
         assert_eq!(level(1, None), None);
         assert_eq!(level(1, Some(&update(1, Some(12)))), Some(12));
         assert_eq!(level(2, Some(&update(2, None))), None);
+    }
+
+    /// A loading frame's difficulty and BGA flag are its lifetime's chosen
+    /// chart's in the same way: none before a publication, none for a
+    /// chart without an entry.
+    #[test]
+    fn a_loading_frame_reads_its_lifetimes_difficulty_and_bga() {
+        let update = |lifetime, difficulty, bga| {
+            let text = LoadingText {
+                chart: ChosenChart {
+                    difficulty,
+                    bga,
+                    ..ChosenChart::default()
+                },
+                ..LoadingText::default()
+            };
+            crate::loading_state::LifetimeState::new(lifetime, TimeUs(0), &text, None)
+                .apply(LoadInput::Stage(Stage::Chart))
+        };
+        let read = |lifetime, u: Option<&LoadingUpdate>| {
+            let f = super::loading_frame_of(lifetime, TimeUs(1_000), u, None);
+            (f.difficulty, f.bga)
+        };
+        assert_eq!(read(1, None), (None, None));
+        assert_eq!(
+            read(1, Some(&update(1, Some(4), Some(true)))),
+            (Some(4), Some(true))
+        );
+        assert_eq!(read(2, Some(&update(2, None, None))), (None, None));
+    }
+
+    /// Through the model's loading frame, an imported skin draws the
+    /// difficulty's and the BGA flag's conditions from the chosen chart,
+    /// none without it, and never a class condition or the song total,
+    /// which loading lacks.
+    #[test]
+    fn a_loading_frame_draws_the_chosen_charts_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (skin, uvs) = crate::attempt_context::meta_tests::skin(dir.path());
+        let mut loading = skin.prepare_loading(skin_model::Side::Left);
+        let mut batch =
+            skin_model::QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        let mut drawn = |chart: Option<ChosenChart>| {
+            let update = chart.map(|chart| {
+                let text = LoadingText {
+                    chart,
+                    ..LoadingText::default()
+                };
+                crate::loading_state::LifetimeState::new(1, TimeUs(0), &text, None)
+                    .apply(LoadInput::Stage(Stage::Chart))
+            });
+            let frame = super::loading_frame_of(1, TimeUs(1_000), update.as_ref(), None);
+            batch.clear();
+            skin.build_loading(&mut loading, &frame.model(), &uvs, &mut batch)
+                .unwrap();
+            let mut w: Vec<i32> = batch
+                .quads()
+                .iter()
+                .map(|q| {
+                    #[expect(clippy::cast_possible_truncation, reason = "test rects are small")]
+                    let w = q.rect[2].round() as i32;
+                    w
+                })
+                .collect();
+            w.sort_unstable();
+            w
+        };
+        assert_eq!(drawn(None), [] as [i32; 0]);
+        let chosen = |difficulty, bga| ChosenChart {
+            difficulty,
+            bga,
+            ..ChosenChart::default()
+        };
+        assert_eq!(drawn(Some(chosen(Some(3), Some(false)))), [13, 20]);
+        assert_eq!(drawn(Some(chosen(Some(0), Some(true)))), [10, 21]);
+        assert_eq!(drawn(Some(chosen(None, None))), [] as [i32; 0]);
+    }
+
+    /// Reading the chosen chart's difficulty and BGA flag into a loading
+    /// frame allocates nothing, with and without them, after a positive
+    /// control proving the counter counts.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_loading_frames_chosen_metadata_alloc() {
+        use crate::alloc_count::this_thread;
+        let update = |difficulty, bga| {
+            let text = LoadingText {
+                chart: ChosenChart {
+                    difficulty,
+                    bga,
+                    ..ChosenChart::default()
+                },
+                ..LoadingText::default()
+            };
+            crate::loading_state::LifetimeState::new(1, TimeUs(0), &text, None)
+                .apply(LoadInput::Stage(Stage::Chart))
+        };
+        let updates = [
+            update(Some(4), Some(true)),
+            update(Some(0), Some(false)),
+            update(None, None),
+        ];
+        let control = this_thread();
+        drop(std::hint::black_box(vec![1_u8; 8]));
+        assert!(this_thread() > control, "the allocation was not counted");
+        let before = this_thread();
+        let mut read = [(None, None); 4];
+        for (r, u) in read.iter_mut().zip(updates.iter().map(Some).chain([None])) {
+            let f = super::loading_frame_of(1, TimeUs(1_000), u, None);
+            *r = std::hint::black_box((f.difficulty, f.bga));
+        }
+        assert_eq!(this_thread(), before, "a loading frame allocated");
+        assert_eq!(
+            read,
+            [
+                (Some(4), Some(true)),
+                (Some(0), Some(false)),
+                (None, None),
+                (None, None)
+            ]
+        );
     }
 
     /// A loading frame says whether the play its lifetime loads is

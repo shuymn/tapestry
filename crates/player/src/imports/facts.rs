@@ -112,4 +112,4 @@ pub fn level_of(text: &str) -> i32 {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;

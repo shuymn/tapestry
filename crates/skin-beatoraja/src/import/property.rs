@@ -347,6 +347,14 @@ pub(crate) enum Value {
     /// judgments, where the source sets it only for a judge region its
     /// judge widget makes (`play/JudgeManager.java:129-133`, `:678`).
     RecentTiming,
+    /// `chart_totalgauge` (368, `:389-394`): the song information's gauge
+    /// total, `(int) getTotal()`: the chart's `#TOTAL` read as the
+    /// reference decoder reads it, else the default its rule sets for an
+    /// absent one (`play/BMSPlayerRule.java:68-80`), whatever the play
+    /// preset, while the chart is known. The source has the song
+    /// information on a direct launch too (`PlayerResource.java:175`,
+    /// `song/SongData.java:130-139`, `:219`).
+    SongTotal,
 }
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
@@ -437,6 +445,7 @@ impl Value {
             Self::DurationGreen => "duration.green",
             Self::PlayLevel => "chart.level",
             Self::RecentTiming => "judge.recent_ms",
+            Self::SongTotal => "chart.total",
             Self::DurationVariant(n) => DURATION_VARIANTS
                 .get(usize::from(n))
                 .copied()
@@ -453,6 +462,7 @@ impl Value {
             Self::HispeedX100 | Self::HispeedWhole | Self::HispeedFraction => Some("hispeed.valid"),
             Self::Duration | Self::DurationGreen => Some("duration.valid"),
             Self::PlayLevel => Some("chart.level_valid"),
+            Self::SongTotal => Some("chart.total_valid"),
             Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
             _ => None,
         }
@@ -475,6 +485,7 @@ impl Value {
                 | Self::Late(_)
                 | Self::PlayLevel
                 | Self::RecentTiming
+                | Self::SongTotal
         )
     }
 
@@ -572,6 +583,7 @@ fn shown(id: i32) -> Option<Value> {
         91 => Value::BpmMin,
         96 => Value::PlayLevel,
         525 => Value::RecentTiming,
+        368 => Value::SongTotal,
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
         162 => Value::ElapsedSeconds,
