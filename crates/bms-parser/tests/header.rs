@@ -156,10 +156,12 @@ fn an_unreadable_difficulty_keeps_the_one_before() {
     assert_eq!(bms_parser::java_int("-"), None);
 }
 
-/// A chart has a BGA when a `#BMPxx` with an object id and a path stands
-/// in what is read: the loader's taken branches, the listing's top level.
-/// Whether a channel shows it does not matter; an empty definition or a
-/// name that is no object id defines nothing.
+/// A chart has a BGA when a line the reference decoder registers as a
+/// `#BMPxx` stands in what is read: the loader's taken branches, the
+/// listing's top level. The decoder reads it by fixed position: `BMP` in
+/// any case, an object id in the next two characters, and at least eight
+/// characters in the line, the path from the eighth on, kept even when it
+/// is only spaces. Whether a channel shows it does not matter.
 #[test]
 fn a_bmp_definition_with_a_path_is_a_bga() {
     let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
@@ -175,12 +177,31 @@ fn a_bmp_definition_with_a_path_is_a_bga() {
         ("#bmpZZ  a.png ", (true, true)),
         ("#BMP01", (false, false)),
         ("#BMP01 ", (false, false)),
+        ("#BMP01  ", (true, true)),
+        ("#BmP01xa", (true, true)),
+        // Counted in UTF-16 units, as Java's `String.length` counts.
+        ("#BMP01\u{e9}", (false, false)),
+        ("#BMP01\u{1F600}", (true, true)),
         ("#BMP0! a.bmp", (false, false)),
-        ("#BMP001 a.bmp", (false, false)),
+        ("#BMP001 a.bmp", (true, true)),
+        ("#BMP001", (false, false)),
         ("#BGA01 01 0 0 10 10 0 0", (false, false)),
         ("#SETRANDOM 1\n#IF 1\n#BMP01 a.bmp\n#ENDIF", (true, false)),
         ("#SETRANDOM 1\n#IF 2\n#BMP01 a.bmp\n#ENDIF", (false, false)),
     ] {
         assert_eq!(read(&chart(defs)), want, "{defs:?}");
     }
+    // A registered definition is no unknown header.
+    let dir = tempfile::tempdir().unwrap();
+    let text = chart("#BMP001 a.bmp");
+    let loaded =
+        bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+    assert!(
+        !loaded
+            .warnings
+            .iter()
+            .any(|w| matches!(w.kind, bms_parser::WarningKind::UnknownHeader(_))),
+        "{:?}",
+        loaded.warnings
+    );
 }

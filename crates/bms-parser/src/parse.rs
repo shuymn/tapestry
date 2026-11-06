@@ -156,7 +156,14 @@ pub fn parse(
                 });
             }
             if !branches.directive(&upper, value, line, warnings)? && branches.active() {
-                parse_header(&mut source, line, &upper, value, warnings)?;
+                // The image is not shown; that one is defined is a label,
+                // read from the line as the reference decoder reads it.
+                let untrimmed = raw_line.trim_start().strip_prefix('#').unwrap_or(body);
+                if defines_bga(untrimmed) {
+                    source.labels.bga = true;
+                } else {
+                    parse_header(&mut source, line, &upper, value, warnings)?;
+                }
             }
         }
     }
@@ -166,18 +173,20 @@ pub fn parse(
     Ok(source)
 }
 
-/// Whether the header `upper` (its name in upper case) with `value` defines
-/// a BGA image as the reference decoder lists one (jbms-parser
-/// `BMSDecoder`): `#BMPxx` with an object id and a path. Its list holds
-/// every definition, whether or not a channel shows it, and a chart with
-/// one has a BGA (beatoraja `song/SongData.java:216`).
-pub(crate) fn defines_bga(upper: &str, value: &str) -> bool {
-    !value.is_empty()
-        && upper
-            .strip_prefix("BMP")
-            .filter(|rest| rest.len() == 2)
-            .and_then(|rest| parse_base36(rest.as_bytes()))
-            .is_some()
+/// Whether a command line, `body` after its `#` (its start trimmed, its
+/// end kept), defines a BGA image as the reference decoder registers one
+/// (jbms-parser `BMSDecoder`): `BMP` in any case, an object id in the next
+/// two characters, and at least seven UTF-16 units in all, the path read
+/// from the seventh on, whatever the sixth is, and kept even when it is
+/// only spaces. So `#BMP01` and two spaces registers, with one space it
+/// does not, and `#BMP001 a.bmp` registers id `00`. Its list holds every
+/// definition, whether or not a channel shows it, and a chart with one has
+/// a BGA (beatoraja `song/SongData.java:216`).
+pub(crate) fn defines_bga(body: &str) -> bool {
+    body.get(..3)
+        .is_some_and(|word| word.eq_ignore_ascii_case("BMP"))
+        && body.as_bytes().get(3..5).and_then(parse_base36).is_some()
+        && body.encode_utf16().nth(6).is_some()
 }
 
 /// The first code point of each run of ten decimal digits, zero to nine,
@@ -471,8 +480,6 @@ fn parse_header(
                 });
             }
         }
-        // The image is not shown; that one is defined is a label.
-        _ if defined_id("BMP").is_some() => source.labels.bga |= defines_bga(upper, value),
         _ if IGNORED_HEADERS.contains(&upper)
             || IGNORED_DEFINITIONS
                 .iter()

@@ -91,7 +91,8 @@
 //!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
 //!   other unknown header is a warning. Of these, `#DIFFICULTY` and whether
-//!   a `#BMPxx` with a path is defined are kept as labels ([`Labels`]),
+//!   a `#BMPxx` the reference decoder registers is defined are kept as
+//!   labels ([`Labels`]),
 //!   which the chart does not hold.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
@@ -252,8 +253,9 @@ pub struct Labels {
     /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
     /// reference decoder keeps its last readable value; empty when none.
     pub difficulty: String,
-    /// Whether it defines a BGA image: a `#BMPxx` with a value, whether or
-    /// not a channel shows it, as the reference decoder lists them.
+    /// Whether it defines a BGA image: a `#BMPxx` line the reference
+    /// decoder registers, read by its fixed positions, whether or not a
+    /// channel shows it.
     pub bga: bool,
 }
 

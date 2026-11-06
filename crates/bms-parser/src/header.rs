@@ -135,7 +135,10 @@ pub(crate) fn listing(text: &str) -> Listing {
                 continue;
             }
             _ if depth > 0 => continue,
-            _ if crate::parse::defines_bga(&upper, value) => {
+            _ if crate::parse::defines_bga(
+                raw_line.trim_start().strip_prefix('#').unwrap_or(body),
+            ) =>
+            {
                 bga = true;
                 continue;
             }
