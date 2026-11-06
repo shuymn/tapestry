@@ -2100,25 +2100,49 @@ fn a_play_skin_reads_the_recent_timing() {
         })
         .collect();
     assert_eq!(played[2].0.history.openings.len(), 1, "the rearm");
-    // What a frame shows after `events`' first `n`: the latest event the
-    // timing takes, each named by its note in the scripted play; `None`
-    // where the play's own timing decides it (the rearm's long note).
-    let expected = |events: &[eval::JudgeEvent], n: usize, rearm: bool| {
-        let mut want = Some((Some(0), false, false));
+    // What a frame shows after `events`' first `n` (docs/stage3.md R3, the
+    // recent timing), each value from its own re-evaluated event, so a
+    // play whose input landed elsewhere on its clock still agrees: a
+    // press's deviation, negated, in ms truncated toward 0; a miss, its
+    // note's time minus the miss's; a long note finished by a release, the
+    // farther of its head and its release, the release on a tie, and the
+    // release's when that one is early and the note BAD; an empty POOR,
+    // its own deviation. A held head leaves it.
+    let expected = |chart: &bms_model::Chart, events: &[eval::JudgeEvent], n: usize| {
+        let ms = |us: i64| Some(i32::try_from(us / 1_000).unwrap());
+        let mut want = (Some(0), false, false);
         for e in &events[..n] {
-            want = match e.kind {
-                eval::JudgeEventKind::Judged { .. } if rearm => None,
-                eval::JudgeEventKind::Judged { lane, note, .. } => match (lane.index(), note) {
-                    (1, 0) => Some((Some(-210), false, true)),
-                    (1, 1) => Some((Some(30), true, false)),
-                    (1, 2) => Some((Some(0), false, false)),
-                    (1, 3) => Some((Some(-30), false, true)),
-                    (2, 0) => Some((Some(40), false, false)),
-                    other => panic!("{other:?}"),
-                },
-                eval::JudgeEventKind::EmptyPoor { .. } => Some((Some(-140), false, true)),
-                _ => want,
+            let (us, imperfect) = match e.kind {
+                eval::JudgeEventKind::Judged {
+                    lane,
+                    note,
+                    judgment,
+                    deviation,
+                    release,
+                    ..
+                } => {
+                    let us = match (deviation, release) {
+                        (None, _) => chart.lanes[lane.index()][note].time.0 - e.time.0,
+                        (Some(d), None) => -d.0,
+                        (Some(d), Some(r)) => {
+                            let chosen = if d.0.abs() > r.0.abs() { -d.0 } else { -r.0 };
+                            if judgment >= rules::Judgment::Bad && chosen > 0 {
+                                -r.0
+                            } else {
+                                chosen
+                            }
+                        }
+                    };
+                    (us, judgment != rules::Judgment::Perfect)
+                }
+                eval::JudgeEventKind::EmptyPoor { deviation, .. } => (-deviation.0, true),
+                _ => continue,
             };
+            want = (
+                ms(us),
+                imperfect && us / 1_000 > 0,
+                imperfect && us / 1_000 < 0,
+            );
         }
         want
     };
@@ -2129,27 +2153,26 @@ fn a_play_skin_reads_the_recent_timing() {
     // dropped). No capture must show a judgment: a frame may draw a view
     // older than its time (the deterministic test,
     // `tests/recent_timing.rs`, checks each value).
+    let charts = [&chart, &chart, &rearm_chart];
     let mut judged = 0;
     for name in [
         "miss", "early", "empty", "late", "held", "release", "retry", "rearmed",
     ] {
         let s = side(name);
         let generation = usize::try_from(side_num(&s, "generation")).unwrap();
-        let candidate = side_num(&s, "view_generation");
+        // The rearm's cancelled candidate is not its record's.
+        if generation == 3 && side_num(&s, "view_generation") == 0 {
+            continue;
+        }
         let n = usize::try_from(side_num(&s, "events")).unwrap();
         let (_, events) = &played[generation - 1];
         assert!(n <= events.len() && n < 1 << 14, "{name}: {s}");
         if let Some(t) = events[..n].last() {
             assert!(t.time.0 <= side_num(&s, "finalized_us"), "{name}: {s}");
         }
-        // The rearm's cancelled candidate is not its record's.
-        if generation == 3 && candidate == 0 {
-            continue;
-        }
-        if let Some(want) = expected(events, n, generation == 3) {
-            assert_eq!(shown(name), want, "{name}: {s}");
-            judged += usize::from(want != (Some(0), false, false));
-        }
+        let want = expected(charts[generation - 1], events, n);
+        assert_eq!(shown(name), want, "{name}: {s}");
+        judged += usize::from(want != (Some(0), false, false));
     }
     println!("captures that showed a judgment: {judged}");
 }
