@@ -48,6 +48,7 @@ use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
 /// the controls it records (dev-tools).
 #[cfg(feature = "dev-tools")]
 type Feed = (input::AutoplayInput, usize, Vec<eval::ControlId>);
+use crate::selection_skin::SkinFeed;
 use crate::shelf::{Shelf, file_name};
 use crate::ui_text::{Label, Message};
 use crate::window::ImeSwitch;
@@ -176,6 +177,9 @@ pub struct Selection {
     /// Steps of the play preset taken and not yet applied: the flow takes
     /// them after each look ([`AppRig::take_preset_step`]).
     pub preset_steps: std::collections::VecDeque<game::PresetStep>,
+    /// What the render thread is given of each change: the lifetime, the
+    /// timers' starts and the skin's window.
+    pub feed: SkinFeed,
     /// The scripted input (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub script: Option<crate::dev::SelectScript>,
@@ -220,6 +224,7 @@ impl Selection {
     /// Reads the screen's list from the library again.
     fn refresh(&mut self) {
         self.search_pending = false;
+        self.feed.list_revision = self.feed.list_revision.saturating_add(1);
         match self.read_list() {
             Ok(()) => {}
             Err(e) => {
@@ -376,6 +381,7 @@ impl Selection {
         chosen: Option<Pick>,
         skin: &mut SkinState,
         render: &RenderLink,
+        now: TimeUs,
     ) -> Option<Pick> {
         let pick = chosen?;
         let Err(notice) = skin.ready() else {
@@ -384,13 +390,14 @@ impl Selection {
         let (Pick::Play(path) | Pick::Practice(path)) = &pick;
         println!("select: not admitted {}: {notice}", file_name(path));
         self.refused(path, notice, false);
-        self.show(render, None);
+        self.show(render, None, now);
         None
     }
 
-    /// Sends the page if it changed, with `status` in its title (the
-    /// library's when `None`).
-    fn show(&mut self, render: &RenderLink, status: Option<&str>) {
+    /// Sends the screen's update if it changed at `now`, its page with
+    /// `status` in its title (the library's when `None`): the page, and
+    /// what a selection skin draws ([`SkinFeed::update`]).
+    fn show(&mut self, render: &RenderLink, status: Option<&str>, now: TimeUs) {
         if self.dirty {
             self.dirty = false;
             let shelf = self.shelf.status();
@@ -426,7 +433,7 @@ impl Selection {
                     }
                 }
             }
-            render.send(RenderMsg::Menu(Box::new(page)));
+            render.show_selection(self.feed.update(&self.screen, page, now));
         }
     }
 
@@ -1245,6 +1252,13 @@ impl PlayerRig<'_> {
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
         }
+        // The selection skin refused at runtime: the page draws from now
+        // on, and says why.
+        if let Some(why) = self.render.take_selection_refusal() {
+            let notice = crate::imports::notice(skin_model::ScreenKind::Selection, &why);
+            sel.screen.set_notice(Some(notice));
+            sel.dirty = true;
+        }
         #[cfg_attr(
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "scripts choose too")
@@ -1261,7 +1275,8 @@ impl PlayerRig<'_> {
             chosen = sel.drain_owned(&mut self.result_input);
         }
         // Before anything of the choice: no chart without its skin.
-        let chosen = sel.admit(chosen, &mut self.skin, &self.render);
+        let now = self.clock.now();
+        let chosen = sel.admit(chosen, &mut self.skin, &self.render, now);
         if let Some(pick) = &chosen {
             let (Pick::Play(path) | Pick::Practice(path)) = pick;
             let what = if matches!(pick, Pick::Practice(_)) {
@@ -1284,10 +1299,11 @@ impl PlayerRig<'_> {
             // A chart to play enters the play screen's loading state at once
             // (`entered_loading`); the practice page reads it first.
             if sel.practicing {
-                sel.show(&self.render, Some(&Message::Reading { name: &name }.text()));
+                let reading = Message::Reading { name: &name }.text();
+                sel.show(&self.render, Some(&reading), now);
             }
         } else {
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, now);
         }
         chosen
     }
@@ -1634,6 +1650,8 @@ impl AppRig for PlayerRig<'_> {
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
         self.enter_attempt();
+        // Selection is left: nothing of it is drawn again.
+        self.render.leave_selection();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1951,7 +1969,7 @@ impl AppRig for PlayerRig<'_> {
                 script.refused(Chain(&refusal.reason).to_string());
             }
             sel.refused(&refusal.chart, format!("{name}: {shown}"), preset);
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, self.clock.now());
         }
     }
 
@@ -1988,7 +2006,7 @@ impl AppRig for PlayerRig<'_> {
             sel.screen
                 .set_bests_preset(shelf.ok().map(|s| s.chosen().clone()));
             sel.refresh_bests();
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, self.clock.now());
         }
     }
 
@@ -2009,9 +2027,11 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
-        sel.entered(self.clock.now());
+        let now = self.clock.now();
+        sel.entered(now);
+        self.render.enter_selection(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
-        sel.show(&self.render, None);
+        sel.show(&self.render, None, now);
     }
 
     /// The one routine of every entry into the practice page: on opening
@@ -2025,6 +2045,7 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.enter_scene();
+        self.render.leave_selection();
         recover(
             &mut self.result_input,
             Owner::Practice,
@@ -2065,8 +2086,15 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
+    /// The flow applies the step taken now: the strip shows the preset's
+    /// name from here ([`crate::selection_skin::PRESET_SHOWN`]).
     fn take_preset_step(&mut self) -> Option<game::PresetStep> {
-        self.selection.as_mut()?.preset_steps.pop_front()
+        let now = self.clock.now();
+        let sel = self.selection.as_mut()?;
+        let step = sel.preset_steps.pop_front()?;
+        sel.feed.preset_step = Some(now);
+        sel.dirty = true;
+        Some(step)
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
@@ -2087,6 +2115,7 @@ impl Selection {
     /// preset are read anew, with what the chart's plays counted.
     fn entered(&mut self, now: TimeUs) {
         self.entered_at = now;
+        self.feed.enter(now);
         self.loading = None;
         self.screen.end_composition();
         self.shelf.release();
@@ -2312,7 +2341,7 @@ mod tests {
             }
             let chosen = sel.drain(&mut Pad::default());
             let began = Instant::now();
-            let admitted = sel.admit(chosen, skin, &render);
+            let admitted = sel.admit(chosen, skin, &render, TimeUs(0));
             assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
             admitted
         };
@@ -2399,6 +2428,7 @@ mod tests {
             screen,
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
             rate: 48_000,
@@ -3533,6 +3563,7 @@ mod tests {
             screen: SelectScreen::new(roots.clone()),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
             rate: 48_000,

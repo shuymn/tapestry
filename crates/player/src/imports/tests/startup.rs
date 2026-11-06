@@ -257,6 +257,7 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
                 play: None,
                 notice: Some(format!("リザルトのスキンは使えません（内蔵画面）: {why}")),
                 pending: None,
+                selection: None,
             }
         );
     }

@@ -48,6 +48,7 @@ mod render_side;
 mod result_input;
 mod select;
 mod selection;
+mod selection_skin;
 mod shelf;
 mod start_gate;
 mod tuning;
@@ -1505,6 +1506,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_refusal: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),
+        feed: selection_skin::SkinFeed::default(),
         ime,
         rate: opened.rate,
         chosen_at: TimeUs(0),
@@ -1544,6 +1546,11 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             rig.pending = started.pending;
             if let (Some(notice), Some(sel)) = (started.notice, &mut rig.selection) {
                 sel.screen.set_notice(Some(notice));
+            }
+            // The select screen's view is made for the installed skin's
+            // song list.
+            if let Some(sel) = &mut rig.selection {
+                sel.feed.window = started.selection;
             }
             (true, None)
         }

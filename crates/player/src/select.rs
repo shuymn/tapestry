@@ -431,6 +431,12 @@ impl SelectScreen {
         SORTS.get(self.sort).map_or(Sort::Title, |&(s, _)| s)
     }
 
+    /// The order the list is in, by its place among those Left and Right
+    /// cycle.
+    pub const fn order(&self) -> usize {
+        self.sort
+    }
+
     /// Whether the search box has focus.
     pub const fn searching(&self) -> bool {
         self.searching
@@ -1184,10 +1190,6 @@ impl SelectScreen {
 /// The player's strings a selection skin draws, in the chosen language
 /// (docs/stage3.md S10-09d, #176 C10): the results' name holds no query,
 /// which a skin reads as data.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no selection skin is drawn until S10-09e")
-)]
 pub fn labels() -> SelectionLabels {
     SelectionLabels {
         all_charts: Label::AllCharts.text().to_owned(),
