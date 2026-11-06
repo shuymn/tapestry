@@ -561,6 +561,73 @@ mod tests {
         assert!(!SelectionEvents::default().preset_shown(TimeUs(t)));
     }
 
+    /// The settings a skin shows are the play options in force, the
+    /// preset's displayed gauge as an attempt resolves it, the settings
+    /// keys' values and, in each update, the list's order; none before
+    /// the options are known.
+    #[test]
+    fn the_settings_are_the_players_own() {
+        use skin_model::{GaugeLook, MasterVolume, SelectionOrder, SpeedReference, SpeedView};
+        let tuning = crate::tuning::LiveTuning::new(game::Tuning {
+            volume_percent: 53,
+            display_offset_us: -12_000,
+            input_offset_us: 0,
+        });
+        let mut hispeed = game::HiSpeedSettings::default();
+        hispeed.reference = game::HiSpeedReference::Main;
+        hispeed.green_target = 450;
+        let mut covers = game::Covers::default();
+        covers.lift.on = true;
+        let options = game::PlayOptions::new(hispeed, covers).unwrap();
+        let preset = rules::tapestry();
+        // A gauge past the preset's resolves as an attempt does.
+        for gauge in [0, 1, 99] {
+            let policy = game::DefaultPolicy {
+                displayed: gauge,
+                on_failure: game::FailureAction::default(),
+            };
+            let shown = &preset.gauges[game::resolve_displayed(&policy, &preset).0];
+            let s = super::settings_of(
+                Some(options),
+                Some(&preset),
+                gauge,
+                SelectionOrder::Title,
+                &tuning,
+            )
+            .unwrap();
+            assert_eq!(s.gauge, Some(GaugeLook::of(shown)), "{gauge}");
+            assert_eq!(
+                s.speed,
+                SpeedView::Floating {
+                    reference: SpeedReference::Main,
+                    green: 450
+                }
+            );
+            assert_eq!(s.covers_on, [covers.sudden.on, true, covers.hidden.on]);
+            assert_eq!(s.display_offset_ms, -12);
+            // 53 % plays as the f32 0.53, which the source shows as 52.
+            assert_eq!(s.master_volume, MasterVolume::of_gain(0.53));
+            assert_eq!(s.master_volume.number, 52);
+        }
+        assert_eq!(
+            super::settings_of(None, Some(&preset), 0, SelectionOrder::Title, &tuning),
+            None
+        );
+        let s = super::settings_of(Some(options), None, 0, SelectionOrder::Title, &tuning);
+        assert_eq!(s.unwrap().gauge, None);
+        // The update takes the list's order.
+        let mut feed = super::SkinFeed {
+            settings: s,
+            ..super::SkinFeed::default()
+        };
+        feed.enter(TimeUs(0));
+        let mut screen = SelectScreen::new(Vec::new());
+        screen.input(MenuInput::Key(MenuKey::Right));
+        let page = screen.page("");
+        let u = feed.update(&screen, page, TimeUs(0));
+        assert_eq!(u.settings.unwrap().order, SelectionOrder::Artist);
+    }
+
     /// The slot keeps the newest of a lifetime with one notification,
     /// and nothing of a lifetime not current.
     #[test]
