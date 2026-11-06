@@ -285,3 +285,34 @@ fn the_song_list_s_values_count_against_the_expanded_cap() {
         other => panic!("{other:?}"),
     }
 }
+
+/// Each of the song list's nine `Destination[]` fields, a destination's
+/// `dst` in it, and `customEvents` are read on a selection skin only: an
+/// include of a missing file there refuses a selection skin's tables and
+/// leaves a play skin's untouched.
+#[test]
+fn song_list_fields_and_custom_events_are_read_on_selection_only() {
+    use crate::resolve::SONG_LIST_FIELDS;
+    let missing = r#"{"include": "none.json"}"#;
+    let mut cases: Vec<String> = SONG_LIST_FIELDS
+        .iter()
+        .map(|f| format!(r#""songlist": {{"id": "l", "{f}": [{missing}]}}"#))
+        .collect();
+    cases.push(format!(
+        r#""songlist": {{"id": "l", "liston": [{{"id": "p", "dst": [{missing}]}}]}}"#
+    ));
+    cases.push(format!(r#""customEvents": [{missing}]"#));
+    for body in &cases {
+        for (ty, read) in [(5, true), (0, false)] {
+            let d = skin(&format!(r#"{{"type": {ty}, {body}}}"#));
+            let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+            let enabled = BTreeSet::new();
+            let r = resolve(&mut def, &enabled).and_then(|mut r| r.tables(&enabled));
+            assert_eq!(
+                matches!(r, Err(ImportError::Read { .. })),
+                read,
+                "{ty} {body}: {r:?}"
+            );
+        }
+    }
+}

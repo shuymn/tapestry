@@ -8,6 +8,46 @@ use common::selection::{SET, TEXT_T, TITLE, folder, import_selection, song_list}
 use skin_beatoraja::{ImportError, ImportLimit};
 use skin_model::{MAX_IMAGE_CHOICE_REFS, MAX_SKIN_KEYS, MAX_TRACK_KEYS, MAX_WIDGET_QUADS};
 
+/// The song list elements' visibilities count to the skin's operation
+/// cap: as many elements as fit are accepted, one more refuses.
+#[test]
+fn song_list_ops_count_to_the_cap() {
+    // Sixty slots, each arm and the title under long conditions, so the
+    // operations reach their cap before the quads do.
+    let ops = "[2, 21, 22, 23, 101, 102, 103, 104, -105]";
+    let place: Vec<String> = (0..60).map(|i| at(0, 10 * i, 300, 8)).collect();
+    let arms: Vec<String> = place
+        .iter()
+        .map(|p| format!(r#"{p}], "op": {ops}, "dummy": [0"#))
+        .collect();
+    let refs: Vec<&str> = arms.iter().map(String::as_str).collect();
+    let rest = format!(
+        r#""text": [{{"id": "t", "op": {ops}, "dst": [{}]}}]"#,
+        at(0, 0, 100, 10)
+    );
+    let body = |lists: usize| {
+        let list = song_list(&refs, &refs, 0, &rest);
+        let dsts = vec![r#"{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#; lists];
+        format!(
+            r#""imageset": [{SET}], "text": [{TEXT_T}], {list}, "destination": [{}]"#,
+            dsts.join(",")
+        )
+    };
+    let ops = |lists: usize| {
+        import_selection(folder(&body(lists)).path())
+            .unwrap()
+            .report
+            .usage
+            .ops as usize
+    };
+    let (one, two) = (ops(1), ops(2));
+    let per = two - one;
+    let fit = 1 + (skin_model::MAX_SKIN_OPS - one) / per;
+    assert_eq!(ops(fit), one + (fit - 1) * per);
+    let (l, _) = limit(import_selection(folder(&body(fit + 1)).path()));
+    assert_eq!(l, ImportLimit::Ops);
+}
+
 fn at(x: i32, y: i32, w: i32, h: i32) -> String {
     format!(r#"{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}"#)
 }
