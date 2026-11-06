@@ -571,7 +571,7 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
             // granted: that frame shows the key.
             gate.hold();
             let views = seen().last().unwrap().views;
-            let mut next = |key| {
+            let next = |key| {
                 let before = seen().len();
                 let pressed = tuning.adjust(key);
                 gate.step();
