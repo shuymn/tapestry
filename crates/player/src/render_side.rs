@@ -7119,6 +7119,7 @@ pub(crate) mod tests {
             request: u64,
         ) -> Option<Result<Preparation, RenderError>> {
             if self.shared.hold.load(Ordering::Acquire) {
+                self.shared.held_request.store(request, Ordering::Release);
                 return None;
             }
             // Read once: the request whose preparation stages and holds.
@@ -7322,6 +7323,8 @@ pub(crate) mod tests {
     pub(crate) struct Installers {
         builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
+        /// The last request whose preparation `hold` kept unanswered.
+        held_request: Arc<std::sync::atomic::AtomicU64>,
         fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
         /// Loading frames drawn as the pending presentation.
@@ -8184,12 +8187,21 @@ pub(crate) mod tests {
         assert!(frames() >= from + 3);
         link.commit_attempt().unwrap();
 
+        // The render thread took the request now being prepared and the
+        // hold kept it unanswered: released only then, so the preparation
+        // the render thread sees is the held one, never a fresh one.
+        let held = |link: &super::RenderLink| {
+            let request = link.requests.load(Ordering::Relaxed);
+            wait_until(|| screens.held_request.load(Ordering::Acquire) == request)
+        };
+
         // Cancelled while held, then released: the late answer never
         // comes, and nothing commits.
         screens.hold.store(true, Ordering::Release);
         let from = frames();
         let cancelled = link.prepare_attempt(titled(&chart), || frames() >= from + 3);
         assert_eq!(cancelled.unwrap(), Preparation::Cancelled);
+        assert!(held(&link));
         screens.hold.store(false, Ordering::Release);
         let from = frames();
         assert!(wait_until(|| frames() >= from + 3));
@@ -8200,10 +8212,11 @@ pub(crate) mod tests {
         screens.hold.store(true, Ordering::Release);
         let late = link.prepare_attempt(titled(&chart), || false);
         assert!(matches!(late, Err(ScreenError::NoAnswer)), "{late:?}");
+        assert!(held(&link));
         screens.hold.store(false, Ordering::Release);
         let from = frames();
         assert!(wait_until(|| frames() >= from + 3));
-        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        link.set_timeouts(super::LOAD_TIMEOUT, super::EXIT_TIMEOUT);
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
         link.exit();
         assert_eq!(
