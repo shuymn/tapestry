@@ -308,11 +308,14 @@ fn song_list_fields_and_custom_events_are_read_on_selection_only() {
             let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
             let enabled = BTreeSet::new();
             let r = resolve(&mut def, &enabled).and_then(|mut r| r.tables(&enabled));
-            assert_eq!(
-                matches!(r, Err(ImportError::Read { .. })),
-                read,
-                "{ty} {body}: {r:?}"
-            );
+            if read {
+                assert!(
+                    matches!(r, Err(ImportError::Read { .. })),
+                    "{ty} {body}: {r:?}"
+                );
+            } else {
+                assert!(r.is_ok(), "{ty} {body}: {r:?}");
+            }
         }
     }
 }

@@ -253,6 +253,9 @@ fn lua_timer_reads_take_the_selection_timers() {
 fn lua_reads_take_the_selection_text_and_index_bridges() {
     let more = "table.insert(skin.text, { id = \"q\", font = \"f\", size = 10,\n\
                   value = function() return ms.text(30) end })\n\
+                table.insert(skin.text, { id = \"pl\", font = \"f\", size = 10,\n\
+                  value = function() return ms.text(1000) end })\n\
+                table.insert(skin.destination, { id = \"pl\", dst = { { x = 0, y = 20, w = 100, h = 10 } } })\n\
                 table.insert(skin.imageset, { id = \"ct\",\n\
                   images = { \"b0\", \"b0\", \"b0\", \"b0\", \"b0\", \"b1\" },\n\
                   value = function() return ms.event_index(370) end })\n\
@@ -265,7 +268,7 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
             .iter()
             .filter(|d| **d == Disposition::Lowered)
             .count(),
-        2,
+        3,
         "{:?}",
         i.callbacks
     );
@@ -274,9 +277,11 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
     row.score = best(1, 0, 1);
     let mut v = view(vec![row], Some(0), None, None);
     v.query = "Q".to_owned();
+    v.place = skin_model::SelectionPlace::Folder(vec!["X".to_owned()]);
     s.view(&v);
     let (texts, _) = s.requests();
     assert!(texts.iter().any(|(_, t)| t == "Q"), "{texts:?}");
+    assert!(texts.iter().any(|(_, t)| t == "X > "), "{texts:?}");
     // A normal clear: the source's clear type 5, image 5 of the set.
     let at_700: Vec<[u8; 2]> = s
         .drawn(0)
