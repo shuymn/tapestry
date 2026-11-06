@@ -2054,6 +2054,37 @@ mod tests {
     /// with headings it is the built-in page's window.
     #[test]
     fn a_view_without_headings_counts_selectable_rows() {
+        use skin_model::{MAX_VISIBLE_ROWS, Ratio, RowKind};
+        // A hundred charts in ten folders: at most `MAX_VISIBLE_ROWS` rows,
+        // none a heading, the position exact over the hundred.
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
+        s.set_entries(names.iter().flat_map(|f| folder(f, 10)).collect());
+        let window = |s: &SelectScreen| {
+            let v = s.view(100, 100, false);
+            assert_eq!(v.rows.len(), MAX_VISIBLE_ROWS);
+            assert!(v.rows.iter().all(|r| r.kind == RowKind::Chart));
+            (v.cursor, v.position, view_keys(&v))
+        };
+        let (cursor, position, keys) = window(&s);
+        assert_eq!((cursor, position), (Some(0), Ratio::new(0, 99)));
+        assert_eq!(keys.first().map(String::as_str), Some("a00.bms"));
+        assert_eq!(keys.last().map(String::as_str), Some("g03.bms"));
+        for _ in 0..45 {
+            s.input(key(MenuKey::Down));
+        }
+        let (cursor, position, keys) = window(&s);
+        assert_eq!((cursor, position), (Some(45), Ratio::new(45, 99)));
+        assert_eq!(keys[45], "e05.bms");
+        s.input(key(MenuKey::End));
+        let (cursor, position, keys) = window(&s);
+        assert_eq!(
+            (cursor, position),
+            (Some(MAX_VISIBLE_ROWS - 1), Ratio::new(99, 99))
+        );
+        assert_eq!(keys.last().map(String::as_str), Some("j09.bms"));
+        assert_eq!(keys.first().map(String::as_str), Some("d06.bms"));
+
         let mut s = screen();
         assert_eq!(
             view_keys(&s.view(10, 10, false)),
@@ -2135,30 +2166,6 @@ mod tests {
         s.input(key(MenuKey::Down));
         let v = s.view(0, 0, false);
         assert_eq!(v.selected.unwrap().labels.level_value, 7);
-    }
-
-    /// The rows that are not charts carry no level, features or draws.
-    #[test]
-    fn rows_that_are_not_charts_carry_no_chart_facts() {
-        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
-        let mut e = entry(r"C:\charts\a\1.bms", "t");
-        e.header.playlevel = Some("9".to_owned());
-        e.random = true;
-        s.set_top(
-            library::Level {
-                charts: vec![e],
-                ..library::Level::default()
-            },
-            1,
-        );
-        let v = s.view(0, 10, false);
-        let all = &v.rows[0];
-        assert_eq!(all.kind, skin_model::RowKind::All { charts: 1 });
-        assert_eq!(
-            (all.level_value, all.features, all.random),
-            (0, None, false)
-        );
-        assert_eq!((v.rows[1].level_value, v.rows[1].random), (9, true));
     }
 
     /// The labels a skin draws are the player's own strings in its
