@@ -7644,9 +7644,11 @@ pub(crate) mod tests {
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
     pub(crate) struct Installers {
-        builds: Arc<AtomicU32>,
+        /// The screens built so far.
+        pub(crate) builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
-        fail: Arc<AtomicBool>,
+        /// Every frame and installation fails as a lost device while set.
+        pub(crate) fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
         /// Loading frames drawn as the pending presentation.
         pending: Arc<AtomicU32>,

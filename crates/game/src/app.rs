@@ -72,8 +72,17 @@ pub trait AppRig: Rig {
     /// Song selection was entered: called on every entry, before anything
     /// is shown there.
     fn entered_selection(&mut self);
+    /// The screen failed while selection showed and was built again: the
+    /// same entry goes on, so what it started (its timers, a skin's state)
+    /// is kept and only what the new screen draws is sent again. Called
+    /// instead of [`entered_selection`](Self::entered_selection); the
+    /// default enters selection anew.
+    fn recovered_selection(&mut self) {
+        self.entered_selection();
+    }
     /// The shelf, or why it cannot open: called on every entry into
-    /// selection, right after [`entered_selection`](Self::entered_selection),
+    /// selection, right after [`entered_selection`](Self::entered_selection)
+    /// or [`recovered_selection`](Self::recovered_selection),
     /// and after every poll or batch of preset steps there that changed
     /// it.
     fn presets_changed(&mut self, shelf: Result<&Shelf, &ShelfError>) {
@@ -319,8 +328,13 @@ impl App {
     /// plays before it are saved.
     pub fn run<R: AppRig>(&mut self, rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
         let mut refusal = None;
+        let mut recovered = false;
         'select: loop {
-            rig.entered_selection();
+            if std::mem::take(&mut recovered) {
+                rig.recovered_selection();
+            } else {
+                rig.entered_selection();
+            }
             rig.presets_changed(self.shelf.as_ref());
             self.events.on_event(&SessionEvent::Select);
             if let Some(r) = &refusal {
@@ -336,9 +350,11 @@ impl App {
                 while rig.take().is_some() {}
                 while rig.take_menu().is_some() {}
                 // The screen is built again, acknowledged, and selection
-                // entered anew; if it cannot be, the run ends.
+                // shown on it again within the same entry; if it cannot
+                // be, the run ends.
                 if rig.screen_failed() {
                     rig.prepare_screen().map_err(LiveError::Screen)?;
+                    recovered = true;
                     continue 'select;
                 }
                 // Steps taken before a choice apply to the chart chosen.

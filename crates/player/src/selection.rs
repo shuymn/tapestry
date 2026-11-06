@@ -2049,6 +2049,18 @@ impl AppRig for PlayerRig<'_> {
         sel.show(&self.render, None, now);
     }
 
+    /// The same entry on a screen built again: its lifetime, its timers'
+    /// starts and the skin's state stay (design.md "Rendering and Skins",
+    /// Screen skins); its update is sent again, so the new screen prepares
+    /// what it draws.
+    fn recovered_selection(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        sel.dirty = true;
+        sel.show(&self.render, None, self.clock.now());
+    }
+
     /// The one routine of every entry into the practice page: on opening
     /// and after every return (a refused Start, a refused opening or
     /// restore, the rounds left by the quit key or a result's back).
@@ -3853,6 +3865,111 @@ pub(crate) mod tests {
             f(rig)
         });
         out
+    }
+
+    /// Closes the window when dropped, so a run waiting on it ends even
+    /// when the check driving it fails.
+    #[cfg(feature = "dev-tools")]
+    struct CloseOnDrop<'a>(&'a crate::controls::Controls);
+
+    #[cfg(feature = "dev-tools")]
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    /// A device lost while selection shows is not an entry (design.md
+    /// "Rendering and Skins", Screen skins): through the app's run, the
+    /// screen built again draws the same lifetime with the skin's state and
+    /// the timers' starts kept; a real entry again (after a refused chart)
+    /// is a new lifetime with a fresh state and its own starts.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_device_recovery_keeps_the_entry_and_an_entry_again_starts_anew() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(dir.path(), &[&["a.bms"]]);
+        let menu = Arc::clone(&sel.menu);
+        let screens = crate::render_side::tests::Installers::default();
+        let render = screens.spawn_bare();
+        assert_eq!(
+            render
+                .select(
+                    skin_model::ScreenKind::Selection,
+                    Some(crate::render_side::tests::bundle())
+                )
+                .wait()
+                .unwrap(),
+            game::Preparation::Ready
+        );
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        // A preset that does not exist: a chart chosen is refused, and
+        // selection entered again.
+        let mut app_settings = settings.clone();
+        app_settings.player.preset = "missing".to_owned();
+        let seen = || screens.selections.lock().unwrap().clone();
+        let skinned = |lifetime: u64| {
+            seen()
+                .into_iter()
+                .find(|s| s.lifetime == lifetime && s.state.is_some())
+        };
+        let (ran, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            let controls = rig.controls;
+            let mut app = game::App::new(
+                DataRoot::new(dir.path().join("app")),
+                app_settings,
+                crate::session_config(replay::ReceiveMethod::Scripted, None),
+                Box::new(|s: &game::Settings| game::Parts::unsaved(&s.player)),
+                Box::new(game::NoSessionEvents),
+            );
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _close = CloseOnDrop(controls);
+                    assert!(crate::render_side::tests::wait_until(
+                        || skinned(1).is_some()
+                    ));
+                    let first = skinned(1).unwrap();
+                    // The device lost; once the flow built the screen
+                    // again, the new one draws.
+                    screens.fail.store(true, Ordering::Release);
+                    assert!(crate::render_side::tests::wait_until(|| {
+                        screens.builds.load(Ordering::Acquire) >= 2
+                    }));
+                    screens.fail.store(false, Ordering::Release);
+                    assert!(crate::render_side::tests::wait_until(|| {
+                        seen().iter().any(|s| s.device != first.device)
+                    }));
+                    let again = seen()
+                        .into_iter()
+                        .find(|s| s.device != first.device)
+                        .unwrap();
+                    assert_eq!(
+                        (again.lifetime, again.state, again.events.entered),
+                        (1, first.state, first.events.entered),
+                        "{again:?}"
+                    );
+                    assert_eq!(again.events.changed, first.events.changed);
+                    // The chart chosen and refused: selection entered again.
+                    menu.push(MenuInput::Key(MenuKey::End));
+                    menu.push(MenuInput::Key(MenuKey::Enter));
+                    assert!(crate::render_side::tests::wait_until(
+                        || skinned(2).is_some()
+                    ));
+                    let next = skinned(2).unwrap();
+                    assert_ne!(next.state, first.state);
+                    assert!(next.events.entered > first.events.entered, "{next:?}");
+                    assert!(seen().iter().all(|s| s.lifetime <= 2), "{:?}", seen());
+                });
+                app.run(rig)
+            })
+        });
+        assert!(ran.is_ok(), "{ran:?}");
     }
 
     /// Leaving selection for a chart's loading or for the practice page
