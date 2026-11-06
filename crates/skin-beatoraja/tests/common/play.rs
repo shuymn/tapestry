@@ -268,6 +268,19 @@ impl Drawn {
         d
     }
 
+    /// `skin` played over `chart`, its notes' end at `last_note_end`.
+    #[allow(dead_code, reason = "not every test binary ends its notes")]
+    pub fn over_ending(skin: Skin, chart: &bms_model::Chart, last_note_end: TimeUs) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                last_note_end,
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over a chart of `notes` notes by an attempt that is
     /// autoplay when `autoplay`.
     #[allow(dead_code, reason = "not every test binary autoplays")]
