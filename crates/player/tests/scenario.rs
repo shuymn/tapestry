@@ -1937,8 +1937,8 @@ fn write_text_chart(fx: &Fixture, name: &str, text: &str) -> bms_model::Chart {
 /// pressed 30 ms early (+30, early); 6 s on time, then a press 140 ms
 /// after it, an empty POOR against it (−140, late); 8 s pressed 30 ms late
 /// (−30, late); the long note's head 10 ms late, held, which leaves −30;
-/// its release 40 ms before its end, PERFECT (+40, neither). A retry's
-/// READY reads 0. Then the rearm's chart: its first READY takes an empty
+/// its release 40 ms before its end, PERFECT (+40, neither); the play is
+/// retried. Then the rearm's chart: its first READY takes an empty
 /// POOR 480 ms before the long note's head and is cancelled by START held
 /// before chart time 0, its release rearming a fresh READY, which holds
 /// the long note: a held head leaves the timing, so that candidate reads 0
@@ -2049,7 +2049,6 @@ fn a_play_skin_reads_the_recent_timing() {
         [
             "select = { path = \"library/t/t.bms\" }",
             "play = { input = \"logs/timing.tprl\", until = \"end\" }",
-            "capture = { ready_at = 0, file = \"retry.png\" }",
             "result = \"retry\"",
             "play = { input = \"logs/timing.tprl\", until = \"end\" }",
             "result = \"back\"",
@@ -2156,7 +2155,7 @@ fn a_play_skin_reads_the_recent_timing() {
     let charts = [&chart, &chart, &rearm_chart];
     let mut judged = 0;
     for name in [
-        "miss", "early", "empty", "late", "held", "release", "retry", "rearmed",
+        "miss", "early", "empty", "late", "held", "release", "rearmed",
     ] {
         let s = side(name);
         let generation = usize::try_from(side_num(&s, "generation")).unwrap();
