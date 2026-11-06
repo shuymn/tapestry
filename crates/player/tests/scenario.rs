@@ -1647,7 +1647,9 @@ fn restart_keeps_the_chosen_preset() {
 /// live result. Its outcome is any the real clock permits (design.md "Play
 /// Lifecycle"): only POORs, as many as the notes missed by its end; the
 /// gauge's failure aborts it and enters Closing, or a late wake completes
-/// it first, all four notes missed and no Closing. The exact count and
+/// it first, all four notes missed and no Closing; or a pause before its
+/// transport commits lets that wake cancel it before playback, nothing
+/// recorded and no played record. The exact count and
 /// Closing are the unit test's on a virtual clock
 /// (`generated_no_press_input_misses_into_closing_on_the_play_path`); a
 /// frame of Closing is not asserted: none is guaranteed to be presented.
@@ -1671,6 +1673,14 @@ fn a_generated_no_press_play_misses_into_closing() {
     let [play] = lines(&stdout, "play 1: ")[..] else {
         panic!("{stdout}");
     };
+    let (records, _) = fx.played_records();
+    if play == "play 1: Completed; nothing recorded" {
+        // Its first scoring wake came before its transport committed, so
+        // the candidate was cancelled before playback.
+        assert!(lines(&stdout, "closing: ").is_empty(), "{stdout}");
+        assert!(records.is_empty(), "{records:?}");
+        return;
+    }
     // Only misses, and the re-evaluation agrees.
     let poor: u32 = play
         .split_once("; perfect 0 great 0 good 0 bad 0 poor ")
@@ -1688,7 +1698,6 @@ fn a_generated_no_press_play_misses_into_closing() {
         assert_eq!(poor, 4, "{play}");
         assert_eq!(closing, 0, "{stdout}");
     }
-    let (records, _) = fx.played_records();
     assert_eq!(records.len(), 1, "{records:?}");
     let rec = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
     assert!(
