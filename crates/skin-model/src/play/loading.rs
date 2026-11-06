@@ -321,6 +321,20 @@ pub struct Loading {
 }
 
 impl Loading {
+    /// A state with no timer and no text slot, which a selection skin
+    /// gives: every build of it is refused.
+    pub(crate) fn inert(scratch: Side) -> Self {
+        Self {
+            poisoned: None,
+            starts: Box::default(),
+            ms: Box::default(),
+            fields: [0; field::COUNT],
+            scratch,
+            text: TextTable::new(Vec::new()),
+            bitmap: Box::default(),
+        }
+    }
+
     /// A fresh state with `whens` `when` timers and `text_slots` empty
     /// text slots, its lanes laid out for `scratch`.
     pub(crate) fn new(whens: usize, text_slots: usize, scratch: Side) -> Self {

@@ -307,6 +307,9 @@ pub struct LoadState {
 /// Why [`Skin::prepare`](crate::Skin::prepare) refused an attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PrepareError {
+    /// The skin is not a play skin.
+    #[error("the skin is not a play skin")]
+    Kind,
     #[error("the attempt's lead-in is negative")]
     NegativeLeadIn,
     #[error("the attempt gives {got} initial gauges for {expected} gauges")]
@@ -355,6 +358,10 @@ pub enum BuildError {
     /// cover setting.
     #[error("the frame's readouts are out of range or disagree with the lanes")]
     InvalidReadouts,
+    /// The skin is not made for the screen built: a play or loading frame
+    /// of a selection skin, or a selection frame of a play skin.
+    #[error("the skin is not made for this screen")]
+    Kind,
 }
 
 /// One attempt's skin state: the reducer, every timer's start and reading,

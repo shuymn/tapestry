@@ -84,6 +84,7 @@ mod play;
 mod quad;
 mod schema;
 mod screen;
+mod select;
 mod selection;
 mod skin;
 mod track;
@@ -96,6 +97,8 @@ pub use atlas::{
     Page, Variant, cell_fits_page, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
+#[cfg(feature = "dev-tools")]
+pub use expr::evaluations;
 pub use expr::{
     CompileError, ErrorKind, MAX_ELAPSED_MS, MAX_NAME_BYTES, MAX_NESTING, MAX_OPS, MAX_SKIN_OPS,
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
@@ -147,13 +150,17 @@ pub use play::{
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
+pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};
+pub use select::schema::{field as selection_field, timer as selection_timer};
+pub use select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 pub use selection::{
     ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowFeatures, RowKey, RowKind,
     RowScore, RowView, SelectedChart, SelectionLabels, SelectionPlace, SelectionView,
 };
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
-    MAX_WIDGET_QUADS, Skin, SkinDef, Source, TimerRef, WidgetDefs,
+    MAX_WIDGET_QUADS, SelectionDefs, SelectionRequests, Skin, SkinDef, Source, TimerRef,
+    WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
@@ -179,9 +186,17 @@ pub use widget::lanes::{
     LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
     LanesError, NoteOrder, Side, SourceLanes,
 };
+pub use widget::ratio_bar::{
+    RatioBarDef, RatioBarError, RatioForm, RatioSource, SLIDER_STEPS, SliderCommand,
+    SliderDirection,
+};
 pub use widget::scroll::{Gain, Scale};
+pub use widget::song_list::{
+    ImagePartDef, LEVEL_STYLES, LampKey, LevelDef, MAX_PLACEMENTS, PartDef, PlacementDef, RowLabel,
+    RowStyle, RowTextDef, SongListDef, SongListError,
+};
 pub use widget::text::{
     ChartText, FontRef, MAX_TEXT_BYTES, MAX_TEXT_ELEMENTS, MAX_TEXT_EM, MAX_TEXT_EM_PX, Overflow,
-    TextDef, TextError, TextField, TextImage, TextRequest, TextSlots, TextTable, TextTableError,
-    TextValue,
+    SelectionText, TextDef, TextError, TextField, TextImage, TextRequest, TextSlots, TextTable,
+    TextTableError, TextValue,
 };

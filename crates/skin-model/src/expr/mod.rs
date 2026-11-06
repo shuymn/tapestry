@@ -24,6 +24,8 @@ mod program;
 
 pub use error::{CompileError, ErrorKind, Span};
 pub(crate) use lex::is_tail;
+#[cfg(feature = "dev-tools")]
+pub use program::evaluations;
 pub use program::{Program, State};
 
 use crate::schema::{Schema, Ty};

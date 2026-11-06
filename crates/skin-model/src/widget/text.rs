@@ -51,10 +51,22 @@ pub enum TextField {
     Genre,
 }
 
+/// A string of the selection screen, not of a chart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionText {
+    /// The search box's text.
+    Query,
+    /// The place's folder names, or the "all charts" or results label,
+    /// each followed by `" > "`; empty at Top.
+    Place,
+}
+
 /// What a text element shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextValue {
     Field(TextField),
+    /// A selection screen's string; only a selection skin shows one.
+    Selection(SelectionText),
     /// `field`, or `empty` where its string is empty: chosen when the text
     /// is prepared. `empty` is as a [`Literal`](Self::Literal).
     FieldOr {
@@ -107,9 +119,10 @@ impl TextDef {
             (FontRef::Bitmap(_), TextValue::Literal(s)) => {
                 u32::try_from(s.chars().count()).unwrap_or(u32::MAX)
             }
-            (FontRef::Bitmap(_), TextValue::Field(_) | TextValue::FieldOr { .. }) => {
-                u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX)
-            }
+            (
+                FontRef::Bitmap(_),
+                TextValue::Field(_) | TextValue::FieldOr { .. } | TextValue::Selection(_),
+            ) => u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX),
             (FontRef::Default | FontRef::File(_), _) => 1,
         }
     }
@@ -307,6 +320,7 @@ impl TextSlots {
     pub(crate) fn names(self, value: &TextValue) -> bool {
         let f = match value {
             TextValue::Literal(_) => return self.literals,
+            TextValue::Selection(_) => return false,
             TextValue::Field(f) | TextValue::FieldOr { field: f, .. } => *f,
         };
         let parts = match f {
@@ -327,6 +341,9 @@ impl TextSlots {
 pub enum TextTableError {
     #[error("the table has {got} slots for {expected} text elements")]
     Len { expected: usize, got: usize },
+    /// The state is not one this skin made.
+    #[error("the state is not this skin's")]
+    Foreign,
 }
 
 /// Whether a literal is 1 to [`MAX_TEXT_BYTES`] bytes with no control
@@ -376,8 +393,21 @@ impl TextValue {
     /// emptiness is its string's as written, so one of control characters
     /// alone keeps the field and draws nothing.
     pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
+        self.resolve_with(chart, "", "")
+    }
+
+    /// The string it shows with `chart`'s header, the selection screen's
+    /// `query` and `place`.
+    pub(crate) fn resolve_with<'a>(
+        &'a self,
+        chart: &ChartText<'a>,
+        query: &'a str,
+        place: &'a str,
+    ) -> Cow<'a, str> {
         match self {
             Self::Literal(s) => Cow::Borrowed(s),
+            Self::Selection(SelectionText::Query) => Cow::Borrowed(query),
+            Self::Selection(SelectionText::Place) => Cow::Borrowed(place),
             Self::Field(f) => f.resolve(chart),
             Self::FieldOr { field, empty } => {
                 let s = field.resolve(chart);
