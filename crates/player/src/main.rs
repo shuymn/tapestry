@@ -593,8 +593,6 @@ fn start_engine(
     )
     .context("the audio engine cannot start")?;
     loaded.settings().device.apply_to(&mut engine);
-    #[cfg(feature = "dev-tools")]
-    let audio = audio.with_script_fence(controls.script_fence().clone());
     Ok((audio.start(engine, probe), gain))
 }
 
@@ -1344,8 +1342,6 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     )
     .context("the audio engine cannot start")?;
     settings.device.apply_to(&mut engine);
-    #[cfg(feature = "dev-tools")]
-    let audio = audio.with_script_fence(controls.script_fence().clone());
     let audio = audio.start(engine, probes.sounds.0);
     // Autoplay's queues are sized by each chart's feed, before its first
     // play; until then they hold nothing.

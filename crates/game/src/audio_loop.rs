@@ -22,8 +22,6 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-#[cfg(feature = "dev-tools")]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -245,77 +243,6 @@ pub struct TransportGate {
     pub generation: u32,
     /// Where its transport commits, in chart time.
     pub commit_at: TimeUs,
-}
-
-/// How long a transport's commit waits for the input thread to feed a
-/// script up to it ([`ScriptFence`]): a bound that only catches an input
-/// thread that never wakes again.
-#[cfg(feature = "dev-tools")]
-const FENCE_BOUND: Duration = Duration::from_secs(60);
-
-/// The input thread's progress through a scripted play's input (design.md
-/// "Shortening Launch-Based Checks", scripted input; dev-tools): it
-/// counts every wake it completes and says whether it fed a script, and
-/// a READY candidate's transport commits only after a wake begun at the
-/// pass that commits it has completed. The script's items before the
-/// commit point, a hold among them, are then read before the commit
-/// however late the input thread runs, as they are on time. Allocates
-/// nothing after [`new`](Self::new).
-#[cfg(feature = "dev-tools")]
-#[derive(Clone, Debug, Default)]
-pub struct ScriptFence(Arc<FenceState>);
-
-#[cfg(feature = "dev-tools")]
-#[derive(Debug, Default)]
-struct FenceState {
-    /// Wakes the input thread completed.
-    wakes: AtomicU64,
-    /// Whether its last wake fed a script.
-    scripted: AtomicBool,
-    /// The input thread has ended.
-    ended: AtomicBool,
-}
-
-#[cfg(feature = "dev-tools")]
-impl ScriptFence {
-    /// A fence no wake has passed.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The input thread completed a wake, which fed a script if
-    /// `scripted`.
-    pub fn woke(&self, scripted: bool) {
-        self.0.scripted.store(scripted, Ordering::Release);
-        self.0.wakes.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// The input thread has ended: nothing waits for it any more.
-    pub fn end(&self) {
-        self.0.ended.store(true, Ordering::Release);
-    }
-
-    /// Waits, while the input thread feeds a script, until a wake begun
-    /// after this call has completed, as long as `armed` holds and at most
-    /// [`FENCE_BOUND`].
-    fn pass(&self, armed: impl Fn() -> bool) {
-        let s = &*self.0;
-        if !s.scripted.load(Ordering::Acquire) {
-            return;
-        }
-        // The wake in progress now may have read its clock before this
-        // call; the one after it began after it.
-        let past = s.wakes.load(Ordering::Acquire).saturating_add(2);
-        let bound = Instant::now() + FENCE_BOUND;
-        while s.wakes.load(Ordering::Acquire) < past
-            && !s.ended.load(Ordering::Acquire)
-            && armed()
-            && Instant::now() < bound
-        {
-            std::thread::sleep(Duration::from_micros(200));
-        }
-    }
 }
 
 /// What the audio thread measured for a play (design.md "Latency Figures"),
@@ -554,9 +481,6 @@ pub struct AudioWorker {
     steady_from: Option<TimeUs>,
     /// The play's underruns counted so far.
     steady: u32,
-    /// What a transport's commit waits for, if anything (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    fence: Option<ScriptFence>,
 }
 
 /// A rearm the audio thread set aside while the restore it would replace
@@ -629,8 +553,6 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         queue_change: 0,
         steady_from: None,
         steady: 0,
-        #[cfg(feature = "dev-tools")]
-        fence: None,
     };
     // Before its first step, the line of an engine that has not woken.
     worker.publish_line();
@@ -1291,18 +1213,12 @@ impl AudioWorker {
             engine,
             queue,
             transport,
-            #[cfg(feature = "dev-tools")]
-            fence,
             ..
         } = self;
         let mut admit = || {
-            transport.as_ref().is_some_and(|t| {
-                #[cfg(feature = "dev-tools")]
-                if let Some(f) = fence {
-                    f.pass(|| t.gate.state().phase == input::GatePhase::Armed);
-                }
-                t.gate.commit(t.generation)
-            })
+            transport
+                .as_ref()
+                .is_some_and(|t| t.gate.commit(t.generation))
         };
         let report = engine.step_admitting(out, queue.commands(), &mut admit)?;
         self.consumed = self.consumed.saturating_add(u64::from(report.commands));
@@ -1441,13 +1357,6 @@ impl AudioWorker {
         self.probe = Some(probe);
     }
 
-    /// Each READY candidate's transport commits only past `fence`
-    /// ([`ScriptFence`]; dev-tools).
-    #[cfg(feature = "dev-tools")]
-    pub fn set_script_fence(&mut self, fence: ScriptFence) {
-        self.fence = Some(fence);
-    }
-
     /// The engine.
     #[must_use]
     pub const fn engine(&self) -> &AudioEngine {
@@ -1491,40 +1400,5 @@ mod tests {
         worker.shared.line_shift.store(500, Ordering::Release);
         let torn = counters.frame_line(TimeUs(1_000));
         assert_eq!(torn.base_us, 500);
-    }
-
-    /// The fence a scripted play's commit waits past: none while the input
-    /// thread feeds no script; while it does, until a wake begun during
-    /// the wait has completed (the second after the call, the first having
-    /// possibly read its clock before it), or until the candidate is no
-    /// longer armed or the input thread has ended.
-    #[cfg(feature = "dev-tools")]
-    #[test]
-    fn a_scripted_commit_waits_for_a_wake_begun_after_it() {
-        use std::sync::atomic::AtomicU32;
-
-        use super::ScriptFence;
-
-        let fence = ScriptFence::new();
-        let asked = AtomicU32::new(0);
-        // Each look at the candidate is a wake completing meanwhile.
-        let waking = |scripted| {
-            let (fence, asked) = (&fence, &asked);
-            move || {
-                asked.fetch_add(1, Ordering::Relaxed);
-                fence.woke(scripted);
-                true
-            }
-        };
-        fence.woke(false);
-        fence.pass(waking(false));
-        assert_eq!(asked.swap(0, Ordering::Relaxed), 0, "no script: no wait");
-        fence.woke(true);
-        fence.pass(waking(true));
-        assert_eq!(asked.swap(0, Ordering::Relaxed), 2);
-        // Cancelled meanwhile: no wait for the wakes.
-        fence.pass(|| false);
-        fence.end();
-        fence.pass(|| panic!("an ended input thread is not waited for"));
     }
 }

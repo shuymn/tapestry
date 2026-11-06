@@ -54,8 +54,6 @@ pub use adjust_keys::{
 };
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
 pub use attempt::{Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal};
-#[cfg(feature = "dev-tools")]
-pub use audio_loop::ScriptFence;
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, TransportGate, audio_control,

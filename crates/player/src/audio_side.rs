@@ -29,9 +29,6 @@ pub struct Opened {
 pub struct AudioThread {
     worker: SyncSender<AudioWorker>,
     handle: JoinHandle<()>,
-    /// What each READY candidate's commit waits past (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    fence: Option<game::ScriptFence>,
 }
 
 /// The running audio thread and its control.
@@ -47,25 +44,11 @@ impl AudioThread {
     pub fn start(self, engine: AudioEngine, probe: rtrb::Producer<AudioProbe>) -> AudioLink {
         let (control, mut worker) = audio_control(engine);
         worker.set_probe(probe);
-        #[cfg(feature = "dev-tools")]
-        if let Some(fence) = self.fence {
-            worker.set_script_fence(fence);
-        }
         let _ = self.worker.send(worker);
         AudioLink {
             control,
             handle: self.handle,
         }
-    }
-
-    /// Each READY candidate's transport commits past `fence`, the input
-    /// thread's wakes, when it feeds a script ([`game::ScriptFence`];
-    /// dev-tools).
-    #[cfg(feature = "dev-tools")]
-    #[must_use]
-    pub fn with_script_fence(mut self, fence: game::ScriptFence) -> Self {
-        self.fence = Some(fence);
-        self
     }
 }
 
@@ -136,8 +119,6 @@ where
             AudioThread {
                 worker: worker_tx,
                 handle,
-                #[cfg(feature = "dev-tools")]
-                fence: None,
             },
             opened,
         )),

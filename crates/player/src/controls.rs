@@ -57,10 +57,6 @@ pub struct Controls {
     /// The scene epoch: a play starting or ending, or focus changing, moves
     /// it, so a key held across it repeats no action.
     scene: std::sync::atomic::AtomicU64,
-    /// The input thread's wakes, which a scripted READY's commit waits
-    /// past (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    script_fence: game::ScriptFence,
 }
 
 impl Controls {
@@ -98,16 +94,7 @@ impl Controls {
             tuning,
             overlay: Arc::new(AtomicBool::new(false)),
             scene: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(feature = "dev-tools")]
-            script_fence: game::ScriptFence::new(),
         }
-    }
-
-    /// The input thread's wakes, which a scripted READY's transport
-    /// commits past ([`game::ScriptFence`]; dev-tools).
-    #[cfg(feature = "dev-tools")]
-    pub const fn script_fence(&self) -> &game::ScriptFence {
-        &self.script_fence
     }
 
     /// The clock's time now.
