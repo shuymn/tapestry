@@ -4,16 +4,26 @@
 //! table that has the id wins. The play loader sets `note` and keeps
 //! looking, so a later play object of the same id overrides it
 //! (`JsonPlaySkinObjectLoader.java:37-181`): `note` is looked up last.
+//! The selection loader looks up the common objects, the gauge among
+//! them, then its `songlist` (`JsonSelectSkinObjectLoader.java:30-37`):
+//! the play loader's own objects are never looked up there.
 
 use std::collections::HashMap;
+
+use skin_model::ScreenKind;
 
 use super::report::Object;
 use crate::error::ImportError;
 use crate::resolve::{ARRAYS, Definition, RECORDS, Tables};
 
+/// The common objects' entries of [`ORDER`]: up to the gauge.
+const COMMON: usize = 14;
+/// The selection loader's `songlist` entry of [`ORDER`].
+const SONG_LIST: usize = 21;
+
 /// The destination lookup order, by table name (an array field's or a
 /// record field's, [`records`]).
-const ORDER: [(&str, Object); 21] = [
+const ORDER: [(&str, Object); 22] = [
     ("image", Object::Image),
     ("imageset", Object::ImageSet),
     ("value", Object::Value),
@@ -35,7 +45,16 @@ const ORDER: [(&str, Object); 21] = [
     ("judge", Object::Judge),
     ("pmchara", Object::PmChara),
     ("note", Object::Note),
+    ("songlist", Object::SongList),
 ];
+
+/// Whether a `kind` screen's loader looks up entry `slot` of [`ORDER`].
+fn looked_up(kind: ScreenKind, slot: usize) -> bool {
+    match kind {
+        ScreenKind::Selection => slot < COMMON || slot == SONG_LIST,
+        ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => slot < SONG_LIST,
+    }
+}
 
 /// The records of a table: an array field's, or a record field's one.
 pub(crate) fn records<'t>(tables: &'t Tables, name: &str) -> &'t [u32] {
@@ -87,14 +106,19 @@ pub(crate) struct Objects {
 }
 
 impl Objects {
-    /// The object destination id `id` names: the kind and its record.
+    /// The object destination id `id` names on a `kind` screen: the kind
+    /// and its record.
     pub(crate) fn lookup(
         &mut self,
         def: &mut Definition,
         tables: &Tables,
         id: &str,
+        kind: ScreenKind,
     ) -> Result<Option<(Object, u32)>, ImportError> {
-        for (slot, &(name, object)) in self.maps.iter_mut().zip(&ORDER) {
+        for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
+            if !looked_up(kind, i) {
+                continue;
+            }
             if slot.is_none() {
                 *slot = Some(index(def, records(tables, name), false)?);
             }
@@ -105,7 +129,8 @@ impl Objects {
         Ok(None)
     }
 
-    /// Whether more than one table has a record of id `id`.
+    /// Whether more than one of the play loader's tables has a record of
+    /// id `id`.
     pub(crate) fn shared(
         &mut self,
         def: &mut Definition,
@@ -113,7 +138,7 @@ impl Objects {
         id: &str,
     ) -> Result<bool, ImportError> {
         let mut found = false;
-        for &(_, object) in &ORDER {
+        for &(_, object) in ORDER.iter().take(SONG_LIST) {
             if self.names(def, tables, id, object)? {
                 if found {
                     return Ok(true);

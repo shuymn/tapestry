@@ -111,6 +111,8 @@ pub enum Object {
     Bga,
     Judge,
     PmChara,
+    /// The selection skin's `songlist`.
+    SongList,
     /// A destination with a negative numeric id other than the built-in
     /// black and white: a player-drawn image the importer cannot draw.
     System,
@@ -126,6 +128,13 @@ pub enum PropertyKind {
     Boolean,
     /// An image selector's `ref`, an image-index property.
     ImageIndex,
+    /// A slider's `type`.
+    Slider,
+    /// A graph's `type`.
+    Graph,
+    /// An action: an image's `act` or `click`, a song list's `clickable`
+    /// slots, a `customEvents` entry.
+    Event,
 }
 
 /// Why a track was not imported (design.md, the S6b track rules).
@@ -193,6 +202,10 @@ pub enum DeviationId {
     /// A critical untimed track that settles, drawn at its last key from
     /// the start: its entrance is lost.
     D20,
+    /// A source cut running past its file's edge: its in-file part is
+    /// stretched to the frame, where the source repeats the edge texels
+    /// over the overrun.
+    D22,
 }
 
 /// How the lanes and their covers are drawn differently from the source:
@@ -245,6 +258,14 @@ pub enum NoteKind {
     UnsupportedProperty {
         kind: PropertyKind,
         id: Option<i32>,
+    },
+    /// A selection setting, capability or action the native screen will
+    /// back (class E of the selection profile): until then it is
+    /// unavailable, so its element draws nothing, or its action has no
+    /// hit target.
+    Unavailable {
+        kind: PropertyKind,
+        id: i32,
     },
     /// A field value the importer cannot reproduce.
     UnsupportedField {
@@ -325,6 +346,12 @@ impl fmt::Display for NoteKind {
             }
             Self::UnsupportedProperty { kind, id: None } => {
                 write!(f, "an unsupported or script {kind:?} property")
+            }
+            Self::Unavailable { kind, id } => {
+                write!(
+                    f,
+                    "{kind:?} property {id}, unavailable until its native bridge"
+                )
             }
             Self::UnsupportedField { field } => write!(f, "an unsupported `{field}`"),
             Self::UndefinedOp(id) => write!(f, "an undefined condition {id}"),
@@ -429,6 +456,9 @@ pub struct Usage {
     pub resolved_digit_offsets: u32,
     /// Digit offsets the numbers and combos keep, each copy counted.
     pub digit_offsets: u32,
+    /// Song list placements read, the inactive arms' slots included: the
+    /// row text table's slots, at most [`skin_model::MAX_PLACEMENTS`].
+    pub placements: u32,
 }
 
 /// What an import changed, dropped or ignored.

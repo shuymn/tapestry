@@ -392,6 +392,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "gauge_node_count",
             "lanes_overlap",
             "lanes_scratch_overlap",
+            "selection",
         ],
     );
     let imports: Vec<&str> = seeds::skin_imports().iter().map(|(n, _)| *n).collect();
@@ -515,10 +516,23 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 ),
                 "{name}: {result:?}"
             ),
-            "header_selection" | "header_decision" | "header_result" => {
+            "header_selection" => {
+                // Imported into its own slot: a header alone has no song
+                // list, an essential part.
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.kind, ScreenKind::Selection, "{name}");
+                match imported {
+                    Some(Err(ImportError::Essential {
+                        part: skin_beatoraja::EssentialPart::SongList,
+                        why: None,
+                        ..
+                    })) => {}
+                    other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
+                }
+            }
+            "header_decision" | "header_result" => {
                 // Imported into its own slot, which has no importer yet.
                 let kind = match name {
-                    "header_selection" => ScreenKind::Selection,
                     "header_decision" => ScreenKind::Decision,
                     _ => ScreenKind::Result,
                 };
@@ -701,6 +715,14 @@ fn usage(elements: u32, images: u32, frames: u32, files: u32) -> Usage {
     }
 }
 
+/// The quads of the `selection` seed's frames ([`crate::draw`]), two for
+/// each cursor: on the chart, the bars of its slot and the folder's below,
+/// the chart's lamp, the panel image and the slider (its level's
+/// difficulty has no style, so it draws nothing); on the folder, the three
+/// bars, the chart's lamp and the two; on the "all charts" row, two bars
+/// and the two.
+const SELECTION_DRAWN: [usize; 6] = [5, 5, 6, 6, 4, 4];
+
 fn kinds(i: &Imported) -> Vec<NoteKind> {
     i.report.notes.iter().map(|n| n.kind).collect()
 }
@@ -714,6 +736,19 @@ fn skin_import_seeds_import_and_draw_as_built() {
         // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
         let drawn = draw(&i, &[]);
         match name {
+            "selection" => {
+                // The list, the EX score, the two ratio bars and the panel
+                // image; three placements of a bar, a lamp, the level's
+                // two cells and three labels each.
+                assert_eq!(u.elements, 5, "{name}");
+                assert_eq!(u.placements, 3, "{name}");
+                assert_eq!(u.widget_quads, 3 * (2 + 1 + 2 + 3) + 4, "{name}");
+                assert_eq!(kinds(&i), [], "{name}");
+                assert_eq!(i.skin.kind(), ScreenKind::Selection, "{name}");
+                // The chart's EX score is unknown (no best), its rate bar
+                // likewise.
+                assert_eq!(drawn, SELECTION_DRAWN, "{name}");
+            }
             "images" => {
                 assert_eq!(u, usage(2, 2, 14, 2), "{name}");
                 assert_eq!(i.skin.sheet().frame_count(), 14, "{name}");
@@ -1190,11 +1225,15 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let e = imported_lua(imported).expect_err(name);
                 match (name, &e) {
-                    ("lua_selection", ImportError::NoImporter { kind }) => {
-                        assert_eq!(
-                            (h.kind, *kind),
-                            (ScreenKind::Selection, ScreenKind::Selection)
-                        );
+                    (
+                        "lua_selection",
+                        ImportError::Essential {
+                            part: skin_beatoraja::EssentialPart::SongList,
+                            why: None,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(h.kind, ScreenKind::Selection);
                     }
                     (
                         "slot_scene",

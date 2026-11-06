@@ -370,6 +370,123 @@ fn write_png(path: &Path, w: u32, h: u32) {
 /// state builds again.
 #[must_use]
 pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
+    if imported.skin.kind() == ScreenKind::Selection {
+        return draw_selection(&imported.skin);
+    }
+    draw_skin(imported, seed)
+}
+
+/// What an imported selection skin draws: the quads of frames at a few
+/// times over a view of a chart, a folder and the "all charts" row, the
+/// cursor on each, every frame within the skin's capacities; a press on
+/// each frame's place changes nothing it drew.
+///
+/// # Panics
+///
+/// If the atlas or the selection state is refused, a frame is refused or
+/// holds more quads than the skin's capacity, or a press changes the
+/// state.
+fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
+    use bms_model::TimeUs;
+    use skin_model::{
+        AtlasLimits, ChartLabels, Layout, QuadBatch, Ratio, RowKey, RowKind, RowScore, RowView,
+        SelectedChart, SelectionFrame, SelectionLabels, SelectionPlace, SelectionTimers,
+        SelectionView, Variant,
+    };
+
+    let limits = AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let uvs = skin
+        .atlas(Variant::Lo, limits, &|| false)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1;
+    let row = |kind: RowKind, title: &str| RowView {
+        key: match kind {
+            RowKind::Chart => RowKey::Chart(format!("{title}.bms").into()),
+            RowKind::All { .. } => RowKey::All,
+            _ => RowKey::Folder(skin_model::FolderId::new(title.into())),
+        },
+        kind,
+        title: title.to_owned(),
+        subtitle: String::new(),
+        artist: String::new(),
+        level: "12".to_owned(),
+        level_value: 12,
+        difficulty: Some(3),
+        score: RowScore::NoBest { plays: 1 },
+        features: None,
+        random: false,
+    };
+    let rows = vec![
+        row(RowKind::Chart, "c"),
+        row(RowKind::Folder { charts: 3 }, "f"),
+        row(RowKind::All { charts: 9 }, "a"),
+    ];
+    let labels = SelectionLabels {
+        all_charts: "all".to_owned(),
+        search_results: "found".to_owned(),
+    };
+    let mut sel = skin.prepare_selection();
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let layout = Layout::AUTHOR;
+    let mut drawn = Vec::new();
+    for cursor in 0..rows.len() {
+        let selected = (cursor == 0).then(|| SelectedChart {
+            labels: ChartLabels {
+                title: "c".to_owned(),
+                level_value: 12,
+                ..ChartLabels::default()
+            },
+            summary: None,
+            random: false,
+            max_ex: Some(300),
+            score: RowScore::NoBest { plays: 1 },
+        });
+        let view = SelectionView {
+            rows: rows.clone(),
+            cursor: Some(cursor),
+            position: Ratio::new(u64::try_from(cursor).unwrap_or(0), 2),
+            place: SelectionPlace::Folder(vec!["f".to_owned()]),
+            query: "q".to_owned(),
+            selected,
+        };
+        skin.update_selection(&mut sel, &view, &labels)
+            .expect("an imported selection skin takes a view");
+        let requests = skin.selection_text_requests(&sel, [1_920, 1_080], &layout);
+        assert!(requests.texts.len() <= skin_model::MAX_TEXT_ELEMENTS);
+        assert!(requests.rows.len() <= skin_model::MAX_PLACEMENTS);
+        for ms in [0, 500] {
+            batch.clear();
+            let frame = SelectionFrame {
+                now: TimeUs(ms * 1_000),
+                target: [1_920, 1_080],
+                layout: &layout,
+                timers: SelectionTimers {
+                    screen: Some(TimeUs(0)),
+                    change: Some(TimeUs(0)),
+                    panels: [Some(TimeUs(0)), None, None],
+                },
+            };
+            skin.build_selection(&mut sel, &frame, &uvs, &mut batch)
+                .expect("an imported selection skin builds");
+            check_batch(skin, &batch);
+            drawn.push(batch.quads().len());
+            let before = format!("{sel:?}");
+            for q in batch.quads() {
+                let _ = skin.slider_at(&sel, [q.rect[0], q.rect[1]], [1_920, 1_080]);
+            }
+            assert_eq!(format!("{sel:?}"), before, "a press changed the state");
+        }
+    }
+    drawn
+}
+
+/// [`draw`] of a play skin.
+fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     use bms_model::{ChartBuilder, Lane, TimeUs};
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};

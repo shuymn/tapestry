@@ -127,7 +127,8 @@ impl Program {
     }
 
     /// The value of a program folded to one constant at compile time.
-    pub(crate) fn constant(&self) -> Option<i32> {
+    #[must_use]
+    pub fn constant(&self) -> Option<i32> {
         match *self.ops {
             [Op::Const(c)] => Some(c),
             _ => None,

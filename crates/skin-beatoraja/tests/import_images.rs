@@ -459,6 +459,72 @@ fn cut(src: &str, dst: &str) -> common::Loaded {
     ))
 }
 
+/// A cut 10 texels wider than its 800-wide file: drawn at its whole
+/// frame, the file's 800 columns stretched over it, with one D22 note for
+/// each destination drawing it.
+#[test]
+fn a_cut_past_the_file_s_edge_is_stretched_with_a_note() {
+    // `j` is a real 800-wide cut of the same file: never noted, whichever
+    // destination reads it.
+    let loaded = common::import_sized(
+        [1_920, 1_080],
+        r#""source": [{"id": "b", "path": "b.png"}],
+           "image": [{"id": "i", "src": "b", "w": 810, "h": 60},
+                     {"id": "j", "src": "b", "w": 800, "h": 60}],
+           "destination": [{"id": "i", "dst": [{"w": 810, "h": 60}]},
+                           {"id": "i", "dst": [{"y": 100, "w": 810, "h": 60}]},
+                           {"id": "j", "dst": [{"y": 200, "w": 800, "h": 60}]},
+                           {"id": "j", "dst": [{"y": 300, "w": 800, "h": 60}]}]"#,
+        &[("b.png", 800, 300)],
+    );
+    assert_eq!(
+        common::kinds(loaded.report()),
+        [NoteKind::Deviation(DeviationId::D22); 2]
+    );
+    // The file's last ten columns red: the stretched frame samples red at
+    // its right end and not at its middle, the file's 800 columns spread
+    // over the frame's 810.
+    common::png_with(loaded.dir.path(), "b.png", 800, 300, |x, _| {
+        if x >= 790 {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 255, 255]
+        }
+    });
+    let skin = loaded.ok().skin.clone();
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let quads = loaded.quads(0);
+    assert_eq!(quads.len(), 4);
+    let q = quads[0];
+    assert_eq!((q.rect[2], q.rect[3]), (810.0, 60.0));
+    let at = |fu| common::play::texel_at(&atlas, &q, fu, 0.5)[0];
+    assert_eq!((at(0.5), at(0.995)), (0, 255));
+    // At 791/810 across, the file's column 791 · 800/810 ≈ 781: not red,
+    // where an unstretched cut would sample column 791.
+    assert_eq!(at(791.0 / 810.0), 0);
+}
+
+/// An image set's entry cut past its file's edge is noted for each
+/// destination drawing the set, its cached image reused.
+#[test]
+fn a_set_entry_past_the_file_s_edge_is_noted_each_time() {
+    let loaded = common::import_sized(
+        [1_920, 1_080],
+        r#""source": [{"id": "b", "path": "b.png"}],
+           "image": [{"id": "i", "src": "b", "w": 810, "h": 60}],
+           "imageset": [{"id": "s", "images": ["i"]}],
+           "destination": [{"id": "s", "dst": [{"w": 810, "h": 60}]},
+                           {"id": "s", "dst": [{"y": 100, "w": 810, "h": 60}]}]"#,
+        &[("b.png", 800, 300)],
+    );
+    assert_eq!(
+        common::kinds(loaded.report()),
+        [NoteKind::Deviation(DeviationId::D22); 2]
+    );
+}
+
 /// A critical EX score whose glyphs are cut `src` from the 120×20 `n.png`.
 fn critical(src: &str) -> common::Loaded {
     import_body(&format!(
@@ -467,18 +533,14 @@ fn critical(src: &str) -> common::Loaded {
     ))
 }
 
-/// A mirrored or out-of-file source rectangle drops a decorative element
-/// and refuses a critical one, with its own reason; `-1` sizes still take
-/// the whole file (`JsonSkinObjectLoader.java:600-619`).
+/// A mirrored source rectangle drops a decorative element and refuses a
+/// critical one, with its own reason; one frame partly past its file's
+/// edge is drawn, its in-file part stretched to the frame, with a D22
+/// note; `-1` sizes still take the whole file
+/// (`JsonSkinObjectLoader.java:600-619`).
 #[test]
 fn mirrored_or_outside_source_rects() {
-    for src in [
-        r#""x": -1, "w": 32, "h": 32"#,
-        r#""w": -2, "h": 32"#,
-        r#""x": 33, "w": 32, "h": 32"#,
-        r#""y": 1, "w": -1, "h": -1"#,
-        r#""w": 65, "h": 64"#,
-    ] {
+    for src in [r#""x": -1, "w": 32, "h": 32"#, r#""w": -2, "h": 32"#] {
         let loaded = cut(src, "");
         assert_eq!(
             common::kinds(loaded.report()),
@@ -486,6 +548,19 @@ fn mirrored_or_outside_source_rects() {
             "{src}"
         );
         assert!(loaded.quads(0).is_empty(), "{src}");
+    }
+    for src in [
+        r#""x": 33, "w": 32, "h": 32"#,
+        r#""y": 1, "w": -1, "h": -1"#,
+        r#""w": 65, "h": 64"#,
+    ] {
+        let loaded = cut(src, "");
+        assert_eq!(
+            common::kinds(loaded.report()),
+            [NoteKind::Deviation(DeviationId::D22)],
+            "{src}"
+        );
+        assert_eq!(loaded.quads(0).len(), 1, "{src}");
     }
     for src in [r#""x": 32, "w": 32, "h": 64"#, r#""w": -1, "h": -1"#] {
         let loaded = cut(src, "");

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use skin_model::{
     CoverImage, CycleDef, ImageChoiceDef, ImageChoicePart, ImageDef, ImageSpan, PastTable, Program,
-    Source, Track, Ty,
+    ScreenKind, Source, Track, Ty,
 };
 
 use super::super::asset::{ImageKey, NotAdded};
@@ -65,8 +65,8 @@ fn value_deviates(v: Value) -> bool {
 /// Image set `value` and `ref`'s selector: an explicit value first, its
 /// null falling back to `ref` in the image-index namespace; a value the
 /// model cannot show does not fall back.
-pub(in super::super) fn set_selector(value: &Prop, r: i32) -> SetSelector {
-    match property::value_prop(value) {
+pub(in super::super) fn set_selector(kind: ScreenKind, value: &Prop, r: i32) -> SetSelector {
+    match property::value_prop(kind, value) {
         IntProp::Shown(v) => SetSelector::Expr {
             src: value_selector(v),
             deviates: value_deviates(v),
@@ -77,16 +77,34 @@ pub(in super::super) fn set_selector(value: &Prop, r: i32) -> SetSelector {
                 id,
             },
         },
-        IntProp::Null => match property::index_by_id(r) {
+        IntProp::Unavailable(id) => SetSelector::Unsupported {
+            why: NoteKind::Unavailable {
+                kind: PropertyKind::Integer,
+                id,
+            },
+        },
+        IntProp::Null => match property::index_in(kind, r) {
             IndexProp::Null => SetSelector::Null,
             IndexProp::Unsupported(id) => SetSelector::Unsupported {
                 why: index_unsupported(id),
+            },
+            IndexProp::Unavailable(id) => SetSelector::Unsupported {
+                why: index_unavailable(id),
             },
             p => SetSelector::Expr {
                 src: p.selector().unwrap_or("0").to_owned(),
                 deviates: p.deviates(),
             },
         },
+    }
+}
+
+/// The note of an image-index property bridged only with the native
+/// settings (class E of the selection profile).
+pub(in super::super) fn index_unavailable(id: i32) -> NoteKind {
+    NoteKind::Unavailable {
+        kind: PropertyKind::ImageIndex,
+        id,
     }
 }
 
@@ -130,7 +148,13 @@ struct Entry {
 
 /// The cache key of record `rec`'s image for an image choice of `c`.
 fn choice_key(c: &Common, rec: u32, s: &SrcImage) -> ImageKey {
-    (rec, c.filter == skin_model::Filter::Linear, s.div, true)
+    (
+        rec,
+        c.filter == skin_model::Filter::Linear,
+        s.div,
+        true,
+        s.timing,
+    )
 }
 
 /// A choice's image the sheet would not take, as a refusal no hole stands
@@ -204,12 +228,20 @@ impl Cx<'_> {
     ) -> Result<Result<(u32, [u32; 2]), Unplaced>, ImportError> {
         let key = choice_key(c, rec, s);
         if let Some(found) = self.assets.image(key, None) {
+            // A cached cut past its file's edge is noted for this
+            // destination too, with no reload or charge.
+            if self.overruns.contains(&key) {
+                self.overrun_note(c.span);
+            }
             return Ok(Ok(found));
         }
         let (def, cell) = match self.place_choice(c, s)? {
             Ok(placed) => placed,
             Err(u) => return Ok(Err(u)),
         };
+        if self.cut_overran {
+            self.overruns.insert(key);
+        }
         Ok(self
             .assets
             .add_image(key, None, def, cell)
@@ -338,9 +370,19 @@ impl Cx<'_> {
             };
             let key = choice_key(&c, rec, &s);
             let cell = match (placed.get(&key), self.assets.image(key, None)) {
-                (Some(&cell), _) | (None, Some((_, cell))) => cell,
+                (Some(&cell), _) | (None, Some((_, cell))) => {
+                    // A cached cut past its file's edge is noted for this
+                    // destination too, with no reload or charge.
+                    if self.overruns.contains(&key) {
+                        self.overrun_note(c.span);
+                    }
+                    cell
+                }
                 (None, None) => match self.place_choice(&c, &s)? {
                     Ok((def, cell)) => {
+                        if self.cut_overran {
+                            self.overruns.insert(key);
+                        }
                         placed.insert(key, cell);
                         to_add.push((key, def, cell));
                         cell
