@@ -440,9 +440,11 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
-    /// The admitted cuts, by file and rect, that run past their file's
-    /// edge (D22), and the destinations noted for one.
-    overruns: BTreeSet<(u32, [u32; 4])>,
+    /// The cached images, by key, whose cut runs past its file's edge
+    /// (D22); whether the cut placed last did; and the destinations noted
+    /// for one.
+    overruns: BTreeSet<self::asset::ImageKey>,
+    cut_overran: bool,
     overrun_at: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
@@ -534,6 +536,7 @@ impl<'d> Cx<'d> {
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
             overruns: BTreeSet::new(),
+            cut_overran: false,
             overrun_at: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
