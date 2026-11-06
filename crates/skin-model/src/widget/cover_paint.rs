@@ -19,6 +19,7 @@
 
 use super::ImageRef;
 use super::lanes::{LaneFrameGeometry, LaneView};
+use super::ratio_bar::SliderDirection;
 use crate::canvas::f32_of;
 use crate::place::{Affine, LaneMap};
 use crate::play::schema::PROGRESS_FULL;
@@ -124,15 +125,6 @@ pub enum SliderRate {
     /// The attempt's progress, `time.progress_ppm / 10⁶`
     /// (`skin/property/FloatPropertyFactory.java:128-136`).
     Progress,
-}
-
-/// Where a slider moves, on the canvas (y down).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SliderDirection {
-    Up,
-    Right,
-    Down,
-    Left,
 }
 
 /// Why a cover paint definition was refused.
