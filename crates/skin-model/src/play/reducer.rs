@@ -287,7 +287,8 @@ impl Reducer {
     ///   release's, the one farther from its time, the release on a tie
     ///   (`:533-537`). An early one that leaves the judgment BAD or worse
     ///   is taken when the release margin has passed, from the release
-    ///   (`:538-540`, `:565-567`).
+    ///   (`:538-540`, `:565-567`): the source from the frame that read
+    ///   the release (`:539`), here the release's own time.
     /// - A long note held to its end, or decided at its head's press: its
     ///   head's (`:572-573`). A BAD head is decided at its press here,
     ///   where the source's long note waits for its release (`:428`), the
