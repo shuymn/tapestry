@@ -347,7 +347,7 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
                 prop_assert!(visual.contains(&(lane.index(), note)), "{:?}", ev);
                 prop_assert!(ev.time <= note_of(lane, note).end());
             }
-            K::EmptyPoor { lane } | K::PlaySound { lane, .. } => {
+            K::EmptyPoor { lane, .. } | K::PlaySound { lane, .. } => {
                 prop_assert!(
                     holding[lane.index()].is_none(),
                     "a press while held: {:?}",

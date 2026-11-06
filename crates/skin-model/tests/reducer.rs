@@ -869,3 +869,81 @@ fn real_streams_without_ln_held() {
         assert!(h.start(timer::JUDGE).is_some(), "{name}");
     }
 }
+
+/// A judgment with its deviation and release in µs.
+fn judged_us(
+    l: u8,
+    note: usize,
+    judgment: Judgment,
+    deviation: Option<i64>,
+    release: Option<i64>,
+) -> JudgeEventKind {
+    JudgeEventKind::Judged {
+        lane: lane(l),
+        note,
+        judgment,
+        deviation: deviation.map(TimeUs),
+        release: release.map(TimeUs),
+        combo: 0,
+    }
+}
+
+/// The recent timing (stage3.md R3) after each effect: note time minus
+/// press in ms, truncated toward 0, and whether the judgment is worse than
+/// PERFECT. A held head leaves it; a long note finished by a release takes
+/// the farther of its head and its release, the release on a tie, and an
+/// early one that leaves it BAD the release's; held to its end, its
+/// head's; a miss, its note's time minus the miss's; an empty POOR, the
+/// note it is against; past what a number shows, bounded.
+#[test]
+fn the_recent_timing_follows_the_sources_judgments() {
+    use Judgment::{Bad, Good, Great, Perfect, Poor};
+    use skin_model::field::{JUDGE_RECENT_IMPERFECT, JUDGE_RECENT_MS};
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .long(lane(2), TimeUs(2_000 * MS), TimeUs(2_300 * MS))
+        .tap(lane(1), TimeUs(3_000 * MS))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    let mut at = |ms: i64, kind: JudgeEventKind| {
+        h.frame(ms, &[ev(ms, kind)]);
+        (
+            h.field(JUDGE_RECENT_MS),
+            h.field(JUDGE_RECENT_IMPERFECT) != 0,
+        )
+    };
+    // 30.999 ms early: +30; 1.999 ms late: −1.
+    let great = judged_us(1, 0, Great, Some(-30_999), None);
+    assert_eq!(at(970, great), (30, true));
+    let perfect = judged_us(1, 0, Perfect, Some(1_999), None);
+    assert_eq!(at(1_002, perfect), (-1, false));
+    // A held head changes nothing.
+    assert_eq!(at(1_990, ln_held(2, 0, Great)), (-1, false));
+    // The release, 50 ms early, farther than the head's 10 ms late.
+    let release = judged_us(2, 0, Good, Some(10_000), Some(-50_000));
+    assert_eq!(at(2_250, release), (50, true));
+    // A tie, the head 40 ms late and the release 40 ms early: the release.
+    let tie = judged_us(2, 0, Good, Some(40_000), Some(-40_000));
+    assert_eq!(at(2_260, tie), (40, true));
+    // The head 140 ms early, farther than the release's 130 ms: the head,
+    // unless the judgment is BAD, which waits for the release's.
+    let early = |j| judged_us(2, 0, j, Some(-140_000), Some(-130_000));
+    assert_eq!(at(2_270, early(Good)), (140, true));
+    assert_eq!(at(2_280, early(Bad)), (130, true));
+    // Held to its end, released there: the head's 20 ms late.
+    let held = judged_us(2, 0, Great, Some(20_000), Some(0));
+    assert_eq!(at(2_300, held), (-20, true));
+    // A miss 210 ms past its note; a note out of range leaves it.
+    assert_eq!(at(3_210, judged_us(1, 1, Poor, None, None)), (-210, true));
+    let unknown = judged_us(1, 9, Perfect, None, None);
+    assert_eq!(at(3_211, unknown), (-210, true));
+    // An empty POOR 1.5 ms before its note: +1; bounded at the extremes.
+    let empty = |d| JudgeEventKind::EmptyPoor {
+        lane: lane(1),
+        deviation: TimeUs(d),
+    };
+    assert_eq!(at(3_300, empty(-1_500)), (1, true));
+    assert_eq!(at(3_400, empty(i64::MIN)), (i32::MAX - 1, true));
+    assert_eq!(at(3_500, empty(i64::MAX)), (-(i32::MAX - 1), true));
+}

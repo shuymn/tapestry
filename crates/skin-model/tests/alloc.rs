@@ -169,7 +169,13 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                     let deviation = (judgment != Judgment::Poor).then_some(TimeUs(0));
                     out.push(ev(t, judged(judgment, deviation, None)));
                     if judgment == Judgment::Poor {
-                        out.push(ev(t + 10 * MS, JudgeEventKind::EmptyPoor { lane }));
+                        out.push(ev(
+                            t + 10 * MS,
+                            JudgeEventKind::EmptyPoor {
+                                lane,
+                                deviation: TimeUs(10 * MS),
+                            },
+                        ));
                     }
                 }
                 NoteKind::Long { end, .. } => {

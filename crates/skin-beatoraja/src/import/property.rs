@@ -341,6 +341,12 @@ pub(crate) enum Value {
     /// (`n / 2 % 2`), the green number for an odd `n`; each rounded half
     /// up from the exact ratio (D4), while its variant is known.
     DurationVariant(u8),
+    /// `judge_duration1` (525, `:469`, `:909-916`): the latest judgment's
+    /// timing, note time minus press in ms (`play/JudgeManager.java:457`,
+    /// `:690`), as `judge.recent_ms` takes it, read whichever widget draws
+    /// judgments, where the source sets it only for a judge region its
+    /// judge widget makes (`play/JudgeManager.java:129-133`, `:678`).
+    RecentTiming,
 }
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
@@ -430,6 +436,7 @@ impl Value {
             Self::Duration => "duration.ms",
             Self::DurationGreen => "duration.green",
             Self::PlayLevel => "chart.level",
+            Self::RecentTiming => "judge.recent_ms",
             Self::DurationVariant(n) => DURATION_VARIANTS
                 .get(usize::from(n))
                 .copied()
@@ -467,6 +474,7 @@ impl Value {
                 | Self::Early(_)
                 | Self::Late(_)
                 | Self::PlayLevel
+                | Self::RecentTiming
         )
     }
 
@@ -563,6 +571,7 @@ fn shown(id: i32) -> Option<Value> {
         90 => Value::BpmMax,
         91 => Value::BpmMin,
         96 => Value::PlayLevel,
+        525 => Value::RecentTiming,
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
         162 => Value::ElapsedSeconds,
@@ -902,6 +911,22 @@ mod tests {
             assert!(!value.deviates() && value.part().is_none(), "{id}");
             assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
         }
+        // The recent timing, 1P only: the other players' stay unsupported.
+        let recent = Value::RecentTiming;
+        assert_eq!(int_by_id(525), IntProp::Shown(recent));
+        assert_eq!(int_by_name("judge_duration1"), Some(IntProp::Shown(recent)));
+        assert_eq!(
+            (recent.expr(), recent.availability()),
+            ("judge.recent_ms", None)
+        );
+        assert!(!recent.deviates() && recent.part().is_none());
+        assert_eq!(
+            recent.range(),
+            (-i64::from(i32::MAX - 1), i64::from(i32::MAX - 1))
+        );
+        for id in [526, 527] {
+            assert_eq!(int_by_id(id), IntProp::Unsupported(Some(id)), "{id}");
+        }
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);
         assert_eq!(int_by_id(131), IntProp::Null);
@@ -1064,8 +1089,9 @@ mod range_tests {
                     v.expr()
                 );
                 let (lo, hi) = v.range();
-                // The play level alone is signed, as `Integer.parseInt` is.
-                let least = if v == Value::PlayLevel {
+                // The play level is signed, as `Integer.parseInt` is, and
+                // the recent timing, as a note time minus a press is.
+                let least = if matches!(v, Value::PlayLevel | Value::RecentTiming) {
                     -i64::from(i32::MAX)
                 } else {
                     0

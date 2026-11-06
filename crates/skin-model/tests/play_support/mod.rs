@@ -136,7 +136,10 @@ pub fn mine(l: u8, note: usize) -> JudgeEventKind {
 }
 
 pub fn empty_poor(l: u8) -> JudgeEventKind {
-    JudgeEventKind::EmptyPoor { lane: lane(l) }
+    JudgeEventKind::EmptyPoor {
+        lane: lane(l),
+        deviation: TimeUs(0),
+    }
 }
 
 pub fn gauge(g: usize, value: GaugeValue) -> JudgeEventKind {

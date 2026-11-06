@@ -382,7 +382,10 @@ fn timing_counts_the_judged_presses() {
         judged(Judgment::Poor, Some(150_000)),
         judged(Judgment::Poor, None),
         JudgeEvent {
-            kind: JudgeEventKind::EmptyPoor { lane: lane(1) },
+            kind: JudgeEventKind::EmptyPoor {
+                lane: lane(1),
+                deviation: TimeUs(0),
+            },
             ..judged(Judgment::Poor, None)
         },
         JudgeEvent {

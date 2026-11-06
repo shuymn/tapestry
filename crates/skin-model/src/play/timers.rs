@@ -553,7 +553,11 @@ impl Play {
             .chain(r.variants.into_iter().flatten())
             .chain(native)
             .chain([r.bpm_change, r.bpm_change_valid, r.level, r.level_valid])
-            .chain([i32::from(self.autoplay)]);
+            .chain([i32::from(self.autoplay)])
+            .chain([
+                self.reducer.recent.ms,
+                i32::from(self.reducer.recent.imperfect),
+            ]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

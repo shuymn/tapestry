@@ -243,6 +243,12 @@ const GAUGE_RANGE: i32 = 230;
 /// `judge_1p_perfect`: the latest judgment was a PERFECT
 /// (`BooleanPropertyFactory.java:234-247`).
 const JUDGE_PERFECT: i32 = 241;
+/// `judge_1p_early` and `judge_1p_late` (`BooleanPropertyFactory.java:
+/// 234-247`, `:543-544`): the latest judgment the recent timing takes is
+/// worse than PERFECT and its timing, note time minus press in ms, above
+/// or below 0; a timing of 0 holds neither.
+const JUDGE_EARLY: i32 = 1_242;
+const JUDGE_LATE: i32 = 1_243;
 /// The shown gauge's families (`BooleanPropertyFactory.java:394-414,
 /// 693-704`): `gauge_groove`, the source's gauge types up to 2;
 /// `gauge_hard`, from 3; `gauge_ex`, types 0, 1, 4, 5, 7 and 8. The model
@@ -346,6 +352,14 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
     Some(match id {
         GAUGE_RANGE..=240 => (Body::Range(id - GAUGE_RANGE), false),
         JUDGE_PERFECT => (Body::Text("on(judge.perfect)"), false),
+        JUDGE_EARLY => (
+            Body::Text("judge.recent_imperfect && judge.recent_ms > 0"),
+            false,
+        ),
+        JUDGE_LATE => (
+            Body::Text("judge.recent_imperfect && judge.recent_ms < 0"),
+            false,
+        ),
         GAUGE_GROOVE => (Body::Kinds(&["assist_easy", "easy", "normal"]), true),
         GAUGE_HARD => (Body::Kinds(&["hard", "ex_hard", "hazard"]), true),
         GAUGE_EX => (
@@ -611,14 +625,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 54);
+        assert_eq!(exprs.len(), 58);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     #[test]
-    fn cover_switches_and_bpm_change_conditions_map() {
+    fn cover_bpm_change_and_timing_conditions_map() {
         let none = BTreeMap::new();
         for (id, name, src, d4) in [
             (
@@ -632,6 +646,18 @@ mod tests {
             (271, "lanecover1_on", "cover.enabled", false),
             (272, "lift1_on", "lift.enabled", false),
             (273, "hidden1_on", "hidden.enabled", false),
+            (
+                1_242,
+                "judge_1p_early",
+                "judge.recent_imperfect && judge.recent_ms > 0",
+                false,
+            ),
+            (
+                1_243,
+                "judge_1p_late",
+                "judge.recent_imperfect && judge.recent_ms < 0",
+                false,
+            ),
         ] {
             assert_eq!(numeric(id, &none), expr(src, d4));
             assert_eq!(numeric(-id, &none), expr(&format!("!({src})"), d4));
