@@ -94,6 +94,7 @@ use crate::loading_text::LoadingText;
 use crate::loading_text::Stage;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
+use crate::ui_text::{Label, Message};
 
 /// What draws: the renderer, or a double in tests.
 pub trait Screen: Send {
@@ -1656,7 +1657,7 @@ impl SkinState {
     pub fn ready(&mut self) -> Result<(), String> {
         if let Self::Selecting(pending) = self {
             let Some(answer) = pending.poll(SELECT_SLICE) else {
-                return Err("スキンを準備しています".to_owned());
+                return Err(Label::SkinPreparing.text().to_owned());
             };
             *self = Self::answered(answer);
         }
@@ -1674,14 +1675,22 @@ impl SkinState {
             Ok(Preparation::Ready) => Self::Ready,
             Ok(Preparation::Refused(why)) => {
                 eprintln!("render: the play skin was refused: {why}");
-                Self::Refused(format!("スキンを使えません: {why}"))
+                Self::Refused(
+                    Message::SkinUnusable {
+                        why: &why.to_string(),
+                    }
+                    .text(),
+                )
             }
-            Ok(Preparation::Cancelled) => {
-                Self::Refused("スキンの準備は取り消されました".to_owned())
-            }
+            Ok(Preparation::Cancelled) => Self::Refused(Label::SkinCancelled.text().to_owned()),
             Err(e) => {
                 eprintln!("render: the play skin cannot be installed: {}", Chain(&e));
-                Self::Refused(format!("スキンを準備できません: {}", Chain(&e)))
+                Self::Refused(
+                    Message::SkinCannotPrepare {
+                        why: &Chain(&e).to_string(),
+                    }
+                    .text(),
+                )
             }
         }
     }
@@ -2784,6 +2793,10 @@ impl Run {
                                 ..
                             }
                         ),
+                        #[cfg(feature = "dev-tools")]
+                        skin_loading: loading_frame.filter(|&l| {
+                            !pending_presentation(&self.committed, self.specialized_in, l)
+                        }),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),

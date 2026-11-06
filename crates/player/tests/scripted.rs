@@ -5,6 +5,8 @@
 
 #![cfg(feature = "dev-tools")]
 
+mod text_skin;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -490,7 +492,10 @@ fn an_invalid_key_config_exits_nonzero() {
 /// boundary and the audio thread's transport, and the notes, pressed
 /// 1.2 s later than the log has them, are played by that READY: every note
 /// judged PERFECT, and the audio restarted for it, its key sounds and BGM
-/// all sounding, as a play without the hold does. The saved record keeps
+/// all sounding, as a play without the hold does. The rearm is answered
+/// at least 30 ms after the release (design.md "Shortening Launch-Based
+/// Checks", scripted input), and every press still lands on its note. The
+/// saved record keeps
 /// the cancelled opening, Q's press in it, and the winning READY's input
 /// alone; F2, pressed during the play, reaches the adjustments and no
 /// record, and the winning capture re-evaluates equal to the live play.
@@ -499,6 +504,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     const Q: u32 = 0x10;
     let Fixture {
         dir,
+        chart,
         chart_path,
         log,
         appdata,
@@ -528,6 +534,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
 
     let out = scripted_play(&chart_path, &log, &appdata)
         .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .args(["--dev-rearm-delay", "30"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -557,13 +564,18 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     assert_eq!(h.openings.len(), 1, "{h:?}");
     let o = &h.openings[0];
     assert_eq!(o.reason, replay::CancelReason::Held);
-    // The release was seen at an input boundary just after 200 ms: the
-    // next READY's chart time 0 lies about 1.2 s after the first's.
-    assert!(
-        (-1_250_000..=-1_199_000).contains(&o.origin.0),
-        "{:?}",
-        o.origin
-    );
+    // On the clock the next READY's chart time 0 lies 1.2 s after the
+    // first's and at least the rearm's delay more; how much more is the
+    // scheduling's (the exact times are the unit test's,
+    // `a_late_rearm_opens_at_the_scripted_release`).
+    assert!(o.origin.0 <= -1_230_000, "{:?}", o.origin);
+    // On the chart, every press is on its note: the rearm opened at the
+    // release, not where it was answered.
+    let late: Vec<_> = all_events(&chart, &rec)
+        .into_iter()
+        .filter(|e| matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 != 0))
+        .collect();
+    assert!(late.is_empty(), "{late:?}");
     let cancelled = &h.events[o.events.start as usize..o.events.end as usize];
     assert!(cancelled.iter().any(|e| e.kind
         == eval::InputKind::Control {
@@ -584,6 +596,58 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         stdout.contains("adjust: hi-speed 4.50 floating"),
         "{stdout}"
     );
+}
+
+/// A skin built per chart on the direct path, its READY cancelled by a hold
+/// and rearmed: the candidate keeps the attempt's prepared text, so the play
+/// that opens shows the title in its op-less and op-81 texts and nothing in
+/// its op-80 one.
+#[test]
+fn a_rearmed_candidate_keeps_a_per_chart_skins_text() {
+    use text_skin::{Band, bars};
+    const Q: u32 = 0x10;
+    let Fixture {
+        dir,
+        chart_path,
+        log,
+        appdata,
+        ..
+    } = fixture_of(&CHART.replace("#TITLE scripted", "#TITLE aa"));
+    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(&log, replay::encode(&rec)).unwrap();
+    text_skin::write(&dir.path().join("skin"), &appdata);
+    let frames = dir.path().join("frames");
+    let out = scripted_play(&chart_path, &log, &appdata)
+        .arg("--dev-frames")
+        .arg(&frames)
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let saved = records(&appdata);
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    assert_eq!(rec.history.openings.len(), 1, "a candidate was cancelled");
+    let shown = |name: &str| {
+        [Band::Always, Band::Loading, Band::Loaded].map(|b| bars(&frames.join(name), b))
+    };
+    assert_eq!(shown("ready.png"), [2, 0, 2], "{stdout}");
+    assert_eq!(shown("play.png"), [2, 0, 2], "{stdout}");
 }
 
 /// Quit on Q (0x10), the default START, is refused with the collision
@@ -1863,7 +1927,9 @@ const MIX_CHART: &str = "#PLAYER 1\n#TITLE mix\n#BPM 120\n#WAV01 click.wav\n#LNT
 /// release, so a separate CN mode adds nothing here), an empty POOR and a
 /// scratch hit, with START, SELECT and the auxiliary keys pressed during
 /// it, which are recorded, and F2, which is not. The cancelled opening
-/// keeps START's press.
+/// keeps START's press. The rearm is answered at least 30 ms after the
+/// release, and each press keeps its offset from its note (design.md
+/// "Shortening Launch-Based Checks", scripted input).
 #[test]
 fn the_winning_capture_reevaluates_equal_to_live() {
     const Q: u32 = 0x10;
@@ -1926,6 +1992,7 @@ fn the_winning_capture_reevaluates_equal_to_live() {
 
     let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
         .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])
+        .args(["--dev-rearm-delay", "30"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1971,6 +2038,12 @@ fn the_winning_capture_reevaluates_equal_to_live() {
             .filter(|e| matches!(e.kind, JudgeEventKind::Judged { judgment, .. } if judgment == j))
             .count()
     };
+    // Each press as far from its note as the log has it: on time, and key
+    // 2 40 ms early.
+    let off = judged.iter().any(|e| {
+        matches!(e.kind, JudgeEventKind::Judged { deviation: Some(d), .. } if d.0 != 0 && d.0 != -40_000)
+    });
+    assert!(!off, "{judged:?}");
     assert!(count(Judgment::Perfect) >= 1, "{judged:?}");
     assert_eq!(count(Judgment::Great), 1, "{judged:?}");
     assert_eq!(count(Judgment::Poor), 1, "{judged:?}");

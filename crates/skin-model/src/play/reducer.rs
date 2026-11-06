@@ -16,9 +16,9 @@
 
 use bms_model::{Chart, LANE_COUNT, NoteKind, TimeUs};
 use eval::{JudgeEvent, JudgeEventKind, Section};
-use rules::{GaugeValue, LnMode};
+use rules::{GaugeValue, Judgment, LnMode};
 
-use super::schema::Grade;
+use super::schema::{Grade, READOUT_MAX};
 
 /// A long note's head and end times.
 #[derive(Clone, Copy, Debug)]
@@ -27,17 +27,49 @@ struct Long {
     end: TimeUs,
 }
 
+/// A note's time, and its end for a long note.
+#[derive(Clone, Copy, Debug)]
+struct Times {
+    time: TimeUs,
+    end: Option<TimeUs>,
+}
+
+/// The recent timing (stage3.md R3): the latest judgment the source's
+/// timing readout takes, its timing in the source's sign (note time
+/// minus press, so early is positive) in whole ms truncated toward 0
+/// (`play/JudgeManager.java:457`, `:690`), and whether it is worse than
+/// PERFECT. 0 and PERFECT before any (`:130-133`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Recent {
+    pub(crate) ms: i32,
+    pub(crate) imperfect: bool,
+}
+
+impl Recent {
+    /// The readout of a judgment whose timing, in the source's sign, is
+    /// `source_us` µs, worse than PERFECT when `imperfect`: truncated
+    /// toward 0, then bounded to what a number shows.
+    fn of(source_us: i64, imperfect: bool) -> Self {
+        let ms = (source_us / 1_000).clamp(-i64::from(READOUT_MAX), i64::from(READOUT_MAX));
+        Self {
+            ms: i32::try_from(ms).unwrap_or(0),
+            imperfect,
+        }
+    }
+}
+
 /// The effect-sourced state of one attempt.
 #[derive(Clone, Debug)]
 pub(crate) struct Reducer {
-    /// Per lane and note: the long note's times, `None` for a tap or mine.
-    longs: [Box<[Option<Long>]>; LANE_COUNT],
+    /// Per lane and note: its time, and its end for a long note.
+    notes: [Box<[Times]>; LANE_COUNT],
     /// The long-note judgment mode the notes are drawn by: LN, the only
     /// mode judged (design.md "LN Judgment Modes").
     pub(crate) ln_mode: LnMode,
     pub(crate) bomb: [Option<TimeUs>; LANE_COUNT],
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
     pub(crate) judge: Option<(Grade, TimeUs)>,
+    pub(crate) recent: Recent,
     pub(crate) combo_up: Option<TimeUs>,
     targets: u32,
     pub(crate) full_combo: Option<TimeUs>,
@@ -68,11 +100,11 @@ pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: Ti
 }
 
 impl Reducer {
-    /// The bytes its buffers hold: every lane's long notes, and each
+    /// The bytes its buffers hold: every lane's note times, and each
     /// gauge's maximum and when it reached it.
     pub(crate) fn heap_bytes(&self) -> usize {
-        let longs: usize = self.longs.iter().map(|l| size_of_val(&**l)).sum();
-        longs
+        let notes: usize = self.notes.iter().map(|l| size_of_val(&**l)).sum();
+        notes
             + size_of_val(&*self.gauge_max)
             + size_of_val(&*self.gauge_start)
             + size_of_val(&*self.gauge_top)
@@ -98,13 +130,16 @@ impl Reducer {
                 targets = targets.saturating_add(1);
             }
         }
-        let longs = std::array::from_fn(|l| {
+        let notes = std::array::from_fn(|l| {
             chart.lanes.get(l).map_or_else(Box::default, |notes| {
                 notes
                     .iter()
-                    .map(|n| match n.kind {
-                        NoteKind::Long { end, .. } => Some(Long { head: n.time, end }),
-                        NoteKind::Tap | NoteKind::Mine { .. } => None,
+                    .map(|n| Times {
+                        time: n.time,
+                        end: match n.kind {
+                            NoteKind::Long { end, .. } => Some(end),
+                            NoteKind::Tap | NoteKind::Mine { .. } => None,
+                        },
                     })
                     .collect()
             })
@@ -113,11 +148,12 @@ impl Reducer {
             .map(|(value, top)| ((value >= top).then_some(play_at), top))
             .unzip();
         Self {
-            longs,
+            notes,
             ln_mode: LnMode::Ln,
             bomb: [None; LANE_COUNT],
             mine: [None; LANE_COUNT],
             judge: None,
+            recent: Recent::default(),
             combo_up: None,
             targets,
             full_combo: None,
@@ -131,12 +167,14 @@ impl Reducer {
 
     /// Back to the clean reducer [`new`](Self::new) made, in place, for a
     /// rearmed READY candidate (design.md "Play Lifecycle", the start
-    /// gate): no lane bombed or hit by a mine, nothing judged, and each
-    /// gauge's maximum as the attempt started. Allocates nothing.
+    /// gate): no lane bombed or hit by a mine, nothing judged, the recent
+    /// timing 0, and each gauge's maximum as the attempt started.
+    /// Allocates nothing.
     pub(crate) fn rearm(&mut self) {
         self.bomb = [None; LANE_COUNT];
         self.mine = [None; LANE_COUNT];
         self.judge = None;
+        self.recent = Recent::default();
         self.combo_up = None;
         self.full_combo = None;
         self.gauge_max.copy_from_slice(&self.gauge_start);
@@ -163,6 +201,9 @@ impl Reducer {
             } => {
                 let l = lane.index();
                 self.judge = Some((Grade::of(judgment), t));
+                if let Some(us) = self.source_timing(l, note, judgment, deviation, release, t) {
+                    self.recent = Recent::of(us, judgment != Judgment::Perfect);
+                }
                 self.combo_up = (combo > 0).then_some(t);
                 if self.targets > 0 && combo == self.targets && self.full_combo.is_none() {
                     self.full_combo = Some(t);
@@ -186,6 +227,9 @@ impl Reducer {
                 self.feedback(l, Grade::of(judgment), t);
             }
             JudgeEventKind::LnHeld { lane, judgment, .. } => {
+                // The source's held head leaves the recent timing alone
+                // (`play/JudgeManager.java:428-438`); its long note's
+                // judgment sets it.
                 let l = lane.index();
                 self.judge = Some((Grade::of(judgment), t));
                 self.feedback(l, Grade::of(judgment), t);
@@ -195,8 +239,14 @@ impl Reducer {
                     *mine = Some(t);
                 }
             }
-            JudgeEventKind::EmptyPoor { lane } => {
+            JudgeEventKind::EmptyPoor { lane, deviation } => {
                 self.judge = Some((Grade::EmptyPoor, t));
+                // The source's empty POOR, its judgment 5
+                // (`play/JudgeManager.java:400-404`), takes the timing of
+                // the note it is against, as a judged press does (`:423`
+                // and `:440` for a long note's head, `:457-458` for a
+                // tap).
+                self.recent = Recent::of(deviation.0.saturating_neg(), true);
                 if self.empty_poor_breaks_combo {
                     self.combo_up = None;
                 }
@@ -221,7 +271,55 @@ impl Reducer {
 
     /// Note `note` on lane `l` if it is a long note.
     fn long(&self, l: usize, note: usize) -> Option<Long> {
-        self.longs.get(l)?.get(note).copied().flatten()
+        let n = self.notes.get(l)?.get(note)?;
+        n.end.map(|end| Long { head: n.time, end })
+    }
+
+    /// The timing, in µs and the source's sign (note time minus press),
+    /// the source gives the judgment of note `note` on lane `l` decided at
+    /// `t`; `None` for a note out of range.
+    ///
+    /// - A press: its deviation, negated (`play/JudgeManager.java:457`).
+    /// - A miss: the note's time minus `t`, where the source takes the
+    ///   frame that passed its late BAD edge (`:594-598`); here the
+    ///   evaluator's deadline, or the press that passed the note.
+    /// - A long note finished by a release: of its head's and its
+    ///   release's, the one farther from its time, the release on a tie
+    ///   (`:533-537`). An early one that leaves the judgment BAD or worse
+    ///   is taken when the release margin has passed, from the release
+    ///   (`:538-540`, `:565-567`): the source from the frame that read
+    ///   the release (`:539`), here the release's own time.
+    /// - A long note held to its end, or decided at its head's press: its
+    ///   head's (`:572-573`). A BAD head is decided at its press here,
+    ///   where the source's long note waits for its release (`:428`), the
+    ///   preset's known difference.
+    fn source_timing(
+        &self,
+        l: usize,
+        note: usize,
+        judgment: Judgment,
+        deviation: Option<TimeUs>,
+        release: Option<TimeUs>,
+        t: TimeUs,
+    ) -> Option<i64> {
+        let neg = |d: TimeUs| d.0.saturating_neg();
+        Some(match (deviation, release) {
+            (None, _) => self.notes.get(l)?.get(note)?.time.0.saturating_sub(t.0),
+            (Some(head), None) => neg(head),
+            (Some(head), Some(r)) => {
+                let (head, r) = (neg(head), neg(r));
+                let chosen = if head.unsigned_abs() > r.unsigned_abs() {
+                    head
+                } else {
+                    r
+                };
+                if judgment >= Judgment::Bad && chosen > 0 {
+                    r
+                } else {
+                    chosen
+                }
+            }
+        })
     }
 
     /// A press's bomb on lane `l` when `grade` is within the bomb

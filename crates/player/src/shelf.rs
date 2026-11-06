@@ -41,6 +41,7 @@ use library::{
 
 use crate::background::{Job, Queued, Worker};
 use crate::loudness::{Host, Loudness};
+use crate::ui_text::{Label, Message};
 
 /// How often a load's wait for its chart's background measurement looks
 /// whether it was cancelled: a measurement asks about as often, before
@@ -138,6 +139,34 @@ pub enum Paused {
     Cancelled,
 }
 
+/// How the latest pass ended, or why none could start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// It ended, or none has run yet.
+    Ended,
+    /// No library roots are configured.
+    NoRoots,
+    /// The scan could not start.
+    CannotStart,
+    /// The scan failed.
+    Failed,
+}
+
+/// The status of a running pass: scanning, or rebuilding the bests with
+/// the plays counted so far.
+fn running(bests: &library::BestsReport) -> Cow<'static, str> {
+    if bests.running {
+        Cow::Owned(
+            Message::BestsRebuilding {
+                counted: bests.counted,
+            }
+            .text(),
+        )
+    } else {
+        Cow::Borrowed(Label::Scanning.text())
+    }
+}
+
 /// The library and its scan passes.
 pub struct Shelf {
     library: Library,
@@ -152,7 +181,7 @@ pub struct Shelf {
     /// The running pass's progress last seen, in batches.
     seen: u64,
     /// The latest pass's outcome, for the select screen.
-    status: String,
+    outcome: Outcome,
     /// The loaded chart's loudness.
     loudness: Loudness,
     /// The background measurement of charts whose load was cancelled
@@ -232,7 +261,7 @@ impl Shelf {
             ended: None,
             rescan_after,
             seen: 0,
-            status: String::new(),
+            outcome: Outcome::Ended,
             loudness: Loudness::default(),
             background,
             #[cfg(any(test, feature = "dev-tools"))]
@@ -248,17 +277,15 @@ impl Shelf {
 
     /// What the library is doing, for the select screen: scanning, or
     /// rebuilding the bests with the plays counted so far.
-    pub fn status(&self) -> Cow<'_, str> {
+    pub fn status(&self) -> Cow<'static, str> {
         match &self.scan {
-            Some(scan) => {
-                let bests = scan.report().bests;
-                if bests.running {
-                    Cow::Owned(format!("ベスト再構築中 {}", bests.counted))
-                } else {
-                    Cow::Borrowed("スキャン中")
-                }
-            }
-            None => Cow::Borrowed(&self.status),
+            Some(scan) => running(&scan.report().bests),
+            None => Cow::Borrowed(match self.outcome {
+                Outcome::Ended => "",
+                Outcome::NoRoots => Label::NoRoots.text(),
+                Outcome::CannotStart => Label::ScanCannotStart.text(),
+                Outcome::Failed => Label::ScanFailed.text(),
+            }),
         }
     }
 
@@ -309,7 +336,7 @@ impl Shelf {
 
     fn start_pass(&mut self) {
         if self.roots.is_empty() {
-            self.status = "device.toml に [library] roots がありません".to_owned();
+            self.outcome = Outcome::NoRoots;
             return;
         }
         match self.library.scan(&self.roots, self.options.clone()) {
@@ -326,7 +353,7 @@ impl Shelf {
                 let line = format!("library: the scan cannot start: {}", Chain(&e));
                 eprintln!("{line}");
                 log::warn!("{line}");
-                self.status = "スキャンできません".to_owned();
+                self.outcome = Outcome::CannotStart;
                 self.ended = Some(Instant::now());
             }
         }
@@ -425,7 +452,7 @@ impl Shelf {
                     println!("{line}");
                     log::info!("{line}");
                 }
-                self.status = String::new();
+                self.outcome = Outcome::Ended;
                 #[cfg(any(test, feature = "dev-tools"))]
                 {
                     self.passes += 1;
@@ -435,7 +462,7 @@ impl Shelf {
                 let line = format!("library: the scan failed: {}", Chain(&e));
                 eprintln!("{line}");
                 log::warn!("{line}");
-                self.status = "スキャンに失敗しました".to_owned();
+                self.outcome = Outcome::Failed;
             }
         }
     }
@@ -832,6 +859,40 @@ mod tests {
 
     fn holds(shelf: &Shelf, name: &str) -> bool {
         listed(shelf).iter().any(|n| n == name)
+    }
+
+    /// The status in full: a pass running until it is polled to its end,
+    /// and no roots configured.
+    #[test]
+    fn the_status_says_what_the_library_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let charts = dir.path().join("charts");
+        chart(&charts, "a.bms");
+        let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
+        let shelf = Shelf::new(library, vec![charts], Duration::from_millis(20), None);
+        assert_eq!(shelf.status(), "スキャン中");
+        let (library, _) = open(&DataRoot::new(dir.path().join("none"))).unwrap();
+        let mut shelf = Shelf::new(library, Vec::new(), Duration::from_millis(20), None);
+        assert_eq!(
+            shelf.status(),
+            "device.toml に [library] roots がありません"
+        );
+        // The other ends a pass can have, by the state their paths set.
+        for (outcome, shown) in [
+            (super::Outcome::CannotStart, "スキャンできません"),
+            (super::Outcome::Failed, "スキャンに失敗しました"),
+            (super::Outcome::Ended, ""),
+        ] {
+            shelf.outcome = outcome;
+            assert_eq!(shelf.status(), shown, "{outcome:?}");
+        }
+        // A running pass's bests phase, as its report gives it.
+        let bests = library::BestsReport {
+            running: true,
+            counted: 7,
+            ..library::BestsReport::default()
+        };
+        assert_eq!(super::running(&bests), "ベスト再構築中 7");
     }
 
     /// While a chart's choice pauses the scan no pass starts, however long

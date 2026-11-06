@@ -49,6 +49,7 @@ use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
 #[cfg(feature = "dev-tools")]
 type Feed = (input::AutoplayInput, usize, Vec<eval::ControlId>);
 use crate::shelf::{Shelf, file_name};
+use crate::ui_text::{Label, Message};
 use crate::window::ImeSwitch;
 
 /// Arrow keys a scripted pick queues at a time: fewer than the queue holds
@@ -363,7 +364,7 @@ impl Selection {
             self.preset_refusal = false;
         }
         self.screen
-            .set_save_error(error.map(|e| format!("player.toml を保存できません: {e}")));
+            .set_save_error(error.map(|why| Message::SaveFailed { why }.text()));
         self.dirty = true;
     }
 
@@ -411,6 +412,19 @@ impl Selection {
                 })
             {
                 println!("dev: select notice: {}", notice.text);
+            }
+            // The title and the keys, the page's own words, for a
+            // script's checks (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if self.script.is_some() {
+                for line in &page.lines {
+                    if matches!(
+                        line.style,
+                        crate::menu_screen::LineStyle::Title | crate::menu_screen::LineStyle::Help
+                    ) {
+                        println!("dev: select page: {}", line.text);
+                    }
+                }
             }
             render.send(RenderMsg::Menu(Box::new(page)));
         }
@@ -560,6 +574,15 @@ impl Selection {
                 }
                 Some(SelectStep::Sleep(ms)) => {
                     if !script.slept(ms) {
+                        return false;
+                    }
+                }
+                Some(SelectStep::File(path)) => {
+                    if !path.exists() {
+                        if script.watchdog_expired() {
+                            script.fail(format!("{} never appeared", path.display()));
+                            controls.close();
+                        }
                         return false;
                     }
                 }
@@ -1261,7 +1284,7 @@ impl PlayerRig<'_> {
             // A chart to play enters the play screen's loading state at once
             // (`entered_loading`); the practice page reads it first.
             if sel.practicing {
-                sel.show(&self.render, Some(&format!("読み込み中: {name}")));
+                sel.show(&self.render, Some(&Message::Reading { name: &name }.text()));
             }
         } else {
             sel.show(&self.render, None);
@@ -1299,7 +1322,7 @@ impl PlayerRig<'_> {
                 if loading.is_some() {
                     show_stage(render, loading.as_ref(), Stage::Scan);
                 } else {
-                    let page = screen.page("ライブラリのスキャンの一時停止を待っています");
+                    let page = screen.page(Label::ScanPauseWait.text());
                     render.send(RenderMsg::Menu(Box::new(page)));
                 }
             },
@@ -1546,6 +1569,7 @@ impl PlayerRig<'_> {
                         current: log.clone(),
                         sources: crate::source_config(),
                         loading: None,
+                        rearm_delay: TimeUs(0),
                     };
                     self.input
                         .switch(Mode::Script(Box::new(script)), crate::source_config());
@@ -3328,6 +3352,43 @@ mod tests {
         }
     }
 
+    /// A `file` step holds the script until its file exists, past
+    /// [`crate::dev::STEP_TIMEOUT`], then moves on; one whose file never
+    /// appears fails at [`crate::dev::STEP_WATCHDOG`].
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_file_step_waits_for_its_file() {
+        use crate::dev::scenario::{Origin, StepKind};
+        use crate::dev::{STEP_TIMEOUT, STEP_WATCHDOG, SelectScript, SelectStep};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Select,
+        };
+        let go = dir.path().join("go");
+        sel.script = Some(SelectScript::compiled(vec![(
+            SelectStep::File(go.clone()),
+            o,
+        )]));
+        sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
+        assert!(!sel.script(&controls, 0, None));
+        assert!(sel.script.as_ref().unwrap().front().is_some());
+        std::fs::write(&go, "").unwrap();
+        sel.script(&controls, 0, None);
+        let script = sel.script.as_ref().unwrap();
+        assert_eq!((script.front(), script.failure()), (None, None));
+        sel.script = Some(SelectScript::compiled(vec![(
+            SelectStep::File(dir.path().join("never")),
+            o,
+        )]));
+        sel.script.as_mut().unwrap().age(STEP_WATCHDOG);
+        assert!(!sel.script(&controls, 0, None));
+        let failure = sel.script.as_ref().unwrap().failure().unwrap();
+        assert!(failure.contains("never appeared"), "{failure}");
+    }
+
     /// Listed charts, one per relative path under one root, or several roots,
     /// on a shelf that scans again at once, opened as a run opens (on Top) and
     /// with every chart listed. A file named `hidden*` is 5-key-shaped.
@@ -3501,6 +3562,40 @@ mod tests {
                 "c".to_owned(),
                 "d".to_owned(),
             ]
+        );
+    }
+
+    /// Each place's title in full up to the preset, a non-ASCII folder's
+    /// name shown as stored on its row, its heading and its title, and the
+    /// all-chart list's.
+    #[test]
+    fn each_place_is_named_in_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["曲集/x/a.bms", "曲集/y/b.bms"]]);
+        let title = |sel: &Selection| sel.screen.page("").lines[0].text.clone();
+        let order = "  並び順: タイトル  プリセット: ";
+        assert!(title(&sel).starts_with(&format!("曲選択  2 譜面{order}")));
+        assert_eq!(
+            list(&sel),
+            [format!(">{}", all_row(2)), folder_row("曲集", 2)]
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Enter]);
+        assert!(
+            title(&sel).starts_with(&format!("曲選択  曲集  2 譜面{order}")),
+            "{}",
+            title(&sel)
+        );
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Up, MenuKey::Enter]);
+        assert!(
+            title(&sel).starts_with(&format!("曲選択  全譜面  2 譜面{order}")),
+            "{}",
+            title(&sel)
+        );
+        let page = sel.screen.page("");
+        assert!(
+            page.lines.iter().any(|l| l.text == r"▼ 曲集\x"),
+            "{:?}",
+            page.lines
         );
     }
 

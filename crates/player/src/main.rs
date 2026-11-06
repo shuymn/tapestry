@@ -51,6 +51,7 @@ mod selection;
 mod shelf;
 mod start_gate;
 mod tuning;
+mod ui_text;
 mod window;
 
 // The render crate's WARP helpers and its declarative, imported and
@@ -328,7 +329,9 @@ fn settings(root: &DataRoot) -> anyhow::Result<Settings> {
         save_settings(&device, &DeviceSettings::default())
             .with_context(|| device.display().to_string())?;
     }
-    Settings::load(root).with_context(|| root.path().display().to_string())
+    let settings = Settings::load(root).with_context(|| root.path().display().to_string())?;
+    ui_text::init(settings.player.language);
+    Ok(settings)
 }
 
 /// How a session's input is received, chosen once from the command line.
@@ -516,6 +519,7 @@ fn prepare(chart: &Path, input: &PlayInput, start: Option<TimeUs>) -> anyhow::Re
                 current: script,
                 sources: source_config(),
                 loading,
+                rearm_delay: input.rearm_delay,
             };
             Ok(Prepared {
                 loaded,
@@ -2291,6 +2295,7 @@ mod tests {
             log: std::path::PathBuf::from("log.tprl"),
             speed: Vec::new(),
             loading: Vec::new(),
+            rearm_delay: bms_model::TimeUs(0),
         });
         assert_eq!(
             launched(script, crate::dev::Options::default(), &device),

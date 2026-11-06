@@ -272,6 +272,10 @@ fn dev_scripted_input_is_unknown_without_feature() {
     for opt in ["--dev-adjust-at", "--dev-adjust", "--dev-adjust-end"] {
         assert_unknown(&["play", "a.bms", opt, "1"], opt);
     }
+    assert_unknown(
+        &["play", "a.bms", "--dev-rearm-delay", "1"],
+        "--dev-rearm-delay",
+    );
     assert_unknown(&["keys", "--dev-scripted-keys", "1"], "--dev-scripted-keys");
     assert_unknown(&["--dev-stop-timeout", "1"], "--dev-stop-timeout");
     assert_unknown(&["--auto", "--dev-stop-timeout", "1"], "--dev-stop-timeout");

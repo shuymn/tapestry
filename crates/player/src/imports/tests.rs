@@ -1390,10 +1390,26 @@ fn the_reports_carry_text_only() {
         line(ScreenKind::Decision, &Shown::Refused("why".into())),
         "skin: decision: refused: why"
     );
-    assert_eq!(
-        notice(ScreenKind::Result, "why"),
-        "リザルトのスキンは使えません（内蔵画面）: why"
-    );
+    for (kind, shown) in [
+        (
+            ScreenKind::Play,
+            "プレイのスキンは使えません（内蔵画面）: why",
+        ),
+        (
+            ScreenKind::Selection,
+            "選曲のスキンは使えません（内蔵画面）: why",
+        ),
+        (
+            ScreenKind::Decision,
+            "決定のスキンは使えません（内蔵画面）: why",
+        ),
+        (
+            ScreenKind::Result,
+            "リザルトのスキンは使えません（内蔵画面）: why",
+        ),
+    ] {
+        assert_eq!(notice(kind, "why"), shown);
+    }
     let admission = render::RenderError::Admission {
         kind: ScreenKind::Play,
         needed: render::SHARED_TEXELS + 1,
@@ -1406,6 +1422,18 @@ fn the_reports_carry_text_only() {
         panic!("{state:?}");
     };
     assert_eq!(shown, format!("スキンを使えません: {reason}"));
+    let notice_of = |answer| match crate::render_side::SkinState::answered(answer) {
+        crate::render_side::SkinState::Refused(shown) => shown,
+        state => panic!("{state:?}"),
+    };
+    assert_eq!(
+        notice_of(Ok(game::Preparation::Cancelled)),
+        "スキンの準備は取り消されました"
+    );
+    assert_eq!(
+        notice_of(Err(crate::render_side::ScreenError::Ended)),
+        "スキンを準備できません: the render thread ended"
+    );
 }
 
 mod attempt;

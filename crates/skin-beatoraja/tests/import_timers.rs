@@ -70,6 +70,7 @@ fn judgetimer_is_the_bomb_threshold() {
             },
             None => JudgeEventKind::EmptyPoor {
                 lane: Lane::new(1).unwrap(),
+                deviation: TimeUs(0),
             },
         },
     };

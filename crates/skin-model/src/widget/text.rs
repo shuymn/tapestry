@@ -55,6 +55,12 @@ pub enum TextField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextValue {
     Field(TextField),
+    /// `field`, or `empty` where its string is empty: chosen when the text
+    /// is prepared. `empty` is as a [`Literal`](Self::Literal).
+    FieldOr {
+        field: TextField,
+        empty: String,
+    },
     /// 1 to [`MAX_TEXT_BYTES`] bytes with no control character.
     Literal(String),
 }
@@ -101,7 +107,7 @@ impl TextDef {
             (FontRef::Bitmap(_), TextValue::Literal(s)) => {
                 u32::try_from(s.chars().count()).unwrap_or(u32::MAX)
             }
-            (FontRef::Bitmap(_), TextValue::Field(_)) => {
+            (FontRef::Bitmap(_), TextValue::Field(_) | TextValue::FieldOr { .. }) => {
                 u32::try_from(MAX_TEXT_BYTES).unwrap_or(u32::MAX)
             }
             (FontRef::Default | FontRef::File(_), _) => 1,
@@ -296,12 +302,12 @@ impl TextSlots {
     }
 
     /// Whether a slot showing `value` is in the set: a literal while the
-    /// set has the literals, a field while the set names it or one of its
-    /// parts.
+    /// set has the literals, a field, with or without its string for when
+    /// it is empty, while the set names it or one of its parts.
     pub(crate) fn names(self, value: &TextValue) -> bool {
         let f = match value {
             TextValue::Literal(_) => return self.literals,
-            TextValue::Field(f) => *f,
+            TextValue::Field(f) | TextValue::FieldOr { field: f, .. } => *f,
         };
         let parts = match f {
             TextField::FullTitle => Self::bit(TextField::Title) | Self::bit(TextField::Subtitle),
@@ -342,10 +348,10 @@ pub(crate) fn clean(s: &str) -> String {
     out
 }
 
-impl TextValue {
-    /// The string this value shows for `chart`, before cleaning: a
-    /// literal or a single field borrowed, a joined pair owned.
-    pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
+impl TextField {
+    /// This field's string for `chart`: a single field borrowed, a joined
+    /// pair owned.
+    fn resolve<'a>(self, chart: &ChartText<'a>) -> Cow<'a, str> {
         let join = |a: &'a str, b: &str| {
             if b.is_empty() {
                 Cow::Borrowed(a)
@@ -354,16 +360,33 @@ impl TextValue {
             }
         };
         match self {
+            Self::Title => Cow::Borrowed(chart.title),
+            Self::Subtitle => Cow::Borrowed(chart.subtitle),
+            Self::FullTitle => join(chart.title, chart.subtitle),
+            Self::Artist => Cow::Borrowed(chart.artist),
+            Self::Subartist => Cow::Borrowed(chart.subartist),
+            Self::FullArtist => join(chart.artist, chart.subartist),
+            Self::Genre => Cow::Borrowed(chart.genre),
+        }
+    }
+}
+
+impl TextValue {
+    /// The string this value shows for `chart`, before cleaning: a field's
+    /// emptiness is its string's as written, so one of control characters
+    /// alone keeps the field and draws nothing.
+    pub(crate) fn resolve<'a>(&'a self, chart: &ChartText<'a>) -> Cow<'a, str> {
+        match self {
             Self::Literal(s) => Cow::Borrowed(s),
-            Self::Field(f) => match f {
-                TextField::Title => Cow::Borrowed(chart.title),
-                TextField::Subtitle => Cow::Borrowed(chart.subtitle),
-                TextField::FullTitle => join(chart.title, chart.subtitle),
-                TextField::Artist => Cow::Borrowed(chart.artist),
-                TextField::Subartist => Cow::Borrowed(chart.subartist),
-                TextField::FullArtist => join(chart.artist, chart.subartist),
-                TextField::Genre => Cow::Borrowed(chart.genre),
-            },
+            Self::Field(f) => f.resolve(chart),
+            Self::FieldOr { field, empty } => {
+                let s = field.resolve(chart);
+                if s.is_empty() {
+                    Cow::Borrowed(empty)
+                } else {
+                    s
+                }
+            }
         }
     }
 }

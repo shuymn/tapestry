@@ -3038,6 +3038,7 @@ mod tests {
             loading_stamp: None,
             menu: false,
             loading: false,
+            skin_loading: None,
             generation: Some(generation),
             timing: render::FrameTiming {
                 cpu: std::time::Duration::ZERO,

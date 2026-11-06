@@ -2022,3 +2022,314 @@ fn a_play_skin_reads_the_attempts_autoplay() {
         assert_eq!(corner(&png), [255, 0, 0], "{name}");
     }
 }
+
+/// The recent timing's chart at 120 BPM (a measure is 2 s): key 1 at
+/// 125 ms, 4, 6 and 8 s, key 2's long note from 10 to 12 s, and a sound at
+/// 14 s the play lasts to. Every capture is a second or more from the
+/// next judgment, so a late frame still shows the one it names.
+const TIMING_CHART: &str = "#PLAYER 1\n#TITLE timing\n#BPM 120\n#WAV01 key.wav\n#LNTYPE 1\n#00138:01\n\
+    #00011:00010000000000000000000000000000\n#00211:01\n#00311:01\n#00411:01\n\
+    #00552:01\n#00652:01\n#00701:01\n";
+
+/// The rearm's chart: key 2's long note from 0 to 3 s.
+const REARM_CHART: &str = "#PLAYER 1\n#TITLE rearm\n#BPM 120\n#WAV01 key.wav\n#LNTYPE 1\n#00138:01\n\
+    #00052:01\n#00152:00000100\n";
+
+/// What a captured frame of the recent-timing skin shows, read from its
+/// display list: number 525's value from its glyphs (`n.png`, 24 glyphs
+/// 10 wide: digits, padding, a sign, then the same for a negative), `None`
+/// when undrawn, and whether the 1242 (30 wide) and 1243 (40 wide)
+/// images drew.
+fn timing_shown(list: &str) -> (Option<i32>, bool, bool) {
+    let nums = |line: &str, key: &str| -> Vec<i64> {
+        let rest = line.split(&format!("\"{key}\":[")).nth(1).unwrap();
+        rest.split(']')
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|n| n.trim().parse::<f64>().unwrap().round() as i64)
+            .collect()
+    };
+    let quads: Vec<&str> = list.lines().filter(|l| l.contains("\"src\":[")).collect();
+    let mut cells: Vec<(i64, i64)> = quads
+        .iter()
+        .filter(|l| l.contains("\"file\":\"n.png\""))
+        .map(|l| (nums(l, "rect")[0], nums(l, "src")[0] / 10))
+        .collect();
+    cells.sort_unstable();
+    let ms = (!cells.is_empty()).then(|| {
+        let (sign, digits) = cells.split_first().unwrap();
+        assert_eq!(sign.1 % 12, 11, "{cells:?}");
+        let magnitude = digits.iter().fold(0, |v, &(_, g)| {
+            assert!(g % 12 < 10 && g / 12 == sign.1 / 12, "{cells:?}");
+            v * 10 + i32::try_from(g % 12).unwrap()
+        });
+        if sign.1 >= 12 { -magnitude } else { magnitude }
+    });
+    let wide = |w: i64| {
+        quads
+            .iter()
+            .any(|l| l.contains("\"file\":\"white.png\"") && nums(l, "rect")[2] == w)
+    };
+    (ms, wide(30), wide(40))
+}
+
+/// Writes chart `name` of `text` into the library, with its sound.
+fn write_text_chart(fx: &Fixture, name: &str, text: &str) -> bms_model::Chart {
+    let dir = fx.library().join(name);
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    fs::write(dir.join(format!("{name}.bms")), text).unwrap();
+    bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart
+}
+
+/// A play skin's recent timing agrees with the view each captured frame
+/// drew, on the game's real threads (a consistency check: which judgment a
+/// frame shows depends on when it acquired its view, so none is required):
+/// number 525's digits and the images on ops 1242 (early) and 1243
+/// (late), from a log's play under the default beatoraja-style preset.
+///
+/// The play: key 1's note at 125 ms missed (−210, its late BAD edge); 4 s
+/// pressed 30 ms early (+30, early); 6 s on time, then a press 140 ms
+/// after it, an empty POOR against it (−140, late); 8 s pressed 30 ms late
+/// (−30, late); the long note's head 10 ms late, held, which leaves −30;
+/// its release 40 ms before its end, PERFECT (+40, neither); the play is
+/// retried. Then the rearm's chart: its first READY takes an empty
+/// POOR 480 ms before the long note's head and is cancelled by START held
+/// before chart time 0, its release rearming a fresh READY, which holds
+/// the long note: a held head leaves the timing, so that candidate reads 0
+/// only if the rearm started it over.
+#[test]
+fn a_play_skin_reads_the_recent_timing() {
+    const Q: u32 = 0x10;
+    let fx = Fixture::new();
+    let chart = write_text_chart(&fx, "t", TIMING_CHART);
+    let rearm_chart = write_text_chart(&fx, "r", REARM_CHART);
+    let at = |e: PhysicalInputEvent, ms: i64| PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        ..e
+    };
+    // Each note is a press and its release, in note order.
+    let all = hits(&chart, |_| true);
+    assert_eq!(all.len(), 10);
+    let (key1, key2) = ((all[0], all[1]), (all[8], all[9]));
+    let played = [
+        at(key1.0, 3_970),
+        at(key1.1, 3_990),
+        at(key1.0, 6_000),
+        at(key1.1, 6_020),
+        at(key1.0, 6_140),
+        at(key1.1, 6_150),
+        at(key1.0, 8_030),
+        at(key1.1, 8_050),
+        at(key2.0, 10_010),
+        at(key2.1, 11_960),
+    ];
+    write_log(&fx.base.join("logs").join("timing.tprl"), &played, 1);
+    let q = |ms: i64, value: i32| PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(Q),
+            value,
+        },
+    };
+    let held = hits(&rearm_chart, |_| true);
+    assert_eq!(held.len(), 2);
+    // START released 250 ms before chart time 0 rearms a READY whose chart
+    // time 0 lies about 1 s later on the log's clock (the lead-in after
+    // the release, as in
+    // `the_start_gate_cancels_and_rearms_ready_on_the_real_threads`): the
+    // long note is pressed there and held to its end.
+    let rearmed = [
+        at(held[0], -480),
+        at(held[1], -470),
+        q(-450, 1),
+        q(-250, 0),
+        at(held[0], 760),
+        at(held[1], 3_760),
+    ];
+    let path = fx.base.join("logs").join("rearm.tprl");
+    write_log(&path, &rearmed, 1);
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let image = |name: &str, w: u32| {
+        let file = fs::File::create(skin.join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, 20);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let white: Vec<u8> = (0..w * 20).flat_map(|_| [255; 4]).collect();
+        e.write_header().unwrap().write_image_data(&white).unwrap();
+    };
+    image("white.png", 16);
+    image("n.png", 240);
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"timing\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         skin.source = { { id = \"b\", path = \"white.png\" }, { id = \"n\", path = \"n.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.value = { { id = \"v\", src = \"n\", x = 0, y = 0, w = 240, h = 20, divx = 24, digit = 4,\n\
+           value = function() return ms.number(525) end } }\n\
+         skin.destination = {\n\
+           { id = \"v\", dst = { { x = 0, y = 500, w = 12, h = 20 } } },\n\
+           { id = \"b\", op = { 1242 }, dst = { { x = 0, y = 100, w = 30, h = 10 } } },\n\
+           { id = \"b\", draw = function() return ms.option(1243) end,\n\
+             dst = { { x = 0, y = 200, w = 40, h = 10 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let captures = [
+        ("miss", 1_000),
+        ("early", 4_500),
+        ("empty", 6_700),
+        ("late", 8_500),
+        ("held", 10_500),
+        ("release", 12_500),
+    ];
+    let mut steps: Vec<String> = captures
+        .iter()
+        .map(|(name, ms)| format!("capture = {{ at = {ms}, file = \"{name}.png\" }}"))
+        .collect();
+    steps.extend(
+        [
+            "select = { path = \"library/t/t.bms\" }",
+            "play = { input = \"logs/timing.tprl\", until = \"end\" }",
+            "result = \"retry\"",
+            "play = { input = \"logs/timing.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            "capture = { at = 1500, file = \"rearmed.png\" }",
+            "select = { path = \"library/r/r.bms\" }",
+            "play = { input = \"logs/rearm.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]
+        .map(str::to_owned),
+    );
+    let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+    let (out, stdout, stderr) = fx.run(&scenario(&steps));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out = fx.base.join("out");
+    let shown = |name: &str| {
+        let list = fs::read_to_string(out.join(format!("{name}.jsonl")))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        timing_shown(&list)
+    };
+    let side = |name: &str| fs::read_to_string(out.join(format!("{name}.json"))).unwrap();
+    // Each play's events, re-evaluated from its record: the main play,
+    // its retry, then the rearm's winning candidate.
+    let (records, _) = fx.played_records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    let played: Vec<(PlayRecord, Vec<eval::JudgeEvent>)> = records
+        .iter()
+        .zip([&chart, &chart, &rearm_chart])
+        .map(|(path, chart)| {
+            let rec = replay::decode(&fs::read(path).unwrap(), &DecodeLimits::default()).unwrap();
+            let input = eval::EvalInput {
+                events: rec.events.clone(),
+                device: eval::DeviceProfile {
+                    sources: rec
+                        .devices
+                        .sources
+                        .iter()
+                        .map(|s| s.profile.clone())
+                        .collect(),
+                },
+                start: rec.start.clone(),
+                ..eval::EvalInput::default()
+            };
+            let events = eval::evaluate(chart, &input, &rules::beatoraja_style())
+                .unwrap()
+                .events;
+            (rec, events)
+        })
+        .collect();
+    assert_eq!(played[2].0.history.openings.len(), 1, "the rearm");
+    // What a frame shows after `events`' first `n` (docs/stage3.md R3, the
+    // recent timing), each value from its own re-evaluated event, so a
+    // play whose input landed elsewhere on its clock still agrees: a
+    // press's deviation, negated, in ms truncated toward 0; a miss, its
+    // note's time minus the miss's; a long note finished by a release, the
+    // farther of its head and its release, the release on a tie, and the
+    // release's when that one is early and the note BAD; an empty POOR,
+    // its own deviation. A held head leaves it.
+    let expected = |chart: &bms_model::Chart, events: &[eval::JudgeEvent], n: usize| {
+        let ms = |us: i64| Some(i32::try_from(us / 1_000).unwrap());
+        let mut want = (Some(0), false, false);
+        for e in &events[..n] {
+            let (us, imperfect) = match e.kind {
+                eval::JudgeEventKind::Judged {
+                    lane,
+                    note,
+                    judgment,
+                    deviation,
+                    release,
+                    ..
+                } => {
+                    let us = match (deviation, release) {
+                        (None, _) => chart.lanes[lane.index()][note].time.0 - e.time.0,
+                        (Some(d), None) => -d.0,
+                        (Some(d), Some(r)) => {
+                            let chosen = if d.0.abs() > r.0.abs() { -d.0 } else { -r.0 };
+                            if judgment >= rules::Judgment::Bad && chosen > 0 {
+                                -r.0
+                            } else {
+                                chosen
+                            }
+                        }
+                    };
+                    (us, judgment != rules::Judgment::Perfect)
+                }
+                eval::JudgeEventKind::EmptyPoor { deviation, .. } => (-deviation.0, true),
+                _ => continue,
+            };
+            want = (
+                ms(us),
+                imperfect && us / 1_000 > 0,
+                imperfect && us / 1_000 < 0,
+            );
+        }
+        want
+    };
+    // Every capture against what its own frame drew from: its play's
+    // generation and candidate, and the events its view had published,
+    // all of which the frame applied (the fixture's few events fit the
+    // frame's effect buffer and queue, 2^14 each, so none is split or
+    // dropped). No capture must show a judgment: a frame may draw a view
+    // older than its time (the deterministic test,
+    // `tests/recent_timing.rs`, checks each value).
+    let charts = [&chart, &chart, &rearm_chart];
+    let mut judged = 0;
+    for name in [
+        "miss", "early", "empty", "late", "held", "release", "rearmed",
+    ] {
+        let s = side(name);
+        let generation = usize::try_from(side_num(&s, "generation")).unwrap();
+        // The rearm's cancelled candidate is not its record's.
+        if generation == 3 && side_num(&s, "view_generation") == 0 {
+            continue;
+        }
+        let n = usize::try_from(side_num(&s, "events")).unwrap();
+        let (_, events) = &played[generation - 1];
+        assert!(n <= events.len() && n < 1 << 14, "{name}: {s}");
+        if let Some(t) = events[..n].last() {
+            assert!(t.time.0 <= side_num(&s, "finalized_us"), "{name}: {s}");
+        }
+        let want = expected(charts[generation - 1], events, n);
+        assert_eq!(shown(name), want, "{name}: {s}");
+        judged += usize::from(want != (Some(0), false, false));
+    }
+    println!("captures that showed a judgment: {judged}");
+}

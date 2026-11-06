@@ -56,7 +56,10 @@
 //! The callback's result is then converted as its consumer converts it
 //! ([`Conv`]): a `draw` or `op` by truthiness, a number's `value` or an
 //! image set's as an integer (nil and booleans 0), distributed into a
-//! [`Node::Select`]'s arms.
+//! [`Node::Select`]'s arms; a text's `value` as it is, for the lowering to
+//! read its shape. For a text alone, the scene's constants fold (texts 1001
+//! to 1003, options 290 and 1008, recording no read) and a string read
+//! compares with `""`.
 //!
 //! The residual is a DAG in one arena a lowering, dropped with it. Every
 //! node is charged against [`MAX_EXPANDED_NODES`] before it is pushed
@@ -94,6 +97,8 @@ pub(crate) enum S {
     Name(u32),
     /// A literal: its file and its index in that file's strings.
     Lit { file: u16, id: u32 },
+    /// The empty string of a scene constant.
+    Empty,
 }
 
 /// A value known at import.
@@ -144,8 +149,9 @@ pub(crate) enum Node {
     Neg(u32),
     /// `+ - *` of integers.
     Arith(Bin, u32, u32),
-    /// A comparison: integers, booleans (`==` and `~=`), or a timer read
-    /// against the off value (`==` and `~=`).
+    /// A comparison: integers, booleans (`==` and `~=`), a timer read
+    /// against the off value (`==` and `~=`), or, for a text's value, a
+    /// string read against `""` (`==` and `~=`).
     Cmp(Bin, u32, u32),
     /// `then` where the boolean `cond` holds, else `other`.
     Select {
@@ -164,6 +170,8 @@ pub(crate) enum Conv {
     Truthy,
     /// A number's `value`: an integer, nil and booleans 0.
     Int,
+    /// A text's `value`: left as it is, its shape the lowering's to read.
+    Text,
     /// An image set's `value`: as [`Self::Int`], and a root that is exactly
     /// a `gauge_type()` read selects by the gauge's type.
     Index,
@@ -268,6 +276,22 @@ fn reader(api: u16) -> Option<(usize, u8)> {
     }
 }
 
+/// What host read `api` of `arg` answers when the scene holds it constant:
+/// the table texts and the course and table options.
+fn scene_constant(api: u16, arg: Option<i64>) -> Option<Val> {
+    let id = i32::try_from(arg?).ok()?;
+    match HOST_APIS.get(usize::from(api)).copied()? {
+        ("main_state", "text") => super::facts::scene_text(id).then_some(Val::Str(S::Empty)),
+        ("main_state", "option") => super::facts::scene_option(id).map(Val::Bool),
+        _ => None,
+    }
+}
+
+/// Whether host API `api` is `main_state.text`.
+pub(crate) fn is_text(api: u16) -> bool {
+    HOST_APIS.get(usize::from(api)) == Some(&("main_state", "text"))
+}
+
 /// Whether host API `api` is `main_state.timer`.
 pub(crate) fn is_timer(api: u16) -> bool {
     HOST_APIS.get(usize::from(api)) == Some(&("main_state", "timer"))
@@ -301,6 +325,8 @@ struct Eval<'a> {
     depth: u32,
     /// The instances being inlined, outermost first.
     stack: Vec<u32>,
+    /// The consumer is a text's value ([`Conv::Text`]).
+    text: bool,
 }
 
 /// Instance `inst` of admitted analysis `adm` evaluated into its
@@ -318,11 +344,13 @@ pub(crate) fn evaluate(
         res: Residual::default(),
         depth: 0,
         stack: Vec::new(),
+        text: conv == Conv::Text,
     };
     let v = ev.function(inst, &[])?;
     let root = match conv {
         Conv::Truthy => ev.truthy(v)?,
         Conv::Int | Conv::Index => ev.integer(v)?,
+        Conv::Text => v,
     };
     ev.res.root = root;
     Ok(ev.res)
@@ -894,6 +922,7 @@ impl<'a> Eval<'a> {
                             .and_then(|m| m.get(&n))
                             .copied()
                     }
+                    S::Empty => self.an.entry(t, b"").map_err(stop)?,
                 };
                 match c {
                     Some(c) => self.captured(c, None),
@@ -948,6 +977,11 @@ impl<'a> Eval<'a> {
                         _ => return construct("host arguments"),
                     },
                 };
+                if self.text
+                    && let Some(known) = scene_constant(api, arg)
+                {
+                    return self.known(known);
+                }
                 let r = self.push(Node::Read { api, arg })?;
                 charge(self.an, "read", 1)?;
                 did("read");
@@ -1180,9 +1214,31 @@ impl<'a> Eval<'a> {
                 if kx == INT || kx == BOOL {
                     return self.push(Node::Cmp(op, x, y));
                 }
+                if self.text && kx == STR {
+                    let (read, other) = if self.val(y).is_some() {
+                        (x, y)
+                    } else {
+                        (y, x)
+                    };
+                    if matches!(self.res.node(read), Node::Read { .. })
+                        && let Some(Val::Str(s)) = self.val(other)
+                        && self.is_empty(s)
+                    {
+                        return self.push(Node::Cmp(op, read, other));
+                    }
+                }
                 refuse(Unsupported::Type)
             }
             _ => refuse(Unsupported::Type),
+        }
+    }
+
+    /// Whether known string `s` is empty.
+    fn is_empty(&self, s: S) -> bool {
+        match s {
+            S::Empty => true,
+            S::Lit { file, id } => self.bytes(file, id).is_empty(),
+            S::Name(n) => self.an.names.get(&b""[..]) == Some(&n),
         }
     }
 
@@ -1193,6 +1249,7 @@ impl<'a> Eval<'a> {
             return Ok(a == b);
         };
         match (p, q) {
+            (S::Empty, s) | (s, S::Empty) => Ok(self.is_empty(s)),
             (S::Name(m), S::Name(n)) => Ok(m == n),
             (S::Lit { file, id }, S::Name(n)) | (S::Name(n), S::Lit { file, id }) => {
                 let s = self.bytes(file, id);

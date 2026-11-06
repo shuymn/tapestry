@@ -112,6 +112,9 @@ pub enum JudgeEventKind {
     EmptyPoor {
         /// The lane pressed.
         lane: Lane,
+        /// Press time minus the time of the note the empty POOR is
+        /// against.
+        deviation: TimeUs,
     },
     /// A press on `lane` plays `sound`.
     PlaySound {
@@ -1270,13 +1273,13 @@ impl<'a> Evaluator<'a> {
         if lead_in && best.is_none() {
             return;
         }
-        // An empty POOR, early when pressed at or before the note it is
-        // against.
+        // An empty POOR's deviation from the note it is against: early
+        // when pressed at or before it, 0 included.
         let empty_poor = against
             .filter(|_| best.is_none())
             .and_then(|k| state.targets.get(k))
             .and_then(|&i| notes.get(i))
-            .map(|n| t <= n.time);
+            .map(|n| TimeUs(t.0.saturating_sub(n.time.0)));
         let rule = self.rule.empty_poor;
         if let Some(sound) = self.sound_of(lane, &scan) {
             self.emit(
@@ -1369,9 +1372,9 @@ impl<'a> Evaluator<'a> {
             self.emit(t, Some(origin), kind, out);
             return;
         }
-        if let Some(early) = empty_poor {
+        if let Some(deviation) = empty_poor {
             self.tally.empty_poor = self.tally.empty_poor.saturating_add(1);
-            let side = if early {
+            let side = if deviation.0 <= 0 {
                 &mut self.tally.empty_poor_early
             } else {
                 &mut self.tally.empty_poor_late
@@ -1392,6 +1395,7 @@ impl<'a> Evaluator<'a> {
                 Some(origin),
                 JudgeEventKind::EmptyPoor {
                     lane: lane_of(lane),
+                    deviation,
                 },
                 out,
             );

@@ -44,6 +44,11 @@ thread_local! {
     /// meanwhile: a skin handler run by the capture would make one.
     static CAPTURING: Cell<bool> = const { Cell::new(false) };
     pub(crate) static CAPTURE_CALLS: Cell<u32> = const { Cell::new(0) };
+    /// The time cap in place of [`super::limits::MAX_LUA_TIME`] for the
+    /// imports this thread runs, when a test sets one: a test of another
+    /// limit sets one it cannot reach, so a loaded machine's clock never
+    /// decides which limit refuses first.
+    pub(crate) static TIME_LIMIT: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
 }
 
 thread_local! {

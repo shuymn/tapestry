@@ -568,6 +568,11 @@ pub struct Options {
     /// first opening (`--dev-loading`): each by scan code with its press and
     /// release times after loading starts, fed only to the adjustment tap.
     pub loading_keys: Vec<(u32, TimeUs, TimeUs)>,
+    /// How long after a cancelled READY's release a scripted play's rearm
+    /// is answered at the earliest (`--dev-rearm-delay <ms>`): a game thread
+    /// late to ask, made on purpose, which the script's chart times do not
+    /// follow.
+    pub rearm_delay: TimeUs,
     /// Show the measurement overlay from the start, without its key.
     pub overlay: bool,
     /// The result screen's input, scripted (`--dev-result`): `next`,
@@ -646,6 +651,7 @@ impl Options {
                     log,
                     speed: self.speed_keys.iter().map(|&k| (k, at)).collect(),
                     loading: self.loading_keys.clone(),
+                    rearm_delay: self.rearm_delay,
                 })
             })),
         }
@@ -689,6 +695,11 @@ impl Options {
             "dev-size" => self.size = Some(size(p)?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-start" => self.start = Some(start(p)?),
+            "dev-rearm-delay" => {
+                let bad = || UsageError::Usage("--dev-rearm-delay takes milliseconds".to_owned());
+                let ms: u32 = p.value()?.to_string_lossy().parse().map_err(|_| bad())?;
+                self.rearm_delay = TimeUs(i64::from(ms) * 1_000);
+            }
             "dev-result" => {
                 let steps = p.value()?;
                 self.result =
@@ -827,6 +838,10 @@ pub enum SelectStep {
     PickSearched(String),
     /// Wait this many milliseconds on the select screen.
     Sleep(u64),
+    /// Wait on the select screen until this file exists, at most
+    /// [`STEP_WATCHDOG`]: a test's signal that it changed something the
+    /// run must not see yet.
+    File(PathBuf),
     /// Wait this many milliseconds on the select screen and print how often
     /// the input thread woke meanwhile.
     Idle(u64),
@@ -938,7 +953,7 @@ pub struct SlowLoad {
 }
 
 /// `--dev-select <steps>`: the select screen's input, comma-separated:
-/// `pick=<file>`, `wait=<file>`, `search=<text>`, `sleep=<ms>`,
+/// `pick=<file>`, `wait=<file>`, `file=<path>`, `search=<text>`, `sleep=<ms>`,
 /// `idle=<ms>`, `enter`, `prev-preset`, `next-preset`, `drawn`,
 /// `back`, `retry`, `next`, `prev`, `close-measuring`, `quit-measuring`,
 /// `quit-decoding`, `slow-load=<ms>`, `quit-loading`, `close-loading`,
@@ -1013,6 +1028,7 @@ impl SelectScript {
             .map(|s| match s.split_once('=') {
                 Some(("pick", f)) => Ok(SelectStep::Pick(f.to_owned())),
                 Some(("wait", f)) => Ok(SelectStep::Wait(f.to_owned())),
+                Some(("file", f)) => Ok(SelectStep::File(PathBuf::from(f))),
                 Some(("folder", f)) => Ok(SelectStep::Folder(f.to_owned())),
                 Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
@@ -1455,6 +1471,9 @@ pub struct ScriptInput {
     pub speed: Vec<(u32, TimeUs)>,
     /// Keys held while loading, with their press and release times.
     pub loading: Vec<(u32, TimeUs, TimeUs)>,
+    /// How long a rearm waits at the least after the release
+    /// ([`Options::rearm_delay`]).
+    pub rearm_delay: TimeUs,
 }
 
 /// The keys of `list` held while loading, comma-separated as
@@ -1791,7 +1810,9 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 }
 
 /// Writes frames as PNG files: `select.png` at the first select screen
-/// frame, `loading.png` at the first loading state frame, `ready.png` at
+/// frame, `loading.png` at the first loading state frame,
+/// `loading-skin-<lifetime>.png` at each loading lifetime's first frame the
+/// skin drew, `ready.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
 /// after `play_at` (and each play's own as `play-<generation>.png`),
 /// and `end.png` at the first end screen frame.
@@ -1803,6 +1824,9 @@ pub struct FrameDump {
     end: bool,
     select: bool,
     loading: bool,
+    /// The loading lifetime whose `loading-skin-<lifetime>.png` was written
+    /// last.
+    skin_loading: Option<u64>,
     /// The generation of the play whose `play-<generation>.png` was
     /// written last.
     numbered: Option<u64>,
@@ -1819,6 +1843,7 @@ impl FrameDump {
             end: false,
             select: false,
             loading: false,
+            skin_loading: None,
             numbered: None,
         }
     }
@@ -1863,6 +1888,12 @@ impl FrameSink for FrameDump {
         {
             self.numbered = Some(g);
             names.push(format!("play-{g}.png"));
+        }
+        if let Some(l) = drawn.skin_loading
+            && self.skin_loading != Some(l)
+        {
+            self.skin_loading = Some(l);
+            names.push(format!("loading-skin-{l}.png"));
         }
         match drawn.play {
             Some(t) if t.0 < 0 && !self.ready_state => {

@@ -243,6 +243,12 @@ const GAUGE_RANGE: i32 = 230;
 /// `judge_1p_perfect`: the latest judgment was a PERFECT
 /// (`BooleanPropertyFactory.java:234-247`).
 const JUDGE_PERFECT: i32 = 241;
+/// `judge_1p_early` and `judge_1p_late` (`BooleanPropertyFactory.java:
+/// 234-247`, `:543-544`): the latest judgment the recent timing takes is
+/// worse than PERFECT and its timing, note time minus press in ms, above
+/// or below 0; a timing of 0 holds neither.
+const JUDGE_EARLY: i32 = 1_242;
+const JUDGE_LATE: i32 = 1_243;
 /// The shown gauge's families (`BooleanPropertyFactory.java:394-414,
 /// 693-704`): `gauge_groove`, the source's gauge types up to 2;
 /// `gauge_hard`, from 3; `gauge_ex`, types 0, 1, 4, 5, 7 and 8. The model
@@ -280,6 +286,12 @@ const HIDDEN_ON: i32 = 273;
 /// reads the play context's exact BPM-change fact (D4).
 const CHART_NO_BPM_CHANGE: i32 = 176;
 const CHART_BPM_CHANGE: i32 = 177;
+/// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
+/// source's preload state and its complement: entering READY flips them
+/// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
+/// The loading timer runs in loading frames only.
+const NOW_LOADING: i32 = 80;
+const LOADED: i32 = 81;
 /// `table_song` (`BooleanPropertyFactory.java:351-352`), whether the chart
 /// came from a difficulty table: a scene constant, false, as there are no
 /// difficulty tables and outside one the source's table name is empty
@@ -346,12 +358,22 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
     Some(match id {
         GAUGE_RANGE..=240 => (Body::Range(id - GAUGE_RANGE), false),
         JUDGE_PERFECT => (Body::Text("on(judge.perfect)"), false),
+        JUDGE_EARLY => (
+            Body::Text("judge.recent_imperfect && judge.recent_ms > 0"),
+            false,
+        ),
+        JUDGE_LATE => (
+            Body::Text("judge.recent_imperfect && judge.recent_ms < 0"),
+            false,
+        ),
         GAUGE_GROOVE => (Body::Kinds(&["assist_easy", "easy", "normal"]), true),
         GAUGE_HARD => (Body::Kinds(&["hard", "ex_hard", "hazard"]), true),
         GAUGE_EX => (
             Body::Kinds(&["assist_easy", "easy", "ex_hard", "hazard"]),
             true,
         ),
+        NOW_LOADING => (Body::Text("on(loading)"), false),
+        LOADED => (Body::Text("!on(loading)"), false),
         GREAT_EXIST => (Body::Text("count.great > 0"), false),
         GOOD_EXIST => (Body::Text("count.good > 0"), false),
         BAD_EXIST => (Body::Text("count.bad > 0"), false),
@@ -611,14 +633,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 54);
+        assert_eq!(exprs.len(), 62);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     #[test]
-    fn cover_switches_and_bpm_change_conditions_map() {
+    fn cover_bpm_change_and_timing_conditions_map() {
         let none = BTreeMap::new();
         for (id, name, src, d4) in [
             (
@@ -628,10 +650,24 @@ mod tests {
                 true,
             ),
             (177, "chart_bpmchange", "bpm.change", true),
+            (80, "now_loading", "on(loading)", false),
+            (81, "loaded", "!on(loading)", false),
             (270, "lanecover1_changing", "cover.adjusting", false),
             (271, "lanecover1_on", "cover.enabled", false),
             (272, "lift1_on", "lift.enabled", false),
             (273, "hidden1_on", "hidden.enabled", false),
+            (
+                1_242,
+                "judge_1p_early",
+                "judge.recent_imperfect && judge.recent_ms > 0",
+                false,
+            ),
+            (
+                1_243,
+                "judge_1p_late",
+                "judge.recent_imperfect && judge.recent_ms < 0",
+                false,
+            ),
         ] {
             assert_eq!(numeric(id, &none), expr(src, d4));
             assert_eq!(numeric(-id, &none), expr(&format!("!({src})"), d4));

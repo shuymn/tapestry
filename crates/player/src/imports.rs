@@ -45,6 +45,7 @@ use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side};
 
 use crate::log_file;
 use crate::render_side::{RenderLink, SELECT_SLICE};
+use crate::ui_text::{Label, Message};
 
 pub mod facts;
 
@@ -766,12 +767,12 @@ pub fn line(kind: ScreenKind, shown: &Shown) -> String {
 /// admission notice instead ([`crate::render_side::SkinState`]).
 pub fn notice(kind: ScreenKind, why: &str) -> String {
     let screen = match kind {
-        ScreenKind::Play => "プレイ",
-        ScreenKind::Selection => "選曲",
-        ScreenKind::Decision => "決定",
-        ScreenKind::Result => "リザルト",
+        ScreenKind::Play => Label::ScreenPlay,
+        ScreenKind::Selection => Label::ScreenSelection,
+        ScreenKind::Decision => Label::ScreenDecision,
+        ScreenKind::Result => Label::ScreenResult,
     };
-    format!("{screen}のスキンは使えません（内蔵画面）: {why}")
+    Message::SkinBuiltIn { screen, why }.text()
 }
 
 /// An installed bundle's atlas array: its level-0 texels
@@ -1060,7 +1061,7 @@ pub fn startup(
                         "the play skin cannot be used: {why}"
                     )));
                 }
-                started.play = Some(format!("スキンを使えません: {why}"));
+                started.play = Some(Message::SkinUnusable { why: &why }.text());
             }
             Shown::Refused(why) | Shown::BuiltIn(why) => notices.push(notice(kind, &why)),
         }
