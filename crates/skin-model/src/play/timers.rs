@@ -9,7 +9,7 @@ use eval::Tally;
 use rules::GaugeValue;
 
 use super::schema::{
-    COVER_PERMILLE, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX,
+    COVER_PERMILLE, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL,
     RATE_BASIS_POINTS, READOUT_MAX_U32, field, lane_timer, timer,
 };
 use super::{
@@ -75,7 +75,8 @@ fn rate_bp(ex: u32, targets: u64) -> i32 {
 
 /// The readout fields of one frame, `field::BPM_CURRENT_X100` to
 /// `field::DURATION_VALID` and from `field::DURATION_VARIANTS` to
-/// `field::CHART_LEVEL_VALID`, validated before anything is applied.
+/// `field::CHART_LEVEL_VALID`, and `field::TIME_PROGRESS_PPM`, validated
+/// before anything is applied.
 #[derive(Clone, Copy)]
 struct Readouts {
     /// Per variant in slot order: ms, green and validity.
@@ -92,6 +93,7 @@ struct Readouts {
     level_valid: i32,
     remaining_s: i32,
     elapsed_s: i32,
+    progress_ppm: i32,
     covers: Covers,
     hispeed: i32,
     hispeed_valid: i32,
@@ -331,6 +333,23 @@ fn seconds(us: i128, up: bool) -> i32 {
     i32::try_from(s).unwrap_or(i32::MAX)
 }
 
+/// The attempt's progress at `now` from `start` to `end` (µs, `start ≤
+/// end`), in parts per million: 0 before `start` (READY, the source's
+/// `TIMER_PLAY` off), [`PROGRESS_FULL`] at and after `end` (the source's
+/// `min(…, 1)`), and `⌊10⁶ · (now − start) / (end − start)⌋` between
+/// them (`skin/property/FloatPropertyFactory.java:128-136`).
+fn progress_ppm(now: i128, start: i128, end: i128) -> i32 {
+    if now < start {
+        return 0;
+    }
+    if now >= end {
+        return PROGRESS_FULL;
+    }
+    // `start ≤ now < end`: the divisor is positive, the share below 10⁶.
+    let full = i128::from(PROGRESS_FULL);
+    i32::try_from((now - start) * full / (end - start)).unwrap_or(PROGRESS_FULL)
+}
+
 /// A timer's reading at `now`: elapsed ms since `start`, at least 0 (an
 /// effect stamped after `now` reads 0), or [`TIMER_OFF`].
 fn reading(now: TimeUs, start: Option<TimeUs>) -> i32 {
@@ -409,6 +428,7 @@ impl Play {
             level_valid,
             remaining_s: seconds(end - now.max(start), true),
             elapsed_s: seconds(now - start, false),
+            progress_ppm: progress_ppm(now, start, end),
             covers,
             hispeed,
             hispeed_valid,
@@ -564,7 +584,8 @@ impl Play {
                 Lane::all()
                     .zip(self.reducer.lanes)
                     .map(|(lane, j)| j.read(frame.input.lane(lane))),
-            );
+            )
+            .chain([r.progress_ppm]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

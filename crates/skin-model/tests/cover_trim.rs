@@ -505,7 +505,7 @@ fn paint_err(def_: CoverPaintDef) -> String {
 fn paints_are_checked_at_load() {
     let fail = |error| dbg(LoadError::CoverPaint { paint: 0, error });
     let slider = |d: CoverPaintDef| CoverPaintDef {
-        slider_range: Some(100),
+        slider: Some(skin_model::Slider::sudden(100)),
         ..d
     };
     // A slider moves SUDDEN+ alone.
