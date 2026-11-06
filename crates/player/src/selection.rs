@@ -48,6 +48,7 @@ use crate::{dev::SelectStep, dev::scenario::InputRef, input_side::Mode};
 /// the controls it records (dev-tools).
 #[cfg(feature = "dev-tools")]
 type Feed = (input::AutoplayInput, usize, Vec<eval::ControlId>);
+use crate::selection_skin::SkinFeed;
 use crate::shelf::{Shelf, file_name};
 use crate::ui_text::{Label, Message};
 use crate::window::ImeSwitch;
@@ -176,6 +177,9 @@ pub struct Selection {
     /// Steps of the play preset taken and not yet applied: the flow takes
     /// them after each look ([`AppRig::take_preset_step`]).
     pub preset_steps: std::collections::VecDeque<game::PresetStep>,
+    /// What the render thread is given of each change: the lifetime, the
+    /// timers' starts and the skin's window.
+    pub feed: SkinFeed,
     /// The scripted input (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub script: Option<crate::dev::SelectScript>,
@@ -220,6 +224,7 @@ impl Selection {
     /// Reads the screen's list from the library again.
     fn refresh(&mut self) {
         self.search_pending = false;
+        self.feed.list_revision = self.feed.list_revision.saturating_add(1);
         match self.read_list() {
             Ok(()) => {}
             Err(e) => {
@@ -334,6 +339,16 @@ impl Selection {
         self.drain(&mut menus.pad)
     }
 
+    /// What startup left the select screen: a skin's refusal `notice`, and
+    /// the installed selection skin's song list (`window`, its center slot
+    /// and its placements), which the screen's view is made for.
+    pub fn started(&mut self, notice: Option<String>, window: Option<(usize, usize)>) {
+        if let Some(notice) = notice {
+            self.screen.set_notice(Some(notice));
+        }
+        self.feed.window = window;
+    }
+
     /// Shows on the page that `chart` was refused, and why (`text`);
     /// `preset` when the refusal was the shelf's, which cannot open.
     fn refused(&mut self, chart: &std::path::Path, text: String, preset: bool) {
@@ -376,6 +391,7 @@ impl Selection {
         chosen: Option<Pick>,
         skin: &mut SkinState,
         render: &RenderLink,
+        now: TimeUs,
     ) -> Option<Pick> {
         let pick = chosen?;
         let Err(notice) = skin.ready() else {
@@ -384,13 +400,14 @@ impl Selection {
         let (Pick::Play(path) | Pick::Practice(path)) = &pick;
         println!("select: not admitted {}: {notice}", file_name(path));
         self.refused(path, notice, false);
-        self.show(render, None);
+        self.show(render, None, now);
         None
     }
 
-    /// Sends the page if it changed, with `status` in its title (the
-    /// library's when `None`).
-    fn show(&mut self, render: &RenderLink, status: Option<&str>) {
+    /// Sends the screen's update if it changed at `now`, its page with
+    /// `status` in its title (the library's when `None`): the page, and
+    /// what a selection skin draws ([`SkinFeed::update`]).
+    fn show(&mut self, render: &RenderLink, status: Option<&str>, now: TimeUs) {
         if self.dirty {
             self.dirty = false;
             let shelf = self.shelf.status();
@@ -426,7 +443,7 @@ impl Selection {
                     }
                 }
             }
-            render.send(RenderMsg::Menu(Box::new(page)));
+            render.show_selection(self.feed.update(&self.screen, page, now));
         }
     }
 
@@ -1249,6 +1266,14 @@ impl PlayerRig<'_> {
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
         }
+        // The selection skin refused at runtime: the page draws from now
+        // on, and says why.
+        if let Some(why) = self.render.take_selection_refusal() {
+            log::warn!("select: the selection skin was refused, the built-in page draws: {why}");
+            let notice = crate::imports::notice(skin_model::ScreenKind::Selection, &why);
+            sel.screen.set_notice(Some(notice));
+            sel.dirty = true;
+        }
         #[cfg_attr(
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "scripts choose too")
@@ -1265,7 +1290,8 @@ impl PlayerRig<'_> {
             chosen = sel.drain_owned(&mut self.result_input);
         }
         // Before anything of the choice: no chart without its skin.
-        let chosen = sel.admit(chosen, &mut self.skin, &self.render);
+        let now = self.clock.now();
+        let chosen = sel.admit(chosen, &mut self.skin, &self.render, now);
         if let Some(pick) = &chosen {
             let (Pick::Play(path) | Pick::Practice(path)) = pick;
             let what = if matches!(pick, Pick::Practice(_)) {
@@ -1288,10 +1314,11 @@ impl PlayerRig<'_> {
             // A chart to play enters the play screen's loading state at once
             // (`entered_loading`); the practice page reads it first.
             if sel.practicing {
-                sel.show(&self.render, Some(&Message::Reading { name: &name }.text()));
+                let reading = Message::Reading { name: &name }.text();
+                sel.show(&self.render, Some(&reading), now);
             }
         } else {
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, now);
         }
         chosen
     }
@@ -1638,6 +1665,8 @@ impl AppRig for PlayerRig<'_> {
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
         self.enter_attempt();
+        // Selection is left: nothing of it is drawn again.
+        self.render.leave_selection();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -1955,7 +1984,7 @@ impl AppRig for PlayerRig<'_> {
                 script.refused(Chain(&refusal.reason).to_string());
             }
             sel.refused(&refusal.chart, format!("{name}: {shown}"), preset);
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, self.clock.now());
         }
     }
 
@@ -1992,7 +2021,7 @@ impl AppRig for PlayerRig<'_> {
             sel.screen
                 .set_bests_preset(shelf.ok().map(|s| s.chosen().clone()));
             sel.refresh_bests();
-            sel.show(&self.render, None);
+            sel.show(&self.render, None, self.clock.now());
         }
     }
 
@@ -2013,9 +2042,23 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
-        sel.entered(self.clock.now());
+        let now = self.clock.now();
+        sel.entered(now);
+        self.render.enter_selection(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
-        sel.show(&self.render, None);
+        sel.show(&self.render, None, now);
+    }
+
+    /// The same entry on a screen built again: its lifetime, its timers'
+    /// starts and the skin's state stay (design.md "Rendering and Skins",
+    /// Screen skins); its update is sent again, so the new screen prepares
+    /// what it draws.
+    fn recovered_selection(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        sel.dirty = true;
+        sel.show(&self.render, None, self.clock.now());
     }
 
     /// The one routine of every entry into the practice page: on opening
@@ -2029,6 +2072,7 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.enter_scene();
+        self.render.leave_selection();
         recover(
             &mut self.result_input,
             Owner::Practice,
@@ -2069,8 +2113,15 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
+    /// The flow applies the step taken now: the strip shows the preset's
+    /// name from here ([`crate::selection_skin::PRESET_SHOWN`]).
     fn take_preset_step(&mut self) -> Option<game::PresetStep> {
-        self.selection.as_mut()?.preset_steps.pop_front()
+        let now = self.clock.now();
+        let sel = self.selection.as_mut()?;
+        let step = sel.preset_steps.pop_front()?;
+        sel.feed.preset_step = Some(now);
+        sel.dirty = true;
+        Some(step)
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
@@ -2091,6 +2142,7 @@ impl Selection {
     /// preset are read anew, with what the chart's plays counted.
     fn entered(&mut self, now: TimeUs) {
         self.entered_at = now;
+        self.feed.enter(now);
         self.loading = None;
         self.screen.end_composition();
         self.shelf.release();
@@ -2123,7 +2175,7 @@ fn wait_chart_load(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -2351,7 +2403,7 @@ mod tests {
             }
             let chosen = sel.drain(&mut Pad::default());
             let began = Instant::now();
-            let admitted = sel.admit(chosen, skin, &render);
+            let admitted = sel.admit(chosen, skin, &render, TimeUs(0));
             assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
             admitted
         };
@@ -2438,6 +2490,7 @@ mod tests {
             screen,
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
             rate: 48_000,
@@ -3545,7 +3598,10 @@ mod tests {
     /// Listed charts, one per relative path under one root, or several roots,
     /// on a shelf that scans again at once, opened as a run opens (on Top) and
     /// with every chart listed. A file named `hidden*` is 5-key-shaped.
-    fn tree(dir: &std::path::Path, roots: &[&[&str]]) -> (Selection, Vec<std::path::PathBuf>) {
+    pub(crate) fn tree(
+        dir: &std::path::Path,
+        roots: &[&[&str]],
+    ) -> (Selection, Vec<std::path::PathBuf>) {
         let roots: Vec<_> = roots
             .iter()
             .enumerate()
@@ -3572,6 +3628,7 @@ mod tests {
             screen: SelectScreen::new(roots.clone()),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
             rate: 48_000,
@@ -3677,6 +3734,323 @@ mod tests {
         let lines = list(sel);
         let at = lines.iter().position(|l| l.starts_with('>')).unwrap();
         (lines[at][1..].to_owned(), at)
+    }
+
+    /// The skin's update: its view is the installed song list's window
+    /// (three rows above the cursor, three below, no heading), with the
+    /// player's labels; timer `change` starts at the entry and again when
+    /// the cursor's row or the place changes, not on a refresh keeping the
+    /// row; each entry is a new lifetime with its own starts; a preset step
+    /// reaches the strip with the preset's name.
+    #[test]
+    fn the_skins_update_follows_the_cursor_and_the_place() {
+        use crate::selection_skin::SkinFeed;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(
+            dir.path(),
+            &[&["s1/song/a.bms", "s2/song/b.bms", "d.bms", "song/c.bms"]],
+        );
+        sel.feed = SkinFeed::default();
+        sel.feed.window = Some((3, 7));
+        let at = |sel: &mut Selection, t: i64| {
+            let page = sel.screen.page("");
+            sel.feed.update(&sel.screen, page, TimeUs(t))
+        };
+        sel.feed.enter(TimeUs(100));
+        let u = at(&mut sel, 100);
+        assert_eq!((u.lifetime, u.revision), (1, 1));
+        assert_eq!(u.labels, crate::select::labels());
+        // Top: the all-charts row, s1, s2, c, d; three below the cursor.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert_eq!(
+            (u.events.entered, u.events.changed),
+            (TimeUs(100), TimeUs(100))
+        );
+        keys(&mut sel, &[MenuKey::Down]);
+        let u = at(&mut sel, 200);
+        assert_eq!((u.view.rows.len(), u.view.cursor), (5, Some(1)));
+        assert_eq!(u.events.changed, TimeUs(200));
+        // A refresh keeping the cursor's row: no restart, a new list.
+        let lists = u.list_revision;
+        sel.refresh();
+        let u = at(&mut sel, 300);
+        assert_eq!(u.events.changed, TimeUs(200));
+        assert!(u.list_revision > lists);
+        // Into folder s1: the place changes.
+        keys(&mut sel, &[MenuKey::Enter]);
+        let u = at(&mut sel, 400);
+        assert_eq!(
+            u.view.place,
+            skin_model::SelectionPlace::Folder(vec!["s1".to_owned()])
+        );
+        assert_eq!(u.events.changed, TimeUs(400));
+        // Back, onto the all-charts row, into the all-chart list: rows by
+        // folder, none of them a heading.
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Home, MenuKey::Enter]);
+        let u = at(&mut sel, 500);
+        assert_eq!(u.view.place, skin_model::SelectionPlace::All);
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert!(
+            u.view
+                .rows
+                .iter()
+                .all(|r| r.kind == skin_model::RowKind::Chart)
+        );
+        assert_eq!(u.events.changed, TimeUs(500));
+        // A preset step: the strip names the preset.
+        sel.screen.set_preset("ベータ".to_owned(), None);
+        sel.feed.preset_step = Some(TimeUs(550));
+        let u = at(&mut sel, 550);
+        assert_eq!(u.strip.preset, "ベータ");
+        assert_eq!(u.events.preset_step, Some(TimeUs(550)));
+        // The next entry: another lifetime, its own starts.
+        sel.feed.enter(TimeUs(600));
+        let u = at(&mut sel, 600);
+        assert_eq!((u.lifetime, u.revision), (2, 1));
+        assert_eq!(
+            (u.events.entered, u.events.changed),
+            (TimeUs(600), TimeUs(600))
+        );
+        assert_eq!(u.events.preset_step, None);
+        // Without a skin the view is the cursor's row alone; the keys act
+        // the same.
+        sel.feed.window = None;
+        assert_eq!(at(&mut sel, 700).view.rows.len(), 1);
+    }
+
+    /// What startup leaves the select screen reaches its updates: the
+    /// installed skin's window makes the view, and a refusal is the
+    /// notice.
+    #[test]
+    fn startup_gives_the_updates_the_skins_window_and_the_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["a.bms", "b.bms", "c.bms"]]);
+        sel.started(Some("refused".to_owned()), Some((3, 7)));
+        sel.feed.enter(TimeUs(0));
+        let page = sel.screen.page("");
+        let u = sel.feed.update(&sel.screen, page, TimeUs(0));
+        // Top: the all-charts row and the three charts, the cursor first.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert_eq!(u.strip.notice.as_deref(), Some("refused"));
+    }
+
+    /// `f` on a rig of the game's threads whose render thread is `render`,
+    /// on `screens`, with `sel` on its select screen, entered and its first
+    /// update drawn (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_selection<R>(
+        sel: Selection,
+        screens: &crate::render_side::tests::Installers,
+        render: crate::render_side::RenderLink,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R,
+    ) -> R {
+        use game::AppRig as _;
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let (out, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+            // No adjustment waits on the input thread, which none serves.
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            rig.entered_selection();
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.lifetime == 1)
+            }));
+            f(rig)
+        });
+        out
+    }
+
+    /// Closes the window when dropped, so a run waiting on it ends even
+    /// when the check driving it fails.
+    #[cfg(feature = "dev-tools")]
+    struct CloseOnDrop<'a>(&'a crate::controls::Controls);
+
+    #[cfg(feature = "dev-tools")]
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    /// A device lost while selection shows is not an entry (design.md
+    /// "Rendering and Skins", Screen skins): through the app's run, the
+    /// screen built again draws the same lifetime with the skin's state and
+    /// the timers' starts kept; a real entry again (after a refused chart)
+    /// is a new lifetime with a fresh state and its own starts.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_device_recovery_keeps_the_entry_and_an_entry_again_starts_anew() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(dir.path(), &[&["a.bms"]]);
+        let menu = Arc::clone(&sel.menu);
+        let screens = crate::render_side::tests::Installers::default();
+        let render = screens.spawn_bare();
+        assert_eq!(
+            render
+                .select(
+                    skin_model::ScreenKind::Selection,
+                    Some(crate::render_side::tests::bundle())
+                )
+                .wait()
+                .unwrap(),
+            game::Preparation::Ready
+        );
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        // A preset that does not exist: a chart chosen is refused, and
+        // selection entered again.
+        let mut app_settings = settings.clone();
+        app_settings.player.preset = "missing".to_owned();
+        let seen = || screens.selections.lock().unwrap().clone();
+        let skinned = |lifetime: u64| {
+            seen()
+                .into_iter()
+                .find(|s| s.lifetime == lifetime && s.state.is_some())
+        };
+        let (ran, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            let controls = rig.controls;
+            let mut app = game::App::new(
+                DataRoot::new(dir.path().join("app")),
+                app_settings,
+                crate::session_config(replay::ReceiveMethod::Scripted, None),
+                Box::new(|s: &game::Settings| game::Parts::unsaved(&s.player)),
+                Box::new(game::NoSessionEvents),
+            );
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _close = CloseOnDrop(controls);
+                    assert!(crate::render_side::tests::wait_until(
+                        || skinned(1).is_some()
+                    ));
+                    let first = skinned(1).unwrap();
+                    // The device lost; once the flow built the screen
+                    // again, the new one draws.
+                    screens.fail.store(true, Ordering::Release);
+                    assert!(crate::render_side::tests::wait_until(|| {
+                        screens.builds.load(Ordering::Acquire) >= 2
+                    }));
+                    screens.fail.store(false, Ordering::Release);
+                    assert!(crate::render_side::tests::wait_until(|| {
+                        seen().iter().any(|s| s.device != first.device)
+                    }));
+                    let again = seen()
+                        .into_iter()
+                        .find(|s| s.device != first.device)
+                        .unwrap();
+                    assert_eq!(
+                        (again.lifetime, again.state, again.events.entered),
+                        (1, first.state, first.events.entered),
+                        "{again:?}"
+                    );
+                    assert_eq!(again.events.changed, first.events.changed);
+                    // The chart chosen and refused: selection entered again.
+                    menu.push(MenuInput::Key(MenuKey::End));
+                    menu.push(MenuInput::Key(MenuKey::Enter));
+                    assert!(crate::render_side::tests::wait_until(
+                        || skinned(2).is_some()
+                    ));
+                    let next = skinned(2).unwrap();
+                    assert_ne!(next.state, first.state);
+                    assert!(next.events.entered > first.events.entered, "{next:?}");
+                    assert!(seen().iter().all(|s| s.lifetime <= 2), "{:?}", seen());
+                });
+                app.run(rig)
+            })
+        });
+        assert!(ran.is_ok(), "{ran:?}");
+    }
+
+    /// Leaving selection for a chart's loading or for the practice page
+    /// ends its lifetime: an update the select screen makes after it is
+    /// never drawn (design.md "Rendering and Skins", Screen skins).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn leaving_for_a_chart_or_the_practice_page_draws_no_later_update() {
+        use bms_model::TimeSource as _;
+        use game::AppRig as _;
+        for practice in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (sel, roots) = tree(dir.path(), &[&["a.bms"]]);
+            let chart = roots[0].join("a.bms");
+            let screens = crate::render_side::tests::Installers::default();
+            let drawn = on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+                if practice {
+                    let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+                    rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+                } else {
+                    rig.entered_loading(&chart);
+                }
+                let sel = rig.selection.as_mut().unwrap();
+                sel.dirty = true;
+                sel.show(&rig.render, None, rig.clock.now());
+                assert!(rig.render.fence(Duration::from_secs(5)));
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.revision)
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                drawn.contains(&1) && !drawn.contains(&2),
+                "{practice}: {drawn:?}"
+            );
+        }
+    }
+
+    /// A selection skin refused at runtime is said on the select screen:
+    /// the game thread's next look puts the reason in the notice of the
+    /// update it sends (design.md "Rendering and Skins", Screen skins).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_runtime_refusal_is_the_notice_of_the_next_update() {
+        use game::AppRig as _;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(dir.path(), &[&["a.bms"]]);
+        let screens = crate::render_side::tests::Installers::default();
+        let render = screens.spawn_bare();
+        let skin = crate::render_side::tests::bundle();
+        assert_eq!(
+            render
+                .select(skin_model::ScreenKind::Selection, Some(skin))
+                .wait()
+                .unwrap(),
+            game::Preparation::Ready
+        );
+        let next = on_selection(sel, &screens, render, |rig| {
+            screens.refuse_selection.store(true, Ordering::Release);
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.state.is_none())
+            }));
+            let before = screens.updates.lock().unwrap().len();
+            assert!(rig.choose().is_none());
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens.updates.lock().unwrap().len() > before
+            }));
+            screens.updates.lock().unwrap().last().unwrap().clone()
+        });
+        assert_eq!((next.lifetime, next.revision), (1, 2));
+        let notice = next.strip.notice.unwrap_or_default();
+        assert!(notice.contains("refused for the test"), "{notice}");
     }
 
     const ALL: &str = "▶ 全譜面";

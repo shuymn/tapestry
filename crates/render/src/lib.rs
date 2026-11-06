@@ -78,8 +78,8 @@ pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 pub use renderer::{
     Admission, CommitError, FrameTiming, LoadingTextError, LoadingTextKey, MAX_SPRITES,
-    MemoryWitness, PreparedToken, RenderError, Renderer, SHARED_TEXELS, Target, VM_TEXELS,
-    letterbox,
+    MemoryWitness, PreparedToken, RenderError, Renderer, SHARED_TEXELS, STRIP_SPRITES, Target,
+    VM_TEXELS, letterbox,
 };
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,

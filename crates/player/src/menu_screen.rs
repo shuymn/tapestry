@@ -41,6 +41,7 @@ use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 use crate::loading_state::LoadingUpdate;
 use crate::loading_text::ChosenChart;
 use crate::render_side::{Screen, refusal};
+use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionUpdate, StripText};
 
 /// The size of a line's text, in layout pixels (1920×1080).
 pub const TEXT_SIZE: f32 = 30.0;
@@ -209,6 +210,95 @@ fn lines_from(top: f32, i: usize) -> f32 {
     top + LINE_STEP * i as f32
 }
 
+/// `page`'s lines laid out in `fonts` from `left` and `top`, and its
+/// caret's area.
+fn lay_out(
+    fonts: &mut Fonts,
+    page: &MenuPage,
+    left: f32,
+    top: f32,
+) -> (Vec<TextBlock>, Option<[f32; 4]>) {
+    let blocks: Vec<TextBlock> = page
+        .lines
+        .iter()
+        .take(PAGE_LINES)
+        .enumerate()
+        .map(|(i, line)| {
+            let style = TextStyle {
+                left,
+                top: lines_from(top, i),
+                size: TEXT_SIZE,
+                color: line.style.color(),
+            };
+            TextBlock::new(fonts, &line.text, style)
+        })
+        .collect();
+    let area = caret_area(page, |prefix| {
+        let style = TextStyle {
+            left: LEFT,
+            top: 0.0,
+            size: TEXT_SIZE,
+            color: [0; 4],
+        };
+        TextBlock::new(fonts, prefix, style).width()
+    });
+    (blocks, area)
+}
+
+/// The underline of `page`'s composition, from its caret's `area`: none
+/// when nothing is composed.
+fn underline(page: &MenuPage, area: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    area.filter(|_| page.caret.is_some_and(|c| c.end > c.start))
+        .map(|[x, y, w, h]| [x, y + h - 6.0, w, 2.0])
+}
+
+/// What the selection skin's text on this screen was prepared for: text
+/// prepared for another device, size, update or skin state is prepared
+/// again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionKey {
+    device: u64,
+    target: [u32; 2],
+    lifetime: u64,
+    revision: u64,
+    state: u64,
+}
+
+/// The strip's sprites over a selection skin at `now`, in layout pixels:
+/// a dark band under each line shown (the search line and the notice, and
+/// the preset's name while it shows) and the composition's underline. At
+/// most [`render::STRIP_SPRITES`]; allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn strip_sprites(
+    lines: usize,
+    preset: bool,
+    underline: Option<[f32; 4]>,
+    out: &mut [Sprite; render::STRIP_SPRITES],
+) -> usize {
+    let band = |i: usize| Sprite {
+        rect: [0.0, line_top(i) - 3.0, 1_920.0, LINE_STEP],
+        uv: solid_uv(),
+        color: [0.0, 0.0, 0.0, 0.75],
+        ..Sprite::default()
+    };
+    let shown = lines.min(2) + usize::from(preset);
+    let mut n = 0;
+    for (i, slot) in out.iter_mut().take(shown).enumerate() {
+        *slot = band(i);
+        n += 1;
+    }
+    if let (Some(rect), Some(slot)) = (underline, out.get_mut(n)) {
+        *slot = Sprite {
+            rect,
+            uv: solid_uv(),
+            color: [1.0; 4],
+            ..Sprite::default()
+        };
+        n += 1;
+    }
+    n
+}
+
 /// Where the load's lines start on the play screen while a chart loads:
 /// right of the lanes, under the measurement overlay's place.
 const LOADING_LEFT: f32 = 1_000.0;
@@ -241,6 +331,23 @@ pub struct MenuScreen {
     stale: bool,
     /// The chosen chart's text as the loading presentation holds it.
     chosen: ChosenTextState,
+    /// The strip's search line and notice over a selection skin.
+    strip: Option<MenuText>,
+    /// The strip's preset name, drawn while it shows.
+    preset: Option<MenuText>,
+    /// The strip's lines prepared.
+    strip_lines: usize,
+    /// The strip's composition, underlined.
+    strip_underline: Option<[f32; 4]>,
+    /// What the selection skin's text and the strip were prepared for.
+    selection_key: Option<SelectionKey>,
+    /// The caret's area of the fallback page prepared with the selection
+    /// skin, sent when a refusal draws the page.
+    page_caret: Option<[f32; 4]>,
+    /// A frame's app work allocates once while set (tests: the allocation
+    /// guards' positive control).
+    #[cfg(all(test, feature = "dev-tools"))]
+    alloc_probe: bool,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -352,7 +459,91 @@ impl MenuScreen {
                 staged: None,
                 refused: None,
             },
+            strip: None,
+            preset: None,
+            strip_lines: 0,
+            strip_underline: None,
+            selection_key: None,
+            page_caret: None,
+            #[cfg(all(test, feature = "dev-tools"))]
+            alloc_probe: false,
         }
+    }
+
+    /// Brings the selection skin's text, the strip and the fallback page
+    /// to `u` when it is not prepared for it on this screen: the page
+    /// first (what a refusal draws), then the strip, then the skin's state
+    /// and its lines. Allocates: on an update or a resize, outside a
+    /// frame's build.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is the device's or the font's: the screen is built
+    /// again. The inner one is the skin's refusal of its text on a healthy
+    /// device.
+    fn prepare_selection(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: &mut SelectionLogic,
+        changed: bool,
+    ) -> Result<Result<(), String>, RenderError> {
+        let key = SelectionKey {
+            device: self.renderer.device_generation(),
+            target: self.renderer.target(),
+            lifetime: u.lifetime,
+            revision: u.revision,
+            state: logic.id,
+        };
+        if !changed && !self.stale && self.selection_key == Some(key) {
+            return Ok(Ok(()));
+        }
+        self.selection_key = None;
+        self.page_caret = self.prepare_page(&u.page, LEFT, TOP)?;
+        self.prepare_strip(&u.strip)?;
+        let skin = Arc::clone(logic.bundle.skin());
+        if let Err(e) = skin.update_selection(&mut logic.sel, &u.view, &u.labels) {
+            return Ok(Err(e.to_string()));
+        }
+        match self.renderer.prepare_selection_text(&mut logic.sel) {
+            Ok(()) => {}
+            Err(e) if e.is_refusal() => return Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => return Err(e),
+        }
+        self.selection_key = Some(key);
+        Ok(Ok(()))
+    }
+
+    /// The app's share of a selection frame of `u` at `now`: the skin's
+    /// timers from the update's starts, the skin's frame and the strip's
+    /// sprites staged, with no call into wgpu. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame: nothing is staged.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_selection_frame(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: &mut SelectionLogic,
+        now: bms_model::TimeUs,
+    ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        let mut sprites = [Sprite::default(); render::STRIP_SPRITES];
+        let n = strip_sprites(
+            self.strip_lines,
+            u.events.preset_shown(now),
+            self.strip_underline,
+            &mut sprites,
+        );
+        let frame = skin_model::SelectionFrame {
+            now,
+            target: self.renderer.target(),
+            layout: &skin_model::Layout::AUTHOR,
+            timers: u.events.timers(),
+        };
+        self.renderer
+            .build_selection(&mut logic.sel, &frame, sprites.get(..n).unwrap_or_default())
     }
 
     /// Brings the loading presentation's chosen-chart text to `update`.
@@ -460,34 +651,24 @@ impl MenuScreen {
     /// As the renderer's text, and [`Fonts::runtime`] on a screen for plays
     /// only, whose first page is the first that needs a font.
     fn prepare(&mut self, page: &MenuPage, left: f32, top: f32) -> Result<(), RenderError> {
+        let area = self.prepare_page(page, left, top)?;
+        self.send(area);
+        Ok(())
+    }
+
+    /// [`prepare`](Self::prepare), its caret's area returned instead of
+    /// sent.
+    fn prepare_page(
+        &mut self,
+        page: &MenuPage,
+        left: f32,
+        top: f32,
+    ) -> Result<Option<[f32; 4]>, RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
             none => none.insert(Fonts::runtime()?),
         };
-        let blocks: Vec<TextBlock> = page
-            .lines
-            .iter()
-            .take(PAGE_LINES)
-            .enumerate()
-            .map(|(i, line)| {
-                let style = TextStyle {
-                    left,
-                    top: lines_from(top, i),
-                    size: TEXT_SIZE,
-                    color: line.style.color(),
-                };
-                TextBlock::new(fonts, &line.text, style)
-            })
-            .collect();
-        let area = caret_area(page, |prefix| {
-            let style = TextStyle {
-                left: LEFT,
-                top: 0.0,
-                size: TEXT_SIZE,
-                color: [0; 4],
-            };
-            TextBlock::new(fonts, prefix, style).width()
-        });
+        let (blocks, area) = lay_out(fonts, page, left, top);
         let refs: Vec<&TextBlock> = blocks.iter().collect();
         let text = self
             .text
@@ -499,9 +680,42 @@ impl MenuScreen {
             .iter()
             .take(PAGE_LINES)
             .position(|l| l.style == LineStyle::Cursor);
-        self.underline = area
-            .filter(|_| page.caret.is_some_and(|c| c.end > c.start))
-            .map(|[x, y, w, h]| [x, y + h - 6.0, w, 2.0]);
+        self.underline = underline(page, area);
+        Ok(area)
+    }
+
+    /// Lays out the strip `strip` over a selection skin: its search line
+    /// and notice from the top, the preset's name in a text of its own
+    /// under them, which a frame draws only while it shows; the caret's
+    /// area goes to the window.
+    fn prepare_strip(&mut self, strip: &StripText) -> Result<(), RenderError> {
+        let fonts = match &mut self.fonts {
+            Some(fonts) => fonts,
+            none => none.insert(Fonts::runtime()?),
+        };
+        let page = strip.page();
+        let (blocks, area) = lay_out(fonts, &page, LEFT, TOP);
+        let refs: Vec<&TextBlock> = blocks.iter().collect();
+        let text = self
+            .strip
+            .get_or_insert_with(|| MenuText::new(&self.renderer));
+        text.prepare(&self.renderer, fonts, &refs)?;
+        let preset = MenuPage {
+            lines: vec![MenuLine {
+                text: strip.preset.clone(),
+                style: LineStyle::Title,
+            }],
+            caret: None,
+        };
+        let below = lines_from(TOP, page.lines.len());
+        let (blocks, _) = lay_out(fonts, &preset, LEFT, below);
+        let refs: Vec<&TextBlock> = blocks.iter().collect();
+        let text = self
+            .preset
+            .get_or_insert_with(|| MenuText::new(&self.renderer));
+        text.prepare(&self.renderer, fonts, &refs)?;
+        self.strip_lines = page.lines.len();
+        self.strip_underline = underline(&page, area);
         self.send(area);
         Ok(())
     }
@@ -725,6 +939,82 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    /// The skin installed for selection draws `u` with `logic`, the strip
+    /// over it; without one (or with a state of another installation) the
+    /// page draws. A refusal of the skin's text or frame draws the page
+    /// prepared with the update in the same frame, which prepares nothing
+    /// more.
+    fn selection(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: Option<&mut SelectionLogic>,
+        changed: bool,
+        now: bms_model::TimeUs,
+    ) -> Result<SelectionDrawn, RenderError> {
+        let installed = self.renderer.selection_bundle().cloned();
+        let logic = logic.filter(|l| installed.is_some_and(|b| Arc::ptr_eq(&b, &l.bundle)));
+        let Some(logic) = logic else {
+            // A page laid out for the skin's screen sent no caret: it is
+            // laid out again with its own.
+            let changed = changed || self.selection_key.take().is_some();
+            let timing = self.menu(&u.page, changed)?;
+            return Ok(SelectionDrawn {
+                timing,
+                refused: None,
+            });
+        };
+        let refused = match self.prepare_selection(u, logic, changed)? {
+            Ok(()) => match self.build_selection_frame(u, logic, now) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            },
+            Err(why) => Some(why),
+        };
+        if refused.is_some() {
+            // The page prepared with the update draws, its caret with it
+            // in place of the strip's.
+            self.selection_key = None;
+            self.send(self.page_caret);
+            let timing = self.menu_frame(&u.page, false)?;
+            self.shown(timing.presented);
+            return Ok(SelectionDrawn { timing, refused });
+        }
+        let preset = u.events.preset_shown(now);
+        let texts = [
+            self.strip.as_ref().filter(|_| self.strip_lines > 0),
+            self.preset.as_ref().filter(|_| preset),
+        ];
+        let mut drawn: [Option<&MenuText>; 2] = [None; 2];
+        let mut n = 0;
+        for t in texts.into_iter().flatten() {
+            if let Some(slot) = drawn.get_mut(n) {
+                *slot = Some(t);
+                n += 1;
+            }
+        }
+        let timing = match drawn {
+            [Some(a), Some(b)] => self.renderer.submit_selection(&[a, b]),
+            [Some(a), None] => self.renderer.submit_selection(&[a]),
+            _ => self.renderer.submit_selection(&[]),
+        }?;
+        self.shown(timing.presented);
+        Ok(SelectionDrawn {
+            timing,
+            refused: None,
+        })
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_requests(&self) -> (Vec<String>, usize) {
+        let (lines, rasterized) = self.renderer.selection_requests();
+        (lines.to_vec(), rasterized)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
+        self.renderer.selection_quads()
+    }
+
     /// A new size invalidates the text prepared: the page shown, or the
     /// launch screen, is prepared again before its next frame.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -805,38 +1095,55 @@ impl MenuScreen {
         if changed || self.stale || self.text.is_none() {
             self.prepare(page, LEFT, TOP)?;
         }
-        let cursor = self.cursor;
-        let underline = self.underline;
+        let start = self.build_page_frame();
         let Some(text) = &self.text else {
             return Err(RenderError::OtherRenderersText);
         };
-        self.renderer.menu_frame(
-            |b| {
-                if let Some(i) = cursor {
-                    b.push(
-                        Blend::Alpha,
-                        Sprite {
-                            rect: [LEFT - 20.0, line_top(i) - 3.0, 1_840.0, LINE_STEP - 2.0],
-                            uv: solid_uv(),
-                            color: [0.15, 0.3, 0.6, 1.0],
-                            ..Sprite::default()
-                        },
-                    );
-                }
-                if let Some(rect) = underline {
-                    b.push(
-                        Blend::Alpha,
-                        Sprite {
-                            rect,
-                            uv: solid_uv(),
-                            color: [1.0; 4],
-                            ..Sprite::default()
-                        },
-                    );
-                }
-            },
-            text,
-        )
+        self.renderer.submit_menu(start, text)
+    }
+
+    /// The app's share of a frame of the page prepared last: its cursor
+    /// and composition sprites staged, with no call into wgpu. Allocates
+    /// nothing. Returns when the frame's work began.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_page_frame(&mut self) -> std::time::Instant {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        let cursor = self.cursor;
+        let underline = self.underline;
+        self.renderer.build_menu(|b| {
+            if let Some(i) = cursor {
+                b.push(
+                    Blend::Alpha,
+                    Sprite {
+                        rect: [LEFT - 20.0, line_top(i) - 3.0, 1_840.0, LINE_STEP - 2.0],
+                        uv: solid_uv(),
+                        color: [0.15, 0.3, 0.6, 1.0],
+                        ..Sprite::default()
+                    },
+                );
+            }
+            if let Some(rect) = underline {
+                b.push(
+                    Blend::Alpha,
+                    Sprite {
+                        rect,
+                        uv: solid_uv(),
+                        color: [1.0; 4],
+                        ..Sprite::default()
+                    },
+                );
+            }
+        })
+    }
+
+    /// Allocates once when the probe is set (tests): the positive control
+    /// of the allocation guards over a frame's app work.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn probe_alloc(&self) {
+        if self.alloc_probe {
+            drop(std::hint::black_box(Box::new(0_u8)));
+        }
     }
 }
 
@@ -1179,4 +1486,7 @@ mod tests {
         screen.menu(&page, true).unwrap();
         assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
     }
+
+    #[cfg(feature = "dev-tools")]
+    mod skinned;
 }

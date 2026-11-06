@@ -94,6 +94,7 @@ use crate::loading_text::LoadingText;
 use crate::loading_text::Stage;
 use crate::measure::{Drawn, Figures, Measure, PlayMeasure};
 use crate::menu_screen::{MenuPage, SPLASH};
+use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionSlot, SelectionUpdate};
 use crate::ui_text::{Label, Message};
 
 /// What draws: the renderer, or a double in tests.
@@ -279,6 +280,44 @@ pub trait Screen: Send {
             presented: true,
             present_count: None,
         })
+    }
+    /// Draws the select screen from `update` at `now`: with `logic`, the
+    /// selection installation's state for the update's lifetime, the skin
+    /// and the strip over it, its text prepared again when `changed` (or
+    /// when this screen has not prepared it); else the update's page, as
+    /// [`menu`](Self::menu). A skin that refuses its frame or its text on
+    /// a healthy device has the update's page drawn instead in the same
+    /// frame, and says why ([`SelectionDrawn::refused`]). The default draws
+    /// the page.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu`](Self::menu).
+    fn selection(
+        &mut self,
+        update: &SelectionUpdate,
+        logic: Option<&mut SelectionLogic>,
+        changed: bool,
+        now: TimeUs,
+    ) -> Result<SelectionDrawn, RenderError> {
+        let _ = (logic, now);
+        self.menu(&update.page, changed)
+            .map(|timing| SelectionDrawn {
+                timing,
+                refused: None,
+            })
+    }
+    /// The lines the selection skin's text last asked for, and how many
+    /// were rasterized (dev-tools tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_requests(&self) -> (Vec<String>, usize) {
+        (Vec::new(), 0)
+    }
+    /// The selection frame last built, its quads (dev-tools tests); none
+    /// by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
+        None
     }
     /// Draws the play screen while a chart loads before READY:
     /// the skin's loading frame `frame`, then `page`, the load's lines,
@@ -601,6 +640,14 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
+    /// Answer when taken (tests): the render thread has taken every
+    /// message before it, and drawn the frame that followed them, if any.
+    #[cfg(test)]
+    Fence(mpsc::SyncSender<()>),
+    /// Draw the select screen from the newest update in the slot
+    /// ([`RenderLink::show_selection`]), if it is newer than the one held
+    /// and its lifetime current.
+    SelectionChanged,
     /// Draw the play screen's loading state of this loading lifetime with
     /// the lines in the slot ([`LoadingSink`]), kept through a chart's load
     /// and a preparation until something else is drawn; nothing when the
@@ -745,6 +792,28 @@ struct Shared {
     /// written at each build: what a skin is packed for
     /// ([`RenderLink::atlas_limits`]).
     packing: Mutex<Option<(skin_model::AtlasLimits, [u32; 2])>>,
+    /// The select screen's newest update and its current lifetime.
+    selection: Mutex<SelectionSlot>,
+    /// Why the selection skin was refused at runtime, until the game
+    /// thread takes it for its notice ([`RenderLink::take_selection_refusal`]).
+    selection_refused: Mutex<Option<String>>,
+    /// How long the launch screen has shown, in place of the clock's
+    /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
+    #[cfg(test)]
+    launch_elapsed: Mutex<Option<Duration>>,
+}
+
+impl Shared {
+    fn selection_slot(&self) -> std::sync::MutexGuard<'_, SelectionSlot> {
+        self.selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `lifetime` is selection's current one.
+    fn selection_current(&self, lifetime: u64) -> bool {
+        self.selection_slot().current(lifetime)
+    }
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -1065,6 +1134,63 @@ impl RenderLink {
         *wake = Some(self.tx.clone());
         extent.queued.store(false, Ordering::Release);
         self.send(RenderMsg::Follow(Arc::clone(extent)));
+    }
+
+    /// Whether the render thread answered a fence within `deadline`
+    /// (tests): it took every message sent before it, and drew the frame
+    /// that followed them, if any ([`RenderMsg::Fence`]).
+    #[cfg(test)]
+    pub(crate) fn fence(&self, deadline: Duration) -> bool {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Fence(tx));
+        rx.recv_timeout(deadline).is_ok()
+    }
+
+    /// Makes the render thread read the launch screen's time as `elapsed`
+    /// from now on, or from its clock again with `None` (tests).
+    #[cfg(test)]
+    pub(crate) fn set_launch_elapsed(&self, elapsed: Option<Duration>) {
+        *self
+            .shared
+            .launch_elapsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = elapsed;
+    }
+
+    /// Selection lifetime `lifetime` begins: updates of it are taken from
+    /// now on, and nothing of an earlier one is kept.
+    pub fn enter_selection(&self, lifetime: u64) {
+        self.shared.selection_slot().enter(lifetime);
+    }
+
+    /// Selection is left (a choice, the practice page): its lifetime ends
+    /// and the slot empties, so no update of it is drawn, one the render
+    /// thread already took included.
+    pub fn leave_selection(&self) {
+        self.shared.selection_slot().leave();
+    }
+
+    /// Shows the select screen's `update`: it replaces one the render
+    /// thread has not taken, and a signal goes only when none waits, so at
+    /// most one update and one message wait whatever the rate. An update
+    /// of a lifetime not current is dropped.
+    pub fn show_selection(&self, update: SelectionUpdate) {
+        // Signalled under the lock, so the render thread's take, which
+        // clears the flag first, never misses it.
+        let mut slot = self.shared.selection_slot();
+        if slot.offer(update) {
+            self.send(RenderMsg::SelectionChanged);
+        }
+    }
+
+    /// Why the selection skin was refused at runtime, once: the select
+    /// screen's notice says it from the next update.
+    pub fn take_selection_refusal(&self) -> Option<String> {
+        self.shared
+            .selection_refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Shows the end screen's `page`: it replaces a page the render thread
@@ -1735,6 +1861,10 @@ pub fn spawn(
         #[cfg(test)]
         commit_timed_out: AtomicBool::new(false),
         packing: Mutex::new(None),
+        selection: Mutex::new(SelectionSlot::default()),
+        selection_refused: Mutex::new(None),
+        #[cfg(test)]
+        launch_elapsed: Mutex::new(None),
     });
     let thread_shared = Arc::clone(&shared);
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
@@ -1794,6 +1924,8 @@ pub fn spawn(
                 menu_stats: crate::dev::MenuStats::default(),
                 #[cfg(feature = "dev-tools")]
                 loading_stats: crate::dev::MenuStats::default(),
+                selection: None,
+                selection_states: 0,
             };
             r.run(&rx);
         })
@@ -2127,6 +2259,18 @@ enum Mode {
         changed: bool,
         loading: Option<u64>,
     },
+    /// The select screen from its newest update: [`Run::selection`].
+    Selection,
+}
+
+/// The select screen as the render thread holds it: the newest update
+/// taken, whether the screen has applied it, and the selection skin's
+/// state for its lifetime ([`SelectionLogic`]), kept apart from the
+/// screen so a screen built again draws on from it.
+struct ShownSelection {
+    update: Box<SelectionUpdate>,
+    changed: bool,
+    logic: Option<SelectionLogic>,
 }
 
 /// An attempt's preparation the screen has not answered yet.
@@ -2222,9 +2366,76 @@ struct Run {
     /// The loading state's frames (dev-tools).
     #[cfg(feature = "dev-tools")]
     loading_stats: crate::dev::MenuStats,
+    /// The select screen's newest update and skin state, while its
+    /// lifetime is current.
+    selection: Option<ShownSelection>,
+    /// The selection skin states made so far: each takes the next number.
+    selection_states: u64,
 }
 
 impl Run {
+    /// How long the launch screen has shown: since the render thread
+    /// started (in tests, the time a test set instead, if any).
+    fn launch_elapsed(shared: &Shared, started: Instant) -> Duration {
+        #[cfg(test)]
+        if let Some(elapsed) = *shared
+            .launch_elapsed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return elapsed;
+        }
+        #[cfg(not(test))]
+        let _ = shared;
+        started.elapsed()
+    }
+
+    /// Takes the newest selection update from the slot, if it is newer than
+    /// the one held and its lifetime current: the lifetime's first starts
+    /// the skin's state afresh.
+    fn take_selection(&mut self) {
+        let taken = {
+            let mut slot = self.shared.selection_slot();
+            slot.take().filter(|u| slot.current(u.lifetime))
+        };
+        let Some(update) = taken else {
+            return;
+        };
+        match &mut self.selection {
+            Some(shown) if !update.newer_than(&shown.update) => {}
+            Some(shown) if shown.update.lifetime == update.lifetime => {
+                shown.update = update;
+                shown.changed = true;
+            }
+            other => {
+                *other = Some(ShownSelection {
+                    update,
+                    changed: true,
+                    logic: None,
+                });
+            }
+        }
+    }
+
+    /// The selection skin's state for `shown`'s lifetime on the committed
+    /// installation: made afresh for a new lifetime or installation, none
+    /// without an installation.
+    fn selection_logic(committed: &Committed, shown: &mut ShownSelection, states: &mut u64) {
+        match committed.get(ScreenKind::Selection) {
+            None => shown.logic = None,
+            Some(i)
+                if shown
+                    .logic
+                    .as_ref()
+                    .is_none_or(|l| !Arc::ptr_eq(&l.bundle, i.bundle())) =>
+            {
+                *states = states.saturating_add(1);
+                shown.logic = Some(SelectionLogic::new(i.bundle(), *states));
+            }
+            Some(_) => {}
+        }
+    }
+
     fn run(&mut self, rx: &Receiver<RenderMsg>) {
         let mut mode = Mode::Splash { pending: None };
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
@@ -2311,18 +2522,43 @@ impl Run {
                     mode = after_preparing(mode);
                     continue;
                 }
+                // A test's fence: every message before it was taken, and
+                // the frame after them drawn.
+                #[cfg(test)]
+                Ok(RenderMsg::Fence(reply)) => {
+                    let _ = reply.send(());
+                    continue;
+                }
                 Ok(RenderMsg::Menu(page)) => {
                     mode = match mode {
                         // The launch screen shows out its time.
-                        Mode::Splash { .. } if self.started.elapsed() < SPLASH => Mode::Splash {
-                            pending: Some(page),
-                        },
+                        Mode::Splash { .. }
+                            if Self::launch_elapsed(&self.shared, self.started) < SPLASH =>
+                        {
+                            Mode::Splash {
+                                pending: Some(page),
+                            }
+                        }
                         _ => Mode::Menu {
                             page,
                             update: None,
                             changed: true,
                             loading: None,
                         },
+                    };
+                }
+                Ok(RenderMsg::SelectionChanged) => {
+                    self.take_selection();
+                    mode = match mode {
+                        // The launch screen shows out its time, the
+                        // select screen after it.
+                        Mode::Splash { .. }
+                            if Self::launch_elapsed(&self.shared, self.started) < SPLASH =>
+                        {
+                            Mode::Splash { pending: None }
+                        }
+                        _ if self.selection.is_some() => Mode::Selection,
+                        other => other,
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
@@ -2539,17 +2775,34 @@ impl Run {
                 _ => None,
             };
             // The launch screen's time is over: the page waiting replaces it.
-            let elapsed = self.started.elapsed();
+            let elapsed = Self::launch_elapsed(&self.shared, self.started);
             if elapsed >= SPLASH
                 && let Mode::Splash { pending } = &mut mode
-                && let Some(page) = pending.take()
             {
-                mode = Mode::Menu {
-                    page,
-                    update: None,
-                    changed: true,
-                    loading: None,
-                };
+                if let Some(page) = pending.take() {
+                    mode = Mode::Menu {
+                        page,
+                        update: None,
+                        changed: true,
+                        loading: None,
+                    };
+                } else if self.selection.is_some() {
+                    mode = Mode::Selection;
+                }
+            }
+            // Selection was left during the wait: nothing of its update is
+            // built or presented, and nothing is drawn until what comes
+            // next, which takes the frame granted. Checked here, after the
+            // launch screen handed over and right before the build.
+            if matches!(mode, Mode::Selection)
+                && self
+                    .selection
+                    .as_ref()
+                    .is_none_or(|s| !self.shared.selection_current(s.update.lifetime))
+            {
+                self.selection = None;
+                mode = Mode::Idle;
+                continue;
             }
             #[cfg(feature = "dev-tools")]
             let mut view_stamp = None;
@@ -2562,12 +2815,16 @@ impl Run {
                         // No launch screen: the page waiting, if any, at
                         // once; else the frame granted waits for what
                         // comes next.
-                        mode = pending.take().map_or(Mode::Idle, |page| Mode::Menu {
-                            page,
-                            update: None,
-                            changed: true,
-                            loading: None,
-                        });
+                        mode = match pending.take() {
+                            Some(page) => Mode::Menu {
+                                page,
+                                update: None,
+                                changed: true,
+                                loading: None,
+                            },
+                            None if self.selection.is_some() => Mode::Selection,
+                            None => Mode::Idle,
+                        };
                         continue;
                     };
                     drawn.map(|presented| {
@@ -2766,6 +3023,54 @@ impl Run {
                     *changed = false;
                     drawn
                 }
+                Mode::Selection => {
+                    let Some(shown) = self.selection.as_mut() else {
+                        mode = Mode::Idle;
+                        continue;
+                    };
+                    Self::selection_logic(&self.committed, shown, &mut self.selection_states);
+                    #[cfg(feature = "dev-tools")]
+                    let [_, _, _, before] = crate::alloc_count::counts();
+                    let now = self.clock.now();
+                    let changed = std::mem::replace(&mut shown.changed, false);
+                    let drawn = screen.selection(&shown.update, shown.logic.as_mut(), changed, now);
+                    if let Ok(SelectionDrawn {
+                        refused: Some(why), ..
+                    }) = &drawn
+                    {
+                        // A runtime refusal on a healthy device is for the
+                        // rest of the run: the installation goes from the
+                        // screen and from what a screen built again
+                        // restores, and the game thread's next look shows
+                        // why; this frame drew the page.
+                        eprintln!(
+                            "render: the selection skin was refused, the built-in page draws from now on: {why}"
+                        );
+                        screen.remove(ScreenKind::Selection);
+                        self.committed.clear(ScreenKind::Selection);
+                        shown.logic = None;
+                        *self
+                            .shared
+                            .selection_refused
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
+                    }
+                    #[cfg(feature = "dev-tools")]
+                    if let Ok(d) = &drawn {
+                        let [_, _, _, after] = crate::alloc_count::counts();
+                        self.menu_stats.frame(d.timing.cpu, after - before, changed);
+                        // What a refusal put on the screen, once drawn.
+                        if changed
+                            && let Some(notice) = shown.update.page.lines.iter().find(|l| {
+                                l.style == crate::menu_screen::LineStyle::Notice
+                                    && !l.text.is_empty()
+                            })
+                        {
+                            println!("dev: drawn notice: {}", notice.text);
+                        }
+                    }
+                    drawn.map(|d| (d.timing, None))
+                }
                 Mode::End => screen.end(&self.end_page.1).map(|presented| {
                     let timing = FrameTiming {
                         cpu: Duration::ZERO,
@@ -2793,7 +3098,7 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
-                        menu: matches!(mode, Mode::Menu { .. }),
+                        menu: matches!(mode, Mode::Menu { .. } | Mode::Selection),
                         #[cfg(feature = "dev-tools")]
                         loading: matches!(
                             mode,
@@ -7257,10 +7562,89 @@ pub(crate) mod tests {
             self.installed.clear(kind);
         }
         fn wait(&self) -> bool {
+            self.shared.waits.fetch_add(1, Ordering::AcqRel);
+            while self.shared.pace.load(Ordering::Acquire) {
+                let permits = &self.shared.permits;
+                if permits
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    break;
+                }
+                self.shared.held.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.shared.held.store(false, Ordering::Release);
             true
         }
         fn paced(&self) -> bool {
-            false
+            self.shared.pace.load(Ordering::Acquire)
+        }
+        fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
+            let shown = self.shared.splash.load(Ordering::Acquire);
+            if shown {
+                self.shared.splashes.fetch_add(1, Ordering::AcqRel);
+            }
+            shown.then_some(Ok(true))
+        }
+        fn selection(
+            &mut self,
+            update: &crate::selection_skin::SelectionUpdate,
+            logic: Option<&mut crate::selection_skin::SelectionLogic>,
+            changed: bool,
+            now: TimeUs,
+        ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
+            if self.shared.fail.load(Ordering::Acquire) {
+                return Err(RenderError::SurfaceLost);
+            }
+            // A skin draws only with its installation on this screen.
+            let logic = logic.filter(|_| self.installed.get(ScreenKind::Selection).is_some());
+            let state = logic.as_ref().map(|l| l.id);
+            let seen = SelectionSeen {
+                device: self.device,
+                lifetime: update.lifetime,
+                revision: update.revision,
+                state,
+                changed,
+                events: update.events,
+            };
+            self.shared.selections.lock().unwrap().push(seen);
+            if changed {
+                self.shared.updates.lock().unwrap().push(update.clone());
+            }
+            // The skin's frame at `now`, built by the model alone, when the
+            // skin is a selection skin.
+            if let Some(logic) = logic.filter(|_| state.is_some()) {
+                let skin = Arc::clone(logic.bundle.skin());
+                if skin
+                    .update_selection(&mut logic.sel, &update.view, &update.labels)
+                    .is_ok()
+                {
+                    let mut batch = skin_model::QuadBatch::with_capacity(
+                        skin.quad_capacity(),
+                        skin.run_capacity(),
+                    );
+                    let frame = skin_model::SelectionFrame {
+                        now,
+                        target: [1_920, 1_080],
+                        layout: &skin_model::Layout::AUTHOR,
+                        timers: update.events.timers(),
+                    };
+                    if skin
+                        .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
+                        .is_ok()
+                    {
+                        let rects = batch.quads().iter().map(|q| q.rect).collect();
+                        self.shared.built.lock().unwrap().push((seen, now, rects));
+                    }
+                }
+            }
+            let refused = (state.is_some() && self.shared.refuse_selection.load(Ordering::Acquire))
+                .then(|| "refused for the test".to_owned());
+            Ok(crate::selection_skin::SelectionDrawn {
+                timing: timing(true),
+                refused,
+            })
         }
         fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
             Ok(())
@@ -7328,9 +7712,11 @@ pub(crate) mod tests {
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
     pub(crate) struct Installers {
-        builds: Arc<AtomicU32>,
+        /// The screens built so far.
+        pub(crate) builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
-        fail: Arc<AtomicBool>,
+        /// Every frame and installation fails as a lost device while set.
+        pub(crate) fail: Arc<AtomicBool>,
         loading: Arc<AtomicU32>,
         /// Loading frames drawn as the pending presentation.
         pending: Arc<AtomicU32>,
@@ -7352,6 +7738,29 @@ pub(crate) mod tests {
         /// Set once a removal waits on `hold_remove`.
         remove_held: Arc<AtomicBool>,
         log: Log,
+        /// Selection frames refuse while set, as a skin refusing one.
+        pub(crate) refuse_selection: Arc<AtomicBool>,
+        /// Frames are paced while set: each wait takes one of `permits`,
+        /// holding until there is one.
+        pub(crate) pace: Arc<AtomicBool>,
+        pub(crate) permits: Arc<AtomicU32>,
+        /// The waits begun.
+        pub(crate) waits: Arc<AtomicU32>,
+        /// Set while a wait holds for want of a permit.
+        pub(crate) held: Arc<AtomicBool>,
+        /// The screens draw a launch screen while set; none otherwise.
+        pub(crate) splash: Arc<AtomicBool>,
+        /// The launch screen frames drawn.
+        pub(crate) splashes: Arc<AtomicU32>,
+        /// Each selection frame: its update's lifetime and revision, the
+        /// skin state's number (none without one), whether it was laid out
+        /// again, and its timers.
+        pub(crate) selections: Arc<std::sync::Mutex<Vec<SelectionSeen>>>,
+        /// Each update a selection frame applied first, in order.
+        pub(crate) updates: Arc<std::sync::Mutex<Vec<crate::selection_skin::SelectionUpdate>>>,
+        /// Each selection frame a selection skin built (by the model
+        /// alone): the frame, its time and its quads' rects.
+        pub(crate) built: Arc<std::sync::Mutex<Vec<SelectionBuilt>>>,
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
         /// Restores of this kind are refused as on a healthy device.
@@ -7370,6 +7779,21 @@ pub(crate) mod tests {
         /// for none.
         hold_staged: Arc<std::sync::atomic::AtomicU64>,
     }
+
+    /// One selection frame as an [`Installer`] saw it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct SelectionSeen {
+        pub(crate) device: u64,
+        pub(crate) lifetime: u64,
+        pub(crate) revision: u64,
+        pub(crate) state: Option<u64>,
+        pub(crate) changed: bool,
+        pub(crate) events: crate::selection_skin::SelectionEvents,
+    }
+
+    /// A selection skin's frame as an [`Installer`] built it: the frame,
+    /// its time and its quads' rects in layout pixels.
+    pub(crate) type SelectionBuilt = (SelectionSeen, TimeUs, Vec<[f32; 4]>);
 
     impl Installers {
         /// A render thread on these installers with `chart` loaded and
@@ -10848,4 +11272,7 @@ pub(crate) mod tests {
     // Lane input through the acquisition into both skins' key beams and
     // key timers.
     mod lane_input;
+    // The select screen's updates through the slot into the skin or the
+    // page.
+    mod selection;
 }

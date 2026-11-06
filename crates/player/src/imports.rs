@@ -384,6 +384,10 @@ pub fn build(
     }
 }
 
+/// Why a Lua selection skin keeps the built-in select screen: it is
+/// activated with runtime Lua outside play (docs/stage3.md S7-07).
+pub const LUA_SELECTION: &str = "a Lua selection skin needs runtime Lua (S7-07)";
+
 /// What [`built`] made.
 enum Built {
     Bundle(Arc<SkinBundle>, Summary),
@@ -455,6 +459,11 @@ fn built(
             slot: kind,
             found,
         }));
+    }
+    // A Lua selection skin waits for runtime Lua outside play: no Lua
+    // beyond its header runs for a skin that will not be used.
+    if kind == ScreenKind::Selection && matches!(pass, Pass::Lua(_)) {
+        return Ok(Built::NoImporter(LUA_SELECTION.to_owned()));
     }
     stopped()?;
     // 3. The configuration.
@@ -941,13 +950,18 @@ pub struct Started {
     /// Play's pending skin, marked pending on the render thread: each
     /// attempt is prepared with its specialization ([`PendingSkin`]).
     pub pending: Option<PendingSkin>,
+    /// The installed selection skin's song list: its center slot and its
+    /// placements, which the select screen's view is made for.
+    pub selection: Option<(usize, usize)>,
 }
 
 impl PartialEq for Started {
-    /// The notices equal, and the pending skins the same one, if any.
+    /// The notices and the selection windows equal, and the pending
+    /// skins the same one, if any.
     fn eq(&self, other: &Self) -> bool {
         self.play == other.play
             && self.notice == other.notice
+            && self.selection == other.selection
             && match (&self.pending, &other.pending) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(&a.play, &b.play),
@@ -1040,9 +1054,15 @@ pub fn startup(
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
+                let skin = bundle.skin();
+                let window = (kind == ScreenKind::Selection)
+                    .then(|| (skin.song_list_center(), skin.song_list_slots()));
                 let pending = render.select(kind, Some(bundle));
                 match answered(kind, pending, &mut stop)? {
                     None => {
+                        if window.is_some() {
+                            started.selection = window;
+                        }
                         committed = committed.saturating_add(texels);
                         let atlas = Atlas { texels, side };
                         log_installed(kind, &summary, atlas, committed, log::logger());

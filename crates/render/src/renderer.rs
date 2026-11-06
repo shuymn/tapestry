@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasLimits, BitmapLines, BuildError, ChartText, Layout, ScreenKind, TextSlots, TextTable,
-    TextTableError,
+    AtlasLimits, BitmapLines, BuildError, ChartText, Layout, ScreenKind, Selection, SelectionFrame,
+    TextSlots, TextTable, TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
@@ -33,8 +33,28 @@ use crate::text_cache::{Holder, TextCache};
 use crate::text_upload::{self, TextReport, TextScratch};
 use crate::{
     AttemptInput, Blend, FrameInput, Instance, LoadingFrame, OVERLAY_SPRITES, PlaySkin, SimpleSkin,
-    SkinError, SpriteBatch,
+    SkinError, Sprite, SpriteBatch,
 };
+
+/// The most sprites the selection screen's strip draws over its skin, from
+/// the reserve the skin cannot fill ([`Renderer::build_selection`]).
+pub const STRIP_SPRITES: usize = 4;
+
+/// `rect` in layout pixels (1920×1080, fitted to the whole `target` as
+/// the menus' text is) in the canvas pixels of `skin`'s projection.
+fn layout_to_canvas([x, y, w, h]: [f32; 4], skin: &Projection, target: [u32; 2]) -> [f32; 4] {
+    let [fx, fy, fw, _] = Projection::fixed(target).viewport();
+    let fs = fw / 1_920.0;
+    let [sx, sy, sw, _] = skin.viewport();
+    let [hw, _] = skin.half();
+    let ss = (sw / (2.0 * hw)).max(f32::MIN_POSITIVE);
+    [
+        (fx + x * fs - sx) / ss,
+        (fy + y * fs - sy) / ss,
+        w * fs / ss,
+        h * fs / ss,
+    ]
+}
 
 /// The next [`Renderer`]'s id.
 static RENDERERS: AtomicU64 = AtomicU64::new(0);
@@ -393,10 +413,13 @@ struct Resources {
 }
 
 /// A screen kind's committed installation other than play's: its
-/// installation and its own resources. No frame draws it yet.
+/// installation and its own resources; the selection screen's frames
+/// draw its ([`Renderer::build_selection`]).
 struct Slot {
     installation: Installation,
     resources: Resources,
+    /// The lines the screen's text tables draw, in its resources' cache.
+    text: Holder,
 }
 
 /// An installation staged and not yet committed, of the kind its token
@@ -455,7 +478,8 @@ impl Admission {
 /// replacement reaches (design.md "Memory Budget"): the installed
 /// resources and the staged ones live together until the commit. The
 /// other kinds' committed installations are reported only through
-/// [`Renderer::admission`].
+/// [`Renderer::admission`], but for the selection screen's lines and the
+/// selection skin's state, which change with each update it draws.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryWitness {
     /// The installed bundle's CPU description, kept for recovery.
@@ -508,6 +532,12 @@ pub struct MemoryWitness {
     /// The staged resources' text cache, when they are new, and the staged
     /// attempt's holder.
     pub staged_text_cache: u64,
+    /// The committed selection installation's lines held in its text
+    /// layer's cache: the holder of the lines its frames draw.
+    pub selection_text: u64,
+    /// The selection skin's state the render thread keeps for the screen's
+    /// lifetime, apart from the renderer ([`Renderer::memory_with`]).
+    pub selection_state: u64,
 }
 
 impl MemoryWitness {
@@ -532,6 +562,8 @@ impl MemoryWitness {
             .saturating_add(self.text_upload)
             .saturating_add(self.text_cache)
             .saturating_add(self.staged_text_cache)
+            .saturating_add(self.selection_text)
+            .saturating_add(self.selection_state)
     }
 }
 
@@ -725,6 +757,17 @@ pub struct Renderer {
     /// fails ([`fail_next_text_wait`](Self::fail_next_text_wait)).
     #[cfg(feature = "dev-tools")]
     text_wait_fault: bool,
+    /// Development builds: the lines the last selection text preparation
+    /// asked for.
+    #[cfg(feature = "dev-tools")]
+    selection_requests: Vec<String>,
+    /// Development builds: the lines it rasterized.
+    #[cfg(feature = "dev-tools")]
+    selection_rasterized: usize,
+    /// Development builds: the next selection frame, or text preparation,
+    /// is refused as a skin refuses one.
+    #[cfg(feature = "dev-tools")]
+    selection_faults: (bool, bool),
 }
 
 impl Renderer {
@@ -829,6 +872,12 @@ impl Renderer {
             text_hooks: text_upload::Hooks::default(),
             #[cfg(feature = "dev-tools")]
             text_wait_fault: false,
+            #[cfg(feature = "dev-tools")]
+            selection_requests: Vec::new(),
+            #[cfg(feature = "dev-tools")]
+            selection_rasterized: 0,
+            #[cfg(feature = "dev-tools")]
+            selection_faults: (false, false),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1483,6 +1532,7 @@ impl Renderer {
                         *slot = Some(Slot {
                             installation,
                             resources,
+                            text: Holder::default(),
                         });
                     }
                 }
@@ -1558,6 +1608,7 @@ impl Renderer {
                     *slot = Some(Slot {
                         installation: installation.clone(),
                         resources: r,
+                        text: Holder::default(),
                     });
                 }
             }
@@ -1589,6 +1640,18 @@ impl Renderer {
     /// presentation.
     #[must_use]
     pub fn memory(&self) -> MemoryWitness {
+        self.memory_with(None)
+    }
+
+    /// [`memory`](Self::memory) with `selection`, the selection skin's
+    /// state its owner keeps beside the renderer (the render thread, for
+    /// the screen's lifetime), counted.
+    #[must_use]
+    pub fn memory_with(&self, selection: Option<&Selection>) -> MemoryWitness {
+        let selection_text = Self::screen(ScreenKind::Selection)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+            .map_or(0, |slot| slot.text.bytes());
         let staged = self.pending.as_ref().map(|p| (p, p.skin.installation()));
         let installed = self.installed.as_ref();
         let cpu = staged
@@ -1635,6 +1698,8 @@ impl Renderer {
             staged_batch: res.map_or(0, |r| r.staging.bytes()),
             attempt: self.skin.attempt_bytes(),
             staged_attempt: staged.map_or(0, |p| p.skin.attempt_bytes()),
+            selection_text: bytes(selection_text),
+            selection_state: selection.map_or(0, Selection::resident_bytes),
         }
     }
 
@@ -2081,9 +2146,272 @@ impl Renderer {
         if text.owner() != self.id {
             return Err(RenderError::OtherRenderersText);
         }
+        let start = self.build_menu(sprites);
+        self.submit_menu(start, text)
+    }
+
+    /// The app's share of a menu frame: the sprites `sprites` pushes,
+    /// staged with no call into wgpu, allocating nothing of its own.
+    /// Returns when the frame's work began, for
+    /// [`submit_menu`](Self::submit_menu).
+    pub fn build_menu(&mut self, sprites: impl FnOnce(&mut SpriteBatch)) -> Instant {
         let start = Instant::now();
         self.staging.fill(sprites);
+        start
+    }
+
+    /// Submits and presents the menu frame
+    /// [`build_menu`](Self::build_menu) staged at `start`, with `text`
+    /// over it.
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_menu(
+        &mut self,
+        start: Instant,
+        text: &MenuText,
+    ) -> Result<FrameTiming, RenderError> {
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
         self.draw(start, Some(text), Projection::fixed(self.target()))
+    }
+
+    /// The selection screen's committed bundle, if any: what its frames
+    /// draw ([`build_selection`](Self::build_selection)).
+    #[must_use]
+    pub fn selection_bundle(&self) -> Option<&Arc<SkinBundle>> {
+        self.committed_installation(ScreenKind::Selection)
+            .map(Installation::bundle)
+    }
+
+    /// Prepares `sel`'s lines, as its last view and labels left them
+    /// ([`Skin::update_selection`](skin_model::Skin::update_selection)),
+    /// in the selection installation's text layer, and attaches them with
+    /// its bitmap-font lines. Lines already in the layer cost no raster;
+    /// the lines the selection drew before are let go once the new ones
+    /// are placed, never before, so a refusal leaves them drawing. On a
+    /// view change outside a frame's build: it allocates and waits for
+    /// the GPU. Nothing without a selection installation.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_loading_text`](Self::prepare_loading_text): a refusal
+    /// of a line or a write, or of the tables
+    /// ([`RenderError::Skin`]), both refusals
+    /// ([`RenderError::is_refusal`]), or the device failing while it is
+    /// waited for.
+    pub fn prepare_selection_text(&mut self, sel: &mut Selection) -> Result<(), RenderError> {
+        let target = self.target();
+        #[cfg(feature = "dev-tools")]
+        if std::mem::take(&mut self.selection_faults.1) {
+            return Err(RenderError::Skin(SkinError {
+                reason: "the selection text was refused (development fault)".to_owned(),
+            }));
+        }
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Ok(());
+        };
+        let bundle = Arc::clone(slot.installation.bundle());
+        let skin = bundle.skin();
+        let requests = skin.selection_text_requests(sel, target, &Layout::AUTHOR);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.selection_requests = requests
+                .texts
+                .iter()
+                .chain(&requests.rows)
+                .map(|r| r.text.clone())
+                .collect();
+        }
+        let refused = |e: TextTableError| {
+            RenderError::Skin(SkinError {
+                reason: e.to_string(),
+            })
+        };
+        if let Some(producer) = bundle.text_producer() {
+            self.text_report = TextReport::default();
+            let (texts, held, report) = text_upload::prepare(
+                text_upload::Prepare {
+                    gpu: &self.gpu,
+                    atlas: &slot.resources.atlas,
+                    cache: &mut slot.resources.text_cache,
+                    scratch: &mut self.text_scratch,
+                    producer: producer.as_ref(),
+                    held: &[&slot.text],
+                    #[cfg(test)]
+                    hooks: &mut self.text_hooks,
+                    #[cfg(feature = "dev-tools")]
+                    wait_fault: &mut self.text_wait_fault,
+                },
+                &requests.texts,
+                skin.text_slots(),
+            )?;
+            let (rows, row_held, rows_report) = text_upload::prepare(
+                text_upload::Prepare {
+                    gpu: &self.gpu,
+                    atlas: &slot.resources.atlas,
+                    cache: &mut slot.resources.text_cache,
+                    scratch: &mut self.text_scratch,
+                    producer: producer.as_ref(),
+                    held: &[&slot.text, &held],
+                    #[cfg(test)]
+                    hooks: &mut self.text_hooks,
+                    #[cfg(feature = "dev-tools")]
+                    wait_fault: &mut self.text_wait_fault,
+                },
+                &requests.rows,
+                skin.song_list_slots(),
+            )?;
+            #[cfg(feature = "dev-tools")]
+            {
+                let placed = report
+                    .counts
+                    .placements
+                    .saturating_add(rows_report.counts.placements);
+                self.selection_rasterized = usize::try_from(placed).unwrap_or(usize::MAX);
+            }
+            self.text_report = rows_report;
+            let _ = report;
+            skin.attach_selection_text(sel, texts, rows)
+                .map_err(refused)?;
+            slot.text = held;
+            slot.text.extend(row_held);
+        } else {
+            let empty = |n: usize| TextTable::new(vec![None; n]);
+            skin.attach_selection_text(
+                sel,
+                empty(skin.text_slots()),
+                empty(skin.song_list_slots()),
+            )
+            .map_err(refused)?;
+            slot.text = Holder::default();
+        }
+        skin.attach_selection_bitmap_text(sel);
+        Ok(())
+    }
+
+    /// The app's share of a selection frame: the selection installation's
+    /// skin builds `f` of `sel` into its slot's staging, and `strip`, in
+    /// layout pixels (1920×1080 over the whole target), follows from the
+    /// reserve the skin cannot fill, with no call into wgpu. Nothing
+    /// allocates, the refusal included. At most [`STRIP_SPRITES`] of the
+    /// strip are drawn.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame, or [`BuildError::Kind`] without a
+    /// selection installation: nothing of it is staged.
+    pub fn build_selection(
+        &mut self,
+        sel: &mut Selection,
+        f: &SelectionFrame<'_>,
+        strip: &[Sprite],
+    ) -> Result<(), BuildError> {
+        self.started = None;
+        let start = Instant::now();
+        let target = self.target();
+        #[cfg(feature = "dev-tools")]
+        if std::mem::take(&mut self.selection_faults.0) {
+            return Err(BuildError::Kind);
+        }
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Err(BuildError::Kind);
+        };
+        let f = SelectionFrame { target, ..*f };
+        let projection = slot.resources.staging.projection();
+        let mut placed = [Sprite::default(); STRIP_SPRITES];
+        let mut n = 0;
+        for (out, s) in placed.iter_mut().zip(strip) {
+            *out = Sprite {
+                rect: layout_to_canvas(s.rect, &projection, target),
+                ..*s
+            };
+            n += 1;
+        }
+        let bundle = slot.installation.bundle();
+        let uvs = bundle.uvs();
+        let skin = bundle.skin();
+        slot.resources.staging.build_with(
+            |quads| skin.build_selection(sel, &f, uvs, quads),
+            placed.get(..n).unwrap_or_default(),
+        )?;
+        self.started = Some(start);
+        Ok(())
+    }
+
+    /// Submits and presents the selection frame
+    /// [`build_selection`](Self::build_selection) staged, then each of
+    /// `texts` in a pass of its own over it (the strip's lines). Without a
+    /// frame built since, nothing is acquired or submitted, as
+    /// [`submit`](Self::submit).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_selection(&mut self, texts: &[&MenuText]) -> Result<FrameTiming, RenderError> {
+        if texts.iter().any(|t| t.owner() != self.id) {
+            return Err(RenderError::OtherRenderersText);
+        }
+        let screen = Self::screen(ScreenKind::Selection);
+        let Some(start) = self.started.take() else {
+            return Ok(FrameTiming {
+                cpu: Duration::ZERO,
+                sprites: 0,
+                dropped: 0,
+                presented: false,
+                present_count: None,
+            });
+        };
+        let Some(Some(slot)) = screen.and_then(|i| self.screens.get(i)) else {
+            return Ok(FrameTiming {
+                cpu: Duration::ZERO,
+                sprites: 0,
+                dropped: 0,
+                presented: false,
+                present_count: None,
+            });
+        };
+        let projection = slot.resources.staging.projection();
+        self.draw_on(start, texts, projection, screen)
+    }
+
+    /// Development builds: the next selection frame is refused
+    /// ([`build_selection`](Self::build_selection)) as a skin refuses one,
+    /// or with `text` the next selection text preparation.
+    #[cfg(feature = "dev-tools")]
+    pub fn refuse_next_selection(&mut self, text: bool) {
+        if text {
+            self.selection_faults.1 = true;
+        } else {
+            self.selection_faults.0 = true;
+        }
+    }
+
+    /// Development builds: the selection frame last built, its quads in
+    /// drawing order, the strip's included; `None` without a selection
+    /// installation.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
+        let i = Self::screen(ScreenKind::Selection)?;
+        let slot = self.screens.get(i)?.as_ref()?;
+        Some(slot.resources.staging.batch().quads().quads().to_vec())
+    }
+
+    /// Development builds: the lines the last
+    /// [`prepare_selection_text`](Self::prepare_selection_text) asked
+    /// for, the text elements' then the rows', and how many it
+    /// rasterized.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn selection_requests(&self) -> (&[String], usize) {
+        (&self.selection_requests, self.selection_rasterized)
     }
 
     /// Submits and presents the staged batch through `projection`, each
@@ -2096,15 +2424,39 @@ impl Renderer {
         text: Option<&MenuText>,
         projection: Projection,
     ) -> Result<FrameTiming, RenderError> {
+        self.draw_on(start, text.as_slice(), projection, None)
+    }
+
+    /// [`draw`](Self::draw) of the staging, instances and atlas of
+    /// `screen`'s slot (play's own with `None`), with each of `texts` in
+    /// a pass of its own after the sprites.
+    fn draw_on(
+        &mut self,
+        start: Instant,
+        texts: &[&MenuText],
+        projection: Projection,
+        screen: Option<usize>,
+    ) -> Result<FrameTiming, RenderError> {
         // Whatever is drawn now, a play frame built before it is not
         // submitted again.
         self.started = None;
-        let sprites = self.staging.instances().len();
+        let (staging, instances, atlas_bind) = match screen
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+        {
+            Some(slot) => (
+                &slot.resources.staging,
+                &slot.resources.instances,
+                &slot.resources.atlas_bind,
+            ),
+            None => (&self.staging, &self.instances, &self.atlas_bind),
+        };
+        let sprites = staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
             cpu,
             sprites,
-            dropped: self.staging.batch().dropped(),
+            dropped: staging.batch().dropped(),
             presented,
             present_count: None,
         };
@@ -2158,11 +2510,7 @@ impl Renderer {
         };
         let acquired = acquire.elapsed();
         let queue = self.gpu.queue();
-        queue.write_buffer(
-            &self.instances,
-            0,
-            bytemuck::cast_slice(self.staging.instances()),
-        );
+        queue.write_buffer(instances, 0, bytemuck::cast_slice(staging.instances()));
         // Only when it changes: on the first frame, a resize, or between
         // the menus' fixed canvas and the play skin's.
         let half = projection.half();
@@ -2199,8 +2547,8 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
-            pass.set_bind_group(0, &self.atlas_bind, &[]);
-            pass.set_vertex_buffer(0, self.instances.slice(..));
+            pass.set_bind_group(0, atlas_bind, &[]);
+            pass.set_vertex_buffer(0, instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
             // sets its scissor, its fixed clip's intersected with its inline
@@ -2208,12 +2556,12 @@ impl Renderer {
             // run sets the whole target back, and a run whose clips keep no
             // pixel is not drawn.
             let mut scissor = full;
-            for run in self.staging.batch().runs() {
+            for run in staging.batch().runs() {
                 let end = run.end.min(staged);
                 if run.start >= end {
                     break;
                 }
-                let rect = match self.staging.run_scissor(run) {
+                let rect = match staging.run_scissor(run) {
                     Scissor::Full => full,
                     Scissor::Rect(rect) => rect,
                     Scissor::Empty => continue,
@@ -2230,7 +2578,7 @@ impl Renderer {
                 pass.draw(0..4, run.start..end);
             }
         }
-        if let Some(text) = text {
+        for text in texts {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("menu text"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

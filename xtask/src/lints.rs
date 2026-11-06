@@ -429,6 +429,19 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::resize",
             "MenuScreen::target",
             "MenuScreen::minimized",
+            "MenuScreen::build_selection_frame",
+            "MenuScreen::build_page_frame",
+            "strip_sprites",
+        ],
+    ),
+    // The selection frame's timers, the strip's preset line, and the
+    // lifetime check before the frame's build.
+    Site::Fns(
+        "crates/player/src/selection_skin.rs",
+        &[
+            "SelectionEvents::timers",
+            "SelectionEvents::preset_shown",
+            "SelectionSlot::current",
         ],
     ),
     // The development builds' counting allocator, which every allocation
