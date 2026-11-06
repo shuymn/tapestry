@@ -100,16 +100,37 @@ fn frozen_input() -> EvalInput {
     }
 }
 
+/// The evaluation as printed, less what only presentation reads (design.md
+/// "Policies, Combinations and Versions"): an empty POOR's deviation, so a change of
+/// results changes the digest and a presentation value does not.
+fn results(evaluation: &Evaluation) -> String {
+    let printed = format!("{evaluation:?}");
+    let mut text = String::with_capacity(printed.len());
+    let mut rest = printed.as_str();
+    while let Some(i) = rest.find("EmptyPoor {") {
+        let (head, tail) = rest.split_at(i);
+        text.push_str(head);
+        let end = tail.find('}').unwrap();
+        let body = &tail[..end];
+        let cut = body.find(", deviation").unwrap_or(body.len());
+        text.push_str(&body[..cut]);
+        text.push(' ');
+        rest = &tail[end..];
+    }
+    text.push_str(rest);
+    text
+}
+
 fn digest(evaluation: &Evaluation) -> String {
-    let text = format!("{evaluation:?}");
+    let text = results(evaluation);
     Sha256::digest(text.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
 }
 
-/// The digests pin the evaluation by standard evaluator version 4, its
-/// events as printed (an empty POOR with its deviation); display
+/// The digests pin the results of standard evaluator version 4, its
+/// events as printed less presentation-only values ([`results`]); display
 /// geometry takes no part in it.
 #[test]
 fn loaded_charts_evaluate_as_before() {
@@ -130,27 +151,27 @@ fn loaded_charts_evaluate_as_before() {
     let expected: [(&str, &str); 6] = [
         (
             "mixed",
-            "76f75012947d078b7ace44476cfff0ace5c92ea08d469d00349fa550469bfd62",
+            "0ac86e4990f2e43d9aefe2881f6389bc365a1ee030bbae0baafebaf020498faf",
         ),
         (
             "cycling",
-            "85c6b3b33ba8982b2aaa1e0fcde7315e3555b73efebc883fef3fb5835ca05950",
+            "49429a3a6cf6ca1baf4c4c7d1e2d3471f9bca58ca7f8143acffddb0c115a759b",
         ),
         (
             "bpm_stop",
-            "fef7c7ba507df325ecc3085a4745471f844139529a055f6a9c324ee9739a6d52",
+            "f2f39c9ca77d208e4ca9d3c658453cfb1acc533d86dfc3233a6b886af64c505d",
         ),
         (
             "mines",
-            "a6773ede3390e36998be58187164b0f56a62e19fec367bd88b039e8625ae3a78",
+            "c2fd0d676d6a76cd5c89d7b7a0a11ecb81baa06de863c4c1a2418e41ec4d73c6",
         ),
         (
             "lntype1",
-            "abb038b2397047d9e4219c93a5871827484af5ec45f99c06070f1e7878eb1ca5",
+            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
         ),
         (
             "lnobj",
-            "abb038b2397047d9e4219c93a5871827484af5ec45f99c06070f1e7878eb1ca5",
+            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
         ),
     ];
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (*n, d.as_str())).collect();
