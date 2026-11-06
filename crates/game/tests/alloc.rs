@@ -173,7 +173,7 @@ fn logic_does_not_allocate_during_play() {
         eval::LaneInput {
             held: false,
             pressed: Some(TimeUs(10_000 * MS)),
-            released: Some(TimeUs(10_050 * MS)),
+            released: Some(TimeUs(10_080 * MS)),
         }
     );
     let stream = runner.stream();

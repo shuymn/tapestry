@@ -592,7 +592,7 @@ fn autoplay_presses_every_note_and_releases_before_the_next() {
             ev(1_000_005, 0, B, 1),
             ev(1_020_005, 0, A, 0),
             ev(1_020_005, 0, A, 1),
-            ev(1_070_005, 0, A, 0),
+            ev(1_100_005, 0, A, 0),
             ev(1_500_005, 0, B, 0),
         ]
     );
@@ -1029,8 +1029,8 @@ fn autoplay_refuses_times_outside_the_range() {
         bindings: vec![Binding { control: A, lane }],
         axes: Vec::new(),
     };
-    // The release is at 1_050_000: the largest offset that fits.
-    let fits = i64::MAX - 1_050_000;
+    // The release is at 1_080_000: the largest offset that fits.
+    let fits = i64::MAX - 1_080_000;
     assert_eq!(
         autoplay(&chart, &profile(fits))
             .unwrap()

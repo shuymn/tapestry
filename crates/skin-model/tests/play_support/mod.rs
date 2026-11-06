@@ -199,6 +199,7 @@ pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
 pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
     PlayContext {
+        autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in_ms * MS),

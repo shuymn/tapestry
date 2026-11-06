@@ -16,7 +16,7 @@ use crate::sources::{DeviceKind, SourceSet};
 pub const AUTOPLAY_DEVICE: DeviceId = DeviceId(u64::MAX);
 
 /// How long autoplay holds a tap, unless the lane's next note comes first.
-const TAP_HOLD: TimeUs = TimeUs(50_000);
+const TAP_HOLD: TimeUs = TimeUs(80_000);
 
 /// A note time plus the hold or the input offset left the `i64` range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -96,7 +96,7 @@ impl LaneEvents<'_> {
 
 /// Inputs that hit every tap and long note of `chart` on time, as source 0
 /// with `profile`'s bindings and input offset: each note's control is
-/// pressed at the note and released after 50 ms or at the lane's next
+/// pressed at the note and released after 80 ms or at the lane's next
 /// note, whichever is first, or at a long note's end. Mines are left
 /// alone, and lanes without a binding are skipped.
 ///
@@ -347,8 +347,8 @@ mod tests {
                 let release = match n.kind {
                     NoteKind::Mine { .. } => continue,
                     NoteKind::Long { end, .. } => end,
-                    NoteKind::Tap => notes.get(i + 1).map_or(TimeUs(n.time.0 + 50 * MS), |next| {
-                        TimeUs((n.time.0 + 50 * MS).min(next.time.0))
+                    NoteKind::Tap => notes.get(i + 1).map_or(TimeUs(n.time.0 + 80 * MS), |next| {
+                        TimeUs((n.time.0 + 80 * MS).min(next.time.0))
                     }),
                 };
                 for (at, value) in [(n.time, 1), (release, 0)] {
@@ -594,7 +594,7 @@ mod tests {
         let mut feeder = AutoplayInput::new(events.clone());
         let mut set = set();
         let _first = opened(&mut feeder, &mut set);
-        feeder.poll(TimeUs(1_100 * MS), &mut set);
+        feeder.poll(TimeUs(1_120 * MS), &mut set);
         set.close_recording();
         assert!(!feeder.is_done());
         // Recording opened on the source as the first play left it would

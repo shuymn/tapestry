@@ -403,6 +403,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         border: GaugeValue(80 * GaugeValue::PERCENT),
     }];
     let ctx = PlayContext {
+        autoplay: false,
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
@@ -686,6 +687,7 @@ fn gauge_probes(
             border: GaugeValue(border),
         }];
         let ctx = PlayContext {
+            autoplay: false,
             gauges: &descs,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,
@@ -771,6 +773,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         border: GaugeValue(80 * GaugeValue::PERCENT),
     }];
     let ctx = PlayContext {
+        autoplay: false,
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
@@ -1022,6 +1025,7 @@ fn loading_probes(
             hidden: 0,
         };
         let frame = LoadingFrame {
+            autoplay: false,
             now: TimeUs(ms * 1_000),
             load: LoadState {
                 since: TimeUs(0),
@@ -1040,6 +1044,7 @@ fn loading_probes(
     }
     // Covers the frame's lanes do not show: refused, then for good.
     let mut frame = LoadingFrame {
+        autoplay: false,
         now: TimeUs(6_000_000),
         load: LoadState {
             since: TimeUs(0),
@@ -1340,6 +1345,7 @@ fn choice_probes(
         failed_at: None,
     }];
     let ctx = PlayContext {
+        autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full { lead_in: TimeUs(0) },
         empty_poor_breaks_combo: false,
@@ -1449,6 +1455,7 @@ fn rate_and_kind_probes(
     };
     for counted in [false, true] {
         let ctx = PlayContext {
+            autoplay: false,
             gauges: &descs,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: counted,
@@ -1724,6 +1731,7 @@ fn readout_probes(
         }),
     ] {
         let ctx = PlayContext {
+            autoplay: false,
             gauges: &descs,
             attempt: Attempt::Full { lead_in: TimeUs(0) },
             empty_poor_breaks_combo: false,

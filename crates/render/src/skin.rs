@@ -88,6 +88,8 @@ pub struct LoadingFrame<'a> {
     /// The chosen chart's play level; `None` leaves what depends on it
     /// undrawn.
     pub play_level: Option<i32>,
+    /// Whether the play loaded is autoplay.
+    pub autoplay: bool,
     /// The revision of the loading text installed for this lifetime; 0
     /// with none.
     pub text: u64,
@@ -98,6 +100,7 @@ impl<'a> LoadingFrame<'a> {
     #[must_use]
     pub const fn model(&self) -> skin_model::LoadingFrame<'a> {
         skin_model::LoadingFrame {
+            autoplay: self.autoplay,
             now: self.now,
             load: self.load,
             target: self.target,

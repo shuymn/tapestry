@@ -1799,3 +1799,68 @@ fn a_missed_note_draws_the_finish_window() {
     assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
     assert_eq!(corner(&out.join("hit.png")), [0, 0, 0]);
 }
+
+/// A play skin reads the attempt's autoplay while loading and playing: a
+/// full-canvas blue image on op 33 (autoplay) and a red corner on op 32
+/// (not autoplay). An autoplay draws the blue, a log's play the corner.
+#[test]
+fn a_play_skin_reads_the_attempts_autoplay() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    write_log(&fx.base.join("logs").join("none.tprl"), &[], 1);
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("white.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let white: Vec<u8> = (0..16 * 16).flat_map(|_| [255; 4]).collect();
+    e.write_header().unwrap().write_image_data(&white).unwrap();
+    fs::write(
+        skin.join("play.luaskin"),
+        "local skin = { type = 0, name = \"autoplay\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"b\", path = \"white.png\" } }\n\
+         skin.image = { { id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 } }\n\
+         skin.destination = {\n\
+           { id = \"b\", op = { 33 }, dst = { { x = 0, y = 0, w = 1920, h = 1080, r = 0, g = 0 } } },\n\
+           { id = \"b\", op = { 32 }, dst = { { x = 0, y = 0, w = 192, h = 108, g = 0, b = 0 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 'play.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { loading = true, file = \"auto_load.png\" }",
+        "capture = { at = 200, file = \"auto_play.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "capture = { loading = true, file = \"log_load.png\" }",
+        "capture = { at = 200, file = \"log_play.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/none.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let out = fx.base.join("out");
+    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
+    for name in ["auto_load", "auto_play"] {
+        let png = out.join(format!("{name}.png"));
+        assert_eq!(centre(&png), [0, 0, 255], "{name}");
+        assert_eq!(corner(&png), [0, 0, 255], "{name}");
+    }
+    for name in ["log_load", "log_play"] {
+        let png = out.join(format!("{name}.png"));
+        assert_eq!(centre(&png), [0, 0, 0], "{name}");
+        assert_eq!(corner(&png), [255, 0, 0], "{name}");
+    }
+}
