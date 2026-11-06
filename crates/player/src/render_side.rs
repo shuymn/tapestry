@@ -1490,6 +1490,12 @@ impl RenderLink {
 pub struct PendingLoad(Receiver<Result<(), RenderError>>);
 
 impl PendingLoad {
+    /// A load answered on `rx`, in place of the render thread's (tests).
+    #[cfg(test)]
+    pub(crate) const fn answered_on(rx: Receiver<Result<(), RenderError>>) -> Self {
+        Self(rx)
+    }
+
     /// Waits for the answer, at most the answer's bound from here, calling
     /// `serve` every [`CANCEL_POLL`] at most meanwhile: the game thread
     /// serves the adjustments through the chart's load on the render
