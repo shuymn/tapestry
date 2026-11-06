@@ -413,6 +413,19 @@ impl Selection {
             {
                 println!("dev: select notice: {}", notice.text);
             }
+            // The title and the keys, the page's own words, for a
+            // script's checks (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if self.script.is_some() {
+                for line in &page.lines {
+                    if matches!(
+                        line.style,
+                        crate::menu_screen::LineStyle::Title | crate::menu_screen::LineStyle::Help
+                    ) {
+                        println!("dev: select page: {}", line.text);
+                    }
+                }
+            }
             render.send(RenderMsg::Menu(Box::new(page)));
         }
     }
@@ -561,6 +574,15 @@ impl Selection {
                 }
                 Some(SelectStep::Sleep(ms)) => {
                     if !script.slept(ms) {
+                        return false;
+                    }
+                }
+                Some(SelectStep::File(path)) => {
+                    if !path.exists() {
+                        if script.watchdog_expired() {
+                            script.fail(format!("{} never appeared", path.display()));
+                            controls.close();
+                        }
                         return false;
                     }
                 }
@@ -3327,6 +3349,43 @@ mod tests {
             let failure = sel.script.as_ref().unwrap().failure().unwrap();
             assert!(failure.contains(what), "{failure}");
         }
+    }
+
+    /// A `file` step holds the script until its file exists, past
+    /// [`crate::dev::STEP_TIMEOUT`], then moves on; one whose file never
+    /// appears fails at [`crate::dev::STEP_WATCHDOG`].
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_file_step_waits_for_its_file() {
+        use crate::dev::scenario::{Origin, StepKind};
+        use crate::dev::{STEP_TIMEOUT, STEP_WATCHDOG, SelectScript, SelectStep};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Select,
+        };
+        let go = dir.path().join("go");
+        sel.script = Some(SelectScript::compiled(vec![(
+            SelectStep::File(go.clone()),
+            o,
+        )]));
+        sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
+        assert!(!sel.script(&controls, 0, None));
+        assert!(sel.script.as_ref().unwrap().front().is_some());
+        std::fs::write(&go, "").unwrap();
+        sel.script(&controls, 0, None);
+        let script = sel.script.as_ref().unwrap();
+        assert_eq!((script.front(), script.failure()), (None, None));
+        sel.script = Some(SelectScript::compiled(vec![(
+            SelectStep::File(dir.path().join("never")),
+            o,
+        )]));
+        sel.script.as_mut().unwrap().age(STEP_WATCHDOG);
+        assert!(!sel.script(&controls, 0, None));
+        let failure = sel.script.as_ref().unwrap().failure().unwrap();
+        assert!(failure.contains("never appeared"), "{failure}");
     }
 
     /// Listed charts, one per relative path under one root, or several roots,
