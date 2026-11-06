@@ -45,6 +45,7 @@ fn input(held: bool, pressed: Option<i64>, released: Option<i64>) -> LaneInput {
         held,
         pressed: pressed.map(TimeUs),
         released: released.map(TimeUs),
+        presses: u32::from(pressed.is_some()),
     }
 }
 

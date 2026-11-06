@@ -380,6 +380,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/play/reducer.rs"),
     Site::File("crates/skin-model/src/play/schema.rs"),
     Site::File("crates/skin-model/src/play/timers.rs"),
+    Site::File("crates/skin-model/src/select/mod.rs"),
+    Site::File("crates/skin-model/src/select/schema.rs"),
     // A frame of an image from its cycle and its place in the atlas.
     Site::File("crates/skin-model/src/atlas/uv.rs"),
     // The canvas, the regions' placement and the widgets.
@@ -394,7 +396,9 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/lanes.rs"),
+    Site::File("crates/skin-model/src/widget/ratio_bar.rs"),
     Site::File("crates/skin-model/src/widget/scroll.rs"),
+    Site::File("crates/skin-model/src/widget/song_list.rs"),
     Site::File("crates/skin-model/src/widget/text.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",

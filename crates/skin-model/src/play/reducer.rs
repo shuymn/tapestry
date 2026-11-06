@@ -58,6 +58,56 @@ impl Recent {
     }
 }
 
+/// A lane's visual state from the effects (stage3.md R3), the source's
+/// per-lane judge value (`play/JudgeManager.java:805-811`): its code, the
+/// time of the event that set it, `None` before any, and the presses of
+/// its lane at that µs before it (the event's `presses`). A later press
+/// clears it to 0 unless an effect at that press sets it again
+/// ([`LaneJudge::read`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaneJudge {
+    code: u8,
+    at: Option<TimeUs>,
+    presses: u32,
+}
+
+impl LaneJudge {
+    /// A normal long note held (`:266`, `:438`).
+    const HELD: u8 = 8;
+
+    /// The code of a judgment other than a miss whose timing, in the
+    /// source's sign (note time minus press), is `source_us`:
+    /// `j == 0 ? 1 : 2j + (late ? 1 : 0)` for the source's index `j`, late
+    /// meaning a timing of 0 or less, so on time is late (`:671-672`). An
+    /// empty POOR is index 5. `None` for a miss, index 4, which leaves the
+    /// code (`:671`).
+    fn code(grade: Grade, source_us: i64) -> Option<u8> {
+        let j = match grade {
+            Grade::Perfect => return Some(1),
+            Grade::Great => 1,
+            Grade::Good => 2,
+            Grade::Bad => 3,
+            Grade::Poor => return None,
+            Grade::EmptyPoor => 5,
+        };
+        Some(2 * j + u8::from(source_us <= 0))
+    }
+
+    /// What lane input `input` reads with this state: 0 when a press
+    /// came after the event that set it, since the source clears a lane on
+    /// a press matching no note (`:460-462`) and a press that matches one
+    /// is set by its own effect at its time. A press came after it when
+    /// the lane's latest press is later, or in the same µs with more
+    /// presses at that µs than the event counted.
+    pub(crate) fn read(self, input: eval::LaneInput) -> i32 {
+        match (self.at, input.pressed) {
+            (Some(at), Some(p)) if p > at || (p == at && input.presses > self.presses) => 0,
+            (None, _) => 0,
+            (Some(_), _) => i32::from(self.code),
+        }
+    }
+}
+
 /// The effect-sourced state of one attempt.
 #[derive(Clone, Debug)]
 pub(crate) struct Reducer {
@@ -70,6 +120,7 @@ pub(crate) struct Reducer {
     pub(crate) mine: [Option<TimeUs>; LANE_COUNT],
     pub(crate) judge: Option<(Grade, TimeUs)>,
     pub(crate) recent: Recent,
+    pub(crate) lanes: [LaneJudge; LANE_COUNT],
     pub(crate) combo_up: Option<TimeUs>,
     targets: u32,
     pub(crate) full_combo: Option<TimeUs>,
@@ -154,6 +205,7 @@ impl Reducer {
             mine: [None; LANE_COUNT],
             judge: None,
             recent: Recent::default(),
+            lanes: [LaneJudge::default(); LANE_COUNT],
             combo_up: None,
             targets,
             full_combo: None,
@@ -168,13 +220,14 @@ impl Reducer {
     /// Back to the clean reducer [`new`](Self::new) made, in place, for a
     /// rearmed READY candidate (design.md "Play Lifecycle", the start
     /// gate): no lane bombed or hit by a mine, nothing judged, the recent
-    /// timing 0, and each gauge's maximum as the attempt started.
-    /// Allocates nothing.
+    /// timing and every lane's visual state 0, and each gauge's maximum as
+    /// the attempt started. Allocates nothing.
     pub(crate) fn rearm(&mut self) {
         self.bomb = [None; LANE_COUNT];
         self.mine = [None; LANE_COUNT];
         self.judge = None;
         self.recent = Recent::default();
+        self.lanes = [LaneJudge::default(); LANE_COUNT];
         self.combo_up = None;
         self.full_combo = None;
         self.gauge_max.copy_from_slice(&self.gauge_start);
@@ -198,11 +251,13 @@ impl Reducer {
                 deviation,
                 release,
                 combo,
+                presses,
             } => {
                 let l = lane.index();
                 self.judge = Some((Grade::of(judgment), t));
                 if let Some(us) = self.source_timing(l, note, judgment, deviation, release, t) {
                     self.recent = Recent::of(us, judgment != Judgment::Perfect);
+                    self.set_lane(l, LaneJudge::code(Grade::of(judgment), us), t, presses);
                 }
                 self.combo_up = (combo > 0).then_some(t);
                 if self.targets > 0 && combo == self.targets && self.full_combo.is_none() {
@@ -226,11 +281,18 @@ impl Reducer {
                 }
                 self.feedback(l, Grade::of(judgment), t);
             }
-            JudgeEventKind::LnHeld { lane, judgment, .. } => {
+            JudgeEventKind::LnHeld {
+                lane,
+                judgment,
+                presses,
+                ..
+            } => {
                 // The source's held head leaves the recent timing alone
                 // (`play/JudgeManager.java:428-438`); its long note's
-                // judgment sets it.
+                // judgment sets it. Its lane shows the normal long note in
+                // progress (`:438`).
                 let l = lane.index();
+                self.set_lane(l, Some(LaneJudge::HELD), t, presses);
                 self.judge = Some((Grade::of(judgment), t));
                 self.feedback(l, Grade::of(judgment), t);
             }
@@ -239,14 +301,25 @@ impl Reducer {
                     *mine = Some(t);
                 }
             }
-            JudgeEventKind::EmptyPoor { lane, deviation } => {
+            JudgeEventKind::EmptyPoor {
+                lane,
+                deviation,
+                presses,
+            } => {
                 self.judge = Some((Grade::EmptyPoor, t));
                 // The source's empty POOR, its judgment 5
                 // (`play/JudgeManager.java:400-404`), takes the timing of
                 // the note it is against, as a judged press does (`:423`
                 // and `:440` for a long note's head, `:457-458` for a
                 // tap).
-                self.recent = Recent::of(deviation.0.saturating_neg(), true);
+                let us = deviation.0.saturating_neg();
+                self.recent = Recent::of(us, true);
+                self.set_lane(
+                    lane.index(),
+                    LaneJudge::code(Grade::EmptyPoor, us),
+                    t,
+                    presses,
+                );
                 if self.empty_poor_breaks_combo {
                     self.combo_up = None;
                 }
@@ -320,6 +393,19 @@ impl Reducer {
                 }
             }
         })
+    }
+
+    /// Lane `l`'s visual state set to `code` by an event at `at` that
+    /// counted `presses` before it at that µs; a miss's `None` leaves it,
+    /// its time and its count.
+    fn set_lane(&mut self, l: usize, code: Option<u8>, at: TimeUs, presses: u32) {
+        if let (Some(code), Some(lane)) = (code, self.lanes.get_mut(l)) {
+            *lane = LaneJudge {
+                code,
+                at: Some(at),
+                presses,
+            };
+        }
     }
 
     /// A press's bomb on lane `l` when `grade` is within the bomb

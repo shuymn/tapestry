@@ -101,6 +101,7 @@ fn all_perfect(chart: &Chart) {
                 note,
                 judgment,
                 deviation,
+                presses: _,
             } => {
                 assert_eq!((judgment, deviation), (Judgment::Perfect, TimeUs(0)));
                 held.push((lane.index(), note));

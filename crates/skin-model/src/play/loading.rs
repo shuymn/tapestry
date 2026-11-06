@@ -159,6 +159,15 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // state does not have.
         Unavailable, // judge.recent_ms
         Unavailable, // judge.recent_imperfect
+        // The lanes' visual states, 93 to 100: the reducer's too.
+        Unavailable, // judge.lane.0
+        Unavailable, // judge.lane.1
+        Unavailable, // judge.lane.2
+        Unavailable, // judge.lane.3
+        Unavailable, // judge.lane.4
+        Unavailable, // judge.lane.5
+        Unavailable, // judge.lane.6
+        Unavailable, // judge.lane.7
     ]
 };
 
@@ -306,6 +315,20 @@ pub struct Loading {
 }
 
 impl Loading {
+    /// A state with no timer and no text slot, which a selection skin
+    /// gives: every build of it is refused.
+    pub(crate) fn inert(scratch: Side) -> Self {
+        Self {
+            poisoned: None,
+            starts: Box::default(),
+            ms: Box::default(),
+            fields: [0; field::COUNT],
+            scratch,
+            text: TextTable::new(Vec::new()),
+            bitmap: Box::default(),
+        }
+    }
+
     /// A fresh state with `whens` `when` timers and `text_slots` empty
     /// text slots, its lanes laid out for `scratch`.
     pub(crate) fn new(whens: usize, text_slots: usize, scratch: Side) -> Self {

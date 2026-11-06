@@ -15,7 +15,9 @@ pub(crate) mod glyphs;
 pub(crate) mod image_choice;
 pub(crate) mod judge;
 pub(crate) mod lanes;
+pub(crate) mod ratio_bar;
 pub(crate) mod scroll;
+pub(crate) mod song_list;
 pub(crate) mod text;
 
 use bms_model::TimeUs;

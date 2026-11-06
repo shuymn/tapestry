@@ -333,6 +333,7 @@ fn check_long_notes(play: &Play, e: &Evaluation) -> Result<(), TestCaseError> {
                 note,
                 judgment,
                 deviation,
+                presses: _,
             } => {
                 let l = lane.index();
                 prop_assert!(holding[l].is_none(), "a press while held: {:?}", ev);

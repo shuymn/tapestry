@@ -154,6 +154,8 @@ impl Program {
     /// Allocates nothing and never panics.
     #[must_use]
     pub fn eval(&self, state: &State<'_>) -> i32 {
+        #[cfg(feature = "dev-tools")]
+        EVALUATIONS.with(|n| n.set(n.get().wrapping_add(1)));
         let mut st = Stack {
             v: [0; MAX_STACK],
             sp: 0,
@@ -192,6 +194,19 @@ impl Program {
     pub fn eval_bool(&self, state: &State<'_>) -> bool {
         self.eval(state) != 0
     }
+}
+
+#[cfg(feature = "dev-tools")]
+thread_local! {
+    static EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many programs this thread has evaluated (dev-tools): what a test
+/// reads to tell how often a frame runs a condition.
+#[cfg(feature = "dev-tools")]
+#[must_use]
+pub fn evaluations() -> u64 {
+    EVALUATIONS.with(std::cell::Cell::get)
 }
 
 /// Timer `t`'s reading: clamped elapsed ms, or [`TIMER_OFF`].

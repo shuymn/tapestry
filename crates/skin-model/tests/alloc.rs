@@ -123,12 +123,32 @@ fn ev(time: i64, kind: JudgeEventKind) -> JudgeEvent {
     }
 }
 
+/// An event caused by an input at `time`: a press, which it counts as
+/// the one press of its lane in its µs, or a release, after none.
+fn by_input(time: i64, mut kind: JudgeEventKind) -> JudgeEvent {
+    match &mut kind {
+        JudgeEventKind::Judged {
+            release: Some(_), ..
+        } => {}
+        JudgeEventKind::Judged { presses, .. }
+        | JudgeEventKind::LnHeld { presses, .. }
+        | JudgeEventKind::EmptyPoor { presses, .. } => *presses = 1,
+        _ => {}
+    }
+    JudgeEvent {
+        origin: Some(TimeUs(time)),
+        ..ev(time, kind)
+    }
+}
+
 /// Every kind of effect for every target of `section` (every note without
 /// one) and every mine inside it, with both gauges reported after each
 /// judgment, sorted by time, ending with `SongEnd`. A `clean` play judges
 /// every target GOOD or better, so its combo reaches the target count;
 /// otherwise BADs, POORs, BAD heads and empty POORs break it. The combos
-/// are counted in time order, an empty POOR breaking the combo.
+/// are counted in time order, an empty POOR breaking the combo. Events a
+/// press or a release causes carry it as their origin; a tap's press is
+/// 2 ms early or late in turn.
 fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEvent> {
     let grades = Judgment::ALL;
     let inside = |t: TimeUs| section.is_none_or(|s| s.start <= t && t < s.end);
@@ -145,6 +165,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                 deviation,
                 release,
                 combo: 0,
+                presses: 0,
             };
             match note.kind {
                 NoteKind::Mine { .. } => {
@@ -157,7 +178,7 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                     continue;
                 }
                 NoteKind::Tap => {
-                    out.push(ev(
+                    out.push(by_input(
                         t,
                         JudgeEventKind::PlaySound {
                             lane,
@@ -166,14 +187,20 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                     ));
                     let k = usize::try_from(t / (50 * MS)).unwrap();
                     let judgment = grades[k % if clean { 3 } else { 5 }];
-                    let deviation = (judgment != Judgment::Poor).then_some(TimeUs(0));
-                    out.push(ev(t, judged(judgment, deviation, None)));
+                    let side = if k.is_multiple_of(2) { -2 } else { 2 };
                     if judgment == Judgment::Poor {
-                        out.push(ev(
+                        out.push(ev(t, judged(judgment, None, None)));
+                    } else {
+                        let deviation = Some(TimeUs(side * MS));
+                        out.push(by_input(t, judged(judgment, deviation, None)));
+                    }
+                    if judgment == Judgment::Poor {
+                        out.push(by_input(
                             t + 10 * MS,
                             JudgeEventKind::EmptyPoor {
                                 lane,
                                 deviation: TimeUs(10 * MS),
+                                presses: 0,
                             },
                         ));
                     }
@@ -181,19 +208,20 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                 NoteKind::Long { end, .. } => {
                     if !clean && (t / (200 * MS)) % 3 == 0 {
                         let head = judged(Judgment::Bad, Some(TimeUs(-20 * MS)), None);
-                        out.push(ev(t - 20 * MS, head));
+                        out.push(by_input(t - 20 * MS, head));
                         out.push(ev(
                             t + 100 * MS,
                             JudgeEventKind::LnHoldEnded { lane, note: n },
                         ));
                     } else {
-                        out.push(ev(
+                        out.push(by_input(
                             t,
                             JudgeEventKind::LnHeld {
                                 lane,
                                 note: n,
                                 judgment: Judgment::Great,
                                 deviation: TimeUs(0),
+                                presses: 0,
                             },
                         ));
                         // With breaks, the recent timing's long-note arms:
@@ -202,6 +230,8 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                         // the note BAD (+130, not the head's +140); each
                         // 30 ms clear of the next judgment, so a frame
                         // reads it (`Witness::recent`).
+                        // The first two are released, the last held to its
+                        // end and judged by the deadline.
                         let (at, done) = match (t / (200 * MS)) % 3 {
                             1 if !clean => (
                                 end.0 - 30 * MS,
@@ -224,8 +254,9 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
                                 judged(Judgment::Perfect, Some(TimeUs(0)), Some(TimeUs(0))),
                             ),
                         };
-                        out.push(ev(at, JudgeEventKind::LnHoldEnded { lane, note: n }));
-                        out.push(ev(at, done));
+                        let made = if at == end.0 { ev } else { by_input };
+                        out.push(made(at, JudgeEventKind::LnHoldEnded { lane, note: n }));
+                        out.push(made(at, done));
                     }
                 }
             }
@@ -1299,6 +1330,38 @@ fn loading_skin() -> Loaded {
 }
 
 /// What a stretch saw.
+/// What a lane's visual state read, a [`Witness::lane_states`] entry.
+#[derive(Clone, Copy)]
+enum LaneArm {
+    /// A code, set by a press-caused effect at the lane's latest press.
+    KeptAtPress,
+    /// A judgment's or an empty POOR's code, early and late.
+    Early,
+    Late,
+    /// A held long note's.
+    Held,
+    /// An empty POOR's.
+    EmptyPoor,
+    /// 0, after a press later than the effect that set it.
+    LaterPress,
+    /// 0, after a press in the µs of the effect that set it, past the
+    /// presses it counted (a reversal's press after its release).
+    PressLaterInItsUs,
+}
+
+impl LaneArm {
+    const COUNT: usize = 7;
+}
+
+/// One lane's input and effects as the frames feed them: when its press
+/// is released, and the time of the effect that last set its visual
+/// state, with the presses before it in its µs.
+struct LaneTrack {
+    lane: Lane,
+    release_at: Option<i64>,
+    set: Option<(TimeUs, u32)>,
+}
+
 struct Witness {
     split_drains: u32,
     small_drops: u32,
@@ -1316,6 +1379,11 @@ struct Witness {
     /// farther than its release) and +130 (an early release leaving it
     /// BAD).
     recent: [u32; 2],
+    /// The frames where a lane's visual state read, by
+    /// [`LaneArm`]: a code kept at the press that set it, an early and a
+    /// late code, a held long note's, an empty POOR's, 0 after a later
+    /// press, and 0 after a press in the µs of the release that set it.
+    lane_states: [u32; LaneArm::COUNT],
     empty_frames_after_ready: u32,
     /// Whether a quad showed a frame other than an image's first.
     later_frame: bool,
@@ -1435,6 +1503,7 @@ impl Witness {
             when_started: false,
             rates_apart: false,
             recent: [0; 2],
+            lane_states: [0; LaneArm::COUNT],
             kinds: [false; GaugeLook::COUNT],
             empty_frames_after_ready: 0,
             later_frame: false,
@@ -1546,6 +1615,12 @@ fn stretch(
     let mut stalled = false;
     let midway = from + (to - from) / 2;
     let last = events.last().map_or(0, |e| e.time.0);
+    let mut input = eval::InputFacts::NONE;
+    let mut lanes: [LaneTrack; 8] = std::array::from_fn(|i| LaneTrack {
+        lane: Lane::new(u8::try_from(i).unwrap()).unwrap(),
+        release_at: None,
+        set: None,
+    });
     while now <= to {
         if (midway..midway + 16 * MS).contains(&now) {
             now += 1_000 * MS;
@@ -1604,14 +1679,69 @@ fn stretch(
         let target_no = (frame_no / 5) % TARGETS.len();
         let layout_no = (frame_no / 37) % views.layouts.len();
         let view = views.lanes[(frame_no / 23) % views.lanes.len()];
-        // Lane input changing under the frames: every key pressed and
-        // released in turn, so key-on and key-off both run.
-        let mut input = eval::InputFacts::NONE;
-        for lane in bms_model::Lane::all() {
-            let at = TimeUs(now - i64::try_from(lane.index()).unwrap() * 7_000);
-            input.press(lane, at);
-            if (frame_no + lane.index()).is_multiple_of(3) {
+        // Lane input following the drained effects, so key-on and key-off
+        // both run: each press its effects carry, released 5 ms later; a
+        // long note held to its release, every other one reversed there (a
+        // release, then a press in its µs); and every 11th frame a press
+        // that judges nothing on a lane not held.
+        for l in lanes.iter_mut() {
+            if l.release_at.is_some_and(|r| r <= now) {
+                input.release(l.lane, TimeUs(l.release_at.take().unwrap_or(now)));
+            }
+        }
+        for e in drain {
+            let at = e.time;
+            let (lane, press, release, sets, reversed) = match e.kind {
+                JudgeEventKind::Judged {
+                    lane,
+                    note,
+                    judgment,
+                    release,
+                    presses,
+                    ..
+                } => {
+                    let released = e.origin.is_some() && release.is_some();
+                    let pressed = e.origin.is_some() && release.is_none();
+                    let sets = (judgment != Judgment::Poor).then_some(presses);
+                    (lane, pressed, released, sets, note % 2 == 0)
+                }
+                JudgeEventKind::LnHeld { lane, presses, .. }
+                | JudgeEventKind::EmptyPoor { lane, presses, .. } => {
+                    (lane, true, false, Some(presses), false)
+                }
+                _ => continue,
+            };
+            let Some(l) = lanes.get_mut(lane.index()) else {
+                continue;
+            };
+            if press {
+                if input.lane(lane).held {
+                    input.release(lane, at);
+                }
+                input.press(lane, at);
+                let long = matches!(e.kind, JudgeEventKind::LnHeld { .. });
+                l.release_at = (!long).then_some(at.0 + 5 * MS);
+            }
+            if release {
                 input.release(lane, at);
+                if reversed {
+                    input.press(lane, at);
+                    l.release_at = Some(at.0 + 5 * MS);
+                }
+            }
+            if let Some(presses) = sets {
+                l.set = Some((at, presses));
+            }
+        }
+        if frame_no.is_multiple_of(11) {
+            let lane = bms_model::Lane::all()
+                .nth((frame_no / 11) % 8)
+                .unwrap_or(bms_model::Lane::SCRATCH);
+            if !input.lane(lane).held
+                && let Some(l) = lanes.get_mut(lane.index())
+            {
+                input.press(lane, TimeUs(now));
+                l.release_at = Some(now + 5 * MS);
             }
         }
         let frame = SkinFrame {
@@ -1698,6 +1828,34 @@ fn stretch(
             (Some(40), Some(1)) => w.recent[0] += 1,
             (Some(130), Some(1)) => w.recent[1] += 1,
             _ => {}
+        }
+        let mut seen = [false; LaneArm::COUNT];
+        for l in &lanes {
+            let v = read(field::lane_judge(l.lane)).unwrap_or(0);
+            let pressed = input.lane(l.lane).pressed;
+            let mut arm = |a: LaneArm| seen[a as usize] = true;
+            match v {
+                2 | 4 | 6 | 10 => arm(LaneArm::Early),
+                3 | 5 | 7 | 11 => arm(LaneArm::Late),
+                _ => {}
+            }
+            match v {
+                8 => arm(LaneArm::Held),
+                10 | 11 => arm(LaneArm::EmptyPoor),
+                _ => {}
+            }
+            let presses = input.lane(l.lane).presses;
+            match (v, l.set, pressed) {
+                (1.., Some((at, 1..)), Some(p)) if p == at => arm(LaneArm::KeptAtPress),
+                (0, Some((at, _)), Some(p)) if p > at => arm(LaneArm::LaterPress),
+                (0, Some((at, n)), Some(p)) if p == at && presses > n => {
+                    arm(LaneArm::PressLaterInItsUs);
+                }
+                _ => {}
+            }
+        }
+        for (n, s) in w.lane_states.iter_mut().zip(seen) {
+            *n += u32::from(s);
         }
         if let Some(seen) = read(field::GAUGE_KIND)
             .and_then(|k| usize::try_from(k).ok())
@@ -1871,6 +2029,11 @@ fn build_does_not_allocate() {
                 w.recent.iter().all(|&n| n > 0),
                 "{name}: a long note's timing arm never read: {:?}",
                 w.recent
+            );
+            assert!(
+                w.lane_states.iter().all(|&n| n > 0),
+                "{name}: a lane state's arm never read: {:?}",
+                w.lane_states
             );
         }
         if matches!(*name, "clean round" | "autoplay") {
@@ -3352,6 +3515,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         ),
     ];

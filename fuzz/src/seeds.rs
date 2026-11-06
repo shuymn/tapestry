@@ -1591,7 +1591,7 @@ fn note_parts_body(edits: &[(&str, &str)], sized: bool) -> String {
 /// Image selection, generated: groups of the grid's four frames by the
 /// gauge's type, the cover's switch, no property and past their frames;
 /// image sets with a hole, an undefined id, a wider image and a repeat,
-/// by each supported selector; and sets by image indices 500-507, which
+/// by each supported selector; and sets by image indices 508-515, which
 /// the model cannot read.
 fn selectors_body() -> String {
     let group = |id: &str, fields: &str| {
@@ -1615,7 +1615,7 @@ fn selectors_body() -> String {
     ]
     .into_iter()
     .map(|(id, f)| (id.to_owned(), f.to_owned()))
-    .chain((500..=507).map(|r| (format!("r{r}"), format!(r#""ref": {r}"#))))
+    .chain((508..=515).map(|r| (format!("r{r}"), format!(r#""ref": {r}"#))))
     .collect();
     let images: Vec<String> = groups
         .iter()

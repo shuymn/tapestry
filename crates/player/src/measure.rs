@@ -1253,6 +1253,7 @@ mod frame_tests {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         }
     }
@@ -1275,6 +1276,7 @@ mod frame_tests {
                     note: 0,
                     judgment: Judgment::Great,
                     deviation: TimeUs(0),
+                    presses: 0,
                 },
             ),
             // Its judgment at the release (20 ms): no press latency.
@@ -1288,6 +1290,7 @@ mod frame_tests {
                     deviation: Some(TimeUs(0)),
                     release: Some(TimeUs(-150_000)),
                     combo: 1,
+                    presses: 0,
                 },
             ),
             // A tap pressed at 30 ms, and a miss with no origin.
@@ -1302,6 +1305,7 @@ mod frame_tests {
                     deviation: None,
                     release: None,
                     combo: 0,
+                    presses: 0,
                 },
             ),
         ];

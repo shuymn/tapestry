@@ -125,13 +125,22 @@ fn group_refs_resolve_as_image_indices() {
     };
     // A group and an image set alike.
     for id in [
-        10, 43, 90, 170, 302, 342, 386, 450, 459, 466, 469, 500, 507, 1_510,
+        10, 43, 90, 170, 302, 342, 386, 450, 459, 466, 469, 508, 519, 1_510,
     ] {
         let fields = format!(r#", "ref": {id}"#);
         for l in [group(2, &fields), set(r#"["i0", "i2"]"#, &fields)] {
             assert_eq!(common::kinds(l.report()), [prop(id)], "{id}");
             assert_eq!(l.report().usage.images, 0, "{id}");
             assert_eq!(l.ok().skin.choice_ref_count(), 0, "{id}");
+        }
+    }
+    // The 1P lanes' visual states select among both entries, with no
+    // note.
+    for id in [500, 507] {
+        let fields = format!(r#", "ref": {id}"#);
+        for l in [group(2, &fields), set(r#"["i0", "i2"]"#, &fields)] {
+            assert!(l.report().notes.is_empty(), "{id}: {:?}", l.report().notes);
+            assert_eq!(l.ok().skin.choice_ref_count(), 2, "{id}");
         }
     }
     // A `len` of 1 or less is an ordinary image whatever its `ref`.
