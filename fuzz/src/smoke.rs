@@ -817,15 +817,17 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [1, 1, 12, 1], "{name}");
             }
             "paints" => {
-                // The lanes, LIFT's and HIDDEN+'s paint and four paints.
-                assert_eq!(u.elements, 7, "{name}");
+                // The lanes, LIFT's and HIDDEN+'s paint, four paints and
+                // the progress slider.
+                assert_eq!(u.elements, 8, "{name}");
                 assert_eq!(
                     i.skin.quad_capacity(),
-                    6 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
+                    7 + skin_model::LANE_QUADS + skin_model::LANE_RESERVED,
                     "{name}"
                 );
-                // Each paint in every frame beside the notes on screen.
-                assert_eq!(drawn, [4, 4, 15, 4], "{name}");
+                // Each paint and the slider in every frame beside the
+                // notes on screen.
+                assert_eq!(drawn, [5, 5, 16, 5], "{name}");
             }
             "followers" => {
                 use skin_beatoraja::{DeviationId, LaneApprox};

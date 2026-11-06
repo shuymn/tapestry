@@ -32,6 +32,10 @@ pub enum LoadingField {
     Descriptor,
     /// Available while the frame gives the chosen chart's play level.
     Chosen,
+    /// Known before the play starts: it reads its READY value, which a
+    /// program may read: `time.progress_ppm`, 0 (the source's
+    /// `TIMER_PLAY` is off).
+    Before,
     /// Not read: a program reading it is rejected for loading.
     Unavailable,
 }
@@ -47,7 +51,7 @@ pub enum LoadingTimer {
 
 /// Every PLAY field's class while loading, in slot order (`field::*`).
 const FIELDS: [LoadingField; field::COUNT] = {
-    use LoadingField::{Chosen, Descriptor, Live, Setting, Unavailable};
+    use LoadingField::{Before, Chosen, Descriptor, Live, Setting, Unavailable};
     [
         Unavailable, // combo
         Unavailable, // max_combo
@@ -168,6 +172,8 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // judge.lane.5
         Unavailable, // judge.lane.6
         Unavailable, // judge.lane.7
+        // The progress, 101: 0 until the play starts, as in READY.
+        Before, // time.progress_ppm
     ]
 };
 
@@ -207,7 +213,7 @@ impl Need {
         p.into_iter()
             .flat_map(Program::fields)
             .fold(Self::default(), |need, slot| match loading_field(slot) {
-                Some(LoadingField::Live | LoadingField::Setting) => need,
+                Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => need,
                 Some(LoadingField::Descriptor) => Self {
                     descriptor: true,
                     ..need
@@ -521,6 +527,7 @@ mod tests {
         for name in settings {
             assert_eq!(class(name), Some(LoadingField::Setting), "{name}");
         }
+        assert_eq!(class("time.progress_ppm"), Some(LoadingField::Before));
         for f in PLAY.fields {
             let named = [
                 "load.percent",
@@ -529,6 +536,7 @@ mod tests {
                 "gauge.valid",
                 "chart.level",
                 "chart.level_valid",
+                "time.progress_ppm",
             ]
             .contains(&f.name)
                 || settings.contains(&f.name);
