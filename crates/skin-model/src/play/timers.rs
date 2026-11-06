@@ -578,7 +578,14 @@ impl Play {
                 i32::from(self.autoplay),
                 self.reducer.recent.ms,
                 i32::from(self.reducer.recent.imperfect),
-            ]);
+            ])
+            // Each lane's visual state: its effects' code against the
+            // view's latest press.
+            .chain(
+                Lane::all()
+                    .zip(self.reducer.lanes)
+                    .map(|(lane, j)| j.read(frame.input.lane(lane))),
+            );
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

@@ -159,6 +159,15 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // state does not have.
         Unavailable, // judge.recent_ms
         Unavailable, // judge.recent_imperfect
+        // The lanes' visual states, 93 to 100: the reducer's too.
+        Unavailable, // judge.lane.0
+        Unavailable, // judge.lane.1
+        Unavailable, // judge.lane.2
+        Unavailable, // judge.lane.3
+        Unavailable, // judge.lane.4
+        Unavailable, // judge.lane.5
+        Unavailable, // judge.lane.6
+        Unavailable, // judge.lane.7
     ]
 };
 

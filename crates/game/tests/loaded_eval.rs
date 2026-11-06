@@ -101,10 +101,22 @@ fn frozen_input() -> EvalInput {
 }
 
 /// The evaluation as printed, less what only presentation reads (design.md
-/// "Policies, Combinations and Versions"): an empty POOR's deviation, so a change of
-/// results changes the digest and a presentation value does not.
+/// "Policies, Combinations and Versions"): an empty POOR's deviation and
+/// each event's presses before it in its µs, so a change of results changes
+/// the digest and a presentation value does not.
 fn results(evaluation: &Evaluation) -> String {
-    let printed = format!("{evaluation:?}");
+    let full = format!("{evaluation:?}");
+    let mut printed = String::with_capacity(full.len());
+    let mut rest = full.as_str();
+    while let Some(i) = rest.find(", presses: ") {
+        printed.push_str(&rest[..i]);
+        let tail = &rest[i + ", presses: ".len()..];
+        let digits = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        rest = &tail[digits..];
+    }
+    printed.push_str(rest);
     let mut text = String::with_capacity(printed.len());
     let mut rest = printed.as_str();
     while let Some(i) = rest.find("EmptyPoor {") {

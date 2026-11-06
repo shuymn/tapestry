@@ -461,6 +461,7 @@ fn bodies_follow_the_active_branch() {
                 note: 0,
                 judgment: Judgment::Perfect,
                 deviation: TimeUs(0),
+                presses: 0,
             },
         };
         let events = if held { vec![ev] } else { Vec::new() };

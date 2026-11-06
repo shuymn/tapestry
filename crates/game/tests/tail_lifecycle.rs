@@ -477,6 +477,7 @@ fn input(held: bool, pressed: Option<i64>, released: Option<i64>) -> LaneInput {
         held,
         pressed: pressed.map(|ms| TimeUs(ms * MS - OFFSET)),
         released: released.map(|ms| TimeUs(ms * MS - OFFSET)),
+        presses: u32::from(pressed.is_some()),
     }
 }
 
@@ -654,6 +655,7 @@ fn a_stale_audio_report_does_not_end_the_tail() {
             held: true,
             pressed: Some(TimeUs(ended - 500 - OFFSET)),
             released: Some(TimeUs(1_120 * MS - OFFSET)),
+            presses: 1,
         }
     );
     assert_eq!(rig.key_starts, quiet.key_starts + 1);
