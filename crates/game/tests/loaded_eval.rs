@@ -108,7 +108,8 @@ fn digest(evaluation: &Evaluation) -> String {
         .collect()
 }
 
-/// The digests pin the evaluation by standard evaluator version 4; display
+/// The digests pin the evaluation by standard evaluator version 4, its
+/// events as printed (an empty POOR with its deviation); display
 /// geometry takes no part in it.
 #[test]
 fn loaded_charts_evaluate_as_before() {
@@ -129,27 +130,27 @@ fn loaded_charts_evaluate_as_before() {
     let expected: [(&str, &str); 6] = [
         (
             "mixed",
-            "0ac86e4990f2e43d9aefe2881f6389bc365a1ee030bbae0baafebaf020498faf",
+            "76f75012947d078b7ace44476cfff0ace5c92ea08d469d00349fa550469bfd62",
         ),
         (
             "cycling",
-            "49429a3a6cf6ca1baf4c4c7d1e2d3471f9bca58ca7f8143acffddb0c115a759b",
+            "85c6b3b33ba8982b2aaa1e0fcde7315e3555b73efebc883fef3fb5835ca05950",
         ),
         (
             "bpm_stop",
-            "f2f39c9ca77d208e4ca9d3c658453cfb1acc533d86dfc3233a6b886af64c505d",
+            "fef7c7ba507df325ecc3085a4745471f844139529a055f6a9c324ee9739a6d52",
         ),
         (
             "mines",
-            "c2fd0d676d6a76cd5c89d7b7a0a11ecb81baa06de863c4c1a2418e41ec4d73c6",
+            "a6773ede3390e36998be58187164b0f56a62e19fec367bd88b039e8625ae3a78",
         ),
         (
             "lntype1",
-            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
+            "abb038b2397047d9e4219c93a5871827484af5ec45f99c06070f1e7878eb1ca5",
         ),
         (
             "lnobj",
-            "e9549920fa034c5c1a141563e588f512a5055269ad2590a0fe37a64a7fde60c4",
+            "abb038b2397047d9e4219c93a5871827484af5ec45f99c06070f1e7878eb1ca5",
         ),
     ];
     let got: Vec<(&str, &str)> = got.iter().map(|(n, d)| (*n, d.as_str())).collect();
