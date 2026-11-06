@@ -1853,18 +1853,14 @@ fn the_quit_key_during_a_specialization_returns_after_the_job() {
 }
 
 /// The select harness with `steps`, its stdout read line by line as it
-/// comes, each line with when it came, and its stderr whole: the run's
-/// status, its lines and its stderr. A run not ended within 600 s is
-/// killed, and the test fails naming `what` with the lines so far.
-fn timed_run(
+/// comes, and its stderr whole: the run's status, its lines and its
+/// stderr. A run not ended within 600 s is killed, and the test fails
+/// naming `what` with the lines so far.
+fn bounded_run(
     fx: &Fixture,
     steps: &str,
     what: &str,
-) -> (
-    std::process::ExitStatus,
-    Vec<(std::time::Instant, String)>,
-    String,
-) {
+) -> (std::process::ExitStatus, Vec<String>, String) {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     let mut child = select(fx, steps, &[])
@@ -1879,13 +1875,13 @@ fn timed_run(
     std::thread::spawn(move || {
         for line in BufReader::new(out).lines() {
             let Ok(line) = line else { break };
-            if tx.send((Instant::now(), line)).is_err() {
+            if tx.send(line).is_err() {
                 break;
             }
         }
     });
     let deadline = Instant::now() + Duration::from_secs(600);
-    let mut seen: Vec<(Instant, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     loop {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(l) => seen.push(l),
@@ -1902,37 +1898,35 @@ fn timed_run(
 
 /// The window's close while a pending skin's specialization loops, and
 /// while a quit waits for a job whose VM is held past the stop bound,
-/// leaves the job's wait within the stop bound and ends the run: no
-/// selection is entered again and no play opens.
+/// leaves the job's wait and ends the run: no selection is entered again
+/// and no play opens. The wait is left after the close, and with the
+/// quit first, only after the close; that the run's end gives the job up
+/// within the stop bound, however long the quit waited, is timed in
+/// `a_quit_waits_for_the_job_and_the_runs_end_bounds_it`
+/// (src/imports/tests/attempt.rs).
 #[test]
 fn a_close_during_a_specialization_ends_the_run() {
-    use std::time::Duration;
     for step in ["close-specializing", "escalate-specializing"] {
         let fx = fixture();
         write_ranked(&fx, "a", "a.bms", Some(2));
         write_class_skin(&fx, "while true do end");
         let (status, seen, stderr) =
-            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
-        let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
+            bounded_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
+        let stdout: String = seen.iter().map(|l| format!("{l}\n")).collect();
         assert_eq!(status.code(), Some(0), "{step}: {stdout}\n{stderr}");
-        let when = |line: &str| {
+        let line = |text: &str| {
             seen.iter()
-                .find(|(_, l)| l == line)
-                .map(|(t, _)| *t)
-                .unwrap_or_else(|| panic!("{step}: no {line}: {stdout}"))
+                .position(|l| l == text)
+                .unwrap_or_else(|| panic!("{step}: no {text}: {stdout}"))
         };
-        let closed = when("dev: closed while specializing");
-        let left = when("dev: specialization wait left");
-        // The stop bound (2 s) and a slice, with room for a loaded machine.
+        let closed = line("dev: closed while specializing");
         assert!(
-            left.duration_since(closed) < Duration::from_secs(3),
-            "{step}: {:?}",
-            left.duration_since(closed)
+            closed < line("dev: specialization wait left"),
+            "{step}: {stdout}"
         );
         if step == "escalate-specializing" {
-            let quit = when("dev: quit pressed while specializing");
             assert!(
-                closed.duration_since(quit) >= Duration::from_secs(2),
+                line("dev: quit pressed while specializing") < closed,
                 "{stdout}"
             );
         }
@@ -1952,12 +1946,15 @@ fn a_close_during_a_specialization_ends_the_run() {
 
 /// A failure of the input thread while a pending skin's specialization
 /// loops, and while a quit waits for a job whose VM is held past the stop
-/// bound, leaves the job's wait within the stop bound and ends the run
-/// with the failure's cause: no selection is entered again and no play
-/// opens.
+/// bound, leaves the job's wait and ends the run with the failure's
+/// cause: no selection is entered again and no play opens. The wait is
+/// left after the failure, and with the quit first, only after the
+/// failure; that the run's end gives the job up within the stop bound,
+/// however long the quit waited, is timed in
+/// `a_quit_waits_for_the_job_and_the_runs_end_bounds_it`
+/// (src/imports/tests/attempt.rs).
 #[test]
 fn an_input_failure_during_a_specialization_ends_the_run() {
-    use std::time::Duration;
     for step in [
         "input-failure-specializing",
         "escalate-input-failure-specializing",
@@ -1966,31 +1963,26 @@ fn an_input_failure_during_a_specialization_ends_the_run() {
         write_ranked(&fx, "a", "a.bms", Some(2));
         write_class_skin(&fx, "while true do end");
         let (status, seen, stderr) =
-            timed_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
-        let stdout: String = seen.iter().map(|(_, l)| format!("{l}\n")).collect();
+            bounded_run(&fx, &format!("{step},pick=a.bms,enter,close"), step);
+        let stdout: String = seen.iter().map(|l| format!("{l}\n")).collect();
         assert_eq!(status.code(), Some(1), "{step}: {stdout}\n{stderr}");
         assert!(
             stderr.contains("the input thread is gone"),
             "{step}: {stdout}\n{stderr}"
         );
-        let when = |line: &str| {
+        let line = |text: &str| {
             seen.iter()
-                .find(|(_, l)| l == line)
-                .map(|(t, _)| *t)
-                .unwrap_or_else(|| panic!("{step}: no {line}: {stdout}"))
+                .position(|l| l == text)
+                .unwrap_or_else(|| panic!("{step}: no {text}: {stdout}"))
         };
-        let failed = when("dev: input failed while specializing");
-        let left = when("dev: specialization wait left");
-        // The stop bound (2 s) and a slice, with room for a loaded machine.
+        let failed = line("dev: input failed while specializing");
         assert!(
-            left.duration_since(failed) < Duration::from_secs(3),
-            "{step}: {:?}",
-            left.duration_since(failed)
+            failed < line("dev: specialization wait left"),
+            "{step}: {stdout}"
         );
         if step.starts_with("escalate") {
-            let quit = when("dev: quit pressed while specializing");
             assert!(
-                failed.duration_since(quit) >= Duration::from_secs(2),
+                line("dev: quit pressed while specializing") < failed,
                 "{stdout}"
             );
         }
