@@ -128,7 +128,7 @@ pub use session::{
 };
 pub use settings::{
     ControllerDevice, CoverSettings, DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings,
-    DeviceSettingsError, KeyConfig, KeyError, LaneKey, LibrarySettings, NEXT_PRESET_KEY,
+    DeviceSettingsError, KeyConfig, KeyError, LaneKey, Language, LibrarySettings, NEXT_PRESET_KEY,
     OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
     SettingsError, SettingsFile, SkinChoice, SkinChoices, load_settings, reserved_key,
     save_settings,

@@ -820,6 +820,10 @@ pub struct PlayerSettings {
     /// (design.md "Play Lifecycle", Closing). Declared before the tables,
     /// so it is written before them.
     pub on_failure: FailureAction,
+    /// The language of the player's own screen text, `"ja"` by default
+    /// (design.md "Settings Files"). Read once, at startup; declared
+    /// before the tables, so it is written before them.
+    pub language: Language,
     /// The speed settings, `[hispeed]` (design.md "Play Adjustments").
     pub hispeed: HiSpeedSettings,
     /// The lane covers, `[covers]`.
@@ -837,11 +841,23 @@ impl Default for PlayerSettings {
             preset: "beatoraja-style".to_owned(),
             displayed_gauge: 0,
             on_failure: FailureAction::Close,
+            language: Language::Ja,
             hispeed: HiSpeedSettings::default(),
             covers: CoverSettings::default(),
             skins: SkinChoices::default(),
         }
     }
+}
+
+/// The language the player's own screen text is shown in (`language` in
+/// `player.toml`); chart text and other data are shown as stored. A value
+/// naming no language refuses the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    /// Japanese, the base every other language falls back to.
+    #[default]
+    #[serde(rename = "ja")]
+    Ja,
 }
 
 /// `[skins]` of `player.toml`: the skin chosen for each screen kind, by

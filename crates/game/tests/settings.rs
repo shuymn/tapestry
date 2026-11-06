@@ -6,9 +6,10 @@ use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
     Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, FailureAction,
-    HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, LibrarySettings, LocalRecords,
-    PlayerSettings, PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings, SettingsError,
-    SkinChoice, SkinChoices, SpeedMode, Tuning, load_settings, save_settings, write_atomic,
+    HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language, LibrarySettings,
+    LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings,
+    SettingsError, SkinChoice, SkinChoices, SpeedMode, Tuning, load_settings, save_settings,
+    write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -98,6 +99,7 @@ fn changed() -> Settings {
             preset: "wide".to_owned(),
             displayed_gauge: 1,
             on_failure: FailureAction::PlayToEnd,
+            language: Language::Ja,
             hispeed: HiSpeedSettings {
                 mode: SpeedMode::Classic,
                 reference: HiSpeedReference::Maximum,
@@ -1596,4 +1598,40 @@ fn on_failure_reads_closes_by_default_and_round_trips() {
     let table = text.lines().position(|l| l.starts_with('['));
     assert!(line.is_some() && line < table, "{text}");
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
+}
+
+/// `language` in `player.toml`: a missing key gives `ja`, `ja` reads as
+/// itself, a value naming no language refuses the file with an error
+/// naming the key and the value, and a written file holds the language
+/// ahead of the tables (design.md "Settings Files").
+#[test]
+fn language_reads_ja_by_default_refuses_others_and_is_written() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    for text in ["preset = \"wide\"\n", "language = \"ja\"\n"] {
+        fs::write(root.player_settings(), text).unwrap();
+        assert_eq!(
+            Settings::load(&root).unwrap().player.language,
+            Language::Ja,
+            "{text}"
+        );
+    }
+    fs::write(
+        root.player_settings(),
+        "preset = \"wide\"\nlanguage = \"xx\"\n",
+    )
+    .unwrap();
+    let e = Settings::load(&root).unwrap_err();
+    assert!(matches!(e, SettingsError::Parse(_)), "{e:?}");
+    let message = Chain(&e).to_string();
+    assert!(
+        message.contains("language") && message.contains("xx"),
+        "{message}"
+    );
+    fs::remove_file(root.player_settings()).unwrap();
+    save_settings(&root.player_settings(), &PlayerSettings::default()).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    let line = text.lines().position(|l| l == "language = \"ja\"");
+    let table = text.lines().position(|l| l.starts_with('['));
+    assert!(line.is_some() && line < table, "{text}");
 }
