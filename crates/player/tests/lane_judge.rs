@@ -66,7 +66,8 @@ fn device() -> DeviceProfile {
 
 /// The scratch's tap at 1 s and long note from 6.5 to 7 s; key 1's taps
 /// at 1, 2 and 3 s; key 2's long note from 4 to 4.5 s; key 3's taps at 5
-/// and 5.5 s; key 4's tap at 6 s.
+/// and 5.5 s; key 4's taps at 6 and 8.5 s; key 5's long note from 7.5
+/// to 8 s.
 fn chart() -> Chart {
     ChartBuilder::new(150_000)
         .tap(lane(0), TimeUs(1_000 * MS))
@@ -78,6 +79,8 @@ fn chart() -> Chart {
         .tap(lane(3), TimeUs(5_500 * MS))
         .tap(lane(4), TimeUs(6_000 * MS))
         .long(lane(0), TimeUs(6_500 * MS), TimeUs(7_000 * MS))
+        .long(lane(5), TimeUs(7_500 * MS), TimeUs(8_000 * MS))
+        .tap(lane(4), TimeUs(8_500 * MS))
         .build()
         .unwrap()
 }
@@ -220,11 +223,17 @@ impl<'a> Rig<'a> {
     /// skin when the view is a new candidate's, as the render thread does;
     /// `emitted` effects are expected.
     fn frame(&mut self, skin: &Skin, uvs: &UvTable, now: TimeUs, emitted: usize) -> [usize; 8] {
+        let shown = self.bounded(skin, uvs, now, CONFIG.effects);
+        assert_eq!(self.effects.len(), emitted, "an effect split or dropped");
+        shown
+    }
+
+    /// The frame at `now`, acquiring at most `room` effects; the rest
+    /// stay queued for the next frame.
+    fn bounded(&mut self, skin: &Skin, uvs: &UvTable, now: TimeUs, room: usize) -> [usize; 8] {
         self.effects.clear();
         let effects = &mut self.effects;
-        let room = effects.capacity();
         let view = self.side.acquire(room, |e| effects.push(*e)).unwrap();
-        assert_eq!(self.effects.len(), emitted, "an effect split or dropped");
         if view.generation != self.generation {
             self.generation = view.generation;
             self.play.rearm();
@@ -279,12 +288,15 @@ impl<'a> Rig<'a> {
 /// 300 ms before the third one, early (10); the third missed (left); a
 /// press 400 ms after it, matching nothing (0); key 2's head 10 ms early,
 /// held (8); its release 140 ms before its end, GOOD by the release,
-/// early (4); key 3 100 ms late, GOOD (5), then 150 ms early, BAD (6). A
+/// early (4); key 3 100 ms late, GOOD (5), then 150 ms early, BAD (6);
 /// key 4 40 ms early, GREAT (2), then a press on its note's time, an
 /// empty POOR on time, which is late (11); the scratch's long note held
 /// by its axis (8), then a reversal 100 ms before its end, whose release
 /// judges it and whose press, at the same µs and after it, matches nothing
-/// (0). A retry starts at 0 and takes its own first judgment.
+/// (0), and stays so through the release deadline after it; key 5's head
+/// pressed and released in one µs, the release judging it BAD (6), which
+/// stays; key 4 GREAT with its effects held back a frame, 0 until they
+/// arrive, then 2. A retry starts at 0 and takes its own first judgment.
 #[test]
 fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     let dir = tempfile::tempdir().unwrap();
@@ -374,6 +386,26 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
         r.effects
     );
     assert_eq!(s, [0, 0, 4, 6, 11, 0, 0, 0], "reversal");
+    // Key 5's head pressed on its time and released in the same µs, the
+    // other order: the release, after the press, judges the long note BAD
+    // early (6), which stays.
+    r.set(7_500, 5, 1);
+    r.set(7_500, 5, 0);
+    let s = r.step(&skin, &uvs, 7_500);
+    assert_eq!(s, [0, 0, 4, 6, 11, 6, 0, 0], "press, release");
+    let s = r.step(&skin, &uvs, 7_600);
+    assert_eq!(s, [0, 0, 4, 6, 11, 6, 0, 0], "press, release, later");
+    // Key 4 20 ms early, GREAT, its effects held back for a frame: the
+    // view's press is ahead of them, so the lane reads 0 until they
+    // arrive, then their code (2).
+    r.tap(8_480, 4);
+    r.writer.publish(TimeUs(8_480 * MS));
+    let emitted = r.logic.advance_to(TimeUs(8_480 * MS)).emitted;
+    assert!(emitted > 0);
+    let s = r.bounded(&skin, &uvs, TimeUs(8_480 * MS), 0);
+    assert_eq!(s, [0, 0, 4, 6, 0, 6, 0, 0], "effects pending");
+    let s = r.frame(&skin, &uvs, TimeUs(8_490 * MS), emitted);
+    assert_eq!(s, [0, 0, 4, 6, 2, 6, 0, 0], "effects delivered");
     // A retry: a fresh attempt and preparation.
     let mut r = Rig::new(&chart, &rule, &dev, &skin, &ctx);
     assert_eq!(r.step(&skin, &uvs, 500), [0; 8], "retried");

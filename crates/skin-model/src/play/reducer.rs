@@ -61,13 +61,13 @@ impl Recent {
 /// A lane's visual state from the effects (stage3.md R3), the source's
 /// per-lane judge value (`play/JudgeManager.java:805-811`): its code, the
 /// time of the event that set it, `None` before any, and whether that
-/// event was a press. A later press clears it to 0 unless an effect at
-/// that press sets it again ([`LaneJudge::read`]).
+/// event was a release. A later press clears it to 0 unless an
+/// effect at that press sets it again ([`LaneJudge::read`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LaneJudge {
     code: u8,
     at: Option<TimeUs>,
-    by_press: bool,
+    by_release: bool,
 }
 
 impl LaneJudge {
@@ -93,14 +93,22 @@ impl LaneJudge {
     }
 
     /// What lane input `input` reads with this state: 0 when a press
-    /// came after the event that set it, or with it when that event was
-    /// not a press (a reversal's release, then its press), since the
-    /// source clears a lane on a press matching no note (`:460-462`) and
-    /// a press that matches one is set by its own effect at its time.
+    /// came after the event that set it, since the source clears a lane on
+    /// a press matching no note (`:460-462`) and a press that matches one
+    /// is set by its own effect at its time. At the event's own µs, a press
+    /// came after it only when that event was a release, the press last: a
+    /// reversal's release, then its press. The lane is then held with both
+    /// edges at that µs, or was released later, which a press then a
+    /// release at that µs could not be without a press between. A press
+    /// then a release in one µs, whose release set it, keeps it, and so
+    /// does a press's judgment.
     pub(crate) fn read(self, input: eval::LaneInput) -> i32 {
+        let after = |at: TimeUs, p: TimeUs| {
+            p > at || (p == at && self.by_release && (input.held || input.released != Some(at)))
+        };
         match (self.at, input.pressed) {
+            (Some(at), Some(p)) if after(at, p) => 0,
             (None, _) => 0,
-            (Some(at), Some(p)) if p > at || (p == at && !self.by_press) => 0,
             (Some(_), _) => i32::from(self.code),
         }
     }
@@ -256,8 +264,8 @@ impl Reducer {
                     self.recent = Recent::of(us, judgment != Judgment::Perfect);
                     // A release or an end sets it at its own time; a
                     // judgment decided at a press, at the press's.
-                    let by_press = ev.origin.is_some() && release.is_none();
-                    self.set_lane(l, LaneJudge::code(Grade::of(judgment), us), t, by_press);
+                    let by_release = release.is_some();
+                    self.set_lane(l, LaneJudge::code(Grade::of(judgment), us), t, by_release);
                 }
                 self.combo_up = (combo > 0).then_some(t);
                 if self.targets > 0 && combo == self.targets && self.full_combo.is_none() {
@@ -287,7 +295,7 @@ impl Reducer {
                 // judgment sets it. Its lane shows the normal long note in
                 // progress (`:438`).
                 let l = lane.index();
-                self.set_lane(l, Some(LaneJudge::HELD), t, true);
+                self.set_lane(l, Some(LaneJudge::HELD), t, false);
                 self.judge = Some((Grade::of(judgment), t));
                 self.feedback(l, Grade::of(judgment), t);
             }
@@ -305,7 +313,12 @@ impl Reducer {
                 // tap).
                 let us = deviation.0.saturating_neg();
                 self.recent = Recent::of(us, true);
-                self.set_lane(lane.index(), LaneJudge::code(Grade::EmptyPoor, us), t, true);
+                self.set_lane(
+                    lane.index(),
+                    LaneJudge::code(Grade::EmptyPoor, us),
+                    t,
+                    false,
+                );
                 if self.empty_poor_breaks_combo {
                     self.combo_up = None;
                 }
@@ -381,14 +394,14 @@ impl Reducer {
         })
     }
 
-    /// Lane `l`'s visual state set to `code` by an event at `at`, a press
-    /// when `by_press`; a miss's `None` leaves it.
-    fn set_lane(&mut self, l: usize, code: Option<u8>, at: TimeUs, by_press: bool) {
+    /// Lane `l`'s visual state set to `code` by an event at `at`, a
+    /// release when `by_release`; a miss's `None` leaves it.
+    fn set_lane(&mut self, l: usize, code: Option<u8>, at: TimeUs, by_release: bool) {
         if let (Some(code), Some(lane)) = (code, self.lanes.get_mut(l)) {
             *lane = LaneJudge {
                 code,
                 at: Some(at),
-                by_press,
+                by_release,
             };
         }
     }

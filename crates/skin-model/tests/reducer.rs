@@ -953,7 +953,8 @@ fn the_recent_timing_follows_the_sources_judgments() {
 /// late` with on time late, an empty POOR as index 5; a miss leaves it; a
 /// held long note is 8; a press with no effect at its time clears it, a
 /// press with one keeps that one's, and a press at the time of a release's
-/// judgment, after it, clears it; a rearm reads 0 on every lane.
+/// judgment clears it when it came after the release, not before it; a
+/// rearm reads 0 on every lane.
 #[test]
 fn each_lane_follows_its_judgments_and_presses() {
     use Judgment::{Bad, Good, Great, Perfect, Poor};
@@ -1030,11 +1031,22 @@ fn each_lane_follows_its_judgments_and_presses() {
     // Its release 50 ms early, farther than the head's 10 ms late: GOOD,
     // early, at the release; the earlier press leaves it.
     let release = judged_us(2, 0, Good, Some(10_000), Some(-50_000));
+    h.input.release(lane(2), TimeUs(2_250 * MS));
     let e = at(2_250 * MS, true, release);
     assert_eq!(step(&mut h, 2_250 * MS, Some(e))[2], 4);
-    // A press at the release's time comes after it: cleared.
+    // A press and then the release in that µs: the press came first, and
+    // the release's judgment stays.
     h.input.press(lane(2), TimeUs(2_250 * MS));
-    assert_eq!(step(&mut h, 2_251 * MS, None)[2], 0, "reversal");
+    h.input.release(lane(2), TimeUs(2_250 * MS));
+    assert_eq!(step(&mut h, 2_251 * MS, None)[2], 4, "press, release");
+    // The release and then a press in that µs, a reversal: the press
+    // came after it, cleared.
+    h.input.release(lane(2), TimeUs(2_250 * MS));
+    h.input.press(lane(2), TimeUs(2_250 * MS));
+    assert_eq!(step(&mut h, 2_252 * MS, None)[2], 0, "reversal");
+    // A later release leaves it cleared.
+    h.input.release(lane(2), TimeUs(2_260 * MS));
+    assert_eq!(step(&mut h, 2_260 * MS, None)[2], 0, "reversal, release");
     // Held to its end, judged by the deadline, the head 20 ms late: GREAT,
     // late, though the lane's press came before it.
     let held = judged_us(2, 0, Great, Some(20_000), Some(0));
