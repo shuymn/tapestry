@@ -2404,6 +2404,24 @@ impl Renderer {
         Some(slot.resources.staging.batch().quads().quads().to_vec())
     }
 
+    /// Development builds: what the selection frame last built observed
+    /// of the skin's elements, in drawing order; `None` without a
+    /// selection installation.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn selection_observations(&self) -> Option<Vec<skin_model::ElementObservation>> {
+        let i = Self::screen(ScreenKind::Selection)?;
+        let slot = self.screens.get(i)?.as_ref()?;
+        Some(
+            slot.resources
+                .staging
+                .batch()
+                .quads()
+                .observations()
+                .to_vec(),
+        )
+    }
+
     /// Development builds: the lines the last
     /// [`prepare_selection_text`](Self::prepare_selection_text) asked
     /// for, the text elements' then the rows', and how many it

@@ -320,6 +320,19 @@ pub trait Screen: Send {
     fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
         None
     }
+    /// What the selection frame last built observed of the skin's
+    /// elements (dev-tools tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_observations(&self) -> Option<Vec<skin_model::ElementObservation>> {
+        None
+    }
+    /// How many views the selection skin has taken
+    /// ([`skin_model::Skin::update_selection`]) on this screen (dev-tools
+    /// tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_views(&self) -> u64 {
+        0
+    }
     /// Draws the play screen while a chart loads before READY:
     /// the skin's loading frame `frame`, then `page`, the load's lines,
     /// over it in a pass of their own, laid out again when `changed`
@@ -3051,17 +3064,9 @@ impl Run {
                     // The settings the skin shows, the volume and the
                     // display offset as they are now: F3 to F6 show at the
                     // next frame, with no view of the game thread's.
-                    if let (Some(logic), Some(s)) = (shown.logic.as_mut(), &shown.update.settings) {
-                        let s = self
-                            .tuning
-                            .as_deref()
-                            .map_or(*s, |t| crate::selection_skin::live_settings(s, t));
-                        // Another skin's state is refused alike by the
-                        // build, which draws nothing of it.
-                        let _ = logic
-                            .bundle
-                            .skin()
-                            .update_selection_settings(&mut logic.sel, &s);
+                    if let Some(logic) = shown.logic.as_mut() {
+                        logic
+                            .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
                     }
                     let now = self.clock.now();
                     let changed = std::mem::replace(&mut shown.changed, false);

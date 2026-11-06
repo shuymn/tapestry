@@ -272,14 +272,35 @@ fn selection_frame_alloc() {
     let mut s = searching("abc", "かな");
     s.set_notice(Some("refused".to_owned()));
     feed.preset_step = Some(TimeUs(0));
+    // The settings, applied each frame with the settings keys' values.
+    let tuning = crate::tuning::LiveTuning::new(game::Tuning {
+        volume_percent: 50,
+        display_offset_us: 0,
+        input_offset_us: 0,
+    });
+    feed.settings = crate::selection_skin::settings_of(
+        Some(game::PlayerSettings::default().options().unwrap()),
+        Some(&rules::tapestry()),
+        0,
+        s.order_view(),
+        &tuning,
+    );
     let u = update(&mut feed, &s, 0);
+    assert!(u.settings.is_some());
     let counted = |f: &mut dyn FnMut()| {
         let before = crate::alloc_count::this_thread();
         f();
         crate::alloc_count::this_thread() - before
     };
     let build = |screen: &mut MenuScreen, logic: &mut SelectionLogic, k: i64| {
+        // F4 and F6 between frames.
+        if k % 2 == 0 {
+            tuning.adjust(game::Adjust::VolumeUp);
+        } else {
+            tuning.adjust(game::Adjust::DisplayOffsetUp);
+        }
         let n = counted(&mut || {
+            logic.apply_settings(u.settings.as_ref(), Some(&tuning));
             screen
                 .build_selection_frame(&u, logic, TimeUs(k * 16_667))
                 .unwrap();

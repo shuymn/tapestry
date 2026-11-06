@@ -448,6 +448,7 @@ pub const IN_PLAY: &[Site] = &[
             "SelectionEvents::preset_shown",
             "SelectionSlot::current",
             "live_settings",
+            "SelectionLogic::apply_settings",
         ],
     ),
     // The development builds' counting allocator, which every allocation

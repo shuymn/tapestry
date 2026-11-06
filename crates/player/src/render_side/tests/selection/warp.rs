@@ -129,6 +129,12 @@ impl Screen for Lossy {
     fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.menu.selection_quads()
     }
+    fn selection_observations(&self) -> Option<Vec<skin_model::ElementObservation>> {
+        self.menu.selection_observations()
+    }
+    fn selection_views(&self) -> u64 {
+        self.menu.selection_views()
+    }
     fn resize(&mut self, width: u32, height: u32) {
         self.menu.resize(width, height);
     }
@@ -382,5 +388,140 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
         assert!(after.iter().all(|f| f.3), "{text}");
         assert_eq!(link.take_selection_refusal(), None);
         link.exit();
+    }
+}
+
+/// What a selection frame of the settings fixture showed: numbers 57 and
+/// 12 as drawn, the master gain's graph's width, and the views the skin
+/// had taken by then.
+#[derive(Clone, Debug, PartialEq)]
+struct SettingsSeen {
+    numbers: Vec<i64>,
+    graph: Option<f32>,
+    views: u64,
+}
+
+/// Each selection frame's [`SettingsSeen`].
+#[derive(Clone, Default)]
+struct SettingsFrames(Arc<Mutex<Vec<SettingsSeen>>>);
+
+impl FrameSink for SettingsFrames {
+    fn frame(&mut self, screen: &dyn Screen, _drawn: &crate::measure::Drawn<'_>) {
+        let (Some(observed), Some(quads)) =
+            (screen.selection_observations(), screen.selection_quads())
+        else {
+            return;
+        };
+        let numbers = observed.iter().filter_map(|o| o.value).collect();
+        // The graph is the fixture's last element.
+        let graph = observed
+            .last()
+            .filter(|o| o.outcome == skin_model::Outcome::Sampled)
+            .and_then(|o| quads.get(o.quad_start as usize))
+            .map(|q| q.rect[2]);
+        self.0.lock().unwrap().push(SettingsSeen {
+            numbers,
+            graph,
+            views: screen.selection_views(),
+        });
+    }
+}
+
+/// C13 (player half) and C14: through the player's startup settings, its
+/// settings keys' values, the select screen's update and the render
+/// thread's frame on WARP, a loaded `master_volume` shows the source's
+/// number of the `f32` that plays and its exact ratio, the gain playing
+/// unchanged; F4, F6 and F5 on selection show at the next frames with no
+/// view taken.
+#[test]
+fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
+    use game::{Adjust, AppRig as _};
+    let dir = crate::selection_skin::settings_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080);
+    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path());
+    // The width of graph 17 for the gain `n / d`, 1 000 wide.
+    let width = |n: u64, d: u64| (1_000.0 * n as f64 / d as f64) as f32;
+    for (gain, number, ratio) in [
+        (0.7649_f32, 76, (12_832_893, 1 << 24)),
+        (0.01, 1, (5_368_709, 1 << 29)),
+        (0.45, 45, (7_549_747, 1 << 24)),
+    ] {
+        let frames = SettingsFrames::default();
+        let make: MakeScreen = Box::new(|| {
+            let r = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(
+                Box::new(MenuScreen::new(r, Some(render::text::Fonts::runtime()?)))
+                    as Box<dyn Screen>,
+            )
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(frames.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Selection, Some(Arc::clone(&skin)))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        let mut settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        settings.device.master_volume = gain;
+        let charts = tempfile::tempdir().unwrap();
+        let (sel, _) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);
+        let seen = || frames.0.lock().unwrap().clone();
+        let shows = |numbers: [i64; 2], graph: f32| {
+            wait_until(|| {
+                seen().last().is_some_and(|s| {
+                    s.numbers == numbers && s.graph.is_some_and(|g| (g - graph).abs() < 0.01)
+                })
+            })
+        };
+        crate::tests::on_rig_with(settings, link, |rig, _| {
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            rig.entered_selection();
+            let tuning = Arc::clone(rig.controls.tuning());
+            assert!(
+                shows([number, 0], width(ratio.0, ratio.1)),
+                "{gain}: {:?}",
+                seen().last()
+            );
+            // The audio's gain is the loaded one, exactly.
+            assert_eq!(tuning.volume().to_bits(), gain.to_bits());
+            if gain != 0.7649 {
+                return;
+            }
+            let views = seen().last().unwrap().views;
+            // F4: 76 + 5, the f32 0.81.
+            assert!(tuning.adjust(Adjust::VolumeUp));
+            assert!(
+                shows([81, 0], width(13_589_545, 1 << 24)),
+                "{:?}",
+                seen().last()
+            );
+            // F6, then F5: the display offset 1 ms, then 0.
+            assert!(tuning.adjust(Adjust::DisplayOffsetUp));
+            assert!(shows([81, 1], width(13_589_545, 1 << 24)));
+            assert!(tuning.adjust(Adjust::DisplayOffsetDown));
+            assert!(shows([81, 0], width(13_589_545, 1 << 24)));
+            // No view was taken for any of them.
+            assert_eq!(seen().last().unwrap().views, views);
+        });
     }
 }

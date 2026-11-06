@@ -316,6 +316,28 @@ impl SelectionLogic {
             id,
         }
     }
+
+    /// Applies `settings` (none before the flow gives them) to the state,
+    /// with the volume and the display offset as `tuning` holds them now
+    /// when there is one: once a frame, so F3 to F6 show at the next one
+    /// with no view. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn apply_settings(
+        &mut self,
+        settings: Option<&SelectionSettings>,
+        tuning: Option<&LiveTuning>,
+    ) {
+        let Some(s) = settings else {
+            return;
+        };
+        let s = tuning.map_or(*s, |t| live_settings(s, t));
+        // Another skin's state is refused alike by the build, which
+        // draws nothing of it.
+        let _ = self
+            .bundle
+            .skin()
+            .update_selection_settings(&mut self.sel, &s);
+    }
 }
 
 /// What restarts timer `change` when it changes: the place, the cursor's
@@ -423,6 +445,19 @@ pub struct SelectionDrawn {
 /// font `f.ttf`, the place's text (1000) and the search's (30).
 #[cfg(test)]
 pub(crate) fn fixture() -> tempfile::TempDir {
+    fixture_of(false)
+}
+
+/// [`fixture`] with the settings drawn after it, in this order: number
+/// 57 (the master gain's), number 12 (the display offset) and graph 17
+/// (the master gain, 1 000 wide at y 100) (dev-tools tests).
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) fn settings_fixture() -> tempfile::TempDir {
+    fixture_of(true)
+}
+
+#[cfg(test)]
+fn fixture_of(settings: bool) -> tempfile::TempDir {
     use std::fmt::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -445,12 +480,24 @@ pub(crate) fn fixture() -> tempfile::TempDir {
         )
         .unwrap();
     }
+    let (widgets, drawn) = if settings {
+        (
+            r#""value": [{"id": "n57", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 57},
+                         {"id": "n12", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 12}],
+               "graph": [{"id": "vg", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 0}],"#,
+            r#",{"id": "n57", "dst": [{"x": 0, "y": 200, "w": 10, "h": 10}]},
+               {"id": "n12", "dst": [{"x": 0, "y": 150, "w": 10, "h": 10}]},
+               {"id": "vg", "dst": [{"x": 0, "y": 100, "w": 1000, "h": 10}]}"#,
+        )
+    } else {
+        ("", "")
+    };
     let json = format!(
         r#"{{"type": 5, "w": 1920, "h": 1080,
             "source": [{{"id": "s", "path": "s.png"}}],
             "font": [{{"id": "f", "path": "f.ttf"}}],
             "image": [{{"id": "b", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8}}],
-            "imageset": [{{"id": "set", "images": ["b", "b", "b", "b", "b", "b"]}}],
+            "imageset": [{{"id": "set", "images": ["b", "b", "b", "b", "b", "b"]}}], {widgets}
             "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},
                      {{"id": "place", "font": "f", "size": 30, "ref": 1000}},
                      {{"id": "q", "font": "f", "size": 30, "ref": 30}}],
@@ -458,7 +505,7 @@ pub(crate) fn fixture() -> tempfile::TempDir {
                           "text": [{{"id": "t", "dst": [{{"x": 10, "y": 10, "w": 700, "h": 40}}]}}]}},
             "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}},
                             {{"id": "place", "dst": [{{"x": 100, "y": 1000, "w": 800, "h": 40}}]}},
-                            {{"id": "q", "dst": [{{"x": 100, "y": 950, "w": 800, "h": 40}}]}}]}}"#
+                            {{"id": "q", "dst": [{{"x": 100, "y": 950, "w": 800, "h": 40}}]}}{drawn}]}}"#
     );
     std::fs::write(d.join("s.json"), json).unwrap();
     dir
