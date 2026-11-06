@@ -4,9 +4,9 @@
 //! ended. Everything here is ordinary game data: the player translates it
 //! into whatever a skin takes, so the game depends on no skin crate.
 
-use bms_model::{Chart, Speed, TimeUs};
+use bms_model::{Chart, NoteKind, Speed, TimeUs};
 use eval::Section;
-use rules::{GaugeRule, LnMode, RulePreset};
+use rules::{GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
 use crate::policy::GaugeIndex;
 use crate::practice::mapped;
@@ -92,6 +92,9 @@ pub struct Attempt {
     pub last_note_end: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
+    /// The chart's gauge total as the reference player's song information
+    /// gives it ([`song_total`]).
+    pub song_total: i32,
     /// The tempo provider and reference tempos, from the chart as loaded
     /// at the attempt's speed over its section.
     pub tempo: AttemptTempo,
@@ -162,9 +165,51 @@ impl Attempt {
             kind,
             last_note_end,
             labels: labels.clone(),
+            song_total: song_total(chart),
             tempo: AttemptTempo::prepare(chart, section),
         }
     }
+}
+
+/// `chart`'s gauge total as the reference player's song information gives
+/// it, whatever the play preset (beatoraja `IntegerPropertyFactory.java:
+/// 389-394`, `(int) getTotal()`): its `#TOTAL` read as the reference decoder
+/// reads it, a number above 0 ([`HeaderPolicy::DefExRankFirst`]), else the
+/// default the reference sets for an absent one, `max(260, 7.605 n /
+/// (0.01 n + 6.5))` (`play/BMSPlayerRule.java:68-80`). `n` is the whole
+/// chart's notes as the reference counts them in its default long-note
+/// mode, each tap and each long note once and no mine (jbms-parser
+/// `TimeLine.getTotalNotes`). The default is computed in `f64` in the
+/// reference's order of operations, so its truncation is the reference's
+/// (an exact quotient differs at 4 420 notes: 663 exactly, 662 in `f64`);
+/// a `#TOTAL` is truncated exactly, and past `i32` saturates, as the
+/// reference's cast does.
+#[must_use]
+pub fn song_total(chart: &Chart) -> i32 {
+    if let Some(milli) = HeaderPolicy::DefExRankFirst
+        .read(&chart.meta.judgment_headers)
+        .total_milli
+    {
+        return i32::try_from(milli / 1_000).unwrap_or(i32::MAX);
+    }
+    let notes = chart
+        .lanes
+        .iter()
+        .flatten()
+        .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }))
+        .count();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a note count is far below 2^53, where f64 is exact"
+    )]
+    let n = notes as f64;
+    let total = f64::max(260.0, 7.605 * n / (0.01 * n + 6.5));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the reference truncates (`(int)`); the value is at most 760.5"
+    )]
+    let total = total as i32;
+    total
 }
 
 #[cfg(test)]
@@ -229,5 +274,69 @@ mod tests {
             speed: Speed::NORMAL,
         };
         assert_eq!(practice.of(&empty), TimeUs(4_000 * MS));
+    }
+
+    /// A chart of `taps` taps on key 1, one long note on key 2 and one mine
+    /// on key 3, with `headers` declared.
+    fn counted(taps: i64, headers: &[bms_model::HeaderValue]) -> bms_model::Chart {
+        let lane = |i| Lane::new(i).unwrap();
+        let mut b = ChartBuilder::new(150_000)
+            .long(lane(2), TimeUs(0), TimeUs(500 * MS))
+            .mine(lane(3), TimeUs(0), 1);
+        for t in 0..taps {
+            b = b.tap(lane(1), TimeUs(t * MS));
+        }
+        let mut chart = b.build().unwrap();
+        chart.meta.judgment_headers = headers
+            .iter()
+            .map(|&value| bms_model::JudgmentHeader {
+                name: bms_model::JudgmentHeaderName::Total,
+                value,
+            })
+            .collect();
+        chart
+    }
+
+    /// The song total is the `#TOTAL` the reference decoder reads (above 0,
+    /// the last such one), truncated, else `(int) max(260, 7.605 n /
+    /// (0.01 n + 6.5))` in `f64` over the taps and long notes, each once,
+    /// no mine: 260 to 337 notes, the reference's truncation at 4 420 notes
+    /// (662, where the exact quotient is 663), whatever the preset.
+    #[test]
+    fn the_song_total_is_the_references() {
+        use bms_model::HeaderValue;
+        let total = |taps, headers: &[HeaderValue]| super::song_total(&counted(taps, headers));
+        assert_eq!(total(3, &[]), 260);
+        // 336 taps and the long note: 337 notes; one more passes 260.
+        assert_eq!(total(336, &[]), 260);
+        assert_eq!(total(337, &[]), 260);
+        // 1 000 notes: 460.909.
+        assert_eq!(total(999, &[]), 460);
+        assert_eq!(total(4_419, &[]), 662);
+        assert_eq!(total(4_418, &[]), 662);
+        assert_eq!(total(4_420, &[]), 663);
+        assert_eq!(
+            total(3, &[HeaderValue::decimal_milli(300_700)]),
+            300,
+            "truncated"
+        );
+        assert_eq!(total(3, &[HeaderValue::decimal_milli(500)]), 0);
+        for refused in [
+            HeaderValue::integer(0),
+            HeaderValue::integer(-5),
+            HeaderValue::NotANumber,
+        ] {
+            assert_eq!(
+                total(3, &[HeaderValue::integer(200), refused]),
+                200,
+                "{refused:?} keeps the earlier one"
+            );
+            assert_eq!(total(3, &[refused]), 260, "{refused:?} alone");
+        }
+        assert_eq!(
+            total(3, &[HeaderValue::Integer(10_i128.pow(29))]),
+            i32::MAX,
+            "saturates"
+        );
     }
 }

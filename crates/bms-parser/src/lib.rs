@@ -10,9 +10,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 9
+//! # Loader version 10
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 9; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 10; changing any of them
 //! changes the version.
 //!
 //! - **Text encoding:** a UTF-8 or UTF-16 BOM decides the encoding. Without
@@ -90,7 +90,10 @@
 //! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
 //!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
-//!   other unknown header is a warning.
+//!   other unknown header is a warning. Of these, `#DIFFICULTY` and whether
+//!   a `#BMPxx` the reference decoder registers is defined are kept as
+//!   labels ([`Labels`]),
+//!   which the chart does not hold.
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
 //!   earlier position. The end plays no sound. An empty `#LNOBJ` is
@@ -175,9 +178,10 @@ use bms_model::{
 
 pub use error::{LoadError, Warning, WarningKind};
 pub use header::{ChartMode, Header, Listing, read_header, read_listing};
+pub use parse::java_int;
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 9;
+pub const LOADER_VERSION: u32 = 10;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.
@@ -246,6 +250,13 @@ pub struct Labels {
     pub genre: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
+    /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
+    /// reference decoder keeps its last readable value; empty when none.
+    pub difficulty: String,
+    /// Whether it defines a BGA image: a `#BMPxx` line the reference
+    /// decoder registers, read by its fixed positions, whether or not a
+    /// channel shows it.
+    pub bga: bool,
 }
 
 /// A loaded chart and what the loader skipped or assumed.

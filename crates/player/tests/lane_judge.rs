@@ -311,6 +311,7 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     let dev = device();
     let gauges: Vec<GaugeDesc> = rule.gauges.iter().map(GaugeDesc::from_rule).collect();
     let ctx = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &gauges,
         attempt: Attempt::Full { lead_in: TimeUs(0) },

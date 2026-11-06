@@ -118,6 +118,7 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              folder TEXT NOT NULL,
              mode INTEGER NOT NULL,
              random INTEGER NOT NULL,
+             bga INTEGER NOT NULL,
              loader INTEGER NOT NULL,
              taps INTEGER,
              longs INTEGER,
@@ -317,6 +318,7 @@ pub struct Row {
     pub header: Header,
     pub mode: ChartMode,
     pub random: bool,
+    pub bga: bool,
     pub summary: Option<ChartSummary>,
 }
 
@@ -400,10 +402,10 @@ pub fn commit(
         let mut upsert = tx.prepare(
             "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, subtitle,
                  artist, subartist, genre, playlevel, difficulty, bpm, norm_text, title_key,
-                 artist_key, folder, mode, random, loader, taps, longs, mines, length_us,
-                 tempo_start, tempo_min, tempo_max)
+                 artist_key, folder, mode, random, bga, loader, taps, longs, mines,
+                 length_us, tempo_start, tempo_min, tempo_max)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -412,7 +414,8 @@ pub fn commit(
                  difficulty = excluded.difficulty, bpm = excluded.bpm,
                  norm_text = excluded.norm_text, title_key = excluded.title_key,
                  artist_key = excluded.artist_key, mode = excluded.mode,
-                 random = excluded.random, loader = excluded.loader, taps = excluded.taps,
+                 random = excluded.random, bga = excluded.bga, loader = excluded.loader,
+                 taps = excluded.taps,
                  longs = excluded.longs, mines = excluded.mines,
                  length_us = excluded.length_us, tempo_start = excluded.tempo_start,
                  tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max",
@@ -445,6 +448,7 @@ pub fn commit(
                     .unwrap_or_default(),
                 mode_value(row.mode),
                 row.random,
+                row.bga,
                 i64::from(bms_parser::LOADER_VERSION),
                 summary.map(|s| s.taps),
                 summary.map(|s| s.longs),
@@ -467,7 +471,7 @@ pub fn commit(
 /// The columns [`entry`] reads, of `charts` as `c`.
 pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.title, \
      c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm, c.random, \
-     c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max";
+     c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max";
 
 /// A tempo as a summary column stores it: `u128` does not fit an integer.
 const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
@@ -525,7 +529,8 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
             bpm: r.get(12)?,
         },
         random: r.get(13)?,
-        summary: summary(r, 14)?,
+        bga: r.get(14)?,
+        summary: summary(r, 15)?,
     })
 }
 

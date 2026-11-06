@@ -117,9 +117,9 @@ fn index(db: &Path, root: &Path) {
             .prepare(
                 "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, artist,
                      genre, playlevel, norm_text, title_key, artist_key, folder, mode, random,
-                     loader)
+                     bga, loader)
                  VALUES (1, ?1, 0, ?2, zeroblob(32), zeroblob(16), ?3, ?4, 'bench', ?5,
-                     ?3 || char(31, 31) || ?4 || char(31, 31) || 'bench', ?3, ?4, ?6, 0, 0, 0)",
+                     ?3 || char(31, 31) || ?4 || char(31, 31) || 'bench', ?3, ?4, ?6, 0, 0, 0, 0)",
             )
             .expect("the statement");
         for i in 1..INDEXED {

@@ -531,6 +531,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        meta: skin_model::ChartMetadata::UNKNOWN,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -816,6 +817,7 @@ fn gauge_probes(
             bpm_range: None,
             bpm_whole_change: None,
             play_level: None,
+            meta: skin_model::ChartMetadata::UNKNOWN,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -902,6 +904,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        meta: skin_model::ChartMetadata::UNKNOWN,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1157,6 +1160,8 @@ fn loading_probes(
             covers: readouts_for(lanes).covers,
             gauge,
             play_level: None,
+            difficulty: None,
+            bga: None,
         };
         skin.build_loading(&mut loading, &frame, uvs, batch)
             .expect("the loading frame builds");
@@ -1176,6 +1181,8 @@ fn loading_probes(
         covers: readouts_for(LANES_OFF).covers,
         gauge: Some(normal),
         play_level: None,
+        difficulty: None,
+        bga: None,
     };
     frame.covers.cover = 500;
     assert_eq!(
@@ -1478,6 +1485,7 @@ fn choice_probes(
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        meta: skin_model::ChartMetadata::UNKNOWN,
     };
     let mut play = skin
         .prepare(chart, &ctx)
@@ -1588,6 +1596,7 @@ fn rate_and_kind_probes(
             bpm_range: None,
             bpm_whole_change: None,
             play_level: None,
+            meta: skin_model::ChartMetadata::UNKNOWN,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -1864,6 +1873,7 @@ fn readout_probes(
             bpm_range: range,
             bpm_whole_change: None,
             play_level: None,
+            meta: skin_model::ChartMetadata::UNKNOWN,
         };
         let mut play = skin
             .prepare(chart, &ctx)

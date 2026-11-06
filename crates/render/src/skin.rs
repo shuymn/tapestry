@@ -88,6 +88,12 @@ pub struct LoadingFrame<'a> {
     /// The chosen chart's play level; `None` leaves what depends on it
     /// undrawn.
     pub play_level: Option<i32>,
+    /// The chosen chart's difficulty (`skin_model::LoadingFrame::difficulty`);
+    /// `None` leaves what depends on it undrawn.
+    pub difficulty: Option<u8>,
+    /// Whether the chosen chart has a BGA; `None` leaves what depends on it
+    /// undrawn.
+    pub bga: Option<bool>,
     /// Whether the play loaded is autoplay.
     pub autoplay: bool,
     /// The revision of the loading text installed for this lifetime; 0
@@ -100,6 +106,8 @@ impl<'a> LoadingFrame<'a> {
     #[must_use]
     pub const fn model(&self) -> skin_model::LoadingFrame<'a> {
         skin_model::LoadingFrame {
+            difficulty: self.difficulty,
+            bga: self.bga,
             autoplay: self.autoplay,
             now: self.now,
             load: self.load,

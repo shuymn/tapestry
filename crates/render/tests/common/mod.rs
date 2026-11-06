@@ -70,6 +70,7 @@ pub const GAUGES: [GaugeDesc; 1] = [GaugeDesc {
 /// snapshot a declarative skin refuses.
 pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
     PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges,
         attempt: Attempt::Full {
@@ -254,6 +255,8 @@ pub fn input<'a>(
 /// text. The renderer applies its own target.
 pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> LoadingFrame<'static> {
     LoadingFrame {
+        difficulty: None,
+        bga: None,
         autoplay: false,
         lifetime,
         now,

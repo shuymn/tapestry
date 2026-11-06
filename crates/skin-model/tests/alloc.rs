@@ -1246,12 +1246,15 @@ fn load(
 /// descriptor and the covers. The play fixture's other widgets are defined
 /// but not drawn.
 fn loading_skin() -> Loaded {
-    // 32, as the sheet's cycles name: on the progress, the descriptor
-    // and the covers in turn.
+    // 32, as the sheet's cycles name: on the progress, the descriptor,
+    // the covers, the chosen chart's difficulty and its BGA flag in turn
+    // (the last two read while the frame gives them).
     let conditions = [
         "load.percent >= 50",
         "gauge.valid && gauge.kind == hard",
         "cover.enabled && lift.permille > 0",
+        "chart.difficulty_valid && chart.difficulty == 3",
+        "chart.bga_valid && !chart.bga",
     ];
     let whens = (0..32)
         .map(|i| bool_program(conditions[i % conditions.len()]))
@@ -1923,6 +1926,7 @@ fn build_does_not_allocate() {
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
     let full = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full {
@@ -1978,6 +1982,11 @@ fn build_does_not_allocate() {
             "autoplay",
             PlayContext {
                 autoplay: true,
+                meta: skin_model::ChartMetadata {
+                    difficulty: Some(3),
+                    total: Some(300),
+                    bga: Some(true),
+                },
                 ..full
             },
             effects(&chart, None, true),
@@ -2258,6 +2267,8 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            difficulty: None,
+            bga: None,
             autoplay: false,
             now: TimeUs(ms * MS),
             load: LoadState {
@@ -2288,7 +2299,8 @@ fn build_does_not_allocate() {
 /// The loading frame `no` of a lifetime begun at `since`: the clock, the
 /// progress, the target, the layout, the lanes and the covers moving, the
 /// descriptor of either gauge given on two frames of three, the chosen
-/// chart's play level on four of five, the play autoplay on every other.
+/// chart's play level on four of five, its difficulty on six of seven and
+/// its BGA flag on three of four, the play autoplay on every other.
 fn loading_frame<'a>(
     views: &'a Views,
     descs: &[GaugeDesc],
@@ -2297,6 +2309,8 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        difficulty: (no % 7 != 6).then_some(u8::try_from(no % 6).unwrap()),
+        bga: (no % 4 != 3).then_some(no % 8 < 4),
         autoplay: no.is_multiple_of(2),
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
@@ -3845,6 +3859,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         initial_gauges: vec![GaugeValue(70 * GaugeValue::PERCENT), GaugeValue::FULL],
     };
     let full = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: descs,
         attempt: Attempt::Full {

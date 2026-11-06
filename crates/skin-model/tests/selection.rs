@@ -1294,6 +1294,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
     assert_eq!(skin.kind(), ScreenKind::Selection);
     let chart = ChartBuilder::new(150_000).build().unwrap();
     let ctx = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &[],
         attempt: Attempt::Full { lead_in: TimeUs(0) },
@@ -1315,6 +1316,8 @@ fn the_other_kinds_entry_points_draw_nothing() {
     let layout = skin_model::Layout::AUTHOR;
     let mut loading = skin.prepare_loading(Side::Left);
     let lf = LoadingFrame {
+        difficulty: None,
+        bga: None,
         now: TimeUs(0),
         load: LoadState {
             since: TimeUs(0),

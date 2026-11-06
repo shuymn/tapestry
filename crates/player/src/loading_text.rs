@@ -98,6 +98,13 @@ pub struct ChosenChart {
     /// The play level its `#PLAYLEVEL` gives ([`level_of`](crate::imports::facts::level_of)):
     /// known once the entry is, a missing header 0, as an attempt's is.
     pub play_level: Option<i32>,
+    /// The difficulty its `#DIFFICULTY` gives
+    /// ([`difficulty_of`](crate::imports::facts::difficulty_of)): known
+    /// once the entry is, a missing header 0, as an attempt's is.
+    pub difficulty: Option<u8>,
+    /// Whether it defines a BGA image, as its entry records: known once
+    /// the entry is.
+    pub bga: Option<bool>,
 }
 
 /// The chart being loaded, as its lines name it.

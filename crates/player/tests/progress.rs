@@ -214,6 +214,7 @@ fn context<'a>(
     attempt: Attempt<'a>,
 ) -> PlayContext<'a> {
     PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay,
         gauges,
         attempt,
