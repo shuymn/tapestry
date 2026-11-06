@@ -241,6 +241,10 @@ pub(crate) struct Residual {
     /// Every [`Node::Read`] created, in order.
     pub(crate) reads: Vec<u32>,
     pub(crate) root: u32,
+    /// Whether it read data the configured pass left captured (a scalar
+    /// or a table, not a module, host function or closure): a value that
+    /// pass may have computed from an import fact.
+    pub(crate) captures_data: bool,
 }
 
 impl Residual {
@@ -847,6 +851,10 @@ impl<'a> Eval<'a> {
             Captured::Lib(l) => Val::Lib(l),
             Captured::Other => return refuse(Unsupported::Capture("a captured value")),
         };
+        self.res.captures_data |= matches!(
+            v,
+            Val::Nil | Val::Bool(_) | Val::Int(_) | Val::Str(_) | Val::Table(_)
+        );
         self.known(v)
     }
 

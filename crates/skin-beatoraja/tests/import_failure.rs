@@ -804,6 +804,73 @@ fn lua_callback_skin(timer: i32, draw: Option<&str>, value: Option<&str>) -> tem
     d
 }
 
+/// [`lua_callback_skin`] with `prelude` run by the configured pass before
+/// its tables, imported on a play scene whose chart rank is known.
+fn lua_prelude_import(
+    timer: i32,
+    prelude: &str,
+    draw: Option<&str>,
+    value: Option<&str>,
+) -> Result<skin_beatoraja::LuaImported, ImportError> {
+    use skin_beatoraja::{ChartRank, Fact, ImportFacts, LuaOutcome};
+    let d = lua_callback_skin(timer, draw, value);
+    let p = d.path().join("s.luaskin");
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(
+        &p,
+        text.replacen("skin.source", &format!("{prelude}\nskin.source"), 1),
+    )
+    .unwrap();
+    let cancel = skin_beatoraja::Cancel::new();
+    let h = skin_beatoraja::read_lua_header(d.path(), "s.luaskin", &cancel)?;
+    let mut facts = ImportFacts::unavailable(skin_model::ScreenKind::Play);
+    facts.chart_rank = Fact::Known(Some(ChartRank::Rank(2)));
+    match h.import(&Config::defaults(h.header()), &facts, &cancel)? {
+        LuaOutcome::Imported(i) => Ok(i),
+        LuaOutcome::Pending(p) => panic!("pending: {p:?}"),
+    }
+}
+
+/// A judgment class the configured pass read and left captured is as
+/// unreproduced as one a callback reads: a callback on `failed` reading
+/// captured state after such a read is refused, by `draw`, by `value` and
+/// inside a compound condition; elsewhere it lowers with its D4 note; and
+/// with no class read the same capture lowers on `failed`.
+#[test]
+fn lua_captured_judgment_classes_refuse_failure_presentation() {
+    use skin_beatoraja::lua::Unsupported;
+    use skin_beatoraja::{DeviationId, LuaWhy};
+    let read = "local show = ms.option(182)";
+    for (field, draw, value) in [
+        ("draw", Some("show"), None),
+        ("draw", Some("show and ms.option(273)"), None),
+        ("value", None, Some("show and 1 or 0")),
+    ] {
+        match lua_prelude_import(3, read, draw, value) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Critical { field: f, why },
+                ..
+            }) => {
+                assert_eq!(f, field);
+                assert!(matches!(why, Unsupported::Capture(_)), "{why:?}");
+            }
+            other => panic!("{draw:?} {value:?}: {other:?}"),
+        }
+        let r = lua_prelude_import(41, read, draw, value).unwrap();
+        assert_eq!(dispositions(&r), [1, 0, 0], "{draw:?} {value:?}");
+        assert!(
+            r.imported
+                .report
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Deviation(DeviationId::D4)),
+            "{draw:?} {value:?}"
+        );
+        let r = lua_prelude_import(3, "local show = true", draw, value).unwrap();
+        assert_eq!(dispositions(&r), [1, 0, 0], "{draw:?} {value:?}");
+    }
+}
+
 /// How many callables were lowered, replaced and refused.
 fn dispositions(r: &skin_beatoraja::LuaImported) -> [usize; 3] {
     use skin_beatoraja::lua::Disposition;

@@ -94,6 +94,11 @@ use crate::tree::{Kind, LuaScalar, NONE};
 /// The gauge looks `gauge_type()` selects, by index.
 const LOOKS: [&str; 6] = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
 
+/// Why a critical element refuses a callback reading captured state after
+/// the configured pass read a judgment class.
+const CLASS_CAPTURE: Unsupported =
+    Unsupported::Capture("state captured after a judgment class read");
+
 /// A lowered callback.
 #[derive(Debug)]
 pub(crate) struct Lowered {
@@ -1270,8 +1275,16 @@ impl Cx<'_> {
         if an.writes(inst) {
             return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
         }
-        let r = residual::evaluate(adm, inst, conv, &cancelled)
-            .and_then(|res: Residual| l.emit_root(&res, conv));
+        let r = residual::evaluate(adm, inst, conv, &cancelled).and_then(|res: Residual| {
+            // What the configured pass left captured after reading a
+            // judgment class may hold it: a critical element cannot
+            // reproduce it, a decorative one notes D4.
+            if res.captures_data && an.class_read.get() {
+                l.out.deviates = true;
+                l.out.unreproduced = l.out.unreproduced.or(Some(CLASS_CAPTURE));
+            }
+            l.emit_root(&res, conv)
+        });
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
