@@ -29,6 +29,9 @@ pub struct Listing {
     pub mode: ChartMode,
     /// Whether it declares `#RANDOM` or `#SETRANDOM`, in any branch.
     pub random: bool,
+    /// Whether it defines a BGA image at the top level, as
+    /// [`Labels::bga`](crate::Labels::bga) reads one.
+    pub bga: bool,
 }
 
 /// The descriptive header values of a chart, as written (trimmed), each
@@ -48,7 +51,8 @@ pub struct Header {
     pub genre: Option<String>,
     /// `#PLAYLEVEL`.
     pub playlevel: Option<String>,
-    /// `#DIFFICULTY`.
+    /// `#DIFFICULTY`, the last one [`java_int`](crate::java_int) reads, as
+    /// the loader keeps it.
     pub difficulty: Option<String>,
     /// `#BPM`, the start tempo as written.
     pub bpm: Option<String>,
@@ -98,7 +102,7 @@ const fn key_6_or_7(channel: [u8; 2]) -> bool {
 /// [`read_listing`]'s one pass over the decoded text.
 pub(crate) fn listing(text: &str) -> Listing {
     let mut header = Header::default();
-    let (mut two, mut seven, mut random) = (false, false, false);
+    let (mut two, mut seven, mut random, mut bga) = (false, false, false, false);
     // Open `#IF` and `#SWITCH` blocks; the closers saturate, so a stray one
     // does not hide the rest of the file.
     let mut depth = 0_usize;
@@ -131,13 +135,20 @@ pub(crate) fn listing(text: &str) -> Listing {
                 continue;
             }
             _ if depth > 0 => continue,
+            _ if crate::parse::defines_bga(
+                raw_line.trim_start().strip_prefix('#').unwrap_or(body),
+            ) =>
+            {
+                bga = true;
+                continue;
+            }
             "TITLE" => &mut header.title,
             "SUBTITLE" => &mut header.subtitle,
             "ARTIST" => &mut header.artist,
             "SUBARTIST" => &mut header.subartist,
             "GENRE" => &mut header.genre,
             "PLAYLEVEL" => &mut header.playlevel,
-            "DIFFICULTY" => &mut header.difficulty,
+            "DIFFICULTY" if crate::parse::sets_difficulty(value) => &mut header.difficulty,
             "BPM" => &mut header.bpm,
             _ => continue,
         };
@@ -154,5 +165,6 @@ pub(crate) fn listing(text: &str) -> Listing {
         header,
         mode,
         random,
+        bga,
     }
 }

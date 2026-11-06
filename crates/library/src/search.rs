@@ -573,9 +573,9 @@ mod tests {
                 .unwrap()
                 .execute(
                     "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
-                         folder, mode, random, loader)
+                         folder, mode, random, bga, loader)
                      SELECT id, 'new.bms', 0, 0, zeroblob(32), zeroblob(16), 'new', 'new', ?1,
-                         0, 0, 0
+                         0, 0, 0, 0
                      FROM roots",
                     [&folder],
                 )

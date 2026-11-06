@@ -9,9 +9,9 @@
 
 use bms_model::TimeUs;
 use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
-use skin_model::{BpmRange, ChartText, GaugeDesc, PlayContext, Side};
+use skin_model::{BpmRange, ChartMetadata, ChartText, GaugeDesc, PlayContext, Side};
 
-use crate::imports::facts::level_of;
+use crate::imports::facts::{difficulty_of, level_of};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
@@ -37,6 +37,9 @@ pub struct AttemptContext {
     /// The chart's play level, parsed from its label as the attempt's
     /// import facts are ([`level_of`]).
     play_level: i32,
+    /// The chart's metadata the `chart.*` fields read: its difficulty and
+    /// whether it has a BGA from its labels, its song total from the game.
+    meta: ChartMetadata,
     /// The presentation epoch the attempt was attached as: a snapshot of
     /// another epoch gives its frames no gain.
     epoch: u64,
@@ -57,6 +60,11 @@ impl AttemptContext {
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
             play_level: level_of(&attempt.labels.playlevel),
+            meta: ChartMetadata {
+                difficulty: Some(difficulty_of(&attempt.labels.difficulty)),
+                total: Some(attempt.song_total),
+                bga: Some(attempt.labels.bga),
+            },
             labels: attempt.labels,
             tempo: attempt.tempo,
             epoch,
@@ -110,6 +118,7 @@ impl AttemptContext {
     /// The borrowed context a skin prepares with, for one call.
     pub fn context(&self) -> PlayContext<'_> {
         PlayContext {
+            meta: self.meta,
             autoplay: self.autoplay,
             gauges: &self.gauges,
             attempt: match &self.kind {
@@ -157,6 +166,9 @@ fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod meta_tests;
+
+#[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
     use game::{Attempt, ChartLabels};
@@ -194,6 +206,8 @@ mod tests {
                 subartist: "sa".to_owned(),
                 genre: "g".to_owned(),
                 playlevel: "12".to_owned(),
+                difficulty: "4".to_owned(),
+                bga: true,
             },
             &chart,
         );
@@ -221,6 +235,15 @@ mod tests {
         assert_eq!(ctx.bpm_whole_change, Some(false));
         assert!(ctx.autoplay);
         assert_eq!(ctx.play_level, Some(12));
+        // An empty chart: the default total for no notes.
+        assert_eq!(
+            ctx.meta,
+            skin_model::ChartMetadata {
+                difficulty: Some(4),
+                total: Some(260),
+                bga: Some(true),
+            }
+        );
         assert_eq!(
             ctx.bpm_range,
             Some(skin_model::BpmRange {

@@ -86,16 +86,20 @@ fn the_loaders_labels_come_from_the_taken_branches() {
 #SUBTITLE First
 #SUBTITLE [ANOTHER]
 #PLAYLEVEL 12
+#DIFFICULTY 2
 #BPM 120
 #SETRANDOM 2
 #IF 1
 #GENRE Untaken
 #PLAYLEVEL 3
+#DIFFICULTY 5
+#BMP01 untaken.bmp
 #ENDIF
 #IF 2
 #ARTIST Branch two
 #SUBARTIST Two
 #PLAYLEVEL \u{3000}9a \t
+#DIFFICULTY 4
 #ENDIF
 #ENDRANDOM
 #00111:01
@@ -112,8 +116,92 @@ fn the_loaders_labels_come_from_the_taken_branches() {
             subartist: "Two".to_owned(),
             genre: String::new(),
             playlevel: "9a".to_owned(),
+            difficulty: "4".to_owned(),
+            bga: false,
         }
     );
     let header = read_header(text.as_bytes(), &Limits::default()).unwrap();
     assert_eq!(header.artist.as_deref(), Some("Someone"));
+    assert_eq!(header.difficulty.as_deref(), Some("2"));
+    let listing = bms_parser::read_listing(text.as_bytes(), &Limits::default()).unwrap();
+    assert!(!listing.bga);
+}
+
+/// A `#DIFFICULTY` the reference decoder's `Integer.parseInt` cannot read
+/// keeps the one before it, in the loader and the listing alike; one it
+/// reads replaces it, whatever its value.
+#[test]
+fn an_unreadable_difficulty_keeps_the_one_before() {
+    let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
+    let read = |text: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded =
+            bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+        let header = read_header(text.as_bytes(), &Limits::default()).unwrap();
+        (loaded.labels.difficulty, header.difficulty)
+    };
+    let some = |s: &str| (s.to_owned(), Some(s.to_owned()));
+    for (defs, want) in [
+        ("#DIFFICULTY 4\n#DIFFICULTY broken", some("4")),
+        ("#DIFFICULTY 4\n#DIFFICULTY 9", some("9")),
+        ("#DIFFICULTY 4\n#DIFFICULTY -1", some("-1")),
+        ("#DIFFICULTY 4\n#DIFFICULTY 99999999999", some("4")),
+        ("#DIFFICULTY broken", (String::new(), None)),
+    ] {
+        assert_eq!(read(&chart(defs)), want, "{defs:?}");
+    }
+    assert_eq!(bms_parser::java_int("+\u{FF13}"), Some(3));
+    assert_eq!(bms_parser::java_int("-2147483648"), Some(i32::MIN));
+    assert_eq!(bms_parser::java_int("2147483648"), None);
+    assert_eq!(bms_parser::java_int("-"), None);
+}
+
+/// A chart has a BGA when a line the reference decoder registers as a
+/// `#BMPxx` stands in what is read: the loader's taken branches, the
+/// listing's top level. The decoder reads it by fixed position: `BMP` in
+/// any case, an object id in the next two characters, and at least eight
+/// characters in the line, the path from the eighth on, kept even when it
+/// is only spaces. Whether a channel shows it does not matter.
+#[test]
+fn a_bmp_definition_with_a_path_is_a_bga() {
+    let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
+    let read = |text: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded =
+            bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+        let listing = bms_parser::read_listing(text.as_bytes(), &Limits::default()).unwrap();
+        (loaded.labels.bga, listing.bga)
+    };
+    for (defs, want) in [
+        ("#BMP00 poor.bmp", (true, true)),
+        ("#bmpZZ  a.png ", (true, true)),
+        ("#BMP01", (false, false)),
+        ("#BMP01 ", (false, false)),
+        ("#BMP01  ", (true, true)),
+        ("#BmP01xa", (true, true)),
+        // Counted in UTF-16 units, as Java's `String.length` counts.
+        ("#BMP01\u{e9}", (false, false)),
+        ("#BMP01\u{1F600}", (true, true)),
+        ("#BMP0! a.bmp", (false, false)),
+        ("#BMP001 a.bmp", (true, true)),
+        ("#BMP001", (false, false)),
+        ("#BGA01 01 0 0 10 10 0 0", (false, false)),
+        ("#SETRANDOM 1\n#IF 1\n#BMP01 a.bmp\n#ENDIF", (true, false)),
+        ("#SETRANDOM 1\n#IF 2\n#BMP01 a.bmp\n#ENDIF", (false, false)),
+    ] {
+        assert_eq!(read(&chart(defs)), want, "{defs:?}");
+    }
+    // A registered definition is no unknown header.
+    let dir = tempfile::tempdir().unwrap();
+    let text = chart("#BMP001 a.bmp");
+    let loaded =
+        bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+    assert!(
+        !loaded
+            .warnings
+            .iter()
+            .any(|w| matches!(w.kind, bms_parser::WarningKind::UnknownHeader(_))),
+        "{:?}",
+        loaded.warnings
+    );
 }

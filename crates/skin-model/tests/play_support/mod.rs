@@ -205,6 +205,7 @@ pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
 pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
     PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &GAUGES,
         attempt: Attempt::Full {

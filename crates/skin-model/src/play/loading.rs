@@ -11,8 +11,8 @@ use bms_model::TimeUs;
 use rules::GaugeValue;
 
 use super::schema::{field, timer};
-use super::timers::{covers, level_fields, read_timers};
-use super::{BuildError, CoverSettings, GaugeDesc, LoadState};
+use super::timers::{chart_fields, covers, level_fields, read_timers};
+use super::{BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
@@ -30,7 +30,8 @@ pub enum LoadingField {
     Setting,
     /// Available while the frame gives a gauge descriptor.
     Descriptor,
-    /// Available while the frame gives the chosen chart's play level.
+    /// Available while the frame gives this datum of the chosen chart:
+    /// its play level, its difficulty or whether it has a BGA.
     Chosen,
     /// Known before the play starts: it reads its READY value, which a
     /// program may read: `time.progress_ppm`, 0 (the source's
@@ -174,6 +175,15 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // judge.lane.7
         // The progress, 101: 0 until the play starts, as in READY.
         Before, // time.progress_ppm
+        // The chart's metadata, 102 to 107: its difficulty and whether it
+        // has a BGA are the chosen chart's, from the frame; its total comes
+        // with the attempt, which a loading frame does not have.
+        Chosen,      // chart.difficulty
+        Chosen,      // chart.difficulty_valid
+        Unavailable, // chart.total
+        Unavailable, // chart.total_valid
+        Chosen,      // chart.bga
+        Chosen,      // chart.bga_valid
     ]
 };
 
@@ -181,6 +191,21 @@ const FIELDS: [LoadingField; field::COUNT] = {
 #[must_use]
 pub fn loading_field(slot: u16) -> Option<LoadingField> {
     FIELDS.get(usize::from(slot)).copied()
+}
+
+/// The chosen chart's data a loading frame may give, as bits of
+/// [`Need::chosen`]: its play level, its difficulty, whether it has a BGA.
+const CHOSEN_LEVEL: u8 = 1;
+const CHOSEN_DIFFICULTY: u8 = 2;
+const CHOSEN_BGA: u8 = 4;
+
+/// The chosen chart's datum [`LoadingField::Chosen`] field `slot` reads.
+const fn chosen_bit(slot: u16) -> u8 {
+    match slot {
+        field::CHART_LEVEL | field::CHART_LEVEL_VALID => CHOSEN_LEVEL,
+        field::CHART_DIFFICULTY | field::CHART_DIFFICULTY_VALID => CHOSEN_DIFFICULTY,
+        _ => CHOSEN_BGA,
+    }
 }
 
 /// Built-in timer `slot`'s class while loading: `loading` and `screen`
@@ -201,8 +226,9 @@ pub const fn loading_timer(slot: u16) -> Option<LoadingTimer> {
 pub(crate) struct Need {
     /// It reads a descriptor field: evaluated while a descriptor is given.
     descriptor: bool,
-    /// It reads the play level: evaluated while the frame gives one.
-    level: bool,
+    /// The chosen chart's data it reads ([`CHOSEN_LEVEL`] and the others):
+    /// evaluated while the frame gives each.
+    chosen: u8,
     /// It reads an unavailable field: never evaluated while loading.
     never: bool,
 }
@@ -219,7 +245,7 @@ impl Need {
                     ..need
                 },
                 Some(LoadingField::Chosen) => Self {
-                    level: true,
+                    chosen: need.chosen | chosen_bit(slot),
                     ..need
                 },
                 Some(LoadingField::Unavailable) | None => Self {
@@ -233,15 +259,15 @@ impl Need {
     pub(crate) const fn and(self, other: Self) -> Self {
         Self {
             descriptor: self.descriptor || other.descriptor,
-            level: self.level || other.level,
+            chosen: self.chosen | other.chosen,
             never: self.never || other.never,
         }
     }
 
-    /// Whether it is met in a frame that gives a descriptor or not, and a
-    /// play level or not.
-    pub(crate) const fn met(self, descriptor: bool, level: bool) -> bool {
-        !self.never && (descriptor || !self.descriptor) && (level || !self.level)
+    /// Whether it is met in a frame that gives a descriptor or not, and
+    /// the chosen chart's data `chosen` ([`LoadingFrame::chosen`]).
+    pub(crate) const fn met(self, descriptor: bool, chosen: u8) -> bool {
+        !self.never && (descriptor || !self.descriptor) && self.chosen & !chosen == 0
     }
 }
 
@@ -296,8 +322,44 @@ pub struct LoadingFrame<'a> {
     /// The chosen chart's play level, never a previous attempt's; `None`
     /// leaves what depends on it undrawn.
     pub play_level: Option<i32>,
+    /// The chosen chart's difficulty, from 1 to 5 and 0 for any other or
+    /// none, as [`ChartMetadata::difficulty`]; `None` leaves what depends on
+    /// it undrawn.
+    pub difficulty: Option<u8>,
+    /// Whether the chosen chart has a BGA, as [`ChartMetadata::bga`];
+    /// `None` leaves what depends on it undrawn.
+    pub bga: Option<bool>,
     /// Whether the attempt being loaded is autoplay.
     pub autoplay: bool,
+}
+
+impl LoadingFrame<'_> {
+    /// The chosen chart's data this frame gives, as [`Need`] reads them.
+    pub(crate) const fn chosen(&self) -> u8 {
+        let [_, difficulty, _, _, _, bga] = chart_fields(self.meta());
+        let level = if level_fields(self.play_level).1 != 0 {
+            CHOSEN_LEVEL
+        } else {
+            0
+        };
+        level
+            | if difficulty != 0 {
+                CHOSEN_DIFFICULTY
+            } else {
+                0
+            }
+            | if bga != 0 { CHOSEN_BGA } else { 0 }
+    }
+
+    /// The chosen chart's metadata as the frame gives it: no total, which
+    /// comes with the attempt.
+    const fn meta(&self) -> ChartMetadata {
+        ChartMetadata {
+            difficulty: self.difficulty,
+            bga: self.bga,
+            ..ChartMetadata::UNKNOWN
+        }
+    }
 }
 
 /// The loading runtime's state as of its last build: every timer's start
@@ -470,6 +532,9 @@ impl Loading {
         set(field::CHART_LEVEL, level);
         set(field::CHART_LEVEL_VALID, level_valid);
         set(field::AUTOPLAY, i32::from(frame.autoplay));
+        for (slot, v) in (field::CHART_DIFFICULTY..).zip(chart_fields(frame.meta())) {
+            set(slot, v);
+        }
         self.fields = fields;
         for (slot, start) in (0..timer::BUILTIN).zip(self.starts.iter_mut()) {
             *start = match loading_timer(slot) {
@@ -478,17 +543,14 @@ impl Loading {
             };
         }
         let descriptor = gauge.is_some();
+        let chosen = frame.chosen();
         read_timers(
             frame.now,
             &self.fields,
             &mut self.starts,
             &mut self.ms,
             whens,
-            |i| {
-                whens_need
-                    .get(i)
-                    .is_some_and(|n| n.met(descriptor, level_valid != 0))
-            },
+            |i| whens_need.get(i).is_some_and(|n| n.met(descriptor, chosen)),
         );
         Ok(())
     }
@@ -508,7 +570,15 @@ mod tests {
         for name in ["load.percent", "autoplay"] {
             assert_eq!(class(name), Some(LoadingField::Live), "{name}");
         }
-        for name in ["chart.level", "chart.level_valid"] {
+        let chosen = [
+            "chart.level",
+            "chart.level_valid",
+            "chart.difficulty",
+            "chart.difficulty_valid",
+            "chart.bga",
+            "chart.bga_valid",
+        ];
+        for name in chosen {
             assert_eq!(class(name), Some(LoadingField::Chosen), "{name}");
         }
         for name in ["gauge.kind", "gauge.valid"] {
@@ -534,11 +604,10 @@ mod tests {
                 "autoplay",
                 "gauge.kind",
                 "gauge.valid",
-                "chart.level",
-                "chart.level_valid",
                 "time.progress_ppm",
             ]
             .contains(&f.name)
+                || chosen.contains(&f.name)
                 || settings.contains(&f.name);
             if !named {
                 assert_eq!(class(f.name), Some(LoadingField::Unavailable), "{}", f.name);
@@ -550,6 +619,8 @@ mod tests {
             field::BPM_CHANGE_VALID,
             field::JUDGE_RECENT_MS,
             field::JUDGE_RECENT_IMPERFECT,
+            field::CHART_TOTAL,
+            field::CHART_TOTAL_VALID,
         ] {
             assert_eq!(loading_field(slot), Some(LoadingField::Unavailable));
         }

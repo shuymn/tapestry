@@ -1098,9 +1098,9 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
     controls.quitting() || controls.leaving()
 }
 
-/// What a loading frame may show of a chart, from its library entry's
-/// `header`.
-fn chosen_chart(h: &library::Header) -> ChosenChart {
+/// What a loading frame may show of a chart, from its library entry.
+fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
+    let h = &e.header;
     ChosenChart {
         title: h.title.clone(),
         subtitle: h.subtitle.clone(),
@@ -1110,6 +1110,10 @@ fn chosen_chart(h: &library::Header) -> ChosenChart {
         play_level: Some(crate::imports::facts::level_of(
             h.playlevel.as_deref().unwrap_or_default(),
         )),
+        difficulty: Some(crate::imports::facts::difficulty_of(
+            h.difficulty.as_deref().unwrap_or_default(),
+        )),
+        bga: Some(e.bga),
     }
 }
 
@@ -1652,7 +1656,7 @@ impl AppRig for PlayerRig<'_> {
             preset: sel.screen.preset().to_owned(),
             practice: sel.practicing,
             autoplay: self.autoplay,
-            chart: header.map_or_else(ChosenChart::default, chosen_chart),
+            chart: entry.map_or_else(ChosenChart::default, chosen_chart),
         };
         println!("load: the play screen loads {}", file_name(chart));
         let gauge = sel
@@ -2131,6 +2135,21 @@ mod tests {
     use crate::select::{MenuInput, MenuKey, MenuQueue, SelectScreen};
     use crate::shelf::{Shelf, open};
 
+    /// A library entry with `header` and BGA flag `bga`.
+    fn entry(header: library::Header, bga: bool) -> library::ChartEntry {
+        library::ChartEntry {
+            path: std::path::PathBuf::from("a.bms"),
+            size: 0,
+            mtime_ns: 0,
+            sha256: [0; 32],
+            md5: [0; 16],
+            header,
+            random: false,
+            bga,
+            summary: None,
+        }
+    }
+
     /// The chart's load waits on the render thread serving the adjustments
     /// (design.md "Play Adjustments"): F2 pressed while the load is pending
     /// steps a Classic hi-speed of 3.20 to 3.45, published before the load
@@ -2231,16 +2250,36 @@ mod tests {
     #[test]
     fn the_chosen_charts_level_comes_from_its_entry() {
         let level = |text: Option<&str>| {
-            chosen_chart(&library::Header {
+            let header = library::Header {
                 playlevel: text.map(str::to_owned),
                 ..library::Header::default()
-            })
-            .play_level
+            };
+            chosen_chart(&entry(header, false)).play_level
         };
         assert_eq!(level(Some("12")), Some(12));
         assert_eq!(level(Some("１２")), Some(12));
         assert_eq!(level(Some("12+")), Some(0));
         assert_eq!(level(None), Some(0));
+    }
+
+    /// A chosen chart's difficulty is its entry's `#DIFFICULTY` as an
+    /// attempt reads it, 1 to 5 and 0 for any other or none, and its BGA
+    /// flag the entry's: both known once the entry is.
+    #[test]
+    fn the_chosen_charts_difficulty_and_bga_come_from_its_entry() {
+        let chosen = |text: Option<&str>, bga| {
+            let header = library::Header {
+                difficulty: text.map(str::to_owned),
+                ..library::Header::default()
+            };
+            let c = chosen_chart(&entry(header, bga));
+            (c.difficulty, c.bga)
+        };
+        assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
+        assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
+        for text in [Some("6"), Some("0"), Some("-1"), Some("2a"), None] {
+            assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
+        }
     }
 
     /// A healthy screen whose first loading frame comes after the hold's

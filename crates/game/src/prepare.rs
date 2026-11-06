@@ -22,8 +22,9 @@ pub struct Ingested {
 
 /// A chart's descriptive labels as its file declares them in the branches
 /// its ingestion took, each empty when it declares none: what a skin's
-/// chart text shows, and the play level a skin's import reads. They come
-/// with the chart from one ingestion, never from reading the file again.
+/// chart text shows, the play level a skin's import reads, and the chart
+/// metadata a skin's readouts show. They come with the chart from one
+/// ingestion, never from reading the file again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChartLabels {
     /// The title.
@@ -38,6 +39,10 @@ pub struct ChartLabels {
     pub genre: String,
     /// The play level as written, trimmed: text, which the reader parses.
     pub playlevel: String,
+    /// `#DIFFICULTY` as written, trimmed: text, which the reader parses.
+    pub difficulty: String,
+    /// Whether the chart defines a BGA image (`bms_parser::Labels::bga`).
+    pub bga: bool,
 }
 
 /// Why a chart could not be ingested.
@@ -114,6 +119,8 @@ impl ChartIngest for BmsIngest {
                 subartist: l.subartist,
                 genre: l.genre,
                 playlevel: l.playlevel,
+                difficulty: l.difficulty,
+                bga: l.bga,
             },
             chart: loaded.chart,
             warnings: loaded

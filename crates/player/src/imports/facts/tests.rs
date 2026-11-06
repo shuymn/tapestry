@@ -8,7 +8,7 @@ use super::{attempt_facts, level_of};
 
 /// `text` loaded as `a.bms` under the play preset `preset`, the chart one
 /// note after `text`'s headers.
-pub(in crate::imports) fn loaded(text: &str, preset: &str) -> game::Loaded {
+pub(crate) fn loaded(text: &str, preset: &str) -> game::Loaded {
     let dir = tempfile::tempdir().unwrap();
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
