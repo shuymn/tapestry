@@ -324,7 +324,11 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?
         {
             Ok(f) => f,
-            Err(Failed::File { refused }) if role.refuses() && (refused || !holes) => {
+            // A play-critical image's failure is its own error; an
+            // essential part's is refused as that part, with its note.
+            Err(Failed::File { refused })
+                if matches!(role, Role::Critical(_)) && (refused || !holes) =>
+            {
                 if let Some(source) = self.assets.take_error(&name) {
                     return Err(ImportError::Asset {
                         at: self.loc(at),
@@ -385,10 +389,12 @@ impl Cx<'_> {
                 self.drop_el(role, at, NoteKind::CellTooLarge { w, h })?;
                 Ok(None)
             }
-            Err(NotAdded::Image(e)) if role.refuses() => Err(ImportError::Asset {
-                at: self.loc(at),
-                source: e,
-            }),
+            Err(NotAdded::Image(e)) if matches!(role, Role::Critical(_)) => {
+                Err(ImportError::Asset {
+                    at: self.loc(at),
+                    source: e,
+                })
+            }
             Err(NotAdded::Image(_)) => {
                 self.drop_el(role, at, NoteKind::MissingAsset)?;
                 Ok(None)

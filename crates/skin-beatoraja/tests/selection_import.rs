@@ -117,6 +117,22 @@ fn the_selected_row_must_draw_after_folding() {
     import_selection_with(d.path(), |c| c.options = vec![Some(901)]).unwrap();
 }
 
+/// The selected row's image file missing: refused as the selected row,
+/// naming the missing file, not as a play-critical image.
+#[test]
+fn a_missing_bar_image_refuses_the_selected_row() {
+    let d = folder(&minimal(""));
+    std::fs::remove_file(d.path().join("s.png")).unwrap();
+    match import_selection(d.path()) {
+        Err(ImportError::Essential {
+            part: EssentialPart::SelectedRow,
+            why: Some(NoteKind::MissingAsset),
+            at: Some(_),
+        }) => {}
+        other => panic!("{:?}", other.map(|i| i.report)),
+    }
+}
+
 #[test]
 fn a_skin_without_a_drawn_list_refuses() {
     let d = folder(&format!(r#""imageset": [{SET}], "text": [{TEXT_T}]"#));
