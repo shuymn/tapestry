@@ -103,6 +103,10 @@ pub(crate) struct Lowered {
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
     pub(crate) deviates: bool,
+    /// A read a critical element cannot reproduce (an `option` whose
+    /// condition is [`Cond::Expr`]'s `unreproduced`): why such an element
+    /// refuses it.
+    pub(crate) unreproduced: Option<Unsupported>,
     /// Whether its residual folded to a known value, for the conversion
     /// report.
     #[cfg(feature = "dev-tools")]
@@ -240,6 +244,7 @@ impl<'a> Lower<'a> {
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
+                unreproduced: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
             },
@@ -404,7 +409,11 @@ impl Lower<'_> {
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
                 did("work:option");
-                self.option(ops::numeric(id, &BTreeMap::new()), unmapped)
+                let why = Unsupported::Unmapped {
+                    api,
+                    id: i64::from(id),
+                };
+                self.option(ops::numeric(id, &BTreeMap::new()), why)
             }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
@@ -421,14 +430,19 @@ impl Lower<'_> {
     }
 
     /// An option read's mapped condition `c`, built within the bound
-    /// already charged.
-    fn option(&mut self, c: Cond, unmapped: impl FnOnce() -> Stop) -> R<Mapped> {
+    /// already charged; `unmapped` is why a read with no mapping, or one a
+    /// critical element cannot reproduce, stops.
+    fn option(&mut self, c: Cond, unmapped: Unsupported) -> R<Mapped> {
         match c {
             Cond::Expr {
                 src,
                 display_deviation,
+                unreproduced,
             } => {
                 self.out.deviates |= display_deviation;
+                if unreproduced.is_some() {
+                    self.out.unreproduced = self.out.unreproduced.or(Some(unmapped));
+                }
                 Ok(Mapped::Bool(Self::text(self.an, &["(", &src, ")"])?))
             }
             Cond::Fold(b) => Ok(Mapped::Bool(Self::text(
@@ -436,7 +450,7 @@ impl Lower<'_> {
                 &[if b { "true" } else { "false" }],
             )?)),
             Cond::Undefined(_) => Ok(Mapped::Bool(Self::text(self.an, &["false"])?)),
-            Cond::Unsupported(_) => Err(unmapped()),
+            Cond::Unsupported(_) => Err(Stop::Unsupported(unmapped)),
         }
     }
 
@@ -1364,6 +1378,7 @@ impl Cx<'_> {
                         guards: Vec::new(),
                         part: None,
                         deviates: false,
+                        unreproduced: None,
                         #[cfg(feature = "dev-tools")]
                         constant: matches!(fold, TextFold::Literal(_)),
                     }),
@@ -1466,6 +1481,11 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
         let why = match self.lower(id, Conv::Truthy) {
+            // A critical element refuses what it cannot reproduce.
+            Ok(Lowering::Lowered(Lowered {
+                unreproduced: Some(why),
+                ..
+            })) if critical => why,
             Ok(Lowering::Lowered(l)) => {
                 self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
@@ -1524,6 +1544,12 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, scan) = match self.lower(id, conv) {
             Ok(Lowering::Lowered(l)) => {
+                let role = l.part.map_or(base, Role::Critical);
+                // A critical number refuses what it cannot reproduce.
+                if let (Some(why), Role::Critical(_)) = (l.unreproduced, role) {
+                    self.outcome((c, id), "value", role, (Disposition::Refused, Some(why)));
+                    return Err(self.critical(id, "value", why));
+                }
                 self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));

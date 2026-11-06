@@ -299,7 +299,9 @@ const SONG_NO_BGA: i32 = 170;
 /// The model reads the class of the play preset's reading of the rank
 /// (D4), as the import facts give options 180 to 184
 /// (`lua::facts::JudgeClass::of`), where the source bands the song data's
-/// rank.
+/// rank. A critical destination reading one is refused
+/// ([`Cond::Expr`]'s `unreproduced`): the class may differ from the
+/// source's (`#DEFEXRANK` normalized there, `play/BMSPlayerRule.java:63`).
 const CHART_JUDGE: i32 = 180;
 /// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
 /// source's preload state and its complement: entering READY flips them
@@ -317,10 +319,15 @@ pub(crate) const TABLE_SONG: i32 = 1_008;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cond {
     /// A model expression (a `bool`), and whether what it tests differs
-    /// from the source's in an owner-decided way (D4).
+    /// from the source's in an owner-decided way (D4). `unreproduced` is
+    /// the signed op when what it tests is not the source's datum at all
+    /// (the judgment classes, the preset's reading of the rank): a
+    /// decorative element keeps it with its D4 note, a critical one is
+    /// refused as for an unsupported op.
     Expr {
         src: String,
         display_deviation: bool,
+        unreproduced: Option<i32>,
     },
     /// A built-in the model has no value for.
     Unsupported(i32),
@@ -453,6 +460,9 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
             Cond::Expr {
                 src,
                 display_deviation,
+                unreproduced: (CHART_JUDGE..=CHART_JUDGE + 4)
+                    .contains(&id)
+                    .then_some(if negative { -id } else { id }),
             }
         }
         None => Cond::Unsupported(if negative { -id } else { id }),
@@ -615,6 +625,7 @@ mod tests {
         Cond::Expr {
             src: src.to_owned(),
             display_deviation,
+            unreproduced: None,
         }
     }
 
@@ -715,9 +726,11 @@ mod tests {
             ));
         }
         for (id, name, src, d4) in cases {
+            // Only the classes refuse a critical destination.
             let want = Cond::Expr {
                 src: src.clone(),
                 display_deviation: d4,
+                unreproduced: d4.then_some(id),
             };
             assert_eq!(numeric(id, &none), want, "{id}");
             assert_eq!(named(&name), Some(want), "{name}");
@@ -726,6 +739,7 @@ mod tests {
                 Cond::Expr {
                     src: format!("!({src})"),
                     display_deviation: d4,
+                    unreproduced: d4.then_some(-id),
                 },
                 "{id}"
             );

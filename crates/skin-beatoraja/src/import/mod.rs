@@ -1413,7 +1413,8 @@ impl<'d> Cx<'d> {
     }
 
     /// Applies one condition, setting `deviates` for a D4 one: `Ok(false)`
-    /// when the element is dropped or never drawn. A repeated expression
+    /// when the element is dropped or never drawn. One a critical element
+    /// cannot reproduce is unsupported there. A repeated expression
     /// adds nothing: the supported conditions are a closed set, so a long
     /// list builds no more; one destination listing more of them than one
     /// source holds is refused at its location (`ops`' tests).
@@ -1427,8 +1428,15 @@ impl<'d> Cx<'d> {
     ) -> Result<bool, ImportError> {
         match c {
             Cond::Expr {
+                unreproduced: Some(op),
+                ..
+            } if matches!(role, Role::Critical(_)) => {
+                self.condition(role, at, Cond::Unsupported(op), conds, deviates)
+            }
+            Cond::Expr {
                 src,
                 display_deviation,
+                ..
             } => {
                 *deviates |= display_deviation;
                 if !conds.contains(&src) {

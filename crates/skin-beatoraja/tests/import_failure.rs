@@ -315,6 +315,28 @@ fn an_unsupported_part_refuses_at_its_destination() {
     }
 }
 
+/// The judgment classes (180 to 184) are the play preset's reading of the
+/// rank, which may differ from the source's band (`#DEFEXRANK`
+/// normalized there): a critical destination reading one, by number, by
+/// name or negated, is refused as for an unsupported op; a decorative one
+/// keeps it with its D4 note (`chart_meta.rs`).
+#[test]
+fn judgment_class_conditions_refuse_failure_presentation() {
+    for (fields, id) in [
+        (r#""op": [180]"#, 180),
+        (r#""op": [-184]"#, -184),
+        (r#""draw": 182"#, 182),
+        (r#""op": ["chart_judge_hard"]"#, 181),
+        (r#""draw": "!chart_judge_easy""#, -183),
+    ] {
+        let r = images("", &[&fail("i", fields)]);
+        refused_as_failure(r, &at("i"), prop(PropertyKind::Boolean, Some(id)));
+    }
+    // The difficulty is the source's datum: kept.
+    let r = images("", &[&fail("i", r#""op": [151]"#)]);
+    assert!(r.loaded.result.is_ok());
+}
+
 #[test]
 fn a_failure_image_refuses_a_file_it_cannot_load() {
     // Missing for the source too, and refused by this importer alone:
@@ -858,6 +880,48 @@ fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
                 why: unmapped
             }],
             "{field}"
+        );
+    }
+}
+
+/// A Lua callback reading a judgment class: on `failed` refused at the
+/// callback as a read with no mapping, elsewhere lowered and kept with its
+/// D4 note.
+#[test]
+fn lua_judgment_class_reads_refuse_failure_presentation() {
+    use skin_beatoraja::lua::{HOST_APIS, Unsupported};
+    use skin_beatoraja::{DeviationId, LuaWhy};
+    let api = HOST_APIS
+        .iter()
+        .position(|&(_, n)| n == "option")
+        .and_then(|i| u16::try_from(i).ok())
+        .unwrap();
+    for (field, draw, value, id, line) in [
+        ("draw", Some("ms.option(180)"), None, 180, 7),
+        ("draw", Some("not ms.option(184)"), None, 184, 7),
+        ("value", None, Some("ms.option(181) and 1 or 0"), 181, 6),
+    ] {
+        let d = lua_callback_skin(3, draw, value);
+        match common::lua_import(d.path()) {
+            Err(ImportError::Lua {
+                at: Some(at),
+                why: LuaWhy::Critical { field: f, why },
+            }) => {
+                assert_eq!((f, why), (field, Unsupported::Unmapped { api, id }));
+                assert_eq!((at.file.as_str(), at.line), ("s.luaskin", line));
+            }
+            other => panic!("{field}: {other:?}"),
+        }
+        let d = lua_callback_skin(41, draw, value);
+        let r = common::lua_import(d.path()).unwrap();
+        assert_eq!(dispositions(&r), [1, 0, 0], "{field} {id}");
+        assert!(
+            r.imported
+                .report
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Deviation(DeviationId::D4)),
+            "{field} {id}"
         );
     }
 }
