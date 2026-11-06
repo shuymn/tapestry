@@ -305,8 +305,9 @@ impl Cx<'_> {
     /// resolved object, where the source's adds 5 s (stage3.md R3).
     /// `changeable` needs nothing, since the play has no pointer, and
     /// `event` is unused on that path. Its range is scaled from the skin's
-    /// height to 1 080 reference pixels, or from its width to 1 920 for
-    /// a horizontal one (`:398-415`), and truncated once, exactly. Any
+    /// height to 1 080 reference pixels, the same ratio as from its width
+    /// to 1 920 for a horizontal one (`:398-415`, every accepted size being
+    /// 16:9), and truncated once, exactly. Any
     /// other slider is dropped with a note, or refuses the skin when it is
     /// failure presentation.
     pub(in super::super) fn slider(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
@@ -366,17 +367,11 @@ impl Cx<'_> {
             Ok(v) => v,
             Err(why) => return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why),
         };
-        // `⌊1080 · range / height⌋`, or `⌊1920 · range / width⌋` across,
-        // at most `MAX_COORD`.
-        let scaled = match direction {
-            SliderDirection::Left | SliderDirection::Right => {
-                Q::int(range).mul(self.r).map(Q::floor)
-            }
-            SliderDirection::Up | SliderDirection::Down => {
-                (HEIGHT * i128::from(range)).checked_div(i128::from(self.height))
-            }
-        };
-        let r = scaled
+        // `⌊1080 · range / height⌋`, at most `MAX_COORD`. Every size the
+        // importer takes is 16:9, so the source's width scale for a
+        // horizontal slider is the same ratio.
+        let r = (HEIGHT * i128::from(range))
+            .checked_div(i128::from(self.height))
             .and_then(|r| u32::try_from(r).ok())
             .filter(|&r| i128::from(r) <= i128::from(MAX_COORD))
             .ok_or_else(|| self.range(at, "range"))?;

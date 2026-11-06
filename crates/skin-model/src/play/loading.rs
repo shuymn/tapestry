@@ -212,26 +212,21 @@ impl Need {
     pub(crate) fn of(p: Option<&Program>) -> Self {
         p.into_iter()
             .flat_map(Program::fields)
-            .fold(Self::default(), Self::reading)
-    }
-
-    /// What it needs once it reads field `slot` too.
-    pub(crate) fn reading(self, slot: u16) -> Self {
-        match loading_field(slot) {
-            Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => self,
-            Some(LoadingField::Descriptor) => Self {
-                descriptor: true,
-                ..self
-            },
-            Some(LoadingField::Chosen) => Self {
-                level: true,
-                ..self
-            },
-            Some(LoadingField::Unavailable) | None => Self {
-                never: true,
-                ..self
-            },
-        }
+            .fold(Self::default(), |need, slot| match loading_field(slot) {
+                Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => need,
+                Some(LoadingField::Descriptor) => Self {
+                    descriptor: true,
+                    ..need
+                },
+                Some(LoadingField::Chosen) => Self {
+                    level: true,
+                    ..need
+                },
+                Some(LoadingField::Unavailable) | None => Self {
+                    never: true,
+                    ..need
+                },
+            })
     }
 
     /// What it and `other` need together.

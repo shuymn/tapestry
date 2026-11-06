@@ -222,11 +222,6 @@ impl Q {
         (self.d == 1).then_some(self.n)
     }
 
-    /// The greatest integer at most `self`: `⌊self⌋`.
-    pub(crate) const fn floor(self) -> i128 {
-        self.n.div_euclid(self.d)
-    }
-
     /// The nearest integer, halves rounded up: `⌊self + ½⌋`.
     pub(crate) fn round(self) -> Option<i128> {
         let num = self.n.checked_mul(2)?.checked_add(self.d)?;

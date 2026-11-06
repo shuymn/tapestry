@@ -27,7 +27,7 @@ use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
-    SliderDirection, SliderRate, TrimOutcome,
+    SliderDirection, TrimOutcome,
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
@@ -1388,16 +1388,9 @@ impl Skin {
                         }
                         _ => None,
                     };
-                    let need = Need::of(e.visible.as_ref()).and(Need::of(value));
-                    // A progress slider reads the progress.
-                    let slider = match e.source {
-                        Source::CoverPaint(p) => cover_paints.get(index(p)).and_then(|p| p.slider),
-                        _ => None,
-                    };
-                    match slider.map(|s| s.rate) {
-                        Some(SliderRate::Progress) => need.reading(field::TIME_PROGRESS_PPM),
-                        Some(SliderRate::Sudden) | None => need,
-                    }
+                    // A progress slider reads `time.progress_ppm`, which
+                    // loading knows (0) and nothing else needs.
+                    Need::of(e.visible.as_ref()).and(Need::of(value))
                 },
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
