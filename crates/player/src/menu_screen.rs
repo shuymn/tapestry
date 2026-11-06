@@ -341,6 +341,9 @@ pub struct MenuScreen {
     strip_underline: Option<[f32; 4]>,
     /// What the selection skin's text and the strip were prepared for.
     selection_key: Option<SelectionKey>,
+    /// The caret's area of the fallback page prepared with the selection
+    /// skin, sent when a refusal draws the page.
+    page_caret: Option<[f32; 4]>,
 }
 
 /// One request for the chosen chart's text: the installation, size and
@@ -457,6 +460,7 @@ impl MenuScreen {
             strip_lines: 0,
             strip_underline: None,
             selection_key: None,
+            page_caret: None,
         }
     }
 
@@ -488,7 +492,7 @@ impl MenuScreen {
             return Ok(Ok(()));
         }
         self.selection_key = None;
-        self.prepare_page(&u.page, LEFT, TOP)?;
+        self.page_caret = self.prepare_page(&u.page, LEFT, TOP)?;
         self.prepare_strip(&u.strip)?;
         let skin = Arc::clone(logic.bundle.skin());
         if let Err(e) = skin.update_selection(&mut logic.sel, &u.view, &u.labels) {
@@ -959,7 +963,10 @@ impl Screen for MenuScreen {
             Err(why) => Some(why),
         };
         if refused.is_some() {
+            // The page prepared with the update draws, its caret with it
+            // in place of the strip's.
             self.selection_key = None;
+            self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
             self.shown(timing.presented);
             return Ok(SelectionDrawn { timing, refused });

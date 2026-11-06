@@ -94,6 +94,32 @@ fn the_strip_shows_the_search_and_its_composition_over_the_skin() {
     assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
 }
 
+/// A refused frame with the search box focused draws the page prepared
+/// with the update, and sends the caret's area on the page's search line,
+/// not the strip's.
+#[test]
+fn a_refused_frame_sends_the_pages_caret() {
+    for text in [false, true] {
+        let (_dir, mut screen, mut logic, sent) = skinned();
+        let mut feed = SkinFeed::default();
+        feed.enter(TimeUs(0));
+        let u = update(&mut feed, &searching("abc", "かな"), 0);
+        drawn(&mut screen, &mut logic, &u, true, 0);
+        let strip = sent.0.lock().unwrap().last().copied().flatten().unwrap();
+        assert_eq!(strip[1], super::line_top(0));
+        let line = u.page.caret.unwrap().line;
+        assert_ne!(line, 0);
+        screen.renderer.refuse_next_selection(text);
+        let d = screen
+            .selection(&u, Some(&mut logic), text, TimeUs(0))
+            .unwrap();
+        assert!(d.refused.is_some(), "{text}");
+        let page = sent.0.lock().unwrap().last().copied().flatten().unwrap();
+        assert_eq!(page[1], super::line_top(line), "{text}: {page:?}");
+        assert!(page[2] > 30.0, "{text}: {page:?}");
+    }
+}
+
 /// After a preset step at `t` the strip names the preset at `t` and
 /// `t + 2 999 999 µs`, not at `t + 3 000 000 µs`.
 #[test]
