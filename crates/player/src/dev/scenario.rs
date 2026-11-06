@@ -34,8 +34,9 @@
 //! [[step]]
 //! play = { input = "auto", until = "end" }
 //! # input = "auto" | "<input log, relative to this file>" | { miss = "all" }
-//! # { miss = "all" }: generated for the chart, no key pressed, every note
-//! # missed, played and saved as a log's play is
+//! # { miss = "all" }: generated for the chart, no key pressed, played
+//! # and saved as a log's play is: its judgeable notes are missed, and it
+//! # ends as such a play does
 //! # until = "end" | { at_ms = 2250, command = "retry" | "quit" | "skip" }
 //! # "quit": the quit key before the play completes, which ends it midway
 //! # on its result; "skip": the quit key once it is complete, its tail

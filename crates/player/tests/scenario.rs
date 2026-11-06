@@ -636,6 +636,15 @@ fn other_scenario_version_is_refused() {
     );
     assert!(!stderr.contains("what_v5_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
+    // The previous version too: its files are refused, never read.
+    let old = scenario(&["quit = {}"]).replacen("version = 4", "version = 3", 1);
+    let (out, _, stderr) = fx.run(&old);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("version 3 is not supported; this build reads version 4"),
+        "{stderr}"
+    );
+    assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
@@ -1632,9 +1641,12 @@ fn restart_keeps_the_chosen_preset() {
     );
 }
 
-/// Input generated to press nothing misses every note: with the HAZARD
-/// gauge shown its first miss fails it, the play enters Closing, and it is
-/// played and saved as a log's play is, with no judgment but misses.
+/// Input generated to press nothing: with the HAZARD gauge shown, its
+/// first miss fails it and the play enters Closing, as its report says. It
+/// is played and saved as a log's play is: one keyboard, nothing held at
+/// the start, no press, its re-evaluation the live result. A frame of
+/// Closing is not asserted: none is guaranteed to be presented (design.md
+/// "Play Lifecycle", Closing); the phase a frame names is the unit test's.
 #[test]
 fn a_generated_no_press_play_misses_into_closing() {
     let fx = Fixture::new();
@@ -1646,7 +1658,6 @@ fn a_generated_no_press_play_misses_into_closing() {
     )
     .unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
-        "capture = { at = 2800, file = \"c.png\" }",
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = { miss = \"all\" }, until = \"end\" }",
         "result = \"back\"",
@@ -1658,9 +1669,16 @@ fn a_generated_no_press_play_misses_into_closing() {
         1,
         "{stdout}"
     );
+    let [play] = lines(&stdout, "play 1: Aborted(GaugeFailed)")[..] else {
+        panic!("{stdout}");
+    };
+    // Only misses, and the re-evaluation agrees.
+    assert!(
+        play.contains("perfect 0 great 0 good 0 bad 0 poor 1"),
+        "{play}"
+    );
+    assert!(play.contains("re-evaluation matches live: true"), "{play}");
     assert_eq!(lines(&stdout, "closing: ").len(), 1, "{stdout}");
-    let side = fs::read_to_string(fx.base.join("out").join("c.json")).unwrap();
-    assert!(side.contains("\"phase\":\"closing\""), "{side}");
     let (records, _) = fx.played_records();
     assert_eq!(records.len(), 1, "{records:?}");
     let rec = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
@@ -1671,6 +1689,37 @@ fn a_generated_no_press_play_misses_into_closing() {
         "{:?}",
         rec.events.first()
     );
+    assert_eq!(rec.devices.sources.len(), 1);
+    assert_eq!(rec.devices.sources[0].kind, replay::DeviceKind::Keyboard);
+    assert!(rec.start.held.is_empty(), "{:?}", rec.start);
+}
+
+/// A chart with no judgeable note is refused, generated input or not
+/// (design.md "Invalid Charts": nothing to play): the library never lists
+/// it, so its `play` never starts and nothing is saved.
+#[test]
+fn a_generated_no_press_play_of_a_chart_without_notes_is_refused() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let dir = fx.library().join("tail");
+    fs::write(
+        dir.join("tail.bms"),
+        "#PLAYER 1\n#TITLE none\n#BPM 120\n#WAV02 bgm.wav\n#00101:02\n",
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/tail/tail.bms\" }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        format!("{stdout}{stderr}").contains("tail.bms was not listed"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
+    assert!(fx.records().is_empty());
 }
 
 /// A generated input is no input file: an unknown word is refused by its
@@ -1685,7 +1734,8 @@ fn a_generated_input_is_checked() {
         "quit = {}",
     ]));
     assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("line "), "{stderr}");
+    // The `play` step's own line.
+    assert!(stderr.contains("line 8"), "{stderr}");
     let (out, _, stderr) = fx.run(&scenario(&[
         "select = { path = \"library/a/a.bms\" }",
         "play = { input = \"auto\", until = { at_ms = 1, command = \"retry\" } }",
@@ -1771,9 +1821,11 @@ fn pixel(path: &Path, x: usize, y: usize) -> [u8; 3] {
 /// the combo break its condition, opaque from 750 to 1250 ms on that timer:
 /// the shape of a skin's end-of-play image, in blue, and an untimed red
 /// corner on the same read. A play ends with its audio, so the chart's BGM lasts through
-/// the capture: a miss has the image inside its window, a perfect play has
-/// none. A retry of the miss starts from a clean snapshot: its first READY
-/// frame has no corner, with no tally set by hand.
+/// the capture: after a miss the corner shows, after a perfect play it does
+/// not. A retry of the miss starts from a clean snapshot: its first READY
+/// frame has no corner, with no tally set by hand. The blue window runs on
+/// the last-note timer, which only a frame at an exact time shows for
+/// certain: `lua_bridges` tests it at those times.
 #[test]
 fn a_missed_note_draws_the_finish_window() {
     let fx = Fixture::new();
@@ -1853,14 +1905,12 @@ fn a_missed_note_draws_the_finish_window() {
         assert!(play.contains(score), "{stdout}");
     }
     let out = fx.base.join("out");
-    let (centre, corner) = (|p: &Path| pixel(p, 640, 360), |p: &Path| pixel(p, 20, 700));
-    assert_eq!(centre(&out.join("miss.png")), [0, 0, 255]);
+    let corner = |p: &Path| pixel(p, 20, 700);
     assert_eq!(corner(&out.join("miss.png")), [255, 0, 0]);
     assert_eq!(
         corner(&out.join("retry.png")),
         [0, 0, 0],
         "the retry's first frame"
     );
-    assert_eq!(centre(&out.join("hit.png")), [0, 0, 0]);
     assert_eq!(corner(&out.join("hit.png")), [0, 0, 0]);
 }
