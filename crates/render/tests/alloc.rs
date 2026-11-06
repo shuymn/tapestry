@@ -62,7 +62,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
 use decl_support::{
-    FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts, solid_bundle,
+    FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts, shared_limit_bundle,
+    solid_bundle,
 };
 use eval::{JudgeEvent, JudgeEventKind};
 use game::adjustment::PresentationSnapshot;
@@ -513,15 +514,15 @@ fn frames_do_not_allocate_from_the_first() {
 
 /// Skins that each fit alone but together pass the texels the screens
 /// share are refused before anything is allocated (design.md "Memory
-/// Budget"): a generated cell whose atlas array is exactly the shared
-/// limit fits alone, but as the selection screen's beside play's tiny
-/// skin it is refused, with no allocation, nothing staged, and play's
-/// installation drawing its next frame as before. It is never uploaded.
+/// Budget"): a generated cell whose atlas array, with its text layer, is
+/// exactly the shared limit fits alone, but as the selection screen's
+/// beside play's tiny skin it is refused, with no allocation, nothing
+/// staged, and play's installation drawing its next frame as before. It
+/// is never uploaded.
 fn shared_admission() {
     const TINY: u64 = 256 * 256 * 2;
     let mut r = offscreen(1_920, 1_080);
-    let big = solid_bundle(&r, &Look::left([0, 0, 255, 255]), [4_096, 3_072]);
-    assert_eq!(big.atlas_texels(), SHARED_TEXELS);
+    let big = shared_limit_bundle(&r, [0, 0, 255, 255]);
     // Alone, exactly at the limit, it fits.
     r.admit(ScreenKind::Selection, &big).unwrap();
     let tiny = solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]);

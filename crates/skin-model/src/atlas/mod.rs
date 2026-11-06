@@ -58,7 +58,7 @@ pub const MAX_PAGE_SIDE: u32 = 8_192;
 pub const MAX_PAGES: u32 = 64;
 /// The most level-0 texels across every layer of the array, the reserved
 /// ones and the text layer included; the mips add a third.
-pub const MAX_ATLAS_TEXELS: u64 = 128 << 20;
+pub const MAX_ATLAS_TEXELS: u64 = 192 << 20;
 /// The smallest page side of an atlas with a text layer.
 pub const MIN_TEXT_SIDE: u32 = 2_048;
 
