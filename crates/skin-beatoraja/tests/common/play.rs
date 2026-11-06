@@ -96,6 +96,7 @@ pub fn judged(ms: i64, judgment: Judgment, combo: u32) -> JudgeEvent {
             deviation: Some(TimeUs(0)),
             release: None,
             combo,
+            presses: 0,
         },
     }
 }

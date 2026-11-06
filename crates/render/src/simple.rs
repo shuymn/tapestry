@@ -1434,6 +1434,7 @@ mod tests {
             note,
             judgment: Judgment::Great,
             deviation: TimeUs(0),
+            presses: 0,
         };
         event(0, at, Some(at), kind)
     }
@@ -1462,6 +1463,7 @@ mod tests {
             deviation: deviation.map(TimeUs),
             release: release.map(TimeUs),
             combo: 1,
+            presses: 0,
         };
         event(2, at, origin, kind)
     }
@@ -1578,6 +1580,7 @@ mod tests {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         );
         let judged_view = view_of(&tap, &[judged]);
@@ -1640,6 +1643,7 @@ mod tests {
                     deviation: Some(TimeUs(-60 * MS)),
                     release: None,
                     combo: 1,
+                    presses: 0,
                 },
             ),
             event(
@@ -2198,6 +2202,7 @@ mod tests {
                     deviation: Some(TimeUs(-200 * MS)),
                     release: None,
                     combo: 1,
+                    presses: 0,
                 },
             );
             let judged_view = view_of(&chart, &[judged]);
@@ -2505,6 +2510,7 @@ mod tests {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         };
         let effects = [press];

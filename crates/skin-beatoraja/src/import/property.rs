@@ -680,9 +680,26 @@ pub(crate) enum IndexProp {
     /// `option_1p` (42, `IntegerPropertyFactory.java:1136-1143`): the lane
     /// option, 0 (OFF), as tapestry applies none.
     RandomOption,
+    /// The 1P lanes' visual states (500-507, `:929-935`,
+    /// `play/JudgeManager.java:805-811`), by the source's skin offset: 0 the
+    /// scratch, 1-7 the keys, as [`bms_model::Lane::index`] numbers them
+    /// (`play/LaneProperty.java:50`). Read from `judge.lane.N`.
+    LaneJudge(u8),
     /// A property the model has no value for.
     Unsupported(i32),
 }
+
+/// The fields of [`IndexProp::LaneJudge`], by lane.
+const LANE_JUDGES: [&str; 8] = [
+    "judge.lane.0",
+    "judge.lane.1",
+    "judge.lane.2",
+    "judge.lane.3",
+    "judge.lane.4",
+    "judge.lane.5",
+    "judge.lane.6",
+    "judge.lane.7",
+];
 
 impl IndexProp {
     /// The integer selector in the model: `None` for an unsupported one.
@@ -701,6 +718,7 @@ impl IndexProp {
             Self::LiftEnabled => "if lift.enabled then 1 else 0",
             Self::HiddenEnabled => "if hidden.enabled then 1 else 0",
             Self::RandomOption => "0",
+            Self::LaneJudge(n) => LANE_JUDGES.get(usize::from(n))?,
             Self::Unsupported(_) => return None,
         })
     }
@@ -709,14 +727,17 @@ impl IndexProp {
     /// way (D4): the gauge's type projected onto the six looks, and the
     /// switches read from the play rather than the configuration.
     pub(crate) fn deviates(self) -> bool {
-        !matches!(self, Self::Null | Self::RandomOption | Self::Unsupported(_))
+        !matches!(
+            self,
+            Self::Null | Self::RandomOption | Self::LaneJudge(_) | Self::Unsupported(_)
+        )
     }
 }
 
 /// The image-index ids the factory knows besides the supported ones
 /// (`IntegerPropertyFactory.java:920-961, 1088-1383`): the `IndexType`
 /// entries, the ranking patterns 380-399, the skin-selection ids
-/// (`SkinPropertyMapper.java:101-104`) and the judge readings 500-519 and
+/// (`SkinPropertyMapper.java:101-104`) and the judge readings 508-519 and
 /// 1510-1699 (`SkinProperty.java:1054-1067`).
 const INDEX_KNOWN: &[(i32, i32)] = &[
     (10, 12),
@@ -738,7 +759,7 @@ const INDEX_KNOWN: &[(i32, i32)] = &[
     (400, 400),
     (450, 466),
     (469, 469),
-    (500, 519),
+    (508, 519),
     (1_510, 1_699),
 ];
 
@@ -750,6 +771,7 @@ pub(crate) fn index_by_id(id: i32) -> IndexProp {
         330 => IndexProp::CoverEnabled,
         331 => IndexProp::LiftEnabled,
         332 => IndexProp::HiddenEnabled,
+        500..=507 => IndexProp::LaneJudge(u8::try_from(id - 500).unwrap_or(0)),
         _ if INDEX_KNOWN.iter().any(|&(a, b)| (a..=b).contains(&id)) => IndexProp::Unsupported(id),
         _ => IndexProp::Null,
     }
@@ -974,6 +996,23 @@ mod tests {
         assert_eq!(index_by_id(40), IndexProp::GaugeKind);
         assert_eq!(index_by_id(42), IndexProp::RandomOption);
         assert_eq!(index_by_id(43), IndexProp::Unsupported(43));
+        // The 1P lanes' visual states, 500 the scratch to 507 key 7, read
+        // from each lane's field and keeping the source; 508, 509 and the
+        // other players' stay unsupported, and none is a value property.
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        for n in 0..8_u8 {
+            let id = 500 + i32::from(n);
+            let p = index_by_id(id);
+            assert_eq!(p, IndexProp::LaneJudge(n));
+            let src = p.selector().unwrap();
+            assert_eq!(src, format!("judge.lane.{n}"));
+            assert!(!p.deviates());
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Int).is_ok());
+            assert_eq!(int_by_id(id), IntProp::Null);
+        }
+        for id in [508, 509, 510, 517, 519] {
+            assert_eq!(index_by_id(id), IndexProp::Unsupported(id), "{id}");
+        }
         assert_eq!(
             int_by_name("maxcombo2"),
             Some(IntProp::Shown(Value::MaxCombo))

@@ -369,6 +369,7 @@ fn timing_counts_the_judged_presses() {
             deviation: d.map(TimeUs),
             release: None,
             combo: 0,
+            presses: 0,
         },
     };
     let events = [
@@ -385,6 +386,7 @@ fn timing_counts_the_judged_presses() {
             kind: JudgeEventKind::EmptyPoor {
                 lane: lane(1),
                 deviation: TimeUs(0),
+                presses: 0,
             },
             ..judged(Judgment::Poor, None)
         },
@@ -394,6 +396,7 @@ fn timing_counts_the_judged_presses() {
                 note: 0,
                 judgment: Judgment::Perfect,
                 deviation: TimeUs(-5_000),
+                presses: 0,
             },
             ..judged(Judgment::Poor, None)
         },

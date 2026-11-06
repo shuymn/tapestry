@@ -138,6 +138,7 @@ fn the_play_objects_draw_together() {
             note: 0,
             judgment: Judgment::Perfect,
             deviation: TimeUs(0),
+            presses: 0,
         },
     };
     d.frame(900, &[held]);

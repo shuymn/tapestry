@@ -930,13 +930,14 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 use skin_beatoraja::{DeviationId, PropertyKind};
                 // Each selector but the perfect count and no property
                 // D4; the group past its frames never drawn; each set's
-                // undefined id ignored; 500-507 refused by their id.
+                // undefined id ignored; 508-515, 1P keys past 7 and 2P, refused by
+                // their id.
                 let mut k = kinds(&i);
                 k.sort_by_key(|n| format!("{n:?}"));
                 let mut want = vec![NoteKind::Deviation(DeviationId::D4); 6];
                 want.push(NoteKind::Track(skin_beatoraja::TrackWhy::NeverDrawn));
                 want.extend([NoteKind::UndefinedObject; 5]);
-                want.extend((500..=507).map(|id| NoteKind::UnsupportedProperty {
+                want.extend((508..=515).map(|id| NoteKind::UnsupportedProperty {
                     kind: PropertyKind::ImageIndex,
                     id: Some(id),
                 }));

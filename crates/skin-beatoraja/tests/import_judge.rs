@@ -130,6 +130,7 @@ fn empty_poor() -> JudgeEventKind {
     JudgeEventKind::EmptyPoor {
         lane: Lane::new(1).unwrap(),
         deviation: TimeUs(0),
+        presses: 0,
     }
 }
 

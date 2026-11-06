@@ -47,6 +47,7 @@ pub fn judged(
         deviation: deviation_ms.map(|d| TimeUs(d * MS)),
         release: release_ms.map(|r| TimeUs(r * MS)),
         combo,
+        presses: 0,
     }
 }
 
@@ -118,6 +119,7 @@ pub fn ln_held(l: u8, note: usize, judgment: Judgment) -> JudgeEventKind {
         note,
         judgment,
         deviation: TimeUs(0),
+        presses: 0,
     }
 }
 
@@ -139,6 +141,7 @@ pub fn empty_poor(l: u8) -> JudgeEventKind {
     JudgeEventKind::EmptyPoor {
         lane: lane(l),
         deviation: TimeUs(0),
+        presses: 0,
     }
 }
 

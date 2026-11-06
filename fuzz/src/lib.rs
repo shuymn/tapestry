@@ -473,6 +473,7 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 1,
+                presses: 0,
             },
         }];
         batch.clear();
@@ -832,6 +833,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             deviation: Some(TimeUs(0)),
             release: None,
             combo: 12,
+            presses: 0,
         },
     );
     for (ms, effects) in [(900, [gauge]), (1_000, [judged])] {
@@ -933,6 +935,7 @@ fn grade_anchor_probes(
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 12,
+                presses: 0,
             },
         };
         let effects: Vec<JudgeEvent> = gauge.into_iter().chain([judged]).collect();
@@ -1124,6 +1127,7 @@ fn digit_probes(
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: value,
+                presses: 0,
             },
         }];
         batch.clear();
@@ -1176,6 +1180,7 @@ fn long_note_probes(
             note: 0,
             judgment: Judgment::Perfect,
             deviation: TimeUs(0),
+            presses: 0,
         },
     }];
     let mut chart = ChartBuilder::new(150_000)

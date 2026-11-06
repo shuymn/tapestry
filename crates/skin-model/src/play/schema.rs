@@ -23,6 +23,9 @@ pub const GAUGE_KIND_ENUM: EnumId = EnumId(0);
 pub const READOUT_MAX: i32 = i32::MAX - 1;
 /// [`READOUT_MAX`] as a `u32`.
 pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
+/// The largest lane visual state, `judge.lane.N`: an empty POOR at or
+/// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
+pub const LANE_JUDGE_MAX: i32 = 11;
 /// A cover setting's full amount, ‰.
 pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
@@ -211,6 +214,14 @@ pub static PLAY: Schema = Schema {
             export: T,
         },
         flag("judge.recent_imperfect", T),
+        int("judge.lane.0", LANE_JUDGE_MAX, T),
+        int("judge.lane.1", LANE_JUDGE_MAX, T),
+        int("judge.lane.2", LANE_JUDGE_MAX, T),
+        int("judge.lane.3", LANE_JUDGE_MAX, T),
+        int("judge.lane.4", LANE_JUDGE_MAX, T),
+        int("judge.lane.5", LANE_JUDGE_MAX, T),
+        int("judge.lane.6", LANE_JUDGE_MAX, T),
+        int("judge.lane.7", LANE_JUDGE_MAX, T),
     ],
     timers: &[
         timer("ready", E),
@@ -428,8 +439,23 @@ pub mod field {
     pub const JUDGE_RECENT_MS: u16 = 91;
     /// Whether that judgment is worse than PERFECT; false before any.
     pub const JUDGE_RECENT_IMPERFECT: u16 = 92;
+    /// The first of the eight lanes' visual states, `judge.lane.N` at
+    /// `93 + N` for [`Lane::index`](bms_model::Lane::index) `N`; see
+    /// [`lane_judge`].
+    pub const JUDGE_LANES: u16 = 93;
     /// The number of fields.
-    pub const COUNT: usize = 93;
+    pub const COUNT: usize = 101;
+
+    /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
+    /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`Lane::index` is below LANE_COUNT (8)"
+    )]
+    pub const fn lane_judge(lane: bms_model::Lane) -> u16 {
+        JUDGE_LANES + lane.index() as u16
+    }
 
     /// The `duration.<t>.<k>.ms` slot of the variant at `tempo` (0 to 3:
     /// current, main, min, max), `covered` or not; `.green` and `.valid`
@@ -702,7 +728,17 @@ mod tests {
             slot("judge.recent_imperfect"),
             Some(field::JUDGE_RECENT_IMPERFECT)
         );
-        assert_eq!(field::COUNT, 93);
+        for lane in Lane::all() {
+            let name = format!("judge.lane.{}", lane.index());
+            assert_eq!(slot(&name), Some(field::lane_judge(lane)), "{name}");
+            assert_eq!(
+                PLAY.field(&name).map(|(_, f)| (f.ty, f.export)),
+                Some((FieldTy::Int { lo: 0, hi: 11 }, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::lane_judge(Lane::SCRATCH), 93);
+        assert_eq!(field::COUNT, 101);
     }
 
     #[test]

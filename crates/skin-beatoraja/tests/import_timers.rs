@@ -67,10 +67,12 @@ fn judgetimer_is_the_bomb_threshold() {
                 deviation: Some(TimeUs(0)),
                 release: None,
                 combo: 0,
+                presses: 0,
             },
             None => JudgeEventKind::EmptyPoor {
                 lane: Lane::new(1).unwrap(),
                 deviation: TimeUs(0),
+                presses: 0,
             },
         },
     };

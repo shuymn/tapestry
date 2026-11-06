@@ -216,6 +216,7 @@ impl Feed<'_> {
                     deviation: Some(TimeUs(0)),
                     release: None,
                     combo: u32::try_from(self.next).unwrap(),
+                    presses: 0,
                 },
             });
             self.next += 1;
@@ -238,6 +239,7 @@ impl Feed<'_> {
                     note: index,
                     judgment: Judgment::Great,
                     deviation: TimeUs(0),
+                    presses: 0,
                 }]
             } else if release.0 > now.0 - FRAME_US && release <= now {
                 self.ended += 1;
@@ -253,6 +255,7 @@ impl Feed<'_> {
                         deviation: Some(TimeUs(0)),
                         release: Some(TimeUs(release.0 - end.0)),
                         combo: 1,
+                        presses: 0,
                     },
                 ]
             } else {
@@ -760,6 +763,7 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
             note: index,
             judgment: Judgment::Great,
             deviation: TimeUs(0),
+            presses: 0,
         },
     }];
     let held_view = common::with_notes(view(0, 0), chart, &held);
