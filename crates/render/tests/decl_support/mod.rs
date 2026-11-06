@@ -96,6 +96,10 @@ pub struct Look {
     /// while the shown gauge's look is `hard` (a survival gauge's), and
     /// over [`JUDGE_MARKER`] once a judgment started its timer.
     pub markers: bool,
+    /// A marker drawing the image unclipped over [`FINISH_MARKER`] once the
+    /// `last_note` timer started: from the notes' end, at the first playing
+    /// frame at or past it.
+    pub finish: bool,
     /// Three loading elements drawing the image unclipped: over
     /// [`BACKGROUND`] on the untimed `screen` timer, over a 100×100 square
     /// moving right from [`ANIMATION`] at 1 canvas pixel per ms of the
@@ -267,6 +271,8 @@ pub const PROGRESS_SLOT: u16 = skin_model::timer::BUILTIN + 1;
 pub const GAUGE_MARKER: [i32; 4] = [1_200, 100, 100, 100];
 /// Where the judgment marker draws.
 pub const JUDGE_MARKER: [i32; 4] = [1_500, 100, 100, 100];
+/// Where the finish marker draws.
+pub const FINISH_MARKER: [i32; 4] = [1_700, 100, 100, 100];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -280,6 +286,7 @@ impl Look {
             text: false,
             text_on_screen: false,
             markers: false,
+            finish: false,
             loading: false,
             structure: false,
             chart_text: false,
@@ -401,6 +408,12 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
         elements.push(ElementDef {
             timer: TimerRef::Builtin(skin_model::timer::JUDGE),
             ..image(JUDGE_MARKER, false)
+        });
+    }
+    if look.finish {
+        elements.push(ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::LAST_NOTE),
+            ..image(FINISH_MARKER, false)
         });
     }
     if look.chart_text {
