@@ -298,15 +298,6 @@ const CHART_DIFFICULTY: i32 = 150;
 /// `song_no_bga` (`BooleanPropertyFactory.java:435`): the song data has no
 /// BGA, a chart with no `#BMPxx` image (`song/SongData.java:216`).
 const SONG_NO_BGA: i32 = 170;
-/// `chart_judge_veryhard` to `chart_judge_veryeasy`
-/// (`BooleanPropertyFactory.java:448-452`): the chart's judgment class.
-/// The model reads the class of the play preset's reading of the rank
-/// (D4), as the import facts give options 180 to 184
-/// (`lua::facts::JudgeClass::of`), where the source bands the song data's
-/// rank. A critical destination reading one is refused
-/// ([`Cond::Expr`]'s `unreproduced`): the class may differ from the
-/// source's (`#DEFEXRANK` normalized there, `play/BMSPlayerRule.java:63`).
-const CHART_JUDGE: i32 = 180;
 /// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
 /// source's preload state and its complement: entering READY flips them
 /// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
@@ -323,15 +314,10 @@ pub(crate) const TABLE_SONG: i32 = 1_008;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cond {
     /// A model expression (a `bool`), and whether what it tests differs
-    /// from the source's in an owner-decided way (D4). `unreproduced` is
-    /// the signed op when what it tests is not the source's datum at all
-    /// (the judgment classes, the preset's reading of the rank): a
-    /// decorative element keeps it with its D4 note, a critical one is
-    /// refused as for an unsupported op.
+    /// from the source's in an owner-decided way (D4).
     Expr {
         src: String,
         display_deviation: bool,
-        unreproduced: Option<i32>,
     },
     /// A built-in the model has no value for.
     Unsupported(i32),
@@ -422,14 +408,6 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         154 => (Body::Text("chart.difficulty == 4"), false),
         155 => (Body::Text("chart.difficulty == 5"), false),
         SONG_NO_BGA => (Body::Text("chart.bga_valid && !chart.bga"), false),
-        CHART_JUDGE => (
-            Body::Text("chart.judge_class_valid && chart.judge_class == 0"),
-            true,
-        ),
-        181 => (Body::Text("chart.judge_class == 1"), true),
-        182 => (Body::Text("chart.judge_class == 2"), true),
-        183 => (Body::Text("chart.judge_class == 3"), true),
-        184 => (Body::Text("chart.judge_class == 4"), true),
         _ => return None,
     })
 }
@@ -464,9 +442,6 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
             Cond::Expr {
                 src,
                 display_deviation,
-                unreproduced: (CHART_JUDGE..=CHART_JUDGE + 4)
-                    .contains(&id)
-                    .then_some(if negative { -id } else { id }),
             }
         }
         None => Cond::Unsupported(if negative { -id } else { id }),
@@ -529,7 +504,6 @@ fn selection_cond(id: i32, negative: bool) -> Cond {
             Cond::Expr {
                 src,
                 display_deviation: false,
-                unreproduced: None,
             }
         }
         _ => Cond::Unsupported(if negative { -id } else { id }),
@@ -688,7 +662,6 @@ mod tests {
         Cond::Expr {
             src: src.to_owned(),
             display_deviation,
-            unreproduced: None,
         }
     }
 
@@ -740,15 +713,16 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 86);
+        assert_eq!(exprs.len(), 76);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     /// The chart's metadata conditions read the `chart.*` fields, each by
-    /// name too; the classes are D4, and the conditions an unknown value's
-    /// 0 would hold are guarded by its validity. 171 stays unsupported.
+    /// name too, and the condition an unknown value's 0 would hold is
+    /// guarded by its validity. 171 and the judgment classes 180 to 184
+    /// stay unsupported.
     #[test]
     fn chart_metadata_conditions_map() {
         let none = BTreeMap::new();
@@ -757,19 +731,11 @@ mod tests {
                 150,
                 "chart_difficulty_0".to_owned(),
                 "chart.difficulty_valid && chart.difficulty == 0".to_owned(),
-                false,
             ),
             (
                 170,
                 "song_no_bga".to_owned(),
                 "chart.bga_valid && !chart.bga".to_owned(),
-                false,
-            ),
-            (
-                180,
-                "chart_judge_veryhard".to_owned(),
-                "chart.judge_class_valid && chart.judge_class == 0".to_owned(),
-                true,
             ),
         ];
         for k in 1..=5 {
@@ -777,39 +743,23 @@ mod tests {
                 150 + k,
                 format!("chart_difficulty_{k}"),
                 format!("chart.difficulty == {k}"),
-                false,
             ));
         }
-        for (k, name) in [(1, "hard"), (2, "normal"), (3, "easy"), (4, "veryeasy")] {
-            cases.push((
-                180 + k,
-                format!("chart_judge_{name}"),
-                format!("chart.judge_class == {k}"),
-                true,
-            ));
-        }
-        for (id, name, src, d4) in cases {
-            // Only the classes refuse a critical destination.
-            let want = Cond::Expr {
-                src: src.clone(),
-                display_deviation: d4,
-                unreproduced: d4.then_some(id),
-            };
-            assert_eq!(numeric(id, &none), want, "{id}");
-            assert_eq!(named(&name), Some(want), "{name}");
+        for (id, name, src) in cases {
+            assert_eq!(numeric(id, &none), expr(&src, false), "{id}");
+            assert_eq!(named(&name), Some(expr(&src, false)), "{name}");
             assert_eq!(
                 numeric(-id, &none),
-                Cond::Expr {
-                    src: format!("!({src})"),
-                    display_deviation: d4,
-                    unreproduced: d4.then_some(-id),
-                },
+                expr(&format!("!({src})"), false),
                 "{id}"
             );
             let scope = skin_model::Scope::new(&skin_model::PLAY);
             assert!(skin_model::compile(&src, &scope, skin_model::Ty::Bool).is_ok());
         }
-        assert_eq!(numeric(171, &none), Cond::Unsupported(171));
+        for id in [171, 180, 181, 182, 183, 184] {
+            assert_eq!(numeric(id, &none), Cond::Unsupported(id));
+            assert_eq!(numeric(-id, &none), Cond::Unsupported(-id));
+        }
     }
 
     #[test]

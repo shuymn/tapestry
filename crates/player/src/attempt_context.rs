@@ -11,7 +11,7 @@ use bms_model::TimeUs;
 use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
 use skin_model::{BpmRange, ChartMetadata, ChartText, GaugeDesc, PlayContext, Side};
 
-use crate::imports::facts::{class_of, difficulty_of, level_of};
+use crate::imports::facts::{difficulty_of, level_of};
 
 /// The scratch side the simple skin draws, its author's layout: it has no
 /// imported side and no player layout.
@@ -38,8 +38,7 @@ pub struct AttemptContext {
     /// import facts are ([`level_of`]).
     play_level: i32,
     /// The chart's metadata the `chart.*` fields read: its difficulty and
-    /// whether it has a BGA from its labels, its class from the play
-    /// preset's reading of its rank, its song total from the game.
+    /// whether it has a BGA from its labels, its song total from the game.
     meta: ChartMetadata,
     /// The presentation epoch the attempt was attached as: a snapshot of
     /// another epoch gives its frames no gain.
@@ -63,7 +62,6 @@ impl AttemptContext {
             play_level: level_of(&attempt.labels.playlevel),
             meta: ChartMetadata {
                 difficulty: Some(difficulty_of(&attempt.labels.difficulty)),
-                judge_class: class_of(attempt.rank),
                 total: Some(attempt.song_total),
                 bga: Some(attempt.labels.bga),
             },
@@ -237,13 +235,11 @@ mod tests {
         assert_eq!(ctx.bpm_whole_change, Some(false));
         assert!(ctx.autoplay);
         assert_eq!(ctx.play_level, Some(12));
-        // An empty chart under the tapestry preset: no rank, so the class
-        // of `#RANK 2`, and the default total for no notes.
+        // An empty chart: the default total for no notes.
         assert_eq!(
             ctx.meta,
             skin_model::ChartMetadata {
                 difficulty: Some(4),
-                judge_class: Some(2),
                 total: Some(260),
                 bga: Some(true),
             }

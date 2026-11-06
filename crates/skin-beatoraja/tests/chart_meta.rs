@@ -1,9 +1,8 @@
 //! The chart's metadata a play skin reads each frame (docs/stage3.md
 //! "Ops and conditions"): its difficulty through ops 150 to 155, whether
-//! it has a BGA through 170, its judgment class through 180 to 184 and its
-//! song total through number 368, from the play context, and while loading
-//! the difficulty and the BGA flag from the frame's chosen chart. JSON and
-//! Lua alike.
+//! it has a BGA through 170 and its song total through number 368, from
+//! the play context, and while loading the difficulty and the BGA flag
+//! from the frame's chosen chart. JSON and Lua alike.
 
 mod common;
 
@@ -11,10 +10,8 @@ use bms_model::ChartBuilder;
 use common::play::{Drawn, Loader};
 use common::{import_body, write};
 use skin_beatoraja::lua::Disposition;
-use skin_beatoraja::{Cancel, Config, DeviationId, LuaImported, NoteKind, read_lua_header};
+use skin_beatoraja::{Cancel, Config, LuaImported, read_lua_header};
 use skin_model::ChartMetadata;
-
-const D4: NoteKind = NoteKind::Deviation(DeviationId::D4);
 
 /// An image drawn `w` wide under each op of `ops`, by number or name.
 fn drawn_under(ops: &[(&str, i32)]) -> String {
@@ -78,33 +75,6 @@ fn difficulty_ops_read_the_charts_difficulty() {
     assert!(report.notes.is_empty(), "{:?}", report.notes);
 }
 
-/// Ops 180 to 184 hold for the class 0 to 4 alone, each destination with
-/// one D4 note
-/// (the play preset's class, not the source's raw rank); none holds for a
-/// rank in no class or an unknown one.
-#[test]
-fn class_ops_read_the_presets_class() {
-    let body = drawn_under(&[
-        ("180", 10),
-        ("181", 11),
-        ("182", 12),
-        ("\"chart_judge_easy\"", 13),
-        ("184", 14),
-        ("-180", 20),
-    ]);
-    let meta = |judge_class| ChartMetadata {
-        judge_class,
-        ..ChartMetadata::UNKNOWN
-    };
-    assert_eq!(drawn(&body, meta(Some(0))), [10]);
-    for c in 1..=4_u8 {
-        assert_eq!(drawn(&body, meta(Some(c))), [10 + i32::from(c), 20], "{c}");
-    }
-    assert_eq!(drawn(&body, meta(None)), [20]);
-    let loaded = import_body(&body);
-    assert_eq!(common::kinds(loaded.report()), [D4; 6]);
-}
-
 /// 170 holds while the chart has no BGA and the flag is known; its
 /// negation draws otherwise.
 #[test]
@@ -149,22 +119,15 @@ fn number_368_shows_the_song_total() {
 }
 
 /// While loading, the difficulty and the BGA flag are the frame's chosen
-/// chart's, none holding without one; the class and the song total are
-/// unavailable, so neither a class condition, its negation nor 368 draws.
+/// chart's, none holding without one; the song total is unavailable, so
+/// 368 draws nothing.
 #[test]
 fn loading_reads_the_chosen_charts_difficulty_and_bga() {
     let body = format!(
         r#"{},
            "value": [{{"id": "v", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 4,
                        "ref": 368}}]"#,
-        drawn_under(&[
-            ("152", 10),
-            ("-152", 11),
-            ("170", 12),
-            ("-170", 13),
-            ("182", 14),
-            ("-182", 15),
-        ])
+        drawn_under(&[("152", 10), ("-152", 11), ("170", 12), ("-170", 13),])
     )
     .replace(
         r#""destination": ["#,
@@ -182,8 +145,8 @@ fn loading_reads_the_chosen_charts_difficulty_and_bga() {
     assert_eq!(widths(&l.rects(30)), [13]);
 }
 
-/// A Lua callback's `option(152)`, `option(-170)` and `option(181)` and
-/// its `number(368)` lower and read the same fields at frame time.
+/// A Lua callback's `option(152)` and `option(-170)` and its
+/// `number(368)` lower and read the same fields at frame time.
 #[test]
 fn lua_callbacks_read_the_same_metadata() {
     let d = tempfile::tempdir().unwrap();
@@ -198,30 +161,27 @@ fn lua_callbacks_read_the_same_metadata() {
           skin.destination = {\n\
             { id = \"i\", draw = function() return ms.option(152) end, dst = { { w = 10, h = 10 } } },\n\
             { id = \"i\", draw = function() return ms.option(-170) end, dst = { { w = 11, h = 10 } } },\n\
-            { id = \"i\", draw = function() return ms.option(181) end, dst = { { w = 12, h = 10 } } },\n\
-            { id = \"i\", draw = function() return ms.number(368) >= 300 end, dst = { { w = 13, h = 10 } } } }\n\
+            { id = \"i\", draw = function() return ms.number(368) >= 300 end, dst = { { w = 12, h = 10 } } } }\n\
           return skin\n",
     );
     common::png(d.path(), "a.png", 64, 64);
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let i: LuaImported = common::lua_play(&h, &Config::default(), &cancel).unwrap();
-    assert_eq!(i.callbacks, [Disposition::Lowered; 4]);
+    assert_eq!(i.callbacks, [Disposition::Lowered; 3]);
     let chart = ChartBuilder::new(150_000).build().unwrap();
     for (meta, want) in [
         (
             ChartMetadata {
                 difficulty: Some(2),
-                judge_class: Some(1),
                 total: Some(300),
                 bga: Some(true),
             },
-            vec![10, 11, 12, 13],
+            vec![10, 11, 12],
         ),
         (
             ChartMetadata {
                 difficulty: Some(3),
-                judge_class: Some(2),
                 total: Some(299),
                 bga: Some(false),
             },

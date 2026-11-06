@@ -3,8 +3,8 @@
 //! play preset), the game's attempt, this adapter's play context, then the
 //! real `Logic`, the render side's acquisition and the production frame
 //! adapter (`render::skin_frame`) into an imported skin whose images stand
-//! under ops 150 to 155, 170 and 180 to 184 and whose number shows 368
-//! (docs/stage3.md R3).
+//! under ops 150 to 155 and 170 and whose number shows 368 (docs/stage3.md
+//! R3).
 
 use bms_model::{Lane, TimeUs};
 use eval::{Binding, ControlId, DeviceProfile, InputStart, SourceProfile};
@@ -23,7 +23,7 @@ const LIMITS: AtlasLimits = AtlasLimits {
 };
 
 /// Each condition's image is drawn `w` wide, 10 high.
-const OPS: [(i32, i32); 13] = [
+const OPS: [(i32, i32); 8] = [
     (150, 10),
     (151, 11),
     (152, 12),
@@ -32,11 +32,6 @@ const OPS: [(i32, i32); 13] = [
     (155, 15),
     (170, 20),
     (-170, 21),
-    (180, 30),
-    (181, 31),
-    (182, 32),
-    (183, 33),
-    (184, 34),
 ];
 
 /// Writes a `w`×16 white PNG at `path`.
@@ -163,45 +158,37 @@ fn drawn(loaded: &game::Loaded, skin: &Skin, uvs: &UvTable) -> (Vec<i32>, usize,
 
 /// Charts with and without each header, loaded as a direct launch loads
 /// them, under the play presets: the difficulty selects 150 to 155 (0 for
-/// none or one outside 1 to 5), a `#BMPxx` clears 170, the preset's class
-/// selects 180 to 184 (`#RANK 2`'s without a rank it reads), and 368 shows
-/// the `#TOTAL` the reference reads, else its default (260 below 338
-/// notes): three digits each.
+/// none or one outside 1 to 5), a `#BMPxx` clears 170, and 368 shows the
+/// `#TOTAL` the reference reads, else its default (260 below 338 notes):
+/// three digits each.
 #[test]
 fn chart_metadata_reaches_the_frames_from_a_loaded_chart() {
     let dir = tempfile::tempdir().unwrap();
     let (skin, uvs) = skin(dir.path());
     for (text, preset, widths, total) in [
         (
-            "#DIFFICULTY 4\n#RANK 0\n#TOTAL 300.7\n#BMP01 a.bmp\n",
+            "#DIFFICULTY 4\n#TOTAL 300.7\n#BMP01 a.bmp\n",
             "beatoraja-style",
-            vec![14, 21, 30],
+            vec![14, 21],
             300,
         ),
-        ("", "beatoraja-style", vec![10, 20, 32], 260),
-        ("", "tapestry", vec![10, 20, 32], 260),
+        ("", "beatoraja-style", vec![10, 20], 260),
+        ("", "tapestry", vec![10, 20], 260),
         (
-            "#DIFFICULTY 9\n#DEFEXRANK 120\n#TOTAL 0\n",
+            "#DIFFICULTY 9\n#TOTAL 0\n",
             "beatoraja-style",
-            vec![10, 20, 34],
+            vec![10, 20],
             260,
         ),
         (
-            "#DIFFICULTY 1\n#RANK 3\n#TOTAL 999.9\n",
+            "#DIFFICULTY 1\n#TOTAL 999.9\n",
             "beatoraja-style",
-            vec![11, 20, 33],
+            vec![11, 20],
             999,
         ),
-        // `#RANK 7` is no rank to this preset: `#RANK 2`'s class.
-        (
-            "#DIFFICULTY 5\n#RANK 7\n",
-            "beatoraja-style",
-            vec![15, 20, 32],
-            260,
-        ),
-        // The tapestry preset reads `#RANK 7` as written: in no band. Its
-        // own default total does not move 368.
-        ("#DIFFICULTY 2\n#RANK 7\n", "tapestry", vec![12, 20], 260),
+        ("#DIFFICULTY 5\n", "beatoraja-style", vec![15, 20], 260),
+        // The tapestry preset's own default total does not move 368.
+        ("#DIFFICULTY 2\n", "tapestry", vec![12, 20], 260),
     ] {
         let loaded = loaded(text, preset);
         assert_eq!(

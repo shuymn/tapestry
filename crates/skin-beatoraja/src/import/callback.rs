@@ -94,11 +94,6 @@ use crate::tree::{Kind, LuaScalar, NONE};
 /// The gauge looks `gauge_type()` selects, by index.
 const LOOKS: [&str; 6] = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
 
-/// Why a critical element refuses a callback reading captured state after
-/// the configured pass read a judgment class.
-const CLASS_CAPTURE: Unsupported =
-    Unsupported::Capture("state captured after a judgment class read");
-
 /// A lowered callback.
 #[derive(Debug)]
 pub(crate) struct Lowered {
@@ -108,10 +103,6 @@ pub(crate) struct Lowered {
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
     pub(crate) deviates: bool,
-    /// A read a critical element cannot reproduce (an `option` whose
-    /// condition is [`Cond::Expr`]'s `unreproduced`): why such an element
-    /// refuses it.
-    pub(crate) unreproduced: Option<Unsupported>,
     /// The value its expression folds to when it compiles to a constant,
     /// its guards aside: a visibility known false folds as a JSON
     /// condition does.
@@ -267,7 +258,6 @@ impl<'a> Lower<'a> {
                 guards: Vec::new(),
                 part: None,
                 deviates: false,
-                unreproduced: None,
                 known: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
@@ -449,11 +439,7 @@ impl Lower<'_> {
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
                 did("work:option");
-                let why = Unsupported::Unmapped {
-                    api,
-                    id: i64::from(id),
-                };
-                self.option(ops::numeric_in(self.kind, id, &BTreeMap::new()), why)
+                self.option(ops::numeric_in(self.kind, id, &BTreeMap::new()), unmapped)
             }
             "timer" => {
                 let id = id.filter(|&n| n >= 0).ok_or_else(unmapped)?;
@@ -470,19 +456,14 @@ impl Lower<'_> {
     }
 
     /// An option read's mapped condition `c`, built within the bound
-    /// already charged; `unmapped` is why a read with no mapping, or one a
-    /// critical element cannot reproduce, stops.
-    fn option(&mut self, c: Cond, unmapped: Unsupported) -> R<Mapped> {
+    /// already charged.
+    fn option(&mut self, c: Cond, unmapped: impl FnOnce() -> Stop) -> R<Mapped> {
         match c {
             Cond::Expr {
                 src,
                 display_deviation,
-                unreproduced,
             } => {
                 self.out.deviates |= display_deviation;
-                if unreproduced.is_some() {
-                    self.out.unreproduced = self.out.unreproduced.or(Some(unmapped));
-                }
                 Ok(Mapped::Bool(Self::text(self.an, &["(", &src, ")"])?))
             }
             Cond::Fold(b) => Ok(Mapped::Bool(Self::text(
@@ -490,7 +471,7 @@ impl Lower<'_> {
                 &[if b { "true" } else { "false" }],
             )?)),
             Cond::Undefined(_) => Ok(Mapped::Bool(Self::text(self.an, &["false"])?)),
-            Cond::Unsupported(_) => Err(Stop::Unsupported(unmapped)),
+            Cond::Unsupported(_) => Err(unmapped()),
         }
     }
 
@@ -1332,16 +1313,8 @@ impl Cx<'_> {
         if an.writes(inst) {
             return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
         }
-        let r = residual::evaluate(adm, inst, conv, &cancelled).and_then(|res: Residual| {
-            // What the configured pass left captured after reading a
-            // judgment class may hold it: a critical element cannot
-            // reproduce it, a decorative one notes D4.
-            if res.captures_data && an.class_read.get() {
-                l.out.deviates = true;
-                l.out.unreproduced = l.out.unreproduced.or(Some(CLASS_CAPTURE));
-            }
-            l.emit_root(&res, conv)
-        });
+        let r = residual::evaluate(adm, inst, conv, &cancelled)
+            .and_then(|res: Residual| l.emit_root(&res, conv));
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
@@ -1448,7 +1421,6 @@ impl Cx<'_> {
                         guards: Vec::new(),
                         part: None,
                         deviates: false,
-                        unreproduced: None,
                         known: None,
                         #[cfg(feature = "dev-tools")]
                         constant: matches!(fold, TextFold::Literal(_)),
@@ -1552,11 +1524,6 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
         let why = match self.lower(id, Conv::Truthy) {
-            // A critical element refuses what it cannot reproduce.
-            Ok(Lowering::Lowered(Lowered {
-                unreproduced: Some(why),
-                ..
-            })) if critical => why,
             Ok(Lowering::Lowered(l)) => {
                 self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
@@ -1623,12 +1590,6 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, scan) = match self.lower(id, conv) {
             Ok(Lowering::Lowered(l)) => {
-                let role = l.part.map_or(base, Role::Critical);
-                // A critical number refuses what it cannot reproduce.
-                if let (Some(why), Role::Critical(_)) = (l.unreproduced, role) {
-                    self.outcome((c, id), "value", role, (Disposition::Refused, Some(why)));
-                    return Err(self.critical(id, "value", why));
-                }
                 self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));

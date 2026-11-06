@@ -243,9 +243,6 @@ pub(crate) struct Analysis {
     /// Whether [`admit`] ran the effect walk over every root of this
     /// analysis.
     admitted: Cell<bool>,
-    /// Whether the configured pass read a judgment class (options 180 to
-    /// 184, the play preset's class): what it left captured may hold it.
-    pub(crate) class_read: Cell<bool>,
     /// The callbacks consumed, in order, for the report.
     #[cfg(feature = "dev-tools")]
     pub(crate) consumed: RefCell<Vec<Consumed>>,

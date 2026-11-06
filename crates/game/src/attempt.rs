@@ -6,7 +6,7 @@
 
 use bms_model::{Chart, NoteKind, Speed, TimeUs};
 use eval::Section;
-use rules::{GaugeRule, HeaderPolicy, JudgeRank, LnMode, RulePreset};
+use rules::{GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
 use crate::policy::GaugeIndex;
 use crate::practice::mapped;
@@ -92,9 +92,6 @@ pub struct Attempt {
     pub last_note_end: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
-    /// The rank the play preset's header policy reads from the chart, which
-    /// the evaluator judges with; `None` when it reads none.
-    pub rank: Option<JudgeRank>,
     /// The chart's gauge total as the reference player's song information
     /// gives it ([`song_total`]).
     pub song_total: i32,
@@ -168,7 +165,6 @@ impl Attempt {
             kind,
             last_note_end,
             labels: labels.clone(),
-            rank: preset.headers.read(&chart.meta.judgment_headers).rank,
             song_total: song_total(chart),
             tempo: AttemptTempo::prepare(chart, section),
         }

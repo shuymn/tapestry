@@ -824,15 +824,6 @@ fn definition(
 /// callables ([`callback::admit`]). A configured pass may return another
 /// type than its header pass, and that refusal comes before any
 /// callable's.
-/// Records on `def`'s analysis whether its configured pass read a judgment
-/// class among `reads`, which the callbacks' lowering consults.
-fn mark_class_read(def: &Definition, reads: &[FactRead]) {
-    if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
-        an.class_read
-            .set(reads.iter().any(|r| r.fact == FactId::JudgeClass));
-    }
-}
-
 fn admit(def: &mut Definition, slot: ScreenKind) -> Result<(), ImportError> {
     let (found, node) = def.kind()?;
     if found != slot {
@@ -946,7 +937,6 @@ impl LuaHeader {
                 }));
             }
         };
-        mark_class_read(&def, &reads);
         admit(&mut def, facts.scene)?;
         let mut t = LAST_TIMINGS.with(Cell::get);
         let start = std::time::Instant::now();
@@ -983,7 +973,6 @@ impl LuaHeader {
         #[cfg(feature = "dev-tools")]
         let mut records = survey::Records::default();
         let result = def.and_then(|mut def| {
-            mark_class_read(&def, &reads);
             let r =
                 admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));
             store = common_reads(&mut def, &mut counts);

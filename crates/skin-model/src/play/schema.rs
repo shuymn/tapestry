@@ -30,8 +30,6 @@ pub const LANE_JUDGE_MAX: i32 = 11;
 pub const PROGRESS_FULL: i32 = 1_000_000;
 /// The largest `chart.difficulty`: `#DIFFICULTY` 5.
 pub const DIFFICULTY_MAX: i32 = 5;
-/// The largest `chart.judge_class`: the easiest of the five classes.
-pub const JUDGE_CLASS_MAX: i32 = 4;
 /// A cover setting's full amount, ‰.
 pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
@@ -231,8 +229,6 @@ pub static PLAY: Schema = Schema {
         int("time.progress_ppm", PROGRESS_FULL, T),
         int("chart.difficulty", DIFFICULTY_MAX, T),
         flag("chart.difficulty_valid", T),
-        int("chart.judge_class", JUDGE_CLASS_MAX, T),
-        flag("chart.judge_class_valid", T),
         int("chart.total", READOUT_MAX, T),
         flag("chart.total_valid", T),
         flag("chart.bga", T),
@@ -468,24 +464,18 @@ pub mod field {
     pub const CHART_DIFFICULTY: u16 = 102;
     /// Whether the chart's difficulty is known.
     pub const CHART_DIFFICULTY_VALID: u16 = 103;
-    /// The chart's judgment class from the play preset's reading of its
-    /// rank, 0 the hardest to 4 the easiest; 0 while
-    /// `chart.judge_class_valid` is false.
-    pub const CHART_JUDGE_CLASS: u16 = 104;
-    /// Whether the chart has a judgment class.
-    pub const CHART_JUDGE_CLASS_VALID: u16 = 105;
     /// The chart's gauge total, whole; 0 while `chart.total_valid` is
     /// false.
-    pub const CHART_TOTAL: u16 = 106;
+    pub const CHART_TOTAL: u16 = 104;
     /// Whether the chart's gauge total is known and a number can show it.
-    pub const CHART_TOTAL_VALID: u16 = 107;
+    pub const CHART_TOTAL_VALID: u16 = 105;
     /// Whether the chart defines a BGA image; false while
     /// `chart.bga_valid` is false.
-    pub const CHART_BGA: u16 = 108;
+    pub const CHART_BGA: u16 = 106;
     /// Whether that is known.
-    pub const CHART_BGA_VALID: u16 = 109;
+    pub const CHART_BGA_VALID: u16 = 107;
     /// The number of fields.
-    pub const COUNT: usize = 110;
+    pub const COUNT: usize = 108;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -798,12 +788,6 @@ mod tests {
                 field::CHART_DIFFICULTY_VALID,
                 None,
             ),
-            ("chart.judge_class", field::CHART_JUDGE_CLASS, Some(4)),
-            (
-                "chart.judge_class_valid",
-                field::CHART_JUDGE_CLASS_VALID,
-                None,
-            ),
             ("chart.total", field::CHART_TOTAL, Some(i32::MAX - 1)),
             ("chart.total_valid", field::CHART_TOTAL_VALID, None),
             ("chart.bga", field::CHART_BGA, None),
@@ -819,7 +803,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(field::COUNT, 110);
+        assert_eq!(field::COUNT, 108);
     }
 
     #[test]
