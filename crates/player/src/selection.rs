@@ -1546,6 +1546,7 @@ impl PlayerRig<'_> {
                         current: log.clone(),
                         sources: crate::source_config(),
                         loading: None,
+                        rearm_delay: TimeUs(0),
                     };
                     self.input
                         .switch(Mode::Script(Box::new(script)), crate::source_config());

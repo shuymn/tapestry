@@ -652,10 +652,12 @@ fn rewritten_chunks_share_one_allowance() {
         .iter()
         .map(|(n, t)| (n.as_str(), t.as_str()))
         .collect();
-    assert_eq!(
-        why(run_with(&entry, &named, &Cancel::new())),
-        LuaWhy::Limit(LuaLimit::Generated)
-    );
+    // The rewriting's allowance refuses, whatever the clock: the time cap
+    // is one this import cannot reach.
+    super::tests::TIME_LIMIT.with(|t| t.set(Some(std::time::Duration::MAX)));
+    let r = run_with(&entry, &named, &Cancel::new());
+    super::tests::TIME_LIMIT.with(|t| t.set(None));
+    assert_eq!(why(r), LuaWhy::Limit(LuaLimit::Generated));
 }
 
 #[test]

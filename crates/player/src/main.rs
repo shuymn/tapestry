@@ -516,6 +516,7 @@ fn prepare(chart: &Path, input: &PlayInput, start: Option<TimeUs>) -> anyhow::Re
                 current: script,
                 sources: source_config(),
                 loading,
+                rearm_delay: input.rearm_delay,
             };
             Ok(Prepared {
                 loaded,
@@ -2291,6 +2292,7 @@ mod tests {
             log: std::path::PathBuf::from("log.tprl"),
             speed: Vec::new(),
             loading: Vec::new(),
+            rearm_delay: bms_model::TimeUs(0),
         });
         assert_eq!(
             launched(script, crate::dev::Options::default(), &device),
