@@ -1641,12 +1641,16 @@ fn restart_keeps_the_chosen_preset() {
     );
 }
 
-/// Input generated to press nothing: with the HAZARD gauge shown, its
-/// first miss fails it and the play enters Closing, as its report says. It
-/// is played and saved as a log's play is: one keyboard, nothing held at
-/// the start, no press, its re-evaluation the live result. A frame of
-/// Closing is not asserted: none is guaranteed to be presented (design.md
-/// "Play Lifecycle", Closing); the phase a frame names is the unit test's.
+/// Input generated to press nothing, with the HAZARD gauge shown and a
+/// failure closing the play, played and saved as a log's play is: one
+/// keyboard, nothing held at the start, no press, its re-evaluation the
+/// live result. Its outcome is any the real clock permits (design.md "Play
+/// Lifecycle"): only POORs, as many as the notes missed by its end; the
+/// gauge's failure aborts it and enters Closing, or a late wake completes
+/// it first, all four notes missed and no Closing. The exact count and
+/// Closing are the unit test's on a virtual clock
+/// (`generated_no_press_input_misses_into_closing_on_the_play_path`); a
+/// frame of Closing is not asserted: none is guaranteed to be presented.
 #[test]
 fn a_generated_no_press_play_misses_into_closing() {
     let fx = Fixture::new();
@@ -1664,21 +1668,26 @@ fn a_generated_no_press_play_misses_into_closing() {
         "quit = {}",
     ]));
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert_eq!(
-        lines(&stdout, "play 1: Aborted(GaugeFailed)").len(),
-        1,
-        "{stdout}"
-    );
-    let [play] = lines(&stdout, "play 1: Aborted(GaugeFailed)")[..] else {
+    let [play] = lines(&stdout, "play 1: ")[..] else {
         panic!("{stdout}");
     };
     // Only misses, and the re-evaluation agrees.
-    assert!(
-        play.contains("perfect 0 great 0 good 0 bad 0 poor 1"),
-        "{play}"
-    );
+    let poor: u32 = play
+        .split_once("; perfect 0 great 0 good 0 bad 0 poor ")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .and_then(|(n, _)| n.parse().ok())
+        .unwrap_or_else(|| panic!("{play}"));
     assert!(play.contains("re-evaluation matches live: true"), "{play}");
-    assert_eq!(lines(&stdout, "closing: ").len(), 1, "{stdout}");
+    let closing = lines(&stdout, "closing: ").len();
+    if play.starts_with("play 1: Aborted(GaugeFailed);") {
+        // Every miss the wake that failed it finalized, then Closing.
+        assert!((1..=4).contains(&poor), "{play}");
+        assert_eq!(closing, 1, "{stdout}");
+    } else {
+        assert!(play.starts_with("play 1: Completed;"), "{play}");
+        assert_eq!(poor, 4, "{play}");
+        assert_eq!(closing, 0, "{stdout}");
+    }
     let (records, _) = fx.played_records();
     assert_eq!(records.len(), 1, "{records:?}");
     let rec = replay::decode(&fs::read(&records[0]).unwrap(), &DecodeLimits::default()).unwrap();
@@ -1695,7 +1704,8 @@ fn a_generated_no_press_play_misses_into_closing() {
 }
 
 /// A chart with no judgeable note is refused, generated input or not
-/// (design.md "Invalid Charts": nothing to play): the library never lists
+/// (design.md "The tapestry Preset", zero judgeable notes: nothing to
+/// play): the library never lists
 /// it, so its `play` never starts and nothing is saved.
 #[test]
 fn a_generated_no_press_play_of_a_chart_without_notes_is_refused() {

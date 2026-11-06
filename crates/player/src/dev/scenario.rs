@@ -2063,6 +2063,117 @@ mod tests {
         assert!(after_quit.is_ok(), "{:?}", after_quit.err());
     }
 
+    /// The input `{ miss = "all" }` compiles to played on the session's
+    /// play path on a virtual clock (design.md "Play Lifecycle"), with the
+    /// HAZARD gauge shown and a failure closing the play: its first miss
+    /// fails the gauge at that wake, so the play is aborted by it with
+    /// exactly one POOR and nothing else, and enters Closing. Autoplay in
+    /// its place compiles to no log, and plays every note.
+    #[test]
+    fn generated_no_press_input_misses_into_closing_on_the_play_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("library").join("a");
+        fs::create_dir_all(&a).unwrap();
+        // Four notes, 500 ms apart from 2 s.
+        let chart = a.join("a.bms");
+        fs::write(&chart, "#PLAYER 1\n#TITLE a\n#BPM 120\n#00111:01010101\n").unwrap();
+        let s = parse(
+            &file(
+                None,
+                &[
+                    "select = { path = \"library/a/a.bms\" }",
+                    "play = { input = { miss = \"all\" }, until = \"end\" }",
+                    "result = \"back\"",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        let mut script = s.script;
+        let mut input = None;
+        while let Some(step) = script.front().cloned() {
+            if let SelectStep::Play(p) = step {
+                input = Some(p.input);
+            }
+            script.done();
+        }
+        let Some(InputRef::Log(k)) = input else {
+            panic!("{input:?}");
+        };
+        let mut logs = s.session.logs;
+        let log = logs.swap_remove(usize::from(k));
+
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                // HAZARD.
+                displayed_gauge: 5,
+                on_failure: game::FailureAction::Close,
+                ..game::PlayerSettings::default()
+            },
+        };
+        let parts = game::Parts::unsaved(&settings.player);
+        let config = game::SessionConfig {
+            lead_in: TimeUs(1_000_000),
+            step: TimeUs(1_000),
+            start: TimeUs(0),
+            effects: 64,
+            seed: 1,
+            speed: bms_model::Speed::NORMAL,
+            app_version: "0.0.0-test".to_owned(),
+            provenance: replay::BuildProvenance::Development,
+            receive: replay::ReceiveMethod::Scripted,
+            autoplay: None,
+        };
+        let root = game::DataRoot::new(dir.path().join("root"));
+        let loaded = game::Loaded::load(root, settings, &chart, config, parts).unwrap();
+        let bank = std::sync::Arc::new(audio::SoundBank::from_sounds(48_000, Vec::new()));
+        let engine = audio::AudioEngine::new(
+            bank,
+            &loaded.chart().bgm,
+            48_000,
+            480,
+            audio::MAX_VOICES,
+            64,
+        )
+        .unwrap();
+        let device = audio::SimDevice::new(audio::SimConfig::steady(48_000, 480, TimeUs(0)));
+        let runner = game::RunnerAudio::new(engine, audio::RecordingOutput::new(device, 0));
+        let mut session = loaded.start(
+            runner,
+            input::SourceSet::new(crate::source_config()).unwrap(),
+        );
+        let report = session
+            .play(game::PlayScript {
+                input: log,
+                commands: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            report.end,
+            game::PlayEnd::Aborted(game::AbortCause::GaugeFailed)
+        );
+        let c = report.tally.counts;
+        assert_eq!(
+            (c.perfect, c.great, c.good, c.bad, c.poor),
+            (0, 0, 0, 0, 1),
+            "{c:?}"
+        );
+        assert!(report.closing.is_some(), "{:?}", report.closing);
+        let result = report.result.as_ref().unwrap();
+        assert!(result.matches_live);
+        let record = report.record.as_ref().unwrap();
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|e| !matches!(e.kind, eval::InputKind::Control { value, .. } if value != 0)),
+            "{:?}",
+            record.events
+        );
+    }
+
     /// A step where its screen does not show is refused, naming it and the
     /// step before.
     #[test]
