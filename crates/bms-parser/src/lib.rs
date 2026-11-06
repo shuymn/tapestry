@@ -10,9 +10,9 @@
 //! wrap, or lose the sign; they cover the library and its unit tests, not
 //! the integration tests.
 //!
-//! # Loader version 9
+//! # Loader version 10
 //!
-//! These rules are fixed for [`LOADER_VERSION`] 9; changing any of them
+//! These rules are fixed for [`LOADER_VERSION`] 10; changing any of them
 //! changes the version.
 //!
 //! - **Text encoding:** a UTF-8 or UTF-16 BOM decides the encoding. Without
@@ -181,7 +181,7 @@ pub use header::{ChartMode, Header, Listing, read_header, read_listing};
 pub use parse::java_int;
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
-pub const LOADER_VERSION: u32 = 9;
+pub const LOADER_VERSION: u32 = 10;
 
 /// Bounds on the work a chart may cause (design.md "Loading Limits"). The
 /// defaults sit far above real charts.
