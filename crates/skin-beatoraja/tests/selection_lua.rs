@@ -195,6 +195,32 @@ fn a_lua_draw_known_false_folds_as_json_does() {
     import_lua(&lua_skin("draw = function() return ms.option(2) end,", "")).unwrap();
 }
 
+/// A Lua timer read takes the selection profile's timers: 11 is the
+/// change timer, drawn while it is on.
+#[test]
+fn lua_timer_reads_take_the_selection_timers() {
+    let more = "table.insert(skin.destination, { id = \"b1\",\n\
+                  draw = function() return ms.timer(11) ~= ms.timer_off_value end,\n\
+                  dst = { { x = 700, y = 0, w = 8, h = 8 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", more)).unwrap();
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        1,
+        "{:?}",
+        i.callbacks
+    );
+    let mut s = Sel::new(i.imported.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let drawn = |s: &mut Sel| s.drawn(0).iter().any(|(_, r)| r[0] == 700.0);
+    assert!(!drawn(&mut s));
+    s.timers.change = Some(bms_model::TimeUs(0));
+    assert!(drawn(&mut s));
+}
+
 /// Lua text and image index reads take the selection bridges as their
 /// JSON `ref`s do: text 30 (the query) and image index 370 (the selected
 /// row's clear type).

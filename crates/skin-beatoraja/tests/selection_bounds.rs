@@ -130,6 +130,45 @@ fn song_list_keys_count_to_the_cap() {
     assert_eq!(line, u32::try_from(songlist + 1).ok());
 }
 
+/// An inactive arm that cannot be reproduced is a hidden copy of the
+/// active arm, its keys charged as the model counts them: at the key cap
+/// the import and the model both accept the skin.
+#[test]
+fn a_hidden_placement_s_keys_count_to_the_cap() {
+    let on = format!(
+        "{}, {}, {}",
+        r#"{"time": 0, "x": 0, "y": 900, "w": 300, "h": 40}"#,
+        r#"{"time": 1, "x": 0, "y": 900, "w": 300, "h": 40}"#,
+        r#"{"time": 2, "x": 0, "y": 900, "w": 300, "h": 40}"#
+    );
+    let off = r#"{"x": 0, "y": 900, "w": 300, "h": 40}], "stretch": 1, "dummy": [0"#;
+    let body = |fillers: &[String]| {
+        let list = song_list(&[&on], &[off], 0, TITLE);
+        let mut dsts: Vec<String> = fillers.to_vec();
+        dsts.push(r#"{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#.to_owned());
+        format!(
+            r#""imageset": [{SET}], "text": [{TEXT_T}], {list}, "destination": [{}]"#,
+            dsts.join(",")
+        )
+    };
+    let base = import_selection(folder(&body(&[])).path())
+        .unwrap()
+        .report
+        .usage
+        .keys as usize;
+    let room = MAX_SKIN_KEYS - base;
+    let fillers: Vec<String> = (0..room / MAX_TRACK_KEYS)
+        .map(|_| filler(MAX_TRACK_KEYS))
+        .chain(
+            [filler(room % MAX_TRACK_KEYS)]
+                .into_iter()
+                .filter(|_| !room.is_multiple_of(MAX_TRACK_KEYS)),
+        )
+        .collect();
+    let i = import_selection(folder(&body(&fillers)).path()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(i.report.usage.keys as usize, MAX_SKIN_KEYS);
+}
+
 /// Two song list destinations: one definition, so one row text table,
 /// each charged its own quads and its parts' visibilities once per slot.
 #[test]
