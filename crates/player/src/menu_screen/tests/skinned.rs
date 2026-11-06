@@ -119,6 +119,60 @@ fn the_preset_name_shows_three_seconds_from_its_step() {
     );
 }
 
+/// A preset step the flow takes reaches the strip through the game
+/// thread's update: the update names the preset the step chose, stamped
+/// with the time the step was taken (`t`), and the frames of that update
+/// draw the name at `t` and `t + 2 999 999 µs`, not at `t + 3 000 000 µs`.
+#[test]
+fn a_preset_step_through_the_flow_names_the_preset_for_three_seconds() {
+    use bms_model::TimeSource as _;
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let mut shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    let screens = crate::render_side::tests::Installers::default();
+    let render = screens.spawn_bare();
+    let (u, before, after) = crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+        let sel = rig.selection.as_mut().unwrap();
+        sel.preset_steps.push_back(game::PresetStep::Next);
+        let before = rig.clock.now();
+        let step = rig.take_preset_step().unwrap();
+        let after = rig.clock.now();
+        shelf.step(step);
+        rig.presets_changed(Ok(&shelf));
+        assert!(rig.choose().is_none());
+        let stamped = || {
+            screens
+                .updates
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|u| u.events.preset_step.is_some())
+                .cloned()
+        };
+        assert!(crate::render_side::tests::wait_until(|| stamped().is_some()));
+        (stamped().unwrap(), before, after)
+    });
+    let t = u.events.preset_step.unwrap();
+    assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
+    assert_ne!(shelf.chosen_name(), "tapestry");
+    assert_eq!(u.strip.preset, shelf.chosen_name());
+    let (_dir, mut screen, mut logic, _) = skinned();
+    let t = t.0;
+    let hidden = drawn(&mut screen, &mut logic, &u, true, t - 1);
+    assert_eq!(drawn(&mut screen, &mut logic, &u, false, t), hidden + 1);
+    assert_eq!(
+        drawn(&mut screen, &mut logic, &u, false, t + 2_999_999),
+        hidden + 1
+    );
+    assert_eq!(
+        drawn(&mut screen, &mut logic, &u, false, t + 3_000_000),
+        hidden
+    );
+}
+
 /// A selection frame's app work (the timers, the skin's build and the
 /// strip's sprites) allocates nothing, from the first frame after an
 /// update on, after a resize prepared outside the count, and refused.

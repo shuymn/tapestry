@@ -7521,23 +7521,53 @@ pub(crate) mod tests {
             update: &crate::selection_skin::SelectionUpdate,
             logic: Option<&mut crate::selection_skin::SelectionLogic>,
             changed: bool,
-            _now: TimeUs,
+            now: TimeUs,
         ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
             if self.shared.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
             }
             // A skin draws only with its installation on this screen.
-            let state = logic
-                .filter(|_| self.installed.get(ScreenKind::Selection).is_some())
-                .map(|l| l.id);
-            self.shared.selections.lock().unwrap().push(SelectionSeen {
+            let logic = logic.filter(|_| self.installed.get(ScreenKind::Selection).is_some());
+            let state = logic.as_ref().map(|l| l.id);
+            let seen = SelectionSeen {
                 device: self.device,
                 lifetime: update.lifetime,
                 revision: update.revision,
                 state,
                 changed,
                 events: update.events,
-            });
+            };
+            self.shared.selections.lock().unwrap().push(seen);
+            if changed {
+                self.shared.updates.lock().unwrap().push(update.clone());
+            }
+            // The skin's frame at `now`, built by the model alone, when the
+            // skin is a selection skin.
+            if let Some(logic) = logic.filter(|_| state.is_some()) {
+                let skin = Arc::clone(logic.bundle.skin());
+                if skin
+                    .update_selection(&mut logic.sel, &update.view, &update.labels)
+                    .is_ok()
+                {
+                    let mut batch = skin_model::QuadBatch::with_capacity(
+                        skin.quad_capacity(),
+                        skin.run_capacity(),
+                    );
+                    let frame = skin_model::SelectionFrame {
+                        now,
+                        target: [1_920, 1_080],
+                        layout: &skin_model::Layout::AUTHOR,
+                        timers: update.events.timers(),
+                    };
+                    if skin
+                        .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
+                        .is_ok()
+                    {
+                        let rects = batch.quads().iter().map(|q| q.rect).collect();
+                        self.shared.built.lock().unwrap().push((seen, now, rects));
+                    }
+                }
+            }
             let refused = (state.is_some() && self.shared.refuse_selection.load(Ordering::Acquire))
                 .then(|| "refused for the test".to_owned());
             Ok(crate::selection_skin::SelectionDrawn {
@@ -7649,6 +7679,11 @@ pub(crate) mod tests {
         /// skin state's number (none without one), whether it was laid out
         /// again, and its timers.
         pub(crate) selections: Arc<std::sync::Mutex<Vec<SelectionSeen>>>,
+        /// Each update a selection frame applied first, in order.
+        pub(crate) updates: Arc<std::sync::Mutex<Vec<crate::selection_skin::SelectionUpdate>>>,
+        /// Each selection frame a selection skin built (by the model
+        /// alone): the frame, its time and its quads' rects.
+        pub(crate) built: Arc<std::sync::Mutex<Vec<SelectionBuilt>>>,
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
         /// Restores of this kind are refused as on a healthy device.
@@ -7678,6 +7713,10 @@ pub(crate) mod tests {
         pub(crate) changed: bool,
         pub(crate) events: crate::selection_skin::SelectionEvents,
     }
+
+    /// A selection skin's frame as an [`Installer`] built it: the frame,
+    /// its time and its quads' rects in layout pixels.
+    pub(crate) type SelectionBuilt = (SelectionSeen, TimeUs, Vec<[f32; 4]>);
 
     impl Installers {
         /// A render thread on these installers with `chart` loaded and

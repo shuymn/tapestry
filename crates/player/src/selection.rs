@@ -2149,7 +2149,7 @@ fn wait_chart_load(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3537,7 +3537,10 @@ mod tests {
     /// Listed charts, one per relative path under one root, or several roots,
     /// on a shelf that scans again at once, opened as a run opens (on Top) and
     /// with every chart listed. A file named `hidden*` is 5-key-shaped.
-    fn tree(dir: &std::path::Path, roots: &[&[&str]]) -> (Selection, Vec<std::path::PathBuf>) {
+    pub(crate) fn tree(
+        dir: &std::path::Path,
+        roots: &[&[&str]],
+    ) -> (Selection, Vec<std::path::PathBuf>) {
         let roots: Vec<_> = roots
             .iter()
             .enumerate()
@@ -3752,6 +3755,120 @@ mod tests {
         // the same.
         sel.feed.window = None;
         assert_eq!(at(&mut sel, 700).view.rows.len(), 1);
+    }
+
+    /// `f` on a rig of the game's threads whose render thread is `render`,
+    /// on `screens`, with `sel` on its select screen, entered and its first
+    /// update drawn (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_selection<R>(
+        sel: Selection,
+        screens: &crate::render_side::tests::Installers,
+        render: crate::render_side::RenderLink,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R,
+    ) -> R {
+        use game::AppRig as _;
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let (out, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+            // No adjustment waits on the input thread, which none serves.
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            rig.entered_selection();
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.lifetime == 1)
+            }));
+            f(rig)
+        });
+        out
+    }
+
+    /// Leaving selection for a chart's loading or for the practice page
+    /// ends its lifetime: an update the select screen makes after it is
+    /// never drawn (design.md "Rendering and Skins", Screen skins).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn leaving_for_a_chart_or_the_practice_page_draws_no_later_update() {
+        use bms_model::TimeSource as _;
+        use game::AppRig as _;
+        for practice in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (sel, roots) = tree(dir.path(), &[&["a.bms"]]);
+            let chart = roots[0].join("a.bms");
+            let screens = crate::render_side::tests::Installers::default();
+            let drawn = on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+                if practice {
+                    let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+                    rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+                } else {
+                    rig.entered_loading(&chart);
+                }
+                let sel = rig.selection.as_mut().unwrap();
+                sel.dirty = true;
+                sel.show(&rig.render, None, rig.clock.now());
+                std::thread::sleep(Duration::from_millis(200));
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.revision)
+                    .collect::<Vec<_>>()
+            });
+            assert!(
+                drawn.contains(&1) && !drawn.contains(&2),
+                "{practice}: {drawn:?}"
+            );
+        }
+    }
+
+    /// A selection skin refused at runtime is said on the select screen:
+    /// the game thread's next look puts the reason in the notice of the
+    /// update it sends (design.md "Rendering and Skins", Screen skins).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_runtime_refusal_is_the_notice_of_the_next_update() {
+        use game::AppRig as _;
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(dir.path(), &[&["a.bms"]]);
+        let screens = crate::render_side::tests::Installers::default();
+        let render = screens.spawn_bare();
+        let skin = crate::render_side::tests::bundle();
+        assert_eq!(
+            render
+                .select(skin_model::ScreenKind::Selection, Some(skin))
+                .wait()
+                .unwrap(),
+            game::Preparation::Ready
+        );
+        let next = on_selection(sel, &screens, render, |rig| {
+            screens.refuse_selection.store(true, Ordering::Release);
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.state.is_none())
+            }));
+            let before = screens.updates.lock().unwrap().len();
+            assert!(rig.choose().is_none());
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens.updates.lock().unwrap().len() > before
+            }));
+            screens.updates.lock().unwrap().last().unwrap().clone()
+        });
+        assert_eq!((next.lifetime, next.revision), (1, 2));
+        let notice = next.strip.notice.unwrap_or_default();
+        assert!(notice.contains("refused for the test"), "{notice}");
     }
 
     const ALL: &str = "▶ 全譜面";

@@ -172,5 +172,162 @@ fn the_skin_state_follows_the_lifetime_and_a_refusal_is_for_the_run() {
     link.exit();
 }
 
+/// A self-made selection skin of one image on a `when` timer whose
+/// condition always holds, moving right 1 px per ms from the timer's
+/// start: a frame's quad is at x = the time since the start, in ms.
+fn when_bundle() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    use skin_model::{
+        Anchor, AtlasLimits, Blend, ElementDef, End, FileDef, Filter, Fit, ImageDef, KeyDef, Place,
+        Region, RegionDef, SELECTION, Scope, SelectionDefs, Sheet, Skin, SkinDef, Source, TimerRef,
+        Track, Ty, Variant, compile,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(dir.path().join("0.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 2, 2);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    e.write_header()
+        .unwrap()
+        .write_image_data(&[255; 16])
+        .unwrap();
+    let sheet = Sheet::new(
+        dir.path(),
+        vec![FileDef {
+            path: "0.png".to_owned(),
+            hi: None,
+        }],
+        vec![ImageDef {
+            file: 0,
+            rect: None,
+            grid: [1, 1],
+            cycle: None,
+            filter: Filter::Linear,
+        }],
+    )
+    .unwrap();
+    let key = |at: i64, x: i32| {
+        let mut props = [None; 9];
+        props[..4].copy_from_slice(&[Some(x), Some(0), Some(10), Some(10)]);
+        KeyDef {
+            at: TimeUs(at),
+            props,
+        }
+    };
+    let element = ElementDef {
+        source: Source::Image(0),
+        track: Track::new(
+            &[key(0, 0), key(1_000_000_000, 1_000_000)],
+            skin_model::Ease::Linear,
+            End::Hold,
+        )
+        .unwrap(),
+        timer: TimerRef::When(0),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place: Place::SCREEN,
+    };
+    let skin = Skin::new_selection(
+        SkinDef {
+            fit: Fit::Fixed,
+            regions: [RegionDef {
+                anchor: Anchor::TopLeft,
+                optional: false,
+            }; Region::COUNT],
+            whens: vec![compile("true", &Scope::new(&SELECTION), Ty::Bool).unwrap()],
+            sheet,
+            lanes: None,
+            elements: vec![element],
+            widgets: skin_model::WidgetDefs::default(),
+            bomb_up_to: None,
+            close: None,
+        },
+        SelectionDefs::default(),
+    )
+    .unwrap();
+    let limits = AtlasLimits {
+        max_side: 256,
+        max_layers: 4,
+        reserved_layers: 1,
+    };
+    let atlas = skin.atlas(Variant::Lo, limits, &|| false).unwrap();
+    let clips = render::ClipTable::new(Vec::new()).unwrap();
+    let bundle =
+        render::SkinBundle::new(Arc::new(skin), atlas, clips, skin_model::Side::Right).unwrap();
+    (dir, Arc::new(bundle))
+}
+
+/// Each frame the skin built of lifetime `lifetime`: its device, and its
+/// `when` timer's start in ms read from its quad.
+fn when_starts(screens: &Installers, lifetime: u64) -> Vec<(u64, i64)> {
+    screens
+        .built
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(seen, _, _)| seen.lifetime == lifetime)
+        .map(|(seen, now, rects)| {
+            #[expect(clippy::cast_possible_truncation, reason = "whole ms of a test's run")]
+            let x = rects[0][0].round() as i64;
+            (seen.device, now.0 / 1_000 - x)
+        })
+        .collect()
+}
+
+/// A `when` timer of the selection skin starts at the first frame of each
+/// entry, its condition holding throughout, and keeps its start across a
+/// screen built again within the entry (design.md "Rendering and Skins",
+/// Screen skins; C4).
+#[test]
+fn a_when_timer_restarts_at_each_entry_and_survives_a_screen_built_again() {
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let (_dir, skin) = when_bundle();
+    assert_eq!(
+        link.select(ScreenKind::Selection, Some(skin))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let near = |a: i64, b: i64| (a - b).abs() <= 1;
+    link.enter_selection(1);
+    link.show_selection(update(1, 1));
+    assert!(wait_until(|| when_starts(&screens, 1).len() >= 3));
+    let first = when_starts(&screens, 1);
+    let (device, start) = first[0];
+    assert!(first.iter().all(|&(_, s)| near(s, start)), "{first:?}");
+    // The first frame started it: its quad at x = 0.
+    let first_now = screens.built.lock().unwrap()[0].1;
+    assert!(near(start, first_now.0 / 1_000), "{start} {first_now:?}");
+    // A screen built again within the entry: the same start.
+    rebuild(&screens, &link);
+    link.show_selection(update(1, 2));
+    assert!(wait_until(|| when_starts(&screens, 1)
+        .iter()
+        .any(|&(d, _)| d != device)));
+    let again = when_starts(&screens, 1);
+    assert!(
+        again
+            .iter()
+            .filter(|&&(d, _)| d != device)
+            .all(|&(_, s)| near(s, start)),
+        "{again:?}"
+    );
+    // Another screen drawn, selection left, and the next entry: started
+    // again at its first frame.
+    link.send(super::super::RenderMsg::Menu(Box::default()));
+    std::thread::sleep(Duration::from_millis(50));
+    link.leave_selection();
+    link.enter_selection(2);
+    link.show_selection(update(2, 1));
+    assert!(wait_until(|| !when_starts(&screens, 2).is_empty()));
+    let built = screens.built.lock().unwrap().clone();
+    let (_, entered, _) = built.iter().find(|(s, _, _)| s.lifetime == 2).unwrap();
+    let (_, restart) = when_starts(&screens, 2)[0];
+    assert!(near(restart, entered.0 / 1_000), "{restart} {entered:?}");
+    assert!(restart >= start + 50, "{restart} {start}");
+    link.exit();
+}
+
 #[cfg(feature = "dev-tools")]
 mod warp;

@@ -1915,7 +1915,7 @@ mod tests {
 
     /// [`on_rig`] with `settings` and the render thread `render`.
     #[cfg(feature = "dev-tools")]
-    fn on_rig_with<R>(
+    pub(crate) fn on_rig_with<R>(
         settings: game::Settings,
         render: crate::render_side::RenderLink,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings) -> R,
