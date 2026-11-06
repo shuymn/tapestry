@@ -31,9 +31,13 @@ use std::sync::Arc;
 
 use bms_model::TimeUs;
 use render::SkinBundle;
-use skin_model::{SelectionLabels, SelectionTimers, SelectionView};
+use skin_model::{
+    MasterVolume, SelectionLabels, SelectionOrder, SelectionSettings, SelectionTimers,
+    SelectionView, SpeedReference, SpeedView,
+};
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage};
+use crate::tuning::LiveTuning;
 
 /// How long the strip shows the preset's name after a preset step.
 pub const PRESET_SHOWN: TimeUs = TimeUs(3_000_000);
@@ -58,6 +62,10 @@ pub struct SelectionUpdate {
     pub strip: StripText,
     /// The timers' starts.
     pub events: SelectionEvents,
+    /// The player's settings the skin shows, as the game thread knows
+    /// them; each frame takes the volume and the display offset as they
+    /// are then ([`live_settings`]). `None` until the flow gives them.
+    pub settings: Option<SelectionSettings>,
 }
 
 impl SelectionUpdate {
@@ -169,6 +177,71 @@ impl SelectionEvents {
     }
 }
 
+/// `s` with the master gain that plays and the display offset as
+/// `tuning` holds them now: what a selection frame shows of the settings
+/// keys (F3 to F6), read on the render thread. Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+#[must_use]
+pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSettings {
+    let offset = tuning.display_offset_us() / 1_000;
+    SelectionSettings {
+        display_offset_ms: i32::try_from(offset).unwrap_or(if offset < 0 {
+            i32::MIN
+        } else {
+            i32::MAX
+        }),
+        master_volume: MasterVolume::of_gain(tuning.volume()),
+        ..*s
+    }
+}
+
+/// The settings a selection skin shows, as the game thread knows them
+/// (docs/stage3.md §3, Selection): the play options in force (`options`,
+/// none before any), the chosen `preset`'s gauge shown for the settings'
+/// `gauge` as an attempt resolves it, the list's `order`, and the volume
+/// and the display offset `tuning` holds now.
+pub fn settings_of(
+    options: Option<game::PlayOptions>,
+    preset: Option<&rules::RulePreset>,
+    gauge: usize,
+    order: SelectionOrder,
+    tuning: &LiveTuning,
+) -> Option<SelectionSettings> {
+    let options = options?;
+    let hispeed = options.hispeed();
+    let speed = match hispeed.mode {
+        game::SpeedMode::Classic => SpeedView::Classic,
+        game::SpeedMode::Floating => SpeedView::Floating {
+            reference: match hispeed.reference {
+                game::HiSpeedReference::Start => SpeedReference::Start,
+                game::HiSpeedReference::Maximum => SpeedReference::Maximum,
+                game::HiSpeedReference::Main => SpeedReference::Main,
+                game::HiSpeedReference::Minimum => SpeedReference::Minimum,
+            },
+            green: hispeed.green_target,
+        },
+    };
+    let covers = options.covers();
+    let gauge = preset.and_then(|p| {
+        let policy = game::DefaultPolicy {
+            displayed: gauge,
+            on_failure: game::FailureAction::default(),
+        };
+        p.gauges
+            .get(game::resolve_displayed(&policy, p).0)
+            .map(skin_model::GaugeLook::of)
+    });
+    let s = SelectionSettings {
+        display_offset_ms: 0,
+        master_volume: MasterVolume::of_gain(0.0),
+        speed,
+        order,
+        gauge,
+        covers_on: [covers.sudden.on, covers.lift.on, covers.hidden.on],
+    };
+    Some(live_settings(&s, tuning))
+}
+
 /// The newest update and the lifetime it may belong to, between the game
 /// and render threads.
 #[derive(Debug, Default)]
@@ -272,6 +345,9 @@ pub struct SkinFeed {
     /// The installed selection skin's song list: its center slot and its
     /// placements; `None` without a skin.
     pub window: Option<(usize, usize)>,
+    /// The settings the flow gave at the entry and at each preset change
+    /// ([`settings_of`]), each update with the list's order.
+    pub settings: Option<SelectionSettings>,
 }
 
 impl SkinFeed {
@@ -326,6 +402,10 @@ impl SkinFeed {
                 panels: [None; 3],
                 preset_step: self.preset_step,
             },
+            settings: self.settings.map(|s| SelectionSettings {
+                order: screen.order_view(),
+                ..s
+            }),
         }
     }
 }
@@ -447,6 +527,7 @@ mod tests {
             labels: crate::select::labels(),
             strip: StripText::default(),
             events: SelectionEvents::default(),
+            settings: None,
         };
         let mut slot = SelectionSlot::default();
         assert!(!slot.offer(update(1, 1)));

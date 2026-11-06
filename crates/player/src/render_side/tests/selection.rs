@@ -33,6 +33,7 @@ fn update_of(lifetime: u64, revision: u64, view: SelectionView) -> SelectionUpda
             changed: entered,
             ..SelectionEvents::default()
         },
+        settings: None,
     }
 }
 

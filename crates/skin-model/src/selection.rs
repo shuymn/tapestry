@@ -58,6 +58,7 @@ impl Ratio {
     /// a value below 2^-40 (−240 dB) can need, reads as 0, and anything
     /// else (negative, above 1, not finite) as `None`. Reads the bits
     /// only: no float arithmetic.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     #[must_use]
     pub fn of_f32(x: f32) -> Option<Self> {
         const ZERO: Ratio = Ratio {
@@ -113,6 +114,7 @@ pub struct MasterVolume {
 impl MasterVolume {
     /// The volume of `gain`, a gain from 0 to 1 (`device.toml`'s range);
     /// one outside it reads as 0.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     #[must_use]
     pub fn of_gain(gain: f32) -> Self {
         let Some(ratio) = Ratio::of_f32(gain) else {

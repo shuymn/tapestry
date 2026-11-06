@@ -1253,6 +1253,28 @@ fn hold(
 }
 
 impl PlayerRig<'_> {
+    /// Gives the select screen's updates the settings a skin shows
+    /// (docs/stage3.md §3, Selection): the play options in force, the
+    /// chosen preset's displayed gauge and the settings keys' values.
+    fn feed_settings(&mut self) {
+        let options = self
+            .adjust
+            .as_ref()
+            .map(game::AdjustDriver::options)
+            .or_else(|| self.files.play_options());
+        let tuning = self.controls.tuning();
+        let gauge = self.gauge;
+        if let Some(sel) = &mut self.selection {
+            sel.feed.settings = crate::selection_skin::settings_of(
+                options,
+                sel.screen.bests_preset(),
+                gauge,
+                sel.screen.order_view(),
+                tuning,
+            );
+        }
+    }
+
     /// Whether a loading lifetime runs: from the choice or a practice's
     /// Start until loading ends.
     pub(crate) fn loading_active(&self) -> bool {
@@ -2017,10 +2039,14 @@ impl AppRig for PlayerRig<'_> {
         if let Some(sel) = &mut self.selection {
             sel.presets(name, error, shelf.is_ok());
             sel.save_error(self.files.player_error(), failed);
-            // The list shows the bests of the chosen preset.
+            // The list shows the bests of the chosen preset, and a skin
+            // its gauge.
             sel.screen
                 .set_bests_preset(shelf.ok().map(|s| s.chosen().clone()));
             sel.refresh_bests();
+        }
+        self.feed_settings();
+        if let Some(sel) = &mut self.selection {
             sel.show(&self.render, None, self.clock.now());
         }
     }
@@ -2039,6 +2065,8 @@ impl AppRig for PlayerRig<'_> {
         );
         self.render.clear_end();
         self.render.clear_loading();
+        // The play options as the play before left them.
+        self.feed_settings();
         let Some(sel) = &mut self.selection else {
             return;
         };
