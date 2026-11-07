@@ -366,8 +366,9 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 /// 3. The configuration: each option and file choice by name, against the
 ///    header; an unknown name refuses.
 /// 4. The import, Lua against the base facts; a kind with no importer
-///    keeps its built-in screen, and a Lua play skin reading a chart fact
-///    ends pending, built for each attempt ([`specialize`]).
+///    keeps its built-in screen. A Lua play skin reading a chart fact
+///    ends pending, built for each attempt ([`specialize`]); a Lua skin of
+///    another kind reading one refuses.
 /// 5. The pack ([`pack`]).
 pub fn build(
     kind: ScreenKind,
@@ -383,10 +384,6 @@ pub fn build(
         Err(why) => KindOutcome::Refused(why),
     }
 }
-
-/// Why a Lua selection skin keeps the built-in select screen: it is
-/// activated with runtime Lua outside play (docs/stage3.md S7-07).
-pub const LUA_SELECTION: &str = "a Lua selection skin needs runtime Lua (S7-07)";
 
 /// What [`built`] made.
 enum Built {
@@ -460,11 +457,6 @@ fn built(
             found,
         }));
     }
-    // A Lua selection skin waits for runtime Lua outside play: no Lua
-    // beyond its header runs for a skin that will not be used.
-    if kind == ScreenKind::Selection && matches!(pass, Pass::Lua(_)) {
-        return Ok(Built::NoImporter(LUA_SELECTION.to_owned()));
-    }
     stopped()?;
     // 3. The configuration.
     let config = config(pass.header(), choice)?;
@@ -482,8 +474,8 @@ fn built(
                         dependencies: p.dependencies,
                         usage: p.usage,
                     };
-                    // Only play's configured pass runs: another kind
-                    // has no importer yet, so it never gets here.
+                    // Only play's facts are given per attempt: another
+                    // kind's pending fact refuses.
                     if kind != ScreenKind::Play {
                         return Err(note.refusal());
                     }

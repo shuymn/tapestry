@@ -295,58 +295,68 @@ fn listed(place: SelectionPlace, query: &str) -> SelectionView {
 
 /// The fixture skin built for a WARP target.
 fn skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
-    let dir = crate::selection_skin::fixture();
+    skin_of("s.json")
+}
+
+/// The Lua fixture's skin `entry` (its JSON or its Lua) built for a WARP
+/// target.
+fn skin_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let dir = crate::selection_skin::lua_fixture();
     let limits = crate::render_common::offscreen(1_920, 1_080);
-    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path());
+    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path(), entry);
     (dir, skin)
 }
 
-/// The selection skin installed on a real screen draws each update with
-/// the player's labels, folder names and the query as they are: the
-/// all-charts row's label, the place's text at All, in the results and in
-/// a folder, and the search's text; without the skin the same updates
-/// draw the page, and no selection frame.
+/// The selection skin installed on a real screen, JSON or Lua, draws each
+/// update with the player's labels, folder names and the query as they
+/// are: the all-charts row's label, the place's text at All, in the
+/// results and in a folder, and the search's text; without the skin the
+/// same updates draw the page, and no selection frame.
 #[test]
 fn the_installed_skin_draws_each_place_with_the_players_labels() {
-    let (_dir, skin) = skin();
-    let (link, frames) = warp_link(None);
-    assert_eq!(
-        link.select(ScreenKind::Selection, Some(Arc::clone(&skin)))
-            .wait()
-            .unwrap(),
-        Preparation::Ready
-    );
-    link.enter_selection(1);
-    let asked = |lines: &[&str]| {
-        wait_until(|| {
-            frames.0.lock().unwrap().iter().any(|(quads, asked, ..)| {
-                quads.is_some_and(|n| n > 0) && lines.iter().all(|l| asked.iter().any(|a| a == l))
-            })
-        })
-    };
-    let places = [
-        (
-            SelectionPlace::All,
-            "",
-            vec!["全譜面", "全譜面 > ", "曲集", "譜面の名前"],
-        ),
-        (SelectionPlace::Results, "abc", vec!["検索結果 > ", "abc"]),
-        (
-            SelectionPlace::Folder(vec!["曲集".to_owned(), "下の階".to_owned()]),
-            "",
-            vec!["曲集 > 下の階 > "],
-        ),
-    ];
-    for (revision, (place, query, lines)) in (1..).zip(places) {
-        link.show_selection(update_of(1, revision, listed(place, query)));
-        assert!(
-            asked(&lines),
-            "{lines:?}: {:?}",
-            frames.0.lock().unwrap().last()
+    for entry in ["s.json", "s.luaskin"] {
+        let (_dir, skin) = skin_of(entry);
+        let (link, frames) = warp_link(None);
+        assert_eq!(
+            link.select(ScreenKind::Selection, Some(Arc::clone(&skin)))
+                .wait()
+                .unwrap(),
+            Preparation::Ready,
+            "{entry}"
         );
+        link.enter_selection(1);
+        let asked = |lines: &[&str]| {
+            wait_until(|| {
+                frames.0.lock().unwrap().iter().any(|(quads, asked, ..)| {
+                    quads.is_some_and(|n| n > 0)
+                        && lines.iter().all(|l| asked.iter().any(|a| a == l))
+                })
+            })
+        };
+        let places = [
+            (
+                SelectionPlace::All,
+                "",
+                vec!["全譜面", "全譜面 > ", "曲集", "譜面の名前"],
+            ),
+            (SelectionPlace::Results, "abc", vec!["検索結果 > ", "abc"]),
+            (
+                SelectionPlace::Folder(vec!["曲集".to_owned(), "下の階".to_owned()]),
+                "",
+                vec!["曲集 > 下の階 > "],
+            ),
+        ];
+        for (revision, (place, query, lines)) in (1..).zip(places) {
+            link.show_selection(update_of(1, revision, listed(place, query)));
+            assert!(
+                asked(&lines),
+                "{entry}: {lines:?}: {:?}",
+                frames.0.lock().unwrap().last()
+            );
+        }
+        assert_eq!(link.take_selection_refusal(), None, "{entry}");
+        link.exit();
     }
-    assert_eq!(link.take_selection_refusal(), None);
-    link.exit();
 
     // No skin installed: the page, and no selection frame.
     let (link, frames) = warp_link(None);
@@ -494,7 +504,7 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
     use game::{Adjust, AppRig as _};
     let dir = crate::selection_skin::settings_fixture();
     let limits = crate::render_common::offscreen(1_920, 1_080);
-    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path());
+    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path(), "s.json");
     // The width of graph 17 for the gain `n / d`, 1 000 wide.
     let width = |n: u64, d: u64| (1_000.0 * n as f64 / d as f64) as f32;
     for (gain, number, ratio) in [
