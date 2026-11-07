@@ -447,9 +447,14 @@ fn at_most_two_atlases_live_with_a_lagging_renderer() {
         "a poll with two atlases live keeps it waiting"
     );
     assert_eq!(seen.alive(), 2);
-    // The renderer moves on, releasing the first: the build starts.
+    // The renderer moves on, releasing the first: its report starts the
+    // build, before any poll.
     let b = shown(&rs);
     fake.take(&mut rs, b);
+    assert!(
+        !rs.deferred() && rs.running(),
+        "the report retries the build"
+    );
     ran(&mut rs);
     seen.note(&rs);
     assert!(!rs.deferred());
