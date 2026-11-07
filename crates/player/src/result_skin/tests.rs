@@ -1261,3 +1261,126 @@ fn a_full_report_retries_nothing() {
     assert_eq!(jobs_started(), jobs);
     assert!(rs.deferred());
 }
+
+/// A skin of four cells of `h.png` (200×200) on one 256-pixel page: A and
+/// B (100×100) fit together, C (200×200) with neither. At level 7 it shows
+/// C; otherwise A for the probe (154 = 1), A and B for 154 = 2, B for 3
+/// and C for 4.
+fn cells_skin() -> (tempfile::TempDir, Arc<super::PendingResult>) {
+    let d = skin_reading(
+        "local lv = ms.number(96)\nlocal nr = ms.number(154)",
+        "local A = { id = \"a\", src = \"h\", x = 0, y = 0, w = 100, h = 100 }\n\
+         local B = { id = \"b2\", src = \"h\", x = 100, y = 100, w = 100, h = 100 }\n\
+         local C = { id = \"c\", src = \"h\", x = 0, y = 0, w = 200, h = 200 }\n\
+         local imgs = { A }\n\
+         if lv == 7 or nr == 4 then imgs = { C } elseif nr == 2 then imgs = { A, B } \
+         elseif nr == 3 then imgs = { B } end",
+        "imgs",
+    );
+    png(d.path(), "h.png", 200, 200);
+    let entry = fs::read_to_string(d.path().join("s.luaskin"))
+        .unwrap()
+        .replace(
+            "{ id = \"b\", path = \"big.png\" } }",
+            "{ id = \"b\", path = \"big.png\" }, { id = \"h\", path = \"h.png\" } }",
+        );
+    fs::write(d.path().join("s.luaskin"), entry).unwrap();
+    let one_page = AtlasLimits {
+        max_side: 256,
+        max_layers: render::RESERVED_LAYERS + 1,
+        ..LIMITS
+    };
+    let p = pending(d.path(), one_page);
+    (d, p)
+}
+
+/// D11 "Reuse" at the one reuse point: an image entry packed again from
+/// the layout's own cells still serves the probe when it holds the
+/// probe's cell. C shown, the probe's A prepared; P's A and B do not fit
+/// with C and are packed alone; an unchanged retry reuses them.
+#[test]
+fn an_entry_holding_the_probes_cells_is_reused() {
+    let _s = serial();
+    let (_d, p) = cells_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    rs.request(view_at(7, 1));
+    settled(&mut rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert_eq!(rs.staged_line(), "per view, images prepared");
+    let b0 = builds();
+    rs.request(view_at(8, 2));
+    settled(&mut rs);
+    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    assert_eq!(builds() - b0, 1, "A and B packed alone");
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert_eq!(jobs_started(), jobs, "the probe's A is held: reused");
+}
+
+/// A deferred build keeps the shown probe entry, which an unchanged retry
+/// reuses: A shown, then C, which does not fit with A, deferred with two
+/// atlases retained.
+#[test]
+fn a_deferral_keeps_the_probe_reusable() {
+    let _s = serial();
+    let (_d, p) = cells_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(view_at(8, 1));
+    settled(&mut rs);
+    rs.set_retained(&[
+        skin_model::AtlasId(u64::MAX),
+        skin_model::AtlasId(u64::MAX - 1),
+    ]);
+    rs.request(view_at(8, 4));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert_eq!(jobs_started(), jobs, "the shown probe entry: reused");
+}
+
+/// A worker failing after its release loses the probe's entry; a later
+/// entry without the probe's cell is not reused for it. C shown, the
+/// probe's A prepared unshown; P's A and B release A and panic at the
+/// build; B is built alone; an unchanged retry prepares again.
+#[test]
+fn a_lost_probe_entry_is_not_reused() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _s = serial();
+    let (_d, p) = cells_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    rs.request(view_at(7, 1));
+    settled(&mut rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    REACHED.store(false, SeqCst);
+    FAIL.store(1, SeqCst);
+    GATE.store(true, SeqCst);
+    rs.request(view_at(8, 2));
+    let end = Instant::now() + Duration::from_secs(20);
+    while !REACHED.load(SeqCst) {
+        assert!(Instant::now() < end, "the layout did not reach its build");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    GATE.store(false, SeqCst);
+    settled(&mut rs);
+    assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
+    assert!(rs.image().is_none());
+    rs.request(view_at(8, 3));
+    settled(&mut rs);
+    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert_eq!(
+        jobs_started() - jobs,
+        1,
+        "B lacks the probe's A: prepared again"
+    );
+}

@@ -20,7 +20,7 @@ use skin_beatoraja::{
 use skin_model::{
     Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, LampKey, Layout, ResourceCache,
     ResultChart, ResultFields, ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView,
-    Root, ScreenKind, Sheet, TimingStats,
+    Root, ScreenKind, Sheet, TimingStats, Variant,
 };
 
 use crate::imports::{self, ImportTarget, Job, Ran};
@@ -180,8 +180,9 @@ pub struct ResultSkin {
     attempt: Option<ForAttempt>,
     /// The prepared atlas (D13).
     image: Option<Arc<ImageEntry>>,
-    /// The probe's facts, for reusing the image stage.
-    probe: Option<FactDeps>,
+    /// The probe's facts and the cells its layout needs: the image stage
+    /// is reused while the facts hold and the image entry holds the cells.
+    probe: Option<(FactDeps, Needs)>,
     /// The one cached specialization, whichever path made it: a view's
     /// layout, or a bundle for every view of a skin that reads no fact of
     /// the viewed result. Reused while its reads hold ([`Self::reuse_for_attempt`],
@@ -361,14 +362,31 @@ fn lock(slot: &Slot) -> MutexGuard<'_, Option<Images>> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A layout's cells and how they are packed: what an atlas must hold for
+/// the layout to bind to it ([`Atlas::rebind`]).
+struct Needs {
+    sheet: Sheet,
+    variant: Variant,
+    text: bool,
+}
+
+impl Needs {
+    /// Whether `entry`'s atlas holds every cell, packed as needed.
+    fn held_by(&self, entry: &ImageEntry) -> bool {
+        entry
+            .atlas
+            .rebind(&self.sheet, self.variant, self.text)
+            .is_ok()
+    }
+}
+
 /// What a layout leaves: its specialization or why not; what is left of
 /// the holdings it took from its slot ([`release`]), `None` when it never
-/// took them; and whether its build packed its own cells alone, setting
-/// aside the cells of earlier atlases, the probe's among them.
+/// took them; and, when it is specialized, the cells it needs.
 struct Laid {
     result: Result<Specialized, Unbuilt>,
     taken: Option<Images>,
-    alone: bool,
+    needs: Option<Needs>,
 }
 
 impl Laid {
@@ -376,7 +394,7 @@ impl Laid {
         Self {
             result: Err(why.into()),
             taken: None,
-            alone: false,
+            needs: None,
         }
     }
 }
@@ -424,13 +442,13 @@ fn layout(
     let held = entry
         .as_ref()
         .and_then(|e| e.atlas.rebind(skin.sheet(), variant, text).ok());
-    let (atlas, entry, taken, alone) = match held {
-        Some(atlas) => (atlas, entry, None, false),
+    let (atlas, entry, taken) = match held {
+        Some(atlas) => (atlas, entry, None),
         None => {
             drop(entry);
             let limits = pending.target.limits;
             let mut guard = lock(slot);
-            let (packed, alone) = {
+            let packed = {
                 let (e, c) = guard
                     .as_ref()
                     .map_or((None, None), |i| (i.entry.as_ref(), i.cells.as_ref()));
@@ -449,9 +467,9 @@ fn layout(
                     .filter(|_| earlier)
                     .filter(|u| u.plan(variant, limits, text).is_ok())
                 {
-                    Some(u) => (u, false),
+                    Some(u) => u,
                     None if skin.sheet().plan(variant, limits, text).is_ok() => {
-                        (skin.sheet().clone(), earlier)
+                        skin.sheet().clone()
                     }
                     None => {
                         return Laid::refused(
@@ -469,7 +487,7 @@ fn layout(
                 return Laid {
                     result: Err(Unbuilt::Deferred),
                     taken: Some(images),
-                    alone,
+                    needs: None,
                 };
             }
             let kept = images.cells;
@@ -488,7 +506,7 @@ fn layout(
                                 cells: kept,
                                 ..Images::default()
                             }),
-                            alone,
+                            needs: None,
                         };
                     }
                 };
@@ -501,16 +519,21 @@ fn layout(
                 ..Images::default()
             });
             match new.atlas.rebind(skin.sheet(), variant, text) {
-                Ok(a) => (a, Some(new), taken, alone),
+                Ok(a) => (a, Some(new), taken),
                 Err(e) => {
                     return Laid {
                         result: Err(format!("the layout cannot be bound: {e}").into()),
                         taken,
-                        alone,
+                        needs: None,
                     };
                 }
             }
         }
+    };
+    let needs = Needs {
+        sheet: skin.sheet().clone(),
+        variant,
+        text,
     };
     let result = imports::bundle_of(skin, scratch, atlas, &pending.target, cancel)
         .map(|bundle| Specialized {
@@ -522,7 +545,7 @@ fn layout(
     Laid {
         result,
         taken,
-        alone,
+        needs: Some(needs),
     }
 }
 
@@ -693,12 +716,13 @@ impl ResultSkin {
                                 Some(Err(format!("the atlas cannot be built: {e}"))),
                                 deps,
                                 None,
+                                None,
                             );
                         }
                         let images = lock(&slot).take().unwrap_or_default();
                         let (images, room) = release(images, base.as_ref(), others);
                         if !room {
-                            return (None, deps, Some(images));
+                            return (None, deps, Some(images), None);
                         }
                         #[cfg(any(test, feature = "dev-tools"))]
                         BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -714,12 +738,12 @@ impl ResultSkin {
                                     cancel,
                                 )
                             });
-                        (Some(r.map(Some)), deps, Some(images))
+                        (Some(r.map(Some)), deps, Some(images), None)
                     }
                     Ok(LuaOutcome::Imported(_)) => {
                         let view = ViewFacts(Some(match facts.result {
                             Fact::Known(f) => f,
-                            _ => return (None, deps, None),
+                            _ => return (None, deps, None, None),
                         }));
                         let laid = layout(&pending, view, Some(class), &slot, base, others, cancel);
                         // The probe's layout is never shown: its atlas is.
@@ -730,17 +754,18 @@ impl ResultSkin {
                             })),
                             deps,
                             laid.taken,
+                            laid.needs,
                         )
                     }
-                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, None),
-                    _ => (None, deps, None),
+                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, None, None),
+                    _ => (None, deps, None, None),
                 }
             },
             quit,
             end_run,
         );
         match ran {
-            Ran::Done((outcome, deps, taken)) => {
+            Ran::Done((outcome, deps, taken, needs)) => {
                 self.restore(taken, &slot);
                 match outcome {
                     // A bundle for every view, cached with what it read.
@@ -756,7 +781,7 @@ impl ResultSkin {
                     // Images prepared: laid out per view.
                     Some(Ok(None)) => {
                         self.attempt = Some(ForAttempt::Pending);
-                        self.probe = Some(deps);
+                        self.probe = needs.map(|n| (deps, n));
                     }
                     // Refused with no result fact read.
                     Some(Err(why)) if !reads_result(&deps) => {
@@ -868,8 +893,9 @@ impl ResultSkin {
     /// The one reuse decision for an attempt whose probe facts are `facts`
     /// (D11, "Reuse"), whichever path left the holding: the cached
     /// specialization when it reads no fact of the viewed result and its
-    /// reads hold, as one bundle for every view; else the prepared atlas
-    /// when the probe's facts hold, laid out per view.
+    /// reads hold, as one bundle for every view; else the image entry when
+    /// the probe's facts hold and it holds every cell the probe's layout
+    /// needs, however it was packed since, laid out per view.
     fn reuse_for_attempt(&self, facts: &ImportFacts) -> Option<ForAttempt> {
         if let Some(l) = &self.layout
             && !reads_result(&l.facts)
@@ -877,8 +903,9 @@ impl ResultSkin {
         {
             return Some(ForAttempt::Every(Arc::clone(&l.bundle), l.entry.clone()));
         }
-        if let (Some(deps), Some(_)) = (&self.probe, &self.image)
+        if let (Some((deps, needs)), Some(e)) = (&self.probe, &self.image)
             && deps.holds(facts)
+            && needs.held_by(e)
         {
             return Some(ForAttempt::Pending);
         }
@@ -963,18 +990,9 @@ impl ResultSkin {
     }
 
     fn landed(&mut self, out: LayoutOut, slot: &Slot) {
-        // The entry is keyed by cells, not by request: it stays. A build of
-        // the layout's cells alone set the probe's aside: the image stage
-        // prepares again.
-        let Laid {
-            result,
-            taken,
-            alone,
-        } = out.laid;
+        // The entry is keyed by cells, not by request: it stays.
+        let Laid { result, taken, .. } = out.laid;
         self.restore(taken, slot);
-        if alone {
-            self.probe = None;
-        }
         let latest = self.latest.map(|(r, _)| r);
         match result {
             Ok(spec) if latest == Some(out.request) => {
@@ -1034,12 +1052,7 @@ impl ResultSkin {
         self.deferred = None;
         if let Some((job, _, slot)) = self.job.take() {
             match job.finish(|| true, end_run) {
-                Ran::Done(out) => {
-                    if out.laid.alone {
-                        self.probe = None;
-                    }
-                    self.restore(out.laid.taken, &slot);
-                }
+                Ran::Done(out) => self.restore(out.laid.taken, &slot),
                 Ran::Refused(_) => self.restore(None, &slot),
                 // Its thread is detached and may still take the slot.
                 Ran::Abandoned => {}
