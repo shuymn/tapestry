@@ -630,6 +630,55 @@ pub fn survey_with(
     s
 }
 
+/// A JSON skin's survey: `entry` in `root` read and imported for the kind
+/// its header names, with `choice`'s options and files, and drawn over
+/// [`Choice::result`] when it is a result skin that imports. Only the
+/// outcome, the kind, the notes by kind and the frames are filled.
+#[must_use]
+pub fn survey_json(root: &Path, entry: &str, choice: &Choice) -> Survey {
+    let (mut def, header) = match crate::read_header(root, entry) {
+        Ok(read) => read,
+        Err(e) => {
+            return Survey {
+                outcome: format!("header {}", label(&e)),
+                ..Survey::default()
+            };
+        }
+    };
+    let kind = header.kind;
+    let mut s = Survey {
+        kind: Some(kind),
+        ..Survey::default()
+    };
+    let config = match Config::named(
+        &header,
+        choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
+        choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
+    ) {
+        Ok(config) => config,
+        Err(_) => {
+            s.outcome = "config".to_owned();
+            return s;
+        }
+    };
+    match crate::import(&mut def, &header, &config, kind) {
+        Ok(imported) => {
+            s.outcome = "imported".into();
+            for n in &imported.report.notes {
+                *s.notes.entry(note(&n.kind)).or_default() += 1;
+            }
+            if kind == ScreenKind::Result
+                && let Some(view) = &choice.result
+            {
+                let charge = imported.report.usage.widget_quads;
+                s.frames = frames(&imported.skin, charge, view);
+            }
+        }
+        Err(e) => s.outcome = label(&e),
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::Became;
