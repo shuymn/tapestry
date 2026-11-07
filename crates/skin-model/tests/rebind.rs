@@ -338,3 +338,34 @@ const LIMITS_TEXT: AtlasLimits = AtlasLimits {
     max_side: 2_048,
     ..LIMITS
 };
+
+/// A file's identity holds the header admission recorded, a PNG's fields
+/// included (design D13): rewritten at the same dimensions with other
+/// texels and the same header it is still held, the packed texels kept;
+/// rewritten with only its colour type changed, RGBA to RGB, it is
+/// another file and refused.
+#[test]
+fn a_file_rewritten_with_another_decode_mode_is_not_held() {
+    let d = dir();
+    save(d.path(), "a.png", &pattern(12, 10, 9));
+    let base = [whole_of("a.png")];
+    let built = build(&sheet(d.path(), &base), Variant::Lo, LIMITS, false);
+    let packed = expected(d.path(), &base, 1, &[]);
+    // Same dimensions and header, other texels: held, drawn as packed.
+    save(d.path(), "a.png", &pattern(12, 10, 10));
+    let same = built
+        .rebind(&sheet(d.path(), &base), Variant::Lo, false)
+        .unwrap();
+    assert_content(&same, &packed, 1);
+    // Same dimensions, RGB instead of RGBA: another decode mode.
+    image::DynamicImage::ImageRgba8(pattern(12, 10, 9))
+        .to_rgb8()
+        .save_with_format(d.path().join("a.png"), image::ImageFormat::Png)
+        .unwrap();
+    let rgb = sheet(d.path(), &base);
+    assert_eq!(rgb.frame_count(), 1);
+    assert!(matches!(
+        built.rebind(&rgb, Variant::Lo, false),
+        Err(AtlasError::NotHeld)
+    ));
+}

@@ -145,11 +145,7 @@ fn a_bundle_checks_its_clips_and_its_layers() {
     );
     assert_eq!(
         new(two, clip()).unwrap_err(),
-        BundleError::Layers {
-            first: 2,
-            last: 2,
-            end: 1
-        }
+        BundleError::Reserved { packed: 2 }
     );
     assert!(new(good, clip()).is_ok());
 }
@@ -216,6 +212,64 @@ fn a_rebound_subset_on_a_later_page_makes_a_bundle_that_draws() {
     r.commit(token).unwrap();
     let (_, p) = frame(&mut r);
     halves(&p, BLUE, BLACK);
+}
+
+/// Pages packed for another reservation are refused even for a rebound
+/// subset whose frames fall in the renderer's layers 1 to 2. Red on page
+/// 0 and blue on page 1: packed after two reserved layers, the red skin's
+/// frame is on layer 2, but the upload puts page 0 at layer 1, so it would
+/// sample blue; packed after none, the blue skin's frame is on layer 1,
+/// where the upload puts page 0, red.
+#[test]
+fn a_rebound_subset_of_pages_packed_for_another_reservation_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = offscreen(64, 64);
+    let look = |rgba| Look {
+        side: 200,
+        ..Look::left(rgba)
+    };
+    let (red, blue) = (look([255, 0, 0, 255]), look([0, 0, 255, 255]));
+    let file = |name: &str| skin_model::FileDef {
+        path: name.into(),
+        hi: None,
+    };
+    let whole = |file| skin_model::ImageDef {
+        file,
+        rect: None,
+        grid: [1, 1],
+        cycle: None,
+        filter: skin_model::Filter::Nearest,
+    };
+    for (reserved, subset, layer) in [(2, &red, 2), (0, &blue, 1)] {
+        let skin = decl_support::skin(dir.path(), subset);
+        let _ = decl_support::skin(dir.path(), if reserved == 2 { &blue } else { &red });
+        let both = skin_model::Sheet::new(
+            dir.path(),
+            vec![file("ff0000-200.png"), file("0000ff-200.png")],
+            vec![whole(0), whole(1)],
+        )
+        .unwrap();
+        let base = decl_support::skin_of(both, &red);
+        let limits = skin_model::AtlasLimits {
+            max_side: 256,
+            reserved_layers: reserved,
+            ..r.atlas_limits()
+        };
+        let built = base
+            .atlas(skin_model::Variant::Lo, limits, &|| false)
+            .unwrap();
+        assert_eq!(built.pages().len(), 2);
+        let rebound = built
+            .rebind(skin.sheet(), skin_model::Variant::Lo, false)
+            .unwrap();
+        let layers: Vec<u16> = rebound.uvs().frames().iter().map(|f| f.layer).collect();
+        assert_eq!(layers, [layer], "reserved {reserved}");
+        let clips = render::ClipTable::new(vec![[0.0, 0.0, 960.0, 1_080.0]]).unwrap();
+        assert_eq!(
+            SkinBundle::new(Arc::new(skin), rebound, clips, Side::Left).unwrap_err(),
+            BundleError::Reserved { packed: reserved },
+        );
+    }
 }
 
 /// A staged installation leaves the one in use drawing, through frames,

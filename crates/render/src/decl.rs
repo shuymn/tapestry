@@ -87,8 +87,16 @@ pub enum BundleError {
         /// The skin's.
         expected: usize,
     },
+    /// The atlas's pages were packed after another count of reserved
+    /// layers than the renderer's: each frame's layer would name another
+    /// page than the one uploaded there.
+    #[error("the atlas was packed after {packed} reserved layers, not {RESERVED_LAYERS}")]
+    Reserved {
+        /// The reserved layers it was packed after.
+        packed: u32,
+    },
     /// A frame of the atlas does not lie on its pages after the renderer's
-    /// reserved layers: it was built for another reservation.
+    /// reserved layers.
     #[error("the atlas's frames lie on layers {first} to {last}, not {RESERVED_LAYERS} to {end}")]
     Layers {
         /// The lowest layer a frame lies on.
@@ -153,9 +161,10 @@ impl SkinBundle {
     /// # Errors
     ///
     /// [`BundleError::Atlas`] for an atlas whose uv table is of another
-    /// sheet or length, [`BundleError::Layers`] for a frame outside its
-    /// pages after the renderer's [`RESERVED_LAYERS`] (an atlas built for
-    /// another reservation: its pages are uploaded after them), and
+    /// sheet or length, [`BundleError::Reserved`] for pages packed after
+    /// another count of reserved layers than the renderer's
+    /// [`RESERVED_LAYERS`] (its pages are uploaded after them),
+    /// [`BundleError::Layers`] for a frame outside its pages, and
     /// [`BundleError::Clips`] for a clip table without every clip the skin
     /// names.
     pub fn new(
@@ -171,8 +180,14 @@ impl SkinBundle {
                 expected: skin.frame_count(),
             });
         }
-        // Every frame lies on a page; a rebound subset may leave the first
-        // pages unused.
+        // Page `i` is uploaded at layer `RESERVED_LAYERS + i`, so the pages
+        // must have been packed for that: a rebound subset's frames alone
+        // cannot tell, since it may leave the first pages unused.
+        let packed = pages.reserved_layers();
+        if packed != RESERVED_LAYERS {
+            return Err(BundleError::Reserved { packed });
+        }
+        // Every frame lies on a page.
         let count = u32::try_from(pages.pages().len()).unwrap_or(u32::MAX);
         let end = RESERVED_LAYERS.saturating_add(count).saturating_sub(1);
         let layers = uvs.frames().iter().map(|f| f.layer);

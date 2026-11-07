@@ -152,6 +152,10 @@ pub struct PackedPages {
     pages: Vec<Page>,
     variant: Variant,
     text_layer: Option<u16>,
+    /// The layers kept before the pages when they were packed
+    /// ([`AtlasLimits::reserved_layers`]): page `i` is layer
+    /// `reserved_layers + i`.
+    reserved_layers: u32,
     /// The skin folder the files were read from.
     root: PathBuf,
     /// The files read, by their admitted identity, ordered by name.
@@ -219,6 +223,13 @@ impl PackedPages {
     #[must_use]
     pub fn variant(&self) -> Variant {
         self.variant
+    }
+
+    /// The layers kept before the pages when they were packed: page `i`
+    /// is layer `reserved_layers + i`, whichever frames a table uses.
+    #[must_use]
+    pub fn reserved_layers(&self) -> u32 {
+        self.reserved_layers
     }
 
     /// The bytes the placements keep beside the pages: every held cell
@@ -555,6 +566,7 @@ impl Sheet {
             pages,
             variant,
             text_layer,
+            reserved_layers: limits.reserved_layers,
             root: self.root().to_path_buf(),
             files,
             cells,
