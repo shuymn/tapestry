@@ -2041,3 +2041,149 @@ fn a_refused_specialization_shows_its_reason_on_the_select_screen() {
     );
     assert!(lines(&stdout, "play started").is_empty(), "{stdout}");
 }
+
+/// A result skin whose Lua loops at the stage `looping` names: the image
+/// stage's probe reads every result value as 1, an autoplay's layout reads
+/// its PERFECT count (110) above 1.
+fn write_looping_result_skin(fx: &Fixture, looping: &str) {
+    let dir = fx.appdata.join("result");
+    write_blue_skin(&dir);
+    let cond = match looping {
+        "image" => "ms.number(110) == 1",
+        _ => "ms.number(110) ~= 1",
+    };
+    fs::write(
+        dir.join("result.luaskin"),
+        format!(
+            "local skin = {{ type = 7, name = \"r\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             if {cond} then while true do end end\n\
+             skin.source = {{ {{ id = \"b\", path = \"blue.png\" }} }}\n\
+             skin.image = {{ {{ id = \"b\", src = \"b\", x = 0, y = 0, w = 16, h = 16 }} }}\n\
+             skin.value = {{ {{ id = \"ex\", src = \"b\", x = 0, y = 0, w = 10, h = 1, divx = 10, digit = 4, ref = 71 }} }}\n\
+             skin.destination = {{ {{ id = \"b\", dst = {{ {{ x = 0, y = 0, w = 16, h = 16 }} }} }},\n\
+               {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }} }}\n\
+             return skin\n"
+        ),
+    )
+    .unwrap();
+    let root = DataRoot::new(fx.appdata.join("tapestry"));
+    fs::write(
+        root.player_settings(),
+        format!(
+            "[skins.result]\nroot = '{}'\nentry = 'result.luaskin'\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The quit key while the result skin's job loops cancels it and waits
+/// for its thread: in the image stage of the attempt's Preparing, the
+/// attempt is cancelled and no play opens; on P (ResultPreparing), the
+/// preparation is withdrawn through the rig's hook, which leaves no job
+/// thread running and nothing published but the built-in result (the
+/// quit is taken at P's idle wait's end, by which the loop may have met
+/// the instruction limit). Either way the selection is entered again.
+#[test]
+fn a_quit_during_a_result_skin_job_joins_it() {
+    for stage in ["image", "layout"] {
+        let fx = fixture();
+        write_ranked(&fx, "a", "a.bms", Some(2));
+        write_looping_result_skin(&fx, stage);
+        let step = format!("result-{stage}-quit-specializing");
+        let (status, seen, stderr) = bounded_run(
+            &fx,
+            &format!("{step},pick=a.bms,enter,wait=a.bms,close"),
+            &step,
+        );
+        let stdout: String = seen.iter().map(|l| format!("{l}\n")).collect();
+        assert_eq!(status.code(), Some(0), "{step}: {stdout}\n{stderr}");
+        let line = |text: &str| {
+            seen.iter()
+                .position(|l| l.starts_with(text))
+                .unwrap_or_else(|| panic!("{step}: no {text}: {stdout}"))
+        };
+        let quit = line("dev: quit pressed while specializing");
+        let chose = line("select: chose a.bms");
+        assert!(chose < quit, "{step}: {stdout}");
+        let published = lines(&stdout, "dev: result skin published: ");
+        if stage == "image" {
+            assert!(published.is_empty(), "{step}: {stdout}");
+            assert!(
+                quit < line("dev: result image stage: per view, images none"),
+                "{step}: {stdout}"
+            );
+            assert!(
+                lines(&stdout, "play started").is_empty(),
+                "{step}: {stdout}"
+            );
+        } else {
+            assert!(
+                published.iter().all(|l| l.ends_with("built-in")),
+                "{step}: {stdout}"
+            );
+            let settled = line("dev: result skin settled: withdrawn");
+            assert!(quit < settled, "{step}: {stdout}");
+            let jobs = lines(&stdout, "dev: result skin jobs: ");
+            let [jobs] = jobs.as_slice() else {
+                panic!("{step}: {stdout}");
+            };
+            let (live, counts) = jobs
+                .trim_start_matches("dev: result skin jobs: live ")
+                .split_once(" joined ")
+                .unwrap();
+            let (joined, started) = counts.split_once(" of ").unwrap();
+            assert_eq!(live, "0", "{step}: {stdout}");
+            assert_eq!(joined, started, "{step}: {stdout}");
+        }
+        assert!(
+            stdout.rfind("select: 1 charts listed").unwrap() > quit,
+            "{step}: {stdout}"
+        );
+    }
+}
+
+/// A failure of the input thread, or the window's close, while a
+/// withdrawn P waits for a result skin's layout job whose VM is held past
+/// the stop bound ends the wait within the stop bound and the run with
+/// it: the input failure's cause is reported.
+#[test]
+fn the_runs_end_bounds_a_withdrawn_layouts_wait() {
+    for mode in ["escalate-input-failure", "escalate"] {
+        let fx = fixture();
+        write_ranked(&fx, "a", "a.bms", Some(2));
+        write_looping_result_skin(&fx, "layout");
+        let step = format!("result-layout-{mode}-specializing");
+        let (status, seen, stderr) =
+            bounded_run(&fx, &format!("{step},pick=a.bms,enter,close"), &step);
+        let stdout: String = seen.iter().map(|l| format!("{l}\n")).collect();
+        let line = |text: &str| {
+            seen.iter()
+                .position(|l| l == text)
+                .unwrap_or_else(|| panic!("{step}: no {text}: {stdout}"))
+        };
+        let quit = line("dev: quit pressed while specializing");
+        let ended = if mode == "escalate" {
+            assert_eq!(status.code(), Some(0), "{step}: {stdout}\n{stderr}");
+            line("dev: closed while specializing")
+        } else {
+            assert_eq!(status.code(), Some(1), "{step}: {stdout}\n{stderr}");
+            assert!(
+                stderr.contains("the input thread is gone"),
+                "{step}: {stdout}\n{stderr}"
+            );
+            line("dev: input failed while specializing")
+        };
+        assert!(quit < ended, "{step}: {stdout}");
+        assert!(
+            ended < line("dev: result skin settled: withdrawn"),
+            "{step}: {stdout}"
+        );
+        assert!(
+            lines(&stdout, "dev: result skin published: ").is_empty(),
+            "{step}: {stdout}"
+        );
+    }
+}

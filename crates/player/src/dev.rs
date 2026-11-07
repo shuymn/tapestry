@@ -235,15 +235,44 @@ impl Specializing {
         }
     }
 
+    /// The mode and the stage a script or `--dev-specializing` names: a
+    /// play skin's mode alone, a result skin's with `result-image-` or
+    /// `result-layout-` before it.
+    pub fn staged(name: &str) -> Option<(SpecializingStage, Self)> {
+        if let Some(mode) = name.strip_prefix("result-image-") {
+            Self::named(mode).map(|m| (SpecializingStage::ResultImage, m))
+        } else if let Some(mode) = name.strip_prefix("result-layout-") {
+            Self::named(mode).map(|m| (SpecializingStage::ResultLayout, m))
+        } else {
+            Self::named(name).map(|m| (SpecializingStage::Play, m))
+        }
+    }
+
     /// Whether every VM's destruction is held and the quit pressed first.
     const fn escalates(self) -> bool {
         matches!(self, Self::Escalate | Self::EscalateInputFailure)
     }
 }
 
-/// The specialization's script step armed, its steps' baseline, and when
-/// an escalation's quit was pressed.
-static SPECIALIZING: Mutex<Option<(Specializing, u64, Option<Instant>)>> = Mutex::new(None);
+/// Whose job a [`Specializing`] step acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecializingStage {
+    /// A pending play skin's specialization.
+    Play,
+    /// A result skin's image stage in an attempt's Preparing.
+    ResultImage,
+    /// A result skin's layout on P or a switch.
+    ResultLayout,
+}
+
+/// The specialization's script step armed, the stage it acts on, its
+/// steps' baseline, and when an escalation's quit was pressed.
+#[expect(
+    clippy::type_complexity,
+    reason = "one armed step, read and written whole under its lock"
+)]
+static SPECIALIZING: Mutex<Option<(Specializing, SpecializingStage, u64, Option<Instant>)>> =
+    Mutex::new(None);
 
 /// Instruction hook steps past the job's start that show its Lua
 /// executing.
@@ -259,9 +288,9 @@ pub fn take_specialization_quit() -> bool {
     SPECIALIZATION_QUIT.swap(false, Ordering::AcqRel)
 }
 
-/// Arms `s` for the next specialization.
-pub fn specializing(s: Specializing) {
-    *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, u64::MAX, None));
+/// Arms `s` for the next specialization at `stage`.
+pub fn specializing(stage: SpecializingStage, s: Specializing) {
+    *SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner) = Some((s, stage, u64::MAX, None));
 }
 
 /// The next specialization holds `ms` once its wait is shown
@@ -280,8 +309,16 @@ pub fn specialization_began() {
         println!("dev: the specialization holds {ms} ms");
         std::thread::sleep(Duration::from_millis(ms));
     }
+    stage_began(SpecializingStage::Play);
+}
+
+/// A job of `stage` starts: an armed step for that stage counts the Lua's
+/// steps from here, and an escalation holds every VM's destruction.
+pub fn stage_began(stage: SpecializingStage) {
     let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((s, from, _)) = armed.as_mut() {
+    if let Some((s, at, from, _)) = armed.as_mut()
+        && *at == stage
+    {
         *from = skin_beatoraja::lua::vm_hooks::steps();
         if s.escalates() {
             skin_beatoraja::lua::vm_hooks::hold();
@@ -293,7 +330,7 @@ pub fn specialization_began() {
 /// at each look of the job's wait; `fail_input` fails the input thread.
 pub fn specialization_signal(controls: &crate::controls::Controls, fail_input: impl Fn()) {
     let mut armed = SPECIALIZING.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some((s, from, quit_at)) = armed.as_mut() else {
+    let Some((s, _, from, quit_at)) = armed.as_mut() else {
         return;
     };
     if skin_beatoraja::lua::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
@@ -898,7 +935,7 @@ pub enum SelectStep {
     /// What the next pending play skin's specialization gets once its Lua
     /// executes (`quit-specializing`, `close-specializing`,
     /// `escalate-specializing`).
-    Specializing(Specializing),
+    Specializing(SpecializingStage, Specializing),
     /// Every loudness measurement from here on holds this many
     /// milliseconds before its first block, stopped as a measurement is: a
     /// slow measurement, a load's or the background's.
@@ -1033,7 +1070,7 @@ impl SelectScript {
                 Some(("row", f)) => Ok(SelectStep::Row(f.to_owned())),
                 Some(("search", t)) => Ok(SelectStep::Search(t.to_owned())),
                 Some(("sleep", ms)) => ms.parse().map(SelectStep::Sleep).map_err(|_| {
-                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, <quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
+                    format!("{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close")
                 }),
                 Some(("idle", ms)) => ms
                     .parse()
@@ -1085,14 +1122,14 @@ impl SelectScript {
                 None if s == "close-loading" => Ok(SelectStep::CloseLoading),
                 None if let Some(mode) = s
                     .strip_suffix("-specializing")
-                    .and_then(Specializing::named) =>
+                    .and_then(Specializing::staged) =>
                 {
-                    Ok(SelectStep::Specializing(mode))
+                    Ok(SelectStep::Specializing(mode.0, mode.1))
                 }
                 None if s == "hold-background" => Ok(SelectStep::HoldBackground),
                 None if s == "close" => Ok(SelectStep::Close),
                 _ => Err(format!(
-                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, <quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
+                    "{s} is not pick=, wait=, search=, sleep=, idle=, slow-load=, slow-measuring=, slow-decoding=, slow-preparing=, slow-specializing=, slow-chart-load=, press-loading=, hold-background, background=running, background=idle, enter, prev-preset, next-preset, drawn, back, retry, next, prev, close-measuring, quit-measuring, quit-decoding, quit-loading, close-loading, [result-image-|result-layout-]<quit|close|input-failure|escalate|escalate-input-failure>-specializing or close"
                 )),
             })
             .map(|step| step.map(|s| (s, None)))

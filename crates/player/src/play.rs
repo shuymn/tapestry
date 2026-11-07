@@ -294,16 +294,10 @@ impl PlayerRig<'_> {
         let chart = crate::result_skin::attempt_chart(loaded);
         self.result_chart = Some(chart);
         let mut result = std::mem::take(&mut self.result_skin);
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         let rig = &*self;
-        let staged = result.image_stage(
-            chart,
-            || rig.controls.leaving(),
-            || {
-                rig.controls.quitting()
-                    || rig.input_failure().is_some()
-                    || rig.audio_failure().is_some()
-            },
-        );
+        let staged = result.image_stage(chart, || rig.controls.leaving(), || rig.run_ends());
         self.result_skin = result;
         #[cfg(feature = "dev-tools")]
         println!(
@@ -311,6 +305,33 @@ impl PlayerRig<'_> {
             self.result_skin.staged_line()
         );
         staged
+    }
+
+    /// Whether the run ends: the window's close, or a failure of the input
+    /// or audio thread. A script's step on a result skin's job (dev-tools)
+    /// acts at every look.
+    fn run_ends(&self) -> bool {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
+        self.controls.quitting() || self.input_failure().is_some() || self.audio_failure().is_some()
+    }
+
+    /// The result skin's running layout job cancelled and waited for; the
+    /// run's end bounds the wait ([`imports::STOP_WAIT`]).
+    fn settle_result(&mut self) {
+        let mut result = std::mem::take(&mut self.result_skin);
+        let rig = &*self;
+        result.settle(|| rig.run_ends());
+        self.result_skin = result;
+        // The job's thread has ended, and its VMs with it, unless the
+        // run's end gave it up (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: result skin jobs: live {} joined {} of {}",
+            skin_beatoraja::lua::vm_hooks::live(),
+            crate::imports::jobs_joined(),
+            crate::imports::jobs_started()
+        );
     }
 
     /// The play skin the attempt at `loaded` is prepared with: the skin in
@@ -922,19 +943,19 @@ impl Rig for PlayerRig<'_> {
     }
 
     /// A withdrawn preparation cancels the result skin's layout job and
-    /// waits for its thread (design D11, "Cancellation").
+    /// waits for its thread (design D11, "Cancellation"); the run's end
+    /// bounds the wait.
     fn withdraw_result(&mut self) {
-        let controls = self.controls;
-        self.result_skin.settle(|| controls.quitting());
+        self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: withdrawn");
     }
 
     /// A leaving command the Result state acts on cancels a switch's
-    /// layout job and waits for its thread before it is served (D11).
+    /// layout job and waits for its thread before it is served (D11); the
+    /// run's end bounds the wait.
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
-        let controls = self.controls;
-        self.result_skin.settle(|| controls.quitting());
+        self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
     }
@@ -1530,11 +1551,18 @@ impl Rig for PlayerRig<'_> {
         if let Some(chart) = self.result_chart {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
+            #[cfg(feature = "dev-tools")]
+            if self.result_skin.has_job() {
+                crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+            }
         }
     }
 
     fn poll_result(&mut self, _prep: &mut (), deadline: TimeUs) -> game::Polled {
         loop {
+            // A script's step on the layout (dev-tools), at every look.
+            #[cfg(feature = "dev-tools")]
+            crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
             if self.result_skin.poll() {
                 return game::Polled::Ready;
             }
