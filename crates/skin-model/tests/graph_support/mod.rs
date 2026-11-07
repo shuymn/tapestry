@@ -78,14 +78,8 @@ pub fn element(i: u32, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
 }
 
 /// An element drawing judge graph `i` over `r` on the screen timer,
-/// turned `angle` degrees about `pivot`, with `native`.
-pub fn placed_element(
-    i: u32,
-    r: [i32; 4],
-    angle: i32,
-    pivot: skin_model::Anchor,
-    native: Option<skin_model::Native>,
-) -> ElementDef {
+/// turned `angle` degrees about `pivot`, with no native size.
+pub fn placed_element(i: u32, r: [i32; 4], angle: i32, pivot: skin_model::Anchor) -> ElementDef {
     let mut props = [None; 9];
     for (p, v) in props.iter_mut().zip(r) {
         *p = Some(v);
@@ -110,7 +104,6 @@ pub fn placed_element(
         clip: None,
         place: Place {
             pivot,
-            native,
             ..Place::SCREEN
         },
     }

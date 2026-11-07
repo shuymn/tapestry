@@ -121,8 +121,11 @@ impl Objects {
         id: &str,
         kind: ScreenKind,
     ) -> Result<Option<(Object, u32)>, ImportError> {
+        // A judge graph match stands only if no later common table holds
+        // the id (`JsonSkinObjectLoader.java:475-555`).
+        let mut judge_graph = None;
         for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
-            if !looked_up(kind, i) {
+            if !looked_up(kind, i) || (judge_graph.is_some() && i >= COMMON) {
                 continue;
             }
             if slot.is_none() {
@@ -130,38 +133,13 @@ impl Objects {
             }
             if let Some(&rec) = slot.as_ref().and_then(|m| m.get(id)) {
                 if object == Object::JudgeGraph {
-                    let later = self.after_judge_graph(def, tables, id, i)?;
-                    return Ok(Some(later.unwrap_or((object, rec))));
+                    judge_graph = Some((object, rec));
+                    continue;
                 }
                 return Ok(Some((object, rec)));
             }
         }
-        Ok(None)
-    }
-
-    /// The first record of id `id` in the common tables after the judge
-    /// graph's entry `at` of [`ORDER`] (through the gauge): the source's
-    /// judge graph match does not return, so a later common object of the
-    /// same id replaces it (`JsonSkinObjectLoader.java:475-555`).
-    fn after_judge_graph(
-        &mut self,
-        def: &mut Definition,
-        tables: &Tables,
-        id: &str,
-        at: usize,
-    ) -> Result<Option<(Object, u32)>, ImportError> {
-        for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
-            if i <= at || i >= COMMON {
-                continue;
-            }
-            if slot.is_none() {
-                *slot = Some(index(def, records(tables, name), false)?);
-            }
-            if let Some(&rec) = slot.as_ref().and_then(|m| m.get(id)) {
-                return Ok(Some((object, rec)));
-            }
-        }
-        Ok(None)
+        Ok(judge_graph)
     }
 
     /// Whether more than one of the play loader's tables has a record of

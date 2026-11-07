@@ -161,12 +161,12 @@ fn frames(
             .ok()?;
         f.most = f.most.max(batch.quads().len());
         f.dropped = f.dropped.saturating_add(batch.dropped());
-        f.chips = batch
-            .quads()
-            .iter()
-            .filter(|q| q.filter == Filter::NearestBase)
-            .count();
     }
+    f.chips = batch
+        .quads()
+        .iter()
+        .filter(|q| q.filter == Filter::NearestBase)
+        .count();
     Some(f)
 }
 

@@ -324,20 +324,23 @@ impl Assets {
         }
     }
 
-    /// The chip grid lit `lit` texels of each cell, once
-    /// [`Self::add_chip_grid`] added it.
-    pub(crate) fn chip_grid(&self, lit: [u8; 2]) -> Option<u32> {
-        self.chip_grids.get(&lit).copied()
-    }
-
-    /// Adds the white chip grid of [`skin_model::CHIP_GRID_CELLS`] cells down, lit
-    /// `lit` texels of each cell, sampled at level 0, its image and frame
-    /// already charged. No file is admitted or attempted.
+    /// The white chip grid of [`skin_model::CHIP_GRID_CELLS`] cells down,
+    /// lit `lit` texels of each cell, sampled at level 0, added once: its
+    /// image and frame are charged before it is added, and a later request
+    /// charges nothing. No file is admitted or attempted.
     ///
     /// # Errors
     ///
-    /// The image or frame limit, or a variant's texel total.
-    pub(crate) fn add_chip_grid(&mut self, lit: [u8; 2]) -> Result<u32, ImportLimit> {
+    /// The image or frame budget, or a variant's texel total.
+    pub(crate) fn chip_grid(
+        &mut self,
+        budget: &mut Budget,
+        lit: [u8; 2],
+    ) -> Result<u32, ImportLimit> {
+        if let Some(&i) = self.chip_grids.get(&lit) {
+            return Ok(i);
+        }
+        budget.image(1)?;
         let cell = u32::from(skin_model::GRID_CELL);
         let def = SolidImageDef {
             size: [cell, cell * skin_model::CHIP_GRID_CELLS],

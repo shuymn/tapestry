@@ -15,7 +15,7 @@ use bms_model::TimeUs;
 use skin_model::{Filter, GraphFit, JudgeGraphDef, JudgeGraphKind, Source};
 
 use super::super::policy::Role;
-use super::super::report::NoteKind;
+use super::super::report::{NoteKind, Span};
 use super::super::{Cx, Dst, Opts};
 use crate::error::ImportError;
 
@@ -86,14 +86,11 @@ impl Cx<'_> {
         if dst.filter != 0 {
             self.ignored(at, NoteKind::Ignored { field: "filter" });
         }
-        let Some(chips) = self.chip_grid(&c, lit(no_gap_x, no_gap))? else {
-            return Ok(());
-        };
-        let Some(solid) = self.white(&c)? else {
-            return Ok(());
-        };
-        def.chips = chips;
-        def.solid = solid;
+        def.chips = self
+            .assets
+            .chip_grid(&mut self.budget, lit(no_gap_x, no_gap))
+            .map_err(|l| self.limit(at, l))?;
+        def.solid = self.white(at)?;
         let mut rects = Vec::with_capacity(c.track.keys.len());
         for k in &c.track.keys {
             let r = self.key_rect(&c, k)?;
@@ -105,37 +102,17 @@ impl Cx<'_> {
         self.push(c, Source::JudgeGraph(index), t)
     }
 
-    /// The white chip grid lit `lit` texels of each cell, charged and added
-    /// once.
-    fn chip_grid(
-        &mut self,
-        c: &super::super::Common,
-        lit: [u8; 2],
-    ) -> Result<Option<u32>, ImportError> {
-        if let Some(i) = self.assets.chip_grid(lit) {
-            return Ok(Some(i));
-        }
-        self.budget.image(1).map_err(|l| self.limit(c.span, l))?;
-        let i = self
-            .assets
-            .add_chip_grid(lit)
-            .map_err(|l| self.limit(c.span, l))?;
-        Ok(Some(i))
-    }
-
     /// The opaque white system image, drawn nearest, charged and added
-    /// once.
-    fn white(&mut self, c: &super::super::Common) -> Result<Option<u32>, ImportError> {
+    /// once; a limit is located at `at`.
+    fn white(&mut self, at: Span) -> Result<u32, ImportError> {
         let white = [255; 4];
         if let Some(i) = self.assets.system(white, Filter::Nearest) {
-            return Ok(Some(i));
+            return Ok(i);
         }
-        self.budget.image(1).map_err(|l| self.limit(c.span, l))?;
-        let i = self
-            .assets
+        self.budget.image(1).map_err(|l| self.limit(at, l))?;
+        self.assets
             .add_system(white, Filter::Nearest)
-            .map_err(|l| self.limit(c.span, l))?;
-        Ok(Some(i))
+            .map_err(|l| self.limit(at, l))
     }
 }
 

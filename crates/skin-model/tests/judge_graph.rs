@@ -520,7 +520,7 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     use skin_model::Anchor;
     let def = || vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)];
     let frame = |angle| {
-        let e = graph_support::placed_element(0, [400, 300, 200, 100], angle, Anchor::Center, None);
+        let e = graph_support::placed_element(0, [400, 300, 200, 100], angle, Anchor::Center);
         let mut fx = GFx::new(skin(vec![e], def()));
         fx.view(&rotation_view());
         fx.frame(0);
@@ -560,7 +560,7 @@ fn every_fit_sizes_the_whole_graph() {
     let mut bins = vec![[0; 9]; 70];
     bins[3] = perfects(25);
     let frame = |r, fit| {
-        let e = graph_support::placed_element(0, r, 0, Anchor::TopLeft, None);
+        let e = graph_support::placed_element(0, r, 0, Anchor::TopLeft);
         let def = skin_model::JudgeGraphDef {
             fit,
             ..graph(JudgeGraphKind::Judgment, GRID, true, 0)
@@ -676,7 +676,7 @@ fn a_fitted_graph_turns_about_its_drawn_regions_pivot() {
     let mut bins = vec![[0; 9]; 70];
     bins[3] = perfects(25);
     let frame = |r, fit, angle| {
-        let e = graph_support::placed_element(0, r, angle, Anchor::TopLeft, None);
+        let e = graph_support::placed_element(0, r, angle, Anchor::TopLeft);
         let def = skin_model::JudgeGraphDef {
             fit,
             ..graph(JudgeGraphKind::Judgment, GRID, true, 0)
@@ -711,13 +711,8 @@ fn a_fitted_graph_turns_about_its_drawn_regions_pivot() {
 fn a_judge_graph_element_takes_no_native_size() {
     use skin_model::{Anchor, Native};
     let dir = tempfile::tempdir().unwrap();
-    let e = graph_support::placed_element(
-        0,
-        [0, 0, 10, 10],
-        0,
-        Anchor::TopLeft,
-        Some(Native::Exact([1, 1])),
-    );
+    let mut e = graph_support::placed_element(0, [0, 0, 10, 10], 0, Anchor::TopLeft);
+    e.place.native = Some(Native::Exact([1, 1]));
     let def = skin_model::SkinDef {
         fit: skin_model::Fit::Fixed,
         regions: [skin_model::RegionDef {
