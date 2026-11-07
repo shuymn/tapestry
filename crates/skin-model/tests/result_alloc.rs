@@ -149,7 +149,14 @@ fn skin() -> Skin {
         graph(JudgeGraphKind::Judgment, true, false),
         graph(JudgeGraphKind::EarlyLate, true, true),
     ];
-    Skin::new_result(def, ResultDefs { judge_graphs }).unwrap()
+    Skin::new_result(
+        def,
+        ResultDefs {
+            judge_graphs,
+            ..ResultDefs::default()
+        },
+    )
+    .unwrap()
 }
 
 #[test]

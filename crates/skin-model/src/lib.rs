@@ -176,7 +176,10 @@ pub use result::view::{
     ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines, TimelinesError, TimingStats,
     Unavailable,
 };
-pub use result::{ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers};
+pub use result::{
+    MAX_RESULT_OUTRO, ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers,
+    ResultTiming,
+};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
 pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};

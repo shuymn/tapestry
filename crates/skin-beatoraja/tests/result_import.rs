@@ -6,6 +6,7 @@
 
 mod common;
 
+use bms_model::TimeUs;
 use common::result::{
     Res, best, facts, folder, import_result, lua_outcome, lua_result, ready, sheet, unavailable,
 };
@@ -14,7 +15,7 @@ use skin_beatoraja::{
     EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts, LuaOutcome, LuaWhy,
     NoteKind, Object, Report, Severity,
 };
-use skin_model::{BestView, ResultNumber, ResultView, ScreenKind};
+use skin_model::{BestView, MAX_RESULT_OUTRO, ResultNumber, ResultTiming, ResultView, ScreenKind};
 
 /// The top of a quad drawn from a source rect at `y` of height `h`.
 fn top(y: f32, h: f32) -> f32 {
@@ -774,6 +775,106 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ResultNumber(154)),
         other => panic!("{other:?}"),
     }
+}
+
+/// A result skin with its essential parts and the top-level fields `top`,
+/// written as JSON (`"name": value, ...`, ending with a comma) and
+/// imported; its timing and report.
+fn json_timing(top: &str) -> (ResultTiming, Report) {
+    let values = value("ex", r#""ref": 71"#);
+    let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
+    let d = folder(&format!(
+        r#"{top} "value": [{values}], "destination": [{dsts}]"#
+    ));
+    let i = import_result(d.path()).unwrap_or_else(|e| panic!("{top}: {e:?}"));
+    (i.skin.result_timing(), i.report)
+}
+
+/// [`json_timing`] as a Lua skin, `top` its statements setting the
+/// skin table's fields.
+fn lua_timing(top: &str) -> (ResultTiming, Report) {
+    let d = sheet();
+    let values = lua_value("ex", 4, "ref = 71");
+    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(top, &values, "", &dsts).as_bytes(),
+    );
+    let i = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{top}: {e:?}"));
+    (i.imported.skin.result_timing(), i.imported.report)
+}
+
+/// The outro clamp notes of `r`.
+fn clamps(r: &Report) -> Vec<(Severity, NoteKind)> {
+    r.notes
+        .iter()
+        .filter(|n| matches!(n.kind, NoteKind::OutroClamped { .. }))
+        .map(|n| (n.severity, n.kind))
+        .collect()
+}
+
+/// C1 (S10-09i): a result skin's `fadeout`, `input` and `scene` are read
+/// in µs from JSON and Lua alike: absent 0, negative 0, a `scene` of 0 or
+/// below none, and a `fadeout` past 10 s clamped to it with a deviation
+/// note naming the declaration.
+#[test]
+fn a_result_skin_declares_its_timing() {
+    let ms = |n: i64| TimeUs(n * 1_000);
+    let timing = |outro, input, scene| ResultTiming {
+        outro,
+        input,
+        scene,
+    };
+    let clamped = |declared_ms| vec![(Severity::Deviation, NoteKind::OutroClamped { declared_ms })];
+    for (json, lua, want, notes) in [
+        ("", "", timing(ms(0), ms(0), None), vec![]),
+        (
+            r#""fadeout": 500, "input": 1000, "scene": 3600000,"#,
+            "skin.fadeout = 500 skin.input = 1000 skin.scene = 3600000",
+            timing(ms(500), ms(1_000), Some(ms(3_600_000))),
+            vec![],
+        ),
+        (
+            r#""fadeout": -5, "input": -1, "scene": -7,"#,
+            "skin.fadeout = -5 skin.input = -1 skin.scene = -7",
+            timing(ms(0), ms(0), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 1, "input": 1, "scene": 0,"#,
+            "skin.fadeout = 1 skin.input = 1 skin.scene = 0",
+            timing(ms(1), ms(1), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 10000,"#,
+            "skin.fadeout = 10000",
+            timing(MAX_RESULT_OUTRO, ms(0), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 10001,"#,
+            "skin.fadeout = 10001",
+            timing(MAX_RESULT_OUTRO, ms(0), None),
+            clamped(10_001),
+        ),
+        (
+            r#""fadeout": 2147483647, "input": 2147483647, "scene": 2147483647,"#,
+            "skin.fadeout = 2147483647 skin.input = 2147483647 skin.scene = 2147483647",
+            timing(MAX_RESULT_OUTRO, ms(2_147_483_647), Some(ms(2_147_483_647))),
+            clamped(i32::MAX),
+        ),
+    ] {
+        let (j, jr) = json_timing(json);
+        assert_eq!(j, want, "json {json}");
+        assert_eq!(clamps(&jr), notes, "json {json}");
+        let (l, lr) = lua_timing(lua);
+        assert_eq!(l, want, "lua {lua}");
+        assert_eq!(clamps(&lr), notes, "lua {lua}");
+    }
+    assert_eq!(MAX_RESULT_OUTRO, ms(10_000));
 }
 
 /// S10-09i: number 152, the EX score's difference from the best, draws

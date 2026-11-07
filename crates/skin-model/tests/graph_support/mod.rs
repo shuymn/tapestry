@@ -168,6 +168,7 @@ pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
         def,
         ResultDefs {
             judge_graphs: graphs,
+            ..ResultDefs::default()
         },
     )
     .unwrap()

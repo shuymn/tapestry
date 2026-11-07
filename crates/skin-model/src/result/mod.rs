@@ -38,6 +38,26 @@ pub struct ResultTimers {
     pub fadeout: Option<TimeUs>,
 }
 
+/// The longest outro a result skin's declaration is honoured for: 10 s
+/// (a provisional interaction limit; design.md "State Model", Result). A
+/// longer declaration is clamped to it.
+pub const MAX_RESULT_OUTRO: TimeUs = TimeUs(10_000_000);
+
+/// What a result skin declares for its screen's timing (design.md "State
+/// Model", Result), in µs: the source's `fadeout`, `input` and `scene`
+/// (`skin/json/JsonSkin.java:14-16`), each 0 when not declared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResultTiming {
+    /// The outro: how long the fade-out (timer 2) plays before retry, back
+    /// or the quit key takes effect; 0 to [`MAX_RESULT_OUTRO`].
+    pub outro: TimeUs,
+    /// How long from the screen's start commands are not taken; 0 or more.
+    pub input: TimeUs,
+    /// When the screen leaves on its own (back, with its outro), from its
+    /// start; `None` when the skin declares no positive time.
+    pub scene: Option<TimeUs>,
+}
+
 /// What one result frame gives the skin.
 #[derive(Clone, Copy, Debug)]
 pub struct ResultFrame<'a> {
