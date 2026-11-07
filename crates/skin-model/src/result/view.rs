@@ -93,7 +93,7 @@ pub struct ResultScore {
     /// The emphasized gauge's end value, in ‰.
     pub gauge_permille: u16,
     pub clear: LampKey,
-    /// Whether the emphasized gauge cleared.
+    /// Whether the view cleared: its lamp is not failed (options 90 and 91).
     pub cleared: bool,
     /// `None` when the largest EX score is 0.
     pub rate: Option<ResultRate>,

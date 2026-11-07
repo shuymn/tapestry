@@ -46,6 +46,7 @@ mod presentmon;
 mod recording;
 mod render_side;
 mod result_input;
+mod result_view;
 mod select;
 mod selection;
 mod selection_skin;

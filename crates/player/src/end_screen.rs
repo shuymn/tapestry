@@ -455,7 +455,11 @@ pub fn lines(
     if let Some(best) = &report.best {
         set(
             12,
-            format!("{} {}", report.preset.id, crate::bests::best_line(best)),
+            format!(
+                "{} {}",
+                report.preset.id,
+                crate::bests::best_line(best, &report.preset)
+            ),
         );
     }
     if let ViewStatus::Ready(s) = status {
@@ -961,6 +965,17 @@ pub(crate) mod tests {
             coverage: Coverage::Recorded,
             as_played,
             graphs: Arc::new(game::ResultGraphs::EMPTY),
+            figures: game::ResultFigures {
+                notes: 0,
+                max_ex: 0,
+                rate: None,
+                next_rank: 0,
+                clear: game::BestLamp::Failed,
+                cleared: false,
+                gauge_permille: 0,
+                timing: None,
+            },
+            best: None,
         }
     }
 

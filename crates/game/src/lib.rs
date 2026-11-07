@@ -37,6 +37,7 @@ pub mod readouts;
 mod ready_history;
 mod render;
 mod restore;
+mod result_figures;
 mod result_graphs;
 pub mod result_screen;
 mod results;
@@ -59,7 +60,10 @@ pub use audio_loop::{
     Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
-pub use bests::{BestScore, BestView, SavedPlay};
+pub use bests::{
+    BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
+    SavedPlay,
+};
 pub use driver::{AdjustDriver, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
@@ -102,6 +106,10 @@ pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEU
 pub use ready_history::{HistoryFull, HistoryRecorder};
 pub use render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
+pub use result_figures::{
+    MAX_TIMELINE_BINS, Rate, ResultBasis, ResultFigures, TIMELINE_BIN_US, TIMELINE_CHANNELS,
+    TIMING_RANGE_US, TimelineAxis, Timelines, TimingStats, next_rank,
+};
 pub use result_graphs::{
     Axis, GRAPH_COLUMNS, GaugeColumn, GaugeTrace, ResultGraphs, TIMING_BIN_US, TIMING_BINS, Timing,
     condense, listed,

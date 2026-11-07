@@ -1,7 +1,8 @@
 //! The sprite pipelines' atlas: one `Rgba8Unorm` texture array whose layers
-//! all share one power-of-two side. Layer 0 is reserved for the built-in
-//! atlas (the bitmap font and the solid block, [`crate::atlas`]) at its top
-//! left; a skin's pages follow it, each with its four supplied mip levels
+//! all share one side, a multiple of [`PAGE_SIDE_STEP`]. Layer 0 is
+//! reserved for the built-in atlas (the bitmap font and the solid block,
+//! [`crate::atlas`]) at its top left, which the shader reads by integer
+//! texel; a skin's pages follow it, each with its four supplied mip levels
 //! (docs/stage3.md R7), then the skin's text layer, if it has one, created
 //! zeroed and written by the text preparation. Without a skin's pages the
 //! array is the built-in atlas alone, one 128-texel layer.
@@ -14,7 +15,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, MIP_LEVELS};
+use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, MIP_LEVELS, PAGE_SIDE_STEP};
 
 use crate::atlas::{ATLAS_SIZE, build_atlas};
 use crate::gpu::Gpu;
@@ -41,9 +42,11 @@ pub struct AtlasPages<'a> {
 /// Why a skin's atlas was not uploaded. The atlas in use stays.
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
-    /// The side is not a power of two at least the built-in atlas's, or
-    /// is past the device's largest texture.
-    #[error("the page side {side} is not a power of two from {ATLAS_SIZE} to the device's {max}")]
+    /// The side is not a multiple of [`PAGE_SIDE_STEP`] at least the
+    /// built-in atlas's, or is past the device's largest texture.
+    #[error(
+        "the page side {side} is not a multiple of {PAGE_SIDE_STEP} from {ATLAS_SIZE} to the device's {max}"
+    )]
     Side {
         /// The pages' side.
         side: u32,
@@ -125,7 +128,8 @@ pub(crate) fn check_pages(
 ) -> Result<u32, UploadError> {
     let side = pages.side;
     let max = limits.max_texture_dimension_2d;
-    if !side.is_power_of_two() || side < ATLAS_SIZE || side > max {
+    // A multiple of the step halves exactly at every mip level.
+    if !side.is_multiple_of(PAGE_SIDE_STEP) || side < ATLAS_SIZE || side > max {
         return Err(UploadError::Side { side, max });
     }
     let layers = u64::try_from(pages.pages.len())
@@ -278,12 +282,6 @@ impl AtlasTexture {
             .saturating_sub(u32::from(self.text_layer.is_some()));
         padded(ATLAS_SIZE) + u64::from(pages) * skin
     }
-
-    /// What layer 0's uv is multiplied by at staging: the built-in atlas's
-    /// side over the page side, a power of two, so exact.
-    pub(crate) fn font_scale(&self) -> f32 {
-        ATLAS_SIZE as f32 / self.side as f32
-    }
 }
 
 /// The bytes of one `side`-texel-square RGBA8 level.
@@ -370,7 +368,13 @@ mod tests {
             pages: &all[..n],
             text_layer: false,
         };
-        for side in [0, 64, 100, 129, 16_384] {
+        // A side past a multiple of 128 is refused; 384 is not a power of
+        // two but passes the side check, failing next on its bytes.
+        assert!(matches!(
+            check_pages(&some(384, 1), &limits()),
+            Err(UploadError::Level { expected, .. }) if expected == 384 * 384 * 4
+        ));
+        for side in [0, 64, 100, 129, 200, 16_384] {
             assert!(
                 matches!(
                     check_pages(&some(side, 1), &limits()),

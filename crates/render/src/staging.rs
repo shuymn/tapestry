@@ -20,8 +20,6 @@ use crate::{Blend, FrameInput, Instance, LoadingFrame, PlaySkin, Run, Sprite, Sp
 pub struct Staging {
     batch: SpriteBatch,
     instances: Vec<Instance>,
-    /// Layer 0's uv scale: the built-in atlas's side over the page side.
-    font_scale: f32,
     projection: Projection,
     clips: ClipTable,
     /// Each clip's scissor under `projection`; one entry per clip.
@@ -55,7 +53,6 @@ impl Staging {
         Self {
             instances: Vec::with_capacity(batch.total_capacity()),
             batch,
-            font_scale: 1.0,
             projection: Projection::new(canvas),
             clips: ClipTable::default(),
             scissors: Vec::new(),
@@ -127,11 +124,6 @@ impl Staging {
         self.clips.project(&self.projection, &mut self.scissors);
     }
 
-    /// Sets layer 0's uv scale ([`Instance::of`]).
-    pub fn set_font_scale(&mut self, font_scale: f32) {
-        self.font_scale = font_scale;
-    }
-
     /// Projects the play skin's frames onto `canvas`'s target, and every
     /// clip's scissor with them, once; allocates nothing, so a resize can
     /// be applied between any two frames.
@@ -201,7 +193,7 @@ impl Staging {
             return Err(e);
         }
         overlay::draw(f.overlay, &mut self.batch);
-        self.batch.stage(&mut self.instances, self.font_scale);
+        self.batch.stage(&mut self.instances);
         Ok(())
     }
 
@@ -224,7 +216,7 @@ impl Staging {
             self.batch.clear();
             return Err(e);
         }
-        self.batch.stage(&mut self.instances, self.font_scale);
+        self.batch.stage(&mut self.instances);
         Ok(())
     }
 
@@ -253,7 +245,7 @@ impl Staging {
         for s in reserve {
             self.batch.push(Blend::Alpha, *s);
         }
-        self.batch.stage(&mut self.instances, self.font_scale);
+        self.batch.stage(&mut self.instances);
         Ok(())
     }
 
@@ -262,7 +254,7 @@ impl Staging {
     pub fn fill(&mut self, push: impl FnOnce(&mut SpriteBatch)) {
         self.batch.clear();
         push(&mut self.batch);
-        self.batch.stage(&mut self.instances, self.font_scale);
+        self.batch.stage(&mut self.instances);
     }
 
     /// The staged instances, in drawing order.
@@ -386,9 +378,8 @@ mod tests {
     }
 
     #[test]
-    fn filling_stages_with_the_font_scale() {
+    fn filling_stages_the_sprites() {
         let mut s = Staging::new(4, &Canvas::new([1920, 1080], Fit::Fixed));
-        s.set_font_scale(0.25);
         s.fill(|b| {
             b.push(
                 Blend::Alpha,
@@ -399,7 +390,7 @@ mod tests {
             );
         });
         assert_eq!(s.instances().len(), 1);
-        assert_eq!(s.instances()[0].uv, [0.125; 4]);
+        assert_eq!(s.instances()[0].uv, [0.5; 4]);
         assert_eq!(s.batch().len(), 1);
         assert_eq!(s.capacity(), 4);
     }

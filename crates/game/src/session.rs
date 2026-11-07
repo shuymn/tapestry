@@ -32,7 +32,7 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use crate::attempt::{Attempt, NoteEnd};
 use crate::autoplay::{Autoplay, AutoplayError};
-use crate::bests::{BestView, SavedPlay};
+use crate::bests::{BestKey, BestLookup, BestView, SavedPlay};
 use crate::live::{Closing, ClosingEnd, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -572,6 +572,15 @@ pub struct PlayOutcome {
 }
 
 impl Loaded {
+    /// The best stored under `key` before this play, as the record sink
+    /// answers ([`RecordSink::best_before`]); unavailable without a sink.
+    pub(crate) fn best_before(&mut self, key: &BestKey, preset: &RulePreset) -> BestLookup {
+        self.parts
+            .records
+            .as_mut()
+            .map_or(BestLookup::Unavailable, |s| s.best_before(key, preset))
+    }
+
     /// Opens the shelf with the preset named in `player.toml` chosen (a
     /// built-in or a user preset; nothing is written), then ingests the
     /// chart and applies the transform.

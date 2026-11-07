@@ -76,10 +76,12 @@ use bms_model::TimeUs;
 use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::{CancelReason, Incomplete};
+use rules::RulePreset;
 
 use crate::app::IDLE_WAIT;
 use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
+use crate::bests::{BestKey, BestLookup};
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
@@ -811,9 +813,15 @@ pub fn run_chart<R: Rig>(
             rig.wait();
             continue;
         }
+        // The own view's figures and timelines are made with the screen;
+        // its best is read in the preparation, after the input is taken
+        // over.
         let mut screen =
             ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
-        match prepare_result(rig, &report, &screen)? {
+        let prepared = prepare_result(rig, &report, &mut screen, &mut |k, p| {
+            loaded.best_before(k, p)
+        })?;
+        match prepared {
             Prepared::Ready => {}
             Prepared::Retry => continue,
             Prepared::Leave => return leave(rig),
@@ -871,6 +879,8 @@ pub fn run_chart<R: Rig>(
                 dirty = true;
             }
             if dirty {
+                // A view landed: its best is read once, before it shows.
+                screen.compare_best(&report, &mut |k, p| loaded.best_before(k, p));
                 rig.show_end(&report, &screen);
             }
         }
@@ -890,11 +900,14 @@ enum Prepared {
 
 /// ResultPreparing (design.md "State Model"): the play is saved and
 /// counted, and the commands pending then were taken as the play's, so
-/// every command taken here is fresh. The rig's preparation is polled in
-/// short slices; between them a quit or back leaves and a retry retries,
-/// either dropping the preparation unfinished, with the commands queued
-/// behind it; a preset step is dropped, since the result opens on the
-/// played preset; a close leaves. A command taken during the poll that
+/// every command taken here is fresh. Once the rig's preparation has
+/// begun, taking the result's input over, the own view's best is read
+/// through `lookup`, and a command pressed during that read withdraws the
+/// result as one during a pending poll does. The rig's preparation is
+/// then polled in short slices; between them a quit or back leaves and a
+/// retry retries, either dropping the preparation unfinished, with the
+/// commands queued behind it; a preset step is dropped, since the result
+/// opens on the played preset; a close leaves. A command taken during the poll that
 /// found it ready is still served before the result shows. A screen that
 /// failed meanwhile is built again, acknowledged, between polls, as on the
 /// result, so the result never shows on a failed screen.
@@ -906,9 +919,14 @@ enum Prepared {
 fn prepare_result<R: Rig>(
     rig: &mut R,
     report: &PlayReport,
-    screen: &ResultScreen,
+    screen: &mut ResultScreen,
+    lookup: &mut dyn FnMut(&BestKey, &RulePreset) -> BestLookup,
 ) -> Result<Prepared, LiveError<R::ScreenError>> {
     let mut prep = rig.begin_result(report, screen);
+    screen.compare_best(report, lookup);
+    if let Some(withdrawn) = withdrawn(rig) {
+        return Ok(withdrawn);
+    }
     loop {
         let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
         let polled = rig.poll_result(&mut prep, deadline);
