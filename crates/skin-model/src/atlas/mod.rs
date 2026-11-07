@@ -28,7 +28,6 @@ use std::sync::Arc;
 use ::image::RgbaImage;
 
 use crate::image::decode::{self, Bands, Site};
-use crate::image::path;
 use crate::image::{self, Stop};
 use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
@@ -661,8 +660,10 @@ impl Sheet {
             let Some((version, at)) = version(file) else {
                 continue;
             };
-            let (_, len) =
-                path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
+            let (_, len) = self
+                .source()
+                .resolve(self.root(), &version.name)
+                .map_err(|e| ImageError::path(at, e))?;
             total = total.saturating_add(len);
             if total > MAX_TOTAL_FILE_BYTES {
                 return Err(ImageError::TotalBytesTooLarge { at }.into());
@@ -675,10 +676,15 @@ impl Sheet {
                 continue;
             };
             let header = (version.dims, version.mode);
-            // Resolved again as it is read: only this file's path is live.
-            let (canonical, _) =
-                path::resolve(self.root(), &version.name).map_err(|e| ImageError::path(at, e))?;
-            let bytes = image::read_encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
+            // Resolved again as it is read: the atlas keeps only this file's
+            // path live (a source's cache holds its resolutions, D13).
+            let (canonical, _) = self
+                .source()
+                .resolve(self.root(), &version.name)
+                .map_err(|e| ImageError::path(at, e))?;
+            let bytes =
+                self.source()
+                    .encoded(&canonical, at, MAX_FILE_BYTES.min(budget), cancel)?;
             drop(canonical);
             budget = budget.saturating_sub(u64::try_from(bytes.len()).unwrap_or(budget));
             // This file's placements and window, at their exact size, made
@@ -700,7 +706,10 @@ impl Sheet {
                 places.sort_unstable_by_key(Placement::top);
             }
             let mut router = Router::new(&places, &mut active, pages, packing.side);
-            match image::decode_file(bytes, at, header, cancel, &mut router)? {
+            match self
+                .source()
+                .decode(bytes, at, header, cancel, &mut router)?
+            {
                 Some(image) => router.blit(&image),
                 None => router.complete(),
             }
