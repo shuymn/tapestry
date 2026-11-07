@@ -64,10 +64,12 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 /// The level-0 texels every screen kind's committed installation shares
-/// with a candidate ([`Renderer::admit`]): one atlas array's cap
-/// ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
-/// admitted on its own.
-pub const SHARED_TEXELS: u64 = skin_model::MAX_ATLAS_TEXELS;
+/// with a candidate ([`Renderer::admit`]): 384 Mi, twice one atlas array's
+/// cap ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
+/// admitted on its own and two at that cap fit together.
+pub const SHARED_TEXELS: u64 = 384 << 20;
+
+const _: () = assert!(SHARED_TEXELS == 2 * skin_model::MAX_ATLAS_TEXELS);
 
 /// What an installation keeping a Lua VM is charged beside its atlas, in
 /// level-0 texels: a VM's memory cap (64 MiB) at the 4 bytes of an RGBA8
@@ -90,6 +92,9 @@ fn charge_of(bundle: &SkinBundle) -> u64 {
     let vm = if bundle.keeps_vm() { VM_TEXELS } else { 0 };
     bundle.atlas_texels().saturating_add(vm)
 }
+
+// The sprite shader reads the built-in atlas at its side, 128.
+const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
@@ -140,15 +145,18 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // The atlas holds premultiplied texels and the colour arrives premultiplied,
 // so their product is premultiplied. A skin's page is sampled bilinearly
 // between its mip levels, or at the nearest texel of the nearest level with
-// the nearest bit; layer 0, the built-in atlas, always at its nearest
-// level-0 texel. All three are sampled, so every sample stays in uniform
-// control flow, and one is chosen.
+// the nearest bit; layer 0, the built-in atlas of 128 texels at its top
+// left, is read at its nearest level-0 texel by integer texel: its uv, the
+// built-in atlas's own, times 128, exact whatever the array's side. Both
+// pages' samples are taken, so every sample stays in uniform control flow,
+// and one result is chosen.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
     let layer = i32(v.flags & 0xFFFFu);
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
     let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
-    let builtin = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
+    let texel = clamp(vec2i(floor(v.uv * 128.0)), vec2i(0), vec2i(127));
+    let builtin = textureLoad(atlas, texel, 0, 0);
     let page = select(smoothed, nearest, (v.flags & 0x10000u) != 0u);
     return select(page, builtin, layer == 0) * v.color;
 }
@@ -768,6 +776,10 @@ pub struct Renderer {
     /// is refused as a skin refuses one.
     #[cfg(feature = "dev-tools")]
     selection_faults: (bool, bool),
+    /// Tests and development builds: the charges stated for bundles
+    /// ([`state_charge`](Self::state_charge)).
+    #[cfg(any(test, feature = "dev-tools"))]
+    stated: Vec<(Arc<SkinBundle>, u64)>,
 }
 
 impl Renderer {
@@ -878,6 +890,8 @@ impl Renderer {
             selection_rasterized: 0,
             #[cfg(feature = "dev-tools")]
             selection_faults: (false, false),
+            #[cfg(any(test, feature = "dev-tools"))]
+            stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1070,7 +1084,6 @@ impl Renderer {
         }
         wait_for_gpu(&self.gpu)?;
         self.atlas_bind = bind;
-        self.staging.set_font_scale(atlas.font_scale());
         self.staging.set_clips(clips);
         self.atlas = atlas;
         self.resources += 1;
@@ -1267,7 +1280,27 @@ impl Renderer {
     /// `kind`'s committed charge.
     fn charge(&self, kind: ScreenKind) -> u64 {
         self.committed_installation(kind)
-            .map_or(0, |i| charge_of(i.bundle()))
+            .map_or(0, |i| self.committed_charge(i.bundle()))
+    }
+
+    /// What a committed `bundle` is charged: its own charge, or in tests
+    /// and development builds the one stated for it.
+    fn committed_charge(&self, bundle: &Arc<SkinBundle>) -> u64 {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some((_, texels)) = self.stated.iter().find(|(b, _)| Arc::ptr_eq(b, bundle)) {
+            return *texels;
+        }
+        charge_of(bundle)
+    }
+
+    /// Tests and development builds: charges `bundle` `texels` whenever it
+    /// is a kind's committed installation, in place of its own charge, so
+    /// the shared limit is tested through [`admit`](Self::admit) without
+    /// committing arrays that large. A candidate is charged its own.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn state_charge(&mut self, bundle: &Arc<SkinBundle>, texels: u64) {
+        self.stated.retain(|(b, _)| !Arc::ptr_eq(b, bundle));
+        self.stated.push((Arc::clone(bundle), texels));
     }
 
     /// The charges [`admit`](Self::admit) sums now, and the staged
@@ -1442,7 +1475,6 @@ impl Renderer {
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        staging.set_font_scale(atlas.font_scale());
         wait_for_gpu(&self.gpu)?;
         let text_cache = bundle
             .text_layer()
@@ -3185,12 +3217,10 @@ mod tests {
     /// bind group and the upload's submission (a buffer whose usage mixes
     /// both map modes, which every device's validation refuses), is the
     /// typed `Atlas(Device)` error, not an uncaptured one that would panic,
-    /// and the built-in atlas stays: 128 texels, one layer, its font scale
-    /// 1, so the solid block still draws white at layout (100, 100), target
-    /// pixel (50, 50). With the refused 256-texel array's font scale (1/2)
-    /// taken anyway, the solid uv would read texel 62 of the built-in atlas,
-    /// a glyph cell's empty corner. The same pages without the fault are
-    /// then installed: 256 texels, two layers.
+    /// and the built-in atlas stays: 128 texels, one layer, so the solid
+    /// block still draws white at layout (100, 100), target pixel (50, 50).
+    /// The same pages without the fault are then installed: 256 texels,
+    /// two layers.
     #[test]
     fn a_refusal_after_the_texture_keeps_the_atlas() {
         let mut r = Renderer::new(
@@ -3250,6 +3280,86 @@ mod tests {
         assert_eq!(&pixels[i..i + 3], &[255, 255, 255]);
         r.install_atlas(&pages, ClipTable::default()).unwrap();
         assert_eq!(r.atlas_size(), (256, 2));
+    }
+
+    /// The built-in atlas is read texel for texel on an array whose side,
+    /// 384, is not a power of two: drawn whole at 1:1 at the top left, at
+    /// 2:1 beside it, and at 1:2, where every pixel's centre falls on a
+    /// texel edge (pixel `i` reads texel `2i + 1`), every target pixel is
+    /// the built-in texel under it
+    /// (white glyph texels opaque, the rest transparent over the black
+    /// clear), as on the built-in atlas alone.
+    #[test]
+    fn the_built_in_atlas_reads_exactly_on_a_side_between_powers_of_two() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 1_920,
+                height: 1_080,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        let draw = |r: &mut Renderer| {
+            let text = MenuText::new(r);
+            let whole = |rect| Sprite {
+                rect,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                color: [1.0; 4],
+                ..Sprite::default()
+            };
+            let timing = r
+                .menu_frame(
+                    |b| {
+                        b.push(Blend::Alpha, whole([0.0, 0.0, 128.0, 128.0]));
+                        b.push(Blend::Alpha, whole([200.0, 0.0, 256.0, 256.0]));
+                        b.push(Blend::Alpha, whole([500.0, 0.0, 64.0, 64.0]));
+                    },
+                    &text,
+                )
+                .unwrap();
+            assert!(timing.presented);
+            r.read_back()
+        };
+        let atlas = crate::atlas::build_atlas();
+        let check = |pixels: &[u8]| {
+            let mut opaque = 0;
+            for y in 0..256_usize {
+                for x in 0..564_usize {
+                    let texel = if x < 128 && y < 128 {
+                        Some((x, y))
+                    } else if (200..456).contains(&x) {
+                        Some(((x - 200) / 2, y / 2))
+                    } else if x >= 500 && y < 64 {
+                        Some((2 * (x - 500) + 1, 2 * y + 1))
+                    } else {
+                        None
+                    };
+                    let Some((tx, ty)) = texel else { continue };
+                    let a = atlas[(ty * 128 + tx) * 4 + 3];
+                    let i = (y * 1_920 + x) * 4;
+                    let want = if a == 255 { [255; 3] } else { [0; 3] };
+                    assert_eq!(&pixels[i..i + 3], &want, "pixel ({x}, {y})");
+                    opaque += usize::from(a == 255);
+                }
+            }
+            assert!(opaque > 1_000, "{opaque}");
+        };
+        check(&draw(&mut r));
+        let (l0, l1, l2, l3) = (
+            vec![0u8; 384 * 384 * 4],
+            vec![0u8; 192 * 192 * 4],
+            vec![0u8; 96 * 96 * 4],
+            vec![0u8; 48 * 48 * 4],
+        );
+        let page: crate::PageLevels<'_> = [&l0, &l1, &l2, &l3];
+        let pages = AtlasPages {
+            side: 384,
+            pages: &[page],
+            text_layer: false,
+        };
+        r.install_atlas(&pages, ClipTable::default()).unwrap();
+        assert_eq!(r.atlas_size(), (384, 2));
+        check(&draw(&mut r));
     }
     /// A producer laying a string out by its first letter: `T`, `U` and
     /// `V` as 2032 × 1000 lines (half the 2048 layer each), anything else
@@ -3709,8 +3819,8 @@ mod tests {
         assert_eq!(r.memory().text_upload, 0);
 
         // A refusal by the shared admission, the first step that can
-        // refuse: a tiny selection skin committed, and a play candidate
-        // whose atlas alone is the shared limit.
+        // refuse: a selection skin committed, charged an atlas's cap and a
+        // tiny one's, and a play candidate whose atlas is the cap.
         let token = stage_labels(&mut r, &a, &labels("t", "", ""), 3).unwrap();
         r.commit(token).unwrap();
         assert!(r.text_report().upload_bytes > 0);
@@ -3723,7 +3833,9 @@ mod tests {
             .install(skin_model::ScreenKind::Selection, &tiny, 4)
             .unwrap();
         r.commit(token).unwrap();
-        let big = crate::test_decl::shared_limit_bundle(&r, [0, 0, 255, 255]);
+        let cap = skin_model::MAX_ATLAS_TEXELS;
+        r.state_charge(&tiny, cap + tiny.atlas_texels());
+        let big = crate::test_decl::atlas_cap_bundle(&r, [0, 0, 255, 255]);
         let e = stage_labels(&mut r, &big, &labels("t", "", ""), 5).unwrap_err();
         assert!(matches!(e, RenderError::Admission { .. }), "{e:?}");
         assert_eq!(r.text_report().upload_bytes, 0);

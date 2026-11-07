@@ -50,10 +50,19 @@ pub const MIP_LEVELS: usize = 4;
 pub const GUTTER: u32 = 8;
 /// Every allocation's origin and size are multiples of this: `2^(levels - 1)`.
 pub const ALIGN: u32 = 1 << (MIP_LEVELS - 1);
-/// The smallest page side; the bitmap font's 128 fits a reserved layer.
+/// Every page side is a multiple of this: the built-in atlas's side, so
+/// it fits a reserved layer, and a multiple of [`ALIGN`], so every mip
+/// level halves the side exactly.
+pub const PAGE_SIDE_STEP: u32 = 128;
+/// The smallest page side.
 pub const MIN_PAGE_SIDE: u32 = 256;
 /// The largest page side, also capped by the device's.
 pub const MAX_PAGE_SIDE: u32 = 8_192;
+
+const _: () = assert!(PAGE_SIDE_STEP.is_multiple_of(ALIGN));
+const _: () = assert!(
+    MIN_PAGE_SIDE.is_multiple_of(PAGE_SIDE_STEP) && MAX_PAGE_SIDE.is_multiple_of(PAGE_SIDE_STEP)
+);
 /// The most skin pages, also capped by the device's layers.
 pub const MAX_PAGES: u32 = 64;
 /// The most level-0 texels across every layer of the array, the reserved
