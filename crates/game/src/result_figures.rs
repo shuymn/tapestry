@@ -2,8 +2,8 @@
 //! Lifecycle", the result's views): the rates, grade and clear of the view
 //! ([`ResultFigures`]), its timing statistics from exact sums
 //! ([`TimingStats`]) and its judgments over chart time ([`Timelines`]).
-//! Each is made in one pass over a view's evaluation, in integers, and is a
-//! fixed size whatever the play.
+//! Each is made when a view is summarized, from its evaluation, in
+//! integers, and is a fixed size whatever the play.
 
 use bms_model::{Chart, NoteKind, TimeUs};
 use eval::{Evaluation, JudgeEvent, JudgeEventKind};
