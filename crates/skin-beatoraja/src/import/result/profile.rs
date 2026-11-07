@@ -178,26 +178,27 @@ pub(crate) enum ResOption {
 }
 
 /// The grade conditions by the source's id less 300 (and 320): AAA
-/// first, the grade counting down from 7.
+/// first, the grade counting down from 7. Each is read under its group's
+/// validity ([`option_guard`]).
 const GRADES: [&str; 8] = [
-    "result.rate_valid && result.grade == 7",
-    "result.rate_valid && result.grade == 6",
-    "result.rate_valid && result.grade == 5",
-    "result.rate_valid && result.grade == 4",
-    "result.rate_valid && result.grade == 3",
-    "result.rate_valid && result.grade == 2",
-    "result.rate_valid && result.grade == 1",
-    "result.rate_valid && result.grade == 0",
+    "result.grade == 7",
+    "result.grade == 6",
+    "result.grade == 5",
+    "result.grade == 4",
+    "result.grade == 3",
+    "result.grade == 2",
+    "result.grade == 1",
+    "result.grade == 0",
 ];
 const BEST_GRADES: [&str; 8] = [
-    "best.rate_valid && best.grade == 7",
-    "best.rate_valid && best.grade == 6",
-    "best.rate_valid && best.grade == 5",
-    "best.rate_valid && best.grade == 4",
-    "best.rate_valid && best.grade == 3",
-    "best.rate_valid && best.grade == 2",
-    "best.rate_valid && best.grade == 1",
-    "best.rate_valid && best.grade == 0",
+    "best.grade == 7",
+    "best.grade == 6",
+    "best.grade == 5",
+    "best.grade == 4",
+    "best.grade == 3",
+    "best.grade == 2",
+    "best.grade == 1",
+    "best.grade == 0",
 ];
 const DIFFICULTIES: [&str; 6] = [
     "chart.difficulty == 0",
@@ -214,27 +215,29 @@ fn from(table: &'static [&'static str], k: i32) -> ResOption {
 }
 
 /// The result option `id` (positive): a built-in boolean property of the
-/// source's factory.
+/// source's factory. An expression holds only under its group's validity
+/// ([`option_guard`]), which every reader joins outside it, so a negated
+/// option on a view without the value holds neither (D7).
 pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
     use ResOption::{Constant, Expr};
     Some(Class::Bridge(match id {
         // The emphasized gauge cleared, or not (`BooleanPropertyFactory.java:
         // 648-657`); neither while the view has no result.
-        90 => Expr("result.valid && result.cleared"),
-        91 => Expr("result.valid && !result.cleared"),
+        90 => Expr("result.cleared"),
+        91 => Expr("!result.cleared"),
         150..=155 => from(&DIFFICULTIES, id - 150),
         // Every chart is 7-key.
         160 => Constant(true),
         161..=164 => Constant(false),
-        177 => Expr("chart.bpm_valid && chart.bpm_changes"),
+        177 => Expr("chart.bpm_changes"),
         180..=184 => ResOption::JudgeClass,
         300..=307 => from(&GRADES, id - 300),
         320..=327 => from(&BEST_GRADES, id - 320),
-        330 => Expr("best.known && best.ex_updated"),
-        332 => Expr("best.known && best.bp_updated"),
-        335 => Expr("best.rate_valid && best.rate_updated"),
-        2244 => Expr("result.valid && count.bad > 0"),
-        2245 => Expr("result.valid && count.poor > 0"),
+        330 => Expr("best.ex_updated"),
+        332 => Expr("best.bp_updated"),
+        335 => Expr("best.rate_updated"),
+        2244 => Expr("count.bad > 0"),
+        2245 => Expr("count.poor > 0"),
         // Offline: no IR.
         50 => Constant(true),
         51 => Constant(false),
@@ -304,10 +307,12 @@ pub(crate) fn read_number(value: &ResValue, fields: &ResultFields) -> Read {
     read(value.guard, value.expr, Ty::Int, fields)
 }
 
-/// The validity a load-time read of option `id` needs: its group's. A
-/// frame's expression tests it itself, and so is false without it; a read
-/// while the skin loads refuses without it instead, as a number's does.
-fn option_validity(id: i32) -> &'static str {
+/// The validity option `id` (positive) holds under: its group's, `true`
+/// for an option of no group. A frame joins it outside the option's
+/// expression and any negation or callback around it, so it draws nothing
+/// without it; a read while the skin loads refuses without it instead, as
+/// a number's does.
+pub(crate) fn option_guard(id: i32) -> &'static str {
     match id {
         90 | 91 | 2244 | 2245 => VALID,
         300..=307 => "result.rate_valid",
@@ -320,12 +325,10 @@ fn option_validity(id: i32) -> &'static str {
 
 /// Option `id` (positive) read from `fields` while a skin loads: its
 /// expression as a frame reads it, 0 or 1, under its group's validity
-/// ([`option_validity`]); unavailable for an id with no expression.
+/// ([`option_guard`]); unavailable for an id with no expression.
 pub(crate) fn read_option(id: i32, fields: &ResultFields) -> Read {
     match option(id) {
-        Some(Class::Bridge(ResOption::Expr(src))) => {
-            read(option_validity(id), src, Ty::Bool, fields)
-        }
+        Some(Class::Bridge(ResOption::Expr(src))) => read(option_guard(id), src, Ty::Bool, fields),
         _ => Read::Unavailable,
     }
 }

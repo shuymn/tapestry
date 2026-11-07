@@ -433,6 +433,62 @@ fn a_grouped_clear_image_is_the_status() {
         .unwrap_or_else(|e| panic!("{e:?}"));
 }
 
+/// D7: a negated result option holds only while its value is available,
+/// its validity joined outside the negation, JSON (`op` -90, -330, -300)
+/// and Lua (`not ms.option(..)` in a `draw` callback) alike: on a view
+/// without the result, or without the best, nothing under it draws.
+#[test]
+fn a_negated_result_option_needs_its_value() {
+    let ex = value("ex", r#""ref": 71"#);
+    let at = |id: &str, y: i32, more: &str| {
+        format!(r#"{{"id": "{id}", {more} "dst": [{{"x": 0, "y": {y}, "w": 8, "h": 8}}]}}"#)
+    };
+    let dsts = [
+        dst("ex", ""),
+        at("dot", 300, r#""op": [90],"#),
+        at("lab", 400, r#""op": [-90],"#),
+        at("bar", 500, r#""op": [-330],"#),
+        at("b5", 600, r#""op": [-300],"#),
+    ]
+    .join(",");
+    let j = folder(&format!(r#""value": [{ex}], "destination": [{dsts}]"#));
+    let json = import_result(j.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let draw = |id: &str, y: i32, cond: &str| {
+        lua_dst(id, y, 8, &format!("draw = function() return {cond} end,"))
+    };
+    let lua_dsts = [
+        lua_dst("ex", 100, 4, ""),
+        draw("dot", 300, "ms.option(90)"),
+        draw("lab", 400, "not ms.option(90)"),
+        draw("bar", 500, "not ms.option(330)"),
+        draw("b5", 600, "not ms.option(300)"),
+    ]
+    .join(", ");
+    let l = sheet();
+    common::write(
+        l.path(),
+        "s.luaskin",
+        lua_skin("", &lua_value("ex", 4, "ref = 71"), "", &lua_dsts).as_bytes(),
+    );
+    let lua = lua_result(l.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    for skin in [json.skin, lua.imported.skin] {
+        let mut r = Res::new(skin);
+        let mut shown = |v: &ResultView| {
+            r.view(v);
+            [300.0, 400.0, 500.0, 600.0].map(|y| !r.at(0, top(y, 8.0)).is_empty())
+        };
+        // Cleared, the score updated, AA (not AAA): 90 and !300 hold.
+        let cleared = ready(1_000, true, best(ResultNumber::Shown(-3)));
+        assert_eq!(shown(&cleared), [true, false, false, true]);
+        // Failed with no best: !90 and !300; !330 needs the best.
+        let failed = ready(1_000, false, BestView::Unavailable);
+        assert_eq!(shown(&failed), [false, true, false, true]);
+        // No result: nothing under a result option draws.
+        assert_eq!(shown(&unavailable()), [false; 4]);
+    }
+}
+
 /// C16 on the Lua path: an EX score read by a callback and a status read
 /// by a `draw` callback are the parts; without the score it refuses.
 #[test]

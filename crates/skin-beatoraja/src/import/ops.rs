@@ -505,10 +505,17 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// [`profile::option`] or the result's
 /// [`super::result::profile::option`]), negated for `negative`: its
 /// bridge, built in one allocation of [`MAX_COND_BYTES`], or its constant
-/// folded. The result's judgment class is a load-time fact; the result
-/// schema has no field for it, so a frame condition on it is unsupported.
+/// folded. A result option's validity ([`result::option_guard`]) is
+/// joined outside the negation, so neither the option nor its negation
+/// holds on a view without the value. The result's judgment class is a
+/// load-time fact; the result schema has no field for it, so a frame
+/// condition on it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
     use super::result::profile::{self as result, ResOption};
+    let guard = match result::option_guard(id) {
+        g if kind == ScreenKind::Result && g != "true" => Some(g),
+        _ => None,
+    };
     let class = if kind == ScreenKind::Result {
         result::option(id).map(|c| {
             c.map(|o| match o {
@@ -524,11 +531,16 @@ fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
         Some(Class::Bridge(Some(SelOption::Constant(on)))) => Cond::Fold(on != negative),
         Some(Class::Bridge(Some(SelOption::Expr(e)))) => {
             let mut src = String::with_capacity(MAX_COND_BYTES);
-            if negative {
-                src.push_str("!(");
+            if let Some(g) = guard {
+                src.push_str(g);
+                src.push_str(" && ");
+            }
+            let wrap = negative || guard.is_some();
+            if wrap {
+                src.push_str(if negative { "!(" } else { "(" });
             }
             src.push_str(e);
-            if negative {
+            if wrap {
                 src.push(')');
             }
             Cond::Expr {

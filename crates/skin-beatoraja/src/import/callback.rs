@@ -454,6 +454,15 @@ impl Lower<'_> {
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
                 did("work:option");
+                // A result option's validity joins the element's guards,
+                // outside any negation the callback applies (D7).
+                if self.kind == ScreenKind::Result
+                    && let Ok(abs) = i32::try_from(id.unsigned_abs())
+                    && let g = super::result::profile::option_guard(abs)
+                    && g != "true"
+                {
+                    self.guard(g);
+                }
                 self.option(ops::numeric_in(self.kind, id, &BTreeMap::new()), unmapped)
             }
             "timer" => {
