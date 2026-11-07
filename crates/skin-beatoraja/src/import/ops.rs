@@ -298,6 +298,12 @@ const CHART_DIFFICULTY: i32 = 150;
 /// `song_no_bga` (`BooleanPropertyFactory.java:435`): the song data has no
 /// BGA, a chart with no `#BMPxx` image (`song/SongData.java:216`).
 const SONG_NO_BGA: i32 = 170;
+/// `chart_judge_veryhard` to `chart_judge_veryeasy`
+/// (`BooleanPropertyFactory.java:448-452`): the song data's judgment class,
+/// which `chart.judge_class` holds as the source computes it from the
+/// chart's own rank (`lua::facts::JudgeClass::of_headers`), whatever rank
+/// the play preset judges with; a chart in no class holds none.
+const CHART_JUDGE: i32 = 180;
 /// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
 /// source's preload state and its complement: entering READY flips them
 /// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
@@ -408,6 +414,14 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         154 => (Body::Text("chart.difficulty == 4"), false),
         155 => (Body::Text("chart.difficulty == 5"), false),
         SONG_NO_BGA => (Body::Text("chart.bga_valid && !chart.bga"), false),
+        CHART_JUDGE => (
+            Body::Text("chart.judge_class_valid && chart.judge_class == 0"),
+            false,
+        ),
+        181 => (Body::Text("chart.judge_class == 1"), false),
+        182 => (Body::Text("chart.judge_class == 2"), false),
+        183 => (Body::Text("chart.judge_class == 3"), false),
+        184 => (Body::Text("chart.judge_class == 4"), false),
         _ => return None,
     })
 }
@@ -713,16 +727,15 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 76);
+        assert_eq!(exprs.len(), 86);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
     }
 
     /// The chart's metadata conditions read the `chart.*` fields, each by
-    /// name too, and the condition an unknown value's 0 would hold is
-    /// guarded by its validity. 171 and the judgment classes 180 to 184
-    /// stay unsupported.
+    /// name too, none of them D4, and the conditions an unknown value's 0
+    /// would hold are guarded by its validity. 171 stays unsupported.
     #[test]
     fn chart_metadata_conditions_map() {
         let none = BTreeMap::new();
@@ -737,12 +750,24 @@ mod tests {
                 "song_no_bga".to_owned(),
                 "chart.bga_valid && !chart.bga".to_owned(),
             ),
+            (
+                180,
+                "chart_judge_veryhard".to_owned(),
+                "chart.judge_class_valid && chart.judge_class == 0".to_owned(),
+            ),
         ];
         for k in 1..=5 {
             cases.push((
                 150 + k,
                 format!("chart_difficulty_{k}"),
                 format!("chart.difficulty == {k}"),
+            ));
+        }
+        for (k, name) in [(1, "hard"), (2, "normal"), (3, "easy"), (4, "veryeasy")] {
+            cases.push((
+                180 + k,
+                format!("chart_judge_{name}"),
+                format!("chart.judge_class == {k}"),
             ));
         }
         for (id, name, src) in cases {
@@ -756,10 +781,8 @@ mod tests {
             let scope = skin_model::Scope::new(&skin_model::PLAY);
             assert!(skin_model::compile(&src, &scope, skin_model::Ty::Bool).is_ok());
         }
-        for id in [171, 180, 181, 182, 183, 184] {
-            assert_eq!(numeric(id, &none), Cond::Unsupported(id));
-            assert_eq!(numeric(-id, &none), Cond::Unsupported(-id));
-        }
+        assert_eq!(numeric(171, &none), Cond::Unsupported(171));
+        assert_eq!(numeric(-171, &none), Cond::Unsupported(-171));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! ended. Everything here is ordinary game data: the player translates it
 //! into whatever a skin takes, so the game depends on no skin crate.
 
-use bms_model::{Chart, NoteKind, Speed, TimeUs};
+use bms_model::{Chart, JudgmentHeader, NoteKind, Speed, TimeUs};
 use eval::Section;
 use rules::{GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
@@ -95,6 +95,10 @@ pub struct Attempt {
     /// The chart's gauge total as the reference player's song information
     /// gives it ([`song_total`]).
     pub song_total: i32,
+    /// The chart's judgment-header declarations, as its ingestion kept
+    /// them, from which a skin derives the class it shows whatever rank the
+    /// preset judges with.
+    pub judgment_headers: Vec<JudgmentHeader>,
     /// The tempo provider and reference tempos, from the chart as loaded
     /// at the attempt's speed over its section.
     pub tempo: AttemptTempo,
@@ -166,6 +170,7 @@ impl Attempt {
             last_note_end,
             labels: labels.clone(),
             song_total: song_total(chart),
+            judgment_headers: chart.meta.judgment_headers.clone(),
             tempo: AttemptTempo::prepare(chart, section),
         }
     }
