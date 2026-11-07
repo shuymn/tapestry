@@ -151,7 +151,8 @@ pub(crate) struct GraphDraw<'a> {
 
 /// One bin's counts by the graph's channels: first the notes without a
 /// counted judgment (`notes` less the bin's counted judgments, covered
-/// bins or not), then the judgments.
+/// bins or not; [`Timelines::new`] refuses more judgments than notes),
+/// then the judgments.
 fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS], notes: u32) -> [u32; 10] {
     let [pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l] = *b;
     let counted = b.iter().fold(0_u32, |s, &c| s.saturating_add(c));

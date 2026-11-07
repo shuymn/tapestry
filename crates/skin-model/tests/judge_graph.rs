@@ -638,13 +638,16 @@ fn runs_at(fx: &GFx, x: f32, scale: f32, [top, h]: [f32; 2]) -> Vec<([u8; 3], u3
 
 const GREY: [u8; 3] = [0x55; 3];
 
-/// Every note of an aborted view without a counted judgment draws grey in
-/// its bin, covered or not, and counts in the scale. Bin 0 (covered, the
-/// abort's own bin) holds 7 notes with 5 PERFECTs counted: a note after
-/// the abort and an LN still held, its head in the bin, draw as 2 grey
+/// The widget's rule over aggregate timelines: each bin's notes less its
+/// counted judgments draw grey, covered bins or not, and count in the
+/// scale. Bin 0 (covered) holds 7 notes with 5 PERFECTs counted: 2 grey
 /// chips under the PERFECTs (above them reversed). Bins 1 and 2 are past
 /// the coverage: 4 and 25 notes, all grey; the 25 grey chips alone raise
-/// the scale from 20 to 30.
+/// the scale from 20 to 30. Which notes the counts hold (an LN's head bin,
+/// a judgment finalized after the coverage, the conversion) is the data's
+/// claim, tested upstream: `game`'s `notes_count_in_their_final_bins` and
+/// `judgments_count_by_finalization_and_sit_in_their_notes_bins`, and
+/// `player`'s `the_graph_data_converts_value_for_value`.
 #[test]
 fn every_unjudged_note_draws_grey_and_counts_in_the_scale() {
     let blue = [0x00, 0x88, 0xff];

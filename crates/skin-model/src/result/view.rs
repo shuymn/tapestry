@@ -249,6 +249,8 @@ pub enum TimelinesError {
     Uncovered,
     #[error("{notes} note counts for {bins} bins")]
     Notes { notes: usize, bins: usize },
+    #[error("bin {bin} counts more judgments than its notes")]
+    Overcounted { bin: usize },
 }
 
 impl Timelines {
@@ -259,8 +261,9 @@ impl Timelines {
     /// # Errors
     ///
     /// No bin or more than [`MAX_TIMELINE_BINS`], not one note count per
-    /// bin, a width that is not positive, or `uncovered_from` past the
-    /// bins.
+    /// bin, a bin whose counted judgments exceed its notes (each counted
+    /// judgment is one of its bin's notes), a width that is not positive,
+    /// or `uncovered_from` past the bins.
     pub fn new(
         width: TimeUs,
         bins: Vec<[u32; TIMELINE_CHANNELS]>,
@@ -276,6 +279,13 @@ impl Timelines {
                 notes: notes.len(),
                 bins: n,
             });
+        }
+        if let Some(bin) = bins
+            .iter()
+            .zip(&notes)
+            .position(|(b, &notes)| b.iter().map(|&c| u64::from(c)).sum::<u64>() > u64::from(notes))
+        {
+            return Err(TimelinesError::Overcounted { bin });
         }
         if width.0 <= 0 {
             return Err(TimelinesError::Width);
@@ -366,6 +376,17 @@ mod tests {
                 Err(TimelinesError::Notes { notes, bins: 3 })
             );
         }
+        // Each bin's counted judgments are some of its notes: 9 of 9
+        // holds, 9 of 8 does not, nor a sum past `u32`.
+        assert!(Timelines::new(w, vec![[1; 9]; 2], vec![9, 10], None).is_ok());
+        assert_eq!(
+            Timelines::new(w, vec![[0; 9], [1; 9]], vec![0, 8], None),
+            Err(TimelinesError::Overcounted { bin: 1 })
+        );
+        assert_eq!(
+            Timelines::new(w, vec![[u32::MAX; 9]], vec![u32::MAX], None),
+            Err(TimelinesError::Overcounted { bin: 0 })
+        );
         assert_eq!(
             Timelines::new(TimeUs(0), vec![[0; 9]], vec![0], None),
             Err(TimelinesError::Width)
