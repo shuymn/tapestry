@@ -10,7 +10,7 @@ use eval::{Evaluation, GaugeResult, JudgeEvent};
 use replay::verify::Coverage;
 use rules::{GaugeKind, GaugeValue};
 
-use crate::result_figures::{TimelineAxis, Timelines};
+use crate::result_figures::{TIMING_RANGE_US, TimelineAxis, Timelines, timing_sample};
 use crate::result_screen::SHOWN_GAUGES;
 use crate::results::press_deviations;
 
@@ -22,6 +22,12 @@ pub const TIMING_BIN_US: i64 = 2_000;
 
 /// The deviation bins, from −64 ms up to +64 ms.
 pub const TIMING_BINS: usize = 64;
+
+/// The slots of the timing statistics' samples by ms
+/// ([`ResultGraphs::deviations`]): −150 ms to +150 ms.
+pub const DEVIATION_SLOTS: usize = 301;
+
+const _: () = assert!(DEVIATION_SLOTS as i64 == 2 * (TIMING_RANGE_US / 1_000) + 1);
 
 /// The deviation the first bin starts at.
 const TIMING_LOW_US: i64 = -(TIMING_BIN_US * TIMING_BINS as i64 / 2);
@@ -175,6 +181,11 @@ pub struct ResultGraphs {
     pub no_input_from: Option<u16>,
     /// The press deviations.
     pub timing: Timing,
+    /// The timing statistics' samples by ms, early positive, for a result
+    /// skin's distribution: slot `i` holds the samples whose ms value,
+    /// truncated toward 0, is `i − 150`. The built-in distribution is
+    /// [`timing`](Self::timing).
+    pub deviations: [u32; DEVIATION_SLOTS],
     /// The judgments over chart time.
     pub timelines: Timelines,
 }
@@ -188,6 +199,7 @@ impl ResultGraphs {
         reached: GRAPH_COLUMNS as u16,
         no_input_from: None,
         timing: Timing::NONE,
+        deviations: [0; DEVIATION_SLOTS],
         timelines: Timelines::EMPTY,
     };
 
@@ -216,6 +228,7 @@ impl ResultGraphs {
             Coverage::Recorded | Coverage::EndedMidway(_) => None,
         };
         g.timing = Timing::of(&e.events);
+        deviations(&e.events, &mut g.deviations);
         let mut top = GaugeValue::FULL;
         for (slot, (trace, &i)) in g.traces.iter_mut().zip(listed).enumerate() {
             let (Some(rule), Some(result)) = (rules.get(i), e.gauges.get(i)) else {
@@ -234,6 +247,20 @@ impl ResultGraphs {
         }
         g.top = top;
         g
+    }
+}
+
+/// Counts the timing statistics' samples of `events` into `slots` by ms,
+/// truncated toward 0 ([`ResultGraphs::deviations`]).
+fn deviations(events: &[JudgeEvent], slots: &mut [u32; DEVIATION_SLOTS]) {
+    let low = TIMING_RANGE_US / 1_000;
+    for s in events.iter().filter_map(timing_sample) {
+        let slot = usize::try_from(s / 1_000 + low)
+            .ok()
+            .and_then(|i| slots.get_mut(i));
+        if let Some(n) = slot {
+            *n = n.saturating_add(1);
+        }
     }
 }
 

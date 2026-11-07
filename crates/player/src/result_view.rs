@@ -155,6 +155,7 @@ mod tests {
                     mean_x100: -75,
                     sd_x100: 12,
                 }),
+                areas: [[0; 2]; 5],
             },
             best,
         }
