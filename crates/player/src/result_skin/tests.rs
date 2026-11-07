@@ -685,7 +685,8 @@ fn chart_reads_are_decided_before_ready() {
         "if lv ~= 12 then error(\"level\") end",
         "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
     );
-    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
     staged(&mut rs);
     assert!(
         rs.staged_line().starts_with("every view"),
@@ -696,7 +697,108 @@ fn chart_reads_are_decided_before_ready() {
     rs.request(view(5));
     assert!(!rs.running());
     assert_eq!(jobs_started(), jobs);
-    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    let every = shown(&rs);
+    // An unchanged retry reuses the bundle: no job, no build, no file
+    // read.
+    let (b0, read) = (builds(), p.source_counts());
+    rs.next_attempt();
+    staged(&mut rs);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view(7));
+    assert_eq!(jobs_started(), jobs);
+    assert_eq!(builds(), b0);
+    assert_eq!(p.source_counts(), read);
+    assert!(Arc::ptr_eq(&shown(&rs), &every));
+}
+
+/// The image stage at `level` with judgment class `class`.
+fn staged_at(rs: &mut ResultSkin, level: i32, class: JudgeClass) {
+    let c = ResultChart {
+        level: Some(level),
+        ..chart()
+    };
+    assert_eq!(
+        rs.image_stage(c, Some(class), || false, || false),
+        Staged::Ready
+    );
+}
+
+/// The S10-09i design's Q3 for a bundle for every view: a skin that
+/// reads the result at level 7 only. Level 7 prepares image entry R0 and
+/// publishes its layout; level 8 builds a bundle for every view, R1,
+/// published; level 9's build drops R0 and R1 first, so at most two
+/// atlases live. With two atlases retained, a level's attempt is laid
+/// out per view instead, with no build.
+#[test]
+fn a_bundle_for_every_view_keeps_two_atlases() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)\nif lv == 7 then local nr = ms.number(154) end",
+        "",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    assert_eq!(rs.staged_line(), "per view, images prepared");
+    let r0 = Arc::downgrade(rs.image().unwrap());
+    rs.request(view(5));
+    settled(&mut rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view(5));
+    let r1 = Arc::downgrade(&shown(&rs));
+    rs.next_attempt();
+    staged_at(&mut rs, 9, JudgeClass::Normal);
+    assert!(rs.staged_line().starts_with("every view"));
+    assert!(r0.upgrade().is_none(), "R0's pages live with R2");
+    rs.request(view(5));
+    assert!(r1.upgrade().is_none(), "R1 replaced");
+    // Two atlases retained: no room for a bundle, laid out per view.
+    rs.set_retained(&[
+        skin_model::AtlasId(u64::MAX),
+        skin_model::AtlasId(u64::MAX - 1),
+    ]);
+    rs.next_attempt();
+    let b0 = builds();
+    staged_at(&mut rs, 10, JudgeClass::Normal);
+    assert!(
+        rs.staged_line().starts_with("per view"),
+        "{}",
+        rs.staged_line()
+    );
+    assert_eq!(builds(), b0);
+}
+
+/// D13: an image stage whose probe is refused keeps the layout bound to
+/// the unshown image entry: after view 5's layout and an unavailable
+/// view, a chart of another judgment class refuses the probe before any
+/// result value; back on the first chart, view 5 is reused with no job.
+#[test]
+fn a_refused_probe_keeps_the_reusable_layout() {
+    let _s = serial();
+    let d = skin_reading(
+        "if ms.option(180) then error(\"class\") end\nlocal nr = ms.number(154)",
+        "",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 12, JudgeClass::Normal);
+    rs.request(view(5));
+    settled(&mut rs);
+    let five = shown(&rs);
+    rs.request(ViewFacts(None));
+    settled(&mut rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 12, JudgeClass::VeryHard);
+    assert_eq!(rs.staged_line(), "built-in, images prepared");
+    rs.next_attempt();
+    staged_at(&mut rs, 12, JudgeClass::Normal);
+    let jobs = jobs_started();
+    rs.request(view(5));
+    assert!(!rs.running(), "view 5 reused");
+    assert_eq!(jobs_started(), jobs);
+    assert!(Arc::ptr_eq(&shown(&rs), &five));
 }
 
 /// D13 with the S10-09i design's Q3: a build deferred while two atlases

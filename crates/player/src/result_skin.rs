@@ -200,6 +200,10 @@ pub struct ResultSkin {
     /// The cells of an image entry whose pages a deferred build dropped
     /// (D13), a union base until a build packs them.
     cells: Option<Sheet>,
+    /// The bundle for every view the last skin reading no fact of the
+    /// viewed result was given, with what it read, reused while that
+    /// holds.
+    every: Option<(Arc<SkinBundle>, FactDeps)>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -297,13 +301,53 @@ fn probe_view(chart: ResultChart) -> ResultView {
 
 /// What a job holds of the image side while it runs, handed back when it
 /// ends: the image entry, the kept cells of an entry whose pages were
-/// dropped (D13), and the layout entry bound to an unshown image entry,
-/// which goes with that entry's pages and stays otherwise.
+/// dropped (D13), the layout entry bound to an unshown image entry, and
+/// the bundle for every view a skin reading no fact of the viewed result
+/// was given, with what it read. The last two go once a replacement plan
+/// fits and stay otherwise.
 #[derive(Default)]
 struct Images {
     entry: Option<Arc<ImageEntry>>,
     cells: Option<Sheet>,
     bound: Option<Specialized>,
+    every: Option<(Arc<SkinBundle>, FactDeps)>,
+}
+
+/// Once a replacement plan fits (D13): an image entry that is not `base`
+/// is dropped, its cells kept, with the layout bound to it and the bundle
+/// for every view; returns what is left and whether the atlases live
+/// besides it (`others`, with the entry when kept) leave room for one
+/// more (the S10-09i design's Q3).
+fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Vec<AtlasId>) -> (Images, bool) {
+    let Images {
+        entry,
+        cells,
+        bound,
+        every,
+    } = images;
+    let (entry, dropped) = match entry {
+        Some(e) if base.is_some_and(|b| Arc::ptr_eq(&e, b)) => (Some(e), None),
+        other => (None, other),
+    };
+    drop((bound, every));
+    let cells = match (cells, dropped) {
+        (c, None) => c,
+        (None, Some(d)) => Some(d.packed.clone()),
+        (Some(c), Some(d)) => c.union(&d.packed).or(Some(c)),
+    };
+    let mut live = others;
+    live.extend(entry.as_ref().map(|e| e.pages().id()));
+    live.sort_unstable();
+    live.dedup();
+    let room = live.len() < 2;
+    (
+        Images {
+            entry,
+            cells,
+            ..Images::default()
+        },
+        room,
+    )
 }
 
 /// A layout of `pending` for `view`: the import over the cache, then the
@@ -361,6 +405,7 @@ fn layout(
                 entry,
                 cells,
                 bound,
+                every,
             } = images;
             // The union's base: the shown atlas's cells, the image entry's
             // and the kept ones, which the build keeps as cells only.
@@ -384,38 +429,26 @@ fn layout(
                             entry,
                             cells,
                             bound,
+                            every,
                         },
                     );
                 }
             };
-            // The plan fits: an image entry that is not the shown one is
-            // dropped before the build, with the layout bound to it; its
-            // cells stay until a build packs them.
-            let (entry, dropped) = match entry {
-                Some(e) if base.as_ref().is_some_and(|b| Arc::ptr_eq(&e, b)) => (Some(e), None),
-                other => (None, other),
+            // The plan fits: an unshown image entry goes before the build,
+            // with what is bound to it; its cells stay until a build packs
+            // them.
+            let images = Images {
+                entry,
+                cells,
+                bound,
+                every,
             };
-            drop(bound);
-            let kept = match (cells, dropped) {
-                (c, None) => c,
-                (None, Some(d)) => Some(d.packed.clone()),
-                (Some(c), Some(d)) => c.union(&d.packed).or(Some(c)),
-            };
-            let mut live = others;
-            live.extend(entry.as_ref().map(|e| e.pages().id()));
-            live.sort_unstable();
-            live.dedup();
-            if live.len() + 1 > 2 {
-                return (
-                    Err(Unbuilt::Deferred),
-                    Images {
-                        entry,
-                        cells: kept,
-                        bound: None,
-                    },
-                );
+            let (images, room) = release(images, base.as_ref(), others);
+            if !room {
+                return (Err(Unbuilt::Deferred), images);
             }
-            drop(entry);
+            let kept = images.cells;
+            drop(images.entry);
             #[cfg(all(test, feature = "dev-tools"))]
             tests::build_gate(cancel);
             #[cfg(any(test, feature = "dev-tools"))]
@@ -593,19 +626,22 @@ impl ResultSkin {
             Some(ResultStart::Pending(p)) => Arc::clone(p),
         };
         let facts = result_facts(probe_fields(chart), self.class);
+        // A bundle for every view whose reads still hold, or a probe whose
+        // facts and atlas still hold: no job.
+        if let Some((b, deps)) = &self.every
+            && deps.holds(&facts)
+        {
+            self.attempt = Some(ForAttempt::Every(Arc::clone(b)));
+            return Staged::Ready;
+        }
         if let (Some(deps), Some(_)) = (&self.probe, &self.image)
             && deps.holds(&facts)
         {
             self.attempt = Some(ForAttempt::Pending);
             return Staged::Ready;
         }
-        let images = Images {
-            entry: self.image.take(),
-            cells: self.cells.take(),
-            bound: None,
-        };
+        let images = self.images_for_job();
         let base = self.shown_entry();
-        self.drop_layout_bound_to(images.entry.as_ref());
         let others = self.others();
         let ran = imports::run_job(
             move |cancel: &Cancel| {
@@ -620,10 +656,25 @@ impl ResultSkin {
                 let read = deps.as_ref().is_some_and(reads_result);
                 match o {
                     Ok(LuaOutcome::Imported(i)) if !read => {
-                        // A skin that reads no result fact: one bundle for
-                        // every view, packed as any kind's.
+                        // A skin that reads no fact of the viewed result:
+                        // one bundle for every view, packed as any kind's
+                        // once its plan fits and room is made; with no
+                        // room, laid out per view.
                         let skin = i.imported.skin;
                         let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
+                        let limits = pending.target.limits;
+                        if let Err(e) = skin.sheet().plan(variant, limits, skin.has_outline_text())
+                        {
+                            return (
+                                Some(Err(format!("the atlas cannot be built: {e}"))),
+                                deps,
+                                images,
+                            );
+                        }
+                        let (images, room) = release(images, base.as_ref(), others);
+                        if !room {
+                            return (None, deps, images);
+                        }
                         #[cfg(any(test, feature = "dev-tools"))]
                         BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let r = skin
@@ -666,11 +717,11 @@ impl ResultSkin {
         );
         match ran {
             Ran::Done((outcome, deps, images)) => {
-                self.image = images.entry;
-                self.cells = images.cells;
+                self.restore(images);
                 match outcome {
-                    // A bundle for every view.
+                    // A bundle for every view, kept with what it read.
                     Some(Ok(Some(bundle))) => {
+                        self.every = deps.map(|d| (Arc::clone(&bundle), d));
                         self.attempt = Some(ForAttempt::Every(bundle));
                         self.probe = None;
                     }
@@ -759,13 +810,7 @@ impl ResultSkin {
         };
         // The entry goes to the job, which hands it back; the layout entry
         // bound to an unshown one goes with it, dropped only with its pages.
-        let entry = self.image.take();
-        let bound = self.take_layout_bound_to(entry.as_ref());
-        let images = Images {
-            entry,
-            cells: self.cells.take(),
-            bound,
-        };
+        let images = self.images_for_job();
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
@@ -794,10 +839,18 @@ impl ResultSkin {
         self.publish(p);
     }
 
-    /// Drops the layout entry when it is bound to `entry` and `entry` is
-    /// not shown: a build may drop that entry's pages (D13).
-    fn drop_layout_bound_to(&mut self, entry: Option<&Arc<ImageEntry>>) {
-        drop(self.take_layout_bound_to(entry));
+    /// The image side a job takes: the image entry, the kept cells, the
+    /// layout entry when it is bound to an unshown image entry, and the
+    /// bundle for every view.
+    fn images_for_job(&mut self) -> Images {
+        let entry = self.image.take();
+        let bound = self.take_layout_bound_to(entry.as_ref());
+        Images {
+            entry,
+            cells: self.cells.take(),
+            bound,
+            every: self.every.take(),
+        }
     }
 
     /// The layout entry, taken when it is bound to `entry` and `entry` is
@@ -822,6 +875,9 @@ impl ResultSkin {
         self.cells = images.cells;
         if self.layout.is_none() {
             self.layout = images.bound;
+        }
+        if self.every.is_none() {
+            self.every = images.every;
         }
     }
 
