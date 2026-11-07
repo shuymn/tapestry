@@ -845,6 +845,13 @@ fn common_reads(def: &mut Definition, counts: &mut Counts) -> Store {
 }
 
 impl LuaHeader {
+    /// Its later imports read the skin's image and font content through
+    /// `source` (design D13); its Lua and definition files are read as
+    /// before.
+    pub fn read_through(&mut self, source: skin_model::FileSource) {
+        self.root = self.root.with_source(source);
+    }
+
     /// The header, which [`Config`]s are made against.
     #[must_use]
     pub fn header(&self) -> &Header {
