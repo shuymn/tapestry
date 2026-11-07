@@ -23,7 +23,7 @@ fn skinned() -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
 /// [`skinned`] on `r`.
 fn skinned_on(mut r: render::Renderer) -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
     let dir = crate::selection_skin::fixture();
-    let b = crate::selection_skin::fixture_bundle(&r, dir.path());
+    let b = crate::selection_skin::fixture_bundle(&r, dir.path(), "s.json");
     let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
     r.commit(token).unwrap();
     let sent = Sent::default();

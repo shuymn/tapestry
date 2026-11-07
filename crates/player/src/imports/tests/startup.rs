@@ -558,29 +558,78 @@ fn a_selection_skin_installs_with_its_window_or_leaves_a_notice() {
     link.exit();
 }
 
-/// A Lua selection skin keeps the built-in select screen with its reason
-/// after its header pass: its configured pass, which would fail, never
-/// runs.
+/// A Lua selection skin whose import completes installs with its song
+/// list's window and no notice; one whose configured pass refuses, by an
+/// error or by reading a chart fact, leaves the built-in page with a
+/// notice naming its located reason.
 #[test]
-fn a_lua_selection_skin_stays_built_in_before_its_configured_pass() {
+fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
     let _serial = serial();
+    let build: Build = Arc::new(build);
+    let dir = crate::selection_skin::lua_fixture();
+    let choices = SkinChoices {
+        selection: Some(choice(dir.path(), "s.luaskin")),
+        ..SkinChoices::default()
+    };
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    assert_eq!(started.selection, Some((3, 7)));
+    assert_eq!(started.notice, None);
+    link.exit();
+
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("s.luaskin"),
         "local skin = { type = 5, name = \"t\", w = 1920, h = 1080 }\n\
          if not skin_config then return skin end\n\
-         error(\"the configured pass ran\")\n",
+         error(\"refused\")\n",
     )
     .unwrap();
-    let r = crate::render_common::offscreen(1_920, 1_080);
-    let t = ImportTarget {
-        limits: r.atlas_limits(),
-        size: [1_920, 1_080],
-        default_font: || Ok(crate::render_outline::default_font()),
+    let choices = SkinChoices {
+        selection: Some(choice(dir.path(), "s.luaskin")),
+        ..SkinChoices::default()
     };
-    let c = choice(dir.path(), "s.luaskin");
-    match build(ScreenKind::Selection, &c, false, &t, &Cancel::new()) {
-        KindOutcome::BuiltIn(why) => assert_eq!(why, crate::imports::LUA_SELECTION),
-        other => panic!("{other:?}"),
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    assert_eq!(started.selection, None);
+    let notice = started.notice.unwrap();
+    assert!(notice.ends_with("s.luaskin:3:0: a Lua error"), "{notice}");
+    link.exit();
+
+    // A chart fact read as the skin is built (the rank's band, the play
+    // level) refuses a selection skin with its place: it is never pending,
+    // and nothing is installed.
+    for read in ["ms.option(180)", "ms.number(96)"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.luaskin"),
+            format!(
+                "local skin = {{ type = 5, name = \"t\", w = 1920, h = 1080 }}\n\
+                 if not skin_config then return skin end\n\
+                 local ms = require(\"main_state\")\n\
+                 skin.fact = {read}\n\
+                 return skin\n"
+            ),
+        )
+        .unwrap();
+        let choices = SkinChoices {
+            selection: Some(choice(dir.path(), "s.luaskin")),
+            ..SkinChoices::default()
+        };
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        assert_eq!(started.selection, None, "{read}");
+        assert!(started.pending.is_none(), "{read}");
+        let notice = started.notice.unwrap();
+        let why = format!(
+            "s.luaskin:4:0: main_state.{} reads a fact this scene cannot give",
+            &read[3..]
+        );
+        assert!(notice.ends_with(&why), "{read}: {notice}");
+        assert!(screens.log().is_empty(), "{read}: {:?}", screens.log());
+        link.exit();
     }
 }
