@@ -50,6 +50,7 @@ fn play(autoplay: Fact<bool>, chart_rank: Fact<Option<ChartRank>>) -> ImportFact
         autoplay,
         chart_rank,
         play_level: Fact::Unavailable,
+        result: Fact::Unavailable,
     }
 }
 

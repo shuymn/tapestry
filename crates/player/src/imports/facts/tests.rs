@@ -144,6 +144,7 @@ fn an_attempt_reads_the_class_its_preset_judges_with() {
                     autoplay: Fact::Known(autoplay),
                     chart_rank: Fact::Known(rank),
                     play_level: Fact::Known(0),
+                    result: Fact::Unavailable,
                 },
                 "{text:?} {preset}"
             );

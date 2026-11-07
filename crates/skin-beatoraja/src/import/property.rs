@@ -4,6 +4,7 @@
 
 use skin_model::{ScreenKind, SelectionText};
 
+use super::result::{self, profile::ResValue};
 use super::selection::profile::{Class, SelText, SelValue};
 use super::selection::{self};
 
@@ -363,6 +364,9 @@ pub(crate) enum Value {
     /// A selection number, over the selection schema
     /// ([`super::selection::profile::number`]).
     Selection(SelValue),
+    /// A result number, over the result schema
+    /// ([`super::result::profile::number`]).
+    Result(ResValue),
 }
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
@@ -455,6 +459,7 @@ impl Value {
             Self::RecentTiming => "judge.recent_ms",
             Self::SongTotal => "chart.total",
             Self::Selection(v) => v.expr(),
+            Self::Result(v) => v.expr,
             Self::DurationVariant(n) => DURATION_VARIANTS
                 .get(usize::from(n))
                 .copied()
@@ -474,6 +479,7 @@ impl Value {
             Self::SongTotal => Some("chart.total_valid"),
             Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
             Self::Selection(v) => Some(v.availability()),
+            Self::Result(v) => Some(v.guard),
             _ => None,
         }
     }
@@ -497,7 +503,26 @@ impl Value {
                 | Self::RecentTiming
                 | Self::SongTotal
                 | Self::Selection(_)
+                | Self::Result(_)
         )
+    }
+
+    /// The essential part a result value shows (owner decision O4).
+    pub(crate) fn essential(self) -> Option<super::policy::EssentialPart> {
+        match self {
+            Self::Result(v) => v.part,
+            _ => None,
+        }
+    }
+
+    /// The role of an element showing the value: its critical or
+    /// essential part's, else decorative.
+    pub(crate) fn role(self) -> super::policy::Role {
+        use super::policy::Role;
+        self.part()
+            .map(Role::Critical)
+            .or(self.essential().map(Role::Essential))
+            .unwrap_or(Role::Decorative)
     }
 
     /// The critical part a play-critical value shows (owner decision 5).
@@ -517,6 +542,7 @@ impl Value {
             Self::ScoredPoor => return sum(2),
             Self::ComboBreak => return sum(3),
             Self::BadPoorMiss => return sum(4),
+            Self::Result(v) => return v.range,
             _ => {}
         }
         let e = self.expr();
@@ -584,11 +610,13 @@ fn name_id(name: &str) -> Option<i32> {
 /// selection profile's ([`selection::profile::number`]), an id outside
 /// it as the factory knows it ([`int_by_id`]) but shown by nothing.
 pub(crate) fn int_in(kind: ScreenKind, id: i32) -> IntProp {
-    if kind != ScreenKind::Selection {
-        return int_by_id(id);
-    }
-    match selection::profile::number(id) {
-        Some(Class::Bridge(v)) => IntProp::Shown(Value::Selection(v)),
+    let class = match kind {
+        ScreenKind::Selection => selection::profile::number(id).map(|c| c.map(Value::Selection)),
+        ScreenKind::Result => result::profile::number(id).map(|c| c.map(Value::Result)),
+        ScreenKind::Play | ScreenKind::Decision => return int_by_id(id),
+    };
+    match class {
+        Some(Class::Bridge(v)) => IntProp::Shown(v),
         Some(Class::Unavailable) => IntProp::Unavailable(id),
         Some(Class::Omit) => IntProp::Unsupported(Some(id)),
         None => match int_by_id(id) {
@@ -810,10 +838,12 @@ impl IndexProp {
 /// outside it unsupported where the factory knows it and selecting entry
 /// 0 where it does not.
 pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
-    if kind != ScreenKind::Selection {
-        return index_by_id(id);
-    }
-    match selection::profile::image_index(id) {
+    let class = match kind {
+        ScreenKind::Selection => selection::profile::image_index(id),
+        ScreenKind::Result => result::profile::image_index(id),
+        ScreenKind::Play | ScreenKind::Decision => return index_by_id(id),
+    };
+    match class {
         Some(Class::Bridge(src)) => IndexProp::Selection(src),
         Some(Class::Unavailable) => IndexProp::Unavailable(id),
         Some(Class::Omit) => IndexProp::Unsupported(id),
@@ -882,6 +912,16 @@ pub(crate) enum StrProp {
 /// selection profile's ([`selection::profile::text`]), an id outside it
 /// as the factory knows it ([`str_by_id`]).
 pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
+    if kind == ScreenKind::Result {
+        return match result::profile::text(id) {
+            Some(Class::Bridge(())) => str_by_id(id),
+            Some(Class::Unavailable | Class::Omit) => StrProp::Unsupported(Some(id)),
+            None => match str_by_id(id) {
+                StrProp::Field(_) => StrProp::Unsupported(Some(id)),
+                p => p,
+            },
+        };
+    }
     if kind != ScreenKind::Selection {
         return str_by_id(id);
     }

@@ -6,7 +6,8 @@
 //! (`JsonPlaySkinObjectLoader.java:37-181`): `note` is looked up last.
 //! The selection loader looks up the common objects, the gauge among
 //! them, then its `songlist` (`JsonSelectSkinObjectLoader.java:30-37`):
-//! the play loader's own objects are never looked up there.
+//! the play loader's own objects are never looked up there. The result
+//! loader looks up the common objects alone.
 
 use std::collections::HashMap;
 
@@ -52,7 +53,10 @@ const ORDER: [(&str, Object); 22] = [
 fn looked_up(kind: ScreenKind, slot: usize) -> bool {
     match kind {
         ScreenKind::Selection => slot < COMMON || slot == SONG_LIST,
-        ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => slot < SONG_LIST,
+        // The result loader adds no object of its own
+        // (`JsonResultSkinObjectLoader.java`).
+        ScreenKind::Result => slot < COMMON,
+        ScreenKind::Play | ScreenKind::Decision => slot < SONG_LIST,
     }
 }
 

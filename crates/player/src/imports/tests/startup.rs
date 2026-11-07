@@ -223,7 +223,7 @@ fn a_missing_play_skin_admits_no_chart() {
     link.exit();
 }
 
-/// A result-type skin for the result kind has no importer yet and a play
+/// A result-type skin for the result kind is not shown yet and a play
 /// skin there is of another kind: each keeps the built-in result screen,
 /// with one notice line, nothing is selected for it, and charts stay
 /// admitted.
@@ -239,8 +239,12 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
     )
     .unwrap();
     let build: Build = Arc::new(build);
+    let not_shown = format!(
+        "{}: single-chart result skins are not shown yet",
+        dir.path().join("r.json").display()
+    );
     for (entry, why) in [
-        ("r.json", "single-chart result skins are not imported yet"),
+        ("r.json", not_shown.as_str()),
         (
             "s.json",
             "a 7-key play skin in the single-chart result slot",

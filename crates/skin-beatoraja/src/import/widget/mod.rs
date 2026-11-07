@@ -477,7 +477,10 @@ impl Cx<'_> {
         let group = len > 1;
         let index = property::index_in(self.kind, self.int_or(r, "ref", 0)?);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role(dst.failure);
+        let mut role = lowered.role(dst.failure);
+        if group && self.kind == skin_model::ScreenKind::Result {
+            role = super::result::index_role(role, self.int_or(r, "ref", 0)?);
+        }
         self.actions(at, act)?;
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
@@ -596,6 +599,15 @@ impl Cx<'_> {
         let selector = image_choice::set_selector(self.kind, &value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
+        // On a result skin a set choosing by the clear type is the clear
+        // status, an essential part.
+        if self.kind == skin_model::ScreenKind::Result {
+            role = match property::value_prop(self.kind, &value) {
+                property::IntProp::Shown(v) => v.essential().map_or(role, Role::Essential),
+                property::IntProp::Null => super::result::index_role(role, r),
+                _ => role,
+            };
+        }
         let (src, deviates) = if let Prop::Callable(id) = value {
             // A function's value selects, its element's role joined by the
             // part its reads show; it never falls back to `ref`.

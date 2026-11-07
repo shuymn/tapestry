@@ -27,6 +27,7 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
         autoplay: Fact::Known(autoplay),
         chart_rank: Fact::Known(rank),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
+        result: Fact::Unavailable,
     }
 }
 

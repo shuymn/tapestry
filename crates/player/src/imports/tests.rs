@@ -279,8 +279,8 @@ fn frame(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) -> Vec<u8> {
     crate::render_common::read_back(r)
 }
 
-/// A skin of another kind than the one it is built for refuses; a kind
-/// with no importer yet runs the importer and keeps its built-in screen.
+/// A skin of another kind than the one it is built for refuses; a result
+/// skin, which nothing draws yet, keeps the built-in screen unimported.
 #[test]
 fn a_skin_builds_only_for_its_own_kind_and_importer() {
     let r = crate::render_common::offscreen(1_920, 1_080);
@@ -310,8 +310,17 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         &t,
         &c,
     ) {
+        // The importer maps result skins, but none is drawn yet: the build
+        // keeps the built-in screen before the import, naming the skin.
         KindOutcome::BuiltIn(why) => {
-            assert_eq!(why, "single-chart result skins are not imported yet");
+            let entry = dir.path().join("r.json");
+            assert_eq!(
+                why,
+                format!(
+                    "{}: single-chart result skins are not shown yet",
+                    entry.display()
+                )
+            );
         }
         other => panic!("{other:?}"),
     }

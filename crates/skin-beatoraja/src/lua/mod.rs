@@ -1017,7 +1017,7 @@ impl LuaHeader {
                 slot: facts.scene,
                 found: self.header.kind,
             })
-        } else if !matches!(facts.scene, ScreenKind::Play | ScreenKind::Selection) {
+        } else if facts.scene == ScreenKind::Decision {
             Some(ImportError::NoImporter { kind: facts.scene })
         } else {
             None

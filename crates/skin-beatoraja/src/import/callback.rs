@@ -74,7 +74,7 @@ use std::collections::{BTreeMap, HashMap};
 use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, Ty};
 
 use super::ops::{self, Cond};
-use super::policy::{CriticalPart, Role};
+use super::policy::{CriticalPart, EssentialPart, Role};
 use super::property::{self, IndexProp, IntProp};
 use super::report::{NoteKind, Span};
 use super::timer::{Custom, Timer};
@@ -102,6 +102,8 @@ pub(crate) struct Lowered {
     pub(crate) guards: Vec<&'static str>,
     /// The critical part a read shows.
     pub(crate) part: Option<CriticalPart>,
+    /// On a result skin, the essential part a read shows.
+    pub(crate) essential: Option<EssentialPart>,
     pub(crate) deviates: bool,
     /// The value its expression folds to when it compiles to a constant,
     /// its guards aside: a visibility known false folds as a JSON
@@ -138,7 +140,7 @@ impl NumberValue {
         Self {
             expr: v.expr().to_owned(),
             guard: v.availability().map(str::to_owned),
-            role: v.part().map_or(Role::Decorative, Role::Critical),
+            role: v.role(),
             deviates: v.deviates(),
         }
     }
@@ -203,10 +205,11 @@ impl V {
 }
 
 /// The schema a `kind` screen's expressions read.
-fn schema(kind: ScreenKind) -> &'static skin_model::Schema {
+pub(crate) fn schema(kind: ScreenKind) -> &'static skin_model::Schema {
     match kind {
         ScreenKind::Selection => &SELECTION,
-        ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => &PLAY,
+        ScreenKind::Result => &skin_model::RESULT,
+        ScreenKind::Play | ScreenKind::Decision => &PLAY,
     }
 }
 
@@ -257,6 +260,7 @@ impl<'a> Lower<'a> {
                 src: String::new(),
                 guards: Vec::new(),
                 part: None,
+                essential: None,
                 deviates: false,
                 known: None,
                 #[cfg(feature = "dev-tools")]
@@ -392,15 +396,25 @@ impl Lower<'_> {
             "gauge_type" | "judge" if !play => Err(unmapped()),
             // An image index the selection profile bridges, as an image's
             // or an image set's `ref` reads it: -1 (nothing) to 10.
-            "event_index" if !play => match property::index_in(self.kind, id.ok_or_else(unmapped)?)
-            {
-                IndexProp::Selection(src) => Ok(Mapped::Int {
-                    src: Self::text(self.an, &["(", src, ")"])?,
-                    lo: -1,
-                    hi: 10,
-                }),
-                _ => Err(unmapped()),
-            },
+            "event_index" if !play => {
+                let id = id.ok_or_else(unmapped)?;
+                match property::index_in(self.kind, id) {
+                    IndexProp::Selection(src) => {
+                        if self.kind == ScreenKind::Result
+                            && let Role::Essential(p) =
+                                super::result::index_role(Role::Decorative, id)
+                        {
+                            self.out.essential = self.out.essential.or(Some(p));
+                        }
+                        Ok(Mapped::Int {
+                            src: Self::text(self.an, &["(", src, ")"])?,
+                            lo: -1,
+                            hi: 10,
+                        })
+                    }
+                    _ => Err(unmapped()),
+                }
+            }
             "gauge_type" => {
                 self.guard("gauge.valid");
                 self.out.deviates = true;
@@ -416,6 +430,7 @@ impl Lower<'_> {
                 }
                 self.out.deviates |= v.deviates();
                 self.out.part = self.out.part.or(v.part());
+                self.out.essential = self.out.essential.or(v.essential());
                 let (lo, hi) = v.range();
                 let src = Self::text(self.an, &["(", v.expr(), ")"])?;
                 Ok(Mapped::Int { src, lo, hi })
@@ -1420,6 +1435,7 @@ impl Cx<'_> {
                         src: format!("{fold:?}"),
                         guards: Vec::new(),
                         part: None,
+                        essential: None,
                         deviates: false,
                         known: None,
                         #[cfg(feature = "dev-tools")]
@@ -1464,6 +1480,16 @@ impl Cx<'_> {
         }
     }
 
+    /// The role a role scan's critical `part` gives an element of `base`:
+    /// the scan reads play's ids, so on a result skin, which has no
+    /// play-critical part, it keeps `base`.
+    fn scan_role(&self, part: Option<CriticalPart>, base: Role) -> Role {
+        match part {
+            Some(p) if self.kind != ScreenKind::Result => Role::Critical(p),
+            _ => base,
+        }
+    }
+
     /// The role of the callable at node `id`, read as an element's value
     /// for an element of `role`: critical when the role scan finds a
     /// critical part (a cap or cancellation fatal); a decorative one whose
@@ -1498,7 +1524,7 @@ impl Cx<'_> {
             Err(Stop::Unsupported(_)) => Scan::unresolved("callee"),
         };
         left?;
-        let role = scan.part.map_or(role, Role::Critical);
+        let role = self.scan_role(scan.part, role);
         if role == Role::Decorative
             && let Some(what) = scan.unresolved
         {
@@ -1540,10 +1566,13 @@ impl Cx<'_> {
                     }
                 }
                 *deviates |= l.deviates;
-                // On a selection skin a visibility known to be false folds
-                // as a JSON condition of the same id does: never drawn, so
-                // an essential part is missing rather than kept invisible.
-                if self.kind == ScreenKind::Selection && l.known == Some(0) {
+                // On a selection or result skin a visibility known to be
+                // false folds as a JSON condition of the same id does:
+                // never drawn, so an essential part is missing rather than
+                // kept invisible.
+                if matches!(self.kind, ScreenKind::Selection | ScreenKind::Result)
+                    && l.known == Some(0)
+                {
                     self.ignored(at, NoteKind::Ignored { field: "op" });
                     return Ok(false);
                 }
@@ -1590,7 +1619,12 @@ impl Cx<'_> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let (why, scan) = match self.lower(id, conv) {
             Ok(Lowering::Lowered(l)) => {
-                self.lowered_outcome((c, id), "value", l.part.map_or(base, Role::Critical), &l);
+                let role = l
+                    .part
+                    .map(Role::Critical)
+                    .or(l.essential.map(Role::Essential))
+                    .unwrap_or(base);
+                self.lowered_outcome((c, id), "value", role, &l);
                 #[cfg(test)]
                 LOWERED.with(|w| w.borrow_mut().push(l.src.clone()));
                 #[cfg(test)]
@@ -1599,7 +1633,7 @@ impl Cx<'_> {
                 return Ok(Some(NumberValue {
                     expr: l.src,
                     guard,
-                    role: l.part.map_or(base, Role::Critical),
+                    role,
                     deviates: l.deviates,
                 }));
             }
@@ -1609,7 +1643,7 @@ impl Cx<'_> {
                 return Err(e);
             }
         };
-        let role = scan.part.map_or(base, Role::Critical);
+        let role = self.scan_role(scan.part, base);
         if role != Role::Decorative || scan.unresolved.is_some() {
             let why = match (role, scan.unresolved) {
                 (Role::Decorative, Some(what))
@@ -1634,11 +1668,11 @@ impl Cx<'_> {
     }
 
     /// The note of a decorative callback in `field` replaced for `why`.
-    /// On a selection skin a read the profile does not bridge is noted as
+    /// On a selection or result skin a read the profile does not bridge is noted as
     /// the JSON field of the same id is: the profile's own treatment, so
     /// the two paths cannot differ (docs/stage3.md §3, Selection).
     fn callback_note(&self, field: &'static str, why: Unsupported) -> NoteKind {
-        if self.kind == ScreenKind::Selection
+        if matches!(self.kind, ScreenKind::Selection | ScreenKind::Result)
             && let Unsupported::Unmapped { api, id } = why
             && let Ok(id) = i32::try_from(id)
         {

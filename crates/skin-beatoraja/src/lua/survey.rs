@@ -1240,7 +1240,7 @@ return { type = 0 }",
         for (ty, kind, label) in [
             (5, ScreenKind::Selection, "essential SongList missing"),
             (6, ScreenKind::Decision, "no importer for Decision"),
-            (7, ScreenKind::Result, "no importer for Result"),
+            (7, ScreenKind::Result, "essential ResultScore missing"),
         ] {
             let s = run(&format!("return {{ type = {ty} }}"));
             assert_eq!(

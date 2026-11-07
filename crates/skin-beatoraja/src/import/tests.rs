@@ -594,7 +594,7 @@ fn a_skin_in_another_slot_refuses_before_anything_is_read() {
 
 #[test]
 fn a_kind_with_no_importer_refuses_before_anything_is_read() {
-    for (ty, kind) in [(6, ScreenKind::Decision), (7, ScreenKind::Result)] {
+    for (ty, kind) in [(6, ScreenKind::Decision)] {
         let (r, admits) = into_slot(ty, kind, false);
         match r {
             Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),

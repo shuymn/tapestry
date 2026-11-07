@@ -261,13 +261,10 @@ fn ratio_bars_draw_their_ratios() {
     assert_eq!(4 * hit.value.numerator, 3 * hit.value.denominator);
 }
 
-/// C20: a decision or result skin still has no importer.
+/// C20: a decision skin still has no importer.
 #[test]
-fn decision_and_result_skins_have_no_importer() {
-    for (ty, kind) in [
-        (6, skin_model::ScreenKind::Decision),
-        (7, skin_model::ScreenKind::Result),
-    ] {
+fn decision_skins_have_no_importer() {
+    for (ty, kind) in [(6, skin_model::ScreenKind::Decision)] {
         let d = common::skin(&[("s.json", &format!(r#"{{"type": {ty}}}"#))]);
         let (mut def, h) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
         let r = skin_beatoraja::import(&mut def, &h, &skin_beatoraja::Config::defaults(&h), kind);

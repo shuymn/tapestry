@@ -49,7 +49,10 @@
 //! invalidation and refusing a stale completion belong to the caller
 //! (docs/stage3.md S10-07).
 
-use skin_model::ScreenKind;
+use skin_model::{ResultFields, ScreenKind};
+
+use crate::import::result::profile::{self, Read, ResOption};
+use crate::import::selection::profile::Class;
 
 /// A fact as the snapshot has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +152,10 @@ pub struct ImportFacts {
     /// units, within `i32`; anything else 0); [`Fact::Unavailable`] when
     /// there is no chart.
     pub play_level: Fact<i32>,
+    /// The viewed result's fields, as its frames read them
+    /// ([`ResultFields::of`] the view); read on [`ScreenKind::Result`]
+    /// only, through the result profile.
+    pub result: Fact<ResultFields>,
 }
 
 impl ImportFacts {
@@ -160,11 +167,13 @@ impl ImportFacts {
             autoplay: Fact::Unavailable,
             chart_rank: Fact::Unavailable,
             play_level: Fact::Unavailable,
+            result: Fact::Unavailable,
         }
     }
 
     /// The base snapshot: the session's facts known, the chart's pending
-    /// (unavailable on [`ScreenKind::Selection`], which has no chart).
+    /// (unavailable on [`ScreenKind::Selection`], which has no chart), and
+    /// the result's pending on [`ScreenKind::Result`].
     #[must_use]
     pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
         let (chart_rank, play_level) = if scene == ScreenKind::Selection {
@@ -172,11 +181,17 @@ impl ImportFacts {
         } else {
             (Fact::Pending, Fact::Pending)
         };
+        let result = if scene == ScreenKind::Result {
+            Fact::Pending
+        } else {
+            Fact::Unavailable
+        };
         Self {
             scene,
             autoplay,
             chart_rank,
             play_level,
+            result,
         }
     }
 
@@ -198,6 +213,26 @@ impl ImportFacts {
                 Fact::Pending => Fact::Pending,
                 Fact::Unavailable => Fact::Unavailable,
             },
+            FactId::ResultNumber(n) => self.read_result(|fields| {
+                let Some(Class::Bridge(v)) = profile::number(n) else {
+                    return Read::Unavailable;
+                };
+                profile::read_number(&v, fields)
+            }),
+            FactId::ResultOption(n) => self.read_result(|fields| profile::read_option(n, fields)),
+        }
+    }
+
+    /// A result fact read by `read` from the snapshot's fields: an int
+    /// for a number, 0 or 1 for an option.
+    fn read_result(&self, read: impl FnOnce(&ResultFields) -> Read) -> Fact<FactValue> {
+        match self.result {
+            Fact::Known(fields) => match read(&fields) {
+                Read::Value(v) => Fact::Known(FactValue::Int(v)),
+                Read::Unavailable => Fact::Unavailable,
+            },
+            Fact::Pending => Fact::Pending,
+            Fact::Unavailable => Fact::Unavailable,
         }
     }
 }
@@ -211,6 +246,11 @@ pub enum FactId {
     JudgeClass,
     /// Number 96.
     PlayLevel,
+    /// A result number by its id, read through the result profile on
+    /// [`ScreenKind::Result`].
+    ResultNumber(i32),
+    /// A result option by its id (positive), read likewise.
+    ResultOption(i32),
 }
 
 /// A fact's derived value, as an import read it.
@@ -222,6 +262,9 @@ pub enum FactValue {
     Class(Option<JudgeClass>),
     /// [`FactId::PlayLevel`]: the level.
     Level(i32),
+    /// [`FactId::ResultNumber`]: the value, `i32::MIN` when hidden;
+    /// [`FactId::ResultOption`]: 1 when it holds, else 0.
+    Int(i32),
 }
 
 /// One fact an import read, with the value it read.
@@ -291,6 +334,12 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
         COURSE_MODE | crate::import::ops::TABLE_SONG => return constant(false),
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
         _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
+        // The result profile's: a constant, or a result fact.
+        _ if facts.scene == ScreenKind::Result => match profile::option(id) {
+            Some(Class::Bridge(ResOption::Constant(b))) => return constant(b),
+            Some(Class::Bridge(ResOption::Expr(_))) => FactId::ResultOption(id),
+            _ => return OptionRead::LiveState,
+        },
         _ => return OptionRead::LiveState,
     };
     match facts.value(fact) {
@@ -299,6 +348,7 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
                 FactValue::Bool(on) => on == (id == AUTOPLAY_ON),
                 FactValue::Class(c) => c.is_some() && c == JudgeClass::of_option(id),
                 FactValue::Level(_) => false,
+                FactValue::Int(v) => v != 0,
             };
             OptionRead::Fact {
                 value: negate(on),
@@ -329,19 +379,22 @@ pub(crate) enum NumberRead {
 
 /// Answers `number(n)` from `facts`.
 pub(crate) fn number(facts: &ImportFacts, n: i32) -> NumberRead {
-    if n != PLAY_LEVEL {
+    let fact = if n == PLAY_LEVEL {
+        FactId::PlayLevel
+    } else if facts.scene == ScreenKind::Result
+        && matches!(profile::number(n), Some(Class::Bridge(_)))
+    {
+        FactId::ResultNumber(n)
+    } else {
         return NumberRead::LiveState;
-    }
-    match facts.value(FactId::PlayLevel) {
-        Fact::Known(value @ FactValue::Level(level)) => NumberRead::Fact {
-            value: level,
-            read: FactRead {
-                fact: FactId::PlayLevel,
-                value,
-            },
+    };
+    match facts.value(fact) {
+        Fact::Known(value @ (FactValue::Level(v) | FactValue::Int(v))) => NumberRead::Fact {
+            value: v,
+            read: FactRead { fact, value },
         },
         Fact::Known(_) | Fact::Unavailable => NumberRead::Unavailable,
-        Fact::Pending => NumberRead::Pending(FactId::PlayLevel),
+        Fact::Pending => NumberRead::Pending(fact),
     }
 }
 

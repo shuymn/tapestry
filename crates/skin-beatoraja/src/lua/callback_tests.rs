@@ -899,6 +899,7 @@ fn known() -> super::facts::ImportFacts {
         autoplay: Fact::Known(true),
         chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
         play_level: Fact::Known(12),
+        result: Fact::Unavailable,
     }
 }
 

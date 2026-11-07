@@ -27,6 +27,17 @@ pub(crate) enum Class<T> {
     Omit,
 }
 
+impl<T> Class<T> {
+    /// The class with its bridge mapped by `f`.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Class<U> {
+        match self {
+            Self::Bridge(t) => Class::Bridge(f(t)),
+            Self::Unavailable => Class::Unavailable,
+            Self::Omit => Class::Omit,
+        }
+    }
+}
+
 /// A selection number as the schema gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelValue {

@@ -472,14 +472,14 @@ pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
 /// the selection profile's built-ins ([`profile::option`]) before the
 /// declared items, a built-in outside the profile unsupported.
 pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
-    if kind != ScreenKind::Selection {
+    if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
         return numeric(op, items);
     }
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
         return Cond::Undefined(op);
     };
     if is_builtin(id) {
-        return selection_cond(id, op < 0);
+        return profile_cond(kind, id, op < 0);
     }
     if let Some(&on) = items.get(&id) {
         return Cond::Fold(on == (op > 0));
@@ -487,12 +487,28 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
     Cond::Undefined(op)
 }
 
-/// Selection built-in `id`, negated for `negative`: its bridge, built in
-/// one allocation of [`MAX_COND_BYTES`], or its constant folded.
-fn selection_cond(id: i32, negative: bool) -> Cond {
-    match profile::option(id) {
-        Some(Class::Bridge(SelOption::Constant(on))) => Cond::Fold(on != negative),
-        Some(Class::Bridge(SelOption::Expr(e))) => {
+/// Built-in `id` of a `kind` screen's profile (selection's
+/// [`profile::option`] or the result's
+/// [`super::result::profile::option`]), negated for `negative`: its
+/// bridge, built in one allocation of [`MAX_COND_BYTES`], or its constant
+/// folded. The result's judgment class is a load-time fact, unsupported in
+/// a frame, as on play.
+fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
+    use super::result::profile::{self as result, ResOption};
+    let class = if kind == ScreenKind::Result {
+        result::option(id).map(|c| {
+            c.map(|o| match o {
+                ResOption::Expr(e) => Some(SelOption::Expr(e)),
+                ResOption::Constant(b) => Some(SelOption::Constant(b)),
+                ResOption::JudgeClass => None,
+            })
+        })
+    } else {
+        profile::option(id).map(|c| c.map(Some))
+    };
+    match class {
+        Some(Class::Bridge(Some(SelOption::Constant(on)))) => Cond::Fold(on != negative),
+        Some(Class::Bridge(Some(SelOption::Expr(e)))) => {
             let mut src = String::with_capacity(MAX_COND_BYTES);
             if negative {
                 src.push_str("!(");
@@ -513,7 +529,7 @@ fn selection_cond(id: i32, negative: bool) -> Cond {
 /// A boolean property named `name` on a `kind` screen ([`named`] through
 /// [`numeric_in`]'s built-ins).
 pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
-    if kind != ScreenKind::Selection {
+    if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
         return named(name);
     }
     let mut negative = false;
@@ -523,7 +539,7 @@ pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
         rest = r;
     }
     let id = named_id(rest)?;
-    Some(selection_cond(id, negative))
+    Some(profile_cond(kind, id, negative))
 }
 
 /// The id of boolean property `name`, without `!` prefixes.
