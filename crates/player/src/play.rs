@@ -297,7 +297,8 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         let rig = &*self;
-        let staged = result.image_stage(chart, || rig.controls.leaving(), || rig.run_ends());
+        let class = crate::result_skin::attempt_class(loaded);
+        let staged = result.image_stage(chart, class, || rig.controls.leaving(), || rig.run_ends());
         self.result_skin = result;
         #[cfg(feature = "dev-tools")]
         println!(

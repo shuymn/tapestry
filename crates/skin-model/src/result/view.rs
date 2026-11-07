@@ -117,6 +117,10 @@ pub struct ResultChart {
     pub bpm: Option<ResultBpm>,
     /// Its `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,
+    /// Its length at 1×: its last note's end or BGM event, whichever is
+    /// later, the source's `SongData.getLastTime()`
+    /// (`IntegerPropertyFactory.java:473-478`), whatever section or speed
+    /// is played.
     pub length: Option<TimeUs>,
     /// The judged notes of the draw played, the source's total notes
     /// (`IntegerPropertyFactory.java:562-576`): the chart's, under every

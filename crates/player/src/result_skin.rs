@@ -14,7 +14,9 @@ use std::sync::Arc;
 use eval::Tally;
 use render::SkinBundle;
 use rules::PerJudgment;
-use skin_beatoraja::{Cancel, Config, Fact, FactDeps, FactId, ImportFacts, LuaHeader, LuaOutcome};
+use skin_beatoraja::{
+    Cancel, Config, Fact, FactDeps, ImportFacts, JudgeClass, LuaHeader, LuaOutcome,
+};
 use skin_model::{
     Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, LampKey, Layout, ResourceCache,
     ResultChart, ResultFields, ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView,
@@ -127,7 +129,7 @@ struct LayoutOut {
     request: u64,
     view: ViewFacts,
     result: Result<Specialized, Unbuilt>,
-    entry: Option<Arc<ImageEntry>>,
+    images: Images,
 }
 
 /// The attempt's result skin, as its image stage left it.
@@ -193,6 +195,11 @@ pub struct ResultSkin {
     /// The latest request, and the view it asked for.
     latest: Option<(u64, ViewFacts)>,
     next_request: u64,
+    /// The attempt's chart's judgment class, once its image stage ran.
+    class: Option<Option<JudgeClass>>,
+    /// The cells of an image entry whose pages a deferred build dropped
+    /// (D13), a union base until a build packs them.
+    cells: Option<Sheet>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -204,17 +211,19 @@ impl std::fmt::Debug for ResultSkin {
     }
 }
 
-/// Whether `deps` read a result fact.
+/// Whether `deps` read a fact of the viewed result beyond the chart's
+/// ([`skin_beatoraja::FactId::reads_view`]): the chart's facts are known
+/// before READY and decided there.
 fn reads_result(deps: &FactDeps) -> bool {
-    deps.reads
-        .iter()
-        .any(|r| matches!(r.fact, FactId::ResultNumber(_) | FactId::ResultOption(_)))
+    deps.reads.iter().any(|r| r.fact.reads_view())
 }
 
-/// The snapshot of a result view's fields.
-fn result_facts(fields: ResultFields) -> ImportFacts {
+/// The snapshot of a result view's fields, with the chart's judgment
+/// class `class` (options 180-184) once the attempt gives it.
+fn result_facts(fields: ResultFields, class: Option<Option<JudgeClass>>) -> ImportFacts {
     ImportFacts {
         result: Fact::Known(fields),
+        judge_class: class.map_or(Fact::Unavailable, Fact::Known),
         ..ImportFacts::unavailable(ScreenKind::Result)
     }
 }
@@ -286,26 +295,40 @@ fn probe_view(chart: ResultChart) -> ResultView {
     }
 }
 
+/// What a job holds of the image side while it runs, handed back when it
+/// ends: the image entry, the kept cells of an entry whose pages were
+/// dropped (D13), and the layout entry bound to an unshown image entry,
+/// which goes with that entry's pages and stays otherwise.
+#[derive(Default)]
+struct Images {
+    entry: Option<Arc<ImageEntry>>,
+    cells: Option<Sheet>,
+    bound: Option<Specialized>,
+}
+
 /// A layout of `pending` for `view`: the import over the cache, then the
-/// atlas step against `entry` (D13). When the atlas does not hold the
-/// layout's cells, a union with `base`'s (the shown generation's atlas),
-/// else the layout's cells alone, is planned first; only once a plan fits
-/// is `entry` dropped when it is not `base`, then, unless the atlases live
-/// besides it (`others`, with `entry` when kept) and the new one would
-/// pass two, the plan packed (the S10-09i design's Q3).
+/// atlas step against the image entry (D13). When its atlas does not hold
+/// the layout's cells, a union with `base`'s (the shown generation's
+/// atlas), the entry's and the kept cells, else the layout's cells alone,
+/// is planned first; only once a plan fits are an entry that is not
+/// `base` and the layout bound to it dropped, the entry's cells kept,
+/// then, unless the atlases live besides it (`others`, with the entry
+/// when kept) and the new one would pass two, the plan packed (the
+/// S10-09i design's Q3). Whatever is not dropped is handed back.
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn layout(
     pending: &PendingResult,
     view: ViewFacts,
-    entry: Option<Arc<ImageEntry>>,
+    class: Option<Option<JudgeClass>>,
+    images: Images,
     base: Option<Arc<ImageEntry>>,
     others: Vec<AtlasId>,
     cancel: &Cancel,
-) -> (Result<Specialized, Unbuilt>, Option<Arc<ImageEntry>>) {
+) -> (Result<Specialized, Unbuilt>, Images) {
     let Some(fields) = view.0 else {
-        return (Err("the view is unavailable".to_owned().into()), entry);
+        return (Err("the view is unavailable".to_owned().into()), images);
     };
-    let facts = result_facts(fields);
+    let facts = result_facts(fields, class);
     let imported = match pending
         .header
         .import_reading(&pending.config, &facts, cancel)
@@ -314,34 +337,42 @@ fn layout(
         Ok(LuaOutcome::Pending(p)) => {
             return (
                 Err(format!("the skin reads {:?}, pending here", p.pending).into()),
-                entry,
+                images,
             );
         }
-        Err(refused) => return (Err(imports::chain(&refused.0).into()), entry),
+        Err(refused) => return (Err(imports::chain(&refused.0).into()), images),
     };
     let deps = imported.facts;
     let skin = imported.imported.skin;
     let scratch = imported.imported.scratch;
     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
     let text = skin.has_outline_text();
-    let held = entry.as_ref().and_then(|e| {
+    let held = images.entry.as_ref().and_then(|e| {
         e.atlas
             .rebind(skin.sheet(), variant, text)
             .ok()
             .map(|a| (a, Arc::clone(e)))
     });
-    let (atlas, entry) = match held {
-        Some((atlas, e)) => (atlas, Some(e)),
+    let (atlas, images) = match held {
+        Some((atlas, _)) => (atlas, images),
         None => {
             let limits = pending.target.limits;
-            // The union's base: the shown atlas's cells and the image
-            // entry's, which the build keeps as cells only.
+            let Images {
+                entry,
+                cells,
+                bound,
+            } = images;
+            // The union's base: the shown atlas's cells, the image entry's
+            // and the kept ones, which the build keeps as cells only.
             let mut union = Some(skin.sheet().clone());
             for b in [&base, &entry].into_iter().flatten() {
                 union = union.and_then(|u| u.union(&b.packed));
             }
+            if let Some(c) = &cells {
+                union = union.and_then(|u| u.union(c));
+            }
             let union = union
-                .filter(|_| base.is_some() || entry.is_some())
+                .filter(|_| base.is_some() || entry.is_some() || cells.is_some())
                 .filter(|u| u.plan(variant, limits, text).is_ok());
             let packed = match union {
                 Some(u) => u,
@@ -349,19 +380,40 @@ fn layout(
                 None => {
                     return (
                         Err("the layout's images do not fit one atlas".to_owned().into()),
-                        entry,
+                        Images {
+                            entry,
+                            cells,
+                            bound,
+                        },
                     );
                 }
             };
             // The plan fits: an image entry that is not the shown one is
-            // dropped before the build.
-            let entry = entry.filter(|e| base.as_ref().is_some_and(|b| Arc::ptr_eq(e, b)));
+            // dropped before the build, with the layout bound to it; its
+            // cells stay until a build packs them.
+            let (entry, dropped) = match entry {
+                Some(e) if base.as_ref().is_some_and(|b| Arc::ptr_eq(&e, b)) => (Some(e), None),
+                other => (None, other),
+            };
+            drop(bound);
+            let kept = match (cells, dropped) {
+                (c, None) => c,
+                (None, Some(d)) => Some(d.packed.clone()),
+                (Some(c), Some(d)) => c.union(&d.packed).or(Some(c)),
+            };
             let mut live = others;
             live.extend(entry.as_ref().map(|e| e.pages().id()));
             live.sort_unstable();
             live.dedup();
             if live.len() + 1 > 2 {
-                return (Err(Unbuilt::Deferred), entry);
+                return (
+                    Err(Unbuilt::Deferred),
+                    Images {
+                        entry,
+                        cells: kept,
+                        bound: None,
+                    },
+                );
             }
             drop(entry);
             #[cfg(all(test, feature = "dev-tools"))]
@@ -371,18 +423,30 @@ fn layout(
             let built =
                 match packed.atlas_reserving(variant, limits, text, &|| cancel.is_cancelled()) {
                     Ok(a) => a,
-                    Err(e) => return (Err(format!("the atlas cannot be built: {e}").into()), None),
+                    Err(e) => {
+                        return (
+                            Err(format!("the atlas cannot be built: {e}").into()),
+                            Images {
+                                cells: kept,
+                                ..Images::default()
+                            },
+                        );
+                    }
                 };
             let new = Arc::new(ImageEntry {
                 atlas: built,
                 packed,
             });
+            let images = Images {
+                entry: Some(Arc::clone(&new)),
+                ..Images::default()
+            };
             match new.atlas.rebind(skin.sheet(), variant, text) {
-                Ok(a) => (a, Some(new)),
+                Ok(a) => (a, images),
                 Err(e) => {
                     return (
                         Err(format!("the layout cannot be bound: {e}").into()),
-                        Some(new),
+                        images,
                     );
                 }
             }
@@ -393,11 +457,11 @@ fn layout(
             Ok(Specialized {
                 bundle,
                 facts: deps,
-                entry: entry.clone(),
+                entry: images.entry.clone(),
             }),
-            entry,
+            images,
         ),
-        Err(why) => (Err(why.into()), entry),
+        Err(why) => (Err(why.into()), images),
     }
 }
 
@@ -507,17 +571,19 @@ impl ResultSkin {
         format!("{attempt}, images {images}")
     }
 
-    /// The image stage of an attempt whose chart gives `chart` (D11): the
-    /// probe import and, unless the live prepared atlas holds its cells,
-    /// one atlas build, on a job run with the attempt's two signals. A
-    /// fixed skin, or a probe whose facts and atlas still hold, runs no
-    /// job.
+    /// The image stage of an attempt whose chart gives `chart` and the
+    /// judgment class `class` (D11): the probe import and, unless the live
+    /// prepared atlas holds its cells, one atlas build, on a job run with
+    /// the attempt's two signals. A fixed skin, or a probe whose facts and
+    /// atlas still hold, runs no job.
     pub fn image_stage(
         &mut self,
         chart: ResultChart,
+        class: Option<JudgeClass>,
         quit: impl FnMut() -> bool,
         end_run: impl FnMut() -> bool,
     ) -> Staged {
+        self.class = Some(class);
         let pending = match &self.start {
             None => return Staged::Ready,
             Some(ResultStart::Fixed(b)) => {
@@ -526,16 +592,20 @@ impl ResultSkin {
             }
             Some(ResultStart::Pending(p)) => Arc::clone(p),
         };
-        let facts = result_facts(probe_fields(chart));
+        let facts = result_facts(probe_fields(chart), self.class);
         if let (Some(deps), Some(_)) = (&self.probe, &self.image)
             && deps.holds(&facts)
         {
             self.attempt = Some(ForAttempt::Pending);
             return Staged::Ready;
         }
-        let entry = self.image.take();
+        let images = Images {
+            entry: self.image.take(),
+            cells: self.cells.take(),
+            bound: None,
+        };
         let base = self.shown_entry();
-        self.drop_layout_bound_to(entry.as_ref());
+        self.drop_layout_bound_to(images.entry.as_ref());
         let others = self.others();
         let ran = imports::run_job(
             move |cancel: &Cancel| {
@@ -568,14 +638,15 @@ impl ResultSkin {
                                     cancel,
                                 )
                             });
-                        (Some(r.map(Some)), deps, entry)
+                        (Some(r.map(Some)), deps, images)
                     }
                     Ok(LuaOutcome::Imported(_)) => {
                         let view = ViewFacts(Some(match facts.result {
                             Fact::Known(f) => f,
-                            _ => return (None, deps, entry),
+                            _ => return (None, deps, images),
                         }));
-                        let (r, entry) = layout(&pending, view, entry, base, others, cancel);
+                        let (r, images) =
+                            layout(&pending, view, Some(class), images, base, others, cancel);
                         // The probe's layout is never shown: its atlas is.
                         (
                             Some(r.map(|_| None).map_err(|e| match e {
@@ -583,19 +654,20 @@ impl ResultSkin {
                                 Unbuilt::Deferred => "deferred".to_owned(),
                             })),
                             deps,
-                            entry,
+                            images,
                         )
                     }
-                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, entry),
-                    _ => (None, deps, entry),
+                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, images),
+                    _ => (None, deps, images),
                 }
             },
             quit,
             end_run,
         );
         match ran {
-            Ran::Done((outcome, deps, entry)) => {
-                self.image = entry;
+            Ran::Done((outcome, deps, images)) => {
+                self.image = images.entry;
+                self.cells = images.cells;
                 match outcome {
                     // A bundle for every view.
                     Some(Ok(Some(bundle))) => {
@@ -652,7 +724,8 @@ impl ResultSkin {
         request
     }
 
-    /// The layout of a pending skin for `view`, request `request`.
+    /// The layout of a pending skin for `view`, request `request`. One
+    /// published at once supersedes the request waiting or deferred.
     fn layout_for(&mut self, request: u64, view: ViewFacts) {
         let Some(fields) = view.0 else {
             // An unavailable view: the current bundle when it read no
@@ -663,14 +736,14 @@ impl ResultSkin {
                 }
                 _ => Published::BuiltIn,
             };
-            self.publish(p);
+            self.supersede(p);
             return;
         };
         if let Some(l) = &self.layout
-            && l.facts.holds(&result_facts(fields))
+            && l.facts.holds(&result_facts(fields, self.class))
         {
             let p = Published::Skin(Arc::clone(&l.bundle), l.entry.clone());
-            self.publish(p);
+            self.supersede(p);
             return;
         }
         if self.job.is_some() {
@@ -685,18 +758,24 @@ impl ResultSkin {
             return;
         };
         // The entry goes to the job, which hands it back; the layout entry
-        // bound to an unshown one goes with it if the job drops it.
+        // bound to an unshown one goes with it, dropped only with its pages.
         let entry = self.image.take();
+        let bound = self.take_layout_bound_to(entry.as_ref());
+        let images = Images {
+            entry,
+            cells: self.cells.take(),
+            bound,
+        };
         let base = self.shown_entry();
-        self.drop_layout_bound_to(entry.as_ref());
         let others = self.others();
+        let class = self.class;
         match imports::spawn_job(move |cancel: &Cancel| {
-            let (result, entry) = layout(&pending, view, entry, base, others, cancel);
+            let (result, images) = layout(&pending, view, class, images, base, others, cancel);
             LayoutOut {
                 request,
                 view,
                 result,
-                entry,
+                images,
             }
         }) {
             Ok(job) => self.job = Some((job, request)),
@@ -707,15 +786,42 @@ impl ResultSkin {
         }
     }
 
+    /// Publishes `p` for the latest request: an older request waiting or
+    /// deferred is dropped.
+    fn supersede(&mut self, p: Published) {
+        self.waiting = None;
+        self.deferred = None;
+        self.publish(p);
+    }
+
     /// Drops the layout entry when it is bound to `entry` and `entry` is
     /// not shown: a build may drop that entry's pages (D13).
     fn drop_layout_bound_to(&mut self, entry: Option<&Arc<ImageEntry>>) {
+        drop(self.take_layout_bound_to(entry));
+    }
+
+    /// The layout entry, taken when it is bound to `entry` and `entry` is
+    /// not shown.
+    fn take_layout_bound_to(&mut self, entry: Option<&Arc<ImageEntry>>) -> Option<Specialized> {
         let shown = self.shown_entry();
-        if let (Some(e), Some(l)) = (entry, &self.layout)
-            && !shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, e))
-            && Arc::ptr_eq(l.bundle.atlas_pages(), e.pages())
-        {
-            self.layout = None;
+        match (entry, &self.layout) {
+            (Some(e), Some(l))
+                if !shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, e))
+                    && Arc::ptr_eq(l.bundle.atlas_pages(), e.pages()) =>
+            {
+                self.layout.take()
+            }
+            _ => None,
+        }
+    }
+
+    /// The image side a job hands back: the bound layout entry returns
+    /// unless a layout replaced it.
+    fn restore(&mut self, images: Images) {
+        self.image = images.entry;
+        self.cells = images.cells;
+        if self.layout.is_none() {
+            self.layout = images.bound;
         }
     }
 
@@ -723,15 +829,18 @@ impl ResultSkin {
     /// still the latest, and starts the waiting request. Returns whether
     /// the latest request is published.
     pub fn poll(&mut self) -> bool {
-        if let Some((job, _)) = &mut self.job
+        if let Some((job, request)) = &mut self.job
             && let Some(ran) = job.poll()
         {
+            let request = *request;
             self.job = None;
             match ran {
                 Ran::Done(out) => self.landed(out),
+                // A failed thread's request: the built-in result while it
+                // is still the latest.
                 Ran::Refused(why) => {
                     log::info!("skin: result: its layout failed: {why}");
-                    if self.waiting.is_none() {
+                    if self.latest.map(|(r, _)| r) == Some(request) {
                         self.publish(Published::BuiltIn);
                     }
                 }
@@ -751,7 +860,7 @@ impl ResultSkin {
 
     fn landed(&mut self, out: LayoutOut) {
         // The entry is keyed by cells, not by request: it stays.
-        self.image = out.entry;
+        self.restore(out.images);
         // A layout entry bound to dropped pages goes with them.
         if let Some(l) = &self.layout
             && l.entry.as_ref().is_some_and(|e| {
@@ -764,6 +873,16 @@ impl ResultSkin {
         let latest = self.latest.map(|(r, _)| r);
         match out.result {
             Ok(spec) if latest == Some(out.request) => {
+                // The facts the published layout read (dev-tools).
+                #[cfg(feature = "dev-tools")]
+                println!(
+                    "dev: result layout read:{}",
+                    spec.facts
+                        .reads
+                        .iter()
+                        .map(|r| format!(" {:?}={:?}", r.fact, r.value))
+                        .collect::<String>()
+                );
                 let p = Published::Skin(Arc::clone(&spec.bundle), spec.entry.clone());
                 self.layout = Some(spec);
                 self.publish(p);
@@ -817,7 +936,7 @@ impl ResultSkin {
         if let Some((job, _)) = self.job.take()
             && let Ran::Done(out) = job.finish(|| true, end_run)
         {
-            self.image = out.entry;
+            self.restore(out.images);
         }
     }
 
@@ -848,8 +967,9 @@ impl Drop for ResultSkin {
 /// projection of the loaded chart: its play level and difficulty; the
 /// gauge's TOTAL, whole (number 368); the tempo's lowest and highest in
 /// floored hundredths with whether it changes in whole BPMs, as the play
-/// readouts take them (numbers 90-91); its length, to the end of its last
-/// note (numbers 1163-1164); and its judged notes (number 74), which a
+/// readouts take them (numbers 90-91); its length at 1×, to its last
+/// note's end or BGM event, whatever section or speed is played (numbers
+/// 1163-1164); and its judged notes (number 74), which a
 /// view replaces with its own.
 pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
     let attempt = loaded.attempt();
@@ -865,9 +985,15 @@ pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
             changes: crate::attempt_context::bpm_whole_change(tempo),
         }),
         difficulty: Some(difficulty).filter(|d| (1..=5).contains(d)),
-        length: Some(attempt.last_note_end),
+        length: Some(loaded.chart().meta.length),
         notes: Some(game::ResultBasis::of(loaded.chart(), None).notes),
     }
+}
+
+/// The judgment class of the chart at `loaded` (options 180-184), as the
+/// reference computes it from the chart's own rank.
+pub fn attempt_class(loaded: &game::Loaded) -> Option<JudgeClass> {
+    JudgeClass::of_headers(&loaded.chart().meta.judgment_headers)
 }
 
 /// The facts of `screen`'s view with `chart`: its fields while it is

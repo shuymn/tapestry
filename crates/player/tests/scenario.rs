@@ -2353,14 +2353,23 @@ fn a_play_skin_reads_the_recent_timing() {
 
 /// The S10-09i design's Q1 and Q2 through the real flow: a Lua result
 /// skin that reads numbers 154 and 178 while it loads is laid out for the
-/// own view once its best is compared (the request takes the compared best),
-/// on each play's result; and the result skin settles once for each
-/// leaving command the result acts on, a retry and a back, never on
-/// taking a command alone.
+/// own view once its best is compared (the request takes the compared
+/// best, the play before's), on each play's result; and the result skin
+/// settles once for each leaving command the result acts on, backs and a
+/// retry, never on taking a command alone.
 #[test]
 fn the_result_layout_takes_the_compared_best() {
     let fx = Fixture::new();
-    write_chart(&fx.library(), "a", "譜面A");
+    let a = write_chart(&fx.library(), "a", "譜面A");
+    // The first play hits notes 1 and 3 (BP 2), the retry every note.
+    let half =
+        |t: TimeUs| (2_000_000..2_250_000).contains(&t.0) || (3_000_000..3_250_000).contains(&t.0);
+    write_log(&fx.base.join("logs").join("half.tprl"), &hits(&a, half), 1);
+    write_log(
+        &fx.base.join("logs").join("all.tprl"),
+        &hits(&a, |_| true),
+        1,
+    );
     let skin = fx.base.join("result");
     fs::create_dir_all(&skin).unwrap();
     let file = fs::File::create(skin.join("s.png")).unwrap();
@@ -2396,9 +2405,12 @@ fn the_result_layout_takes_the_compared_best() {
     .unwrap();
     let (out, stdout, stderr) = fx.run(&scenario(&[
         "select = { path = \"library/a/a.bms\" }",
-        "play = { input = \"auto\", until = \"end\" }",
+        "play = { input = \"logs/half.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/all.tprl\", until = \"end\" }",
         "result = \"retry\"",
-        "play = { input = \"auto\", until = \"end\" }",
+        "play = { input = \"logs/all.tprl\", until = \"end\" }",
         "result = \"back\"",
         "quit = {}",
     ]));
@@ -2410,34 +2422,38 @@ fn the_result_layout_takes_the_compared_best() {
             .is_some_and(|l| l.starts_with("skin: result: pending")),
         "{stdout}"
     );
-    // Each play's P asked for its layout once, with the best compared: an
-    // autoplay counts no best, so the comparison gives "unavailable"; a
+    // Each play's P asked for its layout once, with the best compared; a
     // request before the comparison would see none.
     assert_eq!(
         lines(&stdout, "dev: result layout requested: "),
+        ["dev: result layout requested: best known"; 3],
+        "{stdout}"
+    );
+    // The layout read the compared view: the first play has no best
+    // before it (178 hidden); the second's best is the first's BP 2, so
+    // its BP 0 is 2 better; the retry's best is the second's.
+    assert_eq!(
+        lines(&stdout, "dev: result layout read:"),
         [
-            "dev: result layout requested: best unavailable",
-            "dev: result layout requested: best unavailable"
+            "dev: result layout read: ResultNumber(154)=Int(1) ResultNumber(178)=Int(-2147483648)",
+            "dev: result layout read: ResultNumber(154)=Int(0) ResultNumber(178)=Int(-2)",
+            "dev: result layout read: ResultNumber(154)=Int(0) ResultNumber(178)=Int(0)",
         ],
         "{stdout}"
     );
     // The rig's whole path: each attempt's Preparing ran the image stage
     // and prepared the probe's images (prepare_attempt); each P laid the
     // own view out and published it (begin_result, the comparison,
-    // poll_result), the built-in result since an autoplay's best is
-    // unavailable and the skin reads 178 while it loads; the result's
-    // showing asked again and reused that outcome (show_end, idle_wait).
+    // poll_result); the result's showing asked again and reused that
+    // layout (show_end, idle_wait).
     assert_eq!(
         lines(&stdout, "dev: result image stage: "),
-        [
-            "dev: result image stage: per view, images prepared",
-            "dev: result image stage: per view, images prepared"
-        ],
+        ["dev: result image stage: per view, images prepared"; 3],
         "{stdout}"
     );
-    let published = lines(&stdout, "dev: result skin published: ");
-    assert!(
-        published.len() >= 2 && published.iter().all(|l| l.ends_with("built-in")),
+    assert_eq!(
+        lines(&stdout, "dev: result skin published: "),
+        ["dev: result skin published: skin"; 6],
         "{stdout}"
     );
     // The result skin settles once for each leaving command acted on;
@@ -2446,13 +2462,10 @@ fn the_result_layout_takes_the_compared_best() {
         .lines()
         .filter(|l| *l == "dev: result skin settle")
         .count();
-    assert_eq!(settles, 2, "{stdout}");
+    assert_eq!(settles, 3, "{stdout}");
     assert_eq!(
         lines(&stdout, "dev: result skin settled: "),
-        [
-            "dev: result skin settled: accepted",
-            "dev: result skin settled: accepted"
-        ],
+        ["dev: result skin settled: accepted"; 3],
         "{stdout}"
     );
 }
