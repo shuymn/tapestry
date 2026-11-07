@@ -22,9 +22,10 @@ use self::view::{
     BestView, ResultLabels, ResultNumber, ResultStatus, ResultView, Timelines, TimingStats,
 };
 use crate::expr::{State, TIMER_OFF};
-use crate::select::{push, value};
+use crate::select::value;
 use crate::widget::Starts;
 use crate::widget::glyphs::{self, GlyphLine};
+use crate::widget::text::MAX_TEXT_BYTES;
 use crate::widget::text::{ChartText, TextTable};
 
 /// The starts of the result screen's built-in timers this frame, each
@@ -178,9 +179,11 @@ impl ResultScreen {
     }
 
     /// Fills the fields, strings, timing statistics and timelines from
-    /// `view`. Allocates only to grow a string past its capacity, each
-    /// string at most twice [`MAX_TEXT_BYTES`](crate::MAX_TEXT_BYTES), and to copy the timelines,
-    /// at most [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins.
+    /// `view`. Allocates only to replace a string too small for its new
+    /// text, with one of exactly that text's length, so each keeps at most
+    /// twice [`MAX_TEXT_BYTES`](crate::MAX_TEXT_BYTES) however often it
+    /// grows; and to copy the timelines, at most
+    /// [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins.
     pub(crate) fn update(&mut self, view: &ResultView, labels: &ResultLabels) {
         self.fields = fields(view);
         let ready = view.status == ResultStatus::Ready;
@@ -194,8 +197,12 @@ impl ResultScreen {
             (&mut s.subartist, &labels.subartist),
             (&mut s.genre, &labels.genre),
         ] {
+            let from = cut(from);
+            if to.capacity() < from.len() {
+                *to = String::with_capacity(from.len());
+            }
             to.clear();
-            push(to, from);
+            to.push_str(from);
         }
     }
 
@@ -220,6 +227,16 @@ impl ResultScreen {
             |_| true,
         );
     }
+}
+
+/// `src` cut to twice [`MAX_TEXT_BYTES`] at a character boundary: the
+/// text requests cut every string to [`MAX_TEXT_BYTES`] anyway.
+fn cut(src: &str) -> &str {
+    let mut end = src.len().min(MAX_TEXT_BYTES * 2);
+    while !src.is_char_boundary(end) {
+        end -= 1;
+    }
+    src.get(..end).unwrap_or_default()
 }
 
 /// `v` as a signed field value, within ±[`VALUE_MAX`].

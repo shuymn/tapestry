@@ -167,6 +167,46 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
     }
 }
 
+/// A ready view whose score, best, timing and timelines all differ from
+/// [`ready`]'s: EX 5 678, not cleared, a best of EX 444 and no BP, timing
+/// SD 4 321, three bins with the last uncovered.
+pub fn other() -> ResultView {
+    ResultView {
+        status: ResultStatus::Ready,
+        chart: chart(),
+        score: ResultScore {
+            tally: tally(5_678, 3, 900),
+            notes: 950,
+            gauge_permille: 120,
+            clear: LampKey::Failed,
+            cleared: false,
+            rate: Some(ResultRate {
+                rate_bp: 2_988,
+                grade: 1,
+            }),
+            next_rank: 3,
+        },
+        best: BestView::Known(BestFigures {
+            ex: 444,
+            ex_diff: 5_234,
+            bp: ResultNumber::Hidden,
+            bp_diff: ResultNumber::Hidden,
+            clear: LampKey::NoPlay,
+            ex_updated: true,
+            bp_updated: true,
+            rate: None,
+        }),
+        timing: Some(TimingStats {
+            samples: 7,
+            mean_x100: 42,
+            sd_x100: 4_321,
+        }),
+        timelines: Some(
+            Timelines::new(TimeUs(2_000_000), vec![[9; 9], [8; 9], [0; 9]], Some(2)).unwrap(),
+        ),
+    }
+}
+
 /// A result skin with its state, uv table and batch.
 pub struct RFx {
     pub skin: Skin,

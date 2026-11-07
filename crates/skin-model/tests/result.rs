@@ -345,9 +345,20 @@ fn an_unavailable_view_shows_the_chart_alone() {
             .filter(|(_, q)| !q.is_empty())
             .collect()
     };
-    fx.view(&ready(1_234, best(ResultNumber::Shown(1)), 2));
-    fx.frame(0);
-    assert_eq!(shown(&fx), values);
+    // B differs from A in its score, best, timing and timelines.
+    let a = ready(1_234, best(ResultNumber::Shown(1)), 2);
+    let b = result_support::other();
+    let b_values = vec![
+        (100.0, vec![d(5), d(6), d(7), d(8)]),
+        (200.0, vec![d(1), d(2)]),
+        (300.0, vec![d(4), d(3), d(2), d(1)]),
+        (400.0, vec![d(4), d(4), d(4)]),
+    ];
+    // What B alone gives a fresh state of the same skin.
+    let mut fresh = RFx::new(fx.skin.clone());
+    fresh.view(&b);
+    fresh.frame(33);
+    assert_eq!(shown(&fresh), b_values);
     for why in [
         Unavailable::NothingRecorded,
         Unavailable::CannotLoad,
@@ -355,18 +366,26 @@ fn an_unavailable_view_shows_the_chart_alone() {
         Unavailable::Failed,
         Unavailable::CancelledBeforePlayback,
     ] {
-        let mut v = ready(1_234, best(ResultNumber::Shown(1)), 2);
+        fx.view(&a);
+        fx.frame(0);
+        assert_eq!(shown(&fx), values, "{why:?}");
+        let mut v = a.clone();
         v.status = ResultStatus::Unavailable(why);
         fx.view(&v);
         fx.frame(16);
         assert_eq!(shown(&fx), vec![(200.0, vec![d(1), d(2)])], "{why:?}");
         assert_eq!(fx.res.timing(), None);
         assert!(fx.res.timelines().is_none());
+        // Nothing of A survives B: every field, the timing, the timelines
+        // and the frame are B's alone.
+        fx.view(&b);
+        fx.frame(33);
+        assert_eq!(shown(&fx), b_values, "{why:?}");
+        assert_eq!(fx.drawn(), fresh.drawn(), "{why:?}");
+        assert_eq!(fx.res.state().fields, fresh.res.state().fields, "{why:?}");
+        assert_eq!(fx.res.timing(), b.timing);
+        assert_eq!(fx.res.timelines(), b.timelines.as_ref());
     }
-    fx.view(&ready(1_234, best(ResultNumber::Shown(1)), 2));
-    fx.frame(33);
-    assert_eq!(shown(&fx), values);
-    assert!(fx.res.timelines().is_some());
 }
 
 /// The fade-out timer is off until its start, and a `when` timer runs over
@@ -439,6 +458,22 @@ fn result_text_is_the_charts_and_bounded() {
         .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &big)
         .unwrap();
     assert!(fx.res.resident_bytes() <= bound);
+    // Strings growing view after view keep at most twice `MAX_TEXT_BYTES`
+    // each, however often they grow.
+    for n in (1..=3 * MAX_TEXT_BYTES).step_by(37) {
+        let s = "x".repeat(n);
+        let grown = ResultLabels {
+            title: s.clone(),
+            subtitle: s.clone(),
+            artist: s.clone(),
+            subartist: s.clone(),
+            genre: s,
+        };
+        fx.skin
+            .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &grown)
+            .unwrap();
+        assert!(fx.res.resident_bytes() <= bound, "{n}");
+    }
     for r in fx.skin.result_text_requests(&fx.res, fx.target, &fx.layout) {
         assert!(r.text.len() <= MAX_TEXT_BYTES && !r.text.is_empty());
     }
@@ -508,4 +543,156 @@ fn an_image_choice_selects_by_a_result_field() {
     fx.frame(0);
     // NORMAL's clear type, 5.
     assert_eq!(fx.at_y(0.0), vec![(5, 0)]);
+}
+
+/// On result a number draws nothing for `i32::MIN` or `i32::MAX` and draws
+/// every value between; a selection number still draws both extremes (play
+/// and loading are `number.rs`' and `loading.rs`').
+#[test]
+fn a_result_number_leaves_out_the_i32_extremes() {
+    let srcs = ["2147483647", "2147483646", "-2147483647 - 1", "-2147483647"];
+    let elements = || {
+        (0..4_i32)
+            .map(|i| {
+                relement(
+                    Source::Number(u32::try_from(i).unwrap()),
+                    [100, 100 * (i + 1), 10, 10],
+                    None,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut fx = RFx::new(
+        rload(
+            elements(),
+            WidgetDefs {
+                numbers: srcs.iter().map(|s| number(s, 10)).collect(),
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap(),
+    );
+    fx.view(&ready(1, BestView::Unavailable, 1));
+    fx.frame(0);
+    let d =
+        |s: &str| -> Vec<(u32, u16)> { s.bytes().map(|b| (DIGITS, u16::from(b - b'0'))).collect() };
+    assert_eq!(fx.at_y(100.0), vec![]);
+    assert_eq!(fx.at_y(200.0), d("2147483646"));
+    assert_eq!(fx.at_y(300.0), vec![]);
+    assert_eq!(fx.at_y(400.0), d("2147483647"));
+    // The same numbers on selection.
+    let numbers = srcs
+        .iter()
+        .map(|s| skin_model::NumberDef {
+            digits: selection_support::digits(10),
+            value: selection_support::int(s),
+        })
+        .collect();
+    let mut sel = selection_support::Fx::new(
+        selection_support::load(
+            elements()
+                .into_iter()
+                .map(|e| ElementDef {
+                    timer: TimerRef::Builtin(skin_model::selection_timer::SCREEN),
+                    visible: None,
+                    ..e
+                })
+                .collect(),
+            WidgetDefs {
+                numbers,
+                ..WidgetDefs::default()
+            },
+            skin_model::SelectionDefs::default(),
+        )
+        .unwrap(),
+    );
+    sel.view(&selection_support::view(Vec::new(), None));
+    sel.frame(0);
+    let at = |y: f32| -> Vec<(u32, u16)> {
+        sel.drawn()
+            .into_iter()
+            .filter(|(_, r)| r[1] == y)
+            .filter_map(|(f, _)| f)
+            .collect()
+    };
+    assert_eq!(at(100.0), d("2147483647"));
+    assert_eq!(at(300.0), d("2147483648"));
+}
+
+/// Bitmap text on result: laid out from the last view's chart strings by
+/// `attach_result_bitmap_text`, one glyph quad per character, nothing
+/// before it is called, and laid out again for a new view.
+#[test]
+fn result_bitmap_text_follows_the_view() {
+    use image::{ImageFormat, Rgba, RgbaImage};
+    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
+        .save_with_format(dir.path().join("0.png"), ImageFormat::Png)
+        .unwrap();
+    std::fs::write(
+        dir.path().join("f.fnt"),
+        "info face=\"t\" size=10 padding=0,0,0,0\n\
+         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
+         page id=0 file=\"f.png\"\n\
+         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
+         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
+    )
+    .unwrap();
+    RgbaImage::from_pixel(16, 16, Rgba([255; 4]))
+        .save_with_format(dir.path().join("f.png"), ImageFormat::Png)
+        .unwrap();
+    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
+    let file = b
+        .admit_file(FileDef {
+            path: "0.png".into(),
+            hi: None,
+        })
+        .unwrap();
+    b.add_image(ImageDef {
+        file,
+        rect: None,
+        grid: [1, 1],
+        cycle: None,
+        filter: Filter::Linear,
+    })
+    .unwrap();
+    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
+    b.add_bitmap_font(f, &[]).unwrap();
+    let mut def = selection_support::skin_def(
+        vec![relement(Source::Text(0), [0, 0, 200, 20], None)],
+        WidgetDefs {
+            texts: vec![TextDef {
+                font: FontRef::Bitmap(0),
+                ..text(TextValue::Field(TextField::Title))
+            }],
+            ..WidgetDefs::default()
+        },
+    );
+    def.sheet = b.finish();
+    let mut fx = RFx::new(Skin::new_result(def).unwrap());
+    let titled = |title: &str| ResultLabels {
+        title: title.to_owned(),
+        ..labels()
+    };
+    let view = ready(1, BestView::Unavailable, 1);
+    fx.skin
+        .update_result(&mut fx.res, &view, &titled("ABA"))
+        .unwrap();
+    fx.frame(0);
+    assert_eq!(fx.batch.quads().len(), 0);
+    fx.skin.attach_result_bitmap_text(&mut fx.res);
+    fx.frame(0);
+    assert_eq!(fx.batch.quads().len(), 3);
+    fx.skin
+        .update_result(&mut fx.res, &view, &titled("BB"))
+        .unwrap();
+    fx.skin.attach_result_bitmap_text(&mut fx.res);
+    fx.frame(0);
+    assert_eq!(fx.batch.quads().len(), 2);
+    // A state of another skin is left as it is.
+    let mut foreign = rload(vec![], WidgetDefs::default())
+        .unwrap()
+        .prepare_result();
+    fx.skin.attach_result_bitmap_text(&mut foreign);
 }

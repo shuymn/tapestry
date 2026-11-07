@@ -156,15 +156,18 @@ fn a_result_build_allocates_nothing() {
         ready(1_400, BestView::Unavailable, 1),
     ];
     let mut total = 0;
+    // The first build after preparation, before any view, on the batch
+    // reserved at the skin's capacity.
+    total += counted(|| fx.frame(0));
     for v in &views {
         fx.view(v);
         fx.skin
             .attach_result_text(&mut fx.res, TextTable::new(vec![line; 1]))
             .unwrap();
-        // One build outside the count: the batch reaches its size.
-        fx.frame(0);
+        // The first build after each view change counts too.
+        total += counted(|| fx.frame(0));
         assert!(!fx.batch.quads().is_empty());
-        for ms in (0..2_000).step_by(16) {
+        for ms in (16..2_000).step_by(16) {
             fx.timers.fadeout = (ms > 1_000).then_some(TimeUs(1_000_000));
             total += counted(|| fx.frame(ms));
         }
