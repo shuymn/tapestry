@@ -587,3 +587,134 @@ fn a_native_size_fits_the_whole_graph() {
     assert_eq!(at(50.0, 170.5), 1);
     assert_eq!(at(50.0, 172.0), 0);
 }
+
+/// Timelines of 1 s bins with their own notes per bin and an uncovered
+/// mark.
+fn timelines_of(
+    width_s: i64,
+    bins: Vec<[u32; 9]>,
+    notes: Vec<u32>,
+    uncovered: Option<u16>,
+) -> skin_model::ResultView {
+    skin_model::ResultView {
+        timelines: Some(
+            skin_model::Timelines::new(
+                bms_model::TimeUs(width_s * 1_000_000),
+                bins,
+                notes,
+                uncovered,
+            )
+            .unwrap(),
+        ),
+        ..graph_support::ready()
+    }
+}
+
+/// The runs of the bin whose column starts at `x`, bottom up: colour and
+/// cells, in a region from y `top` to `top + h` at `scale`.
+fn runs_at(fx: &GFx, x: f32, scale: f32, [top, h]: [f32; 2]) -> Vec<([u8; 3], u32)> {
+    let mut chips: Vec<_> = fx
+        .chips()
+        .into_iter()
+        .filter(|q| q.rect[0] == x && q.rect[1] >= top && q.rect[1] < top + h)
+        .collect();
+    chips.sort_by(|a, b| b.rect[1].total_cmp(&a.rect[1]));
+    let cell = h / scale;
+    let mut bottom = top + h;
+    chips
+        .iter()
+        .map(|q| {
+            assert!(
+                (q.rect[1] + q.rect[3] - bottom).abs() < 1e-3,
+                "{:?}",
+                q.rect
+            );
+            bottom = q.rect[1];
+            let rgb = [0, 1, 2].map(|c| (q.color[c] * 255.0).round() as u8);
+            (rgb, (q.rect[3] / cell).round() as u32)
+        })
+        .collect()
+}
+
+const GREY: [u8; 3] = [0x55; 3];
+
+/// Every note of an aborted view without a counted judgment draws grey in
+/// its bin, covered or not, and counts in the scale. Bin 0 (covered, the
+/// abort's own bin) holds 7 notes with 5 PERFECTs counted: a note after
+/// the abort and an LN still held, its head in the bin, draw as 2 grey
+/// chips under the PERFECTs (above them reversed). Bins 1 and 2 are past
+/// the coverage: 4 and 25 notes, all grey; the 25 grey chips alone raise
+/// the scale from 20 to 30.
+#[test]
+fn every_unjudged_note_draws_grey_and_counts_in_the_scale() {
+    let blue = [0x00, 0x88, 0xff];
+    let mut pg = [0; 9];
+    pg[0] = 5;
+    let v = timelines_of(1, vec![pg, [0; 9], [0; 9]], vec![7, 4, 25], Some(1));
+    for (reverse, bin0) in [
+        (false, vec![(GREY, 2), (blue, 5)]),
+        (true, vec![(blue, 5), (GREY, 2)]),
+    ] {
+        let def = skin_model::JudgeGraphDef {
+            reverse,
+            ..graph(JudgeGraphKind::Judgment, GRID, false, 0)
+        };
+        let mut fx = GFx::new(skin(
+            vec![screen_element(0, [0, 0, 30, 300], 255)],
+            vec![def],
+        ));
+        fx.view(&v);
+        fx.frame(0);
+        assert_eq!(runs_at(&fx, 0.0, 30.0, [0.0, 300.0]), bin0);
+        assert_eq!(runs_at(&fx, 10.0, 30.0, [0.0, 300.0]), [(GREY, 4)]);
+        assert_eq!(runs_at(&fx, 20.0, 30.0, [0.0, 300.0]), [(GREY, 25)]);
+    }
+    // Every note judged: no grey, and the scale stays 20.
+    let v = timelines_of(1, vec![pg, [0; 9], [0; 9]], vec![5, 0, 0], Some(1));
+    let mut fx = GFx::new(skin(
+        vec![screen_element(0, [0, 0, 30, 300], 255)],
+        vec![graph(JudgeGraphKind::Judgment, GRID, false, 0)],
+    ));
+    fx.view(&v);
+    fx.frame(0);
+    assert_eq!(runs_at(&fx, 0.0, 20.0, [0.0, 300.0]), [(blue, 5)]);
+    assert_eq!(fx.chips().len(), 1);
+}
+
+/// A dense widened timeline (512 bins of 2 s, every channel 9 and 19
+/// grey: 100 notes a bin, scale 100) under both graph types with their
+/// backgrounds, on a batch the skin's load-time charge sizes: every push
+/// is accepted, every bin draws all its runs (6 and 10), and each
+/// background is 10 stripes in 52 pieces and 52 lines.
+#[test]
+fn a_dense_widened_timeline_builds_with_no_dropped_quad() {
+    let v = timelines_of(2, vec![[9; 9]; 512], vec![100; 512], None);
+    let s = skin(
+        vec![
+            screen_element(0, [0, 0, 1_024, 200], 255),
+            screen_element(1, [0, 300, 1_024, 200], 255),
+        ],
+        vec![
+            graph(JudgeGraphKind::Judgment, GRID, true, 0),
+            graph(JudgeGraphKind::EarlyLate, GRID, true, 0),
+        ],
+    );
+    assert_eq!(s.quad_capacity(), 3_654 + 5_702);
+    let mut fx = GFx::new(s);
+    fx.view(&v);
+    fx.frame(0);
+    assert_eq!(fx.batch.dropped(), 0);
+    let back = 10 * 52 + 52;
+    assert_eq!(fx.back().len(), 2 * back);
+    assert_eq!(fx.chips().len(), 512 * 6 + 512 * 10);
+    // Bin 0 of each graph: grey 19 at the bottom, then every channel.
+    let one = runs_at(&fx, 0.0, 100.0, [0.0, 200.0]);
+    assert_eq!(one.first(), Some(&(GREY, 19)));
+    assert_eq!(
+        one.iter().map(|r| r.1).collect::<Vec<_>>(),
+        [19, 9, 18, 18, 18, 18]
+    );
+    let two = runs_at(&fx, 0.0, 100.0, [300.0, 200.0]);
+    assert_eq!(two.first(), Some(&(GREY, 19)));
+    assert_eq!(two.len(), 10);
+}

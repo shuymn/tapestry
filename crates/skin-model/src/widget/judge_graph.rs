@@ -1,5 +1,6 @@
-//! The result's judge graph: a view's judgments over chart time, one
-//! column a timeline bin, stacked in chips from the bottom (design.md
+//! The result's judge graph: a view's notes over chart time, one column
+//! a timeline bin, stacked in chips from the bottom, each note without a
+//! counted judgment grey and the others by their judgment (design.md
 //! "Rendering and Skins", result widgets).
 //!
 //! The source paints two textures and draws each once under the
@@ -148,12 +149,16 @@ pub(crate) struct GraphDraw<'a> {
     pub(crate) screen: Option<i64>,
 }
 
-/// One bin's counts by the graph's channels, not judged first.
-fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS]) -> [u32; 10] {
+/// One bin's counts by the graph's channels: first the notes without a
+/// counted judgment (`notes` less the bin's counted judgments, covered
+/// bins or not), then the judgments.
+fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS], notes: u32) -> [u32; 10] {
     let [pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l] = *b;
+    let counted = b.iter().fold(0_u32, |s, &c| s.saturating_add(c));
+    let grey = notes.saturating_sub(counted);
     match kind {
         JudgeGraphKind::Judgment => [
-            0,
+            grey,
             pg,
             gr_e.saturating_add(gr_l),
             gd_e.saturating_add(gd_l),
@@ -164,7 +169,7 @@ fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS]) -> [u32; 10] {
             0,
             0,
         ],
-        JudgeGraphKind::EarlyLate => [0, pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l],
+        JudgeGraphKind::EarlyLate => [grey, pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l],
     }
 }
 
@@ -199,10 +204,12 @@ impl JudgeGraph {
         };
         let kind = self.def.kind;
         let bins = tl.bins();
+        let notes = tl.notes();
         let largest = bins
             .iter()
-            .map(|b| {
-                bin_counts(kind, b)
+            .zip(notes)
+            .map(|(b, &n)| {
+                bin_counts(kind, b, n)
                     .iter()
                     .fold(0_u32, |s, &c| s.saturating_add(c))
             })
@@ -227,12 +234,12 @@ impl JudgeGraph {
             JudgeGraphKind::EarlyLate => &EARLY_LATE_COLORS,
         };
         let used = colors.len();
-        for (i, b) in (0_u32..).zip(bins) {
+        for (i, (b, &notes)) in (0_u32..).zip(bins.iter().zip(notes)) {
             let [left, right] = g.column(i);
             if left >= clip {
                 break;
             }
-            let counts = bin_counts(kind, b);
+            let counts = bin_counts(kind, b, notes);
             let mut cell = 0_u32;
             for c in 0..used {
                 let ch = if self.def.reverse { used - 1 - c } else { c };
