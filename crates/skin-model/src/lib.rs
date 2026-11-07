@@ -105,7 +105,7 @@ pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
     GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS,
-    PAGE_SIDE_STEP, Page, Variant, cell_fits_page, downsample_rgba,
+    PAGE_SIDE_STEP, PackedPages, Page, Variant, cell_fits_page, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 #[cfg(feature = "dev-tools")]
