@@ -349,6 +349,49 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         }
         other => panic!("{other:?}"),
     }
+    // The gate precedes the configuration and the import: a result skin
+    // whose configuration is invalid (an option it does not declare), or
+    // whose configured Lua pass fails as soon as it runs, keeps the
+    // built-in screen all the same; the Lua skin runs its header pass
+    // alone (with dev-tools, this thread's passes count it).
+    fs::write(
+        dir.path().join("bad.json"),
+        r#"{"type": 7, "w": 1920, "h": 1080,
+            "property": [{"name": "Color", "item": [{"name": "Red", "op": 901}], "def": "Red"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("r.luaskin"),
+        "local skin = { type = 7, name = \"r\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         error(\"the configured pass ran\")\n",
+    )
+    .unwrap();
+    let mut bad = choice(dir.path(), "bad.json");
+    bad.options.insert("Color".to_owned(), "Green".to_owned());
+    for (c2, entry) in [
+        (bad, "bad.json"),
+        (choice(dir.path(), "r.luaskin"), "r.luaskin"),
+    ] {
+        #[cfg(feature = "dev-tools")]
+        let passes = skin_beatoraja::lua::vm_hooks::thread_passes();
+        match build(ScreenKind::Result, &c2, false, &t, &c) {
+            KindOutcome::BuiltIn(why) => assert_eq!(
+                why,
+                format!(
+                    "{}: single-chart result skins are not shown yet",
+                    dir.path().join(entry).display()
+                )
+            ),
+            other => panic!("{entry}: {other:?}"),
+        }
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(
+            skin_beatoraja::lua::vm_hooks::thread_passes() - passes,
+            u64::from(entry == "r.luaskin"),
+            "{entry}"
+        );
+    }
 }
 
 /// The configured folder is the user's absolute choice, taken with
