@@ -334,9 +334,19 @@ fn the_chips_reveal_on_the_screen_timer() {
     assert!((right(&fx) - 200.0).abs() < 1e-3);
     fx.frame(3_375);
     assert!((right(&fx) - 300.0).abs() < 1e-3);
-    // A cut chip's uv is cut alike: bin 1 (100..200) at 150.
-    let cut = fx.chips().into_iter().find(|q| q.rect[0] == 200.0).unwrap();
-    assert!((cut.rect[2] - 100.0).abs() < 1e-3);
+    // At 3.3 s the reveal is at 240, inside bin 2 (200..300): its chips
+    // are cut to 40 wide, their uv to the same 0.4 of bin 0's.
+    fx.frame(3_300);
+    let chips = fx.chips();
+    let whole = chips.iter().find(|q| q.rect[0] == 0.0).unwrap();
+    let cut = chips.iter().find(|q| q.rect[0] == 200.0).unwrap();
+    assert!((cut.rect[2] - 40.0).abs() < 1e-3, "{:?}", cut.rect);
+    let width = |q: &skin_model::Quad| q.uv[2] - q.uv[0];
+    assert!((width(cut) - 0.4 * width(whole)).abs() < 1e-6);
+    assert_eq!(
+        (cut.uv[0], cut.uv[1], cut.uv[3]),
+        (whole.uv[0], whole.uv[1], whole.uv[3])
+    );
     fx.frame(3_500);
     assert_eq!(right(&fx), 400.0);
     // No positive delay: whole at once.
