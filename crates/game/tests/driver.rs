@@ -20,7 +20,7 @@ use input::{
     WindowKeys, window_keys,
 };
 
-const Q: u32 = 0x10;
+const E: u32 = 0x12;
 const W: u32 = 0x11;
 const DOWN: u32 = 0xE050;
 const Z: u32 = 0x2c;
@@ -288,7 +288,7 @@ fn a_start_held_across_a_retry_keeps_adjusting_and_acts_after_a_fresh_press() {
     let mut rig = Rig::new(PlayOptions::default());
     rig.enter(-2_000_000);
     rig.attach(tempo(150, None), -2_000_000).unwrap();
-    rig.keys(10 * MS, &[(Q, true)]);
+    rig.keys(10 * MS, &[(E, true)]);
     assert!(rig.snap().adjusting);
     rig.enter(-2_000_000);
     rig.attach(tempo(150, None), -2_000_000).unwrap();
@@ -297,20 +297,20 @@ fn a_start_held_across_a_retry_keeps_adjusting_and_acts_after_a_fresh_press() {
     assert!(!s.options.covers().sudden.on);
     // Released, then pressed once: with the press before the retry this
     // would be a double press, but the history started afresh.
-    rig.keys(100 * MS, &[(Q, false)])
-        .keys(150 * MS, &[(Q, true)])
-        .keys(160 * MS, &[(Q, false)]);
+    rig.keys(100 * MS, &[(E, false)])
+        .keys(150 * MS, &[(E, true)])
+        .keys(160 * MS, &[(E, false)]);
     assert!(!rig.snap().options.covers().sudden.on);
     // Two fresh presses toggle SUDDEN+.
-    rig.keys(200 * MS, &[(Q, true)])
-        .keys(210 * MS, &[(Q, false)]);
+    rig.keys(200 * MS, &[(E, true)])
+        .keys(210 * MS, &[(E, false)]);
     assert!(rig.snap().options.covers().sudden.on);
 }
 
 #[test]
 fn a_loss_survives_the_attempts_entry_and_a_verified_baseline_ends_it() {
     let mut rig = Rig::new(PlayOptions::default());
-    rig.keys(10 * MS, &[(Q, true)]);
+    rig.keys(10 * MS, &[(E, true)]);
     assert!(rig.snap().adjusting);
     rig.focus.set(false);
     rig.tick(20 * MS);
@@ -347,7 +347,7 @@ fn a_select_before_a_cancelling_hold_solves_under_the_candidate_clock_across_a_t
         if split {
             rig.drain();
         }
-        rig.keys(1_070_000, &[(W, false), (Z, false), (Q, true)]);
+        rig.keys(1_070_000, &[(W, false), (Z, false), (E, true)]);
         let s = rig.snap();
         // 144000 · 0.8 / (300 · 299) = 384/299, then frozen.
         assert_eq!(s.hispeed, Some(r(384, 299)), "split {split}");
@@ -360,7 +360,7 @@ fn a_select_before_a_cancelling_hold_solves_under_the_candidate_clock_across_a_t
 fn owed_recovery_flushes_on_consumption_with_no_device_activity() {
     let mut rig = Rig::new(PlayOptions::default());
     // START held: every wake ticks, more than the queue holds.
-    rig.keys(10 * MS, &[(Q, true)]);
+    rig.keys(10 * MS, &[(E, true)]);
     for k in 1..=1_100 {
         rig.tick(10 * MS + k);
     }
@@ -578,13 +578,13 @@ fn the_driver_gives_one_state_whatever_the_drain_splits() {
                 rig.tap(20 * MS, Z);
             },
             &|rig| {
-                rig.keys(30 * MS, &[(W, false), (Q, true)]);
+                rig.keys(30 * MS, &[(W, false), (E, true)]);
             },
             &|rig| {
                 rig.tap(40 * MS, DOWN);
             },
             &|rig| {
-                rig.keys(50 * MS, &[(Q, false)]);
+                rig.keys(50 * MS, &[(E, false)]);
             },
             &|rig| {
                 rig.tick(60 * MS);
@@ -655,8 +655,8 @@ fn ready_adjustments_use_the_candidate_clock() {
     // START is a hold that cancels the candidate, after its batch: the
     // step pressed with it is made under the candidate's clock.
     rig.open(100 * MS, 500_000, 1);
-    rig.keys(2_000_000, &[(Q, true), (AUX_UP, true)])
-        .keys(2_020_000, &[(AUX_UP, false), (Q, false)]);
+    rig.keys(2_000_000, &[(E, true), (AUX_UP, true)])
+        .keys(2_020_000, &[(AUX_UP, false), (E, false)]);
     let s = rig.snap();
     assert_eq!(s.options.covers().sudden.amount, 210);
     // 144000 · 0.79 / (300 · 300) = 158/125.
@@ -673,8 +673,8 @@ fn a_rearm_keeps_h_and_the_double_press() {
     rig.tap(200 * MS, F2);
     assert_eq!(rig.snap().hispeed, Some(r(37, 10)));
     // START cancels the candidate; released, READY rearms.
-    rig.keys(300 * MS, &[(Q, true)])
-        .keys(350 * MS, &[(Q, false)]);
+    rig.keys(300 * MS, &[(E, true)])
+        .keys(350 * MS, &[(E, false)]);
     rig.drain();
     rig.rearm(400 * MS, 1_400_000, 2);
     let s = rig.snap();
@@ -683,8 +683,8 @@ fn a_rearm_keeps_h_and_the_double_press() {
     assert!(!s.options.covers().sudden.on);
     // The press that cancelled and one after the rearm, 300 ms apart: a
     // double press.
-    rig.keys(600 * MS, &[(Q, true)])
-        .keys(610 * MS, &[(Q, false)]);
+    rig.keys(600 * MS, &[(E, true)])
+        .keys(610 * MS, &[(E, false)]);
     assert!(rig.snap().options.covers().sudden.on);
 }
 
@@ -698,16 +698,16 @@ fn in_play_adjustments_follow_the_transition_table() {
         .unwrap();
     rig.open(100 * MS, 1_100_000, 1);
     rig.commit(1);
-    rig.keys(4_000_000, &[(Q, true)])
+    rig.keys(4_000_000, &[(E, true)])
         .tap(4_010_000, AUX_UP)
-        .keys(4_020_000, &[(Q, false)]);
+        .keys(4_020_000, &[(E, false)]);
     assert_eq!(rig.snap().hispeed, Some(r(321, 100)));
     // SUDDEN+ shown at 0 by a double press solves at the event's tempo:
     // 144000 / (300 · 300) = 1.6.
-    rig.keys(5_000_000, &[(Q, true)])
-        .keys(5_010_000, &[(Q, false)])
-        .keys(5_100_000, &[(Q, true)])
-        .keys(5_110_000, &[(Q, false)]);
+    rig.keys(5_000_000, &[(E, true)])
+        .keys(5_010_000, &[(E, false)])
+        .keys(5_100_000, &[(E, true)])
+        .keys(5_110_000, &[(E, false)]);
     let s = rig.snap();
     assert!(s.options.covers().sudden.on);
     assert_eq!(s.hispeed, Some(r(8, 5)));
@@ -742,10 +742,10 @@ fn screen_recovery_keeps_the_floating_override() {
 fn a_loading_double_press_survives_into_the_play() {
     let mut rig = Rig::new(PlayOptions::default());
     rig.enter(-1_000_000);
-    rig.keys(10 * MS, &[(Q, true)]).keys(20 * MS, &[(Q, false)]);
+    rig.keys(10 * MS, &[(E, true)]).keys(20 * MS, &[(E, false)]);
     rig.attach(tempo(150, None), -1_000_000).unwrap();
-    rig.keys(300 * MS, &[(Q, true)])
-        .keys(310 * MS, &[(Q, false)]);
+    rig.keys(300 * MS, &[(E, true)])
+        .keys(310 * MS, &[(E, false)]);
     assert!(rig.snap().options.covers().sudden.on);
 }
 
@@ -754,11 +754,11 @@ fn the_previous_charts_double_press_does_not() {
     let mut rig = Rig::new(PlayOptions::default());
     rig.enter(-1_000_000);
     rig.attach(tempo(150, None), -1_000_000).unwrap();
-    rig.keys(10 * MS, &[(Q, true)]).keys(20 * MS, &[(Q, false)]);
+    rig.keys(10 * MS, &[(E, true)]).keys(20 * MS, &[(E, false)]);
     // The next chart's loading starts within 500 ms.
     rig.enter(-1_000_000);
-    rig.keys(300 * MS, &[(Q, true)])
-        .keys(310 * MS, &[(Q, false)]);
+    rig.keys(300 * MS, &[(E, true)])
+        .keys(310 * MS, &[(E, false)]);
     assert!(!rig.snap().options.covers().sudden.on);
 }
 
@@ -771,7 +771,7 @@ fn a_device_change_while_loading_is_a_new_baseline() {
     rig.set.connect(DeviceId(2), DeviceKind::Keyboard);
     rig.set.end_batch(TimeUs(5 * MS + 1));
     rig.now = 5 * MS;
-    rig.keys(10 * MS, &[(Q, true)]);
+    rig.keys(10 * MS, &[(E, true)]);
     assert!(rig.snap().adjusting);
     // The second keyboard leaves: an ownership change, a new baseline with
     // START still held and suppressed.
@@ -782,9 +782,9 @@ fn a_device_change_while_loading_is_a_new_baseline() {
     assert!(rig.snap().adjusting);
     // A press before the baseline does not count toward a double press
     // with the next.
-    rig.keys(200 * MS, &[(Q, false)])
-        .keys(300 * MS, &[(Q, true)])
-        .keys(310 * MS, &[(Q, false)]);
+    rig.keys(200 * MS, &[(E, false)])
+        .keys(300 * MS, &[(E, true)])
+        .keys(310 * MS, &[(E, false)]);
     assert!(!rig.snap().options.covers().sudden.on);
     assert_eq!(rig.driver.diagnostics().out_of_order, 0);
 }
@@ -798,7 +798,7 @@ fn a_gesture_accepted_with_the_cancelling_hold_keeps_repeating() {
     rig.enter(-1_000_000);
     rig.attach(tempo(150, None), -1_000_000).unwrap();
     rig.open(100 * MS, 1_100_000, 1);
-    rig.keys(200 * MS, &[(Q, true), (0x2a, true)]);
+    rig.keys(200 * MS, &[(E, true), (0x2a, true)]);
     for k in 1..=4 {
         rig.tick(200 * MS + k * 50 * MS);
     }

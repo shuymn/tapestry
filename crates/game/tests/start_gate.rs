@@ -33,7 +33,7 @@ use rules::Judgment;
 
 type Out = audio::RecordingOutput<audio::SimDevice>;
 
-const Q: ControlId = ControlId(0x10);
+const E: ControlId = ControlId(0x12);
 const W: ControlId = ControlId(0x11);
 const F1: ControlId = ControlId(0x3B);
 
@@ -108,7 +108,7 @@ fn options() -> PlayOptions {
 }
 
 /// A session of `chart()` with the start gate on the default bindings:
-/// START on Q, SELECT on W.
+/// START on E, SELECT on W.
 fn session(root: &DataRoot, events: &Events) -> Session<Out> {
     session_with_sources(root, events, common::sources())
 }
@@ -283,9 +283,9 @@ fn a_hold_cancels_ready_keeps_its_input_and_a_release_rearms_a_fresh_one() {
     // its chart time 0 at 1.2 s of the script.
     let mut items = vec![connect(0)];
     items.extend(tap(4, -500));
-    items.push(raw(-300, 0, Q, 1));
+    items.push(raw(-300, 0, E, 1));
     items.extend(tap(5, 0));
-    items.push(raw(200, 0, Q, 0));
+    items.push(raw(200, 0, E, 0));
     items.extend(notes_from(1_200));
     let report = s.play(script(items, &[])).unwrap();
 
@@ -313,10 +313,10 @@ fn a_hold_cancels_ready_keeps_its_input_and_a_release_rearms_a_fresh_one() {
         vec![
             (-500, l4, 1),
             (-460, l4, 0),
-            (-300, Q.0, 1),
+            (-300, E.0, 1),
             (0, l5, 1),
             (40, l5, 0),
-            (200, Q.0, 0)
+            (200, E.0, 0)
         ]
     );
     // Its scheduled chart start never ran: one transport, the winner's.
@@ -346,7 +346,7 @@ fn every_rearm_takes_a_fresh_origin_and_keeps_every_opening() {
     let mut zero = 0;
     for k in 0..3 {
         let at = zero - 400;
-        let role = if k % 2 == 0 { W } else { Q };
+        let role = if k % 2 == 0 { W } else { E };
         items.push(raw(at, 0, role, 1));
         items.extend(tap(6, at + 50));
         items.push(raw(at + 150, 0, role, 0));
@@ -404,8 +404,8 @@ fn fast_and_slow_count_the_winning_ready_only() {
     );
     let mut items = vec![connect(0)];
     items.extend(tap(1, -60));
-    items.push(raw(-50, 0, Q, 1));
-    items.push(raw(200, 0, Q, 0));
+    items.push(raw(-50, 0, E, 1));
+    items.push(raw(200, 0, E, 0));
     items.extend(tap(1, 1_200 + 130));
     items.extend(notes_from(1_200));
     let report = s.play(script(items, &[])).unwrap();
@@ -448,7 +448,7 @@ fn fast_and_slow_count_the_winning_ready_only() {
 fn a_hold_in_the_last_100_ms_before_the_commit_cancels_it() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let mut items = vec![connect(0), raw(-50, 0, Q, 1), raw(100, 0, Q, 0)];
+    let mut items = vec![connect(0), raw(-50, 0, E, 1), raw(100, 0, E, 0)];
     items.extend(notes_from(1_100));
     let report = s.play(script(items, &[])).unwrap();
 
@@ -466,7 +466,7 @@ fn a_hold_after_the_commit_is_an_ordinary_adjustment() {
     // START held from just after chart time 0 through the notes, F1
     // pressed under it: the play goes on, judged as usual, and the
     // adjustment reaches the reducer.
-    let mut items = vec![connect(0), raw(1, 0, Q, 1)];
+    let mut items = vec![connect(0), raw(1, 0, E, 1)];
     items.extend(notes_from(0));
     items.push(raw(500, 0, F1, 1));
     items.push(raw(520, 0, F1, 0));
@@ -549,7 +549,7 @@ fn a_quit_before_the_commit_saves_the_capture_and_leaves_without_a_result() {
 fn a_quit_while_waiting_keeps_the_cancelled_opening_and_its_input() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let mut items = vec![connect(0), raw(-300, 0, Q, 1)];
+    let mut items = vec![connect(0), raw(-300, 0, E, 1)];
     items.extend(tap(4, 0));
     let report = s.play(script(items, &[(300, Command::Quit)])).unwrap();
 
@@ -563,7 +563,7 @@ fn a_quit_while_waiting_keeps_the_cancelled_opening_and_its_input() {
     let l4 = code(4).0;
     assert_eq!(
         lane_events(&r.history.events),
-        vec![(-300, Q.0, 1), (0, l4, 1), (40, l4, 0)]
+        vec![(-300, E.0, 1), (0, l4, 1), (40, l4, 0)]
     );
     assert_eq!(bgm_starts(&mut s), 0);
 }
@@ -653,7 +653,7 @@ fn a_hold_before_the_opening_defers_it_to_its_release() {
 fn a_close_while_deferred_opens_nothing_and_saves_nothing() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let items = vec![connect(0), raw(-2_000, 0, Q, 1)];
+    let items = vec![connect(0), raw(-2_000, 0, E, 1)];
     let report = s.play_until(script(items, &[]), Some(TimeUs(0))).unwrap();
     assert!(report.is_none());
 }
@@ -664,13 +664,13 @@ fn a_device_removed_and_reconnected_across_a_rearm_keeps_its_source_id() {
     let mut s = session(&root, &Events::default());
     // Two keyboards; START held on keyboard 0; keyboard 1 removed and
     // connected again while waiting; START released.
-    let mut items = vec![connect(0), connect(1), raw(-300, 0, Q, 1)];
+    let mut items = vec![connect(0), connect(1), raw(-300, 0, E, 1)];
     items.push(item(-100 * MS, Action::Disconnect(DeviceId(1))));
     items.push(item(
         -50 * MS,
         Action::Connect(DeviceId(1), DeviceKind::Keyboard),
     ));
-    items.push(raw(100, 0, Q, 0));
+    items.push(raw(100, 0, E, 0));
     items.extend(notes_from(1_100));
     let report = s.play(script(items, &[])).unwrap();
 
@@ -747,14 +747,14 @@ fn a_history_run_out_while_waiting_ends_the_attempt() {
         },
     );
     // START held; 17 keyboards arrive while waiting; START released.
-    let mut items = vec![connect(0), raw(-300, 0, Q, 1)];
+    let mut items = vec![connect(0), raw(-300, 0, E, 1)];
     for d in 1..=17_i64 {
         items.push(item(
             (-250 + d) * MS,
             Action::Connect(DeviceId(d.unsigned_abs()), DeviceKind::Keyboard),
         ));
     }
-    items.push(raw(0, 0, Q, 0));
+    items.push(raw(0, 0, E, 0));
     items.extend(notes_from(1_000));
     let report = s.play(script(items, &[])).unwrap();
 
@@ -1018,7 +1018,7 @@ fn a_failure_after_the_committing_block_leaves_a_played_attempt() {
 fn a_quit_at_the_release_of_a_deferred_opening_leaves_before_it_opens() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let items = vec![connect(0), raw(-2_000, 0, Q, 1), raw(-600, 0, Q, 0)];
+    let items = vec![connect(0), raw(-2_000, 0, E, 1), raw(-600, 0, E, 0)];
     let ran = s.play(script(
         items,
         &[(-600, Command::Retry), (-600, Command::Quit)],
@@ -1033,7 +1033,7 @@ fn a_quit_at_the_release_of_a_deferred_opening_leaves_before_it_opens() {
 fn a_quit_while_the_opening_is_deferred_plays_nothing() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let items = vec![connect(0), raw(-2_000, 0, Q, 1)];
+    let items = vec![connect(0), raw(-2_000, 0, E, 1)];
     let ran = s.play(script(items, &[(-500, Command::Quit)]));
     assert!(matches!(ran, Err(game::SessionPlayError::Left)), "{ran:?}");
 }
@@ -1142,7 +1142,7 @@ fn a_practice_round_commits_at_its_lead_in_start() {
     // Held after the commit, through the section's start: ordinary.
     let (_dir, root) = temp_root();
     let mut s = round(&root);
-    let mut items = vec![connect(0), raw(8_050, 0, Q, 1), raw(10_500, 0, Q, 0)];
+    let mut items = vec![connect(0), raw(8_050, 0, E, 1), raw(10_500, 0, E, 0)];
     items.extend(notes(0));
     let report = s.play(script(items, &[])).unwrap();
     let r = record(&report);
@@ -1155,7 +1155,7 @@ fn a_practice_round_commits_at_its_lead_in_start() {
     // opens there, its lead-in starting 200 ms later, its chart 400 ms on.
     let (_dir, root) = temp_root();
     let mut s = round(&root);
-    let mut items = vec![connect(0), raw(7_950, 0, Q, 1), raw(8_200, 0, Q, 0)];
+    let mut items = vec![connect(0), raw(7_950, 0, E, 1), raw(8_200, 0, E, 0)];
     items.extend(notes(400));
     let report = s.play(script(items, &[])).unwrap();
     let r = record(&report);
@@ -1172,14 +1172,14 @@ fn a_practice_round_commits_at_its_lead_in_start() {
 fn a_withdrawn_attempt_re_solves_with_a_new_epoch() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &Events::default());
-    let items = vec![connect(0), raw(-2_000, 0, Q, 1)];
+    let items = vec![connect(0), raw(-2_000, 0, E, 1)];
     let ran = s.play(script(items, &[(-500, Command::Quit)]));
     assert!(matches!(ran, Err(game::SessionPlayError::Left)), "{ran:?}");
     let first = s.presentation().unwrap().epoch;
     let driver = s.adjustments().unwrap();
     assert_eq!((driver.active(), driver.has_pending()), (None, false));
-    // Q released before the next opening.
-    let mut items = vec![raw(-1_500, 0, Q, 0)];
+    // E released before the next opening.
+    let mut items = vec![raw(-1_500, 0, E, 0)];
     items.extend(notes_from(0));
     let played = s.play(script(items, &[])).unwrap();
     assert!(played.played());

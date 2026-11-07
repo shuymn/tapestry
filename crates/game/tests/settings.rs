@@ -1290,7 +1290,7 @@ fn a_colliding_device_toml_is_refused_at_load() {
             "device.toml: keyboard key config: control 0xe is bound to both retry and SELECT",
         ),
         (
-            with(|d| d.keyboard.aux_positive = Some(0x10)),
+            with(|d| d.keyboard.aux_positive = Some(0x12)),
             "bound to both START and the auxiliary positive key",
         ),
         (

@@ -696,10 +696,11 @@ impl Default for DeviceSettings {
                 // Backspace retries and Escape quits.
                 retry: Some(0x0e),
                 quit: Some(0x01),
-                // START on Q, SELECT on W, the auxiliary keys on Up and
+                // START on E, SELECT on W, the auxiliary keys on Up and
                 // Down, and the scratch key as the scratch's positive
-                // direction.
-                start: Some(0x10),
+                // direction. E is no lane, menu, reserved, retry or quit
+                // key, and leaves Q free for a quit key.
+                start: Some(0x12),
                 select: Some(0x11),
                 aux_negative: Some(0xE048),
                 aux_positive: Some(0xE050),

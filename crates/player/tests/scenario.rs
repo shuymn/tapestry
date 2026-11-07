@@ -2120,7 +2120,7 @@ fn write_text_chart(fx: &Fixture, name: &str, text: &str) -> bms_model::Chart {
 /// only if the rearm started it over.
 #[test]
 fn a_play_skin_reads_the_recent_timing() {
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     let fx = Fixture::new();
     let chart = write_text_chart(&fx, "t", TIMING_CHART);
     let rearm_chart = write_text_chart(&fx, "r", REARM_CHART);
@@ -2149,7 +2149,7 @@ fn a_play_skin_reads_the_recent_timing() {
         received: TimeUs(ms * 1_000),
         source: eval::SourceId(0),
         kind: eval::InputKind::Control {
-            control: eval::ControlId(Q),
+            control: eval::ControlId(E),
             value,
         },
     };
