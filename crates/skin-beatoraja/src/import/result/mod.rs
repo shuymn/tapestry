@@ -9,7 +9,9 @@
 //! visibility reads option 90 or 91 or that shows image index or number
 //! 370. A skin without either is refused ([`ImportError::Essential`]); an
 //! element showing the EX score or the clear type that cannot be
-//! reproduced refuses it too, and any other is dropped with a note.
+//! reproduced refuses it too, and any other is dropped with a note: one
+//! that only reads option 90 or 91 in its visibility is the status when
+//! retained, and dropped with a note otherwise.
 //!
 //! The graphs the result draws (`gaugegraph`, `judgegraph`,
 //! `timingdistributiongraph`) are later widgets: dropped with a note until

@@ -520,6 +520,37 @@ fn an_image_set_is_not_the_score() {
     }
 }
 
+/// C16: an element that only reads option 90 in its visibility is status
+/// when retained, but dropped with a note when it cannot be reproduced
+/// (blend 9): the import refuses only when no status remains. An element
+/// showing 370 that cannot be reproduced refuses.
+#[test]
+fn a_status_condition_alone_drops_when_not_reproduced() {
+    let ex = value("ex", r#""ref": 71"#);
+    let blended = dst("lab", r#""op": [90], "blend": 9,"#);
+    let status = dst("dot", r#""op": [91],"#);
+    let r = essential(&ex, "", &(dst("ex", "") + "," + &status + "," + &blended))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::Blend(9))
+    );
+    assert_eq!(
+        refused(essential(&ex, "", &(dst("ex", "") + "," + &blended))),
+        (EssentialPart::ResultStatus, None)
+    );
+    let set = format!(r#"{{"id": "clr", "ref": 370, "images": {CLEAR_SET}}}"#);
+    assert_eq!(
+        refused(essential(
+            &ex,
+            &set,
+            &(dst("ex", "") + "," + &status + "," + &dst("clr", r#""blend": 9,"#))
+        )),
+        (EssentialPart::ResultStatus, Some(NoteKind::Blend(9)))
+    );
+}
+
 /// C16 on the Lua path: an EX score read by a callback and a status read
 /// by a `draw` callback are the parts; without the score it refuses.
 #[test]
