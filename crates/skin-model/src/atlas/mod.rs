@@ -9,6 +9,10 @@
 //! its own. Texels are premultiplied before anything is filtered, so a
 //! transparent texel's colour never shows.
 //!
+//! The atlas keeps where it placed each cell, by the cell's identity, so
+//! another sheet of the same skin folder whose cells it holds is drawn from
+//! the same pages with no file read ([`Atlas::rebind`]).
+//!
 //! Building an atlas is load-stage work: it allocates and reads the files.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -17,6 +21,9 @@ mod mip;
 pub use mip::downsample_rgba;
 mod pack;
 pub(crate) mod uv;
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use ::image::RgbaImage;
 
@@ -89,7 +96,7 @@ pub struct AtlasLimits {
     pub reserved_layers: u32,
 }
 
-/// Why an atlas was not built.
+/// Why an atlas was not built or rebound.
 #[derive(Debug, thiserror::Error)]
 pub enum AtlasError {
     #[error("the atlas limits leave no layer, a side below {MIN_PAGE_SIDE} or a layer past u16")]
@@ -104,6 +111,10 @@ pub enum AtlasError {
     AtlasAlloc,
     #[error("the packer placed a frame off the alignment")]
     Misaligned,
+    /// A rebind's sheet has a cell the atlas does not hold, or another
+    /// skin folder, variant or text layer ([`Atlas::rebind`]).
+    #[error("the atlas does not hold the sheet's cells for its folder, variant and text layer")]
+    NotHeld,
     #[error(transparent)]
     Image(#[from] ImageError),
     /// The build was cancelled: neither a file's failure nor a limit.
@@ -134,25 +145,62 @@ impl Page {
     }
 }
 
-/// A sheet's atlas for one variant.
-#[derive(Clone, Debug)]
-pub struct Atlas {
+/// An atlas's pages with where it placed each cell: what every atlas
+/// rebound from it shares ([`Atlas::rebind`]).
+#[derive(Debug)]
+pub struct PackedPages {
     side: u32,
     pages: Vec<Page>,
-    uvs: UvTable,
     variant: Variant,
     text_layer: Option<u16>,
+    /// The layers kept before the pages when they were packed
+    /// ([`AtlasLimits::reserved_layers`]): page `i` is layer
+    /// `reserved_layers + i`.
+    reserved_layers: u32,
+    /// The skin folder the files were read from.
+    root: PathBuf,
+    /// The files read, by their admitted identity (the version the
+    /// variant reads: its name in the skin folder and what its header gave
+    /// at load), ordered by name.
+    files: Box<[image::Version]>,
+    /// Every cell placed, ordered by its source and rectangle.
+    cells: Box<[HeldCell]>,
 }
 
-impl Atlas {
-    /// The layer kept for rasterized text, after the pages, if the atlas
-    /// has one ([`Sheet::atlas_reserving`]). It has no CPU page: the
-    /// renderer creates it zeroed and writes lines into it.
-    #[must_use]
-    pub fn text_layer(&self) -> Option<u16> {
-        self.text_layer
-    }
+/// The held files and cells of a build.
+type Held = (Box<[image::Version]>, Box<[HeldCell]>);
 
+/// The index in `files`, ordered by name, of the file of `version`'s
+/// identity: its name, dimensions and decode mode.
+fn held_file(files: &[image::Version], version: &image::Version) -> Option<u32> {
+    let from = files.partition_point(|f| f.name.as_str() < version.name.as_str());
+    let i = files
+        .get(from..)?
+        .iter()
+        .take_while(|f| f.name == version.name)
+        .position(|f| f == version)?;
+    u32::try_from(from + i).ok()
+}
+
+/// A cell placed: its source (a file as an index into the held files, or
+/// a generated colour), its rectangle in the texels of the version read
+/// (`[0, 0, w, h]` for a generated cell), and where its content lies.
+#[derive(Clone, Copy, Debug)]
+struct HeldCell {
+    source: CellSource,
+    rect: [u32; 4],
+    /// The content's left and top on its page, past the gutter.
+    at: [u32; 2],
+    layer: u16,
+}
+
+impl HeldCell {
+    fn key(&self) -> (CellSource, [u32; 4]) {
+        (self.source, self.rect)
+    }
+}
+
+impl PackedPages {
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -165,9 +213,10 @@ impl Atlas {
         &self.pages
     }
 
+    /// The layer kept for rasterized text, after the pages, if any.
     #[must_use]
-    pub fn uvs(&self) -> &UvTable {
-        &self.uvs
+    pub fn text_layer(&self) -> Option<u16> {
+        self.text_layer
     }
 
     #[must_use]
@@ -175,10 +224,152 @@ impl Atlas {
         self.variant
     }
 
-    /// The pages, to upload and drop, and the uv table, to keep.
+    /// The layers kept before the pages when they were packed: page `i`
+    /// is layer `reserved_layers + i`, whichever frames a table uses.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<Page>, UvTable) {
+    pub fn reserved_layers(&self) -> u32 {
+        self.reserved_layers
+    }
+
+    /// The bytes the placements keep beside the pages: every held cell
+    /// and every held file with its name.
+    #[must_use]
+    pub fn placement_bytes(&self) -> u64 {
+        let names: usize = self.files.iter().map(|f| f.name.capacity()).sum();
+        u64::try_from(size_of_val(&*self.cells) + size_of_val(&*self.files) + names)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// `sheet`'s uv table on these pages: one entry per frame, in the
+    /// sheet's frame order, each its cell's placement. O(frames + cells
+    /// log cells); it reads no file.
+    fn uvs_for(&self, sheet: &Sheet, variant: Variant, text: bool) -> Result<UvTable, AtlasError> {
+        if variant != self.variant
+            || text != self.text_layer.is_some()
+            || sheet.root() != self.root.as_path()
+        {
+            return Err(AtlasError::NotHeld);
+        }
+        let files = sheet.files();
+        let mut held = Vec::with_capacity(sheet.cells().len());
+        for cell in sheet.cells() {
+            let key = match cell.source {
+                CellSource::File(f) => {
+                    let (version, hi) = usize::try_from(f)
+                        .ok()
+                        .and_then(|f| files.get(f))
+                        .ok_or(AtlasError::NotHeld)?
+                        .version(variant);
+                    let file = held_file(&self.files, version).ok_or(AtlasError::NotHeld)?;
+                    let rect = if hi {
+                        cell.rect.map(|v| v * 2)
+                    } else {
+                        cell.rect
+                    };
+                    (CellSource::File(file), rect)
+                }
+                CellSource::Solid(_) => (cell.source, cell.rect),
+            };
+            let i = self
+                .cells
+                .binary_search_by(|h| h.key().cmp(&key))
+                .map_err(|_| AtlasError::NotHeld)?;
+            held.push(i);
+        }
+        let to_uv = |v: u32| v as f32 / self.side as f32;
+        let mut frames = Vec::with_capacity(sheet.frames().len());
+        for &cell in sheet.frames() {
+            let Some(c) = usize::try_from(cell)
+                .ok()
+                .and_then(|c| held.get(c))
+                .and_then(|&h| self.cells.get(h))
+            else {
+                return Err(AtlasError::NotHeld);
+            };
+            let ([x, y], [_, _, w, h]) = (c.at, c.rect);
+            frames.push(FrameUv {
+                uv: [to_uv(x), to_uv(y), to_uv(x + w), to_uv(y + h)],
+                layer: c.layer,
+            });
+        }
+        Ok(UvTable::new(sheet.id(), frames.into_boxed_slice()))
+    }
+}
+
+/// A sheet's atlas for one variant: its pages, shared, and the uv table of
+/// the sheet it was built from or rebound to.
+#[derive(Clone, Debug)]
+pub struct Atlas {
+    pages: Arc<PackedPages>,
+    uvs: UvTable,
+}
+
+impl Atlas {
+    /// The layer kept for rasterized text, after the pages, if the atlas
+    /// has one ([`Sheet::atlas_reserving`]). It has no CPU page: the
+    /// renderer creates it zeroed and writes lines into it.
+    #[must_use]
+    pub fn text_layer(&self) -> Option<u16> {
+        self.pages.text_layer
+    }
+
+    /// Every page's side at level 0.
+    #[must_use]
+    pub fn side(&self) -> u32 {
+        self.pages.side
+    }
+
+    /// The skin's pages; page `i` is layer `reserved_layers + i`.
+    #[must_use]
+    pub fn pages(&self) -> &[Page] {
+        &self.pages.pages
+    }
+
+    /// The pages with their placements, shared with every atlas rebound
+    /// from this one.
+    #[must_use]
+    pub fn shared_pages(&self) -> &Arc<PackedPages> {
+        &self.pages
+    }
+
+    #[must_use]
+    pub fn uvs(&self) -> &UvTable {
+        &self.uvs
+    }
+
+    #[must_use]
+    pub fn variant(&self) -> Variant {
+        self.pages.variant
+    }
+
+    /// The shared pages, to upload, and the uv table, to keep.
+    #[must_use]
+    pub fn into_parts(self) -> (Arc<PackedPages>, UvTable) {
         (self.pages, self.uvs)
+    }
+
+    /// The same pages with `sheet`'s uv table, made from the placements
+    /// kept with them, with no file read and no pixel decoded: one entry
+    /// per frame of `sheet`, in its frame order, each its cell's
+    /// placement, under `sheet`'s id. A cell is held when a cell of the
+    /// same identity was packed: the same file, by its name in the skin
+    /// folder in the version `variant` reads and the header admission
+    /// recorded, and the same rectangle; or the same generated colour and
+    /// size. `sheet` may use any subset of the cells, on any of the pages.
+    /// Load-stage work: it allocates the table.
+    ///
+    /// # Errors
+    ///
+    /// [`AtlasError::NotHeld`] when `sheet` is of another skin folder,
+    /// `variant` or `text` (whether a text layer is kept,
+    /// [`Sheet::atlas_reserving`]) is not the atlas's, or a cell of
+    /// `sheet` is not held.
+    pub fn rebind(&self, sheet: &Sheet, variant: Variant, text: bool) -> Result<Self, AtlasError> {
+        let uvs = self.pages.uvs_for(sheet, variant, text)?;
+        Ok(Self {
+            pages: Arc::clone(&self.pages),
+            uvs,
+        })
     }
 }
 
@@ -346,35 +537,88 @@ impl Sheet {
             }
         }
 
-        let to_uv = |v: u32| v as f32 / side as f32;
-        let mut frames = Vec::with_capacity(self.frames().len());
-        for &cell in self.frames() {
-            let i = usize::try_from(cell).unwrap_or(usize::MAX);
-            let (Some(place), Some(&[_, _, w, h])) = (packing.places.get(i), rects.get(i)) else {
-                return Err(AtlasError::Misaligned);
-            };
-            let [x, y, ..] = place.alloc;
-            let (x, y) = (x + GUTTER, y + GUTTER);
-            let layer = u16::try_from(limits.reserved_layers + place.page)
-                .map_err(|_| AtlasError::Limits)?;
-            frames.push(FrameUv {
-                uv: [to_uv(x), to_uv(y), to_uv(x + w), to_uv(y + h)],
-                layer,
-            });
-        }
         let text_layer = if text {
             let layer = limits.reserved_layers + packing.pages;
             Some(u16::try_from(layer).map_err(|_| AtlasError::Limits)?)
         } else {
             None
         };
-        Ok(Atlas {
+        // The placements are made only once every file is read and freed.
+        let (files, cells) = self.held(variant, limits.reserved_layers, &rects, &packing)?;
+        drop((rects, packing));
+        let pages = PackedPages {
             side,
             pages,
-            uvs: UvTable::new(self.id(), frames.into_boxed_slice()),
             variant,
             text_layer,
+            reserved_layers: limits.reserved_layers,
+            root: self.root().to_path_buf(),
+            files,
+            cells,
+        };
+        // The sheet's own table is a rebind to the pages it just filled.
+        let uvs = pages
+            .uvs_for(self, variant, text)
+            .map_err(|_| AtlasError::Misaligned)?;
+        Ok(Atlas {
+            pages: Arc::new(pages),
+            uvs,
         })
+    }
+
+    /// The held files and cells of a packing: each cell's identity, its
+    /// rectangle in the version read and its place, ordered for lookup.
+    fn held(
+        &self,
+        variant: Variant,
+        reserved: u32,
+        rects: &[[u32; 4]],
+        packing: &pack::Packing,
+    ) -> Result<Held, AtlasError> {
+        let identity = |file: u32| {
+            let (version, _) = self
+                .files()
+                .get(usize::try_from(file).ok()?)?
+                .version(variant);
+            Some(version)
+        };
+        // File cells are grouped by file ([`CellSource`]'s order).
+        let mut files: Vec<image::Version> = Vec::new();
+        let mut last = None;
+        for cell in self.cells() {
+            if let CellSource::File(f) = cell.source
+                && last != Some(f)
+            {
+                last = Some(f);
+                files.push(identity(f).ok_or(AtlasError::Misaligned)?.clone());
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        files.dedup();
+        let files = files.into_boxed_slice();
+        let index = |file: u32| held_file(&files, identity(file)?);
+        let mut cells = Vec::with_capacity(self.cells().len());
+        for (i, cell) in self.cells().iter().enumerate() {
+            let (Some(place), Some(&rect)) = (packing.places.get(i), rects.get(i)) else {
+                return Err(AtlasError::Misaligned);
+            };
+            let source = match cell.source {
+                CellSource::File(f) => CellSource::File(index(f).ok_or(AtlasError::Misaligned)?),
+                CellSource::Solid(_) => cell.source,
+            };
+            let [x, y, ..] = place.alloc;
+            cells.push(HeldCell {
+                source,
+                rect,
+                at: [x + GUTTER, y + GUTTER],
+                layer: u16::try_from(reserved + place.page).map_err(|_| AtlasError::Limits)?,
+            });
+        }
+        // Two files of one identity are one file: a rectangle of both is
+        // looked up once, at the first placement.
+        cells.sort_by_key(HeldCell::key);
+        cells.dedup_by_key(|c| c.key());
+        Ok((files, cells.into_boxed_slice()))
     }
 
     /// Reads each file with cells, in file order, and writes its cells;
