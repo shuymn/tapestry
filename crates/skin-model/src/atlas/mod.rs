@@ -24,6 +24,7 @@ pub(crate) mod uv;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ::image::RgbaImage;
 
@@ -144,10 +145,22 @@ impl Page {
     }
 }
 
+/// The identity of one atlas build's pages ([`PackedPages::id`]): a
+/// serial number given when they are packed, kept by every `Arc` of them
+/// and by every atlas rebound to them, never given to another build in the
+/// process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AtlasId(u64);
+
+/// The next pages' identity.
+static NEXT_PAGES: AtomicU64 = AtomicU64::new(0);
+
 /// An atlas's pages with where it placed each cell: what every atlas
 /// rebound from it shares ([`Atlas::rebind`]).
 #[derive(Debug)]
 pub struct PackedPages {
+    /// Their identity among the process's builds.
+    id: AtlasId,
     side: u32,
     pages: Vec<Page>,
     variant: Variant,
@@ -200,6 +213,13 @@ impl HeldCell {
 }
 
 impl PackedPages {
+    /// Their identity: the same for every `Arc` of these pages and every
+    /// atlas rebound to them, another for each build.
+    #[must_use]
+    pub fn id(&self) -> AtlasId {
+        self.id
+    }
+
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -546,6 +566,7 @@ impl Sheet {
         let (files, cells) = self.held(variant, limits.reserved_layers, &rects, &packing)?;
         drop((rects, packing));
         let pages = PackedPages {
+            id: AtlasId(NEXT_PAGES.fetch_add(1, Ordering::Relaxed)),
             side,
             pages,
             variant,
