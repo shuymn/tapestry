@@ -2350,3 +2350,84 @@ fn a_play_skin_reads_the_recent_timing() {
     }
     println!("captures that showed a judgment: {judged}");
 }
+
+/// The S10-09i design's Q1 and Q2 through the real flow: a Lua result
+/// skin that reads numbers 154 and 178 while it loads is laid out for the
+/// own view once its best is compared (the request takes the compared best),
+/// on each play's result; and the result skin settles once for each
+/// leaving command the result acts on, a retry and a back, never on
+/// taking a command alone.
+#[test]
+fn the_result_layout_takes_the_compared_best() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let skin = fx.base.join("result");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("s.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels: Vec<u8> = (0..64 * 16).flat_map(|_| [9, 9, 9, 255]).collect();
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+    fs::write(
+        skin.join("result.luaskin"),
+        "local skin = { type = 7, name = \"r\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         local nr = ms.number(154)\n\
+         local y = 300\n\
+         if ms.number(178) == 0 then y = 400 end\n\
+         skin.source = { { id = \"s\", path = \"s.png\" } }\n\
+         skin.image = { { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }\n\
+         skin.value = { { id = \"ex\", src = \"s\", x = 0, y = 8, w = 40, h = 8, divx = 10, digit = 4, ref = 71 } }\n\
+         skin.destination = { { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },\n\
+           { id = \"dot\", op = { 90 }, dst = { { x = 0, y = y, w = 8, h = 8 } } } }\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.result]\nroot = '{}'\nentry = 'result.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"retry\"",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let skins = lines(&stdout, "skin: result:");
+    assert!(
+        skins
+            .first()
+            .is_some_and(|l| l.starts_with("skin: result: pending")),
+        "{stdout}"
+    );
+    // Each play's P asked for its layout once, with the best compared: an
+    // autoplay counts no best, so the comparison gives "unavailable"; a
+    // request before the comparison would see none.
+    assert_eq!(
+        lines(&stdout, "dev: result layout requested: "),
+        [
+            "dev: result layout requested: best unavailable",
+            "dev: result layout requested: best unavailable"
+        ],
+        "{stdout}"
+    );
+    // One settle for each leaving command acted on, none withdrawn.
+    assert_eq!(
+        lines(&stdout, "dev: result skin settled: "),
+        [
+            "dev: result skin settled: accepted",
+            "dev: result skin settled: accepted"
+        ],
+        "{stdout}"
+    );
+}

@@ -3251,6 +3251,8 @@ impl game::RecordSink for BlockedLookup {
 #[test]
 fn a_fresh_command_during_the_best_read_withdraws_the_result() {
     for case in ["back", "quit", "retry"] {
+        // (The S10-09i design's Q1: no layout is asked for, and the rig's
+        // withdrawal runs once; asserted below.)
         let mut rig = Fake::new(Vec::new(), &[(LEAVE_AT, Command::Quit)], i64::MAX);
         let pressed = std::sync::Arc::clone(&rig.pressed);
         let menu = std::sync::Arc::clone(&rig.menu_pressed);
@@ -3296,6 +3298,9 @@ fn a_fresh_command_during_the_best_read_withdraws_the_result() {
         assert!(!result_of(&events, 1), "{case}");
         assert_eq!(withdrawn(&rig), 1, "{case}");
         assert_eq!(rig.withdraw_calls, 1, "{case}");
+        // The withdrawn play's layout is never asked for; a retry's next
+        // play asks for its own.
+        assert_eq!(rig.compared, usize::from(case == "retry"), "{case}");
         if case == "retry" {
             assert_eq!(rig.reports.len(), 2);
             assert_eq!(rig.shows, 1);

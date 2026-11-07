@@ -921,6 +921,8 @@ impl Rig for PlayerRig<'_> {
     fn withdraw_result(&mut self) {
         let controls = self.controls;
         self.result_skin.settle(|| controls.quitting());
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result skin settled: withdrawn");
     }
 
     /// A leaving command the Result state acts on cancels a switch's
@@ -928,6 +930,8 @@ impl Rig for PlayerRig<'_> {
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
         let controls = self.controls;
         self.result_skin.settle(|| controls.quitting());
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result skin settled: accepted");
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1008,9 +1012,6 @@ impl Rig for PlayerRig<'_> {
     /// gauge descriptor is replaced from the preset the play refreshed,
     /// with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
-        // A retry from the result waits for its layout job's cancellation.
-        let controls = self.controls;
-        self.result_skin.settle(|| controls.quitting());
         self.result_skin.next_attempt();
         let skin = match self.attempt_skin(loaded) {
             Ok(skin) => skin,
@@ -1508,6 +1509,19 @@ impl Rig for PlayerRig<'_> {
     /// P: the own view's layout, asked for once its best is compared, with
     /// the view's final facts (design D11; the S10-09i design's Q1).
     fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
+        // The own view's best as the request takes it (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        {
+            let best = match screen.status() {
+                game::ViewStatus::Ready(s) => match s.best {
+                    None => "none",
+                    Some(game::BestCompare::Unavailable) => "unavailable",
+                    Some(game::BestCompare::Known(_)) => "known",
+                },
+                _ => "no view",
+            };
+            println!("dev: result layout requested: best {best}");
+        }
         if let Some(chart) = self.result_chart {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
