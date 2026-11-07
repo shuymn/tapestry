@@ -813,7 +813,7 @@ pub fn run_chart<R: Rig>(
         }
         let mut screen =
             ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
-        match prepare_result(rig, &report, &screen) {
+        match prepare_result(rig, &report, &screen)? {
             Prepared::Ready => {}
             Prepared::Retry => continue,
             Prepared::Leave => return leave(rig),
@@ -895,14 +895,25 @@ enum Prepared {
 /// either dropping the preparation unfinished, with the commands queued
 /// behind it; a preset step is dropped, since the result opens on the
 /// played preset; a close leaves. A command taken during the poll that
-/// found it ready is still served before the result shows.
-fn prepare_result<R: Rig>(rig: &mut R, report: &PlayReport, screen: &ResultScreen) -> Prepared {
+/// found it ready is still served before the result shows. A screen that
+/// failed meanwhile is built again, acknowledged, between polls, as on the
+/// result, so the result never shows on a failed screen.
+///
+/// # Errors
+///
+/// [`LiveError::Screen`] when the failed screen cannot be built again,
+/// which ends the run.
+fn prepare_result<R: Rig>(
+    rig: &mut R,
+    report: &PlayReport,
+    screen: &ResultScreen,
+) -> Result<Prepared, LiveError<R::ScreenError>> {
     let mut prep = rig.begin_result(report, screen);
     loop {
         let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
         let polled = rig.poll_result(&mut prep, deadline);
         if rig.quitting() {
-            return Prepared::Leave;
+            return Ok(Prepared::Leave);
         }
         while let Some(c) = rig.take_menu() {
             let withdrawn = match c {
@@ -911,10 +922,13 @@ fn prepare_result<R: Rig>(rig: &mut R, report: &PlayReport, screen: &ResultScree
                 MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
             };
             while rig.take_menu().is_some() {}
-            return withdrawn;
+            return Ok(withdrawn);
+        }
+        if rig.screen_failed() {
+            rig.prepare_screen().map_err(LiveError::Screen)?;
         }
         if polled == Polled::Ready {
-            return Prepared::Ready;
+            return Ok(Prepared::Ready);
         }
     }
 }

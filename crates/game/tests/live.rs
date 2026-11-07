@@ -230,16 +230,31 @@ struct Fake {
     /// While set and not released, each result preparation stays pending,
     /// each poll one wait.
     prep_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// A command pressed during the next preparation's first poll.
-    in_first_poll: Option<Command>,
+    /// What happens during the next preparation's first poll.
+    in_first_poll: Option<FirstPoll>,
     /// Each preparation begun, with its clock time.
     preps: Vec<i64>,
+    /// Each poll of a preparation: the clock time and its deadline.
+    poll_deadlines: Vec<(i64, i64)>,
+    /// The clock time of each screen preparation.
+    screen_at: Vec<i64>,
     /// Preparations dropped unfinished.
     withdrawn: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Result commands pressed from another thread, as the window's keys:
     /// those pressed before a preparation begins are dropped there, as the
     /// player's result input drops what was queued before the result.
     menu_pressed: std::sync::Arc<std::sync::Mutex<Vec<game::MenuCommand>>>,
+}
+
+/// What happens during a preparation's first poll ([`Fake::in_first_poll`]).
+#[derive(Clone, Copy, Debug)]
+enum FirstPoll {
+    /// This in-play command is pressed.
+    Command(Command),
+    /// This result command is pressed.
+    Menu(game::MenuCommand),
+    /// The window closes.
+    Close,
 }
 
 /// [`Fake`]'s result preparation: dropped before it was found ready, it
@@ -337,6 +352,8 @@ impl Fake {
             disconnected_at: i64::MAX,
             prep_gate: None,
             in_first_poll: None,
+            poll_deadlines: Vec::new(),
+            screen_at: Vec::new(),
             preps: Vec::new(),
             withdrawn: std::sync::Arc::default(),
             menu_pressed: std::sync::Arc::default(),
@@ -434,6 +451,7 @@ impl Rig for Fake {
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
         self.steps.push("screen");
+        self.screen_at.push(self.clock.now().0);
         self.prepares += 1;
         if self.quit_in_prepare {
             // The window closes while the screen gets ready.
@@ -728,12 +746,16 @@ impl Rig for Fake {
         }
     }
 
-    fn poll_result(&mut self, prep: &mut FakePrep, _deadline: TimeUs) -> game::Polled {
+    fn poll_result(&mut self, prep: &mut FakePrep, deadline: TimeUs) -> game::Polled {
         prep.polls += 1;
-        if prep.polls == 1
-            && let Some(c) = self.in_first_poll.take()
-        {
-            self.commands.push((i64::MIN, c));
+        self.poll_deadlines.push((self.clock.now().0, deadline.0));
+        if prep.polls == 1 {
+            match self.in_first_poll.take() {
+                Some(FirstPoll::Command(c)) => self.commands.push((i64::MIN, c)),
+                Some(FirstPoll::Menu(c)) => self.menu.push((i64::MIN, c)),
+                Some(FirstPoll::Close) => self.quitting = true,
+                None => {}
+            }
         }
         let held = self
             .prep_gate
@@ -2936,6 +2958,18 @@ fn with_blocked_save(
     rig: &mut Fake,
     during_save: impl FnOnce() + Send,
 ) -> (game::Leave, Vec<SessionEvent>) {
+    let (left, events) = try_with_blocked_save(rig, during_save);
+    (left.unwrap(), events)
+}
+
+/// [`with_blocked_save`], the run's error kept.
+fn try_with_blocked_save(
+    rig: &mut Fake,
+    during_save: impl FnOnce() + Send,
+) -> (
+    Result<game::Leave, LiveError<SurfaceLost>>,
+    Vec<SessionEvent>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let events = Events::default();
     let (began, saving) = std::sync::mpsc::sync_channel(0);
@@ -2966,7 +3000,7 @@ fn with_blocked_save(
                 ..p
             },
         );
-        let left = game::live::run_chart(&mut loaded, rig).unwrap();
+        let left = game::live::run_chart(&mut loaded, rig);
         (left, events.all())
     })
 }
@@ -3107,15 +3141,86 @@ fn a_fresh_command_during_the_preparation_withdraws_it() {
 /// never shown.
 #[test]
 fn a_command_during_the_ready_poll_is_served_before_the_result() {
-    for (pressed, plays) in [(Command::Quit, 1), (Command::Retry, 2)] {
+    for (pressed, plays, leave) in [
+        (FirstPoll::Command(Command::Quit), 1, game::Leave::Back),
+        (FirstPoll::Command(Command::Retry), 2, game::Leave::Back),
+        (
+            FirstPoll::Menu(game::MenuCommand::Back),
+            1,
+            game::Leave::Back,
+        ),
+        (FirstPoll::Close, 1, game::Leave::Quit),
+    ] {
         let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
         rig.in_first_poll = Some(pressed);
         let (left, events) = with_blocked_save(&mut rig, || {});
-        assert_eq!(left, game::Leave::Back, "{pressed:?}");
+        assert_eq!(left, leave, "{pressed:?}");
         assert_eq!(rig.reports.len(), plays, "{pressed:?}");
+        assert!(saved(&rig.reports[0]), "{pressed:?}");
         assert!(!result_of(&events, 1), "{pressed:?}");
         assert_eq!(rig.shows, plays - 1, "{pressed:?}");
         assert_eq!(result_of(&events, 2), plays == 2, "{pressed:?}");
+    }
+}
+
+/// Closing the window while the preparation is pending withdraws it and
+/// ends the run, the play saved and no result shown.
+#[test]
+fn a_window_close_during_the_preparation_ends_the_run() {
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut rig = Fake::new(Vec::new(), &[], FRESH_AT);
+    rig.prep_gate = Some(gate);
+    let (left, events) = with_blocked_save(&mut rig, || {});
+    assert_eq!(left, game::Leave::Quit);
+    assert!(saved(&rig.reports[0]));
+    assert!(rig.preps[0] < FRESH_AT);
+    assert_eq!(withdrawn(&rig), 1);
+    assert_eq!(rig.shows, 0);
+    assert!(!result_of(&events, 1));
+    assert_eq!(rig.clock.now().0, FRESH_AT);
+}
+
+/// The screen failing while the preparation is pending is built again
+/// between polls, before the result shows on it, as on the result; a
+/// screen that cannot be built again ends the run with its error, no
+/// result shown. Each pending poll waits at most `IDLE_WAIT`.
+#[test]
+fn a_screen_failure_during_the_preparation_rebuilds_it_first() {
+    for rebuilt in [true, false] {
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut rig = Fake::new(Vec::new(), &[(LEAVE_AT, Command::Quit)], i64::MAX);
+        rig.prep_gate = Some(std::sync::Arc::clone(&gate));
+        rig.screen_fails_at = FRESH_AT;
+        if !rebuilt {
+            // The play's own preparation was the first; the next fails.
+            rig.prepare_fails_from = 2;
+        }
+        rig.at.push((
+            FRESH_AT + 10_000,
+            Box::new(move || gate.store(true, std::sync::atomic::Ordering::SeqCst)),
+        ));
+        let (left, events) = try_with_blocked_save(&mut rig, || {});
+        assert_eq!(rig.screen_at.len(), 2, "{rebuilt}");
+        let at = rig.screen_at[1];
+        assert!(
+            (FRESH_AT..FRESH_AT + 10_000).contains(&at),
+            "{rebuilt}: {at}"
+        );
+        assert!(rig.poll_deadlines.len() > 1, "{rebuilt}");
+        for &(now, deadline) in &rig.poll_deadlines {
+            assert_eq!(deadline, now + game::IDLE_WAIT.0, "{rebuilt}");
+        }
+        if rebuilt {
+            assert_eq!(left.unwrap(), game::Leave::Back);
+            assert_eq!(rig.shows, 1);
+            assert!(rig.shown_at[0] > at);
+            assert!(result_of(&events, 1));
+        } else {
+            assert!(matches!(left, Err(LiveError::Screen(SurfaceLost))));
+            assert_eq!(rig.shows, 0);
+            assert!(!result_of(&events, 1));
+        }
+        assert!(saved(&rig.reports[0]), "{rebuilt}");
     }
 }
 
