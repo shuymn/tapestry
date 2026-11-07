@@ -711,30 +711,15 @@ fn a_fitted_graph_turns_about_its_drawn_regions_pivot() {
 #[test]
 fn a_judge_graph_element_takes_no_native_size() {
     use skin_model::{Anchor, Native};
-    let dir = tempfile::tempdir().unwrap();
     let mut e = graph_support::placed_element(0, [0, 0, 10, 10], 0, Anchor::TopLeft);
     e.place.native = Some(Native::Exact([1, 1]));
-    let def = skin_model::SkinDef {
-        fit: skin_model::Fit::Fixed,
-        regions: [skin_model::RegionDef {
-            anchor: skin_model::Anchor::TopLeft,
-            optional: false,
-        }; skin_model::Region::COUNT],
-        whens: Vec::new(),
-        sheet: graph_support::sheet_builder(dir.path()).finish(),
-        lanes: None,
-        elements: vec![e],
-        widgets: skin_model::WidgetDefs::default(),
-        bomb_up_to: None,
-        close: None,
-    };
     let graphs = ResultDefs {
         judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
         ..ResultDefs::default()
     };
     assert!(matches!(
-        Skin::new_result(def, graphs),
-        Err(LoadError::JudgeGraphNative { element: 0 })
+        graph_support::load_with(vec![e], graphs),
+        Err(LoadError::GraphNative { element: 0 })
     ));
 }
 
