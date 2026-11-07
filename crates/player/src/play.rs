@@ -907,28 +907,27 @@ impl Rig for PlayerRig<'_> {
     fn take_menu(&mut self) -> Option<MenuCommand> {
         loop {
             match self.take() {
-                // A retry or a quit cancels the result's layout job and
-                // waits for its thread before it is served (D11).
-                Some(Command::Retry) => {
-                    let controls = self.controls;
-                    self.result_skin.settle(|| controls.quitting());
-                    return Some(MenuCommand::Retry);
-                }
-                Some(Command::Quit) => {
-                    let controls = self.controls;
-                    self.result_skin.settle(|| controls.quitting());
-                    return Some(MenuCommand::Back);
-                }
+                Some(Command::Retry) => return Some(MenuCommand::Retry),
+                Some(Command::Quit) => return Some(MenuCommand::Back),
                 Some(Command::Suspend) => {}
                 None => break,
             }
         }
-        let c = self.result_input.take();
-        if matches!(c, Some(MenuCommand::Retry | MenuCommand::Back)) {
-            let controls = self.controls;
-            self.result_skin.settle(|| controls.quitting());
-        }
-        c
+        self.result_input.take()
+    }
+
+    /// A withdrawn preparation cancels the result skin's layout job and
+    /// waits for its thread (design D11, "Cancellation").
+    fn withdraw_result(&mut self) {
+        let controls = self.controls;
+        self.result_skin.settle(|| controls.quitting());
+    }
+
+    /// A leaving command the Result state acts on cancels a switch's
+    /// layout job and waits for its thread before it is served (D11).
+    fn accept_leaving(&mut self, _cmd: MenuCommand) {
+        let controls = self.controls;
+        self.result_skin.settle(|| controls.quitting());
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1499,12 +1498,16 @@ impl Rig for PlayerRig<'_> {
     /// the save: what was queued during the play and the save is no
     /// result's, and what comes from here on is fresh. The built-in result
     /// needs nothing more, so the preparation is ready at once.
-    fn begin_result(&mut self, _report: &PlayReport, screen: &ResultScreen) {
+    fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
         }
-        // P: the own view's layout (design D11).
+    }
+
+    /// P: the own view's layout, asked for once its best is compared, with
+    /// the view's final facts (design D11; the S10-09i design's Q1).
+    fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
         if let Some(chart) = self.result_chart {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));

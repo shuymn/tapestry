@@ -243,6 +243,13 @@ struct Fake {
     screen_at: Vec<i64>,
     /// Preparations dropped unfinished.
     withdrawn: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The flow's withdrawals of a preparation ([`Rig::withdraw_result`]).
+    withdraw_calls: usize,
+    /// The leaving commands the Result state acted on
+    /// ([`Rig::accept_leaving`]).
+    accepted: Vec<game::MenuCommand>,
+    /// The preparations whose view was final ([`Rig::result_compared`]).
+    compared: usize,
     /// Result commands pressed from another thread, as the window's keys:
     /// those pressed before a preparation begins are dropped there, as the
     /// player's result input drops what was queued before the result.
@@ -375,6 +382,9 @@ impl Fake {
             screen_at: Vec::new(),
             preps: Vec::new(),
             withdrawn: std::sync::Arc::default(),
+            withdraw_calls: 0,
+            accepted: Vec::new(),
+            compared: 0,
             menu_pressed: std::sync::Arc::default(),
         }
     }
@@ -466,6 +476,18 @@ impl Rig for Fake {
 
     fn quitting(&self) -> bool {
         self.quitting || self.clock.now().0 >= self.quit_at
+    }
+
+    fn withdraw_result(&mut self) {
+        self.withdraw_calls += 1;
+    }
+
+    fn accept_leaving(&mut self, cmd: game::MenuCommand) {
+        self.accepted.push(cmd);
+    }
+
+    fn result_compared(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
+        self.compared += 1;
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
@@ -2006,6 +2028,16 @@ fn result_switches_presets_and_labels_what_if() {
         (11_600_000, NextPreset),
     ];
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    // Preset steps are no leaving command: the run's end leaves no
+    // command to accept.
+    assert!(
+        rig.accepted.iter().all(|c| !matches!(
+            c,
+            game::MenuCommand::NextPreset | game::MenuCommand::PrevPreset
+        )),
+        "{:?}",
+        rig.accepted
+    );
 
     let names = |s: &ResultScreen| s.entries().iter().map(|e| e.id.clone()).collect::<Vec<_>>();
     let first = shown(&rig, 10_999_000);
@@ -3064,6 +3096,9 @@ fn a_quit_during_a_blocked_save_completes_it_and_shows_the_result() {
         assert_eq!(rig.preps.len(), 1, "{case}");
         assert_eq!(rig.shows, 1, "{case}");
         assert_eq!(withdrawn(&rig), 0, "{case}");
+        assert_eq!(rig.withdraw_calls, 0, "{case}");
+        assert_eq!(rig.compared, 1, "{case}");
+        assert_eq!(rig.accepted, [game::MenuCommand::Back], "{case}");
         assert_eq!(
             events.last(),
             Some(&SessionEvent::Result { attempt: 1 }),
@@ -3137,6 +3172,7 @@ fn a_fresh_command_during_the_preparation_withdraws_it() {
         assert!(saved(&rig.reports[0]), "{case}");
         assert!(!result_of(&events, 1), "{case}");
         assert_eq!(withdrawn(&rig), 1, "{case}");
+        assert_eq!(rig.withdraw_calls, 1, "{case}");
         // The preparation began after the save and before the fresh
         // command.
         assert!(rig.preps[0] < FRESH_AT, "{case}");
@@ -3259,6 +3295,7 @@ fn a_fresh_command_during_the_best_read_withdraws_the_result() {
         assert!(saved(&rig.reports[0]), "{case}");
         assert!(!result_of(&events, 1), "{case}");
         assert_eq!(withdrawn(&rig), 1, "{case}");
+        assert_eq!(rig.withdraw_calls, 1, "{case}");
         if case == "retry" {
             assert_eq!(rig.reports.len(), 2);
             assert_eq!(rig.shows, 1);

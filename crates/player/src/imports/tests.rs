@@ -93,7 +93,7 @@ fn refuse_spawn() {
 /// time; each barrier is released when the test ends, failed or not, and
 /// the test's job threads, an abandoned one included, are waited for
 /// then, so none reaches a barrier of the next test.
-fn serial() -> Serial {
+pub(crate) fn serial() -> Serial {
     static SERIAL: Mutex<()> = Mutex::new(());
     let serial = Serial(SERIAL.lock().unwrap_or_else(PoisonError::into_inner));
     assert!(
@@ -103,7 +103,9 @@ fn serial() -> Serial {
     serial
 }
 
-struct Serial(#[expect(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
+pub(crate) struct Serial(
+    #[expect(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>,
+);
 
 impl Drop for Serial {
     fn drop(&mut self) {

@@ -118,12 +118,10 @@ fn staged(rs: &mut ResultSkin) {
     assert_eq!(rs.image_stage(chart(), || false, || false), Staged::Ready);
 }
 
-/// The builds a section counts are this thread's tests' alone: the tests
-/// that count run one at a time.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The builds and jobs a test counts are its own: these tests run one at a
+/// time with the importer's tests, which count jobs too.
+fn serial() -> crate::imports::tests::Serial {
+    crate::imports::tests::serial()
 }
 
 /// C18, C19 (a), (c): the image stage packs the probe's cells once; P and
