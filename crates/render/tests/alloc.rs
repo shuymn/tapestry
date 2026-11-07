@@ -513,11 +513,11 @@ fn frames_do_not_allocate_from_the_first() {
 
 /// A result skin of two solid cells in `dir`, drawing `elements` (image,
 /// left edge) as full-height bands on the screen timer.
-fn result_skin(dir: &std::path::Path, elements: &[(u32, i32)]) -> skin_model::Skin {
+fn result_skin(dir: &std::path::Path, elements: &[(u32, i32)], texts: usize) -> skin_model::Skin {
     use skin_model::{
-        Anchor, Ease, ElementDef, End, Filter, Fit, KeyDef, Place, Region, RegionDef, ResultDefs,
-        Root, SheetBuilder, SkinDef, SolidImageDef, Source, TimerRef, Track, WidgetDefs,
-        result_timer,
+        Align, Anchor, Ease, ElementDef, End, Filter, Fit, FontRef, KeyDef, Overflow, Place,
+        Region, RegionDef, ResultDefs, Root, SheetBuilder, SkinDef, SolidImageDef, Source, TextDef,
+        TextField, TextValue, TimerRef, Track, WidgetDefs, result_timer,
     };
     let mut b = SheetBuilder::new(&Root::new(dir).unwrap());
     for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
@@ -567,13 +567,36 @@ fn result_skin(dir: &std::path::Path, elements: &[(u32, i32)]) -> skin_model::Sk
         bomb_up_to: None,
         close: None,
     };
+    let mut def = def;
+    for k in 0..texts {
+        def.widgets.texts.push(TextDef {
+            value: TextValue::Field(TextField::Title),
+            font: FontRef::Default,
+            align: Align::Left,
+            overflow: Overflow::Spill,
+        });
+        let mut e = def.elements[0].clone();
+        e.source = Source::Text(u32::try_from(k).unwrap());
+        def.elements.push(e);
+    }
     skin_model::Skin::new_result(def, ResultDefs::default()).unwrap()
 }
 
+/// A text producer of the stub's ([`decl_support::Text`]).
+fn stub_text() -> Arc<dyn render::AttemptText> {
+    Arc::new(decl_support::Text {
+        calls: std::sync::atomic::AtomicU32::new(0),
+        rasters: std::sync::atomic::AtomicU32::new(0),
+        refuse: std::sync::atomic::AtomicBool::new(false),
+        strings: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
 /// C11's renderer half (S10-09i): the result's commit point allocates
-/// nothing: the commit of a layout staged on the pages installed, the
-/// installation of its staged lines, and its frames with the strip at
-/// its fullest, the first after the commit included.
+/// nothing: the commit of a layout staged on the pages installed, at its
+/// text capacity, the installation of its staged lines, and its frames
+/// with the strip at its fullest, the first after the commit included; and
+/// the commit of a layout on another array.
 fn result_frames() {
     use skin_model::{
         BestView, LampKey, Layout, ResultChart, ResultFrame, ResultLabels, ResultScore,
@@ -581,13 +604,23 @@ fn result_frames() {
     };
     let mut r = offscreen(1_920, 1_080);
     let dir = tempfile::tempdir().unwrap();
-    let a = result_skin(dir.path(), &[(0, 0), (1, 1_500)]);
+    let a = result_skin(dir.path(), &[(0, 0), (1, 1_500)], 1);
     let atlas = a.atlas(Variant::Lo, r.atlas_limits(), &|| false).unwrap();
-    let b = result_skin(dir.path(), &[(1, 1_000)]);
-    let rebound = atlas.rebind(b.sheet(), Variant::Lo, false).unwrap();
+    let texts = skin_model::MAX_TEXT_ELEMENTS;
+    let b = result_skin(dir.path(), &[(1, 1_000)], texts);
+    assert_eq!(b.text_slots(), texts);
+    let rebound = atlas.rebind(b.sheet(), Variant::Lo, true).unwrap();
     let none = || ClipTable::new(Vec::new()).unwrap();
-    let a = Arc::new(render::SkinBundle::new(Arc::new(a), atlas, none(), Side::Left).unwrap());
-    let b = Arc::new(render::SkinBundle::new(Arc::new(b), rebound, none(), Side::Left).unwrap());
+    let bundle = |s, atlas| {
+        Arc::new(
+            render::SkinBundle::new(Arc::new(s), atlas, none(), Side::Left)
+                .unwrap()
+                .with_text(stub_text())
+                .unwrap(),
+        )
+    };
+    let a = bundle(a, atlas);
+    let b = bundle(b, rebound);
     let token = r.install(ScreenKind::Result, &a, 1).unwrap();
     r.commit(token).unwrap();
     let view = ResultView {
@@ -607,9 +640,11 @@ fn result_frames() {
     // B prepared beside A: staged on its pages, its state and lines.
     let token = r.install(ScreenKind::Result, &b, 2).unwrap();
     let mut res = b.skin().prepare_result();
-    b.skin()
-        .update_result(&mut res, &view, &ResultLabels::default())
-        .unwrap();
+    let labels = ResultLabels {
+        title: "T".to_owned(),
+        ..ResultLabels::default()
+    };
+    b.skin().update_result(&mut res, &view, &labels).unwrap();
     r.prepare_result_text(&mut res).unwrap();
     let layout = Layout::AUTHOR;
     let strip = [Sprite {
@@ -638,6 +673,14 @@ fn result_frames() {
     assert_eq!(commit, 0, "the result's commit allocated");
     assert_eq!(text, 0, "the result's staged lines' installation allocated");
     assert_eq!(allocs, 0, "the result's frames allocated");
+    // A layout on another array: the commit keeps what it replaces.
+    let other = tempfile::tempdir().unwrap();
+    let c = result_skin(other.path(), &[(0, 0)], 0);
+    let c_atlas = c.atlas(Variant::Lo, r.atlas_limits(), &|| false).unwrap();
+    let c = Arc::new(render::SkinBundle::new(Arc::new(c), c_atlas, none(), Side::Left).unwrap());
+    let token = r.install(ScreenKind::Result, &c, 3).unwrap();
+    let ((), commit) = counted(|| r.commit(token).unwrap());
+    assert_eq!(commit, 0, "a commit on another array allocated");
 }
 
 /// Every run's scissor as the renderer resolves it while drawing
