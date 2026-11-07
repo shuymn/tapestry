@@ -3184,7 +3184,94 @@ fn a_command_during_the_ready_poll_is_served_before_the_result() {
     }
 }
 
-/// The screen failing as the preparation is found ready is built again
+//// A record sink whose save succeeds at once and whose best lookup tells
+/// its test it began, then blocks until the test releases it: a slow read
+/// of the own view's best, with the test acting while it waits.
+struct BlockedLookup {
+    began: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl game::RecordSink for BlockedLookup {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Ok(game::RecordRef {
+            path: "saved.tprl".into(),
+        })
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.began.send(()).unwrap();
+        self.release.recv().unwrap();
+        game::BestLookup::KnownEmpty
+    }
+}
+
+/// C3 for the best's read: the uncounted play's own best is read after
+/// the preparation began (design.md "State Model", ResultPreparing), so a
+/// result back, a quit or a retry pressed while that read blocks is fresh
+/// and withdraws the result, as during a pending poll: no result event
+/// and no end screen for the play; back and quit leave the chart, retry
+/// plays the next attempt.
+#[test]
+fn a_fresh_command_during_the_best_read_withdraws_the_result() {
+    for case in ["back", "quit", "retry"] {
+        let mut rig = Fake::new(Vec::new(), &[(LEAVE_AT, Command::Quit)], i64::MAX);
+        let pressed = std::sync::Arc::clone(&rig.pressed);
+        let menu = std::sync::Arc::clone(&rig.menu_pressed);
+        let dir = tempfile::tempdir().unwrap();
+        let events = Events::default();
+        let (began, reading) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let left = std::thread::scope(|s| {
+            s.spawn(move || {
+                reading.recv().unwrap();
+                match case {
+                    "back" => menu.lock().unwrap().push(game::MenuCommand::Back),
+                    "quit" => pressed.lock().unwrap().push(Command::Quit),
+                    _ => pressed.lock().unwrap().push(Command::Retry),
+                }
+                release.send(()).unwrap();
+                // Every later read, released at once.
+                while reading.recv().is_ok() {
+                    release.send(()).unwrap();
+                }
+            });
+            let mut loaded = closing_loaded_with(
+                dir.path(),
+                chart(),
+                0,
+                FailureAction::PlayToEnd,
+                &events,
+                None,
+                TimeUs(1_000 * MS),
+                |p| Parts {
+                    records: Some(Box::new(BlockedLookup {
+                        began,
+                        release: released,
+                    })),
+                    ..p
+                },
+            );
+            game::live::run_chart(&mut loaded, &mut rig)
+        });
+        let events = events.all();
+        assert_eq!(left.unwrap(), game::Leave::Back, "{case}");
+        assert!(saved(&rig.reports[0]), "{case}");
+        assert!(!result_of(&events, 1), "{case}");
+        assert_eq!(withdrawn(&rig), 1, "{case}");
+        if case == "retry" {
+            assert_eq!(rig.reports.len(), 2);
+            assert_eq!(rig.shows, 1);
+            assert!(result_of(&events, 2));
+        } else {
+            assert_eq!(rig.reports.len(), 1, "{case}");
+            assert_eq!(rig.shows, 0, "{case}");
+            assert!(rig.clock.now().0 < LEAVE_AT, "{case}");
+        }
+    }
+}
+
+// The screen failing as the preparation is found ready is built again
 /// first, and a command or a close that arrives while it is rebuilt is
 /// served before the result shows: quit and back leave, retry plays the
 /// next attempt, a close ends the run; the first play's result never
