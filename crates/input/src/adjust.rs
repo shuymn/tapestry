@@ -196,6 +196,53 @@ impl HoldLatch {
     }
 }
 
+/// What the panel level reads ([`PanelLevel::read`]): whether START and
+/// SELECT are held, as the input thread last published them, and how many
+/// times what it published changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Panels {
+    /// A START control is held.
+    pub start: bool,
+    /// A SELECT control is held.
+    pub select: bool,
+    /// Changes of the published level so far, wrapping: a change the
+    /// reader has not seen moves it even when the level is the same again.
+    pub generation: u64,
+}
+
+impl Panels {
+    /// The panel the held roles open, as the select screen's option keys
+    /// do: START alone 0, SELECT alone 1, both 2, neither none.
+    #[must_use]
+    pub const fn open(self) -> Option<usize> {
+        match (self.start, self.select) {
+            (true, false) => Some(0),
+            (false, true) => Some(1),
+            (true, true) => Some(2),
+            (false, false) => None,
+        }
+    }
+}
+
+/// START and SELECT held as a level for the select screen's panels
+/// (design.md "Input", Menu input), published by the input thread at each
+/// boundary ([`AdjustmentTap::publish_panels`]), readable from any thread.
+#[derive(Clone, Debug)]
+pub struct PanelLevel(Arc<AtomicU64>);
+
+impl PanelLevel {
+    /// The level now.
+    #[must_use]
+    pub fn read(&self) -> Panels {
+        let v = self.0.load(Ordering::Acquire);
+        Panels {
+            start: v & 1 != 0,
+            select: v & 2 != 0,
+            generation: v >> 2,
+        }
+    }
+}
+
 /// Where a READY candidate's start gate stands ([`StartGate::state`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatePhase {
@@ -583,6 +630,11 @@ pub struct AdjustmentTap {
     /// The candidate a hold of this batch cancelled: its marker follows the
     /// batch.
     cancelled: Option<u32>,
+    /// The numbers of START's and SELECT's controls, a bit each, for the
+    /// panels ([`set_panel_roles`](Self::set_panel_roles)).
+    panel_roles: [u128; 2],
+    /// The panels' published level.
+    panels: Arc<AtomicU64>,
 }
 
 /// The logic thread's end of the tap.
@@ -645,6 +697,8 @@ pub fn adjustment_queue(
             window_held: 0,
             window_baseline: None,
             cancelled: None,
+            panel_roles: [0; 2],
+            panels: Arc::new(AtomicU64::new(0)),
         },
         AdjustmentReceiver {
             queue: consumer,
@@ -678,6 +732,53 @@ impl AdjustmentTap {
     #[must_use]
     pub fn holding(&self) -> bool {
         self.unverified || self.held_set() & self.latched != 0
+    }
+
+    /// Numbers `start` and `select` (a bit each) are START's and SELECT's
+    /// controls, whose holding the panels' level publishes
+    /// ([`publish_panels`](Self::publish_panels)).
+    pub const fn set_panel_roles(&mut self, start: u128, select: u128) {
+        self.panel_roles = [start, select];
+    }
+
+    /// A handle on the panels' level.
+    #[must_use]
+    pub fn panel_level(&self) -> PanelLevel {
+        PanelLevel(Arc::clone(&self.panels))
+    }
+
+    /// Whether START and SELECT are held now, as the devices that reach the
+    /// tap hold them (the generation 0).
+    #[must_use]
+    pub fn held_panels(&self) -> Panels {
+        let held = self.held_set();
+        let [start, select] = self.panel_roles;
+        Panels {
+            start: held & start != 0,
+            select: held & select != 0,
+            generation: 0,
+        }
+    }
+
+    /// Publishes the panels' level at a boundary: START and SELECT as held
+    /// while `open` (the thread Idle with focus), else neither, so a
+    /// release lost while it was not open never keeps a panel. `true` when
+    /// the level changed; its generation counts the changes.
+    pub fn publish_panels(&mut self, open: bool) -> bool {
+        let held = if open {
+            self.held_panels()
+        } else {
+            Panels::default()
+        };
+        let bits = u64::from(held.start) | (u64::from(held.select) << 1);
+        let before = self.panels.load(Ordering::Acquire);
+        if before & 3 == bits {
+            return false;
+        }
+        let generation = (before >> 2).wrapping_add(1);
+        self.panels
+            .store((generation << 2) | bits, Ordering::Release);
+        true
     }
 
     /// Whether observations are sent. The held controls are counted
