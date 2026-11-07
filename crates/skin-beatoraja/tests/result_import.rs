@@ -927,7 +927,7 @@ fn reads(ids: &[i32]) -> tempfile::TempDir {
     minimal_lua(&pre)
 }
 
-/// The values a Lua skin read for numbers `ids` under `view`, in order.
+/// The result numbers the fixture skin in `d` read under `view`, as (id, value) in read order.
 #[track_caller]
 fn read_values(d: &tempfile::TempDir, view: &ResultView) -> Vec<(i32, i32)> {
     let i = lua_result(d.path(), &facts(Some(view))).unwrap();
@@ -1002,8 +1002,8 @@ fn numbers_372_and_373_are_the_mean_duration() {
         [(372, 1_000), (373, 0)]
     );
     assert_eq!(read_values(&d, &with(Some(9), true)), [(372, 0), (373, 0)]);
-    // Past `i32::MAX` µs: a 40-minute long note released one second early
-    // as a BAD (`IntegerPropertyFactory.java:410-420`).
+    // Past `i32::MAX` µs: a 40-minute long note released one second after
+    // its head, as a BAD (`IntegerPropertyFactory.java:410-420`).
     assert_eq!(
         read_values(&d, &with(Some(2_399_000_000), true)),
         [(372, 2_399_000), (373, 0)]
