@@ -175,15 +175,18 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // judge.lane.7
         // The progress, 101: 0 until the play starts, as in READY.
         Before, // time.progress_ppm
-        // The chart's metadata, 102 to 107: its difficulty and whether it
-        // has a BGA are the chosen chart's, from the frame; its total comes
-        // with the attempt, which a loading frame does not have.
+        // The chart's metadata, 102 to 109: its difficulty and whether it
+        // has a BGA are the chosen chart's, from the frame; its total and
+        // its class come with the attempt, from the parsed chart, which a
+        // loading frame does not have.
         Chosen,      // chart.difficulty
         Chosen,      // chart.difficulty_valid
         Unavailable, // chart.total
         Unavailable, // chart.total_valid
         Chosen,      // chart.bga
         Chosen,      // chart.bga_valid
+        Unavailable, // chart.judge_class
+        Unavailable, // chart.judge_class_valid
     ]
 };
 
@@ -336,7 +339,7 @@ pub struct LoadingFrame<'a> {
 impl LoadingFrame<'_> {
     /// The chosen chart's data this frame gives, as [`Need`] reads them.
     pub(crate) const fn chosen(&self) -> u8 {
-        let [_, difficulty, _, _, _, bga] = chart_fields(self.meta());
+        let [_, difficulty, _, _, _, bga, _, _] = chart_fields(self.meta());
         let level = if level_fields(self.play_level).1 != 0 {
             CHOSEN_LEVEL
         } else {
@@ -351,8 +354,8 @@ impl LoadingFrame<'_> {
             | if bga != 0 { CHOSEN_BGA } else { 0 }
     }
 
-    /// The chosen chart's metadata as the frame gives it: no total, which
-    /// comes with the attempt.
+    /// The chosen chart's metadata as the frame gives it: no total and no
+    /// class, which come with the attempt.
     const fn meta(&self) -> ChartMetadata {
         ChartMetadata {
             difficulty: self.difficulty,
@@ -621,6 +624,8 @@ mod tests {
             field::JUDGE_RECENT_IMPERFECT,
             field::CHART_TOTAL,
             field::CHART_TOTAL_VALID,
+            field::CHART_JUDGE_CLASS,
+            field::CHART_JUDGE_CLASS_VALID,
         ] {
             assert_eq!(loading_field(slot), Some(LoadingField::Unavailable));
         }

@@ -20,8 +20,8 @@ use input::raw;
 use replay::{DecodeError, DecodeLimits, FORMAT_VERSION, MAGIC, PlayRecord};
 use rules::{CanonicalError, RulePreset};
 use skin_beatoraja::{
-    Cancel, ChartRank, Config, DeviationId, Fact, FactDeps, Header, ImportError, ImportFacts,
-    Imported, LuaImported, LuaOutcome, LuaUsage, NoteFallback, NoteKind, SIZES, Severity, import,
+    Cancel, Config, DeviationId, Fact, FactDeps, Header, ImportError, ImportFacts, Imported,
+    JudgeClass, LuaImported, LuaOutcome, LuaUsage, NoteFallback, NoteKind, SIZES, Severity, import,
     read_header, read_lua_header, resolve,
 };
 use skin_model::{FntError, FntFile, FntLimits, ScreenKind};
@@ -2444,10 +2444,10 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 
 /// The play snapshot of a `skin_lua` input's first two bytes: autoplay
 /// unavailable, off, on or pending by `a` modulo 4, on a result scene
-/// showing [`result_view`] for 255; the play level unavailable, pending, or `a / 16` (twice) by
-/// `a / 4` modulo 4; the chart's rank unavailable, pending, a `#RANK` from -8 to
-/// 54 or none read for 55, or a `#DEFEXRANK` from 0 to 315 % in steps of
-/// 5 % by `r`'s low two bits and the rest.
+/// showing [`result_view`] for 255; the play level unavailable, pending,
+/// or `a / 16` (twice) by `a / 4` modulo 4; the chart's judgment class
+/// unavailable, pending, or known by `r`'s low two bits, the rest choosing
+/// one of the five classes or none.
 #[must_use]
 pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let scene = if a == u8::MAX {
@@ -2461,13 +2461,17 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
         2 => Fact::Known(true),
         _ => Fact::Pending,
     };
-    let v = r >> 2;
-    let chart_rank = match r % 4 {
+    let judge_class = match r % 4 {
         0 => Fact::Unavailable,
         1 => Fact::Pending,
-        2 if v == 63 => Fact::Known(None),
-        2 => Fact::Known(Some(ChartRank::Rank(i32::from(v) - 8))),
-        _ => Fact::Known(Some(ChartRank::DefExRankMilli(i64::from(v) * 5_000))),
+        _ => Fact::Known(match (r >> 2) % 6 {
+            0 => Some(JudgeClass::VeryHard),
+            1 => Some(JudgeClass::Hard),
+            2 => Some(JudgeClass::Normal),
+            3 => Some(JudgeClass::Easy),
+            4 => Some(JudgeClass::VeryEasy),
+            _ => None,
+        }),
     };
     let play_level = match (a >> 2) % 4 {
         0 => Fact::Unavailable,
@@ -2484,7 +2488,7 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     ImportFacts {
         scene,
         autoplay,
-        chart_rank,
+        judge_class,
         play_level,
         result,
     }

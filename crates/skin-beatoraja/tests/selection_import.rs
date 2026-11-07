@@ -264,12 +264,11 @@ fn ratio_bars_draw_their_ratios() {
 /// C20: a decision skin still has no importer.
 #[test]
 fn decision_skins_have_no_importer() {
-    for (ty, kind) in [(6, skin_model::ScreenKind::Decision)] {
-        let d = common::skin(&[("s.json", &format!(r#"{{"type": {ty}}}"#))]);
-        let (mut def, h) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
-        let r = skin_beatoraja::import(&mut def, &h, &skin_beatoraja::Config::defaults(&h), kind);
-        assert!(matches!(r, Err(ImportError::NoImporter { kind: k }) if k == kind));
-    }
+    let kind = skin_model::ScreenKind::Decision;
+    let d = common::skin(&[("s.json", r#"{"type": 6}"#)]);
+    let (mut def, h) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
+    let r = skin_beatoraja::import(&mut def, &h, &skin_beatoraja::Config::defaults(&h), kind);
+    assert!(matches!(r, Err(ImportError::NoImporter { kind: k }) if k == kind));
 }
 
 /// An active `listoff` the list does not give: slot 1's unselected arm

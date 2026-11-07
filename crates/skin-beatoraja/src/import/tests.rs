@@ -594,14 +594,12 @@ fn a_skin_in_another_slot_refuses_before_anything_is_read() {
 
 #[test]
 fn a_kind_with_no_importer_refuses_before_anything_is_read() {
-    for (ty, kind) in [(6, ScreenKind::Decision)] {
-        let (r, admits) = into_slot(ty, kind, false);
-        match r {
-            Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
-            other => panic!("{ty}: {:?}", other.map(|i| i.report)),
-        }
-        assert_eq!(admits, 0, "{ty}");
+    let (r, admits) = into_slot(6, ScreenKind::Decision, false);
+    match r {
+        Err(ImportError::NoImporter { kind }) => assert_eq!(kind, ScreenKind::Decision),
+        other => panic!("{:?}", other.map(|i| i.report)),
     }
+    assert_eq!(admits, 0);
 }
 
 /// Imports selection skin `body` (beside a 64×64 `a.png` and a font

@@ -911,17 +911,18 @@ pub fn skin_jsons() -> Vec<Seed> {
 }
 
 /// One `skin_lua` input: the play snapshot's two bytes
-/// ([`crate::lua_facts`]: autoplay off, `#RANK 2`), then the files joined
+/// ([`crate::lua_facts`]: autoplay off, the normal judgment class), then the files joined
 /// by NUL bytes, entry file first ([`crate::LUA_FILES`]).
 fn lua_input(files: &[&str]) -> Vec<u8> {
-    let mut input = vec![LUA_AUTOPLAY_OFF, LUA_RANK_2];
+    let mut input = vec![LUA_AUTOPLAY_OFF, LUA_CLASS_NORMAL];
     input.extend_from_slice(files.join("\0").as_bytes());
     input
 }
 
-/// [`crate::lua_facts`]'s bytes for autoplay off and for `#RANK 2`.
+/// [`crate::lua_facts`]'s bytes for autoplay off and for the normal
+/// judgment class.
 pub const LUA_AUTOPLAY_OFF: u8 = 1;
-pub const LUA_RANK_2: u8 = (10 << 2) | 2;
+pub const LUA_CLASS_NORMAL: u8 = (2 << 2) | 2;
 /// [`crate::lua_facts`]'s first byte for autoplay off and play level 9.
 pub const LUA_AUTOPLAY_OFF_LEVEL_9: u8 = (9 << 4) | (2 << 2) | LUA_AUTOPLAY_OFF;
 /// [`crate::lua_facts`]'s first byte for a result scene.

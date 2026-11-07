@@ -5,27 +5,21 @@
 //! the play level's parse included, is the player's.
 
 use game::Loaded;
-use rules::JudgeRank;
-use skin_beatoraja::{ChartRank, Fact, ImportFacts};
+use skin_beatoraja::{Fact, ImportFacts, JudgeClass};
 use skin_model::ScreenKind;
 
 /// The facts of an attempt at `loaded`'s chart with autoplay as
-/// `autoplay`: the play scene, autoplay known, the rank the play preset's
-/// header policy reads from the chart (as the evaluator judges with it),
-/// and the chart's play level parsed by [`level_of`].
+/// `autoplay`: the play scene, autoplay known, the chart's judgment class
+/// as the reference computes it from the chart's own rank
+/// ([`JudgeClass::of_headers`], whatever the play preset judges with), and
+/// the chart's play level parsed by [`level_of`].
 pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
-    let read = loaded
-        .preset()
-        .headers
-        .read(&loaded.chart().meta.judgment_headers);
-    let rank = read.rank.map(|r| match r {
-        JudgeRank::Rank(r) => ChartRank::Rank(r),
-        JudgeRank::DefExRankMilli(m) => ChartRank::DefExRankMilli(m),
-    });
     ImportFacts {
         scene: ScreenKind::Play,
         autoplay: Fact::Known(autoplay),
-        chart_rank: Fact::Known(rank),
+        judge_class: Fact::Known(JudgeClass::of_headers(
+            &loaded.chart().meta.judgment_headers,
+        )),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
         result: Fact::Unavailable,
     }

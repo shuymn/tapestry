@@ -1158,7 +1158,7 @@ for k = 1, 5000 do
 end
 return skin";
     let input = [
-        &[seeds::LUA_AUTOPLAY_OFF, seeds::LUA_RANK_2],
+        &[seeds::LUA_AUTOPLAY_OFF, seeds::LUA_CLASS_NORMAL],
         entry.as_bytes(),
     ]
     .concat();

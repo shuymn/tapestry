@@ -392,11 +392,11 @@ fn continued(
 // Covers: T09
 #[test]
 fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
-    use super::facts::{ChartRank, Fact, ImportFacts};
+    use super::facts::{Fact, ImportFacts, JudgeClass};
     let unavailable = ImportFacts::unavailable(ScreenKind::Play);
     let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
     let known = ImportFacts {
-        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+        judge_class: Fact::Known(Some(JudgeClass::Normal)),
         ..base
     };
     // The witness sees a skin go on after an error a protected call
@@ -488,12 +488,10 @@ fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
 
 #[test]
 fn a_lua_kind_with_no_importer_refuses_before_the_configured_pass() {
-    for (ty, kind) in [(6, ScreenKind::Decision)] {
-        let (r, passes, admits) = kind_import(ty, kind);
-        match r {
-            Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
-            other => panic!("{ty}: {other:?}"),
-        }
-        assert_eq!((passes, admits), (1, 0), "{ty}");
+    let (r, passes, admits) = kind_import(6, ScreenKind::Decision);
+    match r {
+        Err(ImportError::NoImporter { kind }) => assert_eq!(kind, ScreenKind::Decision),
+        other => panic!("{other:?}"),
     }
+    assert_eq!((passes, admits), (1, 0));
 }
