@@ -2950,7 +2950,14 @@ pub(crate) mod tests {
                 for k in &keys {
                     menu.push(MenuInput::Key(*k));
                 }
+                // No step moves the list: Enter on the folder row the
+                // cursor starts on would enter it.
+                let view = |rig: &crate::play::PlayerRig<'_>| {
+                    rig.selection.as_ref().unwrap().screen.view(0, 0, false)
+                };
+                let before = view(rig);
                 assert!(rig.look().is_none(), "{key:?} {keys:?}");
+                assert_eq!(view(rig), before, "{key:?} {keys:?}");
                 // The update taken: the frames from here draw it.
                 assert!(rig.render.fence(Duration::from_secs(60)));
                 let seen = frames.0.lock().unwrap().len();

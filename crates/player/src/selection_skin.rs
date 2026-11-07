@@ -388,16 +388,15 @@ impl SkinFeed {
         self.changed = now;
         self.key = None;
         self.preset_step = None;
-        self.panel = None;
         self.seen = None;
     }
 
     /// The panels' level as the input thread published it, read at `now`
     /// with the search box's focus (`searching`): the panel START, SELECT
     /// or both open (design.md "Input", Menu input), none while the search
-    /// box has focus. A panel opening, changing, or held again after a
-    /// change the level counted since the last read starts at `now`.
-    /// `true` when the panel changed.
+    /// box has focus. A panel opening, changing, held again after a change
+    /// the level counted since the last read, or open at the lifetime's
+    /// first read starts at `now`. `true` when the panel changed.
     pub fn panels(&mut self, level: input::Panels, searching: bool, now: TimeUs) -> bool {
         let want = if searching { None } else { level.open() };
         let again = self.seen != Some(level.generation);
