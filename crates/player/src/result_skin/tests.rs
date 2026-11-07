@@ -14,6 +14,9 @@ use skin_model::{AtlasLimits, ResultChart, ResultFields, Root};
 
 use super::{Published, ResultSkin, ResultStart, Staged, ViewFacts, builds, probe_view};
 use crate::imports::{ImportTarget, jobs_joined, jobs_started};
+// The builds and jobs a test counts are its own: these tests run one at a
+// time with the importer's tests, which count jobs too.
+use crate::imports::tests::serial;
 
 /// `dir/name`, a `w`×`h` PNG of one colour.
 fn png(dir: &Path, name: &str, w: u32, h: u32) {
@@ -97,7 +100,15 @@ fn chart() -> ResultChart {
 
 /// A ready view whose next-rank difference (154) is `nr`.
 fn view(nr: u32) -> ViewFacts {
-    let mut v = probe_view(chart());
+    view_at(12, nr)
+}
+
+/// [`view`] of a chart at play level `level`.
+fn view_at(level: i32, nr: u32) -> ViewFacts {
+    let mut v = probe_view(ResultChart {
+        level: Some(level),
+        ..chart()
+    });
     v.score.next_rank = nr;
     ViewFacts(Some(ResultFields::of(&v)))
 }
@@ -124,12 +135,6 @@ fn staged(rs: &mut ResultSkin) {
         rs.image_stage(chart(), Some(JudgeClass::Normal), || false, || false),
         Staged::Ready
     );
-}
-
-/// The builds and jobs a test counts are its own: these tests run one at a
-/// time with the importer's tests, which count jobs too.
-fn serial() -> crate::imports::tests::Serial {
-    crate::imports::tests::serial()
 }
 
 /// C18, C19 (a), (c): the image stage packs the probe's cells once; P and
@@ -410,7 +415,7 @@ fn ran(rs: &mut ResultSkin) {
     let end = Instant::now() + Duration::from_secs(20);
     loop {
         rs.poll();
-        if !rs.running() {
+        if !rs.has_job() {
             return;
         }
         assert!(Instant::now() < end, "the layout did not end");
@@ -492,7 +497,7 @@ fn at_most_two_atlases_live_with_a_lagging_renderer() {
     let b = shown(&rs);
     fake.take(&mut rs, b);
     assert!(
-        !rs.deferred() && rs.running(),
+        !rs.deferred() && rs.has_job(),
         "the report retries the build"
     );
     ran(&mut rs);
@@ -665,7 +670,7 @@ fn the_judgment_class_reaches_both_stages() {
         );
         let jobs = jobs_started();
         rs.request(view(5));
-        assert!(!rs.running(), "{reads}");
+        assert!(!rs.has_job(), "{reads}");
         assert_eq!(jobs_started(), jobs, "{reads}");
         assert!(
             matches!(rs.published().0, Some(Published::Skin(..))),
@@ -695,7 +700,7 @@ fn chart_reads_are_decided_before_ready() {
     );
     let jobs = jobs_started();
     rs.request(view(5));
-    assert!(!rs.running());
+    assert!(!rs.has_job());
     assert_eq!(jobs_started(), jobs);
     let every = shown(&rs);
     // An unchanged retry reuses the bundle: no job, no build, no file
@@ -741,18 +746,18 @@ fn a_bundle_for_every_view_keeps_two_atlases() {
     staged_at(&mut rs, 7, JudgeClass::Normal);
     assert_eq!(rs.staged_line(), "per view, images prepared");
     let r0 = Arc::downgrade(rs.image().unwrap());
-    rs.request(view(5));
+    rs.request(view_at(7, 5));
     settled(&mut rs);
     rs.next_attempt();
     staged_at(&mut rs, 8, JudgeClass::Normal);
     assert!(rs.staged_line().starts_with("every view"));
-    rs.request(view(5));
+    rs.request(view_at(8, 5));
     let r1 = Arc::downgrade(&shown(&rs));
     rs.next_attempt();
     staged_at(&mut rs, 9, JudgeClass::Normal);
     assert!(rs.staged_line().starts_with("every view"));
     assert!(r0.upgrade().is_none(), "R0's pages live with R2");
-    rs.request(view(5));
+    rs.request(view_at(9, 5));
     assert!(r1.upgrade().is_none(), "R1 replaced");
     // Two atlases retained: no room for a bundle, laid out per view.
     rs.set_retained(&[
@@ -796,7 +801,7 @@ fn a_refused_probe_keeps_the_reusable_layout() {
     staged_at(&mut rs, 12, JudgeClass::Normal);
     let jobs = jobs_started();
     rs.request(view(5));
-    assert!(!rs.running(), "view 5 reused");
+    assert!(!rs.has_job(), "view 5 reused");
     assert_eq!(jobs_started(), jobs);
     assert!(Arc::ptr_eq(&shown(&rs), &five));
 }
@@ -866,7 +871,7 @@ fn a_refused_layout_keeps_the_reusable_one() {
     assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
     let jobs = jobs_started();
     rs.request(view(5));
-    assert!(!rs.running(), "view 5 reused");
+    assert!(!rs.has_job(), "view 5 reused");
     assert_eq!(jobs_started(), jobs);
     assert!(Arc::ptr_eq(&shown(&rs), &five));
 }
@@ -981,4 +986,117 @@ fn fonts_are_prepared_once() {
         assert_eq!(builds() - b0, 1, "{font}: no build on P or a switch");
         assert_eq!(p.source_counts(), read, "{font}: no file read, no decode");
     }
+}
+
+/// A skin that reads its level (96) and, at level 7 only, 154, choosing
+/// its image by `154 % 3`; a single image at other levels.
+fn level_skin() -> tempfile::TempDir {
+    skin_reading(
+        "local lv = ms.number(96)\nlocal nr = 1\nif lv == 7 then nr = ms.number(154) end",
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    )
+}
+
+/// Table row "per-view layout superseded, then a bundle for every view":
+/// a union build superseded by a reused layout leaves a new image entry
+/// while the old layout is shown; the next chart's bundle for every view
+/// replaces that layout, so a changed chart after it builds its own bundle
+/// in Preparing, with no deferral into P.
+#[test]
+fn a_superseded_union_leaves_room_for_bundles() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _s = serial();
+    let d = level_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    rs.request(view_at(7, 4));
+    settled(&mut rs);
+    // View 2's cell needs a union; view 4 again supersedes it at once.
+    REACHED.store(false, SeqCst);
+    GATE.store(true, SeqCst);
+    rs.request(view_at(7, 2));
+    let end = Instant::now() + Duration::from_secs(20);
+    while !REACHED.load(SeqCst) {
+        assert!(Instant::now() < end, "the layout did not reach its build");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rs.request(view_at(7, 4));
+    GATE.store(false, SeqCst);
+    settled(&mut rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view_at(8, 4));
+    rs.next_attempt();
+    let b0 = builds();
+    staged_at(&mut rs, 9, JudgeClass::Normal);
+    assert!(
+        rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
+    assert_eq!(builds() - b0, 1, "built in Preparing");
+}
+
+/// Table rows "a bundle for every view through deferral" and "unchanged
+/// retry": a changed chart deferred into P while the renderer retains an
+/// atlas is built once the renderer releases it, and an unchanged retry
+/// reuses that bundle with no job, build or file read.
+#[test]
+fn a_deferred_bundle_is_reused_on_a_retry() {
+    let _s = serial();
+    let d = level_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(view_at(8, 4));
+    rs.set_retained(&[skin_model::AtlasId(u64::MAX)]);
+    rs.next_attempt();
+    staged_at(&mut rs, 9, JudgeClass::Normal);
+    assert!(
+        rs.staged_line().starts_with("per view"),
+        "{}",
+        rs.staged_line()
+    );
+    rs.request(view_at(9, 4));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    rs.set_retained(&[]);
+    settled(&mut rs);
+    let nine = shown(&rs);
+    let (jobs, b0, read) = (jobs_started(), builds(), p.source_counts());
+    rs.next_attempt();
+    staged_at(&mut rs, 9, JudgeClass::Normal);
+    assert!(
+        rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
+    rs.request(view_at(9, 5));
+    assert_eq!(jobs_started(), jobs);
+    assert_eq!(builds(), b0);
+    assert_eq!(p.source_counts(), read);
+    assert!(Arc::ptr_eq(&shown(&rs), &nine));
+}
+
+/// Table row "unavailable view": the cached bundle for every view is
+/// reused only while its reads hold the attempt's chart; another chart's
+/// unavailable view shows the built-in result.
+#[test]
+fn an_unavailable_view_reuses_only_its_charts_bundle() {
+    let _s = serial();
+    let d = level_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(ViewFacts(None));
+    let eight = shown(&rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    rs.request(ViewFacts(None));
+    assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(ViewFacts(None));
+    assert!(Arc::ptr_eq(&shown(&rs), &eight));
 }
