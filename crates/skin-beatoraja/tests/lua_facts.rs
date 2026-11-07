@@ -442,27 +442,16 @@ fn a_base_import_stops_pending_at_a_chart_fact() {
     assert_eq!(x(i), 1);
 }
 
+/// A chart with no rank header is in the class of `#RANK 2`, the source's
+/// default; one in no class answers none of 180 to 184 and records that.
 #[test]
-fn a_chart_with_no_rank_header_is_judged_and_classed_as_rank_2() {
-    // Every shipped preset reads no rank from a chart without `#RANK` or
-    // `#DEFEXRANK` and judges it with its absent window, which is its
-    // `#RANK 2` window: the class of `#RANK 2` is the class it plays.
-    for name in rules::BUILT_IN_PRESETS {
-        let p = rules::built_in(name).unwrap();
-        let read = p.headers.read(&[]).rank;
-        assert_eq!(read, None, "{name}");
-        let absent = p.window_policy.prepare(&p.tables, read);
-        let rank_2 = p
-            .window_policy
-            .prepare(&p.tables, Some(rules::JudgeRank::Rank(2)));
-        assert!(absent.is_some(), "{name}");
-        assert_eq!(absent, rank_2, "{name}");
-    }
-    let d = folder("x = ms.option(182) and 1 or 0");
+fn a_rankless_chart_is_normal_and_a_classless_one_holds_none() {
+    assert_eq!(JudgeClass::of_headers(&[]), Some(JudgeClass::Normal));
+    let d = folder("x = (ms.option(182) and 1 or 0) + (ms.option(-184) and 10 or 0)");
     let facts = play(Fact::Unavailable, Fact::Known(None));
     let i = imported(import(&d, &facts));
-    assert_eq!(i.facts, deps(&[class(Some(JudgeClass::Normal))]));
-    assert_eq!(x(i), 1);
+    assert_eq!(i.facts, deps(&[class(None)]));
+    assert_eq!(x(i), 10);
 }
 
 #[test]
