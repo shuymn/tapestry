@@ -3137,6 +3137,7 @@ pub(crate) mod tests {
                     player: game::PlayerSettings::default(),
                 },
                 crate::render_side::tests::Installers::default().spawn_bare(),
+                input::QpcClock::start(),
                 |rig, _, end| {
                     let level = rig.panels.clone().expect("installed with the tap");
                     rig.selection = Some(sel);
@@ -3183,16 +3184,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// What the panels fixture's last four elements showed in each
-    /// selection frame: options 21, 22 and 23's images drawn, and timer
-    /// 21's image's sampled time.
+    /// What the panels fixture's last six elements showed in each
+    /// selection frame: options 21, 22 and 23's images drawn, and timers
+    /// 21, 22 and 23's images' sampled times.
     #[cfg(feature = "dev-tools")]
     #[derive(Clone, Default)]
     struct PanelFrames(Arc<std::sync::Mutex<Vec<PanelFrame>>>);
 
     /// One frame of [`PanelFrames`].
     #[cfg(feature = "dev-tools")]
-    type PanelFrame = ([bool; 3], Option<TimeUs>);
+    type PanelFrame = ([bool; 3], [Option<TimeUs>; 3]);
 
     #[cfg(feature = "dev-tools")]
     impl crate::render_side::FrameSink for PanelFrames {
@@ -3204,27 +3205,30 @@ pub(crate) mod tests {
             let Some(observed) = screen.selection_observations() else {
                 return;
             };
-            let [.., a, b, c, timer] = observed.as_slice() else {
+            let [.., a, b, c, t1, t2, t3] = observed.as_slice() else {
                 return;
             };
             let drawn =
                 |o: &skin_model::ElementObservation| o.outcome == skin_model::Outcome::Sampled;
-            let timer = drawn(timer).then_some(timer.t).flatten();
-            self.0
-                .lock()
-                .unwrap()
-                .push(([drawn(a), drawn(b), drawn(c)], timer));
+            let timer = |o: &skin_model::ElementObservation| drawn(o).then_some(o.t).flatten();
+            self.0.lock().unwrap().push((
+                [drawn(a), drawn(b), drawn(c)],
+                [timer(t1), timer(t2), timer(t3)],
+            ));
         }
     }
 
     /// C16 through the player's rig and the render thread on WARP: the
     /// game thread's look reads the level the input side published and
     /// sends the update; the frames after it draw option 21 under START,
-    /// 23 under both, 22 under SELECT and none once released, and timer
-    /// 21's image only while panel 1 is open, from its opening.
+    /// 23 under both, 22 under SELECT and none once released, and each
+    /// panel's timer image only while it is open, sampled at the time since
+    /// the look that opened it: each panel opens twice, its timer starting
+    /// over each time.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_rig_draws_the_panel_open() {
+        use bms_model::TimeSource as _;
         use game::AppRig as _;
         use game::Preparation;
         use skin_model::ScreenKind;
@@ -3271,22 +3275,41 @@ pub(crate) mod tests {
             player: game::PlayerSettings::default(),
         };
         let last = || frames.0.lock().unwrap().last().copied();
-        crate::tests::on_rig_with(settings, link, |rig, _| {
+        crate::tests::on_rig_hooked(settings, link, clock, |rig, _, _| {
             // The level comes with the adjustments' tap; this one's input
             // side is the test's.
             assert!(rig.panels.is_some(), "installed with the tap");
             rig.adjust = None;
             rig.panels = Some(level);
             rig.selection = Some(sel);
+            // The last frame draws `want`, each panel open sampled at most
+            // the time since `since`, when the look that opened it began.
+            let opened_since = |since: TimeUs, want: [bool; 3]| {
+                let (open, timers) = last().unwrap();
+                let bound = clock.now().0 - since.0;
+                assert_eq!(open, want);
+                for (p, timer) in timers.into_iter().enumerate() {
+                    assert_eq!(timer.is_some(), want[p], "{timers:?}");
+                    if let Some(t) = timer {
+                        assert!(
+                            (0..=bound).contains(&t.0),
+                            "panel {p}: {t:?} not in 0..={bound}"
+                        );
+                    }
+                }
+            };
             // START held at the entry: panel 1 from the entry's update.
             panel_key(&mut set, 0x12, 1);
+            let since = clock.now();
             rig.entered_selection();
             assert!(
-                crate::render_side::tests::wait_until(|| last()
-                    .is_some_and(|(open, timer)| open == [true, false, false] && timer.is_some())),
+                crate::render_side::tests::wait_until(|| last().is_some_and(|(open, timers)| open
+                    == [true, false, false]
+                    && timers[0].is_some())),
                 "{:?}",
                 last()
             );
+            opened_since(since, [true, false, false]);
             let menu = Arc::clone(&rig.selection.as_ref().unwrap().menu);
             // Each step: a key of the keyboard reaching the tap, if any,
             // and keys on the window's queue, taken by one look.
@@ -3299,6 +3322,11 @@ pub(crate) mod tests {
                 (None, vec![MenuKey::Tab], [false; 3]),
                 (None, vec![MenuKey::Tab], [true, false, false]),
                 (Some((0x11, 1)), vec![], [false, false, true]),
+                (Some((0x12, 0)), vec![], [false, true, false]),
+                (Some((0x11, 0)), vec![], [false; 3]),
+                // Panels 2 and 3 again, each timer from its new opening.
+                (Some((0x11, 1)), vec![], [false, true, false]),
+                (Some((0x12, 1)), vec![], [false, false, true]),
                 (Some((0x12, 0)), vec![], [false, true, false]),
                 (Some((0x11, 0)), vec![], [false; 3]),
             ] {
@@ -3314,6 +3342,7 @@ pub(crate) mod tests {
                     rig.selection.as_ref().unwrap().screen.view(0, 0, false)
                 };
                 let before = view(rig);
+                let since = clock.now();
                 assert!(rig.look().is_none(), "{key:?} {keys:?}");
                 assert_eq!(view(rig), before, "{key:?} {keys:?}");
                 // The update taken: the frames from here draw it.
@@ -3323,9 +3352,8 @@ pub(crate) mod tests {
                     crate::render_side::tests::wait_until(|| frames.0.lock().unwrap().len() > seen),
                     "no frame"
                 );
-                let (open, timer) = last().unwrap();
-                assert_eq!(open, want, "{key:?} {keys:?}");
-                assert_eq!(timer.is_some(), want[0], "{timer:?}");
+                // Every step opens its panel afresh.
+                opened_since(since, want);
             }
         });
     }

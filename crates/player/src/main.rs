@@ -1919,7 +1919,9 @@ mod tests {
         render: crate::render_side::RenderLink,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings) -> R,
     ) -> (R, bool) {
-        on_rig_hooked(settings, render, |rig, settings, _| f(rig, settings))
+        on_rig_hooked(settings, render, QpcClock::start(), |rig, settings, _| {
+            f(rig, settings)
+        })
     }
 
     /// The input side of [`on_rig_hooked`]'s rig: its hook, the waker its
@@ -1931,16 +1933,16 @@ mod tests {
         pub(crate) clock: QpcClock,
     }
 
-    /// [`on_rig_with`], `f` given the rig's input side too.
+    /// [`on_rig_with`] on `clock`, `f` given the rig's input side too.
     #[cfg(feature = "dev-tools")]
     pub(crate) fn on_rig_hooked<R>(
         settings: game::Settings,
         render: crate::render_side::RenderLink,
+        clock: QpcClock,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
     ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
-        let clock = QpcClock::start();
         let controls = super::controls(&settings, clock);
         let waker = input::Waker::new().unwrap();
         let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());

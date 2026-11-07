@@ -495,9 +495,9 @@ pub(crate) fn settings_fixture() -> tempfile::TempDir {
     )
 }
 
-/// [`fixture`] with four images drawn after it, in this order: one on
+/// [`fixture`] with six images drawn after it, in this order: one on
 /// each of options 21, 22 and 23 (panels 1, 2 and 3 open), and one on
-/// timer 21 (panel 1's) (dev-tools tests).
+/// each of timers 21, 22 and 23 (the panels' openings) (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) fn panels_fixture() -> tempfile::TempDir {
     fixture_of(
@@ -506,7 +506,11 @@ pub(crate) fn panels_fixture() -> tempfile::TempDir {
            {"id": "b", "op": [22], "dst": [{"x": 0, "y": 320, "w": 8, "h": 8}]},
            {"id": "b", "op": [23], "dst": [{"x": 0, "y": 340, "w": 8, "h": 8}]},
            {"id": "b", "timer": 21, "dst": [{"time": 0, "x": 0, "y": 360, "w": 8, "h": 8},
-                                            {"time": 100000, "x": 100, "y": 360, "w": 8, "h": 8}]}"#,
+                                            {"time": 100000, "x": 100, "y": 360, "w": 8, "h": 8}]},
+           {"id": "b", "timer": 22, "dst": [{"time": 0, "x": 0, "y": 380, "w": 8, "h": 8},
+                                            {"time": 100000, "x": 100, "y": 380, "w": 8, "h": 8}]},
+           {"id": "b", "timer": 23, "dst": [{"time": 0, "x": 0, "y": 400, "w": 8, "h": 8},
+                                            {"time": 100000, "x": 100, "y": 400, "w": 8, "h": 8}]}"#,
     )
 }
 
