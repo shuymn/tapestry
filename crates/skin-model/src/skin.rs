@@ -2155,10 +2155,17 @@ impl Skin {
         fonts
     }
 
-    /// The operations every frame's expressions run.
+    /// The operations every frame's expressions and presentation program
+    /// run (V5 charges the program's).
     #[must_use]
     pub fn ops(&self) -> SkinOps {
         self.ops
+    }
+
+    /// The presentation program's callbacks; 0 without one.
+    #[must_use]
+    pub fn program_callbacks(&self) -> usize {
+        self.present.as_ref().map_or(0, Present::len)
     }
 
     /// The lanes' bar groups: the groups a [`Play`] from
@@ -3531,11 +3538,11 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        // On result, a number draws nothing for the values
-                        // a source number reserves: a hidden value reads
-                        // `i32::MIN`. Play's values never reach them.
-                        let reserved = v == i32::MIN || v == i32::MAX;
-                        if !(reserved && matches!(scene.phase, Phase::Result { .. })) {
+                        // A number draws nothing for the values a source
+                        // number reserves (`SkinNumber.java:135-146` at
+                        // `0.8.9`): a hidden result value reads `i32::MIN`,
+                        // and a skin's value may give either.
+                        if v != i32::MIN && v != i32::MAX {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }
@@ -3702,24 +3709,26 @@ fn screen_elapsed(starts: Starts<'_>, now: TimeUs) -> Option<i64> {
 }
 
 /// V6 for `program`: each read past the schema's `base` fields is an output
-/// of `signature` at its type (`lua.<k>` a boolean or an `i32`, `lua.<k>.ok`
-/// a boolean), and a `when` timer reads none.
+/// read, resolved by name, of the output of `signature` at that slot, at
+/// its type (`lua.<k>` the signature's, `lua.<k>.ok` a boolean); a field
+/// read there, or any output read in a `when` timer, is refused.
 fn check_outputs(
     program: &Program,
     base: usize,
     signature: &[OutTy],
     when: bool,
 ) -> Result<(), LoadError> {
-    for (slot, lo, hi) in program.loads() {
+    for (slot, out) in program.loads() {
         let Some(at) = usize::from(slot).checked_sub(base) else {
             continue;
         };
-        let ty = signature.get(at / 2).ok_or(LoadError::OutputRead)?;
-        let want = match (ty, at % 2) {
-            (OutTy::Int, 0) => (i32::MIN, i32::MAX),
-            _ => (0, 1),
+        let want = signature.get(at / 2).ok_or(LoadError::OutputRead)?;
+        let ok = at % 2 == 1;
+        let matches = match out {
+            Some((ty, o)) => o == ok && (ok || ty == *want),
+            None => false,
         };
-        if when || (lo, hi) != want {
+        if when || !matches {
             return Err(LoadError::OutputRead);
         }
     }

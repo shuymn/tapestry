@@ -130,10 +130,14 @@ impl Checker<'_, '_> {
         let Some((slot, field)) = self.scope.schema.field(name) else {
             return match output {
                 Some((slot, OutTy::Int, false)) => {
-                    let (lo, hi) = (i32::MIN, i32::MAX);
-                    self.int(id, T::Read(Op::Load { slot, lo, hi }), Iv::new(lo, hi))
+                    let op = Op::Output {
+                        slot,
+                        ty: OutTy::Int,
+                        ok: false,
+                    };
+                    self.int(id, T::Read(op), Iv::new(i32::MIN, i32::MAX))
                 }
-                Some((slot, _, _)) => Ok(Self::boolean(T::Read(Op::Load { slot, lo: 0, hi: 1 }))),
+                Some((slot, ty, ok)) => Ok(Self::boolean(T::Read(Op::Output { slot, ty, ok }))),
                 None => Err(self.err(id, ErrorKind::UnknownName { name: name.into() })),
             };
         };

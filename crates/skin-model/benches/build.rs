@@ -19,7 +19,10 @@
 //!
 //! `skin_model_build_program` is `Skin::build` of a skin of a presentation
 //! program at the per-frame cap: 256 callbacks of 256 float instructions,
-//! `MAX_SKIN_OPS` in all, each converted for a number's value.
+//! `MAX_SKIN_OPS` in all, each converted for a number's value: `_mul_add`
+//! multiplies and adds normal floats, `_mod_div` alternates `%` and `/`
+//! over widely separated exponents, `_subnormal` keeps every operand and
+//! result subnormal, the slowest floats.
 
 #[path = "../tests/lanes_support/mod.rs"]
 mod lanes_support;
@@ -226,18 +229,22 @@ fn bench_bitmap_text(c: &mut Criterion) {
     });
 }
 
-/// 256 callbacks sharing one span of 256 instructions: a float multiplied
-/// and added 127 times, then returned.
-fn bench_program(c: &mut Criterion) {
-    use skin_model::present::{
-        Arith, CallbackDef, Conv, Insn, MAX_CALLBACK_OPS, OutTy, PresentDef, Val,
-    };
+/// A skin of 256 callbacks sharing one span: `start` loaded, then 127
+/// pairs of a constant and `op` (its second operand alternating between
+/// `ks`), then returned: `MAX_SKIN_OPS` operations a frame.
+fn program_skin(
+    ops: [skin_model::present::Arith; 2],
+    consts: Vec<skin_model::present::Val>,
+) -> Skin {
+    use skin_model::present::{CallbackDef, Conv, Insn, MAX_CALLBACK_OPS, OutTy, PresentDef};
     let mut code = vec![Insn::Const { dst: 0, k: 0 }];
     for i in 0..(MAX_CALLBACK_OPS - 2) / 2 {
-        let op = if i % 2 == 0 { Arith::Mul } else { Arith::Add };
-        code.push(Insn::Const { dst: 1, k: 1 });
+        code.push(Insn::Const {
+            dst: 1,
+            k: 1 + (i % 2) as u16,
+        });
         code.push(Insn::Arith {
-            op,
+            op: ops[i % 2],
             dst: 0,
             a: 0,
             b: 1,
@@ -254,13 +261,6 @@ fn bench_program(c: &mut Criterion) {
         gate: None,
         after: None,
     };
-    let present = PresentDef {
-        code,
-        consts: vec![Val::Float(0.5), Val::Float(1.000_1)],
-        reads: Vec::new(),
-        callbacks: vec![cb; n],
-        signature: vec![OutTy::Int; n],
-    };
     let skin = Skin::new(SkinDef {
         fit: Fit::Adapt,
         regions: play_support::REGIONS,
@@ -271,18 +271,48 @@ fn bench_program(c: &mut Criterion) {
         widgets: WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
-        present: Some(present),
+        present: Some(PresentDef {
+            code,
+            consts,
+            reads: Vec::new(),
+            callbacks: vec![cb; n],
+            signature: vec![OutTy::Int; n],
+        }),
     })
     .expect("a program at the cap loads");
     assert_eq!(skin.ops().total(), skin_model::MAX_SKIN_OPS);
-    let mut h = harness(skin);
-    h.frame(1_000, &[]);
-    c.bench_function("skin_model_build_program", |b| {
-        b.iter(|| {
-            h.frame(black_box(1_000), &[]);
-            black_box(h.play.state().fields.len())
+    skin
+}
+
+/// The program at the cap with three instruction mixes.
+fn bench_program(c: &mut Criterion) {
+    use skin_model::present::{Arith, Val};
+    for (name, ops, consts) in [
+        (
+            "skin_model_build_program_mul_add",
+            [Arith::Mul, Arith::Add],
+            vec![Val::Float(0.5), Val::Float(1.000_1), Val::Float(0.25)],
+        ),
+        (
+            "skin_model_build_program_mod_div",
+            [Arith::Mod, Arith::Div],
+            vec![Val::Float(1e300), Val::Float(3e-300), Val::Float(7e-301)],
+        ),
+        (
+            "skin_model_build_program_subnormal",
+            [Arith::Mul, Arith::Mod],
+            vec![Val::Float(1e-310), Val::Float(0.999_9), Val::Float(3e-315)],
+        ),
+    ] {
+        let mut h = harness(program_skin(ops, consts));
+        h.frame(1_000, &[]);
+        c.bench_function(name, |b| {
+            b.iter(|| {
+                h.frame(black_box(1_000), &[]);
+                black_box(h.play.state().fields.len())
+            });
         });
-    });
+    }
 }
 
 criterion_group!(

@@ -480,3 +480,57 @@ fn results_convert_as_the_source() {
     }
     assert_eq!(outputs(plain(b).unwrap(), n, 0), want);
 }
+
+/// V6 keeps a read's type: a schema field at the first output's slot,
+/// an integer of range 0 to 1, read where the program's boolean output is,
+/// is refused, though its range is a boolean's.
+#[test]
+fn an_output_slot_read_as_a_field_is_refused() {
+    let mut fields = skin_model::PLAY.fields.to_vec();
+    let mut forged = fields[0].clone();
+    forged.name = "forged";
+    forged.ty = skin_model::FieldTy::Int { lo: 0, hi: 1 };
+    fields.push(forged);
+    let schema: &'static skin_model::Schema = Box::leak(Box::new(skin_model::Schema {
+        fields: Box::leak(fields.into_boxed_slice()),
+        ..skin_model::PLAY
+    }));
+    let mut e = element(Source::Image(0), [0, 0, 10, 10], Place::SCREEN);
+    e.visible = Some(
+        skin_model::compile("forged == 1", &skin_model::Scope::new(schema), Ty::Bool).unwrap(),
+    );
+    assert!(matches!(
+        skin(one(), vec![e], None),
+        Err(LoadError::OutputRead)
+    ));
+    // The same slot read by its output name loads.
+    let b = one();
+    let sig = b.signature();
+    assert!(skin(b, vec![image("lua.0", &sig, None)], None).is_ok());
+}
+
+/// A number whose value is `i32::MIN` or `i32::MAX` draws nothing, on play
+/// too, as the source's number does.
+#[test]
+fn a_reserved_value_draws_no_number() {
+    for (value, shown) in [
+        ("2147483647", false),
+        ("-2147483647 - 1", false),
+        ("5", true),
+    ] {
+        let (e, n) = number(value, None, &[]);
+        let s = load(
+            None,
+            vec![],
+            vec![e],
+            WidgetDefs {
+                numbers: vec![n],
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap();
+        let mut h = harness(s);
+        h.frame(1_000, &[]);
+        assert_eq!(!drawn(&h).is_empty(), shown, "{value}");
+    }
+}
