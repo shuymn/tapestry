@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use replay::PlayRecord;
+use rules::RulePreset;
 use tempfile::NamedTempFile;
 
-use crate::bests::{BestView, SavedPlay};
+use crate::bests::{BestKey, BestLookup, BestView, SavedPlay};
 use crate::error::IoFailure;
 
 /// A complete temporary file in `dir`, under a name no other writer uses; it
@@ -76,6 +77,16 @@ pub trait RecordSink {
     fn after_result(&mut self, play: &SavedPlay<'_>) -> Option<BestView> {
         let _ = play;
         None
+    }
+
+    /// The best stored under `key` before this play, for a result view that
+    /// is not the counted play's own (design.md "Personal Bests", skin
+    /// projections); `preset` is the key's, which names its lamp. One read
+    /// per view, on the result's thread. Unavailable by default: a sink
+    /// that keeps no bests knows none.
+    fn best_before(&mut self, key: &BestKey, preset: &RulePreset) -> BestLookup {
+        let _ = (key, preset);
+        BestLookup::Unavailable
     }
 }
 

@@ -164,7 +164,7 @@ pub mod field {
     pub const RESULT_NEXT_RANK: u16 = 29;
     /// The clear type, the source's index ([`LampKey::clear_type`](crate::LampKey::clear_type)).
     pub const RESULT_CLEAR: u16 = 30;
-    /// Whether the emphasized gauge cleared.
+    /// Whether the view cleared: its lamp is not failed (options 90 and 91).
     pub const RESULT_CLEARED: u16 = 31;
     /// Whether the timing statistics are known: one sample or more.
     pub const TIMING_VALID: u16 = 32;

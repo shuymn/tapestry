@@ -5,11 +5,12 @@
 //! a cached summary stays small; built from a batch evaluation, never
 //! during play.
 
-use bms_model::TimeUs;
+use bms_model::{Chart, TimeUs};
 use eval::{Evaluation, GaugeResult, JudgeEvent};
 use replay::verify::Coverage;
 use rules::{GaugeKind, GaugeValue};
 
+use crate::result_figures::{TimelineAxis, Timelines};
 use crate::result_screen::SHOWN_GAUGES;
 use crate::results::press_deviations;
 
@@ -174,6 +175,8 @@ pub struct ResultGraphs {
     pub no_input_from: Option<u16>,
     /// The press deviations.
     pub timing: Timing,
+    /// The judgments over chart time.
+    pub timelines: Timelines,
 }
 
 impl ResultGraphs {
@@ -185,20 +188,28 @@ impl ResultGraphs {
         reached: GRAPH_COLUMNS as u16,
         no_input_from: None,
         timing: Timing::NONE,
+        timelines: Timelines::EMPTY,
     };
 
-    /// The graphs of `e` on `axis`, for the gauges at `listed` (indices in
-    /// `rules`, the preset `e` was evaluated under), `emphasized` among
-    /// them.
+    /// The graphs of `e`, evaluated on `chart`, on `axis`, for the gauges
+    /// at `listed` (indices in `rules`, the preset `e` was evaluated under),
+    /// `emphasized` among them, and its timelines on `timeline`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, each a view's part"
+    )]
     pub(crate) fn of(
         e: &Evaluation,
+        chart: &Chart,
         rules: &[rules::GaugeRule],
         listed: &[usize],
         emphasized: Option<usize>,
         axis: Axis,
+        timeline: TimelineAxis,
         coverage: Coverage,
     ) -> Self {
         let mut g = Self::EMPTY;
+        g.timelines.fill(&e.events, chart, timeline, coverage);
         g.reached = axis.reached(coverage);
         g.no_input_from = match coverage {
             Coverage::NoInputAfter(t) => Some(axis.column(t)),
