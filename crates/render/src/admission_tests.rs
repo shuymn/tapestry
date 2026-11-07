@@ -8,11 +8,14 @@
 //! `tests/admission.rs` checks that a commit's own charge, unstated, is
 //! its array's texels.
 //!
-//! "Big" is one generated cell, no file read, whose atlas array is exactly
-//! an atlas's cap, built once for the whole binary and never uploaded.
-//! "Tiny" is a 16×16 cell on one 256-texel page. A sum past the limit is
-//! shown past it by the smallest atlas, tiny's, or by a kept VM: charges
-//! are whole layers, so no candidate is one texel past.
+//! "Big" is two generated cells, no file read, whose atlas array is
+//! exactly an atlas's cap, built once for the whole binary and never
+//! uploaded. "Tiny" is a 16×16 cell on one 256-texel page. The shared
+//! limit is more than two caps, so a committed installation is stated
+//! the charge that puts a sum at the boundary a test names, derived from
+//! [`SHARED_TEXELS`] and [`CAP`]. A sum past the limit is shown past it by
+//! the smallest atlas, tiny's, or by a kept VM: charges are whole layers,
+//! so no candidate is one texel past.
 
 use std::sync::{Arc, OnceLock};
 
@@ -23,7 +26,7 @@ use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, ScreenKind};
 use crate::test_common::{GAUGES, attempt, context, offscreen};
 use crate::test_decl::{Look, atlas_cap_bundle, solid_bundle};
 
-/// An atlas's cap: half the shared limit.
+/// An atlas's cap: at most half the shared limit.
 const CAP: u64 = MAX_ATLAS_TEXELS;
 /// Tiny's atlas array: one 256-texel page beside the reserved layer.
 const TINY: u64 = 256 * 256 * 2;
@@ -81,14 +84,16 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
     assert!(e.is_refusal());
 }
 
-/// The shared limit is 384 Mi, two atlases at the cap: big as the
-/// selection screen's candidate fits beside play's skin charged the cap,
-/// exactly at the limit; once a tiny result skin is committed too, the
-/// sum is past the limit by tiny's atlas, and big is refused.
+/// The shared limit is 576 Mi, at least two atlases at the cap: big as
+/// the selection screen's candidate fits beside play's skin charged the
+/// cap; charged what the limit leaves beside big, play's skin puts the sum
+/// exactly at the limit, and one texel more past it; once a tiny result
+/// skin is committed too, the sum is past the limit by tiny's atlas, and
+/// big is refused.
 #[test]
 fn two_skins_at_the_atlas_cap_fit_together() {
-    assert_eq!(SHARED_TEXELS, 384 << 20);
-    assert_eq!(SHARED_TEXELS, 2 * CAP);
+    assert_eq!(SHARED_TEXELS, 576 << 20);
+    const { assert!(SHARED_TEXELS >= 2 * CAP) };
     let mut r = offscreen(1_920, 1_080);
     let big = big(&r);
     let p = tiny(&r, RED);
@@ -97,11 +102,14 @@ fn two_skins_at_the_atlas_cap_fit_together() {
     r.state_charge(&p, CAP);
     assert_eq!(r.admission().charge(ScreenKind::Play), CAP);
     r.admit(ScreenKind::Selection, &big).unwrap();
-    // One texel more is past the limit.
-    r.state_charge(&p, CAP + 1);
+    // Exactly at the limit, then one texel more is past it.
+    let rest = SHARED_TEXELS - CAP;
+    r.state_charge(&p, rest);
+    r.admit(ScreenKind::Selection, &big).unwrap();
+    r.state_charge(&p, rest + 1);
     let e = r.admit(ScreenKind::Selection, &big).unwrap_err();
     refused(&e, ScreenKind::Selection, SHARED_TEXELS + 1);
-    r.state_charge(&p, CAP);
+    r.state_charge(&p, rest);
 
     let result = tiny(&r, GREEN);
     commit(&mut r, ScreenKind::Result, &result, 2);
@@ -129,9 +137,10 @@ fn a_candidate_replaces_its_kinds_charge() {
 }
 
 /// A bundle keeping a VM is charged [`VM_TEXELS`] beside its atlas, a VM's
-/// memory cap at 4 bytes a texel: with a selection skin charged the cap
-/// less tiny's atlas, big as play's would be exactly at the limit beside a
-/// tiny result skin, and the result skin's VM puts it past.
+/// memory cap at 4 bytes a texel: with a selection skin charged what the
+/// limit leaves beside big and tiny's atlas, big as play's would be
+/// exactly at the limit beside a tiny result skin, and the result skin's
+/// VM puts it past.
 #[test]
 fn a_kept_vm_is_charged() {
     assert_eq!(
@@ -142,7 +151,7 @@ fn a_kept_vm_is_charged() {
     let big = big(&r);
     let s = tiny(&r, RED);
     commit(&mut r, ScreenKind::Selection, &s, 1);
-    r.state_charge(&s, CAP - TINY);
+    r.state_charge(&s, SHARED_TEXELS - CAP - TINY);
     let vm = Arc::new(Arc::try_unwrap(tiny(&r, GREEN)).unwrap().keeping_vm());
     assert!(vm.keeps_vm());
     commit(&mut r, ScreenKind::Result, &vm, 2);
@@ -159,7 +168,7 @@ fn a_refused_admission_drops_the_staging_before() {
     let big = big(&r);
     let red = tiny(&r, RED);
     commit(&mut r, ScreenKind::Play, &red, 1);
-    r.state_charge(&red, CAP);
+    r.state_charge(&red, SHARED_TEXELS - CAP);
     let green = tiny(&r, GREEN);
     commit(&mut r, ScreenKind::Result, &green, 2);
     let staged = r
@@ -180,7 +189,8 @@ fn a_refused_admission_drops_the_staging_before() {
 }
 
 /// A removed installation gives its charge back: big, refused as play's
-/// beside a selection skin charged the cap and tiny's atlas, then fits.
+/// beside a selection skin charged what the limit leaves beside big and
+/// tiny's atlas more, then fits.
 /// Play's installation is never removed this way.
 #[test]
 fn a_removed_installation_gives_its_charge_back() {
@@ -190,7 +200,7 @@ fn a_removed_installation_gives_its_charge_back() {
     commit(&mut r, ScreenKind::Play, &red, 1);
     let b = tiny(&r, GREEN);
     commit(&mut r, ScreenKind::Selection, &b, 2);
-    r.state_charge(&b, CAP + TINY);
+    r.state_charge(&b, SHARED_TEXELS - CAP + TINY);
     r.remove(ScreenKind::Play);
     assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &red));
     // Big as play's replaces red; the selection's skin is charged.
@@ -203,34 +213,36 @@ fn a_removed_installation_gives_its_charge_back() {
     r.admit(ScreenKind::Play, &big).unwrap();
 }
 
-/// A candidate's text layer is charged with its pages: one 8 192-texel
-/// page, the reserved layer and the text layer are an atlas's cap. With
-/// play's skin charged the cap and two other kinds each keeping a VM
-/// committed, and the candidate keeping one too, 48 Mi texels and two tiny
-/// atlases are charged beside them: with its text layer it passes the
-/// limit and is refused, before anything is staged; without the layer
-/// it would fit.
+/// A candidate's text layer is charged with its pages: two 8 192-texel
+/// pages, the reserved layer and the text layer are an atlas's cap. With
+/// two other kinds each keeping a VM committed, and the candidate keeping
+/// one too, 48 Mi texels and two tiny atlases are charged beside it, and
+/// play's skin is charged what leaves the candidate exactly one layer
+/// short: with its text layer it passes the limit and is refused, before
+/// anything is staged; without the layer it would fit, exactly at the
+/// limit.
 #[test]
 fn a_candidate_s_text_layer_is_charged() {
     const PAGE: u64 = 8_192 * 8_192;
     let mut r = offscreen(1_920, 1_080);
     let t = tiny(&r, RED);
     play(&mut r, &t, 1);
-    r.state_charge(&t, CAP);
+    let others = 2 * (TINY + VM_TEXELS);
+    let charge = CAP + VM_TEXELS;
+    r.state_charge(&t, SHARED_TEXELS - others - (charge - PAGE));
     let vm = |r: &Renderer| Arc::new(Arc::try_unwrap(tiny(r, GREEN)).unwrap().keeping_vm());
     let (d, re) = (vm(&r), vm(&r));
     commit(&mut r, ScreenKind::Decision, &d, 2);
     commit(&mut r, ScreenKind::Result, &re, 3);
     let candidate = atlas_cap_bundle(&r, RED);
-    assert_eq!((candidate.side(), candidate.text_layer()), (8_192, Some(2)));
+    assert_eq!((candidate.side(), candidate.text_layer()), (8_192, Some(3)));
     let candidate = Arc::new(Arc::try_unwrap(candidate).unwrap().keeping_vm());
-    let committed = CAP + 2 * (TINY + VM_TEXELS);
-    let needed = committed + 3 * PAGE + VM_TEXELS;
-    assert!(needed > SHARED_TEXELS && needed - PAGE <= SHARED_TEXELS);
+    let needed = SHARED_TEXELS + PAGE;
     let e = r.admit(ScreenKind::Selection, &candidate).unwrap_err();
     refused(&e, ScreenKind::Selection, needed);
     let e = r.install(ScreenKind::Selection, &candidate, 4).unwrap_err();
     refused(&e, ScreenKind::Selection, needed);
     assert!(r.staged().is_none());
-    assert_eq!(candidate.atlas_texels(), 3 * PAGE);
+    assert_eq!(candidate.atlas_texels(), CAP);
+    assert_eq!(CAP, 4 * PAGE);
 }
