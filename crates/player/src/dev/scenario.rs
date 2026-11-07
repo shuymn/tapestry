@@ -271,10 +271,10 @@ pub struct ScenarioArgs {
     pub file: PathBuf,
     /// `--dev-render-timeout`, as on song selection.
     pub render_timeout: Option<Duration>,
-    /// `--dev-specializing <mode>`: what the run's first pending play
-    /// skin's specialization gets once its Lua executes, as the select
+    /// `--dev-specializing <mode>`: what the run's first specialization
+    /// of the mode's stage gets once its Lua executes, as the select
     /// script's `<mode>-specializing` step.
-    pub specializing: Option<super::Specializing>,
+    pub specializing: Option<(super::SpecializingStage, super::Specializing)>,
 }
 
 /// The arguments after `--dev-scenario`: the file, then
@@ -296,10 +296,11 @@ pub fn args(p: &mut lexopt::Parser) -> Result<ScenarioArgs, UsageError> {
             lexopt::Arg::Long("dev-specializing") if specializing.is_none() => {
                 let mode = p.value()?;
                 let mode = mode.to_string_lossy();
-                specializing = Some(super::Specializing::named(&mode).ok_or_else(|| {
+                specializing = Some(super::Specializing::staged(&mode).ok_or_else(|| {
                     UsageError::Usage(
                         "--dev-specializing takes quit, close, input-failure, escalate or \
-                         escalate-input-failure"
+                         escalate-input-failure, optionally after result-image- or \
+                         result-layout-"
                             .to_owned(),
                     )
                 })?);
@@ -1665,8 +1666,8 @@ pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
         script,
         session,
     } = load(&args.file)?;
-    if let Some(mode) = args.specializing {
-        super::specializing(mode);
+    if let Some((stage, mode)) = args.specializing {
+        super::specializing(stage, mode);
     }
     crate::select(
         crate::args::Select {

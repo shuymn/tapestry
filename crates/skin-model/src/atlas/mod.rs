@@ -144,10 +144,19 @@ impl Page {
     }
 }
 
+/// A built atlas's identity: a serial given when its pages are packed,
+/// shared by every [`Arc`] of them and every atlas rebound to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtlasId(pub u64);
+
+/// The next [`AtlasId`].
+static NEXT_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// An atlas's pages with where it placed each cell: what every atlas
 /// rebound from it shares ([`Atlas::rebind`]).
 #[derive(Debug)]
 pub struct PackedPages {
+    id: AtlasId,
     side: u32,
     pages: Vec<Page>,
     variant: Variant,
@@ -200,6 +209,12 @@ impl HeldCell {
 }
 
 impl PackedPages {
+    /// Its identity, given when it was packed.
+    #[must_use]
+    pub fn id(&self) -> AtlasId {
+        self.id
+    }
+
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -472,6 +487,39 @@ impl Sheet {
         text: bool,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
+        let (rects, packing) = self.packing(variant, limits, text)?;
+        self.build(variant, limits, text, rects, packing, cancel)
+    }
+
+    /// Whether this sheet's atlas of `variant` fits `limits` (with a text
+    /// layer when `text` is set), and its level-0 texels: the packing and
+    /// every check [`atlas_reserving`](Self::atlas_reserving) makes before
+    /// it allocates or reads anything, with no file read (design D13,
+    /// "Overflow"). Load-stage work.
+    ///
+    /// # Errors
+    ///
+    /// What the build would refuse before its pages: a cell too large, too
+    /// many pages, the limits, or [`AtlasError::AtlasTooLarge`].
+    pub fn plan(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        text: bool,
+    ) -> Result<u64, AtlasError> {
+        let (_, packing) = self.packing(variant, limits, text)?;
+        let kept = limits.reserved_layers + u32::from(text);
+        Ok(pack::cost(kept, packing.pages, packing.side))
+    }
+
+    /// Each cell's rectangle in the version `variant` reads, and their
+    /// packing within `limits`, checked against [`MAX_ATLAS_TEXELS`].
+    fn packing(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        text: bool,
+    ) -> Result<(Vec<[u32; 4]>, pack::Packing), AtlasError> {
         let extra = u32::from(text);
         let min_side = if text { MIN_TEXT_SIDE } else { 0 };
         let max_pages = page_cap(&limits, extra)?;
@@ -507,11 +555,25 @@ impl Sheet {
         // Only the rectangles and the places stay beside the files
         // ([`CELL_TABLE_BYTES`]).
         drop(padded);
-        let side = packing.side;
-        let texels = pack::cost(kept, packing.pages, side);
+        let texels = pack::cost(kept, packing.pages, packing.side);
         if texels > MAX_ATLAS_TEXELS {
             return Err(AtlasError::AtlasTooLarge { texels });
         }
+        Ok((rects, packing))
+    }
+
+    /// The build of a planned packing: the pages allocated and filled, the
+    /// mips, and the placements.
+    fn build(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        text: bool,
+        rects: Vec<[u32; 4]>,
+        packing: pack::Packing,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
+        let side = packing.side;
 
         let mut pages = Vec::new();
         pages
@@ -546,6 +608,7 @@ impl Sheet {
         let (files, cells) = self.held(variant, limits.reserved_layers, &rects, &packing)?;
         drop((rects, packing));
         let pages = PackedPages {
+            id: AtlasId(NEXT_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             side,
             pages,
             variant,

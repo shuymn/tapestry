@@ -276,9 +276,82 @@ pub struct PlayerRig<'a> {
     /// select screen's panels (design.md "Input", Menu input), installed
     /// with the adjustments' tap.
     pub panels: Option<input::PanelLevel>,
+    /// The result skin (design D10-D13): its image stage in each
+    /// attempt's Preparing, its layout on the result and each switch,
+    /// published on the CPU.
+    pub result_skin: crate::result_skin::ResultSkin,
+    /// The attempt's chart facts a result view carries.
+    pub result_chart: Option<skin_model::ResultChart>,
 }
 
 impl PlayerRig<'_> {
+    /// The result skin's image stage for the attempt at `loaded` (design
+    /// D11), after the play skin's specialization and before READY: the
+    /// quit key cancels its job and waits for its thread; the window's
+    /// close and a failure of the input or audio thread end it within the
+    /// stop bound.
+    fn result_stage(&mut self, loaded: &Loaded) -> crate::result_skin::Staged {
+        let chart = crate::result_skin::attempt_chart(loaded);
+        self.result_chart = Some(chart);
+        let mut result = std::mem::take(&mut self.result_skin);
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
+        let rig = &*self;
+        let class = crate::result_skin::attempt_class(loaded);
+        let staged = result.image_stage(chart, class, || rig.controls.leaving(), || rig.run_ends());
+        self.result_skin = result;
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: result image stage: {}",
+            self.result_skin.staged_line()
+        );
+        staged
+    }
+
+    /// Whether the run ends: the window's close, or a failure of the input
+    /// or audio thread. A script's step on a specialization's job
+    /// (dev-tools) acts at every look.
+    fn run_ends(&self) -> bool {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
+        self.controls.quitting() || self.input_failure().is_some() || self.audio_failure().is_some()
+    }
+
+    /// The result skin's running layout job cancelled and waited for; the
+    /// run's end bounds the wait ([`imports::STOP_WAIT`]).
+    fn settle_result(&mut self) {
+        let mut result = std::mem::take(&mut self.result_skin);
+        let rig = &*self;
+        // When the run's end was first seen (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        let ended: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+        result.settle(|| {
+            let ends = rig.run_ends();
+            #[cfg(feature = "dev-tools")]
+            if ends && ended.get().is_none() {
+                ended.set(Some(std::time::Instant::now()));
+            }
+            ends
+        });
+        self.result_skin = result;
+        #[cfg(feature = "dev-tools")]
+        if let Some(at) = ended.get() {
+            println!(
+                "dev: result skin settled {} ms after the run's end",
+                at.elapsed().as_millis()
+            );
+        }
+        // The job's thread has ended, and its VMs with it, unless the
+        // run's end gave it up (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: result skin jobs: live {} joined {} of {}",
+            skin_beatoraja::lua::vm_hooks::live(),
+            crate::imports::jobs_joined(),
+            crate::imports::jobs_started()
+        );
+    }
+
     /// The play skin the attempt at `loaded` is prepared with: the skin in
     /// use, or the pending play skin's specialization for the attempt's
     /// facts ([`crate::imports::PendingSkin::attempt`]), reused while the
@@ -335,15 +408,9 @@ impl PlayerRig<'_> {
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             rig.controls.leaving()
         };
-        let end_run = || {
-            // A script's step on the specialization (dev-tools), asked at
-            // every look of the wait, an attempt's quit included.
-            #[cfg(feature = "dev-tools")]
-            crate::dev::specialization_signal(rig.controls, || rig.input.fail_for_script());
-            rig.controls.quitting()
-                || rig.input_failure().is_some()
-                || rig.audio_failure().is_some()
-        };
+        // A script's step on the specialization (dev-tools) is asked at
+        // every look of the wait, an attempt's quit included.
+        let end_run = || rig.run_ends();
         let (skin, how) = pending.attempt(facts, wait, quit, end_run);
         #[cfg(feature = "dev-tools")]
         println!("dev: specialization wait left");
@@ -837,6 +904,12 @@ impl Rig for PlayerRig<'_> {
         if left > 0 {
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        // A switch's layout lands when its job is done; a close leaves its
+        // wait within the stop bound.
+        self.result_skin.poll();
+        if self.controls.quitting() && self.result_skin.has_job() {
+            self.result_skin.settle(|| true);
+        }
         self.serve_adjustments();
         self.sync();
     }
@@ -879,6 +952,24 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.result_input.take()
+    }
+
+    /// A withdrawn preparation cancels the result skin's layout job and
+    /// waits for its thread (design D11, "Cancellation"); the run's end
+    /// bounds the wait.
+    fn withdraw_result(&mut self) {
+        self.settle_result();
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result skin settled: withdrawn");
+    }
+
+    /// A leaving command the Result state acts on cancels a switch's
+    /// layout job and waits for its thread before it is served (D11); the
+    /// run's end bounds the wait.
+    fn accept_leaving(&mut self, _cmd: MenuCommand) {
+        self.settle_result();
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result skin settled: accepted");
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -959,10 +1050,14 @@ impl Rig for PlayerRig<'_> {
     /// gauge descriptor is replaced from the preset the play refreshed,
     /// with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        self.result_skin.next_attempt();
         let skin = match self.attempt_skin(loaded) {
             Ok(skin) => skin,
             Err(stopped) => return Ok(stopped),
         };
+        if self.result_stage(loaded) == crate::result_skin::Staged::Cancelled {
+            return Ok(Preparation::Cancelled);
+        }
         let specialized = matches!(skin, AttemptSkin::Specialized(_));
         self.attempt_gauge = loaded.displayed().0;
         refresh_loading_gauge(
@@ -1449,8 +1544,58 @@ impl Rig for PlayerRig<'_> {
         }
     }
 
+    /// P: the own view's layout, asked for once its best is compared, with
+    /// the view's final facts (design D11; the S10-09i design's Q1).
+    fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
+        // The own view's best as the request takes it (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        {
+            let best = match screen.status() {
+                game::ViewStatus::Ready(s) => match s.best {
+                    None => "none",
+                    Some(game::BestCompare::Unavailable) => "unavailable",
+                    Some(game::BestCompare::Known(_)) => "known",
+                },
+                _ => "no view",
+            };
+            println!("dev: result layout requested: best {best}");
+        }
+        if let Some(chart) = self.result_chart {
+            self.result_skin
+                .request(crate::result_skin::view_facts(screen, chart));
+            #[cfg(feature = "dev-tools")]
+            if self.result_skin.has_job() {
+                crate::dev::stage_began(crate::dev::SpecializingStage::ResultLayout);
+            }
+        }
+    }
+
+    fn poll_result(&mut self, _prep: &mut (), deadline: TimeUs) -> game::Polled {
+        loop {
+            // A script's step on the layout (dev-tools), at every look.
+            #[cfg(feature = "dev-tools")]
+            crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
+            if self.result_skin.poll() {
+                return game::Polled::Ready;
+            }
+            let left = deadline.0 - self.clock.now().0;
+            if left <= 0 {
+                return game::Polled::Pending;
+            }
+            let slice =
+                Duration::from_micros(left.unsigned_abs()).min(crate::render_side::SELECT_SLICE);
+            thread::park_timeout(slice);
+        }
+    }
+
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
         self.print_view(screen);
+        // A switch: its layout is requested; the current generation stays
+        // until it lands (design D11).
+        if let Some(chart) = self.result_chart {
+            self.result_skin
+                .request(crate::result_skin::view_facts(screen, chart));
+        }
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {

@@ -46,6 +46,7 @@ mod presentmon;
 mod recording;
 mod render_side;
 mod result_input;
+mod result_skin;
 mod result_view;
 mod select;
 mod selection;
@@ -858,6 +859,8 @@ fn rig<'a>(
         gate: None,
         adjust: None,
         panels: None,
+        result_skin: crate::result_skin::ResultSkin::default(),
+        result_chart: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1166,6 +1169,7 @@ fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Res
     match start_skins(rig, loaded.settings(), imports::Launch::Direct) {
         Ok(started) => {
             rig.pending = started.pending;
+            rig.result_skin = crate::result_skin::ResultSkin::new(started.result);
             game::live::run_chart(loaded, rig)
                 .map(|_| ())
                 .map_err(anyhow::Error::from)
@@ -1549,6 +1553,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             }
             // A pending play skin admits charts, each built for.
             rig.pending = started.pending;
+            rig.result_skin = crate::result_skin::ResultSkin::new(started.result);
             if let Some(sel) = &mut rig.selection {
                 sel.started(started.notice, started.selection);
             }
