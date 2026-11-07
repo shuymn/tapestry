@@ -89,12 +89,13 @@ fn translucent() -> [GaugeGraphColors; GaugeLook::COUNT] {
     })
 }
 
-/// A skin of `graphs`, each element `(graph, rect, alpha)` on the screen
-/// timer.
+/// A skin of `graphs`, each element `(graph, rect, alpha)` on the
+/// fade-out timer, which starts 0.7 s before the screen timer, so a
+/// reveal on the element's own time would run ahead of the screen's.
 fn fixture(graphs: Vec<[GaugeGraphColors; 6]>, elements: &[(u32, [i32; 4], i32)]) -> GFx {
     let elements = elements
         .iter()
-        .map(|&(i, r, a)| source_element(Source::GaugeGraph(i), r, a, result_timer::SCREEN))
+        .map(|&(i, r, a)| source_element(Source::GaugeGraph(i), r, a, result_timer::FADEOUT))
         .collect();
     let gauge_graphs = graphs
         .into_iter()
@@ -103,14 +104,25 @@ fn fixture(graphs: Vec<[GaugeGraphColors; 6]>, elements: &[(u32, [i32; 4], i32)]
             solid: SOLID,
         })
         .collect();
-    GFx::new(skin_with(
+    let mut fx = GFx::new(skin_with(
         elements,
         ResultDefs {
             gauge_graphs,
             ..ResultDefs::default()
         },
-    ))
+    ));
+    fx.timers = ResultTimers {
+        screen: Some(TimeUs(0)),
+        fadeout: Some(TimeUs(-700_000)),
+    };
+    fx
 }
+
+/// The screen timer started at 3 s and the element's own at 2.25 s.
+const STAGGERED: ResultTimers = ResultTimers {
+    screen: Some(TimeUs(3_000_000)),
+    fadeout: Some(TimeUs(2_250_000)),
+};
 
 /// The canvas point `x` from the left of `rect` and `row` up from its
 /// bottom.
@@ -305,17 +317,15 @@ fn the_line_stays_in_its_columns_and_stops_at_the_end() {
 }
 
 /// On a screen timer started at 3 s the line reveals left to right over
-/// 1.5 s: none at 3 s, to half the width at 3.75 s, all of it at 4.5 s;
+/// 1.5 s: none at 3 s, to half the width at 3.75 s, all of it at 4.5 s,
+/// though the element's own timer, started at 2.25 s, is 0.75 s ahead;
 /// the back is whole from the first frame. A view switch at 3.75 s keeps
 /// the reveal where it is.
 #[test]
 fn the_line_reveals_on_the_screen_timer() {
     let r = [0, 0, 576, 259];
     let mut fx = fixture(vec![surveyed()], &[(0, r, 255)]);
-    fx.timers = ResultTimers {
-        screen: Some(TimeUs(3_000_000)),
-        fadeout: None,
-    };
+    fx.timers = STAGGERED;
     fx.view(&view(history(
         [flat(50.0); GRAPH_COLUMNS],
         GaugeLook::Normal,
@@ -342,16 +352,35 @@ fn the_line_reveals_on_the_screen_timer() {
 
 /// A what-if view whose input ends in column 144 of a 576-wide graph
 /// (columns 2 wide) shows a white line one unit wide at that column's
-/// left, over the full height; a view without the mark shows none.
+/// left, over the full height; a view without the mark shows none. The
+/// mark is revealed with the line: on a screen timer started at 3 s, a
+/// mark at column 72 (x 144) is hidden at 3 s and at 3.375 s (the line
+/// cut at x 144), and shown at 3.75 s.
 #[test]
 fn the_no_input_mark_sits_at_its_column() {
     let r = [0, 0, 576, 259];
     let mut fx = fixture(vec![surveyed()], &[(0, r, 255)]);
     let mut g = history([flat(50.0); GRAPH_COLUMNS], GaugeLook::Normal);
+    let white = [255.0; 3];
+    let is_white = |fx: &GFx, x: f32| {
+        let got = pixel(fx, at(r, x, 50.5)).0;
+        got.iter().all(|&c| (c - 255.0).abs() <= 1.0)
+    };
+    g.no_input_from = Some(72);
+    fx.view(&view(g));
+    fx.timers = STAGGERED;
+    for (ms, shown) in [(3_000, false), (3_375, false), (3_750, true), (4_500, true)] {
+        fx.frame(ms);
+        assert_eq!(is_white(&fx, 144.5), shown, "{ms} ms");
+        assert!(!is_white(&fx, 145.5), "{ms} ms");
+    }
+    fx.timers = ResultTimers {
+        screen: Some(TimeUs(0)),
+        fadeout: Some(TimeUs(-700_000)),
+    };
     g.no_input_from = Some(144);
     fx.view(&view(g));
     fx.frame(1_500);
-    let white = [255.0; 3];
     for row in [0.5, 129.5, 230.5, 258.5] {
         near(pixel(&fx, at(r, 288.5, row)).0, white, 1.0);
     }
@@ -366,7 +395,8 @@ fn the_no_input_mark_sits_at_its_column() {
 }
 
 /// A ready view without an emphasized gauge draws no gauge graph at all,
-/// its back included; nor does an unavailable view that has one.
+/// its back included, also right after a view that had one; nor does an
+/// unavailable view that has one.
 #[test]
 fn no_gauge_draws_nothing() {
     let mut fx = fixture(vec![surveyed()], &[(0, [0, 0, 519, 259], 255)]);
@@ -374,6 +404,12 @@ fn no_gauge_draws_nothing() {
     fx.frame(1_500);
     assert!(fx.quads().is_empty());
     let mut v = view(history([flat(50.0); GRAPH_COLUMNS], GaugeLook::Normal));
+    fx.view(&v);
+    fx.frame(1_500);
+    assert!(!fx.quads().is_empty());
+    fx.view(&ready());
+    fx.frame(1_500);
+    assert!(fx.quads().is_empty());
     fx.view(&v);
     fx.frame(1_500);
     assert!(!fx.quads().is_empty());
@@ -395,4 +431,27 @@ fn the_worst_frame_fits_the_charge() {
     fx.view(&view(g));
     fx.frame(1_500);
     assert_eq!(fx.quads().len(), 1_443);
+}
+
+/// A graph shorter than the line keeps every quad inside its rect: at
+/// height 1 a flat 50 % gauge's line covers only that row, nothing above
+/// or below it; at height 0 nothing is covered at all.
+#[test]
+fn a_short_graph_stays_in_its_rect() {
+    let mut fx = fixture(
+        vec![surveyed()],
+        &[(0, [0, 10, 576, 1], 255), (0, [0, 20, 576, 0], 255)],
+    );
+    fx.view(&view(history(
+        [flat(50.0); GRAPH_COLUMNS],
+        GaugeLook::Normal,
+    )));
+    fx.frame(1_500);
+    for x in [0.5, 1.5, 287.5, 575.5] {
+        let covered = |y: f32| pixel(&fx, [x, y]).1;
+        assert!(covered(10.5) >= 1, "{x}");
+        for y in [18.5, 19.5, 20.5, 21.5, 8.5, 9.5, 11.5, 12.5] {
+            assert_eq!(covered(y), 0, "({x}, {y})");
+        }
+    }
 }

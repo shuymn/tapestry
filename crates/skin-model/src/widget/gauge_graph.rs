@@ -100,8 +100,10 @@ impl Region<'_> {
     /// Pushes the piece `[left, right) × [bottom, top)` of the graph (its
     /// x from the region's left, its rows up from its bottom, in
     /// reference units) in the straight colour `color`, cut at `clip`
-    /// from the left; `false` when the batch refused it. An empty or
-    /// fully transparent piece pushes nothing.
+    /// from the left and to the graph's rows `[0, h)`, so a graph shorter
+    /// than the line keeps every quad inside its rect; `false` when the
+    /// batch refused it. An empty or fully transparent piece pushes
+    /// nothing.
     fn piece(
         &self,
         [left, right]: [f64; 2],
@@ -110,11 +112,13 @@ impl Region<'_> {
         color: [f32; 4],
         out: &mut QuadBatch,
     ) -> bool {
+        let [x, y, _, h] = self.rect;
         let right = right.min(clip);
-        if right <= left || top <= bottom || color[3] <= 0.0 {
+        let (bottom, top) = (bottom.max(0.0), top.min(h));
+        let [.., alpha] = color;
+        if right <= left || top <= bottom || alpha <= 0.0 {
             return true;
         }
-        let [x, y, _, h] = self.rect;
         let reference = [
             f32_of(x + left),
             f32_of(y + h - top),
