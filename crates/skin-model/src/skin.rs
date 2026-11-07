@@ -3538,11 +3538,13 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        // A number draws nothing for the values a source
-                        // number reserves (`SkinNumber.java:135-146` at
-                        // `0.8.9`): a hidden result value reads `i32::MIN`,
-                        // and a skin's value may give either.
-                        if v != i32::MIN && v != i32::MAX {
+                        // Outside selection a number draws nothing for the
+                        // values a source number reserves
+                        // (`SkinNumber.java:135-146` at `0.8.9`): a hidden
+                        // result value reads `i32::MIN`, and a play skin's
+                        // value may give either.
+                        let reserved = v == i32::MIN || v == i32::MAX;
+                        if !reserved || matches!(scene.phase, Phase::Selection { .. }) {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }

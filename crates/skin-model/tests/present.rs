@@ -487,7 +487,7 @@ fn results_convert_as_the_source() {
 #[test]
 fn an_output_slot_read_as_a_field_is_refused() {
     let mut fields = skin_model::PLAY.fields.to_vec();
-    let mut forged = fields[0].clone();
+    let mut forged = fields[0];
     forged.name = "forged";
     forged.ty = skin_model::FieldTy::Int { lo: 0, hi: 1 };
     fields.push(forged);
