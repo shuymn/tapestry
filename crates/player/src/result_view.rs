@@ -21,6 +21,9 @@ use skin_model::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResultParts {
     pub score: ResultScore,
+    /// The judged notes of the draw played, for the view's
+    /// [`skin_model::ResultChart::notes`].
+    pub notes: u32,
     pub best: BestView,
     pub timing: Option<TimingStats>,
     pub timelines: Option<Timelines>,
@@ -34,13 +37,13 @@ pub fn result_parts(summary: &ViewSummary, preset: &RulePreset) -> ResultParts {
     ResultParts {
         score: ResultScore {
             tally: summary.tally,
-            notes: f.notes,
             gauge_permille: f.gauge_permille,
             clear: lamp_key(Some(f.clear), preset),
             cleared: f.cleared,
             rate: f.rate.map(rate),
             next_rank: f.next_rank,
         },
+        notes: f.notes,
         best: match summary.best {
             None | Some(BestCompare::Unavailable) => BestView::Unavailable,
             Some(BestCompare::Known(b)) => BestView::Known(BestFigures {
@@ -195,7 +198,7 @@ mod tests {
             }),
         };
         let parts = result_parts(&summary(Some(BestCompare::Known(known))), &p);
-        assert_eq!(parts.score.notes, 600);
+        assert_eq!(parts.notes, 600);
         assert_eq!(parts.score.gauge_permille, 1);
         assert_eq!(parts.score.clear, LampKey::Hard);
         assert!(parts.score.cleared);
