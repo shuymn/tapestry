@@ -144,6 +144,24 @@ pub enum Request {
         /// The source set's sizes.
         sources: input::SourceConfig,
     },
+    /// Stops the thread at its next fence ([`FenceGate`]; dev-tools
+    /// tests). Not answered.
+    #[cfg(feature = "dev-tools")]
+    FenceGate(Box<FenceGate>),
+}
+
+/// An interleaving with the game thread at the input thread's next fence
+/// (dev-tools tests): `before` runs on the source set as the fence is
+/// taken, and once the fence is answered the thread sends `reached` and
+/// waits for `resume` (at most 60 s) before the rest of its boundary.
+#[cfg(feature = "dev-tools")]
+pub struct FenceGate {
+    /// Runs on the source set before the fence is answered.
+    pub before: Box<dyn FnOnce(&mut SourceSet) + Send>,
+    /// Sent once the fence is answered.
+    pub reached: mpsc::Sender<()>,
+    /// Waited for after `reached`.
+    pub resume: mpsc::Receiver<()>,
 }
 
 /// What a play records, from the key configs.
@@ -401,6 +419,20 @@ impl InputLink {
     #[must_use]
     pub fn gone(&self) -> bool {
         self.state.gone.load(Ordering::Acquire)
+    }
+
+    /// Stops the input thread at its next fence ([`FenceGate`]; dev-tools
+    /// tests). A failed link sends nothing.
+    #[cfg(feature = "dev-tools")]
+    pub fn fence_gate(&self, gate: FenceGate) {
+        if self.failed.is_none()
+            && self
+                .requests
+                .send(Request::FenceGate(Box::new(gate)))
+                .is_ok()
+        {
+            self.waker.wake();
+        }
     }
 
     /// Marks the input thread gone, as its hook's end does, so the game
@@ -706,6 +738,9 @@ pub struct Hook {
     /// (dev-tools).
     #[cfg(feature = "dev-tools")]
     loading: Option<(input::ScriptedInput, TimeUs)>,
+    /// The gate at the next fence (dev-tools tests).
+    #[cfg(feature = "dev-tools")]
+    fence_gate: Option<Box<FenceGate>>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -741,6 +776,8 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             handoff: None,
             #[cfg(feature = "dev-tools")]
             loading: None,
+            #[cfg(feature = "dev-tools")]
+            fence_gate: None,
         },
         InputLink {
             requests: req_tx,
@@ -835,9 +872,34 @@ impl Hook {
                     continue;
                 }
                 Request::Fence(n) => {
+                    #[cfg(feature = "dev-tools")]
+                    let gate = self.fence_gate.take().map(|gate| {
+                        let FenceGate {
+                            before,
+                            reached,
+                            resume,
+                        } = *gate;
+                        before(sources);
+                        (reached, resume)
+                    });
+                    // The panels' level before the fence's answer: a game
+                    // thread the answer lets go reads the level as of it.
+                    if self.publish_panels(sources) {
+                        self.controls.wake_game();
+                    }
                     if let Some(tap) = sources.adjustment_mut() {
                         tap.fence(n, now);
                     }
+                    #[cfg(feature = "dev-tools")]
+                    if let Some((reached, resume)) = gate {
+                        let _ = reached.send(());
+                        let _ = resume.recv_timeout(Duration::from_secs(60));
+                    }
+                    continue;
+                }
+                #[cfg(feature = "dev-tools")]
+                Request::FenceGate(gate) => {
+                    self.fence_gate = Some(gate);
                     continue;
                 }
                 Request::Close => {
@@ -925,20 +987,27 @@ impl Hook {
     /// rule: held only while Idle with focus, so a focus loss, leaving
     /// Idle or a device's removal (which drops what it held) closes a
     /// panel at the boundary it is seen at; the game thread is woken when
-    /// the level changed.
+    /// the level changed. The level is published before that wake and a
+    /// fence's answer, so a game thread they let go reads it.
     fn menu(&self, sources: &mut SourceSet) {
         let active = self.phase == Phase::Idle && self.controls.focused();
+        let mut wake = self.publish_panels(sources);
         if let Some(menu) = sources.menu_mut() {
             menu.set_active(active);
-            if menu.take_sent() {
-                self.controls.wake_game();
-            }
+            wake |= menu.take_sent();
         }
-        if let Some(tap) = sources.adjustment_mut()
-            && tap.publish_panels(active)
-        {
+        if wake {
             self.controls.wake_game();
         }
+    }
+
+    /// Publishes the panels' level as [`menu`](Self::menu) says; `true`
+    /// when it changed.
+    fn publish_panels(&self, sources: &mut SourceSet) -> bool {
+        let active = self.phase == Phase::Idle && self.controls.focused();
+        sources
+            .adjustment_mut()
+            .is_some_and(|tap| tap.publish_panels(active))
     }
 
     fn publish(&self, sources: &SourceSet) {

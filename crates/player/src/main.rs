@@ -1919,15 +1919,31 @@ mod tests {
         render: crate::render_side::RenderLink,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings) -> R,
     ) -> (R, bool) {
+        on_rig_hooked(settings, render, |rig, settings, _| f(rig, settings))
+    }
+
+    /// The input side of [`on_rig_hooked`]'s rig: its hook, the waker its
+    /// link wakes and the rig's clock, for a test to run the input thread.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) struct InputEnd {
+        pub(crate) hook: input_side::Hook,
+        pub(crate) waker: input::Waker,
+        pub(crate) clock: QpcClock,
+    }
+
+    /// [`on_rig_with`], `f` given the rig's input side too.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_rig_hooked<R>(
+        settings: game::Settings,
+        render: crate::render_side::RenderLink,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
+    ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
         let clock = QpcClock::start();
         let controls = super::controls(&settings, clock);
-        let (_hook, input) = input_side::link(
-            Arc::clone(&controls),
-            Mode::Clock,
-            input::Waker::new().unwrap(),
-        );
+        let waker = input::Waker::new().unwrap();
+        let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());
         let (audio, opened) = crate::audio_side::spawn(
             move || {
                 Ok::<_, std::convert::Infallible>((crate::dev::recording_output(clock, 1), None))
@@ -1953,7 +1969,7 @@ mod tests {
             steps: rtrb::RingBuffer::new(1).0,
         };
         let mut rig = super::rig(&root, &settings, false, threads, &controls, clock).unwrap();
-        let out = f(&mut rig, &settings);
+        let out = f(&mut rig, &settings, InputEnd { hook, waker, clock });
         let gated = rig.gate.is_some() && rig.adjust.is_some();
         let _ = rig.shut_down();
         (out, gated)

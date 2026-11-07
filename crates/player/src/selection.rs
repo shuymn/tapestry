@@ -2138,6 +2138,9 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
+        // Idle first, so the scene's fence below is answered after it and
+        // the panels' level read at the entry is the one Idle publishes.
+        self.input.idle();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2977,6 +2980,153 @@ pub(crate) mod tests {
             let (chosen, _, _) = look(rig, &[]);
             assert!(chosen.is_none(), "Confirm under panel 1 chose");
         });
+    }
+
+    /// The rig's input thread on a clocked thread with a keyboard
+    /// connected; `jobs` run on its source set at its next wake, before
+    /// the hook.
+    #[cfg(feature = "dev-tools")]
+    fn input_thread(
+        end: crate::tests::InputEnd,
+    ) -> (
+        input::ClockedThread,
+        std::sync::mpsc::Sender<Box<dyn FnOnce(&mut input::SourceSet) + Send>>,
+        input::Waker,
+        input::QpcClock,
+    ) {
+        use input::{DeviceId, DeviceKind, SourceConfig, SourceSet};
+        let crate::tests::InputEnd {
+            mut hook,
+            waker,
+            clock,
+        } = end;
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 2,
+            max_sources: 2,
+            max_held: 16,
+            queue_capacity: 64,
+            max_arrivals: 2,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(0));
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce(&mut input::SourceSet) + Send>>();
+        let thread = input::ClockedThread::spawn(clock, sources, &waker, move |s, now| {
+            while let Ok(job) = rx.try_recv() {
+                job(s);
+            }
+            hook.wake(s, now)
+        })
+        .unwrap();
+        (thread, tx, waker, clock)
+    }
+
+    /// A batch at `at` of [`input_thread`]'s keyboard: key `code` to
+    /// `value`.
+    #[cfg(feature = "dev-tools")]
+    fn key_batch(s: &mut input::SourceSet, at: TimeUs, code: u32, value: i32) {
+        s.begin_batch(at);
+        s.packet(&input::Packet {
+            device: input::DeviceId(1),
+            control: eval::ControlId(code),
+            value,
+            background: false,
+        });
+        s.end_batch(at);
+    }
+
+    /// C16 at selection's entry, through the rig and its input thread
+    /// (START on E as installed): the input thread stopped after it
+    /// answers the entry's fence, before the rest of its boundary, the
+    /// entry's update shows the level as of the fence. Back from the
+    /// practice page with START released in the fence's boundary: closed.
+    /// Back from a play's tail (the thread's start) with START held: open,
+    /// from the entry.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_entry_reads_the_level_its_fence_published() {
+        use bms_model::TimeSource as _;
+        use game::AppRig as _;
+        // The update's panel timers as the entry left them.
+        let panels = |rig: &mut crate::play::PlayerRig<'_>| {
+            let sel = rig.selection.as_mut().unwrap();
+            let page = sel.screen.page("");
+            let at = sel.feed.update(&sel.screen, page.clone(), TimeUs(0)).events;
+            (at.panels, at.entered)
+        };
+        // Stops the input thread at its next fence, `before` run there;
+        // `f` runs while it is stopped.
+        let gated = |rig: &mut crate::play::PlayerRig<'_>,
+                     before: Box<dyn FnOnce(&mut input::SourceSet) + Send>,
+                     f: &mut dyn FnMut(&mut crate::play::PlayerRig<'_>)| {
+            let (reached, reached_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume) = std::sync::mpsc::channel();
+            rig.input.fence_gate(crate::input_side::FenceGate {
+                before,
+                reached,
+                resume,
+            });
+            f(rig);
+            assert!(
+                reached_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+                "the gate was reached"
+            );
+            resume_tx.send(()).unwrap();
+        };
+        for back_from_practice in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let sel = selection(dir.path());
+            crate::tests::on_rig_hooked(
+                game::Settings {
+                    device: game::DeviceSettings::default(),
+                    player: game::PlayerSettings::default(),
+                },
+                crate::render_side::tests::Installers::default().spawn_bare(),
+                |rig, _, end| {
+                    let level = rig.panels.clone().expect("installed with the tap");
+                    rig.selection = Some(sel);
+                    let (thread, jobs, waker, clock) = input_thread(end);
+                    let press = |code, value| {
+                        jobs.send(Box::new(move |s: &mut input::SourceSet| {
+                            key_batch(s, clock.now(), code, value);
+                        }))
+                        .unwrap();
+                        waker.wake();
+                    };
+                    if back_from_practice {
+                        // Selection, then START held on the practice page
+                        // (the thread Idle), released at the boundary that
+                        // answers the next entry's fence.
+                        rig.entered_selection();
+                        press(0x12, 1);
+                        assert!(crate::render_side::tests::wait_until(|| level.read().start));
+                        gated(
+                            rig,
+                            Box::new(move |s| key_batch(s, clock.now(), 0x12, 0)),
+                            &mut |rig| rig.entered_selection(),
+                        );
+                        assert_eq!(panels(rig).0, [None; 3]);
+                    } else {
+                        // START held in the tail: nothing published, as
+                        // a wake after the press's sees.
+                        press(0x12, 1);
+                        let (seen, seen_rx) = std::sync::mpsc::channel();
+                        jobs.send(Box::new(move |_: &mut input::SourceSet| {
+                            seen.send(()).unwrap();
+                        }))
+                        .unwrap();
+                        waker.wake();
+                        seen_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                        assert!(!level.read().start);
+                        gated(rig, Box::new(|_| {}), &mut |rig| rig.entered_selection());
+                        let (open, entered) = panels(rig);
+                        assert_eq!(open, [Some(entered), None, None]);
+                    }
+                    thread.stop().unwrap();
+                },
+            );
+        }
     }
 
     /// What the panels fixture's last four elements showed in each
