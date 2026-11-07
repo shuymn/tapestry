@@ -1898,7 +1898,7 @@ mod tests {
     /// thread on stub screens; what `f` returned and whether the rig ended
     /// with a start gate.
     #[cfg(feature = "dev-tools")]
-    fn on_rig<R>(
+    pub(crate) fn on_rig<R>(
         device: game::DeviceSettings,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::DeviceSettings) -> R,
     ) -> (R, bool) {

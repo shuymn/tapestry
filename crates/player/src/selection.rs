@@ -289,26 +289,39 @@ impl Selection {
     ///
     /// While a panel is open (START, SELECT or both held), the keys it
     /// holds back do nothing: the window's by the panel the screen shows
-    /// ([`crate::select::acts_under_panel`]), the controller's by the panel
-    /// open as each was sent ([`crate::select::event_acts_under_panel`]).
-    fn drain(&mut self, pad: &mut Pad) -> Option<Pick> {
+    /// ([`crate::select::acts_under_panel`]), the controller's by that
+    /// panel or the one open as each was sent
+    /// ([`crate::select::event_acts_under_panel`]), none while the search
+    /// box has focus. An input that gives or takes the box's focus reads
+    /// the panels' `level` again at `now` ([`panels`](Self::panels)), so
+    /// the input after it finds the panel it leaves.
+    fn drain_at(
+        &mut self,
+        pad: &mut Pad,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
         while let Some(input) = self.menu.pop() {
             if let MenuInput::Key(key) = input
-                && !crate::select::acts_under_panel(key, self.feed.panel())
+                && !crate::select::acts_under_panel(key, self.shown_panel())
             {
                 continue;
             }
-            if let Some(pick) = self.take(input) {
+            if let Some(pick) = self.take_reading(input, level, now) {
                 return Some(pick);
             }
         }
         // The controller's events after the window's, as the keys they
         // stand for.
-        while let Some((event, panel)) = pad.pop_panel() {
+        while let Some((event, sent)) = pad.pop_panel() {
+            let panel = self
+                .shown_panel()
+                .or(sent.filter(|_| !self.screen.searching()));
             if !crate::select::event_acts_under_panel(event, panel) {
                 continue;
             }
-            if let Some(pick) = self.take(MenuInput::Key(crate::select::event_key(event))) {
+            let key = MenuInput::Key(crate::select::event_key(event));
+            if let Some(pick) = self.take_reading(key, level, now) {
                 return Some(pick);
             }
         }
@@ -327,6 +340,34 @@ impl Selection {
             self.dropped = dropped;
         }
         None
+    }
+
+    /// [`drain_at`](Self::drain_at) with no panels' level to read: the
+    /// panel the screen shows stays.
+    #[cfg(test)]
+    fn drain(&mut self, pad: &mut Pad) -> Option<Pick> {
+        self.drain_at(pad, None, TimeUs(0))
+    }
+
+    /// The panel the screen shows: none while the search box has focus.
+    fn shown_panel(&self) -> Option<usize> {
+        self.feed.panel().filter(|_| !self.screen.searching())
+    }
+
+    /// [`take`](Self::take), then the panels' `level` read again at `now`
+    /// when `input` gave or took the search box's focus.
+    fn take_reading(
+        &mut self,
+        input: MenuInput,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
+        let searching = self.screen.searching();
+        let pick = self.take(input);
+        if self.screen.searching() != searching {
+            self.panels(level, now);
+        }
+        pick
     }
 
     /// Acts on `input` taken from a queue, searching a changed search or
@@ -357,14 +398,19 @@ impl Selection {
         }
     }
 
-    /// [`drain`](Self::drain) while selection owns the menus' queues
+    /// [`drain_at`](Self::drain_at) while selection owns the menus' queues
     /// (`menus`); otherwise nothing is taken, so input queued for another
     /// screen stays its own.
-    fn drain_owned(&mut self, menus: &mut ResultInput) -> Option<Pick> {
+    fn drain_owned(
+        &mut self,
+        menus: &mut ResultInput,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
         if menus.owner() != Owner::Select {
             return None;
         }
-        self.drain(&mut menus.pad)
+        self.drain_at(&mut menus.pad, level, now)
     }
 
     /// What startup left the select screen: a skin's refusal `notice`, and
@@ -1331,7 +1377,11 @@ impl PlayerRig<'_> {
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "scripts choose too")
         )]
-        let mut chosen = sel.drain_owned(&mut self.result_input);
+        let mut chosen = sel.drain_owned(
+            &mut self.result_input,
+            self.panels.as_ref(),
+            self.clock.now(),
+        );
         sel.panels(self.panels.as_ref(), self.clock.now());
         #[cfg(feature = "dev-tools")]
         if chosen.is_none()
@@ -1341,7 +1391,11 @@ impl PlayerRig<'_> {
                 self.scenario.as_ref().map(|s| &s.captures),
             )
         {
-            chosen = sel.drain_owned(&mut self.result_input);
+            chosen = sel.drain_owned(
+                &mut self.result_input,
+                self.panels.as_ref(),
+                self.clock.now(),
+            );
         }
         // Before anything of the choice: no chart without its skin.
         let now = self.clock.now();
@@ -2829,6 +2883,102 @@ pub(crate) mod tests {
         assert_eq!(panels(&mut sel, 40), [Some(TimeUs(40)), None, None]);
     }
 
+    /// The search box's focus changing within one look moves the panel
+    /// for the keys after it, through the rig's look: with START held and
+    /// the box focused, Tab leaves it and the Enter after it is held back;
+    /// Tab into the box lets the Backspace after it edit the query.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_focus_change_in_a_look_moves_the_panel_for_the_keys_after_it() {
+        use eval::ControlId;
+        use game::AppRig as _;
+        use input::MenuEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        let (mut set, level) = panel_keys();
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.adjust = None;
+            rig.panels = Some(level);
+            rig.selection = Some(sel);
+            panel_key(&mut set, 0x12, 1);
+            rig.entered_selection();
+            let menu = Arc::clone(&rig.selection.as_ref().unwrap().menu);
+            let look = |rig: &mut crate::play::PlayerRig<'_>, inputs: &[MenuInput]| {
+                for input in inputs {
+                    menu.push(input.clone());
+                }
+                let chosen = rig.look();
+                let sel = rig.selection.as_ref().unwrap();
+                (chosen, sel.screen.searching(), sel.feed.panel())
+            };
+            let (chosen, searching, panel) = look(rig, &[MenuInput::Key(MenuKey::Tab)]);
+            assert!(chosen.is_none() && searching && panel.is_none());
+            let (chosen, searching, panel) = look(
+                rig,
+                &[MenuInput::Key(MenuKey::Tab), MenuInput::Key(MenuKey::Enter)],
+            );
+            assert!(chosen.is_none(), "Enter under panel 1 chose");
+            assert!(!searching);
+            assert_eq!(panel, Some(0));
+            // A query typed in the box, then Tab into it and Backspace.
+            look(
+                rig,
+                &[
+                    MenuInput::Key(MenuKey::Tab),
+                    MenuInput::Text("ab".to_owned()),
+                    MenuInput::Key(MenuKey::Tab),
+                ],
+            );
+            assert_eq!(rig.selection.as_ref().unwrap().screen.query(), "ab");
+            let (_, searching, panel) = look(
+                rig,
+                &[
+                    MenuInput::Key(MenuKey::Tab),
+                    MenuInput::Key(MenuKey::Backspace),
+                ],
+            );
+            assert!(searching && panel.is_none());
+            assert_eq!(rig.selection.as_ref().unwrap().screen.query(), "a");
+            // The controller's keys follow the panel shown too: Back sent
+            // under panel 1 leaves the focused box, and Confirm sent with
+            // no panel is held back under the panel shown.
+            let (mut pad_tap, receiver) = input::menu_queue(input::MenuBindings {
+                product: controller_product(),
+                controls: vec![
+                    (ControlId(1), input::MenuAction::Press(MenuEvent::Confirm)),
+                    (ControlId(2), input::MenuAction::Press(MenuEvent::Back)),
+                ],
+                step: 1,
+                relative: None,
+                wrap: None,
+            });
+            pad_tap.set_active(true);
+            rig.result_input.pad = Pad {
+                receiver: Some(receiver),
+                dropped: 0,
+            };
+            let mut send = |panel: Option<usize>, control: u32| {
+                pad_tap.set_panel(panel);
+                pad_tap.offer(
+                    &input::Packet {
+                        device: input::DeviceId(7),
+                        control: ControlId(control),
+                        value: 1,
+                        background: false,
+                    },
+                    None,
+                );
+            };
+            send(Some(0), 2);
+            let (_, searching, panel) = look(rig, &[]);
+            assert!(!searching, "Back left the box");
+            assert_eq!(panel, Some(0));
+            send(None, 1);
+            let (chosen, _, _) = look(rig, &[]);
+            assert!(chosen.is_none(), "Confirm under panel 1 chose");
+        });
+    }
+
     /// What the panels fixture's last four elements showed in each
     /// selection frame: options 21, 22 and 23's images drawn, and timer
     /// 21's image's sampled time.
@@ -3168,13 +3318,13 @@ pub(crate) mod tests {
         menus.take_over(Owner::Practice);
         sel.menu.push(MenuInput::Key(MenuKey::Down));
         sel.menu.push(MenuInput::Key(MenuKey::Enter));
-        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(sel.drain_owned(&mut menus, None, TimeUs(0)), None);
         assert_eq!(menus.take_practice(), Some(game::PracticeInput::Down));
         assert_eq!(menus.take_practice(), Some(game::PracticeInput::Confirm));
         // Selection's own, it chooses.
         menus.take_over(Owner::Select);
         sel.menu.push(MenuInput::Key(MenuKey::Enter));
-        assert!(sel.drain_owned(&mut menus).is_some());
+        assert!(sel.drain_owned(&mut menus, None, TimeUs(0)).is_some());
     }
 
     /// A scenario's state on a practice page of a chart of `measures`
@@ -3489,25 +3639,25 @@ pub(crate) mod tests {
             Some(&mut sel.shelf),
         );
         assert_eq!(hook.wake(&mut set, TimeUs(3_000)), input::Phase::Idle);
-        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(sel.drain_owned(&mut menus, None, TimeUs(0)), None);
         assert!(sel.preset_steps.is_empty());
         // A black key goes back: from the all-chart list to Top.
         press(&mut set, &mut hook, key2, 4_000);
-        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(sel.drain_owned(&mut menus, None, TimeUs(0)), None);
         assert!(sel.preset_steps.is_empty());
         assert_eq!(sel.screen.selected().map(|c| &c.path), None);
         // Key 7 steps.
         press(&mut set, &mut hook, key7, 5_000);
-        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(sel.drain_owned(&mut menus, None, TimeUs(0)), None);
         assert_eq!(
             Vec::from(std::mem::take(&mut sel.preset_steps)),
             [game::PresetStep::Next]
         );
         // A white key confirms: the "all charts" row, then a chart.
         press(&mut set, &mut hook, key1, 6_000);
-        assert_eq!(sel.drain_owned(&mut menus), None);
+        assert_eq!(sel.drain_owned(&mut menus, None, TimeUs(0)), None);
         press(&mut set, &mut hook, key1, 6_500);
-        assert!(sel.drain_owned(&mut menus).is_some());
+        assert!(sel.drain_owned(&mut menus, None, TimeUs(0)).is_some());
         assert!(sel.preset_steps.is_empty());
         // The practice page takes it as Confirm.
         menus.take_over(Owner::Practice);
