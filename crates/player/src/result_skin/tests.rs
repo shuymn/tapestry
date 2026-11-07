@@ -473,3 +473,63 @@ fn at_most_two_atlases_live_with_a_lagging_renderer() {
     drop(fake);
     assert_eq!(seen.alive(), 0, "every atlas dropped");
 }
+
+/// A gate a layout waits at between dropping an unshown image entry and
+/// its build, while armed: the tests that arm it cancel there.
+static GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether a layout reached the armed gate.
+static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`GATE`], waited at by a layout's job until it is disarmed or the job
+/// is cancelled.
+pub(super) fn build_gate(cancel: &skin_beatoraja::Cancel) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !GATE.load(SeqCst) {
+        return;
+    }
+    REACHED.store(true, SeqCst);
+    while GATE.load(SeqCst) && !cancel.is_cancelled() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// D11's cancellation after the drop: a layout cancelled once it has
+/// dropped the unshown image entry, before its build, leaves no image
+/// entry (the entry's pages gone); the next attempt's image stage builds
+/// one again although the probe's facts hold.
+#[test]
+fn a_cancel_after_the_drop_leaves_no_entry_then_rebuilds() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * nr, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    let probe = Arc::downgrade(rs.image().unwrap().pages());
+    REACHED.store(false, SeqCst);
+    GATE.store(true, SeqCst);
+    // Nothing is shown: the probe's entry is unshown, and the view's new
+    // cell needs a build.
+    rs.request(view(2));
+    let end = Instant::now() + Duration::from_secs(20);
+    while !REACHED.load(SeqCst) {
+        assert!(Instant::now() < end, "the layout did not reach its build");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rs.settle(|| false);
+    GATE.store(false, SeqCst);
+    assert!(rs.image().is_none(), "no image entry after the cancel");
+    assert!(
+        probe.upgrade().is_none(),
+        "the dropped entry's pages are gone"
+    );
+    // The next attempt: the probe's facts hold, but no entry is live.
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged(&mut rs);
+    assert_eq!(jobs_started() - jobs, 1, "the image stage runs again");
+    assert!(rs.image().is_some(), "an entry built again");
+}

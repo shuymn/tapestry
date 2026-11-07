@@ -1371,3 +1371,43 @@ fn sudden_plus_paint_follows_the_bpm_change_condition() {
         assert_eq!(paints, usize::from(shown), "{fact:?}, {adjusting}");
     }
 }
+
+/// S10-09g D13: a cover cropped from a frame past its file's edge draws
+/// the same texels through an atlas packed from another sheet of its
+/// cells (one frame per cell, another frame order) and rebound to the
+/// imported sheet, as through its own atlas: the edge's substitution and
+/// the crop are cells, which rebinding finds by identity.
+#[test]
+fn an_edge_cut_cropped_cover_rebinds_to_its_cells() {
+    let frame = r#"{"id": "ce", "src": "a", "x": 64, "y": 0, "w": 8, "h": 64}"#;
+    let paint = stretched("ce", 5).replace(r#""w": 430, "h": 600"#, r#""w": 80, "h": 320"#);
+    let plain = r#"{"id": "ce", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let ends = [(0.1, 0.01), (0.9, 0.01), (0.1, 0.99), (0.9, 0.99)];
+    let want = [16, 16, 47, 47].map(|y| common::coord(63, y));
+    let l = tall(frame, &[plain, &paint]);
+    common::png_with(l.dir.path(), "a.png", 64, 256, common::coord);
+    let sheet = l.ok().skin.sheet();
+    let other = sheet.union(sheet).unwrap();
+    let packed = other
+        .atlas_reserving(
+            skin_model::Variant::Lo,
+            common::play::LIMITS,
+            false,
+            &|| false,
+        )
+        .unwrap();
+    let rebound = packed
+        .rebind(sheet, skin_model::Variant::Lo, false)
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        packed.shared_pages(),
+        rebound.shared_pages()
+    ));
+    let q = cover_quad(&l, [20.0, 560.0, 80.0, 320.0]);
+    let got: Vec<_> = ends
+        .iter()
+        .map(|&(u, v)| common::play::texel_at(&rebound, &q, u, v))
+        .collect();
+    assert_eq!(got, want);
+    assert_eq!(edge_paint(&l, [20.0, 560.0, 80.0, 320.0], &ends), want);
+}

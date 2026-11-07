@@ -364,6 +364,8 @@ fn layout(
                 return (Err(Unbuilt::Deferred), entry);
             }
             drop(entry);
+            #[cfg(all(test, feature = "dev-tools"))]
+            tests::build_gate(cancel);
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let built =
