@@ -10,8 +10,8 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::result::{best, ready};
-use common::{font, png, write};
+use common::result::{Res, best, ready};
+use common::{font, link_dir, png, write};
 use skin_beatoraja::{Cancel, Config, Fact, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
 use skin_model::{
     CacheBounds, FileSource, FontReader, ResourceCache, ResultFields, ResultNumber, Root,
@@ -67,12 +67,17 @@ fn skin(root: &Path, fonts: &str, texts: &str) {
     write(root, "s.luaskin", entry.as_bytes());
 }
 
-/// The facts of a view whose next-rank difference (154) is `nr`.
-fn facts(nr: u32) -> ImportFacts {
+/// A view whose next-rank difference (154) is `nr`.
+fn view(nr: u32) -> skin_model::ResultView {
     let mut v = ready(1_000, true, best(ResultNumber::Shown(-3)));
     v.score.next_rank = nr;
+    v
+}
+
+/// The facts of [`view`]`(nr)`.
+fn facts(nr: u32) -> ImportFacts {
     ImportFacts {
-        result: Fact::Known(ResultFields::of(&v)),
+        result: Fact::Known(ResultFields::of(&view(nr))),
         ..ImportFacts::unavailable(ScreenKind::Result)
     }
 }
@@ -237,8 +242,11 @@ fn a_page_without_a_verdict_is_read_and_decoded() {
 /// C19 (g): a run served from the cache, reading nothing from the disk,
 /// imports what a fresh import of the same view through the disk does:
 /// the report with its notes and their places, the usage, the
-/// dependencies, the facts and the sheet, for views that admit fonts in
-/// another order, leave one out, and name one file twice, with notes to
+/// dependencies, the facts, the sheet, and the frame it draws for the
+/// view (each quad's place, size and uv: the glyphs' metrics and the
+/// images' and fonts' bindings and indices). The views admit fonts in
+/// another order, leave one out, and name one file under two names (a
+/// folder and an in-root link to it, charged per name), with notes to
 /// give (a font refused by its path).
 #[test]
 fn a_cached_run_imports_what_a_fresh_one_does() {
@@ -250,22 +258,24 @@ fn a_cached_run_imports_what_a_fresh_one_does() {
     fnt(root, "b.fnt", &["p0.png", "p1.png"], 8);
     fnt(root, "c.fnt", &["q0.png"], 6);
     font(root, "f.ttf");
+    std::fs::create_dir(root.join("real")).unwrap();
+    png(&root.join("real"), "r0.png", 16, 16);
+    fnt(&root.join("real"), "r.fnt", &["r0.png"], 5);
+    link_dir(&root.join("alias"), &root.join("real"));
     // 1: b, c, f; 2: c, b, f (reordered); 3: b, f (c left out);
-    // 4: b, c, b again under another spelling. Every view also names a
-    // font above the skin folder, refused by its path.
+    // 4: one file under two names. Every view also names a font above the
+    // skin folder, refused by its path.
     skin(
         root,
         "add_x((nr == 2 and { { id = \"b\", path = \"c.fnt\" }, { id = \"c\", path = \"b.fnt\" }, \
-                         { id = \"f\", path = \"f.ttf\" } }) \
+                              { id = \"f\", path = \"f.ttf\" } }) \
          or (nr == 3 and { { id = \"b\", path = \"b.fnt\" }, { id = \"f\", path = \"f.ttf\" } }) \
-         or (nr == 4 and { { id = \"b\", path = \"b.fnt\" }, { id = \"c\", path = \"c.fnt\" }, \
-                           { id = \"f\", path = \"./b.fnt\" } }) \
+         or (nr == 4 and { { id = \"b\", path = \"real/r.fnt\" }, { id = \"c\", path = \"alias/r.fnt\" }, \
+                           { id = \"f\", path = \"f.ttf\" } }) \
          or { { id = \"b\", path = \"b.fnt\" }, { id = \"c\", path = \"c.fnt\" }, \
               { id = \"f\", path = \"f.ttf\" } })",
-        // A glyph neither font has, a text of a font left out, and one of
-        // the refused font.
-        "{ { id = \"tb\", font = \"b\", size = 8, constantText = \"AZ\" }, \
-           { id = \"tc\", font = \"c\", size = 8, constantText = \"B\" }, \
+        "{ { id = \"tb\", font = \"b\", size = 8, constantText = \"ABBA\" }, \
+           { id = \"tc\", font = \"c\", size = 8, constantText = \"BA\" }, \
            { id = \"tf\", font = \"f\", size = 8, constantText = \"A\" }, \
            { id = \"tx\", font = \"x\", size = 8, constantText = \"A\" } }",
     );
@@ -304,6 +314,15 @@ fn a_cached_run_imports_what_a_fresh_one_does() {
             ),
             "view {nr}: the sheet"
         );
+        let frame = |i: LuaImported| {
+            let mut res = Res::new(i.imported.skin);
+            res.view(&view(nr));
+            res.skin.attach_result_bitmap_text(&mut res.res);
+            res.frame(0)
+        };
+        let (wq, fq) = (frame(warm), frame(fresh));
+        assert!(fq.len() > 4, "view {nr}: glyphs drawn: {}", fq.len());
+        assert_eq!(wq, fq, "view {nr}: the frame");
     }
     assert!(noted, "the views give notes");
 }
