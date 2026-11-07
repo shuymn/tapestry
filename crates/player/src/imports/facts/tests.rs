@@ -102,7 +102,8 @@ fn an_attempt_reads_the_loaders_level() {
 /// beatoraja-style header policy's reading (`JudgeClass::of_headers`). The
 /// validated rank is in each comment, and where the policy reads the
 /// headers otherwise than that decoder (a decimal `#DEFEXRANK`, one past
-/// `i32`, a `#DEFEXRANK` before a `#RANK`), what it reads.
+/// `i32`, a `#DEFEXRANK` before a `#RANK`, a non-ASCII digit), what it
+/// reads.
 pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeClass>)] = {
     use JudgeClass::{Easy, Hard, Normal, VeryEasy, VeryHard};
     &[
@@ -154,6 +155,11 @@ pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeCla
         ("#DEFEXRANK 28633116\n", Some(Easy), Some(Easy)),         // wraps: -21474835, then 100
         ("#DEFEXRANK 57266231\n", Some(Easy), Some(Easy)),         // wraps: 0, then 100
         ("#DEFEXRANK 57266232\n", Some(Hard), Some(Hard)),         // wraps: 1
+        // A decimal below 1, whose whole part 0 the policy reads, and a
+        // non-ASCII digit, which `Integer.parseInt` reads and the policy's
+        // decimal grammar does not (`crates/rules/src/beatoraja_style.rs:106`).
+        ("#DEFEXRANK 0.5\n", Some(Normal), Some(Easy)), // refused: 75; here 0 read: 0, then 100
+        ("#RANK \u{ff13}\n", Some(Easy), Some(Normal)), // 100; here refused: 75
         // The last header accepted counts, whichever it is.
         ("#RANK 3\n#DEFEXRANK 120\n", Some(Easy), Some(Easy)), // 90
         ("#DEFEXRANK 120\n#RANK 3\n", Some(Easy), Some(Easy)), // 100; here #DEFEXRANK read: 90
