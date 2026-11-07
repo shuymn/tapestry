@@ -8,42 +8,19 @@
 mod common;
 
 use bms_model::TimeUs;
-use common::result::{Res, folder, import_result, lua_result, ready, sheet};
+use common::result::{Res, folder, graph_json, graph_lua, import_result, lua_result, ready, sheet};
 use skin_beatoraja::{ImportFacts, NoteKind, Object, Report, Severity};
 use skin_model::{BestView, Filter, Quad, ResultView, ScreenKind, Timelines};
-
-/// The essential parts every fixture holds: the EX score and an image
-/// under the clear status.
-const ESSENTIALS_JSON: &str = r#"{"id": "ex", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]},
-    {"id": "dot", "op": [90], "dst": [{"x": 0, "y": 300, "w": 8, "h": 8}]}"#;
 
 /// A JSON result skin with `graphs` as its judge graph records, `more`
 /// tables, and `dsts` after the essentials' destinations.
 fn json_skin(graphs: &str, more: &str, dsts: &str) -> String {
-    format!(
-        r#""value": [{{"id": "ex", "src": "s", "x": 0, "y": 32, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}}],
-           "judgegraph": [{graphs}], {more}
-           "destination": [{ESSENTIALS_JSON}, {dsts}]"#
-    )
+    graph_json(&format!(r#""judgegraph": [{graphs}], {more}"#), dsts)
 }
 
 /// The Lua skin of the same parts.
 fn lua_skin(graphs: &str, dsts: &str) -> String {
-    format!(
-        "local skin = {{ type = 7, name = \"t\", w = 1920, h = 1080 }}\n\
-         if not skin_config then return skin end\n\
-         skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
-         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
-         skin.image = {{ {{ id = \"dot\", src = \"s\", x = 48, y = 0, w = 8, h = 8 }} }}\n\
-         skin.value = {{ {{ id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
-             digit = 4, ref = 71 }} }}\n\
-         skin.judgegraph = {{ {graphs} }}\n\
-         skin.destination = {{\n\
-           {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }},\n\
-           {{ id = \"dot\", op = {{ 90 }}, dst = {{ {{ x = 0, y = 300, w = 8, h = 8 }} }} }},\n\
-           {dsts} }}\n\
-         return skin\n"
-    )
+    graph_lua(&format!("skin.judgegraph = {{ {graphs} }}"), dsts)
 }
 
 /// A ready view whose timelines are 70 one-second bins, bin `i` holding

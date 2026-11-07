@@ -440,6 +440,11 @@ pub(crate) struct Cx<'d> {
     widgets: WidgetDefs,
     /// A result skin's judge graphs, by [`Source::JudgeGraph`] index.
     judge_graphs: Vec<skin_model::JudgeGraphDef>,
+    /// A result skin's gauge graphs, by [`Source::GaugeGraph`] index.
+    gauge_graphs: Vec<skin_model::GaugeGraphDef>,
+    /// A result skin's timing distributions, by [`Source::TimingGraph`]
+    /// index.
+    timing_graphs: Vec<skin_model::TimingGraphDef>,
     /// The lanes, once the note destination is mapped.
     lanes: Option<widget::lanes::LaneState>,
     /// The lanes' span, read ahead of the walk for the offset-4 rule.
@@ -543,6 +548,8 @@ impl<'d> Cx<'d> {
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
             judge_graphs: Vec::new(),
+            gauge_graphs: Vec::new(),
+            timing_graphs: Vec::new(),
             lanes: None,
             span_hint: widget::lanes::SpanHint::NoLanes,
             judges: Vec::new(),
@@ -1839,7 +1846,8 @@ impl<'d> Cx<'d> {
             {
                 let widgets = ResultDefs {
                     judge_graphs: std::mem::take(&mut self.judge_graphs),
-                    ..ResultDefs::default()
+                    gauge_graphs: std::mem::take(&mut self.gauge_graphs),
+                    timing_graphs: std::mem::take(&mut self.timing_graphs),
                 };
                 Skin::new_result(def, widgets)
             }

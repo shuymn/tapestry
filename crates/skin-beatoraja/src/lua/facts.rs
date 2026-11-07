@@ -287,6 +287,45 @@ pub enum FactId {
     ResultOption(i32),
 }
 
+impl FactId {
+    /// Whether the fact depends on the viewed result beyond the chart's
+    /// own facts: a result number or option whose expression or validity
+    /// reads anything but the chart's fields (its judged notes, which a
+    /// view replaces with its own, count as the view's), or one the
+    /// profile does not bridge. The session's and the chart's facts, the
+    /// chart's fields and a constant option do not.
+    #[must_use]
+    pub fn reads_view(self) -> bool {
+        match self {
+            Self::Autoplay | Self::JudgeClass | Self::PlayLevel => false,
+            Self::ResultNumber(n) => match profile::number(n) {
+                Some(Class::Bridge(v)) => !(chart_only(v.expr) && chart_only(v.guard)),
+                _ => true,
+            },
+            Self::ResultOption(n) => match profile::option(n) {
+                Some(Class::Bridge(ResOption::Expr(src))) => {
+                    !(chart_only(src) && chart_only(profile::option_guard(n)))
+                }
+                Some(Class::Bridge(ResOption::Constant(_))) => false,
+                _ => true,
+            },
+        }
+    }
+}
+
+/// Whether the result schema expression `src` reads only the chart's
+/// fields other than its judged notes.
+fn chart_only(src: &str) -> bool {
+    src.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .filter(|t| !t.is_empty() && !t.starts_with(|c: char| c.is_ascii_digit()))
+        .all(|t| {
+            matches!(
+                t,
+                "if" | "then" | "else" | "true" | "false" | "abs" | "clamp"
+            ) || (t.starts_with("chart.") && !t.starts_with("chart.notes"))
+        })
+}
+
 /// A fact's derived value, as an import read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FactValue {

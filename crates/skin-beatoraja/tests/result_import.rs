@@ -11,8 +11,8 @@ use common::result::{
 };
 use common::selection::{B0, B1, BAR, DIGITS, DOT, LABEL as LAB, LAMP};
 use skin_beatoraja::{
-    EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts, LuaOutcome, LuaWhy,
-    NoteKind, Object, Report, Severity,
+    Cancel, Config, EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts,
+    LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
 };
 use skin_model::{BestView, ResultNumber, ResultView, ScreenKind};
 
@@ -198,7 +198,8 @@ fn notes(r: &Report) -> Vec<(Severity, NoteKind)> {
 /// hidden (a number draws nothing, an expression reads `i32::MIN`) and
 /// unavailable (nothing drawn under its validity); the chart's fields stay
 /// with no result; the lane index is 0; the fade-out timer runs and the
-/// IR's never does; the graph is dropped with a note on both paths.
+/// IR's never does; the gauge graph is kept on both paths, with no note,
+/// and draws a gauge history.
 #[test]
 fn json_and_lua_draw_the_same_result_frames() {
     let j = folder(&json_body());
@@ -210,7 +211,7 @@ fn json_and_lua_draw_the_same_result_frames() {
     let graph = NoteKind::Unsupported {
         object: Object::GaugeGraph,
     };
-    assert!(notes(&json.report).contains(&(Severity::Dropped, graph)));
+    assert!(!notes(&json.report).contains(&(Severity::Dropped, graph)));
     let mut a = Res::new(json.skin);
     let mut b = Res::new(lua.imported.skin);
     let lua_only = |q: &skin_model::Quad| q.rect[1] != DIFF;
@@ -219,6 +220,31 @@ fn json_and_lua_draw_the_same_result_frames() {
         b.view(v);
         let ours: Vec<_> = b.frame(0).into_iter().filter(lua_only).collect();
         assert_eq!(a.frame(0), ours, "view {i}");
+    }
+    // The gauge graph is drawn on both paths: with a gauge history, its
+    // back above the border spans its 8-wide rect from the top (y 272).
+    let mut with_gauge = views()[0].clone();
+    let flat = skin_model::GaugeColumn {
+        low: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+        high: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+        last: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+    };
+    with_gauge.gauge = Some(Box::new(skin_model::GaugeHistory {
+        columns: [flat; skin_model::GRAPH_COLUMNS],
+        max: rules::GaugeValue(100 * rules::GaugeValue::PERCENT),
+        border: rules::GaugeValue(80 * rules::GaugeValue::PERCENT),
+        look: skin_model::GaugeLook::Normal,
+        reached: 288,
+        no_input_from: None,
+    }));
+    for r in [&mut a, &mut b] {
+        r.view(&with_gauge);
+        let gauge = r
+            .frame(2_000)
+            .into_iter()
+            .filter(|q| q.rect[0] == 0.0 && q.rect[1] == 272.0 && q.rect[2] == 8.0)
+            .count();
+        assert!(gauge > 0, "the gauge graph draws");
     }
     let mut frame = |v: &ResultView| {
         a.view(v);
@@ -774,4 +800,34 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ResultNumber(154)),
         other => panic!("{other:?}"),
     }
+}
+
+/// D11: a refusal carries the facts its run read before it, so the image
+/// stage tells a refusal after a result fact (left to the layout stage)
+/// from one before any (the built-in result).
+#[test]
+fn a_refusal_carries_the_facts_read_before_it() {
+    let d = sheet();
+    let ex = lua_value("ex", 4, "ref = 71");
+    let pre = "local nr = ms.number(154)\nif nr == 1 then error(\"refused\") end";
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &lua_dst("ex", 100, 4, "")).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let mut v = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    v.score.next_rank = 1;
+    let Err(refused) = h.import_reading(&Config::defaults(h.header()), &facts(Some(&v)), &cancel)
+    else {
+        panic!("refused")
+    };
+    assert_eq!(
+        refused.1.reads,
+        [FactRead {
+            fact: FactId::ResultNumber(154),
+            value: FactValue::Int(1),
+        }]
+    );
 }

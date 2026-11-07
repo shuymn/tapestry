@@ -328,6 +328,11 @@ pub enum NoteKind {
         lane: u8,
         paint: NoteFallback,
     },
+    /// A colour in `field` that is not an optional `#` and 6 or 8 hex
+    /// digits, drawn opaque red, as the source's distribution draws one.
+    InvalidColour {
+        field: &'static str,
+    },
     /// A decorative Lua callback in `field` that does not convert,
     /// replaced by its typed constant: `false` for a `draw`, the omitted
     /// number for a `value`.
@@ -376,6 +381,12 @@ impl fmt::Display for NoteKind {
             Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
             Self::Callback { field, why } => {
                 write!(f, "a callback in `{field}` replaced by its constant: {why}")
+            }
+            Self::InvalidColour { field } => {
+                write!(
+                    f,
+                    "a colour in `{field}` that does not parse, drawn opaque red"
+                )
             }
             Self::NotePartFallback { field, lane, paint } => {
                 write!(

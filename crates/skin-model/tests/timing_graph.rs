@@ -51,6 +51,7 @@ fn graph(gx: u16) -> TimingGraphDef {
         average: true,
         dev: true,
         solid: SOLID,
+        fit: skin_model::GraphFit::Stretch,
     }
 }
 
@@ -317,4 +318,72 @@ fn a_negative_size_draws_nothing() {
             }
         }
     }
+}
+
+/// The distribution fits by its `GraphFit` against its texture of `gx` ×
+/// scale texels, as the source's stretch fits it (D8): 301 columns at
+/// scale 10 with no sample. No resize centres 301 × 10 in a 602 × 200
+/// rect from (100, 100), at (250.5, 195), and turns about that region;
+/// the trimmed covering fit scales it to 3 010 × 100 (a column 10 pixels
+/// wide, from x −1 104) and cuts it to the 602 × 100 rect, its PERFECT
+/// column of ms 0 at x 396 to 406, GREAT at ms −30 (x 96 to 106 cut at
+/// 100), and turns about the region drawn.
+#[test]
+fn the_distribution_fits_as_the_source_stretches_it() {
+    use skin_model::GraphFit;
+    let frame = |r, fit| {
+        let mut fx = fixture(vec![TimingGraphDef { fit, ..graph(301) }], &[(0, r)]);
+        fx.view(&view(&[], None));
+        fx.frame(0);
+        fx
+    };
+    let fx = frame([100, 100, 602, 200], GraphFit::Exact { trim: false });
+    inside(fx.quads(), [250.5, 195.0, 301.0, 10.0], 1e-3);
+    assert_eq!(fx.pixel([250.0, 200.0]).1, 0);
+    assert_eq!(fx.pixel([251.0, 200.0]).1, 1);
+    assert_eq!(fx.pixel([551.0, 200.0]).1, 1);
+    assert_eq!(fx.pixel([552.0, 200.0]).1, 0);
+    assert!(fx.quads().iter().all(|q| q.pivot == [250.5, 195.0]));
+    let fx = frame([100, 100, 602, 100], GraphFit::Outer { trim: true });
+    inside(fx.quads(), [100.0, 100.0, 602.0, 100.0], 1e-3);
+    near(fx.pixel([401.0, 150.0]).0, shown(PG), 2.0);
+    near(fx.pixel([101.0, 150.0]).0, shown(GR), 2.0);
+    assert!(fx.quads().iter().all(|q| q.pivot == [100.0, 100.0]));
+}
+
+/// A gauge graph or distribution element naming a native size is
+/// refused: a distribution fits by its `GraphFit`, and a gauge graph's
+/// texture is its rect, which no stretch changes.
+#[test]
+fn a_graph_element_takes_no_native_size() {
+    use skin_model::{GaugeGraphColors, GaugeGraphDef, GaugeLook, LoadError, Native};
+    let mut e = source_element(Source::TimingGraph(0), [0, 0, 10, 10], 255, 0);
+    e.place.native = Some(Native::Exact([1, 1]));
+    let timing = ResultDefs {
+        timing_graphs: vec![graph(301)],
+        ..ResultDefs::default()
+    };
+    let refused = |e, defs| {
+        matches!(
+            graph_support::load_with(vec![e], defs),
+            Err(LoadError::GraphNative { element: 0 })
+        )
+    };
+    assert!(refused(e.clone(), timing));
+    let white = Rgba8::rgb(0xff_ffff, 0xff);
+    let colors = GaugeGraphColors {
+        border_line: white,
+        border_back: white,
+        line: white,
+        back: white,
+    };
+    let gauge = ResultDefs {
+        gauge_graphs: vec![GaugeGraphDef {
+            colors: [colors; GaugeLook::COUNT],
+            solid: SOLID,
+        }],
+        ..ResultDefs::default()
+    };
+    e.source = Source::GaugeGraph(0);
+    assert!(refused(e, gauge));
 }

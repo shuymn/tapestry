@@ -17,7 +17,7 @@ pub(crate) mod font;
 pub(crate) mod path;
 pub(crate) mod source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -838,6 +838,62 @@ impl Sheet {
             source: src,
             files: loaded.into_boxed_slice(),
             images: drawn.into_boxed_slice(),
+            frames: frames.into_boxed_slice(),
+            cells: cells.into_boxed_slice(),
+            fonts: Box::new([]),
+            fnts: Box::new([]),
+            bitmap_fonts: Box::new([]),
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: Vec::new(),
+        })
+    }
+
+    /// A sheet holding every cell of this sheet and of `other`, one frame
+    /// per cell, to pack an atlas both can be rebound to (design D13, "The
+    /// atlas step"): files of the same identity (both versions' names and
+    /// headers) are one file, and cells of the same file and rectangle, or
+    /// colour and size, one cell. It has no images or fonts and reads no
+    /// file. `None` when `other` is of another skin folder.
+    #[must_use]
+    pub fn union(&self, other: &Sheet) -> Option<Sheet> {
+        if self.root != other.root {
+            return None;
+        }
+        let same = |a: &File, b: &File| a.lo == b.lo && a.hi == b.hi;
+        let mut files: Vec<File> = self.files.to_vec();
+        let mut cell_ids = BTreeSet::new();
+        for c in self.cells.iter() {
+            cell_ids.insert(*c);
+        }
+        for c in other.cells.iter() {
+            let source = match c.source {
+                CellSource::File(f) => {
+                    let file = other.files.get(usize::try_from(f).ok()?)?;
+                    let i = match files.iter().position(|g| same(g, file)) {
+                        Some(i) => i,
+                        None => {
+                            files.push(file.clone());
+                            files.len() - 1
+                        }
+                    };
+                    CellSource::File(u32::try_from(i).ok()?)
+                }
+                s @ CellSource::Solid(..) => s,
+            };
+            cell_ids.insert(Cell {
+                source,
+                rect: c.rect,
+            });
+        }
+        // One frame per cell, in the cells' order.
+        let cells: Vec<Cell> = cell_ids.into_iter().collect();
+        let frames: Vec<u32> = (0_u32..).take(cells.len()).collect();
+        Some(Self {
+            id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
+            root: self.root.clone(),
+            source: self.source.clone(),
+            files: files.into_boxed_slice(),
+            images: Box::new([]),
             frames: frames.into_boxed_slice(),
             cells: cells.into_boxed_slice(),
             fonts: Box::new([]),
