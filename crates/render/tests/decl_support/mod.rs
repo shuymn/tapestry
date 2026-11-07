@@ -644,17 +644,18 @@ pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle
 
 /// A bundle of [`Look::left`] in `rgba` with a text element, for `r`'s
 /// device of 8192-texel pages, whose atlas array is exactly an atlas's
-/// cap ([`skin_model::MAX_ATLAS_TEXELS`], half of
-/// [`render::SHARED_TEXELS`]): a generated 8100×1500 cell is past 8064
-/// with its gutter, so it needs a page of 8192, which with the reserved
-/// layer and the text layer makes three layers. Meant to be admitted or
-/// refused, not drawn.
+/// cap ([`skin_model::MAX_ATLAS_TEXELS`]): two generated cells, 8100×1500
+/// and 1500×8100, are each past 8064 with their gutters on one side, so
+/// they need a page of 8192 and cannot share one; their two pages with
+/// the reserved layer and the text layer make four layers. Meant to be
+/// admitted or refused, not drawn.
 pub fn atlas_cap_bundle(r: &Renderer, rgba: [u8; 4]) -> Arc<SkinBundle> {
     let look = Look {
         text: true,
         ..Look::left(rgba)
     };
-    let b = solid_bundle(r, &look, [8_100, 1_500]);
+    let b = solid_cells_bundle(r, &look, &[([8_100, 1_500], rgba), ([1_500, 8_100], rgba)]);
+    assert_eq!((b.side(), b.text_layer()), (8_192, Some(3)));
     assert_eq!(b.atlas_texels(), skin_model::MAX_ATLAS_TEXELS);
     b
 }

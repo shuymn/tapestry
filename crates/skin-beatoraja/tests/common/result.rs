@@ -194,6 +194,9 @@ pub fn ready(ex: u32, cleared: bool, best: BestView) -> ResultView {
             sd_x100: 1_234,
         }),
         timelines: None,
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 

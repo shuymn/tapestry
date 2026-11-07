@@ -442,6 +442,9 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
             sd_x100: 1_234,
         }),
         timelines: None,
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 

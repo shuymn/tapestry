@@ -4828,7 +4828,8 @@ pub(crate) mod tests {
 
     /// A pending play skin's specialization staged with its attempt
     /// through a real menu screen and renderer on WARP, beside a committed
-    /// result skin charged an atlas's cap and a tiny atlas's texels
+    /// result skin charged what the shared limit leaves beside an atlas's
+    /// cap, and a tiny atlas's texels more
     /// (`Renderer::state_charge`, development builds, so no array that
     /// large is uploaded): one whose atlas is the cap passes the shared
     /// limit by the tiny atlas and is refused with the renderer's
@@ -4857,7 +4858,10 @@ pub(crate) mod tests {
                 },
                 render::AdapterChoice::Warp,
             )?;
-            renderer.state_charge(&stated, skin_model::MAX_ATLAS_TEXELS + TINY);
+            renderer.state_charge(
+                &stated,
+                render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + TINY,
+            );
             Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
         });
         let link = spawn_empty(make);
@@ -4897,8 +4901,9 @@ pub(crate) mod tests {
     }
 
     /// A refused shared admission allocates nothing (design.md "Memory
-    /// Budget"): with play's tiny skin committed and charged an atlas's
-    /// cap (`Renderer::state_charge`) and a tiny result skin committed, a
+    /// Budget"): with play's tiny skin committed and charged what the
+    /// shared limit leaves beside an atlas's cap
+    /// (`Renderer::state_charge`) and a tiny result skin committed, a
     /// selection candidate at the cap is past the shared limit by the tiny
     /// atlas. It is refused before anything is allocated or staged, and
     /// play's installation draws its next frame as before. The candidate
@@ -4918,7 +4923,7 @@ pub(crate) mod tests {
         let ctx = context(&GAUGES, false);
         let token = r.stage(&tiny, &attempt(&r, &chart, &ctx), 1).unwrap();
         r.commit(token).unwrap();
-        r.state_charge(&tiny, skin_model::MAX_ATLAS_TEXELS);
+        r.state_charge(&tiny, render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS);
         let result = solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]);
         let token = r.install(ScreenKind::Result, &result, 2).unwrap();
         r.commit(token).unwrap();
