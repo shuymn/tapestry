@@ -2834,7 +2834,11 @@ pub(crate) mod tests {
     /// 21's image's sampled time.
     #[cfg(feature = "dev-tools")]
     #[derive(Clone, Default)]
-    struct PanelFrames(Arc<std::sync::Mutex<Vec<([bool; 3], Option<TimeUs>)>>>);
+    struct PanelFrames(Arc<std::sync::Mutex<Vec<PanelFrame>>>);
+
+    /// One frame of [`PanelFrames`].
+    #[cfg(feature = "dev-tools")]
+    type PanelFrame = ([bool; 3], Option<TimeUs>);
 
     #[cfg(feature = "dev-tools")]
     impl crate::render_side::FrameSink for PanelFrames {
