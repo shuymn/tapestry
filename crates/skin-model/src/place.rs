@@ -116,14 +116,6 @@ pub enum Native {
 }
 
 impl Native {
-    /// The same kind of native size for a frame of `size` texels.
-    pub(crate) fn sized(self, size: [u32; 2]) -> Self {
-        match self {
-            Self::NoLarger(_) => Self::NoLarger(size),
-            Self::Exact(_) => Self::Exact(size),
-        }
-    }
-
     /// The placed canvas rect `[x, y, w, h]` resized at `scale` target
     /// pixels per canvas pixel. A frame without area keeps the rect.
     pub(crate) fn fit(self, [x, y, w, h]: [f32; 4], scale: f32) -> [f32; 4] {

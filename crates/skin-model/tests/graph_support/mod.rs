@@ -139,6 +139,14 @@ pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
 
 /// A result skin of `elements` drawing the result widgets `widgets`.
 pub fn skin_with(elements: Vec<ElementDef>, widgets: ResultDefs) -> Skin {
+    load_with(elements, widgets).unwrap()
+}
+
+/// [`skin_with`], refused or not.
+pub fn load_with(
+    elements: Vec<ElementDef>,
+    widgets: ResultDefs,
+) -> Result<Skin, skin_model::LoadError> {
     let dir = tempfile::tempdir().unwrap();
     let def = SkinDef {
         fit: skin_model::Fit::Fixed,
@@ -155,7 +163,7 @@ pub fn skin_with(elements: Vec<ElementDef>, widgets: ResultDefs) -> Skin {
         close: None,
         present: None,
     };
-    Skin::new_result(def, widgets).unwrap()
+    Skin::new_result(def, widgets)
 }
 
 /// Timelines of 1 s bins, every note judged.

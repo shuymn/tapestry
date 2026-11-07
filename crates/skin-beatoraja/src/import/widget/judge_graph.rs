@@ -90,21 +90,16 @@ impl Cx<'_> {
             .assets
             .chip_grid(&mut self.budget, lit(no_gap_x, no_gap))
             .map_err(|l| self.limit(at, l))?;
-        def.solid = self.white(at)?;
-        let mut rects = Vec::with_capacity(c.track.keys.len());
-        for k in &c.track.keys {
-            let r = self.key_rect(&c, k)?;
-            rects.push(r.model().ok_or_else(|| self.range(at, "dst"))?);
-        }
-        let t = self.model_track(&c, &rects)?;
+        def.solid = self.graph_white(at)?;
+        let t = self.graph_track(&c)?;
         let index = u32::try_from(self.judge_graphs.len()).unwrap_or(u32::MAX);
         self.judge_graphs.push(def);
         self.push(c, Source::JudgeGraph(index), t)
     }
 
-    /// The opaque white system image, drawn nearest, charged and added
-    /// once; a limit is located at `at`.
-    fn white(&mut self, at: Span) -> Result<u32, ImportError> {
+    /// The opaque white system image the result graphs tint, drawn
+    /// nearest, charged and added once; a limit is located at `at`.
+    pub(super) fn graph_white(&mut self, at: Span) -> Result<u32, ImportError> {
         let white = [255; 4];
         if let Some(i) = self.assets.system(white, Filter::Nearest) {
             return Ok(i);
@@ -113,6 +108,19 @@ impl Cx<'_> {
         self.assets
             .add_system(white, Filter::Nearest)
             .map_err(|l| self.limit(at, l))
+    }
+
+    /// A result graph element's track: each key's rect, unbaked.
+    pub(super) fn graph_track(
+        &mut self,
+        c: &super::super::Common,
+    ) -> Result<skin_model::Track, ImportError> {
+        let mut rects = Vec::with_capacity(c.track.keys.len());
+        for k in &c.track.keys {
+            let r = self.key_rect(c, k)?;
+            rects.push(r.model().ok_or_else(|| self.range(c.span, "dst"))?);
+        }
+        self.model_track(c, &rects)
     }
 }
 
