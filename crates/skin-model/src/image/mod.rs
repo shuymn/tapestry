@@ -15,6 +15,7 @@ pub(crate) mod decode;
 pub(crate) mod fnt;
 pub(crate) mod font;
 pub(crate) mod path;
+pub(crate) mod source;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,6 +31,7 @@ use crate::skin::TimerRef;
 use crate::track::MAX_KEY_US;
 use decode::{DecodeError, Halt, Mode};
 use path::PathError;
+use source::{FileSource, HeaderFail};
 
 /// The most files one skin may name.
 pub const MAX_FILES: usize = 4_096;
@@ -427,6 +429,8 @@ static NEXT_SHEET: AtomicU64 = AtomicU64::new(1);
 pub struct Sheet {
     id: u64,
     root: PathBuf,
+    /// What its files are read through.
+    source: FileSource,
     files: Box<[File]>,
     images: Box<[Image]>,
     /// Per frame, in uv-table order: its cell.
@@ -537,8 +541,13 @@ impl Total {
 
 /// A file's name resolved inside the canonical skin folder `root`, with
 /// its length: the metadata checks, before any header is read.
-fn meta(root: &Path, at: FileAt, name: &str) -> Result<(PathBuf, u64), ImageError> {
-    path::resolve(root, name).map_err(|e| ImageError::path(at, e))
+fn meta(
+    src: &FileSource,
+    root: &Path,
+    at: FileAt,
+    name: &str,
+) -> Result<(PathBuf, u64), ImageError> {
+    src.resolve(root, name).map_err(|e| ImageError::path(at, e))
 }
 
 /// One file's versions resolved ([`meta`]); no hi path when there is no
@@ -551,6 +560,7 @@ struct Resolved {
 /// Resolves file `file`'s versions and checks the running byte totals,
 /// returning the totals with this file added.
 fn resolve_file(
+    src: &FileSource,
     root: &Path,
     file: usize,
     def: &FileDef,
@@ -558,9 +568,9 @@ fn resolve_file(
     hi_bytes: Total,
 ) -> Result<(Resolved, Total, Total), ImageError> {
     let lo_at = FileAt { file, hi: false };
-    let (lo, lo_len) = meta(root, lo_at, &def.path)?;
+    let (lo, lo_len) = meta(src, root, lo_at, &def.path)?;
     let hi = match &def.hi {
-        Some(name) => Some(meta(root, FileAt { file, hi: true }, name)?),
+        Some(name) => Some(meta(src, root, FileAt { file, hi: true }, name)?),
         None => None,
     };
     let lo_bytes = lo_bytes
@@ -585,6 +595,7 @@ fn resolve_file(
 /// and checks the running texel totals, returning the file and the
 /// totals with it added.
 fn read_file(
+    src: &FileSource,
     file: usize,
     def: FileDef,
     paths: &Resolved,
@@ -592,13 +603,13 @@ fn read_file(
     hi_texels: Total,
 ) -> Result<(File, Total, Total), ImageError> {
     let lo_at = FileAt { file, hi: false };
-    let (lo_dims, lo_mode) = checked_header(lo_at, &paths.lo)?;
+    let (lo_dims, lo_mode) = checked_header(src, lo_at, &paths.lo)?;
     let lo_texels = lo_texels
         .with(texels(lo_dims))
         .ok_or(ImageError::TotalTooLarge { at: lo_at })?;
     let hi = match (def.hi, &paths.hi) {
         (Some(name), Some(hi_path)) => {
-            let (dims, mode) = checked_header(FileAt { file, hi: true }, hi_path)?;
+            let (dims, mode) = checked_header(src, FileAt { file, hi: true }, hi_path)?;
             let [w, h] = lo_dims;
             if dims != [w * 2, h * 2] {
                 return Err(ImageError::HiSizeMismatch { file });
@@ -726,11 +737,17 @@ thread_local! {
 /// The header of a resolved file, checked, and how it decodes: non-empty,
 /// at most [`MAX_SIDE`] per side and [`MAX_STREAMED_TEXELS`] in all, and
 /// past [`MAX_IMAGE_TEXELS`] only when it can be decoded in bands.
-fn checked_header(at: FileAt, path: &Path) -> Result<([u32; 2], Mode), ImageError> {
+pub(crate) fn checked_header(
+    src: &FileSource,
+    at: FileAt,
+    path: &Path,
+) -> Result<([u32; 2], Mode), ImageError> {
     #[cfg(test)]
     HEADER_READS.with(|n| n.set(n.get() + 1));
-    let (mut file, len) = path::open(path).map_err(|e| ImageError::path(at, e))?;
-    let probe = decode::header(&mut file, len).map_err(|e| ImageError::decode(at, e))?;
+    let probe = src.header(path).map_err(|e| match e {
+        HeaderFail::Path(e) => ImageError::path(at, e),
+        HeaderFail::Decode(e) => ImageError::decode(at, e),
+    })?;
     let [w, h] = probe.dims;
     if w == 0 || h == 0 {
         return Err(ImageError::EmptyFile { at });
@@ -762,6 +779,7 @@ impl Sheet {
         Self {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root: PathBuf::new(),
+            source: FileSource::disk(),
             files: Box::new([]),
             images: Box::new([]),
             frames: Box::new([]),
@@ -812,12 +830,13 @@ impl Sheet {
             check_cycle(image, def)?;
         }
         let root = root.canonicalize().map_err(ImageError::Root)?;
+        let src = FileSource::disk();
 
         // Paths and lengths, before any header is read.
         let mut paths = Vec::with_capacity(files.len());
         let (mut lo_bytes, mut hi_bytes) = (Total::BYTES, Total::BYTES);
         for (file, def) in files.iter().enumerate() {
-            let (resolved, lo, hi) = resolve_file(&root, file, def, lo_bytes, hi_bytes)?;
+            let (resolved, lo, hi) = resolve_file(&src, &root, file, def, lo_bytes, hi_bytes)?;
             (lo_bytes, hi_bytes) = (lo, hi);
             paths.push(resolved);
         }
@@ -826,7 +845,7 @@ impl Sheet {
         let (mut lo_texels, mut hi_texels) = (Total::TEXELS, Total::TEXELS);
         let mut loaded = Vec::with_capacity(files.len());
         for (file, (def, resolved)) in files.into_iter().zip(paths).enumerate() {
-            let (f, lo, hi) = read_file(file, def, &resolved, lo_texels, hi_texels)?;
+            let (f, lo, hi) = read_file(&src, file, def, &resolved, lo_texels, hi_texels)?;
             (lo_texels, hi_texels) = (lo, hi);
             loaded.push(f);
         }
@@ -846,6 +865,7 @@ impl Sheet {
         Ok(Self {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root,
+            source: src,
             files: loaded.into_boxed_slice(),
             images: drawn.into_boxed_slice(),
             frames: frames.into_boxed_slice(),
@@ -878,6 +898,11 @@ impl Sheet {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// What its image and font files are read through.
+    pub(crate) fn source(&self) -> &FileSource {
+        &self.source
     }
 
     pub(crate) fn files(&self) -> &[File] {
