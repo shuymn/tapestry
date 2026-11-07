@@ -19,9 +19,10 @@ use skin_model::{ClipId, Filter, Quad, QuadBatch, RunKey};
 /// screens, origin at the top left): the runtime model's [`Quad`].
 ///
 /// Its uv on layer 0 is the built-in atlas's ([`glyph_rows`](crate::glyph_rows),
-/// [`solid_uv`](crate::solid_uv)), whatever the array's page side: staging
-/// rescales it ([`Instance::of`]). Its colour is straight RGBA: staging
-/// premultiplies it. Layer 0 is always sampled at its nearest level-0
+/// [`solid_uv`](crate::solid_uv)), whatever the array's page side: the
+/// shader reads layer 0 by integer texel, the uv times the built-in
+/// atlas's side, exact on any page side. Its colour is straight RGBA:
+/// staging premultiplies it. Layer 0 is always read at its nearest level-0
 /// texel, so the bitmap font stays sharp, whatever its filter.
 pub type Sprite = Quad;
 
@@ -53,27 +54,19 @@ const _: () = assert!(size_of::<Instance>() == 64);
 
 impl Instance {
     /// `s` as the GPU draws it: its tint's RGB multiplied by its alpha,
-    /// once; its layer and filter packed into the flags; and on layer 0,
-    /// the built-in atlas, its uv multiplied by `font_scale`, the built-in
-    /// atlas's side over the array's page side (1 when the array is the
-    /// built-in atlas alone). The built-in atlas sits at the top left of
-    /// layer 0, so its texels keep their coordinates; the sides are powers
-    /// of two, so the product is exact.
+    /// once; its layer and filter packed into the flags. Its uv is kept as
+    /// it is, on layer 0 too: the built-in atlas's own, which the shader
+    /// reads by integer texel.
     #[must_use]
-    pub fn of(s: &Sprite, font_scale: f32) -> Self {
+    pub fn of(s: &Sprite) -> Self {
         let [r, g, b, a] = s.color;
-        let uv = if s.layer == 0 {
-            s.uv.map(|v| v * font_scale)
-        } else {
-            s.uv
-        };
         let nearest = match s.filter {
             Filter::Nearest => FLAG_NEAREST,
             Filter::Linear => 0,
         };
         Self {
             rect: s.rect,
-            uv,
+            uv: s.uv,
             color: [r * a, g * a, b * a, a],
             pivot: s.pivot,
             angle: s.angle,
@@ -201,20 +194,15 @@ impl SpriteBatch {
         usize::try_from(self.quads.total_capacity().0).unwrap_or(usize::MAX)
     }
 
-    /// Converts the batch into `out` in drawing order ([`Instance::of`]
-    /// with `font_scale`), after clearing it: the per-frame instance
-    /// staging for the GPU buffer. It never allocates: it stages at most
-    /// `out`'s capacity, and the renderer's staging has room for the
-    /// batch's [`total_capacity`](Self::total_capacity).
-    pub fn stage(&self, out: &mut Vec<Instance>, font_scale: f32) {
+    /// Converts the batch into `out` in drawing order ([`Instance::of`]),
+    /// after clearing it: the per-frame instance staging for the GPU
+    /// buffer. It never allocates: it stages at most `out`'s capacity, and
+    /// the renderer's staging has room for the batch's
+    /// [`total_capacity`](Self::total_capacity).
+    pub fn stage(&self, out: &mut Vec<Instance>) {
         out.clear();
         let room = out.capacity();
-        out.extend(
-            self.sprites()
-                .iter()
-                .take(room)
-                .map(|s| Instance::of(s, font_scale)),
-        );
+        out.extend(self.sprites().iter().take(room).map(Instance::of));
     }
 
     /// Pushes refused since the last [`clear`](Self::clear). An overflow
@@ -315,7 +303,7 @@ mod tests {
         );
         let xs = |s: &[Instance]| s.iter().map(|i| i.rect[0]).collect::<Vec<_>>();
         let mut staged = Vec::with_capacity(8);
-        batch.stage(&mut staged, 1.0);
+        batch.stage(&mut staged);
         assert_eq!(xs(&staged), [1.0, 2.0, 3.0, 4.0]);
         let alpha: Vec<_> = batch.blended(Blend::Alpha).map(|s| s.rect[0]).collect();
         assert_eq!(alpha, [1.0, 2.0, 4.0]);
@@ -356,7 +344,7 @@ mod tests {
         }
         let mut staged = Vec::with_capacity(2);
         let room = staged.capacity();
-        batch.stage(&mut staged, 1.0);
+        batch.stage(&mut staged);
         assert_eq!(staged.len(), room);
         assert_eq!(staged.capacity(), room);
     }
@@ -372,9 +360,8 @@ mod tests {
             layer: 3,
             filter: Filter::Linear,
         };
-        let i = Instance::of(&s, 0.5);
+        let i = Instance::of(&s);
         assert_eq!(i.rect, s.rect);
-        // A skin page's uv is its own: not rescaled.
         assert_eq!(i.uv, s.uv);
         assert_eq!(i.color, [0.5, 0.25, 0.125, 0.5]);
         assert_eq!((i.pivot, i.angle), (s.pivot, s.angle));
@@ -384,31 +371,26 @@ mod tests {
             color: [0.2, 0.4, 0.6, 1.0],
             ..s
         };
-        assert_eq!(Instance::of(&opaque, 0.5).color, opaque.color);
+        assert_eq!(Instance::of(&opaque).color, opaque.color);
     }
 
     /// The layer and the filter are packed into the flags; layer 0's uv,
-    /// the built-in atlas's, is scaled to the array's page side: 'A' at
-    /// texel (8, 16) of the 128-texel atlas is at 8/512 of a 512 page.
+    /// the built-in atlas's, is kept for the shader to read by texel.
     #[test]
-    fn staging_packs_the_layer_and_rescales_the_built_in_atlas() {
+    fn staging_packs_the_layer_and_keeps_the_built_in_uv() {
         let glyph = Sprite {
             uv: [8.0 / 128.0, 16.0 / 128.0, 13.0 / 128.0, 23.0 / 128.0],
             ..Sprite::default()
         };
-        let i = Instance::of(&glyph, 128.0 / 512.0);
-        assert_eq!(
-            i.uv,
-            [8.0 / 512.0, 16.0 / 512.0, 13.0 / 512.0, 23.0 / 512.0]
-        );
+        let i = Instance::of(&glyph);
+        assert_eq!(i.uv, glyph.uv);
         assert_eq!(i.flags, 0);
-        assert_eq!(Instance::of(&glyph, 1.0).uv, glyph.uv);
         let pixel_art = Sprite {
             layer: 0x1234,
             filter: Filter::Nearest,
             ..Sprite::default()
         };
-        assert_eq!(Instance::of(&pixel_art, 1.0).flags, 0x1_1234);
+        assert_eq!(Instance::of(&pixel_art).flags, 0x1_1234);
         assert_eq!(FLAG_NEAREST, 0x1_0000);
     }
 

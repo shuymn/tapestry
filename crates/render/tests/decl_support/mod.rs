@@ -76,7 +76,7 @@ fn image(rect: [i32; 4], clipped: bool) -> ElementDef {
 pub struct Look {
     /// Its image's colour.
     pub rgba: [u8; 4],
-    /// Its image's side in texels: past 256 its atlas pages are 512.
+    /// Its image's side in texels: past 240 its atlas pages are wider than 256.
     pub side: u32,
     /// Where it draws, in canvas pixels.
     pub rect: [i32; 4],
@@ -644,15 +644,16 @@ pub fn solid_bundle(r: &Renderer, look: &Look, size: [u32; 2]) -> Arc<SkinBundle
 
 /// A bundle of [`Look::left`] in `rgba` with a text element, for `r`'s
 /// device of 8192-texel pages, whose atlas array is exactly
-/// [`render::SHARED_TEXELS`]: a generated 4096×3072 cell needs a page of
-/// 8192, which with the reserved layer and the text layer makes three
-/// layers. Meant to be admitted alone or refused, not drawn.
+/// [`render::SHARED_TEXELS`]: a generated 8100×1500 cell is past 8064
+/// with its gutter, so it needs a page of 8192, which with the reserved
+/// layer and the text layer makes three layers. Meant to be admitted alone
+/// or refused, not drawn.
 pub fn shared_limit_bundle(r: &Renderer, rgba: [u8; 4]) -> Arc<SkinBundle> {
     let look = Look {
         text: true,
         ..Look::left(rgba)
     };
-    let b = solid_bundle(r, &look, [4_096, 3_072]);
+    let b = solid_bundle(r, &look, [8_100, 1_500]);
     assert_eq!(b.atlas_texels(), render::SHARED_TEXELS);
     b
 }

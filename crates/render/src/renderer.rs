@@ -91,6 +91,9 @@ fn charge_of(bundle: &SkinBundle) -> u64 {
     bundle.atlas_texels().saturating_add(vm)
 }
 
+// The sprite shader reads the built-in atlas at its side, 128.
+const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
+
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
 // the atlas layer (low 16 bits) and the nearest-filter bit.
@@ -140,15 +143,18 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // The atlas holds premultiplied texels and the colour arrives premultiplied,
 // so their product is premultiplied. A skin's page is sampled bilinearly
 // between its mip levels, or at the nearest texel of the nearest level with
-// the nearest bit; layer 0, the built-in atlas, always at its nearest
-// level-0 texel. All three are sampled, so every sample stays in uniform
-// control flow, and one is chosen.
+// the nearest bit; layer 0, the built-in atlas of 128 texels at its top
+// left, is read at its nearest level-0 texel by integer texel: its uv, the
+// built-in atlas's own, times 128, exact whatever the array's side. Both
+// pages' samples are taken, so every sample stays in uniform control flow,
+// and one result is chosen.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
     let layer = i32(v.flags & 0xFFFFu);
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
     let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
-    let builtin = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
+    let texel = clamp(vec2i(floor(v.uv * 128.0)), vec2i(0), vec2i(127));
+    let builtin = textureLoad(atlas, texel, 0, 0);
     let page = select(smoothed, nearest, (v.flags & 0x10000u) != 0u);
     return select(page, builtin, layer == 0) * v.color;
 }
@@ -1070,7 +1076,6 @@ impl Renderer {
         }
         wait_for_gpu(&self.gpu)?;
         self.atlas_bind = bind;
-        self.staging.set_font_scale(atlas.font_scale());
         self.staging.set_clips(clips);
         self.atlas = atlas;
         self.resources += 1;
@@ -1442,7 +1447,6 @@ impl Renderer {
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
-        staging.set_font_scale(atlas.font_scale());
         wait_for_gpu(&self.gpu)?;
         let text_cache = bundle
             .text_layer()
@@ -3185,12 +3189,10 @@ mod tests {
     /// bind group and the upload's submission (a buffer whose usage mixes
     /// both map modes, which every device's validation refuses), is the
     /// typed `Atlas(Device)` error, not an uncaptured one that would panic,
-    /// and the built-in atlas stays: 128 texels, one layer, its font scale
-    /// 1, so the solid block still draws white at layout (100, 100), target
-    /// pixel (50, 50). With the refused 256-texel array's font scale (1/2)
-    /// taken anyway, the solid uv would read texel 62 of the built-in atlas,
-    /// a glyph cell's empty corner. The same pages without the fault are
-    /// then installed: 256 texels, two layers.
+    /// and the built-in atlas stays: 128 texels, one layer, so the solid
+    /// block still draws white at layout (100, 100), target pixel (50, 50).
+    /// The same pages without the fault are then installed: 256 texels,
+    /// two layers.
     #[test]
     fn a_refusal_after_the_texture_keeps_the_atlas() {
         let mut r = Renderer::new(
@@ -3250,6 +3252,84 @@ mod tests {
         assert_eq!(&pixels[i..i + 3], &[255, 255, 255]);
         r.install_atlas(&pages, ClipTable::default()).unwrap();
         assert_eq!(r.atlas_size(), (256, 2));
+    }
+
+    /// The built-in atlas is read texel for texel on an array whose side,
+    /// 384, is not a power of two: drawn whole at 1:1 at the top left and
+    /// at 2:1 beside it, every target pixel is the built-in texel under it
+    /// (white glyph texels opaque, the rest transparent over the black
+    /// clear), as on the built-in atlas alone.
+    #[test]
+    fn the_built_in_atlas_reads_exactly_on_a_side_between_powers_of_two() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 1_920,
+                height: 1_080,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        let draw = |r: &mut Renderer| {
+            let text = MenuText::new(r);
+            let whole = |rect| Sprite {
+                rect,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                color: [1.0; 4],
+                ..Sprite::default()
+            };
+            let timing = r
+                .menu_frame(
+                    |b| {
+                        b.push(Blend::Alpha, whole([0.0, 0.0, 128.0, 128.0]));
+                        b.push(Blend::Alpha, whole([200.0, 0.0, 256.0, 256.0]));
+                        b.push(Blend::Alpha, whole([500.0, 0.0, 64.0, 64.0]));
+                    },
+                    &text,
+                )
+                .unwrap();
+            assert!(timing.presented);
+            r.read_back()
+        };
+        let atlas = crate::atlas::build_atlas();
+        let check = |pixels: &[u8]| {
+            let mut opaque = 0;
+            for y in 0..256_usize {
+                for x in 0..564_usize {
+                    let texel = if x < 128 && y < 128 {
+                        Some((x, y))
+                    } else if (200..456).contains(&x) {
+                        Some(((x - 200) / 2, y / 2))
+                    } else if x >= 500 && y < 64 {
+                        Some((2 * (x - 500) + 1, 2 * y + 1))
+                    } else {
+                        None
+                    };
+                    let Some((tx, ty)) = texel else { continue };
+                    let a = atlas[(ty * 128 + tx) * 4 + 3];
+                    let i = (y * 1_920 + x) * 4;
+                    let want = if a == 255 { [255; 3] } else { [0; 3] };
+                    assert_eq!(&pixels[i..i + 3], &want, "pixel ({x}, {y})");
+                    opaque += usize::from(a == 255);
+                }
+            }
+            assert!(opaque > 1_000, "{opaque}");
+        };
+        check(&draw(&mut r));
+        let (l0, l1, l2, l3) = (
+            vec![0u8; 384 * 384 * 4],
+            vec![0u8; 192 * 192 * 4],
+            vec![0u8; 96 * 96 * 4],
+            vec![0u8; 48 * 48 * 4],
+        );
+        let page: crate::PageLevels<'_> = [&l0, &l1, &l2, &l3];
+        let pages = AtlasPages {
+            side: 384,
+            pages: &[page],
+            text_layer: false,
+        };
+        r.install_atlas(&pages, ClipTable::default()).unwrap();
+        assert_eq!(r.atlas_size(), (384, 2));
+        check(&draw(&mut r));
     }
     /// A producer laying a string out by its first letter: `T`, `U` and
     /// `V` as 2032 × 1000 lines (half the 2048 layer each), anything else

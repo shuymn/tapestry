@@ -25,10 +25,10 @@ use render::{
 };
 use skin_model::{AtlasLimits, ScreenKind};
 
-/// Big's cell: past a 4 096-texel page with its gutter, so its one page
+/// Big's cell: past an 8 064-texel page with its gutter, so its one page
 /// is 8 192 texels a side, beside the reserved layer (and, for big, the
 /// text layer).
-const BIG: [u32; 2] = [4_096, 3_072];
+const BIG: [u32; 2] = [8_100, 1_500];
 /// Tiny's atlas array: one 256-texel page beside the reserved layer.
 const TINY: u64 = 256 * 256 * 2;
 const RED: [u8; 4] = [255, 0, 0, 255];

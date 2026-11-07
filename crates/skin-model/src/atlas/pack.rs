@@ -5,7 +5,7 @@
 
 use etagere::{AllocatorOptions, AtlasAllocator, size2};
 
-use super::{ALIGN, GUTTER, MIN_PAGE_SIDE};
+use super::{ALIGN, GUTTER, MIN_PAGE_SIDE, PAGE_SIDE_STEP};
 
 /// The most cells one page's allocator takes.
 ///
@@ -53,30 +53,23 @@ pub(crate) fn padded([w, h]: [u32; 2]) -> Option<[u32; 2]> {
     Some([pad(w)?, pad(h)?])
 }
 
-/// The largest page side for `max_side`: the largest power of two not
-/// above it (0 below 1).
+/// The largest page side for `max_side`: the largest multiple of
+/// [`PAGE_SIDE_STEP`] not above it (0 below the step).
 pub(crate) fn side_cap(max_side: u32) -> u32 {
-    if max_side == 0 {
-        0
-    } else {
-        1 << (31 - max_side.leading_zeros())
-    }
+    max_side / PAGE_SIDE_STEP * PAGE_SIDE_STEP
 }
 
-/// The candidate sides for cells of `padded` sizes: the powers of two from
-/// [`MIN_PAGE_SIDE`] or `min_side` (or the largest cell rounded up) to
-/// `cap`.
+/// The candidate sides for cells of `padded` sizes, smallest first: the
+/// multiples of [`PAGE_SIDE_STEP`] from [`MIN_PAGE_SIDE`] or `min_side`
+/// (or the largest cell rounded up) to `cap`.
 pub(crate) fn candidates(
     padded: &[[u32; 2]],
     cap: u32,
     min_side: u32,
 ) -> impl Iterator<Item = u32> {
     let largest = padded.iter().flatten().copied().max().unwrap_or(0);
-    let start = largest
-        .max(MIN_PAGE_SIDE)
-        .max(min_side)
-        .checked_next_power_of_two();
-    std::iter::successors(start, |s| s.checked_mul(2)).take_while(move |&s| s <= cap)
+    let start = round_up(largest.max(MIN_PAGE_SIDE).max(min_side), PAGE_SIDE_STEP);
+    std::iter::successors(start, |s| s.checked_add(PAGE_SIDE_STEP)).take_while(move |&s| s <= cap)
 }
 
 /// The order cells are placed in: taller first, then wider, then by index.
@@ -183,10 +176,24 @@ pub(crate) fn cost(reserved: u32, pages: u32, side: u32) -> u64 {
     (u64::from(reserved) + u64::from(pages)) * u64::from(side) * u64::from(side)
 }
 
+/// The least any packing of cells covering `area` texels costs at `side`:
+/// at least one page, and at least the cells' area beside the reserved
+/// layers. It never falls as the side grows.
+fn least_cost(reserved: u32, area: u64, side: u32) -> u64 {
+    let s2 = u64::from(side) * u64::from(side);
+    let reserved = u64::from(reserved) * s2;
+    (reserved + s2).max(reserved.saturating_add(area))
+}
+
 /// Packs cells of `padded` sizes at the cheapest candidate side under this
 /// packing: the fewest texels across all layers, ties going to fewer
 /// pages, among the sides from `min_side` that fit `max_pages`. `reserved`
 /// counts every layer beside the pages.
+///
+/// The sides are tried smallest first. Once a side's least cost
+/// ([`least_cost`]) is past the best found, every larger side's is too,
+/// and the search ends; a side is packed only into the pages that would
+/// not cost more than the best found, so a costlier packing stops early.
 pub(crate) fn pack(
     padded: &[[u32; 2]],
     cap: u32,
@@ -205,9 +212,26 @@ pub(crate) fn pack(
         });
     }
     let order = order(padded);
+    let area = padded
+        .iter()
+        .map(|&[w, h]| u64::from(w) * u64::from(h))
+        .sum::<u64>();
     let mut best: Option<Packing> = None;
     for side in candidates(padded, cap, min_side) {
-        let Some(p) = pack_side(padded, &order, side, max_pages, MAX_CELLS_PER_PAGE)? else {
+        let pages = match &best {
+            Some(b) => {
+                let old = cost(reserved, b.pages, b.side);
+                if least_cost(reserved, area, side) > old {
+                    break;
+                }
+                // The most pages costing no more than the best.
+                let s2 = u64::from(side) * u64::from(side);
+                let within = (old / s2).saturating_sub(u64::from(reserved));
+                u32::try_from(within).unwrap_or(u32::MAX).min(max_pages)
+            }
+            None => max_pages,
+        };
+        let Some(p) = pack_side(padded, &order, side, pages, MAX_CELLS_PER_PAGE)? else {
             continue;
         };
         let better = best.as_ref().is_none_or(|b| {
@@ -217,14 +241,8 @@ pub(crate) fn pack(
             );
             new < old || (new == old && p.pages < b.pages)
         });
-        let one_page = p.pages == 1;
         if better {
             best = Some(p);
-        }
-        // Later sides are larger and need at least one page, so they cost
-        // strictly more than this one.
-        if one_page {
-            break;
         }
     }
     best.ok_or(PackError::TooManyPages)
@@ -234,7 +252,7 @@ pub(crate) fn pack(
 mod tests {
     use proptest::prelude::*;
 
-    use super::{MAX_CELLS_PER_PAGE, candidates, order, pack, pack_side, padded, side_cap};
+    use super::{MAX_CELLS_PER_PAGE, candidates, cost, order, pack, pack_side, padded, side_cap};
 
     /// Whether two rectangles (left, top, width, height) overlap.
     fn overlap(a: [u32; 4], b: [u32; 4]) -> bool {
@@ -282,8 +300,34 @@ mod tests {
         let area = i64::from(super::super::MAX_PAGE_SIDE).pow(2);
         assert!(i32::try_from(area).is_ok());
         assert_eq!(side_cap(8_192), 8_192);
-        assert_eq!(side_cap(8_191), 4_096);
+        assert_eq!(side_cap(8_191), 8_064);
         assert_eq!(side_cap(300), 256);
+        assert_eq!(side_cap(127), 0);
+    }
+
+    /// Frames like a large selection skin's: one 2048-texel image with its
+    /// gutter (2064), many that pad to 2048, and full-screen 1920×1080
+    /// ones. At a power of two the 2064 needs 4096 or 8192, where whole
+    /// layers go mostly empty or one more layer of 8192 is charged; a side
+    /// just past 4096 holds two of them a row and is cheaper.
+    #[test]
+    fn a_side_between_powers_of_two_is_chosen_when_cheaper() {
+        let mut sizes = vec![[2_064, 2_064]];
+        sizes.extend([[2_048, 2_048]; 30]);
+        sizes.extend([[1_936, 1_096]; 6]);
+        let p = pack(&sizes, 8_192, 64, 1, 0).unwrap();
+        assert_eq!((p.side, p.pages), (4_224, 9));
+        let chosen = cost(1, p.pages, p.side);
+        assert_eq!(chosen, 10 * 4_224 * 4_224);
+        let order = order(&sizes);
+        for side in [4_096, 8_192] {
+            let q = pack_side(&sizes, &order, side, 64, MAX_CELLS_PER_PAGE)
+                .unwrap()
+                .unwrap();
+            assert!(cost(1, q.pages, side) > chosen, "{side}: {}", q.pages);
+        }
+        // Deterministic.
+        assert_eq!(pack(&sizes, 8_192, 64, 1, 0).unwrap(), p);
     }
 
     /// Cells from raw values: sizes 1 to 600.
@@ -316,7 +360,7 @@ mod tests {
                 return Ok(());
             };
             prop_assert!(p.pages >= 1 && p.pages <= layers);
-            prop_assert!(p.side.is_power_of_two() && p.side >= 256 && p.side <= cap);
+            prop_assert!(p.side.is_multiple_of(128) && p.side >= 256 && p.side <= cap);
             prop_assert_eq!(p.places.len(), sizes.len());
             for (i, (place, size)) in p.places.iter().zip(&sizes).enumerate() {
                 let [x, y, w, h] = place.alloc;

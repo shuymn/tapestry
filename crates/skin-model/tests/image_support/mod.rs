@@ -201,12 +201,19 @@ pub fn texel(atlas: &Atlas, page: usize, k: usize, x: u32, y: u32) -> [u8; 4] {
 /// height) and its page.
 pub fn content(atlas: &Atlas, frame: u32, reserved: u16) -> ([u32; 4], usize) {
     let f = atlas.uvs().get(frame).unwrap();
-    let side = atlas.side() as f32;
-    let [l, t, r, b] = f.uv.map(|v| v * side);
-    for v in [l, t, r, b] {
-        assert_eq!(v.fract(), 0.0, "uv {:?} is not on a texel edge", f.uv);
-    }
-    let rect = [l as u32, t as u32, (r - l) as u32, (b - t) as u32];
+    // A uv is a texel edge over the side, rounded to `f32`: exact on a
+    // power-of-two side, within 1/2048 of a texel on any side up to 8192.
+    let side = f64::from(atlas.side());
+    let [l, t, r, b] = f.uv.map(|v| {
+        let x = f64::from(v) * side;
+        assert!(
+            (x - x.round()).abs() <= 1.0 / 2_048.0,
+            "uv {:?} is not on a texel edge",
+            f.uv
+        );
+        x.round() as u32
+    });
+    let rect = [l, t, r - l, b - t];
     (rect, usize::from(f.layer - reserved))
 }
 
