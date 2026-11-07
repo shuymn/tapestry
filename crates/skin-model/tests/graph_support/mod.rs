@@ -42,6 +42,7 @@ pub fn graph(kind: JudgeGraphKind, chips: u32, back: bool, delay_ms: i64) -> Jud
         back,
         chips,
         solid: SOLID,
+        fit: skin_model::GraphFit::Stretch,
     }
 }
 

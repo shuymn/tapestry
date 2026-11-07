@@ -299,6 +299,8 @@ pub enum LoadError {
     SongList(#[source] SongListError),
     #[error("judge graph {graph}'s image does not exist")]
     JudgeGraphImage { graph: usize },
+    #[error("judge graph element {element} names a native size: its graph's fit sizes it")]
+    JudgeGraphNative { element: usize },
     #[error("ratio bar {bar}")]
     RatioBar {
         bar: usize,
@@ -1405,8 +1407,9 @@ impl Skin {
     /// element may draw an image, an image choice, a number, a text of the
     /// chart or a judge graph; the lanes, a gauge, a judge, a cover paint,
     /// the song list, a ratio bar or a selection text is refused
-    /// ([`LoadError::SourceKind`]). Every judge graph's images exist, and
-    /// each judge graph element is charged its worst quads.
+    /// ([`LoadError::SourceKind`]). Every judge graph's images exist, no
+    /// judge graph element names a native size (its graph's fit sizes
+    /// it), and each judge graph element is charged its worst quads.
     ///
     /// # Errors
     ///
@@ -1611,6 +1614,12 @@ impl Skin {
             .position(|g| !exists(g.chips) || !exists(g.solid))
         {
             return Err(LoadError::JudgeGraphImage { graph });
+        }
+        if let Some(element) = elements
+            .iter()
+            .position(|e| matches!(e.source, Source::JudgeGraph(_)) && e.place.native.is_some())
+        {
+            return Err(LoadError::JudgeGraphNative { element });
         }
         check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
         for (element, e) in elements.iter().enumerate() {
