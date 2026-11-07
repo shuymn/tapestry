@@ -6,7 +6,7 @@
 mod graph_support;
 
 use graph_support::{
-    GFx, GRID, SOLID, composite, graph, ready, skin_with, source_element, timelines,
+    GFx, GRID, SOLID, composite, graph, near, ready, skin_with, source_element, timelines,
 };
 use rules::GaugeValue;
 use skin_model::{
@@ -16,8 +16,9 @@ use skin_model::{
 };
 
 /// A ready view: `perfects` PERFECTs in one bin, the gauge flat at `pct`
-/// percent, and 5 samples at `ms`.
-fn view(perfects: u32, pct: i64, ms: usize) -> ResultView {
+/// percent, 5 samples at `ms`, and a PERFECT area of ±`perfect` ms with
+/// each later area 20 ms wider.
+fn view(perfects: u32, pct: i64, ms: usize, perfect: i16) -> ResultView {
     let v = GaugeValue(pct * GaugeValue::PERCENT);
     let mut deviations = [0; DEVIATION_SLOTS];
     deviations[150 + ms] = 5;
@@ -41,7 +42,10 @@ fn view(perfects: u32, pct: i64, ms: usize) -> ResultView {
             mean_x100: 20_000,
             sd_x100: 0,
         }),
-        timing_areas: Some([[0, 0]; 5]),
+        timing_areas: Some(std::array::from_fn(|k| {
+            let k = i16::try_from(k).unwrap();
+            [-perfect - 20 * k, perfect + 20 * k]
+        })),
         ..ready()
     }
 }
@@ -49,7 +53,9 @@ fn view(perfects: u32, pct: i64, ms: usize) -> ResultView {
 /// Three views in turn, then the first again: each build shows the
 /// view it follows, the judge graph's chips as tall as its PERFECTs
 /// (5-pixel cells), the gauge line at its value's row, the distribution's
-/// bar in its column; the unavailable view draws no graph.
+/// bar in its column and its areas (+15 ms in PERFECT's colour under a
+/// ±20 ms PERFECT, GREAT's under ±10 ms); the unavailable view draws no
+/// graph.
 #[test]
 fn every_graph_follows_the_view() {
     let line = Rgba8::rgb(0xff_ffff, 0xff);
@@ -74,26 +80,38 @@ fn every_graph_follows_the_view() {
             }],
             timing_graphs: vec![TimingGraphDef {
                 gx: 301,
-                colors: [Rgba8::rgb(0xff_ffff, 0xff); 8],
+                colors: [
+                    Rgba8::rgb(0xff_ffff, 0xff),
+                    Rgba8::rgb(0xff_ffff, 0xff),
+                    Rgba8::rgb(0xff_ffff, 0xff),
+                    Rgba8::rgb(0x00_00ff, 0xff),
+                    Rgba8::rgb(0x00_ff00, 0xff),
+                    Rgba8::rgb(0xff_0000, 0xff),
+                    Rgba8::rgb(0x80_0080, 0xff),
+                    Rgba8::rgb(0x00_0000, 0xff),
+                ],
                 average: false,
                 dev: false,
                 solid: SOLID,
             }],
         },
     ));
-    let first = view(5, 50, 5);
-    let mut unavailable = view(9, 90, 9);
+    let first = view(5, 50, 5, 20);
+    let mut unavailable = view(9, 90, 9, 20);
     unavailable.status = ResultStatus::Unavailable(Unavailable::Failed);
     let views = [
-        (&first, Some((25.0, 50, 5))),
-        (&view(8, 20, 30), Some((40.0, 20, 30))),
+        (&first, Some((25.0, 50, 5, [0.0, 0.0, 255.0]))),
+        (
+            &view(8, 20, 30, 10),
+            Some((40.0, 20, 30, [0.0, 255.0, 0.0])),
+        ),
         (&unavailable, None),
-        (&first, Some((25.0, 50, 5))),
+        (&first, Some((25.0, 50, 5, [0.0, 0.0, 255.0]))),
     ];
     for (v, want) in views {
         fx.view(v);
         fx.frame(1_500);
-        let Some((chips, pct, ms)) = want else {
+        let Some((chips, pct, ms, area)) = want else {
             assert!(fx.quads().is_empty());
             continue;
         };
@@ -107,9 +125,12 @@ fn every_graph_follows_the_view() {
             assert_eq!(n, covered, "{pct}% row {r}");
         }
         // The bar of 5 at scale 10 in column `150 + ms`, nowhere else.
-        let bar = |x: f32| composite(fx.quads(), &fx.atlas, x, 499.5, None).1;
-        assert_eq!(bar(150.5 + ms as f32), 1);
-        assert_eq!(bar(153.5 + ms as f32), 0);
-        assert_eq!(bar(147.5 + ms as f32), 0);
+        let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).0;
+        let white = |x: f32| at(x, 499.5).iter().all(|&c| c > 254.0);
+        assert!(white(150.5 + ms as f32));
+        assert!(!white(153.5 + ms as f32));
+        assert!(!white(147.5 + ms as f32));
+        // The areas: +15 ms halfway up.
+        near(at(165.5, 450.0), area, 1.0);
     }
 }

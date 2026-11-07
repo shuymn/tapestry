@@ -260,3 +260,17 @@ fn the_worst_frames_fit_the_charge() {
     assert!(n4096 <= 3_581, "{n4096}");
     assert!(n301 > 2 * 301, "{n301}");
 }
+
+/// The bars draw over the statistic lines, as the source paints them
+/// last: 5 samples at 0 ms with a mean and σ of 0 put the bar, the average
+/// and both ±σ lines in column 150; at alpha 140 its bottom is the bar's
+/// `f5f5f5`, 245 × 140/255 + 128 × 115/255 = 192.235, where the lines
+/// over the bar would show white, 197.725; above the bar, the line.
+#[test]
+fn the_bars_draw_over_the_lines() {
+    let mut fx = fixture(vec![graph(301)], &[(0, [0, 0, 301, 100])]);
+    fx.view(&view(&[(0, 5)], Some((0, 0))));
+    fx.frame(0);
+    near(pixel(&fx, 150.5, 99.5).0, [192.235; 3], 0.5);
+    near(pixel(&fx, 150.5, 45.0).0, [197.725; 3], 0.5);
+}
