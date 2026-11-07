@@ -173,7 +173,7 @@ fn what_if_peak_stays_within_its_budget() {
             // throughout, outside the closure: the estimate counts them.
             let peak = peak_of(&mut || {
                 let r = ReEvaluate::under(&ctx, &what_if).unwrap();
-                summary = Some(of(&r, &what_if));
+                summary = Some(of(&r, &chart, &what_if));
                 evaluated = Some(r);
             }) + record_bytes(&record);
             let evaluated = evaluated.unwrap();
@@ -228,7 +228,7 @@ fn what_if_peak_stays_within_its_budget() {
             };
             let r = ReEvaluate::under(&ctx, &what_if).unwrap();
             let mut summary = None;
-            let peak = peak_of(&mut || summary = Some(of(&r, &what_if)));
+            let peak = peak_of(&mut || summary = Some(of(&r, &chart, &what_if)));
             let held = usize::try_from(LIVE.load(Ordering::Relaxed)).unwrap();
             assert_eq!(peak, SUMMARY_BYTES, "{gauges} gauges, {inputs} inputs");
             assert_eq!(held, SUMMARY_BYTES, "{gauges} gauges, {inputs} inputs");
@@ -236,6 +236,16 @@ fn what_if_peak_stays_within_its_budget() {
         }
     }
     println!("indicator: SUMMARY_BYTES {SUMMARY_BYTES}");
+    // The timelines are inside that allocation: 512 bins of nine `u32`
+    // channels, 18 KiB, and their axis and mark; with the own summary and
+    // a full cache, 33 of them, 594 KiB and the small parts.
+    let bins = size_of::<[[u32; game::TIMELINE_CHANNELS]; game::MAX_TIMELINE_BINS]>();
+    assert_eq!(bins, 18 << 10);
+    let timelines = size_of::<game::Timelines>();
+    assert!(timelines <= bins + 64, "{timelines}");
+    assert!(SUMMARY_BYTES >= size_of::<game::ResultGraphs>());
+    assert!(size_of::<game::ResultGraphs>() >= timelines);
+    assert!((game::RESULT_CACHE + 1) * bins <= 594 << 10);
     // One gauge whose ID is near the preset file's 1 MiB limit, on a few
     // inputs: hashing the preset must not hold its canonical encoding,
     // which would be larger than the evaluation itself.
@@ -272,10 +282,16 @@ fn record_bytes(record: &PlayRecord) -> usize {
 }
 
 /// The summary of `r`, evaluated under `preset`, on its own deadline.
-fn of(r: &replay::verify::ReEvaluation, preset: &rules::RulePreset) -> ViewSummary {
+fn of(
+    r: &replay::verify::ReEvaluation,
+    chart: &bms_model::Chart,
+    preset: &rules::RulePreset,
+) -> ViewSummary {
     ViewSummary::of(
         &r.evaluation,
+        chart,
         preset,
+        game::ResultBasis::of(chart, None),
         game::Axis {
             origin: bms_model::TimeUs(0),
             end: r.evaluation.final_deadline,

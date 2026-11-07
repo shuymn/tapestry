@@ -407,6 +407,17 @@ impl BestWriter {
         run(&mut self.conn).map_err(|e| self.database(e))
     }
 
+    /// The score stored under `key`, if a row exists: one indexed read, for
+    /// a result view's best before the play (design.md "Personal Bests",
+    /// skin projections).
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn score(&self, key: &Key) -> Result<Option<Score>, LibraryError> {
+        bests::score(&self.conn, key).map_err(|e| self.database(e))
+    }
+
     /// Requests a catch-up ([`Library::request_bests_pass`]).
     ///
     /// # Errors

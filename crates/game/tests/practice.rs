@@ -177,6 +177,8 @@ struct Rounds {
     refuse_restore: Option<RestoreError>,
     /// The results shown, by round.
     shown: Vec<usize>,
+    /// Each result screen shown, as it showed.
+    screens: Vec<game::ResultScreen>,
     /// Commands pressed by a record sink while a round is saved, taken
     /// first.
     pressed: Rc<RefCell<Vec<Command>>>,
@@ -221,6 +223,7 @@ impl Rounds {
             engine_origin: 0,
             refuse_restore: None,
             shown: Vec::new(),
+            screens: Vec::new(),
             pressed: Rc::default(),
         }
     }
@@ -415,7 +418,8 @@ impl Rig for Rounds {
         self.reports.push(report.clone());
     }
 
-    fn show_end(&mut self, _report: &PlayReport, _screen: &game::ResultScreen) {
+    fn show_end(&mut self, _report: &PlayReport, screen: &game::ResultScreen) {
+        self.screens.push(screen.clone());
         if self.shown.last() != Some(&self.round) {
             self.shown.push(self.round);
         }
@@ -830,6 +834,72 @@ fn a_rounds_quit_shows_its_result_from_the_sections_start() {
             assert!(evaluation.gauges.iter().all(|g| !g.cleared), "{at}");
         }
     }
+}
+
+/// [`Saves`] that answers every best before the play as `best`, noting
+/// each key it is asked.
+struct BestSaves {
+    saves: Saves,
+    best: game::BestLookup,
+    asked: Rc<Cell<usize>>,
+}
+
+impl RecordSink for BestSaves {
+    fn save(&mut self, rec: &PlayRecord) -> Result<RecordRef, SaveError> {
+        self.saves.save(rec)
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.asked.set(self.asked.get() + 1);
+        self.best.clone()
+    }
+}
+
+/// A round's result compares with no best (design.md "Personal Bests",
+/// skin projections): its largest EX score counts the section's notes
+/// while a best is the whole chart's, so a best of 16, the whole chart's
+/// largest, over the section's 10 would read 160 %. Its best is
+/// unavailable, read from no store, while its own rate stays.
+#[test]
+fn a_rounds_result_compares_with_no_best() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Rc::new(Cell::new(CLOCK_START));
+    let log = Log::default();
+    let asked = Rc::new(Cell::new(0));
+    let sink = BestSaves {
+        saves: Saves {
+            clock: Rc::clone(&clock),
+            log: Rc::clone(&log),
+            delay: 0,
+            records: Rc::default(),
+        },
+        best: game::BestLookup::Known(game::BestScore {
+            plays: 1,
+            ex: Some(16),
+            bp: Some(0),
+            clear: Some(game::BestLamp::FullCombo),
+        }),
+        asked: Rc::clone(&asked),
+    };
+    let mut loaded = load_with(dir.path(), example_chart(), sink, config(), 0, None);
+    loaded
+        .set_practice(Some(example_practice(&loaded)))
+        .unwrap();
+    let mut rig = Rounds::new(loaded.audio_schedule(), 2, &log, &clock);
+    rig.commands = vec![
+        (1, 10_000 * MS, Command::Quit),
+        (1, 11_500 * MS, Command::Quit),
+    ];
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.shown, vec![1]);
+    let game::ViewStatus::Ready(own) = rig.screens[0].status() else {
+        panic!("{:?}", rig.screens[0].status());
+    };
+    assert_eq!((own.figures.notes, own.figures.max_ex), (5, 10));
+    assert!(own.figures.rate.is_some());
+    assert_eq!(own.best, Some(game::BestCompare::Unavailable));
+    assert_eq!(asked.get(), 0);
 }
 
 /// The quit key pressed while a repeated round is saved, after its

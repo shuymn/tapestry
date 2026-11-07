@@ -15,6 +15,10 @@
 //! - R4: every workspace package's `license` is its entry in [`LICENSES`]
 //!   (a package missing from the table fails), and no [`PERMISSIVE`] package
 //!   declares a dependency of any kind on a [`GPL`] package.
+//! - R5: [`GAME`] does not depend on [`LIBRARY`], directly or through
+//!   another package, by a normal, build or dev dependency (design.md
+//!   "Language and Crate Structure"): the player converts the library's
+//!   types into the game's.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -33,6 +37,10 @@ const EVAL_ALLOWED_WORKSPACE: &[&str] = &["bms-model", "rules"];
 const EVAL_ALLOWED_EXTERNAL: &[&str] = &[];
 /// Packages allowed to be Windows-only (AGENTS.md).
 pub const WINDOWS_ONLY_ALLOWED: &[&str] = &["input", "audio", "render", "player"];
+/// The game core, checked by R5.
+const GAME: &str = "game";
+/// The library, which R5 keeps out of [`GAME`]'s dependencies.
+const LIBRARY: &str = "library";
 /// Feature that holds development-only code.
 const DEV_TOOLS: &str = "dev-tools";
 /// Production binaries and the target they ship for. Built with
@@ -204,6 +212,19 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
                 diagnostics.push(format!(
                     "R4: permissive package `{name}` has a {} dependency on GPL package `{}`",
                     dep.kind, dep.name,
+                ));
+            }
+        }
+    }
+
+    // R5
+    if let Some(game) = members.iter().find(|p| p.name.as_str() == GAME) {
+        for (id, path) in graph.closure(&game.id, true) {
+            if metadata[&id].name.as_str() == LIBRARY {
+                diagnostics.push(format!(
+                    "R5: `{GAME}` depends on `{LIBRARY}` ({}); the player converts the \
+                     library's types into the game's",
+                    describe_path(metadata, &path),
                 ));
             }
         }
@@ -732,6 +753,37 @@ mod tests {
                         "permissive package `xtask` has a {kind} dependency on GPL package `game`"
                     ),
                 ],
+            );
+        }
+    }
+
+    /// `game` reaching `library` directly, by a dev dependency, and
+    /// through another package.
+    #[test]
+    fn r5_rejects_game_depending_on_library() {
+        let cases = [
+            (
+                "game",
+                "[dependencies]\nlibrary = { path = \"../library\" }\n",
+                "via game -> library",
+            ),
+            (
+                "game",
+                "[dev-dependencies]\nlibrary = { path = \"../library\" }\n",
+                "via game -> library",
+            ),
+            (
+                "audio",
+                "[dependencies]\nlibrary = { path = \"../library\" }\n",
+                "via game -> audio -> library",
+            ),
+        ];
+        for (package, body, path) in cases {
+            let mut crates = baseline();
+            set(&mut crates, package, body);
+            assert_single(
+                &check(&crates),
+                &["R5:", "`game` depends on `library`", path],
             );
         }
     }
