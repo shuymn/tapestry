@@ -869,7 +869,7 @@ impl Rig for PlayerRig<'_> {
         // A switch's layout lands when its job is done; a close leaves its
         // wait within the stop bound.
         self.result_skin.poll();
-        if self.controls.quitting() {
+        if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
         self.serve_adjustments();

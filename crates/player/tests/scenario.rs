@@ -2421,7 +2421,13 @@ fn the_result_layout_takes_the_compared_best() {
         ],
         "{stdout}"
     );
-    // One settle for each leaving command acted on, none withdrawn.
+    // The result skin settles once for each leaving command acted on;
+    // taking a command settles nothing.
+    let settles = stdout
+        .lines()
+        .filter(|l| *l == "dev: result skin settle")
+        .count();
+    assert_eq!(settles, 2, "{stdout}");
     assert_eq!(
         lines(&stdout, "dev: result skin settled: "),
         [

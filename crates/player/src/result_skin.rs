@@ -784,6 +784,8 @@ impl ResultSkin {
     /// [`imports::STOP_WAIT`] (D11, "Cancellation"). The waiting request
     /// is dropped. The image entry the job hands back stays.
     pub fn settle(&mut self, end_run: impl FnMut() -> bool) {
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result skin settle");
         self.waiting = None;
         self.deferred = None;
         if let Some((job, _)) = self.job.take()
@@ -791,6 +793,11 @@ impl ResultSkin {
         {
             self.image = out.entry;
         }
+    }
+
+    /// Whether a layout job runs.
+    pub fn has_job(&self) -> bool {
+        self.job.is_some()
     }
 
     /// The result skin of the next attempt is decided again by its image
@@ -805,7 +812,9 @@ impl Drop for ResultSkin {
     /// The run's end: a running job is cancelled and waited for at most
     /// [`imports::STOP_WAIT`].
     fn drop(&mut self) {
-        self.settle(|| true);
+        if self.has_job() {
+            self.settle(|| true);
+        }
     }
 }
 
