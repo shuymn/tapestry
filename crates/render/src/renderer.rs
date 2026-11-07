@@ -3403,6 +3403,15 @@ impl Renderer {
         Some(slot.resources.staging.batch().quads().quads().to_vec())
     }
 
+    /// Tests: the bytes of the result's committed text layer's cache.
+    #[cfg(test)]
+    pub(crate) fn result_text_cache_bytes(&self) -> u64 {
+        Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+            .map_or(0, |s| s.resources.text_cache.bytes())
+    }
+
     /// Tests: makes every staging's instance buffer invalid, as a device
     /// refusing its allocation would, while `on`.
     #[cfg(test)]

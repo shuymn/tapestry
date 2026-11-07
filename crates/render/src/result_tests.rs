@@ -535,6 +535,13 @@ fn bundles_on_one_array_keep_their_own_lines() {
     assert!(r.install_staged_result_text());
     let px = pixels(&mut r, &mut rb, &[]);
     assert_eq!(rgb_at(&px, W, (505, 705)), WHITE);
+    // The witness counts the shared text layer's cache with the result.
+    let cache = r.result_text_cache_bytes();
+    assert!(cache > 0);
+    assert!(
+        r.memory().result_text > cache,
+        "the result's text cache not counted"
+    );
 }
 
 /// The pages-only installation: uploaded and charged with no layout
