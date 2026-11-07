@@ -2920,22 +2920,37 @@ pub(crate) mod tests {
             rig.adjust = None;
             rig.panels = Some(level);
             rig.selection = Some(sel);
+            // START held at the entry: panel 1 from the entry's update.
+            panel_key(&mut set, 0x12, 1);
             rig.entered_selection();
             assert!(
-                crate::render_side::tests::wait_until(
-                    || last().is_some_and(|(open, timer)| open == [false; 3] && timer.is_none())
-                ),
+                crate::render_side::tests::wait_until(|| last()
+                    .is_some_and(|(open, timer)| open == [true, false, false] && timer.is_some())),
                 "{:?}",
                 last()
             );
-            for (code, value, want) in [
-                (0x12, 1, [true, false, false]),
-                (0x11, 1, [false, false, true]),
-                (0x12, 0, [false, true, false]),
-                (0x11, 0, [false; 3]),
+            let menu = Arc::clone(&rig.selection.as_ref().unwrap().menu);
+            // Each step: a key of the keyboard reaching the tap, if any,
+            // and keys on the window's queue, taken by one look.
+            for (key, keys, want) in [
+                (Some((0x12, 0)), vec![], [false; 3]),
+                // Enter in the look that sees START: held back.
+                (Some((0x12, 1)), vec![MenuKey::Enter], [true, false, false]),
+                // The search box taking focus in a look closes the panel
+                // in that look's update; leaving it opens it again.
+                (None, vec![MenuKey::Tab], [false; 3]),
+                (None, vec![MenuKey::Tab], [true, false, false]),
+                (Some((0x11, 1)), vec![], [false, false, true]),
+                (Some((0x12, 0)), vec![], [false, true, false]),
+                (Some((0x11, 0)), vec![], [false; 3]),
             ] {
-                panel_key(&mut set, code, value);
-                assert!(rig.look().is_none());
+                if let Some((code, value)) = key {
+                    panel_key(&mut set, code, value);
+                }
+                for k in &keys {
+                    menu.push(MenuInput::Key(*k));
+                }
+                assert!(rig.look().is_none(), "{key:?} {keys:?}");
                 // The update taken: the frames from here draw it.
                 assert!(rig.render.fence(Duration::from_secs(60)));
                 let seen = frames.0.lock().unwrap().len();
@@ -2944,7 +2959,7 @@ pub(crate) mod tests {
                     "no frame"
                 );
                 let (open, timer) = last().unwrap();
-                assert_eq!(open, want, "{code:#x} {value}");
+                assert_eq!(open, want, "{key:?} {keys:?}");
                 assert_eq!(timer.is_some(), want[0], "{timer:?}");
             }
         });

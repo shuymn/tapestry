@@ -3807,9 +3807,16 @@ mod panel_tests {
         let mut r = Rig::new();
         let t = |ms: i64| Some(TimeUs(ms * 1_000));
         assert_eq!(r.look(5_000), [None; 3]);
-        // START: panel 1; START and SELECT: panel 3; START released:
-        // panel 2; SELECT released: none.
+        // START: panel 1, the game thread woken for it; START and
+        // SELECT: panel 3; START released: panel 2; SELECT released: none.
+        std::thread::park_timeout(std::time::Duration::ZERO);
         r.batch(&[key(E, 1)], false);
+        let began = std::time::Instant::now();
+        std::thread::park_timeout(std::time::Duration::from_secs(60));
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(30),
+            "the game thread was not woken"
+        );
         assert_eq!(r.look(10_000), [t(10), None, None]);
         assert_eq!(r.look(11_000), [t(10), None, None], "still open");
         r.batch(&[key(W, 1)], false);
@@ -3818,6 +3825,19 @@ mod panel_tests {
         assert_eq!(r.look(30_000), [None, t(30), None]);
         r.batch(&[key(W, 0)], false);
         assert_eq!(r.look(40_000), [None; 3]);
+        // Released and held again between two looks: the same panel,
+        // opened afresh.
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(41_000), [t(41), None, None]);
+        r.batch(&[key(E, 0)], false);
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(42_000), [t(42), None, None]);
+        // Held at an entry that never left Idle (back from the practice
+        // page): open from that entry.
+        r.feed.enter(TimeUs(43_000));
+        assert_eq!(r.look(43_000), [t(43), None, None]);
+        r.batch(&[key(E, 0)], false);
+        assert_eq!(r.look(44_000), [None; 3]);
 
         // Menu events overflowing their queue while START is held: the
         // controller's events say panel 1, and the release closes it.
