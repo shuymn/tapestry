@@ -548,8 +548,11 @@ impl ResultScreen {
     /// before this play, once per summary (design.md "Personal Bests",
     /// skin projections): for the play's own preset the best its count's
     /// transaction read before it, and otherwise, or when the play was not
-    /// counted, what `lookup` answers for the view's key and preset. A view
-    /// that is not ready, or whose best was read, is left as it is.
+    /// counted, what `lookup` answers for the view's key and preset. A
+    /// practice round's section compares with none: its largest EX score
+    /// is the section's and a best the whole chart's, so its best is
+    /// unavailable, with no read. A view that is not ready, or whose best
+    /// was read, is left as it is.
     pub fn compare_best(
         &mut self,
         report: &PlayReport,
@@ -579,6 +582,7 @@ impl ResultScreen {
             return;
         }
         let before = match &report.best {
+            _ if self.basis.sectioned => BestLookup::Unavailable,
             Some(BestView::Counted { previous, .. }) if own => {
                 BestLookup::previous(previous.as_ref())
             }

@@ -30,8 +30,8 @@ pub const TIMING_RANGE_US: i64 = 150_999;
 const RANK_LOW: [u128; 8] = [0, 6, 9, 12, 15, 18, 21, 24];
 
 /// What a result's views share: the attempt's judged notes and the
-/// timelines' bins, both fixed by the chart, and whether a rate over the
-/// best can be known.
+/// timelines' bins, both fixed by the chart, whether a rate over the best
+/// can be known, and whether the attempt was a section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResultBasis {
     /// The judged notes of the attempt: taps and long notes, within a
@@ -42,6 +42,10 @@ pub struct ResultBasis {
     /// Whether the chart declares `#RANDOM` or `#SETRANDOM`: its best may
     /// come from a draw with another note count, so no best rate is known.
     pub random: bool,
+    /// Whether the attempt was a practice round's section: its notes are
+    /// the section's while a best is the whole chart's, so nothing is
+    /// compared with a best.
+    pub sectioned: bool,
 }
 
 impl ResultBasis {
@@ -68,6 +72,7 @@ impl ResultBasis {
             notes,
             timeline: TimelineAxis::new(origin, last.unwrap_or(origin)),
             random: !chart.identity.random_results.is_empty(),
+            sectioned: section.is_some(),
         }
     }
 }
