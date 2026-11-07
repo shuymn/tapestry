@@ -4828,7 +4828,7 @@ pub(crate) mod tests {
 
     /// A pending play skin's specialization staged with its attempt
     /// through a real menu screen and renderer on WARP, beside a committed
-    /// result skin charged what the shared limit leaves beside an atlas's
+    /// selection skin charged what the shared limit leaves beside an atlas's
     /// cap, and a tiny atlas's texels more
     /// (`Renderer::state_charge`, development builds, so no array that
     /// large is uploaded): one whose atlas is the cap passes the shared
@@ -4868,7 +4868,7 @@ pub(crate) mod tests {
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(
-            link.select(ScreenKind::Result, Some(result))
+            link.select(ScreenKind::Selection, Some(result))
                 .wait()
                 .unwrap(),
             Preparation::Ready
@@ -4896,6 +4896,59 @@ pub(crate) mod tests {
             specialized(&link, &chart, &play).unwrap(),
             Preparation::Ready
         );
+        link.commit_attempt().unwrap();
+        link.exit();
+    }
+
+    /// A pending play skin's specialization that only the committed result
+    /// skin's charge keeps out (charged as in
+    /// [`a_specialization_past_the_shared_texels_is_refused`]) is ready:
+    /// the result's installation is released before play is admitted
+    /// (design.md "Memory Budget"), and it commits.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_specialization_kept_out_by_the_result_alone_releases_it() {
+        use crate::render_decl::{Look, atlas_cap_bundle, solid_bundle};
+        const TINY: u64 = 256 * 256 * 2;
+        // Built for WARP's limits, as the render thread's screen.
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        let big = atlas_cap_bundle(&r, [0, 0, 255, 255]);
+        let result = solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]);
+        drop(r);
+        assert_eq!(result.atlas_texels(), TINY);
+        let stated = Arc::clone(&result);
+        let make: MakeScreen = Box::new(move || {
+            let mut renderer = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            renderer.state_charge(
+                &stated,
+                render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + TINY,
+            );
+            Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(result))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            link.pend(ScreenKind::Play).wait().unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            specialized(&link, &chart, &big).unwrap(),
+            Preparation::Ready
+        );
+        assert!(!link.failed());
         link.commit_attempt().unwrap();
         link.exit();
     }
