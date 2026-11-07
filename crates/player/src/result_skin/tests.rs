@@ -535,6 +535,15 @@ static REACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// outcome.
 static FAIL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// A layout's job starts: with [`FAIL`] at 3, taken, it panics before any
+/// plan.
+pub(super) fn layout_starts() {
+    use std::sync::atomic::Ordering::SeqCst;
+    if FAIL.compare_exchange(3, 0, SeqCst, SeqCst).is_ok() {
+        panic!("the layout's job, before its plan");
+    }
+}
+
 /// A payload whose drop panics.
 struct Bomb;
 
@@ -1099,4 +1108,156 @@ fn an_unavailable_view_reuses_only_its_charts_bundle() {
     staged_at(&mut rs, 8, JudgeClass::Normal);
     rs.request(ViewFacts(None));
     assert!(Arc::ptr_eq(&shown(&rs), &eight));
+}
+
+/// Table rows "layout job refused its start" and "worker failure before
+/// release": the holdings a job was given come back untouched, so after
+/// view 5, an unavailable view and view 9's job that never starts, or
+/// that panics before its plan, view 5 is reused with no job.
+#[test]
+fn a_failed_job_hands_its_holdings_back() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let _s = serial();
+    for how in ["spawn", "panic"] {
+        let d = skin(
+            "",
+            "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+        );
+        let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+        staged(&mut rs);
+        rs.request(view(5));
+        settled(&mut rs);
+        let five = shown(&rs);
+        rs.request(ViewFacts(None));
+        if how == "spawn" {
+            crate::imports::tests::refuse_spawn();
+        } else {
+            FAIL.store(3, SeqCst);
+        }
+        rs.request(view(9));
+        settled(&mut rs);
+        assert!(
+            matches!(rs.published().0, Some(Published::BuiltIn)),
+            "{how}"
+        );
+        let jobs = jobs_started();
+        rs.request(view(5));
+        assert!(!rs.has_job(), "{how}: view 5 reused");
+        assert_eq!(jobs_started(), jobs, "{how}");
+        assert!(Arc::ptr_eq(&shown(&rs), &five), "{how}");
+    }
+}
+
+/// Table row "image stage refused its start": the image entry and the
+/// probe's facts come back, so the first chart again reuses them with no
+/// job.
+#[test]
+fn a_failed_image_stage_hands_its_holdings_back() {
+    let _s = serial();
+    let d = level_skin();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    let entry = Arc::clone(rs.image().unwrap());
+    rs.next_attempt();
+    crate::imports::tests::refuse_spawn();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert!(
+        rs.staged_line().starts_with("per view"),
+        "{}",
+        rs.staged_line()
+    );
+    assert!(Arc::ptr_eq(rs.image().unwrap(), &entry));
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged_at(&mut rs, 7, JudgeClass::Normal);
+    assert_eq!(jobs_started(), jobs, "the probe reused");
+}
+
+/// Table row "per-view layout packs its own cells alone": two cells that
+/// each fit the target but not together; the probe packs one, P's view the
+/// other alone, so the probe's facts no longer describe the image entry
+/// and an unchanged retry prepares again.
+#[test]
+fn a_layout_packed_alone_prepares_the_probe_again() {
+    let _s = serial();
+    let one_page = AtlasLimits {
+        max_side: 256,
+        max_layers: render::RESERVED_LAYERS + 1,
+        ..LIMITS
+    };
+    let d = skin(
+        "",
+        "{ { id = \"big\", src = \"h\", x = 0, y = 0, w = 200, h = 150 + (nr == 1 and 0 or 1) } }",
+    );
+    png(d.path(), "h.png", 200, 200);
+    let entry = fs::read_to_string(d.path().join("s.luaskin"))
+        .unwrap()
+        .replace(
+            "{ id = \"b\", path = \"big.png\" } }",
+            "{ id = \"b\", path = \"big.png\" }, { id = \"h\", path = \"h.png\" } }",
+        );
+    fs::write(d.path().join("s.luaskin"), entry).unwrap();
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), one_page))));
+    staged(&mut rs);
+    assert_eq!(rs.staged_line(), "per view, images prepared");
+    let b0 = builds();
+    rs.request(view(0));
+    settled(&mut rs);
+    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    assert_eq!(builds() - b0, 1, "view 0's cell alone");
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged(&mut rs);
+    assert_eq!(jobs_started() - jobs, 1, "the image stage prepares again");
+    assert_eq!(rs.staged_line(), "per view, images prepared");
+}
+
+/// A newer request supersedes a deferred one: after a deferral, a view
+/// the shown atlas rebinds is published and nothing waits.
+#[test]
+fn a_newer_request_drops_the_deferred_one() {
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged(&mut rs);
+    rs.request(view(2));
+    settled(&mut rs);
+    rs.set_retained(&[skin_model::AtlasId(u64::MAX)]);
+    // View 3's cell (x = 0) is in no atlas: deferred.
+    rs.request(view(3));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    // View 4's cell (x = 8) is in the shown union.
+    rs.request(view(4));
+    ran(&mut rs);
+    assert!(!rs.deferred());
+    assert!(rs.poll(), "nothing waits");
+}
+
+/// A report that still leaves two atlases live retries no deferred build.
+#[test]
+fn a_full_report_retries_nothing() {
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * (nr % 3), y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged(&mut rs);
+    let two = [
+        skin_model::AtlasId(u64::MAX),
+        skin_model::AtlasId(u64::MAX - 1),
+    ];
+    rs.set_retained(&two);
+    rs.request(view(2));
+    ran(&mut rs);
+    assert!(rs.deferred());
+    let jobs = jobs_started();
+    rs.set_retained(&two);
+    assert!(!rs.has_job());
+    assert_eq!(jobs_started(), jobs);
+    assert!(rs.deferred());
 }

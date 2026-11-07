@@ -9,7 +9,7 @@
 //! ([`Published`]); nothing here installs anything on the GPU (S10-09i
 //! does). Not in-play code: it runs between plays and on the result.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use eval::Tally;
 use render::SkinBundle;
@@ -128,8 +128,7 @@ impl From<String> for Unbuilt {
 struct LayoutOut {
     request: u64,
     view: ViewFacts,
-    result: Result<Specialized, Unbuilt>,
-    images: Images,
+    laid: Laid,
 }
 
 /// The attempt's result skin, as its image stage left it.
@@ -191,7 +190,7 @@ pub struct ResultSkin {
     layout: Option<Specialized>,
     published: Option<Published>,
     generation: u64,
-    job: Option<(Job<LayoutOut>, u64)>,
+    job: Option<(Job<LayoutOut>, u64, Slot)>,
     waiting: Option<(u64, ViewFacts)>,
     /// A request whose build waits for an atlas to be released (Q3).
     deferred: Option<(u64, ViewFacts)>,
@@ -351,27 +350,59 @@ fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Vec<AtlasId>)
     )
 }
 
+/// The holdings a job may release, shared with it while it runs: they
+/// stay here until [`release`] takes them once a replacement plan fits,
+/// so a job that never starts, fails, or ends before that hands them
+/// back untouched, and none is referenced past the release.
+type Slot = Arc<Mutex<Option<Images>>>;
+
+/// `slot`'s holdings, a poisoned lock included.
+fn lock(slot: &Slot) -> MutexGuard<'_, Option<Images>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What a layout leaves: its specialization or why not; what is left of
+/// the holdings it took from its slot ([`release`]), `None` when it never
+/// took them; and whether its build packed its own cells alone, setting
+/// aside the cells of earlier atlases, the probe's among them.
+struct Laid {
+    result: Result<Specialized, Unbuilt>,
+    taken: Option<Images>,
+    alone: bool,
+}
+
+impl Laid {
+    fn refused(why: String) -> Self {
+        Self {
+            result: Err(why.into()),
+            taken: None,
+            alone: false,
+        }
+    }
+}
+
 /// A layout of `pending` for `view`: the import over the cache, then the
-/// atlas step against the image entry (D13). When its atlas does not hold
-/// the layout's cells, a union with `base`'s (the shown generation's
-/// atlas), the entry's and the kept cells, else the layout's cells alone,
-/// is planned first; only once a plan fits are an entry that is not
-/// `base` and the layout bound to it dropped, the entry's cells kept,
-/// then, unless the atlases live besides it (`others`, with the entry
-/// when kept) and the new one would pass two, the plan packed (the
-/// S10-09i design's Q3). Whatever is not dropped is handed back.
+/// atlas step against the slot's image entry (D13). When its atlas does
+/// not hold the layout's cells, a union with `base`'s (the shown
+/// generation's atlas), the entry's and the kept cells, else the layout's
+/// cells alone, is planned first; only once a plan fits are the holdings
+/// taken from `slot` and what is not shown released, then, unless the
+/// atlases live besides it (`others`, with the entry when kept) and the
+/// new one would pass two, the plan packed (the S10-09i design's Q3).
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn layout(
     pending: &PendingResult,
     view: ViewFacts,
     class: Option<Option<JudgeClass>>,
-    images: Images,
+    slot: &Slot,
     base: Option<Arc<ImageEntry>>,
     others: Vec<AtlasId>,
     cancel: &Cancel,
-) -> (Result<Specialized, Unbuilt>, Images) {
+) -> Laid {
+    #[cfg(all(test, feature = "dev-tools"))]
+    tests::layout_starts();
     let Some(fields) = view.0 else {
-        return (Err("the view is unavailable".to_owned().into()), images);
+        return Laid::refused("the view is unavailable".to_owned());
     };
     let facts = result_facts(fields, class);
     let imported = match pending
@@ -380,52 +411,66 @@ fn layout(
     {
         Ok(LuaOutcome::Imported(i)) => i,
         Ok(LuaOutcome::Pending(p)) => {
-            return (
-                Err(format!("the skin reads {:?}, pending here", p.pending).into()),
-                images,
-            );
+            return Laid::refused(format!("the skin reads {:?}, pending here", p.pending));
         }
-        Err(refused) => return (Err(imports::chain(&refused.0).into()), images),
+        Err(refused) => return Laid::refused(imports::chain(&refused.0)),
     };
     let deps = imported.facts;
     let skin = imported.imported.skin;
     let scratch = imported.imported.scratch;
     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
     let text = skin.has_outline_text();
-    let held = images
-        .entry
+    let entry = lock(slot).as_ref().and_then(|i| i.entry.clone());
+    let held = entry
         .as_ref()
         .and_then(|e| e.atlas.rebind(skin.sheet(), variant, text).ok());
-    let (atlas, images) = match held {
-        Some(atlas) => (atlas, images),
+    let (atlas, entry, taken, alone) = match held {
+        Some(atlas) => (atlas, entry, None, false),
         None => {
+            drop(entry);
             let limits = pending.target.limits;
-            // The union's base: the shown atlas's cells, the image entry's
-            // and the kept ones, which the build keeps as cells only.
-            let mut union = Some(skin.sheet().clone());
-            for b in [base.as_ref(), images.entry.as_ref()].into_iter().flatten() {
-                union = union.and_then(|u| u.union(&b.packed));
-            }
-            if let Some(c) = &images.cells {
-                union = union.and_then(|u| u.union(c));
-            }
-            let union = union
-                .filter(|_| base.is_some() || images.entry.is_some() || images.cells.is_some())
-                .filter(|u| u.plan(variant, limits, text).is_ok());
-            let packed = match union {
-                Some(u) => u,
-                None if skin.sheet().plan(variant, limits, text).is_ok() => skin.sheet().clone(),
-                None => {
-                    return (
-                        Err("the layout's images do not fit one atlas".to_owned().into()),
-                        images,
-                    );
+            let mut guard = lock(slot);
+            let (packed, alone) = {
+                let (e, c) = guard
+                    .as_ref()
+                    .map_or((None, None), |i| (i.entry.as_ref(), i.cells.as_ref()));
+                // The union's base: the shown atlas's cells, the image
+                // entry's and the kept ones, which the build keeps as cells
+                // only.
+                let earlier = base.is_some() || e.is_some() || c.is_some();
+                let mut union = Some(skin.sheet().clone());
+                for b in [base.as_ref(), e].into_iter().flatten() {
+                    union = union.and_then(|u| u.union(&b.packed));
+                }
+                if let Some(c) = c {
+                    union = union.and_then(|u| u.union(c));
+                }
+                match union
+                    .filter(|_| earlier)
+                    .filter(|u| u.plan(variant, limits, text).is_ok())
+                {
+                    Some(u) => (u, false),
+                    None if skin.sheet().plan(variant, limits, text).is_ok() => {
+                        (skin.sheet().clone(), earlier)
+                    }
+                    None => {
+                        return Laid::refused(
+                            "the layout's images do not fit one atlas".to_owned(),
+                        );
+                    }
                 }
             };
-            // The plan fits: what is not shown goes before the build.
+            // The plan fits: the holdings are taken, and what is not shown
+            // goes before the build.
+            let images = guard.take().unwrap_or_default();
+            drop(guard);
             let (images, room) = release(images, base.as_ref(), others);
             if !room {
-                return (Err(Unbuilt::Deferred), images);
+                return Laid {
+                    result: Err(Unbuilt::Deferred),
+                    taken: Some(images),
+                    alone,
+                };
             }
             let kept = images.cells;
             drop(images.entry);
@@ -437,44 +482,47 @@ fn layout(
                 match packed.atlas_reserving(variant, limits, text, &|| cancel.is_cancelled()) {
                     Ok(a) => a,
                     Err(e) => {
-                        return (
-                            Err(format!("the atlas cannot be built: {e}").into()),
-                            Images {
+                        return Laid {
+                            result: Err(format!("the atlas cannot be built: {e}").into()),
+                            taken: Some(Images {
                                 cells: kept,
                                 ..Images::default()
-                            },
-                        );
+                            }),
+                            alone,
+                        };
                     }
                 };
             let new = Arc::new(ImageEntry {
                 atlas: built,
                 packed,
             });
-            let images = Images {
+            let taken = Some(Images {
                 entry: Some(Arc::clone(&new)),
                 ..Images::default()
-            };
+            });
             match new.atlas.rebind(skin.sheet(), variant, text) {
-                Ok(a) => (a, images),
+                Ok(a) => (a, Some(new), taken, alone),
                 Err(e) => {
-                    return (
-                        Err(format!("the layout cannot be bound: {e}").into()),
-                        images,
-                    );
+                    return Laid {
+                        result: Err(format!("the layout cannot be bound: {e}").into()),
+                        taken,
+                        alone,
+                    };
                 }
             }
         }
     };
-    match imports::bundle_of(skin, scratch, atlas, &pending.target, cancel) {
-        Ok(bundle) => (
-            Ok(Specialized {
-                bundle,
-                facts: deps,
-                entry: images.entry.clone(),
-            }),
-            images,
-        ),
-        Err(why) => (Err(why.into()), images),
+    let result = imports::bundle_of(skin, scratch, atlas, &pending.target, cancel)
+        .map(|bundle| Specialized {
+            bundle,
+            facts: deps,
+            entry,
+        })
+        .map_err(Unbuilt::from);
+    Laid {
+        result,
+        taken,
+        alone,
     }
 }
 
@@ -513,14 +561,17 @@ impl ResultSkin {
     /// staged or taken and not yet presented, kept by a recovery
     /// description): it replaces the set reported before. Only a later
     /// report without an id releases it here. A deferred build is tried
-    /// again (the S10-09i design's Q3).
+    /// again once fewer than two atlases are live (the S10-09i design's
+    /// Q3).
     #[cfg_attr(
         not(all(test, feature = "dev-tools")),
         expect(dead_code, reason = "S10-09i reports what its renderer retains")
     )]
     pub fn set_retained(&mut self, ids: &[AtlasId]) {
         self.retained = ids.to_vec();
-        self.retry_deferred();
+        if self.others().len() < 2 {
+            self.retry_deferred();
+        }
     }
 
     /// The deferred request, asked for again unless a job runs.
@@ -611,11 +662,13 @@ impl ResultSkin {
             self.attempt = Some(reused);
             return Staged::Ready;
         }
-        let images = self.images_for_job();
+        let slot = self.slot_for_job();
+        let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
         let ran = imports::run_job(
             move |cancel: &Cancel| {
+                let slot = theirs;
                 let o = pending
                     .header
                     .import_reading(&pending.config, &facts, cancel);
@@ -639,12 +692,13 @@ impl ResultSkin {
                             return (
                                 Some(Err(format!("the atlas cannot be built: {e}"))),
                                 deps,
-                                images,
+                                None,
                             );
                         }
+                        let images = lock(&slot).take().unwrap_or_default();
                         let (images, room) = release(images, base.as_ref(), others);
                         if !room {
-                            return (None, deps, images);
+                            return (None, deps, Some(images));
                         }
                         #[cfg(any(test, feature = "dev-tools"))]
                         BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -660,35 +714,34 @@ impl ResultSkin {
                                     cancel,
                                 )
                             });
-                        (Some(r.map(Some)), deps, images)
+                        (Some(r.map(Some)), deps, Some(images))
                     }
                     Ok(LuaOutcome::Imported(_)) => {
                         let view = ViewFacts(Some(match facts.result {
                             Fact::Known(f) => f,
-                            _ => return (None, deps, images),
+                            _ => return (None, deps, None),
                         }));
-                        let (r, images) =
-                            layout(&pending, view, Some(class), images, base, others, cancel);
+                        let laid = layout(&pending, view, Some(class), &slot, base, others, cancel);
                         // The probe's layout is never shown: its atlas is.
                         (
-                            Some(r.map(|_| None).map_err(|e| match e {
+                            Some(laid.result.map(|_| None).map_err(|e| match e {
                                 Unbuilt::Refused(why) => why,
                                 Unbuilt::Deferred => "deferred".to_owned(),
                             })),
                             deps,
-                            images,
+                            laid.taken,
                         )
                     }
-                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, images),
-                    _ => (None, deps, images),
+                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, None),
+                    _ => (None, deps, None),
                 }
             },
             quit,
             end_run,
         );
         match ran {
-            Ran::Done((outcome, deps, images)) => {
-                self.restore(images);
+            Ran::Done((outcome, deps, taken)) => {
+                self.restore(taken, &slot);
                 match outcome {
                     // A bundle for every view, cached with what it read.
                     Some(Ok(Some(bundle))) => {
@@ -722,6 +775,7 @@ impl ResultSkin {
             }
             Ran::Refused(why) => {
                 log::info!("skin: result: its image stage failed: {why}");
+                self.restore(None, &slot);
                 self.attempt = Some(ForAttempt::Pending);
                 Staged::Ready
             }
@@ -737,6 +791,8 @@ impl ResultSkin {
         self.next_request += 1;
         let request = self.next_request;
         self.latest = Some((request, view));
+        // A newer request supersedes the deferred one.
+        self.deferred = None;
         match self.attempt.clone() {
             None => {}
             Some(ForAttempt::Every(b, entry)) => {
@@ -776,22 +832,20 @@ impl ResultSkin {
         };
         // The entry goes to the job, which hands it back; the layout entry
         // bound to an unshown one goes with it, dropped only with its pages.
-        let images = self.images_for_job();
+        let slot = self.slot_for_job();
+        let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
-        match imports::spawn_job(move |cancel: &Cancel| {
-            let (result, images) = layout(&pending, view, class, images, base, others, cancel);
-            LayoutOut {
-                request,
-                view,
-                result,
-                images,
-            }
+        match imports::spawn_job(move |cancel: &Cancel| LayoutOut {
+            request,
+            view,
+            laid: layout(&pending, view, class, &theirs, base, others, cancel),
         }) {
-            Ok(job) => self.job = Some((job, request)),
+            Ok(job) => self.job = Some((job, request, slot)),
             Err(why) => {
                 log::info!("skin: result: its layout cannot start: {why}");
+                self.restore(None, &slot);
                 self.publish(Published::BuiltIn);
             }
         }
@@ -846,23 +900,28 @@ impl ResultSkin {
         holds.then(|| Published::Skin(Arc::clone(&l.bundle), l.entry.clone()))
     }
 
-    /// The image side a job takes: the image entry, the kept cells, and
-    /// the cached specialization unless it is the one shown.
-    fn images_for_job(&mut self) -> Images {
+    /// The image side a job may release, in its slot: the image entry, the
+    /// kept cells, and the cached specialization unless it is the one
+    /// shown.
+    fn slot_for_job(&mut self) -> Slot {
         let shown = matches!(
             (&self.published, &self.layout),
             (Some(Published::Skin(p, _)), Some(l)) if Arc::ptr_eq(p, &l.bundle)
         );
-        Images {
+        Arc::new(Mutex::new(Some(Images {
             entry: self.image.take(),
             cells: self.cells.take(),
             layout: if shown { None } else { self.layout.take() },
-        }
+        })))
     }
 
-    /// The image side a job hands back; its specialization returns unless
-    /// another replaced it.
-    fn restore(&mut self, images: Images) {
+    /// The image side after a job: what it left of the holdings it took,
+    /// else the holdings still in its slot, untouched. A specialization
+    /// returns unless another replaced it.
+    fn restore(&mut self, taken: Option<Images>, slot: &Slot) {
+        let Some(images) = taken.or_else(|| lock(slot).take()) else {
+            return;
+        };
         self.image = images.entry;
         self.cells = images.cells;
         if self.layout.is_none() {
@@ -874,17 +933,17 @@ impl ResultSkin {
     /// still the latest, and starts the waiting request. Returns whether
     /// the latest request is published.
     pub fn poll(&mut self) -> bool {
-        if let Some((job, request)) = &mut self.job
+        if let Some((job, _, _)) = &mut self.job
             && let Some(ran) = job.poll()
+            && let Some((_, request, slot)) = self.job.take()
         {
-            let request = *request;
-            self.job = None;
             match ran {
-                Ran::Done(out) => self.landed(out),
+                Ran::Done(out) => self.landed(out, &slot),
                 // A failed thread's request: the built-in result while it
-                // is still the latest.
+                // is still the latest; the holdings it had not taken stay.
                 Ran::Refused(why) => {
                     log::info!("skin: result: its layout failed: {why}");
+                    self.restore(None, &slot);
                     if self.latest.map(|(r, _)| r) == Some(request) {
                         self.publish(Published::BuiltIn);
                     }
@@ -903,11 +962,21 @@ impl ResultSkin {
         self.job.is_none() && self.waiting.is_none() && self.deferred.is_none()
     }
 
-    fn landed(&mut self, out: LayoutOut) {
-        // The entry is keyed by cells, not by request: it stays.
-        self.restore(out.images);
+    fn landed(&mut self, out: LayoutOut, slot: &Slot) {
+        // The entry is keyed by cells, not by request: it stays. A build of
+        // the layout's cells alone set the probe's aside: the image stage
+        // prepares again.
+        let Laid {
+            result,
+            taken,
+            alone,
+        } = out.laid;
+        self.restore(taken, slot);
+        if alone {
+            self.probe = None;
+        }
         let latest = self.latest.map(|(r, _)| r);
-        match out.result {
+        match result {
             Ok(spec) if latest == Some(out.request) => {
                 // The facts the published layout read (dev-tools).
                 #[cfg(feature = "dev-tools")]
@@ -963,10 +1032,18 @@ impl ResultSkin {
         println!("dev: result skin settle");
         self.waiting = None;
         self.deferred = None;
-        if let Some((job, _)) = self.job.take()
-            && let Ran::Done(out) = job.finish(|| true, end_run)
-        {
-            self.restore(out.images);
+        if let Some((job, _, slot)) = self.job.take() {
+            match job.finish(|| true, end_run) {
+                Ran::Done(out) => {
+                    if out.laid.alone {
+                        self.probe = None;
+                    }
+                    self.restore(out.laid.taken, &slot);
+                }
+                Ran::Refused(_) => self.restore(None, &slot),
+                // Its thread is detached and may still take the slot.
+                Ran::Abandoned => {}
+            }
         }
     }
 

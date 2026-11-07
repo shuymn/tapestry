@@ -85,7 +85,7 @@ pub(super) fn spawn_refused() -> bool {
     REFUSE_SPAWN.swap(false, Ordering::SeqCst)
 }
 
-fn refuse_spawn() {
+pub(crate) fn refuse_spawn() {
     REFUSE_SPAWN.store(true, Ordering::SeqCst);
 }
 
