@@ -1,6 +1,7 @@
 //! The result screen's snapshot (docs/stage3.md, the presentation
-//! snapshot's Result row): one view's result, its timing statistics and
-//! timelines, its best before this play, and the chart's facts. The player
+//! snapshot's Result row): one view's result, its gauge's history, its
+//! timing statistics, deviations and judge areas, its timelines, its best
+//! before this play, and the chart's facts. The player
 //! fills it from the result's projections; whatever draws the screen reads
 //! it, with the chart's strings in [`ResultLabels`].
 //!
@@ -11,8 +12,14 @@
 
 use bms_model::TimeUs;
 use eval::Tally;
+use rules::GaugeValue;
 
-use crate::LampKey;
+use crate::{GaugeLook, LampKey};
+
+/// The columns a [`GaugeHistory`] holds over the play's time.
+pub const GRAPH_COLUMNS: usize = 288;
+/// The slots of a view's deviations: −150 ms to +150 ms.
+pub const DEVIATION_SLOTS: usize = 301;
 
 /// The most bins a [`Timelines`] holds.
 pub const MAX_TIMELINE_BINS: usize = 512;
@@ -37,6 +44,45 @@ pub struct ResultView {
     /// The judgments over chart time; `None` without them. Read only while
     /// `Ready`.
     pub timelines: Option<Timelines>,
+    /// The emphasized gauge's history; `None` without an emphasized gauge.
+    /// Read only while `Ready`.
+    pub gauge: Option<Box<GaugeHistory>>,
+    /// The timing statistics' samples by ms, early positive: slot `i`
+    /// holds those whose ms value, truncated toward 0, is `i − 150`. Read
+    /// only while `Ready`.
+    pub deviations: Option<Box<[u32; DEVIATION_SLOTS]>>,
+    /// The key lanes' judge areas in ms, early positive: PERFECT, GREAT,
+    /// GOOD and BAD as `[−late, early]`, the empty POOR range as
+    /// `[−behind, ahead]`. Read only while `Ready`.
+    pub timing_areas: Option<[[i16; 2]; 5]>,
+}
+
+/// One column of a gauge's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GaugeColumn {
+    /// The lowest value in the column, the one carried into it included.
+    pub low: GaugeValue,
+    /// The highest.
+    pub high: GaugeValue,
+    /// The value at the column's end.
+    pub last: GaugeValue,
+}
+
+/// A view's emphasized gauge over the play's time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GaugeHistory {
+    /// The history, from the play's start to its as-played final deadline.
+    pub columns: [GaugeColumn; GRAPH_COLUMNS],
+    /// The gauge's largest value.
+    pub max: GaugeValue,
+    /// Its border: the clear threshold, or the value a survival gauge
+    /// fails below ([`GaugeDesc::from_rule`](crate::GaugeDesc::from_rule)).
+    pub border: GaugeValue,
+    pub look: GaugeLook,
+    /// The columns the evaluation covers; none from here on is drawn.
+    pub reached: u16,
+    /// The column a what-if's recorded input ends in.
+    pub no_input_from: Option<u16>,
 }
 
 /// Whether a view has a result.
@@ -182,11 +228,13 @@ pub struct TimingStats {
     pub sd_x100: u32,
 }
 
-/// The judgments of one view over chart time, in bins of one width.
+/// The judgments of one view over chart time, in bins of one width, and
+/// the judged notes in each bin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Timelines {
     width: TimeUs,
     bins: Box<[[u32; TIMELINE_CHANNELS]]>,
+    notes: Box<[u16]>,
     uncovered_from: Option<u16>,
 }
 
@@ -199,24 +247,35 @@ pub enum TimelinesError {
     Width,
     #[error("the first uncovered bin is past the bins")]
     Uncovered,
+    #[error("{notes} note counts for {bins} bins")]
+    Notes { notes: usize, bins: usize },
 }
 
 impl Timelines {
-    /// Timelines of `bins`, each `width` of chart time, the bins from
-    /// `uncovered_from` on drawn empty.
+    /// Timelines of `bins`, each `width` of chart time, holding `notes`
+    /// judged notes each, the bins from `uncovered_from` on past what the
+    /// input covers.
     ///
     /// # Errors
     ///
-    /// No bin or more than [`MAX_TIMELINE_BINS`], a width that is not
-    /// positive, or `uncovered_from` past the bins.
+    /// No bin or more than [`MAX_TIMELINE_BINS`], not one note count per
+    /// bin, a width that is not positive, or `uncovered_from` past the
+    /// bins.
     pub fn new(
         width: TimeUs,
         bins: Vec<[u32; TIMELINE_CHANNELS]>,
+        notes: Vec<u16>,
         uncovered_from: Option<u16>,
     ) -> Result<Self, TimelinesError> {
         let n = bins.len();
         if n == 0 || n > MAX_TIMELINE_BINS {
             return Err(TimelinesError::Bins { n });
+        }
+        if notes.len() != n {
+            return Err(TimelinesError::Notes {
+                notes: notes.len(),
+                bins: n,
+            });
         }
         if width.0 <= 0 {
             return Err(TimelinesError::Width);
@@ -227,6 +286,7 @@ impl Timelines {
         Ok(Self {
             width,
             bins: bins.into_boxed_slice(),
+            notes: notes.into_boxed_slice(),
             uncovered_from,
         })
     }
@@ -243,8 +303,14 @@ impl Timelines {
         &self.bins
     }
 
-    /// The first bin drawn empty, past the covered part; `None` when every
-    /// bin is covered.
+    /// The judged notes of the attempt in each bin, whether judged or not.
+    #[must_use]
+    pub fn notes(&self) -> &[u16] {
+        &self.notes
+    }
+
+    /// The first bin past what the input covers; `None` when every bin is
+    /// covered.
     #[must_use]
     pub fn uncovered_from(&self) -> Option<u16> {
         self.uncovered_from
@@ -267,27 +333,45 @@ mod tests {
 
     use super::{MAX_TIMELINE_BINS, Timelines, TimelinesError};
 
-    /// The bins are bounded at the cap, and a width and the uncovered mark
-    /// are checked.
+    /// The bins are bounded at the cap, each has one note count, and a
+    /// width and the uncovered mark are checked.
     #[test]
     fn timelines_hold_at_most_the_cap() {
         let w = TimeUs(1_000_000);
-        let at_cap = Timelines::new(w, vec![[1; 9]; MAX_TIMELINE_BINS], Some(512)).unwrap();
+        let at_cap = Timelines::new(
+            w,
+            vec![[1; 9]; MAX_TIMELINE_BINS],
+            vec![9; MAX_TIMELINE_BINS],
+            Some(512),
+        )
+        .unwrap();
         assert_eq!(at_cap.bins().len(), 512);
+        assert_eq!(at_cap.notes(), &[9; MAX_TIMELINE_BINS][..]);
         assert_eq!(
-            Timelines::new(w, vec![[0; 9]; MAX_TIMELINE_BINS + 1], None),
+            Timelines::new(
+                w,
+                vec![[0; 9]; MAX_TIMELINE_BINS + 1],
+                vec![0; MAX_TIMELINE_BINS + 1],
+                None
+            ),
             Err(TimelinesError::Bins { n: 513 })
         );
         assert_eq!(
-            Timelines::new(w, Vec::new(), None),
+            Timelines::new(w, Vec::new(), Vec::new(), None),
             Err(TimelinesError::Bins { n: 0 })
         );
+        for notes in [2, 4] {
+            assert_eq!(
+                Timelines::new(w, vec![[0; 9]; 3], vec![0; notes], None),
+                Err(TimelinesError::Notes { notes, bins: 3 })
+            );
+        }
         assert_eq!(
-            Timelines::new(TimeUs(0), vec![[0; 9]], None),
+            Timelines::new(TimeUs(0), vec![[0; 9]], vec![0], None),
             Err(TimelinesError::Width)
         );
         assert_eq!(
-            Timelines::new(w, vec![[0; 9]; 3], Some(4)),
+            Timelines::new(w, vec![[0; 9]; 3], vec![0; 3], Some(4)),
             Err(TimelinesError::Uncovered)
         );
     }

@@ -160,10 +160,14 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
             Timelines::new(
                 TimeUs(1_000_000),
                 (0..bins).map(|i| [u32::try_from(i).unwrap(); 9]).collect(),
+                (0..bins).map(|i| u16::try_from(10 * i).unwrap()).collect(),
                 None,
             )
             .unwrap(),
         ),
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 
@@ -204,8 +208,17 @@ pub fn other() -> ResultView {
             sd_x100: 4_321,
         }),
         timelines: Some(
-            Timelines::new(TimeUs(2_000_000), vec![[9; 9], [8; 9], [0; 9]], Some(2)).unwrap(),
+            Timelines::new(
+                TimeUs(2_000_000),
+                vec![[9; 9], [8; 9], [0; 9]],
+                vec![90, 80, 7],
+                Some(2),
+            )
+            .unwrap(),
         ),
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 
