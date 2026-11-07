@@ -381,7 +381,7 @@ pub fn skin(dir: &Path, look: &Look) -> Skin {
 }
 
 /// The compiled skin of `look` drawing image 0 of `sheet`.
-fn skin_of(sheet: Sheet, look: &Look) -> Skin {
+pub fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     let clipped = look.clip.is_some();
     let [x, y, ..] = look.rect;
     let mut elements = vec![image(look.rect, clipped)];

@@ -154,6 +154,70 @@ fn a_bundle_checks_its_clips_and_its_layers() {
     assert!(new(good, clip()).is_ok());
 }
 
+/// An atlas rebound to a skin whose sheet is a subset of the one it was
+/// built from makes a bundle sharing its pages, even when every frame of
+/// the subset lies past the first skin layer, and the bundle draws its
+/// frame from there: two files of 200 texels take a page of 256 each,
+/// red on the first and blue on the second; the blue skin's bundle on
+/// the rebound atlas draws blue.
+#[test]
+fn a_rebound_subset_on_a_later_page_makes_a_bundle_that_draws() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let look = |rgba| Look {
+        side: 200,
+        ..Look::left(rgba)
+    };
+    let (red, blue) = (look([255, 0, 0, 255]), look([0, 0, 255, 255]));
+    // Each writes its file; the blue skin's sheet holds only its own.
+    let _ = decl_support::skin(dir.path(), &red);
+    let blue_skin = decl_support::skin(dir.path(), &blue);
+    let file = |name: &str| skin_model::FileDef {
+        path: name.into(),
+        hi: None,
+    };
+    let whole = |file| skin_model::ImageDef {
+        file,
+        rect: None,
+        grid: [1, 1],
+        cycle: None,
+        filter: skin_model::Filter::Nearest,
+    };
+    let both = skin_model::Sheet::new(
+        dir.path(),
+        vec![file("ff0000-200.png"), file("0000ff-200.png")],
+        vec![whole(0), whole(1)],
+    )
+    .unwrap();
+    let base = decl_support::skin_of(both, &red);
+    let limits = skin_model::AtlasLimits {
+        max_side: 256,
+        ..r.atlas_limits()
+    };
+    let built = base
+        .atlas(skin_model::Variant::Lo, limits, &|| false)
+        .unwrap();
+    assert_eq!(built.pages().len(), 2);
+    let rebound = built
+        .rebind(
+            blue_skin.sheet(),
+            skin_model::Variant::Lo,
+            blue_skin.has_outline_text(),
+        )
+        .unwrap();
+    let layers: Vec<u16> = rebound.uvs().frames().iter().map(|f| f.layer).collect();
+    assert_eq!(layers, [2]);
+    let clips = render::ClipTable::new(vec![[0.0, 0.0, 960.0, 1_080.0]]).unwrap();
+    let bundle = SkinBundle::new(Arc::new(blue_skin), rebound, clips, Side::Left).unwrap();
+    assert!(Arc::ptr_eq(bundle.atlas_pages(), built.shared_pages()));
+    let bundle = Arc::new(bundle);
+    let token = stage(&mut r, &bundle, &chart, 1).unwrap();
+    r.commit(token).unwrap();
+    let (_, p) = frame(&mut r);
+    halves(&p, BLUE, BLACK);
+}
+
 /// A staged installation leaves the one in use drawing, through frames,
 /// until its commit switches the skin, the uv table, the atlas, the clips
 /// and the capacities together: red under the left clip, from a 256-texel
