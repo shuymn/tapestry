@@ -635,6 +635,8 @@ pub struct AdjustmentTap {
     panel_roles: [u128; 2],
     /// The panels' published level.
     panels: Arc<AtomicU64>,
+    /// The focus losses counted at the level's last publication.
+    panel_losses: u64,
 }
 
 /// The logic thread's end of the tap.
@@ -699,6 +701,7 @@ pub fn adjustment_queue(
             cancelled: None,
             panel_roles: [0; 2],
             panels: Arc::new(AtomicU64::new(0)),
+            panel_losses: 0,
         },
         AdjustmentReceiver {
             queue: consumer,
@@ -762,9 +765,12 @@ impl AdjustmentTap {
 
     /// Publishes the panels' level at a boundary: START and SELECT as held
     /// while `open` (the thread Idle with focus), else neither, so a
-    /// release lost while it was not open never keeps a panel. `true` when
-    /// the level changed; its generation counts the changes.
-    pub fn publish_panels(&mut self, open: bool) -> bool {
+    /// release lost while it was not open never keeps a panel. `losses` is
+    /// the focus losses counted so far ([`PresentationFocus::read`]): one
+    /// counted since the last publication is a change too, even with focus
+    /// back by now, so what it closed opens again afresh. `true` when the
+    /// level changed; its generation counts the changes.
+    pub fn publish_panels(&mut self, open: bool, losses: u64) -> bool {
         let held = if open {
             self.held_panels()
         } else {
@@ -772,7 +778,9 @@ impl AdjustmentTap {
         };
         let bits = u64::from(held.start) | (u64::from(held.select) << 1);
         let before = self.panels.load(Ordering::Acquire);
-        if before & 3 == bits {
+        let lost = self.panel_losses != losses;
+        self.panel_losses = losses;
+        if before & 3 == bits && !lost {
             return false;
         }
         let generation = (before >> 2).wrapping_add(1);

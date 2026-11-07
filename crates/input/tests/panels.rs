@@ -93,7 +93,7 @@ fn batch(set: &mut SourceSet, at: i64, packets: &[Packet], open: bool) -> bool {
         set.packet(p);
     }
     set.end_batch(TimeUs(at + 1));
-    set.adjustment_mut().unwrap().publish_panels(open)
+    set.adjustment_mut().unwrap().publish_panels(open, 0)
 }
 
 fn held(level: &PanelLevel) -> (bool, bool, Option<usize>) {
@@ -154,7 +154,7 @@ fn a_closed_boundary_or_a_removal_clears_the_level() {
     set.begin_batch(TimeUs(70));
     set.disconnect(KEYBOARD);
     set.end_batch(TimeUs(71));
-    assert!(set.adjustment_mut().unwrap().publish_panels(true));
+    assert!(set.adjustment_mut().unwrap().publish_panels(true, 0));
     assert_eq!(held(&level), (false, false, None));
 }
 

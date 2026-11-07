@@ -2799,7 +2799,7 @@ pub(crate) mod tests {
             background: false,
         });
         set.end_batch(TimeUs(0));
-        set.adjustment_mut().unwrap().publish_panels(true);
+        set.adjustment_mut().unwrap().publish_panels(true, 0);
     }
 
     /// Under a panel the select screen's list takes no input, as the

@@ -1005,9 +1005,10 @@ impl Hook {
     /// when it changed.
     fn publish_panels(&self, sources: &mut SourceSet) -> bool {
         let active = self.phase == Phase::Idle && self.controls.focused();
+        let (_, losses) = self.controls.presentation_focus().read();
         sources
             .adjustment_mut()
-            .is_some_and(|tap| tap.publish_panels(active))
+            .is_some_and(|tap| tap.publish_panels(active, losses))
     }
 
     fn publish(&self, sources: &SourceSet) {
@@ -3723,7 +3724,7 @@ mod gate_tests {
 /// W) and the controller's menu table: START, both, SELECT, none; a release
 /// lost to a focus loss, a device's removal, menu events overflowing their
 /// queue, and leaving Idle for a play and coming back never keep a panel
-/// open; a panel still held at the next entry opens with a fresh start.
+/// open, and a focus loss between two wakes restarts one; a panel still held at the next entry opens with a fresh start.
 /// The timers' starts are the select screen's update's, at the times the
 /// game thread reads the level.
 #[cfg(test)]
@@ -3941,6 +3942,12 @@ mod panel_tests {
         r.controls.focus(true);
         r.wake();
         assert_eq!(r.look(110_000), [t(110), None, None]);
+        // Focus lost and back between two wakes, START held throughout:
+        // the loss closed the panel, which opens again afresh.
+        r.controls.focus(false);
+        r.controls.focus(true);
+        r.wake();
+        assert_eq!(r.look(115_000), [t(115), None, None]);
 
         // The keyboard removed while it holds START: closed.
         r.sources.begin_batch(TimeUs(r.now + 500));

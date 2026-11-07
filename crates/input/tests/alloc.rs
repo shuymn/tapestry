@@ -343,7 +343,7 @@ fn menu_does_not_allocate() {
             set.end_batch(TimeUs(40_002));
             sent += u64::from(set.menu_mut().unwrap().take_sent());
             let held = t % 7 != 0;
-            set.adjustment_mut().unwrap().publish_panels(held);
+            set.adjustment_mut().unwrap().publish_panels(held, 0);
             opened += u64::from(level.read().open().is_some());
             // Read only every fortieth batch, so the queue fills.
             if t % 40 == 0 {

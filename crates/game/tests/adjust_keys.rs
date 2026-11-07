@@ -316,7 +316,7 @@ fn the_drivers_tap_tells_start_from_select() {
             background: false,
         });
         set.end_batch(TimeUs(11));
-        assert!(set.adjustment_mut().unwrap().publish_panels(true));
+        assert!(set.adjustment_mut().unwrap().publish_panels(true, 0));
         let p = level.read();
         assert_eq!((p.start, p.select), (start, select), "{code:#x}");
     }
