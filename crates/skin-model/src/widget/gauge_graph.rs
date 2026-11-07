@@ -190,7 +190,7 @@ impl GaugeGraph {
         // The back: the below-border colour, then the above-border colour
         // over it from the border to the top.
         let back = colors.back.unit();
-        let hb = (h * border / max).clamp(0.0, h);
+        let hb = h * border / max;
         if !r.piece([0.0, w], [0.0, hb], w, back, out)
             || !r.piece(
                 [0.0, w],

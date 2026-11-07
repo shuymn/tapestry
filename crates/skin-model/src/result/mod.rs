@@ -109,8 +109,6 @@ pub struct ResultScreen {
     deviations: Box<[u32; DEVIATION_SLOTS]>,
     has_deviations: bool,
     areas: Option<[[i16; 2]; 5]>,
-    /// Whether the view is ready.
-    ready: bool,
 }
 
 /// An empty history, the gauge storage's first contents.
@@ -148,7 +146,6 @@ impl ResultScreen {
             deviations: Box::new([0; DEVIATION_SLOTS]),
             has_deviations: false,
             areas: None,
-            ready: false,
         }
     }
 
@@ -197,9 +194,11 @@ impl ResultScreen {
         self.areas
     }
 
-    /// Whether the view is ready.
+    /// Whether the view is ready: its result's fields are valid.
     pub(crate) fn ready(&self) -> bool {
-        self.ready
+        self.fields
+            .get(usize::from(field::RESULT_VALID))
+            .is_some_and(|&v| v != 0)
     }
 
     /// The bytes this state holds, itself and every buffer it owns. For a
@@ -245,7 +244,6 @@ impl ResultScreen {
         let ready = view.status == ResultStatus::Ready;
         self.timing = view.timing.filter(|_| ready);
         self.timelines = view.timelines.clone().filter(|_| ready);
-        self.ready = ready;
         self.has_gauge = false;
         if let Some(g) = view.gauge.as_deref().filter(|_| ready) {
             *self.gauge = *g;
