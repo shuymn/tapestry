@@ -11,14 +11,19 @@
 //! (the lowering's [`Leaves`], which also takes a gauge or timer
 //! comparison whole).
 //!
-//! Every integer is bounded from the ranges of what it reads: an integer
-//! arithmetic result, and an integer a number's value converts, must lie
-//! within ±2^53, where the source's doubles hold it exactly, so nothing
-//! wraps and the source's double path agrees; an integer `//` or `%` whose
-//! divisor can be 0 is refused, since Lua 5.4 raises there and the
-//! source's doubles give NaN. A `math.floor` or `ceil` of a float is an
-//! integer of no known bound. Each refusal is [`Unsupported`] and follows
-//! the callback's role.
+//! Every node the evaluation reached is checked before anything is
+//! emitted, whether or not its value reaches the result, since Lua runs it
+//! all the same: every integer is bounded from the ranges of what it reads,
+//! and an integer arithmetic result, and an integer a number's value
+//! converts, must lie within ±2^53, where the source's doubles hold it
+//! exactly, so nothing wraps and the source's double path agrees; an
+//! integer `//` whose divisor can be 0 is refused, since Lua 5.4 raises
+//! there (the source has no `//`; its `%` by 0 is NaN, which the program
+//! keeps). A `math.floor` or `ceil` of a float is an integer of no known
+//! bound. And every read a reached path performs keeps its availability:
+//! the guards of reads whose values are discarded are read first, so an
+//! unavailable one gives no value, as a lowered expression's joined guards
+//! do. Each refusal is [`Unsupported`] and follows the callback's role.
 
 use skin_model::Ty;
 use skin_model::present::{self, Cmp, Insn, MAX_CALLBACK_OPS, MAX_REGISTERS, MathFn};
@@ -31,14 +36,12 @@ use super::residual::{
 use super::syntax::{Bin, EXACT};
 
 /// A read the program evaluates: its expression's source over the play
-/// schema, its type, its availability guards and, for an integer, its
-/// range.
+/// schema, its type and its availability guards.
 #[derive(Debug)]
 pub(crate) struct Leaf {
     pub(crate) src: String,
     pub(crate) ty: Ty,
     pub(crate) guards: Vec<&'static str>,
-    pub(crate) range: Option<(i64, i64)>,
 }
 
 /// How residual nodes map to reads: a host read, or a comparison the
@@ -46,6 +49,11 @@ pub(crate) struct Leaf {
 pub(crate) trait Leaves {
     /// Node `r` of `res` as a read, `None` when it is not one.
     fn leaf(&mut self, res: &Residual, r: u32) -> R<Option<Leaf>>;
+    /// Read node `r`'s integer range, when it is an integer read.
+    fn range(&self, r: u32) -> Option<(i64, i64)>;
+    /// The availability guards of every read `res` recorded, each set
+    /// once, empty sets left out.
+    fn guards(&self, res: &Residual) -> Vec<Vec<&'static str>>;
 }
 
 /// A compiled callback, its constant and read indices its own from 0.
@@ -88,6 +96,73 @@ fn floor_div(a: i128, b: i128) -> i128 {
     }
 }
 
+/// Every node of `res` checked, operands before the nodes that use them:
+/// its integer part's bounds, each arithmetic result's within ±2^53 and
+/// each integer `//`'s divisor proven nonzero.
+fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) -> R<Vec<Iv>> {
+    let n = res.len();
+    let mut ivs: Vec<Iv> = Vec::with_capacity(n as usize);
+    for r in 0..n {
+        charge(an, "compile:interval", 1)?;
+        did("compile:interval");
+        let get = |x: u32| ivs.get(x as usize).copied().flatten();
+        let ints = |x: u32| res.kind(x) & INT != 0;
+        let iv = match res.node(r) {
+            Node::Known(Val::Int(k)) => Some((i128::from(k), i128::from(k))),
+            Node::Read { .. } => leaves
+                .range(r)
+                .map(|(lo, hi)| (i128::from(lo), i128::from(hi))),
+            Node::Neg(x) => exact(get(x).map(|(lo, hi)| (-hi, -lo)))?,
+            Node::Arith(op, a, b) => match (get(a), get(b), ints(a) && ints(b)) {
+                (Some((al, ah)), Some((bl, bh)), true) => {
+                    let corners = |f: &dyn Fn(i128, i128) -> i128| {
+                        let c = [f(al, bl), f(al, bh), f(ah, bl), f(ah, bh)];
+                        let lo = c.iter().copied().min().unwrap_or(0);
+                        let hi = c.iter().copied().max().unwrap_or(0);
+                        Some((lo, hi))
+                    };
+                    match op {
+                        Bin::Add => exact(corners(&|p, q| p + q))?,
+                        Bin::Sub => exact(corners(&|p, q| p - q))?,
+                        Bin::Mul => exact(corners(&|p, q| p.saturating_mul(q)))?,
+                        Bin::Div => None,
+                        Bin::IDiv if bl <= 0 && bh >= 0 => {
+                            return Err(Stop::Unsupported(Unsupported::Construct(
+                                "an integer // whose divisor can be 0",
+                            )));
+                        }
+                        Bin::IDiv => exact(corners(&floor_div))?,
+                        // `%`: smaller than the divisor in magnitude; NaN,
+                        // a float, for a zero divisor.
+                        _ => {
+                            let m = bl.abs().max(bh.abs());
+                            (m > 0).then_some((1 - m, m - 1))
+                        }
+                    }
+                }
+                _ => None,
+            },
+            Node::Math(f, a, b) => match f {
+                MathOp::Floor | MathOp::Ceil if res.kind(a) & FLT != 0 => hull(get(a), FULL),
+                MathOp::Floor | MathOp::Ceil => get(a),
+                MathOp::Abs => exact(get(a).map(|(lo, hi)| {
+                    let low = if lo <= 0 && hi >= 0 {
+                        0
+                    } else {
+                        lo.abs().min(hi.abs())
+                    };
+                    (low, lo.abs().max(hi.abs()))
+                }))?,
+                MathOp::Max | MathOp::Min => hull(get(a), get(b)),
+            },
+            Node::Select { then, other, .. } => hull(get(then), get(other)),
+            _ => None,
+        };
+        ivs.push(iv);
+    }
+    Ok(ivs)
+}
+
 struct C<'a, L> {
     an: &'a Analysis,
     leaves: &'a mut L,
@@ -108,6 +183,11 @@ pub(crate) fn compile<L: Leaves>(
         Conv::Int => present::Conv::Int,
         Conv::Text | Conv::Index => return Err(Stop::Unsupported(Unsupported::Type)),
     };
+    let ivs = intervals(an, leaves, res)?;
+    if conv == present::Conv::Int {
+        exact(ivs.get(res.root as usize).copied().flatten())?;
+    }
+    let guards = leaves.guards(res);
     let mut c = C {
         an,
         leaves,
@@ -120,10 +200,18 @@ pub(crate) fn compile<L: Leaves>(
         },
         top: 0,
     };
-    let iv = c.emit(res, res.root, 0)?;
-    if conv == present::Conv::Int {
-        exact(iv)?;
+    // Every read's availability first, its value aside.
+    for guards in guards {
+        c.read(
+            Leaf {
+                src: "true".to_owned(),
+                ty: Ty::Bool,
+                guards,
+            },
+            0,
+        )?;
     }
+    c.emit(res, res.root, 0)?;
     c.push(Insn::Ret { src: 0 })?;
     c.out.regs = c.top.saturating_add(1);
     Ok(c.out)
@@ -170,89 +258,83 @@ impl<L: Leaves> C<'_, L> {
         Ok(k)
     }
 
-    /// Node `r` emitted into register `dst`: its integer part's bounds.
-    fn emit(&mut self, res: &Residual, r: u32, dst: u8) -> R<Iv> {
+    /// Read `leaf` into register `dst`.
+    fn read(&mut self, leaf: Leaf, dst: u8) -> R<()> {
+        let dst = self.reg(dst)?;
+        let read = u16::try_from(self.out.reads.len()).map_err(|_| Stop::Unsupported(LIMITS))?;
+        self.out.reads.push(leaf);
+        self.push(Insn::Read { dst, read })?;
+        Ok(())
+    }
+
+    /// Node `r` emitted into register `dst`, its operands into the ones
+    /// above it.
+    fn emit(&mut self, res: &Residual, r: u32, dst: u8) -> R<()> {
         charge(self.an, "compile:node", 1)?;
         did("compile:node");
         let dst = self.reg(dst)?;
         let up = dst.saturating_add(1);
         if let Some(leaf) = self.leaves.leaf(res, r)? {
-            let iv = leaf.range.map(|(lo, hi)| (i128::from(lo), i128::from(hi)));
-            let read =
-                u16::try_from(self.out.reads.len()).map_err(|_| Stop::Unsupported(LIMITS))?;
-            self.out.reads.push(leaf);
-            self.push(Insn::Read { dst, read })?;
-            return Ok(iv);
+            return self.read(leaf, dst);
         }
         let ty = || Err(Stop::Unsupported(Unsupported::Type));
         match res.node(r) {
             Node::Known(v) => {
-                let (pv, iv) = match v {
-                    Val::Nil => (present::Val::Nil, None),
-                    Val::Bool(b) => (present::Val::Bool(b), None),
-                    Val::Int(n) => (present::Val::Int(n), Some((i128::from(n), i128::from(n)))),
-                    Val::Float(f) => (present::Val::Float(f64::from_bits(f)), None),
+                let pv = match v {
+                    Val::Nil => present::Val::Nil,
+                    Val::Bool(b) => present::Val::Bool(b),
+                    Val::Int(n) => present::Val::Int(n),
+                    Val::Float(f) => present::Val::Float(f64::from_bits(f)),
                     _ => return ty(),
                 };
                 let k = self.constant(pv)?;
                 self.push(Insn::Const { dst, k })?;
-                Ok(iv)
             }
             Node::Unreachable => {
                 let k = self.constant(present::Val::Nil)?;
                 self.push(Insn::Const { dst, k })?;
-                Ok(None)
             }
             // A read the mapping does not take as a value (a gauge or a
             // timer outside its comparison).
-            Node::Read { .. } => ty(),
+            Node::Read { .. } => return ty(),
             Node::Not(x) => {
                 self.emit(res, x, dst)?;
                 self.push(Insn::Not { dst, a: dst })?;
-                Ok(None)
             }
             Node::Neg(x) => {
-                let iv = self.emit(res, x, dst)?;
+                self.emit(res, x, dst)?;
                 self.push(Insn::Neg { dst, a: dst })?;
-                exact(iv.map(|(lo, hi)| (-hi, -lo)))
             }
-            Node::Arith(op, a, b) => self.arith(res, op, (a, b), dst, up),
+            Node::Arith(op, a, b) => {
+                self.emit(res, a, dst)?;
+                self.emit(res, b, up)?;
+                self.push(Insn::Arith {
+                    op: residual::arith(op),
+                    dst,
+                    a: dst,
+                    b: up,
+                })?;
+            }
             Node::Math(f, a, b) => {
-                let ia = self.emit(res, a, dst)?;
-                let flt = res.kind(a) & FLT != 0;
-                match f {
-                    MathOp::Floor | MathOp::Ceil | MathOp::Abs => {
-                        let f = match f {
-                            MathOp::Floor => MathFn::Floor,
-                            MathOp::Ceil => MathFn::Ceil,
-                            _ => MathFn::Abs,
-                        };
+                self.emit(res, a, dst)?;
+                let one = match f {
+                    MathOp::Floor => Some(MathFn::Floor),
+                    MathOp::Ceil => Some(MathFn::Ceil),
+                    MathOp::Abs => Some(MathFn::Abs),
+                    MathOp::Max | MathOp::Min => None,
+                };
+                match one {
+                    Some(f) => {
                         self.push(Insn::Math { f, dst, a: dst })?;
-                        if f == MathFn::Abs {
-                            let m = ia.map(|(lo, hi)| {
-                                let top = lo.abs().max(hi.abs());
-                                (
-                                    if lo <= 0 && hi >= 0 {
-                                        0
-                                    } else {
-                                        lo.abs().min(hi.abs())
-                                    },
-                                    top,
-                                )
-                            });
-                            return exact(m);
-                        }
-                        Ok(if flt { hull(ia, FULL) } else { ia })
                     }
-                    MathOp::Max | MathOp::Min => {
-                        let ib = self.emit(res, b, up)?;
+                    None => {
+                        self.emit(res, b, up)?;
                         self.push(Insn::Extreme {
                             max: f == MathOp::Max,
                             dst,
                             a: dst,
                             b: up,
                         })?;
-                        Ok(hull(ia, ib))
                     }
                 }
             }
@@ -268,7 +350,6 @@ impl<L: Leaves> C<'_, L> {
                     _ => (Cmp::Le, up, dst),
                 };
                 self.push(Insn::Cmp { op, dst, a, b })?;
-                Ok(None)
             }
             Node::Select { cond, then, other } => {
                 self.emit(res, cond, dst)?;
@@ -277,53 +358,15 @@ impl<L: Leaves> C<'_, L> {
                     when: false,
                     to: 0,
                 })?;
-                let it = self.emit(res, then, dst)?;
+                self.emit(res, then, dst)?;
                 let jump = self.push(Insn::Jump { to: 0 })?;
                 let at = self.here()?;
                 self.patch(test, at);
-                let io = self.emit(res, other, dst)?;
+                self.emit(res, other, dst)?;
                 let end = self.here()?;
                 self.patch(jump, end);
-                Ok(hull(it, io))
             }
         }
-    }
-
-    /// Arithmetic `op` of `a` and `b` into `dst`, `b` through `up`.
-    fn arith(&mut self, res: &Residual, op: Bin, (a, b): (u32, u32), dst: u8, up: u8) -> R<Iv> {
-        let ia = self.emit(res, a, dst)?;
-        let ib = self.emit(res, b, up)?;
-        self.push(Insn::Arith {
-            op: residual::arith(op),
-            dst,
-            a: dst,
-            b: up,
-        })?;
-        // The integer part: only where both operands may be integers.
-        let ints = res.kind(a) & INT != 0 && res.kind(b) & INT != 0;
-        let (Some((al, ah)), Some((bl, bh)), true) = (ia, ib, ints) else {
-            return Ok(None);
-        };
-        let corners = |f: &dyn Fn(i128, i128) -> i128| {
-            let c = [f(al, bl), f(al, bh), f(ah, bl), f(ah, bh)];
-            let lo = c.iter().copied().min().unwrap_or(0);
-            let hi = c.iter().copied().max().unwrap_or(0);
-            Some((lo, hi))
-        };
-        let iv = match op {
-            Bin::Add => corners(&|p, q| p + q),
-            Bin::Sub => corners(&|p, q| p - q),
-            Bin::Mul => corners(&|p, q| p.saturating_mul(q)),
-            Bin::Div => None,
-            _ if bl <= 0 && bh >= 0 => {
-                return Err(Stop::Unsupported(Unsupported::Construct(
-                    "an integer // or % whose divisor can be 0",
-                )));
-            }
-            Bin::IDiv => corners(&floor_div),
-            _ if bl > 0 => Some((0, bh - 1)),
-            _ => Some((bl + 1, 0)),
-        };
-        exact(iv)
+        Ok(())
     }
 }

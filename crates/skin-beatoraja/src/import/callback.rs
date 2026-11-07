@@ -1110,17 +1110,15 @@ impl Leaves for Lower<'_> {
         let own = |l: &Self, x: u32| l.read_guards.get(&x).cloned().unwrap_or_default();
         match res.node(r) {
             Node::Read { .. } => match self.mapped.get(&r) {
-                Some(Mapped::Int { src, lo, hi }) => Ok(Some(Leaf {
+                Some(Mapped::Int { src, .. }) => Ok(Some(Leaf {
                     src: Self::text(self.an, &[src])?,
                     ty: Ty::Int,
                     guards: own(self, r),
-                    range: Some((*lo, *hi)),
                 })),
                 Some(Mapped::Bool(src)) => Ok(Some(Leaf {
                     src: Self::text(self.an, &[src])?,
                     ty: Ty::Bool,
                     guards: own(self, r),
-                    range: None,
                 })),
                 _ => Ok(None),
             },
@@ -1141,11 +1139,30 @@ impl Leaves for Lower<'_> {
                     src,
                     ty: Ty::Bool,
                     guards: own(self, read),
-                    range: None,
                 }))
             }
             _ => Ok(None),
         }
+    }
+
+    fn range(&self, r: u32) -> Option<(i64, i64)> {
+        match self.mapped.get(&r) {
+            Some(Mapped::Int { lo, hi, .. }) => Some((*lo, *hi)),
+            _ => None,
+        }
+    }
+
+    fn guards(&self, res: &Residual) -> Vec<Vec<&'static str>> {
+        let mut all: Vec<Vec<&'static str>> = Vec::new();
+        for r in &res.reads {
+            if let Some(g) = self.read_guards.get(r)
+                && !g.is_empty()
+                && !all.contains(g)
+            {
+                all.push(g.clone());
+            }
+        }
+        all
     }
 }
 
@@ -1822,6 +1839,19 @@ impl Cx<'_> {
                 }
             }
         }
+        // An expression value of `i32::MIN` or `i32::MAX` draws nothing
+        // and skips the draw conditions after it (`SkinNumber.java:135-146`
+        // at `0.8.9`); a program value does so through `after`.
+        let sentinel = match &self.number_value {
+            Some(e) if !e.starts_with("lua.") => Some(format!(
+                "(({e}) != (-2147483647 - 1)) && (({e}) != 2147483647)"
+            )),
+            _ => None,
+        };
+        let gate = sentinel
+            .into_iter()
+            .chain(gate.iter().map(|g| (*g).to_owned()))
+            .collect::<Vec<_>>();
         let gate = (!gate.is_empty()).then(|| gate.join(" && "));
         self.program(prog, gate, after, at)
     }

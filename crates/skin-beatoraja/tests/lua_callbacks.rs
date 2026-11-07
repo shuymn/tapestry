@@ -756,26 +756,25 @@ fn remaining_note_ratios_compile_into_the_program() {
     assert_eq!(rows(&q), (1, 1));
 }
 
-/// What the program cannot prove is refused by role: an integer `//` or
-/// `%` whose divisor can be 0, an integer that could leave ±2^53, and a
-/// number's value converting a `math.floor` of a float, whose integer has
-/// no bound; each control compiles.
+/// What the program cannot prove is refused by role, also where the
+/// result discards it (Lua runs it all the same): an integer that could
+/// leave ±2^53, and a number's value converting a `math.floor` of a
+/// float, whose integer has no bound; each control compiles. The source's
+/// `%` by 0 is NaN, which the program keeps (no `//`: it is not in the
+/// source's grammar and opens the candidate).
 #[test]
 fn the_program_refuses_what_it_cannot_prove() {
-    // `//` is not in the source's grammar and opens the candidate, so `%`
-    // stands for both.
-    let zero = Unsupported::Construct("an integer // or % whose divisor can be 0");
     for (value, want) in [
         (
             "function() return 10 % ms.number(110) end",
-            Disposition::Replaced(zero),
-        ),
-        (
-            "function() return 10 % (ms.number(110) + 1) end",
             Disposition::Compiled,
         ),
         (
             "function() local n = ms.number(110) return n * n * n * n * 1.0 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) local unused = n * n * n * n return 1.0 end",
             Disposition::Replaced(Unsupported::Range),
         ),
         (
@@ -794,4 +793,102 @@ fn the_program_refuses_what_it_cannot_prove() {
     let draw = "draw = function() return math.floor(ms.number(110) / 3) > 1 end,";
     let i = import(&folder(&skin(&image_at(0, draw))), 905).unwrap();
     assert_eq!(i.callbacks, [Disposition::Compiled]);
+}
+
+/// The numbers are the source's doubles: `(n + 0.5) % 0.1` is exactly 0
+/// there for every count, where Lua 5.4's `fmod` gives about 0.1, so the
+/// value shows 0 and the draw is false.
+#[test]
+fn a_float_modulo_shows_what_the_source_shows() {
+    let d = folder(&skin(&format!(
+        "{}\n{}",
+        "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() return (ms.number(110) + 0.5) % 0.1 * 1000 end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
+        image_at(
+            0,
+            "draw = function() return (ms.number(110) + 0.5) % 0.1 > 0 end,"
+        ),
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled, Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 8);
+    for n in 0..6 {
+        p.tally.counts.perfect = n;
+        p.frame(1_000 + i64::from(n) * 16, &[]);
+        let f = p.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        assert_eq!([at(0), at(1), at(2), at(3)], [0, 1, 0, 1], "{n}");
+    }
+}
+
+/// A read whose value is discarded still keeps its availability: with
+/// the play level unavailable the number draws nothing, as the source's
+/// `number(96)` would have no value.
+#[test]
+fn a_discarded_read_keeps_its_availability() {
+    let d = folder(&value_skin(
+        "function() local unused = ms.number(96) return 1.0 end",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let chart = common::play::chart(8);
+    for (level, drawn) in [(None, false), (Some(12), true)] {
+        let mut p = Drawn::over_level(i.imported.skin.clone(), &chart, level);
+        let q = p.frame(1_000, &[]);
+        assert_eq!(!q.is_empty(), drawn, "{level:?}");
+    }
+}
+
+/// A number whose expression value is `i32::MAX` draws nothing and skips
+/// the program draw after it (`SkinNumber.java:135-146`); any other value
+/// runs it.
+#[test]
+fn an_expression_sentinel_skips_a_program_draw() {
+    for (value, drawn) in [("2147483647", false), ("5", true)] {
+        let d = folder(&skin(&format!(
+            "skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+               value = function() return {value} end }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", draw = function() return ms.number(110) / 2 >= 0 end,\n\
+               dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+        )));
+        let i = import(&d, 905).unwrap();
+        // Dispositions are by callable; the value lowers, the draw compiles.
+        let mut got = i.callbacks.clone();
+        got.sort_by_key(|d| format!("{d:?}"));
+        assert_eq!(
+            got,
+            [Disposition::Compiled, Disposition::Lowered],
+            "{value}"
+        );
+        let mut p = Drawn::new(i.imported.skin, 8);
+        let q = p.frame(1_000, &[]);
+        let ok = p.play.state().fields[skin_model::field::COUNT + 1];
+        assert_eq!((!q.is_empty(), ok == 1), (drawn, drawn), "{value}");
+    }
+}
+
+/// The program has no gating of one draw callback by another: a second
+/// program draw on one element is refused by role.
+#[test]
+fn a_second_program_draw_follows_its_role() {
+    let i = import(
+        &folder(&skin(&image_at(
+            0,
+            "op = { function() return ms.number(110) / 2 >= 0 end },\n\
+             draw = function() return ms.number(111) / 2 >= 0 end,",
+        ))),
+        905,
+    )
+    .unwrap();
+    // Dispositions are by callable: the first consumed compiles.
+    let mut got = i.callbacks.clone();
+    got.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(
+        got,
+        [
+            Disposition::Compiled,
+            Disposition::Replaced(Unsupported::Construct("a draw after a program draw"))
+        ]
+    );
 }

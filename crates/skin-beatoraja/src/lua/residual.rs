@@ -302,6 +302,11 @@ impl Residual {
             .unwrap_or(Node::Unreachable)
     }
 
+    /// The number of nodes.
+    pub(crate) fn len(&self) -> u32 {
+        u32::try_from(self.nodes.len()).unwrap_or(u32::MAX)
+    }
+
     pub(crate) fn kind(&self, r: u32) -> u8 {
         self.kinds.get(r as usize).copied().unwrap_or(0)
     }
@@ -421,6 +426,9 @@ impl<'a> Eval<'a> {
                 let (ka, kb) = (k(a), k(b));
                 let kind = if op == Bin::Div {
                     FLT
+                } else if op == Bin::Mod {
+                    // The source's `%` by a zero integer is NaN.
+                    (if ka & kb & INT != 0 { INT | FLT } else { 0 }) | ((ka | kb) & FLT)
                 } else {
                     (if ka & kb & INT != 0 { INT } else { 0 }) | ((ka | kb) & FLT)
                 };

@@ -83,6 +83,10 @@ pub struct Survey {
     pub destinations: Vec<DestinationEntry>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed.
+    /// An imported skin's verified per-frame cost: the operations its
+    /// expressions and presentation program run, of
+    /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
+    pub frame_ops: Option<(usize, usize)>,
     pub frames: Option<Frames>,
 }
 
@@ -612,6 +616,10 @@ pub fn survey_with(
     match o.result {
         Ok(imported) => {
             s.outcome = "imported".into();
+            s.frame_ops = Some((
+                imported.skin.ops().total(),
+                imported.skin.program_callbacks(),
+            ));
             for n in &imported.report.notes {
                 *s.notes.entry(note(&n.kind)).or_default() += 1;
             }
