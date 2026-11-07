@@ -1,17 +1,132 @@
-//! The presentation program's numerics against the Lua 5.4 VM the
-//! sandbox runs (design.md "beatoraja Lua Skins", numbers): over a grid of
-//! integers and floats (negative operands, ±0.0, infinities, NaN, and
-//! values near 2^53 and 2^63), every arithmetic operator, comparison and
-//! `math` function gives the VM's value with its subtype, or fails where
-//! the VM raises. Integer results that wrap in Lua are outside the accepted
-//! domain (the compiler proves accepted code never reaches them), so there
-//! the program must report an overflow instead.
+//! The presentation program's numerics against the source's interpreter
+//! (design.md "beatoraja Lua Skins", numbers).
+//!
+//! - Every operation the source's interpreter has (`+ - * / %`, the
+//!   comparisons, unary minus, `math.floor`, `ceil`, `abs`, `max`, `min`)
+//!   is checked against `luaj_numerics.txt`, the source's results over a
+//!   grid of integers and floats (zeros of both signs, infinities, NaN,
+//!   values near 2^31 and 2^53), generated from the source's pinned
+//!   interpreter by `xtask/luaj/luaj_table.sh`.
+//! - Where the Lua 5.4 VM the sandbox runs agrees with it (`+ - *`, `//`,
+//!   which the source does not have, and the `math` functions away from a
+//!   zero's sign), the grid is also checked against that VM.
+//!
+//! An integer result past ±2^53 is outside the accepted domain (the
+//! compiler proves accepted code never reaches it): there the program
+//! reports an overflow where `i64` would wrap, and is not compared.
 
 use mlua::{Function, Lua, Value};
-use skin_model::present::num::{arith, compare, extreme, math, to_int};
+use skin_model::present::num::{arith, compare, extreme, math, neg, to_int};
 use skin_model::present::{Arith, Cmp, Fail, MathFn, Val};
 
 const TWO_53: i64 = 1 << 53;
+
+/// A value of the table: `i:<integer>` or `f:<IEEE bits in hex>`, or a
+/// boolean or nil.
+fn parse(s: &str) -> Option<Val> {
+    if let Some(n) = s.strip_prefix("i:") {
+        return Some(Val::Int(n.parse().unwrap()));
+    }
+    if let Some(b) = s.strip_prefix("f:") {
+        return Some(Val::Float(f64::from_bits(
+            u64::from_str_radix(b, 16).unwrap(),
+        )));
+    }
+    match s {
+        "true" => Some(Val::Bool(true)),
+        "false" => Some(Val::Bool(false)),
+        "nil" => Some(Val::Nil),
+        "error" => None,
+        other => panic!("{other}"),
+    }
+}
+
+/// The double a number is, `None` for nil and booleans.
+fn double(v: Val) -> Option<f64> {
+    match v {
+        Val::Int(n) => Some(n as f64),
+        Val::Float(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// Whether `ours` is the source's `theirs`: the same boolean, or the same
+/// double (any NaN equal to any NaN, a zero's sign compared: the source
+/// has only +0).
+fn same(ours: Val, theirs: Val) -> bool {
+    match (double(ours), double(theirs)) {
+        (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
+        (None, None) => ours == theirs,
+        _ => false,
+    }
+}
+
+/// Whether integer operation `op` of `a` and `b` leaves ±2^53, outside the
+/// accepted domain.
+fn outside(op: &str, a: Val, b: Val) -> bool {
+    let (Val::Int(x), Val::Int(y)) = (a, b) else {
+        return false;
+    };
+    let (x, y) = (i128::from(x), i128::from(y));
+    let r = match op {
+        "add" => x + y,
+        "sub" => x - y,
+        "mul" => x * y,
+        _ => return false,
+    };
+    r.abs() > i128::from(TWO_53)
+}
+
+#[test]
+fn every_operation_matches_the_source_interpreter() {
+    let table = include_str!("luaj_numerics.txt");
+    let mut checked = 0;
+    for line in table.lines() {
+        let (lhs, rhs) = line.split_once(" = ").unwrap();
+        let theirs = parse(rhs);
+        let words: Vec<&str> = lhs.split(' ').collect();
+        let ours: Result<Val, Fail> = match words[..] {
+            [op, a, b] => {
+                let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
+                if outside(op, a, b) {
+                    continue;
+                }
+                let arith_op = |o| arith(o, a, b);
+                match op {
+                    "add" => arith_op(Arith::Add),
+                    "sub" => arith_op(Arith::Sub),
+                    "mul" => arith_op(Arith::Mul),
+                    "div" => arith_op(Arith::Div),
+                    "mod" => arith_op(Arith::Mod),
+                    "lt" => compare(Cmp::Lt, a, b).map(Val::Bool),
+                    "le" => compare(Cmp::Le, a, b).map(Val::Bool),
+                    "eq" => compare(Cmp::Eq, a, b).map(Val::Bool),
+                    "max" => extreme(true, a, b),
+                    "min" => extreme(false, a, b),
+                    other => panic!("{other}"),
+                }
+            }
+            [op, a] => {
+                let a = parse(a).unwrap();
+                match op {
+                    "neg" => neg(a),
+                    "floor" => math(MathFn::Floor, a),
+                    "ceil" => math(MathFn::Ceil, a),
+                    "abs" => math(MathFn::Abs, a),
+                    other => panic!("{other}"),
+                }
+            }
+            _ => panic!("{line}"),
+        };
+        match (ours, theirs) {
+            (Ok(o), Some(t)) => assert!(same(o, t), "{lhs}: {o:?} vs the source's {t:?}"),
+            (Err(Fail::Error), None) => {}
+            (o, t) => panic!("{lhs}: {o:?} vs the source's {t:?}"),
+        }
+        checked += 1;
+    }
+    assert!(checked > 9_000, "{checked}");
+}
 
 fn grid() -> Vec<Val> {
     let ints = [
@@ -33,7 +148,6 @@ fn grid() -> Vec<Val> {
     ];
     let floats = [
         0.0,
-        -0.0,
         0.5,
         -0.5,
         1.5,
@@ -44,11 +158,9 @@ fn grid() -> Vec<Val> {
         f64::NEG_INFINITY,
         f64::NAN,
         9_007_199_254_740_992.0,
-        9_007_199_254_740_993.0,
         9_223_372_036_854_775_808.0,
         -9_223_372_036_854_775_808.0,
         4_294_967_296.0,
-        2_147_483_648.0,
         1e300,
     ];
     ints.into_iter()
@@ -76,16 +188,17 @@ fn from_lua(v: &Value) -> Val {
     }
 }
 
-/// Whether `a` and `b` are the same Lua value: one subtype, a float by
-/// its bits (any NaN equal to any NaN).
-fn same(a: Val, b: Val) -> bool {
+/// The same Lua 5.4 value: one subtype, a float by its bits (any NaN equal
+/// to any NaN, the two zeros equal: the source has only +0).
+fn same_54(a: Val, b: Val) -> bool {
     match (a, b) {
-        (Val::Float(x), Val::Float(y)) => (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits(),
+        (Val::Float(x), Val::Float(y)) => {
+            (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits() || (x == 0.0 && y == 0.0)
+        }
         _ => a == b,
     }
 }
 
-/// The VM's result of `f(args)`: its value, or `None` for an error.
 fn vm(f: &Function, args: &[Val]) -> Option<Val> {
     let args: Vec<Value> = args.iter().copied().map(to_lua).collect();
     f.call::<Value>(mlua::MultiValue::from_iter(args))
@@ -94,36 +207,45 @@ fn vm(f: &Function, args: &[Val]) -> Option<Val> {
 }
 
 /// The program's result against the VM's: equal, an error where the VM
-/// raises, or an overflow where the VM's integer result wrapped.
+/// raises, or an overflow exactly where `wraps`.
 fn check(what: &str, ours: Result<Val, Fail>, theirs: Option<Val>, wraps: bool) {
     match (ours, theirs) {
-        (Ok(a), Some(b)) => assert!(same(a, b), "{what}: {a:?} vs the VM's {b:?}"),
+        (Ok(a), Some(b)) if !wraps => assert!(same_54(a, b), "{what}: {a:?} vs the VM's {b:?}"),
         (Err(Fail::Error), None) => {}
         (Err(Fail::Overflow), Some(_)) if wraps => {}
-        (o, t) => panic!("{what}: {o:?} vs the VM's {t:?}"),
+        (o, t) => panic!("{what} (wraps {wraps}): {o:?} vs the VM's {t:?}"),
     }
 }
 
+/// Where Lua 5.4 and the source agree: `+ - *` and `//`, each integer
+/// operation's overflow computed exactly.
 #[test]
-fn arithmetic_matches_the_vm() {
+fn arithmetic_matches_the_lua_vm_where_it_agrees() {
     let lua = Lua::new();
     let ops = [
-        (Arith::Add, "+"),
-        (Arith::Sub, "-"),
-        (Arith::Mul, "*"),
-        (Arith::Div, "/"),
-        (Arith::IDiv, "//"),
-        (Arith::Mod, "%"),
+        (
+            Arith::Add,
+            "+",
+            i64::checked_add as fn(i64, i64) -> Option<i64>,
+        ),
+        (Arith::Sub, "-", i64::checked_sub),
+        (Arith::Mul, "*", i64::checked_mul),
+        (Arith::IDiv, "//", |a: i64, b: i64| {
+            if b == 0 { Some(0) } else { a.checked_div(b) }
+        }),
     ];
     let g = grid();
-    for (op, sym) in ops {
+    for (op, sym, checked) in ops {
         let f: Function = lua
             .load(format!("return function(a, b) return a {sym} b end"))
             .eval()
             .unwrap();
         for &a in &g {
             for &b in &g {
-                let wraps = matches!((a, b), (Val::Int(_), Val::Int(_)));
+                let wraps = match (a, b) {
+                    (Val::Int(x), Val::Int(y)) => checked(x, y).is_none(),
+                    _ => false,
+                };
                 check(
                     &format!("{a:?} {sym} {b:?}"),
                     arith(op, a, b),
@@ -132,10 +254,9 @@ fn arithmetic_matches_the_vm() {
                 );
             }
         }
-        // Non-numbers raise.
         for bad in [Val::Nil, Val::Bool(true)] {
             check(
-                &format!("nil {sym}"),
+                &format!("{bad:?} {sym}"),
                 arith(op, bad, Val::Int(1)),
                 vm(&f, &[bad, Val::Int(1)]),
                 false,
@@ -145,30 +266,7 @@ fn arithmetic_matches_the_vm() {
 }
 
 #[test]
-fn comparisons_match_the_vm() {
-    let lua = Lua::new();
-    let g = grid();
-    for (op, sym) in [
-        (Cmp::Eq, "=="),
-        (Cmp::Ne, "~="),
-        (Cmp::Lt, "<"),
-        (Cmp::Le, "<="),
-    ] {
-        let f: Function = lua
-            .load(format!("return function(a, b) return a {sym} b end"))
-            .eval()
-            .unwrap();
-        for &a in g.iter().chain(&[Val::Nil, Val::Bool(false)]) {
-            for &b in g.iter().chain(&[Val::Nil, Val::Bool(false)]) {
-                let ours = compare(op, a, b).map(Val::Bool);
-                check(&format!("{a:?} {sym} {b:?}"), ours, vm(&f, &[a, b]), false);
-            }
-        }
-    }
-}
-
-#[test]
-fn math_matches_the_vm() {
+fn math_matches_the_lua_vm_where_it_agrees() {
     let lua = Lua::new();
     let g = grid();
     for (f, name) in [
@@ -188,28 +286,10 @@ fn math_matches_the_vm() {
             false,
         );
     }
-    for (max, name) in [(true, "max"), (false, "min")] {
-        let lf: Function = lua.load(format!("return math.{name}")).eval().unwrap();
-        for &a in &g {
-            for &b in &g {
-                check(
-                    &format!("{name}({a:?}, {b:?})"),
-                    extreme(max, a, b),
-                    vm(&lf, &[a, b]),
-                    false,
-                );
-            }
-        }
-    }
-    let neg: Function = lua.load("return function(a) return -a end").eval().unwrap();
+    let lneg: Function = lua.load("return function(a) return -a end").eval().unwrap();
     for &a in &g {
         let wraps = a == Val::Int(i64::MIN);
-        check(
-            &format!("-{a:?}"),
-            skin_model::present::num::neg(a),
-            vm(&neg, &[a]),
-            wraps,
-        );
+        check(&format!("-{a:?}"), neg(a), vm(&lneg, &[a]), wraps);
     }
 }
 

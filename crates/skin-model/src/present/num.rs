@@ -1,22 +1,35 @@
-//! The program's numerics: Lua 5.4's (`lvm.c`, `lmathlib.c`), shared by
-//! the executor and the importer's folding, so folding equals evaluation
-//! (design.md "beatoraja Lua Skins", numbers).
+//! The program's numerics: the source's interpreter's (LuaJ 3.0.2, Lua 5.2
+//! numbers, which are doubles), shared by the executor and the importer's
+//! folding, so folding equals evaluation and both equal what the source
+//! displays (design.md "beatoraja Lua Skins", numbers). An integer is kept
+//! as one while it is exact; every value is the double the source holds.
 //!
-//! - `+ - *` of two integers are checked ([`Fail::Overflow`] where Lua
-//!   would wrap); with a float operand both go through `f64`.
-//! - `/` is always a float division.
-//! - `//` and `%` floor; an integer divisor of 0 is a Lua error (the
-//!   compiler refuses one that can be 0); a float `%` is `fmod` with Lua's
-//!   sign adjustment.
-//! - An integer and a float compare exactly; ordering anything that is not
-//!   a number is a Lua error; `==` across types is false (an integer and a
-//!   float are one type, numbers).
+//! - `+ - *` of two integers are checked ([`Fail::Overflow`] past `i64`;
+//!   the compiler proves accepted code stays within ±2^53, where the
+//!   source's double is the same integer); with a float operand both go
+//!   through `f64`.
+//! - `/` is the source's `ddiv`: a float division, but a zero divisor
+//!   gives +inf for a positive dividend, NaN for zero and -inf otherwise
+//!   (NaN included).
+//! - `%` is the source's `dmod` in doubles: NaN for a zero divisor or an
+//!   infinite dividend, the dividend (or +inf for a negative one) over
+//!   +inf, the dividend (or -inf for a positive one) over -inf, else
+//!   `a - b * floor(a / b)`; an integer result that is exact stays one.
+//! - `//` is not in the source's grammar; it keeps Lua 5.4's floor
+//!   division, an integer divisor of 0 a Lua error.
+//! - Numbers compare as the doubles they are; ordering anything that is
+//!   not a number is a Lua error; `==` across types is false.
+//! - The source has no negative zero: a zero result is +0.
 //! - `floor` and `ceil` keep an integer and give an integer for a float
 //!   result that fits, else the float; `abs` of `i64::MIN` is
 //!   [`Fail::Overflow`]; `max` and `min` keep the first of equal
-//!   arguments, as the sandbox's library does.
+//!   arguments and NaN only where it comes first, as the source's do.
 //! - A result is converted as its consumer converts it
 //!   ([`to_bool`], [`to_int`], `SkinLuaAccessor.java:612-651` at `0.8.9`).
+//!
+//! The differential table `crates/skin-beatoraja/tests/luaj_numerics.txt`,
+//! generated from the source's interpreter by `xtask/luaj/Probe.java`,
+//! pins each operation.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -24,18 +37,19 @@ use super::{Arith, Cmp, Fail, MathFn, Val};
 
 /// 2^63 as a float: the first float past `i64`.
 const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+/// 2^53: the integers within it are exact doubles.
+const TWO_53: f64 = 9_007_199_254_740_992.0;
 
-/// An integer as a float, rounded to nearest as Lua's `cast_num` does.
+/// An integer as a float, rounded to nearest.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "Lua's integer-to-float conversion rounds to nearest"
+    reason = "the source's numbers are doubles; accepted integers are exact"
 )]
 fn float(n: i64) -> f64 {
     n as f64
 }
 
-/// Float `f` as an integer when it is one within `i64`
-/// (`lua_numbertointeger`).
+/// Float `f` as an integer when it is one within `i64`.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "checked integral and within i64 before the cast"
@@ -44,16 +58,21 @@ fn exact_int(f: f64) -> Option<i64> {
     (f.floor() == f && (-TWO_63..TWO_63).contains(&f)).then_some(f as i64)
 }
 
-/// A number's float value; `None` for a non-number.
+/// A float result as the source holds it: no negative zero.
+fn out(f: f64) -> Val {
+    Val::Float(if f == 0.0 { 0.0 } else { f })
+}
+
+/// A number's double; `None` for a non-number.
 fn num(v: Val) -> Option<f64> {
     match v {
         Val::Int(n) => Some(float(n)),
-        Val::Float(f) => Some(f),
+        Val::Float(f) => Some(if f == 0.0 { 0.0 } else { f }),
         Val::Nil | Val::Bool(_) => None,
     }
 }
 
-/// Floor division of integers, `b` not 0 (`luaV_idiv`).
+/// Floor division of integers, `b` not 0 (Lua 5.4's `luaV_idiv`).
 fn idiv(a: i64, b: i64) -> Result<i64, Fail> {
     if b == 0 {
         return Err(Fail::Error);
@@ -67,24 +86,29 @@ fn idiv(a: i64, b: i64) -> Result<i64, Fail> {
     })
 }
 
-/// Floor modulo of integers, `b` not 0 (`luaV_mod`).
-fn imod(a: i64, b: i64) -> Result<i64, Fail> {
-    if b == 0 {
-        return Err(Fail::Error);
+/// The source's float division (`LuaDouble.ddiv`).
+fn ddiv(a: f64, b: f64) -> f64 {
+    if b != 0.0 {
+        a / b
+    } else if a > 0.0 {
+        f64::INFINITY
+    } else if a == 0.0 {
+        f64::NAN
+    } else {
+        f64::NEG_INFINITY
     }
-    // `i64::MIN % -1` is 0, as in Lua.
-    let m = a.checked_rem(b).unwrap_or(0);
-    Ok(if m != 0 && ((m ^ b) < 0) { m + b } else { m })
 }
 
-/// Float modulo (`luai_nummod`): C's `fmod`, then `b` added where a
-/// nonzero result's sign differs from the divisor's.
-fn fmod(a: f64, b: f64) -> f64 {
-    let m = a % b;
-    if (m > 0.0 && b < 0.0) || (m < 0.0 && b > 0.0) {
-        m + b
+/// The source's modulo (`LuaDouble.dmod`).
+fn dmod(a: f64, b: f64) -> f64 {
+    if b == 0.0 || a.is_infinite() {
+        f64::NAN
+    } else if b == f64::INFINITY {
+        if a < 0.0 { f64::INFINITY } else { a }
+    } else if b == f64::NEG_INFINITY {
+        if a > 0.0 { f64::NEG_INFINITY } else { a }
     } else {
-        m
+        a - b * (a / b).floor()
     }
 }
 
@@ -92,30 +116,36 @@ fn fmod(a: f64, b: f64) -> f64 {
 ///
 /// # Errors
 ///
-/// [`Fail::Error`] for a non-number operand or an integer `//` or `%` by
-/// zero, [`Fail::Overflow`] where integer arithmetic would wrap.
+/// [`Fail::Error`] for a non-number operand or an integer `//` by zero,
+/// [`Fail::Overflow`] where integer arithmetic would wrap.
 pub fn arith(op: Arith, a: Val, b: Val) -> Result<Val, Fail> {
     if let (Val::Int(x), Val::Int(y)) = (a, b) {
         let r = match op {
             Arith::Add => x.checked_add(y).ok_or(Fail::Overflow)?,
             Arith::Sub => x.checked_sub(y).ok_or(Fail::Overflow)?,
             Arith::Mul => x.checked_mul(y).ok_or(Fail::Overflow)?,
-            Arith::Div => return Ok(Val::Float(float(x) / float(y))),
+            Arith::Div => return Ok(out(ddiv(float(x), float(y)))),
             Arith::IDiv => idiv(x, y)?,
-            Arith::Mod => imod(x, y)?,
+            Arith::Mod => {
+                let m = dmod(float(x), float(y));
+                return Ok(match exact_int(m) {
+                    Some(n) if m.abs() <= TWO_53 => Val::Int(n),
+                    _ => out(m),
+                });
+            }
         };
         return Ok(Val::Int(r));
     }
     let (Some(x), Some(y)) = (num(a), num(b)) else {
         return Err(Fail::Error);
     };
-    Ok(Val::Float(match op {
+    Ok(out(match op {
         Arith::Add => x + y,
         Arith::Sub => x - y,
         Arith::Mul => x * y,
-        Arith::Div => x / y,
+        Arith::Div => ddiv(x, y),
         Arith::IDiv => (x / y).floor(),
-        Arith::Mod => fmod(x, y),
+        Arith::Mod => dmod(x, y),
     }))
 }
 
@@ -127,7 +157,7 @@ pub fn arith(op: Arith, a: Val, b: Val) -> Result<Val, Fail> {
 pub fn neg(a: Val) -> Result<Val, Fail> {
     match a {
         Val::Int(n) => n.checked_neg().map(Val::Int).ok_or(Fail::Overflow),
-        Val::Float(f) => Ok(Val::Float(-f)),
+        Val::Float(f) => Ok(out(-f)),
         Val::Nil | Val::Bool(_) => Err(Fail::Error),
     }
 }
@@ -138,61 +168,7 @@ pub fn truthy(a: Val) -> bool {
     !matches!(a, Val::Nil | Val::Bool(false))
 }
 
-/// Whether integer `i` is less than float `f` (`LTintfloat`), or, with
-/// `eq`, at most it (`LEintfloat`); NaN orders nothing.
-fn int_lt_float(i: i64, f: f64, eq: bool) -> bool {
-    if f.is_nan() {
-        return false;
-    }
-    if f >= TWO_63 {
-        return true;
-    }
-    if f < -TWO_63 {
-        return false;
-    }
-    // Within i64 now: `i < f` is `i < ceil(f)`, `i <= f` is `i <= floor(f)`.
-    let bound = if eq { f.floor() } else { f.ceil() };
-    match exact_int(bound) {
-        Some(b) => {
-            if eq {
-                i <= b
-            } else {
-                i < b
-            }
-        }
-        // `ceil(f)` is 2^63: every integer is below it.
-        None => true,
-    }
-}
-
-/// Whether float `f` is less than integer `i` (`LTfloatint`), or, with
-/// `eq`, at most it (`LEfloatint`); NaN orders nothing.
-fn float_lt_int(f: f64, i: i64, eq: bool) -> bool {
-    if f.is_nan() {
-        return false;
-    }
-    if f >= TWO_63 {
-        return false;
-    }
-    if f < -TWO_63 {
-        return true;
-    }
-    // `f < i` is `floor(f) < i`, `f <= i` is `ceil(f) <= i`.
-    let bound = if eq { f.ceil() } else { f.floor() };
-    match exact_int(bound) {
-        Some(b) => {
-            if eq {
-                b <= i
-            } else {
-                b < i
-            }
-        }
-        None => false,
-    }
-}
-
-/// Whether `a` equals `b` (`luaV_equalobj`, raw): an integer and a float
-/// are equal when the float is exactly that integer.
+/// Whether `a` equals `b`, raw: numbers by their doubles.
 #[must_use]
 pub fn equal(a: Val, b: Val) -> bool {
     match (a, b) {
@@ -201,7 +177,7 @@ pub fn equal(a: Val, b: Val) -> bool {
         (Val::Int(x), Val::Int(y)) => x == y,
         #[expect(clippy::float_cmp, reason = "Lua's float equality is exact")]
         (Val::Float(x), Val::Float(y)) => x == y,
-        (Val::Int(i), Val::Float(f)) | (Val::Float(f), Val::Int(i)) => exact_int(f) == Some(i),
+        (Val::Int(_), Val::Float(_)) | (Val::Float(_), Val::Int(_)) => num(a) == num(b),
         _ => false,
     }
 }
@@ -233,15 +209,19 @@ pub fn compare(op: Cmp, a: Val, b: Val) -> Result<bool, Fail> {
                 x < y
             }
         }
-        (Val::Int(i), Val::Float(f)) => int_lt_float(i, f, le),
-        (Val::Float(f), Val::Int(i)) => float_lt_int(f, i, le),
+        (Val::Int(_), Val::Float(_)) | (Val::Float(_), Val::Int(_)) => {
+            let (Some(x), Some(y)) = (num(a), num(b)) else {
+                return Err(Fail::Error);
+            };
+            if le { x <= y } else { x < y }
+        }
         _ => return Err(Fail::Error),
     })
 }
 
-/// A float result of `floor` or `ceil` as Lua pushes it (`pushnumint`).
+/// A float result of `floor` or `ceil`: an integer when it is one.
 fn int_or_float(f: f64) -> Val {
-    exact_int(f).map_or(Val::Float(f), Val::Int)
+    exact_int(f).map_or(out(f), Val::Int)
 }
 
 /// `math.floor`, `math.ceil` or `math.abs` of `a`.
@@ -256,7 +236,7 @@ pub fn math(f: MathFn, a: Val) -> Result<Val, Fail> {
         (MathFn::Floor, Val::Float(x)) => Ok(int_or_float(x.floor())),
         (MathFn::Ceil, Val::Float(x)) => Ok(int_or_float(x.ceil())),
         (MathFn::Abs, Val::Int(n)) => n.checked_abs().map(Val::Int).ok_or(Fail::Overflow),
-        (MathFn::Abs, Val::Float(x)) => Ok(Val::Float(x.abs())),
+        (MathFn::Abs, Val::Float(x)) => Ok(out(x.abs())),
         (_, Val::Nil | Val::Bool(_)) => Err(Fail::Error),
     }
 }
@@ -276,7 +256,10 @@ pub fn extreme(max: bool, a: Val, b: Val) -> Result<Val, Fail> {
     } else {
         compare(Cmp::Lt, b, a)?
     };
-    Ok(if better { b } else { a })
+    Ok(match if better { b } else { a } {
+        Val::Float(f) => out(f),
+        v => v,
+    })
 }
 
 /// Lua's `toboolean()`, as a `draw` reads its result.
