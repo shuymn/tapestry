@@ -31,6 +31,15 @@
 //! score, the cursor's exact position, the place, the query and the selected
 //! chart's labels, summary and score.
 //!
+//! A [`ResultView`] is the result screen's snapshot: one view's result,
+//! its timing statistics and [`Timelines`], its best before the play and
+//! the chart's facts, each value shown, hidden or unavailable. A result
+//! skin ([`Skin::new_result`]) reads it through the [`RESULT`] schema: its
+//! [`ResultScreen`] is filled per view ([`Skin::update_result`]) and built
+//! per frame ([`Skin::build_result`]); a hidden value reads `i32::MIN`,
+//! which a number does not draw, and an unavailable one has its validity
+//! field false.
+//!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
 //! gauge, a judgment display, a line of text or the lanes widget on a
 //! keyframe [`Track`] on a timer, placed in one of seven [`Region`]s, and
@@ -82,6 +91,7 @@ mod observation;
 mod place;
 mod play;
 mod quad;
+mod result;
 mod schema;
 mod screen;
 mod select;
@@ -148,6 +158,16 @@ pub use play::{
     RoundedDuration, SkinFrame,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
+pub use result::schema::{
+    CLEAR_MAX, GRADE_MAX, HIDDEN, RESULT, VALUE_MAX as RESULT_VALUE_MAX, field as result_field,
+    timer as result_timer,
+};
+pub use result::view::{
+    BestFigures, BestRate, BestView, MAX_TIMELINE_BINS, ResultBpm, ResultChart, ResultLabels,
+    ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines,
+    TimelinesError, TimingStats, Unavailable,
+};
+pub use result::{ResultError, ResultFrame, ResultScreen, ResultTimers};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
 pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};
