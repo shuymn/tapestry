@@ -146,6 +146,8 @@ pub(crate) struct Prepare<'a> {
     pub(crate) cache: &'a mut TextCache,
     pub(crate) scratch: &'a mut TextScratch,
     pub(crate) producer: &'a dyn AttemptText,
+    /// The producer's bundle's text scope, which keys its lines.
+    pub(crate) scope: u64,
     /// The holders whose lines must stay.
     pub(crate) held: &'a [&'a Holder],
     #[cfg(test)]
@@ -177,6 +179,7 @@ pub(crate) fn prepare(
     let side = p.cache.side();
     let bounds = LineBounds::for_side(side);
     let producer = p.producer;
+    p.cache.set_scope(p.scope);
     let placement = p.cache.place(requests, bounds, p.held, |r, em, b| {
         producer.layout(r, em, b)
     });

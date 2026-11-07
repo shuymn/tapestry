@@ -1585,6 +1585,7 @@ impl Renderer {
                         cache,
                         scratch: &mut self.text_scratch,
                         producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
@@ -2659,6 +2660,7 @@ impl Renderer {
                         cache: &mut self.text_cache,
                         scratch: &mut self.text_scratch,
                         producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
@@ -2877,6 +2879,7 @@ impl Renderer {
                     cache: &mut slot.resources.text_cache,
                     scratch: &mut self.text_scratch,
                     producer: producer.as_ref(),
+                    scope: bundle.text_scope(),
                     held: &[&slot.text],
                     #[cfg(test)]
                     hooks: &mut self.text_hooks,
@@ -2893,6 +2896,7 @@ impl Renderer {
                     cache: &mut slot.resources.text_cache,
                     scratch: &mut self.text_scratch,
                     producer: producer.as_ref(),
+                    scope: bundle.text_scope(),
                     held: &[&slot.text, &held],
                     #[cfg(test)]
                     hooks: &mut self.text_hooks,
@@ -3155,6 +3159,7 @@ impl Renderer {
                         cache,
                         scratch: &mut self.text_scratch,
                         producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,

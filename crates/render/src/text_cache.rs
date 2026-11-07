@@ -52,18 +52,22 @@ pub const MAX_ROUNDS: u32 = 8;
 /// alignment.
 const ALIGN: u32 = skin_model::ALIGN;
 
-/// A line's key: its font, its string and the em it was laid out at, as
-/// `f32` bits.
+/// A line's key: the text scope it was laid out in, its font, its string
+/// and the em it was laid out at, as `f32` bits. A font names a file of its
+/// own skin's sheet, so two bundles sharing one text layer share no line
+/// unless they share their scope ([`TextCache::set_scope`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LineKey {
+    scope: u64,
     font: FontRef,
     text: String,
     em: u32,
 }
 
 impl LineKey {
-    fn of(req: &TextRequest, em: f32) -> Self {
+    fn of(req: &TextRequest, em: f32, scope: u64) -> Self {
         Self {
+            scope,
             font: req.font,
             text: req.text.clone(),
             em: em.to_bits(),
@@ -192,6 +196,8 @@ pub(crate) struct TextCache {
     entries: Vec<Entry>,
     aliases: Vec<Alias>,
     clock: u64,
+    /// The text scope the next placement keys its lines in.
+    scope: u64,
 }
 
 impl std::fmt::Debug for TextCache {
@@ -215,6 +221,7 @@ impl TextCache {
             entries: Vec::new(),
             aliases: Vec::new(),
             clock: 0,
+            scope: 0,
         }
     }
 
@@ -318,6 +325,14 @@ impl TextCache {
         self.entries.iter().find(|e| &e.key == key)
     }
 
+    /// Keys the next placements' lines in `scope`, the text scope of the
+    /// bundle whose producer lays them out
+    /// ([`SkinBundle::text_scope`](crate::SkinBundle::text_scope)): a line
+    /// another scope placed is never a hit.
+    pub(crate) fn set_scope(&mut self, scope: u64) {
+        self.scope = scope;
+    }
+
     /// Places `requests` (at most 64, in slot order) within `bounds`,
     /// laying out what it does not find with `layout`, never writing to
     /// or freeing an entry a holder of `held` holds. The new entries are
@@ -359,7 +374,7 @@ impl TextCache {
         // Every round failed: published hits stay, the rest get nothing.
         let mut slots = Vec::with_capacity(requests.len());
         for r in requests {
-            let alias = LineKey::of(r, r.em_px);
+            let alias = LineKey::of(r, r.em_px, self.scope);
             let line = self
                 .aliases
                 .iter()
@@ -403,9 +418,9 @@ impl TextCache {
         let mut pins: Vec<LineKey> = Vec::new();
         let hits_before = counts.hits;
         for r in requests {
-            let alias = LineKey::of(r, r.em_px);
+            let alias = LineKey::of(r, r.em_px, self.scope);
             let em = r.em_px.min(cap);
-            let mut key = LineKey::of(r, em);
+            let mut key = LineKey::of(r, em, self.scope);
             if first
                 && let Some(a) = self.aliases.iter().find(|a| a.key == alias)
                 && self.entry(&a.line).is_some_and(|e| e.published)

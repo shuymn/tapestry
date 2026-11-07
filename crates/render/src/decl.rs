@@ -136,7 +136,13 @@ pub struct SkinBundle {
     /// Whether its installation keeps a Lua VM, charged
     /// [`VM_TEXELS`](crate::VM_TEXELS) while committed.
     vm: bool,
+    /// The scope its producer's lines are keyed in within a text layer
+    /// ([`text_scope`](Self::text_scope)); 0 without a producer.
+    text_scope: u64,
 }
+
+/// The next text scope ([`SkinBundle::text_scope`]).
+static NEXT_TEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl fmt::Debug for SkinBundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -221,6 +227,7 @@ impl SkinBundle {
             scratch,
             text: None,
             vm: false,
+            text_scope: 0,
         })
     }
 
@@ -236,6 +243,7 @@ impl SkinBundle {
             return Err(BundleError::NoTextLayer);
         }
         self.text = Some(text);
+        self.text_scope = NEXT_TEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self)
     }
 
@@ -292,6 +300,16 @@ impl SkinBundle {
     #[must_use]
     pub fn atlas_id(&self) -> AtlasId {
         self.pages.id()
+    }
+
+    /// The scope its producer's lines are keyed in within a text layer:
+    /// one per bundle given a producer ([`with_text`](Self::with_text)),
+    /// so bundles sharing one atlas array, whose skins name fonts by their
+    /// own sheets' indices, never take each other's lines; 0 without a
+    /// producer.
+    #[must_use]
+    pub fn text_scope(&self) -> u64 {
+        self.text_scope
     }
 
     /// The producer of its attempts' and its loading frames' prepared
