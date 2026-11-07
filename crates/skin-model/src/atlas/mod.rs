@@ -95,7 +95,7 @@ pub struct AtlasLimits {
     pub reserved_layers: u32,
 }
 
-/// Why an atlas was not built.
+/// Why an atlas was not built or rebound.
 #[derive(Debug, thiserror::Error)]
 pub enum AtlasError {
     #[error("the atlas limits leave no layer, a side below {MIN_PAGE_SIDE} or a layer past u16")]
@@ -158,37 +158,35 @@ pub struct PackedPages {
     reserved_layers: u32,
     /// The skin folder the files were read from.
     root: PathBuf,
-    /// The files read, by their admitted identity, ordered by name.
-    files: Box<[HeldFile]>,
+    /// The files read, by their admitted identity (the version the
+    /// variant reads: its name in the skin folder and what its header gave
+    /// at load), ordered by name.
+    files: Box<[image::Version]>,
     /// Every cell placed, ordered by its source and rectangle.
     cells: Box<[HeldCell]>,
 }
 
 /// The held files and cells of a build.
-type Held = (Box<[HeldFile]>, Box<[HeldCell]>);
+type Held = (Box<[image::Version]>, Box<[HeldCell]>);
 
-/// A file read, by its admitted identity: its name in the skin folder in
-/// the version the variant reads, and what its header gave at load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HeldFile {
-    name: String,
-    dims: [u32; 2],
-    mode: decode::Mode,
+/// The index in `files`, ordered by name, of the file of `version`'s
+/// identity: its name, dimensions and decode mode.
+fn held_file(files: &[image::Version], version: &image::Version) -> Option<u32> {
+    let from = files.partition_point(|f| f.name.as_str() < version.name.as_str());
+    let i = files
+        .get(from..)?
+        .iter()
+        .take_while(|f| f.name == version.name)
+        .position(|f| f == version)?;
+    u32::try_from(from + i).ok()
 }
 
-/// Where a held cell's texels came from: an index into the held files, or
-/// a generated colour.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum HeldSource {
-    File(u32),
-    Solid([u8; 4]),
-}
-
-/// A cell placed: its source, its rectangle in the texels of the version
-/// read (`[0, 0, w, h]` for a generated cell), and where its content lies.
+/// A cell placed: its source (a file as an index into the held files, or
+/// a generated colour), its rectangle in the texels of the version read
+/// (`[0, 0, w, h]` for a generated cell), and where its content lies.
 #[derive(Clone, Copy, Debug)]
 struct HeldCell {
-    source: HeldSource,
+    source: CellSource,
     rect: [u32; 4],
     /// The content's left and top on its page, past the gutter.
     at: [u32; 2],
@@ -196,7 +194,7 @@ struct HeldCell {
 }
 
 impl HeldCell {
-    fn key(&self) -> (HeldSource, [u32; 4]) {
+    fn key(&self) -> (CellSource, [u32; 4]) {
         (self.source, self.rect)
     }
 }
@@ -241,20 +239,6 @@ impl PackedPages {
             .unwrap_or(u64::MAX)
     }
 
-    /// The held file of `version`'s identity.
-    fn file(&self, version: &image::Version) -> Option<u32> {
-        let from = self
-            .files
-            .partition_point(|f| f.name.as_str() < version.name.as_str());
-        let i = self
-            .files
-            .get(from..)?
-            .iter()
-            .take_while(|f| f.name == version.name)
-            .position(|f| f.dims == version.dims && f.mode == version.mode)?;
-        u32::try_from(from + i).ok()
-    }
-
     /// `sheet`'s uv table on these pages: one entry per frame, in the
     /// sheet's frame order, each its cell's placement. O(frames + cells
     /// log cells); it reads no file.
@@ -275,15 +259,15 @@ impl PackedPages {
                         .and_then(|f| files.get(f))
                         .ok_or(AtlasError::NotHeld)?
                         .version(variant);
-                    let file = self.file(version).ok_or(AtlasError::NotHeld)?;
+                    let file = held_file(&self.files, version).ok_or(AtlasError::NotHeld)?;
                     let rect = if hi {
                         cell.rect.map(|v| v * 2)
                     } else {
                         cell.rect
                     };
-                    (HeldSource::File(file), rect)
+                    (CellSource::File(file), rect)
                 }
-                CellSource::Solid(color) => (HeldSource::Solid(color), cell.rect),
+                CellSource::Solid(_) => (cell.source, cell.rect),
             };
             let i = self
                 .cells
@@ -595,40 +579,31 @@ impl Sheet {
                 .files()
                 .get(usize::try_from(file).ok()?)?
                 .version(variant);
-            Some(HeldFile {
-                name: version.name.clone(),
-                dims: version.dims,
-                mode: version.mode,
-            })
+            Some(version)
         };
         // File cells are grouped by file ([`CellSource`]'s order).
-        let mut files: Vec<HeldFile> = Vec::new();
+        let mut files: Vec<image::Version> = Vec::new();
         let mut last = None;
         for cell in self.cells() {
             if let CellSource::File(f) = cell.source
                 && last != Some(f)
             {
                 last = Some(f);
-                files.push(identity(f).ok_or(AtlasError::Misaligned)?);
+                files.push(identity(f).ok_or(AtlasError::Misaligned)?.clone());
             }
         }
         files.sort_by(|a, b| a.name.cmp(&b.name));
         files.dedup();
         let files = files.into_boxed_slice();
-        let index = |file: u32| {
-            let held = identity(file)?;
-            let from = files.partition_point(|f| f.name < held.name);
-            let i = files.get(from..)?.iter().position(|f| *f == held)?;
-            u32::try_from(from + i).ok()
-        };
+        let index = |file: u32| held_file(&files, identity(file)?);
         let mut cells = Vec::with_capacity(self.cells().len());
         for (i, cell) in self.cells().iter().enumerate() {
             let (Some(place), Some(&rect)) = (packing.places.get(i), rects.get(i)) else {
                 return Err(AtlasError::Misaligned);
             };
             let source = match cell.source {
-                CellSource::File(f) => HeldSource::File(index(f).ok_or(AtlasError::Misaligned)?),
-                CellSource::Solid(color) => HeldSource::Solid(color),
+                CellSource::File(f) => CellSource::File(index(f).ok_or(AtlasError::Misaligned)?),
+                CellSource::Solid(_) => cell.source,
             };
             let [x, y, ..] = place.alloc;
             cells.push(HeldCell {

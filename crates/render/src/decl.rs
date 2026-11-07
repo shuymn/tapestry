@@ -78,8 +78,8 @@ impl AttemptText for crate::OutlineText {
 /// Why a bundle was not made.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BundleError {
-    /// The atlas was built from another sheet than the skin's, or has
-    /// another number of frames.
+    /// The atlas's uv table, from its build or a rebind, is of another
+    /// sheet than the skin's, or has another number of frames.
     #[error("the atlas is not the skin's: {frames} frames for {expected}")]
     Atlas {
         /// The atlas's frames.
