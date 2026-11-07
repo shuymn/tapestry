@@ -912,25 +912,41 @@ fn prepare_result<R: Rig>(
     loop {
         let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
         let polled = rig.poll_result(&mut prep, deadline);
-        if rig.quitting() {
-            return Ok(Prepared::Leave);
-        }
-        while let Some(c) = rig.take_menu() {
-            let withdrawn = match c {
-                MenuCommand::Retry => Prepared::Retry,
-                MenuCommand::Back => Prepared::Leave,
-                MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
-            };
-            while rig.take_menu().is_some() {}
+        if let Some(withdrawn) = withdrawn(rig) {
             return Ok(withdrawn);
         }
         if rig.screen_failed() {
             rig.prepare_screen().map_err(LiveError::Screen)?;
+            // The rebuild waited on the screen: what came meanwhile is
+            // served before a ready preparation shows the result.
+            if let Some(withdrawn) = withdrawn(rig) {
+                return Ok(withdrawn);
+            }
         }
         if polled == Polled::Ready {
             return Ok(Prepared::Ready);
         }
     }
+}
+
+/// What the commands taken now do to a result's preparation
+/// ([`prepare_result`]): a close leaves, then the first quit, back or
+/// retry withdraws it, with the commands queued behind it; preset steps
+/// are dropped. `None` when nothing withdraws it.
+fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
+    if rig.quitting() {
+        return Some(Prepared::Leave);
+    }
+    while let Some(c) = rig.take_menu() {
+        let withdrawn = match c {
+            MenuCommand::Retry => Prepared::Retry,
+            MenuCommand::Back => Prepared::Leave,
+            MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
+        };
+        while rig.take_menu().is_some() {}
+        return Some(withdrawn);
+    }
+    None
 }
 
 /// One play, from preparing the screen to its report. `None` when the

@@ -232,6 +232,9 @@ struct Fake {
     prep_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// What happens during the next preparation's first poll.
     in_first_poll: Option<FirstPoll>,
+    /// What happens while the screen is built again during a result's
+    /// preparation, once.
+    in_rebuild: Option<FirstPoll>,
     /// Each preparation begun, with its clock time.
     preps: Vec<i64>,
     /// Each poll of a preparation: the clock time and its deadline.
@@ -246,7 +249,8 @@ struct Fake {
     menu_pressed: std::sync::Arc<std::sync::Mutex<Vec<game::MenuCommand>>>,
 }
 
-/// What happens during a preparation's first poll ([`Fake::in_first_poll`]).
+/// What happens during a preparation's first poll ([`Fake::in_first_poll`])
+/// or a rebuild of the screen during it ([`Fake::in_rebuild`]).
 #[derive(Clone, Copy, Debug)]
 enum FirstPoll {
     /// This in-play command is pressed.
@@ -255,6 +259,20 @@ enum FirstPoll {
     Menu(game::MenuCommand),
     /// The window closes.
     Close,
+    /// The screen fails.
+    ScreenFails,
+}
+
+impl Fake {
+    /// `what` happens now.
+    fn happen(&mut self, what: FirstPoll) {
+        match what {
+            FirstPoll::Command(c) => self.commands.push((i64::MIN, c)),
+            FirstPoll::Menu(c) => self.menu.push((i64::MIN, c)),
+            FirstPoll::Close => self.quitting = true,
+            FirstPoll::ScreenFails => self.screen_fails_at = self.clock.now().0,
+        }
+    }
 }
 
 /// [`Fake`]'s result preparation: dropped before it was found ready, it
@@ -352,6 +370,7 @@ impl Fake {
             disconnected_at: i64::MAX,
             prep_gate: None,
             in_first_poll: None,
+            in_rebuild: None,
             poll_deadlines: Vec::new(),
             screen_at: Vec::new(),
             preps: Vec::new(),
@@ -453,6 +472,11 @@ impl Rig for Fake {
         self.steps.push("screen");
         self.screen_at.push(self.clock.now().0);
         self.prepares += 1;
+        if !self.preps.is_empty()
+            && let Some(what) = self.in_rebuild.take()
+        {
+            self.happen(what);
+        }
         if self.quit_in_prepare {
             // The window closes while the screen gets ready.
             self.quitting = true;
@@ -749,13 +773,10 @@ impl Rig for Fake {
     fn poll_result(&mut self, prep: &mut FakePrep, deadline: TimeUs) -> game::Polled {
         prep.polls += 1;
         self.poll_deadlines.push((self.clock.now().0, deadline.0));
-        if prep.polls == 1 {
-            match self.in_first_poll.take() {
-                Some(FirstPoll::Command(c)) => self.commands.push((i64::MIN, c)),
-                Some(FirstPoll::Menu(c)) => self.menu.push((i64::MIN, c)),
-                Some(FirstPoll::Close) => self.quitting = true,
-                None => {}
-            }
+        if prep.polls == 1
+            && let Some(what) = self.in_first_poll.take()
+        {
+            self.happen(what);
         }
         let held = self
             .prep_gate
@@ -3155,6 +3176,39 @@ fn a_command_during_the_ready_poll_is_served_before_the_result() {
         rig.in_first_poll = Some(pressed);
         let (left, events) = with_blocked_save(&mut rig, || {});
         assert_eq!(left, leave, "{pressed:?}");
+        assert_eq!(rig.reports.len(), plays, "{pressed:?}");
+        assert!(saved(&rig.reports[0]), "{pressed:?}");
+        assert!(!result_of(&events, 1), "{pressed:?}");
+        assert_eq!(rig.shows, plays - 1, "{pressed:?}");
+        assert_eq!(result_of(&events, 2), plays == 2, "{pressed:?}");
+    }
+}
+
+/// The screen failing as the preparation is found ready is built again
+/// first, and a command or a close that arrives while it is rebuilt is
+/// served before the result shows: quit and back leave, retry plays the
+/// next attempt, a close ends the run; the first play's result never
+/// shows.
+#[test]
+fn a_command_during_a_screen_rebuild_is_served_before_the_result() {
+    for (pressed, plays, leave) in [
+        (FirstPoll::Command(Command::Quit), 1, game::Leave::Back),
+        (
+            FirstPoll::Menu(game::MenuCommand::Back),
+            1,
+            game::Leave::Back,
+        ),
+        (FirstPoll::Command(Command::Retry), 2, game::Leave::Back),
+        (FirstPoll::Close, 1, game::Leave::Quit),
+    ] {
+        let mut rig = Fake::new(Vec::new(), &[(30_000_000, Command::Quit)], i64::MAX);
+        rig.in_first_poll = Some(FirstPoll::ScreenFails);
+        rig.in_rebuild = Some(pressed);
+        let (left, events) = with_blocked_save(&mut rig, || {});
+        assert_eq!(left, leave, "{pressed:?}");
+        // The play's own screen preparation, then the rebuild.
+        assert!(rig.screen_at.len() >= 2, "{pressed:?}");
+        assert!(rig.screen_at[1] >= rig.preps[0], "{pressed:?}");
         assert_eq!(rig.reports.len(), plays, "{pressed:?}");
         assert!(saved(&rig.reports[0]), "{pressed:?}");
         assert!(!result_of(&events, 1), "{pressed:?}");
