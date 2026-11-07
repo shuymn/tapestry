@@ -640,3 +640,222 @@ fn the_first_what_if_fixes_the_axis_without_an_own_evaluation() {
     assert_eq!(early.graphs.traces[0].unwrap().columns, on_axis);
     assert_ne!(on_axis, on_own);
 }
+
+/// The timelines of `s`'s view: each bin's channels, bins in use only.
+fn bins(s: &ViewSummary) -> Vec<[u32; game::TIMELINE_CHANNELS]> {
+    s.graphs.timelines.used().to_vec()
+}
+
+/// C10, through evaluation then reduction: a tap on a note at 2 s judged
+/// early at 1 999 999 µs, the play aborted at that watermark. The judgment
+/// counts, in its note's bin 2 though the watermark is in bin 1, and the
+/// bins from 3 on are uncovered.
+#[test]
+fn an_early_judgment_keeps_its_notes_bin_past_the_watermark() {
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(2_000_000))
+        .tap(lane(2), TimeUs(5_000_000))
+        .build()
+        .unwrap();
+    let preset = rules::tapestry();
+    let w = TimeUs(1_999_999);
+    let rec = record(
+        &preset,
+        vec![press(1_999_999, 0, lane(1))],
+        EndStatus::EndedMidway,
+        w,
+    );
+    let r = re(&chart, &rec, &preset);
+    assert_eq!(r.coverage, Coverage::EndedMidway(w));
+    let s = summary(
+        &r,
+        &chart,
+        &preset,
+        Axis {
+            origin: TimeUs(0),
+            end: w,
+        },
+    );
+    let lines = &s.graphs.timelines;
+    assert_eq!((lines.axis.width, lines.axis.count), (TimeUs(1_000_000), 6));
+    let mut want = vec![[0; 9]; 6];
+    want[2][0] = 1;
+    assert_eq!(bins(&s), want);
+    assert_eq!(lines.uncovered_from, Some(3));
+}
+
+/// C10: a what-if whose input ends at `t` counts the judgments finalized
+/// at or before `t`, each in its note's bin: a press before `t`, a miss
+/// before `t`, a long note held to its end at `t` (in its head's bin), a
+/// press at `t`; not a long note ending after `t` nor a miss after it. The
+/// play as judged, its input recorded, counts them all and leaves no bin
+/// uncovered.
+#[test]
+fn judgments_count_by_finalization_and_sit_in_their_notes_bins() {
+    let s_ = |ms: i64| TimeUs(ms * MS);
+    let chart = ChartBuilder::new(150_000)
+        .tap(lane(1), s_(1_000))
+        .tap(lane(1), s_(2_000))
+        .long(lane(2), s_(2_500), s_(3_000))
+        .long(lane(3), s_(2_600), s_(3_500))
+        .tap(lane(1), s_(3_000))
+        .tap(lane(1), s_(5_000))
+        .build()
+        .unwrap();
+    let played = rules::tapestry();
+    let t = s_(3_000);
+    let events = vec![
+        press(1_000 * MS, 0, lane(1)),
+        release(1_050 * MS, lane(1)),
+        press(2_500 * MS, 0, lane(2)),
+        press(2_600 * MS, 0, lane(3)),
+        press(3_000 * MS, 0, lane(1)),
+    ];
+    let rec = record(&played, events, EndStatus::PlayedToEnd, t);
+    let other = RulePreset {
+        id: "other".to_owned(),
+        ..rules::tapestry()
+    };
+    let r = re(&chart, &rec, &other);
+    assert_eq!(r.coverage, Coverage::NoInputAfter(t));
+    let axis = Axis {
+        origin: TimeUs(0),
+        end: r.evaluation.final_deadline,
+    };
+    let s = summary(&r, &chart, &other, axis);
+    let mut want = vec![[0; 9]; 6];
+    want[1][0] = 1; // the press at 1 s
+    want[2][8] = 1; // the miss of the 2 s note, a late POOR
+    want[2][0] = 1; // the long note held to its end at `t`, at its head
+    want[3][0] = 1; // the press at `t`
+    assert_eq!(bins(&s), want);
+    assert_eq!(s.graphs.timelines.uncovered_from, Some(4));
+    // As judged, its input recorded through its watermark: every judgment
+    // of the evaluation counts, and every bin is covered.
+    let r = re(&chart, &rec, &played);
+    assert_eq!(r.coverage, Coverage::Recorded);
+    let s = summary(&r, &chart, &played, axis);
+    let lines = bins(&s);
+    assert_eq!(lines, want);
+    assert_eq!(s.graphs.timelines.uncovered_from, None);
+    // The channels add up to the evaluation's own totals.
+    let total: u32 = lines.iter().flatten().sum();
+    let c = r.evaluation.tally.counts;
+    assert_eq!(total, c.perfect + c.great + c.good + c.bad + c.poor);
+}
+
+/// C10: every channel, from events on a built chart: PERFECT; each other
+/// judgment early (a deviation of 0 or less) and late (after its note, or
+/// missed); a long note by whichever of its head and release lies farther
+/// from its time. Mines and empty POORs are no notes of it, and a 600 s
+/// chart takes 301 bins of 2 s.
+#[test]
+fn every_channel_and_the_wide_bins() {
+    use eval::{JudgeEvent, JudgeEventKind};
+    let long = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(0))
+        .tap(lane(1), TimeUs(600_000_000))
+        .build()
+        .unwrap();
+    let basis = game::ResultBasis::of(&long, None);
+    assert_eq!(
+        (basis.timeline.width, basis.timeline.count, basis.notes),
+        (TimeUs(2_000_000), 301, 2)
+    );
+    let mut b = ChartBuilder::new(150_000).mine(lane(7), TimeUs(0), 10);
+    for i in 0..10 {
+        b = b.tap(lane(1), TimeUs(i * 1_000_000));
+    }
+    let chart = b
+        .long(lane(2), TimeUs(0), TimeUs(500_000))
+        .long(lane(3), TimeUs(0), TimeUs(500_000))
+        .build()
+        .unwrap();
+    let basis = game::ResultBasis::of(&chart, None);
+    let judged =
+        |lane: bms_model::Lane, note, judgment, deviation: Option<i64>, release: Option<i64>| {
+            JudgeEvent {
+                seq: 0,
+                time: TimeUs(0),
+                origin: None,
+                kind: JudgeEventKind::Judged {
+                    lane,
+                    note,
+                    judgment,
+                    deviation: deviation.map(TimeUs),
+                    release: release.map(TimeUs),
+                    combo: 0,
+                    presses: 0,
+                },
+            }
+        };
+    let mut events = vec![judged(lane(1), 0, Judgment::Perfect, Some(5_000), None)];
+    for (i, j) in [
+        Judgment::Great,
+        Judgment::Good,
+        Judgment::Bad,
+        Judgment::Poor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let note = 1 + 2 * i;
+        events.push(judged(
+            lane(1),
+            note,
+            j,
+            Some(if i == 0 { 0 } else { -1 }),
+            None,
+        ));
+        events.push(judged(
+            lane(1),
+            note + 1,
+            j,
+            if i == 3 { None } else { Some(1) },
+            None,
+        ));
+    }
+    // Head 30 ms late, released 40 ms early: early. Head 30 ms late,
+    // released 30 ms early, a tie: the release, early.
+    events.push(judged(
+        lane(2),
+        0,
+        Judgment::Good,
+        Some(30_000),
+        Some(-40_000),
+    ));
+    events.push(judged(
+        lane(3),
+        0,
+        Judgment::Bad,
+        Some(30_000),
+        Some(-30_000),
+    ));
+    events.push(JudgeEvent {
+        kind: JudgeEventKind::EmptyPoor {
+            lane: lane(1),
+            deviation: TimeUs(-1),
+            presses: 1,
+        },
+        ..events[0]
+    });
+    events.push(JudgeEvent {
+        kind: JudgeEventKind::MineHit {
+            lane: lane(7),
+            note: 0,
+        },
+        ..events[0]
+    });
+    let mut lines = game::Timelines::EMPTY;
+    lines.fill(&events, &chart, basis.timeline, Coverage::Recorded);
+    let mut want = vec![[0; 9]; 10];
+    want[0][0] = 1;
+    want[0][2] = 1; // the long notes' GOOD, early
+    want[0][3] = 1; // and BAD, early
+    for i in 0..4 {
+        want[1 + 2 * i][1 + i] = 1;
+        want[2 + 2 * i][5 + i] = 1;
+    }
+    assert_eq!(lines.used(), &want[..]);
+    assert_eq!(lines.uncovered_from, None);
+}

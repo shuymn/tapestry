@@ -416,3 +416,7 @@ fn channel(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs
         5 + grade
     }
 }
+
+#[cfg(test)]
+#[path = "result_figures_tests.rs"]
+mod tests;

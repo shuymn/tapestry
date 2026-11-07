@@ -4590,3 +4590,256 @@ fn an_unknown_shown_gauge_resolves_to_the_first_everywhere() {
         assert_eq!(one.closing.is_some(), closes, "{displayed}");
     }
 }
+
+/// A record sink that saves locally, answers the play's count as `count`
+/// says, and answers each view's best before the play by its preset's
+/// hash, noting each key it is asked.
+struct BestsSink {
+    local: game::LocalRecords,
+    count: Option<game::BestView>,
+    answers: Vec<([u8; 32], game::BestLookup)>,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<game::BestKey>>>,
+}
+
+impl game::RecordSink for BestsSink {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.local.save(rec)
+    }
+
+    fn after_result(&mut self, _: &game::SavedPlay<'_>) -> Option<game::BestView> {
+        self.count.clone()
+    }
+
+    fn best_before(&mut self, key: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.asked.lock().unwrap().push(*key);
+        self.answers
+            .iter()
+            .find(|(h, _)| *h == key.preset_sha256)
+            .map_or(game::BestLookup::Unavailable, |(_, a)| a.clone())
+    }
+}
+
+/// [`loaded`] of `chart` with a [`BestsSink`].
+fn loaded_with_bests(
+    dir: &Path,
+    chart: Chart,
+    count: Option<game::BestView>,
+    answers: Vec<([u8; 32], game::BestLookup)>,
+) -> (Loaded, std::sync::Arc<std::sync::Mutex<Vec<game::BestKey>>>) {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = OFFSET;
+    let chart_path = dir.join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let asked = std::sync::Arc::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        records: Some(Box::new(BestsSink {
+            local: game::LocalRecords::new(root.records()),
+            count,
+            answers,
+            asked: std::sync::Arc::clone(&asked),
+        })),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    (
+        Loaded::load(root, settings, &chart_path, config, parts).unwrap(),
+        asked,
+    )
+}
+
+/// A best of `ex`, `bp` and `clear`.
+fn best(ex: u32, bp: u32, clear: game::BestLamp) -> game::BestScore {
+    game::BestScore {
+        plays: 3,
+        ex: Some(ex),
+        bp: Some(bp),
+        clear: Some(clear),
+    }
+}
+
+/// The best comparison a result screen shows, which must be read.
+fn compared(screen: &ResultScreen) -> game::BestCompare {
+    ready(screen)
+        .best
+        .expect("the best was read before the view showed")
+}
+
+/// C7: the own view of a counted play compares with its count's previous
+/// best, read from no store; another view with the store's best under its
+/// preset before the play, read once per view; a known-empty best is the
+/// source's empty score.
+#[test]
+fn each_view_compares_with_its_presets_best_before_the_play() {
+    use game::BestCompare::Known;
+    use game::MenuCommand::{NextPreset, PrevPreset};
+    use game::{BestFigures, BestLamp, BestLookup, BestRate, BestView, Rate};
+    let dir = tempfile::tempdir().unwrap();
+    let hash = |p: &rules::RulePreset| replay::preset_hash(p);
+    let count = BestView::Counted {
+        play: (0, 0),
+        previous: Some(best(1, 5, BestLamp::Cleared { gauge: 0 })),
+        current: best(2, 1, BestLamp::Cleared { gauge: 0 }),
+        ineligible: None,
+    };
+    let answers = vec![
+        (
+            hash(&rules::beatoraja_style()),
+            BestLookup::Known(best(3, 0, BestLamp::FullCombo)),
+        ),
+        (hash(&rules::lr2_style()), BestLookup::KnownEmpty),
+        // Never asked: the own view takes the count's previous best.
+        (hash(&rules::tapestry()), BestLookup::KnownEmpty),
+    ];
+    let (mut loaded, asked) = loaded_with_bests(dir.path(), chart(), Some(count), answers);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(13_000_000, Command::Retry)], 16_000_000);
+    rig.menu = vec![
+        (11_000_000, NextPreset),
+        (11_100_000, NextPreset),
+        (11_200_000, PrevPreset),
+        (11_300_000, NextPreset),
+        (11_400_000, NextPreset),
+    ];
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let own = ready(shown(&rig, 10_999_000));
+    let (ex, bp) = (own.tally.ex_score, own.tally.bp);
+    // Two notes at the tapestry preset's largest weight.
+    assert_eq!((own.figures.notes, own.figures.max_ex), (2, 4));
+    assert!(ex > 1 && bp == 1, "{:?}", own.tally);
+    let rate = |best_ex| {
+        Some(BestRate {
+            rate: Rate::of(best_ex, 4).unwrap(),
+            updated: ex > best_ex,
+        })
+    };
+    assert_eq!(
+        compared(shown(&rig, 10_999_000)),
+        Known(BestFigures {
+            ex: 1,
+            ex_diff: i64::from(ex) - 1,
+            bp: Some(5),
+            bp_diff: Some(i64::from(bp) - 5),
+            clear: Some(BestLamp::Cleared { gauge: 0 }),
+            ex_updated: true,
+            bp_updated: true,
+            rate: rate(1),
+        })
+    );
+    let beatoraja = ready(shown(&rig, 11_050_000));
+    let max = beatoraja.figures.max_ex;
+    assert_eq!(
+        compared(shown(&rig, 11_050_000)),
+        Known(BestFigures {
+            ex: 3,
+            ex_diff: i64::from(beatoraja.tally.ex_score) - 3,
+            bp: Some(0),
+            bp_diff: Some(i64::from(beatoraja.tally.bp)),
+            clear: Some(BestLamp::FullCombo),
+            ex_updated: beatoraja.tally.ex_score > 3,
+            bp_updated: false,
+            rate: Some(BestRate {
+                rate: Rate::of(3, max).unwrap(),
+                updated: beatoraja.tally.ex_score > 3,
+            }),
+        })
+    );
+    let lr2 = ready(shown(&rig, 11_150_000));
+    let empty = compared(shown(&rig, 11_150_000));
+    assert_eq!(
+        empty,
+        Known(BestFigures {
+            ex: 0,
+            ex_diff: i64::from(lr2.tally.ex_score),
+            bp: None,
+            bp_diff: None,
+            clear: None,
+            ex_updated: lr2.tally.ex_score > 0,
+            bp_updated: true,
+            rate: Some(BestRate {
+                rate: Rate::of(0, lr2.figures.max_ex).unwrap(),
+                updated: lr2.tally.ex_score > 0,
+            }),
+        })
+    );
+    // Back on each view, its best is the one read before: each key asked
+    // once, the own never.
+    assert_eq!(
+        compared(shown(&rig, 11_250_000)),
+        compared(shown(&rig, 11_050_000))
+    );
+    assert_eq!(compared(shown(&rig, 11_350_000)), empty);
+    assert_eq!(
+        compared(shown(&rig, 11_450_000)),
+        compared(shown(&rig, 10_999_000))
+    );
+    let chart_sha = rig.reports[0]
+        .record
+        .as_ref()
+        .unwrap()
+        .chart
+        .identity
+        .sha256;
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(
+        asked,
+        [hash(&rules::beatoraja_style()), hash(&rules::lr2_style())].map(|preset_sha256| {
+            game::BestKey {
+                chart_sha256: chart_sha,
+                preset_sha256,
+            }
+        })
+    );
+}
+
+/// C7: a play that was not counted reads its own view's best from the
+/// store too, and an unavailable answer leaves every best value
+/// unavailable; a chart that declares `#RANDOM` has no best rate, while
+/// its EX and BP differences stay.
+#[test]
+fn an_uncounted_play_reads_its_own_best_and_a_random_chart_has_no_best_rate() {
+    use game::{BestCompare, BestLookup, BestView};
+    let tapestry = replay::preset_hash(&rules::tapestry());
+    let items = || vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let not_counted = || Some(BestView::NotCounted("not saved".to_owned()));
+    // Unavailable: nothing answers for the key.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut loaded, asked) = loaded_with_bests(dir.path(), chart(), not_counted(), Vec::new());
+    let mut rig = Fake::new(items(), &[(11_000_000, Command::Retry)], 12_000_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(compared(shown(&rig, 10_999_000)), BestCompare::Unavailable);
+    assert_eq!(asked.lock().unwrap()[0].preset_sha256, tapestry);
+    // Known on a `#RANDOM` chart: the differences, no rate.
+    let dir = tempfile::tempdir().unwrap();
+    let mut random = chart();
+    random.identity.random_results = vec![2];
+    let answers = vec![(
+        tapestry,
+        BestLookup::Known(best(1, 5, game::BestLamp::Failed)),
+    )];
+    let (mut loaded, _) = loaded_with_bests(dir.path(), random, not_counted(), answers);
+    let mut rig = Fake::new(items(), &[(11_000_000, Command::Retry)], 12_000_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let own = ready(shown(&rig, 10_999_000));
+    let BestCompare::Known(b) = compared(shown(&rig, 10_999_000)) else {
+        panic!("unavailable");
+    };
+    assert_eq!(b.ex_diff, i64::from(own.tally.ex_score) - 1);
+    assert_eq!(b.bp_diff, Some(i64::from(own.tally.bp) - 5));
+    assert_eq!(b.clear, Some(game::BestLamp::Failed));
+    assert_eq!(b.rate, None);
+    // The view's own rate still shows.
+    assert!(own.figures.rate.is_some());
+}
