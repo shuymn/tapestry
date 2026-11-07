@@ -1395,6 +1395,16 @@ fn skin_png_seeds_build_or_fail_as_built() {
 }
 
 #[test]
+fn present_seeds_verify_or_fail_as_built() {
+    let seeds = seeds::presents();
+    assert_names(&seeds, &["accepted", "jump_back", "enum_read"]);
+    for (name, data) in &seeds {
+        let want = (*name == "accepted").then_some(2);
+        assert_eq!(crate::present(data), want, "{name}");
+    }
+}
+
+#[test]
 fn skin_fnt_seeds_parse_or_fail_as_built() {
     use skin_model::FntErrorKind as K;
     let seeds = seeds::skin_fnts();

@@ -16,6 +16,10 @@
 //!
 //! `skin_model_build_bitmap_text` is `Skin::build` of 64 lines of 256
 //! kerned glyphs in a bitmap font, the widget quad cap.
+//!
+//! `skin_model_build_program` is `Skin::build` of a skin of a presentation
+//! program at the per-frame cap: 256 callbacks of 256 float instructions,
+//! `MAX_SKIN_OPS` in all, each converted for a number's value.
 
 #[path = "../tests/lanes_support/mod.rs"]
 mod lanes_support;
@@ -222,5 +226,70 @@ fn bench_bitmap_text(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_build, bench_widgets, bench_bitmap_text);
+/// 256 callbacks sharing one span of 256 instructions: a float multiplied
+/// and added 127 times, then returned.
+fn bench_program(c: &mut Criterion) {
+    use skin_model::present::{
+        Arith, CallbackDef, Conv, Insn, MAX_CALLBACK_OPS, OutTy, PresentDef, Val,
+    };
+    let mut code = vec![Insn::Const { dst: 0, k: 0 }];
+    for i in 0..(MAX_CALLBACK_OPS - 2) / 2 {
+        let op = if i % 2 == 0 { Arith::Mul } else { Arith::Add };
+        code.push(Insn::Const { dst: 1, k: 1 });
+        code.push(Insn::Arith {
+            op,
+            dst: 0,
+            a: 0,
+            b: 1,
+        });
+    }
+    code.push(Insn::Ret { src: 0 });
+    assert_eq!(code.len(), MAX_CALLBACK_OPS);
+    let n = skin_model::MAX_SKIN_OPS / MAX_CALLBACK_OPS;
+    let cb = CallbackDef {
+        start: 0,
+        len: MAX_CALLBACK_OPS as u16,
+        regs: 2,
+        conv: Conv::Int,
+        gate: None,
+        after: None,
+    };
+    let present = PresentDef {
+        code,
+        consts: vec![Val::Float(0.5), Val::Float(1.000_1)],
+        reads: Vec::new(),
+        callbacks: vec![cb; n],
+        signature: vec![OutTy::Int; n],
+    };
+    let skin = Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: play_support::REGIONS,
+        whens: Vec::new(),
+        sheet: widget_support::sheet(),
+        lanes: None,
+        elements: Vec::new(),
+        widgets: WidgetDefs::default(),
+        bomb_up_to: None,
+        close: None,
+        present: Some(present),
+    })
+    .expect("a program at the cap loads");
+    assert_eq!(skin.ops().total(), skin_model::MAX_SKIN_OPS);
+    let mut h = harness(skin);
+    h.frame(1_000, &[]);
+    c.bench_function("skin_model_build_program", |b| {
+        b.iter(|| {
+            h.frame(black_box(1_000), &[]);
+            black_box(h.play.state().fields.len())
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_build,
+    bench_widgets,
+    bench_bitmap_text,
+    bench_program
+);
 criterion_main!(benches);
