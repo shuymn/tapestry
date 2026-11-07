@@ -271,6 +271,7 @@ impl Tail {
 impl Rig for Tail {
     type Reader = SourceReader;
     type ScreenError = std::convert::Infallible;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         self.clock.now()

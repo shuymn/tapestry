@@ -2336,6 +2336,38 @@ mod tests {
         assert_eq!(shown, (1, 0, 1));
     }
 
+    /// ResultPreparing (design.md "State Model"): the result's input is
+    /// taken over as the preparation begins, so a key queued during the
+    /// play or its save is dropped there and one pressed after is the
+    /// result's; the input offset keys stay refused until the result shows.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_preparation_takes_the_result_input_and_offsets_wait_for_the_result() {
+        use crate::select::{MenuInput, MenuKey};
+        use game::Rig as _;
+        let (seen, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            let dir = tempfile::tempdir().unwrap();
+            let report = crate::end_screen::tests::report(rules::tapestry());
+            let screen = crate::end_screen::tests::screen(dir.path(), &report);
+            let tuning = Arc::clone(rig.controls.tuning());
+            // As a play starts: no screen reads the queues.
+            rig.result_input.release();
+            rig.result_input.menu.push(MenuInput::Key(MenuKey::Right));
+            rig.begin_result(&report, &screen);
+            let stale = rig.take_menu();
+            rig.result_input.menu.push(MenuInput::Key(MenuKey::Right));
+            let fresh = rig.take_menu();
+            let during = tuning.adjust(game::Adjust::InputOffsetUp);
+            rig.show_end(&report, &screen);
+            let shown = tuning.adjust(game::Adjust::InputOffsetUp);
+            (stale, fresh, during, shown)
+        });
+        assert_eq!(
+            seen,
+            (None, Some(game::MenuCommand::NextPreset), false, true)
+        );
+    }
+
     /// A fence the input thread does not answer within its bound fails the
     /// adjustments for good: the failure is the run's input failure, and
     /// nothing more is asked of the driver, whatever the input thread does

@@ -1,8 +1,9 @@
 //! The play lifecycle every driver shares (design.md "Play Lifecycle"): prepare
 //! → open recording (READY starts) → play → evaluation complete → audio
-//! tail → save → result, with retry, quit, focus loss, removal of the last
-//! device, suspend, an audio, screen or input-thread failure, and a session
-//! policy failure ending the play from any state.
+//! tail → save → the result's preparation → result, with retry, quit,
+//! focus loss, removal of the last device, suspend, an audio, screen or
+//! input-thread failure, and a session policy failure ending the play from
+//! any state.
 //!
 //! The world around the play is a [`Rig`]: the game's threads in the
 //! player, a virtual clock and scripted input in [`crate::Session`] and in
@@ -140,6 +141,9 @@ pub trait Rig {
     type Reader: SourceRead;
     /// Why the screen cannot draw a play.
     type ScreenError: std::error::Error + Send + Sync + 'static;
+    /// A result's preparation in progress ([`begin_result`](Self::begin_result)):
+    /// dropping it unfinished withdraws it.
+    type ResultPrep: Default;
 
     /// The clock every play's origin is on.
     fn now(&self) -> TimeUs;
@@ -383,6 +387,22 @@ pub trait Rig {
     }
     /// The play ended: its report, before any end screen.
     fn ended(&mut self, report: &PlayReport);
+    /// Begins the result's preparation (design.md "State Model",
+    /// ResultPreparing), once the play's save is over and the commands
+    /// pending then were taken as the play's: what the rig gives from here
+    /// on was pressed after the save. By default, ready at once.
+    fn begin_result(&mut self, report: &PlayReport, screen: &ResultScreen) -> Self::ResultPrep {
+        let _ = (report, screen);
+        Self::ResultPrep::default()
+    }
+    /// Advances the result's preparation, waiting until `deadline` on the
+    /// rig's clock at the latest while it is pending. Between polls the
+    /// flow takes the player's commands; one that leaves or retries drops
+    /// `prep` unfinished, the preparation's withdrawal. By default, ready.
+    fn poll_result(&mut self, prep: &mut Self::ResultPrep, deadline: TimeUs) -> Polled {
+        let _ = (prep, deadline);
+        Polled::Ready
+    }
     /// Shows the end screen of a play that was not retried or quit in its
     /// READY state, with its result screen's view; called again whenever the
     /// view changes or the screen was built again.
@@ -518,6 +538,15 @@ pub trait Rig {
     fn gate_exchange(&self) -> usize {
         0
     }
+}
+
+/// Where a result's preparation stands ([`Rig::poll_result`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Polled {
+    /// It is ready: the result can show.
+    Ready,
+    /// It is still running.
+    Pending,
 }
 
 /// What a request to rearm READY gave ([`Rig::rearm_candidate`]).
@@ -736,7 +765,9 @@ fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
 
 /// Plays one chart until the player leaves it: every play's report goes
 /// to [`Rig::ended`]; a play that was not retried, and not quit in its
-/// READY state, shows its result, which waits for a [`MenuCommand`]. The
+/// READY state, has its result prepared ([`prepare_result`]), where a
+/// fresh quit, back or retry withdraws it, then shows its result, which
+/// waits for a [`MenuCommand`]. The
 /// quit key before the chart starts ([`Loaded::starts_at`]) leaves the
 /// chart ([`Leave::Back`]); from then until the play is complete it aborts
 /// the play into Closing, whose end shows the result, ended midway (in
@@ -780,11 +811,16 @@ pub fn run_chart<R: Rig>(
             rig.wait();
             continue;
         }
+        let mut screen =
+            ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
+        match prepare_result(rig, &report, &screen)? {
+            Prepared::Ready => {}
+            Prepared::Retry => continue,
+            Prepared::Leave => return leave(rig),
+        }
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
-        let mut screen =
-            ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
         rig.show_end(&report, &screen);
         loop {
             // The wait ends at the shelf's poll deadline at the latest, so
@@ -839,6 +875,78 @@ pub fn run_chart<R: Rig>(
             }
         }
     }
+}
+
+/// How a result's preparation ended ([`prepare_result`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prepared {
+    /// It is ready: the result shows.
+    Ready,
+    /// A fresh retry withdrew it: the next attempt follows.
+    Retry,
+    /// A fresh quit or back, or a close, withdrew it: the chart is left.
+    Leave,
+}
+
+/// ResultPreparing (design.md "State Model"): the play is saved and
+/// counted, and the commands pending then were taken as the play's, so
+/// every command taken here is fresh. The rig's preparation is polled in
+/// short slices; between them a quit or back leaves and a retry retries,
+/// either dropping the preparation unfinished, with the commands queued
+/// behind it; a preset step is dropped, since the result opens on the
+/// played preset; a close leaves. A command taken during the poll that
+/// found it ready is still served before the result shows. A screen that
+/// failed meanwhile is built again, acknowledged, between polls, as on the
+/// result, so the result never shows on a failed screen.
+///
+/// # Errors
+///
+/// [`LiveError::Screen`] when the failed screen cannot be built again,
+/// which ends the run.
+fn prepare_result<R: Rig>(
+    rig: &mut R,
+    report: &PlayReport,
+    screen: &ResultScreen,
+) -> Result<Prepared, LiveError<R::ScreenError>> {
+    let mut prep = rig.begin_result(report, screen);
+    loop {
+        let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
+        let polled = rig.poll_result(&mut prep, deadline);
+        if let Some(withdrawn) = withdrawn(rig) {
+            return Ok(withdrawn);
+        }
+        if rig.screen_failed() {
+            rig.prepare_screen().map_err(LiveError::Screen)?;
+            // The rebuild waited on the screen: what came meanwhile is
+            // served before a ready preparation shows the result.
+            if let Some(withdrawn) = withdrawn(rig) {
+                return Ok(withdrawn);
+            }
+        }
+        if polled == Polled::Ready {
+            return Ok(Prepared::Ready);
+        }
+    }
+}
+
+/// What the commands taken now do to a result's preparation
+/// ([`prepare_result`]): a close leaves, then the first quit, back or
+/// retry withdraws it, with the commands queued behind it; preset steps
+/// are dropped. `None` when nothing withdraws it.
+fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
+    if rig.quitting() {
+        return Some(Prepared::Leave);
+    }
+    while let Some(c) = rig.take_menu() {
+        let withdrawn = match c {
+            MenuCommand::Retry => Prepared::Retry,
+            MenuCommand::Back => Prepared::Leave,
+            MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
+        };
+        while rig.take_menu().is_some() {}
+        return Some(withdrawn);
+    }
+    None
 }
 
 /// One play, from preparing the screen to its report. `None` when the

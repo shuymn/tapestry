@@ -785,6 +785,7 @@ pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
 impl Rig for PlayerRig<'_> {
     type Reader = SourceReader;
     type ScreenError = ScreenError;
+    type ResultPrep = ();
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
@@ -1437,12 +1438,18 @@ impl Rig for PlayerRig<'_> {
         self.persist();
     }
 
-    fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
-        // On entry: what was queued during the play is no result's.
+    /// The result's input is taken over as its preparation begins, after
+    /// the save: what was queued during the play and the save is no
+    /// result's, and what comes from here on is fresh. The built-in result
+    /// needs nothing more, so the preparation is ready at once.
+    fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
         }
+    }
+
+    fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
         self.print_view(screen);
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
