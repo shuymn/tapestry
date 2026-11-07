@@ -6,7 +6,7 @@
 //! integers, and is a fixed size whatever the play.
 
 use bms_model::{Chart, NoteKind, TimeUs};
-use eval::{Evaluation, JudgeEvent, JudgeEventKind};
+use eval::{Evaluation, JudgeEvent, JudgeEventKind, side_deviation};
 use replay::verify::Coverage;
 use rules::{GaugeValue, Judgment, RulePreset};
 
@@ -540,19 +540,6 @@ fn channel(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs
         1 + grade
     } else {
         5 + grade
-    }
-}
-
-/// The deviation that decides a judgment's side, as [`eval::Tally`] counts
-/// it (design.md "Evaluation Stages", accounting): for a long note
-/// finished by a release, whichever of its head's press and its release
-/// lies farther from its time, the release on a tie; otherwise the
-/// press's, `None` for a miss.
-fn side_deviation(deviation: Option<TimeUs>, release: Option<TimeUs>) -> Option<TimeUs> {
-    match (deviation, release) {
-        (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
-        (_, Some(r)) => Some(r),
-        (head, None) => head,
     }
 }
 

@@ -99,19 +99,29 @@ fn press(d: i64) -> JudgeEvent {
 }
 
 fn judged(deviation: Option<TimeUs>, release: Option<TimeUs>) -> JudgeEvent {
+    judged_as(Judgment::Great, deviation, release)
+}
+
+/// A note judged `judgment`, its head's deviation and its release's.
+fn judged_as(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs>) -> JudgeEvent {
+    event(JudgeEventKind::Judged {
+        lane: Lane::SCRATCH,
+        note: 0,
+        judgment,
+        deviation,
+        release,
+        combo: 0,
+        presses: 0,
+    })
+}
+
+/// An event of `kind` at time 0.
+fn event(kind: JudgeEventKind) -> JudgeEvent {
     JudgeEvent {
         seq: 0,
         time: TimeUs(0),
         origin: None,
-        kind: JudgeEventKind::Judged {
-            lane: Lane::SCRATCH,
-            note: 0,
-            judgment: Judgment::Great,
-            deviation,
-            release,
-            combo: 0,
-            presses: 0,
-        },
+        kind,
     }
 }
 
@@ -256,20 +266,9 @@ fn timeline_bins_widen_past_the_cap() {
     assert!(usize::from(axis.count) <= super::MAX_TIMELINE_BINS);
 }
 
-/// A note judged `judgment`, its head's deviation and its release's.
+/// [`judged_as`] in µs.
 fn note(judgment: Judgment, deviation: Option<i64>, release: Option<i64>) -> JudgeEvent {
-    JudgeEvent {
-        kind: JudgeEventKind::Judged {
-            lane: Lane::SCRATCH,
-            note: 0,
-            judgment,
-            deviation: deviation.map(TimeUs),
-            release: release.map(TimeUs),
-            combo: 0,
-            presses: 0,
-        },
-        ..judged(None, None)
-    }
+    judged_as(judgment, deviation.map(TimeUs), release.map(TimeUs))
 }
 
 /// S10-09i: numbers 372 and 373, the source's penalized mean absolute
@@ -339,4 +338,48 @@ fn the_mean_duration_is_the_sources_penalized_mean() {
     );
     assert_eq!(mean_duration(&[], 0), None);
     assert_eq!(mean_duration(&[hit(Perfect, 5)], 0), None);
+}
+
+/// S10-09i: an aborted play's events hold feedback beside its judged
+/// notes (a held head, a gauge change, a hold's end); only `Judged` events
+/// are notes judged. Three notes, one hit 2 000 µs early, two left
+/// unjudged: (2 000 + 2 · 1 000 000) / 3, rounded down = 667 333 µs.
+#[test]
+fn feedback_events_are_not_judged_notes() {
+    use super::mean_duration;
+    use rules::GaugeValue;
+    let held = event(JudgeEventKind::LnHeld {
+        lane: Lane::SCRATCH,
+        note: 1,
+        judgment: Judgment::Great,
+        deviation: TimeUs(-3_000),
+        presses: 1,
+    });
+    let gauge = event(JudgeEventKind::Gauge {
+        gauge: 0,
+        value: GaugeValue::FULL,
+        reference: GaugeValue::FULL,
+    });
+    let ended = event(JudgeEventKind::LnHoldEnded {
+        lane: Lane::SCRATCH,
+        note: 1,
+    });
+    let hit = judged_as(Judgment::Perfect, Some(TimeUs(-2_000)), None);
+    let events = [held, hit, gauge, ended];
+    assert_eq!(mean_duration(&events, 3), Some(667_333));
+}
+
+/// S10-09i: a long note whose head is graded BAD is decided at the press
+/// with no release (design.md "LN Judgment Modes"; the evaluator's event,
+/// eval's `t3_a_bad_head_decides_its_long_note_at_the_press`), so its
+/// duration is the head's: 200 ms for a head 200 ms late released 500 ms
+/// early, where the source, which scores the release, takes 500 ms.
+#[test]
+fn a_bad_head_long_note_takes_its_heads_duration() {
+    use super::mean_duration;
+    let bad_head = judged_as(Judgment::Bad, Some(TimeUs(200_000)), None);
+    assert_eq!(mean_duration(&[bad_head], 1), Some(200_000));
+    // Had a release been attached, the farther side would be taken.
+    let released = judged_as(Judgment::Bad, Some(TimeUs(200_000)), Some(TimeUs(-500_000)));
+    assert_eq!(mean_duration(&[released], 1), Some(500_000));
 }
