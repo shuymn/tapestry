@@ -892,12 +892,12 @@ fn with_facts(entry: &str, facts: &super::facts::ImportFacts) -> (Captures, Lowe
 
 /// A play snapshot with every fact known.
 fn known() -> super::facts::ImportFacts {
-    use super::facts::{ChartRank, Fact, ImportFacts};
+    use super::facts::{Fact, ImportFacts, JudgeClass};
     use skin_model::ScreenKind;
     ImportFacts {
         scene: ScreenKind::Play,
         autoplay: Fact::Known(true),
-        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+        judge_class: Fact::Known(Some(JudgeClass::Normal)),
         play_level: Fact::Known(12),
     }
 }

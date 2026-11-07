@@ -1,7 +1,7 @@
 //! The play level's parse, and an attempt's facts from loaded chart files
-//! under the play presets' header policies.
+//! under either play preset.
 
-use skin_beatoraja::{ChartRank, Fact, ImportFacts, JudgeClass};
+use skin_beatoraja::{Fact, ImportFacts, JudgeClass};
 use skin_model::ScreenKind;
 
 use super::{attempt_facts, level_of};
@@ -94,60 +94,108 @@ fn an_attempt_reads_the_loaders_level() {
     }
 }
 
-/// The class an attempt reads is the one the play preset's header policy
-/// gives: `#RANK 3` is easy under each preset, a `#DEFEXRANK` its band
-/// where the policy reads it over a later `#RANK`, and no rank the class
-/// of `#RANK 2`. Autoplay is the session's.
+/// The judgment class for a chart of these headers: first the reference's,
+/// the output of the decoder (jbms-parser) and validation
+/// (`BMSPlayerRule.validate`, twice, as the song data takes the chart)
+/// banded as options 180 to 184 band them, at beatoraja's `0.8.9` tag, run
+/// on these inputs with a 7-key chart; then the one shown here, from the
+/// beatoraja-style header policy's reading (`JudgeClass::of_headers`). The
+/// validated rank is in each comment, and where the policy reads the
+/// headers otherwise than that decoder (a decimal `#DEFEXRANK`, one past
+/// `i32`, a `#DEFEXRANK` before a `#RANK`), what it reads.
+pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeClass>)] = {
+    use JudgeClass::{Easy, Hard, Normal, VeryEasy, VeryHard};
+    &[
+        ("", Some(Normal), Some(Normal)),                            // 75
+        ("#RANK 0\n", Some(VeryHard), Some(VeryHard)),               // 25
+        ("#RANK 1\n", Some(Hard), Some(Hard)),                       // 50
+        ("#RANK 2\n", Some(Normal), Some(Normal)),                   // 75
+        ("#RANK 3\n", Some(Easy), Some(Easy)),                       // 100
+        ("#RANK 4\n", Some(VeryEasy), Some(VeryEasy)),               // 125
+        ("#RANK 5\n", Some(Normal), Some(Normal)),                   // refused: 75
+        ("#RANK -1\n", Some(Normal), Some(Normal)),                  // refused: 75
+        ("#RANK 7\n", Some(Normal), Some(Normal)),                   // refused: 75
+        ("#RANK 100\n", Some(Normal), Some(Normal)),                 // refused: 75
+        ("#RANK x\n", Some(Normal), Some(Normal)),                   // refused: 75
+        ("#RANK 2.5\n", Some(Normal), Some(Normal)),                 // refused: 75
+        ("#RANK +3\n", Some(Easy), Some(Easy)),                      // 100
+        ("#RANK 03\n", Some(Easy), Some(Easy)),                      // 100
+        ("#RANK -0\n", Some(VeryHard), Some(VeryHard)),              // 25
+        ("#rank 3\n", Some(Easy), Some(Easy)),                       // 100
+        ("#RANK 3 4\n", Some(Normal), Some(Normal)),                 // refused: 75
+        ("#DEFEXRANK 1\n", Some(Easy), Some(Easy)),                  // 0, then 100
+        ("#DEFEXRANK 2\n", Some(Hard), Some(Hard)),                  // 1
+        ("#DEFEXRANK 10\n", None, None),                             // 7
+        ("#DEFEXRANK 13\n", None, None),                             // 9
+        ("#DEFEXRANK 14\n", Some(VeryHard), Some(VeryHard)),         // 10
+        ("#DEFEXRANK 34.9\n", Some(Normal), Some(VeryHard)), // refused: 75; here 34 read: 25
+        ("#DEFEXRANK 35\n", Some(VeryHard), Some(VeryHard)), // 26
+        ("#DEFEXRANK 46\n", Some(VeryHard), Some(VeryHard)), // 34
+        ("#DEFEXRANK 47\n", Some(Hard), Some(Hard)),         // 35
+        ("#DEFEXRANK 79\n", Some(Hard), Some(Hard)),         // 59
+        ("#DEFEXRANK 80\n", Some(Normal), Some(Normal)),     // 60
+        ("#DEFEXRANK 100\n", Some(Normal), Some(Normal)),    // 75
+        ("#DEFEXRANK 113\n", Some(Normal), Some(Normal)),    // 84
+        ("#DEFEXRANK 114\n", Some(Easy), Some(Easy)),        // 85
+        ("#DEFEXRANK 120\n", Some(Easy), Some(Easy)),        // 90
+        ("#DEFEXRANK 146\n", Some(Easy), Some(Easy)),        // 109
+        ("#DEFEXRANK 147\n", Some(VeryEasy), Some(VeryEasy)), // 110
+        ("#DEFEXRANK 1000\n", Some(VeryEasy), Some(VeryEasy)), // 750
+        ("#DEFEXRANK +120\n", Some(Easy), Some(Easy)),       // 90
+        ("#DEFEXRANK 120.0\n", Some(Normal), Some(Easy)),    // refused: 75; here 120 read: 90
+        ("#DEFEXRANK 1E2\n", Some(Normal), Some(Normal)),    // refused: 75; here 100 read: 75
+        ("#DEFEXRANK 0\n", Some(Normal), Some(Normal)),      // refused: 75
+        ("#DEFEXRANK -5\n", Some(Normal), Some(Normal)),     // refused: 75
+        ("#DEFEXRANK x\n", Some(Normal), Some(Normal)),      // refused: 75
+        ("#DEFEXRANK 120 x\n", Some(Normal), Some(Normal)),  // refused: 75
+        ("#DEFEXRANK 3000000000\n", Some(Normal), Some(VeryEasy)), // refused: 75; here read past i32: 2250000000
+        ("#DEFEXRANK 2147483647\n", Some(VeryEasy), Some(VeryEasy)), // wraps: 21474835
+        ("#DEFEXRANK 28633115\n", Some(VeryEasy), Some(VeryEasy)), // 21474836
+        ("#DEFEXRANK 28633116\n", Some(Easy), Some(Easy)),         // wraps: -21474835, then 100
+        ("#DEFEXRANK 57266231\n", Some(Easy), Some(Easy)),         // wraps: 0, then 100
+        ("#DEFEXRANK 57266232\n", Some(Hard), Some(Hard)),         // wraps: 1
+        // The last header accepted counts, whichever it is.
+        ("#RANK 3\n#DEFEXRANK 120\n", Some(Easy), Some(Easy)), // 90
+        ("#DEFEXRANK 120\n#RANK 3\n", Some(Easy), Some(Easy)), // 100; here #DEFEXRANK read: 90
+        ("#RANK 0\n#DEFEXRANK 120\n", Some(Easy), Some(Easy)), // 90
+        ("#DEFEXRANK 120\n#RANK 0\n", Some(VeryHard), Some(Easy)), // 25; here #DEFEXRANK read: 90
+        ("#RANK 0\n#DEFEXRANK 0\n", Some(VeryHard), Some(VeryHard)), // 25
+        ("#DEFEXRANK 0\n#RANK 0\n", Some(VeryHard), Some(VeryHard)), // 25
+        ("#RANK 3\n#DEFEXRANK x\n", Some(Easy), Some(Easy)),   // 100
+        ("#DEFEXRANK 120\n#RANK x\n", Some(Easy), Some(Easy)), // 90
+        ("#RANK 1\n#RANK 3\n", Some(Easy), Some(Easy)),        // 100
+        ("#RANK 3\n#RANK 9\n", Some(Easy), Some(Easy)),        // 100
+        ("#DEFEXRANK 120\n#DEFEXRANK 0\n", Some(Easy), Some(Easy)), // 90
+        // Within the `#RANDOM` branch the load takes.
+        // 100
+        (
+            "#RANDOM 1\n#IF 1\n#RANK 3\n#ENDIF\n#ENDRANDOM\n",
+            Some(Easy),
+            Some(Easy),
+        ),
+    ]
+};
+
+/// The class an attempt reads is the one shown for the chart's headers
+/// ([`REFERENCE_CLASSES`]) under either play preset, whatever rank the
+/// preset judges with. Autoplay is the session's.
 #[test]
-fn an_attempt_reads_the_class_its_preset_judges_with() {
-    let class = |f: &ImportFacts| match f.chart_rank {
-        Fact::Known(r) => JudgeClass::of(r),
-        other => panic!("{other:?}"),
-    };
-    for (text, preset, rank, judged) in [
-        (
-            "#RANK 3\n",
-            "tapestry",
-            Some(ChartRank::Rank(3)),
-            JudgeClass::Easy,
-        ),
-        (
-            "#RANK 3\n",
-            "beatoraja-style",
-            Some(ChartRank::Rank(3)),
-            JudgeClass::Easy,
-        ),
-        // The tapestry policy keeps the later declaration of the shared
-        // slot; the other reads `#DEFEXRANK` over any `#RANK`.
-        (
-            "#DEFEXRANK 120\n#RANK 1\n",
-            "tapestry",
-            Some(ChartRank::Rank(1)),
-            JudgeClass::Hard,
-        ),
-        (
-            "#DEFEXRANK 120\n#RANK 1\n",
-            "beatoraja-style",
-            Some(ChartRank::DefExRankMilli(120_000)),
-            JudgeClass::VeryEasy,
-        ),
-        // A `#RANK` the policy refuses is no rank.
-        ("#RANK 7\n", "beatoraja-style", None, JudgeClass::Normal),
-        ("", "tapestry", None, JudgeClass::Normal),
-    ] {
-        for autoplay in [false, true] {
-            let facts = attempt_facts(&loaded(text, preset), autoplay);
-            assert_eq!(
-                facts,
-                ImportFacts {
-                    scene: ScreenKind::Play,
-                    autoplay: Fact::Known(autoplay),
-                    chart_rank: Fact::Known(rank),
-                    play_level: Fact::Known(0),
-                },
-                "{text:?} {preset}"
-            );
-            assert_eq!(class(&facts), Some(judged), "{text:?} {preset}");
+fn an_attempt_reads_the_references_class_whatever_the_preset() {
+    for &(text, _, class) in REFERENCE_CLASSES {
+        for preset in ["tapestry", "beatoraja-style"] {
+            for autoplay in [false, true] {
+                let facts = attempt_facts(&loaded(text, preset), autoplay);
+                assert_eq!(
+                    facts,
+                    ImportFacts {
+                        scene: ScreenKind::Play,
+                        autoplay: Fact::Known(autoplay),
+                        judge_class: Fact::Known(class),
+                        play_level: Fact::Known(0),
+                    },
+                    "{text:?} {preset}"
+                );
+            }
         }
     }
 }

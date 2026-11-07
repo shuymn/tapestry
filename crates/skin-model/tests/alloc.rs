@@ -1984,6 +1984,7 @@ fn build_does_not_allocate() {
                 autoplay: true,
                 meta: skin_model::ChartMetadata {
                     difficulty: Some(3),
+                    judge_class: Some(1),
                     total: Some(300),
                     bga: Some(true),
                 },

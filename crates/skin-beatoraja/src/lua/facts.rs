@@ -12,13 +12,10 @@
 //! - 33 and 32, autoplay on and off (`:413-416`): the snapshot's
 //!   [`ImportFacts::autoplay`] on [`ScreenKind::Play`], a constant `false` on
 //!   every other scene, as the source's are off the play state;
-//! - 180 to 184, the chart's judgment class (`:448-452`): the source's
-//!   bands over [`ImportFacts::chart_rank`], the rank the play preset's
-//!   header policy reads (which the evaluator judges with), where the
-//!   source bands the chart's raw rank. A chart the policy reads no rank
-//!   from is judged with the window policy's absent window, which is the
-//!   `#RANK 2` window in every shipped preset, so its class is
-//!   [`JudgeClass::Normal`], the class of `#RANK 2`;
+//! - 180 to 184, the chart's judgment class (`:448-452`): the snapshot's
+//!   [`ImportFacts::judge_class`], the class the source computes from the
+//!   chart's own rank ([`JudgeClass::of_headers`]), whatever the play
+//!   preset judges with, as `chart.judge_class` gives it at frame time;
 //! - 290, course mode (`:523-524`): a constant `false`, as there are no
 //!   courses;
 //! - 1008, `table_song` (`:351-352`): a constant `false`, as there are no
@@ -36,7 +33,7 @@
 //!   strings are empty (`PlayerResource.java:128-129`, `:531-535`).
 //!
 //! An import records each fact it read once, with the derived value it
-//! read (the class, never the rank), in first-read order ([`FactDeps`]);
+//! read, in first-read order ([`FactDeps`]);
 //! [`FactDeps::holds`] says whether a result still fits a snapshot.
 //!
 //! The boundary with the caller: this module gives the pure pieces. The
@@ -49,6 +46,8 @@
 //! invalidation and refusing a stale completion belong to the caller
 //! (docs/stage3.md S10-07).
 
+use bms_model::JudgmentHeader;
+use rules::{HeaderPolicy, JudgeRank};
 use skin_model::ScreenKind;
 
 /// A fact as the snapshot has it.
@@ -62,16 +61,6 @@ pub enum Fact<T> {
     Unavailable,
 }
 
-/// A rank the play preset's header policy reads, as `rules::JudgeRank`
-/// has it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChartRank {
-    /// `#RANK`, as written.
-    Rank(i32),
-    /// `#DEFEXRANK`, in thousandths of a percent.
-    DefExRankMilli(i64),
-}
-
 /// A chart's judgment class: options 180 to 184, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JudgeClass {
@@ -82,9 +71,12 @@ pub enum JudgeClass {
     VeryEasy,
 }
 
-/// The rank whose window the play uses when the header policy reads none:
-/// every shipped preset's absent window is its `#RANK 2` window.
-const ABSENT_RANK: ChartRank = ChartRank::Rank(2);
+/// The rank the reference's 7-key rule gives `#RANK 0` to `#RANK 4`
+/// (`play/JudgeProperty.java:210`, `JudgeWindowRule.NORMAL`'s
+/// `judgerank[r][1]`); `#RANK 2`'s is also the `#DEFEXRANK` multiplier
+/// and the rank of a chart with neither header.
+const RANK_RATES: [i32; 5] = [25, 50, 75, 100, 125];
+const RANK_2_RATE: i32 = 75;
 
 /// The option id of [`JudgeClass::VeryHard`]; the others follow it.
 const JUDGE_CLASS_FIRST: i32 = 180;
@@ -101,20 +93,47 @@ impl JudgeClass {
         Self::VeryEasy,
     ];
 
-    /// The class of `rank`, the header policy's reading, by the source's
-    /// bands: `j == 0 || 10 <= j < 35` very hard, `j == 1 || 35 <= j < 60`
-    /// hard, `j == 2 || 60 <= j < 85` normal, `j == 3 || 85 <= j < 110`
-    /// easy, `j == 4 || j >= 110` very easy. A `#RANK` is `j` itself; a
-    /// `#DEFEXRANK` is its whole percent from 10 up, since the source's
-    /// integer below 10 is a `#RANK` code. No rank read is the class of
-    /// `#RANK 2`, whose window the play then uses. `None` for a `j` in no
-    /// band.
+    /// The class the reference's skin shows for a chart whose judgment
+    /// headers are `headers` (in file order), from the chart alone,
+    /// whatever the play preset: the song data's judge rank
+    /// (`BooleanPropertyFactory.java:448-452`) as beatoraja's `0.8.9` tag
+    /// computes it.
+    ///
+    /// - The rank read is the beatoraja-style header policy's
+    ///   ([`HeaderPolicy::DefExRankFirst`]), the reference decoder's rules
+    ///   read as numbers (design.md "Rule Presets"), whatever policy the
+    ///   play preset judges with. None read is `#RANK 2`.
+    /// - The rule's validation (`play/BMSPlayerRule.java:59-66`) makes it a
+    ///   percentage `j`: `#RANK r` is 25, 50, 75, 100 or 125; `#DEFEXRANK
+    ///   n` (its whole part) is `n * 75 / 100` in `i32` arithmetic, which
+    ///   wraps past `i32` and truncates toward 0. Validation runs again
+    ///   when the song data takes the chart (`song/SongData.java:149`), and
+    ///   there a `j` of 0 or less becomes 100. A whole part past `i32`,
+    ///   which the reference cannot hold, is computed without wrapping.
+    /// - The bands: `j == 0 || 10 <= j < 35` very hard, `j == 1 || 35 <= j
+    ///   < 60` hard, `j == 2 || 60 <= j < 85` normal, `j == 3 || 85 <= j <
+    ///   110` easy, `j == 4 || j >= 110` very easy; `None` for a `j` in no
+    ///   band (5 to 9, from `#DEFEXRANK 7` to `13`).
+    ///
+    /// So `#DEFEXRANK 120` is easy (90), `#DEFEXRANK 1` easy (0, then 100)
+    /// and `#DEFEXRANK 2` hard (1).
     #[must_use]
-    pub fn of(rank: Option<ChartRank>) -> Option<Self> {
-        let j = match rank.unwrap_or(ABSENT_RANK) {
-            ChartRank::Rank(r) => i64::from(r),
-            ChartRank::DefExRankMilli(m) => Some(m.div_euclid(1_000)).filter(|&j| j >= 10)?,
+    pub fn of_headers(headers: &[JudgmentHeader]) -> Option<Self> {
+        let j = match HeaderPolicy::DefExRankFirst.read(headers).rank {
+            None => i64::from(RANK_2_RATE),
+            Some(JudgeRank::Rank(r)) => usize::try_from(r)
+                .ok()
+                .and_then(|i| RANK_RATES.get(i))
+                .map_or(i64::from(RANK_2_RATE), |&rate| i64::from(rate)),
+            Some(JudgeRank::DefExRankMilli(m)) => {
+                let n = m.div_euclid(1_000);
+                match i32::try_from(n) {
+                    Ok(n) => i64::from(n.wrapping_mul(RANK_2_RATE) / 100),
+                    Err(_) => n.saturating_mul(i64::from(RANK_2_RATE)) / 100,
+                }
+            }
         };
+        let j = if j <= 0 { 100 } else { j };
         Some(match j {
             0 | 10..35 => Self::VeryHard,
             1 | 35..60 => Self::Hard,
@@ -123,6 +142,19 @@ impl JudgeClass {
             4 | 110.. => Self::VeryEasy,
             _ => return None,
         })
+    }
+
+    /// Its index, 0 the hardest to 4 the easiest, as `chart.judge_class`
+    /// holds it.
+    #[must_use]
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::VeryHard => 0,
+            Self::Hard => 1,
+            Self::Normal => 2,
+            Self::Easy => 3,
+            Self::VeryEasy => 4,
+        }
     }
 
     /// The class option `id` (180 to 184) tests.
@@ -139,10 +171,10 @@ pub struct ImportFacts {
     /// Whether the session plays automatically; read on
     /// [`ScreenKind::Play`] only.
     pub autoplay: Fact<bool>,
-    /// The rank the play preset's header policy reads from the drawn
-    /// chart, `None` when it reads none (`rules::ReadHeaders::rank`);
-    /// [`Fact::Unavailable`] when there is no chart.
-    pub chart_rank: Fact<Option<ChartRank>>,
+    /// The drawn chart's judgment class ([`JudgeClass::of_headers`]),
+    /// `None` when it is in no class; [`Fact::Unavailable`] when there is
+    /// no chart.
+    pub judge_class: Fact<Option<JudgeClass>>,
     /// The chart's play level as the source parses `#PLAYLEVEL` (Java's
     /// `Integer.parseInt`: an optional `+` or `-`, then one or more
     /// characters `Character.digit(c, 10)` accepts, over UTF-16 code
@@ -158,7 +190,7 @@ impl ImportFacts {
         Self {
             scene,
             autoplay: Fact::Unavailable,
-            chart_rank: Fact::Unavailable,
+            judge_class: Fact::Unavailable,
             play_level: Fact::Unavailable,
         }
     }
@@ -167,7 +199,7 @@ impl ImportFacts {
     /// (unavailable on [`ScreenKind::Selection`], which has no chart).
     #[must_use]
     pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
-        let (chart_rank, play_level) = if scene == ScreenKind::Selection {
+        let (judge_class, play_level) = if scene == ScreenKind::Selection {
             (Fact::Unavailable, Fact::Unavailable)
         } else {
             (Fact::Pending, Fact::Pending)
@@ -175,7 +207,7 @@ impl ImportFacts {
         Self {
             scene,
             autoplay,
-            chart_rank,
+            judge_class,
             play_level,
         }
     }
@@ -188,8 +220,8 @@ impl ImportFacts {
                 Fact::Pending => Fact::Pending,
                 Fact::Unavailable => Fact::Unavailable,
             },
-            FactId::JudgeClass => match self.chart_rank {
-                Fact::Known(r) => Fact::Known(FactValue::Class(JudgeClass::of(r))),
+            FactId::JudgeClass => match self.judge_class {
+                Fact::Known(c) => Fact::Known(FactValue::Class(c)),
                 Fact::Pending => Fact::Pending,
                 Fact::Unavailable => Fact::Unavailable,
             },

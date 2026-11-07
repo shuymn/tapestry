@@ -63,9 +63,7 @@ pub use import::{
     LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, OffsetValue, PartWhy, PropertyKind,
     Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
 };
-pub use lua::facts::{
-    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass,
-};
+pub use lua::facts::{Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass};
 pub use lua::{
     Cancel, LuaHeader, LuaImported, LuaLimit, LuaOutcome, LuaPending, LuaUsage, LuaWhy,
     read_lua_header,
