@@ -781,11 +781,7 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
 /// written as JSON (`"name": value, ...`, ending with a comma) and
 /// imported; its timing and report.
 fn json_timing(top: &str) -> (ResultTiming, Report) {
-    let values = value("ex", r#""ref": 71"#);
-    let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
-    let d = folder(&format!(
-        r#"{top} "value": [{values}], "destination": [{dsts}]"#
-    ));
+    let d = minimal_json(top);
     let i = import_result(d.path()).unwrap_or_else(|e| panic!("{top}: {e:?}"));
     (i.skin.result_timing(), i.report)
 }
@@ -793,17 +789,35 @@ fn json_timing(top: &str) -> (ResultTiming, Report) {
 /// [`json_timing`] as a Lua skin, `top` its statements setting the
 /// skin table's fields.
 fn lua_timing(top: &str) -> (ResultTiming, Report) {
+    let d = minimal_lua(top);
+    let i = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{top}: {e:?}"));
+    (i.imported.skin.result_timing(), i.imported.report)
+}
+
+/// A JSON result skin with only its essential parts (an EX score and a
+/// status image) and the top-level fields `top` (`"name": value, ...`,
+/// ending with a comma).
+fn minimal_json(top: &str) -> tempfile::TempDir {
+    let values = value("ex", r#""ref": 71"#);
+    let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
+    folder(&format!(
+        r#"{top} "value": [{values}], "destination": [{dsts}]"#
+    ))
+}
+
+/// [`minimal_json`] as a Lua skin, `pre` its statements run after the
+/// images.
+fn minimal_lua(pre: &str) -> tempfile::TempDir {
     let d = sheet();
     let values = lua_value("ex", 4, "ref = 71");
     let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
     common::write(
         d.path(),
         "s.luaskin",
-        lua_skin(top, &values, "", &dsts).as_bytes(),
+        lua_skin(pre, &values, "", &dsts).as_bytes(),
     );
-    let i = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
-        .unwrap_or_else(|e| panic!("{top}: {e:?}"));
-    (i.imported.skin.result_timing(), i.imported.report)
+    d
 }
 
 /// The outro clamp notes of `r`.
@@ -903,22 +917,14 @@ fn number_152_is_the_best_difference() {
     assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
 }
 
-/// A Lua result skin reading numbers `ids` while it loads, with its
-/// essential parts.
+/// A [`minimal_lua`] skin that reads each of the result numbers `ids`
+/// through `main_state.number` while it loads, in order.
 fn reads(ids: &[i32]) -> tempfile::TempDir {
     let pre: String = ids
         .iter()
         .map(|id| format!("local n{id} = ms.number({id})\n"))
         .collect();
-    let values = lua_value("ex", 4, "ref = 71");
-    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
-    let d = sheet();
-    common::write(
-        d.path(),
-        "s.luaskin",
-        lua_skin(&pre, &values, "", &dsts).as_bytes(),
-    );
-    d
+    minimal_lua(&pre)
 }
 
 /// The values a Lua skin read for numbers `ids` under `view`, in order.
@@ -996,6 +1002,16 @@ fn numbers_372_and_373_are_the_mean_duration() {
         [(372, 1_000), (373, 0)]
     );
     assert_eq!(read_values(&d, &with(Some(9), true)), [(372, 0), (373, 0)]);
+    // Past `i32::MAX` µs: a 40-minute long note released one second early
+    // as a BAD (`IntegerPropertyFactory.java:410-420`).
+    assert_eq!(
+        read_values(&d, &with(Some(2_399_000_000), true)),
+        [(372, 2_399_000), (373, 0)]
+    );
+    assert_eq!(
+        read_values(&d, &with(Some(u32::MAX), true)),
+        [(372, 4_294_967), (373, 29)]
+    );
     let j = folder(&format!(
         r#""value": [{}, {}, {}],
            "destination": [{}, {}, {}, {}]"#,
@@ -1019,31 +1035,21 @@ fn numbers_372_and_373_are_the_mean_duration() {
 }
 
 /// S10-09i: a timing field the skin reader takes as no 32-bit integer
-/// refuses the import, as every other integer field of a skin does:
-/// `null`, a string that is no number, and a value past `i32`, in JSON and
-/// in Lua; a numeric string reads as its number, as for the other fields.
+/// refuses the import, as every other integer field of a skin does: in
+/// JSON, `null`, a string that is no number and a value past either end of
+/// `i32`; in Lua (which has no `null` field), a string that is no number
+/// and a value past `i32`. A numeric string reads as its number, as for
+/// the other fields.
 #[test]
 fn a_malformed_timing_field_refuses_the_import() {
     for field in ["fadeout", "input", "scene"] {
         for bad in ["null", r#""abc""#, "2147483648", "-2147483649"] {
-            let values = value("ex", r#""ref": 71"#);
-            let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
-            let d = folder(&format!(
-                r#""{field}": {bad}, "value": [{values}], "destination": [{dsts}]"#
-            ));
+            let d = minimal_json(&format!(r#""{field}": {bad},"#));
             let r = import_result(d.path());
             assert!(r.is_err(), "json {field}: {bad} imported");
         }
         for bad in ["\"abc\"", "2147483648"] {
-            let d = sheet();
-            let values = lua_value("ex", 4, "ref = 71");
-            let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
-            let pre = format!("skin.{field} = {bad}");
-            common::write(
-                d.path(),
-                "s.luaskin",
-                lua_skin(&pre, &values, "", &dsts).as_bytes(),
-            );
+            let d = minimal_lua(&format!("skin.{field} = {bad}"));
             let r = lua_outcome(d.path(), &ImportFacts::unavailable(ScreenKind::Result));
             assert!(r.is_err(), "lua {field} = {bad} imported");
         }

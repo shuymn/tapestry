@@ -452,7 +452,7 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
     set(field::RESULT_CLEARED, i32::from(s.cleared));
     if let Some(d) = s.duration_us {
         set(field::DURATION_VALID, 1);
-        set(field::DURATION_US, value(u64::from(d)));
+        set(field::DURATION_10US, value(u64::from(d / 10)));
     }
     if let Some(timing) = view.timing {
         set(field::TIMING_VALID, 1);

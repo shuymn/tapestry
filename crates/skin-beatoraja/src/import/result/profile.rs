@@ -131,8 +131,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // The mean absolute duration in whole ms and its hundredths
         // (`IntegerPropertyFactory.java:410-420`), shown with no timing
         // sample too.
-        372 => v("duration_us / 1000", "duration.valid", (0, M / 1000)),
-        373 => v("duration_us / 10 % 100", "duration.valid", (0, 99)),
+        372 => v("duration_10us / 100", "duration.valid", (0, M / 100)),
+        373 => v("duration_10us % 100", "duration.valid", (0, 99)),
         374 => v(MEAN_WHOLE, "timing.valid", (-M / 100, M / 100)),
         375 => v(MEAN_HUNDREDTHS, "timing.valid", (-99, 99)),
         410..=419 => early_late(id)?,

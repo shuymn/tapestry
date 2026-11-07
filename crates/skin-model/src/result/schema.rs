@@ -123,7 +123,7 @@ pub static RESULT: Schema = Schema {
         flag("chart.length_valid"),
         flag("chart.notes_valid"),
         flag("duration.valid"),
-        value("duration_us"),
+        value("duration_10us"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -219,8 +219,11 @@ pub mod field {
     pub const CHART_NOTES_VALID: u16 = 58;
     /// Whether the mean absolute duration is known: the result has notes.
     pub const DURATION_VALID: u16 = 59;
-    /// The mean absolute duration in µs, the source's penalized mean.
-    pub const DURATION_US: u16 = 60;
+    /// The mean absolute duration in units of 10 µs, rounded down, the
+    /// source's penalized mean: its whole ms and their hundredths are
+    /// exact within the field's bound for every duration a `u32` of µs
+    /// holds, where µs themselves would pass it past about 35 minutes.
+    pub const DURATION_10US: u16 = 60;
     /// The number of fields.
     pub const COUNT: usize = 61;
 }
@@ -266,7 +269,7 @@ mod tests {
             (field::CHART_BPM_VALID, "chart.bpm_valid"),
             (field::CHART_LENGTH_VALID, "chart.length_valid"),
             (field::DURATION_VALID, "duration.valid"),
-            (field::DURATION_US, "duration_us"),
+            (field::DURATION_10US, "duration_10us"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
