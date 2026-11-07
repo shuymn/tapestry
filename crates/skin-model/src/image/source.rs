@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use super::decode::{self, Bands, DecodeError, Mode, Probe};
 use super::font::{FontError, MAX_TOTAL_FONT_BYTES};
 use super::path::{self, PathError};
-use super::{FileAt, ImageError, MAX_FILES, Stop};
+use super::{FileAt, ImageError, MAX_FILES, MAX_PATH_BYTES, Stop};
 
 /// A file verdict that is the file's own and can be given again exactly:
 /// a path check or a header check, with no I/O error or decoder source
@@ -188,6 +188,8 @@ enum Content {
 #[derive(Debug, Default)]
 struct Entries {
     resolutions: HashMap<String, Result<(PathBuf, u64), Failed>>,
+    /// The resolution names' bytes.
+    name_bytes: u64,
     contents: HashMap<ContentKey, Content>,
     fnt_bytes: u64,
     font_bytes: u64,
@@ -218,6 +220,9 @@ impl fmt::Debug for ResourceCache {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheUsage {
     pub resolutions: usize,
+    /// The bytes of the names its resolutions are kept by, each at most
+    /// [`MAX_PATH_BYTES`].
+    pub name_bytes: u64,
     pub contents: usize,
     pub fnt_bytes: u64,
     pub font_bytes: u64,
@@ -252,6 +257,7 @@ impl ResourceCache {
         let e = self.lock();
         CacheUsage {
             resolutions: e.resolutions.len(),
+            name_bytes: e.name_bytes,
             contents: e.contents.len(),
             fnt_bytes: e.fnt_bytes,
             font_bytes: e.font_bytes,
@@ -266,11 +272,19 @@ impl ResourceCache {
         self.lock().resolutions.get(name).cloned()
     }
 
+    /// Records `name`'s resolution unless the entries are full or the name
+    /// is past [`MAX_PATH_BYTES`] (refused by its form, never a file), so
+    /// the names kept hold at most that many bytes each.
     fn record_resolution(&self, name: &str, r: Result<(PathBuf, u64), Failed>) {
         let mut e = self.lock();
-        if e.resolutions.len() < self.bounds.resolutions {
-            e.resolutions.insert(name.to_owned(), r);
+        if name.len() > MAX_PATH_BYTES
+            || e.resolutions.len() >= self.bounds.resolutions
+            || e.resolutions.contains_key(name)
+        {
+            return;
         }
+        e.name_bytes += u64::try_from(name.len()).unwrap_or(u64::MAX);
+        e.resolutions.insert(name.to_owned(), r);
     }
 
     fn content(&self, key: &ContentKey) -> Option<Content> {
@@ -493,6 +507,11 @@ impl FileSource {
         if let Some(Content::Page(dims, mode, r)) = cache.and_then(|c| c.content(&key))
             && (dims, mode) == header
         {
+            // The disk read asks `cancel` before it reads the page; so does
+            // a verdict served in its place.
+            if cancel() {
+                return Err(Stop::Cancelled);
+            }
             return r.map_err(|f| Stop::Image(f.image(at)));
         }
         #[cfg(any(test, feature = "dev-tools"))]
@@ -575,7 +594,7 @@ impl FileSource {
         canonical: &Path,
         check: impl FnOnce(u64) -> Result<(), FontError>,
         read: impl FnOnce(std::fs::File, u64) -> (u64, Result<Vec<u8>, FontError>),
-    ) -> (u64, Result<Arc<[u8]>, FontError>) {
+    ) -> (u64, Result<Vec<u8>, FontError>) {
         let key = ContentKey::FontBytes(canonical.to_path_buf());
         let cache = self.cache_holding(canonical);
         if let Some(Content::FontBytes(b)) = cache.and_then(|c| c.content(&key)) {
@@ -583,7 +602,7 @@ impl FileSource {
             if let Err(e) = check(len) {
                 return (0, Err(e));
             }
-            return (len, Ok(b));
+            return (len, Ok(b.to_vec()));
         }
         #[cfg(any(test, feature = "dev-tools"))]
         self.count(|c| c.font_bytes += 1);
@@ -595,9 +614,9 @@ impl FileSource {
             return (0, Err(e));
         }
         let (taken, r) = read(file, len);
-        let r = r.map(Arc::<[u8]>::from);
+        // Only a cache keeps a copy; the disk hands its bytes over as read.
         if let (Some(c), Ok(b)) = (cache, &r) {
-            c.record(key, Content::FontBytes(Arc::clone(b)));
+            c.record(key, Content::FontBytes(Arc::from(b.as_slice())));
         }
         (taken, r)
     }

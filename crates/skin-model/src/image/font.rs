@@ -225,7 +225,7 @@ impl<'a> FontReader<'a> {
         if !has_magic(&bytes) {
             return Err(FontError::Unsupported { font: index });
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 }
 

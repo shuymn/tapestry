@@ -1560,4 +1560,57 @@ mod tests {
         assert_eq!(kept(&b), before);
         admit(&mut b, "a.fnt").unwrap();
     }
+
+    /// A builder over `dir` reading through `cache`.
+    fn cached(
+        dir: &Path,
+        cache: &std::sync::Arc<super::super::source::ResourceCache>,
+    ) -> SheetBuilder {
+        let root = Root::new(dir).unwrap();
+        let src = super::super::source::FileSource::cached(std::sync::Arc::clone(cache));
+        SheetBuilder::new(&root.with_source(src))
+    }
+
+    /// D13: a page verdict served from a warm cache is still behind the
+    /// cancellation the disk read would ask, and served it reads nothing.
+    #[test]
+    fn a_cancel_reaches_a_page_the_cache_holds() {
+        use super::super::source::ResourceCache;
+        let dir = tempfile::tempdir().unwrap();
+        write_fnt(dir.path(), "a.fnt", &fnt_text(1, 0, 1), 1);
+        let cache = ResourceCache::new(&Root::new(dir.path()).unwrap());
+        admit(&mut cached(dir.path(), &cache), "a.fnt").unwrap();
+        let mut b = cached(dir.path(), &cache);
+        let before = kept(&b);
+        let e = b.admit_fnt("a.fnt", &mut free, &|| true).unwrap_err();
+        assert!(matches!(e, FntAdmitError::Cancelled), "{e:?}");
+        assert_eq!(kept(&b), before);
+        let mut b = cached(dir.path(), &cache);
+        admit(&mut b, "a.fnt").unwrap();
+        assert_eq!(b.source.counts().page_validations, 0, "served");
+    }
+
+    /// D13's bound on names: a name past [`MAX_PATH_BYTES`] is refused by
+    /// its form and never kept, so the names a cache holds stay within it.
+    #[test]
+    fn an_over_long_name_is_not_kept() {
+        use super::super::MAX_PATH_BYTES;
+        use super::super::source::ResourceCache;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ResourceCache::new(&Root::new(dir.path()).unwrap());
+        let mut b = cached(dir.path(), &cache);
+        let long = "a".repeat(MAX_PATH_BYTES + 1);
+        assert!(b.admit_font(FontDef { path: long.clone() }).is_err());
+        assert!(b.admit_fnt(&long, &mut free, &|| false).is_err());
+        assert_eq!(cache.usage(), super::super::source::CacheUsage::default());
+        // A name within it is kept, its bytes counted.
+        assert!(
+            b.admit_font(FontDef {
+                path: "missing.ttf".into()
+            })
+            .is_err()
+        );
+        let u = cache.usage();
+        assert_eq!((u.resolutions, u.name_bytes), (1, 11));
+    }
 }
