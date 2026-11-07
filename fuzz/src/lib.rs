@@ -425,6 +425,7 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
                 grade: 6,
             }),
             next_rank: 17,
+            duration_us: Some(4_321),
         },
         best: BestView::Known(BestFigures {
             ex: 0,

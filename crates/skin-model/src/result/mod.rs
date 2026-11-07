@@ -387,6 +387,10 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
     set(field::RESULT_NEXT_RANK, value(u64::from(s.next_rank)));
     set(field::RESULT_CLEAR, s.clear.clear_type());
     set(field::RESULT_CLEARED, i32::from(s.cleared));
+    if let Some(d) = s.duration_us {
+        set(field::DURATION_VALID, 1);
+        set(field::DURATION_US, value(u64::from(d)));
+    }
     if let Some(timing) = view.timing {
         set(field::TIMING_VALID, 1);
         set(field::TIMING_MEAN_X100, signed(i64::from(timing.mean_x100)));

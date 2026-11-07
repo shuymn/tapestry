@@ -186,6 +186,7 @@ pub fn ready(ex: u32, cleared: bool, best: BestView) -> ResultView {
                 grade: 6,
             }),
             next_rank: 17,
+            duration_us: Some(123_456),
         },
         best,
         timing: Some(TimingStats {

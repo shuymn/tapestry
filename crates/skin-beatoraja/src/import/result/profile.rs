@@ -128,6 +128,11 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             ..v("result.clear", VALID, (0, i64::from(skin_model::CLEAR_MAX)))
         },
         371 => v("best.clear", BEST, (0, i64::from(skin_model::CLEAR_MAX))),
+        // The mean absolute duration in whole ms and its hundredths
+        // (`IntegerPropertyFactory.java:410-420`), shown with no timing
+        // sample too.
+        372 => v("duration_us / 1000", "duration.valid", (0, M / 1000)),
+        373 => v("duration_us / 10 % 100", "duration.valid", (0, 99)),
         374 => v(MEAN_WHOLE, "timing.valid", (-M / 100, M / 100)),
         375 => v(MEAN_HUNDREDTHS, "timing.valid", (-99, 99)),
         410..=419 => early_late(id)?,
@@ -151,10 +156,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
         // The clock is no result fact; no score target; no IR. The best's
         // max combo (173, and 175 the difference from it) is not kept with
-        // a best; the mean absolute duration (372-373, the source's
-        // `getAverageDuration`, misses at 1 s, `play/BMSPlayer.java:918-936`)
-        // is not projected.
-        21..=25 | 151 | 153 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 372 | 373 | 380..=399 => {
+        // a best until stage3.md's row S10-14.
+        21..=25 | 151 | 153 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
         _ => return None,

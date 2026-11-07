@@ -255,3 +255,88 @@ fn timeline_bins_widen_past_the_cap() {
     let axis = TimelineAxis::new(TimeUs(0), TimeUs(i64::MAX / 2));
     assert!(usize::from(axis.count) <= super::MAX_TIMELINE_BINS);
 }
+
+/// A note judged `judgment`, its head's deviation and its release's.
+fn note(judgment: Judgment, deviation: Option<i64>, release: Option<i64>) -> JudgeEvent {
+    JudgeEvent {
+        kind: JudgeEventKind::Judged {
+            lane: Lane::SCRATCH,
+            note: 0,
+            judgment,
+            deviation: deviation.map(TimeUs),
+            release: release.map(TimeUs),
+            combo: 0,
+            presses: 0,
+        },
+        ..judged(None, None)
+    }
+}
+
+/// S10-09i: numbers 372 and 373, the source's penalized mean absolute
+/// duration (0.8.9 `play/BMSPlayer.java:917-936`), run on the source's
+/// arithmetic: PERFECT to BAD add their absolute deviation, unfiltered;
+/// every other note, judged or left unjudged, one second; the sum divided
+/// by the notes, rounded down; nothing with no note.
+#[test]
+fn the_mean_duration_is_the_sources_penalized_mean() {
+    use super::{MISSED_DURATION_US, mean_duration};
+    use Judgment::{Bad, Good, Great, Perfect, Poor};
+    let hit = |j, d| note(j, Some(d), None);
+    // Equal mean and deviation, other mean absolute durations: 5 ms, 4 ms.
+    let five: Vec<_> = [-5_000, -5_000, 5_000, 5_000]
+        .iter()
+        .map(|&d| hit(Great, d))
+        .collect();
+    let four: Vec<_> = [-7_000, -1_000, 1_000, 7_000]
+        .iter()
+        .map(|&d| hit(Great, d))
+        .collect();
+    assert_eq!(TimingStats::of(&five), TimingStats::of(&four));
+    assert_eq!(mean_duration(&five, 4), Some(5_000));
+    assert_eq!(mean_duration(&four, 4), Some(4_000));
+    // One 10 ms hit and one miss: 505 ms.
+    let mixed = [hit(Perfect, 10_000), note(Poor, None, None)];
+    assert_eq!(mean_duration(&mixed, 2), Some(505_000));
+    // All missed: one second, shown with no timing sample.
+    let missed = [note(Poor, None, None), note(Poor, None, None)];
+    assert_eq!(TimingStats::of(&missed), None);
+    assert_eq!(
+        mean_duration(&missed, 2),
+        Some(u32::try_from(MISSED_DURATION_US).unwrap())
+    );
+    // A POOR press on its note counts as missed.
+    assert_eq!(
+        mean_duration(&[note(Poor, Some(200_000), None)], 1),
+        Some(1_000_000)
+    );
+    // Notes left unjudged after an abort: a second each.
+    assert_eq!(
+        mean_duration(&[hit(Perfect, -2_000)], 3),
+        Some((2_000 + 2_000_000) / 3)
+    );
+    // A press past the timing statistics' range still counts.
+    let far = [hit(Bad, -400_000)];
+    assert_eq!(TimingStats::of(&far), None);
+    assert_eq!(mean_duration(&far, 1), Some(400_000));
+    // A long note by the tally's side: the release when it lies farther,
+    // or on a tie; the head when it lies farther.
+    assert_eq!(
+        mean_duration(&[note(Great, Some(-1_000), Some(-3_000))], 1),
+        Some(3_000)
+    );
+    assert_eq!(
+        mean_duration(&[note(Good, Some(2_000), Some(-2_000))], 1),
+        Some(2_000)
+    );
+    assert_eq!(
+        mean_duration(&[note(Good, Some(9_000), Some(-2_000))], 1),
+        Some(9_000)
+    );
+    // Rounded down; no note, nothing.
+    assert_eq!(
+        mean_duration(&[hit(Perfect, 1), hit(Perfect, 1), hit(Perfect, 0)], 3),
+        Some(0)
+    );
+    assert_eq!(mean_duration(&[], 0), None);
+    assert_eq!(mean_duration(&[hit(Perfect, 5)], 0), None);
+}

@@ -902,3 +902,81 @@ fn number_152_is_the_best_difference() {
     assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
     assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
 }
+
+/// A Lua result skin reading numbers `ids` while it loads, with its
+/// essential parts.
+fn reads(ids: &[i32]) -> tempfile::TempDir {
+    let pre: String = ids
+        .iter()
+        .map(|id| format!("local n{id} = ms.number({id})\n"))
+        .collect();
+    let values = lua_value("ex", 4, "ref = 71");
+    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(&pre, &values, "", &dsts).as_bytes(),
+    );
+    d
+}
+
+/// The values a Lua skin read for numbers `ids` under `view`, in order.
+#[track_caller]
+fn read_values(d: &tempfile::TempDir, view: &ResultView) -> Vec<(i32, i32)> {
+    let i = lua_result(d.path(), &facts(Some(view))).unwrap();
+    i.facts
+        .reads
+        .iter()
+        .map(|r| match (r.fact, r.value) {
+            (FactId::ResultNumber(id), FactValue::Int(v)) => (id, v),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// S10-09i: numbers 372 and 373, the mean absolute duration in whole ms
+/// and its hundredths (`IntegerPropertyFactory.java:410-420`), read and
+/// drawn from the view's duration; an all-miss view, with no timing
+/// sample, shows them; a view with no duration or no result draws none.
+#[test]
+fn numbers_372_and_373_are_the_mean_duration() {
+    let with = |us: Option<u32>, timing: bool| {
+        let mut v = ready(1_000, true, BestView::Unavailable);
+        v.score.duration_us = us;
+        if !timing {
+            v.timing = None;
+        }
+        v
+    };
+    let d = reads(&[372, 373]);
+    assert_eq!(
+        read_values(&d, &with(Some(123_456), true)),
+        [(372, 123), (373, 45)]
+    );
+    assert_eq!(
+        read_values(&d, &with(Some(1_000_000), false)),
+        [(372, 1_000), (373, 0)]
+    );
+    assert_eq!(read_values(&d, &with(Some(9), true)), [(372, 0), (373, 0)]);
+    let j = folder(&format!(
+        r#""value": [{}, {}, {}],
+           "destination": [{}, {}, {}, {}]"#,
+        value("ex", r#""ref": 71"#),
+        value("dw", r#""ref": 372"#),
+        value("dh", r#""ref": 373"#),
+        dst("ex", ""),
+        r#"{"id": "dw", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]}"#,
+        r#"{"id": "dh", "dst": [{"x": 0, "y": 200, "w": 4, "h": 8}]}"#,
+        dst("dot", r#""op": [90],"#),
+    ));
+    let mut r = Res::new(import_result(j.path()).unwrap().skin);
+    r.view(&with(Some(505_000), false));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "505");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "0");
+    r.view(&with(None, true));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
+    r.view(&unavailable());
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+}

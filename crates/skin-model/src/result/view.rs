@@ -147,6 +147,9 @@ pub struct ResultScore {
     pub rate: Option<ResultRate>,
     /// The EX score to the next grade step, or to the largest.
     pub next_rank: u32,
+    /// The mean absolute duration of the result's notes in µs, the
+    /// source's penalized mean (numbers 372 and 373); `None` with no note.
+    pub duration_us: Option<u32>,
 }
 
 impl Default for ResultScore {
@@ -158,6 +161,7 @@ impl Default for ResultScore {
             cleared: false,
             rate: None,
             next_rank: 0,
+            duration_us: None,
         }
     }
 }
