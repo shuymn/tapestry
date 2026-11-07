@@ -13,7 +13,7 @@ mod graph_support;
 
 use graph_support::{
     GFx, GRID, GRID_NO_GAP_X, GRID_NO_GAP_Y, GRID_NO_GAPS, composite, element, graph, level, lod,
-    near, over_backdrop, screen_element, skin, view,
+    moving_element, near, over_backdrop, screen_element, skin, view,
 };
 use skin_model::{
     ElementDef, Filter, JudgeGraphKind, LoadError, ResultDefs, ScreenKind, Skin, Source, TimerRef,
@@ -721,4 +721,38 @@ fn a_dense_widened_timeline_builds_with_no_dropped_quad() {
     let two = runs_at(&fx, 0.0, 100.0, [300.0, 200.0]);
     assert_eq!(two.first(), Some(&(GREY, 19)));
     assert_eq!(two.len(), 10);
+}
+
+/// A non-positive height or width draws nothing, as the gauge graph and
+/// the timing distribution: a rect `[0, 10, 520, -1]`, a negative width,
+/// and a track running through height 0 into negative heights; on the
+/// way, at a positive height, the graph draws.
+#[test]
+fn a_negative_size_draws_nothing() {
+    let fixed = |r| moving_element(Source::JudgeGraph(0), &[(0, r, 0)]);
+    let through = moving_element(
+        Source::JudgeGraph(0),
+        &[(0, [0, 400, 520, 4], 0), (1_000, [0, 400, 520, -4], 0)],
+    );
+    let cases = [
+        (fixed([0, 10, 520, -1]), vec![(0, false), (1_000, false)]),
+        (fixed([600, 10, -520, 82]), vec![(0, false), (1_000, false)]),
+        (through, vec![(250, true), (750, false), (1_000, false)]),
+    ];
+    for (el, frames) in cases {
+        let mut fx = GFx::new(skin(
+            vec![el],
+            vec![graph(JudgeGraphKind::EarlyLate, GRID, true, 0)],
+        ));
+        fx.view(&view(vec![[3, 1, 1, 1, 1, 1, 1, 1, 1]; 20]));
+        for (ms, drawn) in frames {
+            fx.frame(ms);
+            assert_eq!(
+                !fx.quads().is_empty(),
+                drawn,
+                "{ms} ms: {:?}",
+                fx.quads().first()
+            );
+        }
+    }
 }

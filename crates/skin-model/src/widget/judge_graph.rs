@@ -187,8 +187,9 @@ pub(crate) fn scale(largest: u32) -> u32 {
 
 impl JudgeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing without timelines; the background whole when on, then the
-    /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
+    /// nothing without timelines or without a positive width and height;
+    /// the background whole when on, then the chips revealed up to
+    /// `w·min(1, t/delay)` of the screen timer's `t`.
     /// The rect is placed (lane map, affine) and fitted to the brush's
     /// native size, if any, as one region; every quad turns with the
     /// brush's angle about the brush's pivot in that region. A refused
@@ -200,6 +201,13 @@ impl JudgeGraph {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
+        // A rect with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing, as the
+        // other result graphs.
+        let [.., w, h] = brush.affine.rect([0.0, 0.0, brush.map.w(rect[2]), rect[3]]);
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
         let Some(tl) = d.timelines else {
             return;
         };
