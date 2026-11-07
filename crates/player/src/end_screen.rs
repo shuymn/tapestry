@@ -974,6 +974,7 @@ pub(crate) mod tests {
                 cleared: false,
                 gauge_permille: 0,
                 timing: None,
+                areas: [[0; 2]; 5],
             },
             best: None,
         }

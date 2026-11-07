@@ -146,8 +146,8 @@ impl ResultExtension for ReEvaluate {
 /// deviation (press − note): every judgment that carries a deviation, a
 /// long note once, at its judgment, by its head's deviation. Misses, notes
 /// a press passed, empty POORs and the feedback of a held head carry none.
-/// The recommended offset and the result's deviation distribution read
-/// these.
+/// The recommended offset and the result's built-in deviation
+/// distribution read these.
 pub fn press_deviations(events: &[JudgeEvent]) -> impl Iterator<Item = (Judgment, TimeUs)> {
     events.iter().filter_map(|e| match e.kind {
         JudgeEventKind::Judged {

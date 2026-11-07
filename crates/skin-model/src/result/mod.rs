@@ -166,7 +166,10 @@ impl ResultScreen {
             + self.text.heap_bytes()
             + glyphs::lines_bytes(&self.bitmap)
             + strings
-            + self.timelines.as_ref().map_or(0, |t| size_of_val(t.bins()));
+            + self
+                .timelines
+                .as_ref()
+                .map_or(0, |t| size_of_val(t.bins()) + size_of_val(t.notes()));
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
