@@ -1797,7 +1797,9 @@ impl<'d> Cx<'d> {
     /// converts to the same fields, `LuaSkinLoader.java:90`), in µs: a
     /// negative value is 0, a `scene` of 0 or below is none, and a
     /// `fadeout` past [`skin_model::MAX_RESULT_OUTRO`] is clamped to it
-    /// with a deviation note.
+    /// with a deviation note. Each is read as every integer field is: a
+    /// value the reader refuses (`null`, a string that is no number, one
+    /// past `i32`) refuses the import.
     fn result_timing(&mut self) -> Result<ResultTiming, ImportError> {
         let us = |ms: i32| TimeUs(i64::from(ms.max(0)) * 1_000);
         let fadeout = self.top_int("fadeout", 0)?;

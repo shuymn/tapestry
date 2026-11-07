@@ -1017,3 +1017,37 @@ fn numbers_372_and_373_are_the_mean_duration() {
     r.view(&unavailable());
     assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
 }
+
+/// S10-09i: a timing field the skin reader takes as no 32-bit integer
+/// refuses the import, as every other integer field of a skin does:
+/// `null`, a string that is no number, and a value past `i32`, in JSON and
+/// in Lua; a numeric string reads as its number, as for the other fields.
+#[test]
+fn a_malformed_timing_field_refuses_the_import() {
+    for field in ["fadeout", "input", "scene"] {
+        for bad in ["null", r#""abc""#, "2147483648", "-2147483649"] {
+            let values = value("ex", r#""ref": 71"#);
+            let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
+            let d = folder(&format!(
+                r#""{field}": {bad}, "value": [{values}], "destination": [{dsts}]"#
+            ));
+            let r = import_result(d.path());
+            assert!(r.is_err(), "json {field}: {bad} imported");
+        }
+        for bad in ["\"abc\"", "2147483648"] {
+            let d = sheet();
+            let values = lua_value("ex", 4, "ref = 71");
+            let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+            let pre = format!("skin.{field} = {bad}");
+            common::write(
+                d.path(),
+                "s.luaskin",
+                lua_skin(&pre, &values, "", &dsts).as_bytes(),
+            );
+            let r = lua_outcome(d.path(), &ImportFacts::unavailable(ScreenKind::Result));
+            assert!(r.is_err(), "lua {field} = {bad} imported");
+        }
+    }
+    let (t, _) = json_timing(r#""fadeout": "500","#);
+    assert_eq!(t.outro, TimeUs(500_000));
+}
