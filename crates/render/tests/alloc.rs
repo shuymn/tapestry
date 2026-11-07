@@ -37,9 +37,11 @@
 //! attempt's play frames with bitmap labels, batches short of sprites and
 //! of runs keeping the overlay whole. An imported skin with outline text
 //! builds its play frames and then its loading frames, each with lines
-//! rasterized by its producer, without allocating. A skin refused
-//! because with the other screens' skins it passes the texels they share
-//! is refused without allocating, before anything is staged.
+//! rasterized by its producer, without allocating. A skin refused because
+//! with the other screens' skins it passes the texels they share is
+//! refused without allocating by the player's allocation guards
+//! (`a_refused_shared_admission_alloc`), which can charge a committed skin
+//! an atlas's cap without uploading one.
 //!
 //! The counting allocator counts only on the thread that opted in, so the
 //! harness's own threads do not disturb it. This file holds a single test
@@ -56,20 +58,16 @@ mod outline_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, MS, attempt, context, input, lane, offscreen, view};
-use decl_support::{
-    FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts, shared_limit_bundle,
-    solid_bundle,
-};
+use decl_support::{FULL_LANES, Look, Part, bundle, full_readouts, lane_chart, part_counts};
 use eval::{JudgeEvent, JudgeEventKind};
 use game::adjustment::PresentationSnapshot;
 use render::{
-    Blend, ClipTable, DeclSkin, FrameInput, Gpu, LoadingFrame, MAX_SPRITES, PlaySkin, RenderError,
-    Renderer, SHARED_TEXELS, Scissor, SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
+    Blend, ClipTable, DeclSkin, FrameInput, Gpu, LoadingFrame, MAX_SPRITES, PlaySkin, Scissor,
+    SimpleSkin, SkinError, Sprite, SpriteBatch, Staging,
 };
 use rules::Judgment;
 use skin_model::{BuildError, ClipId, LaneView, ScreenKind, TextImage, TextTable};
@@ -509,59 +507,6 @@ fn frames_do_not_allocate_from_the_first() {
     loading_frames();
     imported_frames(&chart, &overlay, glyphs);
     outline_frames(&chart, &overlay);
-    shared_admission();
-}
-
-/// Skins that each fit alone but together pass the texels the screens
-/// share are refused before anything is allocated (design.md "Memory
-/// Budget"): a generated cell whose atlas array, with its text layer, is
-/// exactly the shared limit fits alone, but as the selection screen's
-/// beside play's tiny skin it is refused, with no allocation, nothing
-/// staged, and play's installation drawing its next frame as before. It
-/// is never uploaded.
-fn shared_admission() {
-    const TINY: u64 = 256 * 256 * 2;
-    let mut r = offscreen(1_920, 1_080);
-    let big = shared_limit_bundle(&r, [0, 0, 255, 255]);
-    // Alone, exactly at the limit, it fits.
-    r.admit(ScreenKind::Selection, &big).unwrap();
-    let tiny = solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]);
-    assert_eq!(tiny.atlas_texels(), TINY);
-    let chart = ChartBuilder::new(120_000).build().unwrap();
-    let ctx = context(&GAUGES, false);
-    let token = r.stage(&tiny, &attempt(&r, &chart, &ctx), 1).unwrap();
-    r.commit(token).unwrap();
-    let drawn = |r: &mut Renderer| {
-        let v = view(0, 0);
-        let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-        assert!(timing.presented);
-        let pixels = common::read_back(r);
-        (timing.sprites, common::rgb_at(&pixels, 1_920, (480, 540)))
-    };
-    let before = drawn(&mut r);
-    assert!(before.0 > 0);
-    assert_eq!(before.1, [255, 0, 0]);
-    let generation = r.resource_generation();
-
-    let (answer, allocs) = counted(|| r.install(ScreenKind::Selection, &big, 2));
-    let e = answer.unwrap_err();
-    assert!(
-        matches!(
-            e,
-            RenderError::Admission {
-                kind: ScreenKind::Selection,
-                needed,
-                limit,
-            } if needed == SHARED_TEXELS + TINY && limit == SHARED_TEXELS
-        ),
-        "{e:?}"
-    );
-    assert!(e.is_refusal());
-    assert_eq!(allocs, 0, "the refused admission allocated");
-    assert!(r.staged().is_none());
-    assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &tiny));
-    assert_eq!(r.resource_generation(), generation);
-    assert_eq!(drawn(&mut r), before);
 }
 
 /// Every run's scissor as the renderer resolves it while drawing
