@@ -945,7 +945,6 @@ fn prepare_result<R: Rig>(
     let mut prep = rig.begin_result(report, screen);
     screen.compare_best(report, lookup);
     if let Some(withdrawn) = withdrawn(rig) {
-        rig.withdraw_result();
         return Ok(withdrawn);
     }
     // The own view's best is in: its layout is asked for now, with the
@@ -955,7 +954,6 @@ fn prepare_result<R: Rig>(
         let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
         let polled = rig.poll_result(&mut prep, deadline);
         if let Some(withdrawn) = withdrawn(rig) {
-            rig.withdraw_result();
             return Ok(withdrawn);
         }
         if rig.screen_failed() {
@@ -963,7 +961,6 @@ fn prepare_result<R: Rig>(
             // The rebuild waited on the screen: what came meanwhile is
             // served before a ready preparation shows the result.
             if let Some(withdrawn) = withdrawn(rig) {
-                rig.withdraw_result();
                 return Ok(withdrawn);
             }
         }
@@ -976,9 +973,11 @@ fn prepare_result<R: Rig>(
 /// What the commands taken now do to a result's preparation
 /// ([`prepare_result`]): a close leaves, then the first quit, back or
 /// retry withdraws it, with the commands queued behind it; preset steps
-/// are dropped. `None` when nothing withdraws it.
+/// are dropped. A withdrawal tells the rig ([`Rig::withdraw_result`]).
+/// `None` when nothing withdraws it.
 fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
     if rig.quitting() {
+        rig.withdraw_result();
         return Some(Prepared::Leave);
     }
     while let Some(c) = rig.take_menu() {
@@ -988,6 +987,7 @@ fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
             MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
         };
         while rig.take_menu().is_some() {}
+        rig.withdraw_result();
         return Some(withdrawn);
     }
     None

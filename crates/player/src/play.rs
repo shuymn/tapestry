@@ -309,8 +309,8 @@ impl PlayerRig<'_> {
     }
 
     /// Whether the run ends: the window's close, or a failure of the input
-    /// or audio thread. A script's step on a result skin's job (dev-tools)
-    /// acts at every look.
+    /// or audio thread. A script's step on a specialization's job
+    /// (dev-tools) acts at every look.
     fn run_ends(&self) -> bool {
         #[cfg(feature = "dev-tools")]
         crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
@@ -408,15 +408,9 @@ impl PlayerRig<'_> {
             serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
             rig.controls.leaving()
         };
-        let end_run = || {
-            // A script's step on the specialization (dev-tools), asked at
-            // every look of the wait, an attempt's quit included.
-            #[cfg(feature = "dev-tools")]
-            crate::dev::specialization_signal(rig.controls, || rig.input.fail_for_script());
-            rig.controls.quitting()
-                || rig.input_failure().is_some()
-                || rig.audio_failure().is_some()
-        };
+        // A script's step on the specialization (dev-tools) is asked at
+        // every look of the wait, an attempt's quit included.
+        let end_run = || rig.run_ends();
         let (skin, how) = pending.attempt(facts, wait, quit, end_run);
         #[cfg(feature = "dev-tools")]
         println!("dev: specialization wait left");

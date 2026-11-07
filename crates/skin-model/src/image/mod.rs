@@ -17,7 +17,7 @@ pub(crate) mod font;
 pub(crate) mod path;
 pub(crate) mod source;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -861,9 +861,9 @@ impl Sheet {
         }
         let same = |a: &File, b: &File| a.lo == b.lo && a.hi == b.hi;
         let mut files: Vec<File> = self.files.to_vec();
-        let mut cell_ids = BTreeMap::new();
+        let mut cell_ids = BTreeSet::new();
         for c in self.cells.iter() {
-            cell_ids.insert(*c, 0_u32);
+            cell_ids.insert(*c);
         }
         for c in other.cells.iter() {
             let source = match c.source {
@@ -880,20 +880,14 @@ impl Sheet {
                 }
                 s @ CellSource::Solid(..) => s,
             };
-            cell_ids.insert(
-                Cell {
-                    source,
-                    rect: c.rect,
-                },
-                0,
-            );
+            cell_ids.insert(Cell {
+                source,
+                rect: c.rect,
+            });
         }
-        let mut frames: Vec<u32> = Vec::with_capacity(cell_ids.len());
-        for (i, id) in (0_u32..).zip(cell_ids.values_mut()) {
-            *id = i;
-            frames.push(i);
-        }
-        let cells = renumber(cell_ids, &mut frames);
+        // One frame per cell, in the cells' order.
+        let cells: Vec<Cell> = cell_ids.into_iter().collect();
+        let frames: Vec<u32> = (0_u32..).take(cells.len()).collect();
         Some(Self {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root: self.root.clone(),

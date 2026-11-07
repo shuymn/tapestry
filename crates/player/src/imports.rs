@@ -811,19 +811,10 @@ impl<T> Job<T> {
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                 },
-                Some(_)
-                    if self
-                        .handle
-                        .as_ref()
-                        .is_none_or(thread::JoinHandle::is_finished) =>
-                {
-                    self.join();
-                    return self
-                        .outcome
-                        .take()
-                        .unwrap_or(Ran::Refused(ENDED.to_owned()));
-                }
-                Some(_) => thread::sleep(SELECT_SLICE),
+                Some(_) => match self.poll() {
+                    Some(ran) => return ran,
+                    None => thread::sleep(SELECT_SLICE),
+                },
             }
         }
     }
