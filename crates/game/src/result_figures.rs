@@ -199,8 +199,11 @@ fn lamp(e: &Evaluation, preset: &RulePreset) -> BestLamp {
 
 /// The timing statistics of one view (design.md "Play Lifecycle"): each
 /// press judged on its note within [`TIMING_RANGE_US`] is a sample, early
-/// positive, a long note once by its head; misses and empty POORs are
-/// none. The sums are exact; only the outputs are truncated.
+/// positive; a long note gives one, which a release that finished it
+/// makes the farther of its head's press and its release from its time,
+/// the release on a tie, as the tally's side ([`side_deviation`]), and
+/// otherwise its head's. Misses and empty POORs are none. The sums are
+/// exact; only the outputs are truncated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimingStats {
     /// The samples, at least one.
@@ -220,11 +223,14 @@ impl TimingStats {
         let (mut n, mut sum, mut squares) = (0_u32, 0_i64, 0_i128);
         for e in events {
             let JudgeEventKind::Judged {
-                deviation: Some(d), ..
+                deviation: Some(head),
+                release,
+                ..
             } = e.kind
             else {
                 continue;
             };
+            let d = side_deviation(Some(head), release).unwrap_or(head);
             let s = d.0.saturating_neg();
             if s.unsigned_abs() > TIMING_RANGE_US.unsigned_abs() {
                 continue;
@@ -405,15 +411,23 @@ fn channel(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs
         Judgment::Bad => 2,
         Judgment::Poor => 3,
     };
-    let distance = match (deviation, release) {
-        (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
-        (_, Some(r)) => Some(r),
-        (head, None) => head,
-    };
-    if distance.is_some_and(|d| d.0 <= 0) {
+    if side_deviation(deviation, release).is_some_and(|d| d.0 <= 0) {
         1 + grade
     } else {
         5 + grade
+    }
+}
+
+/// The deviation that decides a judgment's side, as [`eval::Tally`] counts
+/// it (design.md "Evaluation Stages", accounting): for a long note
+/// finished by a release, whichever of its head's press and its release
+/// lies farther from its time, the release on a tie; otherwise the
+/// press's, `None` for a miss.
+fn side_deviation(deviation: Option<TimeUs>, release: Option<TimeUs>) -> Option<TimeUs> {
+    match (deviation, release) {
+        (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
+        (_, Some(r)) => Some(r),
+        (head, None) => head,
     }
 }
 

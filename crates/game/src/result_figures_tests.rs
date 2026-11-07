@@ -147,8 +147,8 @@ fn timing_numbers_match_the_source_baseline() {
 
 /// (b) µs samples: 1.5 ms and 0, where the source's ms samples (1 and 0)
 /// give 0/50 for both; (c) the range's edge; (d) a miss, an empty POOR and
-/// a held head's feedback are no samples, and a long note counts once by
-/// its head.
+/// a held head's feedback are no samples, and a long note counts once, by
+/// its head when its release lies closer.
 #[test]
 fn timing_samples_are_presses_in_us_within_the_range() {
     let stats = TimingStats::of(&[press(-1_500), press(0)]).unwrap();
@@ -182,11 +182,45 @@ fn timing_samples_are_presses_in_us_within_the_range() {
         },
         ..press(0)
     });
-    // A long note released 50 ms early: its sample is its head's.
-    events.push(judged(Some(TimeUs(-4_000)), Some(TimeUs(-50_000))));
+    // A long note released 1 ms early, closer than its head: its head's.
+    events.push(judged(Some(TimeUs(-4_000)), Some(TimeUs(-1_000))));
     let stats = TimingStats::of(&events).unwrap();
     assert_eq!(stats.samples, 2);
     assert_eq!(stats.mean_x100, 300);
+}
+
+/// A long note finished by its release gives one sample: the farther of
+/// its head's press and its release from its time, the release on a tie,
+/// as the tally decides its side; a release closer than the head leaves
+/// the head's. The expectations are the source's arithmetic on whole-ms
+/// samples (`play/JudgeManager.java:512-519,625`,
+/// `result/MusicResult.java:347-354`).
+#[test]
+fn a_long_note_samples_the_farther_of_its_head_and_release() {
+    // A tap 2 ms early; a head 4 ms early, released 50 ms early: the
+    // samples are 2 and 50 ms.
+    let farther = TimingStats::of(&[
+        press(-2_000),
+        judged(Some(TimeUs(-4_000)), Some(TimeUs(-50_000))),
+    ])
+    .unwrap();
+    assert_eq!(numbers(farther), (26, 0, 24, 0));
+    // A head 10 ms late, released 10 ms early: the tie takes the release,
+    // +10 ms; with a tap 2 ms early the samples are 2 and 10 ms.
+    let tie = TimingStats::of(&[
+        press(-2_000),
+        judged(Some(TimeUs(10_000)), Some(TimeUs(-10_000))),
+    ])
+    .unwrap();
+    assert_eq!(numbers(tie), (6, 0, 4, 0));
+    // A head 30 ms early, released 5 ms early: the head's, 30 ms.
+    let head = TimingStats::of(&[
+        press(-2_000),
+        judged(Some(TimeUs(-30_000)), Some(TimeUs(-5_000))),
+    ])
+    .unwrap();
+    assert_eq!(numbers(head), (16, 0, 14, 0));
+    assert_eq!(head.samples, 2);
 }
 
 /// 1 s bins up to 512 of them; past that, every bin one whole second wide
