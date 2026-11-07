@@ -97,6 +97,11 @@ fn two_skins_at_the_atlas_cap_fit_together() {
     r.state_charge(&p, CAP);
     assert_eq!(r.admission().charge(ScreenKind::Play), CAP);
     r.admit(ScreenKind::Selection, &big).unwrap();
+    // One texel more is past the limit.
+    r.state_charge(&p, CAP + 1);
+    let e = r.admit(ScreenKind::Selection, &big).unwrap_err();
+    refused(&e, ScreenKind::Selection, SHARED_TEXELS + 1);
+    r.state_charge(&p, CAP);
 
     let result = tiny(&r, GREEN);
     commit(&mut r, ScreenKind::Result, &result, 2);

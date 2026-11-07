@@ -185,14 +185,25 @@ fn the_side_counts_the_reserved_layers() {
     assert_eq!((a.side(), a.pages().len()), (512, 1));
 }
 
+/// The texel of [`a_side_between_powers_of_two_halves_at_every_level`]'s
+/// frame at `(x, y)`: every colour channel varies, so neighbouring texels
+/// differ; opaque, so the page holds them as they are.
+fn varied(x: u32, y: u32) -> [u8; 4] {
+    let b = |v: u32| u8::try_from(v % 256).unwrap();
+    [b(x * 5), b(y * 3), b(x * 7 + y * 13), 255]
+}
+
 /// A side between powers of two: a 300-texel frame with its gutter (316)
 /// is past 256, and 384 is the cheapest side, not 512. Every level halves
-/// it exactly (384, 192, 96, 48) and is the 2×2 box filter of the level
-/// above it, and the frame's colour is under its centre at every level.
+/// it exactly (384, 192, 96, 48), and each texel is the rounded mean of
+/// the 2×2 texels above it, computed here per channel, over a frame whose
+/// texels all differ (a nearest-texel level would fail), and level 0
+/// holds the frame's texels.
 #[test]
 fn a_side_between_powers_of_two_halves_at_every_level() {
     let d = dir();
-    save(d.path(), "a.png", &solid(300, 300, RED));
+    let img = RgbaImage::from_fn(300, 300, |x, y| Rgba(varied(x, y)));
+    save(d.path(), "a.png", &img);
     let sheet = load(d.path(), vec![file("a.png")], vec![whole(0)]).unwrap();
     let limits = AtlasLimits {
         max_side: 8_192,
@@ -200,19 +211,29 @@ fn a_side_between_powers_of_two_halves_at_every_level() {
     };
     let a = sheet.atlas(Variant::Lo, limits, &|| false).unwrap();
     assert_eq!((a.side(), a.pages().len()), (384, 1));
-    let page = &a.pages()[0];
-    for k in 1..4 {
-        let side = 384_usize >> k;
-        let level = page.level(k).unwrap();
-        assert_eq!(level.len(), side * side * 4, "level {k}");
-        let mut want = vec![0_u8; level.len()];
-        skin_model::downsample_rgba(page.level(k - 1).unwrap(), 384 >> (k - 1), &mut want);
-        assert_eq!(level, &want[..], "level {k}");
-    }
     let ([x, y, w, h], p) = content(&a, 0, 1);
-    for k in 0..4 {
-        let (cx, cy) = ((x + w / 2) >> k, (y + h / 2) >> k);
-        assert_eq!(texel(&a, p, k, cx, cy), RED, "level {k}");
+    assert_eq!([w, h], [300, 300]);
+    for (i, j) in [(0, 0), (1, 0), (0, 1), (150, 77), (299, 299)] {
+        assert_eq!(texel(&a, p, 0, x + i, y + j), varied(i, j), "({i}, {j})");
+    }
+    for k in 1..4 {
+        let side = 384_u32 >> k;
+        assert_eq!(
+            a.pages()[p].level(k).unwrap().len(),
+            usize::try_from(side * side * 4).unwrap(),
+            "level {k}"
+        );
+        for ty in 0..side {
+            for tx in 0..side {
+                let above = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .map(|(dx, dy)| texel(&a, p, k - 1, 2 * tx + dx, 2 * ty + dy));
+                let want: [u8; 4] = std::array::from_fn(|c| {
+                    let sum: u32 = above.iter().map(|t| u32::from(t[c])).sum();
+                    u8::try_from((sum + 2) / 4).unwrap()
+                });
+                assert_eq!(texel(&a, p, k, tx, ty), want, "level {k} ({tx}, {ty})");
+            }
+        }
     }
 }
 
