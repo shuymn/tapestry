@@ -27,6 +27,7 @@ const EX3: f32 = 1_080.0 - 150.0 - 8.0;
 const BPD: f32 = 1_080.0 - 200.0 - 8.0;
 const LV: f32 = 1_080.0 - 250.0 - 8.0;
 const NR: f32 = 1_080.0 - 260.0 - 8.0;
+const MN: f32 = 1_080.0 - 270.0 - 8.0;
 
 /// The image set of the clear type: entry `k` is the clear type `k`'s.
 const CLEAR_SET: &str = r#"["b0", "b1", "b5", "lamp", "lab", "bar"]"#;
@@ -43,7 +44,8 @@ fn json_body() -> String {
                      {{"id": "ex3", {DIGITS}, "digit": 4, "value": "score3"}},
                      {{"id": "bpd", {DIGITS}, "digit": 4, "ref": 178}},
                      {{"id": "lv", {DIGITS}, "digit": 2, "ref": 96}},
-                     {{"id": "nr", {DIGITS}, "digit": 4, "ref": 154}}],
+                     {{"id": "nr", {DIGITS}, "digit": 4, "ref": 154}},
+                     {{"id": "mn", {DIGITS}, "digit": 3, "ref": 374}}],
            "gaugegraph": [{{"id": "gg"}}],
            "destination": [
                {{"id": "ex", "dst": [{{"x": 0, "y": 100, "w": 4, "h": 8}}]}},
@@ -51,6 +53,7 @@ fn json_body() -> String {
                {{"id": "bpd", "dst": [{{"x": 0, "y": 200, "w": 4, "h": 8}}]}},
                {{"id": "lv", "dst": [{{"x": 0, "y": 250, "w": 4, "h": 8}}]}},
                {{"id": "nr", "dst": [{{"x": 0, "y": 260, "w": 4, "h": 8}}]}},
+               {{"id": "mn", "dst": [{{"x": 0, "y": 270, "w": 4, "h": 8}}]}},
                {{"id": "dot", "op": [90], "dst": [{{"x": 0, "y": 300, "w": 8, "h": 8}}]}},
                {{"id": "lab", "draw": "update_score", "dst": [{{"x": 0, "y": 400, "w": 8, "h": 8}}]}},
                {{"id": "clr", "dst": [{{"x": 0, "y": 500, "w": 8, "h": 8}}]}},
@@ -121,6 +124,7 @@ fn lua_entry() -> String {
         lua_value("bpd", 4, "value = function() return ms.number(178) end"),
         lua_value("lv", 2, "value = function() return ms.number(96) end"),
         lua_value("nr", 4, "ref = 154"),
+        lua_value("mn", 3, "value = function() return ms.number(374) end"),
     ]
     .join(", ");
     let sets = "{ id = \"clr\", value = function() return ms.event_index(370) end, \
@@ -132,6 +136,7 @@ fn lua_entry() -> String {
         lua_dst("bpd", 200, 4, ""),
         lua_dst("lv", 250, 4, ""),
         lua_dst("nr", 260, 4, ""),
+        lua_dst("mn", 270, 4, ""),
         lua_dst(
             "dot",
             300,
@@ -219,18 +224,19 @@ fn json_and_lua_draw_the_same_result_frames() {
         a.view(v);
         b.view(v);
         (
-            [EX, EX3, BPD, LV, NR].map(|t| a.digits(0, t)),
+            [EX, EX3, BPD, LV, NR, MN].map(|t| a.digits(0, t)),
             [300.0, 400.0, 500.0, 550.0].map(|y| a.at(0, top(y, 8.0))),
             !b.at(0, DIFF).is_empty(),
         )
     };
     let [v1, v2, v3, v4, v5] = <[ResultView; 5]>::try_from(views()).unwrap();
     // Ready: EX 1000 by id and name, BP difference −3, level 12, 17 to the
-    // next grade; cleared, the score updated, NORMAL's clear type (5) and
-    // lane index 0; `number(178) ~= 0` holds.
+    // next grade, the mean −1.49 ms in whole ms truncated toward 0 (its
+    // magnitude 1); cleared, the score updated, NORMAL's clear type (5)
+    // and lane index 0; `number(178) ~= 0` holds.
     let s = |d: &str| d.to_owned();
     let ready_frame = (
-        [s("1000"), s("1000"), s("3"), s("12"), s("17")],
+        [s("1000"), s("1000"), s("3"), s("12"), s("17"), s("1")],
         [vec![DOT], vec![LAB], vec![BAR], vec![B0]],
         true,
     );
@@ -240,7 +246,7 @@ fn json_and_lua_draw_the_same_result_frames() {
     assert_eq!(
         frame(&v2),
         (
-            [s("1000"), s("1000"), s(""), s("12"), s("17")],
+            [s("1000"), s("1000"), s(""), s("12"), s("17"), s("1")],
             [vec![DOT], vec![LAB], vec![BAR], vec![B0]],
             true,
         )
@@ -250,7 +256,7 @@ fn json_and_lua_draw_the_same_result_frames() {
     assert_eq!(
         frame(&v3),
         (
-            [s("1000"), s("1000"), s(""), s("12"), s("17")],
+            [s("1000"), s("1000"), s(""), s("12"), s("17"), s("1")],
             [vec![], vec![], vec![B1], vec![B0]],
             false,
         )
@@ -259,7 +265,7 @@ fn json_and_lua_draw_the_same_result_frames() {
     assert_eq!(
         frame(&v4),
         (
-            [s(""), s(""), s(""), s("12"), s("")],
+            [s(""), s(""), s(""), s("12"), s(""), s("")],
             [vec![], vec![], vec![], vec![B0]],
             false,
         )
