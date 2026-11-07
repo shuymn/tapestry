@@ -184,7 +184,8 @@ fn the_areas_are_the_key_windows_for_the_charts_rank() {
 /// notes at 10.5 s and 20 s are scanned before lane 7's at 600 s widens
 /// the bins to 2 s: they count in bins 5 and 10 of 301. A practice
 /// section from 10 s to 30 s keeps 1 s bins from its start; a mine and a
-/// long note ending past the section count in none.
+/// long note ending past the section count in none. A bin holds 65 536
+/// notes without saturating.
 #[test]
 fn notes_count_in_their_final_bins() {
     let s = |ms: i64| TimeUs(ms * 1_000);
@@ -201,7 +202,7 @@ fn notes_count_in_their_final_bins() {
         (basis.timeline.width, basis.timeline.count, basis.notes),
         (s(2_000), 301, 4)
     );
-    let mut want = [0_u16; 512];
+    let mut want = [0_u32; 512];
     want[5] = 1;
     want[10] = 1;
     want[14] = 1; // the long note at 29 s
@@ -217,8 +218,19 @@ fn notes_count_in_their_final_bins() {
         ),
         (s(1_000), 11, 2)
     );
-    let mut want = [0_u16; 512];
+    let mut want = [0_u32; 512];
     want[0] = 1;
     want[10] = 1;
     assert_eq!(section.notes_per_bin, want);
+    // 65 536 taps in one 1 s bin, 8 192 a lane over the 8 lanes: one more
+    // than a `u16` holds.
+    let mut b = ChartBuilder::new(150_000);
+    for l in 0..8 {
+        for i in 0..8_192 {
+            b = b.tap(lane(l), TimeUs(i * 100));
+        }
+    }
+    let dense = ResultBasis::of(&b.build().unwrap(), None);
+    assert_eq!(dense.notes, 65_536);
+    assert_eq!(dense.notes_used(), &[65_536]);
 }

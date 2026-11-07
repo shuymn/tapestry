@@ -160,7 +160,7 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
             Timelines::new(
                 TimeUs(1_000_000),
                 (0..bins).map(|i| [u32::try_from(i).unwrap(); 9]).collect(),
-                (0..bins).map(|i| u16::try_from(10 * i).unwrap()).collect(),
+                (0..bins).map(|i| u32::try_from(10 * i).unwrap()).collect(),
                 None,
             )
             .unwrap(),

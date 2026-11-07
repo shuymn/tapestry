@@ -234,7 +234,7 @@ pub struct TimingStats {
 pub struct Timelines {
     width: TimeUs,
     bins: Box<[[u32; TIMELINE_CHANNELS]]>,
-    notes: Box<[u16]>,
+    notes: Box<[u32]>,
     uncovered_from: Option<u16>,
 }
 
@@ -264,7 +264,7 @@ impl Timelines {
     pub fn new(
         width: TimeUs,
         bins: Vec<[u32; TIMELINE_CHANNELS]>,
-        notes: Vec<u16>,
+        notes: Vec<u32>,
         uncovered_from: Option<u16>,
     ) -> Result<Self, TimelinesError> {
         let n = bins.len();
@@ -305,7 +305,7 @@ impl Timelines {
 
     /// The judged notes of the attempt in each bin, whether judged or not.
     #[must_use]
-    pub fn notes(&self) -> &[u16] {
+    pub fn notes(&self) -> &[u32] {
         &self.notes
     }
 

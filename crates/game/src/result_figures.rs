@@ -41,7 +41,7 @@ pub struct ResultBasis {
     pub timeline: TimelineAxis,
     /// The judged notes of the attempt in each timeline bin, by their
     /// time; bins past `timeline.count` stay 0.
-    pub notes_per_bin: [u16; MAX_TIMELINE_BINS],
+    pub notes_per_bin: [u32; MAX_TIMELINE_BINS],
     /// Whether the chart declares `#RANDOM` or `#SETRANDOM`: its best may
     /// come from a draw with another note count, so no best rate is known.
     pub random: bool,
@@ -72,7 +72,7 @@ impl ResultBasis {
         }
         let origin = section.map_or(TimeUs(0), |(start, _)| start);
         let timeline = TimelineAxis::new(origin, last.unwrap_or(origin));
-        let mut notes_per_bin = [0_u16; MAX_TIMELINE_BINS];
+        let mut notes_per_bin = [0_u32; MAX_TIMELINE_BINS];
         for note in chart.lanes.iter().flatten().filter(judged) {
             if let Some(n) = timeline
                 .bin(note.time)
@@ -92,7 +92,7 @@ impl ResultBasis {
 
     /// The judged notes in each bin in use.
     #[must_use]
-    pub fn notes_used(&self) -> &[u16] {
+    pub fn notes_used(&self) -> &[u32] {
         self.notes_per_bin
             .get(..usize::from(self.timeline.count))
             .unwrap_or(&self.notes_per_bin)
