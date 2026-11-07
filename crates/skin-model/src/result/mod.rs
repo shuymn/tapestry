@@ -185,7 +185,7 @@ impl ResultScreen {
     /// grows; and to copy the timelines, at most
     /// [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins.
     pub(crate) fn update(&mut self, view: &ResultView, labels: &ResultLabels) {
-        self.fields = fields(view);
+        self.fields = ResultFields::of(view).0;
         let ready = view.status == ResultStatus::Ready;
         self.timing = view.timing.filter(|_| ready);
         self.timelines = view.timelines.clone().filter(|_| ready);
@@ -253,9 +253,35 @@ fn number(n: ResultNumber) -> i32 {
     }
 }
 
-/// The fields of `view`: the chart's under every status; the result's,
-/// the timing's and the best's only while it is ready, each group's
-/// validity false otherwise and its values 0.
+/// The [`RESULT`](schema::RESULT) fields of one view, by slot: what a
+/// result skin's expressions read, in frames ([`Skin::update_result`](crate::Skin::update_result)
+/// fills its state with them) and while a skin is imported for that view,
+/// so the two cannot differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultFields(pub [i32; field::COUNT]);
+
+impl ResultFields {
+    /// The fields of `view`: the chart's under every status; the
+    /// result's, the timing's and the best's only while it is ready, each
+    /// group's validity false otherwise and its values 0; a hidden best
+    /// value `i32::MIN`.
+    #[must_use]
+    pub fn of(view: &ResultView) -> Self {
+        Self(fields(view))
+    }
+
+    /// The state an expression over [`RESULT`](schema::RESULT) reads:
+    /// these fields, with no timer.
+    #[must_use]
+    pub fn state(&self) -> State<'_> {
+        State {
+            fields: &self.0,
+            timers: &[],
+        }
+    }
+}
+
+/// The fields of `view`, as [`ResultFields::of`] gives them.
 fn fields(view: &ResultView) -> [i32; field::COUNT] {
     let mut f = [0; field::COUNT];
     let mut set = |slot: u16, v: i32| {
