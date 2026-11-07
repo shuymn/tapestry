@@ -41,6 +41,8 @@ mod font_support;
 #[path = "../tests/outline_support/mod.rs"]
 mod outline_support;
 #[cfg(test)]
+mod result_tests;
+#[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_common;
 #[cfg(test)]
@@ -68,7 +70,8 @@ mod text_upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use decl::{
-    AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, skin_frame,
+    AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, pages_bytes,
+    pages_texels, skin_frame,
 };
 pub use gpu::{AdapterChoice, Gpu};
 pub use outline::{
@@ -80,8 +83,8 @@ pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 pub use renderer::{
     Admission, CommitError, FrameTiming, LoadingTextError, LoadingTextKey, MAX_SPRITES,
-    MemoryWitness, PreparedToken, RenderError, Renderer, SHARED_TEXELS, STRIP_SPRITES, Target,
-    VM_TEXELS, letterbox,
+    MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError, Renderer, SHARED_TEXELS,
+    STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,

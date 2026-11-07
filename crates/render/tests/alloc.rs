@@ -58,6 +58,7 @@ mod outline_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
@@ -507,6 +508,136 @@ fn frames_do_not_allocate_from_the_first() {
     loading_frames();
     imported_frames(&chart, &overlay, glyphs);
     outline_frames(&chart, &overlay);
+    result_frames();
+}
+
+/// A result skin of two solid cells in `dir`, drawing `elements` (image,
+/// left edge) as full-height bands on the screen timer.
+fn result_skin(dir: &std::path::Path, elements: &[(u32, i32)]) -> skin_model::Skin {
+    use skin_model::{
+        Anchor, Ease, ElementDef, End, Filter, Fit, KeyDef, Place, Region, RegionDef, ResultDefs,
+        Root, SheetBuilder, SkinDef, SolidImageDef, Source, TimerRef, Track, WidgetDefs,
+        result_timer,
+    };
+    let mut b = SheetBuilder::new(&Root::new(dir).unwrap());
+    for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+        b.add_solid_image(SolidImageDef {
+            size: [16, 16],
+            color,
+            filter: Filter::Nearest,
+            grid: None,
+        })
+        .unwrap();
+    }
+    let elements = elements
+        .iter()
+        .map(|&(image, x)| {
+            let mut props = [None; 9];
+            props[..4].copy_from_slice(&[Some(x), Some(0), Some(400), Some(1_080)]);
+            ElementDef {
+                source: Source::Image(image),
+                track: Track::new(
+                    &[KeyDef {
+                        at: TimeUs(0),
+                        props,
+                    }],
+                    Ease::Linear,
+                    End::Hold,
+                )
+                .unwrap(),
+                timer: TimerRef::Builtin(result_timer::SCREEN),
+                visible: None,
+                blend: Blend::Alpha,
+                clip: None,
+                place: Place::SCREEN,
+            }
+        })
+        .collect();
+    let def = SkinDef {
+        fit: Fit::Fixed,
+        regions: [RegionDef {
+            anchor: Anchor::TopLeft,
+            optional: false,
+        }; Region::COUNT],
+        whens: Vec::new(),
+        sheet: b.finish(),
+        lanes: None,
+        elements,
+        widgets: WidgetDefs::default(),
+        bomb_up_to: None,
+        close: None,
+    };
+    skin_model::Skin::new_result(def, ResultDefs::default()).unwrap()
+}
+
+/// C11's renderer half (S10-09i): the result's commit point allocates
+/// nothing: the commit of a layout staged on the pages installed, the
+/// installation of its staged lines, and its frames with the strip at
+/// its fullest, the first after the commit included.
+fn result_frames() {
+    use skin_model::{
+        BestView, LampKey, Layout, ResultChart, ResultFrame, ResultLabels, ResultScore,
+        ResultStatus, ResultTimers, ResultView, Side, Variant,
+    };
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let a = result_skin(dir.path(), &[(0, 0), (1, 1_500)]);
+    let atlas = a.atlas(Variant::Lo, r.atlas_limits(), &|| false).unwrap();
+    let b = result_skin(dir.path(), &[(1, 1_000)]);
+    let rebound = atlas.rebind(b.sheet(), Variant::Lo, false).unwrap();
+    let none = || ClipTable::new(Vec::new()).unwrap();
+    let a = Arc::new(render::SkinBundle::new(Arc::new(a), atlas, none(), Side::Left).unwrap());
+    let b = Arc::new(render::SkinBundle::new(Arc::new(b), rebound, none(), Side::Left).unwrap());
+    let token = r.install(ScreenKind::Result, &a, 1).unwrap();
+    r.commit(token).unwrap();
+    let view = ResultView {
+        status: ResultStatus::Ready,
+        chart: ResultChart::default(),
+        score: ResultScore {
+            clear: LampKey::Normal,
+            ..ResultScore::default()
+        },
+        best: BestView::Unavailable,
+        timing: None,
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
+        timelines: None,
+    };
+    // B prepared beside A: staged on its pages, its state and lines.
+    let token = r.install(ScreenKind::Result, &b, 2).unwrap();
+    let mut res = b.skin().prepare_result();
+    b.skin()
+        .update_result(&mut res, &view, &ResultLabels::default())
+        .unwrap();
+    r.prepare_result_text(&mut res).unwrap();
+    let layout = Layout::AUTHOR;
+    let strip = [Sprite {
+        rect: [0.0, 0.0, 1_920.0, 42.0],
+        uv: render::solid_uv(),
+        color: [0.0, 0.0, 0.0, 0.75],
+        ..Sprite::default()
+    }; render::RESULT_STRIP_SPRITES];
+    let ((), commit) = counted(|| r.commit(token).unwrap());
+    let (installed, text) = counted(|| r.install_staged_result_text());
+    assert!(installed);
+    let ((), allocs) = counted(|| {
+        for k in 0..60 {
+            let f = ResultFrame {
+                now: TimeUs(k * 16_667),
+                target: [1_920, 1_080],
+                layout: &layout,
+                timers: ResultTimers {
+                    screen: Some(TimeUs(0)),
+                    fadeout: (k >= 30).then_some(TimeUs(30 * 16_667)),
+                },
+            };
+            r.build_result(&mut res, &f, &strip).unwrap();
+        }
+    });
+    assert_eq!(commit, 0, "the result's commit allocated");
+    assert_eq!(text, 0, "the result's staged lines' installation allocated");
+    assert_eq!(allocs, 0, "the result's frames allocated");
 }
 
 /// Every run's scissor as the renderer resolves it while drawing
