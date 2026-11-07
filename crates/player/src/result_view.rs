@@ -313,18 +313,28 @@ mod tests {
         }
     }
 
-    /// A preset whose emphasized gauge is not its first: a survival gauge
-    /// looking HARD, its maximum 120 % below the other's 150 %, failing
-    /// below 30 %.
-    fn two_gauges() -> RulePreset {
+    /// A preset of seven gauges whose emphasized one, the seventh, is
+    /// listed in the fifth slot: a survival gauge looking HARD, its
+    /// maximum 120 % below the first's 150 %, failing below 30 %. The
+    /// others end-threshold gauges at 100 %, clearing at 80 %.
+    fn seven_gauges() -> RulePreset {
         let mut p = rules::tapestry();
+        let normal = p.gauges[0].clone();
+        p.gauges.truncate(1);
         p.gauges[0].max = GaugeValue(15_000_000);
-        let hard = &mut p.gauges[1];
+        for i in 1..6 {
+            p.gauges.push(rules::GaugeRule {
+                id: format!("n{i}"),
+                ..normal.clone()
+            });
+        }
+        let mut hard = p.gauges[1].clone();
         hard.id = "hard".to_owned();
         hard.max = GaugeValue(12_000_000);
         hard.kind = GaugeKind::Survival {
             fails_below: GaugeValue(3_000_000),
         };
+        p.gauges.push(hard);
         p
     }
 
@@ -347,7 +357,8 @@ mod tests {
     }
 
     /// C14, through `ResultBasis::of` and `ViewSummary::of`: the
-    /// emphasized gauge's trace converts with its own rule's maximum (not
+    /// emphasized gauge's trace, the preset's seventh in the fifth slot,
+    /// converts with its own rule's maximum (not
     /// the graphs' top), border and look, the covered columns and the
     /// what-if's mark; the deviations, areas and notes per bin carry over
     /// value for value; a view with no gauge has no history.
@@ -360,7 +371,7 @@ mod tests {
             .tap(lane(7), TimeUs(3_000_000))
             .build()
             .unwrap();
-        let p = two_gauges();
+        let p = seven_gauges();
         let b = ResultBasis::of(&chart, None);
         let event = JudgeEvent {
             seq: 0,
@@ -379,13 +390,15 @@ mod tests {
         let e = Evaluation {
             events: vec![event],
             tally: eval::Tally::default(),
-            gauges: vec![
-                gauge(2_000_000, &[(1_000_000, 2_500_000)]),
-                gauge(
-                    10_000_000,
-                    &[(1_000_000, 11_000_000), (2_000_000, 4_000_000)],
-                ),
-            ],
+            gauges: (0..7)
+                .map(|i| match i {
+                    6 => gauge(
+                        10_000_000,
+                        &[(1_000_000, 11_000_000), (2_000_000, 4_000_000)],
+                    ),
+                    _ => gauge(2_000_000, &[(1_000_000, 2_500_000)]),
+                })
+                .collect(),
             completed: true,
             final_deadline: TimeUs(10_000_000),
         };
@@ -399,8 +412,8 @@ mod tests {
         let s = view(&e, Coverage::NoInputAfter(TimeUs(5_000_000)));
         let parts = result_parts(&s, &p, &b);
         let g = parts.gauge.unwrap();
-        let trace = s.graphs.traces[1].unwrap();
-        assert_eq!(s.graphs.emphasized, Some(1));
+        let trace = s.graphs.traces[4].unwrap();
+        assert_eq!((s.graphs.emphasized, trace.gauge), (Some(4), 6));
         assert_ne!(trace.columns, s.graphs.traces[0].unwrap().columns);
         let want: Vec<GaugeColumn> = trace
             .columns
