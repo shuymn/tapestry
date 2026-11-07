@@ -328,7 +328,7 @@ mod tests {
                 ..normal.clone()
             });
         }
-        let mut hard = p.gauges[1].clone();
+        let mut hard = normal;
         hard.id = "hard".to_owned();
         hard.max = GaugeValue(12_000_000);
         hard.kind = GaugeKind::Survival {
@@ -415,16 +415,12 @@ mod tests {
         let trace = s.graphs.traces[4].unwrap();
         assert_eq!((s.graphs.emphasized, trace.gauge), (Some(4), 6));
         assert_ne!(trace.columns, s.graphs.traces[0].unwrap().columns);
-        let want: Vec<GaugeColumn> = trace
-            .columns
-            .iter()
-            .map(|c| GaugeColumn {
-                low: c.low,
-                high: c.high,
-                last: c.last,
-            })
-            .collect();
-        assert_eq!(&g.columns[..], &want[..]);
+        let want = trace.columns.map(|c| GaugeColumn {
+            low: c.low,
+            high: c.high,
+            last: c.last,
+        });
+        assert_eq!(g.columns, want);
         assert_eq!(g.columns[28].low, GaugeValue(10_000_000));
         assert_eq!(g.columns[28].high, GaugeValue(11_000_000));
         assert_eq!(g.columns[57].last, GaugeValue(4_000_000));

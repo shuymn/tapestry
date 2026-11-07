@@ -101,7 +101,8 @@ fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
         empty_poor,
     ];
     let chart = one_tap();
-    let s = summary(&evaluation(events.clone()), &chart, &rules::tapestry());
+    let e = evaluation(events);
+    let s = summary(&e, &chart, &rules::tapestry());
     let mut want = [0_u32; DEVIATION_SLOTS];
     want[300] = 1;
     want[0] = 1;
@@ -114,7 +115,7 @@ fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
     assert_eq!(s.graphs.deviations, want);
     let samples: u32 = s.graphs.deviations.iter().sum();
     assert_eq!(Some(samples), s.figures.timing.map(|t| t.samples));
-    assert_eq!(s.graphs.timing, Timing::of(&events));
+    assert_eq!(s.graphs.timing, Timing::of(&e.events));
     assert_eq!(s.graphs.timing.samples(), 11);
 }
 
