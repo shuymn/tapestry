@@ -690,20 +690,29 @@ impl Drop for ResultSkin {
     }
 }
 
-/// The chart's facts a result view carries for `loaded`: its play level
-/// and difficulty; the total, tempo, length and notes are not projected
-/// before S10-09i, so a skin reading them while it loads is refused for
-/// that view.
+/// The chart's facts a result view carries for `loaded`, each its own
+/// projection of the loaded chart: its play level and difficulty; the
+/// gauge's TOTAL, whole (number 368); the tempo's lowest and highest in
+/// floored hundredths with whether it changes in whole BPMs, as the play
+/// readouts take them (numbers 90-91); its length, to the end of its last
+/// note (numbers 1163-1164); and its judged notes (number 74), which a
+/// view replaces with its own.
 pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
-    let labels = loaded.labels();
+    let attempt = loaded.attempt();
+    let labels = &attempt.labels;
     let difficulty = crate::imports::facts::difficulty_of(&labels.difficulty);
+    let tempo = attempt.tempo.meta();
     ResultChart {
         level: Some(crate::imports::facts::level_of(&labels.playlevel)),
-        total: None,
-        bpm: None,
+        total: u32::try_from(attempt.song_total).ok(),
+        bpm: crate::attempt_context::bpm_range(tempo).map(|r| skin_model::ResultBpm {
+            min_x100: r.min_x100,
+            max_x100: r.max_x100,
+            changes: crate::attempt_context::bpm_whole_change(tempo),
+        }),
         difficulty: Some(difficulty).filter(|d| (1..=5).contains(d)),
-        length: None,
-        notes: None,
+        length: Some(attempt.last_note_end),
+        notes: Some(game::ResultBasis::of(loaded.chart(), None).notes),
     }
 }
 

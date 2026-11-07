@@ -319,3 +319,28 @@ fn only_the_latest_switch_commits() {
     assert!(!rs.busy(), "C's layout is the entry");
     assert!(Arc::ptr_eq(&shown(&rs), &c));
 }
+
+/// Q5: the chart's facts projected for a result view: TOTAL (368), the
+/// tempo's range and change (90-91), the length (1163-1164) and the
+/// judged notes (74), each from the loaded chart.
+#[test]
+fn the_chart_facts_are_projected() {
+    let loaded = crate::imports::facts::tests::loaded(
+        "#PLAYLEVEL 7\n#DIFFICULTY 3\n#TOTAL 300.7\n#BPM01 180\n#00208:01\n#00211:01\n",
+        "beatoraja-style",
+    );
+    let c = super::attempt_chart(&loaded);
+    assert_eq!((c.level, c.difficulty), (Some(7), Some(3)));
+    assert_eq!(c.total, Some(300));
+    assert_eq!(
+        c.bpm,
+        Some(skin_model::ResultBpm {
+            min_x100: 12_000,
+            max_x100: 18_000,
+            changes: true,
+        })
+    );
+    assert_eq!(c.notes, Some(2));
+    // The last note, in measure 2, ends past the first measure's 2 s.
+    assert!(c.length.is_some_and(|l| l.0 >= 2_000_000), "{:?}", c.length);
+}
