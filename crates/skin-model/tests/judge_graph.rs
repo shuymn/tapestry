@@ -425,6 +425,7 @@ fn a_judge_graph_is_checked_and_charged_at_load() {
     let el = || screen_element(0, [0, 0, 10, 10], 255);
     let graphs = |g| ResultDefs {
         judge_graphs: vec![g],
+        ..ResultDefs::default()
     };
     let ok = graph(JudgeGraphKind::Judgment, GRID, true, 0);
     // Not on a play skin.

@@ -6,8 +6,9 @@
 //!
 //! A view change allocates, bounded by the skin (its text slots, at most
 //! twice [`MAX_TEXT_BYTES`](crate::MAX_TEXT_BYTES) a string) and the timelines (at most
-//! [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins); a build
-//! allocates nothing.
+//! [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins); the gauge's
+//! history and the deviations are copied into storage the state makes
+//! once; a build allocates nothing.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
@@ -19,7 +20,8 @@ use bms_model::TimeUs;
 
 use self::schema::{HIDDEN, VALUE_MAX, field, timer};
 use self::view::{
-    BestView, ResultLabels, ResultNumber, ResultStatus, ResultView, Timelines, TimingStats,
+    BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory, ResultLabels,
+    ResultNumber, ResultStatus, ResultView, Timelines, TimingStats,
 };
 use crate::expr::{State, TIMER_OFF};
 use crate::select::value;
@@ -100,7 +102,30 @@ pub struct ResultScreen {
     pub(crate) bitmap: Box<[Option<GlyphLine>]>,
     timing: Option<TimingStats>,
     timelines: Option<Timelines>,
+    /// The view's emphasized gauge, valid while `has_gauge`.
+    gauge: Box<GaugeHistory>,
+    has_gauge: bool,
+    /// The view's deviations, valid while `has_deviations`.
+    deviations: Box<[u32; DEVIATION_SLOTS]>,
+    has_deviations: bool,
+    areas: Option<[[i16; 2]; 5]>,
+    /// Whether the view is ready.
+    ready: bool,
 }
+
+/// An empty history, the gauge storage's first contents.
+const NO_GAUGE: GaugeHistory = GaugeHistory {
+    columns: [GaugeColumn {
+        low: rules::GaugeValue(0),
+        high: rules::GaugeValue(0),
+        last: rules::GaugeValue(0),
+    }; GRAPH_COLUMNS],
+    max: rules::GaugeValue(0),
+    border: rules::GaugeValue(0),
+    look: crate::GaugeLook::Normal,
+    reached: 0,
+    no_input_from: None,
+};
 
 impl ResultScreen {
     /// A fresh state with `whens` `when` timers and `text_slots` text
@@ -118,6 +143,12 @@ impl ResultScreen {
             bitmap: vec![None; text_slots].into_boxed_slice(),
             timing: None,
             timelines: None,
+            gauge: Box::new(NO_GAUGE),
+            has_gauge: false,
+            deviations: Box::new([0; DEVIATION_SLOTS]),
+            has_deviations: false,
+            areas: None,
+            ready: false,
         }
     }
 
@@ -151,6 +182,26 @@ impl ResultScreen {
         self.timelines.as_ref()
     }
 
+    /// The view's emphasized gauge; `None` without one or a result.
+    pub(crate) fn gauge(&self) -> Option<&GaugeHistory> {
+        self.has_gauge.then_some(&*self.gauge)
+    }
+
+    /// The view's deviations; `None` without them or a result.
+    pub(crate) fn deviations(&self) -> Option<&[u32; DEVIATION_SLOTS]> {
+        self.has_deviations.then_some(&*self.deviations)
+    }
+
+    /// The view's judge areas; `None` without them or a result.
+    pub(crate) fn areas(&self) -> Option<[[i16; 2]; 5]> {
+        self.areas
+    }
+
+    /// Whether the view is ready.
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
+    }
+
     /// The bytes this state holds, itself and every buffer it owns. For a
     /// memory witness; it allocates nothing.
     #[must_use]
@@ -163,6 +214,8 @@ impl ResultScreen {
         let bytes = size_of::<Self>()
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
+            + size_of_val(&*self.gauge)
+            + size_of_val(&*self.deviations)
             + self.text.heap_bytes()
             + glyphs::lines_bytes(&self.bitmap)
             + strings
@@ -181,8 +234,8 @@ impl ResultScreen {
         self.ms.len()
     }
 
-    /// Fills the fields, strings, timing statistics and timelines from
-    /// `view`. Allocates only to replace a string too small for its new
+    /// Fills the fields, strings, timing statistics, timelines, gauge
+    /// history, deviations and judge areas from `view`. Allocates only to replace a string too small for its new
     /// text, with one of exactly that text's length, so each keeps at most
     /// twice [`MAX_TEXT_BYTES`](crate::MAX_TEXT_BYTES) however often it
     /// grows; and to copy the timelines, at most
@@ -192,6 +245,18 @@ impl ResultScreen {
         let ready = view.status == ResultStatus::Ready;
         self.timing = view.timing.filter(|_| ready);
         self.timelines = view.timelines.clone().filter(|_| ready);
+        self.ready = ready;
+        self.has_gauge = false;
+        if let Some(g) = view.gauge.as_deref().filter(|_| ready) {
+            *self.gauge = *g;
+            self.has_gauge = true;
+        }
+        self.has_deviations = false;
+        if let Some(d) = view.deviations.as_deref().filter(|_| ready) {
+            *self.deviations = *d;
+            self.has_deviations = true;
+        }
+        self.areas = view.timing_areas.filter(|_| ready);
         let s = &mut self.strings;
         for (to, from) in [
             (&mut s.title, &labels.title),

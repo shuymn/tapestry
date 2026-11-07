@@ -211,7 +211,12 @@ impl JudgeGraph {
         let largest = notes.iter().copied().max().unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
-        let g = Geometry::new(region(rect, brush, [n, scale]), brush.pivot, n, scale);
+        let g = Geometry::new(
+            region(rect, brush, [n.saturating_mul(5), scale.saturating_mul(5)]),
+            brush.pivot,
+            n,
+            scale,
+        );
         if self.def.back
             && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
             && !self.back(&g, f, brush, out)
@@ -323,12 +328,10 @@ impl JudgeGraph {
 
 /// The graph's region in canvas pixels: the reference `rect` through the
 /// brush's lane map and affine, then fitted to its native size, if any,
-/// with the graph's texture as the frame: 5 texels a bin across and 5 a
-/// cell down, `[n, scale]` bins and cells.
-fn region(rect: [f32; 4], brush: &Brush, [n, scale]: [u32; 2]) -> [f32; 4] {
+/// with the graph's texture of `texels` as the frame.
+pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
     let [x, y, w, h] = rect;
     let placed = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
-    let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
     brush.native.map_or(placed, |native| {
         native.sized(texels).fit(placed, brush.scale)
     })
