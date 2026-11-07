@@ -2802,13 +2802,12 @@ pub(crate) mod tests {
         set.adjustment_mut().unwrap().publish_panels(true);
     }
 
-    /// Under a panel the select screen's keys act as the reference's
-    /// option panels let them (`MusicSelectInputProcessor.java` at 0.8.9):
-    /// under panel 1 (START) Up and Down and the scratch scroll
-    /// (`:154-202`), and nothing chooses, practises, goes back or pages
-    /// (`:115`, `:290-329`); under panel 2 (SELECT) and 3 (both) the list
-    /// does not move either; the order, the search box and the presets act
-    /// as without one, and every other controller key does nothing.
+    /// Under a panel the select screen's list takes no input, as the
+    /// reference's option panels hold it (`MusicSelectInputProcessor.java`
+    /// at 0.8.9, `bar.input()` only with none open, `:290`): under every
+    /// panel Up, Down, the scratch and every other controller key do
+    /// nothing, and nothing chooses, practises, goes back or pages; the
+    /// order, the search box and the presets act as without one.
     #[test]
     fn keys_under_a_panel_act_as_the_panels_let_them() {
         use eval::ControlId;
@@ -2851,13 +2850,17 @@ pub(crate) mod tests {
             panel_key(set, code, value);
             sel.panels(Some(&level), TimeUs(1));
         };
-        // Panel 1: Down moves to B; Enter, P, Escape, Backspace, Page Down
-        // and End do nothing; the scratch moves to C, the white keys, the
-        // black keys and key 7 do nothing.
+        // Panel 1: Down, Up, Enter, P, Escape, Backspace, Page Down and
+        // End do nothing; the scratch, the white keys, the black keys and
+        // key 7 do nothing.
         look(&mut sel, &mut set, 0x12, 1);
         assert_eq!(sel.feed.panel(), Some(0));
+        let cursor = |sel: &Selection| sel.screen.view(0, 0, false);
+        let before = cursor(&sel);
         for key in [
             MenuKey::Down,
+            MenuKey::Down,
+            MenuKey::Up,
             MenuKey::Enter,
             MenuKey::Practice,
             MenuKey::Escape,
@@ -2871,7 +2874,15 @@ pub(crate) mod tests {
             send(Some(0), control);
         }
         assert_eq!(sel.drain(&mut pad), None);
+        assert_eq!(cursor(&sel), before, "nothing moved the list");
         assert!(sel.preset_steps.is_empty(), "key 7 stepped no preset");
+        // Tab and the presets act: into the search box and out, and F12.
+        keys(&mut sel, &[MenuKey::Tab]);
+        assert!(sel.screen.searching());
+        keys(&mut sel, &[MenuKey::Tab, MenuKey::NextPreset]);
+        assert!(!sel.screen.searching());
+        assert_eq!(sel.preset_steps.len(), 1, "F12 stepped the preset");
+        sel.preset_steps.clear();
         // Panel 3 (both) and panel 2 (SELECT): nothing moves; the order
         // still changes, and back.
         look(&mut sel, &mut set, 0x11, 1);
@@ -2882,14 +2893,16 @@ pub(crate) mod tests {
         assert_eq!(sel.screen.order(), 0);
         send(Some(2), 2);
         assert_eq!(sel.drain(&mut pad), None);
+        assert_eq!(cursor(&sel), before, "nothing moved the list");
         look(&mut sel, &mut set, 0x12, 0);
         assert_eq!(sel.feed.panel(), Some(1));
         assert_eq!(keys(&mut sel, &[MenuKey::Up, MenuKey::Enter]), None);
-        // Closed: Enter chooses C, where the scratch left the cursor.
+        assert_eq!(cursor(&sel), before, "nothing moved the list");
+        // Closed: Enter chooses A, where the cursor stayed.
         look(&mut sel, &mut set, 0x11, 0);
         assert_eq!(sel.feed.panel(), None);
         let chosen = keys(&mut sel, &[MenuKey::Enter]).expect("Enter chooses");
-        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
+        assert_eq!(played(chosen).file_name().unwrap(), "a.bms");
         // A controller event sent under a panel stays held back once it
         // closed; one sent after acts.
         send(Some(1), 1);
