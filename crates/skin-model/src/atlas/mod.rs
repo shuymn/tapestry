@@ -268,7 +268,7 @@ impl PackedPages {
                     };
                     (CellSource::File(file), rect)
                 }
-                CellSource::Solid(_) => (cell.source, cell.rect),
+                CellSource::Solid(..) => (cell.source, cell.rect),
             };
             let i = self
                 .cells
@@ -604,7 +604,7 @@ impl Sheet {
             };
             let source = match cell.source {
                 CellSource::File(f) => CellSource::File(index(f).ok_or(AtlasError::Misaligned)?),
-                CellSource::Solid(_) => cell.source,
+                CellSource::Solid(..) => cell.source,
             };
             let [x, y, ..] = place.alloc;
             cells.push(HeldCell {

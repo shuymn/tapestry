@@ -83,6 +83,7 @@ fn sheet(root: &Path, wants: &[Want]) -> Sheet {
                     size,
                     color,
                     filter: skin_model::Filter::Linear,
+                    grid: None,
                 })
                 .unwrap();
             }
