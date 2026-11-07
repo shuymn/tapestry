@@ -66,8 +66,9 @@ const _: () = assert!(
 /// The most skin pages, also capped by the device's layers.
 pub const MAX_PAGES: u32 = 64;
 /// The most level-0 texels across every layer of the array, the reserved
-/// ones and the text layer included; the mips add a third.
-pub const MAX_ATLAS_TEXELS: u64 = 192 << 20;
+/// ones and the text layer included; the mips add a third. A provisional
+/// limit, raised when a real case hits it.
+pub const MAX_ATLAS_TEXELS: u64 = 256 << 20;
 /// The smallest page side of an atlas with a text layer.
 pub const MIN_TEXT_SIDE: u32 = 2_048;
 
