@@ -12,10 +12,9 @@ use std::sync::Arc;
 
 use common::result::{Res, best, ready};
 use common::{font, link_dir, png, write};
-use skin_beatoraja::{Cancel, Config, Fact, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
+use skin_beatoraja::{Cancel, Config, LuaImported, LuaOutcome, read_lua_header};
 use skin_model::{
-    CacheBounds, FileSource, FontReader, ResourceCache, ResultFields, ResultNumber, Root,
-    ScreenKind, SourceCounts,
+    CacheBounds, FileSource, FontReader, ResourceCache, ResultNumber, Root, SourceCounts,
 };
 
 /// A bitmap font `name` of size 8 over `pages`, its glyphs `A` and `B`
@@ -74,14 +73,6 @@ fn view(nr: u32) -> skin_model::ResultView {
     v
 }
 
-/// The facts of [`view`]`(nr)`.
-fn facts(nr: u32) -> ImportFacts {
-    ImportFacts {
-        result: Fact::Known(ResultFields::of(&view(nr))),
-        ..ImportFacts::unavailable(ScreenKind::Result)
-    }
-}
-
 /// `root`'s skin imported for `nr` through `source`, or the disk for
 /// `None`.
 fn run(root: &Path, nr: u32, source: Option<FileSource>) -> LuaImported {
@@ -90,7 +81,11 @@ fn run(root: &Path, nr: u32, source: Option<FileSource>) -> LuaImported {
     if let Some(s) = source {
         h.read_through(s);
     }
-    match h.import(&Config::defaults(h.header()), &facts(nr), &cancel) {
+    match h.import(
+        &Config::defaults(h.header()),
+        &common::result::facts(Some(&view(nr))),
+        &cancel,
+    ) {
         Ok(LuaOutcome::Imported(i)) => i,
         other => panic!("{other:?}"),
     }
@@ -110,7 +105,11 @@ fn run_ledgered(
     if let Some(s) = source {
         h.read_through(s);
     }
-    match h.import_ledgered(&Config::defaults(h.header()), &facts(nr), &cancel) {
+    match h.import_ledgered(
+        &Config::defaults(h.header()),
+        &common::result::facts(Some(&view(nr))),
+        &cancel,
+    ) {
         (Ok(LuaOutcome::Imported(i)), ledger) => (i, ledger),
         (other, _) => panic!("{other:?}"),
     }
@@ -162,15 +161,8 @@ fn a_second_run_reads_no_image_or_font_file() {
     let fonts = sheet.font_count();
     assert_eq!(fonts, 1, "the outline font is the sheet's");
     let source = FileSource::cached(Arc::clone(&c));
-    let mut h = read_lua_header(root, "s.luaskin", &Cancel::new()).unwrap();
-    h.read_through(source.clone());
-    let (second, n) = {
-        let i = match h.import(&Config::defaults(h.header()), &facts(7), &Cancel::new()) {
-            Ok(LuaOutcome::Imported(i)) => i,
-            other => panic!("{other:?}"),
-        };
-        (i, source.counts())
-    };
+    let second = run(root, 7, Some(source.clone()));
+    let n = source.counts();
     assert_eq!(n, SourceCounts::default(), "the second run read nothing");
     let read_first = FontReader::new(first.imported.skin.sheet())
         .read(0)
@@ -408,15 +400,9 @@ fn past_a_bound_a_miss_is_read_every_time() {
         assert!(n.resolutions >= 4, "no resolution kept: {n:?}");
         let (_, n) = cached(root, &texts, 5);
         assert_eq!(n.fnt_texts, 1, "no text kept: {n:?}");
-        let (i, _) = cached(root, &fonts, 5);
+        cached(root, &fonts, 5);
         let source = FileSource::cached(Arc::clone(&fonts));
-        let mut h = read_lua_header(root, "s.luaskin", &Cancel::new()).unwrap();
-        h.read_through(source.clone());
-        drop(i);
-        let i = match h.import(&Config::defaults(h.header()), &facts(5), &Cancel::new()) {
-            Ok(LuaOutcome::Imported(i)) => i,
-            other => panic!("{other:?}"),
-        };
+        let i = run(root, 5, Some(source.clone()));
         FontReader::new(i.imported.skin.sheet()).read(0).unwrap();
         assert_eq!(source.counts().font_bytes, 1, "no font bytes kept");
     }

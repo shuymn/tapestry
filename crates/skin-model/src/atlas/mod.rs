@@ -431,7 +431,8 @@ impl Sheet {
                 continue;
             };
             let header = (version.dims, version.mode);
-            // Resolved again as it is read: only this file's path is live.
+            // Resolved again as it is read: the atlas keeps only this file's
+            // path live (a source's cache holds its resolutions, D13).
             let (canonical, _) = self
                 .source()
                 .resolve(self.root(), &version.name)

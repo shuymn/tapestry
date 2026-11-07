@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use super::decode::{self, Bands, DecodeError, Mode, Probe};
 use super::font::{FontError, MAX_TOTAL_FONT_BYTES};
 use super::path::{self, PathError};
-use super::{FileAt, ImageError, MAX_FILES, MAX_PATH_BYTES, Stop};
+use super::{FileAt, ImageError, MAX_FILE_BYTES, MAX_FILES, MAX_PATH_BYTES, Stop};
 
 /// A file verdict that is the file's own and can be given again exactly:
 /// a path check or a header check, with no I/O error or decoder source
@@ -188,8 +188,6 @@ enum Content {
 #[derive(Debug, Default)]
 struct Entries {
     resolutions: HashMap<String, Result<(PathBuf, u64), Failed>>,
-    /// The resolution names' bytes.
-    name_bytes: u64,
     contents: HashMap<ContentKey, Content>,
     fnt_bytes: u64,
     font_bytes: u64,
@@ -257,7 +255,11 @@ impl ResourceCache {
         let e = self.lock();
         CacheUsage {
             resolutions: e.resolutions.len(),
-            name_bytes: e.name_bytes,
+            name_bytes: e
+                .resolutions
+                .keys()
+                .map(|n| u64::try_from(n.len()).unwrap_or(u64::MAX))
+                .sum(),
             contents: e.contents.len(),
             fnt_bytes: e.fnt_bytes,
             font_bytes: e.font_bytes,
@@ -283,7 +285,6 @@ impl ResourceCache {
         {
             return;
         }
-        e.name_bytes += u64::try_from(name.len()).unwrap_or(u64::MAX);
         e.resolutions.insert(name.to_owned(), r);
     }
 
@@ -438,9 +439,9 @@ impl FileSource {
     /// The header of the file at `canonical` ([`decode::header`] on the
     /// opened file).
     pub(crate) fn header(&self, canonical: &Path) -> Result<Probe, HeaderFail> {
-        let key = ContentKey::Header(canonical.to_path_buf());
         let cache = self.cache_holding(canonical);
-        if let Some(Content::Header(r)) = cache.and_then(|c| c.content(&key)) {
+        let key = cache.map(|_| ContentKey::Header(canonical.to_path_buf()));
+        if let Some(Content::Header(r)) = cache.zip(key.as_ref()).and_then(|(c, k)| c.content(k)) {
             return r.map_err(Failed::header);
         }
         #[cfg(any(test, feature = "dev-tools"))]
@@ -448,7 +449,7 @@ impl FileSource {
         let r = path::open(canonical)
             .map_err(HeaderFail::Path)
             .and_then(|(mut file, len)| decode::header(&mut file, len).map_err(HeaderFail::Decode));
-        if let Some(c) = cache {
+        if let (Some(c), Some(key)) = (cache, key) {
             let recorded = match &r {
                 Ok(p) => Some(Ok(*p)),
                 Err(e) => e.recorded().map(Err),
@@ -469,9 +470,9 @@ impl FileSource {
         check: impl FnOnce(u64) -> Result<(), E>,
         path_err: impl Fn(PathError) -> E,
     ) -> Result<Arc<[u8]>, E> {
-        let key = ContentKey::FntText(canonical.to_path_buf());
         let cache = self.cache_holding(canonical);
-        if let Some(Content::FntText(b)) = cache.and_then(|c| c.content(&key)) {
+        let key = cache.map(|_| ContentKey::FntText(canonical.to_path_buf()));
+        if let Some(Content::FntText(b)) = cache.zip(key.as_ref()).and_then(|(c, k)| c.content(k)) {
             check(u64::try_from(b.len()).unwrap_or(u64::MAX))?;
             return Ok(b);
         }
@@ -485,7 +486,7 @@ impl FileSource {
             .read_to_end(&mut bytes)
             .map_err(|e| path_err(PathError::Io(e)))?;
         let bytes: Arc<[u8]> = bytes.into();
-        if let Some(c) = cache {
+        if let (Some(c), Some(key)) = (cache, key) {
             c.record(key, Content::FntText(Arc::clone(&bytes)));
         }
         Ok(bytes)
@@ -502,9 +503,10 @@ impl FileSource {
         max: u64,
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), Stop> {
-        let key = ContentKey::Page(canonical.to_path_buf());
         let cache = self.cache_holding(canonical);
-        if let Some(Content::Page(dims, mode, r)) = cache.and_then(|c| c.content(&key))
+        let key = cache.map(|_| ContentKey::Page(canonical.to_path_buf()));
+        if let Some(Content::Page(dims, mode, r)) =
+            cache.zip(key.as_ref()).and_then(|(c, k)| c.content(k))
             && (dims, mode) == header
         {
             // The disk read asks `cancel` before it reads the page; so does
@@ -520,7 +522,7 @@ impl FileSource {
             .encoded(canonical, at, max, cancel)
             .and_then(|bytes| self.decode(bytes, at, header, cancel, &mut Validate))
             .map(drop);
-        if let Some(c) = cache {
+        if let (Some(c), Some(key)) = (cache, key) {
             let recorded = match &r {
                 Ok(()) => Some(Ok(())),
                 Err(Stop::Image(e)) => Failed::of_image(e).map(Err),
@@ -595,9 +597,10 @@ impl FileSource {
         check: impl FnOnce(u64) -> Result<(), FontError>,
         read: impl FnOnce(std::fs::File, u64) -> (u64, Result<Vec<u8>, FontError>),
     ) -> (u64, Result<Vec<u8>, FontError>) {
-        let key = ContentKey::FontBytes(canonical.to_path_buf());
         let cache = self.cache_holding(canonical);
-        if let Some(Content::FontBytes(b)) = cache.and_then(|c| c.content(&key)) {
+        let key = cache.map(|_| ContentKey::FontBytes(canonical.to_path_buf()));
+        if let Some(Content::FontBytes(b)) = cache.zip(key.as_ref()).and_then(|(c, k)| c.content(k))
+        {
             let len = u64::try_from(b.len()).unwrap_or(u64::MAX);
             if let Err(e) = check(len) {
                 return (0, Err(e));
@@ -615,14 +618,17 @@ impl FileSource {
         }
         let (taken, r) = read(file, len);
         // Only a cache keeps a copy; the disk hands its bytes over as read.
-        if let (Some(c), Ok(b)) = (cache, &r) {
+        if let (Some(c), Some(key), Ok(b)) = (cache, key, &r) {
             c.record(key, Content::FontBytes(Arc::from(b.as_slice())));
         }
         (taken, r)
     }
 
-    /// The encoded bytes of the file at `canonical`, always from the disk
-    /// ([`super::read_encoded`]).
+    /// The encoded bytes of the file at `canonical`, always from the disk,
+    /// closed before they are returned, `cancel` asked before each piece
+    /// read. A file over `limit` refuses as [`ImageError::FileTooLarge`] at
+    /// [`MAX_FILE_BYTES`], and as [`ImageError::TotalBytesTooLarge`] below
+    /// it, where the limit is what remains of a total.
     pub(crate) fn encoded(
         &self,
         canonical: &Path,
@@ -632,21 +638,48 @@ impl FileSource {
     ) -> Result<Vec<u8>, Stop> {
         #[cfg(any(test, feature = "dev-tools"))]
         self.count(|c| c.encoded_reads += 1);
-        super::read_encoded(canonical, at, limit, cancel)
+        let (mut file, len) = path::open(canonical).map_err(|e| ImageError::path(at, e))?;
+        let (bytes, more) =
+            decode::read_capped(&mut file, len, limit, cancel).map_err(|source| {
+                if decode::is_cancelled(&source) {
+                    Stop::Cancelled
+                } else {
+                    Stop::Image(ImageError::Io { at, source })
+                }
+            })?;
+        drop(file);
+        if more {
+            return Err(Stop::Image(if limit < MAX_FILE_BYTES {
+                ImageError::TotalBytesTooLarge { at }
+            } else {
+                ImageError::FileTooLarge { at }
+            }));
+        }
+        Ok(bytes)
     }
 
-    /// [`super::decode_file`], counted.
+    /// Decodes `bytes`, version `at` of a file admitted with `dims` and
+    /// `mode`: a whole file into the image returned; a file decoded in
+    /// bands into `bands`, `cancel` asked as it goes. Counted.
     pub(crate) fn decode(
         &self,
         bytes: Vec<u8>,
         at: FileAt,
-        header: ([u32; 2], Mode),
+        (dims, mode): ([u32; 2], Mode),
         cancel: &dyn Fn() -> bool,
         bands: &mut dyn Bands,
     ) -> Result<Option<::image::RgbaImage>, Stop> {
         #[cfg(any(test, feature = "dev-tools"))]
         self.count(|c| c.decodes += 1);
-        super::decode_file(bytes, at, header, cancel, bands)
+        match mode {
+            Mode::Full(header) => decode::check_whole(&bytes, dims, header)
+                .and_then(|()| decode::decode(bytes, dims))
+                .map(Some)
+                .map_err(|e| Stop::Image(ImageError::decode(at, e))),
+            Mode::Banded(header) => decode::banded(bytes, dims, header, cancel, bands)
+                .map(|()| None)
+                .map_err(|h| Stop::halt(at, h)),
+        }
     }
 }
 

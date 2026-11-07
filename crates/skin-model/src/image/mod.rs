@@ -308,62 +308,11 @@ impl From<ImageError> for Stop {
 }
 
 impl Stop {
-    fn halt(at: FileAt, h: Halt) -> Self {
+    pub(crate) fn halt(at: FileAt, h: Halt) -> Self {
         match h {
             Halt::Cancelled => Self::Cancelled,
             Halt::Failed(e) => Self::Image(ImageError::decode(at, e)),
         }
-    }
-}
-
-/// The encoded bytes of the file at `canonical`, closed before they are
-/// returned, `cancel` asked before each piece read. A file over `limit`
-/// refuses as [`ImageError::FileTooLarge`] at [`MAX_FILE_BYTES`], and as
-/// [`ImageError::TotalBytesTooLarge`] below it, where the limit is what
-/// remains of a total.
-pub(crate) fn read_encoded(
-    canonical: &Path,
-    at: FileAt,
-    limit: u64,
-    cancel: &dyn Fn() -> bool,
-) -> Result<Vec<u8>, Stop> {
-    let (mut file, len) = path::open(canonical).map_err(|e| ImageError::path(at, e))?;
-    let (bytes, more) = decode::read_capped(&mut file, len, limit, cancel).map_err(|source| {
-        if decode::is_cancelled(&source) {
-            Stop::Cancelled
-        } else {
-            Stop::Image(ImageError::Io { at, source })
-        }
-    })?;
-    drop(file);
-    if more {
-        return Err(Stop::Image(if limit < MAX_FILE_BYTES {
-            ImageError::TotalBytesTooLarge { at }
-        } else {
-            ImageError::FileTooLarge { at }
-        }));
-    }
-    Ok(bytes)
-}
-
-/// Decodes `bytes`, version `at` of a file admitted with `dims` and
-/// `mode`: a whole file into the image returned; a file decoded in bands
-/// into `bands`, `cancel` asked as it goes.
-pub(crate) fn decode_file(
-    bytes: Vec<u8>,
-    at: FileAt,
-    (dims, mode): ([u32; 2], Mode),
-    cancel: &dyn Fn() -> bool,
-    bands: &mut dyn decode::Bands,
-) -> Result<Option<::image::RgbaImage>, Stop> {
-    match mode {
-        Mode::Full(header) => decode::check_whole(&bytes, dims, header)
-            .and_then(|()| decode::decode(bytes, dims))
-            .map(Some)
-            .map_err(|e| Stop::Image(ImageError::decode(at, e))),
-        Mode::Banded(header) => decode::banded(bytes, dims, header, cancel, bands)
-            .map(|()| None)
-            .map_err(|h| Stop::halt(at, h)),
     }
 }
 

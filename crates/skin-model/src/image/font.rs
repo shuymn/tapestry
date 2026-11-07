@@ -158,11 +158,13 @@ impl Sheet {
 }
 
 /// Reads a sheet's font files for installation, against one budget of
-/// [`MAX_TOTAL_FONT_BYTES`] bytes actually read. Each name is resolved
-/// again inside the skin folder; the opened handle must be a regular file
-/// of at most [`MAX_FONT_BYTES`] and of the budget left; at most that
-/// handle's length plus one byte is read; and the magic is checked on the
-/// bytes read. What a read takes from the budget stays taken, a failed
+/// [`MAX_TOTAL_FONT_BYTES`] bytes actually read, through the sheet's
+/// source. Each name is resolved again inside the skin folder (or answered
+/// by the source's cache); a file read from the disk must be, on its opened
+/// handle, a regular file of at most [`MAX_FONT_BYTES`] and of the budget
+/// left, and at most that handle's length plus one byte is read; bytes the
+/// cache holds are checked by their length alike; and the magic is checked
+/// on the bytes. What a read takes from the budget stays taken, a failed
 /// read's included.
 #[derive(Debug)]
 pub struct FontReader<'a> {
