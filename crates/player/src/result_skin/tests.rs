@@ -206,17 +206,26 @@ fn a_missing_cell_packs_a_union_once() {
 #[test]
 fn refused_probes() {
     let _s = serial();
+    // Refused before 154 is read: the built-in result, with no layout job.
     let d = skin(
-        "error(\"refused\")",
+        "",
         "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
     );
-    // `nr` is read before the error: the refusal follows a result fact.
+    let entry = fs::read_to_string(d.path().join("s.luaskin"))
+        .unwrap()
+        .replace(
+            "local nr = ms.number(154)",
+            "error(\"refused\")\nlocal nr = ms.number(154)",
+        );
+    fs::write(d.path().join("s.luaskin"), entry).unwrap();
     let p = pending(d.path(), LIMITS);
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
     staged(&mut rs);
     assert!(rs.image().is_none(), "nothing prepared");
+    let jobs = jobs_started();
     rs.request(view(5));
-    settled(&mut rs);
+    assert!(!rs.busy(), "no layout job");
+    assert_eq!(jobs_started(), jobs);
     assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
 
     let d = skin(
