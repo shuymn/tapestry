@@ -11,8 +11,8 @@ use common::result::{
 };
 use common::selection::{B0, B1, BAR, DIGITS, DOT, LABEL as LAB, LAMP};
 use skin_beatoraja::{
-    EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts, LuaOutcome, LuaWhy,
-    NoteKind, Object, Report, Severity,
+    Cancel, Config, EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts,
+    LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
 };
 use skin_model::{BestView, ResultNumber, ResultView, ScreenKind};
 
@@ -774,4 +774,34 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ResultNumber(154)),
         other => panic!("{other:?}"),
     }
+}
+
+/// D11: a refusal carries the facts its run read before it, so the image
+/// stage tells a refusal after a result fact (left to the layout stage)
+/// from one before any (the built-in result).
+#[test]
+fn a_refusal_carries_the_facts_read_before_it() {
+    let d = sheet();
+    let ex = lua_value("ex", 4, "ref = 71");
+    let pre = "local nr = ms.number(154)\nif nr == 1 then error(\"refused\") end";
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &lua_dst("ex", 100, 4, "")).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let mut v = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    v.score.next_rank = 1;
+    let Err((_, deps)) = h.import_reading(&Config::defaults(h.header()), &facts(Some(&v)), &cancel)
+    else {
+        panic!("refused")
+    };
+    assert_eq!(
+        deps.reads,
+        [FactRead {
+            fact: FactId::ResultNumber(154),
+            value: FactValue::Int(1),
+        }]
+    );
 }
