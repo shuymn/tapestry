@@ -517,9 +517,11 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// What a proof resting on captured state needs: the candidate closed.
-    fn bound(&self) -> R<()> {
-        if self.an.open.get().is_some() {
+    /// What a proof resting on the captured binding cell `d` of `file`
+    /// needs: the candidate closed and the cell never written at frame
+    /// time.
+    fn bound(&self, file: u16, d: u32) -> R<()> {
+        if !self.an.cell_holds(file, d) {
             return refuse(Unsupported::Interference);
         }
         Ok(())
@@ -885,7 +887,7 @@ impl<'a> Eval<'a> {
         {
             return Ok(v);
         }
-        self.bound()?;
+        self.bound(f.file, d)?;
         match self.an.upvalue(f.inst, d) {
             Some(c) => self.captured(c, Some((f.ast, f.file, d))),
             None => refuse(Unsupported::Capture("an upvalue")),
@@ -897,7 +899,7 @@ impl<'a> Eval<'a> {
         if env != CHUNK_ENV && self.slot(f, env)?.is_some() {
             return construct("_ENV");
         }
-        self.bound()?;
+        self.bound(f.file, env)?;
         match self.an.global(f.inst, env, f.ast.str(name)).map_err(stop)? {
             Some(c) => self.captured(c, None),
             None => refuse(Unsupported::Capture("an entry no path copied")),

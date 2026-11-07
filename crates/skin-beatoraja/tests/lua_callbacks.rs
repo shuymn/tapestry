@@ -892,3 +892,148 @@ fn a_second_program_draw_follows_its_role() {
         ]
     );
 }
+
+/// A latch: a closure whose frame-time body writes its own upvalue
+/// `state` (a located write), drawn by a decorative image.
+const LATCH: &str = "local latch = (function()\n\
+      local state = ms.timer_off_value\n\
+      return function()\n\
+        if state == ms.timer_off_value and ms.number(100) == 200000 then\n\
+          state = ms.time()\n\
+        end\n\
+        return state\n\
+      end\n\
+    end)()\n\
+    table.insert(skin.destination, { id = \"i\", draw = function() return latch() ~= 0 end,\n\
+      dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+
+/// How many callables lowered, compiled or were replaced for a write or
+/// an interference.
+fn tally(i: &LuaImported) -> (usize, usize, usize) {
+    let n = |f: fn(&Disposition) -> bool| i.callbacks.iter().filter(|d| f(d)).count();
+    (
+        n(|d| matches!(d, Disposition::Lowered | Disposition::Compiled)),
+        n(|d| *d == Disposition::Replaced(Unsupported::Writes)),
+        n(|d| *d == Disposition::Replaced(Unsupported::Interference)),
+    )
+}
+
+/// A frame-time write to an upvalue voids only the proofs through that
+/// cell: the critical gauge pulse beside a latch writing its own `state`
+/// still reads the host module through its upvalue and lowers, and shows
+/// as it does alone; the latch's root writes and is replaced.
+#[test]
+fn a_write_to_another_cell_leaves_a_proof_whole() {
+    let d = folder(&skin(&format!("{LATCH}\n{SHAPE_C}")));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 0));
+    let mut play = Drawn::with_look(i.imported.skin, 10, GaugeLook::Hazard);
+    let pulse = play
+        .frame(1_000, &[])
+        .iter()
+        .filter(|q| q.rect[0] >= 499.0)
+        .count();
+    assert!(pulse > 0);
+}
+
+/// A write that may reach a proof's path voids it: through a table entry
+/// (not located, so the candidate opens) and to the cell the reader's
+/// binding lives in (located): the critical pulse refuses, located at the
+/// write.
+#[test]
+fn a_write_on_a_proofs_path_voids_it() {
+    // The host module held in a table, its entry written at frame time.
+    let entry = "local holder = { m = ms }\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() holder.m = nil return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    // The reader's own upvalue `ms`, rebound at frame time.
+    let cell = "table.insert(skin.destination, { id = \"i\", draw = function() ms = nil return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    for (writer, line) in [(entry, 12), (cell, 11)] {
+        let d = folder(&skin(&format!("{writer}\n{SHAPE_C}")));
+        match import(&d, 905) {
+            Err(ImportError::Lua {
+                at: Some(at),
+                why:
+                    LuaWhy::Critical {
+                        why: Unsupported::Interference,
+                        ..
+                    },
+            }) => assert_eq!(at.line, line, "{writer}"),
+            other => panic!("{writer}: {other:?}"),
+        }
+    }
+}
+
+/// State one callback writes and another reads (a value storing the id it
+/// shows in a chunk local, a draw reading it): the writer and the reader
+/// follow their role, decorative constants here, and an unrelated
+/// critical callback lowers.
+#[test]
+fn a_callback_reading_a_written_cell_follows_its_role() {
+    let d = folder(&skin(&format!(
+        "local shown\n\
+         skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+           value = function() shown = 152 return 0 end }} }}\n\
+         table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"i\", draw = function() return shown ~= nil end,\n\
+           dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n\
+         {SHAPE_C}"
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 1));
+}
+
+/// An open reason that is not a located write keeps the whole candidate
+/// open: beside the latch, a method call opens it, and the critical pulse
+/// refuses at the method call.
+#[test]
+fn an_unlocated_opener_still_opens_the_candidate() {
+    let opener = "table.insert(skin.destination, { id = \"i\", draw = function() return (\"x\"):len() > 0 end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    let d = folder(&skin(&format!("{LATCH}\n{opener}\n{SHAPE_C}")));
+    match import(&d, 905) {
+        Err(ImportError::Lua {
+            at: Some(at),
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+        }) => assert_eq!(at.line, 22),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An id read from a cell frame time writes resolves to its captured value
+/// and the integer numerals written to it (the Rm shape: a value choosing
+/// 152 or 153 and showing it): decorative ids leave the writer a decorative
+/// constant; a critical one among them refuses; a cell written anything
+/// else resolves nothing, which refuses as an unknown id does (the
+/// writer's reason, `Writes`, named).
+#[test]
+fn an_id_through_a_written_cell_resolves_to_what_is_written() {
+    let shape = |assign: &str| {
+        folder(&skin(&format!(
+            "local shown\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+               value = function() if ms.option(1) then {assign} else shown = 153 end return ms.number(shown) end }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+             {SHAPE_C}"
+        )))
+    };
+    let i = import(&shape("shown = 152"), 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 0));
+    for (assign, why) in [
+        ("shown = 101", Unsupported::Writes),
+        ("shown = ms.number(1)", Unsupported::Writes),
+    ] {
+        match import(&shape(assign), 905) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Critical { why: w, .. },
+                ..
+            }) => assert_eq!(w, why, "{assign}"),
+            other => panic!("{assign}: {other:?}"),
+        }
+    }
+}

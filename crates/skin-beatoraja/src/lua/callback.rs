@@ -183,6 +183,10 @@ pub(crate) struct Open {
     pub(crate) why: Unsupported,
 }
 
+/// A located write: where a binding cell is first written at frame time,
+/// and the integer numerals it may get (`None` once anything else).
+pub(crate) type Written = (Site, Option<Vec<i64>>);
+
 /// A function prototype with its captured values: its file, its function
 /// and the values, in its upvalues' order.
 pub(crate) type ProtoKey = (u16, u32, Vec<Captured>);
@@ -221,6 +225,16 @@ pub(crate) struct Analysis {
     /// ([`Unsupported::Interference`]); unset after the walk, it is
     /// closed.
     pub(crate) open: Cell<Option<Open>>,
+    /// The located writes the effect walk met: each upvalue binding cell a
+    /// root may assign at frame time, by its file and declaration, to the
+    /// first place it does and the integer numerals every assignment to it
+    /// writes (`None` once one writes anything else). A proof whose access
+    /// path starts at one does not hold ([`Unsupported::Interference`]);
+    /// the candidate stays closed.
+    pub(crate) written: RefCell<HashMap<(u16, u32), Written>>,
+    /// The located write the last refusal for a written cell met, where
+    /// the refusal of a critical callback is located.
+    pub(crate) interfered: Cell<Option<Site>>,
     /// The root instances whose reach writes ([`super::effects`]): they
     /// never lower ([`Unsupported::Writes`]).
     pub(crate) writers: RefCell<std::collections::HashSet<u32>>,
@@ -396,6 +410,38 @@ impl Analysis {
                 _ => Ok(None),
             },
             _ => Ok(None),
+        }
+    }
+
+    /// Where binding cell `d` of `file` is first written at frame time,
+    /// when it is ([`Self::written`]).
+    pub(crate) fn written_at(&self, file: u16, d: u32) -> Option<Site> {
+        self.written.borrow().get(&(file, d)).map(|w| w.0)
+    }
+
+    /// The integer numerals frame time may write to binding cell `d` of
+    /// `file`: `Some(empty)` for a cell never written, `None` when an
+    /// assignment writes anything else.
+    pub(crate) fn written_ints(&self, file: u16, d: u32) -> Option<Vec<i64>> {
+        match self.written.borrow().get(&(file, d)) {
+            None => Some(Vec::new()),
+            Some((_, ints)) => ints.clone(),
+        }
+    }
+
+    /// Whether a proof through binding cell `d` of `file` holds: the
+    /// candidate is closed and the cell is never written. A written one is
+    /// recorded as the refusal's place.
+    pub(crate) fn cell_holds(&self, file: u16, d: u32) -> bool {
+        if self.open.get().is_some() {
+            return false;
+        }
+        match self.written_at(file, d) {
+            Some(site) => {
+                self.interfered.set(Some(site));
+                false
+            }
+            None => true,
         }
     }
 

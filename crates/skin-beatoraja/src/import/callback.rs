@@ -803,6 +803,7 @@ impl Lower<'_> {
                     _ => {}
                 }
             }
+            let file = self.an.instance(i).map_or(u16::MAX, |x| x.file);
             let ids = Ids {
                 an: self.an,
                 ast,
@@ -810,6 +811,7 @@ impl Lower<'_> {
                 func,
                 own: &own,
                 open,
+                file,
             };
             for &e in &calls {
                 let Expr::Call { callee, args } = ast.expr(e) else {
@@ -825,7 +827,7 @@ impl Lower<'_> {
                             .saturating_add(1),
                     )
                     .map_err(stop)?;
-                let resolved = if open {
+                let resolved = if open || written_path(self.an, ast, file, callee) {
                     None
                 } else {
                     match resolve_callee(self.an, ast, i, callee) {
@@ -934,6 +936,8 @@ struct Ids<'a> {
     /// Its parameters' joins over its call sites.
     own: &'a [Scan],
     open: bool,
+    /// Its file, whose written binding cells resolve nothing.
+    file: u16,
 }
 
 impl Ids<'_> {
@@ -969,10 +973,38 @@ impl Ids<'_> {
             }
             Some(_) => Ok(Scan::unresolved("id")),
             None if self.open => Ok(Scan::unresolved("id")),
-            None => Ok(match self.an.upvalue(self.inst, d) {
-                Some(Captured::Int(n)) => number_part(n),
-                _ => Scan::unresolved("id"),
-            }),
+            // A cell frame time writes holds its captured value or one of
+            // the integer numerals written to it.
+            None => {
+                let Some(ints) = self.an.written_ints(self.file, d) else {
+                    return Ok(Scan::unresolved("id"));
+                };
+                self.an.charge(units(ints.len())).map_err(stop)?;
+                let captured = match self.an.upvalue(self.inst, d) {
+                    Some(Captured::Int(n)) => number_part(n),
+                    // A cell captured nil before its first write.
+                    Some(Captured::Nil) if !ints.is_empty() => Scan::default(),
+                    _ => Scan::unresolved("id"),
+                };
+                Ok(ints
+                    .into_iter()
+                    .fold(captured, |s, n| s.join(number_part(n))))
+            }
+        }
+    }
+}
+
+/// Whether callee expression `e` of `file` is reached through a binding
+/// cell written at frame time: its base upvalue, or the `_ENV` cell a
+/// global is read through.
+fn written_path(an: &Analysis, ast: &Ast, file: u16, e: u32) -> bool {
+    let mut e = e;
+    loop {
+        match ast.expr(e) {
+            Expr::Paren(x) | Expr::Index { obj: x, .. } => e = x,
+            Expr::Local(d) => return !an.cell_holds(file, d),
+            Expr::Global { env, .. } => return !an.cell_holds(file, env),
+            _ => return false,
         }
     }
 }
@@ -1457,10 +1489,12 @@ impl Cx<'_> {
     /// site that voids its proof.
     fn critical(&self, id: u32, field: &'static str, why: Unsupported) -> ImportError {
         let open = match why {
-            Unsupported::Interference => self.analysis().and_then(|an| an.open.get()),
+            Unsupported::Interference => self
+                .analysis()
+                .and_then(|an| an.open.get().map(|o| o.site).or(an.interfered.get())),
             _ => None,
         };
-        let at = match open.map(|o| o.site) {
+        let at = match open {
             Some(Site::Node(n)) => self.def.loc(n),
             Some(Site::Code { file, line }) => self
                 .analysis()
