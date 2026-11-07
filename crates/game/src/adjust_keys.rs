@@ -239,6 +239,7 @@ impl AdjustmentConfig {
             },
             axis: None,
             reversed: self.reversed,
+            panel_roles: [0; 2],
         };
         let [slower, faster] = SPEED_KEYS;
         let speed = [(slower, Adjust::Slower), (faster, Adjust::Faster)];
@@ -296,6 +297,8 @@ pub struct AdjustmentPlan {
     pub bindings: AdjustmentBindings,
     axis: Option<(u8, Option<AxisQuantum>)>,
     reversed: bool,
+    /// The numbers of START's and SELECT's controls, a bit each.
+    panel_roles: [u128; 2],
 }
 
 impl AdjustmentPlan {
@@ -312,11 +315,24 @@ impl AdjustmentPlan {
             if matches!(role, Adjust::Start | Adjust::Select) {
                 self.bindings.latched |= 1 << n;
             }
+            let [start, select] = &mut self.panel_roles;
+            match role {
+                Adjust::Start => *start |= 1 << n,
+                Adjust::Select => *select |= 1 << n,
+                _ => {}
+            }
             if matches!(role, Adjust::ScratchPositive | Adjust::ScratchNegative) {
                 self.bindings.repeating |= 1 << n;
             }
         }
         Ok(n)
+    }
+
+    /// The numbers of START's and SELECT's controls, a bit each, for the
+    /// select screen's panels ([`input::AdjustmentTap::set_panel_roles`]).
+    #[must_use]
+    pub const fn panel_roles(&self) -> [u128; 2] {
+        self.panel_roles
     }
 
     /// The scratch axis's number, if it is tapped.

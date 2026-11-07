@@ -58,9 +58,9 @@ use bms_model::TimeUs;
 
 pub use adjust::{
     ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, GatePhase, GateState,
-    Hold, HoldLatch, MAX_TAPPED, PresentationFocus, RESERVED, StartGate, TapControl, TapError,
-    TapEvent, TapObservation, WINDOW_KEYS, WindowKeyEvent, WindowKeyReceiver, WindowKeys,
-    adjustment_queue, window_keys,
+    Hold, HoldLatch, MAX_TAPPED, PanelLevel, Panels, PresentationFocus, RESERVED, StartGate,
+    TapControl, TapError, TapEvent, TapObservation, WINDOW_KEYS, WindowKeyEvent, WindowKeyReceiver,
+    WindowKeys, adjustment_queue, window_keys,
 };
 pub use autoplay::{AUTOPLAY_DEVICE, AutoplayInput, TimeOverflow, autoplay, autoplay_count};
 pub use cadence::{Phase, WakeReport};

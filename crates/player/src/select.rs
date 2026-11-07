@@ -81,6 +81,14 @@ pub enum MenuInput {
     Text(String),
     /// The IME's composition so far; empty when it ends.
     Preedit(String),
+    /// A controller's menu `event`, sent while `panel` was open: the key
+    /// it stands for ([`event_key`]), queued with the window's keys.
+    Pad {
+        /// The event.
+        event: MenuEvent,
+        /// The panel open as its packet came.
+        panel: Option<usize>,
+    },
 }
 
 /// What a controller's bound lane control does on the select screen
@@ -154,6 +162,46 @@ pub const fn event_key(event: MenuEvent) -> MenuKey {
     }
 }
 
+/// Whether window key `key` acts on the select screen while `panel` is
+/// open (design.md "Input", Menu input), as the reference's option panels
+/// hold the song list (`MusicSelectInputProcessor.java` at 0.8.9): the
+/// list's own input runs only with no panel open (`bar.input()`, `:290`),
+/// so under any panel nothing moves the list, chooses, practises, opens
+/// or leaves a folder or pages (`:115`, `:205`, `:242`; under panel 1 the
+/// reference's Up and Down change an option's target, `:163-202`, which
+/// tapestry's display-only panels leave out); the order, the search box
+/// and the presets act as without a panel (the order is the reference's
+/// sort key, taken before the panels, `:90`; the presets are tapestry's
+/// own).
+#[must_use]
+pub const fn acts_under_panel(key: MenuKey, panel: Option<usize>) -> bool {
+    match (panel, key) {
+        (None, _) => true,
+        (
+            Some(_),
+            MenuKey::Up
+            | MenuKey::Down
+            | MenuKey::PageUp
+            | MenuKey::PageDown
+            | MenuKey::Home
+            | MenuKey::End
+            | MenuKey::Enter
+            | MenuKey::Backspace
+            | MenuKey::BackspaceHeld
+            | MenuKey::Escape
+            | MenuKey::Practice,
+        ) => false,
+        (
+            Some(_),
+            MenuKey::Left
+            | MenuKey::Right
+            | MenuKey::Tab
+            | MenuKey::PrevPreset
+            | MenuKey::NextPreset,
+        ) => true,
+    }
+}
+
 /// The result screen's command for a window key: the arrow keys switch
 /// presets, and every other key does nothing there (the retry and quit
 /// keys arrive as controls, which the window takes from the same press).
@@ -199,10 +247,13 @@ impl MenuQueue {
         match (input, q.back_mut()) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
-            (MenuInput::Key(key), _) => {
-                let keys = q.iter().filter(|i| matches!(i, MenuInput::Key(_))).count();
+            (key @ (MenuInput::Key(_) | MenuInput::Pad { .. }), _) => {
+                let keys = q
+                    .iter()
+                    .filter(|i| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
+                    .count();
                 if keys < QUEUED_KEYS {
-                    q.push_back(MenuInput::Key(key));
+                    q.push_back(key);
                 } else {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -765,6 +816,9 @@ impl SelectScreen {
 
     /// Acts on one input.
     pub fn input(&mut self, input: MenuInput) -> Acted {
+        if let MenuInput::Pad { event, .. } = input {
+            return self.input(MenuInput::Key(event_key(event)));
+        }
         if self.searching {
             return self.search_input(input);
         }
@@ -894,7 +948,8 @@ impl SelectScreen {
                 self.searching = false;
                 Acted::Focus(false)
             }
-            MenuInput::Key(_) => Acted::Nothing,
+            // A controller's event came as its key ([`Self::input`]).
+            MenuInput::Key(_) | MenuInput::Pad { .. } => Acted::Nothing,
         }
     }
 

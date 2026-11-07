@@ -616,6 +616,8 @@ impl SourceSet {
             .iter()
             .take(device.n_axes)
             .find(|a| a.control == packet.control);
+        // The panel START and SELECT open at this packet, in packet order.
+        menu.set_panel(self.adjust.as_ref().and_then(|t| t.held_panels().open()));
         menu.offer(packet, axis);
     }
 

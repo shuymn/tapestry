@@ -2,7 +2,8 @@
 //! packets, pushes, publications, device changes, arrivals, overflow and
 //! focus rejection, a scripted connect and reconnect, the wake loop with
 //! its cut drains, and the controller's menu (steps, bursts, a full queue
-//! and a removal).
+//! and a removal) with the panels' level published and sent with its
+//! events.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -273,6 +274,23 @@ fn menu_does_not_allocate() {
     .unwrap();
     let pad = DeviceId(30);
     set.set_menu(tap);
+    // The confirming button is START too: the panels' level follows it.
+    let (mut adjust, _rx) = input::adjustment_queue(input::AdjustmentBindings {
+        controls: vec![(
+            input::TapControl::Controller {
+                product,
+                control: ControlId(1),
+            },
+            0,
+        )],
+        latched: 1,
+        ..input::AdjustmentBindings::default()
+    })
+    .unwrap();
+    adjust.set_panel_roles(1, 0);
+    let level = adjust.panel_level();
+    set.set_adjustment(adjust);
+    let mut opened = 0_u64;
     // The wheel filtered as absolute, as `device.toml` can set it, through
     // the report reader.
     set.set_axis_mode(product, vec![wheel], false);
@@ -324,9 +342,12 @@ fn menu_does_not_allocate() {
             reader.report(&report, false, &capture, &mut set);
             set.end_batch(TimeUs(40_002));
             sent += u64::from(set.menu_mut().unwrap().take_sent());
+            let held = t % 7 != 0;
+            set.adjustment_mut().unwrap().publish_panels(held, 0);
+            opened += u64::from(level.read().open().is_some());
             // Read only every fortieth batch, so the queue fills.
             if t % 40 == 0 {
-                while menu.pop().is_some() {
+                while menu.pop_panel().is_some() {
                     popped += 1;
                 }
             }
@@ -341,6 +362,7 @@ fn menu_does_not_allocate() {
     }
     TRACK.with(|t| t.set(false));
     assert!(sent > 100, "{sent}");
+    assert!(opened > 0, "{opened}");
     assert!(popped > 1_000, "{popped}");
     assert!(menu.dropped() > 1_000, "{}", menu.dropped());
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);

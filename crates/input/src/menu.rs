@@ -106,14 +106,17 @@ pub struct MenuTap {
     active: bool,
     /// Events queued since [`take_sent`](Self::take_sent).
     sent: bool,
-    queue: rtrb::Producer<MenuEvent>,
+    /// The panel the held START and SELECT open as packets are offered
+    /// ([`set_panel`](Self::set_panel)), sent with each event.
+    panel: Option<u8>,
+    queue: rtrb::Producer<(MenuEvent, Option<u8>)>,
     dropped: Arc<AtomicU64>,
 }
 
 /// The game thread's end of the queue.
 #[derive(Debug)]
 pub struct MenuReceiver {
-    queue: rtrb::Consumer<MenuEvent>,
+    queue: rtrb::Consumer<(MenuEvent, Option<u8>)>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -142,6 +145,7 @@ pub fn menu_queue(bindings: MenuBindings) -> (MenuTap, MenuReceiver) {
             counting: None,
             active: false,
             sent: false,
+            panel: None,
             queue: producer,
             dropped: Arc::clone(&dropped),
         },
@@ -161,6 +165,13 @@ impl MenuTap {
             self.reset();
         }
         self.active = active;
+    }
+
+    /// The panel START and SELECT open as they are held now (`None`:
+    /// neither held), sent with the events from here: the select screen
+    /// drops every event under a panel (design.md "Input", Menu input).
+    pub fn set_panel(&mut self, panel: Option<usize>) {
+        self.panel = panel.and_then(|p| u8::try_from(p).ok());
     }
 
     /// Whether packets become menu events now.
@@ -264,7 +275,7 @@ impl MenuTap {
         let room = self.queue.slots() as u64;
         let mut over = count.saturating_sub(room);
         for _ in 0..count.min(room) {
-            if self.queue.push(event).is_ok() {
+            if self.queue.push((event, self.panel)).is_ok() {
                 self.sent = true;
             } else {
                 over += 1;
@@ -279,7 +290,16 @@ impl MenuTap {
 impl MenuReceiver {
     /// Takes the oldest event.
     pub fn pop(&mut self) -> Option<MenuEvent> {
-        self.queue.pop().ok()
+        self.pop_panel().map(|(event, _)| event)
+    }
+
+    /// Takes the oldest event with the panel START and SELECT opened as it
+    /// was sent ([`MenuTap::set_panel`]).
+    pub fn pop_panel(&mut self) -> Option<(MenuEvent, Option<usize>)> {
+        self.queue
+            .pop()
+            .ok()
+            .map(|(event, panel)| (event, panel.map(usize::from)))
     }
 
     /// Events dropped so far because the queue was full.

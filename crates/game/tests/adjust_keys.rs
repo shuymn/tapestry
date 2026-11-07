@@ -54,13 +54,13 @@ fn with_controller() -> KeyConfigs {
 }
 
 #[test]
-fn the_defaults_bind_q_w_up_down_and_the_scratch_key() {
+fn the_defaults_bind_e_w_up_down_and_the_scratch_key() {
     let k = keys();
     let roles = |keys: &KeyConfig| AdjustmentKeys::of(keys).roles().collect::<Vec<_>>();
     assert_eq!(
         roles(&k.keyboard),
         [
-            (0x10, Role::Start),
+            (0x12, Role::Start),
             (0x11, Role::Select),
             (0xE048, Role::AuxNegative),
             (0xE050, Role::AuxPositive),
@@ -80,7 +80,7 @@ fn the_defaults_bind_q_w_up_down_and_the_scratch_key() {
             .unwrap()
     };
     let role = |code| plan.roles.get(number(code));
-    assert_eq!(role(0x10), Some(Role::Start));
+    assert_eq!(role(0x12), Some(Role::Start));
     assert_eq!(role(0x11), Some(Role::Select));
     assert_eq!(role(0xE048), Some(Role::AuxNegative));
     assert_eq!(role(0xE050), Some(Role::AuxPositive));
@@ -92,7 +92,12 @@ fn the_defaults_bind_q_w_up_down_and_the_scratch_key() {
     assert_eq!(role(0x3c), Some(Role::Faster));
     assert_eq!(
         plan.bindings.latched,
-        (1 << number(0x10).0) | (1 << number(0x11).0)
+        (1 << number(0x12).0) | (1 << number(0x11).0)
+    );
+    // The panels tell START from SELECT.
+    assert_eq!(
+        plan.panel_roles(),
+        [1 << number(0x12).0, 1 << number(0x11).0]
     );
     assert_eq!(plan.bindings.controls.len(), 14);
     assert_eq!(plan.axis(), None, "the keyboard has no axis");
@@ -132,8 +137,8 @@ fn every_role_collision_is_refused() {
         overlap(0x01, AdjustBinding::Key(KeyRole::Quit), Role::Select)
     );
     assert_eq!(
-        check(|k| k.select = Some(0x10)),
-        overlap(0x10, AdjustBinding::Adjustment(Role::Start), Role::Select)
+        check(|k| k.select = Some(0x12)),
+        overlap(0x12, AdjustBinding::Adjustment(Role::Start), Role::Select)
     );
     // The scratch's own key, which only its directions take.
     assert_eq!(
@@ -280,6 +285,43 @@ fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
     assert_eq!(plan.observation(&o(0)), None);
 }
 
+/// The driver's tap publishes START and SELECT for the select screen's
+/// panels by the plan's roles: SELECT (W) held is SELECT, not START.
+#[test]
+fn the_drivers_tap_tells_start_from_select() {
+    let plan = AdjustmentConfig::default()
+        .plan(&keys(), None, None)
+        .unwrap();
+    let options = PlayOptions::new(HiSpeedSettings::default(), Covers::default()).unwrap();
+    let (_driver, tap, _reader) = game::AdjustDriver::new(&plan, options, 0).unwrap();
+    let level = tap.panel_level();
+    let mut set = SourceSet::new(SourceConfig {
+        max_devices: 1,
+        max_sources: 1,
+        max_held: 8,
+        queue_capacity: 16,
+        max_arrivals: 1,
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(1), DeviceKind::Keyboard);
+    set.end_batch(TimeUs(1));
+    set.set_adjustment(tap);
+    for (code, start, select) in [(0x11, false, true), (0x12, true, true)] {
+        set.begin_batch(TimeUs(10));
+        set.packet(&Packet {
+            device: DeviceId(1),
+            control: Code(code),
+            value: 1,
+            background: false,
+        });
+        set.end_batch(TimeUs(11));
+        assert!(set.adjustment_mut().unwrap().publish_panels(true, 0));
+        let p = level.read();
+        assert_eq!((p.start, p.select), (start, select), "{code:#x}");
+    }
+}
+
 #[test]
 fn the_tap_reaches_the_reducer_through_the_plan() {
     let plan = AdjustmentConfig::default()
@@ -306,7 +348,7 @@ fn the_tap_reaches_the_reducer_through_the_plan() {
         set.begin_batch(TimeUs(at));
         set.packet(&Packet {
             device: DeviceId(1),
-            control: Code(0x10),
+            control: Code(0x12),
             value,
             background: false,
         });
@@ -341,7 +383,7 @@ fn the_tap_reaches_the_reducer_through_the_plan() {
 fn more_controls_than_the_tap_observes_are_refused() {
     let mut k = keys();
     k.keyboard.lanes.extend((0..130).map(|i| LaneKey {
-        control: 0x1000 + i,
+        control: 0x1200 + i,
         lane: 1,
     }));
     assert_eq!(

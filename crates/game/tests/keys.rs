@@ -400,7 +400,7 @@ fn keep_keeps_the_current_bindings() {
     // Escape stays the quit key.
     assert_eq!(flow.press(keep), Press::Bound(Role::Quit, vec![kb(0x01)]));
     for (role, control) in [
-        (Role::Start, 0x10),
+        (Role::Start, 0x12),
         (Role::Select, 0x11),
         (Role::AuxNegative, 0xE048),
     ] {
@@ -538,7 +538,8 @@ fn controller_bindings_belong_to_one_controller() {
     for control in 0x10..=0x19 {
         assert!(matches!(flow.press(kb(control)), Press::Bound(..)));
     }
-    // Quit kept; START and SELECT kept would take Q and W, the scratch's.
+    // Quit kept; START and SELECT kept would take E and W, a lane's and
+    // the scratch's.
     assert!(matches!(flow.press(keep), Press::Bound(..)));
     for control in [0x1e, 0x1f, 0x20, 0x22] {
         assert!(matches!(flow.press(kb(control)), Press::Bound(..)));

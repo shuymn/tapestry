@@ -25,6 +25,12 @@ impl Pad {
         self.receiver.as_mut()?.pop()
     }
 
+    /// Takes the next event with the panel open as it was sent
+    /// ([`input::MenuReceiver::pop_panel`]).
+    pub fn pop_panel(&mut self) -> Option<(input::MenuEvent, Option<usize>)> {
+        self.receiver.as_mut()?.pop_panel()
+    }
+
     /// Drops what is queued.
     pub fn clear(&mut self) {
         while self.pop().is_some() {}

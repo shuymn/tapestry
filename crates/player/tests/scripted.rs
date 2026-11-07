@@ -401,8 +401,8 @@ fn perfect_measurement_judges_key_sounds_and_saves() {
         input_offset_us: 30_000,
         ..DeviceSettings::default()
     };
-    // Other physical keys (Q, W, START and SELECT by default, so those
-    // move to E and R): the generated keys must still be the ones
+    // Other physical keys (Q and W, W being SELECT by default, so START
+    // and SELECT are E and R): the generated keys must still be the ones
     // recorded.
     let lanes = &mut device.keyboard.lanes;
     (lanes[1].control, lanes[2].control) = (0x10, 0x11);
@@ -486,7 +486,7 @@ fn an_invalid_key_config_exits_nonzero() {
 }
 
 /// The start gate on the real threads, which every play runs (design.md
-/// "Play Lifecycle", the start gate): START (Q) held 300 ms before chart
+/// "Play Lifecycle", the start gate): START (E) held 300 ms before chart
 /// time 0 cancels the first READY through the input thread's latch, its
 /// release at 200 ms rearms a fresh READY through the input thread's
 /// boundary and the audio thread's transport, and the notes, pressed
@@ -495,12 +495,12 @@ fn an_invalid_key_config_exits_nonzero() {
 /// all sounding, as a play without the hold does. The rearm is answered
 /// at least 30 ms after the release (design.md "Shortening Launch-Based
 /// Checks", scripted input), and every press still lands on its note. The
-/// saved record keeps the cancelled opening, Q's press in it, and the
+/// saved record keeps the cancelled opening, E's press in it, and the
 /// winning READY's input alone.
 ///
 /// An input thread starved past the commit reads the hold only after it:
 /// the design makes that an ordinary in-play adjustment, so the play is
-/// not restarted and the record has no cancelled opening, Q's press in its
+/// not restarted and the record has no cancelled opening, E's press in its
 /// input. Either way F2, pressed during the play, reaches the adjustments
 /// and no record, and the record re-evaluates equal to the live play.
 /// The exact outcomes are the controlled tests':
@@ -510,7 +510,7 @@ fn an_invalid_key_config_exits_nonzero() {
 /// (game's tests/start_gate.rs).
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     let Fixture {
         dir,
         chart,
@@ -528,7 +528,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         received: TimeUs(ms * 1_000),
         source: eval::SourceId(0),
         kind: eval::InputKind::Control {
-            control: eval::ControlId(Q),
+            control: eval::ControlId(E),
             value,
         },
     };
@@ -562,7 +562,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     let q_press = |e: &eval::PhysicalInputEvent| {
         e.kind
             == eval::InputKind::Control {
-                control: eval::ControlId(Q),
+                control: eval::ControlId(E),
                 value: 1,
             }
     };
@@ -574,7 +574,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         "{stdout}"
     );
     let Some(o) = h.openings.first() else {
-        // The hold was read after the commit: no restart, Q's press in the
+        // The hold was read after the commit: no restart, E's press in the
         // played input.
         assert!(rec.events.iter().any(q_press), "{:?}", rec.events);
         return;
@@ -613,7 +613,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     let lanes = rec
         .events
         .iter()
-        .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == Q))
+        .filter(|e| !matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == E))
         .count();
     assert_eq!(lanes, 2 * NOTES);
 }
@@ -625,7 +625,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
 #[test]
 fn a_rearmed_candidate_keeps_a_per_chart_skins_text() {
     use text_skin::{Band, bars};
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     let Fixture {
         dir,
         chart_path,
@@ -638,7 +638,7 @@ fn a_rearmed_candidate_keeps_a_per_chart_skins_text() {
         received: TimeUs(ms * 1_000),
         source: eval::SourceId(0),
         kind: eval::InputKind::Control {
-            control: eval::ControlId(Q),
+            control: eval::ControlId(E),
             value,
         },
     };
@@ -670,7 +670,7 @@ fn a_rearmed_candidate_keeps_a_per_chart_skins_text() {
     assert_eq!(shown("play.png"), [2, 0, 2], "{stdout}");
 }
 
-/// Quit on Q (0x10), the default START, is refused with the collision
+/// Quit on E (0x12), the default START, is refused with the collision
 /// when `device.toml` loads, before any play opens, so the run ends with
 /// a nonzero exit, and nothing is recorded.
 #[test]
@@ -683,7 +683,7 @@ fn a_colliding_device_toml_opens_no_play() {
         ..
     } = fixture();
     let mut device = DeviceSettings::default();
-    device.keyboard.quit = Some(0x10);
+    device.keyboard.quit = Some(0x12);
     game::save_settings(&appdata.join("tapestry").join("device.toml"), &device).unwrap();
     let out = scripted_play(&chart_path, &log, &appdata)
         .output()
@@ -692,7 +692,7 @@ fn a_colliding_device_toml_opens_no_play() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
     let line = "the settings cannot be used: device.toml: keyboard key config: \
-                control 0x10 is bound to both quit and START";
+                control 0x12 is bound to both quit and START";
     assert!(
         stderr.lines().any(|l| l.ends_with(line)),
         "{line:?} in {stderr}"
@@ -1806,7 +1806,7 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 }
 
 /// The loading script on the real threads (`--dev-loading`; design.md
-/// "Play Adjustments"): START (Q) held from the start of loading for
+/// "Play Adjustments"): START (E) held from the start of loading for
 /// 1.5 s, with recording closed, defers an opening asked meanwhile; the
 /// loading script goes on feeding through the deferral, so its release
 /// opens it, and the play's script takes over on the same devices.
@@ -1818,7 +1818,7 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 /// `a_deferred_opening_keeps_the_scripts_timeline` (src/input_side.rs).
 #[test]
 fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     let Fixture {
         dir: _dir,
         chart_path,
@@ -1860,7 +1860,7 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     }
     assert!(!rec.events.iter().any(|e| matches!(
         e.kind,
-        eval::InputKind::Control { control, .. } if control.0 == Q
+        eval::InputKind::Control { control, .. } if control.0 == E
     )));
 }
 
@@ -1901,7 +1901,7 @@ fn autoplay_f2_steps_hi_speed_once() {
 /// reducer takes is out of order.
 #[test]
 fn presentation_times_follow_the_process_clock_under_a_script() {
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     let Fixture {
         dir: _dir,
         chart_path,
@@ -1914,7 +1914,7 @@ fn presentation_times_follow_the_process_clock_under_a_script() {
         received: TimeUs(ms * 1_000),
         source: eval::SourceId(0),
         kind: eval::InputKind::Control {
-            control: eval::ControlId(Q),
+            control: eval::ControlId(E),
             value,
         },
     };
@@ -1969,7 +1969,7 @@ const MIX_CHART: &str = "#PLAYER 1\n#TITLE mix\n#BPM 120\n#WAV01 click.wav\n#LNT
 /// "Shortening Launch-Based Checks", scripted input).
 #[test]
 fn the_winning_capture_reevaluates_equal_to_live() {
-    const Q: u32 = 0x10;
+    const E: u32 = 0x12;
     const W: u32 = 0x11;
     const UP: u32 = 0xE048;
     const KEY6: u32 = 0x21;
@@ -2012,13 +2012,13 @@ fn the_winning_capture_reevaluates_equal_to_live() {
         key(2_520, UP, 1),
         key(2_540, UP, 0),
         key(2_560, W, 0),
-        key(3_300, Q, 1),
-        key(3_320, Q, 0),
+        key(3_300, E, 1),
+        key(3_320, E, 0),
     ]);
     events.sort_by_key(|e| e.received);
     // START held before chart time 0 cancels the first READY; the play's
     // input comes 1.2 s later.
-    let mut shifted = vec![key(-300, Q, 1), key(200, Q, 0)];
+    let mut shifted = vec![key(-300, E, 1), key(200, E, 0)];
     shifted.extend(events.iter().map(|e| eval::PhysicalInputEvent {
         received: TimeUs(e.received.0 + 1_200_000),
         ..*e
@@ -2056,10 +2056,10 @@ fn the_winning_capture_reevaluates_equal_to_live() {
                 }
         })
     };
-    assert!(has(cancelled, Q));
+    assert!(has(cancelled, E));
     // The winning opening records START, SELECT and the auxiliary key, and
     // not F2.
-    for c in [Q, W, UP] {
+    for c in [E, W, UP] {
         assert!(has(&rec.events, c), "{c:#x}");
     }
     assert!(!has(&rec.events, 0x3C) && !has(&h.events, 0x3C));

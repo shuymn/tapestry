@@ -272,6 +272,10 @@ pub struct PlayerRig<'a> {
     /// The adjustments' driver (design.md "Play Adjustments"): the game
     /// thread's one writer of the presentation, installed with the gate.
     pub adjust: Option<game::AdjustDriver>,
+    /// START and SELECT held as the input thread publishes them for the
+    /// select screen's panels (design.md "Input", Menu input), installed
+    /// with the adjustments' tap.
+    pub panels: Option<input::PanelLevel>,
 }
 
 impl PlayerRig<'_> {

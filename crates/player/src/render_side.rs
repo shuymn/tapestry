@@ -3648,7 +3648,7 @@ pub(crate) mod tests {
     }
 
     /// A measurement whose queues nothing feeds.
-    fn measure(clock: QpcClock) -> Measure {
+    pub(crate) fn measure(clock: QpcClock) -> Measure {
         let (_steps, steps) = rtrb::RingBuffer::new(1);
         let (_sounds, sounds) = rtrb::RingBuffer::new(1);
         let overlay = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5426,7 +5426,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn view() -> View {
+    pub(crate) fn view() -> View {
         View { effects: 16 }
     }
 

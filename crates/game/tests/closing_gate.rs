@@ -26,7 +26,7 @@ use game::{
 use input::{Action, DeviceId, DeviceKind, Packet, ScriptItem, ScriptedInput, SourceSet};
 use replay::{BuildProvenance, EndStatus, ReceiveMethod};
 
-const Q: ControlId = ControlId(0x10);
+const E: ControlId = ControlId(0x12);
 
 /// Where the session clock has a play's chart time 0: its READY opens at
 /// session time 0, 1 s before it.
@@ -268,7 +268,7 @@ fn completion_and_failure_in_one_advance_complete_the_play() {
 fn a_cancellation_and_its_rearm_discard_a_retained_failure() {
     let (_dir, root) = temp_root();
     let mut s = session(&root, &notes(16), ZERO + 3_000);
-    let mut items = vec![connect(), raw(2_700, Q, 1), raw(2_800, Q, 0)];
+    let mut items = vec![connect(), raw(2_700, E, 1), raw(2_800, E, 0)];
     // The rearmed READY opens at the release: its chart time 0 is 3.8 s.
     for i in 0..16 {
         let at = 3_800 + 1_000 + i * 100;
@@ -354,7 +354,7 @@ fn an_adjustment_in_closing_keeps_its_gesture() {
     let mut s = session(&root, &notes(16), 0);
     let items = vec![
         connect(),
-        raw(2_000, Q, 1),
+        raw(2_000, E, 1),
         raw(2_100, scratch, 1),
         raw(3_400, scratch, 0),
     ];
