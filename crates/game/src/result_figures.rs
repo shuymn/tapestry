@@ -136,7 +136,9 @@ pub struct ResultFigures {
     /// The view's lamp, by the bests' rule: FULL COMBO, else the cleared
     /// gauge of the highest lamp rank, else failed.
     pub clear: BestLamp,
-    /// Whether the emphasized gauge cleared.
+    /// Whether the view cleared: its lamp ([`clear`](Self::clear)) is not
+    /// failed, so the clear and fail options never disagree with the lamp,
+    /// whichever gauge is emphasized.
     pub cleared: bool,
     /// The emphasized gauge's end value in tenths of a percent, rounded
     /// down, 1 for a value strictly between 0 and 0.1 %.
@@ -158,13 +160,14 @@ impl ResultFigures {
         let max_ex = u32::try_from(u64::from(notes) * u64::from(weight)).unwrap_or(u32::MAX);
         let ex = e.tally.ex_score;
         let shown = emphasized.and_then(|i| e.gauges.get(i));
+        let clear = lamp(e, preset);
         Self {
             notes,
             max_ex,
             rate: Rate::of(ex, max_ex),
             next_rank: next_rank(ex, max_ex),
-            clear: lamp(e, preset),
-            cleared: shown.is_some_and(|g| g.cleared),
+            clear,
+            cleared: clear != BestLamp::Failed,
             gauge_permille: shown.map_or(0, |g| permille(g.value)),
             timing: TimingStats::of(&e.events),
         }

@@ -539,6 +539,46 @@ fn own_timing_matches_the_recommendation_and_emphasis_follows_the_display() {
     assert!(emphasized.contains(&("tapestry".to_owned(), Some(1))));
 }
 
+/// The view's clear reads its lamp, not the emphasized gauge: the normal
+/// gauge cleared and the survival gauge failed, with the survival gauge
+/// displayed, give a cleared lamp and a cleared view (options 90 true and
+/// 91 false), while the emphasized gauge's own end shows it failed.
+#[test]
+fn the_views_clear_follows_its_lamp_not_the_emphasized_gauge() {
+    let chart = taps(40);
+    let preset = rules::tapestry();
+    // The first 16 taps missed, the rest pressed on time: the survival
+    // gauge fails, the normal gauge ends full.
+    let mut events = Vec::new();
+    for i in 16..40 {
+        let t = 1_000 * MS + i * 500 * MS;
+        events.push(press(t, 0, lane(1)));
+        events.push(release(t + 50 * MS, lane(1)));
+    }
+    let end = deadline(&chart, &preset);
+    let rec = record(&preset, events, EndStatus::PlayedToEnd, end);
+    let r = re(&chart, &rec, &preset);
+    let s = ViewSummary::of(
+        &r.evaluation,
+        &chart,
+        &preset,
+        game::ResultBasis::of(&chart, None),
+        Axis {
+            origin: TimeUs(0),
+            end,
+        },
+        r.coverage,
+        r.as_played,
+        &r.started_at_default,
+        Some("survival"),
+    );
+    assert!(r.evaluation.gauges[0].cleared);
+    assert!(r.evaluation.gauges[1].failed_at.is_some());
+    assert_eq!(s.graphs.emphasized, Some(1));
+    assert_eq!(s.figures.clear, game::BestLamp::Cleared { gauge: 0 });
+    assert!(s.figures.cleared);
+}
+
 /// The tapestry preset named `id` with BAD's late edge at `late_ms`, so
 /// its final deadline moves with it.
 fn late_edge(id: &str, late_ms: i64) -> RulePreset {
