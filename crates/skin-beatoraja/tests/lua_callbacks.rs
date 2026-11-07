@@ -581,14 +581,25 @@ fn a_critical_callback_folds_configuration() {
 
 #[test]
 fn intermediates_out_of_range_do_not_convert() {
-    // In range at the end, out of range on the way: Lua's 64-bit
-    // integers and the expressions' 32-bit ones would agree only by luck.
+    // In range at the end, out of range on the way: past `i32`, which the
+    // expressions hold, but within Â±2^53, where the program's 64-bit
+    // integers and the source's doubles agree, so the program takes it.
     let d = folder(&skin(&format!(
         "{}\n{}",
         "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
         "table.insert(skin.destination, { id = \"g\", draw = function()\n\
            local big = ms.number(110) * 1000\n\
            return big * 1000 - big * 1000 + 1 > 0\n\
+         end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
+    )));
+    assert_eq!(import(&d, 905).unwrap().callbacks, [Disposition::Compiled]);
+    // Past Â±2^53, critical: refused.
+    let d = folder(&skin(&format!(
+        "{}\n{}",
+        "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
+        "table.insert(skin.destination, { id = \"g\", draw = function()\n\
+           local big = ms.number(110) * 1000000\n\
+           return big * big * big - big * big * big + 1 > 0\n\
          end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
     )));
     assert!(matches!(
@@ -684,4 +695,103 @@ fn a_configured_offset_folds_into_a_draw() {
         let quads = Drawn::new(i.imported.skin, 0).frame(1_000, &[]);
         assert_eq!(!quads.is_empty(), shown, "{a}");
     }
+}
+
+/// A number `v` whose value callback is `value`, drawn at y 100.
+fn value_skin(value: &str) -> String {
+    skin(&format!(
+        "skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = {value} }} }}\n\
+         table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+    ))
+}
+
+/// The remaining-note ratios: the remaining notes over the total, a float
+/// division, times 100 and 10 000. Both compile into the program, and the
+/// numbers show the source's conversion of the float as the counts move.
+#[test]
+fn remaining_note_ratios_compile_into_the_program() {
+    let remain = "local function remain()\n\
+           return ms.number(106) - ms.number(110) - ms.number(111) - ms.number(112)\n\
+             - ms.number(113) - ms.number(114)\n\
+         end\n";
+    let d = folder(&skin(&format!(
+        "{remain}\
+         skin.value = {{\n\
+           {{ id = \"r\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+             value = function() return remain() / ms.number(106) * 100 end }},\n\
+           {{ id = \"q\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 5,\n\
+             value = function() return remain() / ms.number(106) * 10000 end }} }}\n\
+         table.insert(skin.destination, {{ id = \"r\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"q\", dst = {{ {{ x = 0, y = 200, w = 6, h = 6 }} }} }})"
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled, Disposition::Compiled]);
+    // The digits each number draws, by its row.
+    let rows = |q: &[skin_model::Quad]| {
+        // The source's y is up: rows 100 and 200 of a 1080-high canvas.
+        let n = |y: f32| q.iter().filter(|q| (q.rect[1] - y).abs() < 1.0).count();
+        (n(974.0), n(874.0))
+    };
+    let out = |d: &Drawn| {
+        let f = d.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        [at(0), at(1), at(2), at(3)]
+    };
+    let mut p = Drawn::new(i.imported.skin.clone(), 8);
+    let q = p.frame(1_000, &[]);
+    // Nothing judged: 8 / 8 * 100.
+    assert_eq!(out(&p), [100, 1, 10_000, 1]);
+    assert_eq!(rows(&q), (3, 5));
+    // Three of eight judged: 62.5 and 6 250, the float truncated.
+    p.tally.counts.perfect = 2;
+    p.tally.counts.bad = 1;
+    let q = p.frame(1_016, &[]);
+    assert_eq!(out(&p), [62, 1, 6_250, 1]);
+    assert_eq!(rows(&q), (2, 4));
+    // No notes: 0 / 0 is NaN, which the source's conversion makes 0.
+    let mut p = Drawn::new(i.imported.skin, 0);
+    let q = p.frame(1_000, &[]);
+    assert_eq!(out(&p), [0, 1, 0, 1]);
+    assert_eq!(rows(&q), (1, 1));
+}
+
+/// What the program cannot prove is refused by role: an integer `//` or
+/// `%` whose divisor can be 0, an integer that could leave ±2^53, and a
+/// number's value converting a `math.floor` of a float, whose integer has
+/// no bound; each control compiles.
+#[test]
+fn the_program_refuses_what_it_cannot_prove() {
+    // `//` is not in the source's grammar and opens the candidate, so `%`
+    // stands for both.
+    let zero = Unsupported::Construct("an integer // or % whose divisor can be 0");
+    for (value, want) in [
+        (
+            "function() return 10 % ms.number(110) end",
+            Disposition::Replaced(zero),
+        ),
+        (
+            "function() return 10 % (ms.number(110) + 1) end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() local n = ms.number(110) return n * n * n * n * 1.0 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) return n * n * 1.0 end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() return math.floor(ms.number(110) / 3) end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+    ] {
+        let i = import(&folder(&value_skin(value)), 905).unwrap();
+        assert_eq!(i.callbacks, [want], "{value}");
+    }
+    // A draw only compares the floor, which needs no bound.
+    let draw = "draw = function() return math.floor(ms.number(110) / 3) > 1 end,";
+    let i = import(&folder(&skin(&image_at(0, draw))), 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
 }
