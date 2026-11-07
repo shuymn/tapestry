@@ -222,7 +222,9 @@ fn without_a_sample_only_areas_and_ticks_draw() {
     let mut v = view(&[(-149, 5), (1, 5)], None);
     fx.view(&v);
     fx.frame(0);
-    near(pixel(&fx, 151.5, 45.0).0, shown(PG), 2.0);
+    for x in [150.5, 151.5] {
+        near(pixel(&fx, x, 45.0).0, shown(PG), 2.0);
+    }
     near(pixel(&fx, 151.5, 99.5).0, shown(PG), 2.0);
     near(pixel(&fx, 1.5, 99.5).0, shown(GD), 2.0);
     near(
