@@ -322,8 +322,25 @@ impl PlayerRig<'_> {
     fn settle_result(&mut self) {
         let mut result = std::mem::take(&mut self.result_skin);
         let rig = &*self;
-        result.settle(|| rig.run_ends());
+        // When the run's end was first seen (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        let ended: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+        result.settle(|| {
+            let ends = rig.run_ends();
+            #[cfg(feature = "dev-tools")]
+            if ends && ended.get().is_none() {
+                ended.set(Some(std::time::Instant::now()));
+            }
+            ends
+        });
         self.result_skin = result;
+        #[cfg(feature = "dev-tools")]
+        if let Some(at) = ended.get() {
+            println!(
+                "dev: result skin settled {} ms after the run's end",
+                at.elapsed().as_millis()
+            );
+        }
         // The job's thread has ended, and its VMs with it, unless the
         // run's end gave it up (dev-tools witness).
         #[cfg(feature = "dev-tools")]

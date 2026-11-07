@@ -2181,6 +2181,18 @@ fn the_runs_end_bounds_a_withdrawn_layouts_wait() {
             ended < line("dev: result skin settled: withdrawn"),
             "{step}: {stdout}"
         );
+        // The wait left within the stop bound (2 s) of the run's end, with
+        // slack for a loaded machine.
+        let after = lines(&stdout, "dev: result skin settled ");
+        let [after] = after.as_slice() else {
+            panic!("{step}: {stdout}");
+        };
+        let ms: u64 = after
+            .trim_start_matches("dev: result skin settled ")
+            .trim_end_matches(" ms after the run's end")
+            .parse()
+            .unwrap();
+        assert!(ms <= 6_000, "{step}: {ms} ms: {stdout}");
         assert!(
             lines(&stdout, "dev: result skin published: ").is_empty(),
             "{step}: {stdout}"
