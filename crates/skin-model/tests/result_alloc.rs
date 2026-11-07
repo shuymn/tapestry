@@ -172,6 +172,7 @@ fn skin() -> Skin {
         average: true,
         dev: true,
         solid: 1,
+        fit: skin_model::GraphFit::Stretch,
     }];
     Skin::new_result(
         def,
