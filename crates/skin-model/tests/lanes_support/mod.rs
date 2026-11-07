@@ -128,6 +128,7 @@ pub fn fallback_sheet() -> Sheet {
             size: [32, 8],
             color,
             filter: Filter::Nearest,
+            grid: None,
         })
         .unwrap();
     }

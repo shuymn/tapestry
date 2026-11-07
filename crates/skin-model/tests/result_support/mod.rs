@@ -9,10 +9,10 @@ use eval::Tally;
 use rules::PerJudgment;
 use skin_model::{
     BestFigures, BestRate, BestView, Blend, ElementDef, LampKey, Layout, LoadError, NumberDef,
-    Place, Program, QuadBatch, RESULT, ResultBpm, ResultChart, ResultFrame, ResultLabels,
-    ResultNumber, ResultRate, ResultScore, ResultScreen, ResultStatus, ResultTimers, ResultView,
-    Scope, Skin, Source, Timelines, TimerRef, TimingStats, Ty, UvTable, WidgetDefs, compile,
-    result_timer,
+    Place, Program, QuadBatch, RESULT, ResultBpm, ResultChart, ResultDefs, ResultFrame,
+    ResultLabels, ResultNumber, ResultRate, ResultScore, ResultScreen, ResultStatus, ResultTimers,
+    ResultView, Scope, Skin, Source, Timelines, TimerRef, TimingStats, Ty, UvTable, WidgetDefs,
+    compile, result_timer,
 };
 
 use crate::selection_support::{Drawn, digits, frame_of, rect, skin_def, uvs};
@@ -49,7 +49,7 @@ pub fn number(value: &str, cells: u8) -> NumberDef {
 
 /// A result skin of `elements` with `widgets`.
 pub fn rload(elements: Vec<ElementDef>, widgets: WidgetDefs) -> Result<Skin, LoadError> {
-    Skin::new_result(skin_def(elements, widgets))
+    Skin::new_result(skin_def(elements, widgets), ResultDefs::default())
 }
 
 /// The chart's strings the tests pass.

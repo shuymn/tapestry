@@ -1,8 +1,9 @@
 //! A result skin's per-frame build allocates nothing (docs/stage3.md
-//! S10-09g): numbers over shown and hidden values and their guards, an
-//! image choice over the clear type, chart text, the fade-out and a `when`
-//! timer, frame after frame as the timers move, over views that change
-//! between frames, unavailable ones among them.
+//! S10-09g, S10-09h): numbers over shown and hidden values and their
+//! guards, an image choice over the clear type, chart text, the fade-out
+//! and a `when` timer, both judge graphs with their background and reveal,
+//! frame after frame as the timers move, over views that change between
+//! frames, unavailable ones among them.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -18,9 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::TimeUs;
 use result_support::{RFx, best, number, ready, relement, rint};
 use skin_model::{
-    BestView, ElementDef, FontRef, FrameUv, ImageChoiceDef, ImageChoicePart, ImageSpan, PastTable,
-    ResultNumber, ResultStatus, Skin, Source, TextDef, TextField, TextImage, TextTable, TextValue,
-    TimerRef, Unavailable, WidgetDefs, result_timer,
+    BestView, ElementDef, FontRef, FrameUv, ImageChoiceDef, ImageChoicePart, ImageSpan,
+    JudgeGraphDef, JudgeGraphKind, PastTable, ResultDefs, ResultNumber, ResultStatus, Skin, Source,
+    TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Unavailable, WidgetDefs,
+    result_timer,
 };
 
 struct Counting;
@@ -119,6 +121,8 @@ fn skin() -> Skin {
                 timer: TimerRef::When(0),
                 ..relement(Source::Image(5), [0, 160, 10, 10], None)
             },
+            relement(Source::JudgeGraph(0), [0, 200, 520, 82], None),
+            relement(Source::JudgeGraph(1), [0, 300, 520, 82], None),
         ],
         WidgetDefs {
             numbers: vec![
@@ -133,7 +137,19 @@ fn skin() -> Skin {
         },
     );
     def.whens = vec![result_support::rbool("result.cleared")];
-    Skin::new_result(def).unwrap()
+    let graph = |kind, back, reverse| JudgeGraphDef {
+        kind,
+        delay: TimeUs(500_000),
+        reverse,
+        back,
+        chips: 0,
+        solid: 1,
+    };
+    let judge_graphs = vec![
+        graph(JudgeGraphKind::Judgment, true, false),
+        graph(JudgeGraphKind::EarlyLate, true, true),
+    ];
+    Skin::new_result(def, ResultDefs { judge_graphs }).unwrap()
 }
 
 #[test]
@@ -167,6 +183,13 @@ fn a_result_build_allocates_nothing() {
         // The first build after each view change counts too.
         total += counted(|| fx.frame(0));
         assert!(!fx.batch.quads().is_empty());
+        // Past the reveal, a ready view's graphs draw their backgrounds
+        // and chips.
+        total += counted(|| fx.frame(600));
+        if v.status == ResultStatus::Ready {
+            assert!(fx.batch.quads().len() > 2 * 6, "{}", fx.batch.quads().len());
+        }
+        assert_eq!(fx.batch.dropped(), 0);
         for ms in (16..2_000).step_by(16) {
             fx.timers.fadeout = (ms > 1_000).then_some(TimeUs(1_000_000));
             total += counted(|| fx.frame(ms));

@@ -34,8 +34,8 @@ pub struct Quad {
 // The renderer's sprite carries the same 64 bytes.
 const _: () = assert!(std::mem::size_of::<Quad>() == 64);
 
-/// How an image is sampled. Both use the atlas's box-filtered mip levels
-/// when shrinking.
+/// How an image is sampled. The first two use the atlas's box-filtered
+/// mip levels when shrinking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Filter {
     /// Bilinear within a level, blending between levels.
@@ -43,6 +43,11 @@ pub enum Filter {
     Linear,
     /// The nearest texel of the nearest level, for pixel art.
     Nearest,
+    /// The nearest texel of level 0 however far the image shrinks, for a
+    /// generated grid ([`SolidImageDef::grid`](crate::SolidImageDef)):
+    /// its gaps stay whole texels instead of blending into translucent
+    /// rows.
+    NearestBase,
 }
 
 /// How a quad is blended over what is under it.

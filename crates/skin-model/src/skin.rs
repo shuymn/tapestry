@@ -22,10 +22,11 @@ use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions
 use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
+use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
-use crate::result::view::{ResultLabels, ResultView};
+use crate::result::view::{ResultLabels, ResultView, Timelines};
 use crate::result::{ResultError, ResultFrame, ResultScreen};
 use crate::schema::Ty;
 use crate::screen::ScreenKind;
@@ -48,6 +49,7 @@ use crate::widget::image_choice::{
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgePart, JudgeSlot,
 };
+use crate::widget::judge_graph::{GraphDraw, JudgeGraph, JudgeGraphDef};
 use crate::widget::lanes::LaneView;
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
 use crate::widget::ratio_bar::{
@@ -117,6 +119,15 @@ pub enum Source {
     /// The ratio bar at this index of [`SelectionDefs::ratio_bars`]: its
     /// image cut to, or moved by, its ratio from the element's rect.
     RatioBar(u32),
+    /// The judge graph at this index of [`ResultDefs::judge_graphs`]: the
+    /// view's timelines over the element's rect.
+    JudgeGraph(u32),
+}
+
+/// The widgets only a result skin draws.
+#[derive(Clone, Debug, Default)]
+pub struct ResultDefs {
+    pub judge_graphs: Vec<JudgeGraphDef>,
 }
 
 /// The widgets only a selection skin draws.
@@ -286,6 +297,8 @@ pub enum LoadError {
     SourceKind { element: usize, kind: ScreenKind },
     #[error("the song list")]
     SongList(#[source] SongListError),
+    #[error("judge graph {graph}'s image does not exist")]
+    JudgeGraphImage { graph: usize },
     #[error("ratio bar {bar}")]
     RatioBar {
         bar: usize,
@@ -311,6 +324,8 @@ enum Kind {
     /// The ratio bar's index, and its hit slot when it is a changeable
     /// slider.
     RatioBar(usize, Option<usize>),
+    /// The judge graph's index.
+    JudgeGraph(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -378,8 +393,8 @@ enum Phase<'a> {
     },
     /// A selection frame: its rows, ratios and slider hits.
     Selection { sel: &'a Selection },
-    /// A result frame.
-    Result,
+    /// A result frame: the view's timelines.
+    Result { timelines: Option<&'a Timelines> },
 }
 
 /// A loaded skin.
@@ -414,6 +429,7 @@ pub struct Skin {
     kind: ScreenKind,
     song_list: Option<SongList>,
     ratio_bars: Box<[RatioBar]>,
+    judge_graphs: Box<[JudgeGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
     /// This skin's identity, which a selection state it makes carries: a
@@ -719,7 +735,8 @@ fn check_widget_images(
         | Source::ImageChoice(_)
         | Source::CoverPaint(_)
         | Source::SongList
-        | Source::RatioBar(_) => {}
+        | Source::RatioBar(_)
+        | Source::JudgeGraph(_) => {}
     }
     Ok(())
 }
@@ -771,7 +788,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::ImageChoice(_)
         | Source::CoverPaint(_)
         | Source::SongList
-        | Source::RatioBar(_) => {}
+        | Source::RatioBar(_)
+        | Source::JudgeGraph(_) => {}
     }
     Ok(())
 }
@@ -780,8 +798,9 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// 0 for an image, a cover paint or the lanes, which `quad_capacity`
 /// counts apart; for a
 /// text, 1, or with a bitmap font one per character: a literal's
-/// characters, or [`MAX_TEXT_BYTES`] for a field.
-fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs) -> u32 {
+/// characters, or [`MAX_TEXT_BYTES`] for a field; for a judge graph, its
+/// background's and one per channel of every bin.
+fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) -> u32 {
     match source {
         Source::Image(_)
         | Source::Lanes
@@ -796,6 +815,10 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs) -> u32 {
             .map_or(0, |n| u32::from(n.digits.cells)),
         Source::Gauge(i) => w.gauges.get(index(i)).map_or(0, GaugeDef::quads),
         Source::Judge(i) => w.judges.get(index(i)).map_or(0, JudgeDef::quads),
+        Source::JudgeGraph(i) => res
+            .judge_graphs
+            .get(index(i))
+            .map_or(0, JudgeGraphDef::quads),
     }
 }
 
@@ -829,7 +852,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::ImageChoice(_)
             | Source::CoverPaint(_)
             | Source::SongList
-            | Source::RatioBar(_) => {
+            | Source::RatioBar(_)
+            | Source::JudgeGraph(_) => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -859,7 +883,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::Gauge(_)
                     | Source::Text(_)
                     | Source::Lanes
-                    | Source::RatioBar(_) => e.track.bounds(),
+                    | Source::RatioBar(_)
+                    | Source::JudgeGraph(_) => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1075,7 +1100,11 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
         let ok = match kind {
             ScreenKind::Selection => !matches!(
                 e.source,
-                Source::Lanes | Source::Gauge(_) | Source::Judge(_) | Source::CoverPaint(_)
+                Source::Lanes
+                    | Source::Gauge(_)
+                    | Source::Judge(_)
+                    | Source::CoverPaint(_)
+                    | Source::JudgeGraph(_)
             ),
             ScreenKind::Result => {
                 !selection_text(def, e.source)
@@ -1091,7 +1120,10 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
             }
             ScreenKind::Play | ScreenKind::Decision => {
                 !selection_text(def, e.source)
-                    && !matches!(e.source, Source::SongList | Source::RatioBar(_))
+                    && !matches!(
+                        e.source,
+                        Source::SongList | Source::RatioBar(_) | Source::JudgeGraph(_)
+                    )
             }
         };
         if !ok {
@@ -1341,7 +1373,12 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new(def: SkinDef) -> Result<Self, LoadError> {
-        Self::load(def, ScreenKind::Play, SelectionDefs::default())
+        Self::load(
+            def,
+            ScreenKind::Play,
+            SelectionDefs::default(),
+            ResultDefs::default(),
+        )
     }
 
     /// Loads a selection skin: the checks of [`new`](Self::new) over the
@@ -1360,26 +1397,33 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new_selection(def: SkinDef, widgets: SelectionDefs) -> Result<Self, LoadError> {
-        Self::load(def, ScreenKind::Selection, widgets)
+        Self::load(def, ScreenKind::Selection, widgets, ResultDefs::default())
     }
 
     /// Loads a result skin: the checks of [`new`](Self::new) over the
-    /// result schema and its timers. An element may draw an image, an
-    /// image choice, a number or a text of the chart; the lanes, a gauge, a
-    /// judge, a cover paint, the song list, a ratio bar or a selection
-    /// text is refused ([`LoadError::SourceKind`]).
+    /// result schema and its timers, and its widgets in `widgets`. An
+    /// element may draw an image, an image choice, a number, a text of the
+    /// chart or a judge graph; the lanes, a gauge, a judge, a cover paint,
+    /// the song list, a ratio bar or a selection text is refused
+    /// ([`LoadError::SourceKind`]). Every judge graph's images exist, and
+    /// each judge graph element is charged its worst quads.
     ///
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new_result(def: SkinDef) -> Result<Self, LoadError> {
-        Self::load(def, ScreenKind::Result, SelectionDefs::default())
+    pub fn new_result(def: SkinDef, widgets: ResultDefs) -> Result<Self, LoadError> {
+        Self::load(def, ScreenKind::Result, SelectionDefs::default(), widgets)
     }
 
     /// The checks of [`new`](Self::new) for a skin of `kind`, with the
-    /// selection widgets `sel`.
+    /// selection widgets `sel` and the result widgets `res`.
     #[expect(clippy::too_many_lines, reason = "one ordered list of checks")]
-    fn load(mut def: SkinDef, kind: ScreenKind, sel: SelectionDefs) -> Result<Self, LoadError> {
+    fn load(
+        mut def: SkinDef,
+        kind: ScreenKind,
+        sel: SelectionDefs,
+        res: ResultDefs,
+    ) -> Result<Self, LoadError> {
         let builtin = usize::from(match kind {
             ScreenKind::Selection => selection_timer::BUILTIN,
             ScreenKind::Result => result_timer::BUILTIN,
@@ -1411,6 +1455,7 @@ impl Skin {
             w.image_choices.len(),
             w.cover_paints.len(),
             sel.ratio_bars.len(),
+            res.judge_graphs.len(),
         ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });
@@ -1507,7 +1552,8 @@ impl Skin {
                 | Source::ImageChoice(_)
                 | Source::CoverPaint(_)
                 | Source::SongList
-                | Source::RatioBar(_) => {}
+                | Source::RatioBar(_)
+                | Source::JudgeGraph(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -1540,6 +1586,7 @@ impl Skin {
             Source::ImageChoice(i) => w.image_choices.get(index(i)).is_none(),
             Source::SongList => sel.song_list.is_none(),
             Source::RatioBar(i) => sel.ratio_bars.get(index(i)).is_none(),
+            Source::JudgeGraph(i) => res.judge_graphs.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -1553,9 +1600,17 @@ impl Skin {
             | Source::ImageChoice(_)
             | Source::CoverPaint(_)
             | Source::SongList
-            | Source::RatioBar(_) => false,
+            | Source::RatioBar(_)
+            | Source::JudgeGraph(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
+        }
+        if let Some(graph) = res
+            .judge_graphs
+            .iter()
+            .position(|g| !exists(g.chips) || !exists(g.solid))
+        {
+            return Err(LoadError::JudgeGraphImage { graph });
         }
         check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
         for (element, e) in elements.iter().enumerate() {
@@ -1664,7 +1719,7 @@ impl Skin {
         }
         let widget_quads = elements
             .iter()
-            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w, &sel)));
+            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w, &sel, &res)));
         if widget_quads > u64::from(MAX_WIDGET_QUADS) {
             return Err(LoadError::TooManyWidgetQuads { n: widget_quads });
         }
@@ -1792,6 +1847,15 @@ impl Skin {
                 image: image(def.image),
             })
             .collect();
+        let judge_graphs: Box<[JudgeGraph]> = res
+            .judge_graphs
+            .into_iter()
+            .map(|def| JudgeGraph {
+                def,
+                chips: image(def.chips),
+                solid: image(def.solid),
+            })
+            .collect();
         let elements = def
             .elements
             .into_iter()
@@ -1837,6 +1901,7 @@ impl Skin {
                         });
                         Kind::RatioBar(index(i), hit)
                     }
+                    Source::JudgeGraph(i) => Kind::JudgeGraph(index(i)),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -1891,6 +1956,7 @@ impl Skin {
             kind,
             song_list,
             ratio_bars,
+            judge_graphs,
             sliders,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
@@ -3089,7 +3155,9 @@ impl Skin {
             lanes: LaneView::NONE,
             complete: false,
             hidden_enabled: false,
-            phase: Phase::Result,
+            phase: Phase::Result {
+                timelines: res.timelines(),
+            },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
         Ok(())
@@ -3121,11 +3189,11 @@ impl Skin {
         let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
         let play = match scene.phase {
             Phase::Play { play, notes, .. } => Some((play, notes)),
-            Phase::Loading { .. } | Phase::Selection { .. } | Phase::Result => None,
+            Phase::Loading { .. } | Phase::Selection { .. } | Phase::Result { .. } => None,
         };
         let sel = match scene.phase {
             Phase::Selection { sel } => Some(sel),
-            Phase::Play { .. } | Phase::Loading { .. } | Phase::Result => None,
+            Phase::Play { .. } | Phase::Loading { .. } | Phase::Result { .. } => None,
         };
         #[cfg(feature = "dev-tools")]
         let mut element = 0_u32;
@@ -3337,7 +3405,7 @@ impl Skin {
                         // a source number reserves: a hidden value reads
                         // `i32::MIN`. Play's values never reach them.
                         let reserved = v == i32::MIN || v == i32::MAX;
-                        if !(reserved && matches!(scene.phase, Phase::Result)) {
+                        if !(reserved && matches!(scene.phase, Phase::Result { .. })) {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }
@@ -3358,7 +3426,7 @@ impl Skin {
                                 border: g.border,
                                 value: GaugeValue(0),
                             }),
-                            Phase::Selection { .. } | Phase::Result => None,
+                            Phase::Selection { .. } | Phase::Result { .. } => None,
                         };
                         let d = GaugeDraw { at, shown, t };
                         g.draw(&d, rect, &brush, out);
@@ -3430,6 +3498,22 @@ impl Skin {
                                 }));
                             }
                         }
+                    }
+                }
+                Kind::JudgeGraph(i) => {
+                    if let (Some(g), Phase::Result { timelines }) =
+                        (self.judge_graphs.get(i), scene.phase)
+                    {
+                        let screen = rt
+                            .starts
+                            .at(usize::from(result_timer::SCREEN))
+                            .map(|at| elapsed_us(now, at));
+                        let d = GraphDraw {
+                            at,
+                            timelines,
+                            screen,
+                        };
+                        g.draw(&d, rect, &brush, out);
                     }
                 }
                 Kind::Lanes | Kind::SongList => {}

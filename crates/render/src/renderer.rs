@@ -104,7 +104,7 @@ const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
-// the atlas layer (low 16 bits) and the nearest-filter bit.
+// the atlas layer (low 16 bits) and the nearest and base filter bits.
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
@@ -151,11 +151,13 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // The atlas holds premultiplied texels and the colour arrives premultiplied,
 // so their product is premultiplied. A skin's page is sampled bilinearly
 // between its mip levels, or at the nearest texel of the nearest level with
-// the nearest bit; layer 0, the built-in atlas of 128 texels at its top
-// left, is read at its nearest level-0 texel by integer texel: its uv, the
-// built-in atlas's own, times 128, exact whatever the array's side. Both
-// pages' samples are taken, so every sample stays in uniform control flow,
-// and one result is chosen.
+// the nearest bit, or at the nearest texel of level 0 with the base bit;
+// layer 0, the built-in atlas of 128 texels at its top left, is read at its
+// nearest level-0 texel by integer texel: its uv, the built-in atlas's own,
+// times 128, exact whatever the array's side. The two implicit-derivative
+// samples are always taken, so they stay in uniform control flow; the
+// base read has an explicit level, which needs no derivatives, so only a
+// sprite with the base bit takes it. One result is chosen.
 @fragment
 fn fs(v: VOut) -> @location(0) vec4f {
     let layer = i32(v.flags & 0xFFFFu);
@@ -163,7 +165,10 @@ fn fs(v: VOut) -> @location(0) vec4f {
     let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
     let texel = clamp(vec2i(floor(v.uv * 128.0)), vec2i(0), vec2i(127));
     let builtin = textureLoad(atlas, texel, 0, 0);
-    let page = select(smoothed, nearest, (v.flags & 0x10000u) != 0u);
+    var page = select(smoothed, nearest, (v.flags & 0x10000u) != 0u);
+    if (v.flags & 0x20000u) != 0u {
+        page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
+    }
     return select(page, builtin, layer == 0) * v.color;
 }
 ";

@@ -12,10 +12,10 @@ use result_support::{RFx, best, chart, labels, number, ready, relement, rint, rl
 use selection_support::{DIGITS, frame_of};
 use skin_model::{
     Attempt, BestView, BuildError, ChartMetadata, ElementDef, FontRef, ImageChoiceDef, LoadError,
-    MAX_TEXT_BYTES, Overflow, PlayContext, PrepareError, ResultError, ResultFields, ResultLabels,
-    ResultNumber, ResultStatus, ResultView, ScreenKind, SelectionText, Side, Skin, Source, TextDef,
-    TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef, Unavailable, WidgetDefs,
-    result_field as field, result_timer,
+    MAX_TEXT_BYTES, Overflow, PlayContext, PrepareError, ResultDefs, ResultError, ResultFields,
+    ResultLabels, ResultNumber, ResultStatus, ResultView, ScreenKind, SelectionText, Side, Skin,
+    Source, TextDef, TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef,
+    Unavailable, WidgetDefs, result_field as field, result_timer,
 };
 
 fn text(value: TextValue) -> TextDef {
@@ -432,7 +432,7 @@ fn the_result_timers_follow_the_frame() {
         WidgetDefs::default(),
     );
     def.whens = vec![result_support::rbool("result.cleared")];
-    let mut fx = RFx::new(Skin::new_result(def).unwrap());
+    let mut fx = RFx::new(Skin::new_result(def, ResultDefs::default()).unwrap());
     fx.view(&ready(1, BestView::Unavailable, 1));
     fx.frame(0);
     assert_eq!((fx.at_y(100.0), fx.at_y(200.0)), (vec![], vec![(2, 0)]));
@@ -698,7 +698,7 @@ fn result_bitmap_text_follows_the_view() {
         },
     );
     def.sheet = b.finish();
-    let mut fx = RFx::new(Skin::new_result(def).unwrap());
+    let mut fx = RFx::new(Skin::new_result(def, ResultDefs::default()).unwrap());
     let titled = |title: &str| ResultLabels {
         title: title.to_owned(),
         ..labels()

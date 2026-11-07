@@ -267,7 +267,7 @@ impl PackedPages {
                     };
                     (CellSource::File(file), rect)
                 }
-                CellSource::Solid(_) => (cell.source, cell.rect),
+                CellSource::Solid(..) => (cell.source, cell.rect),
             };
             let i = self
                 .cells
@@ -487,7 +487,7 @@ impl Sheet {
                     .ok()
                     .and_then(|f| files.get(f))
                     .is_some_and(|f| f.version(variant).1),
-                CellSource::Solid(_) => false,
+                CellSource::Solid(..) => false,
             };
             let rect = if hi {
                 cell.rect.map(|v| v * 2)
@@ -603,7 +603,7 @@ impl Sheet {
             };
             let source = match cell.source {
                 CellSource::File(f) => CellSource::File(index(f).ok_or(AtlasError::Misaligned)?),
-                CellSource::Solid(_) => cell.source,
+                CellSource::Solid(..) => cell.source,
             };
             let [x, y, ..] = place.alloc;
             cells.push(HeldCell {
@@ -717,7 +717,7 @@ impl Sheet {
 
         // The generated cells, after the files.
         for (i, cell) in cells.iter().enumerate().skip(start) {
-            let CellSource::Solid(color) = cell.source else {
+            let CellSource::Solid(color, grid) = cell.source else {
                 continue;
             };
             let Some(place) = packing.places.get(i) else {
@@ -729,7 +729,13 @@ impl Sheet {
             else {
                 continue;
             };
-            mip::blit_solid(level, packing.side, color, place.alloc);
+            match grid {
+                None => mip::blit_solid(level, packing.side, color, place.alloc),
+                Some(lit) => {
+                    let [_, _, w, h] = cell.rect;
+                    mip::blit_grid(level, packing.side, color, lit, [w, h], place.alloc);
+                }
+            }
         }
         Ok(())
     }
