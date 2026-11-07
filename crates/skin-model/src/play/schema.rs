@@ -30,6 +30,8 @@ pub const LANE_JUDGE_MAX: i32 = 11;
 pub const PROGRESS_FULL: i32 = 1_000_000;
 /// The largest `chart.difficulty`: `#DIFFICULTY` 5.
 pub const DIFFICULTY_MAX: i32 = 5;
+/// The largest `chart.judge_class`: the easiest of the five classes.
+pub const JUDGE_CLASS_MAX: i32 = 4;
 /// A cover setting's full amount, ‰.
 pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
@@ -233,6 +235,8 @@ pub static PLAY: Schema = Schema {
         flag("chart.total_valid", T),
         flag("chart.bga", T),
         flag("chart.bga_valid", T),
+        int("chart.judge_class", JUDGE_CLASS_MAX, T),
+        flag("chart.judge_class_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -475,7 +479,14 @@ pub mod field {
     /// Whether that is known.
     pub const CHART_BGA_VALID: u16 = 107;
     /// The number of fields.
-    pub const COUNT: usize = 108;
+    /// The chart's judgment class from its own rank as the reference
+    /// computes it, 0 the hardest to 4 the easiest; 0 while
+    /// `chart.judge_class_valid` is false.
+    pub const CHART_JUDGE_CLASS: u16 = 108;
+    /// Whether the chart has a judgment class.
+    pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
+    /// The number of fields.
+    pub const COUNT: usize = 110;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -792,6 +803,12 @@ mod tests {
             ("chart.total_valid", field::CHART_TOTAL_VALID, None),
             ("chart.bga", field::CHART_BGA, None),
             ("chart.bga_valid", field::CHART_BGA_VALID, None),
+            ("chart.judge_class", field::CHART_JUDGE_CLASS, Some(4)),
+            (
+                "chart.judge_class_valid",
+                field::CHART_JUDGE_CLASS_VALID,
+                None,
+            ),
         ];
         for (i, (name, s, hi)) in chart.into_iter().enumerate() {
             assert_eq!(usize::from(s), 102 + i, "{name}");
@@ -803,7 +820,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(field::COUNT, 108);
+        assert_eq!(field::COUNT, 110);
     }
 
     #[test]

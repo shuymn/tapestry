@@ -17,6 +17,7 @@ dev-tools = ["skin-model/dev-tools"]
 bms-model.workspace = true
 image.workspace = true
 mlua.workspace = true
+rules.workspace = true
 skin-model.workspace = true
 
 [dev-dependencies]

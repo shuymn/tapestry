@@ -279,6 +279,31 @@ fn frame(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) -> Vec<u8> {
     crate::render_common::read_back(r)
 }
 
+/// A frame of `b` staged for an attempt at `loaded`'s chart, through its
+/// attempt context, as a play stages it.
+fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::Loaded) -> Vec<u8> {
+    let owned = crate::attempt_context::AttemptContext::new(
+        loaded.attempt(),
+        crate::attempt_context::SIMPLE_SCRATCH,
+        0,
+        false,
+    );
+    let ctx = owned.context();
+    let text = owned.text();
+    let a = AttemptInput {
+        chart: loaded.chart(),
+        context: &ctx,
+        text: &text,
+        target: r.target(),
+    };
+    let token = r.stage(b, &a, request).unwrap();
+    r.commit(token).unwrap();
+    let v = crate::render_common::view(0, 0);
+    let input = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
+    assert!(r.frame(&input).unwrap().presented);
+    crate::render_common::read_back(r)
+}
+
 /// A skin of another kind than the one it is built for refuses; a kind
 /// with no importer yet runs the importer and keeps its built-in screen.
 #[test]
@@ -633,11 +658,18 @@ fn a_lua_skin_builds_on_the_base_facts() {
     }
 }
 
+/// Where [`class_skin`] draws its image while a frame reads the chart as
+/// easy.
+const FRAME_CLASS: [i32; 4] = [300, 100, 100, 100];
+
 /// A Lua play skin whose configured pass draws `blue.png` for an easy
-/// chart (option 183) and `red.png` otherwise, at [`COLOUR`].
+/// chart (option 183) and `red.png` otherwise, at [`COLOUR`], and which
+/// draws the same image at [`FRAME_CLASS`] while a frame's `option(183)`
+/// holds.
 fn class_skin() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let [x, y, w, h] = COLOUR;
+    let [fx, fy, fw, fh] = FRAME_CLASS;
     let entry = format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
          if not skin_config then return skin end\n\
@@ -646,9 +678,12 @@ fn class_skin() -> tempfile::TempDir {
          if ms.option(183) then path = \"blue.png\" end\n\
          skin.source = {{ {{ id = \"a\", path = path }} }}\n\
          skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 16, h = 16 }} }}\n\
-         skin.destination = {{ {{ id = \"i\", dst = {{ {{ x = {x}, y = {}, w = {w}, h = {h} }} }} }} }}\n\
+         skin.destination = {{ {{ id = \"i\", dst = {{ {{ x = {x}, y = {}, w = {w}, h = {h} }} }} }},\n\
+           {{ id = \"i\", draw = function() return ms.option(183) end,\n\
+              dst = {{ {{ x = {fx}, y = {}, w = {fw}, h = {fh} }} }} }} }}\n\
          return skin\n",
-        1_080 - y - h
+        1_080 - y - h,
+        1_080 - fy - fh
     );
     fs::write(dir.path().join("play.luaskin"), entry).unwrap();
     png(&dir.path().join("red.png"), 16, 16, RED);
@@ -658,8 +693,12 @@ fn class_skin() -> tempfile::TempDir {
 
 /// A pending skin reading the judgment class, specialized for the facts of
 /// loaded charts, draws its class's image: red for `#RANK 2` (normal) and
-/// for no rank, blue for `#RANK 3` (easy); each specialization records the
-/// class it read, which another chart of the class holds.
+/// for no rank, blue for `#RANK 3` and `#DEFEXRANK 120` (easy, 90 once the
+/// reference normalizes it) and for `#DEFEXRANK 1` (0, then 100), under
+/// either preset; each specialization records the class it read, which
+/// another chart of the class holds. A frame staged for the same loaded
+/// chart reads the same class: the image at [`FRAME_CLASS`] is drawn for
+/// the easy charts alone.
 #[test]
 fn a_specialization_draws_its_charts_class() {
     let _serial = serial();
@@ -671,17 +710,32 @@ fn a_specialization_draws_its_charts_class() {
     let facts =
         |text| super::facts::attempt_facts(&super::facts::tests::loaded(text, "tapestry"), false);
     let mut request = 0;
-    for (text, colour, class) in [
-        ("#RANK 2\n", RED, JudgeClass::Normal),
-        ("", RED, JudgeClass::Normal),
-        ("#RANK 3\n", BLUE, JudgeClass::Easy),
+    for (text, preset, colour, class) in [
+        ("#RANK 2\n", "tapestry", RED, JudgeClass::Normal),
+        ("", "tapestry", RED, JudgeClass::Normal),
+        ("#RANK 3\n", "tapestry", BLUE, JudgeClass::Easy),
+        (
+            "#DEFEXRANK 120\n",
+            "beatoraja-style",
+            BLUE,
+            JudgeClass::Easy,
+        ),
+        ("#DEFEXRANK 120\n", "tapestry", BLUE, JudgeClass::Easy),
+        ("#DEFEXRANK 1\n", "beatoraja-style", BLUE, JudgeClass::Easy),
     ] {
-        let f = facts(text);
+        let loaded = super::facts::tests::loaded(text, preset);
+        let f = super::facts::attempt_facts(&loaded, false);
         let s = specialize(&p, &f, &Cancel::new()).unwrap();
         assert_eq!(s.summary.sources, ["play.luaskin"], "{text:?}");
         request += 1;
-        let pixels = frame(&mut r, &s.bundle, request);
-        assert_eq!(centre(&pixels, COLOUR), colour, "{text:?}");
+        let pixels = frame_of(&mut r, &s.bundle, request, &loaded);
+        assert_eq!(centre(&pixels, COLOUR), colour, "{text:?} {preset}");
+        let at_frame = centre(&pixels, FRAME_CLASS);
+        if class == JudgeClass::Easy {
+            assert_eq!(at_frame, BLUE, "{text:?} {preset}");
+        } else {
+            assert!(at_frame != RED && at_frame != BLUE, "{text:?} {preset}");
+        }
         assert_eq!(
             s.facts.reads,
             [FactRead {
@@ -758,7 +812,7 @@ fn a_specialization_reads_again_only_what_the_header_pass_did_not() {
     let (p, note) = pending(play(&choice(d, "play.luaskin"), &t));
     assert_eq!(note.fact, FactId::PlayLevel);
     let mut facts = ImportFacts::base(ScreenKind::Play, Fact::Known(false));
-    facts.chart_rank = Fact::Known(None);
+    facts.judge_class = Fact::Known(None);
     facts.play_level = Fact::Known(12);
     // Source y 0 is the canvas's bottom: the images lie on rows 1016 to 1079.
     let at = |p: &[u8]| [32, 232, 432].map(|x| crate::render_common::rgb_at(p, 1_920, (x, 1_048)));
@@ -803,7 +857,7 @@ fn a_specialization_refuses_a_pending_fact_and_stops_when_cancelled() {
         "the skin reads the chart's judgment class, which the attempt's facts leave pending"
     );
     let mut facts = base;
-    facts.chart_rank = Fact::Known(None);
+    facts.judge_class = Fact::Known(None);
     let cancel = Cancel::new();
     cancel.cancel();
     let why = specialize(&p, &facts, &cancel).unwrap_err();
