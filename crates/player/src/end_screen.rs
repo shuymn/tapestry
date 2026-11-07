@@ -651,7 +651,7 @@ pub fn settings_lines(t: Tuning, speed: SpeedLine) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
 
     use bms_model::{ChartBuilder, Lane, TimeUs};
@@ -811,7 +811,7 @@ mod tests {
 
     /// A completed play's report under `preset`, with one gauge result per
     /// preset gauge at 61.234 %, and a record of no input.
-    fn report(preset: rules::RulePreset) -> game::PlayReport {
+    pub(crate) fn report(preset: rules::RulePreset) -> game::PlayReport {
         use eval::{Evaluation, GaugeResult, Tally};
         use rules::PerJudgment;
         let tally = Tally {
@@ -872,7 +872,7 @@ mod tests {
     }
 
     /// The result screen of `report` over the presets in `dir`.
-    fn screen(dir: &Path, report: &game::PlayReport) -> ResultScreen {
+    pub(crate) fn screen(dir: &Path, report: &game::PlayReport) -> ResultScreen {
         let shelf = game::Shelf::open(dir.join("presets"), "tapestry").unwrap();
         ResultScreen::new(report, &shelf, &chart(), game::RECORDING_MEMORY)
     }

@@ -2052,6 +2052,7 @@ impl<O> SessionRig<'_, O> {
 impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     type Reader = input::SourceReader;
     type ScreenError = std::convert::Infallible;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         self.clock.now()

@@ -631,6 +631,7 @@ impl Headless {
 impl Rig for Headless {
     type Reader = SourceReader;
     type ScreenError = SurfaceLost;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         self.clock.now()

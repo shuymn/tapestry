@@ -250,6 +250,7 @@ impl Rounds {
 impl Rig for Rounds {
     type Reader = SourceReader;
     type ScreenError = std::convert::Infallible;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         TimeUs(self.at())
