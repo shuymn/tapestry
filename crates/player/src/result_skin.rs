@@ -32,6 +32,9 @@ pub struct PendingResult {
     config: Config,
     target: ImportTarget,
     cache: Arc<ResourceCache>,
+    /// The source its imports read through; its clones share its counts.
+    #[cfg(all(test, feature = "dev-tools"))]
+    source: FileSource,
 }
 
 impl std::fmt::Debug for PendingResult {
@@ -46,18 +49,22 @@ impl PendingResult {
     /// `header`, its imports reading through a new cache of `root`.
     pub fn new(mut header: LuaHeader, config: Config, target: ImportTarget, root: &Root) -> Self {
         let cache = ResourceCache::new(root);
-        header.read_through(FileSource::cached(Arc::clone(&cache)));
+        let source = FileSource::cached(Arc::clone(&cache));
+        header.read_through(source.clone());
         Self {
             header,
             config,
             target,
             cache,
+            #[cfg(all(test, feature = "dev-tools"))]
+            source,
         }
     }
 
-    /// The skin folder's resource cache.
-    pub fn cache(&self) -> &Arc<ResourceCache> {
-        &self.cache
+    /// What its imports and packs read from the disk (dev-tools).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn source_counts(&self) -> skin_model::SourceCounts {
+        self.source.counts()
     }
 }
 
@@ -71,6 +78,7 @@ pub struct ImageEntry {
 
 impl ImageEntry {
     /// The atlas's shared pages.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn pages(&self) -> &Arc<skin_model::PackedPages> {
         self.atlas.shared_pages()
     }
@@ -144,7 +152,7 @@ pub enum Staged {
 static BUILDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The atlas builds made so far (dev-tools).
-#[cfg(any(test, feature = "dev-tools"))]
+#[cfg(all(test, feature = "dev-tools"))]
 pub fn builds() -> u32 {
     BUILDS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -195,6 +203,11 @@ fn result_facts(fields: ResultFields) -> ImportFacts {
 /// D13's probe: `chart`'s facts, and every result value, best value and
 /// count shown and 1, every validity true.
 pub fn probe_fields(chart: ResultChart) -> ResultFields {
+    ResultFields::of(&probe_view(chart))
+}
+
+/// The view of [`probe_fields`].
+fn probe_view(chart: ResultChart) -> ResultView {
     let one = PerJudgment {
         perfect: 1,
         great: 1,
@@ -214,7 +227,7 @@ pub fn probe_fields(chart: ResultChart) -> ResultFields {
         empty_poor_early: 1,
         empty_poor_late: 1,
     };
-    ResultFields::of(&ResultView {
+    ResultView {
         status: ResultStatus::Ready,
         chart,
         score: ResultScore {
@@ -251,7 +264,7 @@ pub fn probe_fields(chart: ResultChart) -> ResultFields {
         gauge: None,
         deviations: None,
         timing_areas: None,
-    })
+    }
 }
 
 /// A layout of `pending` for `view`: the import over the cache, then the
@@ -282,7 +295,7 @@ fn layout(
                 entry,
             );
         }
-        Err((e, _)) => return (Err(imports::chain(&e)), entry),
+        Err(refused) => return (Err(imports::chain(&refused.0)), entry),
     };
     let deps = imported.facts;
     let skin = imported.imported.skin;
@@ -299,9 +312,14 @@ fn layout(
         Some((atlas, e)) => (atlas, Some(e)),
         None => {
             let limits = pending.target.limits;
-            let union = base
-                .as_ref()
-                .and_then(|b| b.packed.union(skin.sheet()))
+            // The union's base: the shown atlas's cells and the image
+            // entry's, which the build keeps as cells only.
+            let mut union = Some(skin.sheet().clone());
+            for b in [&base, &entry].into_iter().flatten() {
+                union = union.and_then(|u| u.union(&b.packed));
+            }
+            let union = union
+                .filter(|_| base.is_some() || entry.is_some())
                 .filter(|u| u.plan(variant, limits, text).is_ok());
             let packed = match union {
                 Some(u) => u,
@@ -372,11 +390,13 @@ impl ResultSkin {
     }
 
     /// What the result slot holds, and its generation.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn published(&self) -> (Option<&Published>, u64) {
         (self.published.as_ref(), self.generation)
     }
 
     /// The prepared atlas, if one is live.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn image(&self) -> Option<&Arc<ImageEntry>> {
         self.image.as_ref()
     }
@@ -422,7 +442,7 @@ impl ResultSkin {
                 let deps = match &o {
                     Ok(LuaOutcome::Imported(i)) => Some(i.facts.clone()),
                     Ok(LuaOutcome::Pending(p)) => Some(p.facts.clone()),
-                    Err((_, d)) => Some(d.clone()),
+                    Err(refused) => Some(refused.1.clone()),
                 };
                 let read = deps.as_ref().is_some_and(reads_result);
                 match o {
@@ -636,6 +656,7 @@ impl ResultSkin {
     }
 
     /// Whether a job runs or waits.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn busy(&self) -> bool {
         self.job.is_some() || self.waiting.is_some()
     }
@@ -712,3 +733,6 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
     };
     ViewFacts(Some(ResultFields::of(&view)))
 }
+
+#[cfg(all(test, feature = "dev-tools"))]
+mod tests;

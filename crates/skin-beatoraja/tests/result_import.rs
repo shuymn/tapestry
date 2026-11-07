@@ -793,12 +793,12 @@ fn a_refusal_carries_the_facts_read_before_it() {
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let mut v = ready(1_000, true, best(ResultNumber::Shown(-3)));
     v.score.next_rank = 1;
-    let Err((_, deps)) = h.import_reading(&Config::defaults(h.header()), &facts(Some(&v)), &cancel)
+    let Err(refused) = h.import_reading(&Config::defaults(h.header()), &facts(Some(&v)), &cancel)
     else {
         panic!("refused")
     };
     assert_eq!(
-        deps.reads,
+        refused.1.reads,
         [FactRead {
             fact: FactId::ResultNumber(154),
             value: FactValue::Int(1),

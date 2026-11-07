@@ -909,7 +909,7 @@ impl LuaHeader {
         cancel: &Cancel,
     ) -> Result<LuaOutcome, ImportError> {
         self.import_reading(config, facts, cancel)
-            .map_err(|(e, _)| e)
+            .map_err(|refused| refused.0)
     }
 
     /// [`Self::import`], with a refusal carrying the facts the run read
@@ -925,7 +925,7 @@ impl LuaHeader {
         config: &Config,
         facts: &ImportFacts,
         cancel: &Cancel,
-    ) -> Result<LuaOutcome, (ImportError, FactDeps)> {
+    ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
         let o = self.complete(config, facts, cancel);
         let deps = FactDeps {
             scene: facts.scene,
@@ -945,7 +945,7 @@ impl LuaHeader {
                 dependencies: o.dependencies,
                 usage: o.counts,
             })),
-            Err(Stop::Fault(e)) => Err((e, deps)),
+            Err(Stop::Fault(e)) => Err(Box::new((e, deps))),
         }
     }
 
