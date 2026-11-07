@@ -3036,18 +3036,17 @@ pub(crate) mod tests {
         });
     }
 
+    /// Work for [`input_thread`] to run on its source set.
+    #[cfg(feature = "dev-tools")]
+    type Jobs = std::sync::mpsc::Sender<Box<dyn FnOnce(&mut input::SourceSet) + Send>>;
+
     /// The rig's input thread on a clocked thread with a keyboard
     /// connected; `jobs` run on its source set at its next wake, before
     /// the hook.
     #[cfg(feature = "dev-tools")]
     fn input_thread(
         end: crate::tests::InputEnd,
-    ) -> (
-        input::ClockedThread,
-        std::sync::mpsc::Sender<Box<dyn FnOnce(&mut input::SourceSet) + Send>>,
-        input::Waker,
-        input::QpcClock,
-    ) {
+    ) -> (input::ClockedThread, Jobs, input::Waker, input::QpcClock) {
         use input::{DeviceId, DeviceKind, SourceConfig, SourceSet};
         let crate::tests::InputEnd {
             mut hook,

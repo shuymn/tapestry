@@ -146,7 +146,7 @@ pub enum Request {
     },
     /// Stops the thread at its next fence ([`FenceGate`]; dev-tools
     /// tests). Not answered.
-    #[cfg(feature = "dev-tools")]
+    #[cfg(all(test, feature = "dev-tools"))]
     FenceGate(Box<FenceGate>),
 }
 
@@ -154,7 +154,7 @@ pub enum Request {
 /// (dev-tools tests): `before` runs on the source set as the fence is
 /// taken, and once the fence is answered the thread sends `reached` and
 /// waits for `resume` (at most 60 s) before the rest of its boundary.
-#[cfg(feature = "dev-tools")]
+#[cfg(all(test, feature = "dev-tools"))]
 pub struct FenceGate {
     /// Runs on the source set before the fence is answered.
     pub before: Box<dyn FnOnce(&mut SourceSet) + Send>,
@@ -423,7 +423,7 @@ impl InputLink {
 
     /// Stops the input thread at its next fence ([`FenceGate`]; dev-tools
     /// tests). A failed link sends nothing.
-    #[cfg(feature = "dev-tools")]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn fence_gate(&self, gate: FenceGate) {
         if self.failed.is_none()
             && self
@@ -739,7 +739,7 @@ pub struct Hook {
     #[cfg(feature = "dev-tools")]
     loading: Option<(input::ScriptedInput, TimeUs)>,
     /// The gate at the next fence (dev-tools tests).
-    #[cfg(feature = "dev-tools")]
+    #[cfg(all(test, feature = "dev-tools"))]
     fence_gate: Option<Box<FenceGate>>,
 }
 
@@ -776,7 +776,7 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             handoff: None,
             #[cfg(feature = "dev-tools")]
             loading: None,
-            #[cfg(feature = "dev-tools")]
+            #[cfg(all(test, feature = "dev-tools"))]
             fence_gate: None,
         },
         InputLink {
@@ -872,7 +872,7 @@ impl Hook {
                     continue;
                 }
                 Request::Fence(n) => {
-                    #[cfg(feature = "dev-tools")]
+                    #[cfg(all(test, feature = "dev-tools"))]
                     let gate = self.fence_gate.take().map(|gate| {
                         let FenceGate {
                             before,
@@ -890,14 +890,14 @@ impl Hook {
                     if let Some(tap) = sources.adjustment_mut() {
                         tap.fence(n, now);
                     }
-                    #[cfg(feature = "dev-tools")]
+                    #[cfg(all(test, feature = "dev-tools"))]
                     if let Some((reached, resume)) = gate {
                         let _ = reached.send(());
                         let _ = resume.recv_timeout(Duration::from_secs(60));
                     }
                     continue;
                 }
-                #[cfg(feature = "dev-tools")]
+                #[cfg(all(test, feature = "dev-tools"))]
                 Request::FenceGate(gate) => {
                     self.fence_gate = Some(gate);
                     continue;
