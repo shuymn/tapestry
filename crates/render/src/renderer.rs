@@ -691,7 +691,8 @@ pub struct MemoryWitness {
     /// and of a retired one, each distinct presentation once; a staging
     /// sharing one of them adds nothing to `staged_loading`.
     pub result_loading: u64,
-    /// What commits replaced and keep until the next staging: a layout's
+    /// What commits replaced and keep until the next staging or
+    /// `drain_retired()`, whichever comes first: a layout's
     /// staging and instance buffer on the same array, or a whole
     /// installation on another array (its array, layout, text cache,
     /// lines and own CPU description) or a pages-only one.
