@@ -67,7 +67,7 @@ pub static RESULT: Schema = Schema {
         value("ex_score"),
         value("max_combo"),
         value("result.bp"),
-        value("result.notes"),
+        value("chart.notes"),
         value("count.perfect"),
         value("count.great"),
         value("count.good"),
@@ -121,6 +121,7 @@ pub static RESULT: Schema = Schema {
         int("chart.difficulty", 0, 5),
         value("chart.length_ms"),
         flag("chart.length_valid"),
+        flag("chart.notes_valid"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -136,8 +137,9 @@ pub mod field {
     pub const MAX_COMBO: u16 = 2;
     /// The BP.
     pub const RESULT_BP: u16 = 3;
-    /// The judged notes of the draw played.
-    pub const RESULT_NOTES: u16 = 4;
+    /// The chart's judged notes of the draw played, under
+    /// [`CHART_NOTES_VALID`].
+    pub const CHART_NOTES: u16 = 4;
     /// Each grade's judgments, PERFECT to POOR, then the empty POORs.
     pub const COUNT_PERFECT: u16 = 5;
     pub const COUNT_GREAT: u16 = 6;
@@ -211,8 +213,10 @@ pub mod field {
     /// Its length in whole ms, and whether it is known.
     pub const CHART_LENGTH_MS: u16 = 56;
     pub const CHART_LENGTH_VALID: u16 = 57;
+    /// Whether [`CHART_NOTES`] is known.
+    pub const CHART_NOTES_VALID: u16 = 58;
     /// The number of fields.
-    pub const COUNT: usize = 58;
+    pub const COUNT: usize = 59;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -239,7 +243,8 @@ mod tests {
         for (slot, name) in [
             (field::RESULT_VALID, "result.valid"),
             (field::EX_SCORE, "ex_score"),
-            (field::RESULT_NOTES, "result.notes"),
+            (field::CHART_NOTES, "chart.notes"),
+            (field::CHART_NOTES_VALID, "chart.notes_valid"),
             (field::COUNT_EMPTY_POOR, "count.empty_poor"),
             (field::COUNT_SLOW, "count.slow"),
             (field::COUNT_EARLY_PERFECT, "count.early.perfect"),

@@ -899,6 +899,7 @@ fn known() -> super::facts::ImportFacts {
         autoplay: Fact::Known(true),
         judge_class: Fact::Known(Some(JudgeClass::Normal)),
         play_level: Fact::Known(12),
+        result: Fact::Unavailable,
     }
 }
 

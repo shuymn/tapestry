@@ -21,6 +21,7 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
             &loaded.chart().meta.judgment_headers,
         )),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
+        result: Fact::Unavailable,
     }
 }
 

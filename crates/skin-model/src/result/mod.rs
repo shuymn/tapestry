@@ -185,7 +185,7 @@ impl ResultScreen {
     /// grows; and to copy the timelines, at most
     /// [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins.
     pub(crate) fn update(&mut self, view: &ResultView, labels: &ResultLabels) {
-        self.fields = fields(view);
+        self.fields = ResultFields::of(view).0;
         let ready = view.status == ResultStatus::Ready;
         self.timing = view.timing.filter(|_| ready);
         self.timelines = view.timelines.clone().filter(|_| ready);
@@ -253,9 +253,35 @@ fn number(n: ResultNumber) -> i32 {
     }
 }
 
-/// The fields of `view`: the chart's under every status; the result's,
-/// the timing's and the best's only while it is ready, each group's
-/// validity false otherwise and its values 0.
+/// The [`RESULT`](schema::RESULT) fields of one view, by slot: what a
+/// result skin's expressions read, in frames ([`Skin::update_result`](crate::Skin::update_result)
+/// fills its state with them) and while a skin is imported for that view,
+/// so the two cannot differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultFields(pub [i32; field::COUNT]);
+
+impl ResultFields {
+    /// The fields of `view`: the chart's under every status; the
+    /// result's, the timing's and the best's only while it is ready, each
+    /// group's validity false otherwise and its values 0; a hidden best
+    /// value `i32::MIN`.
+    #[must_use]
+    pub fn of(view: &ResultView) -> Self {
+        Self(fields(view))
+    }
+
+    /// The state an expression over [`RESULT`](schema::RESULT) reads:
+    /// these fields, with no timer.
+    #[must_use]
+    pub fn state(&self) -> State<'_> {
+        State {
+            fields: &self.0,
+            timers: &[],
+        }
+    }
+}
+
+/// The fields of `view`, as [`ResultFields::of`] gives them.
 fn fields(view: &ResultView) -> [i32; field::COUNT] {
     let mut f = [0; field::COUNT];
     let mut set = |slot: u16, v: i32| {
@@ -291,17 +317,20 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         );
         set(field::CHART_LENGTH_VALID, 1);
     }
+    if let Some(notes) = c.notes {
+        set(field::CHART_NOTES, value(u64::from(notes)));
+        set(field::CHART_NOTES_VALID, 1);
+    }
     if view.status != ResultStatus::Ready {
         return f;
     }
     let s = &view.score;
     let t = &s.tally;
     set(field::RESULT_VALID, 1);
+    for (slot, v) in (field::EX_SCORE..).zip([t.ex_score, t.max_combo, t.bp]) {
+        set(slot, value(u64::from(v)));
+    }
     let counts = [
-        t.ex_score,
-        t.max_combo,
-        t.bp,
-        s.notes,
         t.counts.perfect,
         t.counts.great,
         t.counts.good,
@@ -323,7 +352,7 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         t.empty_poor_early,
         t.empty_poor_late,
     ];
-    for (slot, v) in (field::EX_SCORE..).zip(counts) {
+    for (slot, v) in (field::COUNT_PERFECT..).zip(counts) {
         set(slot, value(u64::from(v)));
     }
     set(field::GAUGE, i32::from(s.gauge_permille.min(1_000)));

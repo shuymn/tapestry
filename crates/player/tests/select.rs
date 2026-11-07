@@ -1427,7 +1427,10 @@ fn a_refused_play_skin_admits_no_chart_and_a_notice_shows() {
         skins[0].starts_with("skin: play: refused: cannot read missing.json"),
         "{stdout}"
     );
-    let built_in = "single-chart result skins are not imported yet";
+    let built_in = format!(
+        "{}: single-chart result skins are not shown yet",
+        skin.join("r.json").display()
+    );
     assert_eq!(skins[1], format!("skin: result: built-in: {built_in}"));
     let notices = lines(&stdout, "dev: select notice: ");
     assert_eq!(

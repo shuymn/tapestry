@@ -1,5 +1,6 @@
 //! Hooks on the sandbox's VMs for the callers' tests (dev-tools): how
-//! many VMs are open in the process, how many instruction hook steps they
+//! many VMs are open in the process, how many passes ran (in the process
+//! and on the calling thread), how many instruction hook steps they
 //! have run, and a barrier that holds each VM's destruction until
 //! released, so a test can observe a pass midway between its cancellation
 //! and the end of its VM.
@@ -42,6 +43,18 @@ pub fn live() -> usize {
 #[must_use]
 pub fn passes() -> u64 {
     PASSES.load(Ordering::SeqCst)
+}
+
+thread_local! {
+    /// [`PASSES`]'s share of this thread, for callers' tests that run a
+    /// pass on their own thread beside others.
+    static THREAD_PASSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The Lua passes that have created their VM on this thread so far.
+#[must_use]
+pub fn thread_passes() -> u64 {
+    THREAD_PASSES.with(std::cell::Cell::get)
 }
 
 /// The instruction hook steps every VM has run so far.
@@ -89,6 +102,7 @@ pub(super) fn thread_live() -> usize {
 pub(super) fn opened() -> Open {
     LIVE.fetch_add(1, Ordering::SeqCst);
     PASSES.fetch_add(1, Ordering::SeqCst);
+    THREAD_PASSES.with(|n| n.set(n.get() + 1));
     #[cfg(test)]
     THREAD_LIVE.with(|n| n.set(n.get() + 1));
     Open

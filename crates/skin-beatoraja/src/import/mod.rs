@@ -22,7 +22,8 @@ pub(crate) mod ops;
 mod policy;
 mod property;
 mod report;
-mod selection;
+pub(crate) mod result;
+pub(crate) mod selection;
 mod timer;
 mod track;
 mod widget;
@@ -32,9 +33,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
-    LanesError, LoadError, MAX_GEOMETRY, Native, PLAY, Place, Program, Region, RegionDef,
-    SELECTION, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty,
-    WidgetDefs, compile, timer as slot,
+    LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef, Scope,
+    ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile,
+    timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -229,7 +230,10 @@ pub fn import(
             found: header.kind,
         });
     }
-    if !matches!(slot, ScreenKind::Play | ScreenKind::Selection) {
+    if !matches!(
+        slot,
+        ScreenKind::Play | ScreenKind::Selection | ScreenKind::Result
+    ) {
         return Err(ImportError::NoImporter { kind: slot });
     }
     let enabled = config.enabled();
@@ -254,10 +258,10 @@ pub fn import(
     })?;
     let mut cx = Cx::new(def, header, config, tables, choices, (r, size[1]), slot)?;
     let destinations = object::records(&cx.tables, "destination").to_vec();
-    if slot == ScreenKind::Play {
-        cx.span_hint = cx.lane_span_hint(&destinations);
-    } else {
-        cx.selection_tables()?;
+    match slot {
+        ScreenKind::Play => cx.span_hint = cx.lane_span_hint(&destinations),
+        ScreenKind::Selection => cx.selection_tables()?,
+        ScreenKind::Decision | ScreenKind::Result => {}
     }
     for (index, rec) in destinations.into_iter().enumerate() {
         #[cfg(feature = "dev-tools")]
@@ -387,6 +391,9 @@ struct Common {
     /// Whether a condition differs from the source's in an owner-decided
     /// way, or the element's value does: a D4 note when it is retained.
     display_deviation: bool,
+    /// On a result skin, whether its visibility tests the clear status,
+    /// an essential part ([`result`]).
+    tests_status: bool,
 }
 
 /// The import's running state.
@@ -402,6 +409,8 @@ pub(crate) struct Cx<'d> {
     flip: Q,
     /// The selection widgets, on a selection skin.
     sel: selection::State,
+    /// The essential parts retained, on a result skin.
+    res: result::State,
     tables: Tables,
     /// The scale from the skin's pixels to reference pixels.
     r: Q,
@@ -510,6 +519,7 @@ impl<'d> Cx<'d> {
             kind,
             flip: Q::int(geom::HEIGHT),
             sel: selection::State::default(),
+            res: result::State::default(),
             tables,
             r,
             height,
@@ -957,6 +967,13 @@ impl<'d> Cx<'d> {
                 e.kind = Some(format!("{object:?}"));
             }
             return self.selection_destination(dst, object, orec);
+        }
+        if self.kind == ScreenKind::Result {
+            #[cfg(feature = "dev-tools")]
+            if let Some(e) = &mut self.element {
+                e.kind = Some(format!("{object:?}"));
+            }
+            return self.result_destination(dst, object, orec);
         }
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
@@ -1420,6 +1437,7 @@ impl<'d> Cx<'d> {
         } else {
             Some(self.compile(&src, Ty::Bool, at)?)
         };
+        let tests_status = self.kind == ScreenKind::Result && src.contains(result::STATUS_FIELD);
         #[cfg(test)]
         VISIBLE.with(|v| v.borrow_mut().push(visible.clone()));
 
@@ -1455,6 +1473,7 @@ impl<'d> Cx<'d> {
             settled,
             track,
             display_deviation: deviates,
+            tests_status,
         }))
     }
 
@@ -1508,10 +1527,7 @@ impl<'d> Cx<'d> {
 
     /// The schema the skin's expressions read: its screen's.
     fn schema(&self) -> &'static skin_model::Schema {
-        match self.kind {
-            ScreenKind::Selection => &SELECTION,
-            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => &PLAY,
-        }
+        callback::schema(self.kind)
     }
 
     /// The screen's own `screen` timer, which an element without a timer
@@ -1519,7 +1535,8 @@ impl<'d> Cx<'d> {
     fn screen(&self) -> TimerRef {
         TimerRef::Builtin(match self.kind {
             ScreenKind::Selection => skin_model::selection_timer::SCREEN,
-            ScreenKind::Play | ScreenKind::Decision | ScreenKind::Result => slot::SCREEN,
+            ScreenKind::Result => skin_model::result_timer::SCREEN,
+            ScreenKind::Play | ScreenKind::Decision => slot::SCREEN,
         })
     }
 
@@ -1678,6 +1695,9 @@ impl<'d> Cx<'d> {
     /// when it deviates ([`Common::display_deviation`]), and D9
     /// [`LaneApprox::CoverMotion`] once when it follows the covers.
     fn retained(&mut self, c: &Common) -> Result<(), ImportError> {
+        if self.kind == ScreenKind::Result {
+            self.result_retained(c.role, c.tests_status);
+        }
         self.untimed_phase(c);
         if c.settled {
             self.note(
@@ -1773,10 +1793,14 @@ impl<'d> Cx<'d> {
 
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
         let selection = self.kind == ScreenKind::Selection;
+        let result = self.kind == ScreenKind::Result;
         if selection {
             self.selection_essentials()?;
         }
-        let (bomb_up_to, close) = if selection {
+        if result {
+            self.result_essentials()?;
+        }
+        let (bomb_up_to, close) = if selection || result {
             (None, None)
         } else {
             (self.bomb_up_to()?, self.close()?)
@@ -1808,6 +1832,8 @@ impl<'d> Cx<'d> {
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
             };
             Skin::new_selection(def, widgets)
+        } else if result {
+            Skin::new_result(def)
         } else {
             Skin::new(def)
         };

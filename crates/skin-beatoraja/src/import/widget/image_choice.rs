@@ -252,7 +252,8 @@ impl Cx<'_> {
     /// `⌊N / len⌋` of its `N` frames, the remainder never shown; never
     /// drawn when a run would be empty. The cycle is resolved for a run's
     /// frames, so a run of one frame ignores its timer. It is lowered as
-    /// `lowered` says.
+    /// `lowered` says, with `role`: its failure role, or the essential part
+    /// its index shows.
     #[expect(clippy::too_many_arguments, reason = "the group's parts as read")]
     pub(in super::super) fn image_group(
         &mut self,
@@ -262,10 +263,9 @@ impl Cx<'_> {
         len: i32,
         selector: (&'static str, bool),
         charged: bool,
-        lowered: Lowered,
+        (lowered, role): (Lowered, Role),
     ) -> Result<(), ImportError> {
         let at = dst.span;
-        let role = lowered.role(dst.failure);
         let n = self.grid_frames(at, s.div)?;
         let len = u32::try_from(len).unwrap_or(0);
         let q = n.checked_div(len).unwrap_or(0);

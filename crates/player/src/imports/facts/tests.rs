@@ -198,6 +198,7 @@ fn an_attempt_reads_the_references_class_whatever_the_preset() {
                         autoplay: Fact::Known(autoplay),
                         judge_class: Fact::Known(class),
                         play_level: Fact::Known(0),
+                        result: Fact::Unavailable,
                     },
                     "{text:?} {preset}"
                 );

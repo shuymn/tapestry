@@ -392,6 +392,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "gauge_node_count",
             "lanes_overlap",
             "lanes_scratch_overlap",
+            "result",
             "selection",
         ],
     );
@@ -530,16 +531,28 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                     other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
                 }
             }
-            "header_decision" | "header_result" => {
-                // Imported into its own slot, which has no importer yet.
-                let kind = match name {
-                    "header_decision" => ScreenKind::Decision,
-                    _ => ScreenKind::Result,
-                };
+            "header_result" => {
+                // Imported into its own slot: a header alone has no EX
+                // score, an essential part.
                 let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-                assert_eq!(h.kind, kind, "{name}");
+                assert_eq!(h.kind, ScreenKind::Result, "{name}");
                 match imported {
-                    Some(Err(ImportError::NoImporter { kind: k })) => assert_eq!(k, kind, "{name}"),
+                    Some(Err(ImportError::Essential {
+                        part: skin_beatoraja::EssentialPart::ResultScore,
+                        why: None,
+                        ..
+                    })) => {}
+                    other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
+                }
+            }
+            "header_decision" => {
+                // Imported into its own slot, which has no importer yet.
+                let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(h.kind, ScreenKind::Decision, "{name}");
+                match imported {
+                    Some(Err(ImportError::NoImporter { kind })) => {
+                        assert_eq!(kind, ScreenKind::Decision, "{name}");
+                    }
                     other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
                 }
             }
@@ -723,6 +736,15 @@ fn usage(elements: u32, images: u32, frames: u32, files: u32) -> Usage {
 /// and the two.
 const SELECTION_DRAWN: [usize; 6] = [5, 5, 6, 6, 4, 4];
 
+/// The quads of the `result` seed's frames ([`crate::draw`]), two for each
+/// view. Ready: the EX score's four digits, the mean's, the level's two,
+/// the status image under option 90, the clear type's image and the lane
+/// image; the BP difference is hidden (no previous BP), so its number
+/// draws nothing; the grade image (AA, option 301) on the fade-out only.
+/// With no result: the level's two digits and the lane image alone. The
+/// mean, −1.49 ms, shows its whole ms truncated toward 0: one digit.
+const RESULT_DRAWN: [usize; 4] = [4 + 1 + 2 + 3, 4 + 1 + 2 + 3 + 1, 3, 3];
+
 fn kinds(i: &Imported) -> Vec<NoteKind> {
     i.report.notes.iter().map(|n| n.kind).collect()
 }
@@ -733,9 +755,22 @@ fn skin_import_seeds_import_and_draw_as_built() {
         let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
         let i = imported.unwrap_or_else(|e| panic!("{name}: {e}"));
         let u = i.report.usage;
-        // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
+        // A play skin's quads at 0, 50, 500 and 5,000 ms, each with a
+        // perfect judgment; a result skin's per [`draw`].
         let drawn = draw(&i, &[]);
         match name {
+            "result" => {
+                // The gauge graph is a later widget, dropped with a note.
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Unsupported {
+                        object: skin_beatoraja::Object::GaugeGraph
+                    }],
+                    "{name}"
+                );
+                assert_eq!(i.skin.kind(), ScreenKind::Result, "{name}");
+                assert_eq!(drawn, RESULT_DRAWN, "{name}");
+            }
             "selection" => {
                 // The list, the EX score, the two ratio bars and the panel
                 // image; three placements of a bar, a lamp, the level's
@@ -1164,6 +1199,7 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "isolation",
             "callback_lowered",
             "facts",
+            "result_facts",
             "callback_replaced",
             "callback_effect",
             "host_write",
@@ -1188,11 +1224,27 @@ fn skin_lua_seeds_import_or_fail_as_built() {
         assert!(data.len() <= 64 * 1_024, "{name}: {} bytes", data.len());
         let result = skin_lua(&data);
         match name {
-            "data_only" | "config" | "config_local" | "modules" | "isolation" | "facts" => {
+            "data_only" | "config" | "config_local" | "modules" | "isolation" | "facts"
+            | "result_facts" => {
                 let (h, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(h.options.len(), 1, "{name}");
                 let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 assert!(i.imported.report.usage.elements >= 1, "{name}");
+                if name == "result_facts" {
+                    // 154 and 178 read from the view, the hidden one as
+                    // `i32::MIN`.
+                    use skin_beatoraja::{FactId, FactRead, FactValue};
+                    let read = |n, v| FactRead {
+                        fact: FactId::ResultNumber(n),
+                        value: FactValue::Int(v),
+                    };
+                    assert_eq!(
+                        i.facts.reads,
+                        [read(154, 17), read(178, i32::MIN)],
+                        "{name}"
+                    );
+                    assert_eq!(i.imported.skin.kind(), ScreenKind::Result, "{name}");
+                }
                 if name == "modules" {
                     assert_eq!(
                         i.dependencies,

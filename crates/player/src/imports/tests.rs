@@ -304,10 +304,12 @@ fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::
     crate::render_common::read_back(r)
 }
 
-/// A skin of another kind than the one it is built for refuses; a kind
-/// with no importer yet runs the importer and keeps its built-in screen.
+/// A skin of another kind than the one it is built for refuses; a result
+/// skin, which nothing draws yet, keeps the built-in screen unimported.
 #[test]
 fn a_skin_builds_only_for_its_own_kind_and_importer() {
+    // Its Lua header pass opens a VM, which the barrier tests count.
+    let _serial = serial();
     let r = crate::render_common::offscreen(1_920, 1_080);
     let t = target(&r);
     let dir = options_skin();
@@ -335,10 +337,62 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         &t,
         &c,
     ) {
+        // The importer maps result skins, but none is drawn yet: the build
+        // keeps the built-in screen before the import, naming the skin.
         KindOutcome::BuiltIn(why) => {
-            assert_eq!(why, "single-chart result skins are not imported yet");
+            let entry = dir.path().join("r.json");
+            assert_eq!(
+                why,
+                format!(
+                    "{}: single-chart result skins are not shown yet",
+                    entry.display()
+                )
+            );
         }
         other => panic!("{other:?}"),
+    }
+    // The gate precedes the configuration and the import: a result skin
+    // whose configuration is invalid (an option it does not declare), or
+    // whose configured Lua pass fails as soon as it runs, keeps the
+    // built-in screen all the same; the Lua skin runs its header pass
+    // alone (with dev-tools, this thread's passes count it).
+    fs::write(
+        dir.path().join("bad.json"),
+        r#"{"type": 7, "w": 1920, "h": 1080,
+            "property": [{"name": "Color", "item": [{"name": "Red", "op": 901}], "def": "Red"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("r.luaskin"),
+        "local skin = { type = 7, name = \"r\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         error(\"the configured pass ran\")\n",
+    )
+    .unwrap();
+    let mut bad = choice(dir.path(), "bad.json");
+    bad.options.insert("Color".to_owned(), "Green".to_owned());
+    for (c2, entry) in [
+        (bad, "bad.json"),
+        (choice(dir.path(), "r.luaskin"), "r.luaskin"),
+    ] {
+        #[cfg(feature = "dev-tools")]
+        let passes = skin_beatoraja::lua::vm_hooks::thread_passes();
+        match build(ScreenKind::Result, &c2, false, &t, &c) {
+            KindOutcome::BuiltIn(why) => assert_eq!(
+                why,
+                format!(
+                    "{}: single-chart result skins are not shown yet",
+                    dir.path().join(entry).display()
+                )
+            ),
+            other => panic!("{entry}: {other:?}"),
+        }
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(
+            skin_beatoraja::lua::vm_hooks::thread_passes() - passes,
+            u64::from(entry == "r.luaskin"),
+            "{entry}"
+        );
     }
 }
 

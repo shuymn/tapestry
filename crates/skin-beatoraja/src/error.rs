@@ -208,7 +208,7 @@ pub enum ImportError {
         part: CriticalPart,
         why: NoteKind,
     },
-    /// A selection skin's essential part is missing (`why` is `None`) or
+    /// A selection or result skin's essential part is missing (`why` is `None`) or
     /// cannot be reproduced (`why` is what it met), judged after the
     /// configured options are folded; `at` is where it was met, when one
     /// place was.

@@ -72,6 +72,10 @@ pub struct ResultChart {
     /// Its `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,
     pub length: Option<TimeUs>,
+    /// The judged notes of the draw played, the source's total notes
+    /// (`IntegerPropertyFactory.java:562-576`): the chart's, under every
+    /// status.
+    pub notes: Option<u32>,
 }
 
 /// A chart's tempo range.
@@ -88,8 +92,6 @@ pub struct ResultBpm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResultScore {
     pub tally: Tally,
-    /// The judged notes of the draw played.
-    pub notes: u32,
     /// The emphasized gauge's end value, in ‰.
     pub gauge_permille: u16,
     pub clear: LampKey,
@@ -105,7 +107,6 @@ impl Default for ResultScore {
     fn default() -> Self {
         Self {
             tally: Tally::default(),
-            notes: 0,
             gauge_permille: 0,
             clear: LampKey::NoPlay,
             cleared: false,

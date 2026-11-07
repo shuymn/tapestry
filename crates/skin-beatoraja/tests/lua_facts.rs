@@ -49,6 +49,7 @@ fn play(autoplay: Fact<bool>, judge_class: Fact<Option<JudgeClass>>) -> ImportFa
         autoplay,
         judge_class,
         play_level: Fact::Unavailable,
+        result: Fact::Unavailable,
     }
 }
 
