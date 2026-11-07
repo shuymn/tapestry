@@ -559,8 +559,9 @@ fn a_selection_skin_installs_with_its_window_or_leaves_a_notice() {
 }
 
 /// A Lua selection skin whose import completes installs with its song
-/// list's window and no notice; one whose configured pass refuses leaves
-/// the built-in page with a notice naming its located reason.
+/// list's window and no notice; one whose configured pass refuses, by an
+/// error or by reading a chart fact, leaves the built-in page with a
+/// notice naming its located reason.
 #[test]
 fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
     let _serial = serial();
@@ -596,4 +597,39 @@ fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
     let notice = started.notice.unwrap();
     assert!(notice.ends_with("s.luaskin:3:0: a Lua error"), "{notice}");
     link.exit();
+
+    // A chart fact read as the skin is built (the rank's band, the play
+    // level) refuses a selection skin with its place: it is never pending,
+    // and nothing is installed.
+    for read in ["ms.option(180)", "ms.number(96)"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.luaskin"),
+            format!(
+                "local skin = {{ type = 5, name = \"t\", w = 1920, h = 1080 }}\n\
+                 if not skin_config then return skin end\n\
+                 local ms = require(\"main_state\")\n\
+                 skin.fact = {read}\n\
+                 return skin\n"
+            ),
+        )
+        .unwrap();
+        let choices = SkinChoices {
+            selection: Some(choice(dir.path(), "s.luaskin")),
+            ..SkinChoices::default()
+        };
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        assert_eq!(started.selection, None, "{read}");
+        assert!(started.pending.is_none(), "{read}");
+        let notice = started.notice.unwrap();
+        let why = format!(
+            "s.luaskin:4:0: main_state.{} reads a fact this scene cannot give",
+            &read[3..]
+        );
+        assert!(notice.ends_with(&why), "{read}: {notice}");
+        assert!(screens.log().is_empty(), "{read}: {:?}", screens.log());
+        link.exit();
+    }
 }
