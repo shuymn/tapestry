@@ -446,10 +446,14 @@ fn split_view(look: GaugeLook) -> ResultView {
     v
 }
 
+/// A gauge graph's colours: the back below and above the border, then
+/// every line colour below and above it.
+type Roles = ([u8; 4], [u8; 4], Vec<[u8; 4]>, Vec<[u8; 4]>);
+
 /// The gauge graph's colours in a frame of the region (x 100, top 280,
 /// 576 × 200, border at y 321.6): the back below the border, the back
 /// above it, every line piece below the border, every one above it.
-fn gauge_roles(quads: &[Quad]) -> ([u8; 4], [u8; 4], Vec<[u8; 4]>, Vec<[u8; 4]>) {
+fn gauge_roles(quads: &[Quad]) -> Roles {
     let rgb = |q: &Quad| q.color.map(|c| (c * 255.0).round() as u8);
     let inside = |q: &&Quad| q.rect[0] >= 99.0 && q.rect[1] >= 279.0 && q.rect[1] < 481.0;
     let backs: Vec<&Quad> = quads
