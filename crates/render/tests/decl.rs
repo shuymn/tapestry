@@ -101,7 +101,7 @@ fn red() -> Look {
     Look::left([255, 0, 0, 255])
 }
 
-/// Blue over the right half, from a 300-texel image (a 512-texel page),
+/// Blue over the right half, from a 300-texel image (a 384-texel page),
 /// with 9 500 more image elements than one, each over a 10×10 corner: past
 /// [`MAX_SPRITES`], and past the 9 216 instances (with the overlay's
 /// reserve) of the least buffer.
@@ -158,7 +158,7 @@ fn a_bundle_checks_its_clips_and_its_layers() {
 /// until its commit switches the skin, the uv table, the atlas, the clips
 /// and the capacities together: red under the left clip, from a 256-texel
 /// page and the least capacity, then blue under the right clip, from a
-/// 512-texel page and 9 501 sprites. Any of them switched alone would
+/// 384-texel page and 9 501 sprites. Any of them switched alone would
 /// draw the wrong colour or half, or keep the other size.
 #[test]
 fn a_commit_switches_the_whole_installation_together() {
@@ -192,7 +192,7 @@ fn a_commit_switches_the_whole_installation_together() {
     assert_eq!((r.atlas_size().0, r.capacity()), (256, least));
     r.commit(token).unwrap();
     assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &b));
-    assert_eq!(r.atlas_size().0, 512);
+    assert_eq!(r.atlas_size().0, 384);
     assert_eq!(r.capacity(), (9_501, 9_501));
     let (sprites, p) = frame(&mut r);
     assert_eq!(sprites, 9_501);
@@ -441,7 +441,7 @@ fn a_restored_bundle_needs_no_file() {
     let (a, _) = bundle(&r, dir.path(), &red());
     let token = stage(&mut r, &a, &chart, 1).unwrap();
     r.commit(token).unwrap();
-    // The other kinds' own images: green, blue on a 512-texel page, white.
+    // The other kinds' own images: green, blue on a 384-texel page, white.
     let others = [
         (ScreenKind::Selection, Look::left([0, 255, 0, 255])),
         (ScreenKind::Decision, blue()),
@@ -513,10 +513,10 @@ fn a_replacement_peaks_with_both_installations() {
     assert_eq!(peak.committed_cpu, a.resident_bytes());
     assert_eq!(peak.staged_cpu, b.resident_bytes());
     assert_eq!((peak.atlas, peak.batch), (installed.atlas, installed.batch));
-    // A 512-texel page beside the built-in layer: more than the 256-texel
+    // A 384-texel page beside the built-in layer: more than the 256-texel
     // array, and an upload of at least the page's level 0.
     assert!(peak.staged_atlas > installed.atlas);
-    assert!(peak.upload >= 512 * 512 * 4);
+    assert!(peak.upload >= 384 * 384 * 4);
     assert!(peak.staged_batch > installed.batch);
     assert!(peak.total() > installed.total());
 

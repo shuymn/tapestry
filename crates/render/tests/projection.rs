@@ -205,11 +205,10 @@ fn aspects_layout([w, h]: [f32; 2]) -> Vec<Placed> {
 /// canvas is the target at scale 1, so:
 ///
 /// - The built-in solid block (its texels 120..128) into 2×2 pixels at
-///   (100, 100): its uv is scaled by 128 / 256 to texels 120..128 of the
-///   256-texel array, 4 texels a pixel, level 2 by the derivatives. Layer
-///   0 is read at its nearest level-0 texel: white. Sampled at level 2,
-///   which holds nothing for layer 0, it would be black; with its uv not
-///   rescaled it would read texels 240..256, also black.
+///   (100, 100): layer 0 is read by integer texel, `floor(uv · 128)` of
+///   the 128-texel built-in atlas whatever the array's side, at level 0:
+///   white. Sampled at level 2 by the derivatives, which holds nothing for
+///   layer 0, it would be black.
 /// - Page 1 whole into 64×64 pixels, smoothed at (100, 300) and nearest at
 ///   (200, 300): 4 texels a pixel, level 2 under either filter, blue.
 ///   Into 512×512 at (300, 300), magnified: level 0, red. Sampled at
@@ -257,6 +256,60 @@ fn one_scene_at_three_aspects() {
         checked += 1;
     }
     assert_eq!(checked, 3);
+}
+
+/// The scene of [`a_side_between_powers_of_two_keeps_its_levels`]: the
+/// solid block, and page 1 whole at 1:1 (linear), shrunk to a quarter
+/// (linear) and to an eighth (nearest).
+fn between_layout(_: [f32; 2]) -> Vec<Placed> {
+    [
+        solid([100.0, 100.0, 50.0, 50.0], [1.0; 4]),
+        paged(1, Filter::Linear, [100.0, 300.0, 384.0, 384.0], WHOLE),
+        paged(1, Filter::Linear, [600.0, 300.0, 96.0, 96.0], WHOLE),
+        paged(1, Filter::Nearest, [800.0, 300.0, 48.0, 48.0], WHOLE),
+    ]
+    .into_iter()
+    .map(|s| (Blend::Alpha, None, s))
+    .collect()
+}
+
+/// A page side between powers of two, 384 (3 × 128): every level halves
+/// it exactly (384, 192, 96, 48), the device takes the levels as given and
+/// samples them: page 1's level 0 is red and its levels 1 to 3 blue, so
+/// drawn 1:1 it is red, shrunk to a quarter (level 2, linear) or an eighth
+/// (level 3, nearest) blue. The built-in atlas on layer 0 still draws its
+/// solid block white. A power-of-two-only check refuses the array.
+#[test]
+fn a_side_between_powers_of_two_keeps_its_levels() {
+    let red = |_: u32| [255, 0, 0, 255];
+    let blue = |_: u32| [0, 0, 255, 255];
+    let levels = [
+        level(384, red),
+        level(192, blue),
+        level(96, blue),
+        level(48, blue),
+    ];
+    let page: PageLevels<'_> = [&levels[0], &levels[1], &levels[2], &levels[3]];
+    let mut r = offscreen(1_920, 1_080);
+    r.install_atlas(
+        &AtlasPages {
+            side: 384,
+            pages: &[page],
+            text_layer: false,
+        },
+        ClipTable::new(Vec::new()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(r.atlas_size(), (384, 2));
+    r.set_skin(Box::new(Scene::new(Fit::Fixed, between_layout)))
+        .unwrap();
+    let p = frame(&mut r);
+    let at = |x: f32, y: f32| px(&r, &p, x, y);
+    near(at(125.0, 125.0), WHITE, 2);
+    near(at(292.0, 492.0), RED, 2);
+    near(at(648.0, 348.0), BLUE, 2);
+    near(at(824.0, 324.0), BLUE, 2);
+    near(at(50.0, 50.0), BLACK, 2);
 }
 
 /// Bands across the whole canvas, 100 rows each, under clips 0 (the left
