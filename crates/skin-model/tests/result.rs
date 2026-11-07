@@ -458,8 +458,12 @@ fn result_text_is_the_charts_and_bounded() {
         .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &big)
         .unwrap();
     assert!(fx.res.resident_bytes() <= bound);
-    // Strings growing view after view keep at most twice `MAX_TEXT_BYTES`
-    // each, however often they grow.
+    // Strings growing view after view, from a fresh state, keep at most
+    // twice `MAX_TEXT_BYTES` each, however often they grow.
+    let mut res = fx.skin.prepare_result();
+    let bound = res.resident_bytes() + 5 * 2 * u64::try_from(MAX_TEXT_BYTES).unwrap();
+    let mut no_bins = ready(1, BestView::Unavailable, 1);
+    no_bins.timelines = None;
     for n in (1..=3 * MAX_TEXT_BYTES).step_by(37) {
         let s = "x".repeat(n);
         let grown = ResultLabels {
@@ -469,10 +473,8 @@ fn result_text_is_the_charts_and_bounded() {
             subartist: s.clone(),
             genre: s,
         };
-        fx.skin
-            .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &grown)
-            .unwrap();
-        assert!(fx.res.resident_bytes() <= bound, "{n}");
+        fx.skin.update_result(&mut res, &no_bins, &grown).unwrap();
+        assert!(res.resident_bytes() <= bound, "{n}");
     }
     for r in fx.skin.result_text_requests(&fx.res, fx.target, &fx.layout) {
         assert!(r.text.len() <= MAX_TEXT_BYTES && !r.text.is_empty());
