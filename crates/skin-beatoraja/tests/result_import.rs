@@ -935,6 +935,43 @@ fn read_values(d: &tempfile::TempDir, view: &ResultView) -> Vec<(i32, i32)> {
         .collect()
 }
 
+/// A ready view whose best's EX difference is `diff`.
+fn ex_diff(diff: i32) -> ResultView {
+    let BestView::Known(mut b) = best(ResultNumber::Shown(-3)) else {
+        unreachable!()
+    };
+    b.ex_diff = diff;
+    ready(1_000, true, BestView::Known(b))
+}
+
+/// S10-09i: number 152 reads the best's EX difference, signed, as 172
+/// does: positive, negative and zero; and an unavailable best refuses the
+/// read of either, its validity false.
+#[test]
+fn number_152_reads_the_signed_best_difference() {
+    let d = reads(&[152, 172]);
+    for diff in [37, -42, 0] {
+        assert_eq!(
+            read_values(&d, &ex_diff(diff)),
+            [(152, diff), (172, diff)],
+            "{diff}"
+        );
+    }
+    for id in [152, 172] {
+        let d = reads(&[id]);
+        match lua_outcome(
+            d.path(),
+            &facts(Some(&ready(1_000, true, BestView::Unavailable))),
+        ) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Unavailable { id: got, .. },
+                ..
+            }) => assert_eq!(got, id),
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+}
+
 /// S10-09i: numbers 372 and 373, the mean absolute duration in whole ms
 /// and its hundredths (`IntegerPropertyFactory.java:410-420`), read and
 /// drawn from the view's duration; an all-miss view, with no timing
