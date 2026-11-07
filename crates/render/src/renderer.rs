@@ -64,10 +64,12 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 /// The level-0 texels every screen kind's committed installation shares
-/// with a candidate ([`Renderer::admit`]): one atlas array's cap
-/// ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
-/// admitted on its own.
-pub const SHARED_TEXELS: u64 = skin_model::MAX_ATLAS_TEXELS;
+/// with a candidate ([`Renderer::admit`]): 384 Mi, twice one atlas array's
+/// cap ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
+/// admitted on its own and two at that cap fit together.
+pub const SHARED_TEXELS: u64 = 384 << 20;
+
+const _: () = assert!(SHARED_TEXELS == 2 * skin_model::MAX_ATLAS_TEXELS);
 
 /// What an installation keeping a Lua VM is charged beside its atlas, in
 /// level-0 texels: a VM's memory cap (64 MiB) at the 4 bytes of an RGBA8
@@ -774,6 +776,10 @@ pub struct Renderer {
     /// is refused as a skin refuses one.
     #[cfg(feature = "dev-tools")]
     selection_faults: (bool, bool),
+    /// Tests and development builds: the charges stated for bundles
+    /// ([`state_charge`](Self::state_charge)).
+    #[cfg(any(test, feature = "dev-tools"))]
+    stated: Vec<(Arc<SkinBundle>, u64)>,
 }
 
 impl Renderer {
@@ -884,6 +890,8 @@ impl Renderer {
             selection_rasterized: 0,
             #[cfg(feature = "dev-tools")]
             selection_faults: (false, false),
+            #[cfg(any(test, feature = "dev-tools"))]
+            stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -1272,7 +1280,27 @@ impl Renderer {
     /// `kind`'s committed charge.
     fn charge(&self, kind: ScreenKind) -> u64 {
         self.committed_installation(kind)
-            .map_or(0, |i| charge_of(i.bundle()))
+            .map_or(0, |i| self.committed_charge(i.bundle()))
+    }
+
+    /// What a committed `bundle` is charged: its own charge, or in tests
+    /// and development builds the one stated for it.
+    fn committed_charge(&self, bundle: &Arc<SkinBundle>) -> u64 {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if let Some((_, texels)) = self.stated.iter().find(|(b, _)| Arc::ptr_eq(b, bundle)) {
+            return *texels;
+        }
+        charge_of(bundle)
+    }
+
+    /// Tests and development builds: charges `bundle` `texels` whenever it
+    /// is a kind's committed installation, in place of its own charge, so
+    /// the shared limit is tested through [`admit`](Self::admit) without
+    /// committing arrays that large. A candidate is charged its own.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn state_charge(&mut self, bundle: &Arc<SkinBundle>, texels: u64) {
+        self.stated.retain(|(b, _)| !Arc::ptr_eq(b, bundle));
+        self.stated.push((Arc::clone(bundle), texels));
     }
 
     /// The charges [`admit`](Self::admit) sums now, and the staged
@@ -3789,8 +3817,8 @@ mod tests {
         assert_eq!(r.memory().text_upload, 0);
 
         // A refusal by the shared admission, the first step that can
-        // refuse: a tiny selection skin committed, and a play candidate
-        // whose atlas alone is the shared limit.
+        // refuse: a selection skin committed, charged an atlas's cap and a
+        // tiny one's, and a play candidate whose atlas is the cap.
         let token = stage_labels(&mut r, &a, &labels("t", "", ""), 3).unwrap();
         r.commit(token).unwrap();
         assert!(r.text_report().upload_bytes > 0);
@@ -3803,7 +3831,9 @@ mod tests {
             .install(skin_model::ScreenKind::Selection, &tiny, 4)
             .unwrap();
         r.commit(token).unwrap();
-        let big = crate::test_decl::shared_limit_bundle(&r, [0, 0, 255, 255]);
+        let cap = skin_model::MAX_ATLAS_TEXELS;
+        r.state_charge(&tiny, cap + tiny.atlas_texels());
+        let big = crate::test_decl::atlas_cap_bundle(&r, [0, 0, 255, 255]);
         let e = stage_labels(&mut r, &big, &labels("t", "", ""), 5).unwrap_err();
         assert!(matches!(e, RenderError::Admission { .. }), "{e:?}");
         assert_eq!(r.text_report().upload_bytes, 0);

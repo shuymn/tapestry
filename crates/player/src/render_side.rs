@@ -4828,30 +4828,38 @@ pub(crate) mod tests {
 
     /// A pending play skin's specialization staged with its attempt
     /// through a real menu screen and renderer on WARP, beside a committed
-    /// result skin: one whose atlas is the whole shared limit is refused
-    /// with the renderer's admission, as a healthy refusal (no failure
-    /// reported), and one within the limit is ready and commits.
+    /// result skin charged an atlas's cap and a tiny atlas's texels
+    /// (`Renderer::state_charge`, development builds, so no array that
+    /// large is uploaded): one whose atlas is the cap passes the shared
+    /// limit by the tiny atlas and is refused with the renderer's
+    /// admission, as a healthy refusal (no failure reported), and one
+    /// within the limit is ready and commits.
+    #[cfg(feature = "dev-tools")]
     #[test]
     fn a_specialization_past_the_shared_texels_is_refused() {
-        use crate::render_decl::{Look, shared_limit_bundle, solid_bundle};
-        let make: MakeScreen = Box::new(|| {
-            let renderer = render::Renderer::new(
+        use crate::render_decl::{Look, atlas_cap_bundle, solid_bundle};
+        const TINY: u64 = 256 * 256 * 2;
+        // Built for WARP's limits, as the render thread's screen.
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        let big = atlas_cap_bundle(&r, [0, 0, 255, 255]);
+        let (result, play) = (
+            solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
+            solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
+        );
+        drop(r);
+        assert_eq!(result.atlas_texels(), TINY);
+        let stated = Arc::clone(&result);
+        let make: MakeScreen = Box::new(move || {
+            let mut renderer = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
                     height: 1_080,
                 },
                 render::AdapterChoice::Warp,
             )?;
+            renderer.state_charge(&stated, skin_model::MAX_ATLAS_TEXELS + TINY);
             Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
         });
-        // Built for WARP's limits, as the render thread's screen.
-        let r = crate::render_common::offscreen(1_920, 1_080);
-        let big = shared_limit_bundle(&r, [0, 0, 255, 255]);
-        let (result, play) = (
-            solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]),
-            solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]),
-        );
-        drop(r);
         let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
@@ -4886,6 +4894,73 @@ pub(crate) mod tests {
         );
         link.commit_attempt().unwrap();
         link.exit();
+    }
+
+    /// A refused shared admission allocates nothing (design.md "Memory
+    /// Budget"): with play's tiny skin committed and charged an atlas's
+    /// cap (`Renderer::state_charge`) and a tiny result skin committed, a
+    /// selection candidate at the cap is past the shared limit by the tiny
+    /// atlas. It is refused before anything is allocated or staged, and
+    /// play's installation draws its next frame as before. The candidate
+    /// is never uploaded. A positive control proves the counter counts.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_refused_shared_admission_alloc() {
+        use crate::alloc_count::this_thread;
+        use crate::render_common::{GAUGES, attempt, context, input, offscreen, view};
+        use crate::render_decl::{Look, atlas_cap_bundle, solid_bundle};
+        const TINY: u64 = 256 * 256 * 2;
+        let mut r = offscreen(1_920, 1_080);
+        let big = atlas_cap_bundle(&r, [0, 0, 255, 255]);
+        let tiny = solid_bundle(&r, &Look::left([255, 0, 0, 255]), [16, 16]);
+        assert_eq!(tiny.atlas_texels(), TINY);
+        let chart = ChartBuilder::new(120_000).build().unwrap();
+        let ctx = context(&GAUGES, false);
+        let token = r.stage(&tiny, &attempt(&r, &chart, &ctx), 1).unwrap();
+        r.commit(token).unwrap();
+        r.state_charge(&tiny, skin_model::MAX_ATLAS_TEXELS);
+        let result = solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]);
+        let token = r.install(ScreenKind::Result, &result, 2).unwrap();
+        r.commit(token).unwrap();
+        let drawn = |r: &mut render::Renderer| {
+            let v = view(0, 0);
+            let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+            assert!(timing.presented);
+            let pixels = crate::render_common::read_back(r);
+            (
+                timing.sprites,
+                crate::render_common::rgb_at(&pixels, 1_920, (480, 540)),
+            )
+        };
+        let before = drawn(&mut r);
+        assert!(before.0 > 0);
+        assert_eq!(before.1, [255, 0, 0]);
+        let generation = r.resource_generation();
+
+        let control = this_thread();
+        drop(std::hint::black_box(vec![1_u8; 8]));
+        assert!(this_thread() > control, "the allocation was not counted");
+        let start = this_thread();
+        let answer = r.install(ScreenKind::Selection, &big, 3);
+        let allocs = this_thread() - start;
+        let e = answer.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                RenderError::Admission {
+                    kind: ScreenKind::Selection,
+                    needed,
+                    limit,
+                } if needed == render::SHARED_TEXELS + TINY && limit == render::SHARED_TEXELS
+            ),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        assert_eq!(allocs, 0, "the refused admission allocated");
+        assert!(r.staged().is_none());
+        assert!(Arc::ptr_eq(r.installed(ScreenKind::Play).unwrap(), &tiny));
+        assert_eq!(r.resource_generation(), generation);
+        assert_eq!(drawn(&mut r), before);
     }
 
     /// The default skin's refusal of an attempt (a chart row past its

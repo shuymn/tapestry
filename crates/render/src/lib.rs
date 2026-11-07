@@ -33,6 +33,8 @@
 #[cfg(test)]
 extern crate self as render;
 #[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
 #[path = "../tests/font_support/mod.rs"]
 mod font_support;
 #[cfg(test)]
