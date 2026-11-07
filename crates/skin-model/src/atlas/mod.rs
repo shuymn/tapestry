@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use ::image::RgbaImage;
 
-use crate::image::Stop;
 use crate::image::decode::{self, Bands, Site};
+use crate::image::{self, Stop};
 use crate::image::{CellSource, FileAt, ImageError, MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES, Sheet};
 use pack::PackError;
 use uv::{FrameUv, UvTable};
