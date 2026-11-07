@@ -105,7 +105,7 @@ pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
     GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS,
-    PAGE_SIDE_STEP, Page, Variant, cell_fits_page, downsample_rgba,
+    PAGE_SIDE_STEP, PackedPages, Page, Variant, cell_fits_page, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 #[cfg(feature = "dev-tools")]
@@ -115,6 +115,8 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+#[cfg(feature = "dev-tools")]
+pub use image::builder::ByteCharge;
 pub use image::builder::{
     AdmitError, BitmapFontError, Charge, FntAdmitError, FntFileError, FntLimit, FontAdmitError,
     MAX_BITMAP_FONTS, MAX_FALLBACKS, Refused, SheetBuilder,
@@ -127,6 +129,9 @@ pub use image::font::{
     FontDef, FontError, FontReader, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES,
 };
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
+#[cfg(feature = "dev-tools")]
+pub use image::source::SourceCounts;
+pub use image::source::{CacheBounds, CacheUsage, FileSource, ResourceCache};
 pub use image::{
     CycleDef, FileAt, FileDef, GRID_CELL, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES,
     MAX_FILES, MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE,

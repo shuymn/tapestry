@@ -20,6 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
+use super::source::FileSource;
 use super::{MAX_FILE_BYTES, MAX_PATH_BYTES};
 
 /// Why a name did not lead to a file that may be read.
@@ -139,10 +140,15 @@ pub enum RootError {
     Io(io::Error),
 }
 
-/// A skin folder, canonical, that names are read and listed against.
+/// A skin folder, canonical, that names are read and listed against,
+/// with the [`FileSource`] its image and font content is read through
+/// (the disk unless [`Root::with_source`] gives another). Its own
+/// [`read`](Root::read) and [`list`](Root::list), for definitions and
+/// scripts, always reach the disk.
 #[derive(Clone, Debug)]
 pub struct Root {
     dir: PathBuf,
+    source: FileSource,
 }
 
 /// The identity of a file a [`Root`] read: equal for every name that
@@ -207,7 +213,25 @@ impl Root {
         if !dir.is_dir() {
             return Err(RootError::NotAFolder);
         }
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            source: FileSource::disk(),
+        })
+    }
+
+    /// The same folder, its image and font content read through `source`.
+    #[must_use]
+    pub fn with_source(&self, source: FileSource) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            source,
+        }
+    }
+
+    /// The source its image and font content is read through.
+    #[must_use]
+    pub fn source(&self) -> &FileSource {
+        &self.source
     }
 
     /// The canonical folder.
