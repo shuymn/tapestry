@@ -357,10 +357,12 @@ fn write_png(path: &Path, w: u32, h: u32) {
         .expect("write PNG data");
 }
 
-/// What an imported skin draws: the quads of frames at a few times of a
-/// 100-note play with a perfect judgment at each, each frame within the
-/// skin's quad capacity; its loading state is built too, within the same
-/// capacities. `seed` names one more readout frame's gain, covers,
+/// What an imported skin draws: for a play skin, the quads of frames at a
+/// few times of a 100-note play with a perfect judgment at each, each
+/// frame within the skin's quad capacity, its loading state built too,
+/// within the same capacities; for a selection skin, its frames over a
+/// list; for a result skin, frames at 0 and 500 ms of a ready view and of
+/// one with no result ([`result_view`]). `seed` names one more readout frame's gain, covers,
 /// duration variants and native block.
 ///
 /// # Panics
@@ -370,10 +372,133 @@ fn write_png(path: &Path, w: u32, h: u32) {
 /// state builds again.
 #[must_use]
 pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
-    if imported.skin.kind() == ScreenKind::Selection {
-        return draw_selection(&imported.skin);
+    match imported.skin.kind() {
+        ScreenKind::Selection => draw_selection(&imported.skin),
+        ScreenKind::Result => draw_result(&imported.skin),
+        ScreenKind::Play | ScreenKind::Decision => draw_skin(imported, seed),
     }
-    draw_skin(imported, seed)
+}
+
+/// A result view of a 600-note play whose best is known with no BP
+/// (hidden): ready, or with no result when not `ready`.
+#[must_use]
+pub fn result_view(ready: bool) -> skin_model::ResultView {
+    use eval::Tally;
+    use rules::PerJudgment;
+    use skin_model::{
+        BestFigures, BestView, LampKey, ResultChart, ResultNumber, ResultRate, ResultScore,
+        ResultStatus, ResultView, TimingStats, Unavailable,
+    };
+    let counts = PerJudgment {
+        perfect: 500,
+        great: 60,
+        good: 20,
+        bad: 10,
+        poor: 10,
+    };
+    ResultView {
+        status: if ready {
+            ResultStatus::Ready
+        } else {
+            ResultStatus::Unavailable(Unavailable::Failed)
+        },
+        chart: ResultChart {
+            level: Some(12),
+            total: Some(300),
+            notes: Some(600),
+            ..ResultChart::default()
+        },
+        score: ResultScore {
+            tally: Tally {
+                counts,
+                ex_score: 1_060,
+                bp: 20,
+                max_combo: 200,
+                early: counts,
+                ..Tally::default()
+            },
+            gauge_permille: 805,
+            clear: LampKey::Normal,
+            cleared: true,
+            rate: Some(ResultRate {
+                rate_bp: 8_833,
+                grade: 6,
+            }),
+            next_rank: 17,
+        },
+        best: BestView::Known(BestFigures {
+            ex: 0,
+            ex_diff: 1_060,
+            bp: ResultNumber::Hidden,
+            bp_diff: ResultNumber::Hidden,
+            clear: LampKey::NoPlay,
+            ex_updated: true,
+            bp_updated: true,
+            rate: None,
+        }),
+        timing: Some(TimingStats {
+            samples: 590,
+            mean_x100: -149,
+            sd_x100: 1_234,
+        }),
+        timelines: None,
+    }
+}
+
+/// What an imported result skin draws: the quads of frames at a few
+/// times over a ready view and a view with no result, the fade-out
+/// started at the later one, every frame within the skin's capacities.
+///
+/// # Panics
+///
+/// If the atlas or the result state is refused, a frame is refused or
+/// holds more quads than the skin's capacity.
+fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
+    use bms_model::TimeUs;
+    use skin_model::{
+        AtlasLimits, Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers, Variant,
+    };
+    let limits = AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    let uvs = skin
+        .atlas(Variant::Lo, limits, &|| false)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1;
+    let labels = ResultLabels {
+        title: "t".to_owned(),
+        ..ResultLabels::default()
+    };
+    let mut res = skin.prepare_result();
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let layout = Layout::AUTHOR;
+    let mut drawn = Vec::new();
+    for ready in [true, false] {
+        skin.update_result(&mut res, &result_view(ready), &labels)
+            .expect("an imported result skin takes a view");
+        let requests = skin.result_text_requests(&res, [1_920, 1_080], &layout);
+        assert!(requests.len() <= skin_model::MAX_TEXT_ELEMENTS);
+        for ms in [0, 500] {
+            batch.clear();
+            let frame = ResultFrame {
+                now: TimeUs(ms * 1_000),
+                target: [1_920, 1_080],
+                layout: &layout,
+                timers: ResultTimers {
+                    screen: Some(TimeUs(0)),
+                    fadeout: (ms > 0).then_some(TimeUs(0)),
+                },
+            };
+            skin.build_result(&mut res, &frame, &uvs, &mut batch)
+                .expect("an imported result skin builds");
+            check_batch(skin, &batch);
+            drawn.push(batch.quads().len());
+        }
+    }
+    drawn
 }
 
 /// What an imported selection skin draws: the quads of frames at a few
@@ -2321,10 +2446,10 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 
 /// The play snapshot of a `skin_lua` input's first two bytes: autoplay
 /// unavailable, off, on or pending by `a` modulo 4, on a result scene
-/// for 255; the play level unavailable, pending, or `a / 16` (twice) by
-/// `a / 4` modulo 4; the chart's judgment class unavailable, pending, or
-/// known by `r`'s low two bits, the rest choosing one of the five classes
-/// or none.
+/// showing [`result_view`] for 255; the play level unavailable, pending,
+/// or `a / 16` (twice) by `a / 4` modulo 4; the chart's judgment class
+/// unavailable, pending, or known by `r`'s low two bits, the rest choosing
+/// one of the five classes or none.
 #[must_use]
 pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let scene = if a == u8::MAX {
@@ -2355,11 +2480,19 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
         1 => Fact::Pending,
         _ => Fact::Known(i32::from(a >> 4)),
     };
+    // On a result scene, a ready view whose best has no BP: every result
+    // read answers, the hidden ones as `i32::MIN`.
+    let result = if scene == ScreenKind::Result {
+        Fact::Known(skin_model::ResultFields::of(&result_view(true)))
+    } else {
+        Fact::Unavailable
+    };
     ImportFacts {
         scene,
         autoplay,
         judge_class,
         play_level,
+        result,
     }
 }
 

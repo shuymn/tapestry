@@ -113,6 +113,7 @@ const fn fact_name(fact: FactId) -> &'static str {
         FactId::Autoplay => "autoplay",
         FactId::JudgeClass => "the chart's judgment class",
         FactId::PlayLevel => "the chart's play level",
+        FactId::ResultNumber(_) | FactId::ResultOption(_) => "the result's values",
     }
 }
 
@@ -456,6 +457,15 @@ fn built(
             slot: kind,
             found,
         }));
+    }
+    // A result skin imports, but nothing draws it yet: the result screen
+    // stays built in, with nothing imported, installed or charged, until
+    // result skins are drawn (S10-09g PR 5 and S10-09i remove this gate).
+    if kind == ScreenKind::Result {
+        return Ok(Built::NoImporter(format!(
+            "{}: single-chart result skins are not shown yet",
+            choice.root.join(&choice.entry).display()
+        )));
     }
     stopped()?;
     // 3. The configuration.

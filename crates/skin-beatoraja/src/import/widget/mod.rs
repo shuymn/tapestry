@@ -475,9 +475,13 @@ impl Cx<'_> {
         // a `len` of 1 or less is an ordinary image whatever its `ref`.
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
-        let index = property::index_in(self.kind, self.int_or(r, "ref", 0)?);
+        let r = self.int_or(r, "ref", 0)?;
+        let index = property::index_in(self.kind, r);
         let (charged, lowered) = self.lowered(&dst)?;
-        let role = lowered.role(dst.failure);
+        let mut role = lowered.role(dst.failure);
+        if group && self.kind == skin_model::ScreenKind::Result {
+            role = super::result::index_role(role, r);
+        }
         self.actions(at, act)?;
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
@@ -495,7 +499,7 @@ impl Cx<'_> {
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
-            return self.image_group(dst, rec, &s, len, selector, charged, lowered);
+            return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
         let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
@@ -596,6 +600,20 @@ impl Cx<'_> {
         let selector = image_choice::set_selector(self.kind, &value, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
+        // On a result skin a set choosing by the clear type is the clear
+        // status, an essential part.
+        if self.kind == skin_model::ScreenKind::Result {
+            role = match property::value_prop(self.kind, &value) {
+                property::IntProp::Shown(v) => {
+                    super::result::set_role(v.essential().map_or(role, Role::Essential), role)
+                }
+                // A function's value overrides `ref`, so `ref` says nothing.
+                property::IntProp::Null if !matches!(value, Prop::Callable(_)) => {
+                    super::result::index_role(role, r)
+                }
+                _ => role,
+            };
+        }
         let (src, deviates) = if let Prop::Callable(id) = value {
             // A function's value selects, its element's role joined by the
             // part its reads show; it never falls back to `ref`.
@@ -603,7 +621,7 @@ impl Cx<'_> {
             let Some(v) = self.value_callback(at, id, role, Conv::Index)? else {
                 return Ok(());
             };
-            role = v.role;
+            role = super::result::set_role(v.role, role);
             (
                 image_choice::guarded(&v.expr, v.guard.as_deref()),
                 v.deviates,

@@ -122,9 +122,10 @@ impl fmt::Display for CriticalPart {
     }
 }
 
-/// A selection skin's essential parts (docs/stage3.md §3, Selection), the
-/// counterpart of play's critical parts, judged after the configured
-/// options are folded: missing or not reproduced, the skin is refused.
+/// A selection or result skin's essential parts (docs/stage3.md §3,
+/// Selection and Result), the counterpart of play's critical parts, judged
+/// after the configured options are folded: missing or not reproduced,
+/// the skin is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialPart {
     /// A `songlist` that a retained destination names, with a slot whose
@@ -136,6 +137,12 @@ pub enum EssentialPart {
     /// A title style for every listed row kind: chart, folder and "all
     /// charts".
     RowTitle,
+    /// A result skin's EX score: a retained number showing 71 or 171
+    /// (docs/stage3.md §3, Result).
+    ResultScore,
+    /// A result skin's clear status: a retained element whose visibility
+    /// reads option 90 or 91, or that shows image index or number 370.
+    ResultStatus,
 }
 
 impl fmt::Display for EssentialPart {
@@ -144,6 +151,8 @@ impl fmt::Display for EssentialPart {
             Self::SongList => "song list",
             Self::SelectedRow => "selected row",
             Self::RowTitle => "row title",
+            Self::ResultScore => "EX score",
+            Self::ResultStatus => "clear status",
         })
     }
 }
@@ -152,7 +161,7 @@ impl fmt::Display for EssentialPart {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Critical(CriticalPart),
-    /// A selection skin's essential part.
+    /// A selection or result skin's essential part.
     Essential(EssentialPart),
     Decorative,
 }

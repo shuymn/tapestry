@@ -488,12 +488,10 @@ fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
 
 #[test]
 fn a_lua_kind_with_no_importer_refuses_before_the_configured_pass() {
-    for (ty, kind) in [(6, ScreenKind::Decision), (7, ScreenKind::Result)] {
-        let (r, passes, admits) = kind_import(ty, kind);
-        match r {
-            Err(ImportError::NoImporter { kind: k }) => assert_eq!(k, kind),
-            other => panic!("{ty}: {other:?}"),
-        }
-        assert_eq!((passes, admits), (1, 0), "{ty}");
+    let (r, passes, admits) = kind_import(6, ScreenKind::Decision);
+    match r {
+        Err(ImportError::NoImporter { kind }) => assert_eq!(kind, ScreenKind::Decision),
+        other => panic!("{other:?}"),
     }
+    assert_eq!((passes, admits), (1, 0));
 }

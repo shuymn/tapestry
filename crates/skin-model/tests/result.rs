@@ -12,9 +12,9 @@ use result_support::{RFx, best, chart, labels, number, ready, relement, rint, rl
 use selection_support::{DIGITS, frame_of};
 use skin_model::{
     Attempt, BestView, BuildError, ChartMetadata, ElementDef, FontRef, ImageChoiceDef, LoadError,
-    MAX_TEXT_BYTES, Overflow, PlayContext, PrepareError, ResultError, ResultLabels, ResultNumber,
-    ResultStatus, ResultView, ScreenKind, SelectionText, Side, Skin, Source, TextDef, TextField,
-    TextImage, TextTable, TextTableError, TextValue, TimerRef, Unavailable, WidgetDefs,
+    MAX_TEXT_BYTES, Overflow, PlayContext, PrepareError, ResultError, ResultFields, ResultLabels,
+    ResultNumber, ResultStatus, ResultView, ScreenKind, SelectionText, Side, Skin, Source, TextDef,
+    TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef, Unavailable, WidgetDefs,
     result_field as field, result_timer,
 };
 
@@ -177,7 +177,8 @@ fn a_view_fills_the_result_fields() {
         (field::EX_SCORE, 1_000),
         (field::MAX_COMBO, 77),
         (field::RESULT_BP, 20),
-        (field::RESULT_NOTES, 600),
+        (field::CHART_NOTES, 600),
+        (field::CHART_NOTES_VALID, 1),
         (field::COUNT_PERFECT, 400),
         (field::COUNT_GREAT, 2),
         (field::COUNT_POOR, 5),
@@ -250,9 +251,34 @@ fn a_view_fills_the_result_fields() {
     };
     fx.view(&v);
     let f = |slot: u16| fx.res.state().fields[usize::from(slot)];
-    for slot in field::CHART_LEVEL..=field::CHART_LENGTH_VALID {
+    for slot in field::CHART_LEVEL..=field::CHART_NOTES_VALID {
         assert_eq!(f(slot), 0, "slot {slot}");
     }
+    assert_eq!(f(field::CHART_NOTES), 0);
+}
+
+/// The fields a result state reads after a view are exactly
+/// [`ResultFields::of`] that view, the conversion an import reads at load:
+/// for shown, hidden and unavailable values and an unavailable view.
+#[test]
+fn the_state_reads_the_views_result_fields() {
+    let mut fx = RFx::new(rload(vec![], WidgetDefs::default()).unwrap());
+    let mut unavailable = ready(7, best(ResultNumber::Shown(-3)), 1);
+    unavailable.status = ResultStatus::Unavailable(Unavailable::Failed);
+    for view in [
+        ready(1_000, best(ResultNumber::Shown(-3)), 4),
+        ready(1_000, best(ResultNumber::Hidden), 4),
+        ready(1_000, BestView::Unavailable, 4),
+        result_support::other(),
+        unavailable,
+    ] {
+        fx.view(&view);
+        let fields = ResultFields::of(&view);
+        assert_eq!(fx.res.state().fields, &fields.0[..], "{view:?}");
+        assert_eq!(fields.state().fields, fx.res.state().fields);
+    }
+    let hidden = ResultFields::of(&ready(1_000, best(ResultNumber::Hidden), 4));
+    assert_eq!(hidden.0[usize::from(field::BEST_BP_DIFF)], i32::MIN);
 }
 
 /// C12: a number on the BP difference and an element whose visibility

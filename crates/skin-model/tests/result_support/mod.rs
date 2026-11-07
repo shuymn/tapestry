@@ -109,6 +109,7 @@ pub fn chart() -> ResultChart {
         }),
         difficulty: Some(4),
         length: Some(TimeUs(123_456_789)),
+        notes: Some(600),
     }
 }
 
@@ -140,7 +141,6 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
         chart: chart(),
         score: ResultScore {
             tally: tally(ex, 20, 400),
-            notes: 600,
             gauge_permille: 805,
             clear: LampKey::Normal,
             cleared: true,
@@ -173,10 +173,12 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
 pub fn other() -> ResultView {
     ResultView {
         status: ResultStatus::Ready,
-        chart: chart(),
+        chart: ResultChart {
+            notes: Some(950),
+            ..chart()
+        },
         score: ResultScore {
             tally: tally(5_678, 3, 900),
-            notes: 950,
             gauge_permille: 120,
             clear: LampKey::Failed,
             cleared: false,
