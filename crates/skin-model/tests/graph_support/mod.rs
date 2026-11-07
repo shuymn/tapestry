@@ -42,6 +42,7 @@ pub fn graph(kind: JudgeGraphKind, chips: u32, back: bool, delay_ms: i64) -> Jud
         back,
         chips,
         solid: SOLID,
+        fit: skin_model::GraphFit::Stretch,
     }
 }
 
@@ -65,8 +66,13 @@ pub fn track(r: [i32; 4], alpha: i32) -> Track {
 
 /// An element drawing judge graph `i` over `r` at `alpha` on `timer`.
 pub fn element(i: u32, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
+    source_element(Source::JudgeGraph(i), r, alpha, timer)
+}
+
+/// An element drawing `source` over `r` at `alpha` on `timer`.
+pub fn source_element(source: Source, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
     ElementDef {
-        source: Source::JudgeGraph(i),
+        source,
         track: track(r, alpha),
         timer: TimerRef::Builtin(timer),
         visible: None,
@@ -77,41 +83,14 @@ pub fn element(i: u32, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
 }
 
 /// An element drawing judge graph `i` over `r` on the screen timer,
-/// turned `angle` degrees about `pivot`, with `native`.
-pub fn placed_element(
-    i: u32,
-    r: [i32; 4],
-    angle: i32,
-    pivot: skin_model::Anchor,
-    native: Option<skin_model::Native>,
-) -> ElementDef {
-    let mut props = [None; 9];
-    for (p, v) in props.iter_mut().zip(r) {
-        *p = Some(v);
-    }
-    props[4] = Some(255);
-    props[8] = Some(angle);
-    let track = Track::new(
-        &[KeyDef {
-            at: TimeUs(0),
-            props,
-        }],
-        skin_model::Ease::Linear,
-        skin_model::End::Hold,
-    )
-    .unwrap();
+/// turned `angle` degrees about `pivot`, with no native size.
+pub fn placed_element(i: u32, r: [i32; 4], angle: i32, pivot: skin_model::Anchor) -> ElementDef {
     ElementDef {
-        source: Source::JudgeGraph(i),
-        track,
-        timer: TimerRef::Builtin(result_timer::SCREEN),
-        visible: None,
-        blend: Blend::Alpha,
-        clip: None,
         place: Place {
             pivot,
-            native,
             ..Place::SCREEN
         },
+        ..moving_element(Source::JudgeGraph(i), &[(0, r, angle)])
     }
 }
 
@@ -147,8 +126,19 @@ pub fn sheet_builder(dir: &std::path::Path) -> SheetBuilder {
     b
 }
 
-/// A result skin of `elements` drawing `graphs`.
+/// A result skin of `elements` drawing the judge graphs `graphs`.
 pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
+    skin_with(
+        elements,
+        ResultDefs {
+            judge_graphs: graphs,
+            ..ResultDefs::default()
+        },
+    )
+}
+
+/// A result skin of `elements` drawing the result widgets `widgets`.
+pub fn skin_with(elements: Vec<ElementDef>, widgets: ResultDefs) -> Skin {
     let dir = tempfile::tempdir().unwrap();
     let def = SkinDef {
         fit: skin_model::Fit::Fixed,
@@ -164,13 +154,7 @@ pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
         bomb_up_to: None,
         close: None,
     };
-    Skin::new_result(
-        def,
-        ResultDefs {
-            judge_graphs: graphs,
-        },
-    )
-    .unwrap()
+    Skin::new_result(def, widgets).unwrap()
 }
 
 /// Timelines of 1 s bins, every note judged.
@@ -264,6 +248,13 @@ impl GFx {
 
     pub fn quads(&self) -> &[Quad] {
         self.batch.quads()
+    }
+
+    /// The RGB the frame shows at canvas point `[x, y]` and the quads
+    /// covering it, each quad read at the level its own filter picks
+    /// ([`composite`]).
+    pub fn pixel(&self, [x, y]: [f32; 2]) -> ([f32; 3], u32) {
+        composite(self.quads(), &self.atlas, x, y, None)
     }
 
     /// The quads drawn on a chip grid, in push order.
@@ -373,4 +364,49 @@ pub fn near(got: [f32; 3], want: [f32; 3], tolerance: f32) {
 /// Straight colour `rgb` (8-bit) at alpha `a` (0 to 1) over the backdrop.
 pub fn over_backdrop(rgb: [f32; 3], a: f32) -> [f32; 3] {
     rgb.map(|c| c * a + BACKDROP * (1.0 - a))
+}
+
+/// An element drawing `source` on the screen timer whose track runs
+/// linearly through `keys`, each `(ms, [x, y, w, h], angle)` at alpha 255.
+pub fn moving_element(source: Source, keys: &[(i64, [i32; 4], i32)]) -> ElementDef {
+    let keys: Vec<KeyDef> = keys
+        .iter()
+        .map(|&(ms, r, angle)| {
+            let mut props = [None; 9];
+            for (p, v) in props.iter_mut().zip(r) {
+                *p = Some(v);
+            }
+            props[4] = Some(255);
+            props[8] = Some(angle);
+            KeyDef {
+                at: TimeUs(ms * 1_000),
+                props,
+            }
+        })
+        .collect();
+    ElementDef {
+        source,
+        track: Track::new(&keys, skin_model::Ease::Linear, skin_model::End::Hold).unwrap(),
+        timer: TimerRef::Builtin(result_timer::SCREEN),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place: Place::SCREEN,
+    }
+}
+
+/// Every quad of `quads` has a positive width and height and lies inside
+/// `[x, y, w, h]` (unturned, within `eps`).
+#[track_caller]
+pub fn inside(quads: &[Quad], [x, y, w, h]: [f32; 4], eps: f32) {
+    for q in quads {
+        let [qx, qy, qw, qh] = q.rect;
+        assert!(qw > 0.0 && qh > 0.0, "empty quad {:?}", q.rect);
+        assert!(
+            qx >= x - eps && qy >= y - eps && qx + qw <= x + w + eps && qy + qh <= y + h + eps,
+            "{:?} outside {:?}",
+            q.rect,
+            [x, y, w, h]
+        );
+    }
 }

@@ -296,6 +296,9 @@ pub(crate) struct Assets {
     note_fallbacks: [Option<u32>; 3],
     /// The built-in system images, by straight RGBA and a linear filter.
     systems: HashMap<([u8; 4], bool), u32>,
+    /// The judge graphs' white chip grids, by lit texels across and down:
+    /// at most four.
+    chip_grids: HashMap<[u8; 2], u32>,
 }
 
 #[cfg(test)]
@@ -317,7 +320,37 @@ impl Assets {
             bitmap_fonts: HashMap::new(),
             note_fallbacks: [None; 3],
             systems: HashMap::new(),
+            chip_grids: HashMap::new(),
         }
+    }
+
+    /// The white chip grid of [`skin_model::CHIP_GRID_CELLS`] cells down,
+    /// lit `lit` texels of each cell, sampled at level 0, added once: its
+    /// image and frame are charged before it is added, and a later request
+    /// charges nothing. No file is admitted or attempted.
+    ///
+    /// # Errors
+    ///
+    /// The image or frame budget, or a variant's texel total.
+    pub(crate) fn chip_grid(
+        &mut self,
+        budget: &mut Budget,
+        lit: [u8; 2],
+    ) -> Result<u32, ImportLimit> {
+        if let Some(&i) = self.chip_grids.get(&lit) {
+            return Ok(i);
+        }
+        budget.image(1)?;
+        let cell = u32::from(skin_model::GRID_CELL);
+        let def = SolidImageDef {
+            size: [cell, cell * skin_model::CHIP_GRID_CELLS],
+            color: [255; 4],
+            filter: Filter::NearestBase,
+            grid: Some(lit),
+        };
+        let i = self.builder.add_solid_image(def).map_err(solid_limit)?;
+        self.chip_grids.insert(lit, i);
+        Ok(i)
     }
 
     /// The generated image of `paint`, added once: its image and frame

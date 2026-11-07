@@ -13,9 +13,10 @@
 //! that only reads option 90 or 91 in its visibility is the status when
 //! retained, and dropped with a note otherwise.
 //!
-//! The graphs the result draws (`gaugegraph`, `judgegraph`,
-//! `timingdistributiongraph`) are later widgets: dropped with a note until
-//! they exist.
+//! A `judgegraph` becomes the model's judge graph ([`super::widget::
+//! judge_graph`]); the gauge graph and the timing distribution
+//! (`gaugegraph`, `timingdistributiongraph`) are later widgets: dropped
+//! with a note until they exist.
 
 pub(crate) mod profile;
 
@@ -60,6 +61,7 @@ impl Cx<'_> {
             Object::ImageSet => self.image_set(dst, rec),
             Object::Value => self.number(dst, rec),
             Object::Text => self.text(dst, rec),
+            Object::JudgeGraph => self.judge_graph(dst, rec),
             _ => self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object }),
         }
     }

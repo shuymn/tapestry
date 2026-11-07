@@ -24,6 +24,7 @@ use super::{Brush, Frame, ImageRef, tint};
 use crate::atlas::uv::FrameUv;
 use crate::canvas::f32_of;
 use crate::pixmap::{Rgba8, over};
+use crate::place::Native;
 use crate::quad::QuadBatch;
 use crate::result::view::{MAX_TIMELINE_BINS, TIMELINE_CHANNELS, Timelines};
 
@@ -53,12 +54,36 @@ pub enum JudgeGraphKind {
     EarlyLate,
 }
 
+/// How a judge graph's texture fits its element's rect: the source's
+/// stretch modes, applied to the whole graph as the source applies them to
+/// an image, the texture being 5 texels a bin across and 5 a cell down.
+/// The aspect-keeping modes depend on the bins and the scale, so the graph
+/// fits itself each frame. A trimmed mode shows only the part of the
+/// fitted graph inside the rect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GraphFit {
+    /// The rect (stretch 0, and the source's unknown modes).
+    #[default]
+    Stretch,
+    /// The texture's aspect, inside the rect (1).
+    Inner,
+    /// The texture's aspect, covering the rect (2; 3 trimmed).
+    Outer { trim: bool },
+    /// The rect's width, the aspect's height (4; 5 trimmed).
+    Width { trim: bool },
+    /// The rect's height, the aspect's width (6; 7 trimmed).
+    Height { trim: bool },
+    /// The texture's size in target pixels, shrunk with its aspect to fit
+    /// the rect, never enlarged (8).
+    NoLarger,
+    /// The texture's size in target pixels (9; 10 trimmed).
+    Exact { trim: bool },
+}
+
 /// A judge graph as a front end builds it. Its element's track places the
-/// whole graph and gives its colour and alpha; the element's native size
-/// (the source's stretch 8 or 9) fits the whole graph as the source fits
-/// its texture, whose texels are 5 a bin across and 5 a cell down, and
-/// its angle turns the whole graph about the element's pivot in that
-/// region.
+/// whole graph and gives its colour and alpha; its [`GraphFit`] fits the
+/// whole graph in that rect, and the track's angle turns the whole graph
+/// about the element's pivot in the region it draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JudgeGraphDef {
     pub kind: JudgeGraphKind,
@@ -75,12 +100,14 @@ pub struct JudgeGraphDef {
     pub chips: u32,
     /// A white image the background's stripes and lines tint.
     pub solid: u32,
+    pub fit: GraphFit,
 }
 
 impl JudgeGraphDef {
     /// The quads one frame can push at worst: the background's, then one
     /// per channel of every bin.
-    pub(crate) fn quads(&self) -> u32 {
+    #[must_use]
+    pub fn quads(&self) -> u32 {
         let back = if self.back { BACK_QUADS } else { 0 };
         back + BINS * channels(self.kind)
     }
@@ -187,12 +214,13 @@ pub(crate) fn scale(largest: u32) -> u32 {
 
 impl JudgeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing without timelines; the background whole when on, then the
-    /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
-    /// The rect is placed (lane map, affine) and fitted to the brush's
-    /// native size, if any, as one region; every quad turns with the
-    /// brush's angle about the brush's pivot in that region. A refused
-    /// push stops the graph.
+    /// nothing without timelines or without a positive width and height;
+    /// the background whole when on, then the chips revealed up to
+    /// `w·min(1, t/delay)` of the screen timer's `t`.
+    /// The rect is placed (lane map, affine) and fitted by the graph's
+    /// [`GraphFit`] as one region, a trimmed fit cut to the rect; every
+    /// quad turns with the brush's angle about the brush's pivot in the
+    /// region drawn. A refused push stops the graph.
     pub(crate) fn draw(
         &self,
         d: &GraphDraw<'_>,
@@ -200,6 +228,13 @@ impl JudgeGraph {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
+        // A rect with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing, as the
+        // other result graphs.
+        let [.., w, h] = brush.affine.rect([0.0, 0.0, brush.map.w(rect[2]), rect[3]]);
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
         let Some(tl) = d.timelines else {
             return;
         };
@@ -211,7 +246,9 @@ impl JudgeGraph {
         let largest = notes.iter().copied().max().unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
-        let g = Geometry::new(region(rect, brush, [n, scale]), brush.pivot, n, scale);
+        let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
+        let (fitted, clip) = fitted_region(rect, brush, self.def.fit, texels);
+        let g = Geometry::new(fitted, clip, brush.pivot, n, scale);
         if self.def.back
             && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
             && !self.back(&g, f, brush, out)
@@ -321,25 +358,69 @@ impl JudgeGraph {
     }
 }
 
-/// The graph's region in canvas pixels: the reference `rect` through the
-/// brush's lane map and affine, then fitted to its native size, if any,
-/// with the graph's texture as the frame: 5 texels a bin across and 5 a
-/// cell down, `[n, scale]` bins and cells.
-fn region(rect: [f32; 4], brush: &Brush, [n, scale]: [u32; 2]) -> [f32; 4] {
+/// The reference `rect` placed: through the brush's lane map and affine.
+fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
     let [x, y, w, h] = rect;
-    let placed = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
-    let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
+    brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h])
+}
+
+/// A result graph's region in canvas pixels: the reference `rect` placed,
+/// then fitted to the brush's native size, if any, with the graph's
+/// texture of `texels` as the frame (the timing distribution's, D8).
+pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
+    let placed = placed(rect, brush);
     brush.native.map_or(placed, |native| {
         native.sized(texels).fit(placed, brush.scale)
     })
 }
 
-/// A graph's region in canvas pixels, its pivot, and its bins and cells.
+/// A judge graph's region in canvas pixels, and the rect a trimmed fit
+/// cuts it to: the reference `rect` placed, then fitted by `fit` with the
+/// graph's texture of `texels` as the image (D9: 5 texels a bin across
+/// and 5 a cell down).
+fn fitted_region(
+    rect: [f32; 4],
+    brush: &Brush,
+    fit: GraphFit,
+    texels: [u32; 2],
+) -> ([f32; 4], Option<[f32; 4]>) {
+    let placed = placed(rect, brush);
+    let [px, py, pw, ph] = placed.map(f64::from);
+    let [tw, th] = texels.map(|t| f64::from(t.max(1)));
+    let (sx, sy) = (pw / tw, ph / th);
+    let width = |nw: f64| [px + (pw - nw) / 2.0, py, nw, ph].map(f32_of);
+    let height = |nh: f64| [px, py + (ph - nh) / 2.0, pw, nh].map(f32_of);
+    let (fitted, trim) = match fit {
+        GraphFit::Stretch => (placed, false),
+        GraphFit::Inner if sx <= sy => (height(th * sx), false),
+        GraphFit::Inner => (width(tw * sy), false),
+        GraphFit::Outer { trim } if sx >= sy => (height(th * sx), trim),
+        GraphFit::Outer { trim } => (width(tw * sy), trim),
+        GraphFit::Width { trim } => (height(th * sx), trim),
+        GraphFit::Height { trim } => (width(tw * sy), trim),
+        GraphFit::NoLarger => (Native::NoLarger(texels).fit(placed, brush.scale), false),
+        GraphFit::Exact { trim } => (Native::Exact(texels).fit(placed, brush.scale), trim),
+    };
+    (fitted, trim.then_some(placed))
+}
+
+/// The part of the rect `a` inside the rect `b`, `None` when empty.
+fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
+    let [ax, ay, aw, ah] = a;
+    let [bx, by, bw, bh] = b;
+    let (x0, y0) = (ax.max(bx), ay.max(by));
+    let (x1, y1) = ((ax + aw).min(bx + bw), (ay + ah).min(by + bh));
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// A graph's region in canvas pixels, the rect a trimmed fit cuts it to,
+/// its pivot, and its bins and cells.
 struct Geometry {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    clip: Option<[f32; 4]>,
     pivot: [f32; 2],
     n: u32,
     scale: u32,
@@ -352,20 +433,33 @@ fn f64_of(v: i64) -> f64 {
 }
 
 impl Geometry {
-    fn new([x, y, w, h]: [f32; 4], [fx, fy]: [f32; 2], n: u32, scale: u32) -> Self {
+    /// The region `fitted`, cut to `clip` when trimmed, its pivot at
+    /// `[fx, fy]` of the region it draws.
+    fn new(
+        fitted @ [x, y, w, h]: [f32; 4],
+        clip: Option<[f32; 4]>,
+        [fx, fy]: [f32; 2],
+        n: u32,
+        scale: u32,
+    ) -> Self {
+        let [dx, dy, dw, dh] = clip
+            .map_or(Some(fitted), |c| intersect(fitted, c))
+            .unwrap_or(fitted);
         Self {
             x,
             y,
             w,
             h,
-            pivot: [x + fx * w, y + fy * h],
+            clip,
+            pivot: [dx + fx * dw, dy + fy * dh],
             n: n.max(1),
             scale: scale.max(1),
         }
     }
 
-    /// Pushes the canvas rect `rect` of the graph in `color`, turned with
-    /// the brush's angle about the graph's pivot; `false` when refused.
+    /// Pushes the canvas rect `rect` of the graph in `color`, cut with
+    /// its uv to a trimmed fit's rect, turned with the brush's angle about
+    /// the graph's pivot; `false` when refused.
     fn push(
         &self,
         brush: &Brush,
@@ -375,6 +469,20 @@ impl Geometry {
         filter: crate::quad::Filter,
         out: &mut QuadBatch,
     ) -> bool {
+        let (rect, f) = match self.clip {
+            None => (rect, f),
+            Some(clip) => {
+                let Some(cut @ [cx, cy, cw, ch]) = intersect(rect, clip) else {
+                    return true;
+                };
+                let [x, y, w, h] = rect;
+                let [l, t, r, b] = f.uv;
+                let u = |at: f32| l + (r - l) * (at - x) / w;
+                let v = |at: f32| t + (b - t) * (at - y) / h;
+                let uv = [u(cx), v(cy), u(cx + cw), v(cy + ch)];
+                (cut, FrameUv { uv, layer: f.layer })
+            }
+        };
         let b = Brush { color, ..*brush };
         b.push_placed(out, rect, self.pivot, f, filter)
     }
@@ -443,7 +551,33 @@ impl Geometry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE, LINE, LINE_60, Rgba8, scale, stripe};
+    use super::{BASE, Brush, LINE, LINE_60, Rgba8, region, scale, stripe};
+    use crate::place::{Affine, LaneMap, Native};
+    use crate::quad::{Blend, RunKey};
+
+    /// The shared region fits a graph to the brush's native size with the
+    /// texture's own dimensions: a 301 × 30 texture (a distribution's)
+    /// kept 301 × 30 in a 600 × 100 rect, centred; none keeps the rect.
+    #[test]
+    fn the_shared_region_fits_the_actual_texture() {
+        let brush = |native| Brush {
+            key: RunKey {
+                blend: Blend::Alpha,
+                clip: None,
+            },
+            affine: Affine::IDENTITY,
+            map: LaneMap::IDENTITY,
+            pivot: [0.0; 2],
+            angle: 0.0,
+            color: [1.0; 4],
+            native,
+            scale: 1.0,
+        };
+        let rect = [100.0, 50.0, 600.0, 100.0];
+        let exact = region(rect, &brush(Some(Native::Exact([0, 0]))), [301, 30]);
+        assert_eq!(exact, [249.5, 85.0, 301.0, 30.0]);
+        assert_eq!(region(rect, &brush(None), [301, 30]), rect);
+    }
 
     /// The source's background colours: the base, then bands `111100`,
     /// `232300`, …; lines `1f1f1f` and `3f3f3f`.
