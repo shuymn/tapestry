@@ -113,7 +113,9 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         114 => count("count.poor"),
         150 | 170 => v("best.ex", BEST, (0, M)),
         154 => count("result.next_rank"),
-        172 => v("best.ex_diff", BEST, (-M, M)),
+        // One function in the source (`IntegerPropertyFactory.java:197`,
+        // `:232`): the EX score less the best's.
+        152 | 172 => v("best.ex_diff", BEST, (-M, M)),
         // Hidden with no previous BP, as the source's `MIN_VALUE`
         // (`IntegerPropertyFactory.java:712-732`).
         176 => v("best.bp", BEST, (HIDDEN, M)),
@@ -147,8 +149,14 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             (0, 59),
         ),
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
-        // The clock is no result fact; no score target; no IR.
-        21..=25 | 151 | 153 | 157 | 158 | 179 | 180 | 182 | 380..=399 => return Some(Omit),
+        // The clock is no result fact; no score target; no IR. The best's
+        // max combo (173, and 175 the difference from it) is not kept with
+        // a best; the mean absolute duration (372-373, the source's
+        // `getAverageDuration`, misses at 1 s, `play/BMSPlayer.java:918-936`)
+        // is not projected.
+        21..=25 | 151 | 153 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 372 | 373 | 380..=399 => {
+            return Some(Omit);
+        }
         _ => return None,
     }))
 }

@@ -34,7 +34,8 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
         .collect()
 }
 
-/// §A's numeric ids: 48 N, 32 D.
+/// §A's numeric ids and the source's bundled skin's five more (S10-09i):
+/// 49 N, 36 D.
 const NUMERIC: &[(i32, i32, C)] = &[
     (21, 25, C::D),
     (71, 71, C::N),
@@ -46,10 +47,13 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (110, 114, C::N),
     (150, 150, C::N),
     (151, 151, C::D),
+    (152, 152, C::N),
     (153, 153, C::D),
     (154, 154, C::N),
     (157, 158, C::D),
     (170, 172, C::N),
+    (173, 173, C::D),
+    (175, 175, C::D),
     (176, 176, C::N),
     (178, 178, C::N),
     (179, 180, C::D),
@@ -57,6 +61,7 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (183, 184, C::N),
     (368, 368, C::N),
     (370, 371, C::N),
+    (372, 373, C::D),
     (374, 375, C::N),
     (380, 399, C::D),
     (407, 407, C::N),
@@ -136,7 +141,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (48, 32));
+    assert_eq!((count(C::N), count(C::D)), (49, 36));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.

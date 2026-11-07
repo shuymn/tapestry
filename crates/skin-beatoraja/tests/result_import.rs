@@ -775,3 +775,29 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
         other => panic!("{other:?}"),
     }
 }
+
+/// S10-09i: number 152, the EX score's difference from the best, draws
+/// the best's difference as 172 does (`IntegerPropertyFactory.java:197`,
+/// `:232`, one function), and nothing without a best.
+#[test]
+fn number_152_is_the_best_difference() {
+    let d = folder(&format!(
+        r#""value": [{}, {}, {}],
+           "destination": [{}, {}, {}, {}]"#,
+        value("ex", r#""ref": 71"#),
+        value("d152", r#""ref": 152"#),
+        value("d172", r#""ref": 172"#),
+        dst("ex", ""),
+        r#"{"id": "d152", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]}"#,
+        r#"{"id": "d172", "dst": [{"x": 0, "y": 200, "w": 4, "h": 8}]}"#,
+        dst("dot", r#""op": [90],"#),
+    ));
+    let i = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut r = Res::new(i.skin);
+    r.view(&ready(1_000, true, best(ResultNumber::Shown(-3))));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "100");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "100");
+    r.view(&ready(1_000, true, BestView::Unavailable));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
+}
