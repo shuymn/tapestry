@@ -81,6 +81,9 @@ pub struct Survey {
     /// What the import made of each destination ([`ledger`]), only when
     /// asked for developer-local detail.
     pub destinations: Vec<DestinationEntry>,
+    /// A result import drawn over [`Choice::result`], when one was given
+    /// and the import completed.
+    pub frames: Option<Frames>,
 }
 
 /// A configuration by the names the skin gives it.
@@ -99,6 +102,72 @@ pub struct Resolved {
 pub struct Choice {
     pub options: Vec<(String, String)>,
     pub files: Vec<(String, String)>,
+    /// A result view a result import is drawn over once imported
+    /// ([`Survey::frames`]).
+    pub result: Option<skin_model::ResultView>,
+}
+
+/// A result import drawn over [`Choice::result`]: its widget charge, its
+/// quad capacity, and over frames at 0, 0.25, 1 and 5 s of the screen
+/// timer the most quads one drew, the quads every one dropped, and the
+/// last one's chip quads (drawn on a chip grid).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Frames {
+    pub widget_quads: u32,
+    pub capacity: u32,
+    pub most: usize,
+    pub dropped: u32,
+    pub chips: usize,
+}
+
+/// Generous atlas limits for drawing a surveyed skin.
+const SURVEY_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
+    max_side: 8_192,
+    max_layers: 64,
+    reserved_layers: 1,
+};
+
+/// `skin` drawn over `view` ([`Frames`]); `None` when its atlas cannot
+/// be built or a build is refused.
+fn frames(
+    skin: &skin_model::Skin,
+    widget_quads: u32,
+    view: &skin_model::ResultView,
+) -> Option<Frames> {
+    use skin_model::{Filter, Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers, Variant};
+    let atlas = skin.atlas(Variant::Lo, SURVEY_LIMITS, &|| false).ok()?;
+    let mut res = skin.prepare_result();
+    skin.update_result(&mut res, view, &ResultLabels::default())
+        .ok()?;
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut f = Frames {
+        widget_quads,
+        capacity: skin.quad_capacity(),
+        ..Frames::default()
+    };
+    let layout = Layout::AUTHOR;
+    for ms in [0, 250, 1_000, 5_000] {
+        batch.clear();
+        let frame = ResultFrame {
+            now: bms_model::TimeUs(ms * 1_000),
+            target: [1_920, 1_080],
+            layout: &layout,
+            timers: ResultTimers {
+                screen: Some(bms_model::TimeUs(0)),
+                fadeout: None,
+            },
+        };
+        skin.build_result(&mut res, &frame, atlas.uvs(), &mut batch)
+            .ok()?;
+        f.most = f.most.max(batch.quads().len());
+        f.dropped = f.dropped.saturating_add(batch.dropped());
+        f.chips = batch
+            .quads()
+            .iter()
+            .filter(|q| q.filter == Filter::NearestBase)
+            .count();
+    }
+    Some(f)
 }
 
 /// A callback where the import consumed it, or a callable it classified
@@ -545,6 +614,12 @@ pub fn survey_with(
             for n in &imported.report.notes {
                 *s.notes.entry(note(&n.kind)).or_default() += 1;
             }
+            if kind == ScreenKind::Result
+                && let Some(view) = &choice.result
+            {
+                let charge = imported.report.usage.widget_quads;
+                s.frames = frames(&imported.skin, charge, view);
+            }
         }
         Err(Stop::Pending(fact)) => s.outcome = format!("pending {fact:?}"),
         Err(Stop::Fault(e)) => {
@@ -876,6 +951,7 @@ mod tests {
         let choice = Choice {
             options: vec![("fc".to_owned(), "on".to_owned())],
             files: Vec::new(),
+            result: None,
         };
         let s = ledger_survey(&d, true, &choice);
         assert_eq!(s.outcome, "imported");
@@ -887,6 +963,7 @@ mod tests {
         let bad = Choice {
             options: vec![("fc".to_owned(), "never".to_owned())],
             files: Vec::new(),
+            result: None,
         };
         let s = ledger_survey(&d, true, &bad);
         assert_eq!(s.outcome, "config: option \"fc\" has no item \"never\"");
@@ -996,6 +1073,7 @@ mod tests {
         let choice = Choice {
             options: Vec::new(),
             files: vec![("named".to_owned(), "b.png".to_owned())],
+            result: None,
         };
         let s = ledger_survey(&d, true, &choice);
         assert_eq!(s.outcome, "imported");

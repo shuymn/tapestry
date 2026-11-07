@@ -2,15 +2,20 @@
 //! for the developer's PC:
 //! `lua_report [--autoplay on|off]
 //! [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>|pending]
-//! [--option <name> <item>]... [--file <name> <candidate>]... [--local]
-//! <root> <entry> [<root> <entry>]...`
+//! [--result dense] [--option <name> <item>]... [--file <name> <candidate>]...
+//! [--local] <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin, `entry` relative to its skin folder `root`,
 //! with its default configuration, but for what `--option` and `--file`
 //! name, on the scene of the kind its header names, against import facts
 //! with autoplay, the chart's judgment class and its play level as given
 //! (`none` for a chart in no class, `pending` for a level the base
 //! snapshot has pending; each
-//! unavailable when not given), and prints its kind, what did not convert
+//! unavailable when not given) and, with `--result dense`, a result
+//! scene's view known: a ready result with a known best and dense
+//! timelines (512 bins of 2 s, every channel 9 and 19 notes unjudged), over
+//! which a result skin that imports is then drawn (its widget charge,
+//! quad capacity, the most quads a frame drew, the quads dropped and the
+//! chip quads); and prints its kind, what did not convert
 //! as allowlisted counts and outcomes, how many script and unread-entry
 //! roots its configured table holds, a record per callback consumer
 //! (where it is defined, its field, role, disposition and reason, why a
@@ -31,14 +36,18 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use bms_model::TimeUs;
 use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{Choice, DestinationEntry, Local, Survey, survey_with};
-use skin_model::ScreenKind;
+use skin_model::{
+    BestFigures, BestRate, BestView, LampKey, ResultChart, ResultFields, ResultNumber, ResultScore,
+    ResultStatus, ResultView, ScreenKind, Timelines, TimingStats,
+};
 
 const USAGE: &str = "usage: lua_report [--autoplay on|off] \
                      [--class veryhard|hard|normal|easy|veryeasy|none] \
-                     [--level <n>|pending] [--option <name> <item>]... \
+                     [--level <n>|pending] [--result dense] [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...";
 
 fn usage() -> ! {
@@ -66,6 +75,15 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
             }
             [flag, rest @ ..] if flag == "--local" => {
                 local = true;
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--result" => {
+                if v != "dense" {
+                    return None;
+                }
+                let view = dense_view();
+                facts.result = Fact::Known(ResultFields::of(&view));
+                choice.result = Some(view);
                 args = rest;
             }
             [flag, v, rest @ ..] if flag == "--autoplay" => {
@@ -98,6 +116,46 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
             [flag, ..] if flag.starts_with("--") => return None,
             _ => return Some((facts, choice, local, args)),
         }
+    }
+}
+
+/// The view `--result dense` gives: a ready result with every best value
+/// known, timing statistics, and dense timelines (512 bins of 2 s, each
+/// channel 9 and 100 notes a bin, 19 of them unjudged).
+fn dense_view() -> ResultView {
+    let bins = vec![[9; skin_model::TIMELINE_CHANNELS]; skin_model::MAX_TIMELINE_BINS];
+    let notes = vec![100; skin_model::MAX_TIMELINE_BINS];
+    ResultView {
+        status: ResultStatus::Ready,
+        chart: ResultChart::default(),
+        score: ResultScore {
+            clear: LampKey::Normal,
+            cleared: true,
+            ..ResultScore::default()
+        },
+        best: BestView::Known(BestFigures {
+            ex: 900,
+            ex_diff: 100,
+            bp: ResultNumber::Shown(23),
+            bp_diff: ResultNumber::Shown(-3),
+            clear: LampKey::Hard,
+            ex_updated: true,
+            bp_updated: true,
+            rate: Some(BestRate {
+                rate_bp: 7_500,
+                grade: 5,
+                updated: true,
+            }),
+        }),
+        timing: Some(TimingStats {
+            samples: 500,
+            mean_x100: -149,
+            sd_x100: 1_234,
+        }),
+        timelines: Timelines::new(TimeUs(2_000_000), bins, notes, None).ok(),
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 
@@ -235,6 +293,12 @@ fn report(index: usize, survey: &Survey) -> String {
             line(l);
         }
     }
+    if let Some(f) = &survey.frames {
+        line(&format!(
+            "  frames: widget charge {} capacity {} most quads {} dropped {} chips {}",
+            f.widget_quads, f.capacity, f.most, f.dropped, f.chips
+        ));
+    }
     for (label, n) in &survey.facts {
         line(&format!("  fact {label}: {n}"));
     }
@@ -307,6 +371,62 @@ mod tests {
         assert_eq!(facts(&a).unwrap().0.play_level, Fact::Unavailable);
     }
 
+    /// `--result dense` makes a result scene's view known, and a result
+    /// skin that imports with it is drawn over it: its judge graph's chips,
+    /// every bin's grey and channels, are in the frame, nothing dropped.
+    #[test]
+    fn a_result_import_with_the_result_flag_draws_its_judge_graph() {
+        let a = args("--result dense root s.luaskin");
+        let (f, choice, _, rest) = facts(&a).unwrap();
+        assert!(matches!(f.result, Fact::Known(_)));
+        assert!(choice.result.is_some());
+        assert_eq!(rest, ["root", "s.luaskin"]);
+        let d = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([255; 4]))
+            .save(d.path().join("a.png"))
+            .unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             local gap = ms.number(178) < 0 and 0 or 10\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"dot\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }\n\
+             skin.value = { { id = \"ex\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, \
+                 digit = 4, ref = 71 } }\n\
+             skin.judgegraph = { { id = \"g\", type = 2 } }\n\
+             skin.destination = {\n\
+               { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },\n\
+               { id = \"dot\", op = { 90 }, dst = { { x = gap, y = 300, w = 8, h = 8 } } },\n\
+               { id = \"g\", dst = { { x = 0, y = 400, w = 520, h = 82 } } } }\n\
+             return skin\n",
+        )
+        .unwrap();
+        let s = survey_with(d.path(), "s.luaskin", &f, &Cancel::new(), false, &choice);
+        assert_eq!(s.outcome, "imported");
+        let frames = s.frames.unwrap();
+        assert_eq!(frames.chips, 512 * 10);
+        assert_eq!(frames.dropped, 0);
+        assert!(frames.widget_quads >= 5_702);
+        let printed = report(0, &s);
+        assert!(printed.contains("  frames: widget charge "), "{printed}");
+        // Without the flag the best's BP difference is unavailable: the
+        // skin reading it while it loads stops the import.
+        let plain_args = args("root s.luaskin");
+        let plain = facts(&plain_args).unwrap();
+        let s = survey_with(
+            d.path(),
+            "s.luaskin",
+            &plain.0,
+            &Cancel::new(),
+            false,
+            &plain.1,
+        );
+        assert_ne!(s.outcome, "imported");
+        assert!(s.frames.is_none());
+    }
+
     #[test]
     fn local_is_a_flag_of_its_own_among_the_others() {
         for a in ["--local root s", "--autoplay on --local --level 3 root s"] {
@@ -336,6 +456,7 @@ mod tests {
             "--level",
             "--autoplay maybe root s",
             "--class 2 root s",
+            "--result ready root s",
             "--rank 2 root s",
             "--other 1 root s",
             "--locals root s",
