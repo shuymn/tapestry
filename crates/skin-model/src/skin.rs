@@ -1447,10 +1447,11 @@ impl Skin {
     /// Loads a result skin: the checks of [`new`](Self::new) over the
     /// result schema and its timers, and its widgets in `widgets`. An
     /// element may draw an image, an image choice, a number, a text of the
-    /// chart or a judge graph; the lanes, a gauge, a judge, a cover paint,
-    /// the song list, a ratio bar or a selection text is refused
-    /// ([`LoadError::SourceKind`]). Every judge graph's images exist, and
-    /// each judge graph element is charged its worst quads.
+    /// chart, a judge graph, a gauge graph or a timing distribution; the
+    /// lanes, a gauge, a judge, a cover paint, the song list, a ratio bar
+    /// or a selection text is refused ([`LoadError::SourceKind`]). Every
+    /// graph's images exist, and each graph element is charged its worst
+    /// quads.
     ///
     /// # Errors
     ///
@@ -3106,12 +3107,14 @@ impl Skin {
     }
 
     /// Fills `res` from `view` and the chart's `labels`: the fields, the
-    /// timing statistics, the timelines and the strings its text shows.
+    /// timing statistics, the timelines, the gauge history, the
+    /// deviations, the judge areas and the strings its text shows.
     /// The chart's fields follow the view under every status; the result's,
     /// the timing's and the best's are valid only while the view is ready,
     /// and the best's only while it is known; a hidden best value reads
     /// `i32::MIN`. For a view change, not a frame: it may allocate, at most
-    /// the strings' growth and the timelines' copy. The texts stay as
+    /// the strings' growth and the timelines' copy; the gauge history and
+    /// the deviations are copied into storage the state already holds. The texts stay as
     /// attached until a new table is.
     ///
     /// # Errors
@@ -3191,7 +3194,8 @@ impl Skin {
     /// from the frame's starts and the `when` timers over the fields,
     /// places the regions, then appends each drawn element's quads to `out`
     /// in draw order (the caller clears `out`): images, image choices,
-    /// numbers and text. A number draws nothing for `i32::MIN` or
+    /// numbers, text, judge graphs, gauge graphs and timing
+    /// distributions. A number draws nothing for `i32::MIN` or
     /// `i32::MAX`. Allocates nothing.
     ///
     /// A state this skin did not make, or a uv table of another sheet or
