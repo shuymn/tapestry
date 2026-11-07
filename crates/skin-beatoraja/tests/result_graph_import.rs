@@ -416,3 +416,320 @@ fn a_distributions_stretch_fits_it_and_a_gauge_graphs_changes_nothing() {
         assert_eq!(gg(stretch), plain, "stretch {stretch}");
     }
 }
+
+/// An opaque colour whose three channels differ, as `rrggbbff`.
+fn hex(r: u8, g: u8, b: u8) -> String {
+    format!("{r:02x}{g:02x}{b:02x}ff")
+}
+
+/// `rrggbbff` as 8-bit RGBA.
+fn rgba(h: &str) -> [u8; 4] {
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap();
+    [byte(0), byte(2), byte(4), byte(6)]
+}
+
+/// A ready view of `look` whose first 144 columns sit flat at 50 % (the
+/// line below the 80 % border) and the rest at 90 % (above it).
+fn split_view(look: GaugeLook) -> ResultView {
+    let at = |p| GaugeColumn {
+        low: pct(p),
+        high: pct(p),
+        last: pct(p),
+    };
+    let mut columns = [at(50); GRAPH_COLUMNS];
+    for c in &mut columns[144..] {
+        *c = at(90);
+    }
+    columns[144].low = pct(50);
+    let mut v = view(look);
+    v.gauge.as_mut().unwrap().columns = columns;
+    v
+}
+
+/// The gauge graph's colours in a frame of the region (x 100, top 280,
+/// 576 × 200, border at y 321.6): the back below the border, the back
+/// above it, every line piece below the border, every one above it.
+fn gauge_roles(quads: &[Quad]) -> ([u8; 4], [u8; 4], Vec<[u8; 4]>, Vec<[u8; 4]>) {
+    let rgb = |q: &Quad| q.color.map(|c| (c * 255.0).round() as u8);
+    let inside = |q: &&Quad| q.rect[0] >= 99.0 && q.rect[1] >= 279.0 && q.rect[1] < 481.0;
+    let backs: Vec<&Quad> = quads
+        .iter()
+        .filter(inside)
+        .filter(|q| q.rect[2] == 576.0)
+        .collect();
+    let low = backs
+        .iter()
+        .max_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+        .unwrap();
+    let high = backs
+        .iter()
+        .min_by(|a, b| a.rect[1].total_cmp(&b.rect[1]))
+        .unwrap();
+    let yb = 480.0 - 0.8 * 198.0;
+    let mut below = Vec::new();
+    let mut above = Vec::new();
+    for q in quads.iter().filter(inside).filter(|q| q.rect[2] < 576.0) {
+        let c = rgb(q);
+        if q.rect[1] >= yb - 1e-3 {
+            below.push(c);
+        } else if q.rect[1] + q.rect[3] <= yb + 1e-3 {
+            above.push(c);
+        }
+    }
+    for v in [&mut below, &mut above] {
+        v.sort_unstable();
+        v.dedup();
+    }
+    (rgb(low), rgb(high), below, above)
+}
+
+/// C24: every gauge graph colour role reaches its look, JSON and Lua
+/// alike. The 14 named fields, each a distinct opaque colour: the first
+/// three looks draw their own back below the border and line below it,
+/// and share `borderColor` (back above) and `borderlineColor` (line
+/// above); the last three draw their own back and line on both sides.
+/// The 24-entry array gives look `i` entries `4i` to `4i + 3`: border
+/// line, border back, line, back.
+#[test]
+fn every_gauge_graph_colour_reaches_its_role() {
+    let names: Vec<(&str, String)> = [
+        "assistClearBGColor",
+        "assistAndEasyFailBGColor",
+        "grooveFailBGColor",
+        "grooveClearAndHardBGColor",
+        "exHardBGColor",
+        "hazardBGColor",
+        "assistClearLineColor",
+        "assistAndEasyFailLineColor",
+        "grooveFailLineColor",
+        "grooveClearAndHardLineColor",
+        "exHardLineColor",
+        "hazardLineColor",
+        "borderlineColor",
+        "borderColor",
+    ]
+    .into_iter()
+    .zip(0_u8..)
+    .map(|(n, i)| (n, hex(10 + i, 100 + i, 200 + i)))
+    .collect();
+    let json_fields = names
+        .iter()
+        .map(|(n, c)| format!(r#""{n}": "{c}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lua_fields = names
+        .iter()
+        .map(|(n, c)| format!("{n} = \"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let c = |i: usize| rgba(&names[i].1);
+    let dst = format!(r#"{{"id": "gg", {GAUGE_DST}}}"#);
+    let lua_dst = "{ id = \"gg\", dst = { { x = 100, y = 600, w = 576, h = 200 } } }";
+    for (i, look) in GaugeLook::ALL.into_iter().enumerate() {
+        let j = json(
+            &format!(r#""gaugegraph": [{{"id": "gg", {json_fields}}}],"#),
+            &dst,
+        );
+        let l = lua(
+            &format!("skin.gaugegraph = {{ {{ id = \"gg\", {lua_fields} }} }}"),
+            lua_dst,
+        );
+        let v = split_view(look);
+        let (qj, ql) = (frame(j, &v, 2_000), frame(l, &v, 2_000));
+        assert_eq!(qj, ql, "{look:?}");
+        let (back, border_back, line, border_line) = if i < 3 {
+            (c(i), c(13), c(6 + i), c(12))
+        } else {
+            (c(i), c(i), c(6 + i), c(6 + i))
+        };
+        assert_eq!(
+            gauge_roles(&qj),
+            (back, border_back, vec![line], vec![border_line]),
+            "{look:?}"
+        );
+    }
+    let entries: Vec<String> = (0..24_u8).map(|i| hex(10 + i, 60 + i, 110 + i)).collect();
+    let json_array = entries
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (i, look) in GaugeLook::ALL.into_iter().enumerate() {
+        let j = json(
+            &format!(r#""gaugegraph": [{{"id": "gg", "color": [{json_array}]}}],"#),
+            &dst,
+        );
+        let l = lua(
+            &format!("skin.gaugegraph = {{ {{ id = \"gg\", color = {{ {json_array} }} }} }}"),
+            lua_dst,
+        );
+        let v = split_view(look);
+        let (qj, ql) = (frame(j, &v, 2_000), frame(l, &v, 2_000));
+        assert_eq!(qj, ql, "{look:?}");
+        let e = |k: usize| rgba(&entries[4 * i + k]);
+        assert_eq!(
+            gauge_roles(&qj),
+            (e(3), e(1), vec![e(2)], vec![e(0)]),
+            "{look:?}"
+        );
+    }
+}
+
+/// Judge areas small enough that a 301-column graph shows all five:
+/// PERFECT ±10 ms, GREAT ±20, GOOD ±30, BAD ±40, the empty POOR range
+/// −60 to +60.
+const SMALL_AREAS: [[i16; 2]; 5] = [[-10, 10], [-20, 20], [-30, 30], [-40, 40], [-60, 60]];
+
+/// A ready view with the timing statistics of a −1.49 ms mean and a
+/// 12.34 ms σ (the average at ms −1, the ±σ lines at ms 11 and −13), five
+/// deviations at ms −70 (a bar half the height at scale 10), and
+/// [`SMALL_AREAS`].
+fn stats_view() -> ResultView {
+    let mut d = [0; DEVIATION_SLOTS];
+    d[80] = 5;
+    ResultView {
+        deviations: Some(Box::new(d)),
+        timing_areas: Some(SMALL_AREAS),
+        timing: Some(skin_model::TimingStats {
+            samples: 5,
+            mean_x100: -149,
+            sd_x100: 1_234,
+        }),
+        ..view(GaugeLook::Normal)
+    }
+}
+
+/// The distribution's colour at ms `ms`, `row` (from the top, 10 pixels
+/// each at scale 10) in the region of x 100, top 780, 301 × 100.
+fn at_ms(quads: &[Quad], ms: i32, row: f32) -> Option<[u8; 4]> {
+    colour_at(quads, 250.5 + ms as f32, 780.0 + row * 10.0 + 5.0)
+}
+
+/// The eight distribution colour fields, each a distinct opaque colour.
+fn timing_fields() -> Vec<(&'static str, String)> {
+    [
+        "graphColor",
+        "averageColor",
+        "devColor",
+        "PGColor",
+        "GRColor",
+        "GDColor",
+        "BDColor",
+        "PRColor",
+    ]
+    .into_iter()
+    .zip(0_u8..)
+    .map(|(n, i)| (n, hex(20 + i, 120 + i, 220 - i)))
+    .collect()
+}
+
+/// A distribution's JSON and Lua records with `fields` and `more`.
+fn timing_records(fields: &[(&str, String)], more_json: &str, more_lua: &str) -> (String, String) {
+    let j = fields
+        .iter()
+        .map(|(n, c)| format!(r#""{n}": "{c}""#))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let l = fields
+        .iter()
+        .map(|(n, c)| format!("{n} = \"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (
+        format!(r#""timingdistributiongraph": [{{"id": "td", {j}{more_json}}}],"#),
+        format!("skin.timingdistributiongraph = {{ {{ id = \"td\", {l}{more_lua} }} }}"),
+    )
+}
+
+const TIMING_LUA_DST: &str = "{ id = \"td\", dst = { { x = 100, y = 200, w = 301, h = 100 } } }";
+
+/// C24: every distribution colour reaches its role, JSON and Lua alike:
+/// the bar at ms −70, the average line at ms −1, the ±σ line at ms 11,
+/// and the areas PERFECT (ms 5), GREAT (15), GOOD (25), BAD (35) and POOR
+/// (55), each away from the ticks.
+#[test]
+fn every_distribution_colour_reaches_its_role() {
+    let fields = timing_fields();
+    let (tj, tl) = timing_records(&fields, "", "");
+    let dst = format!(r#"{{"id": "td", {TIMING_DST}}}"#);
+    let v = stats_view();
+    let qj = frame(json(&tj, &dst), &v, 0);
+    let ql = frame(lua(&tl, TIMING_LUA_DST), &v, 0);
+    assert_eq!(qj, ql);
+    let c = |i: usize| Some(rgba(&fields[i].1));
+    assert_eq!(at_ms(&qj, -70, 9.0), c(0), "bar");
+    assert_eq!(at_ms(&qj, -1, 5.0), c(1), "average");
+    assert_eq!(at_ms(&qj, 11, 5.0), c(2), "σ");
+    for (k, ms) in [5, 15, 25, 35, 55].into_iter().enumerate() {
+        assert_eq!(at_ms(&qj, ms, 5.0), c(3 + k), "area {k}");
+    }
+}
+
+/// `drawAverage` and `drawDev` are each on only at 1, JSON and Lua alike:
+/// at −1, 0, 1 and 2 (the other flag 0), the average column at ms −1 and
+/// the σ column at ms 11 show their line only at 1, else the area under
+/// them (PERFECT, GREAT).
+#[test]
+fn the_line_flags_are_on_only_at_one() {
+    let fields = timing_fields();
+    let c = |i: usize| Some(rgba(&fields[i].1));
+    let dst = format!(r#"{{"id": "td", {TIMING_DST}}}"#);
+    let v = stats_view();
+    for flag in [-1, 0, 1, 2] {
+        for (name, ms, line, area) in [("drawAverage", -1, 1, 3), ("drawDev", 11, 2, 4)] {
+            let other = if name == "drawAverage" {
+                "drawDev"
+            } else {
+                "drawAverage"
+            };
+            let (tj, tl) = timing_records(
+                &fields,
+                &format!(r#", "{name}": {flag}, "{other}": 0"#),
+                &format!(", {name} = {flag}, {other} = 0"),
+            );
+            let qj = frame(json(&tj, &dst), &v, 0);
+            let ql = frame(lua(&tl, TIMING_LUA_DST), &v, 0);
+            assert_eq!(qj, ql, "{name} {flag}");
+            let want = if flag == 1 { c(line) } else { c(area) };
+            assert_eq!(at_ms(&qj, ms, 5.0), want, "{name} {flag}");
+        }
+    }
+}
+
+/// C25: the distribution's columns are `width / lineWidth`, `lineWidth`
+/// clamped to `1..=width`, and its charge follows them: width 301 at
+/// line width 2 makes 150 columns (centre 75, each 301/150 pixels), so
+/// PERFECT ends at ms 10 (column 85) and GREAT starts at ms 11 (column
+/// 86), charged 5·150 + 11; line widths 0 and −5 clamp to 1 (301
+/// columns, ms 10 PERFECT at x 260.5, ms 11 GREAT), charged 1 516; line
+/// width 1 000 clamps to 301, one column of ms 0 over the whole width,
+/// charged 5 + 11. The number of the essentials adds 4.
+#[test]
+fn the_columns_divide_and_clamp_as_the_source() {
+    let fields = timing_fields();
+    let c = |i: usize| Some(rgba(&fields[i].1));
+    let dst = format!(r#"{{"id": "td", {TIMING_DST}}}"#);
+    let mut v = stats_view();
+    v.timing = None;
+    let case = |line: i32| {
+        let (tj, _) = timing_records(&fields, &format!(r#", "lineWidth": {line}"#), "");
+        let j = json(&tj, &dst);
+        let charge = j.report.usage.widget_quads;
+        (frame(j, &v, 0), charge)
+    };
+    let (q, charge) = case(2);
+    assert_eq!(charge, 4 + 5 * 150 + 11);
+    let col = |j: f32| 100.0 + 301.0 * (j + 0.5) / 150.0;
+    assert_eq!(colour_at(&q, col(85.0), 830.0), c(3));
+    assert_eq!(colour_at(&q, col(86.0), 830.0), c(4));
+    for line in [0, -5] {
+        let (q, charge) = case(line);
+        assert_eq!(charge, 4 + 1_516, "{line}");
+        assert_eq!(at_ms(&q, 10, 5.0), c(3), "{line}");
+        assert_eq!(at_ms(&q, 11, 5.0), c(4), "{line}");
+    }
+    let (q, charge) = case(1_000);
+    assert_eq!(charge, 4 + 5 + 11);
+    assert_eq!(colour_at(&q, 101.0, 830.0), c(3));
+    assert_eq!(colour_at(&q, 400.0, 830.0), c(3));
+}

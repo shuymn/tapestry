@@ -198,7 +198,8 @@ fn notes(r: &Report) -> Vec<(Severity, NoteKind)> {
 /// hidden (a number draws nothing, an expression reads `i32::MIN`) and
 /// unavailable (nothing drawn under its validity); the chart's fields stay
 /// with no result; the lane index is 0; the fade-out timer runs and the
-/// IR's never does; the gauge graph is kept on both paths, with no note.
+/// IR's never does; the gauge graph is kept on both paths, with no note,
+/// and draws a gauge history.
 #[test]
 fn json_and_lua_draw_the_same_result_frames() {
     let j = folder(&json_body());
@@ -219,6 +220,31 @@ fn json_and_lua_draw_the_same_result_frames() {
         b.view(v);
         let ours: Vec<_> = b.frame(0).into_iter().filter(lua_only).collect();
         assert_eq!(a.frame(0), ours, "view {i}");
+    }
+    // The gauge graph is drawn on both paths: with a gauge history, its
+    // back above the border spans its 8-wide rect from the top (y 272).
+    let mut with_gauge = views()[0].clone();
+    let flat = skin_model::GaugeColumn {
+        low: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+        high: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+        last: rules::GaugeValue(50 * rules::GaugeValue::PERCENT),
+    };
+    with_gauge.gauge = Some(Box::new(skin_model::GaugeHistory {
+        columns: [flat; skin_model::GRAPH_COLUMNS],
+        max: rules::GaugeValue(100 * rules::GaugeValue::PERCENT),
+        border: rules::GaugeValue(80 * rules::GaugeValue::PERCENT),
+        look: skin_model::GaugeLook::Normal,
+        reached: 288,
+        no_input_from: None,
+    }));
+    for r in [&mut a, &mut b] {
+        r.view(&with_gauge);
+        let gauge = r
+            .frame(2_000)
+            .into_iter()
+            .filter(|q| q.rect[0] == 0.0 && q.rect[1] == 272.0 && q.rect[2] == 8.0)
+            .count();
+        assert!(gauge > 0, "the gauge graph draws");
     }
     let mut frame = |v: &ResultView| {
         a.view(v);
