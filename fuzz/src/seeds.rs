@@ -1015,6 +1015,19 @@ assert(pcall(function() return string.find(ms.text(1002), "x") end))"#,
     );
     let host_write =
         lua_skin(r#"local ms = require("main_state") pcall(function() ms.number = nil end)"#);
+    // A result skin reading [`crate::result_view`]'s values while it loads:
+    // the offline constants, 17 to the next grade and no previous BP
+    // (`i32::MIN`); its EX score and a status image under option 90.
+    let result = lua_skin(
+        r#"local ms = require("main_state")
+assert(ms.option(50) and not ms.option(51) and ms.number(154) == 17)
+local x = ms.number(178) == 0 and 100 or 200
+skin.value = { { id = "ex", src = "s", w = 100, h = 10, divx = 10, digit = 4,
+  value = function() return ms.number(71) end } }
+skin.destination[2] = { id = "ex", dst = { { x = 0, y = 100, w = 10, h = 10 } } }
+skin.destination[3] = { id = "i", op = { 90 }, dst = { { x = x, y = 0, w = 10, h = 10 } } }"#,
+    )
+    .replace("type = 0", "type = 7");
     vec![
         ("data_only", lua_input(&[&lua_skin("")])),
         ("config", lua_input(&[&config])),
@@ -1027,6 +1040,11 @@ assert(pcall(function() return string.find(ms.text(1002), "x") end))"#,
         ("facts", {
             let mut input = lua_input(&[&facts]);
             input[0] = LUA_AUTOPLAY_OFF_LEVEL_9;
+            input
+        }),
+        ("result_facts", {
+            let mut input = lua_input(&[&result]);
+            input[0] = LUA_RESULT_SCENE;
             input
         }),
         ("callback_replaced", lua_input(&[&replaced])),
@@ -1128,11 +1146,40 @@ fn play_skin(body: &str) -> Vec<u8> {
 
 /// `skin_json` seeds that import: images, numbers, text, bitmap text,
 /// tracks, ops, offsets, a default file choice, the play objects, digit
-/// offsets, and a selection skin with its song list, its styles, a ratio
-/// bar and the selection profile's numbers and options.
+/// offsets, a selection skin with its song list, its styles, a ratio
+/// bar and the selection profile's numbers and options, and a result skin
+/// with the result profile's numbers, options, image indices and timers.
 #[must_use]
 pub fn skin_imports() -> Vec<Seed> {
     vec![
+        (
+            "result",
+            skin_input(&[r#"{"type": 7, "w": 1920, "h": 1080,
+                "source": [{"id": "strip", "path": "strip.png"}],
+                "font": [{"id": "f", "path": "font.ttf"}],
+                "image": [
+                    {"id": "b0", "src": "strip", "x": 0, "w": 10, "h": 10},
+                    {"id": "b1", "src": "strip", "x": 10, "w": 10, "h": 10}],
+                "imageset": [{"id": "clear", "ref": 370, "images": ["b0", "b1", "b0", "b1", "b0", "b1"]},
+                             {"id": "lane", "ref": 450, "images": ["b0", "b1"]}],
+                "value": [{"id": "ex", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4, "ref": 71},
+                          {"id": "bp", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 4, "ref": 178},
+                          {"id": "mean", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 3, "ref": 374},
+                          {"id": "lv", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "value": "playlevel"}],
+                "text": [{"id": "t", "font": "f", "ref": 12}],
+                "gaugegraph": [{"id": "gg"}],
+                "destination": [
+                    {"id": "ex", "dst": [{"x": 0, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "bp", "op": [332], "dst": [{"x": 0, "y": 480, "w": 10, "h": 10}]},
+                    {"id": "mean", "dst": [{"x": 0, "y": 460, "w": 10, "h": 10}]},
+                    {"id": "lv", "dst": [{"x": 0, "y": 440, "w": 10, "h": 10}]},
+                    {"id": "t", "dst": [{"x": 0, "y": 420, "w": 300, "h": 20}]},
+                    {"id": "b0", "op": [90, -51], "dst": [{"x": 200, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "b1", "op": [301], "timer": 2, "dst": [{"x": 220, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "clear", "dst": [{"x": 240, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "lane", "dst": [{"x": 260, "y": 500, "w": 10, "h": 10}]},
+                    {"id": "gg", "dst": [{"x": 0, "y": 0, "w": 300, "h": 100}]}]}"#]),
+        ),
         (
             "selection",
             skin_input(&[r#"{"type": 5, "w": 1920, "h": 1080,
