@@ -155,6 +155,11 @@ fn every_profile_id_has_its_class() {
             assert_eq!(class, None, "option {id}");
         }
     }
+    // Each is a built-in the source's factory knows, so a numeric op
+    // reaches the profile before the declared items.
+    for id in n.clone().chain(d.clone()) {
+        assert!(crate::import::ops::is_builtin(id), "option {id}");
+    }
     assert_eq!(option(160), Some(Class::Bridge(ResOption::Constant(true))));
     for id in 180..=184 {
         assert_eq!(option(id), Some(Class::Bridge(ResOption::JudgeClass)));

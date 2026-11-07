@@ -4,6 +4,7 @@
 
 pub mod lanes;
 pub mod play;
+pub mod result;
 pub mod selection;
 
 use std::fs;
