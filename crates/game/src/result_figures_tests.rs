@@ -383,3 +383,16 @@ fn a_bad_head_long_note_takes_its_heads_duration() {
     let released = judged_as(Judgment::Bad, Some(TimeUs(200_000)), Some(TimeUs(-500_000)));
     assert_eq!(mean_duration(&[released], 1), Some(500_000));
 }
+
+/// S10-09i: a judgment with no head press is a miss for the mean
+/// duration, whatever release it carries: one second, never the release's
+/// deviation alone.
+#[test]
+fn a_judgment_without_a_head_press_adds_a_second() {
+    use super::{MISSED_DURATION_US, mean_duration};
+    let headless = judged_as(Judgment::Good, None, Some(TimeUs(-3_000)));
+    assert_eq!(
+        mean_duration(&[headless], 1),
+        Some(u32::try_from(MISSED_DURATION_US).unwrap())
+    );
+}
