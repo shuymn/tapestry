@@ -172,7 +172,8 @@ pub(crate) enum ResOption {
     /// A truthful constant.
     Constant(bool),
     /// The judgment class (180 to 184): an import fact a Lua skin reads
-    /// while it loads, as on play; a frame expression has none.
+    /// while it loads; the result schema has no field for it, so a frame
+    /// condition on it is unsupported.
     JudgeClass,
 }
 

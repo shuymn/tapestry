@@ -358,7 +358,7 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
     | --- | --- | --- |
     | Numeric | 71 and 171 (EX), 74, 75, 76, 102–103, 107, 110–114, 154, 370, 374–375 (the mean truncated toward 0, under the timing's validity), 407, 410–425 (425 BAD plus POOR); 150, 170, 172, 176, 178, 183–184, 371 (the best); 90–91, 96, 368, 1163–1164 (the chart) | 21–25 (clock), 151, 153, 157–158 (score target), 179–180, 182, 380–399 (IR): omitted |
     | Text | 10, 12, 14, 16 (the chart's labels) | 3, 120–129, 1003, 1020: omitted |
-    | Option | 90–91, 300–307, 2244–2245 (the result); 320–327, 330, 332, 335 (the best); 150–155, 177 (the chart); 160 true and 161–164 false (7-key only); 180–184 (the judgment class, a load-time fact as on play) | 50, 196, 1196, 1199 and 1202 true; 51, 191, 197–198, 280–283, 289–290, 1008 and the rest of 1196–1204 false |
+    | Option | 90–91, 300–307, 2244–2245 (the result); 320–327, 330, 332, 335 (the best); 150–155, 177 (the chart); 160 true and 161–164 false (7-key only); 180–184 (the judgment class: a load-time fact; the result schema has no field for it yet, so a frame condition on it is dropped with a note, where play's reads `chart.judge_class`) | 50, 196, 1196, 1199 and 1202 true; 51, 191, 197–198, 280–283, 289–290, 1008 and the rest of 1196–1204 false |
     | Timer | 2 (the fade-out) | 0, 173–174: never set |
     | Image index | 370 (the clear type, the source's index), 371 (the best's) | 42, 450–457: 0 |
     | Event | | 42: ignored |

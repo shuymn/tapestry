@@ -505,8 +505,8 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// [`profile::option`] or the result's
 /// [`super::result::profile::option`]), negated for `negative`: its
 /// bridge, built in one allocation of [`MAX_COND_BYTES`], or its constant
-/// folded. The result's judgment class is a load-time fact, unsupported in
-/// a frame, as on play.
+/// folded. The result's judgment class is a load-time fact; the result
+/// schema has no field for it, so a frame condition on it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
     use super::result::profile::{self as result, ResOption};
     let class = if kind == ScreenKind::Result {
