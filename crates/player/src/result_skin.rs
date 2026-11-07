@@ -16,7 +16,7 @@ use render::SkinBundle;
 use rules::PerJudgment;
 use skin_beatoraja::{Cancel, Config, Fact, FactDeps, FactId, ImportFacts, LuaHeader, LuaOutcome};
 use skin_model::{
-    Atlas, BestFigures, BestRate, BestView, FileSource, LampKey, Layout, ResourceCache,
+    Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, LampKey, Layout, ResourceCache,
     ResultChart, ResultFields, ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView,
     Root, ScreenKind, Sheet, TimingStats,
 };
@@ -78,7 +78,6 @@ pub struct ImageEntry {
 
 impl ImageEntry {
     /// The atlas's shared pages.
-    #[cfg(all(test, feature = "dev-tools"))]
     pub fn pages(&self) -> &Arc<skin_model::PackedPages> {
         self.atlas.shared_pages()
     }
@@ -106,13 +105,28 @@ struct Specialized {
     entry: Option<Arc<ImageEntry>>,
 }
 
+/// Why a layout gave no specialization.
+#[derive(Debug)]
+enum Unbuilt {
+    /// Refused, with the reason: the built-in result for its view.
+    Refused(String),
+    /// Its build would make a third live atlas (Q3): it waits.
+    Deferred,
+}
+
+impl From<String> for Unbuilt {
+    fn from(why: String) -> Self {
+        Self::Refused(why)
+    }
+}
+
 /// What a layout job gives back: its request, the view it ran for, its
 /// specialization or why not, and the image entry after it (the same, a
 /// new one, or none when it dropped an unshown one).
 struct LayoutOut {
     request: u64,
     view: ViewFacts,
-    result: Result<Specialized, String>,
+    result: Result<Specialized, Unbuilt>,
     entry: Option<Arc<ImageEntry>>,
 }
 
@@ -171,6 +185,11 @@ pub struct ResultSkin {
     generation: u64,
     job: Option<(Job<LayoutOut>, u64)>,
     waiting: Option<(u64, ViewFacts)>,
+    /// A request whose build waits for an atlas to be released (Q3).
+    deferred: Option<(u64, ViewFacts)>,
+    /// The atlases the renderer still references, as it last reported
+    /// them ([`Self::set_retained`]).
+    retained: Vec<AtlasId>,
     /// The latest request, and the view it asked for.
     latest: Option<(u64, ViewFacts)>,
     next_request: u64,
@@ -271,17 +290,20 @@ fn probe_view(chart: ResultChart) -> ResultView {
 /// atlas step against `entry` (D13). When the atlas does not hold the
 /// layout's cells, a union with `base`'s (the shown generation's atlas),
 /// else the layout's cells alone, is planned first; only once a plan fits
-/// is `entry` dropped when it is not `base`, then the plan packed.
+/// is `entry` dropped when it is not `base`, then, unless the atlases live
+/// besides it (`others`, with `entry` when kept) and the new one would
+/// pass two, the plan packed (the S10-09i design's Q3).
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn layout(
     pending: &PendingResult,
     view: ViewFacts,
     entry: Option<Arc<ImageEntry>>,
     base: Option<Arc<ImageEntry>>,
+    others: Vec<AtlasId>,
     cancel: &Cancel,
-) -> (Result<Specialized, String>, Option<Arc<ImageEntry>>) {
+) -> (Result<Specialized, Unbuilt>, Option<Arc<ImageEntry>>) {
     let Some(fields) = view.0 else {
-        return (Err("the view is unavailable".to_owned()), entry);
+        return (Err("the view is unavailable".to_owned().into()), entry);
     };
     let facts = result_facts(fields);
     let imported = match pending
@@ -291,11 +313,11 @@ fn layout(
         Ok(LuaOutcome::Imported(i)) => i,
         Ok(LuaOutcome::Pending(p)) => {
             return (
-                Err(format!("the skin reads {:?}, pending here", p.pending)),
+                Err(format!("the skin reads {:?}, pending here", p.pending).into()),
                 entry,
             );
         }
-        Err(refused) => return (Err(imports::chain(&refused.0)), entry),
+        Err(refused) => return (Err(imports::chain(&refused.0).into()), entry),
     };
     let deps = imported.facts;
     let skin = imported.imported.skin;
@@ -326,7 +348,7 @@ fn layout(
                 None if skin.sheet().plan(variant, limits, text).is_ok() => skin.sheet().clone(),
                 None => {
                     return (
-                        Err("the layout's images do not fit one atlas".to_owned()),
+                        Err("the layout's images do not fit one atlas".to_owned().into()),
                         entry,
                     );
                 }
@@ -334,13 +356,20 @@ fn layout(
             // The plan fits: an image entry that is not the shown one is
             // dropped before the build.
             let entry = entry.filter(|e| base.as_ref().is_some_and(|b| Arc::ptr_eq(e, b)));
+            let mut live = others;
+            live.extend(entry.as_ref().map(|e| e.pages().id()));
+            live.sort_unstable();
+            live.dedup();
+            if live.len() + 1 > 2 {
+                return (Err(Unbuilt::Deferred), entry);
+            }
             drop(entry);
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let built =
                 match packed.atlas_reserving(variant, limits, text, &|| cancel.is_cancelled()) {
                     Ok(a) => a,
-                    Err(e) => return (Err(format!("the atlas cannot be built: {e}")), None),
+                    Err(e) => return (Err(format!("the atlas cannot be built: {e}").into()), None),
                 };
             let new = Arc::new(ImageEntry {
                 atlas: built,
@@ -348,7 +377,12 @@ fn layout(
             });
             match new.atlas.rebind(skin.sheet(), variant, text) {
                 Ok(a) => (a, Some(new)),
-                Err(e) => return (Err(format!("the layout cannot be bound: {e}")), Some(new)),
+                Err(e) => {
+                    return (
+                        Err(format!("the layout cannot be bound: {e}").into()),
+                        Some(new),
+                    );
+                }
             }
         }
     };
@@ -361,7 +395,7 @@ fn layout(
             }),
             entry,
         ),
-        Err(why) => (Err(why), entry),
+        Err(why) => (Err(why.into()), entry),
     }
 }
 
@@ -378,6 +412,45 @@ impl ResultSkin {
         match &self.start {
             Some(ResultStart::Pending(p)) => Some(p),
             _ => None,
+        }
+    }
+
+    /// The atlases live besides the image entry: the renderer's retained
+    /// set, the latest publication's binding and the layout entry's.
+    fn others(&self) -> Vec<AtlasId> {
+        let mut v = self.retained.clone();
+        if let Some(Published::Skin(b, _)) = &self.published {
+            v.push(b.atlas_pages().id());
+        }
+        if let Some(l) = &self.layout {
+            v.push(l.bundle.atlas_pages().id());
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The atlases the renderer still references, in any role (installed,
+    /// staged or taken and not yet presented, kept by a recovery
+    /// description): it replaces the set reported before. Only a later
+    /// report without an id releases it here. A deferred build is tried
+    /// again (the S10-09i design's Q3).
+    #[cfg_attr(
+        not(all(test, feature = "dev-tools")),
+        expect(dead_code, reason = "S10-09i reports what its renderer retains")
+    )]
+    pub fn set_retained(&mut self, ids: &[AtlasId]) {
+        self.retained = ids.to_vec();
+        self.retry_deferred();
+    }
+
+    /// The deferred request, asked for again unless a job runs.
+    fn retry_deferred(&mut self) {
+        if self.job.is_none()
+            && let Some((request, view)) = self.deferred.take()
+            && self.latest.map(|(r, _)| r) == Some(request)
+        {
+            self.layout_for(request, view);
         }
     }
 
@@ -434,6 +507,8 @@ impl ResultSkin {
         }
         let entry = self.image.take();
         let base = self.shown_entry();
+        self.drop_layout_bound_to(entry.as_ref());
+        let others = self.others();
         let ran = imports::run_job(
             move |cancel: &Cancel| {
                 let o = pending
@@ -472,9 +547,16 @@ impl ResultSkin {
                             Fact::Known(f) => f,
                             _ => return (None, deps, entry),
                         }));
-                        let (r, entry) = layout(&pending, view, entry, base, cancel);
+                        let (r, entry) = layout(&pending, view, entry, base, others, cancel);
                         // The probe's layout is never shown: its atlas is.
-                        (Some(r.map(|_| None)), deps, entry)
+                        (
+                            Some(r.map(|_| None).map_err(|e| match e {
+                                Unbuilt::Refused(why) => why,
+                                Unbuilt::Deferred => "deferred".to_owned(),
+                            })),
+                            deps,
+                            entry,
+                        )
                     }
                     Err(_) if !read => (Some(Err("refused".to_owned())), deps, entry),
                     _ => (None, deps, entry),
@@ -578,8 +660,10 @@ impl ResultSkin {
         // bound to an unshown one goes with it if the job drops it.
         let entry = self.image.take();
         let base = self.shown_entry();
+        self.drop_layout_bound_to(entry.as_ref());
+        let others = self.others();
         match imports::spawn_job(move |cancel: &Cancel| {
-            let (result, entry) = layout(&pending, view, entry, base, cancel);
+            let (result, entry) = layout(&pending, view, entry, base, others, cancel);
             LayoutOut {
                 request,
                 view,
@@ -592,6 +676,18 @@ impl ResultSkin {
                 log::info!("skin: result: its layout cannot start: {why}");
                 self.publish(Published::BuiltIn);
             }
+        }
+    }
+
+    /// Drops the layout entry when it is bound to `entry` and `entry` is
+    /// not shown: a build may drop that entry's pages (D13).
+    fn drop_layout_bound_to(&mut self, entry: Option<&Arc<ImageEntry>>) {
+        let shown = self.shown_entry();
+        if let (Some(e), Some(l)) = (entry, &self.layout)
+            && !shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, e))
+            && Arc::ptr_eq(l.bundle.atlas_pages(), e.pages())
+        {
+            self.layout = None;
         }
     }
 
@@ -617,7 +713,12 @@ impl ResultSkin {
                 self.layout_for(request, view);
             }
         }
-        self.job.is_none() && self.waiting.is_none()
+        // A deferred build is tried again once fewer than two atlases are
+        // live.
+        if self.deferred.is_some() && self.job.is_none() && self.others().len() < 2 {
+            self.retry_deferred();
+        }
+        self.job.is_none() && self.waiting.is_none() && self.deferred.is_none()
     }
 
     fn landed(&mut self, out: LayoutOut) {
@@ -647,7 +748,10 @@ impl ResultSkin {
                     self.layout = Some(spec);
                 }
             }
-            Err(why) if latest == Some(out.request) => {
+            Err(Unbuilt::Deferred) if latest == Some(out.request) => {
+                self.deferred = Some((out.request, out.view));
+            }
+            Err(Unbuilt::Refused(why)) if latest == Some(out.request) => {
                 log::info!("skin: result: built-in for this view: {why}");
                 self.publish(Published::BuiltIn);
             }
@@ -655,10 +759,22 @@ impl ResultSkin {
         }
     }
 
+    /// Whether a build waits for an atlas to be released.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// Whether a layout job runs.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn running(&self) -> bool {
+        self.job.is_some()
+    }
+
     /// Whether a job runs or waits.
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn busy(&self) -> bool {
-        self.job.is_some() || self.waiting.is_some()
+        self.job.is_some() || self.waiting.is_some() || self.deferred.is_some()
     }
 
     /// Cancels the job, if any, and waits for its thread: with no bound
@@ -667,6 +783,7 @@ impl ResultSkin {
     /// is dropped. The image entry the job hands back stays.
     pub fn settle(&mut self, end_run: impl FnMut() -> bool) {
         self.waiting = None;
+        self.deferred = None;
         if let Some((job, _)) = self.job.take()
             && let Ran::Done(out) = job.finish(|| true, end_run)
         {

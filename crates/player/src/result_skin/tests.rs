@@ -344,3 +344,132 @@ fn the_chart_facts_are_projected() {
     // The last note, in measure 2, ends past the first measure's 2 s.
     assert!(c.length.is_some_and(|l| l.0 >= 2_000_000), "{:?}", c.length);
 }
+
+/// A renderer that lags: it holds the bundles it took and reports their
+/// atlases as retained only when told to.
+#[derive(Default)]
+struct FakeRenderer {
+    held: Vec<Arc<render::SkinBundle>>,
+}
+
+impl FakeRenderer {
+    /// Takes `bundle`, keeping only it, and reports what it retains.
+    fn take(&mut self, rs: &mut ResultSkin, bundle: Arc<render::SkinBundle>) {
+        self.held = vec![bundle];
+        self.report(rs);
+    }
+
+    fn report(&self, rs: &mut ResultSkin) {
+        let ids: Vec<_> = self.held.iter().map(|b| b.atlas_pages().id()).collect();
+        rs.set_retained(&ids);
+    }
+}
+
+/// Polls `rs` until no layout job runs, at most 20 s.
+fn ran(rs: &mut ResultSkin) {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        rs.poll();
+        if !rs.running() {
+            return;
+        }
+        assert!(Instant::now() < end, "the layout did not end");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Every atlas seen, by a weak reference.
+#[derive(Default)]
+struct Seen(Vec<std::sync::Weak<skin_model::PackedPages>>);
+
+impl Seen {
+    fn note(&mut self, rs: &ResultSkin) {
+        if let Some(e) = rs.image() {
+            self.0.push(Arc::downgrade(e.pages()));
+        }
+        if let Some(Published::Skin(b, _)) = rs.published().0 {
+            self.0.push(Arc::downgrade(b.atlas_pages()));
+        }
+    }
+
+    /// The distinct atlases still alive.
+    fn alive(&self) -> usize {
+        let mut ids: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|w| w.upgrade().map(|p| p.id()))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    }
+}
+
+/// Q3: with a renderer that lags behind the publications, successive
+/// cell-set changes keep at most two atlases alive: the third build waits
+/// until the renderer's report drops an id, a built-in publication with a
+/// retained atlas counts it, a report repeated after a recovery changes
+/// nothing, and the run's end drops every atlas.
+#[test]
+fn at_most_two_atlases_live_with_a_lagging_renderer() {
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 8 * nr, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let mut fake = FakeRenderer::default();
+    let mut seen = Seen::default();
+    staged(&mut rs);
+    seen.note(&rs);
+    let step = |rs: &mut ResultSkin, seen: &mut Seen, nr: u32| {
+        rs.request(view(nr));
+        ran(rs);
+        seen.note(rs);
+    };
+    // P: the probe's atlas is dropped for the union's.
+    step(&mut rs, &mut seen, 2);
+    assert!(seen.alive() <= 2);
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    // A switch: the shown atlas and the new one.
+    step(&mut rs, &mut seen, 3);
+    assert_eq!(seen.alive(), 2, "the renderer's and the new one");
+    // The renderer stalls on the first: a third build waits.
+    let g = rs.published().1;
+    step(&mut rs, &mut seen, 4);
+    assert!(rs.deferred(), "the third build waits");
+    assert_eq!(rs.published().1, g, "nothing published meanwhile");
+    rs.poll();
+    assert!(
+        rs.deferred(),
+        "a poll with two atlases live keeps it waiting"
+    );
+    assert_eq!(seen.alive(), 2);
+    // The renderer moves on, releasing the first: the build starts.
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    ran(&mut rs);
+    seen.note(&rs);
+    assert!(!rs.deferred());
+    assert_eq!(rs.published().1, g + 1);
+    assert!(seen.alive() <= 2, "{}", seen.alive());
+    // The renderer takes it; the next view is unavailable: the built-in
+    // result is published while the renderer retains that atlas.
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    rs.request(ViewFacts(None));
+    assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
+    step(&mut rs, &mut seen, 5);
+    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    assert!(seen.alive() <= 2, "{}", seen.alive());
+    // A recovery reports the same atlas again.
+    fake.report(&mut rs);
+    rs.poll();
+    assert!(seen.alive() <= 2, "{}", seen.alive());
+    // The run's end.
+    drop(rs);
+    drop(fake);
+    assert_eq!(seen.alive(), 0, "every atlas dropped");
+}

@@ -144,10 +144,19 @@ impl Page {
     }
 }
 
+/// A built atlas's identity: a serial given when its pages are packed,
+/// shared by every [`Arc`] of them and every atlas rebound to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AtlasId(pub u64);
+
+/// The next [`AtlasId`].
+static NEXT_ATLAS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// An atlas's pages with where it placed each cell: what every atlas
 /// rebound from it shares ([`Atlas::rebind`]).
 #[derive(Debug)]
 pub struct PackedPages {
+    id: AtlasId,
     side: u32,
     pages: Vec<Page>,
     variant: Variant,
@@ -200,6 +209,12 @@ impl HeldCell {
 }
 
 impl PackedPages {
+    /// Its identity, given when it was packed.
+    #[must_use]
+    pub fn id(&self) -> AtlasId {
+        self.id
+    }
+
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -593,6 +608,7 @@ impl Sheet {
         let (files, cells) = self.held(variant, limits.reserved_layers, &rects, &packing)?;
         drop((rects, packing));
         let pages = PackedPages {
+            id: AtlasId(NEXT_ATLAS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
             side,
             pages,
             variant,
