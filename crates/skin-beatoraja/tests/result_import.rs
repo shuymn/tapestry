@@ -396,6 +396,43 @@ fn a_result_skin_needs_its_score_and_status() {
     );
 }
 
+/// C16: an image group (`len` above 1) by image index 370 is the clear
+/// status, the only one beside an EX number, JSON and Lua alike (the Lua as
+/// the source's bundled result skin writes it, a numeric id in
+/// `skin.image`).
+#[test]
+fn a_grouped_clear_image_is_the_status() {
+    let group = r#"{"id": "grp", "src": "s", "x": 0, "y": 64, "w": 16, "h": 8, "divx": 2,
+                    "len": 2, "ref": 370}"#;
+    let d = sheet();
+    let body = format!(
+        r#"{{"type": 7, "w": 1920, "h": 1080,
+            "source": [{{"id": "s", "path": "s.png"}}],
+            "font": [{{"id": "f", "path": "f.ttf"}}],
+            "image": [{group}],
+            "value": [{ex}],
+            "destination": [{dex}, {dgrp}]}}"#,
+        ex = value("ex", r#""ref": 71"#),
+        dex = dst("ex", ""),
+        dgrp = dst("grp", ""),
+    );
+    common::write(d.path(), "s.json", body.as_bytes());
+    import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let pre = "skin.image[#skin.image + 1] = { id = 100, src = \"s\", x = 0, y = 64, \
+               w = 16, h = 8, divx = 2, len = 2, ref = 370 }";
+    let ex = lua_value("ex", 4, "ref = 71");
+    let dsts =
+        lua_dst("ex", 100, 4, "") + ", { id = 100, dst = { { x = 0, y = 300, w = 8, h = 8 } } }";
+    let l = sheet();
+    common::write(
+        l.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &dsts).as_bytes(),
+    );
+    lua_result(l.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+}
+
 /// C16 on the Lua path: an EX score read by a callback and a status read
 /// by a `draw` callback are the parts; without the score it refuses.
 #[test]

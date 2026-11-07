@@ -498,7 +498,7 @@ impl Cx<'_> {
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
-            return self.image_group(dst, rec, &s, len, selector, charged, lowered);
+            return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
         let Some(c) = self.image_common(&dst, charged, role)? else {
             return Ok(());
