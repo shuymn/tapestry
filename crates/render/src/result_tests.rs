@@ -713,7 +713,8 @@ fn loading_bytes(b: &Arc<SkinBundle>) -> u64 {
 
 /// C21: the witness whole, every term, through a pages-only installation,
 /// a layout staged and committed on it, the identical bundle staged again,
-/// and a bundle on other pages staged and committed: shared pages counted
+/// another layout on the same pages, and a bundle on other pages staged
+/// and committed: shared pages counted
 /// once wherever they are held, with `shared_bytes` keeping the array
 /// whatever holder comes first, each bundle's own bytes in one term, a
 /// committed layout counted, and what a commit replaced kept until the
@@ -776,9 +777,25 @@ fn the_witness_counts_every_result_term_once() {
         }
     );
     r.commit(token).unwrap();
-    // C on its own pages: its array and pages too; committed, B's whole
+    // A on the same pages replacing B: B's layout is kept until the next
+    // staging, its installation gone.
+    let token = r.install(ScreenKind::Result, &x.a, 4).unwrap();
+    r.commit(token).unwrap();
+    let committed = MemoryWitness {
+        result_cpu: x.a.resident_bytes(),
+        result_batch: layout_bytes(&x.a),
+        ..installed
+    };
+    assert_eq!(
+        r.memory(),
+        MemoryWitness {
+            retired: layout_bytes(&x.b),
+            ..committed
+        }
+    );
+    // C on its own pages: its array and pages too; committed, A's whole
     // installation is kept until the next staging.
-    let token = r.install(ScreenKind::Result, &x.c, 4).unwrap();
+    let token = r.install(ScreenKind::Result, &x.c, 5).unwrap();
     let m = r.memory();
     let c_array = r.shared_bytes(x.c.atlas_id()) - x.c.shared_bytes();
     assert!(m.upload > 0);
@@ -802,11 +819,11 @@ fn the_witness_counts_every_result_term_once() {
             result_cpu: x.c.resident_bytes(),
             result_batch: layout_bytes(&x.c),
             result_atlas: c_array,
-            retired: array + layout_bytes(&x.b) + x.b.resident_bytes(),
+            retired: array + layout_bytes(&x.a) + x.a.resident_bytes(),
             ..base
         }
     );
-    let token = r.install(ScreenKind::Result, &x.c, 5).unwrap();
+    let token = r.install(ScreenKind::Result, &x.c, 6).unwrap();
     r.commit(token).unwrap();
     assert_eq!(r.memory().retired, 0, "kept past the next staging");
     assert_eq!(r.memory().shared_cpu, x.c.shared_bytes());
