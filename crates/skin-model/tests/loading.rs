@@ -965,3 +965,31 @@ fn a_refused_loading_state_builds_no_more() {
     assert_eq!(l.try_build_us(400 * MS), Ok(()));
     assert_eq!(l.count(BACKGROUND), 1);
 }
+
+/// A loading number still draws `i32::MIN` and `i32::MAX`: only a result
+/// frame leaves them out.
+#[test]
+fn a_loading_number_draws_the_i32_extremes() {
+    let extremes = |src: &str| {
+        let mut l = Loader::new(skin(
+            Vec::new(),
+            None,
+            vec![untimed(
+                Source::Number(0),
+                [100, 100, 20, 20],
+                Place::SCREEN,
+            )],
+            WidgetDefs {
+                numbers: vec![NumberDef {
+                    digits: digits(TEN, GlyphSet::Ten, 10, Align::Right, Pad::Blank),
+                    value: int(src),
+                }],
+                ..WidgetDefs::default()
+            },
+        ));
+        l.build(0);
+        l.digits()
+    };
+    assert_eq!(extremes("2147483647"), [2, 1, 4, 7, 4, 8, 3, 6, 4, 7]);
+    assert_eq!(extremes("-2147483647 - 1"), [2, 1, 4, 7, 4, 8, 3, 6, 4, 8]);
+}

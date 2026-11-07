@@ -341,7 +341,7 @@ jobs:
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
-        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst_alloc --test ring_out_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc --test history_alloc --test restore_alloc --test reopen_alloc --test tail_alloc --test closing_alloc --test readouts_alloc --test driver_alloc --test selection_alloc
+        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst_alloc --test ring_out_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc --test history_alloc --test restore_alloc --test reopen_alloc --test tail_alloc --test closing_alloc --test readouts_alloc --test driver_alloc --test selection_alloc --test result_alloc
       # The element observations a capture reads run in every play frame of a
       # dev-tools build, so the skin's guard holds with them on too.
       - name: Skin allocation test with observations (release)

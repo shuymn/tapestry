@@ -124,6 +124,23 @@ impl LampKey {
     pub const fn index(self) -> usize {
         self as usize
     }
+
+    /// The source's clear type index of this key (`ClearType.java`): an
+    /// assist clear is its light assist-easy clear (3), and the
+    /// assist-option clear (2), PERFECT (9) and MAX (10) are never given.
+    #[must_use]
+    pub const fn clear_type(self) -> i32 {
+        match self {
+            Self::NoPlay => 0,
+            Self::Failed => 1,
+            Self::AssistEasy => 3,
+            Self::Easy => 4,
+            Self::Normal => 5,
+            Self::Hard => 6,
+            Self::ExHard => 7,
+            Self::FullCombo => 8,
+        }
+    }
 }
 
 /// A chart row's labels, in the order they draw
