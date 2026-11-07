@@ -1527,7 +1527,7 @@ Which tests check part of each row's mitigation. `Tagged tests` is generated fro
 | T05 | Unverified | |
 | T06 | Unverified | CI step "Production excludes dev-tools", with "Development build includes dev-tools (positive control)" |
 | T07 | Unverified | |
-| T08 | Unverified | |
+| T08 | `crates/skin-model/tests/present.rs`: `the_verifier_refuses_each_rule` | |
 | T09 | `crates/skin-beatoraja/src/lua/tests.rs`: `no_skin_code_runs_after_a_fact_stop_inside_a_protected_call`; `crates/skin-beatoraja/tests/lua_facts.rs`: `protected_calls_do_not_catch_a_play_level_refusal_or_a_pending_read` | |
 | T10 | Unverified | |
 | T11 | Unverified | |
