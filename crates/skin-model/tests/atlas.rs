@@ -360,21 +360,29 @@ fn atlas_reserves_a_text_layer() {
         "{err:?}"
     );
     // The texel cap counts the layer: a frame past 8064 wide with its
-    // gutter needs a page of 8192, which with two reserved layers makes
-    // three layers, the 192 Mi texel cap; the text layer is a fourth.
+    // gutter needs a page of 8192, which with two reserved layers and the
+    // text layer makes four layers, exactly the texel cap, and packs; a
+    // third reserved layer makes five, past it.
+    let layer = 8_192 * 8_192;
+    assert_eq!(4 * layer, skin_model::MAX_ATLAS_TEXELS);
     save(d.path(), "wide.png", &solid(8_100, 8, WHITE));
     let wide = load(d.path(), vec![file("wide.png")], vec![whole(0)]).unwrap();
-    let two_reserved = AtlasLimits {
-        reserved_layers: 2,
+    let reserved = |n| AtlasLimits {
+        reserved_layers: n,
         ..limits(8_192, 16)
     };
-    let a = wide.atlas(Variant::Lo, two_reserved, &|| false).unwrap();
-    assert_eq!(a.side(), 8_192);
+    let a = wide
+        .atlas_reserving(Variant::Lo, reserved(2), true, &|| false)
+        .unwrap();
+    assert_eq!(
+        (a.side(), a.pages().len(), a.text_layer()),
+        (8_192, 1, Some(3))
+    );
     let err = wide
-        .atlas_reserving(Variant::Lo, two_reserved, true, &|| false)
+        .atlas_reserving(Variant::Lo, reserved(3), true, &|| false)
         .unwrap_err();
     assert!(
-        matches!(err, skin_model::AtlasError::AtlasTooLarge { texels } if texels == 1 << 28),
+        matches!(err, skin_model::AtlasError::AtlasTooLarge { texels } if texels == 5 * layer),
         "{err:?}"
     );
     // A sheet without frames still gets the layer, on no page.

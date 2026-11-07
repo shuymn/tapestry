@@ -64,12 +64,18 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 /// The level-0 texels every screen kind's committed installation shares
-/// with a candidate ([`Renderer::admit`]): 384 Mi, twice one atlas array's
-/// cap ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
-/// admitted on its own and two at that cap fit together.
-pub const SHARED_TEXELS: u64 = 384 << 20;
+/// with a candidate ([`Renderer::admit`]): 576 Mi, sized so that the
+/// largest skins of each kind fit together with their VM charges, and at
+/// least twice one atlas array's cap ([`skin_model::MAX_ATLAS_TEXELS`]),
+/// so any skin that fits alone is admitted on its own and two at that cap
+/// fit together. A provisional limit, raised when a real case hits it.
+pub const SHARED_TEXELS: u64 = 576 << 20;
 
-const _: () = assert!(SHARED_TEXELS == 2 * skin_model::MAX_ATLAS_TEXELS);
+// Two kinds' installations at the per-atlas cap must fit in the shared
+// budget at once: a candidate at the cap beside another kind committed at
+// it. (A replacement leaves its own kind's charge out, so this is not
+// about the replaced installation.)
+const _: () = assert!(SHARED_TEXELS >= 2 * skin_model::MAX_ATLAS_TEXELS);
 
 /// What an installation keeping a Lua VM is charged beside its atlas, in
 /// level-0 texels: a VM's memory cap (64 MiB) at the 4 bytes of an RGBA8
@@ -3824,8 +3830,9 @@ mod tests {
         assert_eq!(r.memory().text_upload, 0);
 
         // A refusal by the shared admission, the first step that can
-        // refuse: a selection skin committed, charged an atlas's cap and a
-        // tiny one's, and a play candidate whose atlas is the cap.
+        // refuse: a selection skin committed, charged what the shared limit
+        // leaves beside an atlas's cap and a tiny one's more, and a play
+        // candidate whose atlas is the cap.
         let token = stage_labels(&mut r, &a, &labels("t", "", ""), 3).unwrap();
         r.commit(token).unwrap();
         assert!(r.text_report().upload_bytes > 0);
@@ -3839,7 +3846,7 @@ mod tests {
             .unwrap();
         r.commit(token).unwrap();
         let cap = skin_model::MAX_ATLAS_TEXELS;
-        r.state_charge(&tiny, cap + tiny.atlas_texels());
+        r.state_charge(&tiny, crate::SHARED_TEXELS - cap + tiny.atlas_texels());
         let big = crate::test_decl::atlas_cap_bundle(&r, [0, 0, 255, 255]);
         let e = stage_labels(&mut r, &big, &labels("t", "", ""), 5).unwrap_err();
         assert!(matches!(e, RenderError::Admission { .. }), "{e:?}");

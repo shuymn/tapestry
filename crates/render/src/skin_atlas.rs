@@ -390,14 +390,17 @@ mod tests {
                 max: 256
             })
         ));
-        // 8192² × 4 layers: 256 Mi texels, past 192 Mi; 3 layers are the
-        // cap itself, so their bytes are checked next.
+        // 8192² × 5 layers (four pages beside the reserved layer) are past
+        // the cap; 4 layers are the cap itself, so their bytes are checked
+        // next.
+        let layer = 8_192 * 8_192;
+        assert_eq!(4 * layer, super::MAX_ATLAS_TEXELS);
         assert!(matches!(
-            check_pages(&some(8_192, 3), &limits()),
-            Err(UploadError::Texels { texels }) if texels == 1 << 28
+            check_pages(&some(8_192, 4), &limits()),
+            Err(UploadError::Texels { texels }) if texels == 5 * layer
         ));
         assert!(matches!(
-            check_pages(&some(8_192, 2), &limits()),
+            check_pages(&some(8_192, 3), &limits()),
             Err(UploadError::Level {
                 page: 0,
                 level: 0,
