@@ -97,7 +97,9 @@ pub struct AdjustDriver {
 }
 
 impl AdjustDriver {
-    /// The tap for `plan`, to install on the input side, the driver with
+    /// The tap for `plan`, to install on the input side, which publishes
+    /// START and SELECT for the select screen's panels by `plan`'s roles
+    /// ([`AdjustmentPlan::panel_roles`]), the driver with
     /// `options` and the display offset `display_offset_us`, and the
     /// reader of its snapshots, for the frames.
     ///
@@ -111,6 +113,8 @@ impl AdjustDriver {
     ) -> Result<(Self, AdjustmentTap, PresentationReader), TapError> {
         let (mut tap, receiver) = adjustment_queue(plan.bindings.clone())?;
         tap.set_active(true);
+        let [start, select] = plan.panel_roles();
+        tap.set_panel_roles(start, select);
         let reducer = Adjustment::new(options, plan.roles, TimeUs(0), display_offset_us);
         let (writer, reader) = presentation_link(&reducer.snapshot());
         Ok((
