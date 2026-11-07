@@ -88,6 +88,7 @@ mod image;
 mod layout;
 #[cfg(feature = "dev-tools")]
 mod observation;
+mod pixmap;
 mod place;
 mod play;
 mod quad;
@@ -127,10 +128,10 @@ pub use image::font::{
 };
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
 pub use image::{
-    CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
-    MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
-    MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet, SolidImageDef, TexelCap,
-    Unbanded,
+    CycleDef, FileAt, FileDef, GRID_CELL, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES,
+    MAX_FILES, MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE,
+    MAX_SKIN_FRAMES, MAX_STREAMED_TEXELS, MAX_TOTAL_FILE_BYTES, MAX_TOTAL_TEXELS, Sheet,
+    SolidImageDef, TexelCap, Unbanded,
 };
 pub use layout::{
     Adjust, Anchor, Controls, LANE_WIDTH_PCT, Layout, LayoutError, MAX_INSET, MAX_OFFSET, Region,
@@ -140,6 +141,7 @@ pub use layout::{
 pub use observation::{
     DisplayList, ElementObservation, ListedElement, ListedQuad, Outcome, QuadSource,
 };
+pub use pixmap::Rgba8;
 pub use place::{
     Affine, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement, RegionPlacement,
 };
@@ -181,8 +183,8 @@ pub use selection::{
 };
 pub use skin::{
     ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
-    MAX_WIDGET_QUADS, SelectionDefs, SelectionRequests, Skin, SkinDef, Source, TimerRef,
-    WidgetDefs,
+    MAX_WIDGET_QUADS, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef, Source,
+    TimerRef, WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
@@ -203,6 +205,7 @@ pub use widget::image_choice::{
     ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS, PastTable,
 };
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
+pub use widget::judge_graph::{CHIP_GRID_CELLS, JudgeGraphDef, JudgeGraphKind};
 pub use widget::lanes::{
     LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
     LanesError, NoteOrder, Side, SourceLanes,

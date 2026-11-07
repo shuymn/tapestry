@@ -33,9 +33,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
-    LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef, Scope,
-    ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile,
-    timer as slot,
+    LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef, ResultDefs,
+    Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs,
+    compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -1833,7 +1833,7 @@ impl<'d> Cx<'d> {
             };
             Skin::new_selection(def, widgets)
         } else if result {
-            Skin::new_result(def)
+            Skin::new_result(def, ResultDefs::default())
         } else {
             Skin::new(def)
         };

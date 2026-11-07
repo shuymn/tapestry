@@ -30,6 +30,10 @@ pub type Sprite = Quad;
 /// the low 16 bits, and this bit set when the atlas is sampled at its
 /// nearest texel.
 pub const FLAG_NEAREST: u32 = 1 << 16;
+/// The filter bit of [`Instance::flags`] set when the atlas is sampled at
+/// its nearest level-0 texel, however far the sprite shrinks
+/// ([`Filter::NearestBase`]).
+pub const FLAG_BASE: u32 = 1 << 17;
 
 /// One sprite as the GPU reads it: 64 bytes, its fields converted one by
 /// one from a [`Sprite`] ([`Instance::of`]).
@@ -46,7 +50,8 @@ pub struct Instance {
     pub pivot: [f32; 2],
     /// The clockwise rotation about `pivot`, in radians.
     pub angle: f32,
-    /// The atlas layer (low 16 bits) and [`FLAG_NEAREST`].
+    /// The atlas layer (low 16 bits), and [`FLAG_NEAREST`] or
+    /// [`FLAG_BASE`].
     pub flags: u32,
 }
 
@@ -62,6 +67,7 @@ impl Instance {
         let [r, g, b, a] = s.color;
         let nearest = match s.filter {
             Filter::Nearest => FLAG_NEAREST,
+            Filter::NearestBase => FLAG_BASE,
             Filter::Linear => 0,
         };
         Self {
@@ -392,6 +398,13 @@ mod tests {
         };
         assert_eq!(Instance::of(&pixel_art).flags, 0x1_1234);
         assert_eq!(FLAG_NEAREST, 0x1_0000);
+        let grid = Sprite {
+            layer: 0x1234,
+            filter: Filter::NearestBase,
+            ..Sprite::default()
+        };
+        assert_eq!(Instance::of(&grid).flags, 0x2_1234);
+        assert_eq!(FLAG_BASE, 0x2_0000);
     }
 
     /// The instance layout the vertex buffer describes.

@@ -347,6 +347,7 @@ impl Assets {
             size: FALLBACK_SIZE,
             color,
             filter: Filter::Nearest,
+            grid: None,
         };
         let i = self.builder.add_solid_image(def).map_err(solid_limit)?;
         if let Some(cached) = self.note_fallbacks.get_mut(slot) {
@@ -379,6 +380,7 @@ impl Assets {
             size: SYSTEM_SIZE,
             color,
             filter,
+            grid: None,
         };
         let i = self.builder.add_solid_image(def).map_err(solid_limit)?;
         self.systems.insert((color, filter == Filter::Linear), i);

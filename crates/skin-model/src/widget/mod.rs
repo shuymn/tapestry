@@ -14,6 +14,7 @@ pub(crate) mod gauge;
 pub(crate) mod glyphs;
 pub(crate) mod image_choice;
 pub(crate) mod judge;
+pub(crate) mod judge_graph;
 pub(crate) mod lanes;
 pub(crate) mod ratio_bar;
 pub(crate) mod scroll;

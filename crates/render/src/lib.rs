@@ -89,7 +89,7 @@ pub use simple::{
 };
 pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError, cover_settings};
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
-pub use sprite::{Blend, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
+pub use sprite::{Blend, FLAG_BASE, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch};
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};

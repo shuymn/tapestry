@@ -1,0 +1,432 @@
+//! The result's judge graph: a view's judgments over chart time, one
+//! column a timeline bin, stacked in chips from the bottom (design.md
+//! "Rendering and Skins", result widgets).
+//!
+//! The source paints two textures and draws each once under the
+//! destination's colour: a background of stripes and lines, then the
+//! chips, revealed left to right. Here each texture is a set of disjoint
+//! quads, each tinted with its region's colour (layers composed by
+//! [`over`](crate::pixmap::over)), so the destination's alpha applies once
+//! per pixel. Geometry is in the element's own fractional units: bin `i`
+//! of `n` spans `[w·i/n, w·(i+1)/n)`, a cell is `h/scale` tall.
+//!
+//! A chip run is one quad over a generated chip grid
+//! ([`SolidImageDef::grid`](crate::SolidImageDef)) whose uv covers the
+//! run's cells, so the gaps between chips are the grid's transparent
+//! texels.
+
+#![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+
+use bms_model::TimeUs;
+
+use super::{Brush, Frame, ImageRef, tint};
+use crate::atlas::uv::FrameUv;
+use crate::canvas::f32_of;
+use crate::pixmap::{Rgba8, over};
+use crate::quad::QuadBatch;
+use crate::result::view::{MAX_TIMELINE_BINS, TIMELINE_CHANNELS, Timelines};
+
+/// The cells a generated chip grid holds down its height: a graph's
+/// largest scale.
+pub const CHIP_GRID_CELLS: u32 = 100;
+/// The least scale, in cells.
+const MIN_SCALE: u32 = 20;
+/// The background's stripes and lines, at most: ten stripes of up to 53
+/// pieces between 52 lines, and the lines.
+const BACK_QUADS: u32 = 10 * 53 + 52;
+/// The most bins.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_TIMELINE_BINS fits u32, asserted below"
+)]
+const BINS: u32 = MAX_TIMELINE_BINS as u32;
+const _: () = assert!(MAX_TIMELINE_BINS <= u32::MAX as usize);
+
+/// What a judge graph's chips count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JudgeGraphKind {
+    /// The source's type 1: by grade, early and late together.
+    Judgment,
+    /// The source's type 2: PERFECT, then each other grade early, then
+    /// late.
+    EarlyLate,
+}
+
+/// A judge graph as a front end builds it. Its element's track places the
+/// whole graph (its angle ignored) and gives its colour and alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JudgeGraphDef {
+    pub kind: JudgeGraphKind,
+    /// How long the chips take to reveal, left to right, on the screen
+    /// timer; not positive shows them at once.
+    pub delay: TimeUs,
+    /// Stack the channels from the last instead of from the first.
+    pub reverse: bool,
+    /// Draw the background (the source's `backTexOff` 0).
+    pub back: bool,
+    /// The chips' image: a white generated grid of [`CHIP_GRID_CELLS`]
+    /// cells down, whose gaps are the graph's; sampled at its filter,
+    /// [`Filter::NearestBase`](crate::Filter::NearestBase) for crisp gaps.
+    pub chips: u32,
+    /// A white image the background's stripes and lines tint.
+    pub solid: u32,
+}
+
+impl JudgeGraphDef {
+    /// The quads one frame can push at worst: the background's, then one
+    /// per channel of every bin.
+    pub(crate) fn quads(&self) -> u32 {
+        let back = if self.back { BACK_QUADS } else { 0 };
+        back + BINS * channels(self.kind)
+    }
+}
+
+/// The channels a bin stacks: not judged first.
+fn channels(kind: JudgeGraphKind) -> u32 {
+    match kind {
+        JudgeGraphKind::Judgment => 6,
+        JudgeGraphKind::EarlyLate => 10,
+    }
+}
+
+/// Each channel's colour, not judged first (the source's fixed colours).
+const JUDGMENT_COLORS: [Rgba8; 6] = [
+    Rgba8::rgb(0x55_5555, 0xff),
+    Rgba8::rgb(0x00_88ff, 0xff),
+    Rgba8::rgb(0x00_ff88, 0xff),
+    Rgba8::rgb(0xff_ff00, 0xff),
+    Rgba8::rgb(0xff_8800, 0xff),
+    Rgba8::rgb(0xff_0000, 0xff),
+];
+const EARLY_LATE_COLORS: [Rgba8; 10] = [
+    Rgba8::rgb(0x55_5555, 0xff),
+    Rgba8::rgb(0x44_ff44, 0xff),
+    Rgba8::rgb(0x00_88ff, 0xff),
+    Rgba8::rgb(0x00_66cc, 0xff),
+    Rgba8::rgb(0x00_4488, 0xff),
+    Rgba8::rgb(0x00_2244, 0xff),
+    Rgba8::rgb(0xff_8800, 0xff),
+    Rgba8::rgb(0xcc_6600, 0xff),
+    Rgba8::rgb(0x88_4400, 0xff),
+    Rgba8::rgb(0x44_2200, 0xff),
+];
+
+/// The background's base, below cell 10.
+const BASE: Rgba8 = Rgba8::rgb(0, 0xcc);
+/// The line every 10th bin, and every 60th.
+const LINE: Rgba8 = Rgba8::rgb(0x1f_1f1f, 0xff);
+const LINE_60: Rgba8 = Rgba8::rgb(0x3f_3f3f, 0xff);
+
+/// The stripe of cells `10·m` to `10·m + 10`: the base, then an opaque
+/// band whose red and green are `⌊0.007 · 10m · 255⌋`.
+fn stripe(m: u32) -> Rgba8 {
+    if m == 0 {
+        return BASE;
+    }
+    let c = u8::try_from(7 * 10 * m * 255 / 1_000).unwrap_or(u8::MAX);
+    Rgba8([c, c, 0, 0xff])
+}
+
+/// A judge graph as a build draws it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JudgeGraph {
+    pub(crate) def: JudgeGraphDef,
+    pub(crate) chips: ImageRef,
+    pub(crate) solid: ImageRef,
+}
+
+/// What one judge graph's frame reads besides its element's.
+pub(crate) struct GraphDraw<'a> {
+    pub(crate) at: Frame<'a>,
+    /// The view's timelines; nothing draws without them.
+    pub(crate) timelines: Option<&'a Timelines>,
+    /// The screen timer's elapsed µs, `None` while it is off.
+    pub(crate) screen: Option<i64>,
+}
+
+/// One bin's counts by the graph's channels, not judged first.
+fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS]) -> [u32; 10] {
+    let [pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l] = *b;
+    match kind {
+        JudgeGraphKind::Judgment => [
+            0,
+            pg,
+            gr_e.saturating_add(gr_l),
+            gd_e.saturating_add(gd_l),
+            bd_e.saturating_add(bd_l),
+            pr_e.saturating_add(pr_l),
+            0,
+            0,
+            0,
+            0,
+        ],
+        JudgeGraphKind::EarlyLate => [0, pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l],
+    }
+}
+
+/// The scale in cells for the largest bin count `largest`: 20, or the
+/// next step of 10 above it, at most [`CHIP_GRID_CELLS`]. It depends on
+/// the largest count alone, never on the bins' order.
+pub(crate) fn scale(largest: u32) -> u32 {
+    if largest <= MIN_SCALE {
+        MIN_SCALE
+    } else {
+        (largest / 10 * 10 + 10).min(CHIP_GRID_CELLS)
+    }
+}
+
+impl JudgeGraph {
+    /// Draws the graph over `rect` through `brush`: nothing without
+    /// timelines; the background whole when on, then the chips revealed
+    /// up to `w·min(1, t/delay)` of the screen timer's `t`. A refused push
+    /// stops the graph.
+    pub(crate) fn draw(
+        &self,
+        d: &GraphDraw<'_>,
+        rect: [f32; 4],
+        brush: &Brush,
+        out: &mut QuadBatch,
+    ) {
+        let Some(tl) = d.timelines else {
+            return;
+        };
+        let kind = self.def.kind;
+        let bins = tl.bins();
+        let largest = bins
+            .iter()
+            .map(|b| {
+                bin_counts(kind, b)
+                    .iter()
+                    .fold(0_u32, |s, &c| s.saturating_add(c))
+            })
+            .max()
+            .unwrap_or(0);
+        let scale = scale(largest);
+        let n = u32::try_from(bins.len()).unwrap_or(BINS);
+        let g = Geometry::new(rect, n, scale);
+        let brush = Brush {
+            angle: 0.0,
+            native: None,
+            ..*brush
+        };
+        if self.def.back
+            && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
+            && !self.back(&g, f, &brush, out)
+        {
+            return;
+        }
+        let Some(f) = self.chips.frame(d.at.starts, d.at.now, d.at.uvs) else {
+            return;
+        };
+        let reveal = self.reveal(d.screen);
+        let clip = g.x + g.w * reveal;
+        let colors: &[Rgba8] = match kind {
+            JudgeGraphKind::Judgment => &JUDGMENT_COLORS,
+            JudgeGraphKind::EarlyLate => &EARLY_LATE_COLORS,
+        };
+        let used = colors.len();
+        for (i, b) in (0_u32..).zip(bins) {
+            let [left, right] = g.column(i);
+            if left >= clip {
+                break;
+            }
+            let counts = bin_counts(kind, b);
+            let mut cell = 0_u32;
+            for c in 0..used {
+                let ch = if self.def.reverse { used - 1 - c } else { c };
+                let k = counts
+                    .get(ch)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(scale.saturating_sub(cell));
+                if k == 0 {
+                    continue;
+                }
+                let color = colors.get(ch).copied().unwrap_or(BASE).unit();
+                if !g.chips(
+                    i,
+                    [cell, k],
+                    [left, right.min(clip)],
+                    f,
+                    self.chips,
+                    &brush,
+                    color,
+                    out,
+                ) {
+                    return;
+                }
+                cell += k;
+                if cell >= scale {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The chips' revealed fraction of the width at the screen timer's
+    /// elapsed µs: all of it without a positive delay, none while the
+    /// timer is off.
+    fn reveal(&self, screen: Option<i64>) -> f32 {
+        let delay = self.def.delay.0;
+        if delay <= 0 {
+            return 1.0;
+        }
+        screen.map_or(0.0, |t| f32_of((f64_of(t) / f64_of(delay)).min(1.0)))
+    }
+
+    /// The background: each stripe between the lines, then the lines over
+    /// the full height; `false` when the batch refused a quad.
+    fn back(&self, g: &Geometry, f: FrameUv, brush: &Brush, out: &mut QuadBatch) -> bool {
+        let filter = self.solid.filter;
+        let lines = g.n.div_ceil(10);
+        for m in 0..g.scale / 10 {
+            let color = tint(brush.color, stripe(m).unit());
+            let b = Brush { color, ..*brush };
+            let [top, height] = g.rows(10 * m, 10);
+            let mut from = g.x;
+            for l in 0..=lines {
+                let [left, right] = if l < lines {
+                    g.line(10 * l)
+                } else {
+                    [g.x + g.w; 2]
+                };
+                if left > from && !b.push(out, [from, top, left - from, height], f, filter) {
+                    return false;
+                }
+                from = right;
+            }
+        }
+        for l in 0..lines {
+            let i = 10 * l;
+            let line = if i % 60 == 0 { LINE_60 } else { LINE };
+            // Opaque over every stripe: the line's own colour.
+            let color = over(line.unit(), stripe(0).unit());
+            let b = Brush {
+                color: tint(brush.color, color),
+                ..*brush
+            };
+            let [left, right] = g.line(i);
+            if !b.push(out, [left, g.y, right - left, g.h], f, filter) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A graph's region and its bins and cells.
+struct Geometry {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    n: u32,
+    scale: u32,
+}
+
+fn f64_of(v: i64) -> f64 {
+    #[expect(clippy::cast_precision_loss, reason = "a time far below 2^53 µs")]
+    let f = v as f64;
+    f
+}
+
+impl Geometry {
+    fn new([x, y, w, h]: [f32; 4], n: u32, scale: u32) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            n: n.max(1),
+            scale: scale.max(1),
+        }
+    }
+
+    /// Bin `i`'s left and right edges.
+    fn column(&self, i: u32) -> [f32; 2] {
+        let at = |i: u32| {
+            f32_of(f64::from(self.x) + f64::from(self.w) * f64::from(i) / f64::from(self.n))
+        };
+        [at(i), at(i + 1)]
+    }
+
+    /// The line at bin `i`'s left: a fifth of the bin wide, as the
+    /// source's one texel of the bin's five.
+    fn line(&self, i: u32) -> [f32; 2] {
+        let [left, right] = self.column(i);
+        [left, left + (right - left) / 5.0]
+    }
+
+    /// The top and height of `k` cells from cell `from` up.
+    fn rows(&self, from: u32, k: u32) -> [f32; 2] {
+        let cell = f64::from(self.h) / f64::from(self.scale);
+        let bottom = f64::from(self.y) + f64::from(self.h);
+        let top = bottom - cell * f64::from(from + k);
+        [f32_of(top), f32_of(cell * f64::from(k))]
+    }
+
+    /// Pushes bin `i`'s run of `k` cells from cell `from` up, over the
+    /// columns `[left, right)` of the bin (cut at the reveal), its uv the
+    /// grid's bottom `k` cells, cut alike; `false` when refused.
+    #[expect(clippy::too_many_arguments, reason = "one run's parts")]
+    fn chips(
+        &self,
+        i: u32,
+        [from, k]: [u32; 2],
+        [left, right]: [f32; 2],
+        f: FrameUv,
+        image: ImageRef,
+        brush: &Brush,
+        color: [f32; 4],
+        out: &mut QuadBatch,
+    ) -> bool {
+        let [bin_left, bin_right] = self.column(i);
+        if right <= left || bin_right <= bin_left {
+            return true;
+        }
+        let [l, t, r, b] = f.uv;
+        let cut = (right - bin_left) / (bin_right - bin_left);
+        let fk = f32_of(f64::from(k) / f64::from(CHIP_GRID_CELLS));
+        let uv = FrameUv {
+            uv: [l, b - (b - t) * fk, l + (r - l) * cut, b],
+            layer: f.layer,
+        };
+        let [top, height] = self.rows(from, k);
+        let b = Brush {
+            color: tint(brush.color, color),
+            ..*brush
+        };
+        b.push(out, [left, top, right - left, height], uv, image.filter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BASE, LINE, LINE_60, Rgba8, scale, stripe};
+
+    /// The source's background colours: the base, then bands `111100`,
+    /// `232300`, …; lines `1f1f1f` and `3f3f3f`.
+    #[test]
+    fn background_colours_are_the_sources() {
+        assert_eq!(BASE, Rgba8([0, 0, 0, 0xcc]));
+        assert_eq!(stripe(0), BASE);
+        assert_eq!(stripe(1), Rgba8([0x11, 0x11, 0, 0xff]));
+        assert_eq!(stripe(2), Rgba8([0x23, 0x23, 0, 0xff]));
+        assert_eq!(stripe(9), Rgba8([0xa0, 0xa0, 0, 0xff]));
+        assert_eq!(
+            (LINE.0, LINE_60.0),
+            ([0x1f, 0x1f, 0x1f, 0xff], [0x3f, 0x3f, 0x3f, 0xff])
+        );
+    }
+
+    /// 20 cells, or the next step of 10 above the largest count, at most
+    /// 100.
+    #[test]
+    fn the_scale_steps_by_ten() {
+        let got: Vec<u32> = [0, 20, 21, 29, 30, 95, 99, 100, 113, 150]
+            .into_iter()
+            .map(scale)
+            .collect();
+        assert_eq!(got, [20, 20, 30, 30, 40, 100, 100, 100, 100, 100]);
+    }
+}
