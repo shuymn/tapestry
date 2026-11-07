@@ -198,7 +198,7 @@ fn notes(r: &Report) -> Vec<(Severity, NoteKind)> {
 /// hidden (a number draws nothing, an expression reads `i32::MIN`) and
 /// unavailable (nothing drawn under its validity); the chart's fields stay
 /// with no result; the lane index is 0; the fade-out timer runs and the
-/// IR's never does; the graph is dropped with a note on both paths.
+/// IR's never does; the gauge graph is kept on both paths, with no note.
 #[test]
 fn json_and_lua_draw_the_same_result_frames() {
     let j = folder(&json_body());
@@ -210,7 +210,7 @@ fn json_and_lua_draw_the_same_result_frames() {
     let graph = NoteKind::Unsupported {
         object: Object::GaugeGraph,
     };
-    assert!(notes(&json.report).contains(&(Severity::Dropped, graph)));
+    assert!(!notes(&json.report).contains(&(Severity::Dropped, graph)));
     let mut a = Res::new(json.skin);
     let mut b = Res::new(lua.imported.skin);
     let lua_only = |q: &skin_model::Quad| q.rect[1] != DIFF;

@@ -62,7 +62,8 @@ impl TimingGraphDef {
     /// tick, a line or a bar (at most the 301 bars, a tick every 10
     /// columns and 3 lines), each in at most 4 pieces and splitting a run
     /// in two, over at most 11 runs of the areas: `5K + 11`.
-    pub(crate) fn quads(&self) -> u32 {
+    #[must_use]
+    pub fn quads(&self) -> u32 {
         let gx = u32::from(self.gx);
         let k = gx.min(304 + gx.div_ceil(10));
         5 * k + 11
