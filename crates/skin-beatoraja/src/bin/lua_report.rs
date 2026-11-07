@@ -333,6 +333,23 @@ fn report(index: usize, survey: &Survey) -> String {
     s
 }
 
+/// The survey of `entry` in `root`: a JSON skin (an entry ending in
+/// `.json`) takes the JSON import, every other entry the Lua one.
+fn survey_entry(
+    root: &str,
+    entry: &str,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+    choice: &Choice,
+) -> Survey {
+    if entry.ends_with(".json") {
+        survey_json(&PathBuf::from(root), entry, choice)
+    } else {
+        survey_with(&PathBuf::from(root), entry, facts, cancel, local, choice)
+    }
+}
+
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let Some((facts, choice, local, args)) = facts(&all) else {
@@ -345,12 +362,7 @@ fn main() {
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
-        // A JSON skin takes the JSON import; every other entry the Lua one.
-        let survey = if entry.ends_with(".json") {
-            survey_json(&PathBuf::from(root), entry, &choice)
-        } else {
-            survey_with(&PathBuf::from(root), entry, &facts, &cancel, local, &choice)
-        };
+        let survey = survey_entry(root, entry, &facts, &cancel, local, &choice);
         print!("{}", report(index, &survey));
         let kind = survey
             .kind
@@ -484,7 +496,9 @@ mod tests {
                     {"id": "td", "dst": [{"x": 0, "y": 800, "w": 301, "h": 100}]}]}"#,
         )
         .unwrap();
-        let s = survey_json(d.path(), "s.json", &choice);
+        let (f, ..) = facts(&a).unwrap();
+        let root = d.path().to_str().unwrap();
+        let s = super::survey_entry(root, "s.json", &f, &Cancel::new(), false, &choice);
         assert_eq!(s.outcome, "imported");
         assert_eq!(s.kind, Some(ScreenKind::Result));
         let frames = s.frames.unwrap();
