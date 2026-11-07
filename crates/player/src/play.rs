@@ -305,6 +305,11 @@ impl PlayerRig<'_> {
             },
         );
         self.result_skin = result;
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: result image stage: {}",
+            self.result_skin.staged_line()
+        );
         staged
     }
 

@@ -2421,6 +2421,25 @@ fn the_result_layout_takes_the_compared_best() {
         ],
         "{stdout}"
     );
+    // The rig's whole path: each attempt's Preparing ran the image stage
+    // and prepared the probe's images (prepare_attempt); each P laid the
+    // own view out and published it (begin_result, the comparison,
+    // poll_result), the built-in result since an autoplay's best is
+    // unavailable and the skin reads 178 while it loads; the result's
+    // showing asked again and reused that outcome (show_end, idle_wait).
+    assert_eq!(
+        lines(&stdout, "dev: result image stage: "),
+        [
+            "dev: result image stage: per view, images prepared",
+            "dev: result image stage: per view, images prepared"
+        ],
+        "{stdout}"
+    );
+    let published = lines(&stdout, "dev: result skin published: ");
+    assert!(
+        published.len() >= 2 && published.iter().all(|l| l.ends_with("built-in")),
+        "{stdout}"
+    );
     // The result skin settles once for each leaving command acted on;
     // taking a command settles nothing.
     let settles = stdout

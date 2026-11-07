@@ -477,8 +477,34 @@ impl ResultSkin {
     }
 
     fn publish(&mut self, p: Published) {
+        #[cfg(feature = "dev-tools")]
+        println!(
+            "dev: result skin published: {}",
+            match &p {
+                Published::BuiltIn => "built-in",
+                Published::Skin(..) => "skin",
+            }
+        );
         self.published = Some(p);
         self.generation += 1;
+    }
+
+    /// The attempt's result skin as its image stage left it, and whether a
+    /// prepared atlas is live (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn staged_line(&self) -> String {
+        let attempt = match &self.attempt {
+            None => "none",
+            Some(ForAttempt::Every(_)) => "every view",
+            Some(ForAttempt::BuiltIn) => "built-in",
+            Some(ForAttempt::Pending) => "per view",
+        };
+        let images = if self.image.is_some() {
+            "prepared"
+        } else {
+            "none"
+        };
+        format!("{attempt}, images {images}")
     }
 
     /// The image stage of an attempt whose chart gives `chart` (D11): the
