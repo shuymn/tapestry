@@ -29,9 +29,9 @@ pub const TIMING_RANGE_US: i64 = 150_999;
 /// The rank thresholds in 27ths of the largest EX score, F to AAA.
 const RANK_LOW: [u128; 8] = [0, 6, 9, 12, 15, 18, 21, 24];
 
-/// What a result's views share: the attempt's judged notes and the
-/// timelines' bins, both fixed by the chart, whether a rate over the best
-/// can be known, and whether the attempt was a section.
+/// What a result's views share: the attempt's judged notes, the timelines'
+/// bins and the judged notes in each, all fixed by the chart, whether a
+/// rate over the best can be known, and whether the attempt was a section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResultBasis {
     /// The judged notes of the attempt: taps and long notes, within a
@@ -39,6 +39,9 @@ pub struct ResultBasis {
     pub notes: u32,
     /// The timelines' bins.
     pub timeline: TimelineAxis,
+    /// The judged notes of the attempt in each timeline bin, by their
+    /// time; bins past `timeline.count` stay 0.
+    pub notes_per_bin: [u32; MAX_TIMELINE_BINS],
     /// Whether the chart declares `#RANDOM` or `#SETRANDOM`: its best may
     /// come from a draw with another note count, so no best rate is known.
     pub random: bool,
@@ -50,30 +53,49 @@ pub struct ResultBasis {
 
 impl ResultBasis {
     /// The basis of an attempt at `chart`, within `section` (its start and
-    /// the time just past it) for a practice round.
+    /// the time just past it) for a practice round. The last note, which
+    /// fixes the bins' width, is known only once every lane is read, so
+    /// the notes are binned in a second pass.
     #[must_use]
     pub fn of(chart: &Chart, section: Option<(TimeUs, TimeUs)>) -> Self {
+        let judged = |note: &&bms_model::Note| {
+            !matches!(note.kind, NoteKind::Mine { .. })
+                && section.is_none_or(|(start, end)| {
+                    start <= note.time && note.time < end && note.end() < end
+                })
+        };
         let mut notes = 0_u32;
         let mut last = None;
-        for note in chart.lanes.iter().flatten() {
-            if matches!(note.kind, NoteKind::Mine { .. }) {
-                continue;
-            }
-            if let Some((start, end)) = section
-                && !(start <= note.time && note.time < end && note.end() < end)
-            {
-                continue;
-            }
+        for note in chart.lanes.iter().flatten().filter(judged) {
             notes = notes.saturating_add(1);
             last = last.max(Some(note.time));
         }
         let origin = section.map_or(TimeUs(0), |(start, _)| start);
+        let timeline = TimelineAxis::new(origin, last.unwrap_or(origin));
+        let mut notes_per_bin = [0_u32; MAX_TIMELINE_BINS];
+        for note in chart.lanes.iter().flatten().filter(judged) {
+            if let Some(n) = timeline
+                .bin(note.time)
+                .and_then(|b| notes_per_bin.get_mut(usize::from(b)))
+            {
+                *n = n.saturating_add(1);
+            }
+        }
         Self {
             notes,
-            timeline: TimelineAxis::new(origin, last.unwrap_or(origin)),
+            timeline,
+            notes_per_bin,
             random: !chart.identity.random_results.is_empty(),
             sectioned: section.is_some(),
         }
+    }
+
+    /// The judged notes in each bin in use.
+    #[must_use]
+    pub fn notes_used(&self) -> &[u32] {
+        self.notes_per_bin
+            .get(..usize::from(self.timeline.count))
+            .unwrap_or(&self.notes_per_bin)
     }
 }
 
@@ -145,13 +167,22 @@ pub struct ResultFigures {
     pub gauge_permille: u16,
     /// The timing statistics; `None` without a sample.
     pub timing: Option<TimingStats>,
+    /// The key lanes' judge areas a timing distribution draws
+    /// ([`judge_areas`]).
+    pub areas: [[i16; 2]; 5],
 }
 
 impl ResultFigures {
-    /// The figures of `e`, evaluated under `preset`, over the attempt's
-    /// `notes`, its gauge at index `emphasized` shown.
+    /// The figures of `e`, evaluated on `chart` under `preset`, over the
+    /// attempt's `notes`, its gauge at index `emphasized` shown.
     #[must_use]
-    pub fn of(e: &Evaluation, preset: &RulePreset, notes: u32, emphasized: Option<usize>) -> Self {
+    pub fn of(
+        e: &Evaluation,
+        chart: &Chart,
+        preset: &RulePreset,
+        notes: u32,
+        emphasized: Option<usize>,
+    ) -> Self {
         let w = preset.score.ex;
         let weight = [w.perfect, w.great, w.good, w.bad, w.poor]
             .into_iter()
@@ -170,8 +201,36 @@ impl ResultFigures {
             cleared: clear != BestLamp::Failed,
             gauge_permille: shown.map_or(0, |g| permille(g.value)),
             timing: TimingStats::of(&e.events),
+            areas: judge_areas(chart, preset),
         }
     }
+}
+
+/// The key lanes' judge areas of `preset` for `chart`: its windows as the
+/// evaluator prepares them for the chart's rank, PERFECT, GREAT, GOOD and
+/// BAD as `[−late, early]` and the empty POOR range as `[−behind, ahead]`,
+/// in ms truncated toward 0, early positive, each within `i16`. All 0 when
+/// the windows cannot be prepared, which no evaluated view has.
+#[must_use]
+pub fn judge_areas(chart: &Chart, preset: &RulePreset) -> [[i16; 2]; 5] {
+    let headers = preset.headers.read(&chart.meta.judgment_headers);
+    let Some(tables) = preset.window_policy.prepare(&preset.tables, headers.rank) else {
+        return [[0; 2]; 5];
+    };
+    let ms = |t: TimeUs| {
+        let v = (t.0 / 1_000).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+        i16::try_from(v).unwrap_or(0)
+    };
+    let k = &tables.keys;
+    let area = |late: TimeUs, early: TimeUs| [ms(TimeUs(late.0.saturating_neg())), ms(early)];
+    let w = &k.windows;
+    [
+        area(w.perfect.late, w.perfect.early),
+        area(w.great.late, w.great.early),
+        area(w.good.late, w.good.early),
+        area(w.bad.late, w.bad.early),
+        area(k.empty_poor.behind, k.empty_poor.ahead),
+    ]
 }
 
 /// `v` in tenths of a percent, rounded down, at least 1 above 0.
@@ -229,20 +288,7 @@ impl TimingStats {
     #[must_use]
     pub fn of(events: &[JudgeEvent]) -> Option<Self> {
         let (mut n, mut sum, mut squares) = (0_u32, 0_i64, 0_i128);
-        for e in events {
-            let JudgeEventKind::Judged {
-                deviation: Some(head),
-                release,
-                ..
-            } = e.kind
-            else {
-                continue;
-            };
-            let d = side_deviation(Some(head), release).unwrap_or(head);
-            let s = d.0.saturating_neg();
-            if s.unsigned_abs() > TIMING_RANGE_US.unsigned_abs() {
-                continue;
-            }
+        for s in events.iter().filter_map(timing_sample) {
             n = n.saturating_add(1);
             sum = sum.saturating_add(s);
             squares = squares.saturating_add(i128::from(s) * i128::from(s));
@@ -260,6 +306,25 @@ impl TimingStats {
             sd_x100: u32::try_from(sd_x100).unwrap_or(u32::MAX),
         })
     }
+}
+
+/// The timing sample of `e` in µs, early positive ([`TimingStats`]): a
+/// press judged on its note, a long note's by the tally's side when a
+/// release finished it, within [`TIMING_RANGE_US`]; `None` for anything
+/// else, a miss and an empty POOR among them.
+#[must_use]
+pub fn timing_sample(e: &JudgeEvent) -> Option<i64> {
+    let JudgeEventKind::Judged {
+        deviation: Some(head),
+        release,
+        ..
+    } = e.kind
+    else {
+        return None;
+    };
+    let d = side_deviation(Some(head), release).unwrap_or(head);
+    let s = d.0.saturating_neg();
+    (s.unsigned_abs() <= TIMING_RANGE_US.unsigned_abs()).then_some(s)
 }
 
 /// The bins of a result's timelines over chart time: from `origin`, each

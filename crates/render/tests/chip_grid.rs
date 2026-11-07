@@ -128,10 +128,14 @@ fn quads(skin: &Skin, r: &Renderer, perfect: u32) -> (Vec<Sprite>, skin_model::A
         },
         best: BestView::Unavailable,
         timing: None,
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
         timelines: Some(
             Timelines::new(
                 TimeUs(1_000_000),
                 vec![[perfect, 0, 0, 0, 0, 0, 0, 0, 0]],
+                vec![perfect],
                 None,
             )
             .unwrap(),

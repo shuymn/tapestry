@@ -172,9 +172,10 @@ pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
     .unwrap()
 }
 
-/// Timelines of 1 s bins.
+/// Timelines of 1 s bins, every note judged.
 pub fn timelines(bins: Vec<[u32; 9]>) -> Timelines {
-    Timelines::new(TimeUs(1_000_000), bins, None).unwrap()
+    let notes = bins.iter().map(|b| b.iter().sum()).collect();
+    Timelines::new(TimeUs(1_000_000), bins, notes, None).unwrap()
 }
 
 /// A ready view whose timelines are `bins`.
@@ -203,6 +204,9 @@ pub fn ready() -> ResultView {
         best: BestView::Unavailable,
         timing: None,
         timelines: None,
+        gauge: None,
+        deviations: None,
+        timing_areas: None,
     }
 }
 

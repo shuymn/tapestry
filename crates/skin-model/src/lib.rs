@@ -166,9 +166,10 @@ pub use result::schema::{
     timer as result_timer,
 };
 pub use result::view::{
-    BestFigures, BestRate, BestView, MAX_TIMELINE_BINS, ResultBpm, ResultChart, ResultLabels,
-    ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines,
-    TimelinesError, TimingStats, Unavailable,
+    BestFigures, BestRate, BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory,
+    MAX_TIMELINE_BINS, ResultBpm, ResultChart, ResultLabels, ResultNumber, ResultRate, ResultScore,
+    ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines, TimelinesError, TimingStats,
+    Unavailable,
 };
 pub use result::{ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};

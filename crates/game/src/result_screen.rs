@@ -190,7 +190,7 @@ impl ViewSummary {
             coverage,
             as_played,
             graphs: Arc::new(graphs),
-            figures: ResultFigures::of(e, preset, basis.notes, emphasized),
+            figures: ResultFigures::of(e, chart, preset, basis.notes, emphasized),
             best: None,
         }
     }
