@@ -42,6 +42,7 @@ pub fn graph(kind: JudgeGraphKind, chips: u32, back: bool, delay_ms: i64) -> Jud
         back,
         chips,
         solid: SOLID,
+        fit: skin_model::GraphFit::Stretch,
     }
 }
 
@@ -82,18 +83,11 @@ pub fn source_element(source: Source, r: [i32; 4], alpha: i32, timer: u16) -> El
 }
 
 /// An element drawing judge graph `i` over `r` on the screen timer,
-/// turned `angle` degrees about `pivot`, with `native`.
-pub fn placed_element(
-    i: u32,
-    r: [i32; 4],
-    angle: i32,
-    pivot: skin_model::Anchor,
-    native: Option<skin_model::Native>,
-) -> ElementDef {
+/// turned `angle` degrees about `pivot`, with no native size.
+pub fn placed_element(i: u32, r: [i32; 4], angle: i32, pivot: skin_model::Anchor) -> ElementDef {
     ElementDef {
         place: Place {
             pivot,
-            native,
             ..Place::SCREEN
         },
         ..moving_element(Source::JudgeGraph(i), &[(0, r, angle)])

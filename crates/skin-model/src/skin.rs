@@ -310,6 +310,8 @@ pub enum LoadError {
     SongList(#[source] SongListError),
     #[error("judge graph {graph}'s image does not exist")]
     JudgeGraphImage { graph: usize },
+    #[error("judge graph element {element} names a native size: its graph's fit sizes it")]
+    JudgeGraphNative { element: usize },
     #[error("gauge graph {graph}'s image does not exist")]
     GaugeGraphImage { graph: usize },
     #[error("timing distribution {graph}'s image does not exist")]
@@ -1450,8 +1452,9 @@ impl Skin {
     /// chart, a judge graph, a gauge graph or a timing distribution; the
     /// lanes, a gauge, a judge, a cover paint, the song list, a ratio bar
     /// or a selection text is refused ([`LoadError::SourceKind`]). Every
-    /// graph's images exist, and each graph element is charged its worst
-    /// quads.
+    /// graph's images exist, no judge graph element names a native size
+    /// (its graph's fit sizes it), and each graph element is charged its
+    /// worst quads.
     ///
     /// # Errors
     ///
@@ -1664,6 +1667,12 @@ impl Skin {
             .position(|g| !exists(g.chips) || !exists(g.solid))
         {
             return Err(LoadError::JudgeGraphImage { graph });
+        }
+        if let Some(element) = elements
+            .iter()
+            .position(|e| matches!(e.source, Source::JudgeGraph(_)) && e.place.native.is_some())
+        {
+            return Err(LoadError::JudgeGraphNative { element });
         }
         if let Some(graph) = res.gauge_graphs.iter().position(|g| !exists(g.solid)) {
             return Err(LoadError::GaugeGraphImage { graph });

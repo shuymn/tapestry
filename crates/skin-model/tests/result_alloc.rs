@@ -149,6 +149,7 @@ fn skin() -> Skin {
         back,
         chips: 0,
         solid: 1,
+        fit: skin_model::GraphFit::Outer { trim: true },
     };
     let judge_graphs = vec![
         graph(JudgeGraphKind::Judgment, true, false),

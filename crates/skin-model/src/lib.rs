@@ -212,7 +212,7 @@ pub use widget::image_choice::{
     ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS, PastTable,
 };
 pub use widget::judge::{Attach, ComboPart, GradePart, JudgeDef, JudgeError, JudgePart, JudgeSlot};
-pub use widget::judge_graph::{CHIP_GRID_CELLS, JudgeGraphDef, JudgeGraphKind};
+pub use widget::judge_graph::{CHIP_GRID_CELLS, GraphFit, JudgeGraphDef, JudgeGraphKind};
 pub use widget::lanes::{
     LANE_QUADS, LANE_RESERVED, LANE_VISITS, LanePart, LaneParts, LaneStyle, LaneView, LanesDef,
     LanesError, NoteOrder, Side, SourceLanes,
