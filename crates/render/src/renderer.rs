@@ -3283,8 +3283,10 @@ mod tests {
     }
 
     /// The built-in atlas is read texel for texel on an array whose side,
-    /// 384, is not a power of two: drawn whole at 1:1 at the top left and
-    /// at 2:1 beside it, every target pixel is the built-in texel under it
+    /// 384, is not a power of two: drawn whole at 1:1 at the top left, at
+    /// 2:1 beside it, and at 1:2, where every pixel's centre falls on a
+    /// texel edge (pixel `i` reads texel `2i + 1`), every target pixel is
+    /// the built-in texel under it
     /// (white glyph texels opaque, the rest transparent over the black
     /// clear), as on the built-in atlas alone.
     #[test]
