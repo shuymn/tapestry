@@ -205,11 +205,10 @@ fn aspects_layout([w, h]: [f32; 2]) -> Vec<Placed> {
 /// canvas is the target at scale 1, so:
 ///
 /// - The built-in solid block (its texels 120..128) into 2×2 pixels at
-///   (100, 100): its uv is scaled by 128 / 256 to texels 120..128 of the
-///   256-texel array, 4 texels a pixel, level 2 by the derivatives. Layer
-///   0 is read at its nearest level-0 texel: white. Sampled at level 2,
-///   which holds nothing for layer 0, it would be black; with its uv not
-///   rescaled it would read texels 240..256, also black.
+///   (100, 100): layer 0 is read by integer texel, `floor(uv · 128)` of
+///   the 128-texel built-in atlas whatever the array's side, at level 0:
+///   white. Sampled at level 2 by the derivatives, which holds nothing for
+///   layer 0, it would be black.
 /// - Page 1 whole into 64×64 pixels, smoothed at (100, 300) and nearest at
 ///   (200, 300): 4 texels a pixel, level 2 under either filter, blue.
 ///   Into 512×512 at (300, 300), magnified: level 0, red. Sampled at

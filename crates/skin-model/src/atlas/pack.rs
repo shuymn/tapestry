@@ -231,17 +231,9 @@ pub(crate) fn pack(
             }
             None => max_pages,
         };
-        let Some(p) = pack_side(padded, &order, side, pages, MAX_CELLS_PER_PAGE)? else {
-            continue;
-        };
-        let better = best.as_ref().is_none_or(|b| {
-            let (new, old) = (
-                cost(reserved, p.pages, p.side),
-                cost(reserved, b.pages, b.side),
-            );
-            new < old || (new == old && p.pages < b.pages)
-        });
-        if better {
+        // Within that budget a packing costs no more than the best, and on
+        // this larger side the same cost takes fewer pages: it is better.
+        if let Some(p) = pack_side(padded, &order, side, pages, MAX_CELLS_PER_PAGE)? {
             best = Some(p);
         }
     }

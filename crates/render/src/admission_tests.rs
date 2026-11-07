@@ -21,7 +21,7 @@ use render::{RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS};
 use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, ScreenKind};
 
 use crate::test_common::{GAUGES, attempt, context, offscreen};
-use crate::test_decl::{Look, atlas_cap_bundle, solid_bundle, solid_cells_bundle};
+use crate::test_decl::{Look, atlas_cap_bundle, solid_bundle};
 
 /// An atlas's cap: half the shared limit.
 const CAP: u64 = MAX_ATLAS_TEXELS;
@@ -221,11 +221,7 @@ fn a_candidate_s_text_layer_is_charged() {
     let (d, re) = (vm(&r), vm(&r));
     commit(&mut r, ScreenKind::Decision, &d, 2);
     commit(&mut r, ScreenKind::Result, &re, 3);
-    let look = Look {
-        text: true,
-        ..Look::left(RED)
-    };
-    let candidate = solid_cells_bundle(&r, &look, &[([8_100, 1_500], RED)]);
+    let candidate = atlas_cap_bundle(&r, RED);
     assert_eq!((candidate.side(), candidate.text_layer()), (8_192, Some(2)));
     let candidate = Arc::new(Arc::try_unwrap(candidate).unwrap().keeping_vm());
     let committed = CAP + 2 * (TINY + VM_TEXELS);
