@@ -216,10 +216,10 @@ impl JudgeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
     /// nothing without timelines; the background whole when on, then the
     /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
-    /// The rect is placed (lane map, affine) and fitted to the brush's
-    /// native size, if any, as one region; every quad turns with the
-    /// brush's angle about the brush's pivot in that region. A refused
-    /// push stops the graph.
+    /// The rect is placed (lane map, affine) and fitted by the graph's
+    /// [`GraphFit`] as one region, a trimmed fit cut to the rect; every
+    /// quad turns with the brush's angle about the brush's pivot in the
+    /// region drawn. A refused push stops the graph.
     pub(crate) fn draw(
         &self,
         d: &GraphDraw<'_>,
