@@ -315,23 +315,28 @@ fn an_unsupported_part_refuses_at_its_destination() {
     }
 }
 
-/// The judgment classes (180 to 184) are unsupported: a critical
-/// destination reading one, by number, by name or negated, is refused.
+/// The judgment classes (180 to 184) are the source's datum, the class
+/// it computes from the chart's own rank: a critical destination reading
+/// one, by number, by name or negated, is kept with no note, as one
+/// reading the difficulty is.
 #[test]
-fn judgment_class_conditions_refuse_failure_presentation() {
-    for (fields, id) in [
-        (r#""op": [180]"#, 180),
-        (r#""op": [-184]"#, -184),
-        (r#""draw": 182"#, 182),
-        (r#""op": ["chart_judge_hard"]"#, 181),
-        (r#""draw": "!chart_judge_easy""#, -183),
+fn judgment_class_conditions_keep_failure_presentation() {
+    for fields in [
+        r#""op": [180]"#,
+        r#""op": [-184]"#,
+        r#""draw": 182"#,
+        r#""op": ["chart_judge_hard"]"#,
+        r#""draw": "!chart_judge_easy""#,
+        r#""op": [151]"#,
     ] {
-        let r = images("", &[&fail("i", fields)]);
-        refused_as_failure(r, &at("i"), prop(PropertyKind::Boolean, Some(id)));
+        let l = images("", &[&fail("i", fields)]).loaded;
+        assert!(l.result.is_ok(), "{fields}");
+        assert!(
+            l.report().notes.is_empty(),
+            "{fields}: {:?}",
+            l.report().notes
+        );
     }
-    // The difficulty is the source's datum: kept.
-    let r = images("", &[&fail("i", r#""op": [151]"#)]);
-    assert!(r.loaded.result.is_ok());
 }
 
 #[test]
@@ -816,10 +821,13 @@ fn dispositions(r: &skin_beatoraja::LuaImported) -> [usize; 3] {
 fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
     use skin_beatoraja::LuaWhy;
     use skin_beatoraja::lua::Unsupported;
-    // Supported: lowered, kept and drawn once the gauge fails.
+    // Supported: lowered, kept and drawn once the gauge fails. A judgment
+    // class (unknown here, so 184 does not hold) is the source's datum.
     for (draw, value) in [
         (Some("ms.option(273)"), None),
         (None, Some("ms.number(110)")),
+        (Some("not ms.option(184)"), None),
+        (None, Some("ms.option(181) and 1 or 0")),
     ] {
         let d = lua_callback_skin(3, draw, value);
         let r = common::lua_import(d.path()).unwrap();
@@ -877,54 +885,6 @@ fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
                 why: unmapped
             }],
             "{field}"
-        );
-    }
-}
-
-/// A Lua callback reading a judgment class, a read with no mapping: on
-/// `failed` refused at the callback, elsewhere replaced and dropped with
-/// its reason.
-#[test]
-fn lua_judgment_class_reads_refuse_failure_presentation() {
-    use skin_beatoraja::lua::{HOST_APIS, Unsupported};
-    use skin_beatoraja::{DeviationId, LuaWhy};
-    let api = HOST_APIS
-        .iter()
-        .position(|&(_, n)| n == "option")
-        .and_then(|i| u16::try_from(i).ok())
-        .unwrap();
-    for (field, draw, value, id, line) in [
-        ("draw", Some("ms.option(180)"), None, 180, 7),
-        ("draw", Some("not ms.option(184)"), None, 184, 7),
-        ("value", None, Some("ms.option(181) and 1 or 0"), 181, 6),
-    ] {
-        let d = lua_callback_skin(3, draw, value);
-        match common::lua_import(d.path()) {
-            Err(ImportError::Lua {
-                at: Some(at),
-                why: LuaWhy::Critical { field: f, why },
-            }) => {
-                assert_eq!((f, why), (field, Unsupported::Unmapped { api, id }));
-                assert_eq!((at.file.as_str(), at.line), ("s.luaskin", line));
-            }
-            other => panic!("{field}: {other:?}"),
-        }
-        let d = lua_callback_skin(41, draw, value);
-        let r = common::lua_import(d.path()).unwrap();
-        assert_eq!(dispositions(&r), [0, 1, 0], "{field} {id}");
-        let notes = &r.imported.report.notes;
-        let dropped: Vec<_> = notes
-            .iter()
-            .filter(|n| n.severity == Severity::Dropped)
-            .map(|n| n.kind)
-            .collect();
-        let why = Unsupported::Unmapped { api, id };
-        assert_eq!(dropped, [NoteKind::Callback { field, why }], "{field} {id}");
-        assert!(
-            !notes
-                .iter()
-                .any(|n| n.kind == NoteKind::Deviation(DeviationId::D4)),
-            "{field} {id}"
         );
     }
 }

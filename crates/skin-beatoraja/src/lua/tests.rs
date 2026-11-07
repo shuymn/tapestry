@@ -392,11 +392,11 @@ fn continued(
 // Covers: T09
 #[test]
 fn no_skin_code_runs_after_a_fact_stop_inside_a_protected_call() {
-    use super::facts::{ChartRank, Fact, ImportFacts};
+    use super::facts::{Fact, ImportFacts, JudgeClass};
     let unavailable = ImportFacts::unavailable(ScreenKind::Play);
     let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
     let known = ImportFacts {
-        chart_rank: Fact::Known(Some(ChartRank::Rank(2))),
+        judge_class: Fact::Known(Some(JudgeClass::Normal)),
         ..base
     };
     // The witness sees a skin go on after an error a protected call

@@ -87,9 +87,7 @@ use skin_model::{FileId, Root, ScreenKind};
 pub use self::callback::Disposition;
 use self::config::Bridge;
 pub use self::convert::MAX_CONVERTED_BYTES;
-pub use self::facts::{
-    ChartRank, Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass,
-};
+pub use self::facts::{Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass};
 pub use self::host::HOST_APIS;
 pub use self::ledger::{Cancel, LuaUsage};
 use self::ledger::{Counts, Ledger, Stop};
