@@ -811,8 +811,11 @@ pub fn run_chart<R: Rig>(
             rig.wait();
             continue;
         }
+        // The own view's figures and timelines are made with the screen,
+        // and its best is read here: the preparation, after the save.
         let mut screen =
             ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
+        screen.compare_best(&report, &mut |k, p| loaded.best_before(k, p));
         match prepare_result(rig, &report, &screen)? {
             Prepared::Ready => {}
             Prepared::Retry => continue,
@@ -871,6 +874,8 @@ pub fn run_chart<R: Rig>(
                 dirty = true;
             }
             if dirty {
+                // A view landed: its best is read once, before it shows.
+                screen.compare_best(&report, &mut |k, p| loaded.best_before(k, p));
                 rig.show_end(&report, &screen);
             }
         }

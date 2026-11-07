@@ -31,7 +31,9 @@ use replay::verify::Coverage;
 use rules::{GaugeValue, RulePreset};
 use rules_toml::PresetFileError;
 
+use crate::bests::{BestCompare, BestKey, BestLookup, BestView};
 use crate::presets::Shelf;
+use crate::result_figures::{ResultBasis, ResultFigures};
 use crate::result_graphs::{Axis, ResultGraphs, listed};
 use crate::results::{ReEvaluate, ReEvaluationError, ResultContext};
 use crate::session::PlayReport;
@@ -93,7 +95,8 @@ pub struct GaugeEnd {
 }
 
 /// The bytes a [`ViewSummary`] holds on the heap: its graphs' one
-/// allocation, the reference counts included. The same for every play.
+/// allocation, the timelines in it, the reference counts included. The
+/// same for every play.
 pub const SUMMARY_BYTES: usize = size_of::<ArcBlock>();
 
 /// The layout of an `Arc<ResultGraphs>`'s allocation: two counts, then
@@ -124,20 +127,28 @@ pub struct ViewSummary {
     pub coverage: Coverage,
     /// Whether this is the play as it was judged.
     pub as_played: bool,
-    /// The listed gauges' graphs and the press deviations.
+    /// The listed gauges' graphs, the press deviations and the timelines.
     pub graphs: Arc<ResultGraphs>,
+    /// The rates, grade, clear, gauge and timing statistics a skin reads.
+    pub figures: ResultFigures,
+    /// The view against the best under its preset before this play; `None`
+    /// until it is read ([`ResultScreen::compare_best`]).
+    pub best: Option<BestCompare>,
 }
 
 impl ViewSummary {
-    /// The summary of `e`, evaluated under `preset`, on `axis`: `defaults`
-    /// says per gauge whether it started at its start value (empty for a
-    /// full play), and the gauge of ID `displayed`, if the preset has one,
-    /// is emphasized, or else the preset's first. Allocates only the
-    /// graphs, [`SUMMARY_BYTES`].
+    /// The summary of `e`, evaluated on `chart` under `preset`, on `axis`
+    /// and `basis`: `defaults` says per gauge whether it started at its
+    /// start value (empty for a full play), and the gauge of ID
+    /// `displayed`, if the preset has one, is emphasized, or else the
+    /// preset's first. Allocates only the graphs, [`SUMMARY_BYTES`].
     #[must_use]
+    #[expect(clippy::too_many_arguments, reason = "each a part of the view")]
     pub fn of(
         e: &Evaluation,
+        chart: &Chart,
         preset: &RulePreset,
+        basis: ResultBasis,
         axis: Axis,
         coverage: Coverage,
         as_played: bool,
@@ -162,7 +173,16 @@ impl ViewSummary {
                 started_at_default: defaults.get(i).copied().unwrap_or(false),
             });
         }
-        let graphs = ResultGraphs::of(e, &preset.gauges, list, emphasized, axis, coverage);
+        let graphs = ResultGraphs::of(
+            e,
+            chart,
+            &preset.gauges,
+            list,
+            emphasized,
+            axis,
+            basis.timeline,
+            coverage,
+        );
         Self {
             tally: e.tally,
             gauges,
@@ -170,6 +190,8 @@ impl ViewSummary {
             coverage,
             as_played,
             graphs: Arc::new(graphs),
+            figures: ResultFigures::of(e, preset, basis.notes, emphasized),
+            best: None,
         }
     }
 }
@@ -249,6 +271,8 @@ pub struct ResultScreen {
     axis: Option<Axis>,
     /// The ID of the gauge the play displayed.
     displayed: Option<String>,
+    /// What every view shares: the attempt's notes and timeline bins.
+    basis: ResultBasis,
     cache: Vec<Cached>,
     uses: u64,
     landed: Landed,
@@ -273,11 +297,13 @@ impl ResultScreen {
             .gauges
             .get(report.displayed_gauge.0)
             .map(|g| g.id.clone());
-        let origin = report
+        let section = report
             .record
             .as_ref()
             .and_then(|r| r.play_type.practice())
-            .map_or(TimeUs(0), |p| p.start);
+            .map(|p| (p.start, p.end));
+        let origin = section.map_or(TimeUs(0), |(start, _)| start);
+        let basis = ResultBasis::of(chart, section);
         let axis = report
             .result
             .as_ref()
@@ -305,7 +331,9 @@ impl ResultScreen {
                         };
                         ViewSummary::of(
                             e,
+                            chart,
                             &report.preset,
+                            basis,
                             axis,
                             coverage,
                             true,
@@ -324,6 +352,7 @@ impl ResultScreen {
             own,
             axis,
             displayed,
+            basis,
             cache: Vec::new(),
             uses: 0,
             landed: Landed::Nothing,
@@ -509,6 +538,66 @@ impl ResultScreen {
         true
     }
 
+    /// What every view shares: the attempt's notes and timeline bins.
+    #[must_use]
+    pub const fn basis(&self) -> ResultBasis {
+        self.basis
+    }
+
+    /// Compares the viewed result with the best under the viewed preset
+    /// before this play, once per summary (design.md "Personal Bests",
+    /// skin projections): for the play's own preset the best its count's
+    /// transaction read before it, and otherwise, or when the play was not
+    /// counted, what `lookup` answers for the view's key and preset. A view
+    /// that is not ready, or whose best was read, is left as it is.
+    pub fn compare_best(
+        &mut self,
+        report: &PlayReport,
+        lookup: &mut dyn FnMut(&BestKey, &RulePreset) -> BestLookup,
+    ) {
+        let (Landed::Hash(hash), Some(record)) = (&self.landed, &report.record) else {
+            return;
+        };
+        let hash = *hash;
+        let Some(preset) = self.viewed().and_then(|e| e.preset.clone()) else {
+            return;
+        };
+        let random = self.basis.random;
+        let own = hash == self.played;
+        let summary = if own {
+            self.own.as_mut()
+        } else {
+            self.cache
+                .iter_mut()
+                .find(|c| c.hash == hash)
+                .map(|c| &mut c.summary)
+        };
+        let Some(Ok(summary)) = summary else {
+            return;
+        };
+        if summary.best.is_some() {
+            return;
+        }
+        let before = match &report.best {
+            Some(BestView::Counted { previous, .. }) if own => {
+                BestLookup::previous(previous.as_ref())
+            }
+            _ => lookup(
+                &BestKey {
+                    chart_sha256: record.chart.identity.sha256,
+                    preset_sha256: hash,
+                },
+                &preset,
+            ),
+        };
+        summary.best = Some(BestCompare::of(
+            &before,
+            &summary.tally,
+            &summary.figures,
+            random,
+        ));
+    }
+
     fn notify(&mut self, notice: Notice) {
         if self.notices.len() == NOTICES {
             self.notices.pop_front();
@@ -630,7 +719,9 @@ impl ResultScreen {
             });
             ViewSummary::of(
                 &r.evaluation,
+                chart,
                 &preset,
+                self.basis,
                 axis,
                 r.coverage,
                 r.as_played,

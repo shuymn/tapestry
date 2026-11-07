@@ -114,10 +114,17 @@ fn re(chart: &Chart, rec: &PlayRecord, preset: &RulePreset) -> replay::verify::R
     ReEvaluate::under(&ctx, preset).unwrap()
 }
 
-fn summary(r: &replay::verify::ReEvaluation, preset: &RulePreset, axis: Axis) -> ViewSummary {
+fn summary(
+    r: &replay::verify::ReEvaluation,
+    chart: &Chart,
+    preset: &RulePreset,
+    axis: Axis,
+) -> ViewSummary {
     ViewSummary::of(
         &r.evaluation,
+        chart,
         preset,
+        game::ResultBasis::of(chart, None),
         axis,
         r.coverage,
         r.as_played,
@@ -296,7 +303,7 @@ fn survival_failure_is_marked_and_flat_after() {
         origin: TimeUs(0),
         end,
     };
-    let s = summary(&r, &preset, axis);
+    let s = summary(&r, &chart, &preset, axis);
     let failed_at = r.evaluation.gauges[1].failed_at.unwrap();
     assert_eq!(s.gauges[1].unwrap().failed_at, Some(failed_at));
     assert_eq!(s.gauges[0].unwrap().failed_at, None);
@@ -335,7 +342,7 @@ fn coverage_sets_reached_and_no_input() {
     let rec = record(&preset, Vec::new(), EndStatus::EndedMidway, w);
     let r = re(&chart, &rec, &preset);
     assert_eq!(r.coverage, Coverage::EndedMidway(w));
-    let s = summary(&r, &preset, axis);
+    let s = summary(&r, &chart, &preset, axis);
     let expected = axis.column(w) + 1;
     assert_eq!(s.graphs.reached, expected);
     assert!(expected < N);
@@ -348,7 +355,7 @@ fn coverage_sets_reached_and_no_input() {
     };
     let r = re(&chart, &rec, &other);
     assert_eq!(r.coverage, Coverage::NoInputAfter(w));
-    let s = summary(&r, &other, axis);
+    let s = summary(&r, &chart, &other, axis);
     assert_eq!(s.graphs.reached, N);
     assert_eq!(s.graphs.no_input_from, Some(expected - 1));
 }

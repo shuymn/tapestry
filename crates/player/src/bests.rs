@@ -6,8 +6,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use game::{BestScore, BestView, Chain, LocalRecords, RecordRef, RecordSink, SaveError, SavedPlay};
-use library::{Best, BestWriter, Contribution, Ineligible, Ingested, PlayId, Score, Verified};
+use game::{
+    BestKey, BestLamp, BestLookup, BestScore, BestView, Chain, LocalRecords, RecordRef, RecordSink,
+    SaveError, SavedPlay,
+};
+use library::{
+    Best, BestWriter, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Verified,
+};
 use replay::PlayRecord;
 use rules::RulePreset;
 use skin_model::{GaugeLook, OwnLamp, RowScore};
@@ -55,6 +60,38 @@ impl RecordSink for BestsRecords {
         println!("{line}");
         log::info!("{line}");
         Some(view)
+    }
+
+    /// The key's score through the live writer's connection, one indexed
+    /// read; a failed read is logged and leaves the best unavailable.
+    fn best_before(&mut self, key: &BestKey, preset: &RulePreset) -> BestLookup {
+        let read = self
+            .bests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .score(&Key {
+                preset_sha256: key.preset_sha256,
+                ln_mode: LN_MODE,
+                chart_sha256: key.chart_sha256,
+            });
+        match read {
+            Ok(score) => lookup(score.as_ref(), preset),
+            Err(e) => {
+                let line = format!("bests: the best cannot be read: {}", Chain(&e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+                BestLookup::Unavailable
+            }
+        }
+    }
+}
+
+/// A key's stored score under `preset` as a result view compares with it:
+/// known to be empty without a row or a best.
+pub fn lookup(score: Option<&Score>, preset: &RulePreset) -> BestLookup {
+    match score {
+        Some(s) if s.best.is_some() => BestLookup::Known(shown(s, preset)),
+        _ => BestLookup::KnownEmpty,
     }
 }
 
@@ -138,7 +175,28 @@ pub fn shown(score: &Score, preset: &RulePreset) -> BestScore {
         plays: score.plays,
         ex: best.map(|b| b.ex),
         bp: best.map(|b| b.bp),
-        lamp: best.map(|b| lamp_text(b, preset)),
+        clear: best.map(|b| best_lamp(own_lamp(b, preset))),
+    }
+}
+
+/// A lamp as `game` types it, without its look.
+pub fn best_lamp(lamp: OwnLamp) -> BestLamp {
+    match lamp {
+        OwnLamp::FullCombo => BestLamp::FullCombo,
+        OwnLamp::Cleared { gauge, .. } => BestLamp::Cleared { gauge },
+        OwnLamp::Failed => BestLamp::Failed,
+    }
+}
+
+/// A typed lamp's text under `preset`, as [`lamp_name`].
+pub fn clear_name(lamp: BestLamp, preset: &RulePreset) -> String {
+    match lamp {
+        BestLamp::FullCombo => "FC".to_owned(),
+        BestLamp::Failed => "FAILED".to_owned(),
+        BestLamp::Cleared { gauge } => preset
+            .gauges
+            .get(usize::from(gauge))
+            .map_or_else(String::new, |g| g.id.to_uppercase()),
     }
 }
 
@@ -167,17 +225,11 @@ pub fn own_lamp(best: &Best, preset: &RulePreset) -> OwnLamp {
 /// A lamp's text under `preset`: `FC`, the cleared gauge's ID uppercased, or
 /// `FAILED`.
 pub fn lamp_name(lamp: OwnLamp, preset: &RulePreset) -> String {
-    match lamp {
-        OwnLamp::FullCombo => "FC".to_owned(),
-        OwnLamp::Failed => "FAILED".to_owned(),
-        OwnLamp::Cleared { gauge, .. } => preset
-            .gauges
-            .get(usize::from(gauge))
-            .map_or_else(String::new, |g| g.id.to_uppercase()),
-    }
+    clear_name(best_lamp(lamp), preset)
 }
 
 /// The text of `best`'s lamp under `preset` ([`own_lamp`], [`lamp_name`]).
+#[cfg(test)]
 pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
     lamp_name(own_lamp(best, preset), preset)
 }
@@ -200,9 +252,10 @@ pub fn row_score(score: Option<&Score>, preset: &RulePreset) -> RowScore {
     }
 }
 
-/// The end screen's line about the play's best: the best with the play's
-/// difference from the previous one, or why it set none.
-pub fn best_line(view: &BestView) -> String {
+/// The end screen's line about the play's best under its `preset`: the
+/// best with the play's difference from the previous one, or why it set
+/// none.
+pub fn best_line(view: &BestView, preset: &RulePreset) -> String {
     match view {
         BestView::Counted {
             current,
@@ -221,16 +274,18 @@ pub fn best_line(view: &BestView) -> String {
                     format!(" ({:+})", i64::from(now) - i64::from(t))
                 })
             };
-            let new = before.is_none_or(|p| {
-                (p.ex, p.bp, p.lamp.as_ref()) != (current.ex, current.bp, current.lamp.as_ref())
-            });
+            let new = before
+                .is_none_or(|p| (p.ex, p.bp, p.clear) != (current.ex, current.bp, current.clear));
             format!(
                 "BEST EX {}{}  BP {}{}  {}  PLAYS {}{}",
                 current.ex.unwrap_or_default(),
                 delta(play.0, before.and_then(|p| p.ex)),
                 current.bp.unwrap_or_default(),
                 delta(play.1, before.and_then(|p| p.bp)),
-                current.lamp.as_deref().unwrap_or_default(),
+                current
+                    .clear
+                    .map(|c| clear_name(c, preset))
+                    .unwrap_or_default(),
                 current.plays,
                 if new { "  NEW BEST" } else { "" }
             )
@@ -268,7 +323,7 @@ mod tests {
 
     use super::common;
 
-    use game::{BestScore, BestView, RecordSink as _};
+    use game::{BestLamp, BestScore, BestView, RecordSink as _};
     use library::{Best, Score};
 
     use skin_model::{GaugeLook, OwnLamp};
@@ -387,11 +442,17 @@ mod tests {
 
     #[test]
     fn best_line_shows_difference_and_reason() {
+        // Normal is gauge 0 of the ranked preset, hard gauge 3.
+        let p = ranked();
         let score = |plays, ex, bp, lamp: &str| BestScore {
             plays,
             ex: Some(ex),
             bp: Some(bp),
-            lamp: Some(lamp.to_owned()),
+            clear: Some(match lamp {
+                "NORMAL" => BestLamp::Cleared { gauge: 0 },
+                "HARD" => BestLamp::Cleared { gauge: 3 },
+                _ => BestLamp::Failed,
+            }),
         };
         let new = BestView::Counted {
             play: (1234, 10),
@@ -400,7 +461,7 @@ mod tests {
             ineligible: None,
         };
         assert_eq!(
-            best_line(&new),
+            best_line(&new, &p),
             "BEST EX 1234 (+12)  BP 10 (-3)  HARD  PLAYS 5  NEW BEST"
         );
         let worse = BestView::Counted {
@@ -410,7 +471,7 @@ mod tests {
             ineligible: None,
         };
         assert_eq!(
-            best_line(&worse),
+            best_line(&worse, &p),
             "BEST EX 1234 (-34)  BP 10 (+10)  HARD  PLAYS 6"
         );
         let first = BestView::Counted {
@@ -420,7 +481,7 @@ mod tests {
             ineligible: None,
         };
         assert_eq!(
-            best_line(&first),
+            best_line(&first, &p),
             "BEST EX 50  BP 2  FAILED  PLAYS 1  NEW BEST"
         );
         let midway = BestView::Counted {
@@ -433,12 +494,12 @@ mod tests {
             ineligible: Some(library::Ineligible::EndedMidway.to_string()),
         };
         assert_eq!(
-            crate::end_screen::fit(&best_line(&midway), 76),
+            crate::end_screen::fit(&best_line(&midway, &p), 76),
             "BEST NOT UPDATED: ENDED MIDWAY  PLAYS 1"
         );
         let unsaved = BestView::NotCounted(library::Ineligible::NotSaved.to_string());
         assert_eq!(
-            crate::end_screen::fit(&best_line(&unsaved), 76),
+            crate::end_screen::fit(&best_line(&unsaved, &p), 76),
             "BEST NOT UPDATED: NOT SAVED"
         );
     }
@@ -518,10 +579,19 @@ mod tests {
         fx.pass(&lib);
         let mut sink = sink(&fx, &lib);
         let view = finish(&mut sink, &common::played(0));
-        assert_eq!(best_line(&view), "BEST EX 6  BP 0  FC  PLAYS 1  NEW BEST");
+        assert_eq!(
+            best_line(&view, &rules::tapestry()),
+            "BEST EX 6  BP 0  FC  PLAYS 1  NEW BEST"
+        );
         let view = finish(&mut sink, &common::played(30));
-        assert!(best_line(&view).starts_with("BEST EX 6 (-"), "{view:?}");
-        assert!(best_line(&view).ends_with("FC  PLAYS 2"), "{view:?}");
+        assert!(
+            best_line(&view, &rules::tapestry()).starts_with("BEST EX 6 (-"),
+            "{view:?}"
+        );
+        assert!(
+            best_line(&view, &rules::tapestry()).ends_with("FC  PLAYS 2"),
+            "{view:?}"
+        );
         // A database failure: the play is not counted, and a catch-up is
         // requested for its file.
         common::sql(
@@ -535,6 +605,70 @@ mod tests {
         };
         assert!(why.starts_with("failed: "), "{why}");
         assert!(lib.bests_pending().unwrap());
+    }
+
+    /// A view's best before the play, read through the live writer: known
+    /// empty without a row, then the counted best with its typed lamp,
+    /// and known empty again under another preset's key.
+    #[test]
+    fn the_best_before_is_read_typed_through_the_writer() {
+        use game::{BestKey, BestLookup};
+        let fx = common::Fixture::new();
+        let lib = fx.open();
+        fx.pass(&lib);
+        let mut sink = sink(&fx, &lib);
+        let record = common::played(0);
+        let preset = rules::tapestry();
+        let key = BestKey {
+            chart_sha256: record.chart.identity.sha256,
+            preset_sha256: record.preset.sha256,
+        };
+        assert_eq!(sink.best_before(&key, &preset), BestLookup::KnownEmpty);
+        finish(&mut sink, &record);
+        assert_eq!(
+            sink.best_before(&key, &preset),
+            BestLookup::Known(BestScore {
+                plays: 1,
+                ex: Some(6),
+                bp: Some(0),
+                clear: Some(BestLamp::FullCombo),
+            })
+        );
+        let other = BestKey {
+            preset_sha256: [7; 32],
+            ..key
+        };
+        assert_eq!(sink.best_before(&other, &preset), BestLookup::KnownEmpty);
+        // A read the database refuses leaves the best unavailable.
+        common::sql(&fx.db(), "DROP TABLE scores;");
+        assert_eq!(sink.best_before(&key, &preset), BestLookup::Unavailable);
+    }
+
+    /// A stored score converts by its best: none or one without a best is
+    /// known empty, a best carries its lamp by rank.
+    #[test]
+    fn stored_scores_convert_to_lookups() {
+        use game::BestLookup;
+        let p = ranked();
+        assert_eq!(super::lookup(None, &p), BestLookup::KnownEmpty);
+        let no_best = Score {
+            plays: 3,
+            best: None,
+        };
+        assert_eq!(super::lookup(Some(&no_best), &p), BestLookup::KnownEmpty);
+        let scored = Score {
+            plays: 3,
+            best: Some(cleared(&[0, 3], false)),
+        };
+        assert_eq!(
+            super::lookup(Some(&scored), &p),
+            BestLookup::Known(BestScore {
+                plays: 3,
+                ex: Some(10),
+                bp: Some(0),
+                clear: Some(BestLamp::Cleared { gauge: 3 }),
+            })
+        );
     }
 
     #[test]
