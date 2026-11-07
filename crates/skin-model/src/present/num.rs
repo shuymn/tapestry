@@ -77,13 +77,15 @@ fn imod(a: i64, b: i64) -> Result<i64, Fail> {
     Ok(if m != 0 && ((m ^ b) < 0) { m + b } else { m })
 }
 
-/// Float modulo (`luai_nummod`): C's `fmod`, then `b` added where the
-/// result's sign differs from the divisor's, exactly as Lua tests it.
+/// Float modulo (`luai_nummod`): C's `fmod`, then `b` added where a
+/// nonzero result's sign differs from the divisor's.
 fn fmod(a: f64, b: f64) -> f64 {
     let m = a % b;
-    #[expect(clippy::float_cmp, reason = "Lua's test, transcribed")]
-    let adjust = if m > 0.0 { b < 0.0 } else { m < 0.0 && b != m };
-    if adjust { m + b } else { m }
+    if (m > 0.0 && b < 0.0) || (m < 0.0 && b > 0.0) {
+        m + b
+    } else {
+        m
+    }
 }
 
 /// Arithmetic operator `op` of `a` and `b`.
