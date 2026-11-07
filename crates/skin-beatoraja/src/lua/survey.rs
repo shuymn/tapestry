@@ -401,6 +401,7 @@ fn disposition(d: &Disposition) -> String {
         Disposition::Captured => "captured".into(),
         Disposition::ClassifiedOnly => "classified only".into(),
         Disposition::Lowered => "lowered".into(),
+        Disposition::Compiled => "compiled".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
         Disposition::Refused => "refused".into(),
     }

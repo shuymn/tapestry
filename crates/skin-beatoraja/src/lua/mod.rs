@@ -44,6 +44,7 @@ pub(crate) mod callback;
 #[cfg(test)]
 mod callback_tests;
 mod clock;
+pub(crate) mod compile;
 mod config;
 mod convert;
 mod effects;

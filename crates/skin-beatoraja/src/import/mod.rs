@@ -434,6 +434,9 @@ pub(crate) struct Cx<'d> {
     items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
+    /// The play presentation program, its callbacks in the order the
+    /// import consumes them.
+    present: skin_model::present::PresentDef,
     ranks: [Option<u16>; 3],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
@@ -538,6 +541,7 @@ impl<'d> Cx<'d> {
             items,
             whens: Vec::new(),
             when_spans: Vec::new(),
+            present: skin_model::present::PresentDef::default(),
             ranks: [None; 3],
             elements: Vec::new(),
             element_spans: Vec::new(),
@@ -1548,13 +1552,24 @@ impl<'d> Cx<'d> {
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
         trace(Event::Compile);
-        let p =
-            compile(src, &Scope::new(self.schema()), want).map_err(|source| ImportError::Expr {
-                at: self.loc(at),
-                source,
-            })?;
+        let scope = Scope::new(self.schema()).outputs(&self.present.signature);
+        let p = compile(src, &scope, want).map_err(|source| ImportError::Expr {
+            at: self.loc(at),
+            source,
+        })?;
         self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
         Ok(p)
+    }
+
+    /// `src` compiled against the play schema and charged as
+    /// [`Self::compile`] does, or `None` when it does not compile: a
+    /// program read or gate past an expression's limits.
+    fn trial(&mut self, src: &str, want: Ty, at: Span) -> Result<Option<Program>, ImportError> {
+        let Ok(p) = compile(src, &Scope::new(self.schema()), want) else {
+            return Ok(None);
+        };
+        self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
+        Ok(Some(p))
     }
 
     /// The model reference of a mapped timer, adding a rank's `when`
@@ -1828,7 +1843,8 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
-            present: None,
+            present: (!self.present.callbacks.is_empty())
+                .then(|| std::mem::take(&mut self.present)),
         };
         let loaded = if selection {
             let widgets = SelectionDefs {

@@ -84,6 +84,7 @@ use crate::lua::callback::{
     Analysis, Callee, Captured, Disposition, Found, Site, fatal as sentinel, numeral,
     resolve_callee, tree,
 };
+use crate::lua::compile::{self, Compiled, Leaf, Leaves};
 use crate::lua::residual::{
     self, Conv, LIMITS, Node, R, Residual, Stop, Val, charge, did, stop, units,
 };
@@ -246,6 +247,10 @@ struct Lower<'a> {
     mapped: HashMap<u32, Mapped>,
     /// Each node emitted, by its node: a shared node is emitted once.
     memo: HashMap<u32, V>,
+    /// The guards the read being mapped adds.
+    cur: Vec<&'static str>,
+    /// Each read's own availability guards, by its node, for the program.
+    read_guards: HashMap<u32, Vec<&'static str>>,
 }
 
 impl<'a> Lower<'a> {
@@ -268,6 +273,8 @@ impl<'a> Lower<'a> {
             },
             mapped: HashMap::new(),
             memo: HashMap::new(),
+            cur: Vec::new(),
+            read_guards: HashMap::new(),
         }
     }
 }
@@ -322,21 +329,32 @@ impl Lower<'_> {
         if !self.out.guards.contains(&g) {
             self.out.guards.push(g);
         }
+        if !self.cur.contains(&g) {
+            self.cur.push(g);
+        }
     }
 
-    /// Residual `res` emitted as the source of an expression of the
-    /// consumer's type: every read attached first (its mapping, guard,
-    /// deviation and part, an unmapped one refused), then the nodes the
-    /// root reaches, then a trial compile.
-    fn emit_root(&mut self, res: &Residual, conv: Conv) -> R<String> {
+    /// Every read `res` recorded attached: its mapping, guards, deviation
+    /// and part, an unmapped one refused.
+    fn attach(&mut self, res: &Residual) -> R<()> {
         for &r in &res.reads {
             charge(self.an, "attach", 1)?;
             did("attach");
             if let Node::Read { api, arg } = res.node(r) {
+                self.cur.clear();
                 let m = self.map(api, arg)?;
                 self.mapped.insert(r, m);
+                let own = std::mem::take(&mut self.cur);
+                self.read_guards.insert(r, own);
             }
         }
+        Ok(())
+    }
+
+    /// Residual `res`, its reads attached ([`Self::attach`]), emitted as
+    /// the source of an expression of the consumer's type: the nodes the
+    /// root reaches, then a trial compile.
+    fn emit_root(&mut self, res: &Residual, conv: Conv) -> R<String> {
         #[cfg(feature = "dev-tools")]
         {
             self.out.constant = matches!(res.node(res.root), Node::Known(_));
@@ -536,7 +554,9 @@ impl Lower<'_> {
                 an,
                 &[if b { "true" } else { "false" }],
             )?)),
-            Node::Known(_) | Node::Unreachable => ty(),
+            // Floats, `/ // %` and `math` are the program's.
+            Node::Known(_) | Node::Unreachable | Node::Math(..) => ty(),
+            Node::Arith(op, ..) if !matches!(op, Bin::Add | Bin::Sub | Bin::Mul) => ty(),
             Node::Read { .. } => match self.mapped.get(&r) {
                 Some(Mapped::Int { src, lo, hi }) => Self::int(Self::text(an, &[src])?, *lo, *hi),
                 Some(Mapped::Bool(src)) => Ok(V::Bool(Self::text(an, &[src])?)),
@@ -1078,7 +1098,55 @@ fn lib_callee(an: &Analysis, ast: &Ast, inst: u32, callee: u32) -> Result<bool, 
 /// What lowering a callback gave.
 enum Lowering {
     Lowered(Lowered),
+    /// For the program: its reads' metadata, and the callback.
+    Compiled(Lowered, Compiled),
     Unsupported(Unsupported, Scan),
+}
+
+impl Leaves for Lower<'_> {
+    /// A mapped integer or boolean read, or a gauge's or a timer's
+    /// comparison, which the mapping takes whole.
+    fn leaf(&mut self, res: &Residual, r: u32) -> R<Option<Leaf>> {
+        let own = |l: &Self, x: u32| l.read_guards.get(&x).cloned().unwrap_or_default();
+        match res.node(r) {
+            Node::Read { .. } => match self.mapped.get(&r) {
+                Some(Mapped::Int { src, lo, hi }) => Ok(Some(Leaf {
+                    src: Self::text(self.an, &[src])?,
+                    ty: Ty::Int,
+                    guards: own(self, r),
+                    range: Some((*lo, *hi)),
+                })),
+                Some(Mapped::Bool(src)) => Ok(Some(Leaf {
+                    src: Self::text(self.an, &[src])?,
+                    ty: Ty::Bool,
+                    guards: own(self, r),
+                    range: None,
+                })),
+                _ => Ok(None),
+            },
+            Node::Cmp(op, a, b) => {
+                let whole = |x: u32| {
+                    matches!(res.node(x), Node::Read { .. })
+                        && matches!(self.mapped.get(&x), Some(Mapped::Gauge | Mapped::Timer(_)))
+                };
+                let read = match (whole(a), whole(b)) {
+                    (true, _) => a,
+                    (_, true) => b,
+                    _ => return Ok(None),
+                };
+                let V::Bool(src) = self.compare(res, op, a, b)? else {
+                    return Err(Stop::Unsupported(Unsupported::Type));
+                };
+                Ok(Some(Leaf {
+                    src,
+                    ty: Ty::Bool,
+                    guards: own(self, read),
+                    range: None,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// The string `v` when it is one: valid UTF-8, its bytes charged.
@@ -1337,15 +1405,27 @@ impl Cx<'_> {
         if an.writes(inst) {
             return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
         }
-        let r = residual::evaluate(adm, inst, conv, &cancelled)
-            .and_then(|res: Residual| l.emit_root(&res, conv));
+        // The expressions first; on play, a draw or a number's value they
+        // refuse goes to the program, whose refusal is then the reason.
+        let program = self.kind == ScreenKind::Play && matches!(conv, Conv::Truthy | Conv::Int);
+        let r = residual::evaluate(adm, inst, conv, &cancelled).and_then(|res: Residual| {
+            l.attach(&res)?;
+            match l.emit_root(&res, conv) {
+                Ok(src) => Ok(Ok(src)),
+                Err(Stop::Unsupported(_)) if program => {
+                    compile::compile(an, &mut l, &res, conv).map(Err)
+                }
+                Err(e) => Err(e),
+            }
+        });
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
-            Ok(src) => {
+            Ok(Ok(src)) => {
                 l.out.src = src;
                 Ok(Lowering::Lowered(l.out))
             }
+            Ok(Err(c)) => Ok(Lowering::Compiled(l.out, c)),
             Err(Stop::Unsupported(why)) => {
                 let mut s = scan(&l)?;
                 s.part = l.out.part.or(s.part);
@@ -1590,6 +1670,15 @@ impl Cx<'_> {
                 }
                 return Ok(true);
             }
+            Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
+                Ok(k) => {
+                    self.outcome((c, id), field, role, (Disposition::Compiled, None));
+                    *deviates |= l.deviates;
+                    conds.push(format!("lua.{k}"));
+                    return Ok(true);
+                }
+                Err(why) => why,
+            },
             Ok(Lowering::Unsupported(why, _)) => why,
             Err(e) => {
                 self.outcome((c, id), field, role, (Disposition::Refused, None));
@@ -1646,6 +1735,31 @@ impl Cx<'_> {
                     deviates: l.deviates,
                 }));
             }
+            Ok(Lowering::Compiled(l, prog)) => {
+                let role = l
+                    .part
+                    .map(Role::Critical)
+                    .or(l.essential.map(Role::Essential))
+                    .unwrap_or(base);
+                match self.program(prog, None, None, at)? {
+                    Ok(k) => {
+                        self.outcome((c, id), "value", role, (Disposition::Compiled, None));
+                        return Ok(Some(NumberValue {
+                            expr: format!("lua.{k}"),
+                            guard: Some(format!("lua.{k}.ok")),
+                            role,
+                            deviates: l.deviates,
+                        }));
+                    }
+                    Err(why) => (
+                        why,
+                        Scan {
+                            part: l.part,
+                            unresolved: None,
+                        },
+                    ),
+                }
+            }
             Ok(Lowering::Unsupported(why, scan)) => (why, scan),
             Err(e) => {
                 self.outcome((c, id), "value", base, (Disposition::Refused, None));
@@ -1674,6 +1788,130 @@ impl Cx<'_> {
         let note = self.callback_note("value", why);
         self.drop_el(Role::Decorative, at, note)?;
         Ok(None)
+    }
+
+    /// Draw callback `prog`, after the element's conditions `conds`:
+    /// the conditions are its gate, a number's program value its `after`
+    /// (its `lua.<k>.ok`); a condition reading another output (a program
+    /// draw before it) is refused, as the program has no such gating.
+    fn draw_program(
+        &mut self,
+        prog: Compiled,
+        conds: &[String],
+        at: Span,
+    ) -> Result<Result<u16, Unsupported>, ImportError> {
+        let mut gate = Vec::new();
+        let mut after = None;
+        for cond in conds {
+            if !cond.contains("lua.") {
+                gate.push(cond.as_str());
+                continue;
+            }
+            let k = cond
+                .strip_prefix("lua.")
+                .and_then(|r| r.strip_suffix(".ok"))
+                .and_then(|k| k.parse::<u16>().ok())
+                .filter(|&k| {
+                    self.present.callbacks.get(usize::from(k)).map(|c| c.conv)
+                        == Some(skin_model::present::Conv::Int)
+                });
+            match (k, after) {
+                (Some(k), None) => after = Some(k),
+                _ => {
+                    return Ok(Err(Unsupported::Construct("a draw after a program draw")));
+                }
+            }
+        }
+        let gate = (!gate.is_empty()).then(|| gate.join(" && "));
+        self.program(prog, gate, after, at)
+    }
+
+    /// Callback `prog` appended to the program with its `gate` source and
+    /// `after`: its reads and gate compiled and charged; its index, or a
+    /// refusal past the program's or an expression's limits.
+    fn program(
+        &mut self,
+        prog: Compiled,
+        gate: Option<String>,
+        after: Option<u16>,
+        at: Span,
+    ) -> Result<Result<u16, Unsupported>, ImportError> {
+        use skin_model::MAX_SKIN_OPS;
+        use skin_model::present::{CallbackDef, Insn, MAX_CALLBACKS, OutTy, ReadDef};
+        let limits = Ok(Err(LIMITS));
+        let p = &self.present;
+        if p.callbacks.len() >= MAX_CALLBACKS
+            || p.code.len().saturating_add(prog.code.len()) > MAX_SKIN_OPS
+        {
+            return limits;
+        }
+        let mut reads = Vec::with_capacity(prog.reads.len().saturating_add(1));
+        for leaf in &prog.reads {
+            let Some(value) = self.trial(&leaf.src, leaf.ty, at)? else {
+                return limits;
+            };
+            let guard = if leaf.guards.is_empty() {
+                None
+            } else {
+                let Some(g) = self.trial(&leaf.guards.join(" && "), Ty::Bool, at)? else {
+                    return limits;
+                };
+                Some(g)
+            };
+            reads.push(ReadDef { value, guard });
+        }
+        let gate = match gate {
+            None => None,
+            Some(src) => {
+                let Some(value) = self.trial(&src, Ty::Bool, at)? else {
+                    return limits;
+                };
+                reads.push(ReadDef { value, guard: None });
+                Some(reads.len() - 1)
+            }
+        };
+        let p = &mut self.present;
+        let (k_off, r_off) = (p.consts.len(), p.reads.len());
+        let (Ok(start), Ok(len), Ok(k)) = (
+            u32::try_from(p.code.len()),
+            u16::try_from(prog.code.len()),
+            u16::try_from(p.callbacks.len()),
+        ) else {
+            return limits;
+        };
+        let shift = |i: u16, off: usize| u16::try_from(usize::from(i) + off).ok();
+        let gate = match gate.map(|g| u16::try_from(g + r_off).ok()) {
+            None => None,
+            Some(Some(g)) => Some(g),
+            Some(None) => return limits,
+        };
+        let mut code = Vec::with_capacity(prog.code.len());
+        for insn in prog.code {
+            code.push(match insn {
+                Insn::Const { dst, k } => match shift(k, k_off) {
+                    Some(k) => Insn::Const { dst, k },
+                    None => return limits,
+                },
+                Insn::Read { dst, read } => match shift(read, r_off) {
+                    Some(read) => Insn::Read { dst, read },
+                    None => return limits,
+                },
+                other => other,
+            });
+        }
+        p.code.extend(code);
+        p.consts.extend(prog.consts);
+        p.reads.extend(reads);
+        p.callbacks.push(CallbackDef {
+            start,
+            len,
+            regs: prog.regs,
+            conv: prog.conv,
+            gate,
+            after,
+        });
+        p.signature.push(OutTy::of(prog.conv));
+        Ok(Ok(k))
     }
 
     /// The note of a decorative callback in `field` replaced for `why`.
