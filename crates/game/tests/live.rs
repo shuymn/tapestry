@@ -3184,7 +3184,7 @@ fn a_command_during_the_ready_poll_is_served_before_the_result() {
     }
 }
 
-//// A record sink whose save succeeds at once and whose best lookup tells
+/// A record sink whose save succeeds at once and whose best lookup tells
 /// its test it began, then blocks until the test releases it: a slow read
 /// of the own view's best, with the test acting while it waits.
 struct BlockedLookup {
