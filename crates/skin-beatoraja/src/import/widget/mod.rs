@@ -606,7 +606,10 @@ impl Cx<'_> {
                 property::IntProp::Shown(v) => {
                     super::result::set_role(v.essential().map_or(role, Role::Essential), role)
                 }
-                property::IntProp::Null => super::result::index_role(role, r),
+                // A function's value overrides `ref`, so `ref` says nothing.
+                property::IntProp::Null if !matches!(value, Prop::Callable(_)) => {
+                    super::result::index_role(role, r)
+                }
                 _ => role,
             };
         }

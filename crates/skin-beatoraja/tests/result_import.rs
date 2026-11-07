@@ -520,6 +520,33 @@ fn an_image_set_is_not_the_score() {
     }
 }
 
+/// C16 and C15: a set whose `value` overrides `ref` 370 chooses by its
+/// value, so it is not the status, in JSON and in Lua alike: with an EX
+/// number and no other status, both refuse for the status.
+#[test]
+fn an_overridden_clear_ref_is_not_the_status() {
+    let ex = value("ex", r#""ref": 71"#);
+    let set = r#"{"id": "s", "ref": 370, "value": 71, "images": ["b0", "b1"]}"#;
+    assert_eq!(
+        refused(essential(&ex, set, &(dst("ex", "") + "," + &dst("s", "")))),
+        (EssentialPart::ResultStatus, None)
+    );
+    let ex = lua_value("ex", 4, "ref = 71");
+    let sets = "{ id = \"s\", ref = 370, value = function() return ms.number(71) end, \
+                images = { \"b0\", \"b1\" } }";
+    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("s", 300, 8, "");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin("", &ex, sets, &dsts).as_bytes(),
+    );
+    match lua_outcome(d.path(), &ImportFacts::unavailable(ScreenKind::Result)) {
+        Err(ImportError::Essential { part, .. }) => assert_eq!(part, EssentialPart::ResultStatus),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// C16: an element that only reads option 90 in its visibility is status
 /// when retained, but dropped with a note when it cannot be reproduced
 /// (blend 9): the import refuses only when no status remains. An element
