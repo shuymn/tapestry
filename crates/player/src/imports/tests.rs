@@ -308,6 +308,8 @@ fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::
 /// skin, which nothing draws yet, keeps the built-in screen unimported.
 #[test]
 fn a_skin_builds_only_for_its_own_kind_and_importer() {
+    // Its Lua header pass opens a VM, which the barrier tests count.
+    let _serial = serial();
     let r = crate::render_common::offscreen(1_920, 1_080);
     let t = target(&r);
     let dir = options_skin();
