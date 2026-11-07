@@ -12,7 +12,10 @@
 
 mod graph_support;
 
-use graph_support::{GFx, SOLID, composite, near, over_backdrop, ready, skin_with, source_element};
+use graph_support::{
+    GFx, SOLID, composite, inside, moving_element, near, over_backdrop, ready, skin_with,
+    source_element,
+};
 use skin_model::{
     DEVIATION_SLOTS, ResultDefs, ResultStatus, ResultView, Rgba8, Source, TimingGraphDef,
     TimingStats, Unavailable, result_timer,
@@ -273,4 +276,51 @@ fn the_bars_draw_over_the_lines() {
     fx.frame(0);
     near(pixel(&fx, 150.5, 99.5).0, [192.235; 3], 0.5);
     near(pixel(&fx, 150.5, 45.0).0, [197.725; 3], 0.5);
+}
+
+/// A non-positive height or width draws nothing: a rect `[0, 10, 301,
+/// -1]`, a negative width, and a track running through height 0 into
+/// negative heights; at the positive heights on the way, every quad is
+/// non-empty and inside the rect.
+#[test]
+fn a_negative_size_draws_nothing() {
+    let fixed = |r| moving_element(Source::TimingGraph(0), &[(0, r, 0)]);
+    let through = moving_element(
+        Source::TimingGraph(0),
+        &[(0, [0, 400, 301, 4], 0), (1_000, [0, 400, 301, -4], 0)],
+    );
+    let cases = [
+        (fixed([0, 10, 301, -1]), vec![(0, None), (1_000, None)]),
+        (fixed([400, 10, -301, 100]), vec![(0, None)]),
+        (
+            through,
+            vec![
+                (0, Some(4.0)),
+                (250, Some(2.0)),
+                (375, Some(1.0)),
+                (750, None),
+                (1_000, None),
+            ],
+        ),
+    ];
+    for (el, frames) in cases {
+        let mut fx = GFx::new(skin_with(
+            vec![el],
+            ResultDefs {
+                timing_graphs: vec![graph(301)],
+                ..ResultDefs::default()
+            },
+        ));
+        fx.view(&view(&[(-150, 5), (0, 9), (150, 5)], Some((140, 260))));
+        for (ms, h) in frames {
+            fx.frame(ms);
+            match h {
+                None => assert!(fx.quads().is_empty(), "{ms} ms: {:?}", fx.quads().first()),
+                Some(h) => {
+                    assert!(!fx.quads().is_empty(), "{ms} ms");
+                    inside(fx.quads(), [0.0, 400.0, 301.0, h], 1e-3);
+                }
+            }
+        }
+    }
 }

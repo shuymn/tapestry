@@ -15,7 +15,9 @@
 mod graph_support;
 
 use bms_model::TimeUs;
-use graph_support::{GFx, SOLID, composite, near, ready, skin_with, source_element};
+use graph_support::{
+    GFx, SOLID, composite, inside, moving_element, near, ready, skin_with, source_element,
+};
 use rules::GaugeValue;
 use skin_model::{
     GRAPH_COLUMNS, GaugeColumn, GaugeGraphColors, GaugeGraphDef, GaugeHistory, GaugeLook,
@@ -452,6 +454,88 @@ fn a_short_graph_stays_in_its_rect() {
         assert!(covered(10.5) >= 1, "{x}");
         for y in [18.5, 19.5, 20.5, 21.5, 8.5, 9.5, 11.5, 12.5] {
             assert_eq!(covered(y), 0, "({x}, {y})");
+        }
+    }
+}
+
+/// A graph whose height is fractional, under the line's 2 units, or
+/// turned keeps every quad's own rect non-empty and inside the element's
+/// rect, each turned about the region's pivot (its top left, the
+/// element's) by the element's angle: a
+/// track from height 2 to 0 over 1 s, read at fractional heights, and one
+/// turned 30°.
+#[test]
+fn short_quads_are_non_empty_and_inside_the_rect() {
+    let mut columns = [flat(50.0); GRAPH_COLUMNS];
+    columns[10] = col(10.0, 95.0, 79.9);
+    let mut g = history(columns, GaugeLook::Normal);
+    g.no_input_from = Some(100);
+    for angle in [0, 30] {
+        let el = moving_element(
+            Source::GaugeGraph(0),
+            &[
+                (1_500, [100, 100, 576, 2], angle),
+                (2_500, [100, 100, 576, 0], angle),
+            ],
+        );
+        let mut fx = GFx::new(skin_with(
+            vec![el],
+            ResultDefs {
+                gauge_graphs: vec![GaugeGraphDef {
+                    colors: translucent(),
+                    solid: SOLID,
+                }],
+                ..ResultDefs::default()
+            },
+        ));
+        fx.view(&view(g));
+        for ms in [0, 125, 250, 375, 500, 625, 750, 875, 990] {
+            fx.frame(1_500 + ms);
+            let h = 2.0 * (1.0 - ms as f32 / 1_000.0);
+            let rect = [100.0, 100.0, 576.0, h];
+            inside(fx.quads(), rect, 1e-3);
+            assert!(!fx.quads().is_empty(), "{ms} ms");
+            for q in fx.quads() {
+                assert!((q.angle - (angle as f32).to_radians()).abs() < 1e-5);
+                assert_eq!(q.pivot, [100.0, 100.0]);
+            }
+        }
+    }
+}
+
+/// A non-positive height or width draws nothing, never panics: a rect
+/// `[0, 10, 576, -1]`, a negative width, and a track running through
+/// height 0 into negative heights.
+#[test]
+fn a_negative_size_draws_nothing() {
+    let fixed = |r| moving_element(Source::GaugeGraph(0), &[(0, r, 0)]);
+    let through = moving_element(
+        Source::GaugeGraph(0),
+        &[(0, [0, 400, 576, 4], 0), (1_000, [0, 400, 576, -4], 0)],
+    );
+    let cases = [
+        (fixed([0, 10, 576, -1]), [0, 1_000]),
+        (fixed([600, 10, -576, 100]), [0, 1_000]),
+        (through, [750, 1_000]),
+    ];
+    for (el, frames) in cases {
+        let mut fx = GFx::new(skin_with(
+            vec![el],
+            ResultDefs {
+                gauge_graphs: vec![GaugeGraphDef {
+                    colors: surveyed(),
+                    solid: SOLID,
+                }],
+                ..ResultDefs::default()
+            },
+        ));
+        fx.view(&view(history(
+            [flat(50.0); GRAPH_COLUMNS],
+            GaugeLook::Normal,
+        )));
+        for ms in frames {
+            fx.frame(ms);
+            assert!(fx.quads().is_empty(), "{ms} ms: {:?}", fx.quads().first());
         }
     }
 }

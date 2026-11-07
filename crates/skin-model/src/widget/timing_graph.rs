@@ -193,7 +193,8 @@ fn round_ms(x100: i64) -> i32 {
 
 impl TimingGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing unless the view is ready; the areas and ticks, and with
+    /// nothing unless the view is ready or without a positive width and
+    /// height; the areas and ticks, and with
     /// samples the bars and the lines. The rect is placed (lane map,
     /// affine) and fitted to the brush's native size, if any, as one
     /// region; every quad turns with the brush's angle about the brush's
@@ -243,6 +244,11 @@ impl TimingGraph {
         };
         let n = u32::from(def.gx);
         let [x, y, w, h] = region(rect, brush, [n, scale]);
+        // A region with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing.
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
         let [px, py] = brush.pivot;
         let g = Grid {
             x: f64::from(x),

@@ -141,7 +141,7 @@ impl Region<'_> {
 
 impl GaugeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing without a gauge; the back whole, then the line's columns
+    /// nothing without a gauge or without a positive width and height; the back whole, then the line's columns
     /// up to `reached`, cut at `w·min(1, t/1.5 s)` of the screen timer's
     /// `t`, then the no-input mark. The rect is placed (lane map, affine)
     /// as one region; every quad turns with the brush's angle about the
@@ -168,6 +168,11 @@ impl GaugeGraph {
         ];
         let [mx, my, mw, mh] = mapped.map(f32_of);
         let [px, py, pw, ph] = brush.affine.rect([mx, my, mw, mh]);
+        // A rect with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing.
+        if !(mw > 0.0 && mh > 0.0 && pw > 0.0 && ph > 0.0) {
+            return;
+        }
         let [fx, fy] = brush.pivot;
         let r = Region {
             rect: mapped,

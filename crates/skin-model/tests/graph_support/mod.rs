@@ -384,3 +384,48 @@ pub fn near(got: [f32; 3], want: [f32; 3], tolerance: f32) {
 pub fn over_backdrop(rgb: [f32; 3], a: f32) -> [f32; 3] {
     rgb.map(|c| c * a + BACKDROP * (1.0 - a))
 }
+
+/// An element drawing `source` on the screen timer whose track runs
+/// linearly through `keys`, each `(ms, [x, y, w, h], angle)` at alpha 255.
+pub fn moving_element(source: Source, keys: &[(i64, [i32; 4], i32)]) -> ElementDef {
+    let keys: Vec<KeyDef> = keys
+        .iter()
+        .map(|&(ms, r, angle)| {
+            let mut props = [None; 9];
+            for (p, v) in props.iter_mut().zip(r) {
+                *p = Some(v);
+            }
+            props[4] = Some(255);
+            props[8] = Some(angle);
+            KeyDef {
+                at: TimeUs(ms * 1_000),
+                props,
+            }
+        })
+        .collect();
+    ElementDef {
+        source,
+        track: Track::new(&keys, skin_model::Ease::Linear, skin_model::End::Hold).unwrap(),
+        timer: TimerRef::Builtin(result_timer::SCREEN),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
+        place: Place::SCREEN,
+    }
+}
+
+/// Every quad of `quads` has a positive width and height and lies inside
+/// `[x, y, w, h]` (unturned, within `eps`).
+#[track_caller]
+pub fn inside(quads: &[Quad], [x, y, w, h]: [f32; 4], eps: f32) {
+    for q in quads {
+        let [qx, qy, qw, qh] = q.rect;
+        assert!(qw > 0.0 && qh > 0.0, "empty quad {:?}", q.rect);
+        assert!(
+            qx >= x - eps && qy >= y - eps && qx + qw <= x + w + eps && qy + qh <= y + h + eps,
+            "{:?} outside {:?}",
+            q.rect,
+            [x, y, w, h]
+        );
+    }
+}
