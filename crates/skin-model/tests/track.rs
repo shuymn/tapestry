@@ -103,10 +103,38 @@ fn single_key_tracks() {
         ),
         Err(TrackError::LoopOutside {
             from: 100_000,
-            first: 100_000,
             last: 100_000
         })
     );
+}
+
+/// A loop point before the first key, as the source samples it
+/// (`SkinObject.java:358-374` at `0.8.9`): the time wraps first, then a
+/// time before the first key draws nothing. Keys at 5 and 10 s with the
+/// loop at 0 (period 10 s): drawn at 5 s and 15 s, at 7.5 s and 17.5 s
+/// halfway between the keys, and hidden at 10 s, 12 s and 20 s, where
+/// the time wraps to 0 and 2 s.
+#[test]
+fn a_loop_before_the_first_key_leaves_a_gap_each_period() {
+    let keys = [kx(5_000_000, 0), kx(10_000_000, 100)];
+    let t = Track::new(&keys, Ease::Linear, End::Loop { from: TimeUs(0) }).unwrap();
+    for (ms, x) in [
+        (4_999, None),
+        (5_000, Some(0.0)),
+        (7_500, Some(50.0)),
+        (9_999, Some(99.98)),
+        (10_000, None),
+        (12_000, None),
+        (15_000, Some(0.0)),
+        (17_500, Some(50.0)),
+        (20_000, None),
+    ] {
+        assert_eq!(
+            x_at(&t, ms * 1_000).map(|v| (v * 100.0).round() / 100.0),
+            x,
+            "{ms} ms"
+        );
+    }
 }
 
 #[test]
@@ -243,16 +271,14 @@ fn refuses_bad_tracks() {
         Err(TrackError::NegativeStart { at: -1 })
     );
     let three = [kx(100, 0), kx(200, 1), kx(300, 2)];
-    for from in [300, 99] {
+    for from in [300, -1] {
         assert_eq!(
             Track::new(&three, lin, End::Loop { from: TimeUs(from) }),
-            Err(TrackError::LoopOutside {
-                from,
-                first: 100,
-                last: 300
-            })
+            Err(TrackError::LoopOutside { from, last: 300 })
         );
     }
+    // Before the first key is a loop point the source keeps.
+    assert!(Track::new(&three, lin, End::Loop { from: TimeUs(0) }).is_ok());
     let many: Vec<_> = (0..=MAX_TRACK_KEYS as i64).map(|i| kx(i, 0)).collect();
     assert!(Track::new(&many[..MAX_TRACK_KEYS], lin, h).is_ok());
     assert_eq!(

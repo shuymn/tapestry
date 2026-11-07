@@ -169,6 +169,37 @@ fn accepted_tracks_match_the_source() {
     agrees(&round_trip, 0, 150);
 }
 
+/// A loop point before the first key, as the source samples it
+/// (`SkinObject.java:358-374` at `0.8.9`): the time wraps first, then a
+/// wrapped time before the first key draws nothing, a gap each period.
+/// The bundled result skin's shape, keys at 5 and 10 s with the loop at
+/// 0, draws at 5 000 and 15 000 ms and hides at 10 000 and 20 000 ms;
+/// every ms agrees with the source's sampler for it and for loops at 0
+/// and 50 before keys at 100 and 200, under every acceleration.
+#[test]
+fn a_loop_before_the_first_key_leaves_a_gap_as_the_source() {
+    let late = [(5_000, R), (10_000, [110, 20, 60, 40])];
+    let loaded = import_body(&body(&late, 0, 0));
+    assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
+    let mut drawn = loaded.drawn();
+    for (t, shown) in [
+        (4_999, false),
+        (5_000, true),
+        (10_000, false),
+        (15_000, true),
+        (20_000, false),
+    ] {
+        assert_eq!(!drawn.frame(t, &[]).is_empty(), shown, "{t} ms");
+    }
+    agrees(&late, 0, 0);
+    let pair = [(100, R), (200, [110, 20, 60, 40])];
+    for acc in 0..=3 {
+        for l in [0, 50] {
+            agrees(&pair, acc, l);
+        }
+    }
+}
+
 #[test]
 fn tracks_the_model_cannot_follow_are_dropped() {
     let x = |x| [x, 0, 10, 10];
@@ -179,7 +210,6 @@ fn tracks_the_model_cannot_follow_are_dropped() {
             TrackWhy::EqualTime,
         ),
         (vec![(-10, x(0)), (10, x(20))], -1, TrackWhy::NegativeStart),
-        (vec![(100, x(0)), (200, x(20))], 0, TrackWhy::Gap),
         (vec![(0, x(0)), (100, x(20))], -5, TrackWhy::NegativeLoop),
         (
             vec![(0, x(0)), (100, x(20))],
