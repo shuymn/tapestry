@@ -10,6 +10,7 @@ use super::interval::Iv;
 use super::parse::{Ast, BinOp, Func, Id, Kind, UnOp};
 use super::program::{Binary, Op, Unary};
 use super::{MAX_ELAPSED_MS, OptionDef, Scope, TIMER_OFF};
+use crate::present::OutTy;
 use crate::schema::{FieldTy, SchemaError, Ty};
 
 /// A checked tree, ready to fold and emit.
@@ -125,9 +126,20 @@ impl Checker<'_, '_> {
     /// A field read.
     fn field(&self, id: Id) -> Result<Typed, CompileError> {
         let name = self.ast.text(id);
+        let output = self.scope.output(name);
         let Some((slot, field)) = self.scope.schema.field(name) else {
-            return Err(self.err(id, ErrorKind::UnknownName { name: name.into() }));
+            return match output {
+                Some((slot, OutTy::Int, false)) => {
+                    let (lo, hi) = (i32::MIN, i32::MAX);
+                    self.int(id, T::Read(Op::Load { slot, lo, hi }), Iv::new(lo, hi))
+                }
+                Some((slot, _, _)) => Ok(Self::boolean(T::Read(Op::Load { slot, lo: 0, hi: 1 }))),
+                None => Err(self.err(id, ErrorKind::UnknownName { name: name.into() })),
+            };
         };
+        if output.is_some() {
+            return Err(self.err(id, ErrorKind::OutputCollision { name: name.into() }));
+        }
         let load = |lo, hi| T::Read(Op::Load { slot, lo, hi });
         match field.ty {
             FieldTy::Bool => Ok(Self::boolean(load(0, 1))),

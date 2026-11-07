@@ -70,7 +70,8 @@
 //! ([`Skin::clear_loading_text`]).
 //!
 //! Expressions use integers only; floats appear only in a quad's geometry,
-//! after evaluation. The cast lints below reject `as` casts that may
+//! after evaluation, and in the play presentation program ([`present`]),
+//! whose Lua numbers are presentation and never reach the evaluator. The cast lints below reject `as` casts that may
 //! truncate, wrap, or lose the sign; they cover the library and its unit
 //! tests, not integration tests.
 
@@ -91,6 +92,7 @@ mod observation;
 mod pixmap;
 mod place;
 mod play;
+pub mod present;
 mod quad;
 mod result;
 mod schema;

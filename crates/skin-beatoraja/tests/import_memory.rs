@@ -1697,6 +1697,7 @@ fn f14b(root: &Path) -> i64 {
             },
             bomb_up_to: None,
             close: None,
+            present: None,
         };
         black_box(Skin::new(def).unwrap());
     });

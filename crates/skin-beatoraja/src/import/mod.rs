@@ -1828,6 +1828,7 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
+            present: None,
         };
         let loaded = if selection {
             let widgets = SelectionDefs {

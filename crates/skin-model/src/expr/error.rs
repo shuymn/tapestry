@@ -95,6 +95,8 @@ pub enum ErrorKind {
     NameTooLong,
     #[error("unknown name `{name}`")]
     UnknownName { name: Box<str> },
+    #[error("`{name}` names both a field and a program output")]
+    OutputCollision { name: Box<str> },
     #[error("unknown function `{name}`")]
     UnknownFunction { name: Box<str> },
     #[error("unknown timer `{name}`")]

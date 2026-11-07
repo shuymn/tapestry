@@ -94,6 +94,7 @@ fn skin(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .unwrap()
 }
@@ -742,6 +743,7 @@ fn bitmap_text_skin(sheet: skin_model::Sheet) -> Skin {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .unwrap()
 }
@@ -829,6 +831,7 @@ fn a_fields_empty_string_is_the_fields_loading_slot() {
             },
             bomb_up_to: Some(skin_model::Grade::Bad),
             close: None,
+            present: None,
         })
         .unwrap(),
     );

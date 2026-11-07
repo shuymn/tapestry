@@ -348,6 +348,7 @@ pub fn skin_def(elements: Vec<ElementDef>, widgets: WidgetDefs) -> SkinDef {
         widgets,
         bomb_up_to: None,
         close: None,
+        present: None,
     }
 }
 

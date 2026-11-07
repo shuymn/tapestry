@@ -198,6 +198,7 @@ fn bench_bitmap_text(c: &mut Criterion) {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .expect("valid skin");
     let mut h = harness(skin);

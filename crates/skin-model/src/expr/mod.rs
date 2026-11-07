@@ -28,6 +28,7 @@ pub(crate) use lex::is_tail;
 pub use program::evaluations;
 pub use program::{Program, State};
 
+use crate::present::OutTy;
 use crate::schema::{Schema, Ty};
 
 /// The longest expression source, in bytes, checked before lexing.
@@ -82,6 +83,9 @@ pub enum OptionDef<'a> {
 pub struct Scope<'a> {
     schema: &'a Schema,
     options: &'a [OptionDef<'a>],
+    /// The presentation program's outputs, after the schema's fields
+    /// ([`crate::present::output`]).
+    outputs: &'a [OutTy],
 }
 
 impl<'a> Scope<'a> {
@@ -91,6 +95,7 @@ impl<'a> Scope<'a> {
         Self {
             schema,
             options: &[],
+            outputs: &[],
         }
     }
 
@@ -98,6 +103,19 @@ impl<'a> Scope<'a> {
     #[must_use]
     pub fn options(self, options: &'a [OptionDef<'a>]) -> Self {
         Self { options, ..self }
+    }
+
+    /// This scope with the presentation program's `outputs`: `lua.<k>`
+    /// and `lua.<k>.ok` resolve after the schema's fields, a name that is
+    /// both refused.
+    #[must_use]
+    pub fn outputs(self, outputs: &'a [OutTy]) -> Self {
+        Self { outputs, ..self }
+    }
+
+    /// Output `name`'s slot, type and whether it is the `ok` flag.
+    pub(crate) fn output(&self, name: &str) -> Option<(u16, OutTy, bool)> {
+        crate::present::output(self.schema.fields.len(), self.outputs, name)
     }
 }
 
@@ -130,6 +148,24 @@ impl SkinOps {
     /// source is the caller's.
     pub fn charge(&mut self, program: &Program) -> Result<(), CompileError> {
         let total = self.0.saturating_add(program.op_count());
+        if total > MAX_SKIN_OPS {
+            return Err(CompileError::new(
+                Span::default(),
+                ErrorKind::TooManySkinOps,
+            ));
+        }
+        self.0 = total;
+        Ok(())
+    }
+
+    /// Adds `n` operations a frame (the presentation program's cost), or
+    /// refuses them as [`charge`](Self::charge) does.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TooManySkinOps`] past [`MAX_SKIN_OPS`].
+    pub fn charge_ops(&mut self, n: usize) -> Result<(), CompileError> {
+        let total = self.0.saturating_add(n);
         if total > MAX_SKIN_OPS {
             return Err(CompileError::new(
                 Span::default(),

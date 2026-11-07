@@ -145,6 +145,14 @@ impl Program {
         })
     }
 
+    /// The field reads with their clamp ranges: slot, low, high.
+    pub(crate) fn loads(&self) -> impl Iterator<Item = (u16, i32, i32)> + '_ {
+        self.ops.iter().filter_map(|op| match *op {
+            Op::Load { slot, lo, hi } => Some((slot, lo, hi)),
+            _ => None,
+        })
+    }
+
     /// The stack slots evaluation uses.
     #[must_use]
     pub fn stack_depth(&self) -> usize {

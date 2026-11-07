@@ -153,6 +153,7 @@ pub fn skin_with(elements: Vec<ElementDef>, widgets: ResultDefs) -> Skin {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        present: None,
     };
     Skin::new_result(def, widgets).unwrap()
 }
