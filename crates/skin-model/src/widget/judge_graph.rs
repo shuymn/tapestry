@@ -206,16 +206,9 @@ impl JudgeGraph {
         let kind = self.def.kind;
         let bins = tl.bins();
         let notes = tl.notes();
-        let largest = bins
-            .iter()
-            .zip(notes)
-            .map(|(b, &n)| {
-                bin_counts(kind, b, n)
-                    .iter()
-                    .fold(0_u32, |s, &c| s.saturating_add(c))
-            })
-            .max()
-            .unwrap_or(0);
+        // A bin's chips, grey included, are its notes: `Timelines::new`
+        // refuses more counted judgments than notes.
+        let largest = notes.iter().copied().max().unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
         let g = Geometry::new(region(rect, brush, [n, scale]), brush.pivot, n, scale);
@@ -236,7 +229,7 @@ impl JudgeGraph {
         };
         let used = colors.len();
         for (i, (b, &notes)) in (0_u32..).zip(bins.iter().zip(notes)) {
-            let [left, right] = g.column(i);
+            let column @ [left, right] = g.column(i);
             if left >= clip {
                 break;
             }
@@ -254,9 +247,9 @@ impl JudgeGraph {
                 }
                 let color = colors.get(ch).copied().unwrap_or(BASE).unit();
                 if !g.chips(
-                    i,
+                    column,
                     [cell, k],
-                    [left, right.min(clip)],
+                    right.min(clip),
                     f,
                     self.chips,
                     brush,
@@ -409,27 +402,27 @@ impl Geometry {
         [f32_of(top), f32_of(cell * f64::from(k))]
     }
 
-    /// Pushes bin `i`'s run of `k` cells from cell `from` up, over the
-    /// columns `[left, right)` of the bin (cut at the reveal), its uv the
-    /// grid's bottom `k` cells, cut alike; `false` when refused.
+    /// Pushes the run of `k` cells from cell `from` up of the bin whose
+    /// column is `[left, bin_right)`, drawn up to `right` (the reveal's
+    /// cut), its uv the grid's bottom `k` cells, cut alike; `false` when
+    /// refused.
     #[expect(clippy::too_many_arguments, reason = "one run's parts")]
     fn chips(
         &self,
-        i: u32,
+        [left, bin_right]: [f32; 2],
         [from, k]: [u32; 2],
-        [left, right]: [f32; 2],
+        right: f32,
         f: FrameUv,
         image: ImageRef,
         brush: &Brush,
         color: [f32; 4],
         out: &mut QuadBatch,
     ) -> bool {
-        let [bin_left, bin_right] = self.column(i);
-        if right <= left || bin_right <= bin_left {
+        if right <= left || bin_right <= left {
             return true;
         }
         let [l, t, r, b] = f.uv;
-        let cut = (right - bin_left) / (bin_right - bin_left);
+        let cut = (right - left) / (bin_right - left);
         let fk = f32_of(f64::from(k) / f64::from(CHIP_GRID_CELLS));
         let uv = FrameUv {
             uv: [l, b - (b - t) * fk, l + (r - l) * cut, b],

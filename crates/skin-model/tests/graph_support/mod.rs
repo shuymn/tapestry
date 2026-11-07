@@ -85,32 +85,33 @@ pub fn placed_element(
     pivot: skin_model::Anchor,
     native: Option<skin_model::Native>,
 ) -> ElementDef {
-    let mut track = track(r, 255);
-    if angle != 0 {
-        let mut props = [None; 9];
-        for (p, v) in props.iter_mut().zip(r) {
-            *p = Some(v);
-        }
-        props[4] = Some(255);
-        props[8] = Some(angle);
-        track = Track::new(
-            &[KeyDef {
-                at: TimeUs(0),
-                props,
-            }],
-            skin_model::Ease::Linear,
-            skin_model::End::Hold,
-        )
-        .unwrap();
+    let mut props = [None; 9];
+    for (p, v) in props.iter_mut().zip(r) {
+        *p = Some(v);
     }
+    props[4] = Some(255);
+    props[8] = Some(angle);
+    let track = Track::new(
+        &[KeyDef {
+            at: TimeUs(0),
+            props,
+        }],
+        skin_model::Ease::Linear,
+        skin_model::End::Hold,
+    )
+    .unwrap();
     ElementDef {
+        source: Source::JudgeGraph(i),
         track,
+        timer: TimerRef::Builtin(result_timer::SCREEN),
+        visible: None,
+        blend: Blend::Alpha,
+        clip: None,
         place: Place {
             pivot,
             native,
             ..Place::SCREEN
         },
-        ..screen_element(i, r, 255)
     }
 }
 
@@ -282,12 +283,6 @@ impl GFx {
             .copied()
             .collect()
     }
-
-    /// The RGB the renderer draws at canvas point `(x, y)` over the
-    /// backdrop ([`composite`]).
-    pub fn rgb(&self, x: f32, y: f32) -> [f32; 3] {
-        composite(self.quads(), &self.atlas, x, y, None).0
-    }
 }
 
 /// The mip level the shader's sampler reads for quad `q` under `filter`:
@@ -299,12 +294,7 @@ pub fn level(q: &Quad, side: u32, filter: Filter) -> usize {
     if filter == Filter::NearestBase {
         return 0;
     }
-    let [l, t, r, b] = q.uv;
-    let [.., w, h] = q.rect;
-    let s = side as f32;
-    let rho = ((r - l).abs() * s / w).max((b - t).abs() * s / h);
-    let lod = rho.log2();
-    (lod.round().max(0.0) as usize).min(MIP_LEVELS - 1)
+    (lod(q, side).round().max(0.0) as usize).min(MIP_LEVELS - 1)
 }
 
 /// The level of detail of quad `q` (no rounding), as [`level`] computes it.

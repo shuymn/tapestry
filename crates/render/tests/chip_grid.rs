@@ -9,7 +9,7 @@
 mod common;
 
 use bms_model::TimeUs;
-use common::{input, offscreen, view};
+use common::{input, offscreen, rgb_at, view};
 use render::{
     AtlasPages, Blend, ClipTable, FrameInput, Gpu, PageLevels, PlaySkin, Renderer, SkinError,
     Sprite, SpriteBatch,
@@ -159,8 +159,8 @@ fn quads(skin: &Skin, r: &Renderer, perfect: u32) -> (Vec<Sprite>, skin_model::A
     (out.quads().to_vec(), atlas)
 }
 
-/// Draws `sprites` over `atlas`'s pages and reads the target back.
-fn draw(r: &mut Renderer, atlas: &skin_model::Atlas, sprites: Vec<Sprite>) -> Vec<u8> {
+/// Installs `atlas`'s pages.
+fn install(r: &mut Renderer, atlas: &skin_model::Atlas) {
     let levels: Vec<PageLevels<'_>> = atlas
         .pages()
         .iter()
@@ -175,6 +175,10 @@ fn draw(r: &mut Renderer, atlas: &skin_model::Atlas, sprites: Vec<Sprite>) -> Ve
         ClipTable::new(Vec::new()).unwrap(),
     )
     .unwrap();
+}
+
+/// Draws `sprites` over the installed atlas and reads the target back.
+fn draw(r: &mut Renderer, sprites: Vec<Sprite>) -> Vec<u8> {
     r.set_skin(Box::new(Fixed(sprites))).unwrap();
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
@@ -201,13 +205,13 @@ fn a_minified_chip_grid_reads_level_zero_on_the_device() {
         let [_, top, _, h] = chip.rect;
         let rows = top.ceil() as u32..(top + h).floor() as u32;
         let column = (x + 5) as u32;
+        install(&mut r, &atlas);
         for (filter, crisp) in [(Filter::NearestBase, true), (Filter::Nearest, false)] {
-            let p = draw(&mut r, &atlas, vec![Sprite { filter, ..chip }]);
+            let p = draw(&mut r, vec![Sprite { filter, ..chip }]);
             let (w, _) = r.size();
             let (mut lit, mut gaps, mut blended) = (0, 0, 0);
             for y in rows.clone() {
-                let i = ((y * w + column) * 4) as usize;
-                let rgb = [p[i], p[i + 1], p[i + 2]];
+                let rgb = rgb_at(&p, w, (column, y));
                 let is = |want: [u8; 3]| rgb.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 2);
                 if is([0, 136, 255]) {
                     lit += 1;

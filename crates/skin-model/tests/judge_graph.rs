@@ -588,8 +588,8 @@ fn a_native_size_fits_the_whole_graph() {
     assert_eq!(at(50.0, 172.0), 0);
 }
 
-/// Timelines of 1 s bins with their own notes per bin and an uncovered
-/// mark.
+/// Timelines of `width_s`-second bins with their own notes per bin and
+/// an uncovered mark.
 fn timelines_of(
     width_s: i64,
     bins: Vec<[u32; 9]>,
