@@ -1,7 +1,9 @@
 //! Object tables by id, built on first use, in the source's lookup order
 //! (`JsonSkinObjectLoader.java:38-~560`, `PlaySkinObjectLoader.java` at
 //! `0.8.9`): the first record of an id wins in each table, and the first
-//! table that has the id wins. The play loader sets `note` and keeps
+//! table that has the id wins, except `judgegraph`: a later common table
+//! holding the id (up to the gauge) wins over it, as the source's judge
+//! graph match does not return. The play loader sets `note` and keeps
 //! looking, so a later play object of the same id overrides it
 //! (`JsonPlaySkinObjectLoader.java:37-181`): `note` is looked up last.
 //! The selection loader looks up the common objects, the gauge among
@@ -121,6 +123,35 @@ impl Objects {
     ) -> Result<Option<(Object, u32)>, ImportError> {
         for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
             if !looked_up(kind, i) {
+                continue;
+            }
+            if slot.is_none() {
+                *slot = Some(index(def, records(tables, name), false)?);
+            }
+            if let Some(&rec) = slot.as_ref().and_then(|m| m.get(id)) {
+                if object == Object::JudgeGraph {
+                    let later = self.after_judge_graph(def, tables, id, i)?;
+                    return Ok(Some(later.unwrap_or((object, rec))));
+                }
+                return Ok(Some((object, rec)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The first record of id `id` in the common tables after the judge
+    /// graph's entry `at` of [`ORDER`] (through the gauge): the source's
+    /// judge graph match does not return, so a later common object of the
+    /// same id replaces it (`JsonSkinObjectLoader.java:475-555`).
+    fn after_judge_graph(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+        at: usize,
+    ) -> Result<Option<(Object, u32)>, ImportError> {
+        for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
+            if i <= at || i >= COMMON {
                 continue;
             }
             if slot.is_none() {

@@ -106,7 +106,8 @@ pub struct JudgeGraphDef {
 impl JudgeGraphDef {
     /// The quads one frame can push at worst: the background's, then one
     /// per channel of every bin.
-    pub(crate) fn quads(&self) -> u32 {
+    #[must_use]
+    pub fn quads(&self) -> u32 {
         let back = if self.back { BACK_QUADS } else { 0 };
         back + BINS * channels(self.kind)
     }
