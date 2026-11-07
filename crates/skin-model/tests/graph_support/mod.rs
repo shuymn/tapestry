@@ -65,8 +65,13 @@ pub fn track(r: [i32; 4], alpha: i32) -> Track {
 
 /// An element drawing judge graph `i` over `r` at `alpha` on `timer`.
 pub fn element(i: u32, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
+    source_element(Source::JudgeGraph(i), r, alpha, timer)
+}
+
+/// An element drawing `source` over `r` at `alpha` on `timer`.
+pub fn source_element(source: Source, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
     ElementDef {
-        source: Source::JudgeGraph(i),
+        source,
         track: track(r, alpha),
         timer: TimerRef::Builtin(timer),
         visible: None,
@@ -147,8 +152,19 @@ pub fn sheet_builder(dir: &std::path::Path) -> SheetBuilder {
     b
 }
 
-/// A result skin of `elements` drawing `graphs`.
+/// A result skin of `elements` drawing the judge graphs `graphs`.
 pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
+    skin_with(
+        elements,
+        ResultDefs {
+            judge_graphs: graphs,
+            ..ResultDefs::default()
+        },
+    )
+}
+
+/// A result skin of `elements` drawing the result widgets `widgets`.
+pub fn skin_with(elements: Vec<ElementDef>, widgets: ResultDefs) -> Skin {
     let dir = tempfile::tempdir().unwrap();
     let def = SkinDef {
         fit: skin_model::Fit::Fixed,
@@ -164,14 +180,7 @@ pub fn skin(elements: Vec<ElementDef>, graphs: Vec<JudgeGraphDef>) -> Skin {
         bomb_up_to: None,
         close: None,
     };
-    Skin::new_result(
-        def,
-        ResultDefs {
-            judge_graphs: graphs,
-            ..ResultDefs::default()
-        },
-    )
-    .unwrap()
+    Skin::new_result(def, widgets).unwrap()
 }
 
 /// Timelines of 1 s bins, every note judged.
