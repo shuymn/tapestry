@@ -90,11 +90,11 @@ fn graph_quads(r: &mut Res, ms: i64) -> (Vec<Quad>, Vec<Quad>) {
 /// type 1 with every field set, type 2 with the defaults, type 0 and type
 /// 3.
 const GRAPHS_JSON: &str = r#"{"id": "g1", "type": 1, "backTexOff": 0, "delay": 300, "orderReverse": 1, "noGap": 1, "noGapX": 0},
-    {"id": "g2", "type": 2},
+    {"id": "g2", "type": 2, "orderReverse": 2},
     {"id": "g0", "type": 0},
     {"id": "g3", "type": 3}"#;
 const GRAPHS_LUA: &str = "{ id = \"g1\", type = 1, backTexOff = 0, delay = 300, orderReverse = 1, \
-                          noGap = 1, noGapX = 0 }, { id = \"g2\", type = 2 }, \
+                          noGap = 1, noGapX = 0 }, { id = \"g2\", type = 2, orderReverse = 2 }, \
                           { id = \"g0\", type = 0 }, { id = \"g3\", type = 3 }";
 const DSTS_JSON: &str = r#"{"id": "g1", "dst": [{"x": 100, "y": 200, "w": 520, "h": 82}]},
     {"id": "g2", "dst": [{"x": 100, "y": 400, "w": 520, "h": 82, "a": 200}]},
@@ -109,7 +109,8 @@ const DSTS_LUA: &str = "{ id = \"g1\", dst = { { x = 100, y = 200, w = 520, h = 
 /// same frames at every reveal step, each graph its background and chips
 /// on a chip grid; type 0 and type 3 drop with a note on both paths.
 /// The defaults hold: the type-2 graph reveals over 500 ms, the type-1
-/// one over its own 300 ms.
+/// one over its own 300 ms; a flag is on only at 1, so the type-2 graph's
+/// `orderReverse` 2 stacks grey first, the type-1 graph's 1 last.
 #[test]
 fn json_and_lua_judge_graphs_draw_the_same_frames() {
     let j = folder(&json_skin(GRAPHS_JSON, "", DSTS_JSON));
@@ -158,6 +159,22 @@ fn json_and_lua_judge_graphs_draw_the_same_frames() {
     let (chips, _) = graph_quads(&mut a, 500);
     assert_eq!(right(&chips, 200.0), 620.0);
     assert_eq!(right(&chips, 400.0), 620.0);
+    // Bin 1 (x 107.4 to 114.9): the type-2 graph's bottom chip grey, the
+    // type-1 graph's top chip grey.
+    let bin1 = |y: f32| {
+        let mut c: Vec<Quad> = chips
+            .iter()
+            .filter(|q| q.rect[0] > 107.0 && q.rect[0] < 108.0)
+            .filter(|q| q.rect[1] >= top(y) && q.rect[1] < top(y) + 82.0)
+            .copied()
+            .collect();
+        c.sort_by(|a, b| b.rect[1].total_cmp(&a.rect[1]));
+        c.iter()
+            .map(|q| (q.color[0] * 255.0).round() as u8)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bin1(400.0).first(), Some(&0x55));
+    assert_eq!(bin1(200.0).last(), Some(&0x55));
     // Its alpha 200 reaches the type-2 graph's quads.
     assert!(
         chips
