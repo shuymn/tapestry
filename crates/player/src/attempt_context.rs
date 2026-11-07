@@ -145,7 +145,7 @@ impl AttemptContext {
 /// The chart's original lowest and highest tempos in floored hundredths of
 /// a BPM, not scaled by the practice speed (design.md "Play readouts");
 /// `None` past [`skin_model::READOUT_MAX`].
-fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
+pub(crate) fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
     let x100 = |t: bms_model::Tempo| {
         let v = t.units() / (bms_model::Tempo::UNITS_PER_BPM / 100);
         u32::try_from(v)
@@ -162,7 +162,7 @@ fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
 /// BPMs, each truncated and saturating at `i32::MAX` as the source's
 /// integer song data does, uncapped by the readouts' maximum (design.md
 /// "Play readouts").
-fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
+pub(crate) fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
     // `Tempo::MAX` is below 10^12 BPM, so the quotient never overflows.
     let whole = |t: bms_model::Tempo| {
         (t.units() / bms_model::Tempo::UNITS_PER_BPM).min(u128::from(i32::MAX.unsigned_abs()))

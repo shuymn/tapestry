@@ -135,7 +135,9 @@ fn a_kind_is_built_only_after_the_previous_selection_settles() {
     });
     assert_eq!(midway, 1);
     assert_eq!(builds.events(), ["build Play", "released", "build Result"]);
-    assert_eq!(logged(&screens, "install").len(), 2, "{:?}", screens.log());
+    // The result kind's skin is kept on the CPU, never installed (design
+    // D13, "Publication").
+    assert_eq!(logged(&screens, "install").len(), 1, "{:?}", screens.log());
     link.exit();
 }
 
@@ -192,7 +194,8 @@ fn a_healthy_refusal_moves_on_to_the_next_kind() {
         Some("スキンを使えません: the skin cannot be installed")
     );
     assert_eq!(builds.events(), ["build Play", "build Result"]);
-    assert_eq!(logged(&screens, "refuse").len(), 2, "{:?}", screens.log());
+    // Only play's is installed and refused: the result's stays on the CPU.
+    assert_eq!(logged(&screens, "refuse").len(), 1, "{:?}", screens.log());
     link.exit();
 }
 
@@ -223,10 +226,10 @@ fn a_missing_play_skin_admits_no_chart() {
     link.exit();
 }
 
-/// A result-type skin for the result kind is not shown yet and a play
-/// skin there is of another kind: each keeps the built-in result screen,
-/// with one notice line, nothing is selected for it, and charts stay
-/// admitted.
+/// A result skin with neither an EX score nor a status, and a play skin
+/// there of another kind: each is refused and keeps the built-in result
+/// screen, with one notice line, nothing is selected for it, and charts
+/// stay admitted.
 #[test]
 fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
     let _serial = serial();
@@ -239,12 +242,8 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
     )
     .unwrap();
     let build: Build = Arc::new(build);
-    let not_shown = format!(
-        "{}: single-chart result skins are not shown yet",
-        dir.path().join("r.json").display()
-    );
     for (entry, why) in [
-        ("r.json", not_shown.as_str()),
+        ("r.json", "has no EX score"),
         (
             "s.json",
             "a 7-key play skin in the single-chart result slot",
@@ -255,14 +254,13 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
             ..SkinChoices::default()
         };
         let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
-        assert_eq!(
-            started,
-            Started {
-                play: None,
-                notice: Some(format!("リザルトのスキンは使えません（内蔵画面）: {why}")),
-                pending: None,
-                selection: None,
-            }
+        assert!(started.play.is_none() && started.pending.is_none());
+        assert!(started.selection.is_none() && started.result.is_none());
+        let notice = started.notice.unwrap();
+        assert!(
+            notice.starts_with("リザルトのスキンは使えません（内蔵画面）: ")
+                && notice.contains(why),
+            "{notice}"
         );
     }
     assert!(screens.log().is_empty(), "{:?}", screens.log());
@@ -341,7 +339,8 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
     let started = startup(&link, &choices, Launch::Direct, false, &build, || false).unwrap();
     assert_eq!(started, Started::default());
     assert_eq!(builds.events(), ["build Play", "build Result"]);
-    assert_eq!(logged(&screens, "commit").len(), 2, "{:?}", screens.log());
+    // Only play's is committed: the result's stays on the CPU.
+    assert_eq!(logged(&screens, "commit").len(), 1, "{:?}", screens.log());
     link.exit();
 }
 
@@ -379,13 +378,11 @@ fn a_pending_play_skin_is_marked_pending_at_startup() {
             assert_eq!(started.play, None, "{launch:?}");
             assert_eq!(started.notice, None, "{launch:?}");
             assert!(started.pending.is_some(), "{launch:?}");
-            // Only the result kind's skin is installed; play is pending,
-            // so an attempt with the skin in use is refused unasked.
-            assert_eq!(
-                screens.log(),
-                ["1 install Result 2", "1 commit 2"],
-                "{launch:?}"
-            );
+            // Nothing is installed: play is pending, and the result
+            // kind's skin stays on the CPU, so an attempt with the skin in
+            // use is refused unasked.
+            assert!(screens.log().is_empty(), "{launch:?}: {:?}", screens.log());
+            assert!(started.result.is_some(), "{launch:?}");
             let why = crate::render_side::tests::in_use_attempt(&link);
             assert_eq!(why, "the play skin awaits its specialization", "{launch:?}");
             assert!(logged(&screens, "prepare").is_empty(), "{launch:?}");
