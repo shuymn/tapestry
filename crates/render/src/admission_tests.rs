@@ -93,7 +93,7 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
 #[test]
 fn two_skins_at_the_atlas_cap_fit_together() {
     assert_eq!(SHARED_TEXELS, 576 << 20);
-    assert!(SHARED_TEXELS >= 2 * CAP);
+    const { assert!(SHARED_TEXELS >= 2 * CAP) };
     let mut r = offscreen(1_920, 1_080);
     let big = big(&r);
     let p = tiny(&r, RED);
