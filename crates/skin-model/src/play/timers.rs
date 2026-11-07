@@ -9,8 +9,9 @@ use eval::Tally;
 use rules::GaugeValue;
 
 use super::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_PERMILLE, Grade, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX,
-    PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT,
+    NATIVE_TARGET_MAX, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field,
+    lane_timer, timer,
 };
 use super::{
     BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
@@ -236,7 +237,7 @@ pub(crate) const fn level_fields(level: Option<i32>) -> (i32, i32) {
 }
 
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
-pub(crate) const CHART_FIELDS: usize = 6;
+pub(crate) const CHART_FIELDS: usize = 8;
 
 /// The `chart.*` fields of `meta` from `field::CHART_DIFFICULTY`, in slot
 /// order, a play's and a loading frame's alike: each value with its
@@ -258,6 +259,7 @@ pub(crate) const fn chart_fields(meta: ChartMetadata) -> [i32; CHART_FIELDS] {
     }
     let [difficulty, difficulty_valid] = known(small(meta.difficulty), DIFFICULTY_MAX);
     let [total, total_valid] = known(meta.total, READOUT_MAX);
+    let [class, class_valid] = known(small(meta.judge_class), JUDGE_CLASS_MAX);
     let [bga, bga_valid] = match meta.bga {
         Some(b) => [b as i32, 1],
         None => [0, 0],
@@ -269,6 +271,8 @@ pub(crate) const fn chart_fields(meta: ChartMetadata) -> [i32; CHART_FIELDS] {
         total_valid,
         bga,
         bga_valid,
+        class,
+        class_valid,
     ]
 }
 

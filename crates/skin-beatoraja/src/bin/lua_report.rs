@@ -1,13 +1,15 @@
 //! The Lua conversion report (docs/stage3.md §3, the conversion report),
 //! for the developer's PC:
-//! `lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none]
-//! [--level <n>|pending] [--option <name> <item>]... [--file <name>
-//! <candidate>]... [--local] <root> <entry> [<root> <entry>]...`
+//! `lua_report [--autoplay on|off]
+//! [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>|pending]
+//! [--option <name> <item>]... [--file <name> <candidate>]... [--local]
+//! <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin, `entry` relative to its skin folder `root`,
 //! with its default configuration, but for what `--option` and `--file`
-//! name, on the scene of the kind its header names, against import facts with autoplay, the rank the preset read
-//! and the chart's play level as given (`none` for a chart with no rank
-//! header, `pending` for a level the base snapshot has pending; each
+//! name, on the scene of the kind its header names, against import facts
+//! with autoplay, the chart's judgment class and its play level as given
+//! (`none` for a chart in no class, `pending` for a level the base
+//! snapshot has pending; each
 //! unavailable when not given), and prints its kind, what did not convert
 //! as allowlisted counts and outcomes, how many script and unread-entry
 //! roots its configured table holds, a record per callback consumer
@@ -30,11 +32,12 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use skin_beatoraja::Cancel;
-use skin_beatoraja::lua::facts::{ChartRank, Fact, ImportFacts};
+use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{Choice, DestinationEntry, Local, Survey, survey_with};
 use skin_model::ScreenKind;
 
-const USAGE: &str = "usage: lua_report [--autoplay on|off] [--rank <n>|defex <milli>|none] \
+const USAGE: &str = "usage: lua_report [--autoplay on|off] \
+                     [--class veryhard|hard|normal|easy|veryeasy|none] \
                      [--level <n>|pending] [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...";
 
@@ -80,18 +83,16 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
                 };
                 args = rest;
             }
-            [flag, defex, m, rest @ ..] if flag == "--rank" && defex == "defex" => {
-                let m = m.parse().ok()?;
-                facts.chart_rank = Fact::Known(Some(ChartRank::DefExRankMilli(m)));
-                args = rest;
-            }
-            [flag, none, rest @ ..] if flag == "--rank" && none == "none" => {
-                facts.chart_rank = Fact::Known(None);
-                args = rest;
-            }
-            [flag, r, rest @ ..] if flag == "--rank" => {
-                let r = r.parse().ok()?;
-                facts.chart_rank = Fact::Known(Some(ChartRank::Rank(r)));
+            [flag, c, rest @ ..] if flag == "--class" => {
+                facts.judge_class = Fact::Known(match c.as_str() {
+                    "none" => None,
+                    "veryhard" => Some(JudgeClass::VeryHard),
+                    "hard" => Some(JudgeClass::Hard),
+                    "normal" => Some(JudgeClass::Normal),
+                    "easy" => Some(JudgeClass::Easy),
+                    "veryeasy" => Some(JudgeClass::VeryEasy),
+                    _ => return None,
+                });
                 args = rest;
             }
             [flag, ..] if flag.starts_with("--") => return None,
@@ -269,7 +270,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use skin_beatoraja::lua::facts::{ChartRank, Fact};
+    use skin_beatoraja::lua::facts::{Fact, JudgeClass};
     use skin_beatoraja::lua::survey::{
         Became, Consumer, DestinationEntry, DestinationNote, Element, Local, Lowered, Resolved,
         Survey,
@@ -289,17 +290,19 @@ mod tests {
 
     #[test]
     fn the_flags_set_the_snapshot_and_leave_the_skins() {
-        let a = args("--autoplay off --rank 2 --level 12 root s.luaskin");
+        let a = args("--autoplay off --class easy --level 12 root s.luaskin");
         let (f, _, local, rest) = facts(&a).unwrap();
         assert_eq!(f.autoplay, Fact::Known(false));
-        assert_eq!(f.chart_rank, Fact::Known(Some(ChartRank::Rank(2))));
+        assert_eq!(f.judge_class, Fact::Known(Some(JudgeClass::Easy)));
         assert_eq!(f.play_level, Fact::Known(12));
         assert!(!local);
         assert_eq!(rest, ["root", "s.luaskin"]);
         let a = args("--level pending root s.luaskin");
         let (f, ..) = facts(&a).unwrap();
         assert_eq!(f.play_level, Fact::Pending);
-        assert_eq!(f.chart_rank, Fact::Unavailable);
+        assert_eq!(f.judge_class, Fact::Unavailable);
+        let a = args("--class none root s");
+        assert_eq!(facts(&a).unwrap().0.judge_class, Fact::Known(None));
         let a = args("root s.luaskin");
         assert_eq!(facts(&a).unwrap().0.play_level, Fact::Unavailable);
     }
@@ -332,7 +335,8 @@ mod tests {
             "--level 2147483648 root s",
             "--level",
             "--autoplay maybe root s",
-            "--rank x root s",
+            "--class 2 root s",
+            "--rank 2 root s",
             "--other 1 root s",
             "--locals root s",
         ] {

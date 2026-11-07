@@ -1736,14 +1736,14 @@ fn a_per_chart_skin_shows_its_text_as_its_lifetime_allows() {
     assert_eq!(plays, [[2, 0, 2], [2, 0, 2], [3, 0, 3]], "{stdout}");
 }
 
-/// A retry after the play preset's file was edited so that the chart's
-/// class changes (`#DEFEXRANK 120` with `#RANK 1`: hard under the
-/// tapestry policy, very easy under the beatoraja-style one) builds the
-/// pending skin again in the retry, which has no loading state, so the
-/// wait shows as the preparation page's notice; the retry's play draws
-/// the new class's image (blue for very easy) where the first drew red.
+/// A retry after the play preset's file was edited so that the rank it
+/// judges with changes (`#DEFEXRANK 120` with `#RANK 1`: `#RANK 1` under
+/// the tapestry policy, `#DEFEXRANK 120` under the beatoraja-style one)
+/// reuses the specialized skin: the class is the chart's own, easy, whatever
+/// the preset, so the retry builds nothing, shows no notice and draws the
+/// first play's image (blue for easy) again.
 #[test]
-fn a_retry_after_a_preset_edit_builds_the_skin_again() {
+fn a_retry_after_a_preset_edit_keeps_the_charts_class() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     let fx = fixture();
@@ -1751,7 +1751,7 @@ fn a_retry_after_a_preset_edit_builds_the_skin_again() {
     let mut text = fs::read_to_string(&chart).unwrap();
     text.push_str("#DEFEXRANK 120\n#RANK 1\n");
     fs::write(&chart, text).unwrap();
-    write_class_skin(&fx, "if ms.option(184) then path = \"blue.png\" end");
+    write_class_skin(&fx, "");
     let root = DataRoot::new(fx.appdata.join("tapestry"));
     let settings = fs::read_to_string(root.player_settings()).unwrap();
     fs::write(
@@ -1806,20 +1806,17 @@ fn a_retry_after_a_preset_edit_builds_the_skin_again() {
     }
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(0), "{stdout}");
+    assert!(edited, "{stdout}");
     assert_eq!(
         attempt_lines(&stdout),
-        ["skin: play: specialized", "skin: play: specialized"],
+        ["skin: play: specialized", "skin: play: reused"],
         "{stdout}"
     );
-    let at = |from: usize, line: &str| {
-        find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
-    };
-    let first = at(0, "play started");
-    let building = at(first, "skin: play: building for the chart");
-    let page = at(building, "dev: drawn notice: スキンを準備しています");
-    let again = at(page, "skin: play: specialized");
-    at(again, "play started");
-    // The retry's stage is no loading state's.
+    assert_eq!(lines(&stdout, "play started").len(), 2, "{stdout}");
+    assert!(
+        lines(&stdout, "dev: drawn notice: スキンを準備しています").is_empty(),
+        "{stdout}"
+    );
     assert_eq!(
         lines(&stdout, "load: building the play skin").len(),
         1,
@@ -1836,7 +1833,7 @@ fn a_retry_after_a_preset_edit_builds_the_skin_again() {
         .collect();
     plays.sort();
     assert_eq!(plays.len(), 2, "{plays:?}: {stdout}");
-    assert_eq!(centre_rgb(&dumped_rgba(&plays[0])), [255, 0, 0], "{stdout}");
+    assert_eq!(centre_rgb(&dumped_rgba(&plays[0])), [0, 0, 255], "{stdout}");
     assert_eq!(centre_rgb(&dumped_rgba(&plays[1])), [0, 0, 255], "{stdout}");
 }
 

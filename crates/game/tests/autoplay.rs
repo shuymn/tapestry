@@ -194,6 +194,7 @@ impl AutoRig {
 impl Rig for AutoRig {
     type Reader = input::SourceReader;
     type ScreenError = std::convert::Infallible;
+    type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
         self.clock.now()

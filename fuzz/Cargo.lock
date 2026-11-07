@@ -681,6 +681,7 @@ dependencies = [
  "bms-model",
  "image",
  "mlua",
+ "rules",
  "skin-model",
 ]
 

@@ -8330,7 +8330,8 @@ pub(crate) mod tests {
 
     /// Through the model's loading frame, an imported skin draws the
     /// difficulty's and the BGA flag's conditions from the chosen chart,
-    /// none without it, and never the song total, which loading lacks.
+    /// none without it, and never a class condition, its negation or the
+    /// song total, which loading lacks.
     #[test]
     fn a_loading_frame_draws_the_chosen_charts_metadata() {
         let dir = tempfile::tempdir().unwrap();

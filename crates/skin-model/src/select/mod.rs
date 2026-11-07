@@ -396,7 +396,7 @@ impl Selection {
 /// `src` appended to `out` up to twice [`MAX_TEXT_BYTES`] in all, cut at a
 /// character boundary: the text requests cut every string to
 /// [`MAX_TEXT_BYTES`] anyway.
-fn push(out: &mut String, src: &str) {
+pub(crate) fn push(out: &mut String, src: &str) {
     let room = (MAX_TEXT_BYTES * 2).saturating_sub(out.len());
     let mut end = src.len().min(room);
     while !src.is_char_boundary(end) {
@@ -424,7 +424,7 @@ fn row_text(row: &RowView, labels: &SelectionLabels, out: &mut String) {
 }
 
 /// `v` as a field value: at most [`VALUE_MAX`].
-fn value(v: u64) -> i32 {
+pub(crate) fn value(v: u64) -> i32 {
     i32::try_from(v).map_or(VALUE_MAX, |v| v.min(VALUE_MAX))
 }
 

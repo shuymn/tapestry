@@ -107,6 +107,10 @@ pub struct ChartMetadata {
     /// Its difficulty, `chart.difficulty`: `#DIFFICULTY` from 1 to 5, 0
     /// for any other or none. A value above 5 is unknown.
     pub difficulty: Option<u8>,
+    /// Its judgment class, `chart.judge_class`: 0 the hardest to 4 the
+    /// easiest, from its own rank as the reference computes it; `None`
+    /// also for a rank in no class. A value above 4 is none.
+    pub judge_class: Option<u8>,
     /// Its gauge total, whole, `chart.total`; a negative value or one a
     /// number widget reserves (`i32::MAX`) is unknown.
     pub total: Option<i32>,
@@ -118,6 +122,7 @@ impl ChartMetadata {
     /// Nothing known.
     pub const UNKNOWN: Self = Self {
         difficulty: None,
+        judge_class: None,
         total: None,
         bga: None,
     };
