@@ -102,6 +102,7 @@ fn graph_skin(dir: &std::path::Path, x: i32) -> Skin {
         back: false,
         chips: 1,
         solid: 0,
+        fit: skin_model::GraphFit::Stretch,
     };
     Skin::new_result(
         def,

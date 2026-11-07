@@ -7,6 +7,7 @@ pub(super) mod digit_offsets;
 pub(super) mod gauge;
 pub(super) mod image_choice;
 pub(super) mod judge;
+pub(super) mod judge_graph;
 pub(super) mod lanes;
 pub(super) mod note_parts;
 pub(super) mod number;
