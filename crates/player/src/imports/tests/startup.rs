@@ -223,10 +223,10 @@ fn a_missing_play_skin_admits_no_chart() {
     link.exit();
 }
 
-/// A result-type skin for the result kind is not shown yet and a play
-/// skin there is of another kind: each keeps the built-in result screen,
-/// with one notice line, nothing is selected for it, and charts stay
-/// admitted.
+/// A result skin with neither an EX score nor a status, and a play skin
+/// there of another kind: each is refused and keeps the built-in result
+/// screen, with one notice line, nothing is selected for it, and charts
+/// stay admitted.
 #[test]
 fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
     let _serial = serial();
@@ -239,12 +239,8 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
     )
     .unwrap();
     let build: Build = Arc::new(build);
-    let not_shown = format!(
-        "{}: single-chart result skins are not shown yet",
-        dir.path().join("r.json").display()
-    );
     for (entry, why) in [
-        ("r.json", not_shown.as_str()),
+        ("r.json", "has no EX score"),
         (
             "s.json",
             "a 7-key play skin in the single-chart result slot",
@@ -255,14 +251,13 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
             ..SkinChoices::default()
         };
         let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
-        assert_eq!(
-            started,
-            Started {
-                play: None,
-                notice: Some(format!("リザルトのスキンは使えません（内蔵画面）: {why}")),
-                pending: None,
-                selection: None,
-            }
+        assert!(started.play.is_none() && started.pending.is_none());
+        assert!(started.selection.is_none() && started.result.is_none());
+        let notice = started.notice.unwrap();
+        assert!(
+            notice.starts_with("リザルトのスキンは使えません（内蔵画面）: ")
+                && notice.contains(why),
+            "{notice}"
         );
     }
     assert!(screens.log().is_empty(), "{:?}", screens.log());

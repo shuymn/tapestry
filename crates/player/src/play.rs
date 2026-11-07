@@ -276,9 +276,38 @@ pub struct PlayerRig<'a> {
     /// select screen's panels (design.md "Input", Menu input), installed
     /// with the adjustments' tap.
     pub panels: Option<input::PanelLevel>,
+    /// The result skin (design D10-D13): its image stage in each
+    /// attempt's Preparing, its layout on the result and each switch,
+    /// published on the CPU.
+    pub result_skin: crate::result_skin::ResultSkin,
+    /// The attempt's chart facts a result view carries.
+    pub result_chart: Option<skin_model::ResultChart>,
 }
 
 impl PlayerRig<'_> {
+    /// The result skin's image stage for the attempt at `loaded` (design
+    /// D11), after the play skin's specialization and before READY: the
+    /// quit key cancels its job and waits for its thread; the window's
+    /// close and a failure of the input or audio thread end it within the
+    /// stop bound.
+    fn result_stage(&mut self, loaded: &Loaded) -> crate::result_skin::Staged {
+        let chart = crate::result_skin::attempt_chart(loaded);
+        self.result_chart = Some(chart);
+        let mut result = std::mem::take(&mut self.result_skin);
+        let rig = &*self;
+        let staged = result.image_stage(
+            chart,
+            || rig.controls.leaving(),
+            || {
+                rig.controls.quitting()
+                    || rig.input_failure().is_some()
+                    || rig.audio_failure().is_some()
+            },
+        );
+        self.result_skin = result;
+        staged
+    }
+
     /// The play skin the attempt at `loaded` is prepared with: the skin in
     /// use, or the pending play skin's specialization for the attempt's
     /// facts ([`crate::imports::PendingSkin::attempt`]), reused while the
@@ -837,6 +866,12 @@ impl Rig for PlayerRig<'_> {
         if left > 0 {
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        // A switch's layout lands when its job is done; a close leaves its
+        // wait within the stop bound.
+        self.result_skin.poll();
+        if self.controls.quitting() {
+            self.result_skin.settle(|| true);
+        }
         self.serve_adjustments();
         self.sync();
     }
@@ -872,13 +907,28 @@ impl Rig for PlayerRig<'_> {
     fn take_menu(&mut self) -> Option<MenuCommand> {
         loop {
             match self.take() {
-                Some(Command::Retry) => return Some(MenuCommand::Retry),
-                Some(Command::Quit) => return Some(MenuCommand::Back),
+                // A retry or a quit cancels the result's layout job and
+                // waits for its thread before it is served (D11).
+                Some(Command::Retry) => {
+                    let controls = self.controls;
+                    self.result_skin.settle(|| controls.quitting());
+                    return Some(MenuCommand::Retry);
+                }
+                Some(Command::Quit) => {
+                    let controls = self.controls;
+                    self.result_skin.settle(|| controls.quitting());
+                    return Some(MenuCommand::Back);
+                }
                 Some(Command::Suspend) => {}
                 None => break,
             }
         }
-        self.result_input.take()
+        let c = self.result_input.take();
+        if matches!(c, Some(MenuCommand::Retry | MenuCommand::Back)) {
+            let controls = self.controls;
+            self.result_skin.settle(|| controls.quitting());
+        }
+        c
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -959,10 +1009,17 @@ impl Rig for PlayerRig<'_> {
     /// gauge descriptor is replaced from the preset the play refreshed,
     /// with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        // A retry from the result waits for its layout job's cancellation.
+        let controls = self.controls;
+        self.result_skin.settle(|| controls.quitting());
+        self.result_skin.next_attempt();
         let skin = match self.attempt_skin(loaded) {
             Ok(skin) => skin,
             Err(stopped) => return Ok(stopped),
         };
+        if self.result_stage(loaded) == crate::result_skin::Staged::Cancelled {
+            return Ok(Preparation::Cancelled);
+        }
         let specialized = matches!(skin, AttemptSkin::Specialized(_));
         self.attempt_gauge = loaded.displayed().0;
         refresh_loading_gauge(
@@ -1442,15 +1499,41 @@ impl Rig for PlayerRig<'_> {
     /// the save: what was queued during the play and the save is no
     /// result's, and what comes from here on is fresh. The built-in result
     /// needs nothing more, so the preparation is ready at once.
-    fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
+    fn begin_result(&mut self, _report: &PlayReport, screen: &ResultScreen) {
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
+        }
+        // P: the own view's layout (design D11).
+        if let Some(chart) = self.result_chart {
+            self.result_skin
+                .request(crate::result_skin::view_facts(screen, chart));
+        }
+    }
+
+    fn poll_result(&mut self, _prep: &mut (), deadline: TimeUs) -> game::Polled {
+        loop {
+            if self.result_skin.poll() {
+                return game::Polled::Ready;
+            }
+            let left = deadline.0 - self.clock.now().0;
+            if left <= 0 {
+                return game::Polled::Pending;
+            }
+            let slice =
+                Duration::from_micros(left.unsigned_abs()).min(crate::render_side::SELECT_SLICE);
+            thread::park_timeout(slice);
         }
     }
 
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
         self.print_view(screen);
+        // A switch: its layout is requested; the current generation stays
+        // until it lands (design D11).
+        if let Some(chart) = self.result_chart {
+            self.result_skin
+                .request(crate::result_skin::view_facts(screen, chart));
+        }
         let tuning = self.controls.tuning();
         tuning.open_end_screen();
         let queue = self.queue_line.unwrap_or(QueueLine {

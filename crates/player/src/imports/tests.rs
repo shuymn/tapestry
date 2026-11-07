@@ -330,32 +330,20 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         refused(as_result),
         "a 7-key play skin in the single-chart result slot"
     );
-    match build(
+    // A result skin imports for its kind (design D10): one with neither an
+    // EX score nor a status is refused for it.
+    let r = refused(build(
         ScreenKind::Result,
         &choice(dir.path(), "r.json"),
         false,
         &t,
         &c,
-    ) {
-        // The importer maps result skins, but none is drawn yet: the build
-        // keeps the built-in screen before the import, naming the skin.
-        KindOutcome::BuiltIn(why) => {
-            let entry = dir.path().join("r.json");
-            assert_eq!(
-                why,
-                format!(
-                    "{}: single-chart result skins are not shown yet",
-                    entry.display()
-                )
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    // The gate precedes the configuration and the import: a result skin
-    // whose configuration is invalid (an option it does not declare), or
-    // whose configured Lua pass fails as soon as it runs, keeps the
-    // built-in screen all the same; the Lua skin runs its header pass
-    // alone (with dev-tools, this thread's passes count it).
+    ));
+    assert!(r.contains("has no EX score"), "{r}");
+    // Its configuration and its configured Lua pass are its own: an
+    // option it does not declare, or a configured pass that fails as soon
+    // as it runs, refuses it; the Lua skin runs both passes (with
+    // dev-tools, this thread's passes count them).
     fs::write(
         dir.path().join("bad.json"),
         r#"{"type": 7, "w": 1920, "h": 1080,
@@ -377,20 +365,12 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     ] {
         #[cfg(feature = "dev-tools")]
         let passes = skin_beatoraja::lua::vm_hooks::thread_passes();
-        match build(ScreenKind::Result, &c2, false, &t, &c) {
-            KindOutcome::BuiltIn(why) => assert_eq!(
-                why,
-                format!(
-                    "{}: single-chart result skins are not shown yet",
-                    dir.path().join(entry).display()
-                )
-            ),
-            other => panic!("{entry}: {other:?}"),
-        }
+        let why = refused(build(ScreenKind::Result, &c2, false, &t, &c));
+        assert!(!why.is_empty(), "{entry}");
         #[cfg(feature = "dev-tools")]
         assert_eq!(
             skin_beatoraja::lua::vm_hooks::thread_passes() - passes,
-            u64::from(entry == "r.luaskin"),
+            if entry == "r.luaskin" { 2 } else { 0 },
             "{entry}"
         );
     }

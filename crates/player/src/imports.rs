@@ -41,7 +41,7 @@ use skin_beatoraja::{
     Cancel, Config, Definition, Fact, FactDeps, FactId, Header, ImportError, ImportFacts, Imported,
     LuaHeader, LuaOutcome, LuaUsage, Note, NoteLoc, Report, Rule, Usage,
 };
-use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side};
+use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side, Skin};
 
 use crate::log_file;
 use crate::render_side::{RenderLink, SELECT_SLICE};
@@ -86,6 +86,10 @@ pub enum KindOutcome {
     /// has pending: what each attempt's [`specialize`] starts from, and
     /// the base import's report.
     Pending(Arc<PendingPlay>, PendingNote),
+    /// A Lua result skin whose base import read a fact the base snapshot
+    /// has pending: what each image stage and layout starts from
+    /// ([`crate::result_skin`]), and the base import's report.
+    ResultPending(Arc<crate::result_skin::PendingResult>, PendingNote),
 }
 
 /// A pending play skin, built for each attempt ([`specialize`]): the
@@ -382,6 +386,7 @@ pub fn build(
         Ok(Built::Bundle(b, summary)) => KindOutcome::Bundle(b, summary),
         Ok(Built::NoImporter(why)) => KindOutcome::BuiltIn(why),
         Ok(Built::Pending(p, note)) => KindOutcome::Pending(p, note),
+        Ok(Built::ResultPending(p, note)) => KindOutcome::ResultPending(p, note),
         Err(why) => KindOutcome::Refused(why),
     }
 }
@@ -391,6 +396,7 @@ enum Built {
     Bundle(Arc<SkinBundle>, Summary),
     NoImporter(String),
     Pending(Arc<PendingPlay>, PendingNote),
+    ResultPending(Arc<crate::result_skin::PendingResult>, PendingNote),
 }
 
 /// The header pass's result, by format.
@@ -458,15 +464,6 @@ fn built(
             found,
         }));
     }
-    // A result skin imports, but nothing draws it yet: the result screen
-    // stays built in, with nothing imported, installed or charged, until
-    // result skins are drawn (S10-09g PR 5 and S10-09i remove this gate).
-    if kind == ScreenKind::Result {
-        return Ok(Built::NoImporter(format!(
-            "{}: single-chart result skins are not shown yet",
-            choice.root.join(&choice.entry).display()
-        )));
-    }
     stopped()?;
     // 3. The configuration.
     let config = config(pass.header(), choice)?;
@@ -484,8 +481,16 @@ fn built(
                         dependencies: p.dependencies,
                         usage: p.usage,
                     };
-                    // Only play's facts are given per attempt: another
-                    // kind's pending fact refuses.
+                    // A result skin is laid out per attempt and view
+                    // (design D10, D11, D13).
+                    if kind == ScreenKind::Result {
+                        let root = Root::new(&choice.root).map_err(|e| Chain(&e).to_string())?;
+                        let pending =
+                            crate::result_skin::PendingResult::new(h, config, *target, &root);
+                        return Ok(Built::ResultPending(Arc::new(pending), note));
+                    }
+                    // Only play's and the result's facts are given per
+                    // attempt: another kind's pending fact refuses.
                     if kind != ScreenKind::Play {
                         return Err(note.refusal());
                     }
@@ -556,13 +561,32 @@ fn pack(
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> Result<(Arc<SkinBundle>, Summary), String> {
-    let stopped = || stopped(cancel);
     let summary = Summary::of(imported.report, header);
     let skin = imported.skin;
     let variant = skin.variant(target.size, &Layout::AUTHOR);
     let atlas = skin
         .atlas(variant, target.limits, &|| cancel.is_cancelled())
         .map_err(|e| format!("the atlas cannot be built: {}", Chain(&e)))?;
+    let bundle = bundle_of(skin, imported.scratch, atlas, target, cancel)?;
+    Ok((bundle, summary))
+}
+
+/// `skin` bundled with `atlas` (built from its sheet, or rebound to it):
+/// its outline fonts read and its text producer made when it has
+/// rasterized text, and the lanes laid out for `scratch`; `cancel` asked
+/// between its phases.
+///
+/// # Errors
+///
+/// The located reason a font, the text or the bundle refuses.
+pub(crate) fn bundle_of(
+    skin: Skin,
+    scratch: Option<Side>,
+    atlas: skin_model::Atlas,
+    target: &ImportTarget,
+    cancel: &Cancel,
+) -> Result<Arc<SkinBundle>, String> {
+    let stopped = || stopped(cancel);
     stopped()?;
     let producer = if skin.has_outline_text() {
         let mut reader = FontReader::new(skin.sheet());
@@ -582,7 +606,7 @@ fn pack(
     } else {
         None
     };
-    let scratch = imported.scratch.unwrap_or(Side::Left);
+    let scratch = scratch.unwrap_or(Side::Left);
     let bundle = SkinBundle::new(Arc::new(skin), atlas, ClipTable::default(), scratch)
         .map_err(|e| format!("the skin cannot be bundled: {}", Chain(&e)))?;
     let bundle = match producer {
@@ -591,7 +615,12 @@ fn pack(
             .map_err(|e| format!("the skin cannot be bundled: {}", Chain(&e)))?,
         None => bundle,
     };
-    Ok((Arc::new(bundle), summary))
+    Ok(Arc::new(bundle))
+}
+
+/// `e` with its causes, as one line.
+pub(crate) fn chain(e: &ImportError) -> String {
+    Chain(e).to_string()
 }
 
 /// The configuration `choice` names against `header`: each named option's
@@ -657,9 +686,33 @@ pub fn run_cancellable<T: Send + 'static>(
 /// neither, and an abandoned one only in the first.
 pub fn run_job<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
-    mut cancel_attempt: impl FnMut() -> bool,
-    mut end_run: impl FnMut() -> bool,
+    cancel_attempt: impl FnMut() -> bool,
+    end_run: impl FnMut() -> bool,
 ) -> Ran<T> {
+    match spawn_job(job) {
+        Ok(j) => j.finish(cancel_attempt, end_run),
+        Err(why) => Ran::Refused(why),
+    }
+}
+
+/// A job on its own `skin-import` thread ([`spawn_job`]), polled without
+/// blocking ([`Job::poll`]) or waited for ([`Job::finish`]).
+pub struct Job<T> {
+    cancel: Cancel,
+    rx: mpsc::Receiver<Result<T, &'static str>>,
+    handle: Option<thread::JoinHandle<()>>,
+    outcome: Option<Ran<T>>,
+}
+
+/// Starts `job` on a spawned `skin-import` thread, its panic caught and
+/// sent as [`PANICKED`].
+///
+/// # Errors
+///
+/// Why the thread could not start.
+pub fn spawn_job<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+) -> Result<Job<T>, String> {
     let cancel = Cancel::new();
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
@@ -681,45 +734,97 @@ pub fn run_job<T: Send + 'static>(
         #[cfg(test)]
         tests::exit_gate();
     };
-    let handle = match spawn(body) {
-        Ok(h) => h,
-        Err(e) => return Ran::Refused(format!("the import thread cannot start: {e}")),
-    };
+    let handle = spawn(body).map_err(|e| format!("the import thread cannot start: {e}"))?;
     #[cfg(feature = "dev-tools")]
     JOBS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let mut deadline: Option<Instant> = None;
-    let mut outcome: Option<Ran<T>> = None;
-    let mut attempt_cancelled = false;
-    loop {
-        if deadline.is_none() && end_run() {
-            cancel.cancel();
-            deadline = Some(Instant::now() + STOP_WAIT);
-        }
-        if deadline.is_none() && !attempt_cancelled && cancel_attempt() {
-            cancel.cancel();
-            attempt_cancelled = true;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            // Detached: the handle and the receiver go, so a late outcome
-            // is dropped on its own thread.
-            return Ran::Abandoned;
-        }
-        match outcome {
-            None => match rx.recv_timeout(SELECT_SLICE) {
-                Ok(Ok(done)) => outcome = Some(Ran::Done(done)),
-                Ok(Err(why)) => outcome = Some(Ran::Refused(why.to_owned())),
-                Err(RecvTimeoutError::Disconnected) => {
-                    outcome = Some(Ran::Refused(ENDED.to_owned()));
+    Ok(Job {
+        cancel,
+        rx,
+        handle: Some(handle),
+        outcome: None,
+    })
+}
+
+impl<T> Job<T> {
+    /// The outcome once it is in and the thread has ended and been
+    /// joined; `None` meanwhile. It does not block.
+    pub fn poll(&mut self) -> Option<Ran<T>> {
+        if self.outcome.is_none() {
+            match self.rx.try_recv() {
+                Ok(Ok(done)) => self.outcome = Some(Ran::Done(done)),
+                Ok(Err(why)) => self.outcome = Some(Ran::Refused(why.to_owned())),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.outcome = Some(Ran::Refused(ENDED.to_owned()));
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-            },
-            Some(done) if handle.is_finished() => {
-                let _ = handle.join();
-                #[cfg(feature = "dev-tools")]
-                JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return done;
+                Err(mpsc::TryRecvError::Empty) => return None,
             }
-            Some(_) => thread::sleep(SELECT_SLICE),
+        }
+        if self.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            return None;
+        }
+        self.join();
+        self.outcome.take()
+    }
+
+    fn join(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+            #[cfg(feature = "dev-tools")]
+            JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Waits in [`SELECT_SLICE`] slices for the outcome and the thread's
+    /// end, then joins it. Once `cancel_attempt` turns true the job is
+    /// cancelled and the wait goes on, without a bound, until its thread
+    /// ends; once `end_run` turns true, before or after, the job is
+    /// cancelled and the thread waited for at most [`STOP_WAIT`] from then,
+    /// past which [`Ran::Abandoned`].
+    pub fn finish(
+        mut self,
+        mut cancel_attempt: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
+    ) -> Ran<T> {
+        let mut deadline: Option<Instant> = None;
+        let mut attempt_cancelled = false;
+        loop {
+            if deadline.is_none() && end_run() {
+                self.cancel.cancel();
+                deadline = Some(Instant::now() + STOP_WAIT);
+            }
+            if deadline.is_none() && !attempt_cancelled && cancel_attempt() {
+                self.cancel.cancel();
+                attempt_cancelled = true;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                // Detached: the handle and the receiver go, so a late
+                // outcome is dropped on its own thread.
+                self.handle = None;
+                return Ran::Abandoned;
+            }
+            match self.outcome {
+                None => match self.rx.recv_timeout(SELECT_SLICE) {
+                    Ok(Ok(done)) => self.outcome = Some(Ran::Done(done)),
+                    Ok(Err(why)) => self.outcome = Some(Ran::Refused(why.to_owned())),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        self.outcome = Some(Ran::Refused(ENDED.to_owned()));
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                },
+                Some(_)
+                    if self
+                        .handle
+                        .as_ref()
+                        .is_none_or(thread::JoinHandle::is_finished) =>
+                {
+                    self.join();
+                    return self
+                        .outcome
+                        .take()
+                        .unwrap_or(Ran::Refused(ENDED.to_owned()));
+                }
+                Some(_) => thread::sleep(SELECT_SLICE),
+            }
         }
     }
 }
@@ -955,6 +1060,10 @@ pub struct Started {
     /// The installed selection skin's song list: its center slot and its
     /// placements, which the select screen's view is made for.
     pub selection: Option<(usize, usize)>,
+    /// The result kind's skin, kept on the CPU: nothing draws a result
+    /// skin until S10-09i, so it is never selected, pended or installed
+    /// on the render thread (design D13, "Publication").
+    pub result: Option<crate::result_skin::ResultStart>,
 }
 
 impl PartialEq for Started {
@@ -1054,6 +1163,16 @@ pub fn startup(
                 }
             }
             Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
+            Ran::Done(KindOutcome::ResultPending(result, note)) => {
+                started.result = Some(crate::result_skin::ResultStart::Pending(result));
+                Shown::Pending(note.fact)
+            }
+            // A result skin with no fact pending: kept for every chart, on
+            // the CPU only.
+            Ran::Done(KindOutcome::Bundle(bundle, _)) if kind == ScreenKind::Result => {
+                started.result = Some(crate::result_skin::ResultStart::Fixed(bundle));
+                Shown::Installed
+            }
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 let skin = bundle.skin();
