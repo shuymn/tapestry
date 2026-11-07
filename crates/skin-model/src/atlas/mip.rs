@@ -118,6 +118,40 @@ pub(crate) fn blit_solid(page: &mut [u8], side: u32, [r, g, b, a]: [u8; 4], allo
     }
 }
 
+/// Fills the allocation `alloc` of a page `side` texels wide, gutter
+/// included, with a generated grid of `size` texels
+/// ([`SolidImageDef::grid`](crate::SolidImageDef)): in each
+/// [`GRID_CELL`](crate::image::GRID_CELL)-texel cell, the `lit[0]` columns
+/// from its left and the `lit[1]` rows up from its bottom are straight
+/// colour `[r, g, b, a]` premultiplied, the rest transparent. Each gutter
+/// texel repeats the nearest content texel, as [`blit`] extrudes a file's.
+pub(crate) fn blit_grid(
+    page: &mut [u8],
+    side: u32,
+    [r, g, b, a]: [u8; 4],
+    lit: [u8; 2],
+    [w, h]: [u32; 2],
+    alloc: [u32; 4],
+) {
+    let [ax, ay, aw, ah] = alloc;
+    let texel = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
+    let cell = u32::from(crate::image::GRID_CELL);
+    let [lit_x, lit_y] = lit.map(u32::from);
+    // The content column or row an allocation offset `d` shows, of `n`.
+    let content = |d: u32, n: u32| d.saturating_sub(GUTTER).min(n.saturating_sub(1));
+    for dy in 0..ah {
+        let start = (to_usize(ay + dy) * to_usize(side) + to_usize(ax)) * 4;
+        let Some(row) = page.get_mut(start..start + to_usize(aw) * 4) else {
+            continue;
+        };
+        let row_lit = content(dy, h) % cell >= cell.saturating_sub(lit_y);
+        for (dx, t) in (0..aw).zip(row.as_chunks_mut::<4>().0) {
+            let painted = row_lit && content(dx, w) % cell < lit_x;
+            *t = if painted { texel } else { [0; 4] };
+        }
+    }
+}
+
 /// The 2×2 average of four texels' channel, rounded to nearest.
 fn mean(a: u8, b: u8, c: u8, d: u8) -> u8 {
     let sum = u16::from(a) + u16::from(b) + u16::from(c) + u16::from(d);

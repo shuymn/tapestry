@@ -22,6 +22,7 @@ fn solid_def(size: [u32; 2], color: [u8; 4]) -> SolidImageDef {
         size,
         color,
         filter: Filter::Nearest,
+        grid: None,
     }
 }
 

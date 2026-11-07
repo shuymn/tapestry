@@ -394,6 +394,7 @@ pub const IN_PLAY: &[Site] = &[
     // The canvas, the regions' placement and the widgets.
     Site::File("crates/skin-model/src/canvas.rs"),
     Site::File("crates/skin-model/src/layout.rs"),
+    Site::File("crates/skin-model/src/pixmap.rs"),
     Site::File("crates/skin-model/src/place.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
     Site::File("crates/skin-model/src/widget/bar.rs"),
@@ -402,6 +403,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/gauge.rs"),
     Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
+    Site::File("crates/skin-model/src/widget/judge_graph.rs"),
     Site::File("crates/skin-model/src/widget/lanes.rs"),
     Site::File("crates/skin-model/src/widget/ratio_bar.rs"),
     Site::File("crates/skin-model/src/widget/scroll.rs"),

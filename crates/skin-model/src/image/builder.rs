@@ -411,6 +411,12 @@ impl SheetBuilder {
         if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || n > MAX_IMAGE_TEXELS {
             return Err(ImageError::SolidSize { image, w, h });
         }
+        if def
+            .grid
+            .is_some_and(|g| g.iter().any(|&lit| lit == 0 || lit > super::GRID_CELL))
+        {
+            return Err(ImageError::SolidGrid { image });
+        }
         let (Some(lo), Some(hi)) = (self.lo_texels.with(n), self.hi_texels.with(n)) else {
             return Err(ImageError::SolidTotalTooLarge { image });
         };
@@ -980,6 +986,7 @@ mod tests {
             size,
             color: [255, 255, 255, 255],
             filter: Filter::Nearest,
+            grid: None,
         }
     }
 
@@ -1018,7 +1025,7 @@ mod tests {
         let sheet = b.finish();
         // The file's cells first, then the generated one; frames follow.
         let sources: Vec<_> = sheet.cells().iter().map(|c| c.source).collect();
-        let white = CellSource::Solid([255; 4]);
+        let white = CellSource::Solid([255; 4], None);
         assert_eq!(sources, [CellSource::File(0), CellSource::File(0), white]);
         assert_eq!(sheet.cells()[2].rect, [0, 0, 32, 8]);
         assert_eq!(sheet.frames(), [2, 0, 1, 2]);

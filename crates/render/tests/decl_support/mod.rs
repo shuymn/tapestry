@@ -675,6 +675,7 @@ pub fn solid_cells_bundle(
             size,
             color,
             filter: Filter::Nearest,
+            grid: None,
         })
         .unwrap();
     }

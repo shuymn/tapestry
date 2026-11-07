@@ -98,6 +98,10 @@ pub struct ImageDef {
     pub filter: Filter,
 }
 
+/// The side of a generated grid's cell in texels
+/// ([`SolidImageDef::grid`]).
+pub const GRID_CELL: u8 = 5;
+
 /// An image of one colour that no file holds, such as a play part's
 /// fallback paint: a single frame, never animated, the same size in both
 /// variants.
@@ -108,6 +112,13 @@ pub struct SolidImageDef {
     /// Straight (not premultiplied) RGBA.
     pub color: [u8; 4],
     pub filter: Filter,
+    /// `None` paints every texel. `Some([x, y])` cuts the image into
+    /// [`GRID_CELL`]-texel square cells from its top left and paints, in
+    /// each, the `x` columns from its left and the `y` rows up from its
+    /// bottom, each 1 to [`GRID_CELL`]; the rest is transparent. A result
+    /// graph's chips are drawn on such a grid, sampled with
+    /// [`Filter::NearestBase`].
+    pub grid: Option<[u8; 2]>,
 }
 
 /// A file of a sheet, or its high-resolution version.
@@ -228,6 +239,10 @@ pub enum ImageError {
          or more than {MAX_IMAGE_TEXELS} texels"
     )]
     SolidSize { image: usize, w: u32, h: u32 },
+    #[error(
+        "generated image {image}'s grid paints no texel or more than {GRID_CELL} of a cell side"
+    )]
+    SolidGrid { image: usize },
     #[error("generated image {image} passes {MAX_TOTAL_TEXELS} texels in a variant")]
     SolidTotalTooLarge { image: usize },
     #[error("image {image}'s rectangle is outside its file")]
@@ -357,8 +372,9 @@ pub(crate) struct Image {
 pub(crate) enum CellSource {
     /// An index into the files.
     File(u32),
-    /// One straight RGBA colour ([`SolidImageDef`]).
-    Solid([u8; 4]),
+    /// One straight RGBA colour, over the whole cell or on a grid
+    /// ([`SolidImageDef`]).
+    Solid([u8; 4], Option<[u8; 2]>),
 }
 
 /// A rectangle of a file, or a generated colour, packed once however many
@@ -410,7 +426,7 @@ impl Sheet {
                 name: self.files.get(usize::try_from(f).ok()?)?.lo.name.clone(),
                 rect: cell.rect,
             }),
-            CellSource::Solid(color) => Some(Shown::Solid(color)),
+            CellSource::Solid(color, _) => Some(Shown::Solid(color)),
         }
     }
 }
@@ -646,7 +662,7 @@ fn push_solid(
     let first = u32::try_from(frames.len()).unwrap_or(u32::MAX);
     let [w, h] = def.size;
     let cell = Cell {
-        source: CellSource::Solid(def.color),
+        source: CellSource::Solid(def.color, def.grid),
         rect: [0, 0, w, h],
     };
     let next = u32::try_from(cell_ids.len()).unwrap_or(u32::MAX);
