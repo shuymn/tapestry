@@ -27,6 +27,8 @@
 //! - number 96, the play level (`IntegerPropertyFactory.java:154`,
 //!   `:580-584`): the snapshot's [`ImportFacts::play_level`], bound to the
 //!   chart, as `SongData.getLevel()` gives it (`song/SongData.java:167`);
+//!   on [`ScreenKind::Result`] the result's `chart.level` under its
+//!   validity instead, through the result profile as a frame reads it;
 //! - texts 1001 to 1003, the difficulty table's name, level and both
 //!   (`StringPropertyFactory.java:259-261`): the constant `""`, unrecorded,
 //!   as there are no difficulty tables and outside a table the source's
@@ -411,12 +413,14 @@ pub(crate) enum NumberRead {
 
 /// Answers `number(n)` from `facts`.
 pub(crate) fn number(facts: &ImportFacts, n: i32) -> NumberRead {
-    let fact = if n == PLAY_LEVEL {
-        FactId::PlayLevel
-    } else if facts.scene == ScreenKind::Result
+    // A result scene reads every profile number, the play level among
+    // them, from the result's fields, as its frames do (D12).
+    let fact = if facts.scene == ScreenKind::Result
         && matches!(profile::number(n), Some(Class::Bridge(_)))
     {
         FactId::ResultNumber(n)
+    } else if n == PLAY_LEVEL {
+        FactId::PlayLevel
     } else {
         return NumberRead::LiveState;
     };

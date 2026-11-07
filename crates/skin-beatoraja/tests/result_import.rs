@@ -603,6 +603,46 @@ fn status_x(i: skin_beatoraja::LuaImported, view: &ResultView) -> f32 {
     q[0].rect[0]
 }
 
+/// D12: the play level (96) a result skin reads while it loads is the
+/// one its frames read, the view's chart level, on a view with a result
+/// and on one without.
+#[test]
+fn the_load_time_level_is_the_frames() {
+    let pre = "local lv = ms.number(96)";
+    let values = lua_value("ex", 4, "ref = 71")
+        + ", "
+        + &lua_value("lv", 2, "value = function() return ms.number(96) end");
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", "
+        + &lua_dst("lv", 250, 4, "")
+        + ", { id = \"dot\", op = { 90 }, dst = { { x = lv, y = 300, w = 8, h = 8 } } }";
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &values, "", &dsts).as_bytes(),
+    );
+    let level = FactRead {
+        fact: FactId::ResultNumber(96),
+        value: FactValue::Int(12),
+    };
+    let v = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    let i = lua_result(d.path(), &facts(Some(&v))).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(i.facts.reads, [level]);
+    let mut r = Res::new(i.imported.skin);
+    r.view(&v);
+    assert_eq!(r.digits(0, LV), "12");
+    let q = r.frame(0);
+    let dot: Vec<_> = q.iter().filter(|q| q.rect[1] == top(300.0, 8.0)).collect();
+    assert_eq!(dot.len(), 1);
+    assert_eq!(dot[0].rect[0], 12.0);
+    let i = lua_result(d.path(), &facts(Some(&unavailable()))).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(i.facts.reads, [level]);
+    let mut r = Res::new(i.imported.skin);
+    r.view(&unavailable());
+    assert_eq!(r.digits(0, LV), "12");
+}
+
 /// C17: while a skin loads, options 50 and 51 are the offline constants,
 /// and a result value follows its state: shown as itself, hidden as
 /// `i32::MIN` (imported, not refused), unavailable refused; each read is
