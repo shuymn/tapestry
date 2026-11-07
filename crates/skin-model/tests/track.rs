@@ -137,6 +137,28 @@ fn a_loop_before_the_first_key_leaves_a_gap_each_period() {
     }
 }
 
+/// A single key after its loop point never draws, as in the source: every
+/// time past the loop point wraps before the key. Key at 100 ms, loop at
+/// 40 ms (period 60 ms): the key's own time and each following period
+/// boundary wrap to 40 ms, and the times just past them to just after it.
+#[test]
+fn a_single_key_after_its_loop_point_never_draws() {
+    let key = [kx(100_000, 7)];
+    let t = Track::new(
+        &key,
+        Ease::Linear,
+        End::Loop {
+            from: TimeUs(40_000),
+        },
+    )
+    .unwrap();
+    for us in [
+        40_000, 99_999, 100_000, 100_001, 159_999, 160_000, 160_001, 220_000, 280_000,
+    ] {
+        assert_eq!(x_at(&t, us), None, "{us} µs");
+    }
+}
+
 #[test]
 fn loop_from_the_first_key_and_a_start_at_zero() {
     let looped = table_track(End::Loop {

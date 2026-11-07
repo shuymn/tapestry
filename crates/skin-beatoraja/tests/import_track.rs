@@ -200,6 +200,98 @@ fn a_loop_before_the_first_key_leaves_a_gap_as_the_source() {
     }
 }
 
+/// The same shape on a result skin's type-2 judge graph, turning as it
+/// moves: keys at 5 and 10 s, loop 0, angle 10° to 55°. At every ms of
+/// three periods the graph is drawn exactly when the source's sampler
+/// draws, its region at the source's rect within the rounding of D1. The
+/// angle is the source's interpolated value in fractional degrees, where
+/// the source truncates it to whole ones (`SkinObject.java:531`), the
+/// intended deviation of design.md "Custom Skin Format" (angles
+/// interpolate numerically like any value), so the drawn angle is within
+/// a degree above the source's whole degrees.
+#[test]
+fn a_result_graph_loop_before_its_first_key_leaves_the_same_gap() {
+    use bms_model::TimeUs;
+    use common::result::{Res, folder, import_result, ready};
+    use skin_model::{BestView, Filter, ResultView, Timelines};
+
+    let keys: [(i64, [i32; 4], i32); 2] = [
+        (5_000, [100, 400, 520, 82], 10),
+        (10_000, [300, 300, 400, 120], 55),
+    ];
+    let dst = keys
+        .iter()
+        .map(|&(t, [x, y, w, h], angle)| {
+            format!(r#"{{"time": {t}, "x": {x}, "y": {y}, "w": {w}, "h": {h}, "angle": {angle}}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let d = folder(&format!(
+        r#""value": [{{"id": "ex", "src": "s", "x": 0, "y": 32, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}}],
+           "judgegraph": [{{"id": "g", "type": 2}}],
+           "destination": [
+             {{"id": "ex", "dst": [{{"x": 0, "y": 100, "w": 4, "h": 8}}]}},
+             {{"id": "dot", "op": [90], "dst": [{{"x": 0, "y": 300, "w": 8, "h": 8}}]}},
+             {{"id": "g", "loop": 0, "dst": [{dst}]}}]"#
+    ));
+    let imported = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(
+        !imported
+            .report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Track(_))),
+        "{:?}",
+        imported.report
+    );
+    let mut r = Res::new(imported.skin);
+    let timelines = Timelines::new(TimeUs(1_000_000), vec![[1; 9]], vec![9], None).unwrap();
+    r.view(&ResultView {
+        timelines: Some(timelines),
+        ..ready(1_000, true, BestView::Unavailable)
+    });
+    let rects: Vec<Key> = keys.iter().map(|&(t, rect, _)| (t, rect)).collect();
+    let angles: Vec<Key> = keys.iter().map(|&(t, _, a)| (t, [a, 0, 0, 0])).collect();
+    for t in 0..=30_010 {
+        // The graph's background quads (the essentials lie left of x 50).
+        let back: Vec<_> = r
+            .frame(t)
+            .into_iter()
+            .filter(|q| q.filter == Filter::Nearest && q.rect[0] >= 50.0)
+            .collect();
+        let Some(want) = reference(&rects, 0, 0, t) else {
+            assert!(back.is_empty(), "{t} ms: {back:?}");
+            continue;
+        };
+        let bounds = back.iter().fold(
+            [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+            |[x0, y0, x1, y1], q| {
+                let [x, y, w, h] = q.rect;
+                [x0.min(x), y0.min(y), x1.max(x + w), y1.max(y + h)]
+            },
+        );
+        let got = round([
+            bounds[0],
+            bounds[1],
+            bounds[2] - bounds[0],
+            bounds[3] - bounds[1],
+        ]);
+        let want = reflect(want);
+        assert!(
+            want.iter().zip(got).all(|(a, b)| (a - b).abs() <= 1),
+            "{t} ms: {want:?} vs {got:?}"
+        );
+        let source = reference(&angles, 0, 0, t).unwrap()[0];
+        for q in &back {
+            // The quad turns clockwise on the y-down canvas, the source
+            // counterclockwise on its y-up one: the same turn on screen.
+            let drawn = (360.0 - q.angle.to_degrees()) % 360.0;
+            assert!((drawn - source).abs() < 1e-3, "{t} ms: {drawn} vs {source}");
+            assert!((-1e-3..1.0).contains(&(drawn - source.trunc())), "{t} ms");
+        }
+    }
+}
+
 #[test]
 fn tracks_the_model_cannot_follow_are_dropped() {
     let x = |x| [x, 0, 10, 10];
