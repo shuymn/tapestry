@@ -4719,6 +4719,18 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
     // Two notes at the tapestry preset's largest weight.
     assert_eq!((own.figures.notes, own.figures.max_ex), (2, 4));
     assert!(ex > 1 && bp == 1, "{:?}", own.tally);
+    // The view's figures come from its evaluation: one press, one sample.
+    let events = &rig.reports[0]
+        .result
+        .as_ref()
+        .unwrap()
+        .evaluation
+        .as_ref()
+        .unwrap()
+        .events;
+    assert_eq!(own.figures.timing, game::TimingStats::of(events));
+    assert_eq!(own.figures.timing.map(|t| t.samples), Some(1));
+    assert_eq!(own.figures.rate, game::Rate::of(ex, 4));
     let rate = |best_ex| {
         Some(BestRate {
             rate: Rate::of(best_ex, 4).unwrap(),
