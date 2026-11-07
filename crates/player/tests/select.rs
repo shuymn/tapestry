@@ -1427,18 +1427,16 @@ fn a_refused_play_skin_admits_no_chart_and_a_notice_shows() {
         skins[0].starts_with("skin: play: refused: cannot read missing.json"),
         "{stdout}"
     );
-    let built_in = format!(
-        "{}: single-chart result skins are not shown yet",
-        skin.join("r.json").display()
+    // A result skin with no EX score is refused for its kind.
+    assert!(
+        skins[1].starts_with("skin: result: refused: ") && skins[1].contains("has no EX score"),
+        "{stdout}"
     );
-    assert_eq!(skins[1], format!("skin: result: built-in: {built_in}"));
     let notices = lines(&stdout, "dev: select notice: ");
-    assert_eq!(
-        notices.first().copied(),
-        Some(
-            format!("dev: select notice: リザルトのスキンは使えません（内蔵画面）: {built_in}")
-                .as_str()
-        ),
+    assert!(
+        notices.first().is_some_and(|n| n
+            .starts_with("dev: select notice: リザルトのスキンは使えません（内蔵画面）: ")
+            && n.contains("has no EX score")),
         "{stdout}"
     );
     let refused = lines(&stdout, "select: not admitted a.bms: ");
