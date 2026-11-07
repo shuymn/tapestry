@@ -10,22 +10,21 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use super::decode::Bands;
 use super::fnt::{
     Fnt, FntError, FntErrorKind, FntFile, FntLimits, FntPage, MAX_FNT_BYTES, MAX_FONT_GLYPHS,
     MAX_FONT_KERNINGS, MAX_SHEET_GLYPHS, MAX_SHEET_KERNINGS,
 };
 use super::font::{self, FontDef, FontError, MAX_FONTS, MAX_TOTAL_FONT_BYTES};
-use super::path::{self, PathError, Root};
+use super::path::{PathError, Root};
+use super::source::FileSource;
 use super::{
     Cell, File, FileAt, FileDef, Image, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_SIDE, NEXT_SHEET, Sheet, SolidImageDef, Stop, Total, Version,
-    add_frames, check_cycle, checked_header, cut, decode_file, image_frames, push_frames,
-    push_solid, read_encoded, read_file, renumber, resolve_file, texels,
+    add_frames, check_cycle, checked_header, cut, image_frames, push_frames, push_solid, read_file,
+    renumber, resolve_file, texels,
 };
 use crate::atlas::cell_fits_page;
 use crate::quad::Filter;
@@ -195,17 +194,6 @@ fn page_stop(page: usize, s: Stop) -> FntAdmitError {
     }
 }
 
-/// A page validated in bands: decoded, never converted.
-struct Validate;
-
-impl Bands for Validate {
-    fn wants(&mut self, _: u32, _: u32) -> bool {
-        false
-    }
-
-    fn put(&mut self, _: u32, _: &::image::RgbaImage) {}
-}
-
 /// The folder part of a skin-relative name, `""` for none.
 fn folder(name: &str) -> &str {
     name.rfind(['/', '\\'])
@@ -216,10 +204,23 @@ fn charged(c: Charge) -> FntAdmitError {
     FntAdmitError::Limit(FntLimit::Charge(c))
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
+/// The bytes one admission charged against a sheet's byte totals, by the
+/// name the file was asked for: an image's low and high variant, or a
+/// font's or a bitmap font page's bytes (`hi` a page's too, 0 for a
+/// font). Charges stay listed when the admission later fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByteCharge {
+    pub name: String,
+    pub lo: u64,
+    pub hi: u64,
+}
+
 /// A [`Sheet`] under construction against one skin folder.
 #[derive(Debug)]
 pub struct SheetBuilder {
     root: PathBuf,
+    source: FileSource,
     attempts: usize,
     files: Vec<File>,
     lo_bytes: Total,
@@ -235,6 +236,8 @@ pub struct SheetBuilder {
     bitmap_fonts: Vec<Box<[u16]>>,
     glyphs: usize,
     kernings: usize,
+    #[cfg(any(test, feature = "dev-tools"))]
+    charged: Vec<ByteCharge>,
 }
 
 impl SheetBuilder {
@@ -243,6 +246,7 @@ impl SheetBuilder {
     pub fn new(root: &Root) -> Self {
         Self {
             root: root.dir().to_path_buf(),
+            source: root.source().clone(),
             attempts: 0,
             files: Vec::new(),
             lo_bytes: Total::BYTES,
@@ -261,6 +265,8 @@ impl SheetBuilder {
             bitmap_fonts: Vec::new(),
             glyphs: 0,
             kernings: 0,
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: Vec::new(),
         }
     }
 
@@ -289,10 +295,32 @@ impl SheetBuilder {
         let file = self.files.len();
         let index = u32::try_from(file)
             .map_err(|_| AdmitError::Limit(ImageError::TooManyFiles { n: self.attempts }))?;
-        let (resolved, lo_bytes, hi_bytes) =
-            resolve_file(&self.root, file, &def, self.lo_bytes, self.hi_bytes).map_err(classify)?;
-        let (loaded, lo_texels, hi_texels) =
-            read_file(file, def, &resolved, self.lo_texels, self.hi_texels).map_err(classify)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        let asked = def.path.clone();
+        let (resolved, lo_bytes, hi_bytes) = resolve_file(
+            &self.source,
+            &self.root,
+            file,
+            &def,
+            self.lo_bytes,
+            self.hi_bytes,
+        )
+        .map_err(classify)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: asked,
+            lo: lo_bytes.sum - self.lo_bytes.sum,
+            hi: hi_bytes.sum - self.hi_bytes.sum,
+        });
+        let (loaded, lo_texels, hi_texels) = read_file(
+            &self.source,
+            file,
+            def,
+            &resolved,
+            self.lo_texels,
+            self.hi_texels,
+        )
+        .map_err(classify)?;
         self.files.push(loaded);
         (self.lo_bytes, self.hi_bytes) = (lo_bytes, hi_bytes);
         (self.lo_texels, self.hi_texels) = (lo_texels, hi_texels);
@@ -410,15 +438,21 @@ impl SheetBuilder {
                 n: index + 1,
             }));
         }
-        let (path, len) =
-            font::resolve(&self.root, index, &def.path).map_err(FontAdmitError::File)?;
+        let (path, len) = font::resolve(&self.source, &self.root, index, &def.path)
+            .map_err(FontAdmitError::File)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: def.path.clone(),
+            lo: len,
+            hi: 0,
+        });
         let total =
             self.font_bytes
                 .with(len)
                 .ok_or(FontAdmitError::Limit(FontError::TotalTooLarge {
                     font: index,
                 }))?;
-        font::check_magic(index, &path).map_err(FontAdmitError::File)?;
+        font::check_magic(&self.source, index, &path).map_err(FontAdmitError::File)?;
         self.font_bytes = total;
         self.fonts.push(def.path);
         u16::try_from(index)
@@ -477,7 +511,7 @@ impl SheetBuilder {
         self.attempt(charge)?;
         let font_err =
             |e: PathError| FntAdmitError::File(FntFileError::Font(FontError::path(slot, e)));
-        let (resolved, len) = path::resolve(&self.root, name).map_err(font_err)?;
+        let (resolved, len) = self.source.resolve(&self.root, name).map_err(font_err)?;
         let too_large = FntError {
             line: 0,
             kind: FntErrorKind::TooLarge,
@@ -486,6 +520,12 @@ impl SheetBuilder {
             return Err(file_err(too_large));
         }
         let c = Charge::FontBytes(len);
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: name.to_owned(),
+            lo: len,
+            hi: 0,
+        });
         charge(c).map_err(|_| charged(c))?;
         self.font_bytes = self
             .font_bytes
@@ -493,15 +533,18 @@ impl SheetBuilder {
             .ok_or(limit(FntLimit::FontBytes))?;
         #[cfg(test)]
         FNT_READS.with(|n| n.set(n.get() + 1));
-        let (handle, len) = path::open(&resolved).map_err(font_err)?;
-        if len > MAX_FNT_BYTES {
-            return Err(file_err(too_large));
-        }
-        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-        handle
-            .take(MAX_FNT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| font_err(PathError::Io(e)))?;
+        let bytes = self.source.fnt_text(
+            &resolved,
+            MAX_FNT_BYTES,
+            |len| {
+                if len > MAX_FNT_BYTES {
+                    Err(file_err(too_large))
+                } else {
+                    Ok(())
+                }
+            },
+            font_err,
+        )?;
         let glyphs_left = MAX_SHEET_GLYPHS.saturating_sub(self.glyphs);
         let kernings_left = MAX_SHEET_KERNINGS.saturating_sub(self.kernings);
         let limits = FntLimits {
@@ -529,9 +572,17 @@ impl SheetBuilder {
                 hi: false,
             };
             self.attempt(charge)?;
-            let (resolved, len) = path::resolve(&self.root, page)
+            let (resolved, len) = self
+                .source
+                .resolve(&self.root, page)
                 .map_err(|e| page_error(p, ImageError::path(at, e)))?;
             let c = Charge::ImageBytes { lo: len, hi: len };
+            #[cfg(any(test, feature = "dev-tools"))]
+            self.charged.push(ByteCharge {
+                name: page.clone(),
+                lo: len,
+                hi: len,
+            });
             charge(c).map_err(|_| charged(c))?;
             lo_bytes = lo_bytes.with(len).ok_or(limit(FntLimit::ImageBytes))?;
             hi_bytes = hi_bytes.with(len).ok_or(limit(FntLimit::ImageBytes))?;
@@ -552,7 +603,8 @@ impl SheetBuilder {
                 file: first + p,
                 hi: false,
             };
-            let (d, mode) = checked_header(at, resolved).map_err(|e| page_error(p, e))?;
+            let (d, mode) =
+                checked_header(&self.source, at, resolved).map_err(|e| page_error(p, e))?;
             lo_texels = lo_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             hi_texels = hi_texels.with(texels(d)).ok_or(limit(FntLimit::Texels))?;
             dims.push((d, mode));
@@ -577,9 +629,9 @@ impl SheetBuilder {
                 file: first + p,
                 hi: false,
             };
-            let bytes =
-                read_encoded(resolved, at, MAX_FILE_BYTES, cancel).map_err(|e| page_stop(p, e))?;
-            decode_file(bytes, at, header, cancel, &mut Validate).map_err(|e| page_stop(p, e))?;
+            self.source
+                .validate_page(resolved, at, header, MAX_FILE_BYTES, cancel)
+                .map_err(|e| page_stop(p, e))?;
         }
 
         // A page is one cell of the atlas. A corrupt one above stays corrupt
@@ -698,6 +750,7 @@ impl SheetBuilder {
         Sheet {
             id: NEXT_SHEET.fetch_add(1, Ordering::Relaxed),
             root: self.root,
+            source: self.source,
             files: self.files.into_boxed_slice(),
             images: self.images.into_boxed_slice(),
             frames: frames.into_boxed_slice(),
@@ -705,6 +758,8 @@ impl SheetBuilder {
             fonts: self.fonts.into_boxed_slice(),
             fnts: self.fnts.into_boxed_slice(),
             bitmap_fonts: self.bitmap_fonts.into_boxed_slice(),
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: self.charged,
         }
     }
 }
@@ -1548,5 +1603,58 @@ mod tests {
         assert!(matches!(e, FntAdmitError::Cancelled), "{e:?}");
         assert_eq!(kept(&b), before);
         admit(&mut b, "a.fnt").unwrap();
+    }
+
+    /// A builder over `dir` reading through `cache`.
+    fn cached(
+        dir: &Path,
+        cache: &std::sync::Arc<super::super::source::ResourceCache>,
+    ) -> SheetBuilder {
+        let root = Root::new(dir).unwrap();
+        let src = super::super::source::FileSource::cached(std::sync::Arc::clone(cache));
+        SheetBuilder::new(&root.with_source(src))
+    }
+
+    /// D13: a page verdict served from a warm cache is still behind the
+    /// cancellation the disk read would ask, and served it reads nothing.
+    #[test]
+    fn a_cancel_reaches_a_page_the_cache_holds() {
+        use super::super::source::ResourceCache;
+        let dir = tempfile::tempdir().unwrap();
+        write_fnt(dir.path(), "a.fnt", &fnt_text(1, 0, 1), 1);
+        let cache = ResourceCache::new(&Root::new(dir.path()).unwrap());
+        admit(&mut cached(dir.path(), &cache), "a.fnt").unwrap();
+        let mut b = cached(dir.path(), &cache);
+        let before = kept(&b);
+        let e = b.admit_fnt("a.fnt", &mut free, &|| true).unwrap_err();
+        assert!(matches!(e, FntAdmitError::Cancelled), "{e:?}");
+        assert_eq!(kept(&b), before);
+        let mut b = cached(dir.path(), &cache);
+        admit(&mut b, "a.fnt").unwrap();
+        assert_eq!(b.source.counts().page_validations, 0, "served");
+    }
+
+    /// D13's bound on names: a name past [`MAX_PATH_BYTES`] is refused by
+    /// its form and never kept, so the names a cache holds stay within it.
+    #[test]
+    fn an_over_long_name_is_not_kept() {
+        use super::super::MAX_PATH_BYTES;
+        use super::super::source::ResourceCache;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ResourceCache::new(&Root::new(dir.path()).unwrap());
+        let mut b = cached(dir.path(), &cache);
+        let long = "a".repeat(MAX_PATH_BYTES + 1);
+        assert!(b.admit_font(FontDef { path: long.clone() }).is_err());
+        assert!(b.admit_fnt(&long, &mut free, &|| false).is_err());
+        assert_eq!(cache.usage(), super::super::source::CacheUsage::default());
+        // A name within it is kept, its bytes counted.
+        assert!(
+            b.admit_font(FontDef {
+                path: "missing.ttf".into()
+            })
+            .is_err()
+        );
+        let u = cache.usage();
+        assert_eq!((u.resolutions, u.name_bytes), (1, 11));
     }
 }

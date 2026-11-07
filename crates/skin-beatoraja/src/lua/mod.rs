@@ -845,6 +845,32 @@ fn common_reads(def: &mut Definition, counts: &mut Counts) -> Store {
 }
 
 impl LuaHeader {
+    /// Its later imports read the skin's image and font content through
+    /// `source` (design D13); its Lua and definition files are read as
+    /// before.
+    pub fn read_through(&mut self, source: skin_model::FileSource) {
+        self.root = self.root.with_source(source);
+    }
+
+    /// [`Self::import`], with the destination ledger it left (dev-tools):
+    /// what the import made of each destination, with its notes.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses.
+    #[cfg(feature = "dev-tools")]
+    pub fn import_ledgered(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> (
+        Result<LuaOutcome, ImportError>,
+        Vec<crate::import::ledger::DestinationEntry>,
+    ) {
+        crate::import::ledger::recording(|| self.import(config, facts, cancel))
+    }
+
     /// The header, which [`Config`]s are made against.
     #[must_use]
     pub fn header(&self) -> &Header {

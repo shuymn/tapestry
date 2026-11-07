@@ -8,7 +8,8 @@
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
-use super::path::{self, PathError};
+use super::path::PathError;
+use super::source::FileSource;
 use super::{MAX_FILE_BYTES, Sheet, Total};
 
 /// The most font files one skin may name.
@@ -80,8 +81,14 @@ impl FontError {
 
 /// Font `font`'s name resolved inside the canonical skin folder `root`,
 /// with its length.
-pub(crate) fn resolve(root: &Path, font: usize, name: &str) -> Result<(PathBuf, u64), FontError> {
-    path::resolve(root, name).map_err(|e| FontError::path(font, e))
+pub(crate) fn resolve(
+    src: &FileSource,
+    root: &Path,
+    font: usize,
+    name: &str,
+) -> Result<(PathBuf, u64), FontError> {
+    src.resolve(root, name)
+        .map_err(|e| FontError::path(font, e))
 }
 
 /// Whether `bytes` start with a TrueType, OpenType or collection magic.
@@ -93,20 +100,10 @@ fn has_magic(bytes: &[u8]) -> bool {
 
 /// Whether the resolved font file starts with a TrueType, OpenType or
 /// collection magic.
-pub(crate) fn check_magic(font: usize, p: &Path) -> Result<(), FontError> {
-    let (mut file, _) = path::open(p).map_err(|e| FontError::path(font, e))?;
-    let mut magic = [0_u8; 4];
-    match file.read_exact(&mut magic) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(FontError::Unsupported { font });
-        }
-        Err(source) => return Err(FontError::Io { font, source }),
-    }
-    if has_magic(&magic) {
-        Ok(())
-    } else {
-        Err(FontError::Unsupported { font })
+pub(crate) fn check_magic(src: &FileSource, font: usize, p: &Path) -> Result<(), FontError> {
+    match src.font_magic(font, p)? {
+        Some(magic) if has_magic(&magic) => Ok(()),
+        _ => Err(FontError::Unsupported { font }),
     }
 }
 
@@ -140,14 +137,14 @@ impl Sheet {
         };
         let mut paths = Vec::with_capacity(fonts.len());
         for (font, def) in fonts.iter().enumerate() {
-            let (p, len) = resolve(&self.root, font, &def.path)?;
+            let (p, len) = resolve(&self.source, &self.root, font, &def.path)?;
             if !total.add(len) {
                 return Err(FontError::TotalTooLarge { font });
             }
             paths.push(p);
         }
         for (font, p) in paths.iter().enumerate() {
-            check_magic(font, p)?;
+            check_magic(&self.source, font, p)?;
         }
         self.fonts = fonts.into_iter().map(|f| f.path).collect();
         Ok(self)
@@ -161,11 +158,13 @@ impl Sheet {
 }
 
 /// Reads a sheet's font files for installation, against one budget of
-/// [`MAX_TOTAL_FONT_BYTES`] bytes actually read. Each name is resolved
-/// again inside the skin folder; the opened handle must be a regular file
-/// of at most [`MAX_FONT_BYTES`] and of the budget left; at most that
-/// handle's length plus one byte is read; and the magic is checked on the
-/// bytes read. What a read takes from the budget stays taken, a failed
+/// [`MAX_TOTAL_FONT_BYTES`] bytes actually read, through the sheet's
+/// source. Each name is resolved again inside the skin folder (or answered
+/// by the source's cache); a file read from the disk must be, on its opened
+/// handle, a regular file of at most [`MAX_FONT_BYTES`] and of the budget
+/// left, and at most that handle's length plus one byte is read; bytes the
+/// cache holds are checked by their length alike; and the magic is checked
+/// on the bytes. What a read takes from the budget stays taken, a failed
 /// read's included.
 #[derive(Debug)]
 pub struct FontReader<'a> {
@@ -206,15 +205,23 @@ impl<'a> FontReader<'a> {
             .fonts
             .get(index)
             .ok_or(FontError::Unknown { font: index })?;
-        let (canonical, _) = resolve(&self.sheet.root, index, name)?;
-        let (file, len) = path::open(&canonical).map_err(|e| FontError::path(index, e))?;
-        if len > MAX_FONT_BYTES {
-            return Err(FontError::TooLarge { font: index });
-        }
-        if len > self.remaining {
-            return Err(FontError::TotalTooLarge { font: index });
-        }
-        let (taken, read) = read_limited(file, len, index);
+        let src = &self.sheet.source;
+        let (canonical, _) = resolve(src, &self.sheet.root, index, name)?;
+        let remaining = self.remaining;
+        let (taken, read) = src.font_bytes(
+            index,
+            &canonical,
+            |len| {
+                if len > MAX_FONT_BYTES {
+                    Err(FontError::TooLarge { font: index })
+                } else if len > remaining {
+                    Err(FontError::TotalTooLarge { font: index })
+                } else {
+                    Ok(())
+                }
+            },
+            |file, len| read_limited(file, len, index),
+        );
         self.remaining = self.remaining.saturating_sub(taken);
         let bytes = read?;
         if !has_magic(&bytes) {

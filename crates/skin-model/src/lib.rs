@@ -114,6 +114,8 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+#[cfg(feature = "dev-tools")]
+pub use image::builder::ByteCharge;
 pub use image::builder::{
     AdmitError, BitmapFontError, Charge, FntAdmitError, FntFileError, FntLimit, FontAdmitError,
     MAX_BITMAP_FONTS, MAX_FALLBACKS, Refused, SheetBuilder,
@@ -126,6 +128,9 @@ pub use image::font::{
     FontDef, FontError, FontReader, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES,
 };
 pub use image::path::{Entry, FileId, Listing, Root, RootError};
+#[cfg(feature = "dev-tools")]
+pub use image::source::SourceCounts;
+pub use image::source::{CacheBounds, CacheUsage, FileSource, ResourceCache};
 pub use image::{
     CycleDef, FileAt, FileDef, HEADER_BYTES, ImageDef, ImageError, MAX_FILE_BYTES, MAX_FILES,
     MAX_IMAGE_FRAMES, MAX_IMAGE_TEXELS, MAX_IMAGES, MAX_PATH_BYTES, MAX_SIDE, MAX_SKIN_FRAMES,
