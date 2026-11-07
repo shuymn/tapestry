@@ -32,7 +32,7 @@ use skin_model::{
 use crate::outline::{LineBounds, LineFit, LineLayout, TextResidency};
 
 use crate::projection::ClipTable;
-use crate::skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS};
+use crate::skin_atlas::{PageLevels, RESERVED_LAYERS};
 use crate::{AttemptInput, FrameInput, Gpu, LoadingFrame, PlaySkin, SkinError, SpriteBatch};
 
 /// Lays out and rasterizes the lines of a skin's rasterized text: the
@@ -341,27 +341,6 @@ impl SkinBundle {
     #[must_use]
     pub const fn uvs(&self) -> &UvTable {
         &self.uvs
-    }
-
-    /// The pages to upload, every level of each, borrowed: preparation
-    /// work, it allocates the list.
-    pub(crate) fn levels(&self) -> Vec<PageLevels<'_>> {
-        self.pages
-            .pages()
-            .iter()
-            .map(|p| std::array::from_fn(|k| p.level(k).unwrap_or(&[])))
-            .collect()
-    }
-
-    /// Uploads [`levels`](Self::levels) through `upload` as one
-    /// [`AtlasPages`].
-    pub(crate) fn with_pages<R>(&self, upload: impl FnOnce(&AtlasPages<'_>) -> R) -> R {
-        let levels = self.levels();
-        upload(&AtlasPages {
-            side: self.side(),
-            pages: &levels,
-            text_layer: self.text_layer().is_some(),
-        })
     }
 
     /// The bytes it keeps resident on the CPU on its own: the uv table,

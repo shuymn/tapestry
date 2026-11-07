@@ -179,10 +179,11 @@ pub(crate) fn prepare(
     let side = p.cache.side();
     let bounds = LineBounds::for_side(side);
     let producer = p.producer;
-    p.cache.set_scope(p.scope);
-    let placement = p.cache.place(requests, bounds, p.held, |r, em, b| {
-        producer.layout(r, em, b)
-    });
+    let placement = p
+        .cache
+        .place(requests, bounds, p.held, p.scope, |r, em, b| {
+            producer.layout(r, em, b)
+        });
     let mut report = TextReport {
         counts: placement.counts,
         ..TextReport::default()

@@ -67,14 +67,6 @@ struct Draws {
     text: Option<i32>,
 }
 
-impl Draws {
-    /// `self` with one red band at `x` (and green past every read point).
-    fn with_band(self, x: i32) -> Self {
-        let bands: &'static [(u32, i32)] = Box::leak(Box::new([(0, x), (1, 1_919)]));
-        Self { bands, ..self }
-    }
-}
-
 /// A square PNG of `side` texels of `rgba`.
 fn png(path: &Path, side: u32, rgba: [u8; 4]) {
     let w = BufWriter::new(File::create(path).unwrap());
@@ -434,19 +426,21 @@ fn a_layout_on_the_pages_installed_draws_its_own_quads() {
 fn the_newest_staging_draws_its_marks_whole() {
     let mut r = offscreen(W, H);
     let dir = tempfile::tempdir().unwrap();
-    let marks = |band: i32, at: i32| {
-        Draws {
-            number: Some(at),
-            text: Some(at),
-            ..A
-        }
-        .with_band(band)
+    // One red band (and green past every read point), a number and a text.
+    let marks = |bands: &'static [(u32, i32)], at: i32| Draws {
+        bands,
+        number: Some(at),
+        text: Some(at),
+        ..A
     };
     let (a, atlas, mut rest) = on_pages(
         &r,
         dir.path(),
-        marks(0, 500),
-        &[marks(600, 900), marks(1_000, 1_500)],
+        marks(&[(0, 0), (1, 1_919)], 500),
+        &[
+            marks(&[(0, 600), (1, 1_919)], 900),
+            marks(&[(0, 1_000), (1, 1_919)], 1_500),
+        ],
     );
     let (b2, b2_atlas) = rest.pop().unwrap();
     let (b1, b1_atlas) = rest.pop().unwrap();
@@ -762,20 +756,14 @@ fn the_witness_counts_every_result_term_once() {
     let committed = MemoryWitness {
         result_cpu: x.b.resident_bytes(),
         result_batch: layout_bytes(&x.b),
+        result_loading: loading_bytes(&x.b),
         ..installed
     };
     assert_eq!(r.memory(), committed);
-    // The identical bundle staged: its own bytes counted once, as the
-    // result's.
+    // The identical bundle staged: its own bytes and its presentation
+    // counted once, as the result's.
     let token = r.install(ScreenKind::Result, &x.b, 3).unwrap();
-    let installation = r.installation(ScreenKind::Result).unwrap();
-    assert_eq!(
-        r.memory(),
-        MemoryWitness {
-            staged_loading: installation.loading().bytes(),
-            ..committed
-        }
-    );
+    assert_eq!(r.memory(), committed);
     r.commit(token).unwrap();
     // A on the same pages replacing B: B's layout is kept until the next
     // staging, its installation gone.
@@ -784,6 +772,7 @@ fn the_witness_counts_every_result_term_once() {
     let committed = MemoryWitness {
         result_cpu: x.a.resident_bytes(),
         result_batch: layout_bytes(&x.a),
+        result_loading: loading_bytes(&x.a),
         ..installed
     };
     assert_eq!(
@@ -819,6 +808,7 @@ fn the_witness_counts_every_result_term_once() {
             result_cpu: x.c.resident_bytes(),
             result_batch: layout_bytes(&x.c),
             result_atlas: c_array,
+            result_loading: loading_bytes(&x.c) + loading_bytes(&x.a),
             retired: array + layout_bytes(&x.a) + x.a.resident_bytes(),
             ..base
         }
@@ -827,6 +817,95 @@ fn the_witness_counts_every_result_term_once() {
     r.commit(token).unwrap();
     assert_eq!(r.memory().retired, 0, "kept past the next staging");
     assert_eq!(r.memory().shared_cpu, x.c.shared_bytes());
+    assert_eq!(r.memory().result_loading, loading_bytes(&x.c));
+}
+
+/// A text producer holding the default font's bytes and nothing else.
+#[derive(Debug)]
+struct WithFont(Arc<Text>);
+
+impl AttemptText for WithFont {
+    fn layout(
+        &self,
+        req: &skin_model::TextRequest,
+        em_px: f32,
+        bounds: render::LineBounds,
+    ) -> render::LineFit {
+        self.0.layout(req, em_px, bounds)
+    }
+
+    fn raster(&self, layout: &render::LineLayout, out: &mut [u8]) -> Result<(), render::SkinError> {
+        self.0.raster(layout, out)
+    }
+
+    fn resident(&self) -> render::TextResidency {
+        render::TextResidency {
+            skin_fonts: 0,
+            default_font: 4_096,
+        }
+    }
+}
+
+/// S10-09i Q3's handshake on the renderer's side: a commit on another
+/// array keeps the array it replaced, reported as retained, its default
+/// font still witnessed, until the owner drains it outside the commit
+/// point; the drain returns the released identity once, then the renderer
+/// retains only what draws, so another atlas build can be considered. A
+/// same-array replacement drains no array.
+#[test]
+fn a_drain_releases_the_retired_array_outside_the_commit() {
+    let mut r = offscreen(W, H);
+    let x = bundles(&r);
+    let dir = tempfile::tempdir().unwrap();
+    let (a, atlas, _) = on_pages(
+        &r,
+        dir.path(),
+        Draws {
+            text: Some(500),
+            ..A
+        },
+        &[],
+    );
+    let fonted = SkinBundle::new(
+        Arc::new(a),
+        atlas,
+        ClipTable::new(Vec::new()).unwrap(),
+        Side::Left,
+    )
+    .unwrap();
+    let fonted = Arc::new(
+        fonted
+            .with_text(Arc::new(WithFont(producer())) as Arc<dyn AttemptText>)
+            .unwrap(),
+    );
+    let token = r.install(ScreenKind::Result, &fonted, 1).unwrap();
+    r.commit(token).unwrap();
+    assert_eq!(r.memory().default_font, 4_096);
+    // Replaced by a producer-free bundle on another array.
+    let token = r.install(ScreenKind::Result, &x.c, 2).unwrap();
+    r.commit(token).unwrap();
+    assert_eq!(
+        r.retained_atlases(ScreenKind::Result),
+        [Some(x.c.atlas_id()), None, Some(fonted.atlas_id())]
+    );
+    assert_eq!(r.memory().default_font, 4_096, "the retired font left out");
+    // The owner drains it: released once, then only what draws is kept.
+    assert_eq!(r.drain_retired(), Some(fonted.atlas_id()));
+    assert_eq!(r.drain_retired(), None);
+    assert_eq!(
+        r.retained_atlases(ScreenKind::Result),
+        [Some(x.c.atlas_id()), None, None]
+    );
+    let m = r.memory();
+    assert_eq!((m.retired, m.default_font), (0, 0));
+    // A layout replaced on the same array releases no array.
+    let token = r.install(ScreenKind::Result, &x.a, 3).unwrap();
+    r.commit(token).unwrap();
+    let token = r.install(ScreenKind::Result, &x.b, 4).unwrap();
+    r.commit(token).unwrap();
+    assert!(r.memory().retired > 0);
+    assert_eq!(r.drain_retired(), None);
+    assert_eq!(r.memory().retired, 0);
 }
 
 /// The result's lines are staged by their preparation and installed at the
