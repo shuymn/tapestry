@@ -169,8 +169,7 @@ impl MenuTap {
 
     /// The panel START and SELECT open as they are held now (`None`:
     /// neither held), sent with the events from here: the select screen
-    /// takes a scratch's under panel 1 and drops the rest under a panel
-    /// (design.md "Input", Menu input).
+    /// drops every event under a panel (design.md "Input", Menu input).
     pub fn set_panel(&mut self, panel: Option<usize>) {
         self.panel = panel.and_then(|p| u8::try_from(p).ok());
     }

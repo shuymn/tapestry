@@ -289,10 +289,12 @@ impl Selection {
     ///
     /// While a panel is open (START, SELECT or both held), the keys it
     /// holds back do nothing: the window's by the panel the screen shows
-    /// ([`crate::select::acts_under_panel`]), the controller's by that
-    /// panel or the one open as each was sent
-    /// ([`crate::select::event_acts_under_panel`]), none while the search
-    /// box has focus. An input that gives or takes the box's focus reads
+    /// ([`crate::select::acts_under_panel`]); the controller's all, under
+    /// that panel or the one open as each was sent: in the reference they
+    /// set options or, the scratch under panel 1, an option's target
+    /// (`MusicSelectInputProcessor.java` at 0.8.9, `:123-152`, `:158-202`,
+    /// `:213-240`, `:250-288`), never the list, and the panels are display
+    /// only. No panel counts while the search box has focus. An input that gives or takes the box's focus reads
     /// the panels' `level` again at `now` ([`panels`](Self::panels)), so
     /// the input after it finds the panel it leaves.
     fn drain_at(
@@ -311,10 +313,9 @@ impl Selection {
             let shown = self.shown_panel();
             let acts = match input {
                 MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
-                MenuInput::Pad { event, panel } => crate::select::event_acts_under_panel(
-                    event,
-                    shown.or(panel.filter(|_| !self.screen.searching())),
-                ),
+                MenuInput::Pad { panel, .. } => shown
+                    .or(panel.filter(|_| !self.screen.searching()))
+                    .is_none(),
                 MenuInput::Text(_) | MenuInput::Preedit(_) => true,
             };
             if !acts {

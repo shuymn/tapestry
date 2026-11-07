@@ -202,17 +202,6 @@ pub const fn acts_under_panel(key: MenuKey, panel: Option<usize>) -> bool {
     }
 }
 
-/// Whether a controller's menu `event` acts on the select screen while
-/// `panel` is open: under any panel no lane control acts, the scratch
-/// included. In the reference they set options or, the scratch under
-/// panel 1, an option's target (`MusicSelectInputProcessor.java` at 0.8.9,
-/// `:123-152`, `:158-202`, `:213-240`, `:250-288`), never the list; the
-/// panels being display only, they do nothing.
-#[must_use]
-pub const fn event_acts_under_panel(_event: MenuEvent, panel: Option<usize>) -> bool {
-    panel.is_none()
-}
-
 /// The result screen's command for a window key: the arrow keys switch
 /// presets, and every other key does nothing there (the retry and quit
 /// keys arrive as controls, which the window takes from the same press).
