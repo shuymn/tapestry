@@ -117,10 +117,6 @@ pub enum Native {
 
 impl Native {
     /// The same kind of native size for a frame of `size` texels.
-    #[allow(
-        dead_code,
-        reason = "the shared result graph region reads it; used or not, so no expect"
-    )]
     pub(crate) fn sized(self, size: [u32; 2]) -> Self {
         match self {
             Self::NoLarger(_) => Self::NoLarger(size),

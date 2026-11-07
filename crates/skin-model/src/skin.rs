@@ -26,7 +26,7 @@ use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
-use crate::result::view::{ResultLabels, ResultView, Timelines};
+use crate::result::view::{ResultLabels, ResultView};
 use crate::result::{ResultError, ResultFrame, ResultScreen};
 use crate::schema::Ty;
 use crate::screen::ScreenKind;
@@ -41,6 +41,7 @@ use crate::widget::cover_paint::{
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
+use crate::widget::gauge_graph::{GaugeGraph, GaugeGraphDef, GaugeGraphDraw};
 use crate::widget::glyphs;
 use crate::widget::glyphs::{BitmapLines, GlyphLine};
 use crate::widget::image_choice::{
@@ -65,6 +66,7 @@ use crate::widget::text::{
     self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, Text, TextDef,
     TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
 };
+use crate::widget::timing_graph::{TimingGraph, TimingGraphDef, TimingGraphDraw};
 use crate::widget::{Brush, Frame, ImageRef, Starts, sample};
 
 /// The most elements one skin may hold.
@@ -122,12 +124,21 @@ pub enum Source {
     /// The judge graph at this index of [`ResultDefs::judge_graphs`]: the
     /// view's timelines over the element's rect.
     JudgeGraph(u32),
+    /// The gauge graph at this index of [`ResultDefs::gauge_graphs`]: the
+    /// view's emphasized gauge over the element's rect.
+    GaugeGraph(u32),
+    /// The timing distribution at this index of
+    /// [`ResultDefs::timing_graphs`]: the view's deviations over the
+    /// element's rect.
+    TimingGraph(u32),
 }
 
 /// The widgets only a result skin draws.
 #[derive(Clone, Debug, Default)]
 pub struct ResultDefs {
     pub judge_graphs: Vec<JudgeGraphDef>,
+    pub gauge_graphs: Vec<GaugeGraphDef>,
+    pub timing_graphs: Vec<TimingGraphDef>,
 }
 
 /// The widgets only a selection skin draws.
@@ -301,6 +312,10 @@ pub enum LoadError {
     JudgeGraphImage { graph: usize },
     #[error("judge graph element {element} names a native size: its graph's fit sizes it")]
     JudgeGraphNative { element: usize },
+    #[error("gauge graph {graph}'s image does not exist")]
+    GaugeGraphImage { graph: usize },
+    #[error("timing distribution {graph}'s image does not exist")]
+    TimingGraphImage { graph: usize },
     #[error("ratio bar {bar}")]
     RatioBar {
         bar: usize,
@@ -328,6 +343,10 @@ enum Kind {
     RatioBar(usize, Option<usize>),
     /// The judge graph's index.
     JudgeGraph(usize),
+    /// The gauge graph's index.
+    GaugeGraph(usize),
+    /// The timing distribution's index.
+    TimingGraph(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -395,8 +414,8 @@ enum Phase<'a> {
     },
     /// A selection frame: its rows, ratios and slider hits.
     Selection { sel: &'a Selection },
-    /// A result frame: the view's timelines.
-    Result { timelines: Option<&'a Timelines> },
+    /// A result frame: the view's state.
+    Result { res: &'a ResultScreen },
 }
 
 /// A loaded skin.
@@ -432,6 +451,8 @@ pub struct Skin {
     song_list: Option<SongList>,
     ratio_bars: Box<[RatioBar]>,
     judge_graphs: Box<[JudgeGraph]>,
+    gauge_graphs: Box<[GaugeGraph]>,
+    timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
     /// This skin's identity, which a selection state it makes carries: a
@@ -738,7 +759,9 @@ fn check_widget_images(
         | Source::CoverPaint(_)
         | Source::SongList
         | Source::RatioBar(_)
-        | Source::JudgeGraph(_) => {}
+        | Source::JudgeGraph(_)
+        | Source::GaugeGraph(_)
+        | Source::TimingGraph(_) => {}
     }
     Ok(())
 }
@@ -791,7 +814,9 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::CoverPaint(_)
         | Source::SongList
         | Source::RatioBar(_)
-        | Source::JudgeGraph(_) => {}
+        | Source::JudgeGraph(_)
+        | Source::GaugeGraph(_)
+        | Source::TimingGraph(_) => {}
     }
     Ok(())
 }
@@ -801,7 +826,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// counts apart; for a
 /// text, 1, or with a bitmap font one per character: a literal's
 /// characters, or [`MAX_TEXT_BYTES`] for a field; for a judge graph, its
-/// background's and one per channel of every bin.
+/// background's and one per channel of every bin; for a gauge graph or a
+/// timing distribution, its pieces at worst.
 fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) -> u32 {
     match source {
         Source::Image(_)
@@ -821,6 +847,14 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) 
             .judge_graphs
             .get(index(i))
             .map_or(0, JudgeGraphDef::quads),
+        Source::GaugeGraph(i) => res
+            .gauge_graphs
+            .get(index(i))
+            .map_or(0, GaugeGraphDef::quads),
+        Source::TimingGraph(i) => res
+            .timing_graphs
+            .get(index(i))
+            .map_or(0, TimingGraphDef::quads),
     }
 }
 
@@ -855,7 +889,9 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::CoverPaint(_)
             | Source::SongList
             | Source::RatioBar(_)
-            | Source::JudgeGraph(_) => {
+            | Source::JudgeGraph(_)
+            | Source::GaugeGraph(_)
+            | Source::TimingGraph(_) => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -886,7 +922,9 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::Text(_)
                     | Source::Lanes
                     | Source::RatioBar(_)
-                    | Source::JudgeGraph(_) => e.track.bounds(),
+                    | Source::JudgeGraph(_)
+                    | Source::GaugeGraph(_)
+                    | Source::TimingGraph(_) => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1107,6 +1145,8 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                     | Source::Judge(_)
                     | Source::CoverPaint(_)
                     | Source::JudgeGraph(_)
+                    | Source::GaugeGraph(_)
+                    | Source::TimingGraph(_)
             ),
             ScreenKind::Result => {
                 !selection_text(def, e.source)
@@ -1124,7 +1164,11 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                 !selection_text(def, e.source)
                     && !matches!(
                         e.source,
-                        Source::SongList | Source::RatioBar(_) | Source::JudgeGraph(_)
+                        Source::SongList
+                            | Source::RatioBar(_)
+                            | Source::JudgeGraph(_)
+                            | Source::GaugeGraph(_)
+                            | Source::TimingGraph(_)
                     )
             }
         };
@@ -1405,11 +1449,12 @@ impl Skin {
     /// Loads a result skin: the checks of [`new`](Self::new) over the
     /// result schema and its timers, and its widgets in `widgets`. An
     /// element may draw an image, an image choice, a number, a text of the
-    /// chart or a judge graph; the lanes, a gauge, a judge, a cover paint,
-    /// the song list, a ratio bar or a selection text is refused
-    /// ([`LoadError::SourceKind`]). Every judge graph's images exist, no
-    /// judge graph element names a native size (its graph's fit sizes
-    /// it), and each judge graph element is charged its worst quads.
+    /// chart, a judge graph, a gauge graph or a timing distribution; the
+    /// lanes, a gauge, a judge, a cover paint, the song list, a ratio bar
+    /// or a selection text is refused ([`LoadError::SourceKind`]). Every
+    /// graph's images exist, no judge graph element names a native size
+    /// (its graph's fit sizes it), and each graph element is charged its
+    /// worst quads.
     ///
     /// # Errors
     ///
@@ -1459,6 +1504,8 @@ impl Skin {
             w.cover_paints.len(),
             sel.ratio_bars.len(),
             res.judge_graphs.len(),
+            res.gauge_graphs.len(),
+            res.timing_graphs.len(),
         ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });
@@ -1556,7 +1603,9 @@ impl Skin {
                 | Source::CoverPaint(_)
                 | Source::SongList
                 | Source::RatioBar(_)
-                | Source::JudgeGraph(_) => {}
+                | Source::JudgeGraph(_)
+                | Source::GaugeGraph(_)
+                | Source::TimingGraph(_) => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -1590,6 +1639,8 @@ impl Skin {
             Source::SongList => sel.song_list.is_none(),
             Source::RatioBar(i) => sel.ratio_bars.get(index(i)).is_none(),
             Source::JudgeGraph(i) => res.judge_graphs.get(index(i)).is_none(),
+            Source::GaugeGraph(i) => res.gauge_graphs.get(index(i)).is_none(),
+            Source::TimingGraph(i) => res.timing_graphs.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -1604,7 +1655,9 @@ impl Skin {
             | Source::CoverPaint(_)
             | Source::SongList
             | Source::RatioBar(_)
-            | Source::JudgeGraph(_) => false,
+            | Source::JudgeGraph(_)
+            | Source::GaugeGraph(_)
+            | Source::TimingGraph(_) => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -1620,6 +1673,12 @@ impl Skin {
             .position(|e| matches!(e.source, Source::JudgeGraph(_)) && e.place.native.is_some())
         {
             return Err(LoadError::JudgeGraphNative { element });
+        }
+        if let Some(graph) = res.gauge_graphs.iter().position(|g| !exists(g.solid)) {
+            return Err(LoadError::GaugeGraphImage { graph });
+        }
+        if let Some(graph) = res.timing_graphs.iter().position(|g| !exists(g.solid)) {
+            return Err(LoadError::TimingGraphImage { graph });
         }
         check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
         for (element, e) in elements.iter().enumerate() {
@@ -1865,6 +1924,22 @@ impl Skin {
                 solid: image(def.solid),
             })
             .collect();
+        let gauge_graphs: Box<[GaugeGraph]> = res
+            .gauge_graphs
+            .into_iter()
+            .map(|def| GaugeGraph {
+                def,
+                solid: image(def.solid),
+            })
+            .collect();
+        let timing_graphs: Box<[TimingGraph]> = res
+            .timing_graphs
+            .into_iter()
+            .map(|def| TimingGraph {
+                def,
+                solid: image(def.solid),
+            })
+            .collect();
         let elements = def
             .elements
             .into_iter()
@@ -1911,6 +1986,8 @@ impl Skin {
                         Kind::RatioBar(index(i), hit)
                     }
                     Source::JudgeGraph(i) => Kind::JudgeGraph(index(i)),
+                    Source::GaugeGraph(i) => Kind::GaugeGraph(index(i)),
+                    Source::TimingGraph(i) => Kind::TimingGraph(index(i)),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -1966,6 +2043,8 @@ impl Skin {
             song_list,
             ratio_bars,
             judge_graphs,
+            gauge_graphs,
+            timing_graphs,
             sliders,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
@@ -3037,12 +3116,14 @@ impl Skin {
     }
 
     /// Fills `res` from `view` and the chart's `labels`: the fields, the
-    /// timing statistics, the timelines and the strings its text shows.
+    /// timing statistics, the timelines, the gauge history, the
+    /// deviations, the judge areas and the strings its text shows.
     /// The chart's fields follow the view under every status; the result's,
     /// the timing's and the best's are valid only while the view is ready,
     /// and the best's only while it is known; a hidden best value reads
     /// `i32::MIN`. For a view change, not a frame: it may allocate, at most
-    /// the strings' growth and the timelines' copy. The texts stay as
+    /// the strings' growth and the timelines' copy; the gauge history and
+    /// the deviations are copied into storage the state already holds. The texts stay as
     /// attached until a new table is.
     ///
     /// # Errors
@@ -3122,7 +3203,8 @@ impl Skin {
     /// from the frame's starts and the `when` timers over the fields,
     /// places the regions, then appends each drawn element's quads to `out`
     /// in draw order (the caller clears `out`): images, image choices,
-    /// numbers and text. A number draws nothing for `i32::MIN` or
+    /// numbers, text, judge graphs, gauge graphs and timing
+    /// distributions. A number draws nothing for `i32::MIN` or
     /// `i32::MAX`. Allocates nothing.
     ///
     /// A state this skin did not make, or a uv table of another sheet or
@@ -3164,9 +3246,7 @@ impl Skin {
             lanes: LaneView::NONE,
             complete: false,
             hidden_enabled: false,
-            phase: Phase::Result {
-                timelines: res.timelines(),
-            },
+            phase: Phase::Result { res },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
         Ok(())
@@ -3510,17 +3590,39 @@ impl Skin {
                     }
                 }
                 Kind::JudgeGraph(i) => {
-                    if let (Some(g), Phase::Result { timelines }) =
+                    if let (Some(g), Phase::Result { res }) =
                         (self.judge_graphs.get(i), scene.phase)
                     {
-                        let screen = rt
-                            .starts
-                            .at(usize::from(result_timer::SCREEN))
-                            .map(|at| elapsed_us(now, at));
                         let d = GraphDraw {
                             at,
-                            timelines,
-                            screen,
+                            timelines: res.timelines(),
+                            screen: screen_elapsed(rt.starts, now),
+                        };
+                        g.draw(&d, rect, &brush, out);
+                    }
+                }
+                Kind::GaugeGraph(i) => {
+                    if let (Some(g), Phase::Result { res }) =
+                        (self.gauge_graphs.get(i), scene.phase)
+                    {
+                        let d = GaugeGraphDraw {
+                            at,
+                            gauge: res.gauge(),
+                            screen: screen_elapsed(rt.starts, now),
+                        };
+                        g.draw(&d, rect, &brush, out);
+                    }
+                }
+                Kind::TimingGraph(i) => {
+                    if let (Some(g), Phase::Result { res }) =
+                        (self.timing_graphs.get(i), scene.phase)
+                    {
+                        let d = TimingGraphDraw {
+                            at,
+                            deviations: res.deviations(),
+                            timing: res.timing(),
+                            areas: res.areas(),
+                            ready: res.ready(),
                         };
                         g.draw(&d, rect, &brush, out);
                     }
@@ -3549,6 +3651,13 @@ impl Skin {
     pub const fn element_count(&self) -> usize {
         self.elements.len()
     }
+}
+
+/// The result screen timer's elapsed µs at `now`, `None` while it is off.
+fn screen_elapsed(starts: Starts<'_>, now: TimeUs) -> Option<i64> {
+    starts
+        .at(usize::from(result_timer::SCREEN))
+        .map(|at| elapsed_us(now, at))
 }
 
 #[cfg(test)]

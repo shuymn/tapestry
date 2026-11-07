@@ -214,8 +214,9 @@ pub(crate) fn scale(largest: u32) -> u32 {
 
 impl JudgeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing without timelines; the background whole when on, then the
-    /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
+    /// nothing without timelines or without a positive width and height;
+    /// the background whole when on, then the chips revealed up to
+    /// `w·min(1, t/delay)` of the screen timer's `t`.
     /// The rect is placed (lane map, affine) and fitted by the graph's
     /// [`GraphFit`] as one region, a trimmed fit cut to the rect; every
     /// quad turns with the brush's angle about the brush's pivot in the
@@ -227,6 +228,13 @@ impl JudgeGraph {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
+        // A rect with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing, as the
+        // other result graphs.
+        let [.., w, h] = brush.affine.rect([0.0, 0.0, brush.map.w(rect[2]), rect[3]]);
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
         let Some(tl) = d.timelines else {
             return;
         };
@@ -359,10 +367,6 @@ fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
 /// A result graph's region in canvas pixels: the reference `rect` placed,
 /// then fitted to the brush's native size, if any, with the graph's
 /// texture of `texels` as the frame (the timing distribution's, D8).
-#[allow(
-    dead_code,
-    reason = "the timing distribution draws through it (S10-09h-1); used or not, so no expect"
-)]
 pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
     let placed = placed(rect, brush);
     brush.native.map_or(placed, |native| {

@@ -13,7 +13,7 @@ mod graph_support;
 
 use graph_support::{
     GFx, GRID, GRID_NO_GAP_X, GRID_NO_GAP_Y, GRID_NO_GAPS, composite, element, graph, level, lod,
-    near, over_backdrop, screen_element, skin, view,
+    moving_element, near, over_backdrop, screen_element, skin, view,
 };
 use skin_model::{
     ElementDef, Filter, JudgeGraphKind, LoadError, ResultDefs, ScreenKind, Skin, Source, TimerRef,
@@ -125,7 +125,7 @@ fn a_minified_chip_grid_reads_level_zero() {
         let (mut lit, mut gaps, mut blended) = (0, 0, 0);
         for row in top.ceil() as i32..(top + h).floor() as i32 {
             let y = row as f32 + 0.5;
-            let got = composite(fx.quads(), &fx.atlas, x, y, None).0;
+            let got = fx.pixel([x, y]).0;
             if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
                 lit += 1;
             } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -188,17 +188,17 @@ fn the_background_is_the_sources_and_whole_during_the_reveal() {
             (699.5, 0.5, [35.0, 35.0, 0.0], 1.0),
         ];
         for (x, y, rgb, a) in cases {
-            let (got, covered) = composite(fx.quads(), &fx.atlas, x, top + y, None);
+            let (got, covered) = fx.pixel([x, top + y]);
             near(got, over_backdrop(rgb, a * alpha), 2.0);
             assert_eq!(covered, 1, "({x}, {y})");
         }
         // Nothing outside the region.
-        let (_, covered) = composite(fx.quads(), &fx.atlas, 700.5, top + 150.0, None);
+        let (_, covered) = fx.pixel([700.5, top + 150.0]);
         assert_eq!(covered, 0);
     }
     // Once revealed, bin 3's chips draw over the background.
     fx.frame(500);
-    let (got, covered) = composite(fx.quads(), &fx.atlas, 31.0, 245.0, None);
+    let (got, covered) = fx.pixel([31.0, 245.0]);
     near(got, PG, 2.0);
     assert_eq!(covered, 2);
 }
@@ -425,6 +425,7 @@ fn a_judge_graph_is_checked_and_charged_at_load() {
     let el = || screen_element(0, [0, 0, 10, 10], 255);
     let graphs = |g| ResultDefs {
         judge_graphs: vec![g],
+        ..ResultDefs::default()
     };
     let ok = graph(JudgeGraphKind::Judgment, GRID, true, 0);
     // Not on a play skin.
@@ -482,7 +483,7 @@ fn a_horizontally_minified_chip_grid_reads_level_zero() {
     let (mut lit, mut gaps, mut blended) = (0, 0, 0);
     for row in top.ceil() as i32..(top + h).floor() as i32 {
         let y = row as f32 + 0.5;
-        let got = composite(fx.quads(), &fx.atlas, 0.5, y, None).0;
+        let got = fx.pixel([0.5, y]).0;
         if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
             lit += 1;
         } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -537,9 +538,9 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     for i in 0..40 {
         for j in 0..20 {
             let (x, y) = (400.3 + 5.0 * i as f32, 300.3 + 5.0 * j as f32);
-            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let want = flat.pixel([x, y]).0;
             let (dx, dy) = (x - 500.0, y - 350.0);
-            let got = composite(turned.quads(), &turned.atlas, 500.0 - dy, 350.0 + dx, None).0;
+            let got = turned.pixel([500.0 - dy, 350.0 + dx]).0;
             near(got, want, 0.5);
             checked += 1;
         }
@@ -727,10 +728,6 @@ fn a_judge_graph_element_takes_no_native_size() {
         bomb_up_to: None,
         close: None,
     };
-    #[allow(
-        clippy::needless_update,
-        reason = "the other result widgets keep their defaults, whichever exist"
-    )]
     let graphs = ResultDefs {
         judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
         ..ResultDefs::default()
@@ -873,4 +870,48 @@ fn a_dense_widened_timeline_builds_with_no_dropped_quad() {
     let two = runs_at(&fx, 0.0, 100.0, [300.0, 200.0]);
     assert_eq!(two.first(), Some(&(GREY, 19)));
     assert_eq!(two.len(), 10);
+}
+
+/// A non-positive height or width draws nothing, as the gauge graph and
+/// the timing distribution: a rect `[0, 10, 520, -1]`, a negative width,
+/// and a track running through height 0 into negative heights; on the
+/// way, at a positive height, the graph draws. A trimmed fit, which would
+/// otherwise fit a graph into the negative rect and cut it there, draws
+/// nothing either.
+#[test]
+fn a_negative_size_draws_nothing() {
+    let fixed = |r| moving_element(Source::JudgeGraph(0), &[(0, r, 0)]);
+    let through = moving_element(
+        Source::JudgeGraph(0),
+        &[(0, [0, 400, 520, 4], 0), (1_000, [0, 400, 520, -4], 0)],
+    );
+    let cases = [
+        (fixed([0, 10, 520, -1]), vec![(0, false), (1_000, false)]),
+        (fixed([600, 10, -520, 82]), vec![(0, false), (1_000, false)]),
+        (through, vec![(250, true), (750, false), (1_000, false)]),
+    ];
+    let fits = [
+        skin_model::GraphFit::Stretch,
+        skin_model::GraphFit::Outer { trim: true },
+    ];
+    for ((el, frames), fit) in cases
+        .into_iter()
+        .flat_map(|c| fits.map(|fit| (c.clone(), fit)))
+    {
+        let def = skin_model::JudgeGraphDef {
+            fit,
+            ..graph(JudgeGraphKind::EarlyLate, GRID, true, 0)
+        };
+        let mut fx = GFx::new(skin(vec![el], vec![def]));
+        fx.view(&view(vec![[3, 1, 1, 1, 1, 1, 1, 1, 1]; 20]));
+        for (ms, drawn) in frames {
+            fx.frame(ms);
+            assert_eq!(
+                !fx.quads().is_empty(),
+                drawn,
+                "{fit:?} at {ms} ms: {:?}",
+                fx.quads().first()
+            );
+        }
+    }
 }
