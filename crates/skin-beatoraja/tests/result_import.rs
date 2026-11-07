@@ -643,6 +643,63 @@ fn the_load_time_level_is_the_frames() {
     assert_eq!(r.digits(0, LV), "12");
 }
 
+/// §A: the total notes (74) are the chart's, as the source reads them
+/// (`IntegerPropertyFactory.java:562-576`): drawn on a view without a
+/// result too, JSON and Lua, and readable while a Lua skin loads there.
+#[test]
+fn the_note_count_is_the_charts() {
+    let j = folder(&format!(
+        r#""value": [{ex}, {n}],
+           "destination": [{dex}, {{"id": "n", "dst": [{{"x": 0, "y": 260, "w": 4, "h": 8}}]}},
+                           {dot}]"#,
+        ex = value("ex", r#""ref": 71"#),
+        n = value("n", r#""ref": 74"#),
+        dex = dst("ex", ""),
+        dot = dst("dot", r#""op": [90],"#),
+    ));
+    let json = import_result(j.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let pre = "local n = ms.number(74)";
+    let values = lua_value("ex", 4, "ref = 71") + ", " + &lua_value("n", 4, "ref = 74");
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", "
+        + &lua_dst("n", 260, 4, "")
+        + ", { id = \"dot\", op = { 90 }, dst = { { x = n // 100, y = 300, w = 8, h = 8 } } }";
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &values, "", &dsts).as_bytes(),
+    );
+    let none = unavailable();
+    let lua = lua_result(d.path(), &facts(Some(&none))).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        lua.facts.reads,
+        [FactRead {
+            fact: FactId::ResultNumber(74),
+            value: FactValue::Int(600),
+        }]
+    );
+    let ready = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    for skin in [json.skin, lua.imported.skin] {
+        let mut r = Res::new(skin);
+        for v in [&ready, &none] {
+            r.view(v);
+            assert_eq!(r.digits(0, NR), "600");
+        }
+    }
+    let mut r = Res::new(
+        lua_result(d.path(), &facts(Some(&ready)))
+            .unwrap()
+            .imported
+            .skin,
+    );
+    r.view(&ready);
+    let q = r.frame(0);
+    let dot: Vec<_> = q.iter().filter(|q| q.rect[1] == top(300.0, 8.0)).collect();
+    assert_eq!(dot.len(), 1);
+    assert_eq!(dot[0].rect[0], 6.0);
+}
+
 /// C17: while a skin loads, options 50 and 51 are the offline constants,
 /// and a result value follows its state: shown as itself, hidden as
 /// `i32::MIN` (imported, not refused), unavailable refused; each read is

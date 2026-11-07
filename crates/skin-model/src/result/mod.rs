@@ -317,17 +317,20 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         );
         set(field::CHART_LENGTH_VALID, 1);
     }
+    if let Some(notes) = c.notes {
+        set(field::CHART_NOTES, value(u64::from(notes)));
+        set(field::CHART_NOTES_VALID, 1);
+    }
     if view.status != ResultStatus::Ready {
         return f;
     }
     let s = &view.score;
     let t = &s.tally;
     set(field::RESULT_VALID, 1);
+    for (slot, v) in (field::EX_SCORE..).zip([t.ex_score, t.max_combo, t.bp]) {
+        set(slot, value(u64::from(v)));
+    }
     let counts = [
-        t.ex_score,
-        t.max_combo,
-        t.bp,
-        s.notes,
         t.counts.perfect,
         t.counts.great,
         t.counts.good,
@@ -349,7 +352,7 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         t.empty_poor_early,
         t.empty_poor_late,
     ];
-    for (slot, v) in (field::EX_SCORE..).zip(counts) {
+    for (slot, v) in (field::COUNT_PERFECT..).zip(counts) {
         set(slot, value(u64::from(v)));
     }
     set(field::GAUGE, i32::from(s.gauge_permille.min(1_000)));

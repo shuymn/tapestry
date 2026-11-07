@@ -142,6 +142,7 @@ pub fn chart() -> ResultChart {
         }),
         difficulty: Some(4),
         length: Some(TimeUs(123_456_789)),
+        notes: Some(600),
     }
 }
 
@@ -173,7 +174,6 @@ pub fn ready(ex: u32, cleared: bool, best: BestView) -> ResultView {
         chart: chart(),
         score: ResultScore {
             tally: tally(ex, 20),
-            notes: 600,
             gauge_permille: 805,
             clear: if cleared {
                 LampKey::Normal

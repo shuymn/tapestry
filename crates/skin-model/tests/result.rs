@@ -177,7 +177,8 @@ fn a_view_fills_the_result_fields() {
         (field::EX_SCORE, 1_000),
         (field::MAX_COMBO, 77),
         (field::RESULT_BP, 20),
-        (field::RESULT_NOTES, 600),
+        (field::CHART_NOTES, 600),
+        (field::CHART_NOTES_VALID, 1),
         (field::COUNT_PERFECT, 400),
         (field::COUNT_GREAT, 2),
         (field::COUNT_POOR, 5),
@@ -250,9 +251,10 @@ fn a_view_fills_the_result_fields() {
     };
     fx.view(&v);
     let f = |slot: u16| fx.res.state().fields[usize::from(slot)];
-    for slot in field::CHART_LEVEL..=field::CHART_LENGTH_VALID {
+    for slot in field::CHART_LEVEL..=field::CHART_NOTES_VALID {
         assert_eq!(f(slot), 0, "slot {slot}");
     }
+    assert_eq!(f(field::CHART_NOTES), 0);
 }
 
 /// The fields a result state reads after a view are exactly

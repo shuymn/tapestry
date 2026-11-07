@@ -94,7 +94,9 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             part: Some(EssentialPart::ResultScore),
             ..count("ex_score")
         },
-        74 => count("result.notes"),
+        // The chart's, shown without a result too
+        // (`IntegerPropertyFactory.java:562-576`).
+        74 => v("chart.notes", "chart.notes_valid", (0, M)),
         75 => count("max_combo"),
         76 => count("result.bp"),
         90 => v("chart.bpm_max_x100 / 100", "chart.bpm_valid", (0, M / 100)),

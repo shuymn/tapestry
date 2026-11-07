@@ -403,6 +403,7 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
         chart: ResultChart {
             level: Some(12),
             total: Some(300),
+            notes: Some(600),
             ..ResultChart::default()
         },
         score: ResultScore {
@@ -414,7 +415,6 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
                 early: counts,
                 ..Tally::default()
             },
-            notes: 600,
             gauge_permille: 805,
             clear: LampKey::Normal,
             cleared: true,
