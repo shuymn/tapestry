@@ -10,6 +10,11 @@
 //! element's reference units, the graph's rows counted up from its
 //! bottom: column `c` of the history owns `[w·c/288, w·(c+1)/288)`, a
 //! value `v` sits at `v/max·(h − 2)`, and the line is 2 units thick.
+//!
+//! The layers' colours are composed on every build, from the view's look
+//! and the skin's colours, not into a fixed table filled at a view change
+//! as the S10-09h design (D6) planned: a deviation that is arithmetic
+//! only and allocates nothing, as the judge graph composes its own.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

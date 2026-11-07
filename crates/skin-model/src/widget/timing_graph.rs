@@ -12,6 +12,12 @@
 //! pieces, each its layers composed. Geometry is in the element's own
 //! fractional units: column `j` of `gx` spans `[w·j/gx, w·(j+1)/gx)`, a
 //! row is `h/scale` tall from the top, and ms `i` is column `gx/2 + i`.
+//!
+//! Each piece's layers are composed on every build, from the view's areas
+//! and statistics and the skin's colours, not into a fixed table filled
+//! at a view change as the S10-09h design (D6) planned: a deviation that
+//! is arithmetic only and allocates nothing, as the judge graph composes
+//! its own.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
