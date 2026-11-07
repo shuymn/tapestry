@@ -92,6 +92,17 @@ impl Cx<'_> {
     }
 }
 
+/// The role of an image set whose value gives it `role`, else `base`:
+/// only a number shows the EX score (docs/stage3.md §3, Result), so a set
+/// choosing by it keeps `base` and is not the score.
+pub(crate) fn set_role(role: Role, base: Role) -> Role {
+    if role == Role::Essential(EssentialPart::ResultScore) {
+        base
+    } else {
+        role
+    }
+}
+
 /// The role of an element on a result screen showing image index `id`.
 pub(crate) fn index_role(base: Role, id: i32) -> Role {
     if profile::status_index(id) {

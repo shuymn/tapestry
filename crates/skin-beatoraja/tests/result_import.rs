@@ -489,6 +489,37 @@ fn a_negated_result_option_needs_its_value() {
     }
 }
 
+/// C16: only a number shows the EX score; an image set choosing by 71 or
+/// 171, by `value` or a Lua callback, beside a status and no EX number, is
+/// refused for the missing score.
+#[test]
+fn an_image_set_is_not_the_score() {
+    let status = dst("dot", r#""op": [90],"#);
+    for set in [
+        r#"{"id": "s", "value": 71, "images": ["b0", "b1"]}"#,
+        r#"{"id": "s", "value": 171, "images": ["b0", "b1"]}"#,
+    ] {
+        assert_eq!(
+            refused(essential("", set, &(dst("s", "") + "," + &status))),
+            (EssentialPart::ResultScore, None),
+            "{set}"
+        );
+    }
+    let sets = "{ id = \"s\", value = function() return ms.number(71) end, \
+                images = { \"b0\", \"b1\" } }";
+    let dsts = lua_dst("s", 100, 8, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin("", "", sets, &dsts).as_bytes(),
+    );
+    match lua_outcome(d.path(), &ImportFacts::unavailable(ScreenKind::Result)) {
+        Err(ImportError::Essential { part, .. }) => assert_eq!(part, EssentialPart::ResultScore),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// C16 on the Lua path: an EX score read by a callback and a status read
 /// by a `draw` callback are the parts; without the score it refuses.
 #[test]

@@ -603,7 +603,9 @@ impl Cx<'_> {
         // status, an essential part.
         if self.kind == skin_model::ScreenKind::Result {
             role = match property::value_prop(self.kind, &value) {
-                property::IntProp::Shown(v) => v.essential().map_or(role, Role::Essential),
+                property::IntProp::Shown(v) => {
+                    super::result::set_role(v.essential().map_or(role, Role::Essential), role)
+                }
                 property::IntProp::Null => super::result::index_role(role, r),
                 _ => role,
             };
@@ -615,7 +617,7 @@ impl Cx<'_> {
             let Some(v) = self.value_callback(at, id, role, Conv::Index)? else {
                 return Ok(());
             };
-            role = v.role;
+            role = super::result::set_role(v.role, role);
             (
                 image_choice::guarded(&v.expr, v.guard.as_deref()),
                 v.deviates,

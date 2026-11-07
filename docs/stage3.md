@@ -364,7 +364,7 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
     | Event | | 42: ignored |
 
     Essential parts, judged after the configured options are folded and over the retained elements; each missing refuses the import with `ImportError::Essential`, and an element of one that cannot be reproduced refuses it too, where any other is dropped with a note:
-    - **EX score**: a number showing 71 or 171, by `ref`, name or a Lua read.
+    - **EX score**: a number showing 71 or 171, by `ref`, name or a Lua read; an image set choosing by them is not one.
     - **Clear status**: an element whose visibility reads option 90 or 91, or that shows image index or number 370.
 
     While a Lua result skin loads, its reads of result values answer from the viewed result through the same profile: options 50 and 51 the offline constants; a shown value itself, a hidden one `i32::MIN`, and an unavailable one refusing the pass (an option is unavailable without its group's validity). Each read is recorded with its value, and the base snapshot has the result pending. Until result skins are drawn (S10-09g's specialization and S10-09i), the player keeps the built-in result screen and imports no result skin.
