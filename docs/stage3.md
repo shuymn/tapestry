@@ -279,6 +279,7 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
       | Autoplay, options 32 and 33 | Known in the base snapshot, from the session | false | false | false |
       | Judgment class, options 180–184 | Pending in the base snapshot, known after the preset's refresh | Unavailable | Pending in the base snapshot, known at the choice, or unavailable when the draw decides it | Pending in the base snapshot, known per attempt |
       | Course mode, option 290 | false | false | false | false |
+      | The result profile's numbers and options | Unavailable | Unavailable | Unavailable | Pending in the base snapshot, known per view (shown, hidden as `i32::MIN`, or unavailable) |
 
       Building the decision snapshot as unavailable when the draw decides the class is S10-07's.
     - Presentation snapshot (the player fills it, render reads it; design.md "Rendering and Skins"):
@@ -343,13 +344,30 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
 
     | Group | Ids | Treatment |
     | --- | --- | --- |
-    | Chart | numeric 74, 90–91, 96, 368, 1163–1164; text 10, 12, 14, 16; chart options 150–155, 160–164, 177, 180–184, 191 | Needed from the loaded chart and its presentation data, where a fact backs it |
+    | Chart | numeric 74, 90–91, 96, 368, 1163–1164; text 10, 12, 14, 16; chart options 150–155, 160–164, 177, 180–184 | Needed from the loaded chart and its presentation data, where a fact backs it |
     | Current result and timing | numeric 71, 75–76, 102–103, 107, 110–114, 171, 183–184, 374–375, 407, 410–425 | Needed: exact statistics from the recorded events under the viewed preset; 374–375's mean from exact deviation sums and counts, which the histogram cannot give; best-based rates under validity guards |
-    | Own best and change | numeric 150, 154, 170, 172, 176, 178, 370–371; options 90–91, 300–307, 320–327, 330, 332, 335, 2244–2245; image indices 370–371, 450–457 | Needed, by exact comparison of the same saved play's before and after bests; the assigned-lane indices show the actual identity mapping until transforms exist |
-    | Widgets | `gaugegraph`, `judgegraph` types 1 and 2, `timingdistributiongraph` | Needed (R6) |
-    | Transform option | image index and event 42, `main_state.event_index(42)` | Its real current index; the action loses its hit target until the native feature exists |
-    | Separate features | numeric 151, 153, 157–158 (score target), 179–180, 182, 380–399 (IR), 21–25 (clock); text 3, 120–129, 1003, 1020; options 196–198, 1196–1204 (replay slots), 280–283, 289–290 (course), 1008 (false: no difficulty tables), 50–51 (offline true, online false); timers 173–174 | Decorative |
+    | Own best and change | numeric 150, 154, 170, 172, 176, 178, 370–371; options 90–91, 300–307, 320–327, 330, 332, 335, 2244–2245; image indices 370–371 | Needed, by exact comparison of the same saved play's before and after bests |
+    | Widgets | `gaugegraph`, `judgegraph` types 1 and 2, `timingdistributiongraph` | Needed (R6, S10-09h); until then dropped with a note |
+    | Lane options | image indices 42 and 450–457, `main_state.event_index(42)`; event 42 | 0, as the source shows with no lane option or shuffle; event 42 is a select-screen action that does nothing on the result, so it has no hit target |
+    | Separate features | numeric 151, 153, 157–158 (score target), 179–180, 182, 380–399 (IR), 21–25 (clock); text 3, 120–129, 1003, 1020; options 191 (false: no stage file shown), 196–198, 1196–1204 (replay slots), 280–283, 289–290 (course), 1008 (false: no difficulty tables), 50–51 (offline true, online false); timers 173–174 | Decorative |
     | Missing essentials | No truthful current-result and status presentation | Refusal |
+
+    The importer's profile (S10-09g, `skin-beatoraja`'s `import::result::profile`) classifies every id the surveyed result skins read, one explicit `match` per id space, over the result schema (`skin_model::RESULT`); the result loader reads the common objects alone. A JSON field's `ref`, name or `op`, a Lua callback's `main_state` read and a Lua read while the skin loads go through the same function. Each value is shown, hidden or unavailable: a bridge is an expression and the validity it is drawn under, joined into the visibility of every element that reads it, so an unavailable value draws nothing; a hidden value (the BP and its difference with no previous BP, the source's `Integer.MIN_VALUE`) reads `i32::MIN` in every expression, which only a number does not draw. Classes: **N** bridged from the viewed result, its timing statistics, the best before this play or the chart's facts; **D** a truthful constant for a feature tapestry lacks, or omitted with a note; **configured** the skin's own options, folded.
+
+    | Space | N | D |
+    | --- | --- | --- |
+    | Numeric | 71 and 171 (EX), 74, 75, 76, 102–103, 107, 110–114, 154, 370, 374–375 (the mean truncated toward 0, under the timing's validity), 407, 410–425 (425 BAD plus POOR); 150, 170, 172, 176, 178, 183–184, 371 (the best); 90–91, 96, 368, 1163–1164 (the chart) | 21–25 (clock), 151, 153, 157–158 (score target), 179–180, 182, 380–399 (IR): omitted |
+    | Text | 10, 12, 14, 16 (the chart's labels) | 3, 120–129, 1003, 1020: omitted |
+    | Option | 90–91, 300–307, 2244–2245 (the result); 320–327, 330, 332, 335 (the best); 150–155, 177 (the chart); 160 true and 161–164 false (7-key only); 180–184 (the judgment class, a load-time fact as on play) | 50, 196, 1196, 1199 and 1202 true; 51, 191, 197–198, 280–283, 289–290, 1008 and the rest of 1196–1204 false |
+    | Timer | 2 (the fade-out) | 0, 173–174: never set |
+    | Image index | 370 (the clear type, the source's index), 371 (the best's) | 42, 450–457: 0 |
+    | Event | | 42: ignored |
+
+    Essential parts, judged after the configured options are folded and over the retained elements; each missing refuses the import with `ImportError::Essential`, and an element of one that cannot be reproduced refuses it too, where any other is dropped with a note:
+    - **EX score**: a number showing 71 or 171, by `ref`, name or a Lua read.
+    - **Clear status**: an element whose visibility reads option 90 or 91, or that shows image index or number 370.
+
+    While a Lua result skin loads, its reads of result values answer from the viewed result through the same profile: options 50 and 51 the offline constants; a shown value itself, a hidden one `i32::MIN`, and an unavailable one refusing the pass (an option is unavailable without its group's validity). Each read is recorded with its value, and the base snapshot has the result pending. Until result skins are drawn (S10-09g's specialization and S10-09i), the player keeps the built-in result screen and imports no result skin.
 
     The native strip of design.md "Play Lifecycle" (a result skin) draws over every result skin. The result's outro, which retry, back and the quit key wait for, is the skin's declared one; which declarations make it is fixed in S10-09i.
   - **Text limits.** R6's 64 text elements stay: a surveyed selection skin declares 65 text definitions but draws at most 64, and at most 39 once its decorative texts drop (S10-09d's measurement). Visible-row expansion does not count against it: the song list's row text is its own table, one line per placement, at most 60.
