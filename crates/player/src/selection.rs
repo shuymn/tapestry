@@ -286,33 +286,33 @@ impl Selection {
     /// Takes the queued input; the chart it chose, if it did. Consecutive
     /// edits of the search or the order are searched once: at the end, or
     /// before any other input, which acts on the list they make.
+    ///
+    /// While a panel is open (START, SELECT or both held), the keys it
+    /// holds back do nothing: the window's by the panel the screen shows
+    /// ([`crate::select::acts_under_panel`]), the controller's by the panel
+    /// open as each was sent ([`crate::select::event_acts_under_panel`]).
     fn drain(&mut self, pad: &mut Pad) -> Option<Pick> {
-        // The controller's events join the window's, as the keys they
-        // stand for.
-        while let Some(event) = pad.pop() {
-            self.menu
-                .push(MenuInput::Key(crate::select::event_key(event)));
-        }
-        pad.report_dropped("select");
         while let Some(input) = self.menu.pop() {
-            let edit = matches!(
-                input,
-                MenuInput::Text(_)
-                    | MenuInput::Preedit(_)
-                    | MenuInput::Key(
-                        MenuKey::Left
-                            | MenuKey::Right
-                            | MenuKey::Backspace
-                            | MenuKey::BackspaceHeld
-                    )
-            );
-            if self.search_pending && !edit {
-                self.refresh();
+            if let MenuInput::Key(key) = input
+                && !crate::select::acts_under_panel(key, self.feed.panel())
+            {
+                continue;
             }
-            if let Some(pick) = self.act(input) {
+            if let Some(pick) = self.take(input) {
                 return Some(pick);
             }
         }
+        // The controller's events after the window's, as the keys they
+        // stand for.
+        while let Some((event, panel)) = pad.pop_panel() {
+            if !crate::select::event_acts_under_panel(event, panel) {
+                continue;
+            }
+            if let Some(pick) = self.take(MenuInput::Key(crate::select::event_key(event))) {
+                return Some(pick);
+            }
+        }
+        pad.report_dropped("select");
         if self.search_pending {
             self.refresh();
         }
@@ -327,6 +327,34 @@ impl Selection {
             self.dropped = dropped;
         }
         None
+    }
+
+    /// Acts on `input` taken from a queue, searching a changed search or
+    /// order first unless `input` edits it too.
+    fn take(&mut self, input: MenuInput) -> Option<Pick> {
+        let edit = matches!(
+            input,
+            MenuInput::Text(_)
+                | MenuInput::Preedit(_)
+                | MenuInput::Key(
+                    MenuKey::Left | MenuKey::Right | MenuKey::Backspace | MenuKey::BackspaceHeld
+                )
+        );
+        if self.search_pending && !edit {
+            self.refresh();
+        }
+        self.act(input)
+    }
+
+    /// The panels' `level` read at `now`: an update is due when the panel
+    /// the screen shows changed.
+    fn panels(&mut self, level: Option<&input::PanelLevel>, now: TimeUs) {
+        let Some(level) = level else {
+            return;
+        };
+        if self.feed.panels(level.read(), self.screen.searching(), now) {
+            self.dirty = true;
+        }
     }
 
     /// [`drain`](Self::drain) while selection owns the menus' queues
@@ -1296,11 +1324,15 @@ impl PlayerRig<'_> {
             sel.screen.set_notice(Some(notice));
             sel.dirty = true;
         }
+        // The panel the keys find open, then the one they leave (a search
+        // box taking focus closes it).
+        sel.panels(self.panels.as_ref(), self.clock.now());
         #[cfg_attr(
             not(feature = "dev-tools"),
             expect(unused_mut, reason = "scripts choose too")
         )]
         let mut chosen = sel.drain_owned(&mut self.result_input);
+        sel.panels(self.panels.as_ref(), self.clock.now());
         #[cfg(feature = "dev-tools")]
         if chosen.is_none()
             && sel.script(
@@ -2072,6 +2104,8 @@ impl AppRig for PlayerRig<'_> {
         };
         let now = self.clock.now();
         sel.entered(now);
+        // A panel held at the entry opens with it.
+        sel.panels(self.panels.as_ref(), now);
         self.render.enter_selection(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, None, now);
@@ -2622,6 +2656,298 @@ pub(crate) mod tests {
         }
         let chosen = sel.drain(&mut pad).expect("Confirm chooses");
         assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
+    }
+
+    /// A keyboard with START on E and SELECT on W reaching an adjustment
+    /// tap, and the panels' level it publishes.
+    fn panel_keys() -> (input::SourceSet, input::PanelLevel) {
+        use input::{
+            AdjustmentBindings, DeviceId, DeviceKind, SourceConfig, SourceSet, TapControl,
+        };
+        let mut set = SourceSet::new(SourceConfig {
+            max_devices: 1,
+            max_sources: 1,
+            max_held: 4,
+            queue_capacity: 4,
+            max_arrivals: 1,
+        })
+        .unwrap();
+        set.begin_batch(TimeUs(0));
+        set.connect(DeviceId(1), DeviceKind::Keyboard);
+        set.end_batch(TimeUs(0));
+        let (mut tap, _rx) = input::adjustment_queue(AdjustmentBindings {
+            controls: vec![
+                (TapControl::Key(eval::ControlId(0x12)), 0),
+                (TapControl::Key(eval::ControlId(0x11)), 1),
+            ],
+            latched: 0b11,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        tap.set_panel_roles(0b01, 0b10);
+        let level = tap.panel_level();
+        set.set_adjustment(tap);
+        (set, level)
+    }
+
+    /// Key `code` of [`panel_keys`]'s keyboard to `value`, then the
+    /// boundary's publication.
+    fn panel_key(set: &mut input::SourceSet, code: u32, value: i32) {
+        set.begin_batch(TimeUs(0));
+        set.packet(&input::Packet {
+            device: input::DeviceId(1),
+            control: eval::ControlId(code),
+            value,
+            background: false,
+        });
+        set.end_batch(TimeUs(0));
+        set.adjustment_mut().unwrap().publish_panels(true);
+    }
+
+    /// Under a panel the select screen's keys act as the reference's
+    /// option panels let them (`MusicSelectInputProcessor.java` at 0.8.9):
+    /// under panel 1 (START) Up and Down and the scratch scroll
+    /// (`:154-202`), and nothing chooses, practises, goes back or pages
+    /// (`:115`, `:290-329`); under panel 2 (SELECT) and 3 (both) the list
+    /// does not move either; the order, the search box and the presets act
+    /// as without one, and every other controller key does nothing.
+    #[test]
+    fn keys_under_a_panel_act_as_the_panels_let_them() {
+        use eval::ControlId;
+        use input::{MenuAction, MenuBindings, MenuEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let (mut set, level) = panel_keys();
+        let (mut pad_tap, receiver) = input::menu_queue(MenuBindings {
+            product: controller_product(),
+            controls: vec![
+                (ControlId(1), MenuAction::Press(MenuEvent::Confirm)),
+                (ControlId(2), MenuAction::Press(MenuEvent::Down)),
+                (ControlId(3), MenuAction::Press(MenuEvent::Back)),
+                (ControlId(7), MenuAction::Press(MenuEvent::Extra)),
+            ],
+            step: 1,
+            relative: None,
+            wrap: None,
+        });
+        pad_tap.set_active(true);
+        let mut pad = Pad {
+            receiver: Some(receiver),
+            dropped: 0,
+        };
+        // A controller press sent while `panel` is open.
+        let mut send = |panel: Option<usize>, control: u32| {
+            pad_tap.set_panel(panel);
+            pad_tap.offer(
+                &input::Packet {
+                    device: input::DeviceId(7),
+                    control: ControlId(control),
+                    value: 1,
+                    background: false,
+                },
+                None,
+            );
+        };
+        sel.feed.enter(TimeUs(0));
+        let look = |sel: &mut Selection, set: &mut input::SourceSet, code, value| {
+            panel_key(set, code, value);
+            sel.panels(Some(&level), TimeUs(1));
+        };
+        // Panel 1: Down moves to B; Enter, P, Escape, Backspace, Page Down
+        // and End do nothing; the scratch moves to C, the white keys, the
+        // black keys and key 7 do nothing.
+        look(&mut sel, &mut set, 0x12, 1);
+        assert_eq!(sel.feed.panel(), Some(0));
+        for key in [
+            MenuKey::Down,
+            MenuKey::Enter,
+            MenuKey::Practice,
+            MenuKey::Escape,
+            MenuKey::Backspace,
+            MenuKey::PageDown,
+            MenuKey::End,
+        ] {
+            sel.menu.push(MenuInput::Key(key));
+        }
+        for control in [1, 2, 3, 7] {
+            send(Some(0), control);
+        }
+        assert_eq!(sel.drain(&mut pad), None);
+        assert!(sel.preset_steps.is_empty(), "key 7 stepped no preset");
+        // Panel 3 (both) and panel 2 (SELECT): nothing moves; the order
+        // still changes, and back.
+        look(&mut sel, &mut set, 0x11, 1);
+        assert_eq!(sel.feed.panel(), Some(2));
+        keys(&mut sel, &[MenuKey::Up, MenuKey::Home, MenuKey::Right]);
+        assert_eq!(sel.screen.order(), 1, "the next order");
+        keys(&mut sel, &[MenuKey::Left, MenuKey::Enter]);
+        assert_eq!(sel.screen.order(), 0);
+        send(Some(2), 2);
+        assert_eq!(sel.drain(&mut pad), None);
+        look(&mut sel, &mut set, 0x12, 0);
+        assert_eq!(sel.feed.panel(), Some(1));
+        assert_eq!(keys(&mut sel, &[MenuKey::Up, MenuKey::Enter]), None);
+        // Closed: Enter chooses C, where the scratch left the cursor.
+        look(&mut sel, &mut set, 0x11, 0);
+        assert_eq!(sel.feed.panel(), None);
+        let chosen = keys(&mut sel, &[MenuKey::Enter]).expect("Enter chooses");
+        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
+        // A controller event sent under a panel stays held back once it
+        // closed; one sent after acts.
+        send(Some(1), 1);
+        assert_eq!(sel.drain(&mut pad), None);
+        send(None, 1);
+        assert!(sel.drain(&mut pad).is_some());
+    }
+
+    /// While the search box has focus no panel opens, and a panel open
+    /// closes; once the box loses focus with START still held, panel 1
+    /// opens again with a fresh start.
+    #[test]
+    fn the_search_box_keeps_the_panels_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let (mut set, level) = panel_keys();
+        sel.feed.window = Some((3, 7));
+        sel.feed.enter(TimeUs(0));
+        let panels = |sel: &mut Selection, t: i64| {
+            sel.panels(Some(&level), TimeUs(t));
+            let page = sel.screen.page("");
+            sel.feed.update(&sel.screen, page, TimeUs(t)).events.panels
+        };
+        panel_key(&mut set, 0x12, 1);
+        assert_eq!(panels(&mut sel, 10), [Some(TimeUs(10)), None, None]);
+        keys(&mut sel, &[MenuKey::Tab]);
+        assert!(sel.screen.searching());
+        assert_eq!(panels(&mut sel, 20), [None; 3]);
+        // Typing E into the box opens nothing.
+        panel_key(&mut set, 0x12, 0);
+        panel_key(&mut set, 0x12, 1);
+        assert_eq!(panels(&mut sel, 30), [None; 3]);
+        keys(&mut sel, &[MenuKey::Tab]);
+        assert!(!sel.screen.searching());
+        assert_eq!(panels(&mut sel, 40), [Some(TimeUs(40)), None, None]);
+    }
+
+    /// What the panels fixture's last four elements showed in each
+    /// selection frame: options 21, 22 and 23's images drawn, and timer
+    /// 21's image's sampled time.
+    #[cfg(feature = "dev-tools")]
+    #[derive(Clone, Default)]
+    struct PanelFrames(Arc<std::sync::Mutex<Vec<([bool; 3], Option<TimeUs>)>>>);
+
+    #[cfg(feature = "dev-tools")]
+    impl crate::render_side::FrameSink for PanelFrames {
+        fn frame(
+            &mut self,
+            screen: &dyn crate::render_side::Screen,
+            _drawn: &crate::measure::Drawn<'_>,
+        ) {
+            let Some(observed) = screen.selection_observations() else {
+                return;
+            };
+            let [.., a, b, c, timer] = observed.as_slice() else {
+                return;
+            };
+            let drawn =
+                |o: &skin_model::ElementObservation| o.outcome == skin_model::Outcome::Sampled;
+            let timer = drawn(timer).then_some(timer.t).flatten();
+            self.0
+                .lock()
+                .unwrap()
+                .push(([drawn(a), drawn(b), drawn(c)], timer));
+        }
+    }
+
+    /// C16 through the player's rig and the render thread on WARP: the
+    /// game thread's look reads the level the input side published and
+    /// sends the update; the frames after it draw option 21 under START,
+    /// 23 under both, 22 under SELECT and none once released, and timer
+    /// 21's image only while panel 1 is open, from its opening.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_rig_draws_the_panel_open() {
+        use game::AppRig as _;
+        use game::Preparation;
+        use skin_model::ScreenKind;
+
+        let dir = crate::selection_skin::panels_fixture();
+        let limits = crate::render_common::offscreen(1_920, 1_080);
+        let skin = crate::selection_skin::fixture_bundle(&limits, dir.path(), "s.json");
+        let frames = PanelFrames::default();
+        let make: crate::render_side::MakeScreen = Box::new(|| {
+            let r = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(crate::menu_screen::MenuScreen::new(
+                r,
+                Some(render::text::Fonts::runtime()?),
+            )) as Box<dyn crate::render_side::Screen>)
+        });
+        let clock = input::QpcClock::start();
+        let link = crate::render_side::spawn(
+            make,
+            None,
+            None,
+            clock,
+            crate::render_side::tests::view(),
+            crate::render_side::tests::measure(clock),
+            Box::new(frames.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Selection, Some(skin))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        let charts = tempfile::tempdir().unwrap();
+        let (sel, _) = tree(charts.path(), &[&["a.bms"]]);
+        let (mut set, level) = panel_keys();
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        let last = || frames.0.lock().unwrap().last().copied();
+        crate::tests::on_rig_with(settings, link, |rig, _| {
+            // The level comes with the adjustments' tap; this one's input
+            // side is the test's.
+            assert!(rig.panels.is_some(), "installed with the tap");
+            rig.adjust = None;
+            rig.panels = Some(level);
+            rig.selection = Some(sel);
+            rig.entered_selection();
+            assert!(
+                crate::render_side::tests::wait_until(
+                    || last().is_some_and(|(open, timer)| open == [false; 3] && timer.is_none())
+                ),
+                "{:?}",
+                last()
+            );
+            for (code, value, want) in [
+                (0x12, 1, [true, false, false]),
+                (0x11, 1, [false, false, true]),
+                (0x12, 0, [false, true, false]),
+                (0x11, 0, [false; 3]),
+            ] {
+                panel_key(&mut set, code, value);
+                assert!(rig.look().is_none());
+                // The update taken: the frames from here draw it.
+                assert!(rig.render.fence(Duration::from_secs(60)));
+                let seen = frames.0.lock().unwrap().len();
+                assert!(
+                    crate::render_side::tests::wait_until(|| frames.0.lock().unwrap().len() > seen),
+                    "no frame"
+                );
+                let (open, timer) = last().unwrap();
+                assert_eq!(open, want, "{code:#x} {value}");
+                assert_eq!(timer.is_some(), want[0], "{timer:?}");
+            }
+        });
     }
 
     /// The select loop drains result commands on every look; while no

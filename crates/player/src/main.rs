@@ -760,6 +760,7 @@ fn install_adjustments(rig: &mut PlayerRig<'_>, settings: &Settings) -> anyhow::
         tap.set_window_keys(receiver, [number(f1), number(f2)]);
         rig.controls.set_window_keys(keys);
     }
+    rig.panels = Some(tap.panel_level());
     rig.render.presentation(reader);
     rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
     rig.adjust = Some(driver);
@@ -855,6 +856,7 @@ fn rig<'a>(
         gain: audio::Gain::HEADROOM,
         gate: None,
         adjust: None,
+        panels: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;

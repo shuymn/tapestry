@@ -154,6 +154,57 @@ pub const fn event_key(event: MenuEvent) -> MenuKey {
     }
 }
 
+/// Whether window key `key` acts on the select screen while `panel` is
+/// open (design.md "Input", Menu input), as the reference's option panels
+/// hold the song list (`MusicSelectInputProcessor.java` at 0.8.9): under
+/// any panel the list's own input, a choice, practice and the folders'
+/// opening and closing wait (`:115`, `:205`, `:242`, against `:290-329`),
+/// except that panel 1 (START) scrolls a line with Up and Down
+/// (`:163-202`); the order, the search box and the presets act as without
+/// a panel (the order is the reference's sort key, taken before the
+/// panels, `:90`; the presets are tapestry's own).
+#[must_use]
+pub const fn acts_under_panel(key: MenuKey, panel: Option<usize>) -> bool {
+    match (panel, key) {
+        (None, _) => true,
+        (Some(p), MenuKey::Up | MenuKey::Down) => p == 0,
+        (
+            Some(_),
+            MenuKey::PageUp
+            | MenuKey::PageDown
+            | MenuKey::Home
+            | MenuKey::End
+            | MenuKey::Enter
+            | MenuKey::Backspace
+            | MenuKey::BackspaceHeld
+            | MenuKey::Escape
+            | MenuKey::Practice,
+        ) => false,
+        (
+            Some(_),
+            MenuKey::Left
+            | MenuKey::Right
+            | MenuKey::Tab
+            | MenuKey::PrevPreset
+            | MenuKey::NextPreset,
+        ) => true,
+    }
+}
+
+/// Whether a controller's menu `event`, sent while START and SELECT
+/// opened `panel`, acts on the select screen: under panel 1 the scratch
+/// scrolls (`MusicSelectInputProcessor.java:158-202` at 0.8.9), and every
+/// other lane control, which sets an option in the reference
+/// (`:123-152`, `:213-240`, `:250-288`), does nothing, tapestry's panels
+/// being display only.
+#[must_use]
+pub const fn event_acts_under_panel(event: MenuEvent, panel: Option<usize>) -> bool {
+    match panel {
+        None => true,
+        Some(p) => p == 0 && matches!(event, MenuEvent::Up | MenuEvent::Down),
+    }
+}
+
 /// The result screen's command for a window key: the arrow keys switch
 /// presets, and every other key does nothing there (the retry and quit
 /// keys arrive as controls, which the window takes from the same press).

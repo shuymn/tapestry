@@ -28,8 +28,9 @@
 //! open through a handoff to the close, Tail from a close, and Idle only from [`Request::Idle`], which the
 //! game thread sends once a play's audio tail is over. At each boundary
 //! the hook also sets the controller's menu active only while Idle with the
-//! window focused, and wakes the game thread when the batch sent a menu
-//! event (design.md "Input").
+//! window focused, publishes START and SELECT as the select screen's panel
+//! level by the same rule, and wakes the game thread when the batch sent a
+//! menu event or the level changed (design.md "Input").
 //!
 //! The game thread waits for each reply at most [`INPUT_TIMEOUT`] of awake
 //! time; an input thread that is gone or does not answer fails the link for
@@ -920,6 +921,11 @@ impl Hook {
     /// while the thread is Idle and the window has focus, so a request
     /// that opens recording or a focus change ends it at the boundary it
     /// is seen at. The game thread is woken when this batch sent events.
+    /// START and SELECT are published as the panels' level by the same
+    /// rule: held only while Idle with focus, so a focus loss, leaving
+    /// Idle or a device's removal (which drops what it held) closes a
+    /// panel at the boundary it is seen at; the game thread is woken when
+    /// the level changed.
     fn menu(&self, sources: &mut SourceSet) {
         let active = self.phase == Phase::Idle && self.controls.focused();
         if let Some(menu) = sources.menu_mut() {
@@ -927,6 +933,11 @@ impl Hook {
             if menu.take_sent() {
                 self.controls.wake_game();
             }
+        }
+        if let Some(tap) = sources.adjustment_mut()
+            && tap.publish_panels(active)
+        {
+            self.controls.wake_game();
         }
     }
 
@@ -3635,5 +3646,276 @@ mod gate_tests {
         assert!(sources.is_sealed());
         assert_eq!(allocated, 0, "the input thread's abort close allocated");
         assert_eq!(asking, 0, "the game thread's abort close allocated");
+    }
+}
+
+/// C16: the select screen's panels through `Hook::wake` as the input
+/// thread calls it, with the production key configs (START on E, SELECT on
+/// W) and the controller's menu table: START, both, SELECT, none; a release
+/// lost to a focus loss, a device's removal, menu events overflowing their
+/// queue, and leaving Idle for a play and coming back never keep a panel
+/// open; a panel still held at the next entry opens with a fresh start.
+/// The timers' starts are the select screen's update's, at the times the
+/// game thread reads the level.
+#[cfg(test)]
+mod panel_tests {
+    use std::sync::Arc;
+
+    use bms_model::TimeUs;
+    use eval::ControlId;
+    use game::{AdjustmentConfig, DeviceSettings, KeyConfigs};
+    use input::hid::HidProduct;
+    use input::{
+        DeviceId, DeviceKind, MenuEvent, MenuReceiver, Packet, PanelLevel, QpcClock, SourceConfig,
+        SourceSet, Waker,
+    };
+
+    use super::autoplay_tests::{LEAD_IN, recorded};
+    use super::{Hook, InputLink, Mode, Reply, Request, link};
+    use crate::controls::Controls;
+    use crate::selection_skin::SkinFeed;
+
+    const E: ControlId = ControlId(0x12);
+    const W: ControlId = ControlId(0x11);
+    const KEYBOARD: DeviceId = DeviceId(1);
+    const PAD: DeviceId = DeviceId(7);
+    const PRODUCT: HidProduct = HidProduct {
+        vendor_id: 0x1A2B,
+        product_id: 0x3C4D,
+        interface: None,
+    };
+
+    struct Rig {
+        controls: Arc<Controls>,
+        hook: Hook,
+        link: InputLink,
+        sources: SourceSet,
+        level: PanelLevel,
+        menu: MenuReceiver,
+        feed: SkinFeed,
+        screen: crate::select::SelectScreen,
+        now: i64,
+    }
+
+    impl Rig {
+        /// The default keyboard and a controller whose button 1 plays key
+        /// 1 and button 8 the scratch, planned and tapped as the player
+        /// installs them;
+        /// the thread Idle with focus, selection entered at 1 ms.
+        fn new() -> Self {
+            let mut device = DeviceSettings::default();
+            device.controller.lanes = vec![
+                game::LaneKey {
+                    control: 1,
+                    lane: 1,
+                },
+                game::LaneKey {
+                    control: 8,
+                    lane: 0,
+                },
+            ];
+            device.controller_device = Some(PRODUCT.into());
+            let keys = KeyConfigs::from(&device);
+            let plan = AdjustmentConfig::default().plan(&keys, None, None).unwrap();
+            let options =
+                game::PlayOptions::new(game::HiSpeedSettings::default(), game::Covers::default())
+                    .unwrap();
+            let (_driver, tap, _reader) = game::AdjustDriver::new(&plan, options, 0).unwrap();
+            let level = tap.panel_level();
+            let mut sources = SourceSet::new(SourceConfig {
+                max_devices: 4,
+                max_sources: 4,
+                max_held: 16,
+                queue_capacity: 64,
+                max_arrivals: 2,
+            })
+            .unwrap();
+            sources.begin_batch(TimeUs(0));
+            sources.connect(KEYBOARD, DeviceKind::Keyboard);
+            sources.connect(PAD, DeviceKind::Controller);
+            sources.set_product(PAD, PRODUCT);
+            sources.end_batch(TimeUs(0));
+            let bindings =
+                crate::select::menu_bindings(&device.controller, Some(PRODUCT), &device.scratch)
+                    .unwrap();
+            let (menu_tap, menu) = input::menu_queue(bindings);
+            sources.set_menu(menu_tap);
+            let controls = Arc::new(Controls::new(QpcClock::start()));
+            controls.set_latch(sources.gate().handle());
+            controls.set_game(std::thread::current());
+            sources.set_presentation_focus(controls.presentation_focus().clone());
+            sources.set_adjustment(tap);
+            let (hook, link) = link(Arc::clone(&controls), Mode::Clock, Waker::new().unwrap());
+            let mut rig = Self {
+                controls,
+                hook,
+                link,
+                sources,
+                level,
+                menu,
+                feed: SkinFeed::default(),
+                screen: crate::select::SelectScreen::new(Vec::new()),
+                now: 0,
+            };
+            rig.link.requests.send(Request::Idle).unwrap();
+            rig.wake();
+            rig.feed.enter(TimeUs(1_000));
+            rig
+        }
+
+        /// A boundary with no batch before it.
+        fn wake(&mut self) {
+            self.now += 1_000;
+            self.hook.wake(&mut self.sources, TimeUs(self.now));
+        }
+
+        /// One batch of `packets`, each `(device, control, value)`, then
+        /// its boundary.
+        fn batch(&mut self, packets: &[(DeviceId, ControlId, i32)], background: bool) {
+            self.now += 1_000;
+            self.sources.begin_batch(TimeUs(self.now));
+            for &(device, control, value) in packets {
+                self.sources.packet(&Packet {
+                    device,
+                    control,
+                    value,
+                    background,
+                });
+            }
+            self.sources.end_batch(TimeUs(self.now));
+            self.hook.wake(&mut self.sources, TimeUs(self.now));
+        }
+
+        /// The game thread's look at `at`: the level read, and the
+        /// update's panel timers.
+        fn look(&mut self, at: i64) -> [Option<TimeUs>; 3] {
+            self.feed.panels(self.level.read(), false, TimeUs(at));
+            let page = self.screen.page("");
+            self.feed
+                .update(&self.screen, page, TimeUs(at))
+                .events
+                .panels
+        }
+    }
+
+    fn key(control: ControlId, value: i32) -> (DeviceId, ControlId, i32) {
+        (KEYBOARD, control, value)
+    }
+
+    #[test]
+    fn panels_follow_start_and_select_and_no_lost_release_keeps_one() {
+        let mut r = Rig::new();
+        let t = |ms: i64| Some(TimeUs(ms * 1_000));
+        assert_eq!(r.look(5_000), [None; 3]);
+        // START: panel 1; START and SELECT: panel 3; START released:
+        // panel 2; SELECT released: none.
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(10_000), [t(10), None, None]);
+        assert_eq!(r.look(11_000), [t(10), None, None], "still open");
+        r.batch(&[key(W, 1)], false);
+        assert_eq!(r.look(20_000), [None, None, t(20)]);
+        r.batch(&[key(E, 0)], false);
+        assert_eq!(r.look(30_000), [None, t(30), None]);
+        r.batch(&[key(W, 0)], false);
+        assert_eq!(r.look(40_000), [None; 3]);
+
+        // Menu events overflowing their queue while START is held: the
+        // controller's events say panel 1, and the release closes it.
+        r.batch(&[key(E, 1)], false);
+        let mut presses = Vec::new();
+        for _ in 0..=input::MENU_QUEUE {
+            presses.extend([(PAD, ControlId(1), 1), (PAD, ControlId(1), 0)]);
+        }
+        r.batch(&presses, false);
+        assert!(r.menu.dropped() > 0, "overflowed");
+        assert_eq!(r.menu.pop_panel(), Some((MenuEvent::Confirm, Some(0))));
+        assert_eq!(r.look(50_000), [t(50), None, None]);
+        r.batch(&[key(E, 0)], false);
+        assert_eq!(r.look(60_000), [None; 3]);
+
+        // Focus lost while START is held, released in the background:
+        // closed at the loss, and closed when focus comes back.
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(70_000), [t(70), None, None]);
+        r.controls.focus(false);
+        r.wake();
+        assert_eq!(r.look(80_000), [None; 3]);
+        r.batch(&[key(E, 0)], true);
+        r.controls.focus(true);
+        r.wake();
+        assert_eq!(r.look(90_000), [None; 3]);
+        // Held through a focus loss: open again at its return, fresh.
+        r.batch(&[key(E, 1)], false);
+        r.controls.focus(false);
+        r.wake();
+        assert_eq!(r.look(100_000), [None; 3]);
+        r.controls.focus(true);
+        r.wake();
+        assert_eq!(r.look(110_000), [t(110), None, None]);
+
+        // The keyboard removed while it holds START: closed.
+        r.sources.begin_batch(TimeUs(r.now + 500));
+        r.sources.disconnect(KEYBOARD);
+        r.sources.end_batch(TimeUs(r.now + 500));
+        r.wake();
+        assert_eq!(r.look(120_000), [None; 3]);
+        r.sources.begin_batch(TimeUs(r.now + 500));
+        r.sources.connect(KEYBOARD, DeviceKind::Keyboard);
+        r.sources.end_batch(TimeUs(r.now + 500));
+
+        // Held while the thread leaves Idle for a play (a chart chosen),
+        // released before the play ends: closed at the opening and at the
+        // next entry.
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(130_000), [t(130), None, None]);
+        r.open();
+        assert_eq!(r.look(140_000), [None; 3]);
+        r.batch(&[key(E, 0)], false);
+        r.close();
+        r.link.requests.send(Request::Idle).unwrap();
+        r.wake();
+        r.feed.enter(TimeUs(150_000));
+        assert_eq!(r.look(150_000), [None; 3]);
+
+        // Held across the play and still held at the next entry: open at
+        // the entry, its start the entry's, not the press's.
+        r.batch(&[key(E, 1)], false);
+        assert_eq!(r.look(160_000), [t(160), None, None]);
+        r.open();
+        r.close();
+        r.link.requests.send(Request::Idle).unwrap();
+        r.wake();
+        r.feed.enter(TimeUs(170_000));
+        assert_eq!(r.look(170_000), [t(170), None, None]);
+    }
+
+    impl Rig {
+        /// Recording opened at the next boundary, as a chosen chart does.
+        fn open(&mut self) {
+            self.link
+                .requests
+                .send(Request::Open {
+                    lead_in: LEAD_IN,
+                    logic: std::thread::current(),
+                    recorded: recorded(),
+                    gate: None,
+                })
+                .unwrap();
+            self.wake();
+            assert!(matches!(
+                self.link.replies.try_recv(),
+                Ok(Reply::Opened(..))
+            ));
+        }
+
+        /// Recording closed at the next boundary: the thread's tail.
+        fn close(&mut self) {
+            self.link.requests.send(Request::Close).unwrap();
+            self.wake();
+            assert!(matches!(
+                self.link.replies.try_recv(),
+                Ok(Reply::Closed(..))
+            ));
+        }
     }
 }

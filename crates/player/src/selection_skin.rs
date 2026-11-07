@@ -149,7 +149,8 @@ pub struct SelectionEvents {
     /// The entry, or the cursor's row or the place changing since: timer
     /// `change`.
     pub changed: TimeUs,
-    /// Each panel's opening while it is open (none yet).
+    /// Each panel's opening while it is open: START, SELECT or both held
+    /// ([`SkinFeed::panels`]).
     pub panels: [Option<TimeUs>; 3],
     /// The latest preset step the flow applied in the lifetime.
     pub preset_step: Option<TimeUs>,
@@ -370,6 +371,10 @@ pub struct SkinFeed {
     /// The settings the flow gave at the entry and at each preset change
     /// ([`settings_of`]), each update with the list's order.
     pub settings: Option<SelectionSettings>,
+    /// The panel open and when it opened.
+    panel: Option<(usize, TimeUs)>,
+    /// The generation of the panels' level last read in the lifetime.
+    seen: Option<u64>,
 }
 
 impl SkinFeed {
@@ -383,6 +388,32 @@ impl SkinFeed {
         self.changed = now;
         self.key = None;
         self.preset_step = None;
+        self.panel = None;
+        self.seen = None;
+    }
+
+    /// The panels' level as the input thread published it, read at `now`
+    /// with the search box's focus (`searching`): the panel START, SELECT
+    /// or both open (design.md "Input", Menu input), none while the search
+    /// box has focus. A panel opening, changing, or held again after a
+    /// change the level counted since the last read starts at `now`.
+    /// `true` when the panel changed.
+    pub fn panels(&mut self, level: input::Panels, searching: bool, now: TimeUs) -> bool {
+        let want = if searching { None } else { level.open() };
+        let again = self.seen != Some(level.generation);
+        self.seen = Some(level.generation);
+        let open = self.panel.map(|(p, _)| p);
+        if want == open && (want.is_none() || !again) {
+            return false;
+        }
+        self.panel = want.map(|p| (p, now));
+        true
+    }
+
+    /// The panel open, if any.
+    #[must_use]
+    pub fn panel(&self) -> Option<usize> {
+        self.panel.map(|(p, _)| p)
     }
 
     /// The update of `screen` showing `page` at `now`: its view the rows
@@ -421,7 +452,9 @@ impl SkinFeed {
             events: SelectionEvents {
                 entered: self.entered,
                 changed: self.changed,
-                panels: [None; 3],
+                panels: std::array::from_fn(|p| {
+                    self.panel.filter(|&(open, _)| open == p).map(|(_, at)| at)
+                }),
                 preset_step: self.preset_step,
             },
             settings: self.settings.map(|s| SelectionSettings {
@@ -445,7 +478,7 @@ pub struct SelectionDrawn {
 /// font `f.ttf`, the place's text (1000) and the search's (30).
 #[cfg(test)]
 pub(crate) fn fixture() -> tempfile::TempDir {
-    fixture_of(false)
+    fixture_of("", "")
 }
 
 /// [`fixture`] with the settings drawn after it, in this order: number
@@ -453,11 +486,35 @@ pub(crate) fn fixture() -> tempfile::TempDir {
 /// (the master gain, 1 000 wide at y 100) (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) fn settings_fixture() -> tempfile::TempDir {
-    fixture_of(true)
+    fixture_of(
+        r#""value": [{"id": "n57", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 57},
+                     {"id": "n12", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 12}],
+           "graph": [{"id": "vg", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 0}],"#,
+        r#",{"id": "n57", "dst": [{"x": 0, "y": 200, "w": 10, "h": 10}]},
+           {"id": "n12", "dst": [{"x": 0, "y": 150, "w": 10, "h": 10}]},
+           {"id": "vg", "dst": [{"x": 0, "y": 100, "w": 1000, "h": 10}]}"#,
+    )
 }
 
+/// [`fixture`] with four images drawn after it, in this order: one on
+/// each of options 21, 22 and 23 (panels 1, 2 and 3 open), and one on
+/// timer 21 (panel 1's) (dev-tools tests).
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) fn panels_fixture() -> tempfile::TempDir {
+    fixture_of(
+        "",
+        r#",{"id": "b", "op": [21], "dst": [{"x": 0, "y": 300, "w": 8, "h": 8}]},
+           {"id": "b", "op": [22], "dst": [{"x": 0, "y": 320, "w": 8, "h": 8}]},
+           {"id": "b", "op": [23], "dst": [{"x": 0, "y": 340, "w": 8, "h": 8}]},
+           {"id": "b", "timer": 21, "dst": [{"time": 0, "x": 0, "y": 360, "w": 8, "h": 8},
+                                            {"time": 100000, "x": 100, "y": 360, "w": 8, "h": 8}]}"#,
+    )
+}
+
+/// The fixture with `widgets` declared and `drawn` destinations after its
+/// own.
 #[cfg(test)]
-fn fixture_of(settings: bool) -> tempfile::TempDir {
+fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
     use std::fmt::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -480,18 +537,6 @@ fn fixture_of(settings: bool) -> tempfile::TempDir {
         )
         .unwrap();
     }
-    let (widgets, drawn) = if settings {
-        (
-            r#""value": [{"id": "n57", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 57},
-                         {"id": "n12", "src": "s", "x": 0, "y": 0, "w": 10, "h": 1, "divx": 10, "digit": 3, "ref": 12}],
-               "graph": [{"id": "vg", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 0}],"#,
-            r#",{"id": "n57", "dst": [{"x": 0, "y": 200, "w": 10, "h": 10}]},
-               {"id": "n12", "dst": [{"x": 0, "y": 150, "w": 10, "h": 10}]},
-               {"id": "vg", "dst": [{"x": 0, "y": 100, "w": 1000, "h": 10}]}"#,
-        )
-    } else {
-        ("", "")
-    };
     let json = format!(
         r#"{{"type": 5, "w": 1920, "h": 1080,
             "source": [{{"id": "s", "path": "s.png"}}],
