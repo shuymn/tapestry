@@ -125,7 +125,7 @@ fn a_minified_chip_grid_reads_level_zero() {
         let (mut lit, mut gaps, mut blended) = (0, 0, 0);
         for row in top.ceil() as i32..(top + h).floor() as i32 {
             let y = row as f32 + 0.5;
-            let got = composite(fx.quads(), &fx.atlas, x, y, None).0;
+            let got = fx.pixel([x, y]).0;
             if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
                 lit += 1;
             } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -188,17 +188,17 @@ fn the_background_is_the_sources_and_whole_during_the_reveal() {
             (699.5, 0.5, [35.0, 35.0, 0.0], 1.0),
         ];
         for (x, y, rgb, a) in cases {
-            let (got, covered) = composite(fx.quads(), &fx.atlas, x, top + y, None);
+            let (got, covered) = fx.pixel([x, top + y]);
             near(got, over_backdrop(rgb, a * alpha), 2.0);
             assert_eq!(covered, 1, "({x}, {y})");
         }
         // Nothing outside the region.
-        let (_, covered) = composite(fx.quads(), &fx.atlas, 700.5, top + 150.0, None);
+        let (_, covered) = fx.pixel([700.5, top + 150.0]);
         assert_eq!(covered, 0);
     }
     // Once revealed, bin 3's chips draw over the background.
     fx.frame(500);
-    let (got, covered) = composite(fx.quads(), &fx.atlas, 31.0, 245.0, None);
+    let (got, covered) = fx.pixel([31.0, 245.0]);
     near(got, PG, 2.0);
     assert_eq!(covered, 2);
 }
@@ -483,7 +483,7 @@ fn a_horizontally_minified_chip_grid_reads_level_zero() {
     let (mut lit, mut gaps, mut blended) = (0, 0, 0);
     for row in top.ceil() as i32..(top + h).floor() as i32 {
         let y = row as f32 + 0.5;
-        let got = composite(fx.quads(), &fx.atlas, 0.5, y, None).0;
+        let got = fx.pixel([0.5, y]).0;
         if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
             lit += 1;
         } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -538,9 +538,9 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     for i in 0..40 {
         for j in 0..20 {
             let (x, y) = (400.3 + 5.0 * i as f32, 300.3 + 5.0 * j as f32);
-            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let want = flat.pixel([x, y]).0;
             let (dx, dy) = (x - 500.0, y - 350.0);
-            let got = composite(turned.quads(), &turned.atlas, 500.0 - dy, 350.0 + dx, None).0;
+            let got = turned.pixel([500.0 - dy, 350.0 + dx]).0;
             near(got, want, 0.5);
             checked += 1;
         }
@@ -570,7 +570,7 @@ fn a_native_size_fits_the_whole_graph() {
         fx
     };
     let fx = frame([0, 0, 700, 300], Native::Exact([1, 1]));
-    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None);
+    let at = |x: f32, y: f32| fx.pixel([x, y]);
     assert_eq!(at(170.0, 150.0).1, 0);
     assert_eq!(at(530.0, 150.0).1, 0);
     assert_eq!(at(300.0, 70.0).1, 0);
@@ -582,7 +582,7 @@ fn a_native_size_fits_the_whole_graph() {
     // Bin 3's chips: x 190..195, a lit texel column at 191.
     near(at(191.5, 222.0).0, PG, 2.0);
     let fx = frame([0, 0, 100, 300], Native::NoLarger([1, 1]));
-    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).1;
+    let at = |x: f32, y: f32| fx.pixel([x, y]).1;
     assert_eq!(at(50.0, 128.0), 0);
     assert_eq!(at(50.0, 129.5), 1);
     assert_eq!(at(50.0, 170.5), 1);

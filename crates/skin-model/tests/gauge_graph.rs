@@ -15,9 +15,7 @@
 mod graph_support;
 
 use bms_model::TimeUs;
-use graph_support::{
-    GFx, SOLID, composite, inside, moving_element, near, ready, skin_with, source_element,
-};
+use graph_support::{GFx, SOLID, inside, moving_element, near, ready, skin_with, source_element};
 use rules::GaugeValue;
 use skin_model::{
     GRAPH_COLUMNS, GaugeColumn, GaugeGraphColors, GaugeGraphDef, GaugeHistory, GaugeLook,
@@ -132,11 +130,6 @@ fn at([x0, y0, _, h]: [i32; 4], x: f32, row: f32) -> [f32; 2] {
     [x0 as f32 + x, (y0 + h) as f32 - row]
 }
 
-/// The RGB the frame shows at `p`, and the quads covering it.
-fn pixel(fx: &GFx, [x, y]: [f32; 2]) -> ([f32; 3], u32) {
-    composite(fx.quads(), &fx.atlas, x, y, None)
-}
-
 /// A colour in `0..=1` units as 8-bit units.
 fn units(c: [f32; 3]) -> [f32; 3] {
     c.map(|v| v * 255.0)
@@ -183,10 +176,10 @@ fn the_gauge_graph_layers_its_colours_as_the_source() {
         (x519(200.0), 206.5, [0.8360, 0.0817, 0.0517]),
     ];
     for (x, row, want) in cases_200 {
-        near(pixel(&fx, at(big(0), x, row)).0, units(want), 2.0);
+        near(fx.pixel(at(big(0), x, row)).0, units(want), 2.0);
     }
     near(
-        pixel(&fx, at(big(600), x519(150.0), 230.5)).0,
+        fx.pixel(at(big(600), x519(150.0), 230.5)).0,
         units([0.2336, 0.1150, 0.0558]),
         2.0,
     );
@@ -231,15 +224,15 @@ fn the_gauge_graph_layers_its_colours_as_the_source() {
         ),
     ];
     for (x, row, at_200, at_255) in cases {
-        near(pixel(&fx, at(small(300), x, row)).0, units(at_200), 2.0);
-        near(pixel(&fx, at(small(400), x, row)).0, units(at_255), 2.0);
+        near(fx.pixel(at(small(300), x, row)).0, units(at_200), 2.0);
+        near(fx.pixel(at(small(400), x, row)).0, units(at_255), 2.0);
     }
     // A HARD look: its back one translucent colour, over itself above
     // the border.
     fx.view(&view(history(columns, GaugeLook::Hard)));
     fx.frame(1_500);
     near(
-        pixel(&fx, at(big(0), x519(150.0), 230.5)).0,
+        fx.pixel(at(big(0), x519(150.0), 230.5)).0,
         units([0.3379, 0.1520, 0.1520]),
         2.0,
     );
@@ -263,11 +256,11 @@ fn a_stroke_takes_one_colour_unless_it_crosses() {
     let green = [0.0, 255.0, 0.0];
     let red = [255.0, 0.0, 0.0];
     for row in [190.0, 205.0, 205.9, 206.2] {
-        near(pixel(&fx, at(r, 41.0, row)).0, green, 1.0);
+        near(fx.pixel(at(r, 41.0, row)).0, green, 1.0);
     }
-    near(pixel(&fx, at(r, 81.0, 205.0)).0, green, 1.0);
-    near(pixel(&fx, at(r, 81.0, 205.8)).0, red, 1.0);
-    near(pixel(&fx, at(r, 83.0, 209.0)).0, red, 1.0);
+    near(fx.pixel(at(r, 81.0, 205.0)).0, green, 1.0);
+    near(fx.pixel(at(r, 81.0, 205.8)).0, red, 1.0);
+    near(fx.pixel(at(r, 83.0, 209.0)).0, red, 1.0);
 }
 
 /// A 519-wide graph (columns 1.8 wide, under the line's 2) whose columns
@@ -293,7 +286,7 @@ fn the_line_stays_in_its_columns_and_stops_at_the_end() {
     for step in 0..(519 * 4) {
         let x = step as f32 / 4.0 + 0.125;
         for row in rows {
-            let (_, covered) = pixel(&fx, at(r, x, row));
+            let (_, covered) = fx.pixel(at(r, x, row));
             assert!((1..=2).contains(&covered), "({x}, {row}): {covered}");
             lined += usize::from(covered == 2);
         }
@@ -305,7 +298,7 @@ fn the_line_stays_in_its_columns_and_stops_at_the_end() {
     fx.view(&view(aborted));
     fx.frame(1_500);
     let end = 519.0 * 100.0 / 288.0;
-    let covered = |x: f32, row: f32| pixel(&fx, at(r, x, row)).1;
+    let covered = |x: f32, row: f32| fx.pixel(at(r, x, row)).1;
     assert_eq!(covered(end - 0.5, 100.5), 2);
     for step in 0..400 {
         let x = end + 0.01 + step as f32;
@@ -332,11 +325,11 @@ fn the_line_reveals_on_the_screen_timer() {
         [flat(50.0); GRAPH_COLUMNS],
         GaugeLook::Normal,
     )));
-    let line = |fx: &GFx, x: f32| pixel(fx, at(r, x, 129.5)).1 == 2;
+    let line = |fx: &GFx, x: f32| fx.pixel(at(r, x, 129.5)).1 == 2;
     fx.frame(3_000);
     assert!(!line(&fx, 0.5));
     for [x, row] in [[0.5, 0.5], [575.5, 0.5], [0.5, 258.5], [575.5, 258.5]] {
-        assert_eq!(pixel(&fx, at(r, x, row)).1, 1);
+        assert_eq!(fx.pixel(at(r, x, row)).1, 1);
     }
     fx.frame(3_750);
     assert!(line(&fx, 0.5) && line(&fx, 287.5));
@@ -346,7 +339,7 @@ fn the_line_reveals_on_the_screen_timer() {
         GaugeLook::Normal,
     )));
     fx.frame(3_750);
-    let new_line = |fx: &GFx, x: f32| pixel(fx, at(r, x, 154.7)).1 == 2;
+    let new_line = |fx: &GFx, x: f32| fx.pixel(at(r, x, 154.7)).1 == 2;
     assert!(new_line(&fx, 287.5) && !new_line(&fx, 288.5));
     fx.frame(4_500);
     assert!(new_line(&fx, 575.5));
@@ -365,7 +358,7 @@ fn the_no_input_mark_sits_at_its_column() {
     let mut g = history([flat(50.0); GRAPH_COLUMNS], GaugeLook::Normal);
     let white = [255.0; 3];
     let is_white = |fx: &GFx, x: f32| {
-        let got = pixel(fx, at(r, x, 50.5)).0;
+        let got = fx.pixel(at(r, x, 50.5)).0;
         got.iter().all(|&c| (c - 255.0).abs() <= 1.0)
     };
     g.no_input_from = Some(72);
@@ -384,16 +377,16 @@ fn the_no_input_mark_sits_at_its_column() {
     fx.view(&view(g));
     fx.frame(1_500);
     for row in [0.5, 129.5, 230.5, 258.5] {
-        near(pixel(&fx, at(r, 288.5, row)).0, white, 1.0);
+        near(fx.pixel(at(r, 288.5, row)).0, white, 1.0);
     }
     for x in [287.5, 289.5] {
-        let got = pixel(&fx, at(r, x, 50.5)).0;
+        let got = fx.pixel(at(r, x, 50.5)).0;
         assert!(got.iter().any(|&c| c < 200.0), "{x}: {got:?}");
     }
     g.no_input_from = None;
     fx.view(&view(g));
     fx.frame(1_500);
-    assert!(pixel(&fx, at(r, 288.5, 50.5)).0.iter().any(|&c| c < 200.0));
+    assert!(fx.pixel(at(r, 288.5, 50.5)).0.iter().any(|&c| c < 200.0));
 }
 
 /// A ready view without an emphasized gauge draws no gauge graph at all,
@@ -450,7 +443,7 @@ fn a_short_graph_stays_in_its_rect() {
     )));
     fx.frame(1_500);
     for x in [0.5, 1.5, 287.5, 575.5] {
-        let covered = |y: f32| pixel(&fx, [x, y]).1;
+        let covered = |y: f32| fx.pixel([x, y]).1;
         assert!(covered(10.5) >= 1, "{x}");
         for y in [18.5, 19.5, 20.5, 21.5, 8.5, 9.5, 11.5, 12.5] {
             assert_eq!(covered(y), 0, "({x}, {y})");

@@ -13,8 +13,7 @@
 mod graph_support;
 
 use graph_support::{
-    GFx, SOLID, composite, inside, moving_element, near, over_backdrop, ready, skin_with,
-    source_element,
+    GFx, SOLID, inside, moving_element, near, over_backdrop, ready, skin_with, source_element,
 };
 use skin_model::{
     DEVIATION_SLOTS, ResultDefs, ResultStatus, ResultView, Rgba8, Source, TimingGraphDef,
@@ -90,11 +89,6 @@ fn view(slots: &[(i32, u32)], stats: Option<(i32, u32)>) -> ResultView {
     }
 }
 
-/// The RGB the frame shows at `(x, y)`, and the quads covering it.
-fn pixel(fx: &GFx, x: f32, y: f32) -> ([f32; 3], u32) {
-    composite(fx.quads(), &fx.atlas, x, y, None)
-}
-
 /// `rgb` under the element's alpha 140.
 fn shown(rgb: [f32; 3]) -> [f32; 3] {
     over_backdrop(rgb, 140.0 / 255.0)
@@ -130,32 +124,32 @@ fn the_distribution_places_and_layers_as_the_source() {
         (300, GD),
     ];
     for (column, rgb) in bands {
-        let (got, covered) = pixel(&fx, column as f32 + 0.5, 45.0);
+        let (got, covered) = fx.pixel([column as f32 + 0.5, 45.0]);
         near(got, shown(rgb), 2.0);
         assert_eq!(covered, 1, "column {column}");
     }
     let tick_good = [0.4460, 0.4460, 0.2264].map(|c| c * 255.0);
     let tick_perfect = [0.2264, 0.2264, 0.4460].map(|c| c * 255.0);
     for y in [0.5, 19.5] {
-        near(pixel(&fx, 80.5, y).0, tick_good, 2.0);
-        near(pixel(&fx, 140.5, y).0, tick_perfect, 2.0);
+        near(fx.pixel([80.5, y]).0, tick_good, 2.0);
+        near(fx.pixel([140.5, y]).0, tick_perfect, 2.0);
     }
-    near(pixel(&fx, 81.5, 5.0).0, shown(GD), 2.0);
-    near(pixel(&fx, 80.5, 20.5).0, shown(GD), 2.0);
+    near(fx.pixel([81.5, 5.0]).0, shown(GD), 2.0);
+    near(fx.pixel([80.5, 20.5]).0, shown(GD), 2.0);
     for column in [148, 151, 154] {
-        near(pixel(&fx, column as f32 + 0.5, 45.0).0, shown(WHITE), 2.0);
+        near(fx.pixel([column as f32 + 0.5, 45.0]).0, shown(WHITE), 2.0);
     }
     for column in [147, 149, 150, 152, 153, 155] {
-        near(pixel(&fx, column as f32 + 0.5, 45.0).0, shown(PG), 2.0);
+        near(fx.pixel([column as f32 + 0.5, 45.0]).0, shown(PG), 2.0);
     }
     // Bars of 5 at scale 10: the bottom half of their columns.
     for column in [0, 1, 299, 300] {
         let x = column as f32 + 0.5;
-        near(pixel(&fx, x, 50.5).0, shown(BAR), 2.0);
-        near(pixel(&fx, x, 99.5).0, shown(BAR), 2.0);
-        near(pixel(&fx, x, 49.5).0, shown(GD), 2.0);
+        near(fx.pixel([x, 50.5]).0, shown(BAR), 2.0);
+        near(fx.pixel([x, 99.5]).0, shown(BAR), 2.0);
+        near(fx.pixel([x, 49.5]).0, shown(GD), 2.0);
     }
-    assert_eq!(pixel(&fx, 301.5, 50.0).1, 0);
+    assert_eq!(fx.pixel([301.5, 50.0]).1, 0);
 }
 
 /// The scale is 10 rows, or the next step of 10 above the largest slot:
@@ -170,21 +164,21 @@ fn the_scale_is_the_step_of_the_largest_slot() {
     for (count, top) in [(10, 0.0), (11, 45.0), (250, 1_000.0 / 260.0)] {
         fx.view(&view(&[(5, count)], Some((0, 0))));
         fx.frame(0);
-        near(pixel(&fx, x, top + 0.2).0, shown(BAR), 2.0);
+        near(fx.pixel([x, top + 0.2]).0, shown(BAR), 2.0);
         if top > 0.0 {
-            near(pixel(&fx, x, top - 0.2).0, shown(PG), 2.0);
+            near(fx.pixel([x, top - 0.2]).0, shown(PG), 2.0);
         }
     }
     for slots in [[(-1, 21), (0, 30)], [(-1, 30), (0, 21)]] {
         fx.view(&view(&slots, None));
         fx.frame(0);
         // Without timing statistics no bar draws; with them, scale 40.
-        near(pixel(&fx, 150.5, 99.5).0, shown(PG), 2.0);
+        near(fx.pixel([150.5, 99.5]).0, shown(PG), 2.0);
         fx.view(&view(&slots, Some((20_000, 0))));
         fx.frame(0);
         let thirty = 150.0 + f32::from(slots[0].1 == 21);
-        near(pixel(&fx, thirty - 0.5, 25.5).0, shown(BAR), 2.0);
-        near(pixel(&fx, thirty - 0.5, 24.5).0, shown(PG), 2.0);
+        near(fx.pixel([thirty - 0.5, 25.5]).0, shown(BAR), 2.0);
+        near(fx.pixel([thirty - 0.5, 24.5]).0, shown(PG), 2.0);
     }
 }
 
@@ -205,16 +199,16 @@ fn the_range_shown_follows_the_columns() {
         Some((20_000, 0)),
     ));
     fx.frame(0);
-    near(pixel(&fx, 450.5, 90.5).0, shown(BAR), 2.0);
-    near(pixel(&fx, 450.5, 89.5).0, shown(PG), 2.0);
-    assert_eq!(pixel(&fx, 501.5, 50.0).1, 0);
+    near(fx.pixel([450.5, 90.5]).0, shown(BAR), 2.0);
+    near(fx.pixel([450.5, 89.5]).0, shown(PG), 2.0);
+    assert_eq!(fx.pixel([501.5, 50.0]).1, 0);
     let col = 301.0 / 150.0;
     let x = |j: f32| (j + 0.5) * col;
-    near(pixel(&fx, x(75.0), 245.0).0, shown(PG), 2.0);
-    near(pixel(&fx, x(74.0), 245.0).0, shown(PG), 2.0);
-    near(pixel(&fx, x(149.0), 299.5).0, shown(BAR), 2.0);
-    near(pixel(&fx, x(0.0), 299.5).0, shown(BAR), 2.0);
-    near(pixel(&fx, x(1.0), 299.5).0, shown(GD), 2.0);
+    near(fx.pixel([x(75.0), 245.0]).0, shown(PG), 2.0);
+    near(fx.pixel([x(74.0), 245.0]).0, shown(PG), 2.0);
+    near(fx.pixel([x(149.0), 299.5]).0, shown(BAR), 2.0);
+    near(fx.pixel([x(0.0), 299.5]).0, shown(BAR), 2.0);
+    near(fx.pixel([x(1.0), 299.5]).0, shown(GD), 2.0);
 }
 
 /// Without a sample the distribution draws its areas and ticks only: no
@@ -226,12 +220,12 @@ fn without_a_sample_only_areas_and_ticks_draw() {
     fx.view(&v);
     fx.frame(0);
     for x in [150.5, 151.5] {
-        near(pixel(&fx, x, 45.0).0, shown(PG), 2.0);
+        near(fx.pixel([x, 45.0]).0, shown(PG), 2.0);
     }
-    near(pixel(&fx, 151.5, 99.5).0, shown(PG), 2.0);
-    near(pixel(&fx, 1.5, 99.5).0, shown(GD), 2.0);
+    near(fx.pixel([151.5, 99.5]).0, shown(PG), 2.0);
+    near(fx.pixel([1.5, 99.5]).0, shown(GD), 2.0);
     near(
-        pixel(&fx, 80.5, 0.5).0,
+        fx.pixel([80.5, 0.5]).0,
         [0.4460, 0.4460, 0.2264].map(|c| c * 255.0),
         2.0,
     );
@@ -274,8 +268,8 @@ fn the_bars_draw_over_the_lines() {
     let mut fx = fixture(vec![graph(301)], &[(0, [0, 0, 301, 100])]);
     fx.view(&view(&[(0, 5)], Some((0, 0))));
     fx.frame(0);
-    near(pixel(&fx, 150.5, 99.5).0, [192.235; 3], 0.5);
-    near(pixel(&fx, 150.5, 45.0).0, [197.725; 3], 0.5);
+    near(fx.pixel([150.5, 99.5]).0, [192.235; 3], 0.5);
+    near(fx.pixel([150.5, 45.0]).0, [197.725; 3], 0.5);
 }
 
 /// A non-positive height or width draws nothing: a rect `[0, 10, 301,

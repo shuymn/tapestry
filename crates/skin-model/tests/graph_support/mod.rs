@@ -90,33 +90,13 @@ pub fn placed_element(
     pivot: skin_model::Anchor,
     native: Option<skin_model::Native>,
 ) -> ElementDef {
-    let mut props = [None; 9];
-    for (p, v) in props.iter_mut().zip(r) {
-        *p = Some(v);
-    }
-    props[4] = Some(255);
-    props[8] = Some(angle);
-    let track = Track::new(
-        &[KeyDef {
-            at: TimeUs(0),
-            props,
-        }],
-        skin_model::Ease::Linear,
-        skin_model::End::Hold,
-    )
-    .unwrap();
     ElementDef {
-        source: Source::JudgeGraph(i),
-        track,
-        timer: TimerRef::Builtin(result_timer::SCREEN),
-        visible: None,
-        blend: Blend::Alpha,
-        clip: None,
         place: Place {
             pivot,
             native,
             ..Place::SCREEN
         },
+        ..moving_element(Source::JudgeGraph(i), &[(0, r, angle)])
     }
 }
 
@@ -274,6 +254,13 @@ impl GFx {
 
     pub fn quads(&self) -> &[Quad] {
         self.batch.quads()
+    }
+
+    /// The RGB the frame shows at canvas point `[x, y]` and the quads
+    /// covering it, each quad read at the level its own filter picks
+    /// ([`composite`]).
+    pub fn pixel(&self, [x, y]: [f32; 2]) -> ([f32; 3], u32) {
+        composite(self.quads(), &self.atlas, x, y, None)
     }
 
     /// The quads drawn on a chip grid, in push order.

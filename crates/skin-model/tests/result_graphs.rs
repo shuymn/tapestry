@@ -5,9 +5,7 @@
 
 mod graph_support;
 
-use graph_support::{
-    GFx, GRID, SOLID, composite, graph, near, ready, skin_with, source_element, timelines,
-};
+use graph_support::{GFx, GRID, SOLID, graph, near, ready, skin_with, source_element, timelines};
 use rules::GaugeValue;
 use skin_model::{
     DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeGraphColors, GaugeGraphDef, GaugeHistory,
@@ -121,11 +119,11 @@ fn every_graph_follows_the_view() {
         // The gauge line: rows `pct·(102 − 2)/100` and the next.
         let row = pct as f32 + 0.5;
         for (r, covered) in [(row, 1), (row + 1.0, 1), (row + 2.0, 0), (row - 1.0, 0)] {
-            let n = composite(fx.quads(), &fx.atlas, 300.5, 302.0 - r, None).1;
+            let n = fx.pixel([300.5, 302.0 - r]).1;
             assert_eq!(n, covered, "{pct}% row {r}");
         }
         // The bar of 5 at scale 10 in column `150 + ms`, nowhere else.
-        let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).0;
+        let at = |x: f32, y: f32| fx.pixel([x, y]).0;
         let white = |x: f32| at(x, 499.5).iter().all(|&c| c > 254.0);
         assert!(white(150.5 + ms as f32));
         assert!(!white(153.5 + ms as f32));
