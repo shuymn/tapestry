@@ -1836,13 +1836,17 @@ impl<'d> Cx<'d> {
             };
             Skin::new_selection(def, widgets)
         } else if result {
-            Skin::new_result(
-                def,
-                ResultDefs {
+            {
+                #[allow(
+                    clippy::needless_update,
+                    reason = "the other result widgets keep their defaults, whichever exist"
+                )]
+                let widgets = ResultDefs {
                     judge_graphs: std::mem::take(&mut self.judge_graphs),
                     ..ResultDefs::default()
-                },
-            )
+                };
+                Skin::new_result(def, widgets)
+            }
         } else {
             Skin::new(def)
         };

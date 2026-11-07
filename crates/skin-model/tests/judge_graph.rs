@@ -732,6 +732,10 @@ fn a_judge_graph_element_takes_no_native_size() {
         bomb_up_to: None,
         close: None,
     };
+    #[allow(
+        clippy::needless_update,
+        reason = "the other result widgets keep their defaults, whichever exist"
+    )]
     let graphs = ResultDefs {
         judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
         ..ResultDefs::default()
