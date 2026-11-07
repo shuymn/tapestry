@@ -13,7 +13,7 @@ mod graph_support;
 
 use graph_support::{
     GFx, GRID, GRID_NO_GAP_X, GRID_NO_GAP_Y, GRID_NO_GAPS, composite, element, graph, level, lod,
-    near, over_backdrop, screen_element, skin, view,
+    moving_element, near, over_backdrop, screen_element, skin, view,
 };
 use skin_model::{
     ElementDef, Filter, JudgeGraphKind, LoadError, ResultDefs, ScreenKind, Skin, Source, TimerRef,
@@ -125,7 +125,7 @@ fn a_minified_chip_grid_reads_level_zero() {
         let (mut lit, mut gaps, mut blended) = (0, 0, 0);
         for row in top.ceil() as i32..(top + h).floor() as i32 {
             let y = row as f32 + 0.5;
-            let got = composite(fx.quads(), &fx.atlas, x, y, None).0;
+            let got = fx.pixel([x, y]).0;
             if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
                 lit += 1;
             } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -188,17 +188,17 @@ fn the_background_is_the_sources_and_whole_during_the_reveal() {
             (699.5, 0.5, [35.0, 35.0, 0.0], 1.0),
         ];
         for (x, y, rgb, a) in cases {
-            let (got, covered) = composite(fx.quads(), &fx.atlas, x, top + y, None);
+            let (got, covered) = fx.pixel([x, top + y]);
             near(got, over_backdrop(rgb, a * alpha), 2.0);
             assert_eq!(covered, 1, "({x}, {y})");
         }
         // Nothing outside the region.
-        let (_, covered) = composite(fx.quads(), &fx.atlas, 700.5, top + 150.0, None);
+        let (_, covered) = fx.pixel([700.5, top + 150.0]);
         assert_eq!(covered, 0);
     }
     // Once revealed, bin 3's chips draw over the background.
     fx.frame(500);
-    let (got, covered) = composite(fx.quads(), &fx.atlas, 31.0, 245.0, None);
+    let (got, covered) = fx.pixel([31.0, 245.0]);
     near(got, PG, 2.0);
     assert_eq!(covered, 2);
 }
@@ -425,6 +425,7 @@ fn a_judge_graph_is_checked_and_charged_at_load() {
     let el = || screen_element(0, [0, 0, 10, 10], 255);
     let graphs = |g| ResultDefs {
         judge_graphs: vec![g],
+        ..ResultDefs::default()
     };
     let ok = graph(JudgeGraphKind::Judgment, GRID, true, 0);
     // Not on a play skin.
@@ -482,7 +483,7 @@ fn a_horizontally_minified_chip_grid_reads_level_zero() {
     let (mut lit, mut gaps, mut blended) = (0, 0, 0);
     for row in top.ceil() as i32..(top + h).floor() as i32 {
         let y = row as f32 + 0.5;
-        let got = composite(fx.quads(), &fx.atlas, 0.5, y, None).0;
+        let got = fx.pixel([0.5, y]).0;
         if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
             lit += 1;
         } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
@@ -520,7 +521,7 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     use skin_model::Anchor;
     let def = || vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)];
     let frame = |angle| {
-        let e = graph_support::placed_element(0, [400, 300, 200, 100], angle, Anchor::Center, None);
+        let e = graph_support::placed_element(0, [400, 300, 200, 100], angle, Anchor::Center);
         let mut fx = GFx::new(skin(vec![e], def()));
         fx.view(&rotation_view());
         fx.frame(0);
@@ -537,9 +538,9 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     for i in 0..40 {
         for j in 0..20 {
             let (x, y) = (400.3 + 5.0 * i as f32, 300.3 + 5.0 * j as f32);
-            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let want = flat.pixel([x, y]).0;
             let (dx, dy) = (x - 500.0, y - 350.0);
-            let got = composite(turned.quads(), &turned.atlas, 500.0 - dy, 350.0 + dx, None).0;
+            let got = turned.pixel([500.0 - dy, 350.0 + dx]).0;
             near(got, want, 0.5);
             checked += 1;
         }
@@ -547,45 +548,194 @@ fn the_angle_turns_the_whole_graph_about_its_pivot() {
     assert_eq!(checked, 800);
 }
 
-/// The element's native size fits the whole graph as the source's
-/// stretch fits its texture of 5 texels a bin and 5 a cell: 70 bins at
-/// scale 30 are 350 × 150 texels. Exact (stretch 9) centres that size in
-/// a 700 × 300 region, at (175, 75); no larger (stretch 8) shrinks it
-/// into a 100 × 300 region, 100 × 42.86 at y 128.57. The lines, stripes
-/// and chips follow the fitted region; nothing draws outside it.
+/// Each fit sizes the whole graph as the source's stretch sizes an image,
+/// the texture 5 texels a bin and 5 a cell: 70 bins at scale 30 are 350 ×
+/// 150 texels (7 : 3). The background covers exactly the drawn region:
+/// a point half a pixel inside each edge is drawn, half a pixel outside
+/// is not. A trimmed fit draws the fitted graph cut to the element's
+/// rect, its content where the fitted graph puts it (the line at bin 10,
+/// 10 bins of the fitted width from its left).
 #[test]
-fn a_native_size_fits_the_whole_graph() {
-    use skin_model::{Anchor, Native};
+fn every_fit_sizes_the_whole_graph() {
+    use skin_model::{Anchor, GraphFit};
     let mut bins = vec![[0; 9]; 70];
     bins[3] = perfects(25);
-    let frame = |r, native| {
-        let e = graph_support::placed_element(0, r, 0, Anchor::TopLeft, Some(native));
-        let mut fx = GFx::new(skin(
-            vec![e],
-            vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
-        ));
+    let frame = |r, fit| {
+        let e = graph_support::placed_element(0, r, 0, Anchor::TopLeft);
+        let def = skin_model::JudgeGraphDef {
+            fit,
+            ..graph(JudgeGraphKind::Judgment, GRID, true, 0)
+        };
+        let mut fx = GFx::new(skin(vec![e], vec![def]));
         fx.view(&view(bins.clone()));
         fx.frame(0);
         fx
     };
-    let fx = frame([0, 0, 700, 300], Native::Exact([1, 1]));
-    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None);
-    assert_eq!(at(170.0, 150.0).1, 0);
-    assert_eq!(at(530.0, 150.0).1, 0);
-    assert_eq!(at(300.0, 70.0).1, 0);
-    assert_eq!(at(300.0, 230.0).1, 0);
-    // The base at cell 5 beside the lines; the line at bin 10 (x 225).
-    near(at(300.0, 197.5).0, over_backdrop([0.0; 3], 0.8), 2.0);
-    near(at(225.5, 197.5).0, [31.0; 3], 2.0);
-    near(at(180.0, 125.0).0, [17.0, 17.0, 0.0], 2.0);
-    // Bin 3's chips: x 190..195, a lit texel column at 191.
-    near(at(191.5, 222.0).0, PG, 2.0);
-    let fx = frame([0, 0, 100, 300], Native::NoLarger([1, 1]));
-    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).1;
-    assert_eq!(at(50.0, 128.0), 0);
-    assert_eq!(at(50.0, 129.5), 1);
-    assert_eq!(at(50.0, 170.5), 1);
-    assert_eq!(at(50.0, 172.0), 0);
+    let wide = [400, 100, 700, 200];
+    let cases: [([i32; 4], GraphFit, [f32; 4]); 12] = [
+        (
+            [0, 0, 700, 300],
+            GraphFit::Stretch,
+            [0.0, 0.0, 700.0, 300.0],
+        ),
+        (
+            [0, 0, 700, 600],
+            GraphFit::Inner,
+            [0.0, 150.0, 700.0, 450.0],
+        ),
+        (
+            [0, 0, 1_000, 300],
+            GraphFit::Inner,
+            [150.0, 0.0, 850.0, 300.0],
+        ),
+        (
+            wide,
+            GraphFit::Outer { trim: false },
+            [400.0, 50.0, 1_100.0, 350.0],
+        ),
+        (
+            wide,
+            GraphFit::Outer { trim: true },
+            [400.0, 100.0, 1_100.0, 300.0],
+        ),
+        (
+            wide,
+            GraphFit::Width { trim: false },
+            [400.0, 50.0, 1_100.0, 350.0],
+        ),
+        (
+            wide,
+            GraphFit::Width { trim: true },
+            [400.0, 100.0, 1_100.0, 300.0],
+        ),
+        (
+            wide,
+            GraphFit::Height { trim: false },
+            [516.67, 100.0, 983.33, 300.0],
+        ),
+        (
+            wide,
+            GraphFit::Height { trim: true },
+            [516.67, 100.0, 983.33, 300.0],
+        ),
+        (
+            [0, 0, 100, 300],
+            GraphFit::NoLarger,
+            [0.0, 128.57, 100.0, 171.43],
+        ),
+        (
+            [0, 0, 700, 300],
+            GraphFit::Exact { trim: false },
+            [175.0, 75.0, 525.0, 225.0],
+        ),
+        (
+            [400, 100, 200, 100],
+            GraphFit::Exact { trim: true },
+            [400.0, 100.0, 600.0, 200.0],
+        ),
+    ];
+    for (r, fit, [x0, y0, x1, y1]) in cases {
+        let fx = frame(r, fit);
+        let covered = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).1;
+        let (xm, ym) = ((x0 + x1) / 2.0 + 3.3, (y0 + y1) / 2.0);
+        for (x, y, inside) in [
+            (x0 + 0.5, ym, true),
+            (x0 - 0.5, ym, false),
+            (x1 - 0.5, ym, true),
+            (x1 + 0.5, ym, false),
+            (xm, y0 + 0.5, true),
+            (xm, y0 - 0.5, false),
+            (xm, y1 - 0.5, true),
+            (xm, y1 + 0.5, false),
+        ] {
+            assert_eq!(covered(x, y) > 0, inside, "{fit:?} at ({x}, {y})");
+        }
+    }
+    // Trimmed covering: the fitted graph is 700 × 300 from (400, 50), its
+    // line at bin 10 at x 500, its base (cells 0 to 9, 10 pixels each)
+    // from y 250 down to 350, of which 250 to 300 shows.
+    let fx = frame(wide, GraphFit::Outer { trim: true });
+    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).0;
+    near(at(500.5, 200.0), [31.0; 3], 2.0);
+    near(at(605.0, 275.0), over_backdrop([0.0; 3], 0.8), 2.0);
+    near(at(605.0, 245.0), [17.0, 17.0, 0.0], 2.0);
+    // Bin 3's chips (x 430 to 440, cells from y 350 up) cut at the rect's
+    // top, their uv cut alike: cell 24 (y 100 to 110) shows its lit rows,
+    // 108.5 among them, at a lit column.
+    near(at(435.5, 108.5), PG, 2.0);
+}
+
+/// A fitted graph turns about the element's pivot in the region it
+/// draws, not in the element's rect: under no resize the 350 × 150 graph
+/// sits at (175, 75) in a 700 × 300 rect, and turned 90° about its top
+/// left draws at `c + R(p − c)`, `c` = (175, 75), what the unturned graph
+/// draws at `p`. Trimmed, the drawn region's top left is the pivot:
+/// (400, 100), where the covering fit's region starts at y 50.
+#[test]
+fn a_fitted_graph_turns_about_its_drawn_regions_pivot() {
+    use skin_model::{Anchor, GraphFit};
+    let mut bins = vec![[0; 9]; 70];
+    bins[3] = perfects(25);
+    let frame = |r, fit, angle| {
+        let e = graph_support::placed_element(0, r, angle, Anchor::TopLeft);
+        let def = skin_model::JudgeGraphDef {
+            fit,
+            ..graph(JudgeGraphKind::Judgment, GRID, true, 0)
+        };
+        let mut fx = GFx::new(skin(vec![e], vec![def]));
+        fx.view(&view(bins.clone()));
+        fx.frame(0);
+        fx
+    };
+    let exact = GraphFit::Exact { trim: false };
+    let (flat, turned) = (
+        frame([0, 0, 700, 300], exact, 0),
+        frame([0, 0, 700, 300], exact, 90),
+    );
+    assert!(turned.quads().iter().all(|q| q.pivot == [175.0, 75.0]));
+    for i in 0..35 {
+        for j in 0..15 {
+            let (x, y) = (175.3 + 10.0 * i as f32, 75.3 + 10.0 * j as f32);
+            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let (dx, dy) = (x - 175.0, y - 75.0);
+            let got = composite(turned.quads(), &turned.atlas, 175.0 - dy, 75.0 + dx, None).0;
+            near(got, want, 0.5);
+        }
+    }
+    let trimmed = frame([400, 100, 700, 200], GraphFit::Outer { trim: true }, 90);
+    assert!(trimmed.quads().iter().all(|q| q.pivot == [400.0, 100.0]));
+}
+
+/// A judge graph element naming a native size is refused: its graph's
+/// fit sizes it.
+#[test]
+fn a_judge_graph_element_takes_no_native_size() {
+    use skin_model::{Anchor, Native};
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = graph_support::placed_element(0, [0, 0, 10, 10], 0, Anchor::TopLeft);
+    e.place.native = Some(Native::Exact([1, 1]));
+    let def = skin_model::SkinDef {
+        fit: skin_model::Fit::Fixed,
+        regions: [skin_model::RegionDef {
+            anchor: skin_model::Anchor::TopLeft,
+            optional: false,
+        }; skin_model::Region::COUNT],
+        whens: Vec::new(),
+        sheet: graph_support::sheet_builder(dir.path()).finish(),
+        lanes: None,
+        elements: vec![e],
+        widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: None,
+        close: None,
+    };
+    let graphs = ResultDefs {
+        judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
+        ..ResultDefs::default()
+    };
+    assert!(matches!(
+        Skin::new_result(def, graphs),
+        Err(LoadError::JudgeGraphNative { element: 0 })
+    ));
 }
 
 /// Timelines of `width_s`-second bins with their own notes per bin and
@@ -720,4 +870,48 @@ fn a_dense_widened_timeline_builds_with_no_dropped_quad() {
     let two = runs_at(&fx, 0.0, 100.0, [300.0, 200.0]);
     assert_eq!(two.first(), Some(&(GREY, 19)));
     assert_eq!(two.len(), 10);
+}
+
+/// A non-positive height or width draws nothing, as the gauge graph and
+/// the timing distribution: a rect `[0, 10, 520, -1]`, a negative width,
+/// and a track running through height 0 into negative heights; on the
+/// way, at a positive height, the graph draws. A trimmed fit, which would
+/// otherwise fit a graph into the negative rect and cut it there, draws
+/// nothing either.
+#[test]
+fn a_negative_size_draws_nothing() {
+    let fixed = |r| moving_element(Source::JudgeGraph(0), &[(0, r, 0)]);
+    let through = moving_element(
+        Source::JudgeGraph(0),
+        &[(0, [0, 400, 520, 4], 0), (1_000, [0, 400, 520, -4], 0)],
+    );
+    let cases = [
+        (fixed([0, 10, 520, -1]), vec![(0, false), (1_000, false)]),
+        (fixed([600, 10, -520, 82]), vec![(0, false), (1_000, false)]),
+        (through, vec![(250, true), (750, false), (1_000, false)]),
+    ];
+    let fits = [
+        skin_model::GraphFit::Stretch,
+        skin_model::GraphFit::Outer { trim: true },
+    ];
+    for ((el, frames), fit) in cases
+        .into_iter()
+        .flat_map(|c| fits.map(|fit| (c.clone(), fit)))
+    {
+        let def = skin_model::JudgeGraphDef {
+            fit,
+            ..graph(JudgeGraphKind::EarlyLate, GRID, true, 0)
+        };
+        let mut fx = GFx::new(skin(vec![el], vec![def]));
+        fx.view(&view(vec![[3, 1, 1, 1, 1, 1, 1, 1, 1]; 20]));
+        for (ms, drawn) in frames {
+            fx.frame(ms);
+            assert_eq!(
+                !fx.quads().is_empty(),
+                drawn,
+                "{fit:?} at {ms} ms: {:?}",
+                fx.quads().first()
+            );
+        }
+    }
 }

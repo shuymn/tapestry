@@ -401,6 +401,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/cover_paint.rs"),
     Site::File("crates/skin-model/src/widget/digits.rs"),
     Site::File("crates/skin-model/src/widget/gauge.rs"),
+    Site::File("crates/skin-model/src/widget/gauge_graph.rs"),
     Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/judge_graph.rs"),
@@ -409,6 +410,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/scroll.rs"),
     Site::File("crates/skin-model/src/widget/song_list.rs"),
     Site::File("crates/skin-model/src/widget/text.rs"),
+    Site::File("crates/skin-model/src/widget/timing_graph.rs"),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
