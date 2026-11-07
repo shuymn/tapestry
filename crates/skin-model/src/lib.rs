@@ -114,6 +114,8 @@ pub use expr::{
     MAX_SOURCE_BYTES, MAX_STACK, OptionDef, Program, Scope, SkinOps, Span, State, TIMER_OFF,
     compile,
 };
+#[cfg(feature = "dev-tools")]
+pub use image::builder::ByteCharge;
 pub use image::builder::{
     AdmitError, BitmapFontError, Charge, FntAdmitError, FntFileError, FntLimit, FontAdmitError,
     MAX_BITMAP_FONTS, MAX_FALLBACKS, Refused, SheetBuilder,

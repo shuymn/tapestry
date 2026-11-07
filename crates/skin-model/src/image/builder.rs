@@ -204,6 +204,18 @@ fn charged(c: Charge) -> FntAdmitError {
     FntAdmitError::Limit(FntLimit::Charge(c))
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
+/// The bytes one admission charged against a sheet's byte totals, by the
+/// name the file was asked for: an image's low and high variant, or a
+/// font's or a bitmap font page's bytes (`hi` a page's too, 0 for a
+/// font). Charges stay listed when the admission later fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByteCharge {
+    pub name: String,
+    pub lo: u64,
+    pub hi: u64,
+}
+
 /// A [`Sheet`] under construction against one skin folder.
 #[derive(Debug)]
 pub struct SheetBuilder {
@@ -224,6 +236,8 @@ pub struct SheetBuilder {
     bitmap_fonts: Vec<Box<[u16]>>,
     glyphs: usize,
     kernings: usize,
+    #[cfg(any(test, feature = "dev-tools"))]
+    charged: Vec<ByteCharge>,
 }
 
 impl SheetBuilder {
@@ -251,6 +265,8 @@ impl SheetBuilder {
             bitmap_fonts: Vec::new(),
             glyphs: 0,
             kernings: 0,
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: Vec::new(),
         }
     }
 
@@ -279,6 +295,8 @@ impl SheetBuilder {
         let file = self.files.len();
         let index = u32::try_from(file)
             .map_err(|_| AdmitError::Limit(ImageError::TooManyFiles { n: self.attempts }))?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        let asked = def.path.clone();
         let (resolved, lo_bytes, hi_bytes) = resolve_file(
             &self.source,
             &self.root,
@@ -288,6 +306,12 @@ impl SheetBuilder {
             self.hi_bytes,
         )
         .map_err(classify)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: asked,
+            lo: lo_bytes.sum - self.lo_bytes.sum,
+            hi: hi_bytes.sum - self.hi_bytes.sum,
+        });
         let (loaded, lo_texels, hi_texels) = read_file(
             &self.source,
             file,
@@ -416,6 +440,12 @@ impl SheetBuilder {
         }
         let (path, len) = font::resolve(&self.source, &self.root, index, &def.path)
             .map_err(FontAdmitError::File)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: def.path.clone(),
+            lo: len,
+            hi: 0,
+        });
         let total =
             self.font_bytes
                 .with(len)
@@ -490,6 +520,12 @@ impl SheetBuilder {
             return Err(file_err(too_large));
         }
         let c = Charge::FontBytes(len);
+        #[cfg(any(test, feature = "dev-tools"))]
+        self.charged.push(ByteCharge {
+            name: name.to_owned(),
+            lo: len,
+            hi: 0,
+        });
         charge(c).map_err(|_| charged(c))?;
         self.font_bytes = self
             .font_bytes
@@ -541,6 +577,12 @@ impl SheetBuilder {
                 .resolve(&self.root, page)
                 .map_err(|e| page_error(p, ImageError::path(at, e)))?;
             let c = Charge::ImageBytes { lo: len, hi: len };
+            #[cfg(any(test, feature = "dev-tools"))]
+            self.charged.push(ByteCharge {
+                name: page.clone(),
+                lo: len,
+                hi: len,
+            });
             charge(c).map_err(|_| charged(c))?;
             lo_bytes = lo_bytes.with(len).ok_or(limit(FntLimit::ImageBytes))?;
             hi_bytes = hi_bytes.with(len).ok_or(limit(FntLimit::ImageBytes))?;
@@ -716,6 +758,8 @@ impl SheetBuilder {
             fonts: self.fonts.into_boxed_slice(),
             fnts: self.fnts.into_boxed_slice(),
             bitmap_fonts: self.bitmap_fonts.into_boxed_slice(),
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: self.charged,
         }
     }
 }

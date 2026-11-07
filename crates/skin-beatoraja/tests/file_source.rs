@@ -96,6 +96,26 @@ fn run(root: &Path, nr: u32, source: Option<FileSource>) -> LuaImported {
     }
 }
 
+/// [`run`], with the destination ledger the import left.
+fn run_ledgered(
+    root: &Path,
+    nr: u32,
+    source: Option<FileSource>,
+) -> (
+    LuaImported,
+    Vec<skin_beatoraja::lua::survey::DestinationEntry>,
+) {
+    let cancel = Cancel::new();
+    let mut h = read_lua_header(root, "s.luaskin", &cancel).unwrap();
+    if let Some(s) = source {
+        h.read_through(s);
+    }
+    match h.import_ledgered(&Config::defaults(h.header()), &facts(nr), &cancel) {
+        (Ok(LuaOutcome::Imported(i)), ledger) => (i, ledger),
+        (other, _) => panic!("{other:?}"),
+    }
+}
+
 fn cache(root: &Path) -> Arc<ResourceCache> {
     ResourceCache::new(&Root::new(root).unwrap())
 }
@@ -242,9 +262,11 @@ fn a_page_without_a_verdict_is_read_and_decoded() {
 /// C19 (g): a run served from the cache, reading nothing from the disk,
 /// imports what a fresh import of the same view through the disk does:
 /// the report with its notes and their places, the usage, the
-/// dependencies, the facts, the sheet, and the frame it draws for the
-/// view (each quad's place, size and uv: the glyphs' metrics and the
-/// images' and fonts' bindings and indices). The views admit fonts in
+/// dependencies, the facts, the destination ledger (what became of each
+/// destination, with its notes), the bytes each admission charged by the
+/// name asked for, the sheet, and the frame it draws for the view (each
+/// quad's place, size and uv: the glyphs' metrics and the images' and
+/// fonts' bindings and indices). The views admit fonts in
 /// another order, leave one out, and name one file under two names (a
 /// folder and an in-root link to it, charged per name), with notes to
 /// give (a font refused by its path).
@@ -285,13 +307,37 @@ fn a_cached_run_imports_what_a_fresh_one_does() {
     }
     let mut noted = false;
     for nr in [1, 2, 3, 4] {
-        let fresh = run(root, nr, None);
-        let (warm, n) = cached(root, &c, nr);
+        let (fresh, fresh_ledger) = run_ledgered(root, nr, None);
+        let source = FileSource::cached(Arc::clone(&c));
+        let (warm, warm_ledger) = run_ledgered(root, nr, Some(source.clone()));
+        let n = source.counts();
         assert_eq!(
             n,
             SourceCounts::default(),
             "view {nr}: served from the cache"
         );
+        assert!(!fresh_ledger.is_empty(), "view {nr}: a ledger");
+        assert_eq!(
+            warm_ledger, fresh_ledger,
+            "view {nr}: the destination ledger"
+        );
+        let charged = fresh.imported.skin.sheet().charged_bytes();
+        assert_eq!(
+            warm.imported.skin.sheet().charged_bytes(),
+            charged,
+            "view {nr}: the bytes charged by name"
+        );
+        if nr == 4 {
+            let of = |name: &str| {
+                charged
+                    .iter()
+                    .filter(|c| c.name == name)
+                    .map(|c| c.lo)
+                    .sum::<u64>()
+            };
+            let (real, alias) = (of("real/r.fnt"), of("alias/r.fnt"));
+            assert!(real > 0 && real == alias, "both names charged: {charged:?}");
+        }
         let r = &fresh.imported.report;
         noted |= !r.notes.is_empty();
         assert_eq!(&warm.imported.report, r, "view {nr}: the report");

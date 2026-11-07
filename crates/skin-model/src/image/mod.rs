@@ -443,6 +443,9 @@ pub struct Sheet {
     fnts: Box<[fnt::Fnt]>,
     /// The bitmap fonts: each a primary file, then its fallbacks.
     bitmap_fonts: Box<[Box<[u16]>]>,
+    /// The bytes each admission charged ([`builder::ByteCharge`]).
+    #[cfg(any(test, feature = "dev-tools"))]
+    charged: Vec<builder::ByteCharge>,
 }
 
 #[cfg(feature = "dev-tools")]
@@ -787,6 +790,8 @@ impl Sheet {
             fonts: Box::new([]),
             fnts: Box::new([]),
             bitmap_fonts: Box::new([]),
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: Vec::new(),
         }
     }
 
@@ -873,6 +878,8 @@ impl Sheet {
             fonts: Box::new([]),
             fnts: Box::new([]),
             bitmap_fonts: Box::new([]),
+            #[cfg(any(test, feature = "dev-tools"))]
+            charged: Vec::new(),
         })
     }
 
@@ -903,6 +910,14 @@ impl Sheet {
     /// What its image and font files are read through.
     pub(crate) fn source(&self) -> &FileSource {
         &self.source
+    }
+
+    /// The bytes each admission charged against the byte totals, in
+    /// admission order, by the name asked for (dev-tools).
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn charged_bytes(&self) -> &[builder::ByteCharge] {
+        &self.charged
     }
 
     pub(crate) fn files(&self) -> &[File] {
