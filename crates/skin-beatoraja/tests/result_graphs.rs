@@ -312,3 +312,72 @@ fn the_stretch_fits_the_whole_graph() {
     near(bounds(1), [100.0, 655.714, 620.0, 804.286]);
     near(bounds(3), [100.0, 580.0, 620.0, 880.0]);
 }
+
+/// Every texel under quad `q`'s uv at level 0 of `r`'s atlas, `#`
+/// painted and `.` transparent, one string per row, top row first.
+fn mask(r: &Res, q: &Quad) -> Vec<String> {
+    let side = r.atlas.side();
+    let [l, t, rr, b] = q.uv.map(|v| (v * side as f32).round() as u32);
+    let px = r.atlas.pages()[usize::from(q.layer - 1)].level(0).unwrap();
+    (t..b)
+        .map(|y| {
+            (l..rr)
+                .map(|x| {
+                    let i = ((y * side + x) * 4) as usize;
+                    if px[i + 3] == 0 { '.' } else { '#' }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Three cells lit `x` columns from the left and `y` rows up from the
+/// bottom of each 5 × 5 cell, top row first.
+fn cells(x: usize, y: usize) -> Vec<String> {
+    let lit = "#".repeat(x) + &".".repeat(5 - x);
+    let cell: Vec<String> = (0..5)
+        .map(|row| {
+            if row >= 5 - y {
+                lit.clone()
+            } else {
+                ".....".to_owned()
+            }
+        })
+        .collect();
+    cell.iter().chain(&cell).chain(&cell).cloned().collect()
+}
+
+/// D14: `noGap` and `noGapX` are read on their own, each on only at 1:
+/// `noGap` 1 alone fills a chip's height (its cells `####.` in every row),
+/// `noGapX` 1 alone its width (`#####` over 4 rows), and 2 for both keeps
+/// both gaps. Each graph's three chips are read from the imported atlas.
+#[test]
+fn the_gap_flags_are_read_on_their_own() {
+    let graphs = r#"{"id": "a", "type": 1, "noGap": 1, "noGapX": 0},
+        {"id": "b", "type": 1, "noGap": 0, "noGapX": 1},
+        {"id": "c", "type": 1, "noGap": 2, "noGapX": 2}"#;
+    let dsts = r#"{"id": "a", "dst": [{"x": 100, "y": 200, "w": 100, "h": 100}]},
+        {"id": "b", "dst": [{"x": 300, "y": 200, "w": 100, "h": 100}]},
+        {"id": "c", "dst": [{"x": 500, "y": 200, "w": 100, "h": 100}]}"#;
+    let d = folder(&json_skin(graphs, "", dsts));
+    let imported = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut r = Res::new(imported.skin);
+    let v = ResultView {
+        timelines: Some(
+            Timelines::new(
+                TimeUs(1_000_000),
+                vec![[3, 0, 0, 0, 0, 0, 0, 0, 0]],
+                vec![3],
+                None,
+            )
+            .unwrap(),
+        ),
+        ..ready(1_000, true, BestView::Unavailable)
+    };
+    r.view(&v);
+    let (chips, _) = graph_quads(&mut r, 1_000);
+    let at = |x: f32| chips.iter().find(|q| q.rect[0] == x).copied().unwrap();
+    assert_eq!(mask(&r, &at(100.0)), cells(4, 5));
+    assert_eq!(mask(&r, &at(300.0)), cells(5, 4));
+    assert_eq!(mask(&r, &at(500.0)), cells(4, 4));
+}

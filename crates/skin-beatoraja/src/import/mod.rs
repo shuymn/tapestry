@@ -1840,6 +1840,7 @@ impl<'d> Cx<'d> {
                 def,
                 ResultDefs {
                     judge_graphs: std::mem::take(&mut self.judge_graphs),
+                    ..ResultDefs::default()
                 },
             )
         } else {

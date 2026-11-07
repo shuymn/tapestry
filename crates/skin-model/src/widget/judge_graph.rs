@@ -238,7 +238,8 @@ impl JudgeGraph {
         let largest = notes.iter().copied().max().unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
-        let (fitted, clip) = region(rect, brush, self.def.fit, [n, scale]);
+        let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
+        let (fitted, clip) = fitted_region(rect, brush, self.def.fit, texels);
         let g = Geometry::new(fitted, clip, brush.pivot, n, scale);
         if self.def.back
             && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
@@ -349,19 +350,37 @@ impl JudgeGraph {
     }
 }
 
-/// The graph's region in canvas pixels, and the rect a trimmed fit cuts
-/// it to: the reference `rect` through the brush's lane map and affine,
-/// then fitted by `fit` with the graph's texture as the image: 5 texels a
-/// bin across and 5 a cell down, `[n, scale]` bins and cells.
-fn region(
+/// The reference `rect` placed: through the brush's lane map and affine.
+fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
+    let [x, y, w, h] = rect;
+    brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h])
+}
+
+/// A result graph's region in canvas pixels: the reference `rect` placed,
+/// then fitted to the brush's native size, if any, with the graph's
+/// texture of `texels` as the frame (the timing distribution's, D8).
+#[allow(
+    dead_code,
+    reason = "the timing distribution draws through it (S10-09h-1); used or not, so no expect"
+)]
+pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
+    let placed = placed(rect, brush);
+    brush.native.map_or(placed, |native| {
+        native.sized(texels).fit(placed, brush.scale)
+    })
+}
+
+/// A judge graph's region in canvas pixels, and the rect a trimmed fit
+/// cuts it to: the reference `rect` placed, then fitted by `fit` with the
+/// graph's texture of `texels` as the image (D9: 5 texels a bin across
+/// and 5 a cell down).
+fn fitted_region(
     rect: [f32; 4],
     brush: &Brush,
     fit: GraphFit,
-    [n, scale]: [u32; 2],
+    texels: [u32; 2],
 ) -> ([f32; 4], Option<[f32; 4]>) {
-    let [x, y, w, h] = rect;
-    let placed = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
-    let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
+    let placed = placed(rect, brush);
     let [px, py, pw, ph] = placed.map(f64::from);
     let [tw, th] = texels.map(|t| f64::from(t.max(1)));
     let (sx, sy) = (pw / tw, ph / th);
@@ -528,7 +547,33 @@ impl Geometry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE, LINE, LINE_60, Rgba8, scale, stripe};
+    use super::{BASE, Brush, LINE, LINE_60, Rgba8, region, scale, stripe};
+    use crate::place::{Affine, LaneMap, Native};
+    use crate::quad::{Blend, RunKey};
+
+    /// The shared region fits a graph to the brush's native size with the
+    /// texture's own dimensions: a 301 × 30 texture (a distribution's)
+    /// kept 301 × 30 in a 600 × 100 rect, centred; none keeps the rect.
+    #[test]
+    fn the_shared_region_fits_the_actual_texture() {
+        let brush = |native| Brush {
+            key: RunKey {
+                blend: Blend::Alpha,
+                clip: None,
+            },
+            affine: Affine::IDENTITY,
+            map: LaneMap::IDENTITY,
+            pivot: [0.0; 2],
+            angle: 0.0,
+            color: [1.0; 4],
+            native,
+            scale: 1.0,
+        };
+        let rect = [100.0, 50.0, 600.0, 100.0];
+        let exact = region(rect, &brush(Some(Native::Exact([0, 0]))), [301, 30]);
+        assert_eq!(exact, [249.5, 85.0, 301.0, 30.0]);
+        assert_eq!(region(rect, &brush(None), [301, 30]), rect);
+    }
 
     /// The source's background colours: the base, then bands `111100`,
     /// `232300`, …; lines `1f1f1f` and `3f3f3f`.

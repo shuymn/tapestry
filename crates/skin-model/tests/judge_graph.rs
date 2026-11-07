@@ -658,6 +658,51 @@ fn every_fit_sizes_the_whole_graph() {
     near(at(500.5, 200.0), [31.0; 3], 2.0);
     near(at(605.0, 275.0), over_backdrop([0.0; 3], 0.8), 2.0);
     near(at(605.0, 245.0), [17.0, 17.0, 0.0], 2.0);
+    // Bin 3's chips (x 430 to 440, cells from y 350 up) cut at the rect's
+    // top, their uv cut alike: cell 24 (y 100 to 110) shows its lit rows,
+    // 108.5 among them, at a lit column.
+    near(at(435.5, 108.5), PG, 2.0);
+}
+
+/// A fitted graph turns about the element's pivot in the region it
+/// draws, not in the element's rect: under no resize the 350 × 150 graph
+/// sits at (175, 75) in a 700 × 300 rect, and turned 90° about its top
+/// left draws at `c + R(p − c)`, `c` = (175, 75), what the unturned graph
+/// draws at `p`. Trimmed, the drawn region's top left is the pivot:
+/// (400, 100), where the covering fit's region starts at y 50.
+#[test]
+fn a_fitted_graph_turns_about_its_drawn_regions_pivot() {
+    use skin_model::{Anchor, GraphFit};
+    let mut bins = vec![[0; 9]; 70];
+    bins[3] = perfects(25);
+    let frame = |r, fit, angle| {
+        let e = graph_support::placed_element(0, r, angle, Anchor::TopLeft, None);
+        let def = skin_model::JudgeGraphDef {
+            fit,
+            ..graph(JudgeGraphKind::Judgment, GRID, true, 0)
+        };
+        let mut fx = GFx::new(skin(vec![e], vec![def]));
+        fx.view(&view(bins.clone()));
+        fx.frame(0);
+        fx
+    };
+    let exact = GraphFit::Exact { trim: false };
+    let (flat, turned) = (
+        frame([0, 0, 700, 300], exact, 0),
+        frame([0, 0, 700, 300], exact, 90),
+    );
+    assert!(turned.quads().iter().all(|q| q.pivot == [175.0, 75.0]));
+    for i in 0..35 {
+        for j in 0..15 {
+            let (x, y) = (175.3 + 10.0 * i as f32, 75.3 + 10.0 * j as f32);
+            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let (dx, dy) = (x - 175.0, y - 75.0);
+            let got = composite(turned.quads(), &turned.atlas, 175.0 - dy, 75.0 + dx, None).0;
+            near(got, want, 0.5);
+        }
+    }
+    let trimmed = frame([400, 100, 700, 200], GraphFit::Outer { trim: true }, 90);
+    assert!(trimmed.quads().iter().all(|q| q.pivot == [400.0, 100.0]));
 }
 
 /// A judge graph element naming a native size is refused: its graph's
@@ -689,6 +734,7 @@ fn a_judge_graph_element_takes_no_native_size() {
     };
     let graphs = ResultDefs {
         judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
+        ..ResultDefs::default()
     };
     assert!(matches!(
         Skin::new_result(def, graphs),
