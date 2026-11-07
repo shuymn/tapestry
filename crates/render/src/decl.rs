@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BitmapLines, BuildError, Canvas, Layout, Loading, Page, Play, Side, Skin, SkinFrame,
-    TextRequest, TextSlots, TextTable, TextTableError, UvTable,
+    Atlas, BitmapLines, BuildError, Canvas, Layout, Loading, PackedPages, Play, Side, Skin,
+    SkinFrame, TextRequest, TextSlots, TextTable, TextTableError, UvTable,
 };
 
 use crate::outline::{LineBounds, LineFit, LineLayout, TextResidency};
@@ -78,8 +78,8 @@ impl AttemptText for crate::OutlineText {
 /// Why a bundle was not made.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum BundleError {
-    /// The atlas was built from another sheet than the skin's, or has
-    /// another number of frames.
+    /// The atlas's uv table, from its build or a rebind, is of another
+    /// sheet than the skin's, or has another number of frames.
     #[error("the atlas is not the skin's: {frames} frames for {expected}")]
     Atlas {
         /// The atlas's frames.
@@ -87,8 +87,16 @@ pub enum BundleError {
         /// The skin's.
         expected: usize,
     },
-    /// The atlas's frames do not lie on its pages after the renderer's
-    /// reserved layers: it was built for another reservation.
+    /// The atlas's pages were packed after another count of reserved
+    /// layers than the renderer's: each frame's layer would name another
+    /// page than the one uploaded there.
+    #[error("the atlas was packed after {packed} reserved layers, not {RESERVED_LAYERS}")]
+    Reserved {
+        /// The reserved layers it was packed after.
+        packed: u32,
+    },
+    /// A frame of the atlas does not lie on its pages after the renderer's
+    /// reserved layers.
     #[error("the atlas's frames lie on layers {first} to {last}, not {RESERVED_LAYERS} to {end}")]
     Layers {
         /// The lowest layer a frame lies on.
@@ -112,20 +120,18 @@ pub enum BundleError {
 }
 
 /// Everything a declarative skin's installation uploads, held on the CPU:
-/// the compiled skin, its atlas's pages and the uv table that matches
-/// them, its fixed clips, the scratch side its lanes are laid out for, and
-/// the producer of its attempts' prepared text, if any. Its resident bytes
-/// ([`resident_bytes`](Self::resident_bytes)) count against the memory
-/// budget for as long as it is committed.
+/// the compiled skin, its atlas's pages, shared with every atlas rebound
+/// from the same build ([`Atlas::rebind`]), and the uv table of the skin's
+/// sheet on them, its fixed clips, the scratch side its lanes are laid out
+/// for, and the producer of its attempts' prepared text, if any. Its
+/// resident bytes ([`resident_bytes`](Self::resident_bytes)) count against
+/// the memory budget for as long as it is committed.
 pub struct SkinBundle {
     skin: Arc<Skin>,
-    side: u32,
-    pages: Vec<Page>,
+    pages: Arc<PackedPages>,
     uvs: UvTable,
     clips: ClipTable,
     scratch: Side,
-    /// The text layer after the pages, if the atlas has one.
-    text_layer: Option<u16>,
     text: Option<Arc<dyn AttemptText>>,
     /// Whether its installation keeps a Lua VM, charged
     /// [`VM_TEXELS`](crate::VM_TEXELS) while committed.
@@ -135,8 +141,8 @@ pub struct SkinBundle {
 impl fmt::Debug for SkinBundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SkinBundle")
-            .field("side", &self.side)
-            .field("pages", &self.pages.len())
+            .field("side", &self.pages.side())
+            .field("pages", &self.pages.pages().len())
             .field("frames", &self.uvs.frames().len())
             .field("clips", &self.clips.len())
             .field("scratch", &self.scratch)
@@ -147,24 +153,26 @@ impl fmt::Debug for SkinBundle {
 }
 
 impl SkinBundle {
-    /// `skin` with its `atlas` (built from the skin's own sheet), `clips`
-    /// and the lanes laid out for `scratch`, the side its importer gives.
+    /// `skin` with its `atlas`, `clips` and the lanes laid out for
+    /// `scratch`, the side its importer gives. The atlas is built from the
+    /// skin's own sheet or rebound to it ([`Atlas::rebind`]); the bundle
+    /// shares its pages.
     ///
     /// # Errors
     ///
-    /// [`BundleError::Atlas`] for an atlas of another sheet or length,
-    /// [`BundleError::Layers`] for one built for another reservation than
-    /// the renderer's [`RESERVED_LAYERS`] (its pages are uploaded after
-    /// them), and [`BundleError::Clips`] for a clip table without every
-    /// clip the skin names.
+    /// [`BundleError::Atlas`] for an atlas whose uv table is of another
+    /// sheet or length, [`BundleError::Reserved`] for pages packed after
+    /// another count of reserved layers than the renderer's
+    /// [`RESERVED_LAYERS`] (its pages are uploaded after them),
+    /// [`BundleError::Layers`] for a frame outside its pages, and
+    /// [`BundleError::Clips`] for a clip table without every clip the skin
+    /// names.
     pub fn new(
         skin: Arc<Skin>,
         atlas: Atlas,
         clips: ClipTable,
         scratch: Side,
     ) -> Result<Self, BundleError> {
-        let side = atlas.side();
-        let text_layer = atlas.text_layer();
         let (pages, uvs) = atlas.into_parts();
         if uvs.sheet_id() != skin.sheet().id() || uvs.frames().len() != skin.frame_count() {
             return Err(BundleError::Atlas {
@@ -172,19 +180,24 @@ impl SkinBundle {
                 expected: skin.frame_count(),
             });
         }
-        // The packer fills its pages in order, so a frame lies on the
-        // first one; none lies past the last.
-        let layers = uvs.frames().iter().map(|f| f.layer);
-        if let (Some(first), Some(last)) = (layers.clone().min(), layers.max()) {
-            let pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
-            let end = RESERVED_LAYERS.saturating_add(pages).saturating_sub(1);
-            if u32::from(first) != RESERVED_LAYERS || u32::from(last) > end {
-                return Err(BundleError::Layers { first, last, end });
-            }
+        // Page `i` is uploaded at layer `RESERVED_LAYERS + i`, so the pages
+        // must have been packed for that: a rebound subset's frames alone
+        // cannot tell, since it may leave the first pages unused.
+        let packed = pages.reserved_layers();
+        if packed != RESERVED_LAYERS {
+            return Err(BundleError::Reserved { packed });
         }
-        if let Some(layer) = text_layer {
-            let pages = u32::try_from(pages.len()).unwrap_or(u32::MAX);
-            let after = RESERVED_LAYERS.saturating_add(pages);
+        // Every frame lies on a page.
+        let count = u32::try_from(pages.pages().len()).unwrap_or(u32::MAX);
+        let end = RESERVED_LAYERS.saturating_add(count).saturating_sub(1);
+        let layers = uvs.frames().iter().map(|f| f.layer);
+        if let (Some(first), Some(last)) = (layers.clone().min(), layers.max())
+            && (u32::from(first) < RESERVED_LAYERS || u32::from(last) > end)
+        {
+            return Err(BundleError::Layers { first, last, end });
+        }
+        if let Some(layer) = pages.text_layer() {
+            let after = RESERVED_LAYERS.saturating_add(count);
             if u32::from(layer) != after {
                 return Err(BundleError::Layers {
                     first: layer,
@@ -202,12 +215,10 @@ impl SkinBundle {
         }
         Ok(Self {
             skin,
-            side,
             pages,
             uvs,
             clips,
             scratch,
-            text_layer,
             text: None,
             vm: false,
         })
@@ -221,7 +232,7 @@ impl SkinBundle {
     /// [`BundleError::NoTextLayer`] when its atlas has no text layer
     /// (`skin_model::Sheet::atlas_reserving`).
     pub fn with_text(mut self, text: Arc<dyn AttemptText>) -> Result<Self, BundleError> {
-        if self.text_layer.is_none() {
+        if self.pages.text_layer().is_none() {
             return Err(BundleError::NoTextLayer);
         }
         self.text = Some(text);
@@ -236,14 +247,21 @@ impl SkinBundle {
 
     /// The text layer after its pages, if its atlas has one.
     #[must_use]
-    pub const fn text_layer(&self) -> Option<u16> {
-        self.text_layer
+    pub fn text_layer(&self) -> Option<u16> {
+        self.pages.text_layer()
     }
 
     /// Its pages' side.
     #[must_use]
-    pub const fn side(&self) -> u32 {
-        self.side
+    pub fn side(&self) -> u32 {
+        self.pages.side()
+    }
+
+    /// Its atlas's pages with their placements, shared with every atlas
+    /// rebound from the same build.
+    #[must_use]
+    pub const fn atlas_pages(&self) -> &Arc<PackedPages> {
+        &self.pages
     }
 
     /// The same bundle declaring that its installation keeps a Lua VM:
@@ -266,11 +284,11 @@ impl SkinBundle {
     /// has one, at its page side.
     #[must_use]
     pub fn atlas_texels(&self) -> u64 {
-        let side = u64::from(self.side);
-        let layers = u64::try_from(self.pages.len())
+        let side = u64::from(self.side());
+        let layers = u64::try_from(self.pages.pages().len())
             .unwrap_or(u64::MAX)
             .saturating_add(u64::from(RESERVED_LAYERS))
-            .saturating_add(u64::from(self.text_layer.is_some()));
+            .saturating_add(u64::from(self.text_layer().is_some()));
         side.saturating_mul(side).saturating_mul(layers)
     }
 
@@ -309,6 +327,7 @@ impl SkinBundle {
     /// work, it allocates the list.
     pub(crate) fn levels(&self) -> Vec<PageLevels<'_>> {
         self.pages
+            .pages()
             .iter()
             .map(|p| std::array::from_fn(|k| p.level(k).unwrap_or(&[])))
             .collect()
@@ -319,14 +338,14 @@ impl SkinBundle {
     pub(crate) fn with_pages<R>(&self, upload: impl FnOnce(&AtlasPages<'_>) -> R) -> R {
         let levels = self.levels();
         upload(&AtlasPages {
-            side: self.side,
+            side: self.side(),
             pages: &levels,
-            text_layer: self.text_layer.is_some(),
+            text_layer: self.text_layer().is_some(),
         })
     }
 
-    /// The bytes it keeps resident on the CPU: every level of every page,
-    /// the uv table, the clip table and its text producer's skin font
+    /// The bytes it keeps resident on the CPU: every level of every page
+    /// and the placements kept with them, the uv table, the clip table and its text producer's skin font
     /// snapshots. The compiled skin is shared with whoever compiled it and
     /// counted there; the default font is shared by every producer and
     /// counted once ([`MemoryWitness::default_font`](crate::MemoryWitness)).
@@ -334,6 +353,7 @@ impl SkinBundle {
     pub fn resident_bytes(&self) -> u64 {
         let levels: usize = self
             .pages
+            .pages()
             .iter()
             .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(|k| p.level(k)))
             .map(<[u8]>::len)
@@ -343,6 +363,7 @@ impl SkinBundle {
         let fonts = self.text.as_ref().map_or(0, |t| t.resident().skin_fonts);
         u64::try_from(levels + uvs + clips)
             .unwrap_or(u64::MAX)
+            .saturating_add(self.pages.placement_bytes())
             .saturating_add(fonts)
     }
 }

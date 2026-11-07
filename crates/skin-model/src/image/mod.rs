@@ -318,7 +318,7 @@ impl Stop {
 
 /// One version of a file: its name, the dimensions its header gave at
 /// load, and how it decodes, with the header fields that decided it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Version {
     pub name: String,
     pub dims: [u32; 2],
