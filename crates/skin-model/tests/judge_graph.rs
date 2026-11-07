@@ -734,7 +734,7 @@ fn a_judge_graph_element_takes_no_native_size() {
     };
     assert!(matches!(
         Skin::new_result(def, graphs),
-        Err(LoadError::JudgeGraphNative { element: 0 })
+        Err(LoadError::GraphNative { element: 0 })
     ));
 }
 
