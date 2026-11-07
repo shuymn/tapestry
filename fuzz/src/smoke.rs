@@ -743,7 +743,19 @@ const SELECTION_DRAWN: [usize; 6] = [5, 5, 6, 6, 4, 4];
 /// draws nothing; the grade image (AA, option 301) on the fade-out only.
 /// With no result: the level's two digits and the lane image alone. The
 /// mean, −1.49 ms, shows its whole ms truncated toward 0: one digit.
-const RESULT_DRAWN: [usize; 4] = [4 + 1 + 2 + 3, 4 + 1 + 2 + 3 + 1, 3, 3];
+///
+/// The graphs: the views hold no gauge history, timelines, deviations or
+/// judge areas, so the gauge graph and the judge graph draw nothing, and
+/// the ready view's distribution draws its ticks and lines alone. Its
+/// trimmed covering stretch (3) shows 30 of its 301 columns, 10 pixels
+/// each, around the centre: the ticks of columns 140, 150 and 160, and
+/// the average (149) and ±σ lines (137, 161) in two pieces each.
+const RESULT_DRAWN: [usize; 4] = [
+    4 + 1 + 2 + 3 + 3 + 3 * 2,
+    4 + 1 + 2 + 3 + 1 + 3 + 3 * 2,
+    3,
+    3,
+];
 
 fn kinds(i: &Imported) -> Vec<NoteKind> {
     i.report.notes.iter().map(|n| n.kind).collect()
@@ -760,14 +772,8 @@ fn skin_import_seeds_import_and_draw_as_built() {
         let drawn = draw(&i, &[]);
         match name {
             "result" => {
-                // The gauge graph is a later widget, dropped with a note.
-                assert_eq!(
-                    kinds(&i),
-                    [NoteKind::Unsupported {
-                        object: skin_beatoraja::Object::GaugeGraph
-                    }],
-                    "{name}"
-                );
+                // Every graph imports, with no note.
+                assert_eq!(kinds(&i), [], "{name}");
                 assert_eq!(i.skin.kind(), ScreenKind::Result, "{name}");
                 assert_eq!(drawn, RESULT_DRAWN, "{name}");
             }
