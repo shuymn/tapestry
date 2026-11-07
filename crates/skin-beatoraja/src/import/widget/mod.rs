@@ -11,6 +11,7 @@ pub(super) mod judge_graph;
 pub(super) mod lanes;
 pub(super) mod note_parts;
 pub(super) mod number;
+pub(super) mod result_graphs;
 pub(super) mod system;
 pub(super) mod text;
 

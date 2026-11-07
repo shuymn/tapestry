@@ -1169,6 +1169,8 @@ pub fn skin_imports() -> Vec<Seed> {
                           {"id": "lv", "src": "strip", "w": 100, "h": 10, "divx": 10, "digit": 2, "value": "playlevel"}],
                 "text": [{"id": "t", "font": "f", "ref": 12}],
                 "gaugegraph": [{"id": "gg"}],
+                "judgegraph": [{"id": "jg", "type": 2, "backTexOff": 1}],
+                "timingdistributiongraph": [{"id": "td"}],
                 "destination": [
                     {"id": "ex", "dst": [{"x": 0, "y": 500, "w": 10, "h": 10}]},
                     {"id": "bp", "op": [332], "dst": [{"x": 0, "y": 480, "w": 10, "h": 10}]},
@@ -1179,7 +1181,9 @@ pub fn skin_imports() -> Vec<Seed> {
                     {"id": "b1", "op": [301], "timer": 2, "dst": [{"x": 220, "y": 500, "w": 10, "h": 10}]},
                     {"id": "clear", "dst": [{"x": 240, "y": 500, "w": 10, "h": 10}]},
                     {"id": "lane", "dst": [{"x": 260, "y": 500, "w": 10, "h": 10}]},
-                    {"id": "gg", "dst": [{"x": 0, "y": 0, "w": 300, "h": 100}]}]}"#]),
+                    {"id": "gg", "dst": [{"x": 0, "y": 0, "w": 300, "h": 100}]},
+                    {"id": "jg", "dst": [{"x": 300, "y": 0, "w": 300, "h": 100}]},
+                    {"id": "td", "stretch": 3, "dst": [{"x": 600, "y": 0, "w": 301, "h": 100}]}]}"#]),
         ),
         (
             "selection",

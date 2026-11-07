@@ -54,12 +54,13 @@ pub enum JudgeGraphKind {
     EarlyLate,
 }
 
-/// How a judge graph's texture fits its element's rect: the source's
+/// How a result graph's texture fits its element's rect: the source's
 /// stretch modes, applied to the whole graph as the source applies them to
-/// an image, the texture being 5 texels a bin across and 5 a cell down.
-/// The aspect-keeping modes depend on the bins and the scale, so the graph
-/// fits itself each frame. A trimmed mode shows only the part of the
-/// fitted graph inside the rect.
+/// an image, the texture being a judge graph's 5 texels a bin across and
+/// 5 a cell down, or a timing distribution's `gx` × scale texels. The
+/// aspect-keeping modes depend on what the graph shows, so it fits itself
+/// each frame. A trimmed mode shows only the part of the fitted graph
+/// inside the rect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GraphFit {
     /// The rect (stretch 0, and the source's unknown modes).
@@ -364,21 +365,11 @@ fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
     brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h])
 }
 
-/// A result graph's region in canvas pixels: the reference `rect` placed,
-/// then fitted to the brush's native size, if any, with the graph's
-/// texture of `texels` as the frame (the timing distribution's, D8).
-pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
-    let placed = placed(rect, brush);
-    brush.native.map_or(placed, |native| {
-        native.sized(texels).fit(placed, brush.scale)
-    })
-}
-
-/// A judge graph's region in canvas pixels, and the rect a trimmed fit
+/// A result graph's region in canvas pixels, and the rect a trimmed fit
 /// cuts it to: the reference `rect` placed, then fitted by `fit` with the
-/// graph's texture of `texels` as the image (D9: 5 texels a bin across
-/// and 5 a cell down).
-fn fitted_region(
+/// graph's texture of `texels` as the image (a judge graph's 5 texels a
+/// bin across and 5 a cell down, D9; a distribution's `gx` × scale, D8).
+pub(crate) fn fitted_region(
     rect: [f32; 4],
     brush: &Brush,
     fit: GraphFit,
@@ -404,8 +395,39 @@ fn fitted_region(
     (fitted, trim.then_some(placed))
 }
 
+/// `rect` showing `uv`, cut with its uv to `clip` when there is one;
+/// `None` when nothing of it is inside.
+pub(crate) fn cut(
+    rect: [f32; 4],
+    uv: [f32; 4],
+    clip: Option<[f32; 4]>,
+) -> Option<([f32; 4], [f32; 4])> {
+    let Some(clip) = clip else {
+        return Some((rect, uv));
+    };
+    let cut @ [cx, cy, cw, ch] = intersect(rect, clip)?;
+    let [x, y, w, h] = rect;
+    let [l, t, r, b] = uv;
+    let u = |at: f32| l + (r - l) * (at - x) / w;
+    let v = |at: f32| t + (b - t) * (at - y) / h;
+    Some((cut, [u(cx), v(cy), u(cx + cw), v(cy + ch)]))
+}
+
+/// The point `[fx, fy]` of the region a graph draws: `fitted`, cut to
+/// `clip` when a trimmed fit cuts it.
+pub(crate) fn drawn_pivot(
+    fitted: [f32; 4],
+    clip: Option<[f32; 4]>,
+    [fx, fy]: [f32; 2],
+) -> [f32; 2] {
+    let [dx, dy, dw, dh] = clip
+        .map_or(Some(fitted), |c| intersect(fitted, c))
+        .unwrap_or(fitted);
+    [dx + fx * dw, dy + fy * dh]
+}
+
 /// The part of the rect `a` inside the rect `b`, `None` when empty.
-fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
+pub(crate) fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
     let [ax, ay, aw, ah] = a;
     let [bx, by, bw, bh] = b;
     let (x0, y0) = (ax.max(bx), ay.max(by));
@@ -442,16 +464,13 @@ impl Geometry {
         n: u32,
         scale: u32,
     ) -> Self {
-        let [dx, dy, dw, dh] = clip
-            .map_or(Some(fitted), |c| intersect(fitted, c))
-            .unwrap_or(fitted);
         Self {
             x,
             y,
             w,
             h,
             clip,
-            pivot: [dx + fx * dw, dy + fy * dh],
+            pivot: drawn_pivot(fitted, clip, [fx, fy]),
             n: n.max(1),
             scale: scale.max(1),
         }
@@ -469,20 +488,10 @@ impl Geometry {
         filter: crate::quad::Filter,
         out: &mut QuadBatch,
     ) -> bool {
-        let (rect, f) = match self.clip {
-            None => (rect, f),
-            Some(clip) => {
-                let Some(cut @ [cx, cy, cw, ch]) = intersect(rect, clip) else {
-                    return true;
-                };
-                let [x, y, w, h] = rect;
-                let [l, t, r, b] = f.uv;
-                let u = |at: f32| l + (r - l) * (at - x) / w;
-                let v = |at: f32| t + (b - t) * (at - y) / h;
-                let uv = [u(cx), v(cy), u(cx + cw), v(cy + ch)];
-                (cut, FrameUv { uv, layer: f.layer })
-            }
+        let Some((rect, uv)) = cut(rect, f.uv, self.clip) else {
+            return true;
         };
+        let f = FrameUv { uv, layer: f.layer };
         let b = Brush { color, ..*brush };
         b.push_placed(out, rect, self.pivot, f, filter)
     }
@@ -551,33 +560,7 @@ impl Geometry {
 
 #[cfg(test)]
 mod tests {
-    use super::{BASE, Brush, LINE, LINE_60, Rgba8, region, scale, stripe};
-    use crate::place::{Affine, LaneMap, Native};
-    use crate::quad::{Blend, RunKey};
-
-    /// The shared region fits a graph to the brush's native size with the
-    /// texture's own dimensions: a 301 × 30 texture (a distribution's)
-    /// kept 301 × 30 in a 600 × 100 rect, centred; none keeps the rect.
-    #[test]
-    fn the_shared_region_fits_the_actual_texture() {
-        let brush = |native| Brush {
-            key: RunKey {
-                blend: Blend::Alpha,
-                clip: None,
-            },
-            affine: Affine::IDENTITY,
-            map: LaneMap::IDENTITY,
-            pivot: [0.0; 2],
-            angle: 0.0,
-            color: [1.0; 4],
-            native,
-            scale: 1.0,
-        };
-        let rect = [100.0, 50.0, 600.0, 100.0];
-        let exact = region(rect, &brush(Some(Native::Exact([0, 0]))), [301, 30]);
-        assert_eq!(exact, [249.5, 85.0, 301.0, 30.0]);
-        assert_eq!(region(rect, &brush(None), [301, 30]), rect);
-    }
+    use super::{BASE, LINE, LINE_60, Rgba8, scale, stripe};
 
     /// The source's background colours: the base, then bands `111100`,
     /// `232300`, …; lines `1f1f1f` and `3f3f3f`.

@@ -289,3 +289,39 @@ impl Res {
             .collect()
     }
 }
+
+/// The destinations of the essential parts a graph fixture holds: the EX
+/// score and an image under the clear status.
+const GRAPH_ESSENTIALS: &str = r#"{"id": "ex", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]},
+    {"id": "dot", "op": [90], "dst": [{"x": 0, "y": 300, "w": 8, "h": 8}]}"#;
+
+/// A JSON result skin body for [`folder`]: the EX score's number, `tables`
+/// (the graph records, each a member ending in a comma), and the
+/// essentials' destinations then `dsts`.
+pub fn graph_json(tables: &str, dsts: &str) -> String {
+    format!(
+        r#""value": [{{"id": "ex", "src": "s", "x": 0, "y": 32, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}}],
+           {tables}
+           "destination": [{GRAPH_ESSENTIALS}, {dsts}]"#
+    )
+}
+
+/// The Lua skin of the same parts: `tables` as Lua statements and `dsts`
+/// as destination entries.
+pub fn graph_lua(tables: &str, dsts: &str) -> String {
+    format!(
+        "local skin = {{ type = 7, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
+         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.image = {{ {{ id = \"dot\", src = \"s\", x = 48, y = 0, w = 8, h = 8 }} }}\n\
+         skin.value = {{ {{ id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+             digit = 4, ref = 71 }} }}\n\
+         {tables}\n\
+         skin.destination = {{\n\
+           {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }},\n\
+           {{ id = \"dot\", op = {{ 90 }}, dst = {{ {{ x = 0, y = 300, w = 8, h = 8 }} }} }},\n\
+           {dsts} }}\n\
+         return skin\n"
+    )
+}

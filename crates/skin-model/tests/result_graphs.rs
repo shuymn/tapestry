@@ -92,6 +92,7 @@ fn every_graph_follows_the_view() {
                 average: false,
                 dev: false,
                 solid: SOLID,
+                fit: skin_model::GraphFit::Stretch,
             }],
         },
     ));

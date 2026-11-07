@@ -67,7 +67,8 @@ pub struct GaugeGraphDef {
 
 impl GaugeGraphDef {
     /// The quads one frame can push at worst.
-    pub(crate) fn quads(&self) -> u32 {
+    #[must_use]
+    pub fn quads(&self) -> u32 {
         QUADS
     }
 }
