@@ -19,7 +19,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use super::judge_graph::region;
+use super::judge_graph::{GraphFit, cut, drawn_pivot, fitted_region};
 use super::{Brush, Frame, ImageRef, tint};
 use crate::atlas::uv::FrameUv;
 use crate::canvas::f32_of;
@@ -37,9 +37,10 @@ const TICK: [f32; 4] = [0.0, 0.0, 0.0, 0.25];
 const TICK_ROWS: u32 = 2;
 
 /// A timing distribution as a front end builds it. Its element's track
-/// places the whole graph and gives its colour and alpha; the element's
-/// native size fits the whole graph as the source fits its texture of
-/// `gx` × scale texels.
+/// places the whole graph and gives its colour and alpha; its
+/// [`GraphFit`] fits the whole graph as the source fits its texture of
+/// `gx` × scale texels, and the track's angle turns the whole graph about
+/// the element's pivot in the region it draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimingGraphDef {
     /// The columns, one ms each, the centre at `gx / 2`.
@@ -53,6 +54,7 @@ pub struct TimingGraphDef {
     pub dev: bool,
     /// A white image every piece tints.
     pub solid: u32,
+    pub fit: GraphFit,
 }
 
 impl TimingGraphDef {
@@ -60,7 +62,8 @@ impl TimingGraphDef {
     /// tick, a line or a bar (at most the 301 bars, a tick every 10
     /// columns and 3 lines), each in at most 4 pieces and splitting a run
     /// in two, over at most 11 runs of the areas: `5K + 11`.
-    pub(crate) fn quads(&self) -> u32 {
+    #[must_use]
+    pub fn quads(&self) -> u32 {
         let gx = u32::from(self.gx);
         let k = gx.min(304 + gx.div_ceil(10));
         5 * k + 11
@@ -194,9 +197,10 @@ impl TimingGraph {
     /// nothing unless the view is ready or without a positive width and
     /// height; the areas and ticks, and with
     /// samples the bars and the lines. The rect is placed (lane map,
-    /// affine) and fitted to the brush's native size, if any, as one
-    /// region; every quad turns with the brush's angle about the brush's
-    /// pivot in that region. A refused push stops the graph.
+    /// affine) and fitted by the graph's [`GraphFit`] as one region, a
+    /// trimmed fit cut to the rect; every quad turns with the brush's
+    /// angle about the brush's pivot in the region drawn. A refused push
+    /// stops the graph.
     pub(crate) fn draw(
         &self,
         d: &TimingGraphDraw<'_>,
@@ -241,13 +245,12 @@ impl TimingGraph {
             colors: def.colors.map(Rgba8::unit),
         };
         let n = u32::from(def.gx);
-        let [x, y, w, h] = region(rect, brush, [n, scale]);
+        let (fitted @ [x, y, w, h], clip) = fitted_region(rect, brush, def.fit, [n, scale]);
         // A region with no positive width and height (a track may reach
         // one, or interpolate through 0 into one) draws nothing.
         if !(w > 0.0 && h > 0.0) {
             return;
         }
-        let [px, py] = brush.pivot;
         let g = Grid {
             x: f64::from(x),
             y: f64::from(y),
@@ -255,7 +258,8 @@ impl TimingGraph {
             h: f64::from(h),
             gx: f64::from(n),
             scale: f64::from(scale),
-            pivot: [x + px * w, y + py * h],
+            pivot: drawn_pivot(fitted, clip, brush.pivot),
+            clip,
             brush,
             f,
             image: self.solid,
@@ -296,6 +300,8 @@ struct Grid<'a> {
     gx: f64,
     scale: f64,
     pivot: [f32; 2],
+    /// The rect a trimmed fit cuts every piece to.
+    clip: Option<[f32; 4]>,
     brush: &'a Brush,
     f: FrameUv,
     image: ImageRef,
@@ -328,7 +334,14 @@ impl Grid<'_> {
             color: tint(self.brush.color, color),
             ..*self.brush
         };
-        b.push_placed(out, rect, self.pivot, self.f, self.image.filter)
+        let Some((rect, uv)) = cut(rect, self.f.uv, self.clip) else {
+            return true;
+        };
+        let f = FrameUv {
+            uv,
+            layer: self.f.layer,
+        };
+        b.push_placed(out, rect, self.pivot, f, self.image.filter)
     }
 
     /// Pushes column `j` cut at its rows' boundaries (the tick's rows and

@@ -4,18 +4,21 @@
 //! [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>|pending]
 //! [--result dense] [--option <name> <item>]... [--file <name> <candidate>]...
 //! [--local] <root> <entry> [<root> <entry>]...`
-//! imports each Lua skin, `entry` relative to its skin folder `root`,
+//! imports each Lua skin (or JSON skin, an `entry` ending in `.json`,
+//! which reports its outcome, kind, notes and frames alone), `entry`
+//! relative to its skin folder `root`,
 //! with its default configuration, but for what `--option` and `--file`
 //! name, on the scene of the kind its header names, against import facts
 //! with autoplay, the chart's judgment class and its play level as given
 //! (`none` for a chart in no class, `pending` for a level the base
 //! snapshot has pending; each
 //! unavailable when not given) and, with `--result dense`, a result
-//! scene's view known: a ready result with a known best and dense
-//! timelines (512 bins of 2 s, every channel 9 and 19 notes unjudged), over
-//! which a result skin that imports is then drawn (its widget charge,
-//! quad capacity, the most quads a frame drew, the quads dropped and the
-//! chip quads); and prints its kind, what did not convert
+//! scene's view known: a ready result with a known best, dense timelines
+//! (512 bins of 2 s, every channel 9 and 19 notes unjudged), a gauge
+//! history crossing its border in every column and a deviation in every
+//! ms slot, over which a result skin that imports is then drawn (its
+//! widget charge, quad capacity, the most quads a frame drew, the quads
+//! dropped and the chip quads); and prints its kind, what did not convert
 //! as allowlisted counts and outcomes, how many script and unread-entry
 //! roots its configured table holds, a record per callback consumer
 //! (where it is defined, its field, role, disposition and reason, why a
@@ -39,10 +42,13 @@ use std::path::PathBuf;
 use bms_model::TimeUs;
 use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
-use skin_beatoraja::lua::survey::{Choice, DestinationEntry, Local, Survey, survey_with};
+use skin_beatoraja::lua::survey::{
+    Choice, DestinationEntry, Local, Survey, survey_json, survey_with,
+};
 use skin_model::{
-    BestFigures, BestRate, BestView, LampKey, ResultChart, ResultFields, ResultNumber, ResultScore,
-    ResultStatus, ResultView, ScreenKind, Timelines, TimingStats,
+    BestFigures, BestRate, BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory,
+    GaugeLook, LampKey, ResultChart, ResultFields, ResultNumber, ResultScore, ResultStatus,
+    ResultView, ScreenKind, Timelines, TimingStats,
 };
 
 const USAGE: &str = "usage: lua_report [--autoplay on|off] \
@@ -120,9 +126,28 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
 }
 
 /// The view `--result dense` gives: a ready result with every best value
-/// known, timing statistics, and dense timelines (512 bins of 2 s, each
-/// channel 9 and 100 notes a bin, 19 of them unjudged).
+/// known, timing statistics, dense timelines (512 bins of 2 s, each
+/// channel 9 and 100 notes a bin, 19 of them unjudged), a gauge history
+/// whose every column crosses the border (an even column rising from 70 %
+/// to 90 %, an odd one falling back), and a deviation in every ms slot
+/// (up to 250) over 7-key judge areas.
 fn dense_view() -> ResultView {
+    let pct = |p: i64| rules::GaugeValue(p * rules::GaugeValue::PERCENT);
+    let column = |i: usize| {
+        let (low, high) = (pct(70), pct(90));
+        let last = if i.is_multiple_of(2) { high } else { low };
+        GaugeColumn { low, high, last }
+    };
+    let gauge = GaugeHistory {
+        columns: std::array::from_fn(column),
+        max: pct(100),
+        border: pct(80),
+        look: GaugeLook::Normal,
+        reached: u16::try_from(GRAPH_COLUMNS).unwrap_or(u16::MAX),
+        no_input_from: Some(200),
+    };
+    let deviations: [u32; DEVIATION_SLOTS] =
+        std::array::from_fn(|i| 1 + u32::try_from(i % 250).unwrap_or(0));
     let bins = vec![[9; skin_model::TIMELINE_CHANNELS]; skin_model::MAX_TIMELINE_BINS];
     let notes = vec![100; skin_model::MAX_TIMELINE_BINS];
     ResultView {
@@ -153,9 +178,9 @@ fn dense_view() -> ResultView {
             sd_x100: 1_234,
         }),
         timelines: Timelines::new(TimeUs(2_000_000), bins, notes, None).ok(),
-        gauge: None,
-        deviations: None,
-        timing_areas: None,
+        gauge: Some(Box::new(gauge)),
+        deviations: Some(Box::new(deviations)),
+        timing_areas: Some([[-20, 20], [-60, 60], [-160, 160], [-220, 220], [-500, 150]]),
     }
 }
 
@@ -308,6 +333,23 @@ fn report(index: usize, survey: &Survey) -> String {
     s
 }
 
+/// The survey of `entry` in `root`: a JSON skin (an entry ending in
+/// `.json`) takes the JSON import, every other entry the Lua one.
+fn survey_entry(
+    root: &str,
+    entry: &str,
+    facts: &ImportFacts,
+    cancel: &Cancel,
+    local: bool,
+    choice: &Choice,
+) -> Survey {
+    if entry.ends_with(".json") {
+        survey_json(&PathBuf::from(root), entry, choice)
+    } else {
+        survey_with(&PathBuf::from(root), entry, facts, cancel, local, choice)
+    }
+}
+
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
     let Some((facts, choice, local, args)) = facts(&all) else {
@@ -320,7 +362,7 @@ fn main() {
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
-        let survey = survey_with(&PathBuf::from(root), entry, &facts, &cancel, local, &choice);
+        let survey = survey_entry(root, entry, &facts, &cancel, local, &choice);
         print!("{}", report(index, &survey));
         let kind = survey
             .kind
@@ -336,8 +378,8 @@ fn main() {
 mod tests {
     use skin_beatoraja::lua::facts::{Fact, JudgeClass};
     use skin_beatoraja::lua::survey::{
-        Became, Consumer, DestinationEntry, DestinationNote, Element, Local, Lowered, Resolved,
-        Survey,
+        Became, Choice, Consumer, DestinationEntry, DestinationNote, Element, Local, Lowered,
+        Resolved, Survey, survey_json,
     };
     use skin_beatoraja::{NoteKind, PropertyKind, Severity};
 
@@ -425,6 +467,53 @@ mod tests {
         );
         assert_ne!(s.outcome, "imported");
         assert!(s.frames.is_none());
+    }
+
+    /// A JSON result skin takes the JSON import, and with `--result dense`
+    /// its gauge graph and distribution draw over the dense view: the
+    /// gauge graph's back and every column's line, the distribution's
+    /// cut columns, nothing dropped.
+    #[test]
+    fn a_json_result_skin_draws_its_graphs_over_the_dense_view() {
+        let a = args("--result dense root s.json");
+        let (_, choice, _, _) = facts(&a).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([255; 4]))
+            .save(d.path().join("a.png"))
+            .unwrap();
+        std::fs::write(
+            d.path().join("s.json"),
+            r#"{"type": 7, "w": 1920, "h": 1080,
+                "source": [{"id": "a", "path": "a.png"}],
+                "image": [{"id": "dot", "src": "a", "x": 0, "y": 0, "w": 8, "h": 8}],
+                "value": [{"id": "ex", "src": "a", "x": 0, "y": 0, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}],
+                "gaugegraph": [{"id": "gg"}],
+                "timingdistributiongraph": [{"id": "td"}],
+                "destination": [
+                    {"id": "ex", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]},
+                    {"id": "dot", "op": [90], "dst": [{"x": 0, "y": 300, "w": 8, "h": 8}]},
+                    {"id": "gg", "dst": [{"x": 0, "y": 500, "w": 576, "h": 200}]},
+                    {"id": "td", "dst": [{"x": 0, "y": 800, "w": 301, "h": 100}]}]}"#,
+        )
+        .unwrap();
+        let (f, ..) = facts(&a).unwrap();
+        let root = d.path().to_str().unwrap();
+        let s = super::survey_entry(root, "s.json", &f, &Cancel::new(), false, &choice);
+        assert_eq!(s.outcome, "imported");
+        assert_eq!(s.kind, Some(ScreenKind::Result));
+        let frames = s.frames.unwrap();
+        assert_eq!(frames.dropped, 0);
+        // The two graphs and the four-digit number.
+        assert_eq!(frames.widget_quads, 1_443 + 1_516 + 4);
+        // Both graphs drew: at least two pieces of each of the gauge graph's
+        // 288 line columns and of the distribution's 301 barred
+        // columns.
+        assert!(frames.most > 288 * 2 + 301 * 2, "{}", frames.most);
+        assert!(
+            survey_json(d.path(), "s.json", &Choice::default())
+                .frames
+                .is_none()
+        );
     }
 
     #[test]
