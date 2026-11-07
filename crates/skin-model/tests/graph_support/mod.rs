@@ -76,6 +76,44 @@ pub fn element(i: u32, r: [i32; 4], alpha: i32, timer: u16) -> ElementDef {
     }
 }
 
+/// An element drawing judge graph `i` over `r` on the screen timer,
+/// turned `angle` degrees about `pivot`, with `native`.
+pub fn placed_element(
+    i: u32,
+    r: [i32; 4],
+    angle: i32,
+    pivot: skin_model::Anchor,
+    native: Option<skin_model::Native>,
+) -> ElementDef {
+    let mut track = track(r, 255);
+    if angle != 0 {
+        let mut props = [None; 9];
+        for (p, v) in props.iter_mut().zip(r) {
+            *p = Some(v);
+        }
+        props[4] = Some(255);
+        props[8] = Some(angle);
+        track = Track::new(
+            &[KeyDef {
+                at: TimeUs(0),
+                props,
+            }],
+            skin_model::Ease::Linear,
+            skin_model::End::Hold,
+        )
+        .unwrap();
+    }
+    ElementDef {
+        track,
+        place: Place {
+            pivot,
+            native,
+            ..Place::SCREEN
+        },
+        ..screen_element(i, r, 255)
+    }
+}
+
 /// An element on the screen timer.
 pub fn screen_element(i: u32, r: [i32; 4], alpha: i32) -> ElementDef {
     element(i, r, alpha, result_timer::SCREEN)
@@ -286,8 +324,9 @@ pub fn sample(atlas: &Atlas, layer: u16, level: usize, [u, v]: [f32; 2]) -> [f32
 }
 
 /// The RGB (0 to 255) the renderer draws at canvas point `(x, y)`: the
-/// quads in push order over an opaque grey [`BACKDROP`], each unturned
-/// quad covering the point sampled at its uv there (nearest, at the level
+/// quads in push order over an opaque grey [`BACKDROP`], each quad
+/// covering the point (turned clockwise by its angle about its pivot, as
+/// the vertex shader turns its corners) sampled at its uv there (nearest, at the level
 /// [`level`] gives for its own filter, or for `force` when given), times
 /// its colour premultiplied once, blended premultiplied over (design.md
 /// "Rendering and Skins", premultiplied colour); and how many quads cover
@@ -302,7 +341,11 @@ pub fn composite(
     let mut dst = [BACKDROP / 255.0; 3];
     let mut covered = 0;
     for q in quads {
-        assert_eq!(q.angle, 0.0, "the compositor draws unturned quads");
+        // The point turned back about the quad's pivot.
+        let [cx, cy] = q.pivot;
+        let (s, k) = q.angle.sin_cos();
+        let (dx, dy) = (x - cx, y - cy);
+        let (x, y) = (cx + dx * k + dy * s, cy - dx * s + dy * k);
         let [qx, qy, qw, qh] = q.rect;
         if !(x >= qx && x < qx + qw && y >= qy && y < qy + qh) {
             continue;

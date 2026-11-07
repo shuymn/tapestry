@@ -221,6 +221,30 @@ impl Brush {
         }
     }
 
+    /// Pushes the quad showing `f` over the placed canvas rect `rect`,
+    /// turned about the placed canvas point `pivot`: a widget that places
+    /// its whole region once and turns all of its quads about one point;
+    /// `false` when the batch refused it.
+    pub(crate) fn push_placed(
+        &self,
+        out: &mut QuadBatch,
+        rect: [f32; 4],
+        pivot: [f32; 2],
+        f: FrameUv,
+        filter: Filter,
+    ) -> bool {
+        let quad = Quad {
+            rect,
+            uv: f.uv,
+            color: self.color,
+            pivot,
+            angle: self.angle,
+            layer: f.layer,
+            filter,
+        };
+        out.push(self.key, quad)
+    }
+
     /// Pushes [`quad_about`](Self::quad_about); `false` when the batch
     /// refused it.
     pub(crate) fn push_about(

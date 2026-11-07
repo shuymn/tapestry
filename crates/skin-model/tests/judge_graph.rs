@@ -27,10 +27,9 @@ fn perfects(perfect: u32) -> [u32; 9] {
     [perfect, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
-/// The texels under quad `q`'s uv at level 0, as `#` (painted) and `.`
-/// (transparent): its rows read from the bottom up along its first
-/// column, and its columns along its bottom row.
-fn cells(fx: &GFx, q: &skin_model::Quad) -> (String, String) {
+/// Every texel under quad `q`'s uv at level 0, as `#` (painted) and `.`
+/// (transparent): one string per row, top row first.
+fn cells(fx: &GFx, q: &skin_model::Quad) -> Vec<String> {
     let side = fx.atlas.side() as f32;
     let [l, t, r, b] = q.uv.map(|v| (v * side).round() as u32);
     let page = usize::from(q.layer - 1);
@@ -44,24 +43,42 @@ fn cells(fx: &GFx, q: &skin_model::Quad) -> (String, String) {
             other => panic!("texel {other:?} at ({x}, {y})"),
         }
     };
-    let rows = (t..b).rev().map(|y| at(l, y)).collect();
-    let columns = (l..r).map(|x| at(x, b - 1)).collect();
-    (rows, columns)
+    (t..b).map(|y| (l..r).map(|x| at(x, y)).collect()).collect()
+}
+
+/// Three cells of a grid lit `x` columns from the left and `y` rows up
+/// from the bottom of each 5 × 5 cell, top row first.
+fn mask(x: usize, y: usize) -> Vec<String> {
+    let lit = "#".repeat(x) + &".".repeat(5 - x);
+    let cell = (0..5).map(|row| {
+        if row >= 5 - y {
+            lit.clone()
+        } else {
+            ".....".to_owned()
+        }
+    });
+    cell.clone().chain(cell.clone()).chain(cell).collect()
 }
 
 /// A run of three chips on each of the four grids reads the source's
-/// cells from the packed atlas: in each 5 × 5 cell, 4 or 5 texels lit up
-/// from the bottom and 4 or 5 from the left (5 on the axis without a
-/// gap), the rest transparent. A grid painted solid white fails.
+/// cells from the packed atlas, every texel of each: in each 5 × 5 cell,
+/// 4 or 5 rows lit up from the bottom and 4 or 5 columns from the left (5
+/// on the axis without a gap), the rest transparent; read from the bottom
+/// up, a column runs `####.####.####.` or `###############`. A grid
+/// painted solid white, or a cell lit in any other shape, fails.
 #[test]
 fn the_chip_grid_has_the_sources_cells() {
     let cases = [
-        (GRID, "####.####.####.", "####."),
-        (GRID_NO_GAP_X, "####.####.####.", "#####"),
-        (GRID_NO_GAP_Y, "###############", "####."),
-        (GRID_NO_GAPS, "###############", "#####"),
+        (GRID, mask(4, 4)),
+        (GRID_NO_GAP_X, mask(5, 4)),
+        (GRID_NO_GAP_Y, mask(4, 5)),
+        (GRID_NO_GAPS, mask(5, 5)),
     ];
-    for (grid, rows, columns) in cases {
+    assert_eq!(
+        mask(4, 4)[..5],
+        [".....", "####.", "####.", "####.", "####."]
+    );
+    for (grid, want) in cases {
         let s = skin(
             vec![screen_element(0, [0, 0, 100, 100], 255)],
             vec![graph(JudgeGraphKind::Judgment, grid, false, 0)],
@@ -71,8 +88,7 @@ fn the_chip_grid_has_the_sources_cells() {
         fx.frame(0);
         let chips = fx.chips();
         assert_eq!(chips.len(), 1, "grid {grid}");
-        let got = cells(&fx, &chips[0]);
-        assert_eq!(got, (rows.to_owned(), columns.to_owned()), "grid {grid}");
+        assert_eq!(cells(&fx, &chips[0]), want, "grid {grid}");
     }
 }
 
@@ -222,15 +238,28 @@ fn the_scale_is_the_step_of_the_largest_bin() {
     }
 }
 
-/// The runs of one bin, bottom up: each its colour (8-bit RGB) and cells.
+/// The runs of one bin in a region from y 0 to `h`, bottom up: each its
+/// colour (8-bit RGB) and cells. The runs must sit on one another from
+/// the region's bottom, each a whole number of cells.
 fn runs(fx: &GFx, scale: f32, h: f32) -> Vec<([u8; 3], u32)> {
     let mut chips = fx.chips();
     chips.sort_by(|a, b| b.rect[1].total_cmp(&a.rect[1]));
+    let cell = h / scale;
+    let mut bottom = h;
     chips
         .iter()
         .map(|q| {
+            let [_, top, _, height] = q.rect;
+            assert!(
+                (top + height - bottom).abs() < 1e-3,
+                "{:?} not on {bottom}",
+                q.rect
+            );
+            bottom = top;
+            let k = (height / cell).round();
+            assert!((height - k * cell).abs() < 1e-3, "{:?}", q.rect);
             let rgb = [0, 1, 2].map(|c| (q.color[c] * 255.0).round() as u8);
-            (rgb, (q.rect[3] / (h / scale)).round() as u32)
+            (rgb, k as u32)
         })
         .collect()
 }
@@ -429,4 +458,132 @@ fn a_judge_graph_is_checked_and_charged_at_load() {
             Err(LoadError::JudgeGraphImage { graph: 0 })
         ));
     }
+}
+
+/// A minification the horizontal derivative dominates: one bin a pixel
+/// wide over the grid's 5 texels (LOD about 2.32), three chips 150 pixels
+/// tall over 15 texels (magnified). A nearest mipmap filter would read
+/// level 2 from the horizontal step alone, blending; the `NearestBase`
+/// quad reads level 0, every pixel down its column the chip colour or the
+/// backdrop.
+#[test]
+fn a_horizontally_minified_chip_grid_reads_level_zero() {
+    let s = skin(
+        vec![screen_element(0, [0, 0, 1, 1_000], 255)],
+        vec![graph(JudgeGraphKind::Judgment, GRID, false, 0)],
+    );
+    let mut fx = GFx::new(s);
+    fx.view(&view(vec![perfects(3)]));
+    fx.frame(0);
+    let q = fx.chips()[0];
+    assert!((lod(&q, fx.atlas.side()) - 5.0_f32.log2()).abs() < 0.01);
+    assert_eq!(level(&q, fx.atlas.side(), Filter::Nearest), 2);
+    let [_, top, _, h] = q.rect;
+    let (mut lit, mut gaps, mut blended) = (0, 0, 0);
+    for row in top.ceil() as i32..(top + h).floor() as i32 {
+        let y = row as f32 + 0.5;
+        let got = composite(fx.quads(), &fx.atlas, 0.5, y, None).0;
+        if got.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0) {
+            lit += 1;
+        } else if got.iter().all(|g| (g - 128.0).abs() <= 1.0) {
+            gaps += 1;
+        } else {
+            panic!("row {row}: {got:?}");
+        }
+        let nearest = composite(fx.quads(), &fx.atlas, 0.5, y, Some(Filter::Nearest)).0;
+        if !nearest.iter().zip(PG).all(|(g, w)| (g - w).abs() <= 1.0)
+            && !nearest.iter().all(|g| (g - 128.0).abs() <= 1.0)
+        {
+            blended += 1;
+        }
+    }
+    assert!(lit > 0 && gaps > 0, "{lit} lit, {gaps} gaps");
+    assert!(blended > 0);
+}
+
+/// A 20-bin graph with its background and five chips in bin 3.
+fn rotation_view() -> skin_model::ResultView {
+    let mut bins = vec![[0; 9]; 20];
+    bins[3] = perfects(5);
+    bins[12] = [2, 1, 0, 0, 0, 0, 0, 0, 0];
+    view(bins)
+}
+
+/// The track's angle turns the whole graph about the element's pivot in
+/// its region, as the source turns its finished textures: a graph over
+/// (400, 300, 200, 100) turned 90° clockwise about its centre (500, 350)
+/// draws at each point `c + R(p − c)` what the unturned graph draws at
+/// `p`, background, lines, chips and gaps alike. Every quad shares that
+/// pivot and angle; turning each run about its own pivot fails.
+#[test]
+fn the_angle_turns_the_whole_graph_about_its_pivot() {
+    use skin_model::Anchor;
+    let def = || vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)];
+    let frame = |angle| {
+        let e = graph_support::placed_element(0, [400, 300, 200, 100], angle, Anchor::Center, None);
+        let mut fx = GFx::new(skin(vec![e], def()));
+        fx.view(&rotation_view());
+        fx.frame(0);
+        fx
+    };
+    let (flat, turned) = (frame(0), frame(90));
+    // Two stripes in two pieces each, two lines, three runs.
+    assert_eq!(turned.quads().len(), 2 * 2 + 2 + 3);
+    for q in turned.quads() {
+        assert_eq!(q.pivot, [500.0, 350.0]);
+        assert!((q.angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+    let mut checked = 0;
+    for i in 0..40 {
+        for j in 0..20 {
+            let (x, y) = (400.3 + 5.0 * i as f32, 300.3 + 5.0 * j as f32);
+            let want = composite(flat.quads(), &flat.atlas, x, y, None).0;
+            let (dx, dy) = (x - 500.0, y - 350.0);
+            let got = composite(turned.quads(), &turned.atlas, 500.0 - dy, 350.0 + dx, None).0;
+            near(got, want, 0.5);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 800);
+}
+
+/// The element's native size fits the whole graph as the source's
+/// stretch fits its texture of 5 texels a bin and 5 a cell: 70 bins at
+/// scale 30 are 350 × 150 texels. Exact (stretch 9) centres that size in
+/// a 700 × 300 region, at (175, 75); no larger (stretch 8) shrinks it
+/// into a 100 × 300 region, 100 × 42.86 at y 128.57. The lines, stripes
+/// and chips follow the fitted region; nothing draws outside it.
+#[test]
+fn a_native_size_fits_the_whole_graph() {
+    use skin_model::{Anchor, Native};
+    let mut bins = vec![[0; 9]; 70];
+    bins[3] = perfects(25);
+    let frame = |r, native| {
+        let e = graph_support::placed_element(0, r, 0, Anchor::TopLeft, Some(native));
+        let mut fx = GFx::new(skin(
+            vec![e],
+            vec![graph(JudgeGraphKind::Judgment, GRID, true, 0)],
+        ));
+        fx.view(&view(bins.clone()));
+        fx.frame(0);
+        fx
+    };
+    let fx = frame([0, 0, 700, 300], Native::Exact([1, 1]));
+    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None);
+    assert_eq!(at(170.0, 150.0).1, 0);
+    assert_eq!(at(530.0, 150.0).1, 0);
+    assert_eq!(at(300.0, 70.0).1, 0);
+    assert_eq!(at(300.0, 230.0).1, 0);
+    // The base at cell 5 beside the lines; the line at bin 10 (x 225).
+    near(at(300.0, 197.5).0, over_backdrop([0.0; 3], 0.8), 2.0);
+    near(at(225.5, 197.5).0, [31.0; 3], 2.0);
+    near(at(180.0, 125.0).0, [17.0, 17.0, 0.0], 2.0);
+    // Bin 3's chips: x 190..195, a lit texel column at 191.
+    near(at(191.5, 222.0).0, PG, 2.0);
+    let fx = frame([0, 0, 100, 300], Native::NoLarger([1, 1]));
+    let at = |x: f32, y: f32| composite(fx.quads(), &fx.atlas, x, y, None).1;
+    assert_eq!(at(50.0, 128.0), 0);
+    assert_eq!(at(50.0, 129.5), 1);
+    assert_eq!(at(50.0, 170.5), 1);
+    assert_eq!(at(50.0, 172.0), 0);
 }

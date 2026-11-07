@@ -53,7 +53,11 @@ pub enum JudgeGraphKind {
 }
 
 /// A judge graph as a front end builds it. Its element's track places the
-/// whole graph (its angle ignored) and gives its colour and alpha.
+/// whole graph and gives its colour and alpha; the element's native size
+/// (the source's stretch 8 or 9) fits the whole graph as the source fits
+/// its texture, whose texels are 5 a bin across and 5 a cell down, and
+/// its angle turns the whole graph about the element's pivot in that
+/// region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JudgeGraphDef {
     pub kind: JudgeGraphKind,
@@ -176,10 +180,13 @@ pub(crate) fn scale(largest: u32) -> u32 {
 }
 
 impl JudgeGraph {
-    /// Draws the graph over `rect` through `brush`: nothing without
-    /// timelines; the background whole when on, then the chips revealed
-    /// up to `w·min(1, t/delay)` of the screen timer's `t`. A refused push
-    /// stops the graph.
+    /// Draws the graph over the reference rect `rect` through `brush`:
+    /// nothing without timelines; the background whole when on, then the
+    /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
+    /// The rect is placed (lane map, affine) and fitted to the brush's
+    /// native size, if any, as one region; every quad turns with the
+    /// brush's angle about the brush's pivot in that region. A refused
+    /// push stops the graph.
     pub(crate) fn draw(
         &self,
         d: &GraphDraw<'_>,
@@ -203,15 +210,10 @@ impl JudgeGraph {
             .unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
-        let g = Geometry::new(rect, n, scale);
-        let brush = Brush {
-            angle: 0.0,
-            native: None,
-            ..*brush
-        };
+        let g = Geometry::new(region(rect, brush, [n, scale]), brush.pivot, n, scale);
         if self.def.back
             && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
-            && !self.back(&g, f, &brush, out)
+            && !self.back(&g, f, brush, out)
         {
             return;
         }
@@ -249,7 +251,7 @@ impl JudgeGraph {
                     [left, right.min(clip)],
                     f,
                     self.chips,
-                    &brush,
+                    brush,
                     color,
                     out,
                 ) {
@@ -281,7 +283,6 @@ impl JudgeGraph {
         let lines = g.n.div_ceil(10);
         for m in 0..g.scale / 10 {
             let color = tint(brush.color, stripe(m).unit());
-            let b = Brush { color, ..*brush };
             let [top, height] = g.rows(10 * m, 10);
             let mut from = g.x;
             for l in 0..=lines {
@@ -290,7 +291,16 @@ impl JudgeGraph {
                 } else {
                     [g.x + g.w; 2]
                 };
-                if left > from && !b.push(out, [from, top, left - from, height], f, filter) {
+                if left > from
+                    && !g.push(
+                        brush,
+                        color,
+                        [from, top, left - from, height],
+                        f,
+                        filter,
+                        out,
+                    )
+                {
                     return false;
                 }
                 from = right;
@@ -300,13 +310,9 @@ impl JudgeGraph {
             let i = 10 * l;
             let line = if i % 60 == 0 { LINE_60 } else { LINE };
             // Opaque over every stripe: the line's own colour.
-            let color = over(line.unit(), stripe(0).unit());
-            let b = Brush {
-                color: tint(brush.color, color),
-                ..*brush
-            };
+            let color = tint(brush.color, over(line.unit(), stripe(0).unit()));
             let [left, right] = g.line(i);
-            if !b.push(out, [left, g.y, right - left, g.h], f, filter) {
+            if !g.push(brush, color, [left, g.y, right - left, g.h], f, filter, out) {
                 return false;
             }
         }
@@ -314,12 +320,26 @@ impl JudgeGraph {
     }
 }
 
-/// A graph's region and its bins and cells.
+/// The graph's region in canvas pixels: the reference `rect` through the
+/// brush's lane map and affine, then fitted to its native size, if any,
+/// with the graph's texture as the frame: 5 texels a bin across and 5 a
+/// cell down, `[n, scale]` bins and cells.
+fn region(rect: [f32; 4], brush: &Brush, [n, scale]: [u32; 2]) -> [f32; 4] {
+    let [x, y, w, h] = rect;
+    let placed = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
+    let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
+    brush.native.map_or(placed, |native| {
+        native.sized(texels).fit(placed, brush.scale)
+    })
+}
+
+/// A graph's region in canvas pixels, its pivot, and its bins and cells.
 struct Geometry {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+    pivot: [f32; 2],
     n: u32,
     scale: u32,
 }
@@ -331,15 +351,31 @@ fn f64_of(v: i64) -> f64 {
 }
 
 impl Geometry {
-    fn new([x, y, w, h]: [f32; 4], n: u32, scale: u32) -> Self {
+    fn new([x, y, w, h]: [f32; 4], [fx, fy]: [f32; 2], n: u32, scale: u32) -> Self {
         Self {
             x,
             y,
             w,
             h,
+            pivot: [x + fx * w, y + fy * h],
             n: n.max(1),
             scale: scale.max(1),
         }
+    }
+
+    /// Pushes the canvas rect `rect` of the graph in `color`, turned with
+    /// the brush's angle about the graph's pivot; `false` when refused.
+    fn push(
+        &self,
+        brush: &Brush,
+        color: [f32; 4],
+        rect: [f32; 4],
+        f: FrameUv,
+        filter: crate::quad::Filter,
+        out: &mut QuadBatch,
+    ) -> bool {
+        let b = Brush { color, ..*brush };
+        b.push_placed(out, rect, self.pivot, f, filter)
     }
 
     /// Bin `i`'s left and right edges.
@@ -392,11 +428,15 @@ impl Geometry {
             layer: f.layer,
         };
         let [top, height] = self.rows(from, k);
-        let b = Brush {
-            color: tint(brush.color, color),
-            ..*brush
-        };
-        b.push(out, [left, top, right - left, height], uv, image.filter)
+        let color = tint(brush.color, color);
+        self.push(
+            brush,
+            color,
+            [left, top, right - left, height],
+            uv,
+            image.filter,
+            out,
+        )
     }
 }
 
