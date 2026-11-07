@@ -301,31 +301,29 @@ impl Selection {
         level: Option<&input::PanelLevel>,
         now: TimeUs,
     ) -> Option<Pick> {
+        // The controller's events join the window's, within their bound,
+        // with the panel open as each was sent.
+        while let Some((event, panel)) = pad.pop_panel() {
+            self.menu.push(MenuInput::Pad { event, panel });
+        }
+        pad.report_dropped("select");
         while let Some(input) = self.menu.pop() {
-            if let MenuInput::Key(key) = input
-                && !crate::select::acts_under_panel(key, self.shown_panel())
-            {
+            let shown = self.shown_panel();
+            let acts = match input {
+                MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
+                MenuInput::Pad { event, panel } => crate::select::event_acts_under_panel(
+                    event,
+                    shown.or(panel.filter(|_| !self.screen.searching())),
+                ),
+                MenuInput::Text(_) | MenuInput::Preedit(_) => true,
+            };
+            if !acts {
                 continue;
             }
             if let Some(pick) = self.take_reading(input, level, now) {
                 return Some(pick);
             }
         }
-        // The controller's events after the window's, as the keys they
-        // stand for.
-        while let Some((event, sent)) = pad.pop_panel() {
-            let panel = self
-                .shown_panel()
-                .or(sent.filter(|_| !self.screen.searching()));
-            if !crate::select::event_acts_under_panel(event, panel) {
-                continue;
-            }
-            let key = MenuInput::Key(crate::select::event_key(event));
-            if let Some(pick) = self.take_reading(key, level, now) {
-                return Some(pick);
-            }
-        }
-        pad.report_dropped("select");
         if self.search_pending {
             self.refresh();
         }
@@ -2713,6 +2711,49 @@ pub(crate) mod tests {
         }
         let chosen = sel.drain(&mut pad).expect("Confirm chooses");
         assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
+    }
+
+    /// The controller's events share the window's 64-key bound: with a
+    /// chart under the cursor and 64 window keys queued (a held
+    /// Backspace, which does nothing outside the search box), a
+    /// controller Confirm is dropped and counted, and nothing is chosen.
+    #[test]
+    fn controller_events_share_the_key_bound() {
+        use eval::ControlId;
+        use input::{MenuAction, MenuBindings, MenuEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let (mut tap, receiver) = input::menu_queue(MenuBindings {
+            product: controller_product(),
+            controls: vec![(ControlId(1), MenuAction::Press(MenuEvent::Confirm))],
+            step: 1,
+            relative: None,
+            wrap: None,
+        });
+        tap.set_active(true);
+        let mut pad = Pad {
+            receiver: Some(receiver),
+            dropped: 0,
+        };
+        for _ in 0..crate::select::QUEUED_KEYS {
+            sel.menu.push(MenuInput::Key(MenuKey::BackspaceHeld));
+        }
+        tap.offer(
+            &input::Packet {
+                device: input::DeviceId(7),
+                control: ControlId(1),
+                value: 1,
+                background: false,
+            },
+            None,
+        );
+        assert_eq!(
+            sel.drain(&mut pad),
+            None,
+            "the Confirm past the bound chose"
+        );
+        assert_eq!(sel.menu.dropped(), 1);
+        assert_eq!(pad.dropped, 0, "the controller's own queue had room");
     }
 
     /// A keyboard with START on E and SELECT on W reaching an adjustment

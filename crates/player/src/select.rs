@@ -81,6 +81,14 @@ pub enum MenuInput {
     Text(String),
     /// The IME's composition so far; empty when it ends.
     Preedit(String),
+    /// A controller's menu `event`, sent while `panel` was open: the key
+    /// it stands for ([`event_key`]), queued with the window's keys.
+    Pad {
+        /// The event.
+        event: MenuEvent,
+        /// The panel open as its packet came.
+        panel: Option<usize>,
+    },
 }
 
 /// What a controller's bound lane control does on the select screen
@@ -250,10 +258,13 @@ impl MenuQueue {
         match (input, q.back_mut()) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
-            (MenuInput::Key(key), _) => {
-                let keys = q.iter().filter(|i| matches!(i, MenuInput::Key(_))).count();
+            (key @ (MenuInput::Key(_) | MenuInput::Pad { .. }), _) => {
+                let keys = q
+                    .iter()
+                    .filter(|i| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
+                    .count();
                 if keys < QUEUED_KEYS {
-                    q.push_back(MenuInput::Key(key));
+                    q.push_back(key);
                 } else {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -816,6 +827,9 @@ impl SelectScreen {
 
     /// Acts on one input.
     pub fn input(&mut self, input: MenuInput) -> Acted {
+        if let MenuInput::Pad { event, .. } = input {
+            return self.input(MenuInput::Key(event_key(event)));
+        }
         if self.searching {
             return self.search_input(input);
         }
@@ -945,7 +959,8 @@ impl SelectScreen {
                 self.searching = false;
                 Acted::Focus(false)
             }
-            MenuInput::Key(_) => Acted::Nothing,
+            // A controller's event came as its key ([`Self::input`]).
+            MenuInput::Key(_) | MenuInput::Pad { .. } => Acted::Nothing,
         }
     }
 
