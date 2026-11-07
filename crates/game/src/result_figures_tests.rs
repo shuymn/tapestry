@@ -14,8 +14,10 @@ use super::{Rate, TimelineAxis, TimingStats, next_rank};
 /// the largest EX score `notes * 2`; every row agrees with the exact
 /// figures, rates truncated, a grade boundary at `27 · ex = k · max_ex`
 /// met and one below it not, except 1333 of 2000, whose 66.65 % the
-/// source's float rate shows as 66.64 ([`FLOAT_RATES`]).
-const SOURCE_RANKS: [(u32, u32, u32, u32, u8, u32); 25] = [
+/// source's float rate shows as 66.64 ([`FLOAT_RATES`]), and 29 of 54,
+/// whose next grade the source's float product puts 2 away
+/// ([`FLOAT_NEXT`]).
+const SOURCE_RANKS: [(u32, u32, u32, u32, u8, u32); 26] = [
     (0, 270, 0, 0, 0, 30),
     (59, 270, 21, 85, 0, 1),
     (60, 270, 22, 22, 1, 30),
@@ -41,17 +43,28 @@ const SOURCE_RANKS: [(u32, u32, u32, u32, u8, u32); 25] = [
     (2009, 2500, 80, 36, 6, 214),
     (1234, 6666, 18, 51, 0, 248),
     (5678, 9998, 56, 79, 4, 988),
+    (29, 54, 53, 70, 3, 2),
 ];
 
 /// The rows where the source's float rate loses its last digit:
 /// `(ex, max_ex, the exact 103)`.
 const FLOAT_RATES: [(u32, u32, u32); 1] = [(1333, 2000, 65)];
 
+/// The rows where the source's float product `rate · max_ex` falls just
+/// below the EX score before its `ceil`: `(ex, max_ex, the exact 154)`.
+/// At 29 of 54 the next step, 15/27, is EX 30, one away, where the source
+/// shows 2 (`ScoreDataProperty.java:100-104`); tapestry keeps the exact
+/// value, a stated deviation.
+const FLOAT_NEXT: [(u32, u32, u32); 1] = [(29, 54, 1)];
+
 #[test]
 fn rates_grades_and_next_grade_match_the_source() {
-    for (ex, max, whole, mut hundredths, grade, next) in SOURCE_RANKS {
+    for (ex, max, whole, mut hundredths, grade, mut next) in SOURCE_RANKS {
         if let Some(&(_, _, exact)) = FLOAT_RATES.iter().find(|r| (r.0, r.1) == (ex, max)) {
             hundredths = exact;
+        }
+        if let Some(&(_, _, exact)) = FLOAT_NEXT.iter().find(|r| (r.0, r.1) == (ex, max)) {
+            next = exact;
         }
         let r = Rate::of(ex, max).unwrap();
         assert_eq!(
