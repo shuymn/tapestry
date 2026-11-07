@@ -409,15 +409,21 @@ fn staged_result_lines_install_on_their_array() {
     r.prepare_result_text(&mut a).unwrap();
     assert!(r.install_staged_result_text());
     assert!(!r.install_staged_result_text(), "installed once");
-    // Staged for A's array, then the pages replaced: dropped.
+    // Staged for A's array, then C committed on its own array: dropped.
     r.prepare_result_text(&mut a).unwrap();
-    let token = r
-        .install_pages(ScreenKind::Result, x.c.atlas_pages(), 2)
-        .unwrap();
-    r.commit(token).unwrap();
-    let token = r.install(ScreenKind::Result, &x.c, 3).unwrap();
+    let token = r.install(ScreenKind::Result, &x.c, 2).unwrap();
     r.commit(token).unwrap();
     assert!(!r.install_staged_result_text());
+    // A pages-only installation drops what is staged too.
+    let mut c = state(&x.c);
+    r.prepare_result_text(&mut c).unwrap();
+    let token = r
+        .install_pages(ScreenKind::Result, x.a.atlas_pages(), 3)
+        .unwrap();
+    r.commit(token).unwrap();
+    assert!(!r.install_staged_result_text());
+    let token = r.install(ScreenKind::Result, &x.c, 4).unwrap();
+    r.commit(token).unwrap();
     // A refused frame and a refused text, each once.
     let mut c = state(&x.c);
     r.refuse_next_result(true);
