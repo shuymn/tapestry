@@ -202,8 +202,9 @@ pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
     }
 }
 
-/// What a script does to the next pending play skin's specialization
-/// once its Lua executes.
+/// What a script does to the next specialization of its stage (a pending
+/// play skin's, or a result skin's image stage or layout) once its Lua
+/// executes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Specializing {
     /// Press the quit key (`quit-specializing`).
@@ -932,9 +933,10 @@ pub enum SelectStep {
     QuitLoading,
     /// Halfway through the next slow load, close the window.
     CloseLoading,
-    /// What the next pending play skin's specialization gets once its Lua
+    /// What the next specialization of its stage gets once its Lua
     /// executes (`quit-specializing`, `close-specializing`,
-    /// `escalate-specializing`).
+    /// `escalate-specializing`, each optionally after `result-image-` or
+    /// `result-layout-`).
     Specializing(SpecializingStage, Specializing),
     /// Every loudness measurement from here on holds this many
     /// milliseconds before its first block, stopped as a measurement is: a

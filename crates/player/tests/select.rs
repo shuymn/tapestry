@@ -1401,7 +1401,7 @@ fn a_configured_play_skin_is_installed_at_startup() {
 
 /// A play skin that cannot be read admits no chart: the run reports it
 /// refused, the select page shows the result kind's notice line at its
-/// first entry (a result-type skin there has no importer yet), and
+/// first entry (a result skin with no EX score is refused), and
 /// choosing a chart is refused with play's notice, no play starting.
 #[test]
 fn a_refused_play_skin_admits_no_chart_and_a_notice_shows() {

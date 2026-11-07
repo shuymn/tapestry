@@ -306,8 +306,8 @@ fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::
     crate::render_common::read_back(r)
 }
 
-/// A skin of another kind than the one it is built for refuses; a result
-/// skin, which nothing draws yet, keeps the built-in screen unimported.
+/// A skin of another kind than the one it is built for refuses, and a
+/// result skin imports for its own kind.
 #[test]
 fn a_skin_builds_only_for_its_own_kind_and_importer() {
     // Its Lua header pass opens a VM, which the barrier tests count.
