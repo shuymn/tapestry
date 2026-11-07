@@ -483,8 +483,8 @@ pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
 }
 
 /// Numeric op `op` (non-zero) on a `kind` screen: play's [`numeric`], or
-/// the selection profile's built-ins ([`profile::option`]) before the
-/// declared items, a built-in outside the profile unsupported.
+/// the selection or result profile's built-ins before the declared items,
+/// a built-in outside the profile unsupported.
 pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
     if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
         return numeric(op, items);
@@ -505,9 +505,10 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// [`profile::option`] or the result's
 /// [`super::result::profile::option`]), negated for `negative`: its
 /// bridge, built in one allocation of [`MAX_COND_BYTES`], or its constant
-/// folded. A result option's validity ([`result::option_guard`]) is
-/// joined outside the negation, so neither the option nor its negation
-/// holds on a view without the value. The result's judgment class is a
+/// folded. A result option's validity
+/// ([`super::result::profile::option_guard`]) is joined outside the
+/// negation, so neither the option nor its negation holds on a view
+/// without the value. The result's judgment class is a
 /// load-time fact; the result schema has no field for it, so a frame
 /// condition on it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {

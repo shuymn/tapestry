@@ -357,10 +357,12 @@ fn write_png(path: &Path, w: u32, h: u32) {
         .expect("write PNG data");
 }
 
-/// What an imported skin draws: the quads of frames at a few times of a
-/// 100-note play with a perfect judgment at each, each frame within the
-/// skin's quad capacity; its loading state is built too, within the same
-/// capacities. `seed` names one more readout frame's gain, covers,
+/// What an imported skin draws: for a play skin, the quads of frames at a
+/// few times of a 100-note play with a perfect judgment at each, each
+/// frame within the skin's quad capacity, its loading state built too,
+/// within the same capacities; for a selection skin, its frames over a
+/// list; for a result skin, frames at 0 and 500 ms of a ready view and of
+/// one with no result ([`result_view`]). `seed` names one more readout frame's gain, covers,
 /// duration variants and native block.
 ///
 /// # Panics

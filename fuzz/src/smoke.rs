@@ -755,7 +755,8 @@ fn skin_import_seeds_import_and_draw_as_built() {
         let (_, imported) = skin_json(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
         let i = imported.unwrap_or_else(|e| panic!("{name}: {e}"));
         let u = i.report.usage;
-        // Quads at 0, 50, 500 and 5,000 ms, each with a perfect judgment.
+        // A play skin's quads at 0, 50, 500 and 5,000 ms, each with a
+        // perfect judgment; a result skin's per [`draw`].
         let drawn = draw(&i, &[]);
         match name {
             "result" => {

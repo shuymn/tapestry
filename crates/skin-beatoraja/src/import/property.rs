@@ -607,7 +607,8 @@ fn name_id(name: &str) -> Option<i32> {
 }
 
 /// Integer property `id` on a `kind` screen: play's mapping, or the
-/// selection profile's ([`selection::profile::number`]), an id outside
+/// selection or result profile's ([`selection::profile::number`],
+/// [`super::result::profile::number`]), an id outside
 /// it as the factory knows it ([`int_by_id`]) but shown by nothing.
 pub(crate) fn int_in(kind: ScreenKind, id: i32) -> IntProp {
     let class = match kind {
@@ -834,7 +835,8 @@ impl IndexProp {
 }
 
 /// Image-index property `id` on a `kind` screen: play's mapping, or the
-/// selection profile's ([`selection::profile::image_index`]), an id
+/// selection or result profile's ([`selection::profile::image_index`],
+/// [`super::result::profile::image_index`]), an id
 /// outside it unsupported where the factory knows it and selecting entry
 /// 0 where it does not.
 pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
@@ -909,7 +911,8 @@ pub(crate) enum StrProp {
 }
 
 /// String property `id` on a `kind` screen: play's mapping, or the
-/// selection profile's ([`selection::profile::text`]), an id outside it
+/// selection or result profile's ([`selection::profile::text`],
+/// [`super::result::profile::text`]), an id outside it
 /// as the factory knows it ([`str_by_id`]).
 pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
     if kind == ScreenKind::Result {

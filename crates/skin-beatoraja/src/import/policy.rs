@@ -161,7 +161,7 @@ impl fmt::Display for EssentialPart {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Critical(CriticalPart),
-    /// A selection skin's essential part.
+    /// A selection or result skin's essential part.
     Essential(EssentialPart),
     Decorative,
 }

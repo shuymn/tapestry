@@ -475,11 +475,12 @@ impl Cx<'_> {
         // a `len` of 1 or less is an ordinary image whatever its `ref`.
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
-        let index = property::index_in(self.kind, self.int_or(r, "ref", 0)?);
+        let r = self.int_or(r, "ref", 0)?;
+        let index = property::index_in(self.kind, r);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
         if group && self.kind == skin_model::ScreenKind::Result {
-            role = super::result::index_role(role, self.int_or(r, "ref", 0)?);
+            role = super::result::index_role(role, r);
         }
         self.actions(at, act)?;
         if lowered == Lowered::Paint && !group {

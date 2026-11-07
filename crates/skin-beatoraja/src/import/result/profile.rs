@@ -338,12 +338,16 @@ pub(crate) fn read_option(id: i32, fields: &ResultFields) -> Read {
 fn read(guard: &str, src: &str, ty: Ty, fields: &ResultFields) -> Read {
     let scope = Scope::new(&RESULT);
     let state = fields.state();
-    let (Ok(g), Ok(p)) = (compile(guard, &scope, Ty::Bool), compile(src, &scope, ty)) else {
+    // The guard first: an unavailable value compiles nothing more.
+    let Ok(g) = compile(guard, &scope, Ty::Bool) else {
         return Read::Unavailable;
     };
     if !g.eval_bool(&state) {
         return Read::Unavailable;
     }
+    let Ok(p) = compile(src, &scope, ty) else {
+        return Read::Unavailable;
+    };
     match ty {
         Ty::Bool => Read::Value(i32::from(p.eval_bool(&state))),
         _ => Read::Value(p.eval(&state)),
