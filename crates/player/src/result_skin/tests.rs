@@ -356,7 +356,8 @@ fn the_chart_facts_are_projected() {
 /// The chart's length (numbers 1163-1164) is its 1× content end, a
 /// background sound's time included: a note at 2 s and a BGM event at
 /// measure 10 (`#BPM 120`) give 20 s, whatever section or speed the
-/// attempt plays.
+/// attempt plays. The BGM event's sound is declared: the loader keeps no
+/// background object of an undefined `#WAV`.
 #[test]
 fn the_length_is_the_charts_content_end_at_1x() {
     let (_dir, mut loaded) =
