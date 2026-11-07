@@ -11,6 +11,7 @@ pub(crate) mod bar;
 pub(crate) mod cover_paint;
 pub(crate) mod digits;
 pub(crate) mod gauge;
+pub(crate) mod gauge_graph;
 pub(crate) mod glyphs;
 pub(crate) mod image_choice;
 pub(crate) mod judge;
@@ -20,6 +21,7 @@ pub(crate) mod ratio_bar;
 pub(crate) mod scroll;
 pub(crate) mod song_list;
 pub(crate) mod text;
+pub(crate) mod timing_graph;
 
 use bms_model::TimeUs;
 

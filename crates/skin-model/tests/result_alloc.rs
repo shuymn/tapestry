@@ -2,7 +2,8 @@
 //! S10-09g, S10-09h): numbers over shown and hidden values and their
 //! guards, an image choice over the clear type, chart text, the fade-out
 //! and a `when` timer, both judge graphs with their background and reveal,
-//! frame after frame as the timers move, over views that change between
+//! the gauge graph with its reveal and no-input mark, and the timing
+//! distribution with its bars, lines and areas, frame after frame as the timers move, over views that change between
 //! frames, unavailable ones among them.
 //!
 //! A counting global allocator counts allocations made on threads that opt
@@ -18,11 +19,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use result_support::{RFx, best, number, ready, relement, rint};
+use rules::GaugeValue;
 use skin_model::{
-    BestView, ElementDef, FontRef, FrameUv, ImageChoiceDef, ImageChoicePart, ImageSpan,
-    JudgeGraphDef, JudgeGraphKind, PastTable, ResultDefs, ResultNumber, ResultStatus, Skin, Source,
-    TextDef, TextField, TextImage, TextTable, TextValue, TimerRef, Unavailable, WidgetDefs,
-    result_timer,
+    BestView, DEVIATION_SLOTS, ElementDef, FontRef, FrameUv, GRAPH_COLUMNS, GaugeColumn,
+    GaugeGraphColors, GaugeGraphDef, GaugeHistory, GaugeLook, ImageChoiceDef, ImageChoicePart,
+    ImageSpan, JudgeGraphDef, JudgeGraphKind, PastTable, ResultDefs, ResultNumber, ResultStatus,
+    ResultView, Rgba8, Skin, Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef,
+    TimingGraphDef, Unavailable, WidgetDefs, result_timer,
 };
 
 struct Counting;
@@ -123,6 +126,8 @@ fn skin() -> Skin {
             },
             relement(Source::JudgeGraph(0), [0, 200, 520, 82], None),
             relement(Source::JudgeGraph(1), [0, 300, 520, 82], None),
+            relement(Source::GaugeGraph(0), [0, 400, 519, 259], None),
+            relement(Source::TimingGraph(0), [600, 0, 520, 82], None),
         ],
         WidgetDefs {
             numbers: vec![
@@ -149,7 +154,67 @@ fn skin() -> Skin {
         graph(JudgeGraphKind::Judgment, true, false),
         graph(JudgeGraphKind::EarlyLate, true, true),
     ];
-    Skin::new_result(def, ResultDefs { judge_graphs }).unwrap()
+    let translucent = |rgb| Rgba8::rgb(rgb, 0xaa);
+    let look = GaugeGraphColors {
+        border_line: Rgba8::rgb(0xff_0000, 0x80),
+        border_back: translucent(0x44_0000),
+        line: Rgba8::rgb(0x00_00ff, 0x80),
+        back: translucent(0x00_4400),
+    };
+    let gauge_graphs = vec![GaugeGraphDef {
+        colors: [look; GaugeLook::COUNT],
+        solid: 1,
+    }];
+    let timing_graphs = vec![TimingGraphDef {
+        gx: 301,
+        colors: [Rgba8::rgb(0xf5_f5f5, 0xff); 8],
+        average: true,
+        dev: true,
+        solid: 1,
+    }];
+    Skin::new_result(
+        def,
+        ResultDefs {
+            judge_graphs,
+            gauge_graphs,
+            timing_graphs,
+        },
+    )
+    .unwrap()
+}
+
+/// `v` with a gauge history crossing the border every few columns and a
+/// what-if's mark, deviations in every slot, and judge areas.
+fn with_graphs(mut v: ResultView) -> ResultView {
+    let g = |p: i64| GaugeValue(p * GaugeValue::PERCENT);
+    let mut columns = [GaugeColumn {
+        low: g(0),
+        high: g(0),
+        last: g(0),
+    }; GRAPH_COLUMNS];
+    for (i, c) in (0_i64..).zip(columns.iter_mut()) {
+        let (a, b) = (i * 37 % 101, i * 53 % 101);
+        *c = GaugeColumn {
+            low: g(a.min(b)),
+            high: g(a.max(b)),
+            last: g(b),
+        };
+    }
+    v.gauge = Some(Box::new(GaugeHistory {
+        columns,
+        max: g(100),
+        border: g(80),
+        look: GaugeLook::Normal,
+        reached: 288,
+        no_input_from: Some(200),
+    }));
+    let mut deviations = [0_u32; DEVIATION_SLOTS];
+    for (i, d) in (0_u32..).zip(deviations.iter_mut()) {
+        *d = i % 23 + 1;
+    }
+    v.deviations = Some(Box::new(deviations));
+    v.timing_areas = Some([[-20, 20], [-60, 60], [-150, 150], [-220, 220], [-150, 500]]);
+    v
 }
 
 #[test]
@@ -166,10 +231,10 @@ fn a_result_build_allocates_nothing() {
     let mut unavailable = ready(10, BestView::Unavailable, 512);
     unavailable.status = ResultStatus::Unavailable(Unavailable::Failed);
     let views = [
-        ready(1_000, best(ResultNumber::Shown(-3)), 512),
+        with_graphs(ready(1_000, best(ResultNumber::Shown(-3)), 512)),
         ready(1_200, best(ResultNumber::Hidden), 300),
         unavailable,
-        ready(1_400, BestView::Unavailable, 1),
+        with_graphs(ready(1_400, BestView::Unavailable, 1)),
     ];
     let mut total = 0;
     // The first build after preparation, before any view, on the batch
@@ -184,10 +249,17 @@ fn a_result_build_allocates_nothing() {
         total += counted(|| fx.frame(0));
         assert!(!fx.batch.quads().is_empty());
         // Past the reveal, a ready view's graphs draw their backgrounds
-        // and chips.
-        total += counted(|| fx.frame(600));
+        // and chips, the gauge's line and the distribution's bars.
+        total += counted(|| fx.frame(1_600));
         if v.status == ResultStatus::Ready {
             assert!(fx.batch.quads().len() > 2 * 6, "{}", fx.batch.quads().len());
+        }
+        if v.gauge.is_some() {
+            assert!(
+                fx.batch.quads().len() > 288 + 301,
+                "{}",
+                fx.batch.quads().len()
+            );
         }
         assert_eq!(fx.batch.dropped(), 0);
         for ms in (16..2_000).step_by(16) {

@@ -107,6 +107,7 @@ fn graph_skin(dir: &std::path::Path, x: i32) -> Skin {
         def,
         ResultDefs {
             judge_graphs: vec![graph],
+            ..ResultDefs::default()
         },
     )
     .unwrap()

@@ -187,8 +187,9 @@ pub(crate) fn scale(largest: u32) -> u32 {
 
 impl JudgeGraph {
     /// Draws the graph over the reference rect `rect` through `brush`:
-    /// nothing without timelines; the background whole when on, then the
-    /// chips revealed up to `w·min(1, t/delay)` of the screen timer's `t`.
+    /// nothing without timelines or without a positive width and height;
+    /// the background whole when on, then the chips revealed up to
+    /// `w·min(1, t/delay)` of the screen timer's `t`.
     /// The rect is placed (lane map, affine) and fitted to the brush's
     /// native size, if any, as one region; every quad turns with the
     /// brush's angle about the brush's pivot in that region. A refused
@@ -200,6 +201,13 @@ impl JudgeGraph {
         brush: &Brush,
         out: &mut QuadBatch,
     ) {
+        // A rect with no positive width and height (a track may reach
+        // one, or interpolate through 0 into one) draws nothing, as the
+        // other result graphs.
+        let [.., w, h] = brush.affine.rect([0.0, 0.0, brush.map.w(rect[2]), rect[3]]);
+        if !(w > 0.0 && h > 0.0) {
+            return;
+        }
         let Some(tl) = d.timelines else {
             return;
         };
@@ -211,7 +219,12 @@ impl JudgeGraph {
         let largest = notes.iter().copied().max().unwrap_or(0);
         let scale = scale(largest);
         let n = u32::try_from(bins.len()).unwrap_or(BINS);
-        let g = Geometry::new(region(rect, brush, [n, scale]), brush.pivot, n, scale);
+        let g = Geometry::new(
+            region(rect, brush, [n.saturating_mul(5), scale.saturating_mul(5)]),
+            brush.pivot,
+            n,
+            scale,
+        );
         if self.def.back
             && let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs)
             && !self.back(&g, f, brush, out)
@@ -323,12 +336,10 @@ impl JudgeGraph {
 
 /// The graph's region in canvas pixels: the reference `rect` through the
 /// brush's lane map and affine, then fitted to its native size, if any,
-/// with the graph's texture as the frame: 5 texels a bin across and 5 a
-/// cell down, `[n, scale]` bins and cells.
-fn region(rect: [f32; 4], brush: &Brush, [n, scale]: [u32; 2]) -> [f32; 4] {
+/// with the graph's texture of `texels` as the frame.
+pub(crate) fn region(rect: [f32; 4], brush: &Brush, texels: [u32; 2]) -> [f32; 4] {
     let [x, y, w, h] = rect;
     let placed = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
-    let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
     brush.native.map_or(placed, |native| {
         native.sized(texels).fit(placed, brush.scale)
     })

@@ -206,6 +206,7 @@ pub use widget::digits::{
 pub use widget::gauge::{
     GaugeDef, GaugeError, GaugeLook, GaugePart, GaugeParts, MAX_SEGMENTS, Motion,
 };
+pub use widget::gauge_graph::{GaugeGraphColors, GaugeGraphDef};
 pub use widget::glyphs::BitmapLines;
 pub use widget::image_choice::{
     ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS, PastTable,
@@ -230,3 +231,4 @@ pub use widget::text::{
     SelectionText, TextDef, TextError, TextField, TextImage, TextRequest, TextSlots, TextTable,
     TextTableError, TextValue,
 };
+pub use widget::timing_graph::TimingGraphDef;
