@@ -54,12 +54,13 @@ pub enum JudgeGraphKind {
     EarlyLate,
 }
 
-/// How a judge graph's texture fits its element's rect: the source's
+/// How a result graph's texture fits its element's rect: the source's
 /// stretch modes, applied to the whole graph as the source applies them to
-/// an image, the texture being 5 texels a bin across and 5 a cell down.
-/// The aspect-keeping modes depend on the bins and the scale, so the graph
-/// fits itself each frame. A trimmed mode shows only the part of the
-/// fitted graph inside the rect.
+/// an image, the texture being a judge graph's 5 texels a bin across and
+/// 5 a cell down, or a timing distribution's `gx` × scale texels. The
+/// aspect-keeping modes depend on what the graph shows, so it fits itself
+/// each frame. A trimmed mode shows only the part of the fitted graph
+/// inside the rect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GraphFit {
     /// The rect (stretch 0, and the source's unknown modes).
@@ -412,6 +413,19 @@ pub(crate) fn cut(
     Some((cut, [u(cx), v(cy), u(cx + cw), v(cy + ch)]))
 }
 
+/// The point `[fx, fy]` of the region a graph draws: `fitted`, cut to
+/// `clip` when a trimmed fit cuts it.
+pub(crate) fn drawn_pivot(
+    fitted: [f32; 4],
+    clip: Option<[f32; 4]>,
+    [fx, fy]: [f32; 2],
+) -> [f32; 2] {
+    let [dx, dy, dw, dh] = clip
+        .map_or(Some(fitted), |c| intersect(fitted, c))
+        .unwrap_or(fitted);
+    [dx + fx * dw, dy + fy * dh]
+}
+
 /// The part of the rect `a` inside the rect `b`, `None` when empty.
 pub(crate) fn intersect(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {
     let [ax, ay, aw, ah] = a;
@@ -450,16 +464,13 @@ impl Geometry {
         n: u32,
         scale: u32,
     ) -> Self {
-        let [dx, dy, dw, dh] = clip
-            .map_or(Some(fitted), |c| intersect(fitted, c))
-            .unwrap_or(fitted);
         Self {
             x,
             y,
             w,
             h,
             clip,
-            pivot: [dx + fx * dw, dy + fy * dh],
+            pivot: drawn_pivot(fitted, clip, [fx, fy]),
             n: n.max(1),
             scale: scale.max(1),
         }

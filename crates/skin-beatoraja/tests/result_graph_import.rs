@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::result::{Res, folder, import_result, lua_result, ready, sheet};
+use common::result::{Res, folder, graph_json, graph_lua, import_result, lua_result, ready, sheet};
 use rules::GaugeValue;
 use skin_beatoraja::{ImportFacts, NoteKind, Object, Report, Severity};
 use skin_model::{
@@ -16,42 +16,10 @@ use skin_model::{
     ResultView, ScreenKind, Skin,
 };
 
-/// The essential parts every fixture holds.
-const ESSENTIALS_JSON: &str = r#"{"id": "ex", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]},
-    {"id": "dot", "op": [90], "dst": [{"x": 0, "y": 300, "w": 8, "h": 8}]}"#;
-
 /// The gauge graph's region: x 100, y-up 600, 576 × 200 (top 280).
 const GAUGE_DST: &str = r#""dst": [{"x": 100, "y": 600, "w": 576, "h": 200}]"#;
 /// The distribution's region: x 100, y-up 200, 301 × 100 (top 780).
 const TIMING_DST: &str = r#""dst": [{"x": 100, "y": 200, "w": 301, "h": 100}]"#;
-
-/// A JSON result skin with `tables` (the graph records) and `dsts`.
-fn json_skin(tables: &str, dsts: &str) -> String {
-    format!(
-        r#""value": [{{"id": "ex", "src": "s", "x": 0, "y": 32, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}}],
-           {tables}
-           "destination": [{ESSENTIALS_JSON}, {dsts}]"#
-    )
-}
-
-/// The Lua skin of the same parts: `tables` as Lua statements.
-fn lua_skin(tables: &str, dsts: &str) -> String {
-    format!(
-        "local skin = {{ type = 7, name = \"t\", w = 1920, h = 1080 }}\n\
-         if not skin_config then return skin end\n\
-         skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
-         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
-         skin.image = {{ {{ id = \"dot\", src = \"s\", x = 48, y = 0, w = 8, h = 8 }} }}\n\
-         skin.value = {{ {{ id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
-             digit = 4, ref = 71 }} }}\n\
-         {tables}\n\
-         skin.destination = {{\n\
-           {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }},\n\
-           {{ id = \"dot\", op = {{ 90 }}, dst = {{ {{ x = 0, y = 300, w = 8, h = 8 }} }} }},\n\
-           {dsts} }}\n\
-         return skin\n"
-    )
-}
 
 /// An imported skin and its folder, which its atlas reads.
 struct Imported {
@@ -62,7 +30,7 @@ struct Imported {
 
 /// `json_skin` imported.
 fn json(tables: &str, dsts: &str) -> Imported {
-    let d = folder(&json_skin(tables, dsts));
+    let d = folder(&graph_json(tables, dsts));
     let i = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
     Imported {
         _dir: d,
@@ -74,7 +42,7 @@ fn json(tables: &str, dsts: &str) -> Imported {
 /// `lua_skin` imported.
 fn lua(tables: &str, dsts: &str) -> Imported {
     let d = sheet();
-    common::write(d.path(), "s.luaskin", lua_skin(tables, dsts).as_bytes());
+    common::write(d.path(), "s.luaskin", graph_lua(tables, dsts).as_bytes());
     let i = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
         .unwrap()
         .imported;
@@ -417,15 +385,49 @@ fn a_distributions_stretch_fits_it_and_a_gauge_graphs_changes_nothing() {
     }
 }
 
-/// An opaque colour whose three channels differ, as `rrggbbff`.
-fn hex(r: u8, g: u8, b: u8) -> String {
-    format!("{r:02x}{g:02x}{b:02x}ff")
+/// An opaque colour whose three channels differ.
+fn opaque(r: u8, g: u8, b: u8) -> [u8; 4] {
+    [r, g, b, 0xff]
 }
 
-/// `rrggbbff` as 8-bit RGBA.
-fn rgba(h: &str) -> [u8; 4] {
-    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap();
-    [byte(0), byte(2), byte(4), byte(6)]
+/// `c` as the skin writes it, `rrggbbaa`.
+fn hex([r, g, b, a]: [u8; 4]) -> String {
+    format!("{r:02x}{g:02x}{b:02x}{a:02x}")
+}
+
+/// Colour fields as a JSON record's members and as a Lua table's.
+fn fields(fields: &[(&str, [u8; 4])]) -> (String, String) {
+    let join = |f: &dyn Fn(&str, String) -> String| {
+        fields
+            .iter()
+            .map(|&(n, c)| f(n, hex(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (
+        join(&|n, c| format!(r#""{n}": "{c}""#)),
+        join(&|n, c| format!("{n} = \"{c}\"")),
+    )
+}
+
+const GAUGE_LUA_DST: &str = "{ id = \"gg\", dst = { { x = 100, y = 600, w = 576, h = 200 } } }";
+
+/// The gauge graph's roles for `look` under the record members `json`
+/// and `lua`, its JSON and Lua frames equal.
+fn gauge_case(json_members: &str, lua_members: &str, look: GaugeLook) -> Roles {
+    let dst = format!(r#"{{"id": "gg", {GAUGE_DST}}}"#);
+    let j = json(
+        &format!(r#""gaugegraph": [{{"id": "gg", {json_members}}}],"#),
+        &dst,
+    );
+    let l = lua(
+        &format!("skin.gaugegraph = {{ {{ id = \"gg\", {lua_members} }} }}"),
+        GAUGE_LUA_DST,
+    );
+    let v = split_view(look);
+    let (qj, ql) = (frame(j, &v, 2_000), frame(l, &v, 2_000));
+    assert_eq!(qj, ql, "{look:?}");
+    gauge_roles(&qj)
 }
 
 /// A ready view of `look` whose first 144 columns sit flat at 50 % (the
@@ -496,7 +498,7 @@ fn gauge_roles(quads: &[Quad]) -> Roles {
 /// line, border back, line, back.
 #[test]
 fn every_gauge_graph_colour_reaches_its_role() {
-    let names: Vec<(&str, String)> = [
+    let named: Vec<(&str, [u8; 4])> = [
         "assistClearBGColor",
         "assistAndEasyFailBGColor",
         "grooveFailBGColor",
@@ -514,65 +516,38 @@ fn every_gauge_graph_colour_reaches_its_role() {
     ]
     .into_iter()
     .zip(0_u8..)
-    .map(|(n, i)| (n, hex(10 + i, 100 + i, 200 + i)))
+    .map(|(n, i)| (n, opaque(10 + i, 100 + i, 200 + i)))
     .collect();
-    let json_fields = names
-        .iter()
-        .map(|(n, c)| format!(r#""{n}": "{c}""#))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let lua_fields = names
-        .iter()
-        .map(|(n, c)| format!("{n} = \"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let c = |i: usize| rgba(&names[i].1);
-    let dst = format!(r#"{{"id": "gg", {GAUGE_DST}}}"#);
-    let lua_dst = "{ id = \"gg\", dst = { { x = 100, y = 600, w = 576, h = 200 } } }";
+    let (json_fields, lua_fields) = fields(&named);
+    let c = |i: usize| named[i].1;
     for (i, look) in GaugeLook::ALL.into_iter().enumerate() {
-        let j = json(
-            &format!(r#""gaugegraph": [{{"id": "gg", {json_fields}}}],"#),
-            &dst,
-        );
-        let l = lua(
-            &format!("skin.gaugegraph = {{ {{ id = \"gg\", {lua_fields} }} }}"),
-            lua_dst,
-        );
-        let v = split_view(look);
-        let (qj, ql) = (frame(j, &v, 2_000), frame(l, &v, 2_000));
-        assert_eq!(qj, ql, "{look:?}");
         let (back, border_back, line, border_line) = if i < 3 {
             (c(i), c(13), c(6 + i), c(12))
         } else {
             (c(i), c(i), c(6 + i), c(6 + i))
         };
         assert_eq!(
-            gauge_roles(&qj),
+            gauge_case(&json_fields, &lua_fields, look),
             (back, border_back, vec![line], vec![border_line]),
             "{look:?}"
         );
     }
-    let entries: Vec<String> = (0..24_u8).map(|i| hex(10 + i, 60 + i, 110 + i)).collect();
-    let json_array = entries
+    let entries: Vec<[u8; 4]> = (0..24_u8)
+        .map(|i| opaque(10 + i, 60 + i, 110 + i))
+        .collect();
+    let array = entries
         .iter()
-        .map(|e| format!("\"{e}\""))
+        .map(|&e| format!("\"{}\"", hex(e)))
         .collect::<Vec<_>>()
         .join(", ");
     for (i, look) in GaugeLook::ALL.into_iter().enumerate() {
-        let j = json(
-            &format!(r#""gaugegraph": [{{"id": "gg", "color": [{json_array}]}}],"#),
-            &dst,
-        );
-        let l = lua(
-            &format!("skin.gaugegraph = {{ {{ id = \"gg\", color = {{ {json_array} }} }} }}"),
-            lua_dst,
-        );
-        let v = split_view(look);
-        let (qj, ql) = (frame(j, &v, 2_000), frame(l, &v, 2_000));
-        assert_eq!(qj, ql, "{look:?}");
-        let e = |k: usize| rgba(&entries[4 * i + k]);
+        let e = |k: usize| entries[4 * i + k];
         assert_eq!(
-            gauge_roles(&qj),
+            gauge_case(
+                &format!(r#""color": [{array}]"#),
+                &format!("color = {{ {array} }}"),
+                look
+            ),
             (e(3), e(1), vec![e(2)], vec![e(0)]),
             "{look:?}"
         );
@@ -610,7 +585,7 @@ fn at_ms(quads: &[Quad], ms: i32, row: f32) -> Option<[u8; 4]> {
 }
 
 /// The eight distribution colour fields, each a distinct opaque colour.
-fn timing_fields() -> Vec<(&'static str, String)> {
+fn timing_fields() -> Vec<(&'static str, [u8; 4])> {
     [
         "graphColor",
         "averageColor",
@@ -623,22 +598,17 @@ fn timing_fields() -> Vec<(&'static str, String)> {
     ]
     .into_iter()
     .zip(0_u8..)
-    .map(|(n, i)| (n, hex(20 + i, 120 + i, 220 - i)))
+    .map(|(n, i)| (n, opaque(20 + i, 120 + i, 220 - i)))
     .collect()
 }
 
-/// A distribution's JSON and Lua records with `fields` and `more`.
-fn timing_records(fields: &[(&str, String)], more_json: &str, more_lua: &str) -> (String, String) {
-    let j = fields
-        .iter()
-        .map(|(n, c)| format!(r#""{n}": "{c}""#))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let l = fields
-        .iter()
-        .map(|(n, c)| format!("{n} = \"{c}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
+/// A distribution's JSON and Lua records with `colours` and `more`.
+fn timing_records(
+    colours: &[(&str, [u8; 4])],
+    more_json: &str,
+    more_lua: &str,
+) -> (String, String) {
+    let (j, l) = fields(colours);
     (
         format!(r#""timingdistributiongraph": [{{"id": "td", {j}{more_json}}}],"#),
         format!("skin.timingdistributiongraph = {{ {{ id = \"td\", {l}{more_lua} }} }}"),
@@ -660,7 +630,7 @@ fn every_distribution_colour_reaches_its_role() {
     let qj = frame(json(&tj, &dst), &v, 0);
     let ql = frame(lua(&tl, TIMING_LUA_DST), &v, 0);
     assert_eq!(qj, ql);
-    let c = |i: usize| Some(rgba(&fields[i].1));
+    let c = |i: usize| Some(fields[i].1);
     assert_eq!(at_ms(&qj, -70, 9.0), c(0), "bar");
     assert_eq!(at_ms(&qj, -1, 5.0), c(1), "average");
     assert_eq!(at_ms(&qj, 11, 5.0), c(2), "σ");
@@ -676,7 +646,7 @@ fn every_distribution_colour_reaches_its_role() {
 #[test]
 fn the_line_flags_are_on_only_at_one() {
     let fields = timing_fields();
-    let c = |i: usize| Some(rgba(&fields[i].1));
+    let c = |i: usize| Some(fields[i].1);
     let dst = format!(r#"{{"id": "td", {TIMING_DST}}}"#);
     let v = stats_view();
     for flag in [-1, 0, 1, 2] {
@@ -711,7 +681,7 @@ fn the_line_flags_are_on_only_at_one() {
 #[test]
 fn the_columns_divide_and_clamp_as_the_source() {
     let fields = timing_fields();
-    let c = |i: usize| Some(rgba(&fields[i].1));
+    let c = |i: usize| Some(fields[i].1);
     let dst = format!(r#"{{"id": "td", {TIMING_DST}}}"#);
     let mut v = stats_view();
     v.timing = None;
@@ -736,4 +706,21 @@ fn the_columns_divide_and_clamp_as_the_source() {
     assert_eq!(charge, 4 + 5 + 11);
     assert_eq!(colour_at(&q, 101.0, 830.0), c(3));
     assert_eq!(colour_at(&q, 400.0, 830.0), c(3));
+}
+
+/// A graph's destination keeps every key: a gauge graph and a
+/// distribution moving from x 100 to 300 over 1 s are at x 200 at 500 ms.
+#[test]
+fn a_graphs_keys_move_it() {
+    let dsts = r#"{"id": "gg", "dst": [{"time": 0, "x": 100, "y": 600, "w": 576, "h": 200}, {"time": 1000, "x": 300, "y": 600, "w": 576, "h": 200}]},
+        {"id": "td", "dst": [{"time": 0, "x": 100, "y": 200, "w": 301, "h": 100}, {"time": 1000, "x": 300, "y": 200, "w": 301, "h": 100}]}"#;
+    let q = frame(json(BOTH_JSON, dsts), &view(GaugeLook::Normal), 500);
+    let left = |top: f32| {
+        q.iter()
+            .filter(|q| q.rect[1] >= top && q.rect[1] < top + 100.0)
+            .map(|q| q.rect[0])
+            .fold(f32::MAX, f32::min)
+    };
+    assert_eq!(left(280.0), 200.0);
+    assert_eq!(left(780.0), 200.0);
 }

@@ -19,7 +19,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use super::judge_graph::{GraphFit, cut, fitted_region, intersect};
+use super::judge_graph::{GraphFit, cut, drawn_pivot, fitted_region};
 use super::{Brush, Frame, ImageRef, tint};
 use crate::atlas::uv::FrameUv;
 use crate::canvas::f32_of;
@@ -251,11 +251,6 @@ impl TimingGraph {
         if !(w > 0.0 && h > 0.0) {
             return;
         }
-        let [px, py] = brush.pivot;
-        // The pivot sits in the region drawn: a trimmed fit's cut.
-        let [dx, dy, dw, dh] = clip
-            .map_or(Some(fitted), |c| intersect(fitted, c))
-            .unwrap_or(fitted);
         let g = Grid {
             x: f64::from(x),
             y: f64::from(y),
@@ -263,7 +258,7 @@ impl TimingGraph {
             h: f64::from(h),
             gx: f64::from(n),
             scale: f64::from(scale),
-            pivot: [dx + px * dw, dy + py * dh],
+            pivot: drawn_pivot(fitted, clip, brush.pivot),
             clip,
             brush,
             f,

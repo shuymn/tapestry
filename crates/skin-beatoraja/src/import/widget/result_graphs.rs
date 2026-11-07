@@ -18,9 +18,7 @@
 //! distribution's own error colour (`SkinTimingVisualizer.java:185-191`),
 //! with a note; a bad gauge graph colour fails the source's skin instead.
 
-use skin_model::{
-    Filter, GaugeGraphColors, GaugeGraphDef, GaugeLook, Rgba8, Source, TimingGraphDef,
-};
+use skin_model::{GaugeGraphColors, GaugeGraphDef, GaugeLook, Rgba8, Source, TimingGraphDef};
 
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Severity, Span};
@@ -152,29 +150,6 @@ impl Cx<'_> {
         })
     }
 
-    /// The opaque white system image the graphs tint, drawn nearest,
-    /// charged and added once; a limit is located at `at`.
-    fn graph_white(&mut self, at: Span) -> Result<u32, ImportError> {
-        let white = [255; 4];
-        if let Some(i) = self.assets.system(white, Filter::Nearest) {
-            return Ok(i);
-        }
-        self.budget.image(1).map_err(|l| self.limit(at, l))?;
-        self.assets
-            .add_system(white, Filter::Nearest)
-            .map_err(|l| self.limit(at, l))
-    }
-
-    /// The element's track with each key's rect, unbaked.
-    fn graph_track(&mut self, c: &super::super::Common) -> Result<skin_model::Track, ImportError> {
-        let mut rects = Vec::with_capacity(c.track.keys.len());
-        for k in &c.track.keys {
-            let r = self.key_rect(c, k)?;
-            rects.push(r.model().ok_or_else(|| self.range(c.span, "dst"))?);
-        }
-        self.model_track(c, &rects)
-    }
-
     /// The gauge graph record `rec` at `dst`: the 24-entry `color` array
     /// when present (a missing entry `000000`), else the 14 named colours.
     pub(in super::super) fn gauge_graph(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
@@ -185,12 +160,9 @@ impl Cx<'_> {
             let entries = self.opt_strings(Some(array), "color")?;
             let mut looks = [[RED; 4]; GaugeLook::COUNT];
             for (i, slot) in looks.iter_mut().flatten().enumerate() {
-                // Past the array, the source's own black.
+                // Past the array, the source's black; a null entry, red.
                 let s = entries.get(i).map_or(Some("000000"), Option::as_deref);
-                *slot = match s {
-                    Some(s) => self.parsed(at, s, "color"),
-                    None => self.parsed(at, "", "color"),
-                };
+                *slot = self.parsed(at, s.unwrap_or(""), "color");
             }
             looks.map(|[border_line, border_back, line, back]| GaugeGraphColors {
                 border_line,
