@@ -951,6 +951,10 @@ struct Shared {
     /// saw it (dev-tools).
     #[cfg(feature = "dev-tools")]
     end_drawn: AtomicU64,
+    /// Select screen frames presented, each counted after the frame sink
+    /// saw it (dev-tools: a script's `drawn` step on the select screen).
+    #[cfg(feature = "dev-tools")]
+    selection_drawn: AtomicU64,
     /// Loading frames presented (dev-tools: a slow load's checkpoints).
     #[cfg(feature = "dev-tools")]
     loading_drawn: AtomicU64,
@@ -998,6 +1002,8 @@ impl Shared {
             end_page: Mutex::new(EndSlot::default()),
             #[cfg(feature = "dev-tools")]
             end_drawn: AtomicU64::new(0),
+            #[cfg(feature = "dev-tools")]
+            selection_drawn: AtomicU64::new(0),
             #[cfg(feature = "dev-tools")]
             loading_drawn: AtomicU64::new(0),
             loading: Mutex::new(LoadingSlot::default()),
@@ -1528,6 +1534,13 @@ impl RenderLink {
     #[cfg(feature = "dev-tools")]
     pub fn end_page_drawn(&self) -> bool {
         self.shared.end_drawn.load(Ordering::Acquire) >= self.end_pages.load(Ordering::Relaxed)
+    }
+
+    /// How many select screen frames were presented so far, each after
+    /// the frame sink saw it (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn selection_drawn(&self) -> u64 {
+        self.shared.selection_drawn.load(Ordering::Acquire)
     }
 
     /// Waits at most `timeout` until the end page shown last has been
@@ -3809,6 +3822,12 @@ impl Run {
                         self.shared
                             .end_drawn
                             .store(self.end_page.0, Ordering::Release);
+                    }
+                    // A select screen frame drawn, for a script waiting on
+                    // one (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if matches!(mode, Mode::Selection) && timing.presented {
+                        self.shared.selection_drawn.fetch_add(1, Ordering::AcqRel);
                     }
                 }
                 Err(e) => {

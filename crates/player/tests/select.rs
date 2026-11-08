@@ -145,7 +145,7 @@ fn choosing_a_chart_plays_it_and_returns() {
     let frames_arg = frames.display().to_string();
     let (_, stdout) = run(
         &fx,
-        "pick=a.bms,enter,drawn,back,wait=a.bms,close",
+        "pick=a.bms,enter,drawn,back,wait=a.bms,drawn,close",
         &["--dev-frames", &frames_arg],
     );
     let at = |line: &str| {
@@ -524,7 +524,7 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
     let frames_arg = frames.display().to_string();
     let (_, stdout) = run(
         &fx,
-        "pick=a.bms,slow-load=1500,enter,back,close",
+        "pick=a.bms,slow-load=1500,enter,back,wait=a.bms,drawn,close",
         &["--dev-frames", &frames_arg],
     );
     let at = |from: usize, line: &str| {

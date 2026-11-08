@@ -893,8 +893,9 @@ pub enum SelectStep {
     Play(scenario::PlayStep),
     /// Save the frame its capture names, in the next play that starts.
     Capture(u16),
-    /// On a result: wait until its page has been drawn, at most
-    /// [`STEP_TIMEOUT`].
+    /// On a result: wait until its page has been drawn; on the select
+    /// screen: wait until a frame of it is presented after the step
+    /// began. At most [`STEP_TIMEOUT`].
     Drawn,
     /// On a result: leave it (the quit key).
     Back,
@@ -1009,7 +1010,8 @@ pub struct SlowLoad {
 /// the background's; `hold-background` holds every background
 /// measurement from then on at its gate until a load waits for it or the
 /// run ends, and `background` waits until one holds there, or until the
-/// background has no job at all),
+/// background has no job at all, and `drawn` waits until a frame of the
+/// select screen is presented after it),
 /// `drawn` (wait until the result's page is drawn), `back`, `retry`, `next`
 /// and `prev` on a result; a step out of place, or a chart not
 /// listed within [`STEP_TIMEOUT`] of no scan pass running (or
@@ -1028,6 +1030,9 @@ pub struct SelectScript {
     looked: Option<std::time::Instant>,
     /// The input thread's wakes when an `idle` step began.
     pub idle_from: Option<u64>,
+    /// The select screen frames presented when a `drawn` step on it
+    /// began.
+    pub drawn_from: Option<u64>,
     /// The next load's loudness measurement closes the window
     /// (`close-measuring`).
     pub close_measuring: bool,
@@ -1185,6 +1190,7 @@ impl SelectScript {
         self.began = None;
         self.looked = None;
         self.idle_from = None;
+        self.drawn_from = None;
         self.identities.clear();
     }
 
