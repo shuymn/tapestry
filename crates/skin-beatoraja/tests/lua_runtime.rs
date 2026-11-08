@@ -675,6 +675,45 @@ fn a_negative_selector_skips_its_runtime_draws() {
     assert_eq!(outputs(&f), [0, 2, 0, 200, 1]);
 }
 
+/// The same with a selector from `ref` alone (image index 370, the selected
+/// row's clear type, −1 with no played chart under the cursor): its runtime
+/// draw runs only when the selector is not negative.
+#[test]
+fn a_negative_ref_selector_skips_its_runtime_draws() {
+    let text = entry(
+        "local c = 0",
+        &["function() return c end"],
+        "function() return true end",
+    )
+    .replace(
+        "return skin\n",
+        "skin.imageset[#skin.imageset + 1] = { id = \"sr\", ref = 370, images = { \"dot\" } }\n\
+         skin.destination[#skin.destination + 1] = { id = \"sr\",\n\
+           draw = function() c = c + 1 return true end,\n\
+           dst = { { x = 600, y = 0, w = 8, h = 8 } } }\n\
+         return skin\n",
+    );
+    let mut i = import(&text);
+    let n = runtime(&mut i).outputs();
+    // The counter and the draw.
+    assert_eq!(n, 2, "{:?}", i.callbacks);
+    let set = |played| fields(n, &[("selected.played", played), ("cursor.chart", 1)]);
+    for _ in 0..2 {
+        let mut f = set(0);
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0, 0]);
+        assert_eq!(runtime(&mut i).status()[1], CallStatus::Skipped);
+    }
+    // A played chart: the selector is its lamp index, 0, so the draw runs.
+    for _ in 0..2 {
+        let mut f = set(1);
+        runtime(&mut i).frame(&mut f, &[]);
+    }
+    let mut f = set(1);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [2, 1]);
+}
+
 /// C4 on a result screen: a read answers through the result profile's
 /// bridge over the result state, absent-feature ids with the source's
 /// value.
