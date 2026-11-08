@@ -67,17 +67,17 @@ mod sandbox;
 mod schema;
 #[cfg(feature = "dev-tools")]
 pub mod survey;
+mod sync;
 pub(crate) mod syntax;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(feature = "dev-tools")]
 pub mod vm_hooks;
 
-use std::cell::{Cell, RefCell};
+use self::sync::{SyncCell, SyncRefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -338,35 +338,35 @@ pub(crate) struct Pass {
     ledger: Ledger,
     root: Root,
     entry_dir: String,
-    store: RefCell<Store>,
+    store: SyncRefCell<Store>,
     /// The files this pass loaded, the entry first, and as a set.
-    modules: RefCell<Vec<String>>,
-    loaded: RefCell<std::collections::HashSet<String>>,
+    modules: SyncRefCell<Vec<String>>,
+    loaded: SyncRefCell<std::collections::HashSet<String>>,
     /// `require`'s cache: names to identities, identities to values.
-    names: RefCell<HashMap<String, FileId>>,
-    cache: RefCell<HashMap<FileId, Option<RegistryKey>>>,
-    depth: Cell<u32>,
+    names: SyncRefCell<HashMap<String, FileId>>,
+    cache: SyncRefCell<HashMap<FileId, Option<RegistryKey>>>,
+    depth: SyncCell<u32>,
     /// The host API functions, by address.
-    hosts: RefCell<HashMap<usize, u16>>,
-    handled: Cell<u64>,
-    last_error: RefCell<Option<Loc>>,
+    hosts: SyncRefCell<HashMap<usize, u16>>,
+    handled: SyncCell<u64>,
+    last_error: SyncRefCell<Option<Loc>>,
     bridge: Option<Bridge>,
     /// The configured pass's import facts, and the facts it read once
     /// each, in first-read order.
     facts: Option<ImportFacts>,
-    reads: RefCell<Vec<FactRead>>,
+    reads: SyncRefCell<Vec<FactRead>>,
     /// The fact reads by allowlisted label, for the report.
     #[cfg(feature = "dev-tools")]
-    fact_counts: RefCell<std::collections::BTreeMap<String, u32>>,
+    fact_counts: SyncRefCell<std::collections::BTreeMap<String, u32>>,
     /// The configured pass's chunks by identity, and the parsed files
     /// that have constructors, in the order they were parsed.
-    parsed: RefCell<HashMap<FileId, Chunk>>,
-    files: RefCell<Vec<callback::ParsedFile>>,
+    parsed: SyncRefCell<HashMap<FileId, Chunk>>,
+    files: SyncRefCell<Vec<callback::ParsedFile>>,
     /// The bytes of the rewritten chunks kept
     /// ([`limits::MAX_REWRITTEN_BYTES`]).
-    rewritten: Cell<usize>,
+    rewritten: SyncCell<usize>,
     #[cfg(feature = "dev-tools")]
-    timings: Cell<Timings>,
+    timings: SyncCell<Timings>,
 }
 
 /// What [`LuaHeader::timed`] gives: the stages' times of an import, or
@@ -408,25 +408,25 @@ impl Pass {
             ledger: Ledger::new(counts, spent, cancel.clone()),
             root: root.clone(),
             entry_dir,
-            store: RefCell::new(store),
-            modules: RefCell::new(Vec::new()),
-            loaded: RefCell::new(std::collections::HashSet::new()),
-            names: RefCell::new(HashMap::new()),
-            cache: RefCell::new(HashMap::new()),
-            depth: Cell::new(0),
-            hosts: RefCell::new(HashMap::new()),
-            handled: Cell::new(0),
-            last_error: RefCell::new(None),
+            store: SyncRefCell::new(store),
+            modules: SyncRefCell::new(Vec::new()),
+            loaded: SyncRefCell::new(std::collections::HashSet::new()),
+            names: SyncRefCell::new(HashMap::new()),
+            cache: SyncRefCell::new(HashMap::new()),
+            depth: SyncCell::new(0),
+            hosts: SyncRefCell::new(HashMap::new()),
+            handled: SyncCell::new(0),
+            last_error: SyncRefCell::new(None),
             bridge,
             facts,
-            reads: RefCell::new(Vec::new()),
+            reads: SyncRefCell::new(Vec::new()),
             #[cfg(feature = "dev-tools")]
-            fact_counts: RefCell::new(std::collections::BTreeMap::new()),
-            parsed: RefCell::new(HashMap::new()),
-            files: RefCell::new(Vec::new()),
-            rewritten: Cell::new(0),
+            fact_counts: SyncRefCell::new(std::collections::BTreeMap::new()),
+            parsed: SyncRefCell::new(HashMap::new()),
+            files: SyncRefCell::new(Vec::new()),
+            rewritten: SyncCell::new(0),
             #[cfg(feature = "dev-tools")]
-            timings: Cell::new(Timings::default()),
+            timings: SyncCell::new(Timings::default()),
         }
     }
 
@@ -617,7 +617,7 @@ fn pass(
 ) {
     #[cfg(test)]
     tests::pass_witness();
-    let pass = Rc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
+    let pass = Arc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
     let r = run_pass(&pass, entry);
     let counts = pass.ledger.counts();
     let spent = pass.ledger.spent();
@@ -634,14 +634,14 @@ fn pass(
 #[cfg(feature = "dev-tools")]
 thread_local! {
     /// The stages of this thread's last pass.
-    static LAST_TIMINGS: Cell<Timings> = Cell::new(Timings::default());
+    static LAST_TIMINGS: std::cell::Cell<Timings> = std::cell::Cell::new(Timings::default());
     /// The fact reads of this thread's last pass, by label.
-    pub(crate) static LAST_FACTS: RefCell<std::collections::BTreeMap<String, u32>> =
-        const { RefCell::new(std::collections::BTreeMap::new()) };
+    pub(crate) static LAST_FACTS: SyncRefCell<std::collections::BTreeMap<String, u32>> =
+        const { SyncRefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// [`pass`]'s work: the VM lives only inside.
-fn run_pass(pass: &Rc<Pass>, entry: &str) -> Result<Converted, Stop> {
+fn run_pass(pass: &Arc<Pass>, entry: &str) -> Result<Converted, Stop> {
     if pass.ledger.cancelled() {
         return Err(Stop::Fault(ImportError::Lua {
             at: None,
@@ -980,7 +980,7 @@ impl LuaHeader {
             }
         };
         admit(&mut def, facts.scene)?;
-        let mut t = LAST_TIMINGS.with(Cell::get);
+        let mut t = LAST_TIMINGS.with(std::cell::Cell::get);
         let start = std::time::Instant::now();
         std::hint::black_box(import(&mut def, &self.header, config, facts.scene)?);
         t.import = start.elapsed();

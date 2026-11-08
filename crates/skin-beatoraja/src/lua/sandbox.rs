@@ -33,7 +33,7 @@
 //! library's private `charge`, `refuse` and `metatable` callbacks, O(1),
 //! do not.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use mlua::chunk::ChunkMode;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Value, VmState};
@@ -241,12 +241,12 @@ const MEMORY_ERROR: &str = "not enough memory";
 /// `false` once a fault is recorded (any error of `f` becomes one: a
 /// failed allocation the memory fault, another a Lua error). It never
 /// returns a Rust error to Lua.
-pub(super) fn host_raw<F, R>(lua: &Lua, pass: &Rc<Pass>, f: F) -> mlua::Result<Function>
+pub(super) fn host_raw<F, R>(lua: &Lua, pass: &Arc<Pass>, f: F) -> mlua::Result<Function>
 where
-    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + 'static,
+    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + Send + 'static,
     R: mlua::IntoLuaMulti,
 {
-    let pass = Rc::clone(pass);
+    let pass = Arc::clone(pass);
     lua.create_function(move |lua, args: MultiValue| -> mlua::Result<MultiValue> {
         let r = pass
             .ledger
@@ -275,9 +275,9 @@ where
 /// A host function as a skin calls it: [`host_raw`]'s, given exactly
 /// `arity` (0 or 1) of the skin's arguments, its results returned and a
 /// fault raised in Lua.
-pub(super) fn host<F, R>(lua: &Lua, pass: &Rc<Pass>, arity: u8, f: F) -> mlua::Result<Function>
+pub(super) fn host<F, R>(lua: &Lua, pass: &Arc<Pass>, arity: u8, f: F) -> mlua::Result<Function>
 where
-    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + 'static,
+    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<R> + Send + 'static,
     R: mlua::IntoLuaMulti,
 {
     debug_assert!(arity <= 1, "a face passes at most one argument");
@@ -305,7 +305,7 @@ fn lib_ids(lua: &Lua, env: &Table) -> mlua::Result<Table> {
 }
 
 /// A fresh VM for one pass, its environment built and its caps set.
-pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
+pub(super) fn vm(pass: &Arc<Pass>) -> mlua::Result<Lua> {
     let lua = Lua::new_with(
         StdLib::STRING | StdLib::TABLE | StdLib::MATH,
         // A panic in a host function is never a Lua error.
@@ -314,7 +314,7 @@ pub(super) fn vm(pass: &Rc<Pass>) -> mlua::Result<Lua> {
     lua.set_memory_limit(MAX_LUA_MEMORY)?;
     #[cfg(test)]
     lua.set_app_data(super::tests::Live::new());
-    let hook = Rc::clone(pass);
+    let hook = Arc::clone(pass);
     let after_fault = std::cell::Cell::new(0_u32);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(INSTRUCTION_STEP),

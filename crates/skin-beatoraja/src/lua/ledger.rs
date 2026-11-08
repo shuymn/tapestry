@@ -6,7 +6,7 @@
 //! instruction step and protected call raises it again, so a Lua
 //! protected call cannot catch it or reset a budget.
 
-use std::cell::{Cell, RefCell};
+use super::sync::{SyncCell, SyncRefCell};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,7 @@ use crate::lua::LuaLimit;
 /// the test set on its thread (`tests::TIME_LIMIT`).
 fn time_limit() -> Duration {
     #[cfg(test)]
-    if let Some(limit) = super::tests::TIME_LIMIT.with(Cell::get) {
+    if let Some(limit) = super::tests::TIME_LIMIT.with(std::cell::Cell::get) {
         return limit;
     }
     MAX_LUA_TIME
@@ -125,28 +125,28 @@ pub(crate) enum Stop {
 
 /// One pass's accounting.
 pub(crate) struct Ledger {
-    counts: Cell<Counts>,
-    fault: RefCell<Option<Stop>>,
-    faulted: Cell<bool>,
+    counts: SyncCell<Counts>,
+    fault: SyncRefCell<Option<Stop>>,
+    faulted: SyncCell<bool>,
     cancel: Cancel,
     /// The time the candidate's earlier passes ran, and when this one
     /// started, for [`MAX_LUA_TIME`].
     spent: Duration,
     started: Instant,
     /// The time this pass ran Lua, once its execution ended.
-    stopped: Cell<Option<Duration>>,
+    stopped: SyncCell<Option<Duration>>,
 }
 
 impl Ledger {
     pub(crate) fn new(counts: Counts, spent: Duration, cancel: Cancel) -> Self {
         Self {
-            counts: Cell::new(counts),
-            fault: RefCell::new(None),
-            faulted: Cell::new(false),
+            counts: SyncCell::new(counts),
+            fault: SyncRefCell::new(None),
+            faulted: SyncCell::new(false),
             cancel,
             spent,
             started: Instant::now(),
-            stopped: Cell::new(None),
+            stopped: SyncCell::new(None),
         }
     }
 

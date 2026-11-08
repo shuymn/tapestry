@@ -31,6 +31,8 @@
 //! sentinel, the smallest integer, kept so that a skin can test a timer
 //! for off.
 
+use std::sync::Arc;
+
 use mlua::{Lua, MultiValue, Table, Value};
 
 use super::facts::{self, NumberRead, OptionRead, TextRead};
@@ -243,7 +245,7 @@ fn metatable_name(name: &str) -> String {
 
 /// Builds the host modules of a fresh VM, kept in its registry for
 /// `require`.
-pub(super) fn install(lua: &Lua, pass: &std::rc::Rc<Pass>) -> mlua::Result<()> {
+pub(super) fn install(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<()> {
     let configured = pass.bridge.is_some();
     let write = if configured {
         Some(host(lua, pass, 0, |lua, pass, _| -> mlua::Result<()> {

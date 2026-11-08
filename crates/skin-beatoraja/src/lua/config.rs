@@ -26,7 +26,7 @@
 //! decides the definition it returns. Of entries sharing a name, the
 //! last declared wins. An entry without a name is absent.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use mlua::{Function, Lua, Table, Value};
 use skin_model::MAX_PATH_BYTES;
@@ -101,7 +101,7 @@ impl Bridge {
 /// the pass may change, built afresh for it.
 pub(super) fn install(
     lua: &Lua,
-    pass: &Rc<Pass>,
+    pass: &Arc<Pass>,
     env: &Table,
     bridge: &Bridge,
 ) -> mlua::Result<()> {
