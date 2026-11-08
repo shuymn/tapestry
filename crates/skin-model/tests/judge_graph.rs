@@ -421,6 +421,7 @@ fn a_judge_graph_is_checked_and_charged_at_load() {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        present: None,
     };
     let el = || screen_element(0, [0, 0, 10, 10], 255);
     let graphs = |g| ResultDefs {

@@ -26,6 +26,7 @@ use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
+use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
 use crate::result::view::{ResultLabels, ResultView};
@@ -210,6 +211,9 @@ pub struct SkinDef {
     /// Closing), positive; `None` declares nothing, and the player's
     /// floor applies either way.
     pub close: Option<TimeUs>,
+    /// The play presentation program, whose outputs the expressions read
+    /// as `lua.<k>` and `lua.<k>.ok`; `None` has none.
+    pub present: Option<PresentDef>,
 }
 
 /// Why [`Skin::new`] refused a skin; `element` and `when` are indices.
@@ -262,6 +266,14 @@ pub enum LoadError {
     UnknownWidget { element: usize },
     #[error("the widgets can push {n} quads a frame, more than {MAX_WIDGET_QUADS}")]
     TooManyWidgetQuads { n: u64 },
+    #[error("the skin's presentation program")]
+    Present(#[source] PresentError),
+    #[error("a presentation program outside a play skin")]
+    PresentKind,
+    #[error(
+        "an expression reads a presentation output the program lacks, at another type, or in a          `when` timer"
+    )]
+    OutputRead,
     #[error("judge element {element} is outside `judge` (`screen` in a fixed-canvas skin)")]
     JudgeRegion { element: usize },
     #[error("element {element}'s number")]
@@ -431,6 +443,8 @@ pub struct Skin {
     whens: Box<[Program]>,
     /// What each `when` condition needs to be read while loading.
     whens_need: Box<[Need]>,
+    /// The verified presentation program, play only.
+    present: Option<Present>,
     ops: SkinOps,
     sheet: Sheet,
     /// The sheet's identity and frame count, kept so a build never reads
@@ -1526,6 +1540,10 @@ impl Skin {
         sel: SelectionDefs,
         res: ResultDefs,
     ) -> Result<Self, LoadError> {
+        let present = def.present.take();
+        if present.is_some() && kind != ScreenKind::Play {
+            return Err(LoadError::PresentKind);
+        }
         let builtin = usize::from(match kind {
             ScreenKind::Selection => selection_timer::BUILTIN,
             ScreenKind::Result => result_timer::BUILTIN,
@@ -1807,14 +1825,31 @@ impl Skin {
         let groups = lanes
             .into_iter()
             .flat_map(|l| l.bar_groups.iter().filter_map(|g| g.visible.as_ref()));
-        for program in whens
+        let signature: &[OutTy] = present.as_ref().map_or(&[], |p| &p.signature);
+        let base = match kind {
+            ScreenKind::Selection => crate::SELECTION.fields.len(),
+            ScreenKind::Result => crate::RESULT.fields.len(),
+            ScreenKind::Play | ScreenKind::Decision => field::COUNT,
+        };
+        for (i, program) in whens
             .iter()
             .chain(elements.iter().filter_map(|e| e.visible.as_ref()))
             .chain(per_element)
             .chain(groups)
+            .enumerate()
         {
             ops.charge(program).map_err(LoadError::Ops)?;
+            // A selection or result screen's outputs are its runtime's,
+            // which the importer counts after the build ([`Skin::with_outputs`]).
+            if matches!(kind, ScreenKind::Play | ScreenKind::Decision) {
+                check_outputs(program, base, signature, i < whens.len())?;
+            }
         }
+        // V1 to V5, its per-frame cost charged with the expressions'.
+        let present = present
+            .map(|p| Present::verify(p, base, &mut ops))
+            .transpose()
+            .map_err(LoadError::Present)?;
         if let Some(list) = &sel.song_list {
             let lists = elements
                 .iter()
@@ -2080,6 +2115,7 @@ impl Skin {
             elements,
             whens: def.whens.into_boxed_slice(),
             whens_need,
+            present,
             ops,
             sheet_id: def.sheet.id(),
             frame_count: def.sheet.frame_count(),
@@ -2189,10 +2225,17 @@ impl Skin {
         fonts
     }
 
-    /// The operations every frame's expressions run.
+    /// The operations every frame's expressions and presentation program
+    /// run (V5 charges the program's).
     #[must_use]
     pub fn ops(&self) -> SkinOps {
         self.ops
+    }
+
+    /// The presentation program's callbacks; 0 without one.
+    #[must_use]
+    pub fn program_callbacks(&self) -> usize {
+        self.present.as_ref().map_or(0, Present::len)
     }
 
     /// The lanes' bar groups: the groups a [`Play`] from
@@ -2647,6 +2690,13 @@ impl Skin {
         }
     }
 
+    /// The output slots the presentation program writes, two a callback.
+    fn program_slots(&self) -> usize {
+        self.present
+            .as_ref()
+            .map_or(0, |p| crate::output::slots(p.len()))
+    }
+
     /// A fresh [`Play`] for one attempt of `chart`; a retry or the next
     /// practice round calls this again and starts clean.
     ///
@@ -2661,6 +2711,7 @@ impl Skin {
         Play::new(
             chart,
             ctx,
+            self.program_slots(),
             self.whens.len(),
             self.lanes.is_some(),
             self.bar_group_count(),
@@ -2719,6 +2770,7 @@ impl Skin {
         }
         play.check()?;
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
+            || play.field_count() != field::COUNT + self.program_slots()
             || play.bar_capacity() != self.bar_group_count()
             || uvs.sheet_id() != self.sheet_id
             || uvs.frames().len() != self.frame_count
@@ -2727,7 +2779,7 @@ impl Skin {
         }
         let canvas = self.canvas(frame.target);
         let placement = self.placement(&canvas, frame.layout, play.scratch());
-        play.fill(frame, &self.whens)?;
+        play.fill(frame, &self.whens, self.present.as_ref())?;
         // The bar groups' work, lent to the lanes for this frame.
         let mut bars = play.take_bars();
         let shown = &*play;
@@ -3750,16 +3802,12 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        // On selection and result, a number draws nothing
-                        // for the values a source number reserves
-                        // (`SkinNumber.java:135-147`): a hidden value, or a
-                        // resolved value the source hides, reads one. Play
-                        // and loading still draw them (their tests pin it):
-                        // the values they support never reach them.
+                        // A number draws nothing for the values a source
+                        // number reserves (`SkinNumber.java:135-147`): a
+                        // hidden value, a resolved value the source hides,
+                        // or a play skin's program value reads one.
                         let reserved = v == i32::MIN || v == i32::MAX;
-                        let hides =
-                            matches!(scene.phase, Phase::Selection { .. } | Phase::Result { .. });
-                        if !(reserved && hides) {
+                        if !reserved {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }
@@ -3927,6 +3975,33 @@ fn screen_elapsed(starts: Starts<'_>, now: TimeUs) -> Option<i64> {
         .map(|at| elapsed_us(now, at))
 }
 
+/// V6 for `program`: each read past the schema's `base` fields is an output
+/// read, resolved by name, of the output of `signature` at that slot, at
+/// its type (`lua.<k>` the signature's, `lua.<k>.ok` a boolean); a field
+/// read there, or any output read in a `when` timer, is refused.
+fn check_outputs(
+    program: &Program,
+    base: usize,
+    signature: &[OutTy],
+    when: bool,
+) -> Result<(), LoadError> {
+    for (slot, out) in program.loads() {
+        let Some(at) = usize::from(slot).checked_sub(base) else {
+            continue;
+        };
+        let want = signature.get(at / 2).ok_or(LoadError::OutputRead)?;
+        let ok = at % 2 == 1;
+        let matches = match out {
+            Some((ty, o)) => o == ok && (ok || ty == *want),
+            None => false,
+        };
+        if when || !matches {
+            return Err(LoadError::OutputRead);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::radians;
@@ -3999,6 +4074,7 @@ mod tests {
             },
             bomb_up_to: None,
             close: None,
+            present: None,
         })
         .unwrap();
         let chart = ChartBuilder::new(150_000).build().unwrap();

@@ -126,23 +126,24 @@ impl Checker<'_, '_> {
     /// A field read.
     fn field(&self, id: Id) -> Result<Typed, CompileError> {
         let name = self.ast.text(id);
+        let output = self.scope.output(name);
         let Some((slot, field)) = self.scope.schema.field(name) else {
-            // A callback's output: an integer value, or a boolean draw or
-            // `ok` flag, read from its slot after the schema's fields.
-            return match self.scope.output(name) {
-                Some((slot, OutTy::Int, false)) => self.int(
-                    id,
-                    T::Read(Op::Load {
+            return match output {
+                Some((slot, OutTy::Int, false)) => {
+                    let op = Op::Output {
                         slot,
-                        lo: i32::MIN,
-                        hi: i32::MAX,
-                    }),
-                    Iv::new(i32::MIN, i32::MAX),
-                ),
-                Some((slot, _, _)) => Ok(Self::boolean(T::Read(Op::Load { slot, lo: 0, hi: 1 }))),
+                        ty: OutTy::Int,
+                        ok: false,
+                    };
+                    self.int(id, T::Read(op), Iv::new(i32::MIN, i32::MAX))
+                }
+                Some((slot, ty, ok)) => Ok(Self::boolean(T::Read(Op::Output { slot, ty, ok }))),
                 None => Err(self.err(id, ErrorKind::UnknownName { name: name.into() })),
             };
         };
+        if output.is_some() {
+            return Err(self.err(id, ErrorKind::OutputCollision { name: name.into() }));
+        }
         let load = |lo, hi| T::Read(Op::Load { slot, lo, hi });
         match field.ty {
             FieldTy::Bool => Ok(Self::boolean(load(0, 1))),

@@ -2247,7 +2247,7 @@ fn a_mixed_keyframe_is_a_record_with_defaults() {
 #[test]
 fn a_mixed_table_s_other_values_are_never_converted() {
     // A closure the admission refuses where it is read.
-    let closure = "function() return ms.number(110) / 2 > 0 end";
+    let closure = "function() return ms.number(110) ^ 2 > 0 end";
     let body = |record: &str| {
         folder(&[(
             "s.luaskin",

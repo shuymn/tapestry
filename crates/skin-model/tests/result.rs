@@ -623,7 +623,8 @@ fn an_image_choice_selects_by_a_result_field() {
 
 /// On result and on selection a number draws nothing for `i32::MIN` or
 /// `i32::MAX` and draws every value between (`SkinNumber.java:135-147`;
-/// play and loading, which draw both, are `number.rs`' and `loading.rs`').
+/// play and loading, which hide them too, are `number.rs`' and
+/// `loading.rs`').
 #[test]
 fn a_result_number_leaves_out_the_i32_extremes() {
     let srcs = ["2147483647", "2147483646", "-2147483647 - 1", "-2147483647"];
