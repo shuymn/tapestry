@@ -66,6 +66,35 @@ fn choice(value: Program) -> ImageChoiceDef {
     }
 }
 
+/// A decision skin of seven texts, one per chart field (title, subtitle,
+/// full title, genre, artist, subartist, full artist), slot `i` at y
+/// `30 i` in the default font.
+fn label_fields() -> SkinDef {
+    let fields = [
+        TextField::Title,
+        TextField::Subtitle,
+        TextField::FullTitle,
+        TextField::Genre,
+        TextField::Artist,
+        TextField::Subartist,
+        TextField::FullArtist,
+    ];
+    let elements = (0..fields.len())
+        .map(|i| {
+            let i = u32::try_from(i).unwrap();
+            delement(
+                Source::Text(i),
+                [0, 30 * i32::try_from(i).unwrap(), 300, 20],
+            )
+        })
+        .collect();
+    let widgets = WidgetDefs {
+        texts: fields.iter().map(|&f| text(TextValue::Field(f))).collect(),
+        ..WidgetDefs::default()
+    };
+    skin_def(elements, widgets)
+}
+
 /// A decision skin with its state, uv table and batch.
 struct DFx {
     skin: Skin,
@@ -307,29 +336,7 @@ fn decision_entry_points_refuse_other_kinds() {
 /// attached line draws, and a table of another length is refused.
 #[test]
 fn decision_text_shows_the_labels() {
-    let fields = [
-        TextField::Title,
-        TextField::Subtitle,
-        TextField::FullTitle,
-        TextField::Genre,
-        TextField::Artist,
-        TextField::Subartist,
-        TextField::FullArtist,
-    ];
-    let elements = (0..fields.len())
-        .map(|i| {
-            let i = u32::try_from(i).unwrap();
-            delement(
-                Source::Text(i),
-                [0, 30 * i32::try_from(i).unwrap(), 300, 20],
-            )
-        })
-        .collect();
-    let widgets = WidgetDefs {
-        texts: fields.iter().map(|&f| text(TextValue::Field(f))).collect(),
-        ..WidgetDefs::default()
-    };
-    let mut fx = DFx::new(skin_def(elements, widgets));
+    let mut fx = DFx::new(label_fields());
     let chosen = ResultLabels {
         subartist: "Other".to_owned(),
         ..labels()
@@ -400,41 +407,7 @@ fn decision_text_shows_the_labels() {
 /// before it is called, and laid out again for new labels.
 #[test]
 fn decision_bitmap_text_follows_the_labels() {
-    use image::{ImageFormat, Rgba, RgbaImage};
-    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
-    let dir = tempfile::tempdir().unwrap();
-    RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
-        .save_with_format(dir.path().join("0.png"), ImageFormat::Png)
-        .unwrap();
-    std::fs::write(
-        dir.path().join("f.fnt"),
-        "info face=\"t\" size=10 padding=0,0,0,0\n\
-         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-         page id=0 file=\"f.png\"\n\
-         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
-         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
-    )
-    .unwrap();
-    RgbaImage::from_pixel(16, 16, Rgba([255; 4]))
-        .save_with_format(dir.path().join("f.png"), ImageFormat::Png)
-        .unwrap();
-    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    let file = b
-        .admit_file(FileDef {
-            path: "0.png".into(),
-            hi: None,
-        })
-        .unwrap();
-    b.add_image(ImageDef {
-        file,
-        rect: None,
-        grid: [1, 1],
-        cycle: None,
-        filter: Filter::Linear,
-    })
-    .unwrap();
-    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
-    b.add_bitmap_font(f, &[]).unwrap();
+    let (_dir, sheet) = selection_support::bitmap_sheet();
     let mut def = skin_def(
         vec![
             delement(Source::Text(0), [0, 0, 200, 20]),
@@ -450,7 +423,7 @@ fn decision_bitmap_text_follows_the_labels() {
             ..WidgetDefs::default()
         },
     );
-    def.sheet = b.finish();
+    def.sheet = sheet;
     let skin = Skin::new_decision(def.clone()).unwrap();
     let mut dec = skin.prepare_decision();
     let atlas_uvs = |skin: &Skin| {
@@ -526,29 +499,7 @@ fn decision_bitmap_text_follows_the_labels() {
 /// of control characters alone still joined as written, a long field cut.
 #[test]
 fn decision_text_matches_plays_lines() {
-    let fields = [
-        TextField::Title,
-        TextField::Subtitle,
-        TextField::FullTitle,
-        TextField::Genre,
-        TextField::Artist,
-        TextField::Subartist,
-        TextField::FullArtist,
-    ];
-    let elements = (0..fields.len())
-        .map(|i| {
-            let i = u32::try_from(i).unwrap();
-            delement(
-                Source::Text(i),
-                [0, 30 * i32::try_from(i).unwrap(), 300, 20],
-            )
-        })
-        .collect();
-    let widgets = WidgetDefs {
-        texts: fields.iter().map(|&f| text(TextValue::Field(f))).collect(),
-        ..WidgetDefs::default()
-    };
-    let mut fx = DFx::new(skin_def(elements, widgets));
+    let mut fx = DFx::new(label_fields());
     let raw = ResultLabels {
         title: format!("A{}B", "\t".repeat(511)),
         subtitle: "\t".to_owned(),

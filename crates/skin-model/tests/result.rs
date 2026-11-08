@@ -700,41 +700,7 @@ fn a_result_number_leaves_out_the_i32_extremes() {
 /// before it is called, and laid out again for a new view.
 #[test]
 fn result_bitmap_text_follows_the_view() {
-    use image::{ImageFormat, Rgba, RgbaImage};
-    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
-    let dir = tempfile::tempdir().unwrap();
-    RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
-        .save_with_format(dir.path().join("0.png"), ImageFormat::Png)
-        .unwrap();
-    std::fs::write(
-        dir.path().join("f.fnt"),
-        "info face=\"t\" size=10 padding=0,0,0,0\n\
-         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-         page id=0 file=\"f.png\"\n\
-         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
-         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
-    )
-    .unwrap();
-    RgbaImage::from_pixel(16, 16, Rgba([255; 4]))
-        .save_with_format(dir.path().join("f.png"), ImageFormat::Png)
-        .unwrap();
-    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    let file = b
-        .admit_file(FileDef {
-            path: "0.png".into(),
-            hi: None,
-        })
-        .unwrap();
-    b.add_image(ImageDef {
-        file,
-        rect: None,
-        grid: [1, 1],
-        cycle: None,
-        filter: Filter::Linear,
-    })
-    .unwrap();
-    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
-    b.add_bitmap_font(f, &[]).unwrap();
+    let (_dir, sheet) = selection_support::bitmap_sheet();
     let mut def = selection_support::skin_def(
         vec![relement(Source::Text(0), [0, 0, 200, 20], None)],
         WidgetDefs {
@@ -745,7 +711,7 @@ fn result_bitmap_text_follows_the_view() {
             ..WidgetDefs::default()
         },
     );
-    def.sheet = b.finish();
+    def.sheet = sheet;
     let mut fx = RFx::new(Skin::new_result(def, ResultDefs::default()).unwrap());
     let titled = |title: &str| ResultLabels {
         title: title.to_owned(),
