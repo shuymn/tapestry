@@ -300,7 +300,9 @@ fn cells_past_the_edge_match_the_whole_decode_in_bands() {
         image([50, 0, 20, 10], [1, 1]),
         image([0, 45, 10, 20], [1, 1]),
         image([55, 47, 12, 12], [1, 1]),
-        image([40, 30, 30, 30], [3, 3]),
+        // Its 10×10 cells start at x 50, 60 and 70 and y 40, 50 and 60:
+        // the last column and row lie wholly past the edges.
+        image([50, 40, 30, 30], [3, 3]),
     ];
     let whole = sheet(dir.path(), &bytes, images);
     assert!(matches!(whole.files[0].lo.mode, Mode::Full(Some(_))));

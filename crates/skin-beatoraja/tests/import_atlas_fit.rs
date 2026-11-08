@@ -96,6 +96,18 @@ fn an_image_is_dropped_only_past_the_page_s_content() {
 }
 
 #[test]
+fn a_cut_past_its_file_is_charged_at_its_full_size() {
+    // Two 8 177-wide frames from a 64-wide file: each runs past the file's
+    // edge, padded to the cell the source cuts, which no page holds.
+    let over = image([64, 2], r#""x": 0, "y": 0, "w": 16354, "h": 2, "divx": 2"#);
+    assert_eq!(kinds(over.report()), [OVER]);
+    assert_eq!(over.report().notes[0].severity, Severity::Dropped);
+    // One texel narrower, it fits.
+    let fits = image([64, 2], r#""x": 0, "y": 0, "w": 16352, "h": 2, "divx": 2"#);
+    assert!(fits.report().notes.is_empty(), "{:?}", fits.report().notes);
+}
+
+#[test]
 fn the_cells_decide_not_the_file() {
     // A whole-file frame of a sheet whose frames fit goes alone: the file
     // and its small frames stay. Its 1×1 destination is not what drops it.
