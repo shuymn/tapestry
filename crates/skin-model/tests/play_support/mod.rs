@@ -391,6 +391,8 @@ pub struct Harness {
     pub view: LaneView,
     /// The frames' readouts; `None` gives [`readouts_for`] the view.
     pub readouts: Option<FrameReadouts>,
+    /// The frames' turntable angle ([`SkinFrame::turntable`]).
+    pub turntable: i32,
     /// The chart, which [`follow`] reads.
     pub chart: Chart,
     /// The note facts each frame gives, following its effects
@@ -420,6 +422,7 @@ impl Harness {
             layout: Layout::AUTHOR,
             view: VIEW,
             readouts: None,
+            turntable: 0,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
@@ -456,6 +459,7 @@ impl Harness {
             complete: self.complete,
             target: self.target,
             layout: &self.layout,
+            turntable: self.turntable,
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,

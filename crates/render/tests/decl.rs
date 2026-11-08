@@ -880,6 +880,7 @@ fn both_skins_draw_one_snapshot_sequence() {
             generation: 0,
             sequence: 1,
             epoch: 1,
+            scratch: game::ScratchInput::NONE,
         }
     };
     let sudden = |amount| game::Covers {

@@ -186,6 +186,26 @@ pub const IN_PLAY: &[Site] = &[
     // The logic step and its sinks.
     Site::File("crates/game/src/adjustment.rs"),
     Site::File("crates/game/src/driver.rs"),
+    // The turntable: the driver's scratch state at each drain, and the
+    // render thread's clock and autoplay presses at each frame.
+    Site::Fns(
+        "crates/game/src/turntable.rs",
+        &[
+            "ScratchInput::direction",
+            "ScratchDevice::observe",
+            "ScratchDevice::input",
+            "TurntableClock::adopt",
+            "TurntableClock::number",
+            "TurntableClock::pause",
+            "TurntableClock::resume",
+            "TurntableClock::tick",
+            "TurntableClock::angle",
+            "AutoplayScratch::reset",
+            "AutoplayScratch::update",
+            "AutoplayScratch::pressed",
+            "state_ms",
+        ],
+    ),
     Site::Fns(
         "crates/game/src/adjust_keys.rs",
         &["AdjustmentPlan::observation"],
@@ -420,6 +440,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    Site::File("crates/player/src/turntable.rs"),
     // The play and loading frames' calls through the screen the render
     // thread keeps; its menu preparation runs on menus only, and the
     // loading lines' before the loading frame is built.

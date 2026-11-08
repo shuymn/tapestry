@@ -47,6 +47,7 @@ fn snapshot(mode: SpeedMode, green: u32, covers: Covers, h: Option<Ratio>) -> Pr
         generation: 0,
         sequence: 1,
         epoch: 0,
+        scratch: game::ScratchInput::NONE,
     }
 }
 

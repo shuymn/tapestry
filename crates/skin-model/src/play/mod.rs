@@ -326,6 +326,11 @@ pub struct SkinFrame<'a> {
     /// Each effective amount in `lanes` must be its stored setting while
     /// that cover is on and 0 while it is off, else the build is refused.
     pub readouts: FrameReadouts,
+    /// The turntable's angle, clockwise on y-down, in
+    /// 1/[`TURNTABLE_UNITS_PER_DEGREE`](crate::TURNTABLE_UNITS_PER_DEGREE)
+    /// degree: what a turntable follower adds
+    /// ([`AngleFollow::Turntable`](crate::AngleFollow::Turntable)).
+    pub turntable: i32,
 }
 
 /// The chart's load as the play screen shows it before READY
@@ -901,6 +906,7 @@ mod tests {
                     closing: None,
                     target: [1_920, 1_080],
                     layout: &layout,
+                    turntable: 0,
                     lanes: VIEW,
                     readouts: OFF,
                 };
@@ -986,6 +992,7 @@ mod tests {
             closing: None,
             target: [1_920, 1_080],
             layout: &layout,
+            turntable: 0,
             lanes: VIEW,
             readouts: OFF,
         };

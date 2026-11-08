@@ -287,6 +287,9 @@ struct Fake {
     /// The leaving commands the flow served ([`Rig::serve_leaving`]), with
     /// their clock times.
     served: Vec<(game::MenuCommand, i64)>,
+    /// The turntable's signals (docs/stage3.md, offset 1), with their
+    /// clock times.
+    turntable: Vec<(&'static str, i64)>,
     /// Each screen's preparation once a result showed moves the clock this
     /// much further.
     prepare_cost: i64,
@@ -475,6 +478,7 @@ impl Fake {
             timing_until: i64::MAX,
             result_order: Vec::new(),
             served: Vec::new(),
+            turntable: Vec::new(),
             prepare_cost: 0,
             settle_cost: 0,
             pinned_timing: None,
@@ -600,6 +604,14 @@ impl Rig for Fake {
 
     fn serve_leaving(&mut self, cmd: game::MenuCommand) {
         self.served.push((cmd, self.clock.now().0));
+    }
+
+    fn play_state_began(&mut self) {
+        self.turntable.push(("began", self.clock.now().0));
+    }
+
+    fn turntable_paused(&mut self) {
+        self.turntable.push(("paused", self.clock.now().0));
     }
 
     fn result_compared(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
@@ -5892,4 +5904,64 @@ fn a_fallback_during_an_outro_serves_the_command() {
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Back);
     assert_eq!(rig.clock.now().0, s + 2_000_000);
+}
+
+/// The turntable's signals across the result's outro (docs/stage3.md,
+/// offset 1): the play pauses it before its save, whatever the outro
+/// does; a retry accepted during the result begins the next play state
+/// when it is served at the outro's end, not when accepted; back, the
+/// close and an input failure during the outro begin none.
+#[test]
+fn the_turntable_signals_follow_the_outro() {
+    use game::MenuCommand::{Back, Retry};
+    let s = result_start();
+    let at = s + 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let paused_before_result = |rig: &Fake| {
+        rig.turntable
+            .first()
+            .is_some_and(|&(what, t)| what == "paused" && t <= s)
+    };
+
+    // A retry: began once, at the outro's end.
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), at + 2_000_000);
+    press(&mut rig, &[(at, Retry)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert!(paused_before_result(&rig), "{:?}", rig.turntable);
+    let began: Vec<i64> = rig
+        .turntable
+        .iter()
+        .filter(|(what, _)| *what == "began")
+        .map(|&(_, t)| t)
+        .collect();
+    assert_eq!(began, [at + 500_000], "{:?}", rig.turntable);
+
+    // Back, served at the outro's end: no new play state.
+    let mut loaded = self::loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), at + 5_000_000);
+    press(&mut rig, &[(at, Back)]);
+    let _ = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert!(paused_before_result(&rig), "{:?}", rig.turntable);
+    assert!(rig.turntable.iter().all(|(what, _)| *what != "began"));
+
+    // The close during a retry's outro: the run ends, no new play state.
+    let mut loaded = self::loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), at + 300_000);
+    press(&mut rig, &[(at, Retry)]);
+    rig.at.push((at + 300_000, Box::new(|| {})));
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    assert!(rig.turntable.iter().all(|(what, _)| *what != "began"));
+
+    // An input failure during a retry's outro: served at once, so the
+    // retry's play state begins, and the run then ends with the failure.
+    let mut loaded = self::loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), i64::MAX);
+    rig.input_fails_at = at + 1_000_000;
+    rig.at.push((at + 1_000_000, Box::new(|| {})));
+    press(&mut rig, &[(at, Retry)]);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
+    assert!(paused_before_result(&rig), "{:?}", rig.turntable);
 }

@@ -247,6 +247,7 @@ pub fn input<'a>(
         gauge: 0,
         overlay: &[],
         target: [WIDTH, HEIGHT],
+        turntable: 0,
     }
 }
 
@@ -264,6 +265,7 @@ pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> Loading
         load: LoadState { since, percent: 0 },
         target: [1_920, 1_080],
         layout: &Layout::AUTHOR,
+        turntable: 0,
         lanes: LaneView::NONE,
         covers: FrameReadouts::UNAVAILABLE.covers,
         gauge: None,

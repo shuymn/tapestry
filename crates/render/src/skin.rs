@@ -50,6 +50,9 @@ pub struct FrameInput<'a> {
     /// size the frame is projected onto ([`PlaySkin::canvas`]).
     /// [`Renderer::build`](crate::Renderer::build) sets it so.
     pub target: [u32; 2],
+    /// The turntable's angle on the play state's clock
+    /// ([`skin_model::SkinFrame::turntable`]).
+    pub turntable: i32,
 }
 
 impl FrameInput<'_> {
@@ -102,6 +105,9 @@ pub struct LoadingFrame<'a> {
     /// The revision of the loading text installed for this lifetime; 0
     /// with none.
     pub text: u64,
+    /// The turntable's angle on the play state's clock
+    /// ([`skin_model::LoadingFrame::turntable`]).
+    pub turntable: i32,
 }
 
 impl<'a> LoadingFrame<'a> {
@@ -116,6 +122,7 @@ impl<'a> LoadingFrame<'a> {
             load: self.load,
             target: self.target,
             layout: self.layout,
+            turntable: self.turntable,
             lanes: self.lanes,
             covers: self.covers,
             gauge: self.gauge,

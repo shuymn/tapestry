@@ -1122,6 +1122,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             closing: None,
             target: h.target,
             layout: &layout,
+            turntable: 0,
             lanes: h.view,
             readouts: play_support::readouts_for(h.view),
         };

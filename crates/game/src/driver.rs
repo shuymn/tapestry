@@ -46,6 +46,7 @@ use crate::hispeed::PlayOptions;
 use crate::live::InputWaitError;
 use crate::session::Loaded;
 use crate::tempo::AttemptTempo;
+use crate::turntable::ScratchDevice;
 
 /// The input thread, as the driver's waits need it.
 pub trait InputPump {
@@ -73,6 +74,8 @@ pub struct AdjustDriver {
     receiver: AdjustmentReceiver,
     plan: AdjustmentPlan,
     reducer: Adjustment,
+    /// The scratch's device state for the turntable, kept for the run.
+    scratch: ScratchDevice,
     writer: PresentationWriter,
     tempo: Option<AttemptTempo>,
     /// Where the attempt opens, in chart time: the frozen head's base.
@@ -122,6 +125,7 @@ impl AdjustDriver {
                 receiver,
                 plan: plan.clone(),
                 reducer,
+                scratch: ScratchDevice::new(plan),
                 writer,
                 tempo: None,
                 opens_at: TimeUs(0),
@@ -150,6 +154,7 @@ impl AdjustDriver {
             receiver,
             plan,
             reducer,
+            scratch,
             writer,
             tempo,
             opens_at,
@@ -165,6 +170,9 @@ impl AdjustDriver {
         });
         let opens_at = *opens_at;
         let observed = std::iter::from_fn(|| receiver.pop()).filter_map(|o| {
+            // Every movement of the scratch axis turns the turntable,
+            // before the plan drops one without an adjustment quantum.
+            scratch.observe(&o);
             let phase = |head, generation| {
                 Some(Augmented::Obs(Observation {
                     time: o.at,
@@ -196,9 +204,11 @@ impl AdjustDriver {
         });
         let items = cut.into_iter().chain(observed);
         match tempo {
-            Some(t) => reducer.feed(items, t, writer),
-            None => reducer.feed(items, &NoTempo, writer),
+            Some(t) => reducer.take(items, t),
+            None => reducer.take(items, &NoTempo),
         }
+        reducer.set_scratch(scratch.input());
+        reducer.publish(writer);
         receiver.owed()
     }
 

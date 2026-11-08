@@ -694,6 +694,7 @@ pub(crate) mod tests {
             generation: 0,
             sequence: 1,
             epoch: 1,
+            scratch: game::ScratchInput::NONE,
         };
         assert_eq!(
             super::SpeedLine::of(&snapshot, Some(bpm)),

@@ -623,6 +623,39 @@ fn a_line_turns_about_the_box() {
     }
 }
 
+/// A text following the turntable keeps its own angle and takes none of
+/// the turntable's, as the source draws text; an image following it turns.
+#[test]
+fn a_line_keeps_its_angle_under_the_turntable() {
+    let mut props = [None; 9];
+    for (p, v) in props.iter_mut().zip([100, 50, 300, 40]) {
+        *p = Some(v);
+    }
+    props[8] = Some(90);
+    let place = Place {
+        angle: skin_model::AngleFollow::Turntable,
+        ..Place::SCREEN
+    };
+    let e = ElementDef {
+        track: lanes_support::still(props),
+        ..element(Source::Text(0), BOX, place)
+    };
+    let skin = load(vec![e], vec![plain()]).unwrap();
+    let mut h = widget_support::harness(skin);
+    h.skin
+        .attach_text(&mut h.play, TextTable::new(vec![Some(line(INK, 2.0))]))
+        .unwrap();
+    // 100° in the frame's units.
+    h.turntable = 100 * skin_model::TURNTABLE_UNITS_PER_DEGREE;
+    h.frame(100, &[]);
+    let quarter = 90_f64.to_radians() as f32;
+    let quads = h.batch.quads();
+    assert!(!quads.is_empty());
+    for q in quads {
+        assert_eq!(q.angle, quarter);
+    }
+}
+
 #[test]
 fn a_following_line_moves_without_changing_its_request() {
     // The simple lanes are 800 long; a cover of 500 ‰ travels C = 400. A

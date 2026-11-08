@@ -64,7 +64,12 @@
 //!     angle or alpha on either id, or on an id SUDDEN+, LIFT or HIDDEN+
 //!     consumes (listed or added by the source), is refused as the
 //!     element's role says, its configured y ignored; offset 5 outside
-//!     HIDDEN+ and offsets 1 and 2 stay refused.
+//!     HIDDEN+ and offset 2 stay refused. Offset 1 turns an image, an
+//!     image choice or a number with the turntable
+//!     ([`skin_model::AngleFollow::Turntable`]), adding the negated source
+//!     angle as every source angle is negated; a text accepts it and stays
+//!     unrotated, as the source draws text; a configured value on it is
+//!     refused as on 3 and 4, and elsewhere it stays refused.
 //! 15. HIDDEN+ is optional for the player, so it is decorative: outside
 //!     the mapped subset it is dropped with a note and the skin still
 //!     imports ([`super::widget::lanes`]). Its differences from the source

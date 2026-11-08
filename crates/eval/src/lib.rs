@@ -58,7 +58,7 @@ mod notes;
 mod lint_fixtures;
 
 pub use batch::{EvalInput, Evaluation, GaugePoint, GaugeResult, evaluate};
-pub use convert::{ConversionState, Edges, LaneEdge};
+pub use convert::{AxisDirection, AxisTurn, ConversionState, Edges, LaneEdge, TurnStep};
 pub use error::EvalError;
 pub use evaluator::{
     AdvanceError, BATCH_SMALL_BYTES, EVENT_BYTES, Evaluator, GAUGE_BYTES, HELD_BYTES, INPUT_BYTES,
