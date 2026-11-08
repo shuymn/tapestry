@@ -401,7 +401,7 @@ fn a_page_past_the_image_budget_stops_before_it_is_read() {
 
 #[test]
 fn page_bytes_stay_charged_when_a_font_fails() {
-    // Two fonts of 16 pages of 32 MiB each (a sparse PNG), each failing
+    // Two fonts of 8 pages of 64 MiB each (a sparse PNG), each failing
     // after its pages' bytes were charged: the first fills the 512 MiB,
     // so the second's first page passes it.
     let fonts = r#"{"id": "a", "path": "a.fnt"}, {"id": "b", "path": "b.fnt"}"#;
@@ -416,18 +416,18 @@ fn page_bytes_stay_charged_when_a_font_fails() {
         .unwrap()
         .set_len(skin_model::MAX_FILE_BYTES)
         .unwrap();
-    let pages: String = (0..16)
+    let pages: String = (0..8)
         .map(|p| format!("page id={p} file=\"big.png\"\n"))
         .collect();
     let text = format!(
         "info face=\"t\" size=24 padding=0,0,0,0\n\
-         common lineHeight=24 base=20 scaleW=4 scaleH=4 pages=16\n{pages}\
+         common lineHeight=24 base=20 scaleW=4 scaleH=4 pages=8\n{pages}\
          char id=65 x=0 y=0 width=8 height=4 xoffset=0 yoffset=0 xadvance=4 page=0\n"
     );
     write(dir.path(), "a.fnt", text.as_bytes());
     write(dir.path(), "b.fnt", text.as_bytes());
     assert_eq!(
-        16 * skin_model::MAX_FILE_BYTES,
+        8 * skin_model::MAX_FILE_BYTES,
         skin_model::MAX_TOTAL_FILE_BYTES
     );
     match import(dir.path()) {

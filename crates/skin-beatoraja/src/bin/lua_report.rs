@@ -285,6 +285,23 @@ fn report(index: usize, survey: &Survey) -> String {
     for (outcome, n) in &survey.outcomes {
         line(&format!("  callback {outcome}: {n}"));
     }
+    if let Some(rt) = &survey.runtime {
+        let status: Vec<String> = rt.status.iter().map(|(s, n)| format!("{s} {n}")).collect();
+        line(&format!(
+            "  runtime frame (fields 0): outputs {} status {} notes {} (+{}) \
+             instructions {} host calls {} time {} us{}",
+            rt.outputs,
+            status.join(", "),
+            rt.notes.0,
+            rt.notes.1,
+            rt.instructions,
+            rt.host_calls,
+            rt.micros,
+            rt.stopped
+                .as_deref()
+                .map_or_else(String::new, |s| format!(" stopped {s}"))
+        ));
+    }
     for c in &survey.consumers {
         let at = c.at.map_or_else(
             || "module ?".to_owned(),
@@ -411,6 +428,52 @@ mod tests {
         assert_eq!(facts(&a).unwrap().0.judge_class, Fact::Known(None));
         let a = args("root s.luaskin");
         assert_eq!(facts(&a).unwrap().0.play_level, Fact::Unavailable);
+    }
+
+    /// A result skin's callback no expression represents is reported as
+    /// the runtime's, and one runtime frame over a zero state is printed.
+    #[test]
+    fn a_runtime_callback_is_reported_and_run_once() {
+        let a = args("root s.luaskin");
+        let (f, choice, _, _) = facts(&a).unwrap();
+        let d = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([255; 4]))
+            .save(d.path().join("a.png"))
+            .unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"dot\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }\n\
+             skin.value = { { id = \"ex\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, \
+                 digit = 4, ref = 71 },\n\
+               { id = \"r\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4, \
+                 value = function() return ms.number(71) / 2 end } }\n\
+             skin.destination = {\n\
+               { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },\n\
+               { id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },\n\
+               { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } } }\n\
+             return skin\n",
+        )
+        .unwrap();
+        let f = ImportFacts {
+            scene: ScreenKind::Result,
+            ..f
+        };
+        let s = survey_with(d.path(), "s.luaskin", &f, &Cancel::new(), false, &choice);
+        assert_eq!(s.outcome, "imported");
+        assert_eq!(s.outcomes.get("runtime"), Some(&1), "{:?}", s.outcomes);
+        let rt = s.runtime.as_ref().unwrap();
+        assert_eq!(rt.outputs, 1);
+        assert_eq!(rt.status.get("ok"), Some(&1));
+        assert!(rt.host_calls >= 1);
+        let printed = report(0, &s);
+        assert!(
+            printed.contains("  runtime frame (fields 0): outputs 1 status ok 1 "),
+            "{printed}"
+        );
     }
 
     /// `--result dense` makes a result scene's view known, and a result

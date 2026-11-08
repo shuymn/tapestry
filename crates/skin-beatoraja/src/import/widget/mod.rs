@@ -612,6 +612,7 @@ impl Cx<'_> {
                 SetSelector::Expr { src, deviates, .. } => (src, deviates),
             }
         };
+        self.gate_by_value(&src, None, Conv::Index);
         self.actions(at, act)?;
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));

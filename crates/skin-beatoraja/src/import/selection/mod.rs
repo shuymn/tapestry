@@ -162,7 +162,7 @@ impl Cx<'_> {
                 return Ok(());
             }
         }
-        match object {
+        let r = match object {
             Object::Image => self.image(dst, rec),
             Object::ImageSet => self.image_set(dst, rec),
             Object::Value => self.number(dst, rec),
@@ -171,7 +171,9 @@ impl Cx<'_> {
             Object::Graph => self.ratio_bar(dst, rec, true),
             Object::SongList => self.song_list_element(dst, rec),
             _ => self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object }),
-        }
+        };
+        self.end_value_gate();
+        r
     }
 
     /// A slider (`graph` false) or a graph of a selection skin as a ratio

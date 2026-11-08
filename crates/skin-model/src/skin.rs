@@ -459,6 +459,10 @@ pub struct Skin {
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
+    /// The callbacks whose outputs a selection or result state carries
+    /// after its fields ([`crate::output`]): the screen's runtime writes
+    /// them (docs/stage3.md S7-07).
+    outputs: usize,
     /// This skin's identity, which a selection state it makes carries: a
     /// clone keeps it, another load takes the next.
     id: u64,
@@ -2054,6 +2058,7 @@ impl Skin {
             gauge_graphs,
             timing_graphs,
             sliders,
+            outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -2789,6 +2794,22 @@ impl Skin {
         self.song_list.as_ref().map_or(0, |l| l.center)
     }
 
+    /// This skin with `n` callback outputs after a selection or result
+    /// state's fields ([`crate::output`]): the importer's count of the
+    /// callbacks the screen's runtime runs, whose `lua.<k>` names its
+    /// expressions read.
+    #[must_use]
+    pub fn with_outputs(mut self, n: usize) -> Self {
+        self.outputs = n;
+        self
+    }
+
+    /// The callback outputs a selection or result state carries.
+    #[must_use]
+    pub fn outputs(&self) -> usize {
+        self.outputs
+    }
+
     /// A fresh selection state ([`Selection`]): every timer off, every
     /// field 0, every row and text slot empty until a view and a text
     /// table. One a play skin makes is inert: it draws nothing.
@@ -2804,6 +2825,7 @@ impl Skin {
             self.text_slots(),
             self.song_list_slots(),
             self.sliders,
+            self.outputs,
         )
     }
 
@@ -3118,7 +3140,13 @@ impl Skin {
         if self.kind != ScreenKind::Result {
             return ResultScreen::inert(self.id);
         }
-        ResultScreen::new(self.id, true, self.whens.len(), self.text_slots())
+        ResultScreen::new(
+            self.id,
+            true,
+            self.whens.len(),
+            self.text_slots(),
+            self.outputs,
+        )
     }
 
     /// Whether `res` is a state this result skin made.
@@ -3505,11 +3533,16 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        // On result, a number draws nothing for the values
-                        // a source number reserves: a hidden value reads
-                        // `i32::MIN`. Play's values never reach them.
+                        // On selection and result, a number draws nothing
+                        // for the values a source number reserves
+                        // (`SkinNumber.java:135-147`): a hidden value, or a
+                        // resolved value the source hides, reads one. Play
+                        // and loading still draw them (their tests pin it):
+                        // the values they support never reach them.
                         let reserved = v == i32::MIN || v == i32::MAX;
-                        if !(reserved && matches!(scene.phase, Phase::Result { .. })) {
+                        let hides =
+                            matches!(scene.phase, Phase::Selection { .. } | Phase::Result { .. });
+                        if !(reserved && hides) {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }
