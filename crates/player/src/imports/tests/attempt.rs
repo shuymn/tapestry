@@ -240,3 +240,46 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
     }
     drop(serial);
 }
+
+/// A job waited for with a deadline ([`crate::imports::Job::wait_until`],
+/// what a begun preparation's polls use) returns at each deadline while
+/// nothing came and the job runs; once the attempt's quit came it waits
+/// past the deadline for the job's thread, which the quit cancelled.
+#[test]
+fn a_job_wait_returns_at_its_deadline_until_a_quit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::LATE;
+    use crate::imports::{Ran, spawn_job};
+    let mut job = spawn_job(|cancel: &crate::imports::Cancel| {
+        while !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The thread outlives the cancel a while: the quit waits for it.
+        std::thread::sleep(Duration::from_millis(200));
+        7
+    })
+    .unwrap();
+    let quit = AtomicBool::new(false);
+    for _ in 0..3 {
+        let asked = Instant::now();
+        let polled = job.wait_until(
+            Some(asked + Duration::from_millis(50)),
+            || quit.load(Ordering::SeqCst),
+            || false,
+        );
+        assert!(polled.is_none());
+        let took = asked.elapsed();
+        assert!(took >= Duration::from_millis(50) && took < LATE, "{took:?}");
+    }
+    quit.store(true, Ordering::SeqCst);
+    let asked = Instant::now();
+    let ran = job.wait_until(Some(asked), || quit.load(Ordering::SeqCst), || false);
+    assert!(matches!(ran, Some(Ran::Done(7))), "{:?}", ran.map(|_| ()));
+    assert!(
+        asked.elapsed() >= Duration::from_millis(200),
+        "{:?}",
+        asked.elapsed()
+    );
+}

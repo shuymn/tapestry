@@ -861,6 +861,8 @@ fn rig<'a>(
         panels: None,
         result_skin: crate::result_skin::ResultSkin::default(),
         result_chart: None,
+        prep: None,
+        preps: 0,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -2156,7 +2158,6 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_settings_gauge_survives_a_preset_without_it() {
-        use game::Rig as _;
         let dir = tempfile::tempdir().unwrap();
         let settings = gauge_settings(5);
         let short = loaded_under(dir.path(), &settings, "tapestry");

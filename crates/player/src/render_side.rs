@@ -612,7 +612,19 @@ pub enum RenderMsg {
         /// The play skin it is prepared with.
         skin: AttemptSkin,
         /// Where the answer goes.
-        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+        reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+    },
+    /// The attempt's final readiness, bounded: when what this request
+    /// staged still fits the screen's structural inputs, stamp the
+    /// adjustment epoch on it and answer ready, else answer `Stale` with
+    /// the inputs now. It prepares nothing.
+    Ready {
+        /// The request.
+        request: u64,
+        /// The adjustment epoch the attempt's frames are drawn for.
+        epoch: u64,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<ReadyAnswer>,
     },
     /// Another chart: prepare it, building the screen again if it failed,
     /// and answer when ready. Every play draws it until the next.
@@ -1299,12 +1311,28 @@ impl RenderLink {
     /// Why the screen or its device cannot draw at all,
     /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
     /// when the render thread is gone.
+    #[cfg(test)]
     pub fn prepare_attempt_with(
         &self,
         attempt: AttemptContext,
         skin: AttemptSkin,
         mut cancelled: impl FnMut() -> bool,
     ) -> Result<Preparation, ScreenError> {
+        let mut pending = self.begin_attempt(attempt, skin);
+        loop {
+            if let Some(answer) = pending.wait_until(None, &mut cancelled) {
+                return answer.map(|a| a.preparation);
+            }
+        }
+    }
+
+    /// Asks the render thread to prepare the chart loaded last for
+    /// `attempt` with play skin `skin`, as a new request that supersedes
+    /// the ones before, and returns at once: the answer is waited for
+    /// ([`PendingAttempt::wait_until`]) within the answer's bound from now.
+    /// Dropped unanswered, the request is discarded, so its answer,
+    /// however late, installs nothing.
+    pub fn begin_attempt(&self, attempt: AttemptContext, skin: AttemptSkin) -> PendingAttempt {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::PrepareAttempt {
@@ -1313,22 +1341,34 @@ impl RenderLink {
             skin,
             reply,
         });
-        let deadline = Instant::now() + self.answer_timeout;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left.min(CANCEL_POLL)) {
-                Ok(answer) => return Ok(answer?),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-            if cancelled() {
-                self.send(RenderMsg::Discard(request));
-                return Ok(Preparation::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                self.send(RenderMsg::Discard(request));
-                return Err(ScreenError::NoAnswer);
-            }
+        PendingAttempt {
+            request,
+            rx,
+            bound: Instant::now() + self.answer_timeout,
+            tx: self.tx.clone(),
+            open: true,
+        }
+    }
+
+    /// The final readiness of the attempt request `request`
+    /// ([`RenderMsg::Ready`]), with the adjustment epoch `epoch`, waited
+    /// for at most the answer's bound: it prepares nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
+    /// when the render thread is gone.
+    pub fn ready_attempt(&self, request: u64, epoch: u64) -> Result<ReadyAnswer, ScreenError> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::Ready {
+            request,
+            epoch,
+            reply,
+        });
+        match rx.recv_timeout(self.answer_timeout) {
+            Ok(answer) => Ok(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
         }
     }
 
@@ -1674,6 +1714,89 @@ impl PendingLoad {
     }
 }
 
+/// An attempt's preparation asked of the render thread
+/// ([`RenderLink::begin_attempt`]), its answer not yet taken.
+pub struct PendingAttempt {
+    request: u64,
+    rx: Receiver<Result<Answered, RenderError>>,
+    /// The answer's bound.
+    bound: Instant,
+    tx: Sender<RenderMsg>,
+    /// Not answered, discarded or failed yet: dropped so, it is
+    /// discarded.
+    open: bool,
+}
+
+impl PendingAttempt {
+    /// The request's number.
+    pub const fn request(&self) -> u64 {
+        self.request
+    }
+
+    /// Waits for the answer until `until` at most (none: the answer's
+    /// bound), looking at `cancelled` every [`CANCEL_POLL`]. `None` at
+    /// `until` with no answer, to be called again; once `cancelled` says
+    /// so, [`Preparation::Cancelled`] without waiting further. A cancelled
+    /// or timed-out request is discarded, so its answer, however late,
+    /// installs nothing.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen or its device cannot draw at all,
+    /// [`ScreenError::NoAnswer`] past the answer's bound and
+    /// [`ScreenError::Ended`] when the render thread is gone.
+    pub fn wait_until(
+        &mut self,
+        until: Option<Instant>,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Option<Result<Answered, ScreenError>> {
+        loop {
+            let end = until.map_or(self.bound, |u| u.min(self.bound));
+            let left = end.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(answer) => {
+                    self.open = false;
+                    return Some(answer.map_err(ScreenError::from));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.open = false;
+                    return Some(Err(ScreenError::Ended));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if cancelled() {
+                self.discard();
+                return Some(Ok(Answered {
+                    preparation: Preparation::Cancelled,
+                    screen: game::ScreenKey::default(),
+                }));
+            }
+            let now = Instant::now();
+            if now >= self.bound {
+                self.discard();
+                return Some(Err(ScreenError::NoAnswer));
+            }
+            if until.is_some_and(|u| now >= u) {
+                return None;
+            }
+        }
+    }
+
+    /// Drops the request on the render thread, unless already answered.
+    fn discard(&mut self) {
+        if self.open {
+            self.open = false;
+            let _ = self.tx.send(RenderMsg::Discard(self.request));
+        }
+    }
+}
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
 /// A skin's selection the render thread was asked for
 /// ([`RenderLink::select`]), polled by the game thread in short slices so
 /// it goes on with the menus meanwhile. Past the answer's bound, or
@@ -1930,6 +2053,7 @@ pub fn spawn(
                 extent: None,
                 applied: None,
                 selected: None,
+                play_selection: 0,
                 committed: Committed::default(),
                 specialized_in: None,
                 loading_refused: None,
@@ -2303,13 +2427,35 @@ struct Preparing {
     attempt: Box<AttemptContext>,
     /// The declarative skin it stages, if one is chosen.
     skin: Option<Arc<SkinBundle>>,
-    reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+    reply: mpsc::SyncSender<Result<Answered, RenderError>>,
+}
+
+/// How an attempt's preparation ended on the render thread, with the
+/// screen's structural inputs then: those it was staged with when ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answered {
+    /// How it ended.
+    pub preparation: Preparation,
+    /// The screen's device, target size and play skin selection.
+    pub screen: game::ScreenKey,
+}
+
+/// The final readiness's answer ([`RenderMsg::Ready`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyAnswer {
+    /// The staging fits the screen and is stamped: the commit may follow.
+    Ready,
+    /// Nothing of this request is staged, or the screen's structural
+    /// inputs are not those it was staged with: these are the inputs now.
+    Stale(game::ScreenKey),
 }
 
 /// An attempt's preparation answered ready: its token and whether it
 /// staged a declarative skin.
 struct Prepared {
     token: PreparedToken,
+    /// The screen's structural inputs it was staged with.
+    screen: game::ScreenKey,
     declarative: bool,
     /// The attempt's tempo and presentation epoch, current once committed.
     presentation: (game::AttemptTempo, u64),
@@ -2350,6 +2496,9 @@ struct Run {
     /// The declarative skin later attempts are prepared with; `None`
     /// prepares the skin in use (tests choose one).
     selected: Option<Arc<SkinBundle>>,
+    /// The request of the play skin selection in use, which a staged
+    /// attempt's structural inputs hold.
+    play_selection: u64,
     /// Each kind's declarative installation committed last, its loading
     /// presentation with it, kept apart from the screen: a screen built
     /// again restores exactly them.
@@ -2501,6 +2650,7 @@ impl Run {
                         | RenderMsg::Prepare(_)
                         | RenderMsg::PrepareAttempt { .. }
                         | RenderMsg::Commit { .. }
+                        | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_))
                 )
             {
@@ -2683,6 +2833,14 @@ impl Run {
                 }
                 Ok(RenderMsg::Commit { request, reply }) => {
                     let _ = reply.send(self.commit(request));
+                    continue;
+                }
+                Ok(RenderMsg::Ready {
+                    request,
+                    epoch,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.ready(request, epoch));
                     continue;
                 }
                 Ok(RenderMsg::Discard(request)) => {
@@ -3231,11 +3389,11 @@ impl Run {
         request: u64,
         attempt: Box<AttemptContext>,
         skin: AttemptSkin,
-        reply: mpsc::SyncSender<Result<Preparation, RenderError>>,
+        reply: mpsc::SyncSender<Result<Answered, RenderError>>,
     ) {
         // An older request than one asked already changes nothing.
         if !self.newest(request) {
-            let _ = reply.send(Ok(refusal("a newer request superseded it")));
+            let _ = reply.send(Ok(self.answered(refusal("a newer request superseded it"))));
             return;
         }
         // An older preparation, answered or not, and whatever it staged.
@@ -3243,7 +3401,9 @@ impl Run {
         let skin = match skin {
             AttemptSkin::Specialized(bundle) => Some(bundle),
             AttemptSkin::InUse if self.committed.pending(ScreenKind::Play) => {
-                let _ = reply.send(Ok(refusal("the play skin awaits its specialization")));
+                let _ = reply.send(Ok(
+                    self.answered(refusal("the play skin awaits its specialization"))
+                ));
                 return;
             }
             AttemptSkin::InUse => self.selected.clone(),
@@ -3313,6 +3473,11 @@ impl Run {
                     device: screen.device(),
                     kind: ScreenKind::Play,
                 },
+                screen: game::ScreenKey {
+                    device: screen.device(),
+                    target: screen.target(),
+                    skin: self.play_selection,
+                },
                 declarative: p.skin.is_some(),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
                 #[cfg(feature = "dev-tools")]
@@ -3330,8 +3495,46 @@ impl Run {
 
     /// Sends the preparation in progress its `answer`, and ends it.
     fn answer(&mut self, answer: Result<Preparation, RenderError>) {
+        let answer = answer.map(|preparation| self.answered(preparation));
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(answer);
+        }
+    }
+
+    /// `preparation` with the screen's structural inputs: those the
+    /// staging holds when it is ready, else the screen's now.
+    fn answered(&self, preparation: Preparation) -> Answered {
+        let screen = match (&preparation, &self.prepared) {
+            (Preparation::Ready, Some(p)) => p.screen,
+            _ => self.screen_key(),
+        };
+        Answered {
+            preparation,
+            screen,
+        }
+    }
+
+    /// The screen's structural inputs now: its device, its target size and
+    /// the play skin selection in use; the defaults with no screen.
+    fn screen_key(&self) -> game::ScreenKey {
+        game::ScreenKey {
+            device: self.screen.as_ref().map_or(0, |s| s.device()),
+            target: self.screen.as_ref().map_or([0, 0], |s| s.target()),
+            skin: self.play_selection,
+        }
+    }
+
+    /// The final readiness of `request` ([`RenderMsg::Ready`]): its staging
+    /// stamped with `epoch` when it still fits the screen's structural
+    /// inputs, else `Stale` with them. Bounded: it prepares nothing.
+    fn ready(&mut self, request: u64, epoch: u64) -> ReadyAnswer {
+        let now = self.screen_key();
+        match &mut self.prepared {
+            Some(p) if p.token.request == request && p.screen == now => {
+                p.presentation.1 = epoch;
+                ReadyAnswer::Ready
+            }
+            _ => ReadyAnswer::Stale(now),
         }
     }
 
@@ -3445,6 +3648,7 @@ impl Run {
                 return self.remove(request, kind);
             }
             self.selected = None;
+            self.play_selection = request;
             return Ok(Preparation::Ready);
         };
         if let Err(e) = self.recover() {
@@ -3478,6 +3682,7 @@ impl Run {
                 self.committed.set(kind, screen.installation(kind));
                 if kind == ScreenKind::Play {
                     self.selected = Some(bundle);
+                    self.play_selection = request;
                 }
                 Ok(Preparation::Ready)
             }
@@ -3499,7 +3704,7 @@ impl Run {
     /// it answered: one still preparing is answered refused, for `why`.
     fn supersede_attempts(&mut self, why: &str) {
         if let Some(p) = self.attempt.take() {
-            let _ = p.reply.send(Ok(refusal(why)));
+            let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
                 screen.discard();
             }
@@ -3535,6 +3740,7 @@ impl Run {
         }
         self.committed.pend(kind, None);
         self.selected = None;
+        self.play_selection = request;
         self.specialized_in = None;
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
@@ -8222,7 +8428,7 @@ pub(crate) mod tests {
                 );
             }
             let older = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-            let Preparation::Refused(why) = older else {
+            let Preparation::Refused(why) = older.preparation else {
                 panic!("{older:?}");
             };
             assert_eq!(why.reason, "a newer request superseded it");
@@ -9050,6 +9256,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// The attempt's final readiness (design.md "Play Lifecycle",
+    /// preparing each attempt): a staging that still fits the screen is
+    /// ready; another request's, or one after the screen was built again,
+    /// answers `Stale` with the screen's inputs now (a new device), and
+    /// the readiness prepares nothing.
+    #[test]
+    fn a_final_readiness_answers_stale_once_the_screen_changed() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        let mut pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
+        let answered = loop {
+            if let Some(a) = pending.wait_until(None, || false) {
+                break a.unwrap();
+            }
+        };
+        assert_eq!(answered.preparation, Preparation::Ready);
+        let staged = answered.screen;
+        let request = pending.request();
+        assert_eq!(
+            link.ready_attempt(request, 3).unwrap(),
+            super::ReadyAnswer::Ready
+        );
+        assert_eq!(
+            link.ready_attempt(request + 1, 3).unwrap(),
+            super::ReadyAnswer::Stale(staged)
+        );
+        let prepared = |screens: &Installers| {
+            screens
+                .log()
+                .iter()
+                .filter(|l| l.contains("prepare"))
+                .count()
+        };
+        let before = prepared(&screens);
+        rebuild(&screens, &link).unwrap();
+        let super::ReadyAnswer::Stale(now) = link.ready_attempt(request, 3).unwrap() else {
+            panic!("ready after the screen was built again");
+        };
+        assert_ne!(now.device, staged.device);
+        assert_eq!((now.target, now.skin), (staged.target, staged.skin));
+        assert_eq!(prepared(&screens), before);
+        link.exit();
+    }
+
+    /// An attempt's request dropped unanswered, or answered but not taken,
+    /// is discarded: its staging never installs.
+    #[test]
+    fn a_dropped_attempt_request_installs_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let skin = bundle();
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &skin);
+        drop(link.begin_attempt(titled(&chart), super::AttemptSkin::InUse));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        // A request answered ready and taken stays for its commit.
+        let mut pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
+        while pending.wait_until(None, || false).is_none() {}
+        drop(pending);
+        link.commit_attempt().unwrap();
+        link.exit();
+    }
+
     /// Fails the installers' screen and builds it again through the render
     /// thread's own recovery (a preparation of the chart): what the new
     /// screen's build answers.
@@ -9452,7 +9722,10 @@ pub(crate) mod tests {
             reply,
         });
         let answer = rx.recv().unwrap().unwrap();
-        assert!(matches!(answer, Preparation::Refused(_)), "{answer:?}");
+        assert!(
+            matches!(answer.preparation, Preparation::Refused(_)),
+            "{answer:?}"
+        );
         link.exit();
         assert_eq!(
             screens.log(),
