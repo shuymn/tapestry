@@ -30,10 +30,14 @@
 //!   called again the next frame.
 //! - **Notes.** At most [`crate::limits::MAX_NOTES`] notes are kept;
 //!   further occurrences are counted.
+//! - **Permits.** A screen that bounds its kept VMs gives each runtime a
+//!   [`Permit`] from its [`Pool`]; the runtime returns it when dropped,
+//!   after its VM is destroyed, on whichever thread drops it.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use mlua::{Function, Lua, Value};
 use skin_model::output::OutTy;
@@ -347,17 +351,127 @@ pub const fn to_bool(v: &Value) -> bool {
     !matches!(v, Value::Nil | Value::Boolean(false))
 }
 
+/// A bound on the VMs a screen keeps: `n` permits, each held by one VM
+/// and returned exactly once, when that VM is destroyed. Clones share the
+/// pool.
+#[derive(Clone, Debug)]
+pub struct Pool {
+    inner: Arc<PoolInner>,
+}
+
+#[derive(Debug)]
+struct PoolInner {
+    state: Mutex<PoolState>,
+    /// The returns so far: a waiting request retries when it changes.
+    released: AtomicU64,
+}
+
+#[derive(Debug)]
+struct PoolState {
+    free: usize,
+    next: u64,
+    /// The ids handed out and not yet returned.
+    out: Vec<u64>,
+}
+
+impl Pool {
+    /// A pool of `n` permits.
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        Self {
+            inner: Arc::new(PoolInner {
+                state: Mutex::new(PoolState {
+                    free: n,
+                    next: 0,
+                    out: Vec::with_capacity(n),
+                }),
+                released: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// A permit, if one is free.
+    #[must_use]
+    pub fn take(&self) -> Option<Permit> {
+        let mut st = self.inner.lock();
+        if st.free == 0 {
+            return None;
+        }
+        st.free -= 1;
+        let id = st.next;
+        st.next = st.next.wrapping_add(1);
+        st.out.push(id);
+        Some(Permit {
+            id,
+            pool: Arc::clone(&self.inner),
+        })
+    }
+
+    /// The permits free now.
+    #[must_use]
+    pub fn free(&self) -> usize {
+        self.inner.lock().free
+    }
+
+    /// How many permits have been returned: a request waiting for one
+    /// retries when this changes.
+    #[must_use]
+    pub fn releases(&self) -> u64 {
+        self.inner.released.load(Ordering::Acquire)
+    }
+}
+
+impl PoolInner {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        // The state is a count and a list, each update complete before
+        // anything can panic: a poisoned lock holds a consistent state.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Returns permit `id`; a return of an id not outstanding frees
+    /// nothing.
+    fn give_back(&self, id: u64) -> bool {
+        let mut st = self.lock();
+        let Some(at) = st.out.iter().position(|o| *o == id) else {
+            return false;
+        };
+        st.out.swap_remove(at);
+        st.free += 1;
+        drop(st);
+        self.released.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+}
+
+/// One of a [`Pool`]'s permits, held by the VM it admits; dropping it
+/// returns it.
+#[derive(Debug)]
+pub struct Permit {
+    id: u64,
+    pool: Arc<PoolInner>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let _ = self.pool.give_back(self.id);
+    }
+}
+
 /// The runtime of one selection or result skin.
+///
+/// Its fields drop in order: the callbacks' functions and the VM before
+/// its permit, so a permit returns only once the VM is destroyed.
 pub struct ScreenRuntime {
+    sites: Vec<(Site, Function)>,
     lua: Lua,
     pass: Arc<Pass>,
-    sites: Vec<(Site, Function)>,
     status: Vec<CallStatus>,
     stopped: Option<Stopped>,
     over_budget: u32,
     calls: u64,
     #[cfg(feature = "dev-tools")]
     _open: Option<super::vm_hooks::Open>,
+    permit: Option<Permit>,
 }
 
 impl std::fmt::Debug for ScreenRuntime {
@@ -413,16 +527,25 @@ impl ScreenRuntime {
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
         Some(Self {
+            sites,
             lua,
             pass,
-            sites,
             status,
             stopped: None,
             over_budget: 0,
             calls: 0,
             #[cfg(feature = "dev-tools")]
             _open: open,
+            permit: None,
         })
+    }
+
+    /// The runtime holding `permit`, returned when it is dropped, after
+    /// its VM.
+    #[must_use]
+    pub fn with_permit(mut self, permit: Permit) -> Self {
+        self.permit = Some(permit);
+        self
     }
 
     /// The callbacks it runs: the outputs a state carries for it.
@@ -628,7 +751,27 @@ pub(crate) fn stop_why(stop: Option<&Stop>) -> Option<LuaWhy> {
 mod tests {
     use mlua::{Lua, Value};
 
-    use super::{to_bool, to_int};
+    use super::{Pool, to_bool, to_int};
+
+    /// A permit returns exactly once, by its drop, on any thread; a return
+    /// of an id not outstanding frees nothing.
+    #[test]
+    fn permits_return_once() {
+        let pool = Pool::new(2);
+        let a = pool.take().unwrap();
+        let b = pool.take().unwrap();
+        assert!(pool.take().is_none());
+        assert_eq!(pool.releases(), 0);
+        std::thread::spawn(move || drop(a)).join().unwrap();
+        assert_eq!((pool.free(), pool.releases()), (1, 1));
+        assert!(!pool.inner.give_back(b.id.wrapping_add(7)));
+        let id = b.id;
+        drop(b);
+        assert!(!pool.inner.give_back(id));
+        assert_eq!((pool.free(), pool.releases()), (2, 2));
+        let c = pool.take().unwrap();
+        assert_ne!(c.id, id);
+    }
 
     /// C12: the source's `toint` (`d2l; l2i`) and `toboolean`.
     #[test]

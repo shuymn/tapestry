@@ -6,7 +6,7 @@
 mod common;
 
 use skin_beatoraja::lua::Disposition;
-use skin_beatoraja::lua::runtime::{CallStatus, RuntimeNote, ScreenRuntime, Stopped};
+use skin_beatoraja::lua::runtime::{CallStatus, Pool, RuntimeNote, ScreenRuntime, Stopped};
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
 use skin_model::{RESULT, SELECTION, ScreenKind};
 
@@ -447,4 +447,20 @@ fn a_result_skin_runs_its_callbacks() {
     // 9 / 2; with no ranking data the IR score is `Integer.MIN_VALUE`, and
     // the source's int arithmetic wraps where LuaJ's doubles convert.
     assert_eq!(out, [4, -2_147_482_648], "{:?}", runtime(&mut i).status());
+}
+
+/// A runtime's permit returns when the runtime is dropped, on the thread
+/// that drops it.
+#[test]
+fn a_dropped_runtime_returns_its_permit() {
+    let pool = Pool::new(1);
+    let i = import(&entry(
+        "",
+        &["function() return ms.number(77) / 2 end"],
+        "function() return true end",
+    ));
+    let rt = i.runtime.unwrap().with_permit(pool.take().unwrap());
+    assert_eq!(pool.free(), 0);
+    std::thread::spawn(move || drop(rt)).join().unwrap();
+    assert_eq!((pool.free(), pool.releases()), (1, 1));
 }
