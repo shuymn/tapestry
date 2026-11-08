@@ -315,6 +315,7 @@ fn played(
     )
     .unwrap();
     link.send(RenderMsg::Play {
+        state_origin: TimeUs(0),
         side,
         gauge: 0,
         measure: play_measure(clock.now()),
@@ -689,6 +690,7 @@ fn key_timers_follow_the_lifecycles_own_clocks() {
     let ready = link.prepare_attempt(super::attempt(&shared, None), || false);
     assert_eq!(ready.unwrap(), Preparation::Ready);
     link.send(RenderMsg::Play {
+        state_origin: TimeUs(0),
         side,
         gauge: 0,
         measure: play_measure(origin),
@@ -911,6 +913,7 @@ fn tail_presses_reach_both_skins_and_the_audio() {
     )
     .unwrap();
     link.send(RenderMsg::Play {
+        state_origin: TimeUs(0),
         side,
         gauge: 0,
         measure: play_measure(clock.now()),

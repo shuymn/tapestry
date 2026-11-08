@@ -237,6 +237,14 @@ pub static PLAY: Schema = Schema {
         flag("chart.bga_valid", T),
         int("chart.judge_class", JUDGE_CLASS_MAX, T),
         flag("chart.judge_class_valid", T),
+        Field {
+            name: "point",
+            ty: FieldTy::Int {
+                lo: i32::MIN,
+                hi: i32::MAX,
+            },
+            export: E,
+        },
     ],
     timers: &[
         timer("ready", E),
@@ -485,8 +493,10 @@ pub mod field {
     pub const CHART_JUDGE_CLASS: u16 = 108;
     /// Whether the chart has a judgment class.
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
+    /// The source's 7-key point, with its intermediate widths: any `i32`.
+    pub const POINT: u16 = 110;
     /// The number of fields.
-    pub const COUNT: usize = 110;
+    pub const COUNT: usize = 111;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -820,7 +830,18 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(field::COUNT, 110);
+        assert_eq!(slot("point"), Some(field::POINT));
+        assert_eq!(
+            PLAY.field("point").map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: i32::MIN,
+                    hi: i32::MAX
+                },
+                E
+            ))
+        );
+        assert_eq!(field::COUNT, 111);
     }
 
     #[test]

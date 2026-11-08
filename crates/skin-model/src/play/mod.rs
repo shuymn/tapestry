@@ -280,6 +280,11 @@ pub struct SkinFrame<'a> {
     pub now: TimeUs,
     /// Added to `now` for the display clock, which `beat` follows.
     pub display_offset: TimeUs,
+    /// The state clock: µs since the play state was entered, sampled once
+    /// a frame on the monotonic clock (design.md "beatoraja Lua Skins").
+    /// Real time, never chart time: it advances through loading, READY, a
+    /// paused chart time and a practice session's page.
+    pub state_us: i64,
     /// The play view's running totals.
     pub tally: &'a Tally,
     /// The play view's gauges, in the preset's order.
@@ -887,6 +892,7 @@ mod tests {
         let mut frame =
             |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent], notes: &NoteFacts| {
                 let frame = SkinFrame {
+                    state_us: 0,
                     now: TimeUs(now_ms * MS),
                     display_offset: TimeUs(0),
                     tally: &tally,
@@ -972,6 +978,7 @@ mod tests {
             ..tally
         };
         let refused = SkinFrame {
+            state_us: 0,
             now: TimeUs(1_250 * MS),
             display_offset: TimeUs(0),
             tally: &inconsistent,

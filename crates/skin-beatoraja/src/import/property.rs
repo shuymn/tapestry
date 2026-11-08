@@ -260,6 +260,11 @@ pub(crate) enum Value {
     MaxCombo,
     /// The target count (D4 during section practice).
     Notes,
+    /// The source's 7-key point (`point`, 100; `ScoreDataProperty.java:
+    /// 76-79`), over the attempt's targets: a section's during section
+    /// practice, as the source's practice counts only its section's notes
+    /// (`pattern/PracticeModifier.java:30-40`, `play/JudgeManager.java:135`).
+    Point,
     /// The gauge's whole percent.
     GaugePercent,
     /// The gauge's tenths of a percent (D4 below 0.1 %).
@@ -408,6 +413,7 @@ impl Value {
             Self::ExScore => "ex_score",
             Self::MaxCombo => "max_combo",
             Self::Notes => "notes",
+            Self::Point => "point",
             Self::GaugePercent => "gauge / 10",
             Self::GaugeTenths => "gauge % 10",
             Self::Count(0) => "count.perfect",
@@ -490,6 +496,7 @@ impl Value {
             self,
             Self::ExScore
                 | Self::MaxCombo
+                | Self::Point
                 | Self::GaugePercent
                 | Self::Count(_)
                 | Self::ScoredPoor
@@ -635,6 +642,7 @@ fn shown(id: i32) -> Option<Value> {
         71 | 101 => Value::ExScore,
         75 | 105 => Value::MaxCombo,
         74 | 106 => Value::Notes,
+        100 => Value::Point,
         107 => Value::GaugePercent,
         407 => Value::GaugeTenths,
         102 => Value::CurrentRatePercent,
@@ -1008,6 +1016,14 @@ mod tests {
     #[test]
     fn ids_and_names_resolve() {
         assert_eq!(int_by_id(71), IntProp::Shown(Value::ExScore));
+        assert_eq!(int_by_id(100), IntProp::Shown(Value::Point));
+        assert_eq!(int_by_name("point"), Some(IntProp::Shown(Value::Point)));
+        assert_eq!(
+            Value::Point.range(),
+            (i64::from(i32::MIN), i64::from(i32::MAX))
+        );
+        assert!(!Value::Point.deviates() && Value::Point.part().is_none());
+        assert_eq!(Value::Point.availability(), None);
         assert_eq!(int_by_id(112), IntProp::Shown(Value::Count(2)));
         assert_eq!(int_by_id(9_999), IntProp::Null);
         assert_eq!(int_by_id(0), IntProp::Null);
@@ -1297,12 +1313,13 @@ mod range_tests {
                     v.expr()
                 );
                 let (lo, hi) = v.range();
-                // The play level is signed, as `Integer.parseInt` is, and
-                // the recent timing, as a note time minus a press is.
-                let least = if matches!(v, Value::PlayLevel | Value::RecentTiming) {
-                    -i64::from(i32::MAX)
-                } else {
-                    0
+                // The play level is signed, as `Integer.parseInt` is, the
+                // recent timing, as a note time minus a press is, and the
+                // point, whose wrapped terms reach all of `i32`.
+                let least = match v {
+                    Value::PlayLevel | Value::RecentTiming => -i64::from(i32::MAX),
+                    Value::Point => i64::from(i32::MIN),
+                    _ => 0,
                 };
                 assert!(lo >= least && lo <= hi && hi <= i64::from(i32::MAX), "{id}");
             }

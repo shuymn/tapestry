@@ -888,6 +888,9 @@ pub enum RenderMsg {
         gauge: usize,
         /// What its measurement needs.
         measure: Box<PlayMeasure>,
+        /// Where the play state was entered on the clock: each frame's
+        /// state clock runs from it, whatever its candidate's origin.
+        state_origin: TimeUs,
     },
     /// The game created this play state (docs/stage3.md, offset 1): its
     /// turntable clock is adopted when its presentation begins.
@@ -2925,6 +2928,8 @@ enum Mode {
         /// The play's first READY candidate's chart time 0 on the clock: a
         /// rearmed candidate's view carries its own.
         origin: TimeUs,
+        /// Where the play state was entered on the clock, kept by a rearm.
+        state_origin: TimeUs,
         side: RenderSide,
         gauge: usize,
         first: bool,
@@ -3463,6 +3468,7 @@ impl Run {
                     side,
                     gauge,
                     measure,
+                    state_origin,
                 }) => {
                     let origin = measure.origin;
                     self.turntable.play_starts();
@@ -3470,6 +3476,7 @@ impl Run {
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
                     mode = Mode::Play {
                         origin,
+                        state_origin,
                         side,
                         gauge,
                         first: true,
@@ -3675,6 +3682,7 @@ impl Run {
                 }
                 Mode::Play {
                     origin,
+                    state_origin,
                     side,
                     gauge,
                     first,
@@ -3733,7 +3741,10 @@ impl Run {
                         self.turntable.play_starts();
                     }
                     let origin = view.origin.unwrap_or(*origin);
+                    // The frame's one sample gives the chart time and the
+                    // state clock.
                     let now = TimeUs(frame_at.0 - origin.0);
+                    let state_us = frame_at.0 - state_origin.0;
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -3749,6 +3760,7 @@ impl Run {
                     let f = FrameInput {
                         now,
                         display_offset,
+                        state_us,
                         lanes,
                         readouts,
                         view,
@@ -6350,6 +6362,7 @@ pub(crate) mod tests {
         link.commit_attempt().unwrap();
         // READY for 100 ms before chart time 0.
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(TimeUs(clock.now().0 + 100_000)),
@@ -7888,7 +7901,8 @@ pub(crate) mod tests {
     /// A screen noting each frame's chart time with the rearms it was told
     /// of so far.
     struct RearmedFrames {
-        frames: Arc<std::sync::Mutex<Vec<(u32, TimeUs)>>>,
+        /// Each frame's rearms so far, chart time and state clock.
+        frames: Noted,
         rearms: u32,
     }
 
@@ -7907,7 +7921,10 @@ pub(crate) mod tests {
             false
         }
         fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
-            self.frames.lock().unwrap().push((self.rearms, f.now));
+            self.frames
+                .lock()
+                .unwrap()
+                .push((self.rearms, f.now, f.state_us));
             Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -7925,20 +7942,35 @@ pub(crate) mod tests {
         }
     }
 
-    /// A READY rearm reaches the screen through the render thread: the
-    /// logic step's rearm tells the screen once, before its first frame
-    /// drawn from the rearmed candidate's origin.
-    #[test]
-    fn a_rearm_reaches_the_screen_before_its_first_frame() {
-        let chart = ChartBuilder::new(120_000)
+    /// The frames [`RearmedFrames`] notes.
+    type Noted = Arc<std::sync::Mutex<Vec<(u32, TimeUs, i64)>>>;
+
+    /// A chart with one tap at 60 s.
+    fn late_tap() -> Chart {
+        ChartBuilder::new(120_000)
             .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
             .build()
-            .unwrap();
-        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
-        let (mut logic, side) = Logic::<SourceReader>::new(
-            &chart,
-            &rule,
-            &device,
+            .unwrap()
+    }
+
+    /// A render thread drawing [`RearmedFrames`], its attempt over `chart`
+    /// with `rule` prepared: the logic that rearms it, the side its play
+    /// takes, the frames noted, the clock and the link.
+    fn rearmed_play<'a>(
+        chart: &'a Chart,
+        rule: &'a rules::RulePreset,
+        device: &'a DeviceProfile,
+    ) -> (
+        Logic<'a, SourceReader>,
+        game::RenderSide,
+        Noted,
+        QpcClock,
+        super::RenderLink,
+    ) {
+        let (logic, side) = Logic::<SourceReader>::new(
+            chart,
+            rule,
+            device,
             &InputStart::default(),
             Vec::new(),
             LogicConfig {
@@ -7970,7 +8002,18 @@ pub(crate) mod tests {
         .unwrap();
         let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
         assert_eq!(ready.unwrap(), Preparation::Ready);
+        (logic, side, frames, clock, link)
+    }
+
+    /// A READY rearm reaches the screen through the render thread: the
+    /// logic step's rearm tells the screen once, before its first frame
+    /// drawn from the rearmed candidate's origin.
+    #[test]
+    fn a_rearm_reaches_the_screen_before_its_first_frame() {
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) = rearmed_play(&chart, &rule, &device);
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -7982,13 +8025,57 @@ pub(crate) mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|(_, now)| now.0 < -9_000_000)));
+            .any(|(_, now, _)| now.0 < -9_000_000)));
         let _ = link.finish(clock.now());
         link.exit();
         let frames = frames.lock().unwrap();
-        for &(rearms, now) in frames.iter() {
+        for &(rearms, now, _) in frames.iter() {
             let expected = u32::from(now.0 < -9_000_000);
             assert_eq!(rearms, expected, "a frame at {now:?}");
+        }
+    }
+
+    /// Each play frame's state clock runs from the play state's origin,
+    /// sampled with its chart time (design.md "beatoraja Lua Skins", the
+    /// state clock): real time through READY, never reset by a rearm.
+    #[test]
+    fn the_state_clock_runs_from_the_play_state_through_a_rearm() {
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) = rearmed_play(&chart, &rule, &device);
+        // The state entered 7 s ago; the first candidate's chart time 0
+        // lies 2 s ahead, so its first frames are READY's.
+        let state_origin = TimeUs(clock.now().0 - 7_000_000);
+        let first = TimeUs(clock.now().0 + 2_000_000);
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(first),
+            state_origin,
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 2));
+        // The next candidate's chart time 0 lies 10 s ahead.
+        let second = TimeUs(clock.now().0 + 10_000_000);
+        logic.rearm(&InputStart::default(), second);
+        assert!(wait_until(|| frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(rearms, ..)| rearms == 1)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let frames = frames.lock().unwrap();
+        let mut last = i64::MIN;
+        for &(rearms, now, state_us) in frames.iter() {
+            // One sample: the chart time on its candidate's origin, the
+            // state clock on the state's.
+            let origin = if rearms == 0 { first } else { second };
+            assert_eq!(
+                state_us - now.0,
+                origin.0 - state_origin.0,
+                "{rearms} {now:?}"
+            );
+            assert!(now.0 < 0 && state_us >= 7_000_000 && state_us >= last);
+            last = state_us;
         }
     }
 
@@ -8049,6 +8136,7 @@ pub(crate) mod tests {
         // Long before READY's window, so the first candidate's frames do
         // not satisfy it.
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(TimeUs(clock.now().0 + 60_000_000)),
@@ -8128,6 +8216,7 @@ pub(crate) mod tests {
         let first = calls.epoch.load(Ordering::Acquire);
         let (_logic, side) = play();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -8172,6 +8261,7 @@ pub(crate) mod tests {
         assert!(next > first);
         let (_next_logic, side) = play();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -8227,6 +8317,7 @@ pub(crate) mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(origin),
@@ -8347,6 +8438,7 @@ pub(crate) mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(origin),
@@ -8465,6 +8557,7 @@ pub(crate) mod tests {
         .unwrap();
         let origin = clock.now();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(origin),
@@ -8596,6 +8689,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -8729,6 +8823,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -8827,6 +8922,7 @@ pub(crate) mod tests {
         captures.bind(1);
         // Chart time 3 s at the play's first frame: past the capture's.
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(TimeUs(clock.now().0 - 3_000_000)),
@@ -9364,6 +9460,7 @@ pub(crate) mod tests {
         resume.join().unwrap();
         let clock = QpcClock::start();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -12101,6 +12198,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),
@@ -12213,6 +12311,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         link.send(RenderMsg::Play {
+            state_origin: TimeUs(0),
             side,
             gauge: 0,
             measure: play_measure(clock.now()),

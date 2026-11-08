@@ -1781,6 +1781,7 @@ fn stretch(
             }
         }
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: offset,
             tally,
@@ -2163,6 +2164,7 @@ fn build_does_not_allocate() {
     batch.clear();
     let notes = NoteFacts::default();
     let frame = SkinFrame {
+        state_us: 0,
         now: TimeUs(5_000 * MS),
         display_offset: TimeUs(0),
         tally: &t,
@@ -2240,6 +2242,7 @@ fn build_does_not_allocate() {
         batch.clear();
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
             tally: &t,
@@ -2563,6 +2566,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         };
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &t,
@@ -2678,6 +2682,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 play_support::follow(&mut notes, &c, e);
             }
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -2718,6 +2723,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         for _ in 0..3 {
             batch.clear();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(1_000 * MS),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -2865,6 +2871,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     play_support::follow(&mut notes, &chart, e);
                 }
                 let frame = SkinFrame {
+                    state_us: 0,
                     now: TimeUs(now),
                     display_offset: TimeUs(0),
                     tally: &t,
@@ -2910,6 +2917,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         hidden: 0,
                     };
                     let frame = SkinFrame {
+                        state_us: 0,
                         now: TimeUs(from + (k + 1) * 700 * MS),
                         display_offset: TimeUs(0),
                         tally: &t,
@@ -2946,6 +2954,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             for _ in 0..2 {
                 batch.clear();
                 let frame = SkinFrame {
+                    state_us: 0,
                     now: TimeUs(from + 9_000 * MS),
                     display_offset: TimeUs(0),
                     tally: &t,
@@ -3170,6 +3179,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let t = tally(u32::try_from(i / 17).unwrap_or(0));
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &t,
@@ -3227,6 +3237,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         batch.clear();
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(1_000 * MS),
             display_offset: TimeUs(0),
             tally: &t,
@@ -3360,6 +3371,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     // A frame at `now` µs, shown `offset` µs ahead, on the stack.
     let notes = NoteFacts::default();
     let frame_at = |now: i64, offset: i64, target, lanes, readouts| SkinFrame {
+        state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(offset),
         tally: &t,
@@ -3619,6 +3631,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
         let target = TARGETS[i % TARGETS.len()];
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: if judged { &after } else { &before },
@@ -3771,6 +3784,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
             let view = views.lanes[(no / 7) % views.lanes.len()];
             let notes = NoteFacts::default();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -3927,6 +3941,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
     };
     let notes = NoteFacts::default();
     let frame = |now: i64, readouts: FrameReadouts| SkinFrame {
+        state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -4160,6 +4175,7 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let notes = NoteFacts::default();
     let layout = SkinLayout::AUTHOR;
     let frame = |now: i64, t: &'static Tally| SkinFrame {
+        state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: t,
