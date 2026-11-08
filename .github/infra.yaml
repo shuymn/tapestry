@@ -89,4 +89,6 @@ spec:
         - jdx/mise-action@*
         - DeterminateSystems/nix-installer-action@*
         - Swatinem/rust-cache@*
+        - actions/cache/restore@*
+        - actions/cache/save@*
     fork_pr_approval: all_external_contributors
