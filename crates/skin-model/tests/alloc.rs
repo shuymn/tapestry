@@ -676,7 +676,6 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 region,
                 pivot: Anchor::ALL[usize::from(i)],
                 follow: FOLLOWS[usize::from(i) % 4],
-                angle: skin_model::AngleFollow::None,
                 ..Place::SCREEN
             },
         ));
@@ -798,7 +797,6 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     let top = Place {
         region: Region::Top,
         follow: Follow::Cover,
-        angle: skin_model::AngleFollow::None,
         ..Place::SCREEN
     };
     let fixed = lanes_support::rect([900, 20, 300, TEXT_H]);
@@ -1292,7 +1290,6 @@ fn loading_skin() -> Loaded {
                 Place {
                     pivot: Anchor::ALL[usize::from(i)],
                     follow: FOLLOWS[usize::from(i) % 4],
-                    angle: skin_model::AngleFollow::None,
                     ..Place::SCREEN
                 },
             )
@@ -3720,7 +3717,6 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
     for (k, def) in defs.into_iter().enumerate() {
         let place = Place {
             follow: Follow::LiftAndCover,
-            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         };
         let elements = vec![

@@ -452,9 +452,9 @@ impl App {
             }
             // The screen's measures are the chart's 1× times.
             config.speed = Speed::NORMAL;
-            rig.play_state_began();
-        } else {
-            rig.play_state_began();
+        }
+        rig.play_state_began();
+        if !practice {
             // The loading state shows before the chart is read; a practice
             // shows it at each Start instead.
             rig.entered_loading(chart);

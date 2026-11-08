@@ -489,7 +489,6 @@ fn a_follower_checks_every_entry_track() {
     let mut e = chooser(0);
     e.place = Place {
         follow: skin_model::Follow::Cover,
-        angle: skin_model::AngleFollow::None,
         ..Place::SCREEN
     };
     // Without lanes the reach is 0: at the bound is inside.

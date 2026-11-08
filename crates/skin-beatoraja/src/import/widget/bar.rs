@@ -112,7 +112,6 @@ impl Cx<'_> {
                 pivot: c.pivot,
                 native,
                 follow: c.follow,
-                angle: skin_model::AngleFollow::None,
                 ..Place::SCREEN
             },
         };
