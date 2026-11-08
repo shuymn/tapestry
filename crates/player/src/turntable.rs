@@ -66,9 +66,12 @@ impl Turntable {
     }
 
     /// Play state `number`'s resume, applied by the practice page
-    /// ([`practice_page`](Self::practice_page)).
-    pub(crate) const fn resume(&mut self, number: u64) {
-        self.resume = Some(number);
+    /// ([`practice_page`](Self::practice_page)); another number's is
+    /// ignored and leaves a queued one.
+    pub(crate) fn resume(&mut self, number: u64) {
+        if self.clock.number() == Some(number) {
+            self.resume = Some(number);
+        }
     }
 
     /// The practice page shows: its play state's presentation begins, and
@@ -222,6 +225,13 @@ mod tests {
         t.practice_page();
         idle(&mut t, 210, 300);
         assert_eq!(t.angle(), 200 * 1_000);
+        // A resume of another number after its own leaves its own queued.
+        t.resume(2);
+        t.resume(1);
+        t.practice_page();
+        t.presented(TimeUs(400 * MS), None, ScratchInput::NONE);
+        t.presented(TimeUs(410 * MS), None, ScratchInput::NONE);
+        assert_eq!(t.angle(), 210 * 1_000, "resumed");
     }
 
     /// READY's frames tick the clock but update no autoplay: a scratch
@@ -382,6 +392,11 @@ mod tests {
             negative: true,
             ..ScratchInput::NONE
         };
+        // The counter counts: an allocation before the measured interval
+        // shows.
+        let control = this_thread();
+        std::hint::black_box(vec![0_u8; 64]);
+        assert!(this_thread() > control, "the counting allocator counts");
         let before = this_thread();
         for round in 0..3 {
             t.play_starts();

@@ -3824,11 +3824,17 @@ impl Run {
                 && timing.presented
                 && turns
             {
+                // A play frame's tick is the app's work, measured as its
+                // build is.
+                #[cfg(feature = "dev-tools")]
+                let region = chart.is_some().then(crate::alloc_count::AppRegion::enter);
                 let scratch = self
                     .presentation
                     .as_mut()
                     .map_or(game::ScratchInput::NONE, |r| r.read().scratch);
                 self.turntable.presented(frame_at, *chart, scratch);
+                #[cfg(feature = "dev-tools")]
+                drop(region);
             }
             if matches!(mode, Mode::Result) && drawn.is_ok() {
                 self.after_result_frame();
@@ -6007,6 +6013,144 @@ pub(crate) mod tests {
         assert_eq!(seen.lock().unwrap()[0].0, 0, "the wait page turned it");
         link.end_loading().unwrap();
         link.exit();
+    }
+
+    /// A play frame's turntable angle and chart time.
+    type PlayTurned = (i32, TimeUs);
+
+    /// A screen noting every play frame's turntable angle ([`PlayTurned`]).
+    struct PlayTurning(Arc<std::sync::Mutex<Vec<PlayTurned>>>);
+
+    impl Screen for PlayTurning {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            self.0.lock().unwrap().push((f.turntable, f.now));
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The play frames carry the turntable through the render loop: a
+    /// play state adopted at its attempt's preparation takes its baseline
+    /// from the first READY frame (0); each frame's angle is the previous
+    /// frames' ticks, idle at one unit a µs of the frame clock; and the
+    /// committed attempt's autoplay notes press the scratch from the play's
+    /// start, turning it three times as fast (Positive) after a tap.
+    #[test]
+    fn play_frames_carry_the_turntable_and_autoplay() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let (_logic, side) = Logic::<SourceReader>::new(
+            &chart,
+            &rule,
+            &device,
+            &InputStart::default(),
+            Vec::new(),
+            LogicConfig {
+                inputs: 0,
+                effects: 16,
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let shared_chart = Arc::new(chart.clone());
+        let link = spawn(
+            make,
+            Some(Arc::clone(&shared_chart)),
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.play_state(game::PlayState {
+            number: 1,
+            origin: clock.now(),
+        });
+        // A tap on the scratch 150 ms into the play.
+        let notes = vec![game::ScratchNote {
+            time: TimeUs(150_000),
+            kind: game::ScratchNoteKind::Tap,
+        }];
+        let ready = link.prepare_attempt(
+            attempt(&shared_chart, None).with_scratch_notes(notes),
+            || false,
+        );
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        // READY for 100 ms before chart time 0.
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(TimeUs(clock.now().0 + 100_000)),
+        });
+        assert!(wait_until(|| seen
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|f| f.1.0 > 400_000)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let f = seen.lock().unwrap().clone();
+        assert_eq!(f[0].0, 0, "the first READY frame adds 0");
+        assert!(f[0].1.0 < 0, "the first frame is READY's");
+        // The angle frame k + 1 draws less frame k's is frame k's tick:
+        // its interval since frame k − 1 times its rate.
+        let mut rates = Vec::new();
+        for k in 1..f.len() - 1 {
+            let turned = i64::from(f[k + 1].0 - f[k].0).rem_euclid(2_160_000);
+            let dt = f[k].1.0 - f[k - 1].1.0;
+            if dt > 0 {
+                rates.push((f[k].1, turned as f64 / dt as f64));
+            }
+        }
+        // The tap is crossed at the first frame at or after 150 ms and
+        // pressed while its age in state ms is at most 80: rate 3 there,
+        // 1 before it and after the expiry (a millisecond's floor apart).
+        let crossed = f.iter().find(|x| x.1.0 >= 150_000).unwrap().1.0;
+        let mut pressed = 0;
+        for (now, r) in &rates {
+            let expected = if now.0 >= crossed && now.0 <= crossed + 79_000 {
+                pressed += 1;
+                3.0
+            } else if now.0 < crossed || now.0 > crossed + 82_000 {
+                1.0
+            } else {
+                continue;
+            };
+            assert!((r - expected).abs() < 1e-9, "rate {r} at {now:?}");
+        }
+        assert!(pressed > 0, "no frame while the tap was pressed");
     }
 
     /// A render thread drawing on a [`ClockedLoading`], and its frames.
