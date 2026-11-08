@@ -188,13 +188,11 @@ fn cells_past_the_file_repeat_its_edge_through_the_allocation() {
         ([10, 5, 6, 4], [1, 1]),
         ([11, 1, 5, 3], [1, 1]),
     ];
-    let mut seen = Vec::new();
     for (file, name) in [(0, "a.png"), (0, "a.bmp")] {
         let images = cases.iter().map(|&(r, g)| cut(file, r, g)).collect();
         let sheet = load(d.path(), vec![self::file(name)], images).unwrap();
         let a = atlas(&sheet);
         let mut frame = 0;
-        let mut texels = Vec::new();
         for &([rx, ry, rw, rh], [cols, rows]) in &cases {
             let (cw, ch) = (rw / u32::from(cols), rh / u32::from(rows));
             for r in 0..u32::from(rows) {
@@ -206,22 +204,18 @@ fn cells_past_the_file_repeat_its_edge_through_the_allocation() {
                             let nx = rx + c * cw + tx.saturating_sub(x).min(w - 1);
                             let ny = ry + r * ch + ty.saturating_sub(y).min(h - 1);
                             let [cr, cg, cb] = img.get_pixel(nx.min(12), ny.min(6)).0;
-                            let got = texel(&a, page, 0, tx, ty);
                             assert_eq!(
-                                got,
+                                texel(&a, page, 0, tx, ty),
                                 [cr, cg, cb, 255],
                                 "{name} frame {frame} at {tx}, {ty}"
                             );
-                            texels.push(got);
                         }
                     }
                     frame += 1;
                 }
             }
         }
-        seen.push(texels);
     }
-    assert_eq!(seen[0], seen[1]);
 }
 
 #[test]

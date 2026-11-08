@@ -778,7 +778,8 @@ impl Sheet {
     /// each variant's running byte total; then each header (at most
     /// [`HEADER_BYTES`] read): its format, its size, each variant's
     /// running texel total, and an @2x version at exactly twice the size;
-    /// then each image's rectangle inside its file and a non-empty frame.
+    /// then each image's rectangle starting inside its file, which it may
+    /// run past ([`ImageDef::rect`]), and a non-empty frame.
     ///
     /// These counts check what was built. A front end enforces the file,
     /// image and frame limits cumulatively while it builds the input.
