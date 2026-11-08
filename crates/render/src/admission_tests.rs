@@ -152,7 +152,7 @@ fn the_largest_skin_of_each_kind_fits_together() {
             .keeping_vm(),
     );
     let needed: u64 = r.admission().committed.iter().sum::<u64>() + CAP + VM_TEXELS;
-    assert!(231_900_000 < CAP);
+    const { assert!(231_900_000 < CAP) };
     assert!(needed > 576 << 20, "{needed}");
     assert!(needed <= SHARED_TEXELS, "{needed}");
     r.admit(ScreenKind::Result, &result).unwrap();
