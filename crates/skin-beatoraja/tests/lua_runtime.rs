@@ -268,13 +268,17 @@ fn notes_are_capped() {
     ));
     let n = runtime(&mut i).outputs();
     let cap = skin_beatoraja::limits::MAX_NOTES;
-    for _ in 0..cap + 10 {
+    // A frame past the time budget under load reads no id, so frames run
+    // until ten reads past the cap were counted (bounded).
+    let mut frames = 0;
+    while runtime(&mut i).notes().1 < 10 && frames < 4 * cap {
         let mut f = fields(n, &[]);
         runtime(&mut i).frame(&mut f, &[]);
+        frames += 1;
     }
     let (notes, dropped) = runtime(&mut i).notes();
     assert_eq!(notes.len(), cap);
-    assert!(dropped >= 10, "{dropped}");
+    assert!(dropped >= 10, "{dropped} after {frames} frames");
     // Unknown ids are not cached: no bridge was kept for them.
     assert_eq!(runtime(&mut i).counters().bridges, 0);
 }
