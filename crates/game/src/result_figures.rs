@@ -6,7 +6,7 @@
 //! integers, and is a fixed size whatever the play.
 
 use bms_model::{Chart, NoteKind, TimeUs};
-use eval::{Evaluation, JudgeEvent, JudgeEventKind};
+use eval::{Evaluation, JudgeEvent, JudgeEventKind, side_deviation};
 use replay::verify::Coverage;
 use rules::{GaugeValue, Judgment, RulePreset};
 
@@ -167,6 +167,9 @@ pub struct ResultFigures {
     pub gauge_permille: u16,
     /// The timing statistics; `None` without a sample.
     pub timing: Option<TimingStats>,
+    /// The mean absolute duration of the attempt's notes in µs
+    /// ([`mean_duration`]); `None` with no note.
+    pub duration_us: Option<u32>,
     /// The key lanes' judge areas a timing distribution draws
     /// ([`judge_areas`]).
     pub areas: [[i16; 2]; 5],
@@ -201,6 +204,7 @@ impl ResultFigures {
             cleared: clear != BestLamp::Failed,
             gauge_permille: shown.map_or(0, |g| permille(g.value)),
             timing: TimingStats::of(&e.events),
+            duration_us: mean_duration(&e.events, notes),
             areas: judge_areas(chart, preset),
         }
     }
@@ -325,6 +329,54 @@ pub fn timing_sample(e: &JudgeEvent) -> Option<i64> {
     let d = side_deviation(Some(head), release).unwrap_or(head);
     let s = d.0.saturating_neg();
     (s.unsigned_abs() <= TIMING_RANGE_US.unsigned_abs()).then_some(s)
+}
+
+/// What a note judged other than PERFECT to BAD, or left unjudged, adds
+/// to [`mean_duration`]'s sum: one second, as the source adds it.
+pub const MISSED_DURATION_US: u64 = 1_000_000;
+
+/// The mean absolute duration of the attempt's `notes` in µs, the source's
+/// penalized mean (0.8.9 `play/BMSPlayer.java:917-936`, shown as numbers
+/// 372 and 373, `skin/property/IntegerPropertyFactory.java:410-420`):
+/// each note judged PERFECT to BAD adds the absolute deviation of its
+/// press, a long note's by the tally's side as [`timing_sample`] takes it
+/// but with no range filter, and every other note, a POOR, a miss or one
+/// left unjudged after an abort, adds [`MISSED_DURATION_US`]; the sum is
+/// divided by `notes`, rounded down. A long note is one note, as the
+/// evaluator judges it once, where the source counts a long note's end
+/// apart in some modes. `None` when `notes` is 0. One pass, no
+/// allocation, integers only.
+#[must_use]
+pub fn mean_duration(events: &[JudgeEvent], notes: u32) -> Option<u32> {
+    if notes == 0 {
+        return None;
+    }
+    let (mut judged, mut sum) = (0_u32, 0_u64);
+    for e in events {
+        let JudgeEventKind::Judged {
+            judgment,
+            deviation,
+            release,
+            ..
+        } = e.kind
+        else {
+            continue;
+        };
+        judged = judged.saturating_add(1);
+        let pressed = matches!(
+            judgment,
+            Judgment::Perfect | Judgment::Great | Judgment::Good | Judgment::Bad
+        );
+        let d = deviation.map(|head| side_deviation(Some(head), release).unwrap_or(head));
+        let add = match (pressed, d) {
+            (true, Some(d)) => d.0.unsigned_abs(),
+            _ => MISSED_DURATION_US,
+        };
+        sum = sum.saturating_add(add);
+    }
+    let unjudged = u64::from(notes.saturating_sub(judged));
+    sum = sum.saturating_add(unjudged.saturating_mul(MISSED_DURATION_US));
+    u32::try_from(sum / u64::from(notes)).ok()
 }
 
 /// The bins of a result's timelines over chart time: from `origin`, each
@@ -488,19 +540,6 @@ fn channel(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs
         1 + grade
     } else {
         5 + grade
-    }
-}
-
-/// The deviation that decides a judgment's side, as [`eval::Tally`] counts
-/// it (design.md "Evaluation Stages", accounting): for a long note
-/// finished by a release, whichever of its head's press and its release
-/// lies farther from its time, the release on a tie; otherwise the
-/// press's, `None` for a miss.
-fn side_deviation(deviation: Option<TimeUs>, release: Option<TimeUs>) -> Option<TimeUs> {
-    match (deviation, release) {
-        (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
-        (_, Some(r)) => Some(r),
-        (head, None) => head,
     }
 }
 

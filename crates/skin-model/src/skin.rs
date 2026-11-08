@@ -133,10 +133,12 @@ pub enum Source {
     TimingGraph(u32),
 }
 
-/// The widgets only a result skin draws.
+/// What only a result skin has: the widgets it draws and the timing it
+/// declares.
 #[derive(Clone, Debug, Default)]
 pub struct ResultDefs {
     pub judge_graphs: Vec<JudgeGraphDef>,
+    pub timing: crate::result::ResultTiming,
     pub gauge_graphs: Vec<GaugeGraphDef>,
     pub timing_graphs: Vec<TimingGraphDef>,
 }
@@ -451,6 +453,8 @@ pub struct Skin {
     song_list: Option<SongList>,
     ratio_bars: Box<[RatioBar]>,
     judge_graphs: Box<[JudgeGraph]>,
+    /// A result skin's declared timing; the default for another kind.
+    result_timing: crate::result::ResultTiming,
     gauge_graphs: Box<[GaugeGraph]>,
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
@@ -2046,6 +2050,7 @@ impl Skin {
             song_list,
             ratio_bars,
             judge_graphs,
+            result_timing: res.timing,
             gauge_graphs,
             timing_graphs,
             sliders,
@@ -2058,6 +2063,13 @@ impl Skin {
     #[must_use]
     pub fn close(&self) -> Option<TimeUs> {
         self.close
+    }
+
+    /// What a result skin declares for its screen's timing
+    /// ([`ResultDefs::timing`]); every part 0 or none for another kind.
+    #[must_use]
+    pub fn result_timing(&self) -> crate::result::ResultTiming {
+        self.result_timing
     }
 
     /// The frames of the sheet's images: the length of the uv table
