@@ -115,6 +115,7 @@ impl Cx<'_> {
                 IntProp::Shown(v) => NumberValue::of(v),
             }
         };
+        self.gate_by_value(&shown.expr, shown.guard.as_deref(), Conv::Int);
         let role = shown.role.or_failure(dst.failure);
         let Some(DigitsStyle {
             mut c,
