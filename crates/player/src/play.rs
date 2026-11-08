@@ -282,6 +282,24 @@ pub struct PlayerRig<'a> {
     pub result_skin: crate::result_skin::ResultSkin,
     /// The attempt's chart facts a result view carries.
     pub result_chart: Option<skin_model::ResultChart>,
+    /// The result's presentation (the S10-09i design's D1): its lifetime,
+    /// the desired view and what was published.
+    pub presenter: crate::result_present::Presenter,
+    /// The chart's strings the attempt's result shows.
+    pub result_labels: Option<skin_model::ResultLabels>,
+    /// The attempt's result upload was withdrawn by a quit, a close or a
+    /// thread's failure: the end of loading does not wait on the render
+    /// thread, which may still be in it.
+    pub result_withdrawn: bool,
+    /// The facts behind the result strip's lines that do not depend on the
+    /// view, while a result lifetime is current.
+    pub result_facts: Option<crate::result_present::OverlayFacts>,
+    /// The input offset last seen while the result shows, and whether the
+    /// offset keys changed it in this lifetime (O6).
+    pub result_offset: Option<(i64, bool)>,
+    /// A leaving command was accepted on the result: the next screen's
+    /// preparation leaves its lifetime.
+    pub result_leaving: bool,
 }
 
 impl PlayerRig<'_> {
@@ -293,6 +311,7 @@ impl PlayerRig<'_> {
     fn result_stage(&mut self, loaded: &Loaded) -> crate::result_skin::Staged {
         let chart = crate::result_skin::attempt_chart(loaded);
         self.result_chart = Some(chart);
+        self.result_labels = Some(crate::result_present::labels_of(&loaded.attempt().labels));
         let mut result = std::mem::take(&mut self.result_skin);
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
@@ -315,6 +334,137 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
         self.controls.quitting() || self.input_failure().is_some() || self.audio_failure().is_some()
+    }
+
+    /// The atlases the render thread retains for the result go to the
+    /// result skin (the S10-09i design's §2.1 Q3), then its finished job's
+    /// outcome is taken; while a result lifetime is current, the desired
+    /// view's payload is published once its layout is (D1), and a fallback
+    /// the render thread reported applies (D7). Returns whether the latest
+    /// request is published.
+    fn land_result(&mut self) -> bool {
+        let status = self.render.result_status();
+        self.result_skin.set_retained(&status.retained);
+        let ready = self.result_skin.poll();
+        if self.presenter.current() {
+            if self.presenter.status(&status) || ready {
+                self.presenter
+                    .land(&mut self.render, self.result_skin.shown());
+            }
+            self.present_overlay();
+        }
+        ready
+    }
+
+    /// The result's view of `screen` after `report`, as the end page just
+    /// built shows it, becomes the desired one: its snapshot is kept until
+    /// its layout lands. A result lifetime begins with the result's first
+    /// show. Nothing without a result skin, or once the run disabled it.
+    fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        let (Some(chart), Some(page)) = (self.result_chart, self.end_page.clone()) else {
+            return;
+        };
+        if !self.result_skin.has_skin() || self.presenter.disabled().is_some() {
+            return;
+        }
+        if !self.presenter.current() {
+            self.presenter.begin(&mut self.render, self.clock.now());
+            self.result_leaving = false;
+            self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
+        }
+        self.presenter.want(crate::result_present::Snapshot {
+            view: crate::result_present::view_of(screen, chart),
+            labels: self.result_labels.clone().unwrap_or_default(),
+            lines: crate::result_present::view_lines(report, screen),
+            page,
+        });
+        self.result_facts = Some(crate::result_present::OverlayFacts::of(
+            report,
+            screen,
+            self.autoplay,
+        ));
+        self.land_result();
+    }
+
+    /// The strip's lines that do not depend on the view, as they stand:
+    /// the offset guidance once the offset keys changed the offset in this
+    /// lifetime, and a thread's failure.
+    fn present_overlay(&mut self) {
+        let Some(facts) = &self.result_facts else {
+            return;
+        };
+        let now = self.controls.tuning().get().input_offset_us;
+        let used = match &mut self.result_offset {
+            Some((seen, used)) => {
+                *used |= *seen != now;
+                *seen = now;
+                *used
+            }
+            None => false,
+        };
+        let failure = self
+            .input_failure()
+            .map(|e| format!("INPUT: {e}"))
+            .or_else(|| self.audio_failure().map(|e| format!("AUDIO: {e}")));
+        let lines = facts.lines(used.then_some(now), failure);
+        self.presenter.lines(&mut self.render, lines);
+    }
+
+    /// The result's lifetime ends: nothing of it is drawn any more.
+    pub(crate) fn leave_result(&mut self) {
+        self.presenter.end(&mut self.render);
+        self.result_facts = None;
+        self.result_offset = None;
+        self.result_leaving = false;
+    }
+
+    /// The attempt's result is uploaded after its commit and before
+    /// recording opens (the S10-09i design's D2): a fixed skin reinstalled
+    /// when play's admission released it, a chart-only specialization, or
+    /// a prepared atlas, unless its atlas is installed. The wait looks at
+    /// the quit key, the close and the input and audio threads between
+    /// slices: on any of them the upload is withdrawn, so a late staging
+    /// installs nothing, and the end of loading does not wait on the
+    /// render thread. A refusal shows the built-in result for the attempt.
+    fn upload_result(&mut self) {
+        self.result_withdrawn = false;
+        let status = self.render.result_status();
+        if status.disabled.is_some() {
+            return;
+        }
+        let Some(upload) = self.result_skin.upload() else {
+            return;
+        };
+        if status.installed == Some(upload.atlas()) {
+            return;
+        }
+        let mut pending = self.render.upload_result(upload);
+        loop {
+            if preparation_stops(
+                self.quitting(),
+                self.controls.leaving(),
+                self.input_failure(),
+                self.audio_failure(),
+            ) {
+                // Withdrawn as it drops: a completion after it installs
+                // nothing.
+                drop(pending);
+                self.result_withdrawn = true;
+                #[cfg(feature = "dev-tools")]
+                println!("dev: result upload withdrawn");
+                return;
+            }
+            let why = match pending.poll(crate::render_side::SELECT_SLICE) {
+                None => continue,
+                Some(Ok(Preparation::Ready)) => return,
+                Some(Ok(Preparation::Refused(why))) => why.to_string(),
+                Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
+                Some(Err(e)) => Chain(&e).to_string(),
+            };
+            log::info!("skin: result: built-in for this attempt: {why}");
+            self.presenter.attempt_fallback(why);
+            return;
+        }
     }
 
     /// The result skin's running layout job cancelled and waited for; the
@@ -618,6 +768,7 @@ impl PlayerRig<'_> {
         if tuned.is_some() || speed != self.shown_speed {
             self.shown_speed = speed;
             self.send_end(tuned.unwrap_or_else(|| self.controls.tuning().get()));
+            self.present_overlay();
         }
     }
 
@@ -906,7 +1057,7 @@ impl Rig for PlayerRig<'_> {
         }
         // A switch's layout lands when its job is done; a close leaves its
         // wait within the stop bound.
-        self.result_skin.poll();
+        self.land_result();
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
@@ -967,6 +1118,7 @@ impl Rig for PlayerRig<'_> {
     /// layout job and waits for its thread before it is served (D11); the
     /// run's end bounds the wait.
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
+        self.result_leaving = true;
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
@@ -1009,7 +1161,9 @@ impl Rig for PlayerRig<'_> {
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
-        commit_ready(&self.render, loading, &mut self.declared_close)
+        commit_ready(&self.render, loading, &mut self.declared_close)?;
+        self.upload_result();
+        Ok(())
     }
 
     fn discard_attempt(&mut self) {
@@ -1025,6 +1179,12 @@ impl Rig for PlayerRig<'_> {
             .as_mut()
             .and_then(|s| s.loading.take())
             .is_some();
+        // A withdrawn upload may still hold the render thread: the loading
+        // state ends without its answer, and recording does not open.
+        if std::mem::take(&mut self.result_withdrawn) {
+            self.render.clear_loading();
+            return Ok(());
+        }
         match &mut self.gate {
             Some(gate) => gate.end_loading(&self.render, loading),
             None if loading => self.render.end_loading(),
@@ -1033,6 +1193,13 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
+        // Within a result lifetime a screen built again is not a leaving:
+        // the render side draws on from what it presented (the S10-09i
+        // design's D4, "Recovery").
+        if self.presenter.current() && !self.result_leaving {
+            return self.render.prepare();
+        }
+        self.leave_result();
         self.retry_from = self.pending_retry.take();
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
@@ -1051,6 +1218,7 @@ impl Rig for PlayerRig<'_> {
     /// with the gauge the attempt shows.
     fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
         self.result_skin.next_attempt();
+        self.presenter.next_attempt();
         let skin = match self.attempt_skin(loaded) {
             Ok(skin) => skin,
             Err(stopped) => return Ok(stopped),
@@ -1575,7 +1743,7 @@ impl Rig for PlayerRig<'_> {
             // A script's step on the layout (dev-tools), at every look.
             #[cfg(feature = "dev-tools")]
             crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
-            if self.result_skin.poll() {
+            if self.land_result() {
                 return game::Polled::Ready;
             }
             let left = deadline.0 - self.clock.now().0;
@@ -1591,8 +1759,10 @@ impl Rig for PlayerRig<'_> {
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
-        // until it lands (design D11).
-        if let Some(chart) = self.result_chart {
+        // until it lands (design D11). The attempt's fallback requests none.
+        if let Some(chart) = self.result_chart
+            && self.presenter.attempt_fallen().is_none()
+        {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
         }
@@ -1615,6 +1785,9 @@ impl Rig for PlayerRig<'_> {
             ),
             graphs: end_screen::view_graphs(screen),
         });
+        // The skin's presentation goes first, so the built-in page does not
+        // draw before it.
+        self.present_view(report, screen);
         self.send_end(tuning.get());
 
         self.result_shown();

@@ -2026,6 +2026,38 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
+/// The result's next uploads hold on the render thread while set (tests
+/// and development builds: an upload's wait and its withdrawal).
+static RESULT_UPLOAD_HELD: AtomicBool = AtomicBool::new(false);
+/// Set while an upload holds.
+static RESULT_UPLOAD_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// Holds the result's uploads on the render thread from now on (`true`),
+/// or lets the one holding go (`false`) (tests).
+#[cfg(test)]
+pub fn hold_result_uploads(on: bool) {
+    RESULT_UPLOAD_HELD.store(on, Ordering::SeqCst);
+}
+
+/// Whether a result upload holds now (tests).
+#[cfg(test)]
+pub fn result_upload_holding() -> bool {
+    RESULT_UPLOAD_WAITING.load(Ordering::SeqCst)
+}
+
+/// Holds the result's upload on the render thread while
+/// [`hold_result_uploads`] says so, before anything of it is staged.
+pub fn hold_result_upload() {
+    if !RESULT_UPLOAD_HELD.load(Ordering::SeqCst) {
+        return;
+    }
+    RESULT_UPLOAD_WAITING.store(true, Ordering::SeqCst);
+    while RESULT_UPLOAD_HELD.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    RESULT_UPLOAD_WAITING.store(false, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{adler32, crc32, png, read_bounded, read_limited};

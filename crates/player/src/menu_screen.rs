@@ -299,6 +299,24 @@ fn strip_sprites(
     n
 }
 
+/// The result strip's bands for `lines` lines, in layout pixels: one dark
+/// band under each, from the top, at most
+/// [`render::RESULT_STRIP_SPRITES`]. Allocates nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn result_strip_sprites(lines: usize, out: &mut [Sprite; render::RESULT_STRIP_SPRITES]) -> usize {
+    let mut n = 0;
+    for (i, slot) in out.iter_mut().take(lines).enumerate() {
+        *slot = Sprite {
+            rect: [0.0, line_top(i) - 3.0, 1_920.0, LINE_STEP],
+            uv: solid_uv(),
+            color: [0.0, 0.0, 0.0, 0.75],
+            ..Sprite::default()
+        };
+        n += 1;
+    }
+    n
+}
+
 /// Where the load's lines start on the play screen while a chart loads:
 /// right of the lanes, under the measurement overlay's place.
 const LOADING_LEFT: f32 = 1_000.0;
@@ -344,6 +362,10 @@ pub struct MenuScreen {
     /// The caret's area of the fallback page prepared with the selection
     /// skin, sent when a refusal draws the page.
     page_caret: Option<[f32; 4]>,
+    /// The result strip's text: the one drawn, then the ones prepared for
+    /// the commit point to take (the S10-09i design's D1), each with its
+    /// lines' count.
+    result_strip: [(Option<MenuText>, usize); 3],
     /// A frame's app work allocates once while set (tests: the allocation
     /// guards' positive control).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -468,6 +490,7 @@ impl MenuScreen {
             strip_underline: None,
             selection_key: None,
             page_caret: None,
+            result_strip: [(None, 0), (None, 0), (None, 0)],
             #[cfg(all(test, feature = "dev-tools"))]
             alloc_probe: false,
             #[cfg(all(test, feature = "dev-tools"))]
@@ -740,6 +763,13 @@ impl MenuScreen {
         self.sent = Some(area);
     }
 
+    /// The strip's lines the next result frame draws.
+    fn result_strip(&self) -> usize {
+        self.result_strip
+            .first()
+            .map_or(0, |(t, n)| if t.is_some() { *n } else { 0 })
+    }
+
     /// Its renderer, for the tests that draw on it directly.
     #[cfg(test)]
     pub(crate) const fn renderer_mut(&mut self) -> &mut Renderer {
@@ -833,6 +863,142 @@ impl Screen for MenuScreen {
 
     fn remove(&mut self, kind: ScreenKind) {
         self.renderer.remove(kind);
+    }
+
+    fn install_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<skin_model::PackedPages>,
+        request: u64,
+    ) -> Result<Preparation, RenderError> {
+        match self.renderer.install_pages(kind, pages, request) {
+            Ok(_) => Ok(Preparation::Ready),
+            Err(e) if e.is_refusal() => Ok(refusal(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn restore_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<skin_model::PackedPages>,
+    ) -> Result<(), RenderError> {
+        self.renderer.restore_pages(kind, pages)
+    }
+
+    fn disable_result(&mut self) {
+        self.renderer.disable_result();
+    }
+
+    fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
+        self.renderer.drain_retired()
+    }
+
+    fn take_result_release(&mut self) -> bool {
+        self.renderer.take_result_release()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+        self.renderer.retained_atlases(kind)
+    }
+
+    fn prepare_result(
+        &mut self,
+        skin: &Arc<SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &skin_model::ResultLabels,
+    ) -> Result<Result<(), String>, RenderError> {
+        if let Err(e) = skin.skin().update_result(state, view, labels) {
+            return Ok(Err(e.to_string()));
+        }
+        match self.renderer.prepare_result_text(state) {
+            Ok(()) => Ok(Ok(())),
+            Err(e) if e.is_refusal() => Ok(Err(game::Chain(&e).to_string())),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn install_result_text(&mut self) -> bool {
+        self.renderer.install_staged_result_text()
+    }
+
+    fn prepare_result_strip(&mut self, which: usize, lines: &[&str]) -> Result<(), RenderError> {
+        let fonts = match &mut self.fonts {
+            Some(fonts) => fonts,
+            none => none.insert(Fonts::runtime()?),
+        };
+        let page = MenuPage {
+            lines: lines
+                .iter()
+                .map(|l| MenuLine {
+                    text: (*l).to_owned(),
+                    style: LineStyle::Notice,
+                })
+                .collect(),
+            caret: None,
+        };
+        let (blocks, _) = lay_out(fonts, &page, LEFT, TOP);
+        let refs: Vec<&TextBlock> = blocks.iter().collect();
+        let Some((text, n)) = self.result_strip.get_mut(which) else {
+            return Ok(());
+        };
+        let text = text.get_or_insert_with(|| MenuText::new(&self.renderer));
+        text.prepare(&self.renderer, fonts, &refs)?;
+        *n = lines.len().min(PAGE_LINES);
+        Ok(())
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn use_result_strip(&mut self, which: usize) {
+        if let [drawn, rest @ ..] = &mut self.result_strip
+            && let Some(slot) = which.checked_sub(1).and_then(|i| rest.get_mut(i))
+        {
+            std::mem::swap(drawn, slot);
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_result(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+        frame: &skin_model::ResultFrame<'_>,
+    ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        let [(text, lines), ..] = &self.result_strip;
+        let lines = if text.is_some() { *lines } else { 0 };
+        let mut sprites = [Sprite::default(); render::RESULT_STRIP_SPRITES];
+        let n = result_strip_sprites(lines, &mut sprites);
+        self.renderer
+            .build_result(state, frame, sprites.get(..n).unwrap_or_default())
+    }
+
+    fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
+        let lines = self.result_strip();
+        let timing = match self.result_strip.first().and_then(|(t, _)| t.as_ref()) {
+            Some(t) if lines > 0 => self.renderer.submit_result(&[t]),
+            _ => self.renderer.submit_result(&[]),
+        }?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
+        self.renderer.result_quads()
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn result_strip(&self) -> usize {
+        MenuScreen::result_strip(self)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn refuse_next_result(&mut self, text: bool) {
+        self.renderer.refuse_next_result(text);
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

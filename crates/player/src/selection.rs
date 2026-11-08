@@ -2140,6 +2140,7 @@ impl AppRig for PlayerRig<'_> {
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
+        self.leave_result();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2189,6 +2190,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.leave_result();
         self.enter_scene();
         self.render.leave_selection();
         recover(

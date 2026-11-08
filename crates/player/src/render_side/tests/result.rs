@@ -1,0 +1,802 @@
+//! The result screen's presentations on a real screen, on WARP through the
+//! render thread (the S10-09i design's C2, C5a, C5c, C10, C12, C17c, C17d,
+//! C19 and C22): what each frame shows is one view's, the barrier keeps
+//! the view presented, a refusal draws the built-in page in its frame and
+//! disables the kind for the run, and a screen built again draws on from
+//! the revision presented.
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use bms_model::TimeUs;
+use game::Preparation;
+use input::QpcClock;
+use skin_model::{AtlasLimits, Quad, ResultChart, ResultLabels, ScreenKind};
+
+use super::{measure, view, wait_until};
+use crate::menu_screen::MenuScreen;
+use crate::render_side::{EndPage, MakeScreen, NoFrames, RenderLink, Screen, spawn};
+use crate::result_present::{Overlay, ResultPresentation, ViewKey, ViewPayload};
+
+/// What a frame drew: the skin's quads and the strip's lines, or the
+/// built-in page's lines.
+#[derive(Clone, Debug, PartialEq)]
+enum Drawn {
+    Skin(Vec<Quad>, usize),
+    Page(Vec<String>),
+}
+
+/// The frames' pacing: while `pace` is set each frame wait takes one of
+/// `permits`, holding until there is one.
+#[derive(Default)]
+struct Gate {
+    pace: AtomicBool,
+    permits: AtomicU32,
+    waits: AtomicU32,
+    held: AtomicBool,
+}
+
+impl Gate {
+    fn hold(&self) {
+        self.pace.store(true, Ordering::Release);
+        assert!(wait_until(|| self.held.load(Ordering::Acquire)));
+    }
+
+    /// One frame, then held again in the next wait.
+    fn step(&self) {
+        let before = self.waits.load(Ordering::Acquire);
+        self.permits.store(1, Ordering::Release);
+        assert!(wait_until(|| self.waits.load(Ordering::Acquire) > before
+            && self.held.load(Ordering::Acquire)
+            && self.permits.load(Ordering::Acquire) == 0));
+    }
+
+    fn release(&self) {
+        self.pace.store(false, Ordering::Release);
+    }
+}
+
+/// Faults a test turns on.
+#[derive(Default)]
+struct Faults {
+    /// The next result frame submitted fails as a lost device.
+    lose: AtomicBool,
+    /// The next result frame is refused by the skin.
+    refuse: AtomicBool,
+    /// A screen built again refuses to restore the result's installation.
+    refuse_restore: AtomicBool,
+}
+
+/// A WARP menu screen that records what each result frame drew.
+struct Recorded {
+    menu: MenuScreen,
+    gate: Arc<Gate>,
+    faults: Arc<Faults>,
+    drawn: Arc<Mutex<Vec<Drawn>>>,
+}
+
+impl Screen for Recorded {
+    fn load(
+        &mut self,
+        chart: &bms_model::Chart,
+        section: Option<&eval::Section>,
+    ) -> Result<(), render::RenderError> {
+        self.menu.load(chart, section)
+    }
+    fn device(&self) -> u64 {
+        self.menu.device()
+    }
+    fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
+        self.menu.commit(token)
+    }
+    fn discard(&mut self) {
+        self.menu.discard();
+    }
+    fn install(
+        &mut self,
+        kind: ScreenKind,
+        skin: &Arc<render::SkinBundle>,
+        request: u64,
+    ) -> Result<Preparation, render::RenderError> {
+        self.menu.install(kind, skin, request)
+    }
+    fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
+        self.menu.installation(kind)
+    }
+    fn restore(
+        &mut self,
+        kind: ScreenKind,
+        installation: &render::Installation,
+    ) -> Result<(), render::RenderError> {
+        if kind == ScreenKind::Result && self.faults.refuse_restore.load(Ordering::Acquire) {
+            return Err(render::RenderError::Skin(render::SkinError {
+                reason: "the restore was refused".to_owned(),
+            }));
+        }
+        self.menu.restore(kind, installation)
+    }
+    fn remove(&mut self, kind: ScreenKind) {
+        self.menu.remove(kind);
+    }
+    fn install_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<skin_model::PackedPages>,
+        request: u64,
+    ) -> Result<Preparation, render::RenderError> {
+        self.menu.install_pages(kind, pages, request)
+    }
+    fn restore_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<skin_model::PackedPages>,
+    ) -> Result<(), render::RenderError> {
+        self.menu.restore_pages(kind, pages)
+    }
+    fn disable_result(&mut self) {
+        self.menu.disable_result();
+    }
+    fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
+        self.menu.drain_retired()
+    }
+    fn take_result_release(&mut self) -> bool {
+        self.menu.take_result_release()
+    }
+    fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+        self.menu.retained_atlases(kind)
+    }
+    fn prepare_result(
+        &mut self,
+        skin: &Arc<render::SkinBundle>,
+        state: &mut skin_model::ResultScreen,
+        view: &skin_model::ResultView,
+        labels: &ResultLabels,
+    ) -> Result<Result<(), String>, render::RenderError> {
+        self.menu.prepare_result(skin, state, view, labels)
+    }
+    fn install_result_text(&mut self) -> bool {
+        self.menu.install_result_text()
+    }
+    fn prepare_result_strip(
+        &mut self,
+        which: usize,
+        lines: &[&str],
+    ) -> Result<(), render::RenderError> {
+        self.menu.prepare_result_strip(which, lines)
+    }
+    fn use_result_strip(&mut self, which: usize) {
+        self.menu.use_result_strip(which);
+    }
+    fn build_result(
+        &mut self,
+        state: &mut skin_model::ResultScreen,
+        frame: &skin_model::ResultFrame<'_>,
+    ) -> Result<(), skin_model::BuildError> {
+        if self.faults.refuse.swap(false, Ordering::AcqRel) {
+            self.menu.refuse_next_result(false);
+        }
+        self.menu.build_result(state, frame)
+    }
+    fn submit_result(&mut self) -> Result<render::FrameTiming, render::RenderError> {
+        if self.faults.lose.swap(false, Ordering::AcqRel) {
+            return Err(render::RenderError::SurfaceLost);
+        }
+        let t = self.menu.submit_result()?;
+        let quads = self.menu.result_quads().unwrap_or_default();
+        let strip = self.menu.result_strip();
+        self.drawn.lock().unwrap().push(Drawn::Skin(quads, strip));
+        Ok(t)
+    }
+    fn end(&mut self, page: &EndPage) -> Result<bool, render::RenderError> {
+        let p = self.menu.end(page)?;
+        self.drawn
+            .lock()
+            .unwrap()
+            .push(Drawn::Page(page.lines.clone()));
+        Ok(p)
+    }
+    fn wait(&self) -> bool {
+        let gate = &self.gate;
+        gate.waits.fetch_add(1, Ordering::AcqRel);
+        while gate.pace.load(Ordering::Acquire) {
+            if gate
+                .permits
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                break;
+            }
+            gate.held.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        gate.held.store(false, Ordering::Release);
+        !self.menu.paced() || self.menu.wait()
+    }
+    fn paced(&self) -> bool {
+        self.gate.pace.load(Ordering::Acquire) || self.menu.paced()
+    }
+    fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+        self.menu.build(f)
+    }
+    fn draw(&mut self) -> Result<render::FrameTiming, render::RenderError> {
+        self.menu.draw()
+    }
+    fn text(&mut self, lines: &[&str]) -> Result<bool, render::RenderError> {
+        self.menu.text(lines)
+    }
+    fn resize(&mut self, width: u32, height: u32) {
+        self.menu.resize(width, height);
+    }
+    fn target(&self) -> [u32; 2] {
+        self.menu.target()
+    }
+    fn atlas_limits(&self) -> Option<AtlasLimits> {
+        self.menu.atlas_limits()
+    }
+    fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+        self.menu.read_back()
+    }
+}
+
+/// A render thread on recorded WARP screens.
+pub(crate) struct Rig {
+    link: RenderLink,
+    gate: Arc<Gate>,
+    faults: Arc<Faults>,
+    drawn: Arc<Mutex<Vec<Drawn>>>,
+}
+
+impl Rig {
+    pub(crate) fn new() -> Self {
+        let gate = Arc::new(Gate::default());
+        let faults = Arc::new(Faults::default());
+        let drawn = Arc::new(Mutex::new(Vec::new()));
+        let (g, f, d) = (Arc::clone(&gate), Arc::clone(&faults), Arc::clone(&drawn));
+        let make: MakeScreen = Box::new(move || {
+            let r = render::Renderer::new(
+                render::Target::Offscreen {
+                    width: 1_920,
+                    height: 1_080,
+                },
+                render::AdapterChoice::Warp,
+            )?;
+            Ok(Box::new(Recorded {
+                menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
+                gate: Arc::clone(&g),
+                faults: Arc::clone(&f),
+                drawn: Arc::clone(&d),
+            }) as Box<dyn Screen>)
+        });
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        Self {
+            link,
+            gate,
+            faults,
+            drawn,
+        }
+    }
+
+    fn drawn(&self) -> Vec<Drawn> {
+        self.drawn.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.drawn.lock().unwrap().clear();
+    }
+
+    /// Waits until the last frame drew `want`.
+    fn until(&self, want: impl Fn(&Drawn) -> bool) -> bool {
+        wait_until(|| self.drawn.lock().unwrap().last().is_some_and(&want))
+    }
+}
+
+/// A fixed Lua result skin (it reads no result fact): its EX number, the
+/// marker every view draws differently, and a status image.
+pub(crate) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let d = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(d.path().join("s.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let data: Vec<u8> = (0..64 * 16).flat_map(|_| [9, 9, 9, 255]).collect();
+    e.write_header().unwrap().write_image_data(&data).unwrap();
+    std::fs::write(
+        d.path().join("s.luaskin"),
+        "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.source = { { id = \"s\", path = \"s.png\" } }\n\
+         skin.image = { { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }\n\
+         skin.value = { { id = \"ex\", src = \"s\", x = 0, y = 8, w = 40, h = 8, divx = 10, \
+                          digit = 4, ref = 71 } }\n\
+         skin.destination = {\n\
+           { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },\n\
+           { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } },\n\
+         }\n\
+         return skin\n",
+    )
+    .unwrap();
+    let choice = game::SkinChoice {
+        root: d.path().to_owned(),
+        entry: "s.luaskin".to_owned(),
+        options: Default::default(),
+        files: Default::default(),
+    };
+    let target = crate::imports::ImportTarget {
+        limits: AtlasLimits {
+            max_side: 4_096,
+            max_layers: 16,
+            reserved_layers: render::RESERVED_LAYERS,
+        },
+        size: [1_920, 1_080],
+        default_font: || Ok(crate::render_outline::default_font()),
+    };
+    let built = crate::imports::build(
+        ScreenKind::Result,
+        &choice,
+        false,
+        &target,
+        &skin_beatoraja::Cancel::new(),
+    );
+    match built {
+        crate::imports::KindOutcome::Bundle(b, _) => (d, b),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A view payload `key` with EX score `ex`, its view lines `lines` and a
+/// built-in page whose view rows say `v<key>`.
+fn payload(
+    key: ViewKey,
+    skin: Option<&Arc<render::SkinBundle>>,
+    ex: u32,
+    lines: &[&str],
+) -> Arc<ViewPayload> {
+    let mut view = crate::result_skin::probe_view(ResultChart::default());
+    view.score.tally.ex_score = ex;
+    Arc::new(ViewPayload {
+        key,
+        skin: skin.map(Arc::clone),
+        why: None,
+        view,
+        labels: ResultLabels::default(),
+        lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+        page: EndPage {
+            lines: (0..25).map(|i| format!("v{key} {i}")).collect(),
+            graphs: None,
+        },
+    })
+}
+
+/// Sends `payload` as revision `revision` of `lifetime` with `overlay`.
+fn show(
+    link: &RenderLink,
+    lifetime: u64,
+    revision: u64,
+    payload: &Arc<ViewPayload>,
+    overlay: &Overlay,
+) {
+    link.show_result(ResultPresentation {
+        lifetime,
+        revision,
+        request: link.next_request(),
+        payload: Arc::clone(payload),
+        overlay: overlay.clone(),
+    });
+}
+
+/// The skin's own quads of a frame, the strip's bands left out.
+fn skin_quads(q: &[Quad]) -> Vec<Quad> {
+    q.iter().filter(|q| q.layer != 0).copied().collect()
+}
+
+fn skin_frame(d: &Drawn) -> Option<(&[Quad], usize)> {
+    match d {
+        Drawn::Skin(q, n) => Some((q, *n)),
+        Drawn::Page(_) => None,
+    }
+}
+
+/// Installs the fixed skin as the result kind's and begins a lifetime.
+fn installed(rig: &Rig, skin: &Arc<render::SkinBundle>) -> u64 {
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.link.begin_result()
+}
+
+/// While views switch fast, every frame draws one view's number and that
+/// view's strip lines, never parts of two, and the newest view is drawn
+/// in the end (C2; C3 under one bundle; C12's bands).
+#[test]
+fn every_frame_draws_one_views_number_and_strip() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    let b = payload(
+        2,
+        Some(&skin),
+        2_222,
+        &["VIEWING B", "NO INPUT AFTER 1.000 S"],
+    );
+    let overlay = Overlay::default();
+    show(&rig.link, lifetime, 1, &a, &overlay);
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let Some(Drawn::Skin(ref_a, 0)) = rig.drawn().last().cloned() else {
+        panic!("{:?}", rig.drawn().last());
+    };
+    show(&rig.link, lifetime, 2, &b, &overlay);
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 2)));
+    let Some(Drawn::Skin(ref_b, 2)) = rig.drawn().last().cloned() else {
+        panic!();
+    };
+    assert_ne!(ref_a, ref_b, "the views' numbers differ");
+    rig.clear();
+    for i in 0..20_u64 {
+        let p = if i % 2 == 0 { &a } else { &b };
+        show(&rig.link, lifetime, 3 + i, p, &overlay);
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    // The last shown, b, is drawn in the end.
+    assert!(rig.until(|d| *d == Drawn::Skin(ref_b.clone(), 2)));
+    for d in rig.drawn() {
+        let (q, n) = skin_frame(&d).expect("only the skin draws");
+        assert!(
+            (q == ref_a.as_slice() && n == 0) || (q == ref_b.as_slice() && n == 2),
+            "a frame of two views: {n} lines"
+        );
+    }
+    let status = rig.link.result_status();
+    assert_eq!(status.shown, Some((2, true)));
+    assert_eq!(status.lifetime, lifetime);
+    assert_eq!(status.installed, Some(skin.atlas_id()));
+    rig.link.exit();
+}
+
+/// The barrier keeps the view presented when it is set, a newer view
+/// prepared before the frame's wait included; only the overlay merges,
+/// its notice drawn and the newer view's own line not (C5a, C5c). A frame
+/// the skin refuses then draws the built-in page in that frame, with the
+/// pinned view's rows and the newest page's notice, and disables the
+/// result kind for the run (C17c).
+#[test]
+fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    let b = payload(2, Some(&skin), 2_222, &["NO INPUT AFTER 1.000 S"]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let Some(Drawn::Skin(ref_a, 0)) = rig.drawn().last().cloned() else {
+        panic!();
+    };
+    // b is taken and prepared before the next frame's wait, held there.
+    rig.gate.hold();
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    rig.gate.step();
+    assert_eq!(rig.link.pin_result(TimeUs(5)), Some(1));
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        fadeout: Some(TimeUs(5)),
+        ..Overlay::default()
+    };
+    show(&rig.link, lifetime, 3, &b, &notice);
+    rig.clear();
+    rig.gate.release();
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 1)));
+    std::thread::sleep(Duration::from_millis(100));
+    for d in rig.drawn() {
+        let (q, n) = skin_frame(&d).expect("the skin draws");
+        assert_eq!(skin_quads(q), ref_a, "the pinned view's number");
+        assert!(n <= 1, "never the newer view's line");
+    }
+    let status = rig.link.result_status();
+    assert_eq!(status.pinned, Some(1));
+    assert_eq!(status.shown, Some((1, true)));
+    // The newest page carries the notice in a row of its own.
+    let mut latest: Vec<String> = (0..25).map(|i| format!("n {i}")).collect();
+    latest[5] = "NOTICE ROW".to_owned();
+    rig.link.show_end(EndPage {
+        lines: latest,
+        graphs: None,
+    });
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    rig.faults.refuse.store(true, Ordering::Release);
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    let Some(Drawn::Page(page)) = rig.drawn().last().cloned() else {
+        panic!();
+    };
+    assert_eq!(page[2], "v1 2", "the pinned view's rows");
+    assert_eq!(page[5], "NOTICE ROW");
+    assert!(
+        page.iter().any(|l| l.starts_with("RESULT SKIN NOT SHOWN")),
+        "{page:?}"
+    );
+    assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    // Disabled for the run: a selection is refused, and later views draw
+    // the built-in page.
+    assert!(matches!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Refused(_)
+    ));
+    rig.clear();
+    let c = payload(3, Some(&skin), 3_333, &[]);
+    show(&rig.link, lifetime, 4, &c, &Overlay::default());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(rig.drawn().iter().all(|d| matches!(d, Drawn::Page(_))));
+    rig.link.exit();
+}
+
+/// A screen built again during a pinned outro draws the same revision
+/// again, its number and strip, the lifetime going on (C22); one whose
+/// result restore is refused disables the kind and draws the pinned
+/// view's built-in page (C17d, C23's render half).
+#[test]
+fn a_screen_built_again_draws_the_revision_presented() {
+    for refuse in [false, true] {
+        let (_dir, skin) = fixed_skin();
+        let rig = Rig::new();
+        let lifetime = installed(&rig, &skin);
+        let a = payload(1, Some(&skin), 1_111, &["VIEWING A"]);
+        show(&rig.link, lifetime, 1, &a, &Overlay::default());
+        assert!(rig.until(|d| skin_frame(d).is_some()));
+        let Some(Drawn::Skin(ref_a, 1)) = rig.drawn().last().cloned() else {
+            panic!();
+        };
+        assert_eq!(rig.link.pin_result(TimeUs(5)), Some(1));
+        let revision = rig.link.result_status().revision;
+        rig.faults.refuse_restore.store(refuse, Ordering::Release);
+        rig.faults.lose.store(true, Ordering::Release);
+        assert!(wait_until(|| rig.link.failed()));
+        rig.clear();
+        rig.link.prepare().unwrap();
+        if refuse {
+            assert!(rig.until(|d| matches!(d, Drawn::Page(p) if p[2] == "v1 2")));
+            assert!(rig.link.result_status().disabled.is_some());
+        } else {
+            assert!(rig.until(|d| *d == Drawn::Skin(ref_a.clone(), 1)));
+            let status = rig.link.result_status();
+            assert_eq!((status.revision, status.lifetime), (revision, lifetime));
+            assert_eq!(status.pinned, Some(1));
+        }
+        rig.link.exit();
+    }
+}
+
+/// An upload held on the render thread is withdrawn at once when its
+/// pending selection is dropped, and once released installs nothing: the
+/// status names no installation and retains nothing of it (C10's render
+/// half).
+#[test]
+fn a_withdrawn_upload_installs_nothing_when_released() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    crate::dev::hold_result_uploads(true);
+    let pending = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            skin.atlas_pages(),
+        )));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    let at = Instant::now();
+    drop(pending);
+    assert!(
+        at.elapsed() < Duration::from_millis(50),
+        "withdrawn at once"
+    );
+    crate::dev::hold_result_uploads(false);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None);
+    assert!(!status.retained.contains(&skin.atlas_id()), "{status:?}");
+    // The positive control: the same upload answered installs its pages.
+    let mut pending = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            skin.atlas_pages(),
+        )));
+    let answer = loop {
+        if let Some(a) = pending.poll(Duration::from_millis(5)) {
+            break a;
+        }
+    };
+    assert_eq!(answer.unwrap(), Preparation::Ready);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.link.exit();
+}
+
+/// A layout staged on the pages installed by the upload draws with no
+/// upload of its own: the pages-only installation, then a view of a
+/// bundle on the same atlas, drawn (C8's player half, D2's after-commit
+/// step with P).
+#[test]
+fn a_view_draws_on_the_pages_uploaded() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let mut pending = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            skin.atlas_pages(),
+        )));
+    let answer = loop {
+        if let Some(a) = pending.poll(Duration::from_millis(5)) {
+            break a;
+        }
+    };
+    assert_eq!(answer.unwrap(), Preparation::Ready);
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 42, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(q, _)| !q.is_empty())));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, Some(skin.atlas_id()));
+    assert_eq!(status.retained, [skin.atlas_id()]);
+    rig.link.exit();
+}
+
+/// A presentation of an ended lifetime is not drawn: the result left, a
+/// late one draws nothing (C4 on the render thread).
+#[test]
+fn an_ended_lifetimes_presentation_is_not_drawn() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.link.end_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(rig.drawn().is_empty(), "{:?}", rig.drawn());
+    rig.link.exit();
+}
+
+/// The commit point and the build of a result frame allocate nothing
+/// (C11): each cycle commits a view prepared on the installed pages with
+/// its lines and its strip of all 13 lines, merges an overlay, and builds
+/// the skin's frame with the strip; the preparation and the submission
+/// stay outside the count. Unoptimized builds count the standard
+/// library's own allocations: CI runs it in release.
+#[test]
+fn result_frame_alloc() {
+    use super::super::{
+        HeldView, PreparedView, ResultDrawn, ResultSide, Run, STRIP_PREPARED, STRIP_PRESENTED,
+        Shared,
+    };
+    let (_dir, skin) = fixed_skin();
+    let r = render::Renderer::new(
+        render::Target::Offscreen {
+            width: 1_920,
+            height: 1_080,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .unwrap();
+    let mut screen = MenuScreen::new(r, Some(render::text::Fonts::runtime().unwrap()));
+    let token = |request, screen: &MenuScreen| render::PreparedToken {
+        request,
+        device: screen.device(),
+        kind: ScreenKind::Result,
+    };
+    assert_eq!(
+        screen.install(ScreenKind::Result, &skin, 1).unwrap(),
+        Preparation::Ready
+    );
+    screen.commit(token(1, &screen)).unwrap();
+    let shared = Shared::new();
+    let mut side = ResultSide::new(1);
+    let lines: Vec<String> = (0..13).map(|i| format!("FACT {i}")).collect();
+    let strip: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut counts = Vec::new();
+    for cycle in 0..6_u64 {
+        let request = cycle + 2;
+        let p = payload(
+            cycle,
+            Some(&skin),
+            1_000 + u32::try_from(cycle).unwrap(),
+            &[],
+        );
+        assert_eq!(
+            screen.install(ScreenKind::Result, &skin, request).unwrap(),
+            Preparation::Ready
+        );
+        let mut state = skin.skin().prepare_result();
+        screen
+            .prepare_result(&skin, &mut state, &p.view, &p.labels)
+            .unwrap()
+            .unwrap();
+        screen.prepare_result_strip(STRIP_PREPARED, &strip).unwrap();
+        screen
+            .prepare_result_strip(STRIP_PRESENTED, &strip)
+            .unwrap();
+        let overlay = Overlay {
+            lines: lines.clone(),
+            ..Overlay::default()
+        };
+        side.prepared = Some(PreparedView {
+            held: HeldView {
+                revision: cycle + 1,
+                payload: Arc::clone(&p),
+                overlay: Overlay::default(),
+                state: Some(state),
+                page: None,
+            },
+            token: Some(token(request, &screen)),
+        });
+        side.overlay = Some((cycle + 1, overlay));
+        let before = crate::alloc_count::this_thread();
+        let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(1_000_000));
+        counts.push(crate::alloc_count::this_thread() - before);
+        assert_eq!(drawn, ResultDrawn::Built);
+        assert_eq!(screen.result_strip(), 13);
+        screen.submit_result().unwrap();
+        side.dropped = [None, None];
+        let _ = screen.drain_retired();
+    }
+    assert!(counts.iter().all(|&n| n == 0), "{counts:?}");
+}
+
+impl Rig {
+    pub(crate) fn exit(self) {
+        self.link.exit();
+    }
+}
+
+/// Uploads `upload` through `rig`'s link, then presents a view of
+/// `bundle` in a new lifetime: whether the skin drew it, with the
+/// result's installation the uploaded atlas.
+pub(crate) fn presented_on(
+    rig: &Rig,
+    upload: crate::result_skin::Upload,
+    bundle: &Arc<render::SkinBundle>,
+) -> bool {
+    let atlas = upload.atlas();
+    let mut pending = rig.link.upload_result(upload);
+    let answer = loop {
+        if let Some(a) = pending.poll(Duration::from_millis(5)) {
+            break a;
+        }
+    };
+    if !matches!(answer, Ok(Preparation::Ready)) {
+        return false;
+    }
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(bundle), 7, &[]),
+        &Overlay::default(),
+    );
+    rig.until(|d| skin_frame(d).is_some_and(|(q, _)| !skin_quads(q).is_empty()))
+        && rig.link.result_status().installed == Some(atlas)
+}
