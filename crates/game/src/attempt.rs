@@ -13,7 +13,7 @@ use crate::practice::mapped;
 use crate::prepare::ChartLabels;
 use crate::tempo::AttemptTempo;
 
-/// How a play's preparation on the screen ended ([`crate::Rig::prepare_attempt`]).
+/// How a play's preparation on the screen ended ([`crate::Rig::poll_preparation`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Preparation {
     /// The attempt is prepared: recording may open.
