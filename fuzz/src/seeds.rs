@@ -339,11 +339,11 @@ fn join_sections(sections: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Section indexes in the body (`replay::Section` order).
-const DEVICES: usize = 4;
-const START: usize = 5;
-const TUNING: usize = 6;
-const EVENTS: usize = 7;
-const HISTORY: usize = 10;
+const DEVICES: usize = replay::Section::Devices as usize;
+const START: usize = replay::Section::Start as usize;
+const TUNING: usize = replay::Section::Tuning as usize;
+const EVENTS: usize = replay::Section::Events as usize;
+const HISTORY: usize = replay::Section::History as usize;
 
 /// A history section of one opening (opened at 0, nothing held, origin
 /// −1, closed at 0, a hold) with the ranges and counts given.

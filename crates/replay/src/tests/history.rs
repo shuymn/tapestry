@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// The history section's index in the body.
-const HISTORY: usize = 10;
+const HISTORY: usize = crate::Section::History as usize;
 
 fn opening(
     opened: i64,

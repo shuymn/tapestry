@@ -613,8 +613,9 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
     );
 }
 
-/// The golden record's starting tuning: Classic from MAIN, every field
-/// off its default, two covers on with SUDDEN+ the target, `H` = 3/2.
+/// The golden record's starting tuning: Classic from MAIN, the multiplier,
+/// steps and target green number off their defaults, SUDDEN+ and HIDDEN+ on
+/// with SUDDEN+ the target, LIFT at its default, `H` = 3/2.
 fn golden_tuning() -> StartTuning {
     StartTuning {
         mode: TuningMode::Classic,

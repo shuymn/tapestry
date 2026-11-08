@@ -1,7 +1,7 @@
 //! The starting tuning (design.md "Input Log Format"): its section, its
 //! value checks, and its presence exactly when the record played.
 
-use super::{golden, join_sections, limits, sample, split_sections, wrap};
+use super::{GOLDEN_TUNING, golden, join_sections, limits, sample, split_sections, wrap};
 use crate::{
     CoverRecord, DecodeError, EndStatus, HiSpeedRatio, PlayRecord, Section, StartTuning,
     body_bytes, decode, encode,
@@ -140,16 +140,11 @@ fn a_played_record_without_its_tuning_section_is_refused() {
 fn a_capture_cancelled_before_playback_writes_and_reads_no_tuning() {
     let mut rec = golden();
     rec.status.end = EndStatus::CancelledBeforePlayback;
-    rec.status.finalized = bms_model::TimeUs(0);
-    rec.start = eval::InputStart::default();
-    rec.events.clear();
-    rec.arrivals.clear();
     // A tuning given with no played attempt is not written.
     let mut sections = split_sections(&body_bytes(&rec));
     assert!(sections[Section::Tuning as usize].is_empty());
     // A tuning section on such a record is refused.
-    sections[Section::Tuning as usize] =
-        split_sections(&body_bytes(&golden()))[Section::Tuning as usize].clone();
+    sections[Section::Tuning as usize] = GOLDEN_TUNING.to_vec();
     assert_eq!(
         decode(&wrap(&join_sections(&sections), 3), &limits()),
         Err(DecodeError::TrailingBytes)

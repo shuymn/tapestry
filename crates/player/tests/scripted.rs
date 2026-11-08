@@ -1819,12 +1819,13 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 /// 1.5 s, with recording closed, defers an opening asked meanwhile; the
 /// loading script goes on feeding through the deferral, so its release
 /// opens it, and the play's script takes over on the same devices.
-/// Nothing of the loading script is recorded, and one F2 edit made under
-/// the hold (Classic 1.00, step 0.25) is the play's starting tuning: 1.25,
-/// `H` 5/4 (design.md "Input Log Format"). A load that outlasts the
-/// hold opens without a deferral; either way nothing is cancelled and the
-/// play keeps the timeline of the opening first asked for, so every
-/// recorded press is the log's, shifted by one amount of zero or more.
+/// None of the loading script's input packets is recorded, and one F2 edit
+/// made under the hold (Classic 1.00, step 0.25) is the play's starting
+/// tuning: 1.25, `H` 5/4 (design.md "Input Log Format"). A load that
+/// outlasts the hold opens without a deferral; either way nothing is
+/// cancelled and the play keeps the timeline of the opening first asked
+/// for, so every recorded press is the log's, shifted by one amount of
+/// zero or more.
 /// The exact shift is
 /// `a_deferred_opening_keeps_the_scripts_timeline` (src/input_side.rs).
 #[test]
