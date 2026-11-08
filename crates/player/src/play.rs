@@ -314,8 +314,8 @@ pub struct AttemptPrep {
     ticket: u64,
     /// The attempt, until the render thread is asked.
     attempt: Option<game::Attempt>,
-    /// The refreshed play preset, which the loading gauge is drawn from.
-    preset: rules::RulePreset,
+    /// The loading gauge's descriptor, from the refreshed play preset.
+    loading_gauge: Option<skin_model::LoadingGauge>,
     /// The gauge the attempt shows, by its index in the preset.
     displayed: usize,
     /// The attempt's chart facts a result view carries.
@@ -329,9 +329,6 @@ pub struct AttemptPrep {
     specialized: bool,
     /// When the render thread was asked.
     staging: Instant,
-    /// The render request answered ready, which the final readiness and
-    /// the commit name.
-    request: Option<u64>,
     stage: PrepStage,
 }
 
@@ -345,8 +342,9 @@ enum PrepStage {
     Screen(crate::render_side::PendingAttempt),
     /// It ended before the render thread answered ready.
     Ended(Preparation),
-    /// Answered.
-    Answered,
+    /// Answered: with the render request answered ready, which the final
+    /// readiness and the commit name; `None` when it failed.
+    Answered(Option<u64>),
 }
 
 /// How the play skin's stage began.
@@ -429,12 +427,7 @@ impl PlayerRig<'_> {
         };
         prep.specialized = matches!(skin, AttemptSkin::Specialized(_));
         self.attempt_gauge = prep.displayed;
-        refresh_loading_gauge(
-            &self.render,
-            self.loading_active(),
-            &prep.preset,
-            self.attempt_gauge,
-        );
+        refresh_loading_gauge(&self.render, self.loading_active(), prep.loading_gauge);
         // The attempt attached last is the one prepared: its epoch is
         // the frames'.
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
@@ -470,21 +463,18 @@ impl PlayerRig<'_> {
             )
         });
         self.adjust = adjust;
-        let (answer, screen) = match answered? {
-            Ok(a) => (Ok(a.preparation), a.screen),
-            Err(e) => (Err(e), game::ScreenKey::default()),
-        };
+        let answered = answered?;
         // The render thread's staging and upload of the specialization,
         // apart from the job's time.
         if prep.specialized {
-            crate::imports::log_staged(prep.staging.elapsed(), &answer);
+            crate::imports::log_staged(
+                prep.staging.elapsed(),
+                answered.as_ref().map(|a| &a.preparation),
+            );
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("preparing", self.adjust.as_ref());
-        Some(answer.map(|preparation| crate::render_side::Answered {
-            preparation,
-            screen,
-        }))
+        Some(answered)
     }
 
     /// Whether the render thread disabled the result skin for the run (the
@@ -511,14 +501,14 @@ impl PlayerRig<'_> {
         let Some(mut prep) = self.prep.take() else {
             return;
         };
-        match std::mem::replace(&mut prep.stage, PrepStage::Answered) {
+        match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
             PrepStage::Skin(mut job) => {
                 if let Some(pending) = self.pending.as_mut() {
                     pending.settle(&mut job);
                 }
             }
             PrepStage::Image(_, mut job) => self.result_skin.settle_image_stage(&mut job),
-            PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered => {}
+            PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered(_) => {}
         }
     }
 
@@ -1201,11 +1191,9 @@ pub(crate) fn commit_ready(
 pub(crate) fn refresh_loading_gauge(
     render: &RenderLink,
     loading: bool,
-    preset: &rules::RulePreset,
-    gauge: usize,
+    gauge: Option<skin_model::LoadingGauge>,
 ) {
     if loading {
-        let gauge = shown_gauge(preset, gauge);
         render.loading().report(LoadInput::Gauge(gauge), None);
     }
 }
@@ -1498,15 +1486,14 @@ impl Rig for PlayerRig<'_> {
         let mut prep = AttemptPrep {
             ticket: self.preps,
             attempt: Some(attempt),
-            preset: loaded.preset().clone(),
+            loading_gauge: shown_gauge(loaded.preset(), loaded.displayed().0),
             displayed: loaded.displayed().0,
             chart: crate::result_skin::attempt_chart(loaded),
             class: crate::result_skin::attempt_class(loaded),
             labels: Some(labels),
             specialized: false,
             staging: Instant::now(),
-            request: None,
-            stage: PrepStage::Answered,
+            stage: PrepStage::Answered(None),
         };
         prep.stage = match self.begin_skin(loaded) {
             Ok(SkinStep::Ready(skin)) => self.after_skin(&mut prep, skin),
@@ -1537,7 +1524,7 @@ impl Rig for PlayerRig<'_> {
             }
         };
         let polled = loop {
-            match std::mem::replace(&mut prep.stage, PrepStage::Answered) {
+            match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
                 PrepStage::Skin(mut job) => match self.poll_skin(&mut job, deadline) {
                     None => {
                         prep.stage = PrepStage::Skin(job);
@@ -1562,7 +1549,7 @@ impl Rig for PlayerRig<'_> {
                         Some(Ok(answered)) => {
                             if answered.preparation == Preparation::Ready {
                                 handle.staged_with(answered.screen);
-                                prep.request = Some(pending.request());
+                                prep.stage = PrepStage::Answered(Some(pending.request()));
                             }
                             break Ok(game::PrepPoll::Done(answered.preparation));
                         }
@@ -1570,7 +1557,7 @@ impl Rig for PlayerRig<'_> {
                     }
                 }
                 PrepStage::Ended(ended) => break Ok(game::PrepPoll::Done(ended)),
-                PrepStage::Answered => break Err(ScreenError::Lost),
+                PrepStage::Answered(_) => break Err(ScreenError::Lost),
             }
         };
         self.prep = Some(prep);
@@ -1600,7 +1587,10 @@ impl Rig for PlayerRig<'_> {
             .prep
             .as_ref()
             .filter(|p| p.ticket == handle.ticket())
-            .and_then(|p| p.request)
+            .and_then(|p| match p.stage {
+                PrepStage::Answered(request) => request,
+                _ => None,
+            })
         else {
             return Ok(lost(handle.key().screen().unwrap_or_default()));
         };

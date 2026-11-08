@@ -1114,10 +1114,6 @@ impl Loaded {
             chart: self.generation,
             speed: self.config.speed,
             kind,
-            gauges: self
-                .practice()
-                .map(|p| p.initial_gauges.clone())
-                .unwrap_or_default(),
             preset: preset.finish(),
             settings: self.settings_version,
             screen: None,

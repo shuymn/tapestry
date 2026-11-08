@@ -194,7 +194,7 @@ impl ForAttempt {
 /// specialization ended (`answer`: staged and uploaded, refused,
 /// cancelled, or the screen's failure) and the time `took` from the
 /// request to its end.
-pub fn log_staged(took: Duration, answer: &Result<Preparation, crate::render_side::ScreenError>) {
+pub fn log_staged(took: Duration, answer: Result<&Preparation, &crate::render_side::ScreenError>) {
     let ms = took.as_millis();
     match answer {
         Ok(Preparation::Ready) => log::info!("skin: play: staged with the attempt in {ms} ms"),

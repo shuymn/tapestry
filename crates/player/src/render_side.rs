@@ -12399,7 +12399,11 @@ pub(crate) mod tests {
         let shown = rec.until(0, |s| s.red.is_some_and(|r| r.title && r.artist));
         let hard = crate::loading_state::shown_gauge(&rules::tapestry(), 1);
         assert!(hard.is_some());
-        crate::play::refresh_loading_gauge(&link, true, &rules::tapestry(), 1);
+        crate::play::refresh_loading_gauge(
+            &link,
+            true,
+            crate::loading_state::shown_gauge(&rules::tapestry(), 1),
+        );
         let refreshed = rec.until(shown, |s| s.gauge == hard);
         sink.report(LoadInput::Stage(Stage::Loudness), Some(one_line("later")));
         let later = rec.more(refreshed, 3);

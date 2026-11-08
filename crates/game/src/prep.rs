@@ -34,8 +34,6 @@ pub struct PrepKey {
     pub(crate) speed: Speed,
     /// The whole chart with its lead-in, or a practice round's section.
     pub(crate) kind: AttemptKind,
-    /// A practice round's initial gauges; none for a full play.
-    pub(crate) gauges: Vec<GaugeValue>,
     /// The play preset's canonical bytes, hashed.
     pub(crate) preset: u64,
     /// The settings' version: it moves whenever they may have changed.
@@ -100,11 +98,20 @@ impl PrepKey {
             chart: self.chart != other.chart,
             speed: self.speed != other.speed,
             kind: self.kind != other.kind,
-            gauges: self.gauges != other.gauges,
+            gauges: gauges(&self.kind) != gauges(&other.kind),
             preset: self.preset != other.preset,
             settings: self.settings != other.settings,
             screen: self.screen != other.screen,
         }
+    }
+}
+
+/// A practice round's initial gauges, held by its section; none for a full
+/// play.
+fn gauges(kind: &AttemptKind) -> &[GaugeValue] {
+    match kind {
+        AttemptKind::Section(section) => &section.initial_gauges,
+        AttemptKind::Full { .. } => &[],
     }
 }
 
