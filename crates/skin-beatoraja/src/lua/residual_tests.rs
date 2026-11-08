@@ -342,18 +342,16 @@ fn a_helper_with_known_arguments_lowers_as_a_conditional() {
 #[test]
 fn r4_conditionals_need_all_four_proofs() {
     use Disposition::{Lowered, Replaced};
-    // int-or-bool: a string value, and a raw timer value.
-    for value in [
-        "function() return ms.text(1) end",
-        "function() return ms.timer(41) end",
+    // int-or-bool: a string value is no type a number takes; a raw timer
+    // value is an integer of no known bound (its start or the off value),
+    // which a number's value may not convert.
+    for (value, why) in [
+        ("function() return ms.text(1) end", Unsupported::Type),
+        ("function() return ms.timer(41) end", Unsupported::Range),
     ] {
         let entry = number("", value);
         assert!(closed(&entry), "{value}");
-        assert_eq!(
-            run(&entry).callbacks,
-            [Replaced(Unsupported::Type)],
-            "{value}"
-        );
+        assert_eq!(run(&entry).callbacks, [Replaced(why)], "{value}");
     }
     // total: a definite Lua error on a reached path; control: behind a
     // condition folded false.

@@ -1180,6 +1180,10 @@ impl Leaves for Lower<'_> {
     fn range(&self, r: u32) -> Option<(i64, i64)> {
         match self.mapped.get(&r) {
             Some(Mapped::Int { lo, hi, .. }) => Some((*lo, *hi)),
+            // The source's gauge type is a Java `int`.
+            Some(Mapped::Gauge) => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            // A timer's start or the off value: any `long`, of no known
+            // bound ([`compile::intervals`]).
             _ => None,
         }
     }
