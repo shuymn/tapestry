@@ -43,7 +43,6 @@ use mlua::{Function, Lua, Value};
 use skin_model::output::OutTy;
 use skin_model::{Program, RESULT, SELECTION, Scope, ScreenKind, State, Ty, compile};
 
-use super::ledger::Stop;
 use super::{LuaLimit, LuaWhy, Pass, limits};
 use crate::error::ImportError;
 use crate::import::result::profile as res;
@@ -261,36 +260,31 @@ impl Screen {
     /// not bridge, never cached.
     pub(crate) fn option(&mut self, id: i32) -> Option<bool> {
         if !self.options.contains_key(&id) {
-            let known = match self.kind {
-                ScreenKind::Selection => matches!(sel::option(id), Some(sel::Class::Bridge(_))),
-                ScreenKind::Result => matches!(res::option(id), Some(sel::Class::Bridge(_))),
-                ScreenKind::Play | ScreenKind::Decision => false,
+            let constant = |s: &Self, b: bool| {
+                s.compile(if b { "true" } else { "false" }, Ty::Bool)
+                    .map(|value| Bridged { guard: None, value })
             };
-            if !known {
-                return None;
-            }
+            // `None` for an id the profile does not bridge, before any
+            // insertion; a bridge that does not compile is kept as `None`.
             let b = match self.kind {
-                ScreenKind::Selection => match sel::option(id) {
-                    Some(sel::Class::Bridge(sel::SelOption::Expr(src))) => self
+                ScreenKind::Selection => match sel::option(id)? {
+                    sel::Class::Bridge(sel::SelOption::Expr(src)) => self
                         .compile(src, Ty::Bool)
                         .map(|value| Bridged { guard: None, value }),
-                    Some(sel::Class::Bridge(sel::SelOption::Constant(b))) => self
-                        .compile(if b { "true" } else { "false" }, Ty::Bool)
-                        .map(|value| Bridged { guard: None, value }),
-                    _ => None,
+                    sel::Class::Bridge(sel::SelOption::Constant(b)) => constant(self, b),
+                    _ => return None,
                 },
-                ScreenKind::Result => match res::option(id) {
-                    Some(sel::Class::Bridge(res::ResOption::Expr(src))) => {
+                ScreenKind::Result => match res::option(id)? {
+                    sel::Class::Bridge(res::ResOption::Expr(src)) => {
                         let guard = self.compile(res::option_guard(id), Ty::Bool);
                         self.compile(src, Ty::Bool)
                             .map(|value| Bridged { guard, value })
                     }
-                    Some(sel::Class::Bridge(res::ResOption::Constant(b))) => self
-                        .compile(if b { "true" } else { "false" }, Ty::Bool)
-                        .map(|value| Bridged { guard: None, value }),
-                    _ => None,
+                    sel::Class::Bridge(res::ResOption::Constant(b)) => constant(self, b),
+                    sel::Class::Bridge(_) => None,
+                    _ => return None,
                 },
-                ScreenKind::Play | ScreenKind::Decision => None,
+                ScreenKind::Play | ScreenKind::Decision => return None,
             };
             self.options.insert(id, b);
         }
@@ -786,9 +780,10 @@ impl ScreenRuntime {
     pub fn frame(&mut self, fields: &mut [i32], timers: &[i32]) {
         let n = self.sites.len();
         let base = fields.len().saturating_sub(skin_model::output::slots(n));
-        // Every slot finalized: its constant until its callback runs.
-        for (k, (site, _)) in self.sites.iter().enumerate() {
-            write(fields, base, k, constant(site.ty));
+        // Every slot finalized: its constant (0 for a value, false for a
+        // draw) until its callback runs.
+        for k in 0..self.sites.len() {
+            write(fields, base, k, 0);
         }
         if self.stopped.is_some() {
             self.status.fill(CallStatus::Stopped);
@@ -868,8 +863,8 @@ impl ScreenRuntime {
         // The frame's stop, if any, is the frame's alone.
         let _ = self.pass.ledger.take_stop();
         if self.stopped.is_some() {
-            for (k, (site, _)) in self.sites.iter().enumerate() {
-                write(fields, base, k, constant(site.ty));
+            for k in 0..self.sites.len() {
+                write(fields, base, k, 0);
             }
             self.status.fill(CallStatus::Stopped);
             return;
@@ -916,11 +911,6 @@ enum Why {
     Error,
 }
 
-/// A callback's constant: false for a draw, 0 for a value.
-const fn constant(_ty: OutTy) -> i32 {
-    0
-}
-
 /// Writes callback `k`'s value and its `ok` flag (always 1: an output is
 /// available whatever became of its call).
 fn write(fields: &mut [i32], base: usize, k: usize, v: i32) {
@@ -930,14 +920,6 @@ fn write(fields: &mut [i32], base: usize, k: usize, v: i32) {
     }
     if let Some(s) = fields.get_mut(at.saturating_add(1)) {
         *s = 1;
-    }
-}
-
-/// A fault's reason, peeked, for a stop recorded in the ledger.
-pub(crate) fn stop_why(stop: Option<&Stop>) -> Option<LuaWhy> {
-    match stop {
-        Some(Stop::Fault(ImportError::Lua { why, .. })) => Some(*why),
-        _ => None,
     }
 }
 

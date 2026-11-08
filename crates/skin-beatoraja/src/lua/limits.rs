@@ -12,7 +12,9 @@
 //! [`MAX_DECODED_BYTES`](crate::limits::MAX_DECODED_BYTES)).
 
 /// The most Lua-managed memory a VM holds at once, compilation included:
-/// an allocation past it fails. Only one VM is alive at a time.
+/// an allocation past it fails. One pass's VM is alive at a time per
+/// import; a VM kept for a screen's runtime is capped at
+/// [`RUNTIME_MEMORY`] instead.
 pub const MAX_LUA_MEMORY: usize = 64 << 20;
 /// The most Lua VM instructions across both passes, counted on every VM
 /// thread in steps of [`INSTRUCTION_STEP`]: the step that reaches it

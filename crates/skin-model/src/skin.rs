@@ -3536,8 +3536,9 @@ impl Skin {
                         // On selection and result, a number draws nothing
                         // for the values a source number reserves
                         // (`SkinNumber.java:135-147`): a hidden value, or a
-                        // runtime value the source hides, reads one. Play's
-                        // values never reach them.
+                        // resolved value the source hides, reads one. Play
+                        // and loading still draw them (their tests pin it):
+                        // the values they support never reach them.
                         let reserved = v == i32::MIN || v == i32::MAX;
                         let hides =
                             matches!(scene.phase, Phase::Selection { .. } | Phase::Result { .. });

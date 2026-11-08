@@ -1644,10 +1644,11 @@ impl Cx<'_> {
         if c == NONE || !kept || !matches!(self.kind, ScreenKind::Selection | ScreenKind::Result) {
             return Ok(None);
         }
-        // A draw runs after its element's runtime value, when that allows.
+        // A draw runs only when its element's resolved value allows it
+        // ([`Self::gate_by_value`]), then its own conditions.
         let gate: Vec<&str> = match ty {
-            OutTy::Bool => self.value_gate.as_deref().into_iter().collect(),
-            OutTy::Int => Vec::new(),
+            OutTy::Bool => self.value_gate.as_deref(),
+            OutTy::Int => None,
         }
         .into_iter()
         .chain(gate.iter().map(String::as_str))

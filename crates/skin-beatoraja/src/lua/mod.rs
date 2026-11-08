@@ -14,15 +14,18 @@
 //! [`crate::import`], the one import path. The passes share only the
 //! immutable snapshots of the sources they read ([`loader`]) and the
 //! candidate's accounting ([`ledger`]); each VM is dropped when its pass
-//! ends, before the common import. Changing the settings runs the
-//! configured pass again from the header pass's state.
+//! ends, before the common import, except a selection or result skin's
+//! configured VM that [`LuaHeader::import_runtime`] keeps for the screen's
+//! runtime ([`runtime`]) when a callback is routed to it. Changing the
+//! settings runs the configured pass again from the header pass's state.
 //!
-//! A function the returned table holds is a typed callable, never run.
+//! A function the returned table holds is a typed callable, never run by
+//! the import; only a screen's runtime runs the ones routed to it.
 //! The configured pass parses every chunk it loads with the importer's
 //! own parser ([`syntax`]) and runs it instrumented ([`instrument`]), so
 //! that each closure is tagged with its constructor and a capture reader;
 //! the conversion copies each callable's captures before the VM is
-//! dropped, and every root's reach is walked before the common import
+//! dropped or kept, and every root's reach is walked before the common import
 //! ([`callback::admit`], [`effects`]): whether the candidate stays inside
 //! the modeled subset, and which roots write. Only a cap, cancellation
 //! or the analysis time budget refuses the candidate there. The import
@@ -372,9 +375,6 @@ pub(crate) struct Pass {
     rewritten: SyncCell<usize>,
     #[cfg(feature = "dev-tools")]
     timings: SyncCell<Timings>,
-    /// Whether this configured pass keeps its VM for a selection or result
-    /// screen's runtime ([`LuaHeader::import_runtime`]).
-    keep_vm: SyncCell<bool>,
     /// Whether the VM was kept for a screen's runtime: from then on every
     /// import-only capability refuses (docs/stage3.md S7-07). Set once,
     /// never cleared.
@@ -443,7 +443,6 @@ impl Pass {
             rewritten: SyncCell::new(0),
             #[cfg(feature = "dev-tools")]
             timings: SyncCell::new(Timings::default()),
-            keep_vm: SyncCell::new(false),
             runtime: SyncCell::new(false),
             screen: SyncRefCell::new(None),
             runtime_notes: SyncRefCell::new(runtime::Notes::default()),
@@ -648,7 +647,8 @@ struct Converted {
 
 /// Runs one pass over `entry` in a fresh VM, starting from `counts` and
 /// the time `spent` by the candidate's earlier pass, with `bridge` as
-/// `skin_config` when configured; the VM is dropped before it returns.
+/// `skin_config` when configured; the VM is dropped before it returns
+/// unless `keep` keeps it in the converted result ([`run_pass`]).
 fn pass(
     root: &Root,
     entry: &str,
@@ -667,8 +667,7 @@ fn pass(
     #[cfg(test)]
     tests::pass_witness();
     let pass = Arc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
-    pass.keep_vm.set(keep);
-    let r = run_pass(&pass, entry);
+    let r = run_pass(&pass, entry, keep);
     let counts = pass.ledger.counts();
     let spent = pass.ledger.spent();
     let store = pass.store.replace(Store::default());
@@ -690,8 +689,9 @@ thread_local! {
         const { SyncRefCell::new(std::collections::BTreeMap::new()) };
 }
 
-/// [`pass`]'s work: the VM lives only inside.
-fn run_pass(pass: &Arc<Pass>, entry: &str) -> Result<Converted, Stop> {
+/// [`pass`]'s work: the VM lives only inside, unless `keep` keeps it for
+/// a selection or result screen's runtime ([`LuaHeader::import_runtime`]).
+fn run_pass(pass: &Arc<Pass>, entry: &str, keep: bool) -> Result<Converted, Stop> {
     if pass.ledger.cancelled() {
         return Err(Stop::Fault(ImportError::Lua {
             at: None,
@@ -725,7 +725,7 @@ fn run_pass(pass: &Arc<Pass>, entry: &str) -> Result<Converted, Stop> {
         // the screen's runtime, until the import decides whether a
         // callback needs it (docs/stage3.md S7-07); every other pass drops
         // it here.
-        let keep = pass.keep_vm.get()
+        let keep = keep
             && pass
                 .facts
                 .is_some_and(|f| matches!(f.scene, ScreenKind::Selection | ScreenKind::Result));
