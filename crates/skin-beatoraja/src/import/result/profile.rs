@@ -56,6 +56,18 @@ const fn count(expr: &'static str) -> ResValue {
 }
 
 const VALID: &str = "result.valid";
+
+/// A count's share of the chart's notes in whole percent, as the source's
+/// `getJudgeCount(i) * 100 / getNotes()` (`IntegerPropertyFactory.java:
+/// 503-509`): hidden with no notes.
+/// `expr` bounds the count so the product stays an `i32`.
+const fn rate_of(expr: &'static str) -> ResValue {
+    v(
+        expr,
+        "result.valid && chart.notes_valid && chart.notes > 0",
+        (0, M),
+    )
+}
 const BEST: &str = "best.known";
 
 /// The mean timing deviation in whole ms and its hundredths, each
@@ -106,6 +118,19 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // (`IntegerPropertyFactory.java:562-576`).
         74 | 106 => v("chart.notes", "chart.notes_valid", (0, M)),
         75 | 105 | 174 => count("max_combo"),
+        // Twice the notes, with a score (`:127-129`).
+        72 => v(
+            "clamp(chart.notes, 0, 1073741823) * 2",
+            "result.valid && chart.notes_valid",
+            (0, M),
+        ),
+        // Each grade's share of the notes in whole percent, hidden with no
+        // notes (`:503-509`).
+        85 => rate_of("clamp(count.perfect, 0, 21474836) * 100 / chart.notes"),
+        86 => rate_of("clamp(count.great, 0, 21474836) * 100 / chart.notes"),
+        87 => rate_of("clamp(count.good, 0, 21474836) * 100 / chart.notes"),
+        88 => rate_of("clamp(count.bad, 0, 21474836) * 100 / chart.notes"),
+        89 => rate_of("clamp(count.poor, 0, 21474836) * 100 / chart.notes"),
         76 | 177 => count("result.bp"),
         90 => v("chart.bpm_max_x100 / 100", "chart.bpm_valid", (0, M / 100)),
         91 => v("chart.bpm_min_x100 / 100", "chart.bpm_valid", (0, M / 100)),
@@ -143,6 +168,10 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         373 => v("duration_10us % 100", "duration.valid", (0, 99)),
         374 => v(MEAN_WHOLE, "timing.valid", (-M / 100, M / 100)),
         375 => v(MEAN_HUNDREDTHS, "timing.valid", (-99, 99)),
+        // The standard deviation in whole ms and its hundredths
+        // (`:434-440`); it is never negative.
+        376 => v("timing.sd_x100 / 100", "timing.valid", (0, M / 100)),
+        377 => v("timing.sd_x100 % 100", "timing.valid", (0, 99)),
         410..=419 => early_late(id)?,
         420 => count("count.empty_poor"),
         421 => count("count.early.empty_poor"),

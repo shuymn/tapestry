@@ -39,9 +39,9 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
 const NUMERIC: &[(i32, i32, C)] = &[
     (21, 25, C::D),
     (45, 49, C::N),
-    (71, 71, C::N),
+    (71, 72, C::N),
     (74, 76, C::N),
-    (80, 84, C::N),
+    (80, 89, C::N),
     (90, 91, C::N),
     (96, 96, C::N),
     (101, 103, C::N),
@@ -61,7 +61,7 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (182, 182, C::D),
     (183, 184, C::N),
     (368, 368, C::N),
-    (370, 375, C::N),
+    (370, 377, C::N),
     (380, 399, C::D),
     (407, 407, C::N),
     (410, 427, C::N),
@@ -140,7 +140,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (75, 33));
+    assert_eq!((count(C::N), count(C::D)), (83, 33));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
@@ -243,4 +243,47 @@ fn the_mean_truncates_toward_zero() {
         panic!()
     };
     assert_eq!(read_number(&v, &none), Read::Unavailable);
+}
+
+/// 72 is twice the notes; 85 to 89 each grade's whole percent of the
+/// notes, hidden with no notes; 376 and 377 the standard deviation's whole
+/// ms and hundredths (`IntegerPropertyFactory.java:127-129`, `:434-440`,
+/// `:503-509`).
+#[test]
+fn derived_result_numbers_read_as_the_source() {
+    use skin_model::result_field as f;
+    let mut a = [0; f::COUNT];
+    for (field, v) in [
+        (f::RESULT_VALID, 1),
+        (f::CHART_NOTES_VALID, 1),
+        (f::CHART_NOTES, 900),
+        (f::COUNT_PERFECT, 600),
+        (f::COUNT_GREAT, 299),
+        (f::COUNT_POOR, 1),
+        (f::TIMING_VALID, 1),
+        (f::TIMING_SD_X100, 1_234),
+    ] {
+        a[usize::from(field)] = v;
+    }
+    let get = |f: &[i32; f::COUNT], id| match number(id) {
+        Some(Class::Bridge(v)) => read_number(&v, &ResultFields(*f)),
+        _ => Read::Unavailable,
+    };
+    for (id, want) in [
+        (72, 1_800),
+        (85, 66),
+        (86, 33),
+        (87, 0),
+        (89, 0),
+        (376, 12),
+        (377, 34),
+    ] {
+        assert_eq!(get(&a, id), Read::Value(want), "{id}");
+    }
+    a[usize::from(f::CHART_NOTES)] = 0;
+    for id in 85..=89 {
+        assert_eq!(get(&a, id), Read::Unavailable, "{id}");
+    }
+    a[usize::from(f::RESULT_VALID)] = 0;
+    assert_eq!(get(&a, 72), Read::Unavailable);
 }
