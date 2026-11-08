@@ -1083,6 +1083,8 @@ mod tests {
             (s("00012"), 12),
             (s(&"1234567890".repeat(7)), -1),
             (s(&format!("{}1234", "0".repeat(63))), 1234),
+            // 68 bytes, parsed as the first 64: "0.000…0".
+            (s(&format!("0.{}1e80", "0".repeat(62))), 0),
             (s("1_0"), 0),
             (s("\u{661}\u{662}"), 0),
             (Value::Boolean(true), 0),

@@ -289,11 +289,11 @@ fn over(body: &str, time: std::time::Duration) -> (Vec<CallStatus>, u64, u64) {
 fn each_frame_cap_stops_a_call_alone() {
     use skin_beatoraja::lua::limits::{INSTRUCTION_STEP, RUNTIME_HOST_CALLS, RUNTIME_INSTRUCTIONS};
     let budget = [CallStatus::Budget, CallStatus::Budget];
-    let long = std::time::Duration::from_secs(60);
+    let long = std::time::Duration::from_secs(10);
     let (st, ins, _) = over("function() while true do end end", long);
     assert_eq!(st, budget);
     assert!(
-        ins + u64::from(INSTRUCTION_STEP) >= RUNTIME_INSTRUCTIONS,
+        (RUNTIME_INSTRUCTIONS - u64::from(INSTRUCTION_STEP)..=RUNTIME_INSTRUCTIONS).contains(&ins),
         "{ins}"
     );
     let (st, ins, calls) = over(
