@@ -1,8 +1,8 @@
 //! The coordinator's permits, scopes, jobs and commit (C1-C3), one test per
 //! reachable cell of the job lifecycle table (the PR's "Job lifecycle").
 //! Threads meet at channels. The only clock is a watchdog: a wait that
-//! never ends gives up after it, so a broken guard fails instead of
-//! hanging.
+//! never ends panics after it, so a broken guard fails instead of hanging
+//! or passing as a cancel.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -35,7 +35,15 @@ const ONE_EACH: Caps = Caps {
     speculative: 1,
 };
 
-const NEVER: &(dyn Fn() -> bool + Sync) = &|| false;
+/// When the test binary's first watchdog started.
+static STARTED: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+/// A stop that never says stop, and panics once the binary has run past
+/// the watchdog (see [`watchdog`]).
+const NEVER: &(dyn Fn() -> bool + Sync) = &|| {
+    assert!(STARTED.elapsed() <= *WATCHDOG, "the watchdog ran out");
+    false
+};
 const NOTHING: &(dyn Fn(Class) + Sync) = &|_| {};
 
 fn key(name: &str) -> JobKey {
@@ -45,10 +53,15 @@ fn key(name: &str) -> JobKey {
     }
 }
 
-/// A stop that says stop only once the watchdog has run out.
+/// A stop that never says stop, and panics once the watchdog has run out:
+/// the coordinator catches that as the job's panic, so a wait that should
+/// have ended fails the test instead of passing as a cancel.
 fn watchdog() -> impl Fn() -> bool + Sync {
     let begun = Instant::now();
-    move || begun.elapsed() > *WATCHDOG
+    move || {
+        assert!(begun.elapsed() <= *WATCHDOG, "the watchdog ran out");
+        false
+    }
 }
 
 /// A one-shot event between threads.
