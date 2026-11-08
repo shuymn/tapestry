@@ -33,7 +33,9 @@
 //!   the construction premise, whatever arithmetic gave them.
 //! - **What stays residual**: host reads with a known integer argument
 //!   ([`Node::Read`], each recorded in [`Residual::reads`] as it is
-//!   created on a reached path), `-`, `not`, `+ - * / // %` of numbers,
+//!   created on a reached path), `main_state.time()` ([`Node::StateUs`],
+//!   the program's own read, no mapping's), a timer root's slots
+//!   ([`Node::Slot`], below), `-`, `not`, `+ - * / // %` of numbers,
 //!   `math.floor`, `ceil`, `abs`, `max` and `min` of numbers
 //!   ([`Node::Math`]), comparisons, and [`Node::Select`]; known operands
 //!   fold through the program's numerics (the source's, LuaJ's). `A and B` is `Select(A, B, A)`
@@ -55,6 +57,16 @@
 //!   constructors, varargs, `return` lists, recursion, a host argument that
 //!   is not a known integer, a definite Lua error on a reached path, and
 //!   string arithmetic or ordering.
+//!
+//! - **Slots**: a timer root evaluated with its slot cells
+//!   ([`evaluate`]'s `cells`, decided by the caller) reads each as
+//!   [`Node::Slot`] and assigns it as a local of its own body: its final
+//!   values are [`Residual::stores`], every return path's cell values
+//!   carried with the return as a local's are, so a store survives an early
+//!   return. A slot compares with `==` and `~=` only; arithmetic and order
+//!   on one are refused as the off value's are. A helper reaches no slot:
+//!   one that reads the cell meets a written cell ([`Unsupported::
+//!   Interference`]), one that assigns it an assignment outside its locals.
 //!
 //! The callback's result is then converted as its consumer converts it
 //! ([`Conv`]): a `draw` or `op` by truthiness, a number's `value` or an
@@ -174,6 +186,11 @@ pub(crate) enum Node {
     },
     /// A value no path gives: a return that did not happen.
     Unreachable,
+    /// The frame's state clock, `main_state.time()`: µs, 0 to 2^53.
+    StateUs,
+    /// A slot's value as the invocation begins: the off value or an
+    /// integer.
+    Slot(u16),
 }
 
 /// A `math` function the residual keeps.
@@ -229,6 +246,9 @@ pub(crate) enum Conv {
     /// An image set's `value`: as [`Self::Int`], and a root that is exactly
     /// a `gauge_type()` read selects by the gauge's type.
     Index,
+    /// A destination's `timer`: left as it is, a number, nil, a boolean or
+    /// the off value, for the program's `tolong()`.
+    Timer,
 }
 
 /// Why evaluation stopped.
@@ -295,6 +315,8 @@ pub(crate) struct Residual {
     /// Every [`Node::Read`] created, in order.
     pub(crate) reads: Vec<u32>,
     pub(crate) root: u32,
+    /// Each slot's value as the invocation ends, by slot: what it stores.
+    pub(crate) stores: Vec<(u16, u32)>,
 }
 
 impl Residual {
@@ -356,6 +378,11 @@ pub(crate) fn is_timer(api: u16) -> bool {
     HOST_APIS.get(usize::from(api)) == Some(&("main_state", "timer"))
 }
 
+/// Whether host API `api` is `main_state.time`.
+fn is_time(api: u16) -> bool {
+    HOST_APIS.get(usize::from(api)) == Some(&("main_state", "time"))
+}
+
 /// What a function body left: no `return` yet, one that happened, or one
 /// that happened where the condition holds, with its value.
 #[derive(Clone, Copy, Debug)]
@@ -369,12 +396,15 @@ enum Done {
 type Env = Vec<(u32, u32)>;
 
 /// One function being evaluated: its tree, instance and file, and its
-/// locals in scope.
+/// locals in scope, the root's slot cells first.
 struct Frame<'a> {
     ast: &'a Ast,
     inst: u32,
     file: u16,
     env: Env,
+    /// How many of `env`'s first entries are slot cells: the root's, else
+    /// none.
+    cells: usize,
 }
 
 struct Eval<'a> {
@@ -389,15 +419,22 @@ struct Eval<'a> {
     stack: Vec<u32>,
     /// The consumer is a text's value ([`Conv::Text`]).
     text: bool,
+    /// The root's slot cells, by declaration of its file, each to its slot.
+    cells: &'a [(u32, u16)],
+    /// The slot cells' values on the paths that returned, while one may
+    /// have.
+    ret: Option<Vec<u32>>,
 }
 
 /// Instance `inst` of admitted analysis `adm` evaluated into its
 /// residual, converted by `conv`; `cancelled` seen at each inlined
-/// function.
+/// function. `cells` are its slot cells, declarations of its file it
+/// captures, each with its slot; only a timer root has any.
 pub(crate) fn evaluate(
     adm: Admitted<'_>,
     inst: u32,
     conv: Conv,
+    cells: &[(u32, u16)],
     cancelled: &dyn Fn() -> bool,
     interfered: &std::cell::Cell<Option<super::callback::Site>>,
 ) -> R<Residual> {
@@ -409,12 +446,20 @@ pub(crate) fn evaluate(
         depth: 0,
         stack: Vec::new(),
         text: conv == Conv::Text,
+        cells,
+        ret: None,
     };
     let v = ev.function(inst, &[])?;
     let root = match conv {
         Conv::Truthy => ev.truthy(v)?,
         Conv::Int | Conv::Index => ev.integer(v)?,
         Conv::Text => v,
+        Conv::Timer => {
+            if ev.kind(v) & !(NIL | BOOL | NUM | OFF) != 0 {
+                return refuse(Unsupported::Type);
+            }
+            v
+        }
     };
     ev.res.root = root;
     Ok(ev.res)
@@ -428,6 +473,8 @@ impl<'a> Eval<'a> {
             Node::Known(v) => (v.kind(), 1),
             Node::Read { api, .. } => (reader(api).map_or(0, |(_, k)| k), 1),
             Node::Unreachable => (0, 1),
+            Node::StateUs => (INT, 1),
+            Node::Slot(_) => (INT | OFF, 1),
             Node::Not(x) => (BOOL, h(x)),
             Node::Neg(x) => (k(x) & NUM, h(x)),
             Node::Arith(op, a, b) => {
@@ -459,7 +506,11 @@ impl<'a> Eval<'a> {
             }
         };
         let height = match node {
-            Node::Known(_) | Node::Read { .. } | Node::Unreachable => height,
+            Node::Known(_)
+            | Node::Read { .. }
+            | Node::Unreachable
+            | Node::StateUs
+            | Node::Slot(_) => height,
             _ => height.saturating_add(1),
         };
         // Past R4's nesting, refused as it is made. A test can lower the
@@ -616,11 +667,25 @@ impl<'a> Eval<'a> {
             return refuse(Unsupported::Capture("no reader"));
         }
         let params = ast.list(f.params);
-        charge(self.an, "bind", units(params.len().max(args.len())))?;
-        if !params.is_empty() || !args.is_empty() {
+        // The root's slot cells, each read as its slot.
+        let cells = if self.stack.is_empty() {
+            self.cells
+        } else {
+            &[]
+        };
+        charge(
+            self.an,
+            "bind",
+            units(params.len().max(args.len()) + cells.len()),
+        )?;
+        if !params.is_empty() || !args.is_empty() || !cells.is_empty() {
             did("bind");
         }
-        let mut env = Vec::with_capacity(params.len());
+        let mut env = Vec::with_capacity(params.len() + cells.len());
+        for &(d, k) in cells {
+            let v = self.push(Node::Slot(k))?;
+            env.push((d, v));
+        }
         for (k, &p) in params.iter().enumerate() {
             let v = match args.get(k) {
                 Some(&a) => a,
@@ -633,12 +698,28 @@ impl<'a> Eval<'a> {
             inst: j,
             file: inst.file,
             env,
+            cells: cells.len(),
         };
         self.stack.push(j);
         let mut done = Done::No;
         let r = self.block(&mut frame, f.body, &mut done);
         self.stack.pop();
         r?;
+        if frame.cells > 0 {
+            // Each slot's final value: the returned paths' where one
+            // returned, the end's elsewhere.
+            let ret = self.ret.take().unwrap_or_default();
+            for (i, &(_, k)) in cells.iter().enumerate() {
+                let end = frame.env.get(i).map_or(0, |&(_, v)| v);
+                let returned = ret.get(i).copied();
+                let v = match (done, returned) {
+                    (Done::No, _) | (_, None) => end,
+                    (Done::Yes(_), Some(r)) => r,
+                    (Done::Maybe(c, _), Some(r)) => self.select(c, r, end)?,
+                };
+                self.res.stores.push((k, v));
+            }
+        }
         match done {
             Done::No => self.known(Val::Nil),
             Done::Yes(v) => Ok(v),
@@ -744,6 +825,21 @@ impl<'a> Eval<'a> {
                     &[e] => self.expr(f, e)?,
                     _ => return construct("return list"),
                 };
+                if f.cells > 0 {
+                    // The slot cells as this path returns: joined with the
+                    // paths that returned before it.
+                    let now: Vec<u32> = f.env.iter().take(f.cells).map(|&(_, v)| v).collect();
+                    self.ret = Some(match (*done, self.ret.take()) {
+                        (Done::Maybe(c, _), Some(before)) => {
+                            let mut out = Vec::with_capacity(now.len());
+                            for (&b, &n) in before.iter().zip(&now) {
+                                out.push(self.select(c, b, n)?);
+                            }
+                            out
+                        }
+                        _ => now,
+                    });
+                }
                 *done = match *done {
                     Done::No => Done::Yes(v),
                     Done::Maybe(c, w) => Done::Yes(self.select(c, w, v)?),
@@ -762,8 +858,9 @@ impl<'a> Eval<'a> {
     /// residual one runs its arm from the state before, and the states
     /// are merged from the last.
     fn branches(&mut self, f: &mut Frame<'a>, arms: &[u32], done: &mut Done) -> R<()> {
-        // The residual arms: condition, locals and return state after.
-        let mut taken: Vec<(u32, Env, Done)> = Vec::new();
+        // The residual arms: condition, locals, return state and returned
+        // slot cells after.
+        let mut taken: Vec<(u32, Env, Done, Option<Vec<u32>>)> = Vec::new();
         for arm in arms.chunks(3) {
             let &[c, s, n] = arm else {
                 break;
@@ -783,15 +880,18 @@ impl<'a> Eval<'a> {
                 _ => {
                     charge(self.an, "env", units(f.env.len()))?;
                     did("env");
-                    let before = (f.env.clone(), *done);
+                    let before = (f.env.clone(), *done, self.ret.clone());
                     self.block(f, (s, n), done)?;
                     let env = std::mem::replace(&mut f.env, before.0);
                     let after = std::mem::replace(done, before.1);
-                    taken.push((cond, env, after));
+                    let ret = std::mem::replace(&mut self.ret, before.2);
+                    taken.push((cond, env, after, ret));
                 }
             }
         }
-        while let Some((cond, env, after)) = taken.pop() {
+        while let Some((cond, env, after, ret)) = taken.pop() {
+            let rest = self.ret.take();
+            self.ret = self.merge_cells(cond, ret, rest)?;
             charge(self.an, "env", units(f.env.len()))?;
             did("env");
             match (after, *done) {
@@ -815,6 +915,35 @@ impl<'a> Eval<'a> {
             *done = self.merge(cond, after, *done)?;
         }
         Ok(())
+    }
+
+    /// The returned slot cells `a` where `cond` holds and `b` elsewhere,
+    /// joined; a side where no path returned has none.
+    fn merge_cells(
+        &mut self,
+        cond: u32,
+        a: Option<Vec<u32>>,
+        b: Option<Vec<u32>>,
+    ) -> R<Option<Vec<u32>>> {
+        let (a, b) = match (a, b) {
+            (None, None) => return Ok(None),
+            (Some(x), None) | (None, Some(x)) if self.cells.is_empty() => return Ok(Some(x)),
+            (a, b) => (a, b),
+        };
+        let n = self.cells.len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let side = |ev: &mut Self, s: &Option<Vec<u32>>| -> R<u32> {
+                match s.as_ref().and_then(|v| v.get(i)) {
+                    Some(&v) => Ok(v),
+                    None => ev.push(Node::Unreachable),
+                }
+            };
+            let x = side(self, &a)?;
+            let y = side(self, &b)?;
+            out.push(self.select(cond, x, y)?);
+        }
+        Ok(Some(out))
     }
 
     /// The return states `a` where `cond` holds and `b` elsewhere, joined.
@@ -1050,6 +1179,12 @@ impl<'a> Eval<'a> {
                 let xs = self.values(f, args, args.len())?;
                 self.deeper(|ev| ev.function(j, &xs))
             }
+            Some(Val::Host(api)) if is_time(api) => {
+                if !args.is_empty() {
+                    return construct("host arguments");
+                }
+                self.push(Node::StateUs)
+            }
             Some(Val::Host(api)) => {
                 let Some((arity, _)) = reader(api) else {
                     return refuse(Unsupported::HostApi(api));
@@ -1279,6 +1414,15 @@ impl<'a> Eval<'a> {
             }
             Bin::Eq | Bin::Ne => {
                 let eq = op == Bin::Eq;
+                // A slot against the off value, an integer or a slot: the
+                // program compares them as the source's doubles.
+                let slot = |r: u32| matches!(self.res.node(r), Node::Slot(_));
+                let comparable = |ev: &Self, r: u32| {
+                    slot(r) || matches!(ev.val(r), Some(Val::OffValue | Val::Int(_)))
+                };
+                if (slot(x) || slot(y)) && comparable(self, x) && comparable(self, y) {
+                    return self.push(Node::Cmp(op, x, y));
+                }
                 if kx == OFF || ky == OFF {
                     let (r, off) = if kx == OFF { (y, x) } else { (x, y) };
                     let timer = matches!(self.res.node(r), Node::Read { api, .. } if is_timer(api));

@@ -24,14 +24,25 @@
 //! the guards of reads whose values are discarded are read first, so an
 //! unavailable one gives no value, as a lowered expression's joined guards
 //! do. Each refusal is [`Unsupported`] and follows the callback's role.
+//!
+//! A timer root's slots ([`slots`]) are checked before it compiles: each
+//! slot's every write is a constant, a mapped integer read, the state clock
+//! or the off value, so its domain is their join with its initial value;
+//! no write is off, and each is reached only under the slot's own off test
+//! and under a guard false at a zero tally (every slot off, every count,
+//! combo, score and point 0), so no write happens before the first play
+//! frame and none after the slot is set; and no operation of the callback
+//! can raise, so its stores are kept whatever it returns. Its stores are
+//! emitted together after its result: every value into its own register,
+//! then each [`Insn::StoreSlot`] with its domain.
 
 use skin_model::Ty;
-use skin_model::present::{self, Cmp, Insn, MAX_CALLBACK_OPS, MAX_REGISTERS, MathFn};
+use skin_model::present::{self, Cmp, Domain, Insn, MAX_CALLBACK_OPS, MAX_REGISTERS, MathFn};
 
 use super::Unsupported;
 use super::callback::Analysis;
 use super::residual::{
-    self, Conv, FLT, INT, LIMITS, MathOp, Node, R, Residual, Stop, Val, charge, did,
+    self, Conv, FLT, INT, LIMITS, MathOp, NUM, Node, R, Residual, Stop, Val, charge, did,
 };
 use super::syntax::{Bin, EXACT};
 
@@ -64,6 +75,248 @@ pub(crate) struct Compiled {
     pub(crate) reads: Vec<Leaf>,
     pub(crate) regs: u8,
     pub(crate) conv: present::Conv,
+    /// Its stores' domains, which its [`Insn::StoreSlot`]s index from 0.
+    pub(crate) domains: Vec<Domain>,
+    /// The slots it loads and stores, proven ([`slots`]).
+    pub(crate) slots: Vec<Slot>,
+}
+
+/// A slot of the root being compiled: its index, its initial value and
+/// its domain, which [`slots`] proves.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Slot {
+    pub(crate) slot: u16,
+    pub(crate) init: present::Val,
+    pub(crate) domain: Domain,
+}
+
+/// The fields a zero tally holds at 0: the counts, the combos, the EX
+/// score and the point.
+fn zero_at_start(src: &str) -> bool {
+    let name = src
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(src);
+    let field = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+    field
+        && (matches!(name, "combo" | "max_combo" | "ex_score" | "point")
+            || name.starts_with("count."))
+}
+
+/// The largest value of the state clock: 2^53 µs.
+const CLOCK_MAX: i64 = 1 << 53;
+
+fn refusal<T>(what: &'static str) -> R<T> {
+    Err(Stop::Unsupported(super::Unsupported::Construct(what)))
+}
+
+/// The domain of `v` as a value slot `k` (whose domain so far is `own`)
+/// takes: a constant, a mapped integer read, the state clock, the off
+/// value, the slot itself, or a select of those; anything else is a
+/// value computed from state, which a slot does not take.
+fn value_domain<L: Leaves>(
+    an: &Analysis,
+    leaves: &L,
+    res: &Residual,
+    v: u32,
+    k: u16,
+    own: Domain,
+) -> R<Domain> {
+    charge(an, "compile:slot", 1)?;
+    let join = |a: Domain, b: Domain| Domain {
+        off: a.off || b.off,
+        ints: match (a.ints, b.ints) {
+            (Some((p, q)), Some((r, s))) => Some((p.min(r), q.max(s))),
+            (x, None) | (None, x) => x,
+        },
+    };
+    let ints = |lo: i64, hi: i64| Domain {
+        off: false,
+        ints: Some((lo, hi)),
+    };
+    Ok(match res.node(v) {
+        Node::Slot(j) if j == k => own,
+        Node::Known(Val::Int(n)) => ints(n, n),
+        Node::Known(Val::OffValue) => Domain {
+            off: true,
+            ints: None,
+        },
+        Node::StateUs => ints(0, CLOCK_MAX),
+        Node::Read { .. } => match leaves.range(v) {
+            Some((lo, hi)) if res.kind(v) == INT => ints(lo, hi),
+            _ => return refusal("a slot written a read it cannot bound"),
+        },
+        Node::Unreachable => Domain {
+            off: false,
+            ints: None,
+        },
+        Node::Select { then, other, .. } => join(
+            value_domain(an, leaves, res, then, k, own)?,
+            value_domain(an, leaves, res, other, k, own)?,
+        ),
+        _ => return refusal("a slot written a value computed from state"),
+    })
+}
+
+/// A value known under the start assumption, or unknown.
+#[derive(Clone, Copy, PartialEq)]
+enum At0 {
+    Off,
+    Int(i64),
+    Bool(bool),
+}
+
+/// Node `v` as it is before the first play frame, as far as that is known:
+/// every slot off, every field [`zero_at_start`] names 0.
+fn at_start<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, v: u32) -> R<Option<At0>> {
+    charge(an, "compile:slot", 1)?;
+    Ok(match res.node(v) {
+        Node::Slot(_) | Node::Known(Val::OffValue) => Some(At0::Off),
+        Node::Known(Val::Int(n)) => Some(At0::Int(n)),
+        Node::Known(Val::Bool(b)) => Some(At0::Bool(b)),
+        Node::Read { .. } => match leaves.leaf(res, v)? {
+            Some(l) if l.ty == Ty::Int && zero_at_start(&l.src) => Some(At0::Int(0)),
+            _ => None,
+        },
+        Node::Not(x) => match at_start(an, leaves, res, x)? {
+            Some(At0::Bool(b)) => Some(At0::Bool(!b)),
+            _ => None,
+        },
+        Node::Cmp(op, a, b) => {
+            let (x, y) = (at_start(an, leaves, res, a)?, at_start(an, leaves, res, b)?);
+            match (op, x, y) {
+                (Bin::Eq | Bin::Ne, Some(x), Some(y)) => {
+                    Some(At0::Bool((x == y) == (op == Bin::Eq)))
+                }
+                (_, Some(At0::Int(p)), Some(At0::Int(q))) => Some(At0::Bool(match op {
+                    Bin::Lt => p < q,
+                    Bin::Le => p <= q,
+                    Bin::Gt => p > q,
+                    _ => p >= q,
+                })),
+                _ => None,
+            }
+        }
+        Node::Select { cond, then, other } => match at_start(an, leaves, res, cond)? {
+            Some(At0::Bool(true)) => at_start(an, leaves, res, then)?,
+            Some(At0::Bool(false)) => at_start(an, leaves, res, other)?,
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Whether `c` having truthiness `pol` implies slot `k` is off.
+fn implies_off(an: &Analysis, res: &Residual, c: u32, pol: bool, k: u16) -> R<bool> {
+    charge(an, "compile:slot", 1)?;
+    let off_test = |x: u32, y: u32| {
+        matches!(res.node(x), Node::Slot(j) if j == k) && res.val(y) == Some(Val::OffValue)
+    };
+    Ok(match res.node(c) {
+        Node::Known(Val::Bool(b)) => b != pol,
+        Node::Cmp(op @ (Bin::Eq | Bin::Ne), a, b) if off_test(a, b) || off_test(b, a) => {
+            (op == Bin::Eq) == pol
+        }
+        Node::Not(x) => implies_off(an, res, x, !pol, k)?,
+        Node::Select { cond, then, other } => {
+            let when = implies_off(an, res, cond, true, k)? || implies_off(an, res, then, pol, k)?;
+            let unless = implies_off(an, res, cond, false, k)?
+                || if other == cond {
+                    // There the value is the condition's: false.
+                    pol
+                } else {
+                    implies_off(an, res, other, pol, k)?
+                };
+            when && unless
+        }
+        _ => false,
+    })
+}
+
+/// The writes in `v`, slot `k`'s final value, each checked under the
+/// conditions `path` that select it: not off, under the slot's off test,
+/// and under a condition false before the first play frame.
+fn check_writes<L: Leaves>(
+    an: &Analysis,
+    leaves: &mut L,
+    res: &Residual,
+    v: u32,
+    k: u16,
+    path: &mut Vec<(u32, bool)>,
+) -> R<()> {
+    charge(an, "compile:slot", 1)?;
+    match res.node(v) {
+        Node::Slot(j) if j == k => Ok(()),
+        Node::Unreachable => Ok(()),
+        Node::Select { cond, then, other } => {
+            path.push((cond, true));
+            let r = check_writes(an, leaves, res, then, k, path);
+            path.pop();
+            r?;
+            path.push((cond, false));
+            let r = check_writes(an, leaves, res, other, k, path);
+            path.pop();
+            r
+        }
+        _ => {
+            if res.val(v) == Some(Val::OffValue) {
+                return refusal("a slot written the off value");
+            }
+            let mut guarded = false;
+            let mut before = false;
+            for &(c, pol) in path.iter() {
+                guarded = guarded || implies_off(an, res, c, pol, k)?;
+                before = before
+                    || match at_start(an, leaves, res, c)? {
+                        Some(At0::Bool(b)) => b != pol,
+                        _ => false,
+                    };
+            }
+            if !guarded {
+                return refusal("a slot written again once set");
+            }
+            if !before {
+                return refusal("a slot write that can happen outside play frames");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The root's slots `slots`, at their initial values and domains so far,
+/// proven for `res` ([`Residual::stores`]): each slot's domain joined with
+/// its writes', checked against the rules above. Every node the residual
+/// holds is checked to raise nothing.
+pub(crate) fn slots<L: Leaves>(
+    an: &Analysis,
+    leaves: &mut L,
+    res: &Residual,
+    slots: &mut [Slot],
+) -> R<()> {
+    for r in 0..res.len() {
+        charge(an, "compile:slot", 1)?;
+        let num = |x: u32| res.kind(x) & !NUM == 0;
+        let raises = match res.node(r) {
+            Node::Arith(_, a, b) | Node::Math(_, a, b) => !num(a) || !num(b),
+            Node::Neg(a) => !num(a),
+            Node::Cmp(Bin::Eq | Bin::Ne, ..) => false,
+            Node::Cmp(_, a, b) => !num(a) || !num(b),
+            _ => false,
+        };
+        if raises {
+            return refusal("a slot writer that may raise");
+        }
+    }
+    for &(k, v) in &res.stores {
+        let Some(s) = slots.iter_mut().find(|s| s.slot == k) else {
+            return refusal("a slot it does not own");
+        };
+        s.domain = value_domain(an, leaves, res, v, k, s.domain)?;
+        check_writes(an, leaves, res, v, k, &mut Vec::new())?;
+    }
+    Ok(())
 }
 
 /// An integer part's bounds, `None` for a node that is never an integer.
@@ -116,6 +369,7 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
             Node::Read { .. } => leaves
                 .range(r)
                 .map(|(lo, hi)| (i128::from(lo), i128::from(hi))),
+            Node::StateUs => Some((0, i128::from(CLOCK_MAX))),
             Node::Neg(x) => exact(get(x).map(|(lo, hi)| (-hi, -lo)))?,
             // Both operands bounded: both may be integers (bounds are
             // given exactly to the nodes that may be).
@@ -189,6 +443,9 @@ struct C<'a, L> {
     leaves: &'a mut L,
     out: Compiled,
     top: u8,
+    /// Whether the off value is a value here: a timer's result or a
+    /// slot's.
+    off: bool,
 }
 
 /// `res`, converted by `conv` (a `draw` or a number's value), compiled into
@@ -203,10 +460,12 @@ pub(crate) fn compile<L: Leaves>(
     res: &Residual,
     conv: Conv,
     root: Iv,
+    slots: &[Slot],
 ) -> R<Compiled> {
     let conv = match conv {
         Conv::Truthy => present::Conv::Truthy,
         Conv::Int => present::Conv::Int,
+        Conv::Timer => present::Conv::Timer,
         Conv::Text | Conv::Index => return Err(Stop::Unsupported(Unsupported::Type)),
     };
     for _ in 0..res.len() {
@@ -226,8 +485,11 @@ pub(crate) fn compile<L: Leaves>(
             reads: Vec::new(),
             regs: 1,
             conv,
+            domains: Vec::new(),
+            slots: slots.to_vec(),
         },
         top: 0,
+        off: conv == present::Conv::Timer || !res.stores.is_empty(),
     };
     // Every read's availability first, its value aside.
     for guards in guards {
@@ -240,8 +502,29 @@ pub(crate) fn compile<L: Leaves>(
             0,
         )?;
     }
-    c.emit(res, res.root, 0)?;
-    c.push(Insn::Ret { src: 0 })?;
+    // Every store's value into its own register, then the result, then
+    // the stores: a parallel assignment, after which nothing can fail.
+    let n = u8::try_from(res.stores.len()).map_err(|_| Stop::Unsupported(LIMITS))?;
+    for (i, &(_, v)) in (0_u8..).zip(&res.stores) {
+        c.emit(res, v, i)?;
+    }
+    c.emit(res, res.root, n)?;
+    for (i, &(k, v)) in (0_u8..).zip(&res.stores) {
+        let own = slots
+            .iter()
+            .find(|s| s.slot == k)
+            .map(|s| s.domain)
+            .ok_or(Stop::Unsupported(LIMITS))?;
+        let d = value_domain(an, &*c.leaves, res, v, k, own)?;
+        let domain = u16::try_from(c.out.domains.len()).map_err(|_| Stop::Unsupported(LIMITS))?;
+        c.out.domains.push(d);
+        c.push(Insn::StoreSlot {
+            slot: k,
+            src: i,
+            domain,
+        })?;
+    }
+    c.push(Insn::Ret { src: n })?;
     c.out.regs = c.top.saturating_add(1);
     Ok(c.out)
 }
@@ -308,10 +591,20 @@ impl<L: Leaves> C<'_, L> {
         }
         let ty = || Err(Stop::Unsupported(Unsupported::Type));
         match res.node(r) {
+            Node::Known(Val::OffValue) if self.off => {
+                let k = self.constant(present::OFF)?;
+                self.push(Insn::Const { dst, k })?;
+            }
             Node::Known(v) => {
                 let pv = residual::num_val(v).ok_or(Stop::Unsupported(Unsupported::Type))?;
                 let k = self.constant(pv)?;
                 self.push(Insn::Const { dst, k })?;
+            }
+            Node::StateUs => {
+                self.push(Insn::StateUs { dst })?;
+            }
+            Node::Slot(slot) => {
+                self.push(Insn::LoadSlot { dst, slot })?;
             }
             Node::Unreachable => {
                 let k = self.constant(present::Val::Nil)?;

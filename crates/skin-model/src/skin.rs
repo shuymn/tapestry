@@ -38,7 +38,7 @@ use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
 use crate::select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
-use crate::track::{MAX_KEY_US, Track};
+use crate::track::{End, MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
@@ -180,6 +180,9 @@ pub enum TimerRef {
     Builtin(u16),
     /// The skin's `when` timer at this index.
     When(u16),
+    /// The play presentation program's timer callback at this index: an
+    /// element's timer only.
+    Output(u16),
 }
 
 /// One element as a front end builds it. Every element names its timer;
@@ -239,6 +242,8 @@ pub enum LoadError {
     VisibleNotBool { element: usize },
     #[error("element {element}'s timer does not exist")]
     UnknownTimer { element: usize },
+    #[error("element {element}'s track on a program timer loops or ends at or past 4 h")]
+    ProgramTimerTrack { element: usize },
     #[error("element {element}'s image does not exist")]
     UnknownImage { element: usize },
     #[error("image {image}'s cycle timer does not exist")]
@@ -520,8 +525,45 @@ fn screen_slot_of(timer: TimerRef, whens: usize, builtin: usize) -> Option<usize
     match timer {
         TimerRef::Builtin(s) if usize::from(s) < builtin => Some(usize::from(s)),
         TimerRef::When(i) if usize::from(i) < whens => Some(builtin + usize::from(i)),
-        TimerRef::Builtin(_) | TimerRef::When(_) => None,
+        TimerRef::Builtin(_) | TimerRef::When(_) | TimerRef::Output(_) => None,
     }
+}
+
+/// The slot an element's `timer` reads with `whens` `when` timers after
+/// `builtin` built-in ones and the program `present`: [`screen_slot_of`],
+/// or, for [`TimerRef::Output`] (V8), the timer of a timer callback after
+/// every `when` timer. A program timer's track must not depend on how far
+/// past [`crate::MAX_ELAPSED_MS`] it is, since its elapsed time is capped
+/// there: a held end, or a hidden end whose last key is before it, never a
+/// loop ([`LoadError::ProgramTimerTrack`]).
+fn element_slot_of(
+    e: &ElementDef,
+    element: usize,
+    (whens, builtin): (usize, usize),
+    present: Option<&PresentDef>,
+) -> Result<usize, LoadError> {
+    let TimerRef::Output(k) = e.timer else {
+        return screen_slot_of(e.timer, whens, builtin).ok_or(LoadError::UnknownTimer { element });
+    };
+    let cbs = present.map_or(&[][..], |p| &p.callbacks);
+    let k = usize::from(k);
+    if cbs.get(k).map(|c| c.conv) != Some(crate::present::Conv::Timer) {
+        return Err(LoadError::UnknownTimer { element });
+    }
+    let rank = cbs
+        .iter()
+        .take(k)
+        .filter(|c| c.conv == crate::present::Conv::Timer)
+        .count();
+    let accepted = match e.track.end() {
+        (End::Hold, _) => true,
+        (End::Hide, last) => last < MAX_KEY_US,
+        (End::Loop { .. }, _) => false,
+    };
+    if !accepted {
+        return Err(LoadError::ProgramTimerTrack { element });
+    }
+    Ok(builtin + whens + rank)
 }
 
 /// `deg` degrees as radians in `[0, 2π)`, reduced first so large key
@@ -1710,8 +1752,7 @@ impl Skin {
         }
         let mut slots = Vec::with_capacity(elements.len());
         for (element, e) in elements.iter().enumerate() {
-            let slot = screen_slot_of(e.timer, whens.len(), builtin)
-                .ok_or(LoadError::UnknownTimer { element })?;
+            let slot = element_slot_of(e, element, (whens.len(), builtin), present.as_ref())?;
             slots.push(slot);
             if let Source::Judge(i) = e.source
                 && let Some((part, _)) = w
@@ -2727,6 +2768,11 @@ impl Skin {
         }
     }
 
+    /// The timers the presentation program's timer callbacks give.
+    fn program_timers(&self) -> usize {
+        self.present.as_ref().map_or(0, Present::timers)
+    }
+
     /// The output slots the presentation program writes, two a callback.
     fn program_slots(&self) -> usize {
         self.present
@@ -2748,7 +2794,7 @@ impl Skin {
         Play::new(
             chart,
             ctx,
-            self.program_slots(),
+            self.present.as_ref(),
             self.whens.len(),
             self.lanes.is_some(),
             self.bar_group_count(),
@@ -2806,7 +2852,7 @@ impl Skin {
             return Err(BuildError::Kind);
         }
         play.check()?;
-        if play.slots() != usize::from(BUILTIN) + self.whens.len()
+        if play.slots() != usize::from(BUILTIN) + self.whens.len() + self.program_timers()
             || play.field_count() != field::COUNT + self.program_slots()
             || play.bar_capacity() != self.bar_group_count()
             || uvs.sheet_id() != self.sheet_id
@@ -4067,7 +4113,9 @@ fn check_outputs(
         };
         let want = signature.get(at / 2).ok_or(LoadError::OutputRead)?;
         let ok = at % 2 == 1;
+        // V8: a timer output is read only as an element's timer.
         let matches = match out {
+            _ if *want == OutTy::Timer => false,
             Some((ty, o)) => o == ok && (ok || ty == *want),
             None => false,
         };

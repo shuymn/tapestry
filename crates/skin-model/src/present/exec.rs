@@ -13,13 +13,30 @@
 //! an integer result of `i32::MIN` or `i32::MAX` gives `ok` 0, as the
 //! source's number draws nothing for those (`SkinNumber.java:139-143` at
 //! `0.8.9`). No heap, no recursion, no indexing.
+//!
+//! A timer callback ([`Conv::Timer`]) runs as the source's timer property
+//! (`SkinObject.java:350-357`, `TimerProperty.java:8-10`,
+//! `SkinLuaAccessor.java:736-747`): once, its result `tolong()`, a Lua
+//! error the off value; off, or no value, and its timer is off; on, and it
+//! runs again, the second result its start, never checked for off. Its
+//! elapsed ms is `state_us / 1000 - start / 1000`; negative, the timer is
+//! off (the source's `starttime > time`); otherwise it is capped at
+//! [`MAX_ELAPSED_MS`] and the timer's start placed that far before the
+//! frame's chart time, so the element's track ages by it. Its outputs are
+//! whether it was on, and 1 once it ran.
+//!
+//! Slots are loaded and stored in the bank in place: the compiler emits a
+//! callback's stores together at its end, after every value they store is
+//! in a register, so an unavailable read or an overflow before them ends
+//! the invocation with none of them.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use super::num;
-use super::{CallbackDef, Conv, Fail, Insn, MAX_REGISTERS, Present, ReadDef, Val};
-use crate::expr::State;
+use super::{Bank, CallbackDef, Clock, Conv, Fail, Insn, MAX_REGISTERS, Present, ReadDef, Val};
+use crate::expr::{MAX_ELAPSED_MS, State};
 use crate::schema::Ty;
+use bms_model::TimeUs;
 
 #[cfg(feature = "dev-tools")]
 thread_local! {
@@ -49,36 +66,85 @@ fn read(r: &ReadDef, state: &State<'_>) -> Result<Val, Fail> {
     })
 }
 
+/// What one frame's run reads and writes besides the fields.
+pub struct Io<'a, 'b> {
+    pub state: &'a State<'b>,
+    pub clock: Clock,
+    pub bank: &'a mut Bank,
+    /// Callback `k`'s converted result at `2k`, whether it gave one at
+    /// `2k + 1`.
+    pub outs: &'a mut [i32],
+    /// The timer callbacks' starts, in order, `None` while off.
+    pub timers: &'a mut [Option<TimeUs>],
+}
+
 impl Present {
-    /// Runs every callback on `state`, writing callback `k`'s converted
-    /// result to `outs[2k]` and whether it gave one to `outs[2k + 1]`.
-    /// Allocates nothing and never panics; a slot `outs` lacks is not
-    /// written.
-    pub fn run(&self, state: &State<'_>, outs: &mut [i32]) {
+    /// Runs every callback in order over `io`: its state, clock and slots,
+    /// writing callback `k`'s converted result to `outs[2k]` and whether it
+    /// gave one to `outs[2k + 1]`, and each timer callback's start to its
+    /// timer. Allocates nothing and never panics; a slot `outs` or
+    /// `timers` lacks is not written.
+    pub fn run(&self, io: &mut Io<'_, '_>) {
+        let mut timer = 0_usize;
         for (k, cb) in self.def.callbacks.iter().enumerate() {
-            let ran = self.gated(cb, state, outs).then(|| self.invoke(cb, state));
-            let (value, ok) = match ran {
-                None => (0, false),
-                Some(r) => convert(cb.conv, r),
+            let go = self.gated(cb, io.state, io.outs);
+            let (value, ok) = if cb.conv == Conv::Timer {
+                let start = if go { self.timer(cb, io) } else { None };
+                if let Some(t) = io.timers.get_mut(timer) {
+                    *t = start.and_then(|s| s);
+                }
+                timer = timer.saturating_add(1);
+                (i32::from(start.is_some()), go)
+            } else if go {
+                let r = self.invoke(cb, io.state, io.clock, io.bank);
+                convert(cb.conv, r)
+            } else {
+                (0, false)
             };
             let at = k.saturating_mul(2);
-            if let Some(slot) = outs.get_mut(at) {
+            if let Some(slot) = io.outs.get_mut(at) {
                 *slot = value;
             }
-            if let Some(slot) = outs.get_mut(at.saturating_add(1)) {
+            if let Some(slot) = io.outs.get_mut(at.saturating_add(1)) {
                 *slot = i32::from(ok);
             }
         }
     }
 
-    /// Whether `cb` runs this frame: its `after` number gave a value and
-    /// its gate holds.
+    /// Timer callback `cb`'s two invocations: `None` when the first gave
+    /// off or no value; otherwise `Some` of its start against the frame,
+    /// `None` within when the second gave no value or the elapsed time is
+    /// negative.
+    fn timer(&self, cb: &CallbackDef, io: &mut Io<'_, '_>) -> Option<Option<TimeUs>> {
+        let first = start_of(self.invoke(cb, io.state, io.clock, io.bank))?;
+        if first == i64::MIN {
+            return None;
+        }
+        let Some(start) = start_of(self.invoke(cb, io.state, io.clock, io.bank)) else {
+            return Some(None);
+        };
+        let elapsed = elapsed_ms(io.clock.state_us, start);
+        if elapsed < 0 {
+            return Some(None);
+        }
+        let us = elapsed.min(i64::from(MAX_ELAPSED_MS)).saturating_mul(1_000);
+        Some(Some(TimeUs(io.clock.now.0.saturating_sub(us))))
+    }
+
+    /// Whether `cb` runs this frame: the callback it follows allows it
+    /// (a number's value given, a draw true, a timer on) and its gate
+    /// holds.
     fn gated(&self, cb: &CallbackDef, state: &State<'_>, outs: &[i32]) -> bool {
         if let Some(a) = cb.after {
-            let ok = usize::from(a)
-                .checked_mul(2)
-                .and_then(|i| outs.get(i.saturating_add(1)));
-            if ok != Some(&1) {
+            let at = usize::from(a).saturating_mul(2);
+            let ok = outs.get(at.saturating_add(1)) == Some(&1);
+            let value = outs.get(at).is_some_and(|&v| v != 0);
+            let allows = match self.def.callbacks.get(usize::from(a)).map(|c| c.conv) {
+                Some(Conv::Int) => ok,
+                Some(Conv::Truthy | Conv::Timer) => ok && value,
+                None => false,
+            };
+            if !allows {
                 return false;
             }
         }
@@ -93,7 +159,13 @@ impl Present {
     }
 
     /// One invocation of `cb`: its result or why it gave none.
-    fn invoke(&self, cb: &CallbackDef, state: &State<'_>) -> Result<Val, Fail> {
+    fn invoke(
+        &self,
+        cb: &CallbackDef,
+        state: &State<'_>,
+        clock: Clock,
+        bank: &mut Bank,
+    ) -> Result<Val, Fail> {
         #[cfg(feature = "dev-tools")]
         INVOCATIONS.with(|n| n.set(n.get().wrapping_add(1)));
         let mut regs = [Val::Nil; MAX_REGISTERS];
@@ -138,6 +210,22 @@ impl Present {
                     continue;
                 }
                 Insn::Ret { src } => return Ok(get(src)),
+                Insn::StateUs { dst } => (dst, Val::Int(clock.state_us)),
+                Insn::LoadSlot { dst, slot } => (
+                    dst,
+                    bank.vals
+                        .get(usize::from(slot))
+                        .copied()
+                        .unwrap_or(Val::Nil),
+                ),
+                Insn::StoreSlot { slot, src, .. } => {
+                    let v = get(src);
+                    if let Some(s) = bank.vals.get_mut(usize::from(slot)) {
+                        *s = v;
+                    }
+                    pc = next;
+                    continue;
+                }
             };
             if let Some(slot) = regs.get_mut(usize::from(dst)) {
                 *slot = v;
@@ -145,6 +233,26 @@ impl Present {
             pc = next;
         }
         Ok(Val::Nil)
+    }
+}
+
+/// A program timer's elapsed ms at the state clock `state_us` from its
+/// start `start` (µs): `state_us / 1000 - start / 1000`, the source's two
+/// `long` divisions, each truncating toward zero (`TimerProperty.java:8-10`,
+/// `SkinObject.java:353-357` at `0.8.9`).
+#[must_use]
+pub fn elapsed_ms(state_us: i64, start: i64) -> i64 {
+    (state_us / 1_000).saturating_sub(start / 1_000)
+}
+
+/// A timer invocation's result as the source's `tolong()` gives it, a
+/// Lua error the off value (`SkinLuaAccessor.java:740-745`); `None` for
+/// no value.
+fn start_of(r: Result<Val, Fail>) -> Option<i64> {
+    match r {
+        Ok(v) => Some(num::to_long(v)),
+        Err(Fail::Error) => Some(i64::MIN),
+        Err(Fail::Unavailable | Fail::Overflow) => None,
     }
 }
 
@@ -158,5 +266,7 @@ fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
             let n = num::to_int(v);
             (n, n != i32::MIN && n != i32::MAX)
         }
+        // Run through [`Present::timer`] instead.
+        (Conv::Timer, Ok(_)) => (0, false),
     }
 }

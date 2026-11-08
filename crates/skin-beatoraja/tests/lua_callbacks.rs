@@ -1311,3 +1311,270 @@ fn every_integer_source_is_bounded() {
         assert_eq!(i.callbacks, [want], "{source}: {value}");
     }
 }
+
+/// A timer closure made by a factory whose state is `locals`, running
+/// `body`, the timer of `n` images (`i` at x 0, 100, ...).
+fn timer_skin(locals: &str, body: &str, n: usize) -> TempDir {
+    let dsts: String = (0..n)
+        .map(|k| {
+            format!(
+                "table.insert(skin.destination, {{ id = \"i\", timer = latch,\n\
+                   dst = {{ {{ x = {}, y = 0, w = 64, h = 64 }} }} }})\n",
+                k * 100
+            )
+        })
+        .collect();
+    folder(&skin(&format!(
+        "local latch = (function()\n\
+           {locals}\n\
+           return function()\n\
+             {body}\n\
+           end\n\
+         end)()\n\
+         {dsts}"
+    )))
+}
+
+/// The latch's state.
+const STATE: &str = "local state = ms.timer_off_value";
+
+/// The latch's body: the state clock stored once the point reaches
+/// 200 000 (a full score), its start the timer.
+const LATCH_BODY: &str = "if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
+     return state";
+
+/// The slots' values.
+fn bank(p: &Drawn) -> Vec<skin_model::present::Val> {
+    p.play.bank().values().to_vec()
+}
+
+/// A full score over `notes` notes: every note a PERFECT, the max combo
+/// all of them.
+fn full_score(p: &mut Drawn, notes: u32) {
+    p.tally.counts.perfect = notes;
+    p.tally.max_combo = notes;
+    p.tally.combo = notes;
+}
+
+/// The latch shape, the MAX line's timer on two destinations: compiled
+/// into the program; dark until the point reaches 200 000, then lit from
+/// the state clock of that frame and kept, whatever the score after it,
+/// through a rearm; fresh at a retry.
+#[test]
+fn the_latch_starts_once_and_keeps_its_start() {
+    use skin_model::present::{OFF, Val};
+    let d = timer_skin(STATE, LATCH_BODY, 2);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    p.state_us = 1_000_000;
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [OFF]);
+    full_score(&mut p, 4);
+    p.state_us = 2_000_000;
+    assert_eq!(p.frame(1_016, &[]).len(), 2);
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    // The score drops (as no play's does): the start stays.
+    p.tally = common::play::tally(0, 0);
+    p.state_us = 3_500_000;
+    assert_eq!(p.frame(1_032, &[]).len(), 2);
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    p.play.rearm();
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    assert_eq!(p.frame(0, &[]).len(), 2);
+    // A retry prepares the play again: dark until reached again.
+    p.retry(4);
+    assert_eq!(bank(&p), [OFF]);
+    assert!(p.frame(1_000, &[]).is_empty());
+}
+
+/// Every slot's value is computed before any is stored: the second
+/// slot's guard reads the first's value as the run began, so it is set
+/// one run after the first; and a store on a returning path, or in a
+/// callback whose result is the off value or false, is kept.
+#[test]
+fn stores_are_parallel_and_kept_on_every_path() {
+    use skin_model::present::{OFF, Val};
+    let off = "ms.timer_off_value";
+    let full = "ms.number(100) == 200000";
+    // `b` is set only when `a` was set as the run began.
+    let locals = format!("local a = {off}\nlocal b = {off}");
+    let body = format!(
+        "local was = a\n\
+         if a == {off} and {full} then a = ms.time() end\n\
+         if b == {off} and was ~= {off} and {full} then b = ms.time() end\n\
+         return b"
+    );
+    let d = timer_skin(&locals, &body, 1);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    full_score(&mut p, 4);
+    p.state_us = 7_000;
+    // The first run sets `a`, and gives `b`, still off: no second run.
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [Val::Int(7_000), OFF]);
+    p.state_us = 9_000;
+    assert_eq!(p.frame(1_016, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(7_000), Val::Int(9_000)]);
+
+    for (body, drawn) in [
+        // A store on the arm that returns.
+        (
+            format!(
+                "if state == {off} and {full} then state = ms.time() return 0 end\nreturn state"
+            ),
+            true,
+        ),
+        // A store in a run giving the off value, or false.
+        (
+            format!("if state == {off} and {full} then state = ms.time() end\nreturn {off}"),
+            false,
+        ),
+        (
+            format!("if state == {off} and {full} then state = ms.time() end\nreturn false"),
+            true,
+        ),
+    ] {
+        let d = timer_skin(STATE, &body, 1);
+        let i = import(&d, 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
+        let mut p = Drawn::new(i.imported.skin, 4);
+        full_score(&mut p, 4);
+        p.state_us = 5_000;
+        assert_eq!(!p.frame(1_000, &[]).is_empty(), drawn, "{body}");
+        assert_eq!(bank(&p), [Val::Int(5_000)], "{body}");
+    }
+}
+
+/// A slot is taken only for a proven cell, domain and writer; otherwise
+/// the timer follows its role (a decorative constant here): a cell two
+/// instances of a factory capture, a counter, a write a dropped
+/// destination's timer would make, a consumer with a condition, a write
+/// that can happen before play (no tally guard), a write repeated once
+/// set or of the off value, a cell only a helper captures, one a helper
+/// shared by two roots writes (each helper reading a written cell:
+/// `Interference`), and one a root reads through a helper.
+#[test]
+fn a_slot_is_taken_only_when_proven() {
+    let off = "ms.timer_off_value";
+    let full = "ms.number(100) == 200000";
+    let construct = |s| Disposition::Replaced(Unsupported::Construct(s));
+    let one = |body: &str| {
+        let d = folder(&skin(body));
+        import(&d, 905).unwrap_or_else(|e| panic!("{body}: {e:?}"))
+    };
+    let dst = |name: &str, extra: &str| {
+        format!(
+            "table.insert(skin.destination, {{ id = \"i\", timer = {name}, {extra}\n\
+               dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n"
+        )
+    };
+    let latch = |locals: &str, body: &str| {
+        format!("local latch = (function()\n{locals}\nreturn function()\n{body}\nend\nend)()\n")
+    };
+    // Two instances of one factory.
+    let two = format!(
+        "local function mk() local s = {off}\n\
+           return function() if s == {off} and {full} then s = ms.time() end return s end end\n\
+         local l1 = mk()\nlocal l2 = mk()\n{}{}",
+        dst("l1", ""),
+        dst("l2", "")
+    );
+    let i = one(&two);
+    assert!(
+        i.callbacks
+            .contains(&construct("a written cell more than one closure captures")),
+        "{:?}",
+        i.callbacks
+    );
+    assert!(
+        !i.callbacks.contains(&Disposition::Compiled),
+        "{:?}",
+        i.callbacks
+    );
+    for (body, why) in [
+        // A counter: arithmetic on a slot.
+        (
+            latch("local n = 0", "n = n + 1 return 0") + &dst("latch", ""),
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        // A destination whose timer it is, dropped before its timer: the
+        // latch would not run on every frame the source runs it.
+        (
+            latch(STATE, LATCH_BODY) + &dst("latch", "") + &dst("latch", "op = { 906 },"),
+            construct("a slot writer a dropped destination calls"),
+        ),
+        // A consumer with a condition.
+        (
+            latch(STATE, LATCH_BODY)
+                + &dst("latch", "draw = function() return ms.number(110) > 2 end,"),
+            construct("a slot writer the program does not run on every play frame"),
+        ),
+        // Written while loading: no tally in its guard.
+        (
+            latch(
+                STATE,
+                &format!("if state == {off} then state = ms.time() end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot write that can happen outside play frames"),
+        ),
+        // Set again once set: no off test.
+        (
+            latch(
+                STATE,
+                &format!("if {full} then state = ms.time() end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot written again once set"),
+        ),
+        (
+            latch(
+                STATE,
+                &format!("if state == {off} and {full} then state = {off} end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot written the off value"),
+        ),
+        // A cell only a helper captures and writes: the helper reads it,
+        // a written cell, first.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function h() if s == {off} and {full} then s = ms.time() end return s end\n\
+                 local latch = function() h() return h() end\n{}",
+                dst("latch", "")
+            ),
+            Disposition::Replaced(Unsupported::Interference),
+        ),
+        // A helper two roots share writes it.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function h() if s == {off} and {full} then s = ms.time() end return s end\n\
+                 local r1 = function() return h() end\n\
+                 local r2 = function() return h() end\n{}{}",
+                dst("r1", ""),
+                dst("r2", "")
+            ),
+            Disposition::Replaced(Unsupported::Interference),
+        ),
+        // The root reads its cell through a helper.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function peek() return s end\n\
+                 local latch = function()\n\
+                   if s == {off} and {full} then s = ms.time() end return peek() end\n{}",
+                dst("latch", "")
+            ),
+            construct("a written cell more than one closure captures"),
+        ),
+    ] {
+        let i = one(&body);
+        assert!(i.callbacks.contains(&why), "{body}: {:?}", i.callbacks);
+        assert!(
+            !i.callbacks.contains(&Disposition::Compiled),
+            "{body}: {:?}",
+            i.callbacks
+        );
+    }
+}

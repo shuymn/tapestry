@@ -57,6 +57,18 @@
 //! before it is built. Each lowering is a phase of the analysis's time
 //! budget, located at its callable.
 //!
+//! On play a destination's `timer` is compiled into the program as a timer
+//! callback ([`Cx::timer_callback`]), gated as a draw callback is, a
+//! program draw among its conditions its `after`. A timer root that writes
+//! a captured cell keeps it in a slot (design.md "beatoraja Lua Skins",
+//! the program's state) when only that root's instance captures the cell,
+//! the cell's initial value is an integer or, by provenance, the off value,
+//! and the compiler proves its writes ([`compile::slots`]); such a root
+//! runs on every play frame only when each of its consumers is compiled
+//! with no conditions, and when, at the import's end, every destination
+//! whose `timer` it is was compiled so ([`Cx::close_slots`]); otherwise its
+//! consumers are made never to run, each following its element's role.
+//!
 //! A callback that does not lower is unsupported: a decorative one is
 //! replaced by its typed constant, `false` for a `draw` (the element is
 //! never drawn) and the omitted number for a `value`, reported with the
@@ -73,7 +85,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use skin_model::output::OutTy;
 
-use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, Ty};
+use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, TimerRef, Ty};
 
 use super::ops::{self, Cond};
 use super::policy::{CriticalPart, EssentialPart, Role};
@@ -86,13 +98,22 @@ use crate::lua::callback::{
     Analysis, Callee, Captured, Disposition, Found, Site, fatal as sentinel, numeral,
     resolve_callee, tree,
 };
-use crate::lua::compile::{self, Compiled, Leaf, Leaves};
+use crate::lua::compile::{self, Compiled, Leaf, Leaves, Slot};
 use crate::lua::residual::{
     self, Conv, LIMITS, Node, R, Residual, Stop, Val, charge, did, stop, units,
 };
 use crate::lua::syntax::{Ast, Bin, DeclKind, Expr, List, Stmt};
 use crate::lua::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
 use crate::tree::{Kind, LuaScalar, NONE};
+
+/// A slot root: the slots its cells are, in its upvalues' order, and the
+/// timer callbacks compiled for it, each with its element's role, its
+/// callable and its destination.
+#[derive(Debug, Default)]
+pub(super) struct SlotRoot {
+    slots: Vec<u16>,
+    consumers: Vec<(u16, Role, (u32, u32), Span)>,
+}
 
 /// The gauge looks `gauge_type()` selects, by index.
 const LOOKS: [&str; 6] = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
@@ -558,7 +579,9 @@ impl Lower<'_> {
                 &[if b { "true" } else { "false" }],
             )?)),
             // Floats, `/ // %` and `math` are the program's.
-            Node::Known(_) | Node::Unreachable | Node::Math(..) => ty(),
+            Node::Known(_) | Node::Unreachable | Node::Math(..) | Node::StateUs | Node::Slot(_) => {
+                ty()
+            }
             Node::Arith(op, ..) if !matches!(op, Bin::Add | Bin::Sub | Bin::Mul) => ty(),
             Node::Read { .. } => match self.mapped.get(&r) {
                 Some(Mapped::Int { src, lo, hi }) => Self::int(Self::text(an, &[src])?, *lo, *hi),
@@ -1457,31 +1480,49 @@ impl Cx<'_> {
                 _ => "callee",
             })),
         };
-        // A root whose reach writes never lowers.
+        // A root whose reach writes never lowers, but a timer root whose
+        // written cells are its slots compiles into the program.
+        let timer = conv == Conv::Timer;
+        let mut cells: Vec<(u32, Slot)> = Vec::new();
         if an.writes(inst) {
-            return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
+            if !timer {
+                return Ok(Lowering::Unsupported(Unsupported::Writes, scan(&l)?));
+            }
+            match self.slot_cells(an, inst) {
+                Ok(c) => cells = c,
+                Err(Stop::Unsupported(why)) => {
+                    return Ok(Lowering::Unsupported(why, scan(&l)?));
+                }
+                Err(Stop::Fatal(why)) => return Err(fatal(why)),
+            }
         }
+        let decls: Vec<(u32, u16)> = cells.iter().map(|&(d, s)| (d, s.slot)).collect();
         // The expressions first; on play, a draw or a number's value they
-        // refuse goes to the program, whose refusal is then the reason.
+        // refuse goes to the program, whose refusal is then the reason; a
+        // timer goes to the program.
         let program = self.kind == ScreenKind::Play && matches!(conv, Conv::Truthy | Conv::Int);
         // The interference this lowering meets, for its refusal's place.
         self.interference.set(None);
-        let r = residual::evaluate(adm, inst, conv, &cancelled, &self.interference).and_then(
-            |res: Residual| {
+        let r = residual::evaluate(adm, inst, conv, &decls, &cancelled, &self.interference)
+            .and_then(|res: Residual| {
                 l.attach(&res)?;
                 // Every reached operation is checked whichever backend takes
                 // the callback, discarded ones included.
                 let ivs = compile::intervals(an, &l, &res)?;
                 let root = ivs.get(res.root as usize).copied().flatten();
+                if timer {
+                    let mut slots: Vec<Slot> = cells.iter().map(|&(_, s)| s).collect();
+                    compile::slots(an, &mut l, &res, &mut slots)?;
+                    return compile::compile(an, &mut l, &res, conv, root, &slots).map(Err);
+                }
                 match l.emit_root(&res, conv) {
                     Ok(src) => Ok(Ok(src)),
                     Err(Stop::Unsupported(_)) if program => {
-                        compile::compile(an, &mut l, &res, conv, root).map(Err)
+                        compile::compile(an, &mut l, &res, conv, root, &[]).map(Err)
                     }
                     Err(e) => Err(e),
                 }
-            },
-        );
+            });
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
@@ -1625,7 +1666,7 @@ impl Cx<'_> {
         }
         let cancelled = || def.cancelled(|| None).is_err();
         self.interference.set(None);
-        let r = residual::evaluate(adm, inst, Conv::Text, &cancelled, &self.interference);
+        let r = residual::evaluate(adm, inst, Conv::Text, &[], &cancelled, &self.interference);
         match r.and_then(|res: Residual| text_fold(an, &res, self.kind)) {
             Ok(fold) => Ok(Ok(fold)),
             Err(Stop::Unsupported(why)) => Ok(Err(why)),
@@ -1799,7 +1840,7 @@ impl Cx<'_> {
         // ([`Self::gate_by_value`]), then its own conditions.
         let gate: Vec<&str> = match ty {
             OutTy::Bool => self.value_gate.as_deref(),
-            OutTy::Int => None,
+            OutTy::Int | OutTy::Timer => None,
         }
         .into_iter()
         .chain(gate.iter().map(String::as_str))
@@ -1947,15 +1988,32 @@ impl Cx<'_> {
     }
 
     /// Draw callback `prog`, after the element's conditions `conds`:
-    /// the conditions are its gate, a number's program value its `after`
-    /// (its `lua.<k>.ok`); a condition reading another output (a program
-    /// draw before it) is refused, as the program has no such gating.
+    /// its gating ([`Self::gating`]).
     fn draw_program(
         &mut self,
         prog: Compiled,
         conds: &[String],
         at: Span,
     ) -> Result<Result<u16, Unsupported>, ImportError> {
+        let (gate, after) = match self.gating(conds, false) {
+            Ok(g) => g,
+            Err(why) => return Ok(Err(why)),
+        };
+        self.program(prog, gate, after, at)
+    }
+
+    /// A program callback's gating after the element's conditions `conds`:
+    /// the conditions are its gate, a number's program value its `after`
+    /// (its `lua.<k>.ok`), and, for a timer, a program draw (its
+    /// `lua.<k>`) too; a second such output, or a program draw before a
+    /// draw, is refused, as the program has no such gating. An expression
+    /// value's sentinel joins the gate.
+    fn gating(
+        &self,
+        conds: &[String],
+        timer: bool,
+    ) -> Result<(Option<String>, Option<u16>), Unsupported> {
+        use skin_model::present::Conv as P;
         let mut gate = Vec::new();
         let mut after = None;
         for cond in conds {
@@ -1963,18 +2021,23 @@ impl Cx<'_> {
                 gate.push(cond.as_str());
                 continue;
             }
-            let k = cond
-                .strip_prefix("lua.")
+            let conv = |k: u16| self.present.callbacks.get(usize::from(k)).map(|c| c.conv);
+            let rest = cond.strip_prefix("lua.");
+            let number = rest
                 .and_then(|r| r.strip_suffix(".ok"))
                 .and_then(|k| k.parse::<u16>().ok())
-                .filter(|&k| {
-                    self.present.callbacks.get(usize::from(k)).map(|c| c.conv)
-                        == Some(skin_model::present::Conv::Int)
-                });
-            match (k, after) {
+                .filter(|&k| conv(k) == Some(P::Int));
+            let draw = rest
+                .and_then(|k| k.parse::<u16>().ok())
+                .filter(|&k| timer && conv(k) == Some(P::Truthy));
+            match (number.or(draw), after) {
                 (Some(k), None) => after = Some(k),
                 _ => {
-                    return Ok(Err(Unsupported::Construct("a draw after a program draw")));
+                    return Err(Unsupported::Construct(if timer {
+                        "a timer after two program outputs"
+                    } else {
+                        "a draw after a program draw"
+                    }));
                 }
             }
         }
@@ -1991,8 +2054,193 @@ impl Cx<'_> {
             .into_iter()
             .chain(gate.iter().map(|g| (*g).to_owned()))
             .collect::<Vec<_>>();
-        let gate = (!gate.is_empty()).then(|| gate.join(" && "));
-        self.program(prog, gate, after, at)
+        Ok(((!gate.is_empty()).then(|| gate.join(" && ")), after))
+    }
+
+    /// Counts a play destination whose `timer` is a callable: every one a
+    /// slot root's must be compiled ([`Self::close_slots`]).
+    pub(super) fn count_timer_site(&mut self, timer: &Prop) {
+        if self.kind == ScreenKind::Play
+            && let Prop::Callable(id) = *timer
+            && let Some((_, inst)) = self.callable_at(id).filter(|&(_, i)| i != NONE)
+        {
+            let n = self.timer_sites.entry(inst).or_default();
+            *n = n.saturating_add(1);
+        }
+    }
+
+    /// The slot cells of timer root `inst`, which writes: each captured
+    /// declaration written at frame time, with its slot, initial value and
+    /// that value's domain. A cell another instance captures too, or whose
+    /// initial value is neither an integer nor the off value by
+    /// provenance, refuses the root.
+    fn slot_cells(&self, an: &Analysis, inst: u32) -> R<Vec<(u32, Slot)>> {
+        use skin_model::present::{Domain, MAX_SLOTS, OFF, Val as P};
+        let none = || Stop::Unsupported(Unsupported::Capture("an untagged closure"));
+        let i = *an.instance(inst).ok_or_else(none)?;
+        let ast = an.ast(i.file).ok_or_else(none)?;
+        let f = ast.func(i.func).ok_or_else(none)?;
+        let root = self.slot_roots.get(&inst);
+        let mut next = self.present.slots.len();
+        let mut out = Vec::new();
+        for &d in ast.list(f.upvalues) {
+            if an.written_at(i.file, d).is_none() {
+                continue;
+            }
+            charge(an, "slot:captors", units(an.instances.len()))?;
+            let captors = an
+                .instances
+                .iter()
+                .filter(|j| {
+                    j.file == i.file
+                        && ast
+                            .func(j.func)
+                            .is_some_and(|g| ast.list(g.upvalues).contains(&d))
+                })
+                .count();
+            if captors != 1 {
+                return Err(Stop::Unsupported(Unsupported::Construct(
+                    "a written cell more than one closure captures",
+                )));
+            }
+            let key = (u64::from(i.file) << 32) | u64::from(d);
+            let init = match an.captured_upvalue(inst, d) {
+                Some(Captured::Int(n)) if n.unsigned_abs() <= crate::lua::syntax::EXACT => {
+                    P::Int(n)
+                }
+                Some(Captured::Int(i64::MIN))
+                    if an.module_intact && an.marks.get(&key) == Some(&true) =>
+                {
+                    OFF
+                }
+                _ => {
+                    return Err(Stop::Unsupported(Unsupported::Construct(
+                        "a slot whose initial value is not an integer or the off value",
+                    )));
+                }
+            };
+            let slot = match root.and_then(|r| r.slots.get(out.len())) {
+                Some(&k) => k,
+                None => {
+                    let k = next;
+                    next += 1;
+                    u16::try_from(k)
+                        .ok()
+                        .filter(|_| k < MAX_SLOTS)
+                        .ok_or(Stop::Unsupported(LIMITS))?
+                }
+            };
+            let domain = match self.present.slots.get(usize::from(slot)) {
+                Some(s) => s.domain,
+                None => match init {
+                    P::Int(n) => Domain {
+                        off: false,
+                        ints: Some((n, n)),
+                    },
+                    _ => Domain {
+                        off: true,
+                        ints: None,
+                    },
+                },
+            };
+            out.push((d, Slot { slot, init, domain }));
+        }
+        Ok(out)
+    }
+
+    /// A destination's `timer` callable at node `id`, for an element of
+    /// `role` whose track ends `end` with its last key at `last` ms, after
+    /// its conditions `conds`: compiled into the program as a timer
+    /// callback, its timer returned; or the note to drop the element with,
+    /// a critical one refusing the candidate. A program timer's elapsed
+    /// time is capped at 4 h, so a looping track, or a hidden end at or
+    /// past it, follows the role.
+    pub(super) fn timer_callback(
+        &mut self,
+        role: Role,
+        at: Span,
+        (id, end, last): (u32, skin_model::End, i64),
+        conds: &[String],
+    ) -> Result<Result<TimerRef, NoteKind>, ImportError> {
+        let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
+        let capped = match end {
+            skin_model::End::Hold => true,
+            skin_model::End::Hide => last.saturating_mul(1000) < skin_model::MAX_KEY_US,
+            skin_model::End::Loop { .. } => false,
+        };
+        let why = if capped {
+            match self.lower(id, Conv::Timer) {
+                Ok(Lowering::Compiled(_, prog)) => {
+                    let ids: Vec<u16> = prog.slots.iter().map(|s| s.slot).collect();
+                    let slots = !ids.is_empty();
+                    match self.gating(conds, true) {
+                        Err(why) => why,
+                        // A slot root runs on every play frame.
+                        Ok((gate, after)) if slots && (gate.is_some() || after.is_some()) => {
+                            Unsupported::Construct(
+                                "a slot writer the program does not run on every play frame",
+                            )
+                        }
+                        Ok((gate, after)) => match self.program(prog, gate, after, at)? {
+                            Ok(k) => {
+                                if !ids.is_empty() {
+                                    let r = self.slot_roots.entry(inst).or_default();
+                                    r.slots = ids;
+                                    r.consumers.push((k, role, (c, id), at));
+                                }
+                                self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
+                                return Ok(Ok(TimerRef::Output(k)));
+                            }
+                            Err(why) => why,
+                        },
+                    }
+                }
+                Ok(Lowering::Lowered(_)) => Unsupported::Type,
+                Ok(Lowering::Unsupported(why, _)) => why,
+                Err(e) => {
+                    self.outcome((c, id), "timer", role, (Disposition::Refused, None));
+                    return Err(e);
+                }
+            }
+        } else {
+            Unsupported::Construct("a program timer's track that loops or ends past 4 h")
+        };
+        self.follows_role(role, (c, id), "timer", why).map(Err)
+    }
+
+    /// At the import's end: a slot root some destination's `timer` names
+    /// without a compiled consumer does not run on every play frame, so
+    /// its consumers are made never to run (their gate false) and follow
+    /// their role, a critical one refusing the candidate.
+    pub(super) fn close_slots(&mut self) -> Result<(), ImportError> {
+        let roots = std::mem::take(&mut self.slot_roots);
+        let mut roots: Vec<(u32, SlotRoot)> = roots.into_iter().collect();
+        roots.sort_by_key(|&(inst, _)| inst);
+        for (inst, root) in roots {
+            let sites = self.timer_sites.get(&inst).copied().unwrap_or(0);
+            if root.consumers.len() >= usize::try_from(sites).unwrap_or(usize::MAX) {
+                continue;
+            }
+            let why = Unsupported::Construct("a slot writer a dropped destination calls");
+            for (k, role, at, span) in root.consumers {
+                let never = self.compile("false", Ty::Bool, span)?;
+                let read = self.present.reads.len();
+                self.present.reads.push(skin_model::present::ReadDef {
+                    value: never,
+                    guard: None,
+                });
+                if let (Some(cb), Ok(read)) = (
+                    self.present.callbacks.get_mut(usize::from(k)),
+                    u16::try_from(read),
+                ) {
+                    cb.gate = Some(read);
+                    cb.after = None;
+                }
+                let note = self.follows_role(role, at, "timer", why)?;
+                self.note(Some(span), super::report::Severity::Fallback, note);
+            }
+        }
+        Ok(())
     }
 
     /// Callback `prog` appended to the program with its `gate` source and
@@ -2040,7 +2288,7 @@ impl Cx<'_> {
             }
         };
         let p = &mut self.present;
-        let (k_off, r_off) = (p.consts.len(), p.reads.len());
+        let (k_off, r_off, d_off) = (p.consts.len(), p.reads.len(), p.domains.len());
         let (Ok(start), Ok(len), Ok(k)) = (
             u32::try_from(p.code.len()),
             u16::try_from(prog.code.len()),
@@ -2065,6 +2313,10 @@ impl Cx<'_> {
                     Some(read) => Insn::Read { dst, read },
                     None => return limits,
                 },
+                Insn::StoreSlot { slot, src, domain } => match shift(domain, d_off) {
+                    Some(domain) => Insn::StoreSlot { slot, src, domain },
+                    None => return limits,
+                },
                 other => other,
             });
         }
@@ -2080,6 +2332,19 @@ impl Cx<'_> {
             after,
         });
         p.signature.push(OutTy::of(prog.conv));
+        // The root's slots: a new one appended, a known one's domain the
+        // join this consumer proved.
+        for s in &prog.slots {
+            let def = skin_model::present::SlotDef {
+                init: s.init,
+                domain: s.domain,
+            };
+            match p.slots.get_mut(usize::from(s.slot)) {
+                Some(known) => known.domain = s.domain,
+                None => p.slots.push(def),
+            }
+        }
+        p.domains.extend(prog.domains);
         Ok(Ok(k))
     }
 

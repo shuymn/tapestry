@@ -213,6 +213,11 @@ impl Track {
         self.at.len()
     }
 
+    /// What it shows past its last key, and that key's time.
+    pub(crate) fn end(&self) -> (End, i64) {
+        (self.end, self.at.last().copied().unwrap_or(0))
+    }
+
     /// Whether `other` has the same key times, ease and end, so both are
     /// drawn at the same local times and move between the same keys.
     /// Allocates nothing.
