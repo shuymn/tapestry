@@ -1409,3 +1409,33 @@ fn a_pending_lua_skin_draws_on_its_uploaded_pages() {
     assert!(presented_on(&rig, upload, &bundle));
     rig.exit();
 }
+
+/// An image stage whose preparation was superseded or discarded is
+/// settled, never detached (the S10 item 9 design's 9.2 ownership): a
+/// probe that would run forever is cancelled and its thread joined within
+/// the stop bound, and the skin is not left busy.
+#[test]
+fn a_settled_image_stage_is_cancelled_and_joined() {
+    let _s = serial();
+    let d = skin(
+        "while true do end",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let super::ImageStage::Running(mut job) =
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+    else {
+        panic!("a job runs");
+    };
+    let joined = jobs_joined();
+    let from = std::time::Instant::now();
+    rs.settle_image_stage(&mut job);
+    assert!(
+        from.elapsed() < crate::imports::STOP_WAIT,
+        "{:?}",
+        from.elapsed()
+    );
+    assert_eq!(jobs_joined() - joined, 1, "the job's thread joined");
+    assert!(!rs.busy());
+}

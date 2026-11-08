@@ -751,8 +751,7 @@ impl ResultSkin {
     /// [`image_stage`](Self::image_stage)'s start: decided at once when no
     /// job is needed, else its job started and returned at once
     /// ([`ImageStage::Running`]), to be waited for
-    /// ([`ImageJob::wait_until`]) and finished
-    /// ([`finish_image_stage`](Self::finish_image_stage)).
+    /// ([`poll_image_stage`](Self::poll_image_stage)), which finishes it.
     pub fn begin_image_stage(
         &mut self,
         chart: ResultChart,
@@ -859,6 +858,14 @@ impl ResultSkin {
     ) -> Option<Staged> {
         let ran = job.job.wait_until(until, quit, end_run)?;
         Some(self.finish_image_stage(&job.slot, ran))
+    }
+
+    /// An image stage's `job` no attempt waits for any more (its
+    /// preparation superseded or discarded): cancelled and waited for as
+    /// the run's end waits, at most [`imports::STOP_WAIT`], and finished,
+    /// so its images are handed back.
+    pub fn settle_image_stage(&mut self, job: &mut ImageJob) {
+        let _ = self.poll_image_stage(job, None, || false, || true);
     }
 
     /// The attempt's result skin from its image stage's outcome `ran`, the

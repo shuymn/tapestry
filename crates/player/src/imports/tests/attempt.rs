@@ -283,3 +283,38 @@ fn a_job_wait_returns_at_its_deadline_until_a_quit() {
         asked.elapsed()
     );
 }
+
+/// A specialization whose preparation was superseded or discarded is
+/// settled, never detached (the S10 item 9 design's 9.2 ownership: the
+/// handle owns its subjobs): a job that would run forever is cancelled,
+/// its thread joined and its VMs closed within the stop bound.
+#[test]
+fn a_settled_specialization_is_cancelled_and_joined() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = super::lua_skin("if ms.number(96) == 12 then while true do end end");
+    let (p, _) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    let mut skin = PendingSkin::new(p);
+    let (s, j, live) = counters();
+    let crate::imports::Begun::Running(mut job) = skin.begin(
+        facts(
+            "#PLAYLEVEL 12
+",
+        ),
+        || {},
+    ) else {
+        panic!("a job runs");
+    };
+    let from = std::time::Instant::now();
+    skin.settle(&mut job);
+    assert!(
+        from.elapsed() < crate::imports::STOP_WAIT,
+        "{:?}",
+        from.elapsed()
+    );
+    let (s2, j2, live2) = counters();
+    let one = u64::from(cfg!(feature = "dev-tools"));
+    assert_eq!((s2 - s, j2 - j), (one, one), "started and joined");
+    assert_eq!(live2, live, "its VMs closed");
+}

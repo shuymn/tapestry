@@ -502,6 +502,26 @@ impl PlayerRig<'_> {
         self.presenter.attempt_fallen().is_some() || self.result_run_disabled()
     }
 
+    /// The preparation begun last dropped (design.md "Play Lifecycle",
+    /// preparing each attempt: the handle owns its subjobs). A job still
+    /// running is settled as the run's end settles it, within the stop
+    /// bound: the specialization's outcome kept, the image stage's images
+    /// handed back. An unanswered render request is discarded as it drops.
+    fn drop_prep(&mut self) {
+        let Some(mut prep) = self.prep.take() else {
+            return;
+        };
+        match std::mem::replace(&mut prep.stage, PrepStage::Answered) {
+            PrepStage::Skin(mut job) => {
+                if let Some(pending) = self.pending.as_mut() {
+                    pending.settle(&mut job);
+                }
+            }
+            PrepStage::Image(_, mut job) => self.result_skin.settle_image_stage(&mut job),
+            PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered => {}
+        }
+    }
+
     /// Whether the run ends: the window's close, or a failure of the input
     /// or audio thread. A script's step on a specialization's job
     /// (dev-tools) acts at every look.
@@ -1422,7 +1442,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn discard_attempt(&mut self) {
-        self.prep = None;
+        self.drop_prep();
         self.render.discard_attempt();
     }
 
@@ -1469,7 +1489,7 @@ impl Rig for PlayerRig<'_> {
     /// rest ([`poll_preparation`](Rig::poll_preparation)). A preparation
     /// begun before is dropped, its unanswered request discarded.
     fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
-        self.prep = None;
+        self.drop_prep();
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
         self.preps += 1;
@@ -1508,8 +1528,13 @@ impl Rig for PlayerRig<'_> {
         handle: &mut game::PrepHandle,
         deadline: Instant,
     ) -> Result<game::PrepPoll<Preparation>, ScreenError> {
-        let Some(mut prep) = self.prep.take().filter(|p| p.ticket == handle.ticket()) else {
-            return Err(ScreenError::Lost);
+        let mut prep = match self.prep.take() {
+            Some(p) if p.ticket == handle.ticket() => p,
+            // Another handle's: it stays, for its own polls or its drop.
+            other => {
+                self.prep = other;
+                return Err(ScreenError::Lost);
+            }
         };
         let polled = loop {
             match std::mem::replace(&mut prep.stage, PrepStage::Answered) {

@@ -309,6 +309,16 @@ impl PendingSkin {
             skin
         }
     }
+
+    /// A specialization `job` no attempt waits for any more (its
+    /// preparation superseded or discarded): cancelled and waited for as
+    /// the run's end waits, at most [`STOP_WAIT`], and its outcome kept as
+    /// [`finish`](Self::finish) keeps it.
+    pub fn settle(&mut self, job: &mut Specializing) {
+        if let Some(ran) = job.wait_until(None, || false, || true) {
+            let _ = self.finish(job, ran);
+        }
+    }
 }
 
 /// How [`PendingSkin::begin`] began.
