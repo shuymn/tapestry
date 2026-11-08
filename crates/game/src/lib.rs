@@ -21,6 +21,7 @@ mod attempt;
 mod audio_loop;
 mod autoplay;
 mod bests;
+pub mod coord;
 mod driver;
 mod error;
 mod hispeed;
