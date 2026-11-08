@@ -1488,6 +1488,8 @@ return { type = 0 }",
                 (s.outcome.as_str(), s.at, s.kind),
                 (label, None, Some(kind))
             );
+            // A decision import is drawn over its declared timing.
+            assert_eq!(s.frames.is_some(), kind == ScreenKind::Decision, "{ty}");
         }
         let s = run("if skin_config then return { type = 7 } end\nreturn { type = 0 }");
         assert_eq!(s.outcome, "skin in another slot");
