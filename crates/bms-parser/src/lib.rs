@@ -446,6 +446,7 @@ fn build(
     chart
         .validate_presentation_links()
         .map_err(|e| LoadError::Links(Box::new(e)))?;
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
     if files.is_some() {
         chart.identity.resolved_hash = hash::resolved_hash(&chart);
         chart.identity.played_hash = chart.identity.resolved_hash;

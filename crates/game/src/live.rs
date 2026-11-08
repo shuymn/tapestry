@@ -397,6 +397,13 @@ pub trait Rig {
         let _ = (report, screen);
         Self::ResultPrep::default()
     }
+    /// The own view's best has been compared ([`ResultScreen::compare_best`])
+    /// and no command withdrew the preparation meanwhile: the view's facts
+    /// are final, for the work the preparation asks for with them. By
+    /// default, nothing.
+    fn result_compared(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        let _ = (report, screen);
+    }
     /// Advances the result's preparation, waiting until `deadline` on the
     /// rig's clock at the latest while it is pending. Between polls the
     /// flow takes the player's commands; one that leaves or retries drops
@@ -404,6 +411,17 @@ pub trait Rig {
     fn poll_result(&mut self, prep: &mut Self::ResultPrep, deadline: TimeUs) -> Polled {
         let _ = (prep, deadline);
         Polled::Ready
+    }
+    /// The result's preparation was withdrawn (a fresh quit, back or
+    /// retry, or a close, during ResultPreparing): the rig cancels the
+    /// work it began for it and waits for it (design.md "State Model",
+    /// ResultPreparing). By default, nothing.
+    fn withdraw_result(&mut self) {}
+    /// The Result state acts on the leaving command `cmd` (retry, or back
+    /// or the quit key as back): called just before it is served, never
+    /// for a command the flow drops. By default, nothing.
+    fn accept_leaving(&mut self, cmd: MenuCommand) {
+        let _ = cmd;
     }
     /// Shows the end screen of a play that was not retried or quit in its
     /// READY state, with its result screen's view; called again whenever the
@@ -856,10 +874,12 @@ pub fn run_chart<R: Rig>(
             while let Some(c) = rig.take_menu() {
                 match c {
                     MenuCommand::Retry => {
+                        rig.accept_leaving(MenuCommand::Retry);
                         retry = true;
                         break;
                     }
                     MenuCommand::Back => {
+                        rig.accept_leaving(MenuCommand::Back);
                         while rig.take_menu().is_some() {}
                         return leave(rig);
                     }
@@ -927,6 +947,9 @@ fn prepare_result<R: Rig>(
     if let Some(withdrawn) = withdrawn(rig) {
         return Ok(withdrawn);
     }
+    // The own view's best is in: its layout is asked for now, with the
+    // view's final facts.
+    rig.result_compared(report, screen);
     loop {
         let deadline = TimeUs(rig.now().0.saturating_add(IDLE_WAIT.0));
         let polled = rig.poll_result(&mut prep, deadline);
@@ -950,9 +973,11 @@ fn prepare_result<R: Rig>(
 /// What the commands taken now do to a result's preparation
 /// ([`prepare_result`]): a close leaves, then the first quit, back or
 /// retry withdraws it, with the commands queued behind it; preset steps
-/// are dropped. `None` when nothing withdraws it.
+/// are dropped. A withdrawal tells the rig ([`Rig::withdraw_result`]).
+/// `None` when nothing withdraws it.
 fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
     if rig.quitting() {
+        rig.withdraw_result();
         return Some(Prepared::Leave);
     }
     while let Some(c) = rig.take_menu() {
@@ -962,6 +987,7 @@ fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
             MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
         };
         while rig.take_menu().is_some() {}
+        rig.withdraw_result();
         return Some(withdrawn);
     }
     None

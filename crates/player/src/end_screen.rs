@@ -973,6 +973,7 @@ pub(crate) mod tests {
                 clear: game::BestLamp::Failed,
                 cleared: false,
                 gauge_permille: 0,
+                duration_us: None,
                 timing: None,
                 areas: [[0; 2]; 5],
             },

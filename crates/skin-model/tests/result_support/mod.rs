@@ -149,6 +149,7 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
                 grade: 6,
             }),
             next_rank: 17,
+            duration_us: Some(12_345),
         },
         best,
         timing: Some(TimingStats {
@@ -191,6 +192,7 @@ pub fn other() -> ResultView {
                 grade: 1,
             }),
             next_rank: 3,
+            duration_us: Some(1_000_000),
         },
         best: BestView::Known(BestFigures {
             ex: 444,

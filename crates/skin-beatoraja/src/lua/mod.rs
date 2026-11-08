@@ -909,6 +909,24 @@ impl LuaHeader {
         facts: &ImportFacts,
         cancel: &Cancel,
     ) -> Result<LuaOutcome, ImportError> {
+        self.import_reading(config, facts, cancel)
+            .map_err(|refused| refused.0)
+    }
+
+    /// [`Self::import`], with a refusal carrying the facts the run read
+    /// before it refused (design D11, the image stage's refusals: one
+    /// before any result fact leaves the built-in result, one after leaves
+    /// the result to its layout stage).
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses, with the facts read.
+    pub fn import_reading(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
         let o = self.complete(config, facts, cancel);
         let deps = FactDeps {
             scene: facts.scene,
@@ -928,7 +946,7 @@ impl LuaHeader {
                 dependencies: o.dependencies,
                 usage: o.counts,
             })),
-            Err(Stop::Fault(e)) => Err(e),
+            Err(Stop::Fault(e)) => Err(Box::new((e, deps))),
         }
     }
 

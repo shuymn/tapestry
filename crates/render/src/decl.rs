@@ -25,14 +25,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bms_model::{Chart, TimeUs};
 use eval::Section;
 use skin_model::{
-    Atlas, BitmapLines, BuildError, Canvas, Layout, Loading, PackedPages, Play, Side, Skin,
-    SkinFrame, TextRequest, TextSlots, TextTable, TextTableError, UvTable,
+    Atlas, AtlasId, BitmapLines, BuildError, Canvas, Layout, Loading, PackedPages, Play, Side,
+    Skin, SkinFrame, TextRequest, TextSlots, TextTable, TextTableError, UvTable,
 };
 
 use crate::outline::{LineBounds, LineFit, LineLayout, TextResidency};
 
 use crate::projection::ClipTable;
-use crate::skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS};
+use crate::skin_atlas::{PageLevels, RESERVED_LAYERS};
 use crate::{AttemptInput, FrameInput, Gpu, LoadingFrame, PlaySkin, SkinError, SpriteBatch};
 
 /// Lays out and rasterizes the lines of a skin's rasterized text: the
@@ -136,7 +136,13 @@ pub struct SkinBundle {
     /// Whether its installation keeps a Lua VM, charged
     /// [`VM_TEXELS`](crate::VM_TEXELS) while committed.
     vm: bool,
+    /// The scope its producer's lines are keyed in within a text layer
+    /// ([`text_scope`](Self::text_scope)); 0 without a producer.
+    text_scope: u64,
 }
+
+/// The next text scope ([`SkinBundle::text_scope`]).
+static NEXT_TEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl fmt::Debug for SkinBundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -221,6 +227,7 @@ impl SkinBundle {
             scratch,
             text: None,
             vm: false,
+            text_scope: 0,
         })
     }
 
@@ -236,6 +243,7 @@ impl SkinBundle {
             return Err(BundleError::NoTextLayer);
         }
         self.text = Some(text);
+        self.text_scope = NEXT_TEXT_SCOPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self)
     }
 
@@ -284,12 +292,24 @@ impl SkinBundle {
     /// has one, at its page side.
     #[must_use]
     pub fn atlas_texels(&self) -> u64 {
-        let side = u64::from(self.side());
-        let layers = u64::try_from(self.pages.pages().len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(u64::from(RESERVED_LAYERS))
-            .saturating_add(u64::from(self.text_layer().is_some()));
-        side.saturating_mul(side).saturating_mul(layers)
+        pages_texels(&self.pages)
+    }
+
+    /// Its pages' identity ([`PackedPages::id`]): what a bundle rebound to
+    /// the same pages shares.
+    #[must_use]
+    pub fn atlas_id(&self) -> AtlasId {
+        self.pages.id()
+    }
+
+    /// The scope its producer's lines are keyed in within a text layer:
+    /// one per bundle given a producer ([`with_text`](Self::with_text)),
+    /// so bundles sharing one atlas array, whose skins name fonts by their
+    /// own sheets' indices, never take each other's lines; 0 without a
+    /// producer.
+    #[must_use]
+    pub fn text_scope(&self) -> u64 {
+        self.text_scope
     }
 
     /// The producer of its attempts' and its loading frames' prepared
@@ -323,49 +343,68 @@ impl SkinBundle {
         &self.uvs
     }
 
-    /// The pages to upload, every level of each, borrowed: preparation
-    /// work, it allocates the list.
-    pub(crate) fn levels(&self) -> Vec<PageLevels<'_>> {
-        self.pages
-            .pages()
-            .iter()
-            .map(|p| std::array::from_fn(|k| p.level(k).unwrap_or(&[])))
-            .collect()
-    }
-
-    /// Uploads [`levels`](Self::levels) through `upload` as one
-    /// [`AtlasPages`].
-    pub(crate) fn with_pages<R>(&self, upload: impl FnOnce(&AtlasPages<'_>) -> R) -> R {
-        let levels = self.levels();
-        upload(&AtlasPages {
-            side: self.side(),
-            pages: &levels,
-            text_layer: self.text_layer().is_some(),
-        })
-    }
-
-    /// The bytes it keeps resident on the CPU: every level of every page
-    /// and the placements kept with them, the uv table, the clip table and its text producer's skin font
-    /// snapshots. The compiled skin is shared with whoever compiled it and
-    /// counted there; the default font is shared by every producer and
-    /// counted once ([`MemoryWitness::default_font`](crate::MemoryWitness)).
+    /// The bytes it keeps resident on the CPU on its own: the uv table,
+    /// the clip table and its text producer's skin font snapshots. Its
+    /// pages are shared with every bundle rebound to them and counted once
+    /// per [`atlas_id`](Self::atlas_id) ([`shared_bytes`](Self::shared_bytes)).
+    /// The compiled skin is shared with whoever compiled it and counted
+    /// there; the default font is shared by every producer and counted once
+    /// ([`MemoryWitness::default_font`](crate::MemoryWitness)).
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        let levels: usize = self
-            .pages
-            .pages()
-            .iter()
-            .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(|k| p.level(k)))
-            .map(<[u8]>::len)
-            .sum();
         let uvs = size_of_val(self.uvs.frames());
         let clips = self.clips.len() * size_of::<[f32; 4]>();
         let fonts = self.text.as_ref().map_or(0, |t| t.resident().skin_fonts);
-        u64::try_from(levels + uvs + clips)
+        u64::try_from(uvs + clips)
             .unwrap_or(u64::MAX)
-            .saturating_add(self.pages.placement_bytes())
             .saturating_add(fonts)
     }
+
+    /// The bytes its pages keep resident on the CPU, shared with every
+    /// bundle on the same pages: every level of every page and the
+    /// placements kept with them ([`pages_bytes`]).
+    #[must_use]
+    pub fn shared_bytes(&self) -> u64 {
+        pages_bytes(&self.pages)
+    }
+}
+
+/// The level-0 texels of the atlas array `pages` are uploaded as: its
+/// pages, the renderer's reserved layers and its text layer, if it has
+/// one, at its page side.
+#[must_use]
+pub fn pages_texels(pages: &PackedPages) -> u64 {
+    let side = u64::from(pages.side());
+    let layers = u64::try_from(pages.pages().len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::from(RESERVED_LAYERS))
+        .saturating_add(u64::from(pages.text_layer().is_some()));
+    side.saturating_mul(side).saturating_mul(layers)
+}
+
+/// The bytes `pages` keep resident on the CPU: every level of every page
+/// and the placements kept with them.
+#[must_use]
+pub fn pages_bytes(pages: &PackedPages) -> u64 {
+    let levels: usize = pages
+        .pages()
+        .iter()
+        .flat_map(|p| (0..skin_model::MIP_LEVELS).filter_map(|k| p.level(k)))
+        .map(<[u8]>::len)
+        .sum();
+    u64::try_from(levels)
+        .unwrap_or(u64::MAX)
+        .saturating_add(pages.placement_bytes())
+}
+
+/// The pages of `pages` to upload, every level of each, borrowed:
+/// preparation work, it allocates the list.
+pub(crate) fn page_levels(pages: &PackedPages) -> Vec<PageLevels<'_>> {
+    pages
+        .pages()
+        .iter()
+        .map(|p| std::array::from_fn(|k| p.level(k).unwrap_or(&[])))
+        .collect()
 }
 
 /// The loading state of one installation (design.md "Rendering and

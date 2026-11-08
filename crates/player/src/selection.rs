@@ -712,7 +712,7 @@ impl Selection {
                 Some(SelectStep::QuitLoading) => {
                     script.slow_load.get_or_insert_default().quit = true
                 }
-                Some(SelectStep::Specializing(s)) => crate::dev::specializing(s),
+                Some(SelectStep::Specializing(at, s)) => crate::dev::specializing(at, s),
                 Some(SelectStep::CloseLoading) => {
                     script.slow_load.get_or_insert_default().close = true;
                 }

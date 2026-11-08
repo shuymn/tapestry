@@ -12,14 +12,14 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasLimits, BitmapLines, BuildError, ChartText, Layout, ScreenKind, Selection, SelectionFrame,
-    TextSlots, TextTable, TextTableError,
+    AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, Layout, PackedPages, ResultFrame,
+    ResultScreen, ScreenKind, Selection, SelectionFrame, TextSlots, TextTable, TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::decl::{DeclSkin, Installation, SkinBundle};
+use crate::decl::{DeclSkin, Installation, SkinBundle, page_levels, pages_bytes, pages_texels};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
 use crate::pace::Pacer;
@@ -40,6 +40,13 @@ use crate::{
 /// the reserve the skin cannot fill ([`Renderer::build_selection`]).
 pub const STRIP_SPRITES: usize = 4;
 
+/// The most sprites the result screen's strip draws over its skin, one
+/// band per fact that applies, from the same reserve
+/// ([`Renderer::build_result`]).
+pub const RESULT_STRIP_SPRITES: usize = 13;
+
+const _: () = assert!(RESULT_STRIP_SPRITES <= OVERLAY_SPRITES as usize);
+
 /// `rect` in layout pixels (1920×1080, fitted to the whole `target` as
 /// the menus' text is) in the canvas pixels of `skin`'s projection.
 fn layout_to_canvas([x, y, w, h]: [f32; 4], skin: &Projection, target: [u32; 2]) -> [f32; 4] {
@@ -54,6 +61,25 @@ fn layout_to_canvas([x, y, w, h]: [f32; 4], skin: &Projection, target: [u32; 2])
         w * fs / ss,
         h * fs / ss,
     ]
+}
+
+/// The first `N` of `strip`, in layout pixels, placed on the canvas of
+/// `projection` for `target`, and how many there are. Allocates nothing.
+fn placed_strip<const N: usize>(
+    strip: &[Sprite],
+    projection: &Projection,
+    target: [u32; 2],
+) -> ([Sprite; N], usize) {
+    let mut placed = [Sprite::default(); N];
+    let mut n = 0;
+    for (out, s) in placed.iter_mut().zip(strip) {
+        *out = Sprite {
+            rect: layout_to_canvas(s.rect, projection, target),
+            ..*s
+        };
+        n += 1;
+    }
+    (placed, n)
 }
 
 /// The next [`Renderer`]'s id.
@@ -340,6 +366,18 @@ pub enum RenderError {
         /// [`SHARED_TEXELS`].
         limit: u64,
     },
+    /// The result kind is disabled for the run
+    /// ([`Renderer::disable_result`]): nothing of it is installed, staged,
+    /// committed or restored.
+    #[error("the result skin is disabled for this run")]
+    ResultDisabled,
+    /// A pages-only installation asked for a kind other than the result's,
+    /// the only kind that has one ([`Renderer::install_pages`]).
+    #[error("the {kind} screen has no pages-only installation")]
+    PagesKind {
+        /// The kind asked for.
+        kind: ScreenKind,
+    },
 }
 
 impl RenderError {
@@ -357,7 +395,9 @@ impl RenderError {
             Self::Skin(_)
             | Self::Capacity { .. }
             | Self::Superseded { .. }
-            | Self::Admission { .. } => true,
+            | Self::Admission { .. }
+            | Self::ResultDisabled
+            | Self::PagesKind { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
                 wgpu::Error::OutOfMemory { .. } | wgpu::Error::Validation { .. }
@@ -417,6 +457,10 @@ pub enum CommitError {
         /// The request committed.
         asked: u64,
     },
+    /// The token installs the result kind, disabled for the run
+    /// ([`Renderer::disable_result`]).
+    #[error("the result skin is disabled for this run")]
+    ResultDisabled,
 }
 
 /// The GPU and CPU resources a declarative skin's installation replaces
@@ -429,6 +473,65 @@ struct Resources {
     instances: wgpu::Buffer,
     /// The text layer's cache: empty with the atlas.
     text_cache: TextCache,
+}
+
+/// The result kind's pages-only installation ([`Renderer::install_pages`]):
+/// its prepared atlas uploaded, with no layout drawing it yet; a layout
+/// staged on the same pages takes its array.
+struct PagesRes {
+    pages: Arc<PackedPages>,
+    atlas: AtlasTexture,
+    atlas_bind: wgpu::BindGroup,
+    /// The text layer's cache: empty with the atlas.
+    text_cache: TextCache,
+}
+
+/// What a commit replaced, kept with its device resources until the next
+/// staging or [`Renderer::drain_retired`] drops it, so no commit drops any
+/// of the device's: a layout replaced on the same array (its staging and
+/// instance buffer), or an installation or a pages-only installation
+/// replaced on another array.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held once and moved only by a commit, which boxing would make allocate"
+)]
+enum Retired {
+    Layout {
+        staging: Staging,
+        /// Held only so that it is dropped outside the commit.
+        _instances: wgpu::Buffer,
+    },
+    Slot(Slot),
+    Pages(PagesRes),
+}
+
+impl Retired {
+    /// The array it holds, if it holds one.
+    fn atlas_id(&self) -> Option<AtlasId> {
+        match self {
+            Self::Layout { .. } => None,
+            Self::Slot(s) => Some(s.installation.bundle().atlas_id()),
+            Self::Pages(p) => Some(p.pages.id()),
+        }
+    }
+}
+
+/// What a staging holds besides its skin.
+enum PendingRes {
+    /// Nothing of its own: it is its kind's committed bundle, whose
+    /// resources it keeps.
+    Installed,
+    /// A fresh layout on its kind's committed atlas array, whose pages it
+    /// shares: its staging and instance buffer, with nothing uploaded.
+    Layout {
+        staging: Box<Staging>,
+        instances: wgpu::Buffer,
+    },
+    /// Its own atlas array and layout.
+    Own(Box<Resources>),
+    /// A pages-only installation's atlas array; `None` when its pages are
+    /// the ones installed.
+    Pages(Option<Box<PagesRes>>),
 }
 
 /// A screen kind's committed installation other than play's: its
@@ -450,8 +553,11 @@ struct Slot {
 /// bundle's.
 struct Pending {
     token: PreparedToken,
-    skin: DeclSkin,
-    resources: Option<Resources>,
+    /// Its skin; `None` for a pages-only installation.
+    skin: Option<DeclSkin>,
+    /// A pages-only installation's pages.
+    pages: Option<Arc<PackedPages>>,
+    res: PendingRes,
     /// The lines its attempt's table draws, in its resources' cache or the
     /// installed one.
     text: Holder,
@@ -492,13 +598,18 @@ impl Admission {
     }
 }
 
-/// What a renderer holds in memory for its play skin and the one staged
-/// installation of any kind, in bytes, as a witness of the peak a skin's
-/// replacement reaches (design.md "Memory Budget"): the installed
-/// resources and the staged ones live together until the commit. The
-/// other kinds' committed installations are reported only through
+/// What a renderer holds in memory for its play skin, the result's
+/// installation and the one staged installation of any kind, in bytes, as
+/// a witness of the peak a skin's replacement reaches (design.md "Memory
+/// Budget"): the installed resources and the staged ones live together
+/// until the commit, and what a commit replaces until the next staging.
+/// Pages shared by several holders are counted once ([`shared_cpu`]), and
+/// each bundle's own bytes in one term. The selection and decision
+/// screens' committed installations are reported only through
 /// [`Renderer::admission`], but for the selection screen's lines and the
 /// selection skin's state, which change with each update it draws.
+///
+/// [`shared_cpu`]: Self::shared_cpu
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryWitness {
     /// The installed bundle's CPU description, kept for recovery.
@@ -515,7 +626,8 @@ pub struct MemoryWitness {
     /// The installed batch's sprites and runs, its staged instances and
     /// its instance buffer.
     pub batch: u64,
-    /// The same for the staged resources.
+    /// The same for the staged resources, or a layout staged on the
+    /// array installed.
     pub staged_batch: u64,
     /// The installed skin's prepared attempt: its state and every buffer
     /// it holds ([`PlaySkin::attempt_bytes`]).
@@ -557,6 +669,34 @@ pub struct MemoryWitness {
     /// The selection skin's state the render thread keeps for the screen's
     /// lifetime, apart from the renderer ([`Renderer::memory_with`]).
     pub selection_state: u64,
+    /// The pages on the CPU, shared by every bundle on them: counted once
+    /// for each atlas identity ([`AtlasId`]) play's installation, the
+    /// staging or the result's installation holds
+    /// ([`SkinBundle::shared_bytes`]).
+    pub shared_cpu: u64,
+    /// The result's committed bundle's own CPU description, counted here
+    /// alone when it is also staged.
+    pub result_cpu: u64,
+    /// The result's committed layout: its batch, staged instances and
+    /// instance buffer, and its clips.
+    pub result_batch: u64,
+    /// The result's committed atlas array, a layout's or a pages-only
+    /// installation's: every layer's levels.
+    pub result_atlas: u64,
+    /// The result's text layer's cache, a layout's or a pages-only
+    /// installation's, with the lines its frames draw and the ones
+    /// prepared to replace them.
+    pub result_text: u64,
+    /// The loading presentations of the result's committed installation
+    /// and of a retired one, each distinct presentation once; a staging
+    /// sharing one of them adds nothing to `staged_loading`.
+    pub result_loading: u64,
+    /// What commits replaced and keep until the next staging or
+    /// `drain_retired()`, whichever comes first: a layout's
+    /// staging and instance buffer on the same array, or a whole
+    /// installation on another array (its array, layout, text cache,
+    /// lines and own CPU description) or a pages-only one.
+    pub retired: u64,
 }
 
 impl MemoryWitness {
@@ -583,6 +723,13 @@ impl MemoryWitness {
             .saturating_add(self.staged_text_cache)
             .saturating_add(self.selection_text)
             .saturating_add(self.selection_state)
+            .saturating_add(self.shared_cpu)
+            .saturating_add(self.result_cpu)
+            .saturating_add(self.result_atlas)
+            .saturating_add(self.result_batch)
+            .saturating_add(self.result_text)
+            .saturating_add(self.result_loading)
+            .saturating_add(self.retired)
     }
 }
 
@@ -740,6 +887,22 @@ pub struct Renderer {
     resources: u64,
     /// The installation staged and not yet committed.
     pending: Option<Pending>,
+    /// The result kind's pages-only installation, in place of its slot.
+    result_pages: Option<PagesRes>,
+    /// What the last commit replaced, until the next staging or a drain.
+    retired: Option<Retired>,
+    /// Play's admission released the result's installation
+    /// ([`take_result_release`](Self::take_result_release)).
+    result_released: bool,
+    /// The result kind is disabled for the run ([`disable_result`](Self::disable_result)).
+    result_disabled: bool,
+    /// The result's lines prepared and not yet drawn, with the pages
+    /// whose text layer holds them
+    /// ([`prepare_result_text`](Self::prepare_result_text)).
+    staged_result_text: Option<(AtlasId, Holder)>,
+    /// Tests and development builds: atlas arrays uploaded so far.
+    #[cfg(any(test, feature = "dev-tools"))]
+    atlas_uploads: u64,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
@@ -787,6 +950,10 @@ pub struct Renderer {
     /// is refused as a skin refuses one.
     #[cfg(feature = "dev-tools")]
     selection_faults: (bool, bool),
+    /// Tests and development builds: the next result frame, or text
+    /// preparation, is refused as a skin refuses one.
+    #[cfg(any(test, feature = "dev-tools"))]
+    result_faults: (bool, bool),
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -881,6 +1048,13 @@ impl Renderer {
             requested: 0,
             resources: 0,
             pending: None,
+            result_pages: None,
+            retired: None,
+            result_released: false,
+            result_disabled: false,
+            staged_result_text: None,
+            #[cfg(any(test, feature = "dev-tools"))]
+            atlas_uploads: 0,
             started: None,
             refused: None,
             loading_refused: None,
@@ -901,6 +1075,8 @@ impl Renderer {
             selection_rasterized: 0,
             #[cfg(feature = "dev-tools")]
             selection_faults: (false, false),
+            #[cfg(any(test, feature = "dev-tools"))]
+            result_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -1273,11 +1449,22 @@ impl Renderer {
         {
             return Ok(());
         }
+        self.admit_charge(kind, charge_of(bundle), None)
+    }
+
+    /// Whether `charge` as `kind`'s fits beside every other kind's
+    /// committed charge but `without`'s.
+    fn admit_charge(
+        &self,
+        kind: ScreenKind,
+        charge: u64,
+        without: Option<ScreenKind>,
+    ) -> Result<(), RenderError> {
         let others = KINDS
             .iter()
-            .filter(|&&k| k != kind)
+            .filter(|&&k| k != kind && Some(k) != without)
             .fold(0u64, |sum, &k| sum.saturating_add(self.charge(k)));
-        let needed = others.saturating_add(charge_of(bundle));
+        let needed = others.saturating_add(charge);
         if needed > SHARED_TEXELS {
             return Err(RenderError::Admission {
                 kind,
@@ -1288,10 +1475,55 @@ impl Renderer {
         Ok(())
     }
 
-    /// `kind`'s committed charge.
+    /// `kind`'s committed charge: its installation's, or the result's
+    /// pages-only installation's array.
     fn charge(&self, kind: ScreenKind) -> u64 {
-        self.committed_installation(kind)
-            .map_or(0, |i| self.committed_charge(i.bundle()))
+        match self.committed_installation(kind) {
+            Some(i) => self.committed_charge(i.bundle()),
+            None if kind == ScreenKind::Result => self
+                .result_pages
+                .as_ref()
+                .map_or(0, |p| pages_texels(&p.pages)),
+            None => 0,
+        }
+    }
+
+    /// Admits `bundle` as `kind`'s ([`admit`](Self::admit)); for play, when
+    /// only the result's committed installation keeps it out, that
+    /// installation is released first (design.md "Memory Budget"): no
+    /// result is drawn from Preparing until the result, and its owner
+    /// installs it again after play's commit, if it is admitted then.
+    fn admit_or_release(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+    ) -> Result<(), RenderError> {
+        match self.admit(kind, bundle) {
+            Err(_)
+                if kind == ScreenKind::Play
+                    && self.charge(ScreenKind::Result) > 0
+                    && self
+                        .admit_charge(kind, charge_of(bundle), Some(ScreenKind::Result))
+                        .is_ok() =>
+            {
+                self.remove(ScreenKind::Result);
+                self.result_released = true;
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    /// The pages `kind`'s committed atlas array holds, if any: its
+    /// installation's, or the result's pages-only installation's. Play's
+    /// array is never shared with another staging.
+    fn committed_atlas(&self, kind: ScreenKind) -> Option<AtlasId> {
+        let i = Self::screen(kind)?;
+        match self.screens.get(i).and_then(Option::as_ref) {
+            Some(slot) => Some(slot.installation.bundle().atlas_id()),
+            None if kind == ScreenKind::Result => self.result_pages.as_ref().map(|p| p.pages.id()),
+            None => None,
+        }
     }
 
     /// What a committed `bundle` is charged: its own charge, or in tests
@@ -1320,10 +1552,14 @@ impl Renderer {
     pub fn admission(&self) -> Admission {
         Admission {
             committed: KINDS.map(|k| self.charge(k)),
-            candidate: self
-                .pending
-                .as_ref()
-                .map(|p| (p.token.kind, charge_of(p.skin.bundle()))),
+            candidate: self.pending.as_ref().map(|p| {
+                let charge = match (&p.skin, &p.pages) {
+                    (Some(s), _) => charge_of(s.bundle()),
+                    (None, Some(pages)) => pages_texels(pages),
+                    (None, None) => 0,
+                };
+                (p.token.kind, charge)
+            }),
         }
     }
 
@@ -1343,29 +1579,39 @@ impl Renderer {
     ) -> Result<PreparedToken, RenderError> {
         // Never below `committed`: a commit takes only a staging's
         // request, and every staging was asked for first.
-        let newer = self.requested;
-        if request <= newer {
-            return Err(RenderError::Superseded { request, newer });
+        if kind == ScreenKind::Result && self.result_disabled {
+            return Err(RenderError::ResultDisabled);
         }
-        self.requested = request;
-        self.pending = None;
+        self.begin_staging(request)?;
         // An attempt's staging that fails, at any step, leaves no earlier
         // preparation's text report.
         if a.is_some() {
             self.text_report = TextReport::default();
         }
-        self.admit(kind, bundle)?;
+        self.admit_or_release(kind, bundle)?;
         let installed = self
             .committed_installation(kind)
-            .filter(|i| Arc::ptr_eq(i.bundle(), bundle));
-        let (installation, resources) = match installed {
-            Some(i) => (i.clone(), None),
+            .filter(|i| Arc::ptr_eq(i.bundle(), bundle))
+            .cloned();
+        let (installation, mut res) = match installed {
+            Some(i) => (i, PendingRes::Installed),
+            // Another bundle on the pages installed: a fresh layout on
+            // their array, nothing uploaded.
+            None if self.committed_atlas(kind) == Some(bundle.atlas_id()) => {
+                let (staging, instances) = self.layout_for(bundle)?;
+                (
+                    Installation::new(Arc::clone(bundle)),
+                    PendingRes::Layout {
+                        staging: Box::new(staging),
+                        instances,
+                    },
+                )
+            }
             None => (
                 Installation::new(Arc::clone(bundle)),
-                Some(self.resources_for(bundle)?),
+                PendingRes::Own(Box::new(self.resources_for(bundle)?)),
             ),
         };
-        let mut resources = resources;
         let mut skin = DeclSkin::of(&installation);
         let mut text = Holder::default();
         if let Some(a) = a {
@@ -1379,9 +1625,9 @@ impl Renderer {
                 // The staging's own resources, or the installed ones,
                 // whose installed attempt's lines stay, with the installed
                 // loading lines and the loading text staged for them.
-                let (atlas, cache, held) = match resources.as_mut() {
-                    Some(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
-                    None => {
+                let (atlas, cache, held) = match &mut res {
+                    PendingRes::Own(r) => (&r.atlas, &mut r.text_cache, Vec::<&Holder>::new()),
+                    _ => {
                         let staged = self
                             .staged_text
                             .as_ref()
@@ -1403,6 +1649,7 @@ impl Renderer {
                         cache,
                         scratch: &mut self.text_scratch,
                         producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
@@ -1427,8 +1674,9 @@ impl Renderer {
         };
         self.pending = Some(Pending {
             token,
-            skin,
-            resources,
+            skin: Some(skin),
+            pages: None,
+            res,
             text,
         });
         #[cfg(test)]
@@ -1450,8 +1698,84 @@ impl Renderer {
     /// uploaded with its bind group and an instance buffer for the staging,
     /// all finished on the GPU. A device refusing any of them (memory,
     /// validation) is answered as a refusal, never an uncaptured error.
-    fn resources_for(&self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
+    fn resources_for(&mut self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
+        let staging = self.staging_for(bundle)?;
+        let (atlas, atlas_bind, buffer, text_cache) =
+            self.upload_array(bundle.atlas_pages(), Some(staging.instance_capacity()))?;
+        #[expect(
+            clippy::expect_used,
+            reason = "upload_array makes the instance buffer it is given a size for"
+        )]
+        let instances = buffer.expect("an instance buffer was asked for");
+        Ok(Resources {
+            atlas,
+            atlas_bind,
+            staging,
+            instances,
+            text_cache,
+        })
+    }
+
+    /// The one upload transaction of an atlas array: `pages` checked, then,
+    /// inside one set of error scopes, the array uploaded with the built-in
+    /// layer, its bind group and, with `instances`, a staging's instance
+    /// buffer of that many sprites, all submitted once and finished on the
+    /// GPU; and the empty cache of its text layer. A device refusing any of
+    /// them (memory, validation) is answered as a refusal.
+    fn upload_array(
+        &mut self,
+        pages: &PackedPages,
+        instances: Option<usize>,
+    ) -> Result<
+        (
+            AtlasTexture,
+            wgpu::BindGroup,
+            Option<wgpu::Buffer>,
+            TextCache,
+        ),
+        RenderError,
+    > {
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            self.atlas_uploads += 1;
+        }
         let device = self.gpu.device();
+        let levels = page_levels(pages);
+        let upload = AtlasPages {
+            side: pages.side(),
+            pages: &levels,
+            text_layer: pages.text_layer().is_some(),
+        };
+        let layers =
+            skin_atlas::check_pages(&upload, &device.limits()).map_err(RenderError::Atlas)?;
+        let ((atlas, atlas_bind, buffer), refused) = skin_atlas::scoped(device, || {
+            let atlas = AtlasTexture::upload(&self.gpu, &upload, layers);
+            let bind = self.bindings.bind(device, &atlas);
+            #[cfg(test)]
+            if let Some(fault) = self.atlas_fault {
+                fault(&self.gpu);
+            }
+            let buffer = instances.map(|n| self.staged_buffer(n));
+            self.gpu.queue().submit([]);
+            (atlas, bind, buffer)
+        });
+        if let Some(e) = refused {
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
+        wait_for_gpu(&self.gpu)?;
+        let text_cache = pages
+            .text_layer()
+            .map_or_else(TextCache::none, |layer| TextCache::new(atlas.side(), layer));
+        Ok((atlas, atlas_bind, buffer, text_cache))
+    }
+
+    /// A staging sized for `bundle`'s capacities, with its clips, projected
+    /// on the current target.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::Capacity`] when its sprites do not fit a buffer.
+    fn staging_for(&self, bundle: &Arc<SkinBundle>) -> Result<Staging, RenderError> {
         let skin = bundle.skin();
         let (capacity, runs) = (
             skin.quad_capacity().max(MAX_SPRITES as u32),
@@ -1459,7 +1783,7 @@ impl Renderer {
         );
         let instances =
             usize::try_from(capacity.saturating_add(OVERLAY_SPRITES)).unwrap_or(usize::MAX);
-        let max = device.limits().max_buffer_size;
+        let max = self.gpu.device().limits().max_buffer_size;
         if instance_bytes(instances) > max {
             return Err(RenderError::Capacity {
                 sprites: capacity,
@@ -1468,35 +1792,114 @@ impl Renderer {
         }
         let mut staging = Staging::with_runs(capacity, runs, &skin.canvas(self.target()));
         staging.set_clips(bundle.clips().clone());
-        let ((atlas, atlas_bind, buffer), refused) = bundle.with_pages(|pages| {
-            let layers =
-                skin_atlas::check_pages(pages, &device.limits()).map_err(RenderError::Atlas)?;
-            Ok::<_, RenderError>(skin_atlas::scoped(device, || {
-                let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
-                let bind = self.bindings.bind(device, &atlas);
-                #[cfg(test)]
-                if let Some(fault) = self.atlas_fault {
-                    fault(&self.gpu);
-                }
-                let buffer = self.staged_buffer(staging.instance_capacity());
-                self.gpu.queue().submit([]);
-                (atlas, bind, buffer)
-            }))
-        })?;
+        Ok(staging)
+    }
+
+    /// A fresh layout for `bundle` on its kind's committed atlas array:
+    /// its staging and an instance buffer, inside error scopes, with no
+    /// texture uploaded.
+    fn layout_for(&self, bundle: &Arc<SkinBundle>) -> Result<(Staging, wgpu::Buffer), RenderError> {
+        let staging = self.staging_for(bundle)?;
+        let device = self.gpu.device();
+        let (buffer, refused) = skin_atlas::scoped(device, || {
+            let buffer = self.staged_buffer(staging.instance_capacity());
+            self.gpu.queue().submit([]);
+            buffer
+        });
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
         wait_for_gpu(&self.gpu)?;
-        let text_cache = bundle
-            .text_layer()
-            .map_or_else(TextCache::none, |layer| TextCache::new(atlas.side(), layer));
-        Ok(Resources {
+        Ok((staging, buffer))
+    }
+
+    /// `pages` uploaded as an atlas array with the built-in layer and its
+    /// bind group, inside error scopes, finished on the GPU.
+    fn pages_for(&mut self, pages: &Arc<PackedPages>) -> Result<PagesRes, RenderError> {
+        let (atlas, atlas_bind, _, text_cache) = self.upload_array(pages, None)?;
+        Ok(PagesRes {
+            pages: Arc::clone(pages),
             atlas,
             atlas_bind,
-            staging,
-            instances: buffer,
             text_cache,
         })
+    }
+
+    /// Takes `request` for a staging: refused unless newer than every
+    /// request asked for or committed, then the earlier staging and what
+    /// the last commit replaced are dropped.
+    fn begin_staging(&mut self, request: u64) -> Result<(), RenderError> {
+        // Never below `committed`: a commit takes only a staging's
+        // request, and every staging was asked for first.
+        let newer = self.requested;
+        if request <= newer {
+            return Err(RenderError::Superseded { request, newer });
+        }
+        self.requested = request;
+        self.pending = None;
+        self.retired = None;
+        Ok(())
+    }
+
+    /// Stages the result kind's pages-only installation of `pages` for
+    /// `request`: its prepared atlas, uploaded before any layout of it is
+    /// staged ([`stage`](Self::stage)'s rules for requests). When `pages`
+    /// are the ones installed nothing is uploaded; otherwise the kind's
+    /// earlier installation is released first, since nothing of it is
+    /// drawn meanwhile, then the pages are admitted and uploaded. The
+    /// commit makes them the kind's installation, drawing nothing until a
+    /// layout on them is committed. Allocates and waits for the GPU.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::PagesKind`] for a kind other than the result's,
+    /// [`RenderError::ResultDisabled`] while it is disabled, and what
+    /// refuses a staging; the staging is then discarded.
+    pub fn install_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<PackedPages>,
+        request: u64,
+    ) -> Result<PreparedToken, RenderError> {
+        if kind != ScreenKind::Result {
+            return Err(RenderError::PagesKind { kind });
+        }
+        if self.result_disabled {
+            return Err(RenderError::ResultDisabled);
+        }
+        self.begin_staging(request)?;
+        let res = if self.committed_atlas(kind) == Some(pages.id()) {
+            PendingRes::Pages(None)
+        } else {
+            self.release(kind);
+            self.admit_charge(kind, pages_texels(pages), None)?;
+            PendingRes::Pages(Some(Box::new(self.pages_for(pages)?)))
+        };
+        let token = PreparedToken {
+            request,
+            device: self.id,
+            kind,
+        };
+        self.pending = Some(Pending {
+            token,
+            skin: None,
+            pages: Some(Arc::clone(pages)),
+            res,
+            text: Holder::default(),
+        });
+        Ok(token)
+    }
+
+    /// Drops `kind`'s committed installation, the result's pages-only one
+    /// and its staged lines included, leaving a staging in place.
+    fn release(&mut self, kind: ScreenKind) {
+        if let Some(slot) = Self::screen(kind).and_then(|i| self.screens.get_mut(i)) {
+            *slot = None;
+        }
+        if kind == ScreenKind::Result {
+            self.result_pages = None;
+            self.staged_result_text = None;
+        }
     }
 
     /// A staging's instance buffer of `instances` sprites.
@@ -1530,6 +1933,9 @@ impl Renderer {
         if token.device != self.id {
             return Err(CommitError::Device);
         }
+        if token.kind == ScreenKind::Result && self.result_disabled {
+            return Err(CommitError::ResultDisabled);
+        }
         if token.request <= self.committed {
             return Err(CommitError::Superseded {
                 committed: self.committed,
@@ -1555,28 +1961,104 @@ impl Renderer {
             return Err(CommitError::NothingStaged);
         };
         self.committed = token.request;
+        let target = self.target();
         match Self::screen(token.kind) {
             None => {
-                if let Some(r) = pending.resources {
-                    self.replace_resources(r);
+                if let PendingRes::Own(r) = pending.res {
+                    self.replace_resources(*r);
                 }
                 self.installed_text = pending.text;
-                self.activate_decl_skin(pending.skin);
+                if let Some(skin) = pending.skin {
+                    self.activate_decl_skin(skin);
+                }
             }
             Some(i) => {
-                if let Some(mut resources) = pending.resources {
-                    // Projected afresh, as play's commit projects its
-                    // own: the target may have been resized since the
-                    // staging.
-                    let installation = pending.skin.installation();
-                    let canvas = installation.bundle().skin().canvas(self.target());
-                    resources.staging.project(&canvas);
-                    if let Some(slot) = self.screens.get_mut(i) {
-                        *slot = Some(Slot {
-                            installation,
-                            resources,
-                            text: Holder::default(),
-                        });
+                let installation = pending.skin.as_ref().map(DeclSkin::installation);
+                let result = token.kind == ScreenKind::Result;
+                // What it replaces keeps its device resources until the
+                // next staging or a drain: a commit drops none of them.
+                let old = self.screens.get_mut(i).and_then(Option::take);
+                let pages = if result {
+                    self.result_pages.take()
+                } else {
+                    None
+                };
+                match (pending.res, installation) {
+                    (PendingRes::Own(resources), Some(installation)) => {
+                        let mut resources = *resources;
+                        // Projected afresh, as play's commit projects its
+                        // own: the target may have been resized since the
+                        // staging.
+                        let canvas = installation.bundle().skin().canvas(target);
+                        resources.staging.project(&canvas);
+                        if let Some(slot) = self.screens.get_mut(i) {
+                            *slot = Some(Slot {
+                                installation,
+                                resources,
+                                text: Holder::default(),
+                            });
+                        }
+                        self.retired = old.map(Retired::Slot).or_else(|| pages.map(Retired::Pages));
+                    }
+                    (
+                        PendingRes::Layout {
+                            mut staging,
+                            instances,
+                        },
+                        Some(installation),
+                    ) => {
+                        // The installed array, with the lines it holds
+                        // until the new layout's own are installed.
+                        let held = match (old, pages) {
+                            (Some(s), _) => {
+                                self.retired = Some(Retired::Layout {
+                                    staging: s.resources.staging,
+                                    _instances: s.resources.instances,
+                                });
+                                Some((
+                                    s.resources.atlas,
+                                    s.resources.atlas_bind,
+                                    s.resources.text_cache,
+                                    s.text,
+                                ))
+                            }
+                            (None, Some(p)) => {
+                                Some((p.atlas, p.atlas_bind, p.text_cache, Holder::default()))
+                            }
+                            (None, None) => None,
+                        };
+                        let canvas = installation.bundle().skin().canvas(target);
+                        staging.project(&canvas);
+                        if let (Some((atlas, atlas_bind, text_cache, text)), Some(slot)) =
+                            (held, self.screens.get_mut(i))
+                        {
+                            *slot = Some(Slot {
+                                installation,
+                                resources: Resources {
+                                    atlas,
+                                    atlas_bind,
+                                    staging: *staging,
+                                    instances,
+                                    text_cache,
+                                },
+                                text,
+                            });
+                        }
+                    }
+                    (PendingRes::Pages(Some(p)), _) => {
+                        // `install_pages` released any installation first.
+                        self.staged_result_text = None;
+                        self.result_pages = Some(*p);
+                    }
+                    (_, _) => {
+                        // Its own installation stays: the same bundle, or
+                        // the same pages.
+                        if let Some(slot) = self.screens.get_mut(i) {
+                            *slot = old;
+                        }
+                        if result {
+                            self.result_pages = pages;
+                        }
                     }
                 }
             }
@@ -1638,6 +2120,9 @@ impl Renderer {
         installation: &Installation,
     ) -> Result<(), RenderError> {
         self.pending = None;
+        if kind == ScreenKind::Result && self.result_disabled {
+            return Err(RenderError::ResultDisabled);
+        }
         self.admit(kind, installation.bundle())?;
         let r = self.resources_for(installation.bundle())?;
         match Self::screen(kind) {
@@ -1664,15 +2149,173 @@ impl Renderer {
     /// Play's installation is never removed this way: for play it does
     /// nothing.
     pub fn remove(&mut self, kind: ScreenKind) {
-        let Some(i) = Self::screen(kind) else {
+        if Self::screen(kind).is_none() {
             return;
-        };
-        if let Some(slot) = self.screens.get_mut(i) {
-            *slot = None;
         }
+        self.release(kind);
         if self.pending.as_ref().is_some_and(|p| p.token.kind == kind) {
             self.pending = None;
         }
+    }
+
+    /// Restores the result kind's pages-only installation of `pages` at
+    /// once, as [`restore`](Self::restore) restores an installation: a
+    /// renderer built again restores the result's prepared atlas this way.
+    ///
+    /// # Errors
+    ///
+    /// As [`install_pages`](Self::install_pages); every installation in
+    /// use stays.
+    pub fn restore_pages(
+        &mut self,
+        kind: ScreenKind,
+        pages: &Arc<PackedPages>,
+    ) -> Result<(), RenderError> {
+        self.pending = None;
+        if kind != ScreenKind::Result {
+            return Err(RenderError::PagesKind { kind });
+        }
+        if self.result_disabled {
+            return Err(RenderError::ResultDisabled);
+        }
+        self.release(kind);
+        self.admit_charge(kind, pages_texels(pages), None)?;
+        self.result_pages = Some(self.pages_for(pages)?);
+        Ok(())
+    }
+
+    /// The result kind's pages-only installation's pages, if it has one:
+    /// what the render thread keeps to restore on a renderer built again.
+    #[must_use]
+    pub fn installed_pages(&self, kind: ScreenKind) -> Option<&Arc<PackedPages>> {
+        (kind == ScreenKind::Result)
+            .then_some(self.result_pages.as_ref())
+            .flatten()
+            .map(|p| &p.pages)
+    }
+
+    /// Disables the result kind for the rest of this renderer's life
+    /// (design.md "Rendering and Skins", a screen skin refused on a healthy
+    /// device): its installation, pages-only installation, staged lines
+    /// and staging are dropped, and from now on its pages-only
+    /// installations, stagings, commits and restores are refused
+    /// ([`RenderError::ResultDisabled`], [`CommitError::ResultDisabled`]).
+    /// Its owner keeps the run's register and disables a renderer built
+    /// again before restoring anything.
+    pub fn disable_result(&mut self) {
+        self.result_disabled = true;
+        self.remove(ScreenKind::Result);
+    }
+
+    /// Drops what the last commit replaced (a layout on the same array, or
+    /// an installation or pages-only installation on another), outside the
+    /// commit point: dropping device resources allocates. Returns the array
+    /// it released, if any, so the owner can acknowledge it (the S10-09i
+    /// design's §2.1 Q3) before another atlas build is considered. The next
+    /// staging drains it too.
+    pub fn drain_retired(&mut self) -> Option<AtlasId> {
+        self.retired.take().and_then(|r| r.atlas_id())
+    }
+
+    /// Whether play's admission released the result's installation since
+    /// the last call, which clears it: a staging of play that only the
+    /// result's charge kept out releases it before anything else of the
+    /// staging is done, so the release stands whether the staging then
+    /// succeeds or not. The owner reconciles what it keeps to restore
+    /// before its next frame or recovery.
+    pub fn take_result_release(&mut self) -> bool {
+        std::mem::take(&mut self.result_released)
+    }
+
+    /// Whether the result kind is disabled ([`disable_result`](Self::disable_result)).
+    #[must_use]
+    pub const fn result_disabled(&self) -> bool {
+        self.result_disabled
+    }
+
+    /// The atlas identities the renderer holds for `kind`: its committed
+    /// array's (an installation's, or the result's pages-only one's) and
+    /// the staging's, if it has its own array or is a pages-only one.
+    /// Allocates nothing.
+    #[must_use]
+    pub fn retained_atlases(&self, kind: ScreenKind) -> [Option<AtlasId>; 3] {
+        let staged = self
+            .pending
+            .as_ref()
+            .filter(|p| p.token.kind == kind)
+            .and_then(|p| match (&p.res, &p.skin) {
+                (PendingRes::Own(_), Some(skin)) => Some(skin.bundle().atlas_id()),
+                (PendingRes::Pages(Some(r)), _) => Some(r.pages.id()),
+                _ => None,
+            });
+        let retired = self.retired.as_ref().and_then(|r| match r {
+            Retired::Slot(s) => (Self::screen(kind)
+                == Self::screen(s.installation.bundle().skin().kind()))
+            .then(|| s.installation.bundle().atlas_id()),
+            Retired::Pages(p) => (kind == ScreenKind::Result).then(|| p.pages.id()),
+            Retired::Layout { .. } => None,
+        });
+        [self.committed_atlas(kind), staged, retired]
+    }
+
+    /// The bytes `id`'s pages keep resident wherever the renderer holds
+    /// them, counted once: their CPU pages ([`pages_bytes`]) and their
+    /// atlas array on the GPU; 0 when it holds none.
+    #[must_use]
+    pub fn shared_bytes(&self, id: AtlasId) -> u64 {
+        let mut cpu = None;
+        let mut gpu = 0u64;
+        for (i, c, g) in self.shared_holders().into_iter().flatten() {
+            if i == id {
+                cpu.get_or_insert(c);
+                gpu = gpu.saturating_add(g);
+            }
+        }
+        cpu.map_or(0, |c| c.saturating_add(gpu))
+    }
+
+    /// Every holder of pages the witness counts, in its order: play's
+    /// installation, the staging, the result's installation and the
+    /// result's pages-only installation, each with its pages' identity,
+    /// their CPU bytes and their array's bytes on the GPU (0 when the
+    /// array is another holder's).
+    fn shared_holders(&self) -> [Option<(AtlasId, u64, u64)>; 5] {
+        let result = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref);
+        let play = self.installed.as_ref().map(|i| {
+            let b = i.bundle();
+            (b.atlas_id(), b.shared_bytes(), self.atlas.bytes())
+        });
+        let staged = self.pending.as_ref().and_then(|p| {
+            let gpu = match &p.res {
+                PendingRes::Own(r) => r.atlas.bytes(),
+                PendingRes::Pages(Some(r)) => r.atlas.bytes(),
+                _ => 0,
+            };
+            match (&p.skin, &p.pages) {
+                (Some(s), _) => Some((s.bundle().atlas_id(), s.bundle().shared_bytes(), gpu)),
+                (None, Some(pages)) => Some((pages.id(), pages_bytes(pages), gpu)),
+                (None, None) => None,
+            }
+        });
+        let slot = result.map(|s| {
+            let b = s.installation.bundle();
+            (b.atlas_id(), b.shared_bytes(), s.resources.atlas.bytes())
+        });
+        let pages = self
+            .result_pages
+            .as_ref()
+            .map(|p| (p.pages.id(), pages_bytes(&p.pages), p.atlas.bytes()));
+        let retired = self.retired.as_ref().and_then(|r| match r {
+            Retired::Slot(s) => {
+                let b = s.installation.bundle();
+                Some((b.atlas_id(), b.shared_bytes(), s.resources.atlas.bytes()))
+            }
+            Retired::Pages(p) => Some((p.pages.id(), pages_bytes(&p.pages), p.atlas.bytes())),
+            Retired::Layout { .. } => None,
+        });
+        [play, staged, slot, pages, retired]
     }
 
     /// The bytes held for the play skin now, the staged installation's
@@ -1691,24 +2334,94 @@ impl Renderer {
     /// the screen's lifetime), counted.
     #[must_use]
     pub fn memory_with(&self, selection: Option<&Selection>) -> MemoryWitness {
+        let bytes = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        // A text layer's cache with the lines its holders keep.
+        let cache = |c: &TextCache, held: &[&Holder]| {
+            held.iter()
+                .fold(c.bytes(), |sum, h| sum.saturating_add(bytes(h.bytes())))
+        };
         let selection_text = Self::screen(ScreenKind::Selection)
             .and_then(|i| self.screens.get(i))
             .and_then(Option::as_ref)
             .map_or(0, |slot| slot.text.bytes());
-        let staged = self.pending.as_ref().map(|p| (p, p.skin.installation()));
+        let result_slot = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref);
+        let result_installation = result_slot.map(|s| &s.installation);
+        let retired_slot = match &self.retired {
+            Some(Retired::Slot(s)) => Some(s),
+            _ => None,
+        };
         let installed = self.installed.as_ref();
-        let cpu = staged
-            .as_ref()
-            .filter(|(_, s)| !installed.is_some_and(|i| Arc::ptr_eq(i.bundle(), s.bundle())));
-        let loading = staged
-            .as_ref()
-            .filter(|(_, s)| !installed.is_some_and(|i| i.loading().same(s.loading())));
-        let staged = staged.as_ref().map(|(p, _)| *p);
-        let res = staged.and_then(|p| p.resources.as_ref());
-        let bytes = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let pending = self.pending.as_ref();
+        let staged = pending.and_then(|p| p.skin.as_ref().map(DeclSkin::installation));
+        // The staging's own resources, by what it holds: (its array, its
+        // upload, its layout, its text cache).
+        let (staged_atlas, upload, staged_batch, staged_cache) =
+            pending.map_or((0, 0, 0, 0), |p| match &p.res {
+                PendingRes::Own(r) => (
+                    r.atlas.bytes(),
+                    r.atlas.upload_bytes(),
+                    r.staging.bytes(),
+                    r.text_cache.bytes(),
+                ),
+                PendingRes::Pages(Some(r)) => (
+                    r.atlas.bytes(),
+                    r.atlas.upload_bytes(),
+                    0,
+                    r.text_cache.bytes(),
+                ),
+                PendingRes::Layout { staging, .. } => (0, 0, staging.bytes(), 0),
+                PendingRes::Installed | PendingRes::Pages(None) => (0, 0, 0, 0),
+            });
+        // Each committed bundle's own bytes are counted with it: the staged
+        // one's only when it is none of them.
+        let committed = [installed, result_installation];
+        let staged_cpu = staged.as_ref().filter(|s| {
+            !committed
+                .into_iter()
+                .flatten()
+                .any(|i| Arc::ptr_eq(i.bundle(), s.bundle()))
+        });
+        // Each distinct loading presentation once: play's, the result's,
+        // a retired installation's, then the staging's.
+        let staged_loading = staged.as_ref().filter(|s| {
+            ![
+                installed,
+                result_installation,
+                retired_slot.map(|r| &r.installation),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|i| i.loading().same(s.loading()))
+        });
+        let result_loading = result_installation
+            .map_or(0, |i| i.loading().bytes())
+            .saturating_add(
+                retired_slot
+                    .map(|r| &r.installation)
+                    .filter(|r| !result_installation.is_some_and(|i| i.loading().same(r.loading())))
+                    .map_or(0, |r| r.loading().bytes()),
+            );
+        // The pages each distinct identity keeps, once; an array on the
+        // GPU is counted with its holder's resources.
+        let mut seen: [Option<AtlasId>; 5] = [None; 5];
+        let mut shared_cpu = 0u64;
+        for (k, (id, cpu, _)) in self.shared_holders().into_iter().flatten().enumerate() {
+            if !seen.contains(&Some(id)) {
+                shared_cpu = shared_cpu.saturating_add(cpu);
+            }
+            if let Some(s) = seen.get_mut(k) {
+                *s = Some(id);
+            }
+        }
+        // The default font, shared by every producer, once: any bundle
+        // still held, a retired one's included, keeps it.
         let default_font = [
             installed.map(Installation::bundle),
-            staged.map(|p| p.skin.bundle()),
+            staged.as_ref().map(Installation::bundle),
+            result_installation.map(Installation::bundle),
+            retired_slot.map(|r| r.installation.bundle()),
         ]
         .into_iter()
         .flatten()
@@ -1716,33 +2429,62 @@ impl Renderer {
         .map(|t| t.resident().default_font)
         .max()
         .unwrap_or(0);
+        let retired = self.retired.as_ref().map_or(0, |r| match r {
+            Retired::Layout { staging, .. } => staging.bytes(),
+            Retired::Slot(s) => s
+                .resources
+                .atlas
+                .bytes()
+                .saturating_add(s.resources.staging.bytes())
+                .saturating_add(cache(&s.resources.text_cache, &[&s.text]))
+                .saturating_add(s.installation.bundle().resident_bytes()),
+            Retired::Pages(p) => p.atlas.bytes().saturating_add(p.text_cache.bytes()),
+        });
+        let staged_result_text = self.staged_result_text.as_ref().map(|(_, h)| h);
         MemoryWitness {
             default_font,
             text_scratch: self.text_scratch.bytes(),
             text_mask: self.text_scratch.mask_bound(),
             text_upload: self.text_report.upload_bytes,
-            text_cache: self
-                .text_cache
-                .bytes()
-                .saturating_add(bytes(self.installed_text.bytes()))
-                .saturating_add(bytes(self.installed_loading.bytes())),
-            staged_text_cache: res
-                .map_or(0, |r| r.text_cache.bytes())
-                .saturating_add(staged.map_or(0, |p| bytes(p.text.bytes()))),
+            text_cache: cache(
+                &self.text_cache,
+                &[&self.installed_text, &self.installed_loading],
+            ),
+            staged_text_cache: staged_cache
+                .saturating_add(pending.map_or(0, |p| bytes(p.text.bytes()))),
             committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
-            staged_cpu: cpu.map_or(0, |(_, s)| s.bundle().resident_bytes()),
+            staged_cpu: staged_cpu.map_or(0, |s| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
-            staged_loading: loading.map_or(0, |(_, s)| s.loading().bytes()),
+            staged_loading: staged_loading.map_or(0, |s| s.loading().bytes()),
             staged_text: self.staged_text.as_ref().map_or(0, StagedText::bytes),
             atlas: self.atlas.bytes(),
-            staged_atlas: res.map_or(0, |r| r.atlas.bytes()),
-            upload: res.map_or(0, |r| r.atlas.upload_bytes()),
+            staged_atlas,
+            upload,
             batch: self.staging.bytes(),
-            staged_batch: res.map_or(0, |r| r.staging.bytes()),
+            staged_batch,
             attempt: self.skin.attempt_bytes(),
-            staged_attempt: staged.map_or(0, |p| p.skin.attempt_bytes()),
+            staged_attempt: pending
+                .and_then(|p| p.skin.as_ref())
+                .map_or(0, DeclSkin::attempt_bytes),
             selection_text: bytes(selection_text),
             selection_state: selection.map_or(0, Selection::resident_bytes),
+            shared_cpu,
+            result_cpu: result_installation.map_or(0, |i| i.bundle().resident_bytes()),
+            result_batch: result_slot.map_or(0, |s| s.resources.staging.bytes()),
+            result_atlas: result_slot.map_or_else(
+                || self.result_pages.as_ref().map_or(0, |p| p.atlas.bytes()),
+                |s| s.resources.atlas.bytes(),
+            ),
+            result_text: result_slot
+                .map_or(0, |s| cache(&s.resources.text_cache, &[&s.text]))
+                .saturating_add(
+                    self.result_pages
+                        .as_ref()
+                        .map_or(0, |p| p.text_cache.bytes()),
+                )
+                .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
+            result_loading,
+            retired,
         }
     }
 
@@ -2051,7 +2793,9 @@ impl Renderer {
                 let pending = self
                     .pending
                     .as_ref()
-                    .filter(|p| p.token.kind == ScreenKind::Play && p.resources.is_none())
+                    .filter(|p| {
+                        p.token.kind == ScreenKind::Play && matches!(p.res, PendingRes::Installed)
+                    })
                     .map(|p| &p.text);
                 let held = [
                     Some(&self.installed_text),
@@ -2066,6 +2810,7 @@ impl Renderer {
                         cache: &mut self.text_cache,
                         scratch: &mut self.text_scratch,
                         producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
                         held: &held,
                         #[cfg(test)]
                         hooks: &mut self.text_hooks,
@@ -2284,6 +3029,7 @@ impl Renderer {
                     cache: &mut slot.resources.text_cache,
                     scratch: &mut self.text_scratch,
                     producer: producer.as_ref(),
+                    scope: bundle.text_scope(),
                     held: &[&slot.text],
                     #[cfg(test)]
                     hooks: &mut self.text_hooks,
@@ -2300,6 +3046,7 @@ impl Renderer {
                     cache: &mut slot.resources.text_cache,
                     scratch: &mut self.text_scratch,
                     producer: producer.as_ref(),
+                    scope: bundle.text_scope(),
                     held: &[&slot.text, &held],
                     #[cfg(test)]
                     hooks: &mut self.text_hooks,
@@ -2367,16 +3114,8 @@ impl Renderer {
             return Err(BuildError::Kind);
         };
         let f = SelectionFrame { target, ..*f };
-        let projection = slot.resources.staging.projection();
-        let mut placed = [Sprite::default(); STRIP_SPRITES];
-        let mut n = 0;
-        for (out, s) in placed.iter_mut().zip(strip) {
-            *out = Sprite {
-                rect: layout_to_canvas(s.rect, &projection, target),
-                ..*s
-            };
-            n += 1;
-        }
+        let (placed, n) =
+            placed_strip::<STRIP_SPRITES>(strip, &slot.resources.staging.projection(), target);
         let bundle = slot.installation.bundle();
         let uvs = bundle.uvs();
         let skin = bundle.skin();
@@ -2398,27 +3137,33 @@ impl Renderer {
     ///
     /// As [`menu_frame`](Self::menu_frame).
     pub fn submit_selection(&mut self, texts: &[&MenuText]) -> Result<FrameTiming, RenderError> {
+        self.submit_screen(ScreenKind::Selection, texts)
+    }
+
+    /// Submits and presents the frame of `kind`'s slot staged last, then
+    /// each of `texts` in a pass of its own over it. Without a frame built
+    /// since, or without the slot, nothing is acquired or submitted.
+    fn submit_screen(
+        &mut self,
+        kind: ScreenKind,
+        texts: &[&MenuText],
+    ) -> Result<FrameTiming, RenderError> {
         if texts.iter().any(|t| t.owner() != self.id) {
             return Err(RenderError::OtherRenderersText);
         }
-        let screen = Self::screen(ScreenKind::Selection);
+        let screen = Self::screen(kind);
+        let none = FrameTiming {
+            cpu: Duration::ZERO,
+            sprites: 0,
+            dropped: 0,
+            presented: false,
+            present_count: None,
+        };
         let Some(start) = self.started.take() else {
-            return Ok(FrameTiming {
-                cpu: Duration::ZERO,
-                sprites: 0,
-                dropped: 0,
-                presented: false,
-                present_count: None,
-            });
+            return Ok(none);
         };
         let Some(Some(slot)) = screen.and_then(|i| self.screens.get(i)) else {
-            return Ok(FrameTiming {
-                cpu: Duration::ZERO,
-                sprites: 0,
-                dropped: 0,
-                presented: false,
-                present_count: None,
-            });
+            return Ok(none);
         };
         let projection = slot.resources.staging.projection();
         self.draw_on(start, texts, projection, screen)
@@ -2473,6 +3218,239 @@ impl Renderer {
     #[must_use]
     pub fn selection_requests(&self) -> (&[String], usize) {
         (&self.selection_requests, self.selection_rasterized)
+    }
+
+    /// The result screen's committed bundle, if any: what its frames draw
+    /// ([`build_result`](Self::build_result)).
+    #[must_use]
+    pub fn result_bundle(&self) -> Option<&Arc<SkinBundle>> {
+        self.committed_installation(ScreenKind::Result)
+            .map(Installation::bundle)
+    }
+
+    /// Prepares `res`'s lines, as its last view and labels left them
+    /// ([`Skin::update_result`](skin_model::Skin::update_result)), for the
+    /// result bundle staged, or else the committed one, in the text layer
+    /// of the array it draws from, and attaches them with its bitmap-font
+    /// lines to `res`. The lines are staged, not drawn: the frames go on
+    /// drawing the lines installed, held meanwhile, until
+    /// [`install_staged_result_text`](Self::install_staged_result_text)
+    /// installs these. Lines already in the layer cost no raster. For a
+    /// presentation's preparation outside a frame's build: it allocates
+    /// and waits for the GPU. Nothing without a result layout.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_selection_text`](Self::prepare_selection_text).
+    pub fn prepare_result_text(&mut self, res: &mut ResultScreen) -> Result<(), RenderError> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.result_faults.1) {
+            return Err(RenderError::Skin(SkinError {
+                reason: "the result text was refused (development fault)".to_owned(),
+            }));
+        }
+        let target = self.target();
+        let pending = self
+            .pending
+            .as_mut()
+            .filter(|p| p.token.kind == ScreenKind::Result);
+        let staged = pending
+            .as_ref()
+            .and_then(|p| p.skin.as_ref())
+            .map(|s| Arc::clone(s.bundle()));
+        let slot = Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get_mut(i))
+            .and_then(Option::as_mut);
+        let Some(bundle) =
+            staged.or_else(|| slot.as_ref().map(|s| Arc::clone(s.installation.bundle())))
+        else {
+            return Ok(());
+        };
+        // Where the lines go: the staging's own array, else the installed
+        // one, which a layout staged on the same pages draws from too, else
+        // the pages-only one.
+        let (atlas, cache, held) = match (
+            pending.map(|p| &mut p.res),
+            slot,
+            self.result_pages.as_mut(),
+        ) {
+            (Some(PendingRes::Own(r)), _, _) => (&r.atlas, &mut r.text_cache, None),
+            (_, Some(s), _) => {
+                let Slot {
+                    resources, text, ..
+                } = s;
+                (&resources.atlas, &mut resources.text_cache, Some(&*text))
+            }
+            (_, None, Some(p)) => (&p.atlas, &mut p.text_cache, None),
+            _ => return Ok(()),
+        };
+        let skin = bundle.skin();
+        let refused = |e: TextTableError| {
+            RenderError::Skin(SkinError {
+                reason: e.to_string(),
+            })
+        };
+        let holder = match bundle.text_producer() {
+            Some(producer) => {
+                self.text_report = TextReport::default();
+                let requests = skin.result_text_requests(res, target, &Layout::AUTHOR);
+                let (table, holder, report) = text_upload::prepare(
+                    text_upload::Prepare {
+                        gpu: &self.gpu,
+                        atlas,
+                        cache,
+                        scratch: &mut self.text_scratch,
+                        producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
+                        held: held.as_slice(),
+                        #[cfg(test)]
+                        hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
+                    },
+                    &requests,
+                    skin.text_slots(),
+                )?;
+                self.text_report = report;
+                skin.attach_result_text(res, table).map_err(refused)?;
+                holder
+            }
+            None => {
+                skin.attach_result_text(res, TextTable::new(vec![None; skin.text_slots()]))
+                    .map_err(refused)?;
+                Holder::default()
+            }
+        };
+        skin.attach_result_bitmap_text(res);
+        self.staged_result_text = Some((bundle.atlas_id(), holder));
+        Ok(())
+    }
+
+    /// Installs the result's lines [`prepare_result_text`]
+    /// (Self::prepare_result_text) staged, in place of the ones its frames
+    /// draw, which are let go: the commit point of a presentation, between
+    /// frames. Returns whether they were installed: not when none are
+    /// staged, nor when the array they were placed in is no longer the
+    /// result's (they are dropped). Allocates nothing.
+    pub fn install_staged_result_text(&mut self) -> bool {
+        let Some((id, holder)) = self.staged_result_text.take() else {
+            return false;
+        };
+        match Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get_mut(i))
+            .and_then(Option::as_mut)
+        {
+            Some(slot) if slot.installation.bundle().atlas_id() == id => {
+                slot.text = holder;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The app's share of a result frame: the result installation's skin
+    /// builds `f` of `res` into its slot's staging, and `strip`, in layout
+    /// pixels (1920×1080 over the whole target), follows from the reserve
+    /// the skin cannot fill, with no call into wgpu. Nothing allocates,
+    /// the refusal included. At most [`RESULT_STRIP_SPRITES`] of the strip
+    /// are drawn.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame, or [`BuildError::Kind`] without a
+    /// result layout: nothing of it is staged.
+    pub fn build_result(
+        &mut self,
+        res: &mut ResultScreen,
+        f: &ResultFrame<'_>,
+        strip: &[Sprite],
+    ) -> Result<(), BuildError> {
+        self.started = None;
+        let start = Instant::now();
+        let target = self.target();
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.result_faults.0) {
+            return Err(BuildError::Kind);
+        }
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Result).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Err(BuildError::Kind);
+        };
+        let f = ResultFrame { target, ..*f };
+        let (placed, n) = placed_strip::<RESULT_STRIP_SPRITES>(
+            strip,
+            &slot.resources.staging.projection(),
+            target,
+        );
+        let bundle = slot.installation.bundle();
+        let uvs = bundle.uvs();
+        let skin = bundle.skin();
+        slot.resources.staging.build_with(
+            |quads| skin.build_result(res, &f, uvs, quads),
+            placed.get(..n).unwrap_or_default(),
+        )?;
+        self.started = Some(start);
+        Ok(())
+    }
+
+    /// Submits and presents the result frame
+    /// [`build_result`](Self::build_result) staged, then each of `texts`
+    /// in a pass of its own over it (the strip's lines). Without a frame
+    /// built since, nothing is acquired or submitted, as
+    /// [`submit`](Self::submit).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_result(&mut self, texts: &[&MenuText]) -> Result<FrameTiming, RenderError> {
+        self.submit_screen(ScreenKind::Result, texts)
+    }
+
+    /// Tests and development builds: the next result frame is refused
+    /// ([`build_result`](Self::build_result)) as a skin refuses one, or
+    /// with `text` the next result text preparation.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn refuse_next_result(&mut self, text: bool) {
+        if text {
+            self.result_faults.1 = true;
+        } else {
+            self.result_faults.0 = true;
+        }
+    }
+
+    /// Development builds: the result frame last built, the skin's quads
+    /// in drawing order; `None` without a result layout.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
+        let i = Self::screen(ScreenKind::Result)?;
+        let slot = self.screens.get(i)?.as_ref()?;
+        Some(slot.resources.staging.batch().quads().quads().to_vec())
+    }
+
+    /// Tests: the bytes of the result's committed text layer's cache.
+    #[cfg(test)]
+    pub(crate) fn result_text_cache_bytes(&self) -> u64 {
+        Self::screen(ScreenKind::Result)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+            .map_or(0, |s| s.resources.text_cache.bytes())
+    }
+
+    /// Tests: makes every staging's instance buffer invalid, as a device
+    /// refusing its allocation would, while `on`.
+    #[cfg(test)]
+    pub(crate) fn fail_staged_buffers(&mut self, on: bool) {
+        self.buffer_fault = on;
+    }
+
+    /// Tests and development builds: how many atlas arrays were uploaded,
+    /// a skin's or a pages-only installation's.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[must_use]
+    pub const fn atlas_uploads(&self) -> u64 {
+        self.atlas_uploads
     }
 
     /// Submits and presents the staged batch through `projection`, each
@@ -3761,6 +4739,7 @@ mod tests {
             std::slice::from_ref(&req),
             crate::LineBounds::for_side(4_096),
             &[],
+            0,
             tall,
         );
         assert_eq!(p.new[0].rect[2..], [4_096, 1_088]);

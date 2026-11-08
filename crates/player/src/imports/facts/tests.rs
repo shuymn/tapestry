@@ -9,6 +9,11 @@ use super::{attempt_facts, level_of};
 /// `text` loaded as `a.bms` under the play preset `preset`, the chart one
 /// note after `text`'s headers.
 pub(crate) fn loaded(text: &str, preset: &str) -> game::Loaded {
+    loaded_kept(text, preset).1
+}
+
+/// As [`loaded`], with the directory its chart file stays in while kept.
+pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game::Loaded) {
     let dir = tempfile::tempdir().unwrap();
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
@@ -33,7 +38,8 @@ pub(crate) fn loaded(text: &str, preset: &str) -> game::Loaded {
         autoplay: None,
     };
     let parts = game::Parts::unsaved(&settings.player);
-    game::Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+    let loaded = game::Loaded::load(root, settings, &chart_path, config, parts).unwrap();
+    (dir, loaded)
 }
 
 /// The source's `Integer.parseInt` on `#PLAYLEVEL`: an optional sign,
