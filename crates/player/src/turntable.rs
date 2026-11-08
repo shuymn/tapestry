@@ -219,4 +219,76 @@ mod tests {
         play(&mut t, 1_010, negative);
         assert_eq!(t.angle() - before, -10 * 1_000);
     }
+
+    /// The tick a play frame at chart time `chart_ms` adds, the play
+    /// state's origin `delta` µs before chart time 0.
+    fn play_tick(t: &mut Turntable, chart_us: i64, delta: i64) -> i64 {
+        let before = i64::from(t.angle());
+        t.presented(
+            TimeUs(chart_us + delta),
+            Some(TimeUs(chart_us)),
+            ScratchInput::NONE,
+        );
+        (i64::from(t.angle()) - before).rem_euclid(2_160_000)
+    }
+
+    /// Presses are stamped and expire on the play state's floored ms, not
+    /// on chart time: with the state origin 999.6 ms before chart 0, a CN
+    /// end at chart 1 000 ms stamps 1 999 and has expired by chart
+    /// 1 080.5 ms (state 2 080), so the LN from 1 082 ms turns Positive.
+    #[test]
+    fn autoplay_presses_on_the_play_states_ms() {
+        for (delta, positive) in [(0, false), (999_600, true)] {
+            let mut t = Turntable::default();
+            t.created(state(1, 0));
+            t.begin_presentation();
+            let note = |ms: i64, kind| ScratchNote {
+                time: TimeUs(ms * MS),
+                kind,
+            };
+            t.attempt(vec![
+                note(
+                    500,
+                    ScratchNoteKind::LongStart {
+                        end: TimeUs(1_000 * MS),
+                        charge: true,
+                    },
+                ),
+                note(1_000, ScratchNoteKind::LongEnd { charge: true }),
+                note(
+                    1_082,
+                    ScratchNoteKind::LongStart {
+                        end: TimeUs(5_000 * MS),
+                        charge: false,
+                    },
+                ),
+                note(5_000, ScratchNoteKind::LongEnd { charge: false }),
+            ]);
+            t.play_starts();
+            for chart in [1_000_000, 1_080_500, 1_090_000] {
+                play_tick(&mut t, chart, delta);
+            }
+            let turned = play_tick(&mut t, 1_100_000, delta);
+            let want = if positive { 30_000 } else { 2_160_000 - 10_000 };
+            assert_eq!(turned, want, "delta {delta}");
+        }
+    }
+
+    /// A play's start clears autoplay's presses, as its judge's init does.
+    #[test]
+    fn a_play_start_clears_autoplays_presses() {
+        let mut t = Turntable::default();
+        t.created(state(1, 0));
+        t.begin_presentation();
+        t.attempt(vec![ScratchNote {
+            time: TimeUs(1_000 * MS),
+            kind: ScratchNoteKind::Tap,
+        }]);
+        t.play_starts();
+        play_tick(&mut t, 990_000, 0);
+        assert_eq!(play_tick(&mut t, 1_000_000, 0), 30_000, "Positive");
+        // A rearm or a round: chart time starts over, the press is gone.
+        t.play_starts();
+        assert_eq!(play_tick(&mut t, 10_000, 1_000_000), 10_000, "idle");
+    }
 }
