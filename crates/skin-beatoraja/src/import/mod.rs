@@ -434,6 +434,9 @@ pub(crate) struct Cx<'d> {
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
+    /// Where the last lowering's capture proof was voided by a frame-time
+    /// write: its refusal's place.
+    interference: std::cell::Cell<Option<crate::lua::callback::Site>>,
     /// The output types of the callbacks a selection or result screen's
     /// runtime runs, by index: `lua.<k>` in the expressions.
     outputs: Vec<skin_model::output::OutTy>,
@@ -553,6 +556,7 @@ impl<'d> Cx<'d> {
             when_spans: Vec::new(),
             present: skin_model::present::PresentDef::default(),
             number_value: None,
+            interference: std::cell::Cell::new(None),
             ranks: [None; 3],
             elements: Vec::new(),
             element_spans: Vec::new(),

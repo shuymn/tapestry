@@ -377,6 +377,30 @@ fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Vec<AtlasId>)
 /// back untouched, and none is referenced past the release.
 type Slot = Arc<Mutex<Option<Images>>>;
 
+/// What an image stage's job gives: the probe's outcome (a bundle for
+/// every view, images prepared, or a refusal), the facts it read, the
+/// images it took and the cells its layout needs.
+type ImageOut = (
+    Option<Result<Option<Arc<SkinBundle>>, String>>,
+    FactDeps,
+    Option<Images>,
+    Option<Needs>,
+);
+
+/// How [`ResultSkin::begin_image_stage`] began.
+pub enum ImageStage {
+    /// Decided at once.
+    Ready(Staged),
+    /// Its job runs.
+    Running(Box<ImageJob>),
+}
+
+/// An image stage's job in flight.
+pub struct ImageJob {
+    job: imports::Job<ImageOut>,
+    slot: Slot,
+}
+
 /// `slot`'s holdings, a poisoned lock included.
 fn lock(slot: &Slot) -> MutexGuard<'_, Option<Images>> {
     slot.lock().unwrap_or_else(PoisonError::into_inner)
@@ -705,110 +729,151 @@ impl ResultSkin {
     /// prepared atlas holds its cells, one atlas build, on a job run with
     /// the attempt's two signals. A fixed skin, or a probe whose facts and
     /// atlas still hold, runs no job.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn image_stage(
         &mut self,
         chart: ResultChart,
         class: Option<JudgeClass>,
-        quit: impl FnMut() -> bool,
-        end_run: impl FnMut() -> bool,
+        mut quit: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
     ) -> Staged {
+        match self.begin_image_stage(chart, class) {
+            ImageStage::Ready(staged) => staged,
+            ImageStage::Running(mut job) => loop {
+                if let Some(staged) = self.poll_image_stage(&mut job, None, &mut quit, &mut end_run)
+                {
+                    break staged;
+                }
+            },
+        }
+    }
+
+    /// [`image_stage`](Self::image_stage)'s start: decided at once when no
+    /// job is needed, else its job started and returned at once
+    /// ([`ImageStage::Running`]), to be waited for
+    /// ([`poll_image_stage`](Self::poll_image_stage)), which finishes it.
+    pub fn begin_image_stage(
+        &mut self,
+        chart: ResultChart,
+        class: Option<JudgeClass>,
+    ) -> ImageStage {
         self.chart = Some(chart);
         self.class = Some(class);
         let pending = match &self.start {
-            None => return Staged::Ready,
+            None => return ImageStage::Ready(Staged::Ready),
             Some(ResultStart::Fixed(b)) => {
                 self.attempt = Some(ForAttempt::Every(Arc::clone(b), None));
-                return Staged::Ready;
+                return ImageStage::Ready(Staged::Ready);
             }
             Some(ResultStart::Pending(p)) => Arc::clone(p),
         };
         let facts = result_facts(probe_fields(chart), self.class);
         if let Some(reused) = self.reuse_for_attempt(&facts) {
             self.attempt = Some(reused);
-            return Staged::Ready;
+            return ImageStage::Ready(Staged::Ready);
         }
         let slot = self.slot_for_job();
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
-        let ran = imports::run_job(
-            move |cancel: &Cancel| {
-                let slot = theirs;
-                let o = pending
-                    .header
-                    .import_reading(&pending.config, &facts, cancel);
-                let deps = match &o {
-                    Ok(LuaOutcome::Imported(i)) => i.facts.clone(),
-                    Ok(LuaOutcome::Pending(p)) => p.facts.clone(),
-                    Err(refused) => refused.1.clone(),
-                };
-                let read = reads_result(&deps);
-                match o {
-                    Ok(LuaOutcome::Imported(i)) if !read => {
-                        // A skin that reads no fact of the viewed result:
-                        // one bundle for every view, packed as any kind's
-                        // once its plan fits and what is not shown is
-                        // released; with no room, laid out per view.
-                        let skin = i.imported.skin;
-                        let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
-                        let limits = pending.target.limits;
-                        if let Err(e) = skin.sheet().plan(variant, limits, skin.has_outline_text())
-                        {
-                            return (
-                                Some(Err(format!("the atlas cannot be built: {e}"))),
-                                deps,
-                                None,
-                                None,
-                            );
-                        }
-                        let images = lock(&slot).take().unwrap_or_default();
-                        let (images, room) = release(images, base.as_ref(), others);
-                        if !room {
-                            return (None, deps, Some(images), None);
-                        }
-                        #[cfg(any(test, feature = "dev-tools"))]
-                        BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let r = skin
-                            .atlas(variant, pending.target.limits, &|| cancel.is_cancelled())
-                            .map_err(|e| format!("the atlas cannot be built: {e}"))
-                            .and_then(|a| {
-                                imports::bundle_of(
-                                    skin,
-                                    i.imported.scratch,
-                                    a,
-                                    &pending.target,
-                                    cancel,
-                                )
-                            });
-                        (Some(r.map(Some)), deps, Some(images), None)
-                    }
-                    Ok(LuaOutcome::Imported(_)) => {
-                        let view = ViewFacts(Some(match facts.result {
-                            Fact::Known(f) => f,
-                            _ => return (None, deps, None, None),
-                        }));
-                        let laid = layout(&pending, view, Some(class), &slot, base, others, cancel);
-                        // The probe's layout is never shown: its atlas is.
-                        (
-                            Some(laid.result.map(|_| None).map_err(|e| match e {
-                                Unbuilt::Refused(why) => why,
-                                Unbuilt::Deferred => "deferred".to_owned(),
-                            })),
+        let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
+            let slot = theirs;
+            let o = pending
+                .header
+                .import_reading(&pending.config, &facts, cancel);
+            let deps = match &o {
+                Ok(LuaOutcome::Imported(i)) => i.facts.clone(),
+                Ok(LuaOutcome::Pending(p)) => p.facts.clone(),
+                Err(refused) => refused.1.clone(),
+            };
+            let read = reads_result(&deps);
+            match o {
+                Ok(LuaOutcome::Imported(i)) if !read => {
+                    // A skin that reads no fact of the viewed result:
+                    // one bundle for every view, packed as any kind's
+                    // once its plan fits and what is not shown is
+                    // released; with no room, laid out per view.
+                    let skin = i.imported.skin;
+                    let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
+                    let limits = pending.target.limits;
+                    if let Err(e) = skin.sheet().plan(variant, limits, skin.has_outline_text()) {
+                        return (
+                            Some(Err(format!("the atlas cannot be built: {e}"))),
                             deps,
-                            laid.taken,
-                            laid.needs,
-                        )
+                            None,
+                            None,
+                        );
                     }
-                    Err(_) if !read => (Some(Err("refused".to_owned())), deps, None, None),
-                    _ => (None, deps, None, None),
+                    let images = lock(&slot).take().unwrap_or_default();
+                    let (images, room) = release(images, base.as_ref(), others);
+                    if !room {
+                        return (None, deps, Some(images), None);
+                    }
+                    #[cfg(any(test, feature = "dev-tools"))]
+                    BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let r = skin
+                        .atlas(variant, pending.target.limits, &|| cancel.is_cancelled())
+                        .map_err(|e| format!("the atlas cannot be built: {e}"))
+                        .and_then(|a| {
+                            imports::bundle_of(skin, i.imported.scratch, a, &pending.target, cancel)
+                        });
+                    (Some(r.map(Some)), deps, Some(images), None)
                 }
-            },
-            quit,
-            end_run,
-        );
+                Ok(LuaOutcome::Imported(_)) => {
+                    let view = ViewFacts(Some(match facts.result {
+                        Fact::Known(f) => f,
+                        _ => return (None, deps, None, None),
+                    }));
+                    let laid = layout(&pending, view, Some(class), &slot, base, others, cancel);
+                    // The probe's layout is never shown: its atlas is.
+                    (
+                        Some(laid.result.map(|_| None).map_err(|e| match e {
+                            Unbuilt::Refused(why) => why,
+                            Unbuilt::Deferred => "deferred".to_owned(),
+                        })),
+                        deps,
+                        laid.taken,
+                        laid.needs,
+                    )
+                }
+                Err(_) if !read => (Some(Err("refused".to_owned())), deps, None, None),
+                _ => (None, deps, None, None),
+            }
+        });
+        match spawned {
+            Ok(job) => ImageStage::Running(Box::new(ImageJob { job, slot })),
+            Err(why) => ImageStage::Ready(self.finish_image_stage(&slot, Ran::Refused(why))),
+        }
+    }
+
+    /// The image stage's `job` waited for until `until` at most
+    /// ([`imports::Job::wait_until`] with the attempt's two signals), and
+    /// finished once it ended; `None` at `until` with the job running.
+    pub fn poll_image_stage(
+        &mut self,
+        job: &mut ImageJob,
+        until: Option<std::time::Instant>,
+        quit: impl FnMut() -> bool,
+        end_run: impl FnMut() -> bool,
+    ) -> Option<Staged> {
+        let ran = job.job.wait_until(until, quit, end_run)?;
+        Some(self.finish_image_stage(&job.slot, ran))
+    }
+
+    /// An image stage's `job` no attempt waits for any more (its
+    /// preparation superseded or discarded): cancelled and waited for as
+    /// the run's end waits, at most [`imports::STOP_WAIT`], and finished,
+    /// so its images are handed back.
+    pub fn settle_image_stage(&mut self, job: &mut ImageJob) {
+        let _ = self.poll_image_stage(job, None, || false, || true);
+    }
+
+    /// The attempt's result skin from its image stage's outcome `ran`, the
+    /// job's images handed back through `slot`.
+    fn finish_image_stage(&mut self, slot: &Slot, ran: Ran<ImageOut>) -> Staged {
         match ran {
             Ran::Done((outcome, deps, taken, needs)) => {
-                self.restore(taken, &slot);
+                self.restore(taken, slot);
                 match outcome {
                     // A bundle for every view, cached with what it read.
                     Some(Ok(Some(bundle))) => {
@@ -842,7 +907,7 @@ impl ResultSkin {
             }
             Ran::Refused(why) => {
                 log::info!("skin: result: its image stage failed: {why}");
-                self.restore(None, &slot);
+                self.restore(None, slot);
                 self.attempt = Some(ForAttempt::Pending);
                 Staged::Ready
             }
@@ -1166,4 +1231,4 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
 }
 
 #[cfg(all(test, feature = "dev-tools"))]
-mod tests;
+pub(crate) mod tests;

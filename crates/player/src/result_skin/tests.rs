@@ -13,10 +13,11 @@ use skin_beatoraja::{Config, JudgeClass, read_lua_header};
 use skin_model::{AtlasLimits, ResultChart, ResultFields, Root};
 
 use super::{Published, ResultSkin, ResultStart, Staged, ViewFacts, builds, probe_view};
-use crate::imports::{ImportTarget, jobs_joined, jobs_started};
-// The builds and jobs a test counts are its own: these tests run one at a
-// time with the importer's tests, which count jobs too.
-use crate::imports::tests::serial;
+use crate::imports::ImportTarget;
+// The jobs a test counts are its own (each job carries the tally of the
+// test that started it); its builds are, as these tests run one at a time
+// with the importer's tests.
+use crate::imports::tests::{jobs_joined, jobs_started, serial};
 
 /// `dir/name`, a `w`×`h` PNG of one colour.
 fn png(dir: &Path, name: &str, w: u32, h: u32) {
@@ -31,7 +32,7 @@ fn png(dir: &Path, name: &str, w: u32, h: u32) {
 /// A result skin `s.luaskin` reading 154 as `nr` while it loads, then
 /// running `pre`, with the image list `images` (a Lua expression) of
 /// `s.png`, its EX number and a status dot.
-fn skin(pre: &str, images: &str) -> tempfile::TempDir {
+pub(crate) fn skin(pre: &str, images: &str) -> tempfile::TempDir {
     skin_reading("local nr = ms.number(154)", pre, images)
 }
 
@@ -69,14 +70,14 @@ fn target(limits: AtlasLimits) -> ImportTarget {
     }
 }
 
-const LIMITS: AtlasLimits = AtlasLimits {
+pub(crate) const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 4_096,
     max_layers: 16,
     reserved_layers: render::RESERVED_LAYERS,
 };
 
 /// The skin in `dir`, pending, its imports through its cache.
-fn pending(dir: &Path, limits: AtlasLimits) -> Arc<super::PendingResult> {
+pub(crate) fn pending(dir: &Path, limits: AtlasLimits) -> Arc<super::PendingResult> {
     let h = read_lua_header(dir, "s.luaskin", &skin_beatoraja::Cancel::new()).unwrap();
     let config = Config::defaults(h.header());
     Arc::new(super::PendingResult::new(
@@ -726,7 +727,7 @@ fn chart_reads_are_decided_before_ready() {
 }
 
 /// The image stage at `level` with judgment class `class`.
-fn staged_at(rs: &mut ResultSkin, level: i32, class: JudgeClass) {
+pub(crate) fn staged_at(rs: &mut ResultSkin, level: i32, class: JudgeClass) {
     let c = ResultChart {
         level: Some(level),
         ..chart()
@@ -1408,4 +1409,34 @@ fn a_pending_lua_skin_draws_on_its_uploaded_pages() {
     let rig = Rig::new();
     assert!(presented_on(&rig, upload, &bundle));
     rig.exit();
+}
+
+/// An image stage whose preparation was superseded or discarded is
+/// settled, never detached (the S10 item 9 design's 9.2 ownership): a
+/// probe that would run forever is cancelled and its thread joined within
+/// the stop bound, and the skin is not left busy.
+#[test]
+fn a_settled_image_stage_is_cancelled_and_joined() {
+    let _s = serial();
+    let d = skin(
+        "while true do end",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let super::ImageStage::Running(mut job) =
+        rs.begin_image_stage(chart(), Some(JudgeClass::Normal))
+    else {
+        panic!("a job runs");
+    };
+    let joined = jobs_joined();
+    let from = std::time::Instant::now();
+    rs.settle_image_stage(&mut job);
+    assert!(
+        from.elapsed() < crate::imports::STOP_WAIT,
+        "{:?}",
+        from.elapsed()
+    );
+    assert_eq!(jobs_joined() - joined, 1, "the job's thread joined");
+    assert!(!rs.busy());
 }

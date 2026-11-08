@@ -140,15 +140,12 @@ pub enum PropertyKind {
 /// Why a track was not imported (design.md, the S6b track rules).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackWhy {
-    /// Keys at one time with different values.
-    EqualTime,
     /// The first key is before 0.
     NegativeStart,
     /// After its last key the source shows the first key.
     FallbackToFirst,
-    /// The loop wraps into negative times.
-    NegativeLoop,
-    /// More than the model's keys, or a key after its last time.
+    /// More than the model's keys, a key after its last time, or a loop
+    /// point before the earliest the model loops from.
     Limits,
     /// The source never draws it.
     NeverDrawn,
