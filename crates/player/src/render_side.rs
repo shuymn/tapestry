@@ -7418,6 +7418,7 @@ pub(crate) mod tests {
             hispeed: h.and_then(|(n, d)| game::Ratio::new(n, d)),
             display_offset_us: offset,
             epoch,
+            scratch: game::ScratchInput::NONE,
             ..PresentationSnapshot {
                 options: game::PlayOptions::default(),
                 hispeed: None,
@@ -7427,6 +7428,7 @@ pub(crate) mod tests {
                 generation: 0,
                 sequence: 0,
                 epoch: 0,
+                scratch: game::ScratchInput::NONE,
             }
         };
         let (mut writer, reader) = presentation_link(&snapshot(Some((4, 1)), 0, 1));

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use eval::ControlId as InputControl;
+use eval::{ControlId as InputControl, ScratchSettings};
 use input::hid::is_axis;
 use input::raw::key_identity;
 use input::{AdjustmentBindings, DeviceKind, MAX_TAPPED, TapControl, TapEvent, TapObservation};
@@ -187,7 +187,7 @@ pub enum AdjustKeyError {
 
 /// What the play adjustments take from `device.toml` beside the key
 /// configs, whose roles they bind: the scratch axis's `[scratch]` settings.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdjustmentConfig {
     /// Whether the scratch axis adjusts the other way from its movement
     /// (`adjust_reversed`).
@@ -195,15 +195,32 @@ pub struct AdjustmentConfig {
     /// The movement of a scratch axis that does not wrap, or is relative,
     /// that makes one step (`adjust_counts_per_step`); positive.
     pub counts_per_step: Option<u32>,
+    /// The scratch axis's conversion settings as the evaluator resolves
+    /// them: the turntable's presentation steps the same rule
+    /// (thresholds and release time) with the tapped movements.
+    pub scratch: ScratchSettings,
+}
+
+impl Default for AdjustmentConfig {
+    fn default() -> Self {
+        Self {
+            reversed: false,
+            counts_per_step: None,
+            scratch: ScratchSettings::DEFAULT,
+        }
+    }
 }
 
 impl AdjustmentConfig {
     /// The settings `device` gives.
     #[must_use]
-    pub const fn of(device: &DeviceSettings) -> Self {
+    pub fn of(device: &DeviceSettings) -> Self {
         Self {
             reversed: device.scratch.adjust_reversed,
             counts_per_step: device.scratch.adjust_counts_per_step,
+            // The thresholds and release time do not depend on the
+            // device's declaration, which only the movement reads.
+            scratch: device.scratch.settings(None),
         }
     }
 
@@ -239,6 +256,7 @@ impl AdjustmentConfig {
             },
             axis: None,
             reversed: self.reversed,
+            scratch: self.scratch,
             panel_roles: [0; 2],
         };
         let [slower, faster] = SPEED_KEYS;
@@ -297,6 +315,8 @@ pub struct AdjustmentPlan {
     pub bindings: AdjustmentBindings,
     axis: Option<(u8, Option<AxisQuantum>)>,
     reversed: bool,
+    /// The scratch axis's resolved conversion settings.
+    scratch: ScratchSettings,
     /// The numbers of START's and SELECT's controls, a bit each.
     panel_roles: [u128; 2],
 }
@@ -339,6 +359,19 @@ impl AdjustmentPlan {
     #[must_use]
     pub fn axis(&self) -> Option<u8> {
         self.axis.map(|(n, _)| n)
+    }
+
+    /// Whether the scratch axis adjusts, and turns the turntable, the
+    /// other way from its movement.
+    #[must_use]
+    pub const fn reversed(&self) -> bool {
+        self.reversed
+    }
+
+    /// The scratch axis's resolved conversion settings.
+    #[must_use]
+    pub const fn scratch(&self) -> ScratchSettings {
+        self.scratch
     }
 
     /// The reducer's observation of the tap's `o`: its time and sequence,

@@ -452,7 +452,9 @@ impl App {
             }
             // The screen's measures are the chart's 1× times.
             config.speed = Speed::NORMAL;
+            rig.play_state_began();
         } else {
+            rig.play_state_began();
             // The loading state shows before the chart is read; a practice
             // shows it at each Start instead.
             rig.entered_loading(chart);
@@ -558,6 +560,9 @@ fn practice_chart<R: AppRig>(
             // next round plays.
             let mut set_up = false;
             let ran = start_rounds(loaded, &screen, rig, &mut set_up);
+            // Back on the page: a turntable paused by a round's result
+            // resumes.
+            rig.turntable_resumed();
             if set_up {
                 screen.sync(loaded);
             }

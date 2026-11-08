@@ -215,6 +215,15 @@ enum Seen {
     Practice(Option<String>),
 }
 
+/// The turntable clock's signals from the flow (docs/stage3.md, offset 1),
+/// each with the number of [`Seen`] entries before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tt {
+    Began(usize),
+    Paused(usize),
+    Resumed(usize),
+}
+
 /// What happens during a slow load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InLoad {
@@ -327,6 +336,10 @@ struct Headless {
     prepared_for: Vec<usize>,
     // What the rig saw.
     seen: Vec<Seen>,
+    /// The turntable clock's signals, in order.
+    turntable: Vec<Tt>,
+    /// The plays saved when each pause came.
+    paused_before_save: Vec<usize>,
     entries: usize,
     violations: Vec<String>,
     /// Every load with its plays' reports.
@@ -485,6 +498,8 @@ impl Headless {
             cancel_loads: Vec::new(),
             prepared_for: Vec::new(),
             seen: Vec::new(),
+            turntable: Vec::new(),
+            paused_before_save: Vec::new(),
             entries: 0,
             violations: Vec::new(),
             loads: Vec::new(),
@@ -873,6 +888,21 @@ impl Rig for Headless {
         self.loads.last_mut().unwrap().1.push(report.clone());
     }
 
+    fn play_state_began(&mut self) {
+        self.turntable.push(Tt::Began(self.seen.len()));
+    }
+
+    fn turntable_paused(&mut self) {
+        // Before the save: no report of the play is in yet.
+        let saved = self.reports().count();
+        self.turntable.push(Tt::Paused(self.seen.len()));
+        self.paused_before_save.push(saved);
+    }
+
+    fn turntable_resumed(&mut self) {
+        self.turntable.push(Tt::Resumed(self.seen.len()));
+    }
+
     fn idle_wait(&mut self, deadline: TimeUs) {
         self.idle_waits.push((self.at(), deadline.0));
         // Up to the deadline, or to the next action or edit if that is
@@ -1201,6 +1231,20 @@ fn select_play_retry_back_select_again() {
             Seen::Shown(1),
         ]
     );
+    // A play state per chart chosen and per retry; each play pauses the
+    // turntable before its save, on its way to the result.
+    assert_eq!(
+        rig.turntable,
+        [
+            Tt::Began(1),
+            Tt::Paused(2),
+            Tt::Began(3),
+            Tt::Paused(3),
+            Tt::Began(5),
+            Tt::Paused(6),
+        ]
+    );
+    assert_eq!(rig.paused_before_save, [0, 1, 2]);
     let [(0, a), (1, b)] = &rig.loads[..] else {
         panic!("{:?}", rig.seen);
     };
@@ -2544,6 +2588,11 @@ fn practice_screen_repeats_and_quits() {
             Seen::Select,
         ]
     );
+    // P begins the one play state: the Start, round 1 and the automatic
+    // round 2 keep it; round 2 goes on to its result, which pauses the
+    // turntable before its save, and the page resumes it.
+    assert_eq!(rig.turntable, [Tt::Began(1), Tt::Paused(3), Tt::Resumed(4)]);
+    assert_eq!(rig.paused_before_save, [1]);
     let speed = Speed::from_twentieths(15).unwrap();
     assert_eq!(rig.speeds, [speed]);
     let [(P, reports)] = &rig.loads[..] else {
@@ -2634,6 +2683,9 @@ fn practice_quit_in_ready_returns_to_the_page() {
         events.count(|e| matches!(e, SessionEvent::Result { .. })),
         0
     );
+    // P begins the play state; the Start and the aborted round keep it,
+    // and the return to the page resumes nothing paused.
+    assert_eq!(rig.turntable, [Tt::Began(1), Tt::Resumed(3)]);
 }
 
 /// Every Start loads the chart, at an unchanged speed too: a first entry
