@@ -928,3 +928,120 @@ fn a_small_modulo_composes() {
         assert_eq!([at(0), at(1)], [want, 1], "{n}");
     }
 }
+
+/// Every source of an integer the compiler accepts has a range, and
+/// arithmetic past ±2^53 over it is refused, discarded or not; a source
+/// with no mapped range (a timer's start or off value) is of no known
+/// bound, and the gauge's type is a Java `int`.
+/// One row a source, each with a control that stays within the range.
+#[test]
+fn every_integer_source_is_bounded() {
+    let range = Disposition::Replaced(Unsupported::Range);
+    for (source, value, want) in [
+        // A literal: its own value; one past 2^53 does not fold.
+        (
+            "literal",
+            "function() return ms.number(110) * 4503599627 * 1.0 end",
+            range,
+        ),
+        (
+            "literal",
+            "function() return ms.number(110) * 2 * 1.0 end",
+            Disposition::Compiled,
+        ),
+        // A captured integer: its value.
+        (
+            "captured",
+            "function() return ms.number(110) * K * 1.0 end",
+            range,
+        ),
+        (
+            "captured",
+            "function() return (K + 1) * 1.0 end",
+            Disposition::Compiled,
+        ),
+        // A mapped number read: its field's range.
+        (
+            "number",
+            "function() local n = ms.number(110) local u = n * n * n * n return 1 end",
+            range,
+        ),
+        (
+            "number",
+            "function() local n = ms.number(110) local u = n * n return 1 end",
+            Disposition::Lowered,
+        ),
+        // A judgment count: its count's range.
+        (
+            "judge",
+            "function() local j = ms.judge(1) local u = j * j * j * j return 1 end",
+            range,
+        ),
+        // A timer read: of no known bound (its start or the off value).
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t return 1 end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t return unused ~= nil end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = -t return 1 end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = t + 1 return 1 end",
+            range,
+        ),
+        // The gauge's type: a Java `int`.
+        (
+            "gauge_type",
+            "function() local g = ms.gauge_type() local u = g * g * g return 1 end",
+            range,
+        ),
+        // Operators: each result's range from its operands'; a select's
+        // the hull of its arms (here converted as a number's value; the
+        // effect walk admits no arithmetic on a select of integers, its
+        // arms' kinds unknown).
+        (
+            "math.abs",
+            "function() local t = ms.timer(0) local u = math.abs(t) return 1 end",
+            range,
+        ),
+        (
+            "math.max",
+            "function() local t = ms.timer(0) local u = math.max(t, 1) * 2 return 1 end",
+            range,
+        ),
+        (
+            "select",
+            "function() if ms.option(271) then return ms.timer(0) end return 0 end",
+            range,
+        ),
+        (
+            "math.floor",
+            "function() local u = math.floor(ms.number(110) / 3) * 2 return 1 end",
+            range,
+        ),
+        (
+            "%",
+            "function() local u = (ms.number(110) % 7) * 1000 return 1 end",
+            Disposition::Lowered,
+        ),
+    ] {
+        let body = format!(
+            "local K = 4503599627370496\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+               value = {value} }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+        );
+        let i = import(&folder(&skin(&body)), 905)
+            .unwrap_or_else(|e| panic!("{source}: {value}: {e:?}"));
+        assert_eq!(i.callbacks, [want], "{source}: {value}");
+    }
+}

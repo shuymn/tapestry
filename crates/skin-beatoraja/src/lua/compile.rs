@@ -97,6 +97,8 @@ fn floor_div(a: i128, b: i128) -> i128 {
 }
 
 /// Every node of `res` checked, operands before the nodes that use them,
+/// each node that may be an integer given bounds (the whole of `i64` when
+/// nothing narrower is known), each that never is none,
 /// before either backend is chosen (a lowered expression too runs every
 /// reached operation in the source):
 /// its integer part's bounds, each arithmetic result's within ±2^53 and
@@ -170,6 +172,11 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
             Node::Select { then, other, .. } => hull(get(then), get(other)),
             _ => None,
         };
+        // "Of no known bound" is not "never an integer": a node that may
+        // be an integer and that no rule above bounds (a timer read, whose
+        // start or off value is any `long`; the gauge's type) gets the
+        // whole of `i64`, so arithmetic on it meets the ±2^53 rule.
+        let iv = if ints(r) { iv.or(FULL) } else { None };
         ivs.push(iv);
     }
     Ok(ivs)
