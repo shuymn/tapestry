@@ -88,12 +88,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          version: 2026.11.3
-          install: true
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-mise
       - name: Show toolchain
         run: |
           mise ls --current
@@ -138,12 +133,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          version: 2026.11.3
-          install: true
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-mise
       - name: Show toolchain
         run: |
           mise ls --current
@@ -218,12 +208,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          version: 2026.11.3
-          install: true
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-mise
       - name: Show toolchain
         run: |
           mise ls --current
@@ -300,12 +285,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          version: 2026.11.3
-          install: true
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-mise
       - name: Show toolchain
         run: |
           mise ls --current
@@ -397,12 +377,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          version: 2026.11.3
-          install: true
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/setup-mise
       - name: Show toolchain
         run: |
           mise ls --current
@@ -501,13 +476,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: ./.github/actions/setup-mise
         with:
-          version: 2026.11.3
-          install: true
           install_args: rust actionlint shellcheck
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
       - name: Banned words
         run: mise exec -- cargo xtask banned-words --all
       # Each allocation guard also runs in a release step above.

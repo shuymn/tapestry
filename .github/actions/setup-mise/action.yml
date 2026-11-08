@@ -1,0 +1,83 @@
+name: Set up mise
+description: >-
+  jdx/mise-action with the pinned mise, its tool cache saved only on main, and
+  the mise binary cached on its own so a job that fetched it once does not
+  download it from GitHub releases again.
+
+# mise-action fetches a pinned mise from GitHub releases whenever its tool
+# cache misses (a changed mise.toml or mise.lock, other install_args, the
+# monthly cache period, or a job that never runs on main). Its own binary cache
+# is used only when `version` is unset. The binary directory is therefore
+# cached here, keyed on the runner image and the installed version, with the
+# signed checksums the action verifies a present binary against offline; a
+# binary or checksum that fails verification is downloaded again by the action.
+
+inputs:
+  install:
+    description: mise-action's `install`.
+    default: "true"
+  install_args:
+    description: mise-action's `install_args`.
+    default: ""
+  cache:
+    description: mise-action's `cache` (the tool cache, not the binary cache).
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # The directory mise-action installs mise into: `bin` under its default
+    # mise directory.
+    - name: Locate the mise binary
+      id: bin
+      shell: bash
+      run: |
+        if [ -n "${MISE_DATA_DIR:-}" ]; then dir=$MISE_DATA_DIR
+        elif [ -n "${XDG_DATA_HOME:-}" ]; then dir=$XDG_DATA_HOME/mise
+        elif [ "$RUNNER_OS" = Windows ] && [ -n "${LOCALAPPDATA:-}" ]; then dir=$LOCALAPPDATA\\mise
+        else dir=$HOME/.local/share/mise
+        fi
+        if [ "$RUNNER_OS" = Windows ]; then bin=$dir\\bin; else bin=$dir/bin; fi
+        echo "dir=$bin" >> "$GITHUB_OUTPUT"
+        echo "prefix=mise-binary-v1-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-self-hosted}-" >> "$GITHUB_OUTPUT"
+    # The newest binary saved for this image; after a version bump it is the
+    # old one, which the action replaces.
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: restore
+      with:
+        path: ${{ steps.bin.outputs.dir }}
+        key: ${{ steps.bin.outputs.prefix }}
+        restore-keys: ${{ steps.bin.outputs.prefix }}
+    - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      with:
+        version: 2026.11.3
+        install: ${{ inputs.install }}
+        install_args: ${{ inputs.install_args }}
+        cache: ${{ inputs.cache }}
+        cache_save: ${{ github.ref == 'refs/heads/main' }}
+    # Saved only with the signed checksums, which the next run verifies the
+    # binary against without the network, and only when not restored under
+    # the same key.
+    - name: Key the mise binary
+      id: key
+      if: github.ref == 'refs/heads/main'
+      shell: bash
+      env:
+        BIN: ${{ steps.bin.outputs.dir }}
+        PREFIX: ${{ steps.bin.outputs.prefix }}
+        MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+      run: |
+        version=$(cat "$BIN/mise-version" 2>/dev/null || true)
+        key=
+        if [ -n "$version" ] && [ -f "$BIN/SHASUMS256-$version.txt" ] \
+            && [ -f "$BIN/SHASUMS256-$version.txt.minisig" ]; then
+          key=$PREFIX$version
+        fi
+        if [ "$key" = "$MATCHED" ]; then key=; fi
+        echo "key=$key"
+        echo "key=$key" >> "$GITHUB_OUTPUT"
+    - if: github.ref == 'refs/heads/main' && steps.key.outputs.key != ''
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.bin.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
