@@ -289,6 +289,31 @@ fn bands_match_the_whole_decode_in_every_colour_type() {
 }
 
 #[test]
+fn cells_past_the_edge_match_the_whole_decode_in_bands() {
+    // 61×53: cells past the right edge, past the bottom edge across the
+    // last band (rows 48 to 52), past both, and a grid whose last cells
+    // lie wholly past both edges.
+    let png = Png::new(61, 53, png::ColorType::Rgba, png::BitDepth::Eight);
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = png.encode();
+    let images = vec![
+        image([50, 0, 20, 10], [1, 1]),
+        image([0, 45, 10, 20], [1, 1]),
+        image([55, 47, 12, 12], [1, 1]),
+        // Its 10×10 cells start at x 50, 60 and 70 and y 40, 50 and 60:
+        // the last column and row lie wholly past the edges.
+        image([50, 40, 30, 30], [3, 3]),
+    ];
+    let whole = sheet(dir.path(), &bytes, images);
+    assert!(matches!(whole.files[0].lo.mode, Mode::Full(Some(_))));
+    let full = levels(&whole.atlas(Variant::Lo, LIMITS, &never).unwrap());
+    let bands = banded(whole, &bytes);
+    let band = levels(&bands.atlas(Variant::Lo, LIMITS, &never).unwrap());
+    assert!(full.iter().any(|l| l.iter().any(|&b| b != 0)));
+    assert_eq!(full, band);
+}
+
+#[test]
 fn sixteen_bit_samples_round_as_the_whole_decode_does() {
     // (v + 128) / 257 changes between 128 and 129, and between 385 and
     // 386; opaque, so premultiplication keeps each value.

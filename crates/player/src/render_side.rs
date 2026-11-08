@@ -4696,6 +4696,13 @@ pub(crate) mod tests {
         preset_attempt(chart, &rules::tapestry(), section, "")
     }
 
+    /// How long the tests that upload an atlas at the per-atlas cap wait for
+    /// an answer: WARP builds those 256 Mi texels on the CPU, which takes
+    /// past [`LOAD_TIMEOUT`] on a loaded machine (the answer is then
+    /// `NoAnswer` though nothing failed).
+    #[cfg(feature = "dev-tools")]
+    const ATLAS_CAP_ANSWER: Duration = Duration::from_secs(180);
+
     /// A render thread on the screens `make` builds, with no chart, no
     /// section and no frame sink.
     pub(crate) fn spawn_empty(make: MakeScreen) -> super::RenderLink {
@@ -4864,7 +4871,8 @@ pub(crate) mod tests {
             );
             Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
         });
-        let link = spawn_empty(make);
+        let mut link = spawn_empty(make);
+        link.set_timeouts(ATLAS_CAP_ANSWER, Duration::from_secs(10));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(
@@ -4931,7 +4939,8 @@ pub(crate) mod tests {
             );
             Ok(Box::new(crate::menu_screen::MenuScreen::new(renderer, None)) as Box<dyn Screen>)
         });
-        let link = spawn_empty(make);
+        let mut link = spawn_empty(make);
+        link.set_timeouts(ATLAS_CAP_ANSWER, Duration::from_secs(10));
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(
