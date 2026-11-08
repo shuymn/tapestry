@@ -897,6 +897,9 @@ pub enum SelectStep {
     /// screen: wait until a frame of it is presented after the step
     /// began. At most [`STEP_TIMEOUT`].
     Drawn,
+    /// On a result: nothing, until it leaves on its own (a result skin's
+    /// scene time); on the select screen, done at once.
+    Stay,
     /// On a result: leave it (the quit key).
     Back,
     /// On a result: retry.
@@ -2113,6 +2116,87 @@ pub fn refuse_result_select() -> bool {
         "select",
         RESULT_SELECTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
     )
+}
+
+/// The frame under the result's barrier refused, counted from 1: `pinned<N>`
+/// in [`RESULT_FAULTS_ENV`], read once as the render thread starts; 0 none.
+static PINNED_FAULT: AtomicU64 = AtomicU64::new(0);
+static PINNED_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// The frame under the result's barrier lost as a device loss, counted
+/// from 1, with the result's restore on the screen built after it refused:
+/// `lostpinned<N>` in [`RESULT_FAULTS_ENV`]; 0 none.
+static LOST_PINNED_FAULT: AtomicU64 = AtomicU64::new(0);
+static LOST_PINNED_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Reads [`RESULT_FAULTS_ENV`]'s `pinned<N>` and `lostpinned<N>` before
+/// any frame, so a frame reads only atomics.
+pub fn read_result_faults() {
+    let list = std::env::var(RESULT_FAULTS_ENV).unwrap_or_default();
+    let count = |prefix: &str| {
+        list.split(',')
+            .find_map(|f| f.trim().strip_prefix(prefix)?.parse().ok())
+            .unwrap_or(0)
+    };
+    PINNED_FAULT.store(count("pinned"), Ordering::SeqCst);
+    LOST_PINNED_FAULT.store(count("lostpinned"), Ordering::SeqCst);
+}
+
+/// Whether this result frame, built under the barrier, is lost as a
+/// device loss; the result's next restore is refused then.
+pub fn lose_pinned_frame() -> bool {
+    let n = LOST_PINNED_FAULT.load(Ordering::SeqCst);
+    let lost = n != 0 && LOST_PINNED_SEEN.fetch_add(1, Ordering::SeqCst) + 1 == n;
+    if lost {
+        RESTORE_REFUSED.store(true, Ordering::SeqCst);
+    }
+    lost
+}
+
+/// Whether this restore of the result's installation is refused (once,
+/// after [`lose_pinned_frame`]).
+pub fn refuse_result_restore() -> bool {
+    RESTORE_REFUSED.swap(false, Ordering::SeqCst)
+}
+
+/// Whether this result frame, built under the barrier, is refused.
+pub fn refuse_pinned_frame() -> bool {
+    let n = PINNED_FAULT.load(Ordering::SeqCst);
+    n != 0 && PINNED_SEEN.fetch_add(1, Ordering::SeqCst) + 1 == n
+}
+
+/// Holds the result skin's settles (the layout job's cancellation) while
+/// set (tests); [`RESULT_SETTLE_WAITING`] says one holds.
+#[cfg(test)]
+static RESULT_SETTLE_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static RESULT_SETTLE_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// Holds the result skin's settles from now on (`true`), or lets the one
+/// holding go (`false`) (tests).
+#[cfg(test)]
+pub fn hold_result_settles(on: bool) {
+    RESULT_SETTLE_HELD.store(on, Ordering::SeqCst);
+}
+
+/// Whether a settle holds now (tests).
+#[cfg(test)]
+pub fn result_settle_holding() -> bool {
+    RESULT_SETTLE_WAITING.load(Ordering::SeqCst)
+}
+
+/// Holds a settle of the result skin while [`hold_result_settles`] says so.
+#[cfg(test)]
+pub fn hold_result_settle() {
+    if !RESULT_SETTLE_HELD.load(Ordering::SeqCst) {
+        return;
+    }
+    RESULT_SETTLE_WAITING.store(true, Ordering::SeqCst);
+    while RESULT_SETTLE_HELD.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    RESULT_SETTLE_WAITING.store(false, Ordering::SeqCst);
 }
 
 /// Whether this view's text preparation is refused.

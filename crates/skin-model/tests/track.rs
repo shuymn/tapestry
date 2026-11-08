@@ -159,6 +159,88 @@ fn a_single_key_after_its_loop_point_never_draws() {
     }
 }
 
+/// Keys sharing a time (`SkinObject.java:545-575` at `0.8.9`): the last
+/// of them shows at it, and before it the track moves toward the first.
+#[test]
+fn keys_at_one_time_show_the_last_and_approach_the_first() {
+    let keys = [
+        kx(0, 0),
+        kx(100_000, 50),
+        kx(100_000, 120),
+        kx(100_000, 200),
+        kx(200_000, 300),
+    ];
+    for ease in [Ease::Linear, Ease::In, Ease::Out, Ease::Step] {
+        let t = Track::new(&keys, ease, End::Hold).unwrap();
+        assert_eq!(x_at(&t, 100_000), Some(200.0), "{ease:?}");
+        assert!(x_at(&t, 99_999).unwrap() <= 50.0, "{ease:?}");
+    }
+    let lin = Track::new(&keys, Ease::Linear, End::Hold).unwrap();
+    assert_near(x_at(&lin, 150_000), Some(250.0));
+    assert_near(x_at(&lin, 99_000), Some(49.5));
+    assert_near(x_at(&lin, 101_000), Some(201.0));
+    let step = Track::new(&keys, Ease::Step, End::Hold).unwrap();
+    assert_eq!(x_at(&step, 99_999), Some(0.0));
+    // At 0, the second of two keys shows.
+    let zero = Track::new(
+        &[kx(0, 0), kx(0, 40), kx(100_000, 140)],
+        Ease::Linear,
+        End::Hold,
+    )
+    .unwrap();
+    assert_eq!(x_at(&zero, 0), Some(40.0));
+    assert_near(x_at(&zero, 50_000), Some(90.0));
+    // An end pair under hide: the last at its time, nothing after.
+    let end = Track::new(
+        &[kx(0, 0), kx(200_000, 100), kx(200_000, 30)],
+        Ease::Linear,
+        End::Hide,
+    )
+    .unwrap();
+    assert_eq!(x_at(&end, 200_000), Some(30.0));
+    assert_eq!(x_at(&end, 200_001), None);
+}
+
+/// A negative loop point wraps in `i128`, so no time overflows: keys at
+/// 100 and 300 ms with the loop 2 s before 0 (period 2.3 s).
+#[test]
+fn a_negative_loop_point_wraps_any_time() {
+    let from = -2_000_000_i64;
+    let keys = [kx(100_000, 0), kx(300_000, 200)];
+    let t = Track::new(&keys, Ease::Linear, End::Loop { from: TimeUs(from) }).unwrap();
+    let wrapped = |us: i64| {
+        let (u, f) = (i128::from(us), i128::from(from));
+        i64::try_from(f + (u - f).rem_euclid(300_000 - f)).unwrap()
+    };
+    // `i64::MAX` wraps to −1 724 193 µs: in the gap, so nothing draws.
+    assert_eq!(wrapped(i64::MAX), -1_724_193);
+    assert_eq!(x_at(&t, i64::MAX), None);
+    // A period before, less the 1 924 193 µs from there to 200 ms.
+    assert_eq!(wrapped(i64::MAX - 375_807), 200_000);
+    assert_eq!(x_at(&t, i64::MAX - 375_807), Some(100.0));
+    assert_eq!(x_at(&t, i64::MIN), None);
+    // A period later the track shows what it showed.
+    for us in [100_000, 150_000, 299_999] {
+        assert_eq!(x_at(&t, us + 2_300_000), x_at(&t, us), "{us}");
+        assert_eq!(wrapped(us + 2_300_000), us);
+    }
+    assert_eq!(x_at(&t, 300_000), None);
+    assert_eq!(x_at(&t, 2_399_999), None);
+    assert_eq!(x_at(&t, 2_400_000), Some(0.0));
+    // The earliest loop point: `t − from` passes no bound either.
+    let far = Track::new(
+        &keys,
+        Ease::Linear,
+        End::Loop {
+            from: TimeUs(-MAX_KEY_US),
+        },
+    )
+    .unwrap();
+    assert_eq!(x_at(&far, 200_000), Some(100.0));
+    // `i64::MAX` wraps to −10 326 424 193 µs, before the first key.
+    assert_eq!(x_at(&far, i64::MAX), None);
+}
+
 #[test]
 fn loop_from_the_first_key_and_a_start_at_zero() {
     let looped = table_track(End::Loop {
@@ -280,27 +362,32 @@ fn refuses_bad_tracks() {
     let h = End::Hold;
     let lin = Ease::Linear;
     assert_eq!(Track::new(&[], lin, h), Err(TrackError::NoKeys));
-    assert_eq!(
-        Track::new(&[kx(0, 0), kx(0, 1)], lin, h),
-        Err(TrackError::NotIncreasing { index: 1 })
-    );
+    // Keys may share a time; a decrease is refused.
+    assert!(Track::new(&[kx(0, 0), kx(0, 1)], lin, h).is_ok());
     assert_eq!(
         Track::new(&[kx(0, 0), kx(10, 1), kx(5, 2)], lin, h),
         Err(TrackError::NotIncreasing { index: 2 })
+    );
+    assert_eq!(
+        Track::new(&[kx(0, 0), kx(10, 1), kx(10, 2), kx(9, 3)], lin, h),
+        Err(TrackError::NotIncreasing { index: 3 })
     );
     assert_eq!(
         Track::new(&[kx(-1, 0)], lin, h),
         Err(TrackError::NegativeStart { at: -1 })
     );
     let three = [kx(100, 0), kx(200, 1), kx(300, 2)];
-    for from in [300, -1] {
+    for from in [300, -MAX_KEY_US - 1] {
         assert_eq!(
             Track::new(&three, lin, End::Loop { from: TimeUs(from) }),
             Err(TrackError::LoopOutside { from, last: 300 })
         );
     }
-    // Before the first key is a loop point the source keeps.
-    assert!(Track::new(&three, lin, End::Loop { from: TimeUs(0) }).is_ok());
+    // Before the first key, down to 4 h before 0, is a loop point the
+    // source keeps.
+    for from in [0, -1, -MAX_KEY_US] {
+        assert!(Track::new(&three, lin, End::Loop { from: TimeUs(from) }).is_ok());
+    }
     let many: Vec<_> = (0..=MAX_TRACK_KEYS as i64).map(|i| kx(i, 0)).collect();
     assert!(Track::new(&many[..MAX_TRACK_KEYS], lin, h).is_ok());
     assert_eq!(
@@ -398,5 +485,56 @@ proptest! {
             prop_assert_eq!(looped.sample(kn), hold.sample(from));
         }
         prop_assert_eq!(hold.sample(k0 - 1), None);
+    }
+}
+
+/// Keys whose times may repeat.
+fn keys_with_repeats() -> impl Strategy<Value = Vec<KeyDef>> {
+    (
+        0..1_000_000_i64,
+        prop::collection::vec((0..3_i64, -10_000..10_000_i32), 1..8),
+    )
+        .prop_map(|(k0, steps)| {
+            let mut at = k0;
+            steps
+                .into_iter()
+                .map(|(dt, x)| {
+                    at += dt * 100_000;
+                    kx(at, x)
+                })
+                .collect()
+        })
+}
+
+proptest! {
+    /// With repeated times and any loop point from 4 h before 0, every
+    /// time samples without panicking: the last key of a shared time shows
+    /// at it, and a loop shows the held track at the time wrapped in
+    /// `i128`.
+    #[test]
+    fn repeated_times_and_negative_loops(
+        keys in keys_with_repeats(),
+        ease in ease(),
+        t in any::<i64>(),
+        back in 0..=MAX_KEY_US,
+    ) {
+        let kn = keys[keys.len() - 1].at.0;
+        let hold = Track::new(&keys, ease, End::Hold).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            let last = keys[i + 1..].iter().all(|n| n.at != k.at);
+            if last {
+                prop_assert_eq!(x_at(&hold, k.at.0), Some(k.props[0].unwrap() as f32));
+            }
+        }
+        let from = (kn - 1).min(-back);
+        let looped = Track::new(&keys, ease, End::Loop { from: TimeUs(from) }).unwrap();
+        let got = looped.sample(t);
+        if t > from {
+            let (u, f) = (i128::from(t), i128::from(from));
+            let folded = i64::try_from(f + (u - f).rem_euclid(i128::from(kn) - f)).unwrap();
+            prop_assert_eq!(got, hold.sample(folded));
+        } else {
+            prop_assert_eq!(got, hold.sample(t));
+        }
     }
 }
