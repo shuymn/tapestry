@@ -341,6 +341,16 @@ pub struct Specializing {
 }
 
 impl Specializing {
+    /// Whether its job's thread has ended, its outcome not yet taken
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn finished(&self) -> bool {
+        self.job
+            .as_ref()
+            .and_then(|j| j.handle.as_ref())
+            .is_some_and(thread::JoinHandle::is_finished)
+    }
+
     /// [`Job::wait_until`]: `quit` (the attempt's quit key) cancels it and
     /// waits for its thread's end; `end_run` cancels it and waits at most
     /// [`STOP_WAIT`]. `None` at `until` with no outcome and no signal.

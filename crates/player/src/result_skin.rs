@@ -1231,4 +1231,4 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
 }
 
 #[cfg(all(test, feature = "dev-tools"))]
-mod tests;
+pub(crate) mod tests;

@@ -32,7 +32,7 @@ fn png(dir: &Path, name: &str, w: u32, h: u32) {
 /// A result skin `s.luaskin` reading 154 as `nr` while it loads, then
 /// running `pre`, with the image list `images` (a Lua expression) of
 /// `s.png`, its EX number and a status dot.
-fn skin(pre: &str, images: &str) -> tempfile::TempDir {
+pub(crate) fn skin(pre: &str, images: &str) -> tempfile::TempDir {
     skin_reading("local nr = ms.number(154)", pre, images)
 }
 
@@ -70,14 +70,14 @@ fn target(limits: AtlasLimits) -> ImportTarget {
     }
 }
 
-const LIMITS: AtlasLimits = AtlasLimits {
+pub(crate) const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 4_096,
     max_layers: 16,
     reserved_layers: render::RESERVED_LAYERS,
 };
 
 /// The skin in `dir`, pending, its imports through its cache.
-fn pending(dir: &Path, limits: AtlasLimits) -> Arc<super::PendingResult> {
+pub(crate) fn pending(dir: &Path, limits: AtlasLimits) -> Arc<super::PendingResult> {
     let h = read_lua_header(dir, "s.luaskin", &skin_beatoraja::Cancel::new()).unwrap();
     let config = Config::defaults(h.header());
     Arc::new(super::PendingResult::new(
@@ -727,7 +727,7 @@ fn chart_reads_are_decided_before_ready() {
 }
 
 /// The image stage at `level` with judgment class `class`.
-fn staged_at(rs: &mut ResultSkin, level: i32, class: JudgeClass) {
+pub(crate) fn staged_at(rs: &mut ResultSkin, level: i32, class: JudgeClass) {
     let c = ResultChart {
         level: Some(level),
         ..chart()

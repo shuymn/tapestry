@@ -273,7 +273,7 @@ fn critical_skin(dir: &Path, entry: &str, path: &str) {
 }
 
 /// The choice of `entry` in `root`, nothing named.
-fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
+pub(crate) fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
     SkinChoice {
         root: root.into(),
         entry: entry.to_owned(),
@@ -283,7 +283,7 @@ fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
 }
 
 /// What `r` packs for, with the generated default font.
-fn target(r: &Renderer) -> ImportTarget {
+pub(crate) fn target(r: &Renderer) -> ImportTarget {
     ImportTarget {
         limits: r.atlas_limits(),
         size: [1_920, 1_080],
@@ -292,7 +292,7 @@ fn target(r: &Renderer) -> ImportTarget {
 }
 
 /// Builds `choice` as a play skin for `t`.
-fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
+pub(crate) fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
     build(ScreenKind::Play, choice, false, t, &Cancel::new())
 }
 
@@ -313,7 +313,7 @@ fn refused(o: KindOutcome) -> String {
 }
 
 #[track_caller]
-fn pending(o: KindOutcome) -> (Arc<PendingPlay>, PendingNote) {
+pub(crate) fn pending(o: KindOutcome) -> (Arc<PendingPlay>, PendingNote) {
     match o {
         KindOutcome::Pending(p, note) => (p, note),
         other => panic!("{other:?}"),
@@ -708,7 +708,7 @@ fn tagged_and_directory_choices_are_chosen_by_name() {
 
 /// A Lua play skin whose configured pass runs `body` with `ms` the host
 /// module, drawing a 64×64 red `a.png` at `x`, which `body` sets.
-fn lua_skin(body: &str) -> tempfile::TempDir {
+pub(crate) fn lua_skin(body: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let entry = format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
@@ -766,7 +766,7 @@ const FRAME_CLASS: [i32; 4] = [300, 100, 100, 100];
 /// chart (option 183) and `red.png` otherwise, at [`COLOUR`], and which
 /// draws the same image at [`FRAME_CLASS`] while a frame's `option(183)`
 /// holds.
-fn class_skin() -> tempfile::TempDir {
+pub(crate) fn class_skin() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let [x, y, w, h] = COLOUR;
     let [fx, fy, fw, fh] = FRAME_CLASS;

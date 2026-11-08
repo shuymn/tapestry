@@ -966,6 +966,9 @@ impl PlayerRig<'_> {
     /// must stay open until the process exits.
     #[must_use]
     pub fn shut_down(mut self) -> RenderEnd {
+        // A preparation still running settles its job before the render
+        // thread and the skins go.
+        self.drop_prep();
         self.persist();
         let ended = self.render.exit();
         self.audio.exit();
@@ -1556,8 +1559,16 @@ impl Rig for PlayerRig<'_> {
                         Some(Err(e)) => break Err(e),
                     }
                 }
-                PrepStage::Ended(ended) => break Ok(game::PrepPoll::Done(ended)),
-                PrepStage::Answered(_) => break Err(ScreenError::Lost),
+                // Ended or answered: it stays so, for its final readiness
+                // and its commit, however often it is polled again.
+                PrepStage::Ended(ended) => {
+                    prep.stage = PrepStage::Ended(ended.clone());
+                    break Ok(game::PrepPoll::Done(ended));
+                }
+                PrepStage::Answered(request) => {
+                    prep.stage = PrepStage::Answered(request);
+                    break Err(ScreenError::Lost);
+                }
             }
         };
         self.prep = Some(prep);
@@ -2295,6 +2306,173 @@ mod tests {
     use game::Command;
 
     use super::{until_due, until_fired};
+
+    /// The player's rig's preparation (design.md "Play Lifecycle",
+    /// preparing each attempt): it owns its jobs, and its answer stays
+    /// for its final readiness.
+    mod preparation {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use game::Rig as _;
+        use skin_beatoraja::JudgeClass;
+        use skin_beatoraja::lua::vm_hooks;
+
+        use crate::imports::facts::tests::loaded;
+        use crate::imports::tests as imports;
+        use crate::play::PrepStage;
+        use crate::render_side::ScreenError;
+        use crate::render_side::tests::{Installers, bundle};
+        use crate::result_skin::tests as result;
+        use crate::result_skin::{ResultSkin, ResultStart};
+
+        fn settings() -> game::Settings {
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            }
+        }
+
+        /// A render thread with `loaded`'s chart.
+        fn render(loaded: &game::Loaded) -> crate::render_side::RenderLink {
+            Installers::default().spawn(&Arc::new(loaded.chart().clone()), &bundle())
+        }
+
+        /// The stage the rig's preparation stands at.
+        fn stage<'r>(rig: &'r crate::play::PlayerRig<'_>) -> Option<&'r PrepStage> {
+            rig.prep.as_ref().map(|p| &p.stage)
+        }
+
+        /// A pending play skin built from `body`.
+        fn pending_play(body: &str) -> (tempfile::TempDir, crate::imports::PendingSkin) {
+            let r = crate::render_common::offscreen(1_920, 1_080);
+            let t = imports::target(&r);
+            let dir = imports::lua_skin(body);
+            let (p, _) = imports::pending(imports::play(
+                &imports::choice(dir.path(), "play.luaskin"),
+                &t,
+            ));
+            (dir, crate::imports::PendingSkin::new(p))
+        }
+
+        /// A rig shut down while its preparation's specialization runs
+        /// settles the job through the preparation's drop: cancelled, its
+        /// thread joined and its VM closed.
+        #[test]
+        fn a_rig_shut_down_mid_specialization_settles_its_job() {
+            let _serial = imports::serial();
+            let (_dir, skin) = pending_play("if ms.number(96) == 12 then while true do end end");
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            let base = vm_hooks::live();
+            let before = imports::jobs_counted();
+            let (began, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.pending = Some(skin);
+                    let _handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    matches!(stage(rig), Some(PrepStage::Skin(_)))
+                });
+            assert!(began, "the specialization runs");
+            let after = imports::jobs_counted();
+            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+            assert_eq!(vm_hooks::live(), base);
+        }
+
+        /// A preparation discarded once its specialization has ended,
+        /// its outcome not taken, keeps the specialization: the next
+        /// preparation with the same facts reuses it, with no job.
+        #[test]
+        fn a_discarded_preparation_keeps_its_finished_specialization() {
+            let _serial = imports::serial();
+            let r = crate::render_common::offscreen(1_920, 1_080);
+            let t = imports::target(&r);
+            let dir = imports::class_skin();
+            let (p, _) = imports::pending(imports::play(
+                &imports::choice(dir.path(), "play.luaskin"),
+                &t,
+            ));
+            let loaded = loaded("#RANK 2\n", "tapestry");
+            let before = imports::jobs_counted();
+            let ((ran, reused), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.pending = Some(crate::imports::PendingSkin::new(p));
+                    let _first = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let ran = matches!(stage(rig), Some(PrepStage::Skin(_)));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !matches!(stage(rig), Some(PrepStage::Skin(job)) if job.finished())
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    rig.discard_attempt();
+                    let _second = rig.begin_preparation(&loaded, loaded.prep_key());
+                    (ran, !matches!(stage(rig), Some(PrepStage::Skin(_))))
+                });
+            assert!(ran, "the first preparation runs the specialization");
+            assert!(reused, "the second reuses it");
+            assert_eq!(imports::jobs_counted().0 - before.0, 1);
+        }
+
+        /// A preparation discarded while the result skin's image stage
+        /// runs hands the stage's images back to the result skin.
+        #[test]
+        fn a_discarded_preparation_hands_the_image_stages_images_back() {
+            let _serial = imports::serial();
+            let d = result::skin(
+                "if ms.number(96) == 13 then while true do end end",
+                "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+            );
+            let p = result::pending(d.path(), result::LIMITS);
+            let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+            result::staged_at(&mut rs, 12, JudgeClass::Normal);
+            assert!(rs.image().is_some(), "the probe's images");
+            let loaded = loaded("#PLAYLEVEL 13\n", "tapestry");
+            let ((ran, back), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.result_skin = rs;
+                    let _handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let ran = matches!(stage(rig), Some(PrepStage::Image(..)));
+                    rig.discard_attempt();
+                    (ran, rig.result_skin.image().is_some())
+                });
+            assert!(ran, "the image stage runs");
+            assert!(back, "its images handed back");
+        }
+
+        /// A poll with another preparation's ticket leaves the rig's
+        /// preparation in place, and a poll after it ended keeps its
+        /// answer: its final readiness is still ready.
+        #[test]
+        fn a_foreign_or_late_poll_keeps_the_preparation() {
+            let loaded = loaded("", "tapestry");
+            let ((foreign, ended, late, ready), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let mut handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let mut other = game::PrepHandle::new(loaded.prep_key(), handle.ticket() + 1);
+                    let foreign = matches!(
+                        rig.poll_preparation(&mut other, Instant::now()),
+                        Err(ScreenError::Lost)
+                    );
+                    let ended = loop {
+                        let until = Instant::now() + Duration::from_millis(10);
+                        if let game::PrepPoll::Done(ended) =
+                            rig.poll_preparation(&mut handle, until).unwrap()
+                        {
+                            break ended;
+                        }
+                    };
+                    let late = matches!(
+                        rig.poll_preparation(&mut handle, Instant::now()),
+                        Err(ScreenError::Lost)
+                    );
+                    let ready = matches!(rig.ready_attempt(1, &handle), Ok(game::Readiness::Ready));
+                    (foreign, ended, late, ready)
+                });
+            assert!(foreign, "another ticket's poll is lost");
+            assert_eq!(ended, game::Preparation::Ready);
+            assert!(late, "a poll after the end answers nothing new");
+            assert!(ready, "the answered request stays");
+        }
+    }
 
     /// The awake time the marker wait reads, set by the test.
     static AWAKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
