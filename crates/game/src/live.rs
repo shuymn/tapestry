@@ -1127,8 +1127,9 @@ const PREP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
 /// is read again with the screen's structural inputs now, and a changed
 /// key begins the preparation again at once; an unchanged one (the
 /// staging lost with nothing structural changed) ends the run with the
-/// screen's error and is never retried. Each retry needs a real
-/// structural change, so none is capped.
+/// screen's error and is never retried. Before either, a thread's
+/// failure, a failed screen, a quit or a close ends it as at the commit.
+/// Each retry needs a real structural change, so none is capped.
 ///
 /// # Errors
 ///
@@ -1159,6 +1160,14 @@ fn prepare_attempt<R: Rig>(
         {
             Readiness::Ready => return Ok(Preparation::Ready),
             Readiness::Stale(stale) => {
+                // What ends the run or the play comes first, as at the
+                // commit: a thread's failure, then a screen that failed
+                // after the staging (the preparation begun again would
+                // build it again and hide it), then a quit or a close.
+                preflight(rig)?;
+                if rig.quitting() || rig.take() == Some(Command::Quit) {
+                    return Ok(Preparation::Cancelled);
+                }
                 let now = loaded.prep_key().with_screen(stale.screen);
                 if now == *handle.key() {
                     return Err(LiveError::Screen(stale.lost));
