@@ -91,9 +91,10 @@ pub enum End {
     Hold,
     /// Nothing: drawn while `t ≤ kn`.
     Hide,
-    /// Loops back to `from` (`k0 ≤ from < kn`): for `t > from`, the track
+    /// Loops back to `from` (`0 ≤ from < kn`): for `t > from`, the track
     /// shows `from + (t − from) mod (kn − from)`, so `kn` already shows
-    /// `from`.
+    /// `from`. A loop point before the first key leaves a gap each period
+    /// where nothing draws, as before the first key.
     Loop { from: TimeUs },
 }
 
@@ -131,8 +132,8 @@ pub enum TrackError {
     NotIncreasing { index: usize },
     #[error("key {index} is after {MAX_KEY_US} µs")]
     KeyTooLate { index: usize },
-    #[error("the loop point {from} µs is outside [{first}, {last}) µs")]
-    LoopOutside { from: i64, first: i64, last: i64 },
+    #[error("the loop point {from} µs is outside [0, {last}) µs")]
+    LoopOutside { from: i64, last: i64 },
     #[error("key {index}'s {prop:?} is out of range")]
     OutOfRange { index: usize, prop: Prop },
 }
@@ -141,7 +142,7 @@ impl Track {
     /// Validates and densifies `keys` (stage3.md R2): 1 to
     /// [`MAX_TRACK_KEYS`] keys, checked before anything is allocated, at
     /// strictly increasing times from 0 to [`MAX_KEY_US`]; a loop point in
-    /// `[k0, kn)`; color and alpha in `0..=255`, geometry and angle within
+    /// `[0, kn)`; color and alpha in `0..=255`, geometry and angle within
     /// ±[`MAX_GEOMETRY`].
     ///
     /// # Errors
@@ -168,11 +169,10 @@ impl Track {
             return Err(TrackError::KeyTooLate { index });
         }
         if let End::Loop { from } = end
-            && !(first.at <= from && from < last.at)
+            && !(0 <= from.0 && from < last.at)
         {
             return Err(TrackError::LoopOutside {
                 from: from.0,
-                first: first.at.0,
                 last: last.at.0,
             });
         }
@@ -241,8 +241,11 @@ impl Track {
     }
 
     /// The track at local time `t_us` (µs since its timer started), or
-    /// `None` when it is not drawn: before the first key, or after the last
-    /// under [`End::Hide`]. Allocates nothing and never panics.
+    /// `None` when it is not drawn: before the first key, after the last
+    /// under [`End::Hide`], or where a loop wraps to before the first key
+    /// (`SkinObject.java:358-374` at `0.8.9`: the time wraps first, then a
+    /// time before the first key draws nothing). Allocates nothing and
+    /// never panics.
     #[must_use]
     pub fn sample(&self, t_us: i64) -> Option<Sample> {
         let (&k0, &kn) = (self.at.first()?, self.at.last()?);
@@ -254,12 +257,13 @@ impl Track {
             End::Hold => t_us,
             End::Hide if t_us > kn => return None,
             End::Hide => t_us,
-            // `from ≥ k0 ≥ 0` and `t_us > from`, so neither subtraction
+            // `from ≥ 0` and `t_us > from`, so neither subtraction
             // overflows, and `kn − from > 0`.
             End::Loop { from } if t_us > from.0 => from.0 + (t_us - from.0).rem_euclid(kn - from.0),
             End::Loop { .. } => t_us,
         };
-        // `t ≥ k0`, so at least one key is at or before it.
+        // A loop point before the first key wraps into the gap before it:
+        // no key is at or before such a `t`, so it draws nothing.
         let i = self.at.partition_point(|&k| k <= t).checked_sub(1)?;
         let a = self.v.get(i)?;
         let (Some(&at_a), Some(&at_b), Some(b)) =

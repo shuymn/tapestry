@@ -117,6 +117,10 @@ pub struct ResultChart {
     pub bpm: Option<ResultBpm>,
     /// Its `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,
+    /// Its length at 1×: its last note's end or BGM event, whichever is
+    /// later, the source's `SongData.getLastTime()`
+    /// (`IntegerPropertyFactory.java:473-478`), whatever section or speed
+    /// is played.
     pub length: Option<TimeUs>,
     /// The judged notes of the draw played, the source's total notes
     /// (`IntegerPropertyFactory.java:562-576`): the chart's, under every
@@ -147,6 +151,9 @@ pub struct ResultScore {
     pub rate: Option<ResultRate>,
     /// The EX score to the next grade step, or to the largest.
     pub next_rank: u32,
+    /// The mean absolute duration of the result's notes in µs, the
+    /// source's penalized mean (numbers 372 and 373); `None` with no note.
+    pub duration_us: Option<u32>,
 }
 
 impl Default for ResultScore {
@@ -158,6 +165,7 @@ impl Default for ResultScore {
             cleared: false,
             rate: None,
             next_rank: 0,
+            duration_us: None,
         }
     }
 }

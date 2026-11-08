@@ -211,6 +211,11 @@ pub struct ChartMeta {
     pub judgment_headers: Vec<JudgmentHeader>,
     /// The long-note judgment mode, if declared.
     pub ln_mode: Option<LnMode>,
+    /// The chart's length at 1×, at whatever speed it is loaded: the
+    /// latest of every note's end and every BGM event's time
+    /// ([`ChartSummary::length`] of the 1× chart). The loader fills it; a
+    /// chart built in code leaves it at 0.
+    pub length: TimeUs,
 }
 
 /// What identifies the chart a play used. The loader fills it; a chart built

@@ -105,9 +105,10 @@ mod widget;
 
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
-    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasLimits, CELL_TABLE_BYTES, FILE_TABLE_BYTES,
-    GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS,
-    PAGE_SIDE_STEP, PackedPages, Page, Variant, cell_fits_page, downsample_rgba,
+    ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasId, AtlasLimits, CELL_TABLE_BYTES,
+    FILE_TABLE_BYTES, GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE,
+    MIN_TEXT_SIDE, MIP_LEVELS, PAGE_SIDE_STEP, PackedPages, Page, Variant, cell_fits_page,
+    downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 #[cfg(feature = "dev-tools")]
@@ -178,7 +179,10 @@ pub use result::view::{
     ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines, TimelinesError, TimingStats,
     Unavailable,
 };
-pub use result::{ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers};
+pub use result::{
+    MAX_RESULT_OUTRO, ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers,
+    ResultTiming,
+};
 pub use schema::{EnumDef, EnumId, Export, Field, FieldTy, Schema, SchemaError, TimerDef, Ty};
 pub use screen::ScreenKind;
 pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};

@@ -5,11 +5,6 @@
 //! `skin_model`'s result types, with each lamp and the gauge given its
 //! gauge's look under the view's preset. `skin_model` holds no `game` type and `game` no library type,
 //! so the conversion is the player's.
-// S10-09i installs the result view; until then only the tests read it.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "S10-09i installs the result view")
-)]
 
 use game::{BestCompare, BestLamp, Rate, ResultBasis, ResultGraphs, ViewSummary};
 use rules::RulePreset;
@@ -53,6 +48,7 @@ pub fn result_parts(
             cleared: f.cleared,
             rate: f.rate.map(rate),
             next_rank: f.next_rank,
+            duration_us: f.duration_us,
         },
         notes: f.notes,
         best: match summary.best {
@@ -210,6 +206,7 @@ mod tests {
                 clear: BestLamp::Cleared { gauge: 1 },
                 cleared: true,
                 gauge_permille: 1,
+                duration_us: Some(505_000),
                 timing: Some(game::TimingStats {
                     samples: 4,
                     mean_x100: -75,
@@ -271,6 +268,7 @@ mod tests {
             })
         );
         assert_eq!(parts.score.next_rank, 67);
+        assert_eq!(parts.score.duration_us, Some(505_000));
         let BestView::Known(b) = parts.best else {
             panic!("{:?}", parts.best);
         };

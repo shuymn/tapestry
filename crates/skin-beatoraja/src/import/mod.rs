@@ -34,8 +34,8 @@ use bms_model::TimeUs;
 use skin_model::{
     Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
     LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef, ResultDefs,
-    Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs,
-    compile, timer as slot,
+    ResultTiming, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty,
+    WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -1820,15 +1820,52 @@ impl<'d> Cx<'d> {
         Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
     }
 
+    /// A result skin's declared timing (design.md "State Model", Result),
+    /// from the top-level `fadeout`, `input` and `scene` in ms
+    /// (`JsonSkin.java:14-16`, each 0 when absent; a Lua skin's table
+    /// converts to the same fields, `LuaSkinLoader.java:90`), in µs: a
+    /// negative value is 0, a `scene` of 0 or below is none, and a
+    /// `fadeout` past [`skin_model::MAX_RESULT_OUTRO`] is clamped to it
+    /// with a deviation note. Each is read as every integer field is: a
+    /// value the reader refuses (`null`, a string that is no number, one
+    /// past `i32`) refuses the import.
+    fn result_timing(&mut self) -> Result<ResultTiming, ImportError> {
+        let us = |ms: i32| TimeUs(i64::from(ms.max(0)) * 1_000);
+        let fadeout = self.top_int("fadeout", 0)?;
+        let input = self.top_int("input", 0)?;
+        let scene = self.top_int("scene", 0)?;
+        let mut outro = us(fadeout);
+        if outro > skin_model::MAX_RESULT_OUTRO {
+            outro = skin_model::MAX_RESULT_OUTRO;
+            let [f] = self.def.fields(self.def.top(), ["fadeout"]);
+            let at = f.map(|f| self.arena_span(f));
+            self.note(
+                at,
+                Severity::Deviation,
+                NoteKind::OutroClamped {
+                    declared_ms: fadeout,
+                },
+            );
+        }
+        Ok(ResultTiming {
+            outro,
+            input: us(input),
+            scene: (scene > 0).then(|| us(scene)),
+        })
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
         let selection = self.kind == ScreenKind::Selection;
         let result = self.kind == ScreenKind::Result;
         if selection {
             self.selection_essentials()?;
         }
-        if result {
+        let timing = if result {
             self.result_essentials()?;
-        }
+            self.result_timing()?
+        } else {
+            ResultTiming::default()
+        };
         let (bomb_up_to, close) = if selection || result {
             (None, None)
         } else {
@@ -1869,6 +1906,7 @@ impl<'d> Cx<'d> {
                     judge_graphs: std::mem::take(&mut self.judge_graphs),
                     gauge_graphs: std::mem::take(&mut self.gauge_graphs),
                     timing_graphs: std::mem::take(&mut self.timing_graphs),
+                    timing,
                 };
                 Skin::new_result(def, widgets)
             }
