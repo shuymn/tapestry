@@ -10,7 +10,7 @@ use bms_model::{ChartBuilder, TimeUs};
 use result_support::labels;
 use selection_support::{frame_of, rect, skin_def, uvs};
 use skin_model::{
-    Attempt, Blend, BuildError, ChartMetadata, DECISION, DecisionError, DecisionFrame,
+    Attempt, Blend, BuildError, ChartMetadata, ChartText, DECISION, DecisionError, DecisionFrame,
     DecisionScreen, DecisionTimers, ElementDef, FontRef, ImageChoiceDef, ImageChoicePart,
     ImageSpan, KeyDef, Layout, LoadError, Overflow, PastTable, Place, PlayContext, PrepareError,
     Program, QuadBatch, ResultLabels, Scope, ScreenKind, SelectionText, Side, Skin, SkinDef,
@@ -150,6 +150,10 @@ fn a_decision_skin_refuses_what_other_screens_draw() {
     ];
     let skin = Skin::new_decision(skin_def(ok.clone(), widgets())).unwrap();
     assert_eq!(skin.kind(), ScreenKind::Decision);
+    // The constant choice draws its entry 1: image 1's first frame.
+    let mut fx = DFx::new(skin_def(ok.clone(), widgets()));
+    fx.frame(0);
+    assert_eq!(fx.at_y(20.0), [(Some((1, 0)), 1.0)]);
     for refused in [
         Source::Lanes,
         Source::Number(0),
@@ -277,6 +281,25 @@ fn decision_entry_points_refuse_other_kinds() {
     fx.skin.update_decision(&mut fx.dec, &labels()).unwrap();
     fx.frame(0);
     assert_eq!(fx.at_y(0.0), [(Some((0, 0)), 1.0)]);
+    // A build of another skin's state, or with another sheet's uv table,
+    // draws nothing.
+    let frame = DecisionFrame {
+        now: TimeUs(0),
+        target: fx.target,
+        layout: &fx.layout,
+        timers: fx.timers,
+    };
+    fx.batch.clear();
+    fx.skin
+        .build_decision(&mut foreign, &frame, &fx.uvs, &mut fx.batch)
+        .unwrap();
+    assert!(fx.batch.quads().is_empty());
+    let other_uvs = uvs(&Skin::new_decision(skin_def(elements(), WidgetDefs::default())).unwrap());
+    assert_ne!(other_uvs.sheet_id(), fx.uvs.sheet_id());
+    fx.skin
+        .build_decision(&mut fx.dec, &frame, &other_uvs, &mut fx.batch)
+        .unwrap();
+    assert!(fx.batch.quads().is_empty());
 }
 
 /// The text elements show the chosen chart's labels as play builds them,
@@ -428,26 +451,27 @@ fn decision_bitmap_text_follows_the_labels() {
         },
     );
     def.sheet = b.finish();
-    let skin = Skin::new_decision(def).unwrap();
+    let skin = Skin::new_decision(def.clone()).unwrap();
     let mut dec = skin.prepare_decision();
-    let uvs = skin
-        .sheet()
-        .atlas(
-            skin_model::Variant::Lo,
-            skin_model::AtlasLimits {
-                max_side: 2_048,
-                max_layers: 4,
-                reserved_layers: 1,
-            },
-            &|| false,
-        )
-        .unwrap()
-        .into_parts()
-        .1;
-    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let atlas_uvs = |skin: &Skin| {
+        skin.sheet()
+            .atlas(
+                skin_model::Variant::Lo,
+                skin_model::AtlasLimits {
+                    max_side: 2_048,
+                    max_layers: 4,
+                    reserved_layers: 1,
+                },
+                &|| false,
+            )
+            .unwrap()
+            .into_parts()
+            .1
+    };
+    let uvs = atlas_uvs(&skin);
     let layout = Layout::AUTHOR;
-    let mut glyphs_at = |dec: &mut DecisionScreen| {
-        batch.clear();
+    let glyphs_of = |skin: &Skin, uvs: &UvTable, dec: &mut DecisionScreen| {
+        let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         let frame = DecisionFrame {
             now: TimeUs(0),
             target: [1_920, 1_080],
@@ -457,12 +481,13 @@ fn decision_bitmap_text_follows_the_labels() {
                 fadeout: None,
             },
         };
-        skin.build_decision(dec, &frame, &uvs, &mut batch).unwrap();
+        skin.build_decision(dec, &frame, uvs, &mut batch).unwrap();
         // Each line's glyphs sit above its box's bottom: the title's
         // (box at y 0) above y 20, the genre's (box at y 40) below it.
         let first = batch.quads().iter().filter(|q| q.rect[1] < 20.0).count();
         [first, batch.quads().len() - first]
     };
+    let glyphs_at = |dec: &mut DecisionScreen| glyphs_of(&skin, &uvs, dec);
     let chosen = |title: &str, genre: &str| ResultLabels {
         title: title.to_owned(),
         genre: genre.to_owned(),
@@ -476,11 +501,82 @@ fn decision_bitmap_text_follows_the_labels() {
         .unwrap();
     skin.attach_decision_bitmap_text(&mut dec);
     assert_eq!(glyphs_at(&mut dec), [2, 4]);
-    // A state of another skin is left as it is.
-    let mut foreign = Skin::new_decision(skin_def(vec![], WidgetDefs::default()))
-        .unwrap()
-        .prepare_decision();
+    // Control characters are dropped before a line is cut, as play does:
+    // 511 tabs between two glyphs leave both.
+    let tabs = format!("A{}B", "\t".repeat(511));
+    skin.update_decision(&mut dec, &chosen(&tabs, "B")).unwrap();
+    skin.attach_decision_bitmap_text(&mut dec);
+    assert_eq!(glyphs_at(&mut dec), [2, 1]);
+    // A state of another skin of the same definition is left as it is:
+    // its own skin still draws no glyph for it.
+    let other = Skin::new_decision(def).unwrap();
+    let other_uvs = atlas_uvs(&other);
+    let mut foreign = other.prepare_decision();
+    other
+        .update_decision(&mut foreign, &chosen("AB", "B"))
+        .unwrap();
     skin.attach_decision_bitmap_text(&mut foreign);
+    assert_eq!(glyphs_of(&other, &other_uvs, &mut foreign), [0, 0]);
+    other.attach_decision_bitmap_text(&mut foreign);
+    assert_eq!(glyphs_of(&other, &other_uvs, &mut foreign), [2, 1]);
+}
+
+/// The labels' lines are play's for the same strings: control characters
+/// dropped before a line is cut (511 tabs inside a 513-byte title), a field
+/// of control characters alone still joined as written, a long field cut.
+#[test]
+fn decision_text_matches_plays_lines() {
+    let fields = [
+        TextField::Title,
+        TextField::Subtitle,
+        TextField::FullTitle,
+        TextField::Genre,
+        TextField::Artist,
+        TextField::Subartist,
+        TextField::FullArtist,
+    ];
+    let elements = (0..fields.len())
+        .map(|i| {
+            let i = u32::try_from(i).unwrap();
+            delement(
+                Source::Text(i),
+                [0, 30 * i32::try_from(i).unwrap(), 300, 20],
+            )
+        })
+        .collect();
+    let widgets = WidgetDefs {
+        texts: fields.iter().map(|&f| text(TextValue::Field(f))).collect(),
+        ..WidgetDefs::default()
+    };
+    let mut fx = DFx::new(skin_def(elements, widgets));
+    let raw = ResultLabels {
+        title: format!("A{}B", "\t".repeat(511)),
+        subtitle: "\t".to_owned(),
+        artist: "é".repeat(400),
+        subartist: format!("\u{7}{}", "y".repeat(600)),
+        genre: "\n\n".to_owned(),
+    };
+    assert_eq!(raw.title.len(), 513);
+    fx.skin.update_decision(&mut fx.dec, &raw).unwrap();
+    let decision = fx
+        .skin
+        .decision_text_requests(&fx.dec, fx.target, &fx.layout);
+    let play = fx.skin.text_requests(
+        &ChartText {
+            title: &raw.title,
+            subtitle: &raw.subtitle,
+            artist: &raw.artist,
+            subartist: &raw.subartist,
+            genre: &raw.genre,
+        },
+        fx.target,
+        &fx.layout,
+    );
+    let lines = |r: &[skin_model::TextRequest]| -> Vec<(u16, String)> {
+        r.iter().map(|r| (r.slot, r.text.clone())).collect()
+    };
+    assert_eq!(lines(&decision), lines(&play));
+    assert_eq!(decision.first().map(|r| r.text.as_str()), Some("AB"));
 }
 
 /// The fade-out follows the scene: an element on the fade-out timer, its
