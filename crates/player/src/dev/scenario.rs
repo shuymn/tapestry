@@ -1764,6 +1764,7 @@ mod tests {
     ) -> game::PlayReport {
         let preset = rules::tapestry();
         let record = finalized.map(|f| replay::PlayRecord {
+            start_tuning: Some(replay::StartTuning::default()),
             versions: replay::Versions {
                 evaluator: 1,
                 app: "0.0.0-test".to_owned(),
@@ -2774,6 +2775,7 @@ mod tests {
         };
         let profile = game::DeviceSettings::default().profile(&[input::DeviceKind::Keyboard], &[]);
         let rec = PlayRecord {
+            start_tuning: Some(replay::StartTuning::default()),
             versions: Versions {
                 evaluator: 1,
                 app: "test".to_owned(),

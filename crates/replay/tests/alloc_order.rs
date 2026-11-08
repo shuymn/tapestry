@@ -83,6 +83,8 @@ fn capture(origin: i64) -> PlayRecord {
         })
         .collect();
     PlayRecord {
+        // A capture cancelled before playback has no starting tuning.
+        start_tuning: None,
         versions: Versions {
             evaluator: 1,
             app: "0.1.0".to_owned(),

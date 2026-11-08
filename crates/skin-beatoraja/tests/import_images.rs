@@ -460,12 +460,12 @@ fn cut(src: &str, dst: &str) -> common::Loaded {
 }
 
 /// A cut 10 texels wider than its 800-wide file: drawn at its whole
-/// frame, the file's 800 columns stretched over it, with one D22 note for
-/// each destination drawing it.
+/// frame, its last ten columns repeating the file's last column, as the
+/// source's texture clamped to its edge samples them
+/// (`JsonSkinObjectLoader.java:601-621`), with no note.
 #[test]
-fn a_cut_past_the_file_s_edge_is_stretched_with_a_note() {
-    // `j` is a real 800-wide cut of the same file: never noted, whichever
-    // destination reads it.
+fn a_cut_past_the_file_s_edge_repeats_its_edge() {
+    // `j` is a real 800-wide cut of the same file.
     let loaded = common::import_sized(
         [1_920, 1_080],
         r#""source": [{"id": "b", "path": "b.png"}],
@@ -477,13 +477,9 @@ fn a_cut_past_the_file_s_edge_is_stretched_with_a_note() {
                            {"id": "j", "dst": [{"y": 300, "w": 800, "h": 60}]}]"#,
         &[("b.png", 800, 300)],
     );
-    assert_eq!(
-        common::kinds(loaded.report()),
-        [NoteKind::Deviation(DeviationId::D22); 2]
-    );
-    // The file's last ten columns red: the stretched frame samples red at
-    // its right end and not at its middle, the file's 800 columns spread
-    // over the frame's 810.
+    assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
+    // The file's last ten columns red: the frame samples blue at its
+    // middle and at column 785, red from column 790 to its right end.
     common::png_with(loaded.dir.path(), "b.png", 800, 300, |x, _| {
         if x >= 790 {
             [255, 0, 0, 255]
@@ -500,16 +496,16 @@ fn a_cut_past_the_file_s_edge_is_stretched_with_a_note() {
     let q = quads[0];
     assert_eq!((q.rect[2], q.rect[3]), (810.0, 60.0));
     let at = |fu| common::play::texel_at(&atlas, &q, fu, 0.5)[0];
-    assert_eq!((at(0.5), at(0.995)), (0, 255));
-    // At 791/810 across, the file's column 791 · 800/810 ≈ 781: not red,
-    // where an unstretched cut would sample column 791.
-    assert_eq!(at(791.0 / 810.0), 0);
+    assert_eq!(
+        (at(0.5), at(785.5 / 810.0), at(791.0 / 810.0), at(0.995)),
+        (0, 0, 255, 255)
+    );
 }
 
-/// An image set's entry cut past its file's edge is noted for each
-/// destination drawing the set, its cached image reused.
+/// An image set's entry cut past its file's edge draws for each
+/// destination drawing the set, its cached image reused, with no note.
 #[test]
-fn a_set_entry_past_the_file_s_edge_is_noted_each_time() {
+fn a_set_entry_past_the_file_s_edge_draws_each_time() {
     let loaded = common::import_sized(
         [1_920, 1_080],
         r#""source": [{"id": "b", "path": "b.png"}],
@@ -519,10 +515,8 @@ fn a_set_entry_past_the_file_s_edge_is_noted_each_time() {
                            {"id": "s", "dst": [{"y": 100, "w": 810, "h": 60}]}]"#,
         &[("b.png", 800, 300)],
     );
-    assert_eq!(
-        common::kinds(loaded.report()),
-        [NoteKind::Deviation(DeviationId::D22); 2]
-    );
+    assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
+    assert_eq!(loaded.quads(0).len(), 2);
 }
 
 /// A critical EX score whose glyphs are cut `src` from the 120×20 `n.png`.
@@ -533,11 +527,11 @@ fn critical(src: &str) -> common::Loaded {
     ))
 }
 
-/// A mirrored source rectangle drops a decorative element and refuses a
-/// critical one, with its own reason; one frame partly past its file's
-/// edge is drawn, its in-file part stretched to the frame, with a D22
-/// note; `-1` sizes still take the whole file
-/// (`JsonSkinObjectLoader.java:600-619`).
+/// A mirrored source rectangle, or one starting left of or above its
+/// file, drops a decorative element and refuses a critical one, with its
+/// own reason; a cut starting inside its file and running past its right
+/// or bottom edge is drawn with no note, a grid of frames included; `-1`
+/// sizes still take the whole file (`JsonSkinObjectLoader.java:600-619`).
 #[test]
 fn mirrored_or_outside_source_rects() {
     for src in [r#""x": -1, "w": 32, "h": 32"#, r#""w": -2, "h": 32"#] {
@@ -555,11 +549,7 @@ fn mirrored_or_outside_source_rects() {
         r#""w": 65, "h": 64"#,
     ] {
         let loaded = cut(src, "");
-        assert_eq!(
-            common::kinds(loaded.report()),
-            [NoteKind::Deviation(DeviationId::D22)],
-            "{src}"
-        );
+        assert!(loaded.report().notes.is_empty(), "{src}");
         assert_eq!(loaded.quads(0).len(), 1, "{src}");
     }
     for src in [r#""x": 32, "w": 32, "h": 64"#, r#""w": -1, "h": -1"#] {
@@ -567,18 +557,17 @@ fn mirrored_or_outside_source_rects() {
         assert!(loaded.report().notes.is_empty(), "{src}");
         assert_eq!(loaded.quads(0).len(), 1, "{src}");
     }
-    // Only the cells cut must lie inside: ten 11-px cells of a 116-px
-    // strip at x 4 stay in the 120-px file, ten 12-px ones leave it.
-    assert!(
-        critical(r#""x": 4, "w": 116, "h": 20"#)
-            .report()
-            .notes
-            .is_empty()
-    );
+    // A critical grid starting inside the file: ten 11-px cells of a
+    // 116-px strip at x 4 stay in the 120-px file, ten 12-px ones run 4
+    // px past it, both drawn; one starting above it is refused.
     for src in [
+        r#""x": 4, "w": 116, "h": 20"#,
         r#""x": 4, "w": 120, "h": 20"#,
-        r#""y": -20, "w": 120, "h": 20"#,
     ] {
+        assert!(critical(src).report().notes.is_empty(), "{src}");
+    }
+    {
+        let src = r#""y": -20, "w": 120, "h": 20"#;
         let e = critical(src).err();
         assert!(
             matches!(
@@ -611,6 +600,64 @@ fn painted_at(l: common::Loaded, ms: i64, at: &[(f32, f32)]) -> Vec<Vec<[u8; 4]>
                 .collect()
         })
         .collect()
+}
+
+/// Cuts starting inside the 64×64 `a.png` and running past its right or
+/// bottom edge, per axis: each texel past the file repeats the file's
+/// nearest edge texel, as the source's texture clamped to its edge samples
+/// (`JsonSkinObjectLoader.java:601-621`), for a grid's frames on either
+/// axis and a frame past both edges; a frame wholly right of the file and
+/// partly below it keeps its edge column, padded down its rows. None is
+/// noted.
+#[test]
+fn cuts_past_the_edge_repeat_it_per_axis() {
+    let c = common::coord;
+    let one = |src: &str, ms: i64, at: &[(f32, f32)]| {
+        let loaded = cut(src, "");
+        assert!(
+            loaded.report().notes.is_empty(),
+            "{src}: {:?}",
+            loaded.report()
+        );
+        let got = painted_at(loaded, ms, at);
+        assert_eq!(got.len(), 1, "{src}");
+        got.into_iter().next().unwrap()
+    };
+    // Two 20-px columns from x 40, cycling over 1 s: frame 1 (500 ms)
+    // covers columns 60 to 79, the file's 63 from 64 on.
+    let cols = r#""x": 40, "w": 40, "h": 64, "divx": 2, "cycle": 1000"#;
+    let across = [(2.5 / 20.0, 0.5), (10.5 / 20.0, 0.5), (19.5 / 20.0, 0.5)];
+    assert_eq!(one(cols, 500, &across), [c(62, 32), c(63, 32), c(63, 32)]);
+    assert_eq!(one(cols, 0, &across), [c(42, 32), c(50, 32), c(59, 32)]);
+    // The same down two 20-px rows from y 40.
+    let rows = r#""y": 40, "w": 64, "h": 40, "divy": 2, "cycle": 1000"#;
+    let down = [(0.5, 2.5 / 20.0), (0.5, 10.5 / 20.0), (0.5, 19.5 / 20.0)];
+    assert_eq!(one(rows, 500, &down), [c(32, 62), c(32, 63), c(32, 63)]);
+    // One 30-px frame from (50, 50): past both edges.
+    let corner = [
+        (5.5 / 30.0, 5.5 / 30.0),
+        (20.5 / 30.0, 20.5 / 30.0),
+        (5.5 / 30.0, 20.5 / 30.0),
+    ];
+    assert_eq!(
+        one(r#""x": 50, "y": 50, "w": 30, "h": 30"#, 0, &corner),
+        [c(55, 55), c(63, 63), c(55, 63)]
+    );
+    // Wholly right of the file, partly below it: column 63, rows padded.
+    let mixed = [(0.5, 5.5 / 30.0), (0.5, 20.5 / 30.0)];
+    assert_eq!(
+        one(r#""x": 70, "y": 50, "w": 10, "h": 30"#, 0, &mixed),
+        [c(63, 55), c(63, 63)]
+    );
+}
+
+/// A single frame wholly past its file keeps its one-texel edge cell, so
+/// a long one still fits a page: an 8 192-texel line right of the file.
+#[test]
+fn a_long_frame_wholly_past_the_file_keeps_its_edge_cell() {
+    let loaded = cut(r#""x": 64, "w": 8192, "h": 1"#, "");
+    assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
+    assert_eq!(loaded.quads(0).len(), 1);
 }
 
 /// A single frame lying wholly at or past the file's right or bottom edge
