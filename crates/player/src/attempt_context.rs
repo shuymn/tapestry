@@ -48,6 +48,9 @@ pub struct AttemptContext {
     epoch: u64,
     /// Whether the attempt is autoplay.
     autoplay: bool,
+    /// The scratch lane's notes autoplay's turntable presses, built before
+    /// READY; none for a play by hand.
+    scratch_notes: Vec<game::ScratchNote>,
 }
 
 impl AttemptContext {
@@ -74,6 +77,7 @@ impl AttemptContext {
             tempo: attempt.tempo,
             epoch,
             autoplay,
+            scratch_notes: Vec::new(),
         }
     }
 
@@ -106,6 +110,19 @@ impl AttemptContext {
     /// The presentation epoch the attempt was attached as.
     pub const fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The attempt with `notes` as autoplay's scratch notes.
+    #[must_use]
+    pub fn with_scratch_notes(mut self, notes: Vec<game::ScratchNote>) -> Self {
+        self.scratch_notes = notes;
+        self
+    }
+
+    /// Autoplay's scratch notes, taken out for the render thread's
+    /// turntable.
+    pub fn take_scratch_notes(&mut self) -> Vec<game::ScratchNote> {
+        std::mem::take(&mut self.scratch_notes)
     }
 
     /// The chart's five labels, borrowed for one preparation.

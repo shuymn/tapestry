@@ -72,6 +72,7 @@ impl ScratchInput {
     /// first (its deadline at or before `now`), then Negative wins if any
     /// Negative is live, else Positive, else neither. Allocates nothing.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn direction(&self, now: TimeUs, auto: [bool; 2]) -> Turn {
         let [auto_positive, auto_negative] = auto;
         let analog = self.analog.filter(|a| a.until > now);
@@ -131,6 +132,7 @@ impl ScratchDevice {
     }
 
     /// Takes one of the tap's observations, before the plan filters it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn observe(&mut self, o: &TapObservation) {
         let bit = |n: u8| 1u128.checked_shl(u32::from(n)).unwrap_or(0);
         match o.event {
@@ -159,6 +161,7 @@ impl ScratchDevice {
     }
 
     /// What the snapshot publishes: nothing during a loss.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn input(&self) -> ScratchInput {
         if self.lost {
             return ScratchInput::NONE;
@@ -306,6 +309,7 @@ pub struct TurntableClock {
 impl TurntableClock {
     /// Takes play state `number`: another number than its own starts it
     /// over (angle 0, no previous tick, running); its own changes nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn adopt(&mut self, number: u64) {
         if !matches!(self.number, Some(n) if n == number) {
             *self = Self {
@@ -319,12 +323,14 @@ impl TurntableClock {
 
     /// The play state it belongs to.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn number(&self) -> Option<u64> {
         self.number
     }
 
     /// Play state `number`'s pause: the ticks stop and the previous one
     /// is forgotten; the angle stays. Another number's is ignored.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn pause(&mut self, number: u64) {
         if matches!(self.number, Some(n) if n == number) {
             self.paused = true;
@@ -335,6 +341,7 @@ impl TurntableClock {
     /// Play state `number`'s resume: a paused clock ticks again, its next
     /// tick a fresh baseline adding 0; a running one runs on. Another
     /// number's is ignored.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn resume(&mut self, number: u64) {
         if matches!(self.number, Some(n) if n == number) && self.paused {
             self.paused = false;
@@ -346,6 +353,7 @@ impl TurntableClock {
     /// `turn`: the first records the time and adds 0, each later one adds
     /// the time since the previous at `turn`'s rate. Nothing while paused
     /// or without a play state.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn tick(&mut self, now: TimeUs, turn: Turn) {
         if self.paused || self.number.is_none() {
             return;
@@ -372,12 +380,14 @@ impl TurntableClock {
     }
 
     /// The angle a turntable follower adds, clockwise on y-down, in
-    /// sixths of a millidegree (`skin_model::TURNTABLE_UNITS_PER_DEGREE`):
-    /// the source's angle negated, as every source angle is.
+    /// sixths of a millidegree (`skin_model::TURNTABLE_UNITS_PER_DEGREE`),
+    /// within one revolution: the source's angle negated, as every source
+    /// angle is.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn angle(&self) -> i32 {
         // Within one revolution, so it fits.
-        i32::try_from(-self.scratch).unwrap_or(0)
+        i32::try_from((REVOLUTION - self.scratch) % REVOLUTION).unwrap_or(0)
     }
 }
 
@@ -420,6 +430,7 @@ impl AutoplayScratch {
     };
 
     /// Back to [`NEW`](Self::NEW), in place.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn reset(&mut self) {
         *self = Self::NEW;
     }
@@ -429,6 +440,7 @@ impl AutoplayScratch {
     /// chart time, at or before `t`), then each press older than 80 ms
     /// cleared while nothing processes, then a plain long note whose end
     /// is before `t` completed.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn update(&mut self, notes: &[ScratchNote], t: TimeUs, ms: i64) {
         let [positive, negative] = &mut self.press;
         while let Some(note) = notes.get(self.cursor) {
@@ -472,6 +484,7 @@ impl AutoplayScratch {
 
     /// Whether Positive and Negative are pressed.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn pressed(&self) -> [bool; 2] {
         let [p, n] = self.press;
         [p.is_some(), n.is_some()]
@@ -481,6 +494,7 @@ impl AutoplayScratch {
 /// A frame's state time: whole ms since the play state's origin, floored,
 /// as the source's state timer counts them (`TimerManager.java:33-35`).
 #[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub const fn state_ms(now: TimeUs, origin: TimeUs) -> i64 {
     now.0.saturating_sub(origin.0).div_euclid(1_000)
 }

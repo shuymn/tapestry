@@ -853,6 +853,17 @@ pub enum RenderMsg {
         /// What its measurement needs.
         measure: Box<PlayMeasure>,
     },
+    /// The game created this play state (docs/stage3.md, offset 1): its
+    /// turntable clock is adopted when its presentation begins.
+    PlayState(game::PlayState),
+    /// Play state `number`'s turntable clock pauses (`pause`) or resumes,
+    /// whatever is presented.
+    Turntable {
+        /// The play state.
+        number: u64,
+        /// Whether it pauses rather than resumes.
+        pause: bool,
+    },
     /// The play ended at `end` on the clock: answer with its measured
     /// figures, and count nothing more until the next play.
     Finish {
@@ -1661,6 +1672,17 @@ impl RenderLink {
         self.send(RenderMsg::Presentation(Box::new(reader)));
     }
 
+    /// The game created play state `state`: its turntable clock starts at
+    /// its presentation's first frame.
+    pub fn play_state(&self, state: game::PlayState) {
+        self.send(RenderMsg::PlayState(state));
+    }
+
+    /// Play state `number`'s turntable clock pauses (`pause`) or resumes.
+    pub fn turntable(&self, number: u64, pause: bool) {
+        self.send(RenderMsg::Turntable { number, pause });
+    }
+
     /// Drops what the last attempt's preparation staged, if it was not
     /// committed; it never installs.
     pub fn discard_attempt(&self) {
@@ -2228,6 +2250,7 @@ pub fn spawn(
                 attempt: None,
                 prepared: None,
                 presentation: None,
+                turntable: crate::turntable::Turntable::default(),
                 tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
@@ -2319,6 +2342,7 @@ fn loading_frame_of(
     now: TimeUs,
     update: Option<&LoadingUpdate>,
     snapshot: Option<&game::adjustment::PresentationSnapshot>,
+    turntable: i32,
 ) -> LoadingFrame<'static> {
     let (lanes, covers) = match snapshot {
         Some(s) => {
@@ -2352,6 +2376,7 @@ fn loading_frame_of(
         // The renderer applies its own target.
         target: [1_920, 1_080],
         layout: &skin_model::Layout::AUTHOR,
+        turntable,
         lanes,
         covers,
         gauge,
@@ -2688,6 +2713,8 @@ struct Prepared {
     declarative: bool,
     /// The attempt's tempo and presentation epoch, current once committed.
     presentation: (game::AttemptTempo, u64),
+    /// Autoplay's scratch notes, the turntable's once committed.
+    scratch_notes: Vec<game::ScratchNote>,
     /// The attempt's READY on the chart's axis (dev-tools).
     #[cfg(feature = "dev-tools")]
     ready: (TimeUs, TimeUs),
@@ -2753,6 +2780,8 @@ struct Run {
     prepared: Option<Prepared>,
     /// The adjustments' snapshots ([`RenderMsg::Presentation`]).
     presentation: Option<game::adjustment::PresentationReader>,
+    /// The play state's turntable (docs/stage3.md, offset 1).
+    turntable: crate::turntable::Turntable,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
@@ -2940,6 +2969,9 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Menu(page)) => {
+                    // The practice page begins its play state's
+                    // presentation.
+                    self.turntable.begin_presentation();
                     mode = match mode {
                         // The launch screen shows out its time.
                         Mode::Splash { .. }
@@ -2978,6 +3010,7 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
+                    self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing, and neither do the
                     // lines of a lifetime whose loading frame was refused.
@@ -3063,8 +3096,21 @@ impl Run {
                     skin,
                     reply,
                 }) => {
+                    self.turntable.begin_presentation();
                     self.begin_attempt(request, attempt, skin, reply);
                     mode = after_preparing(mode);
+                    continue;
+                }
+                Ok(RenderMsg::PlayState(state)) => {
+                    self.turntable.created(state);
+                    continue;
+                }
+                Ok(RenderMsg::Turntable { number, pause }) => {
+                    if pause {
+                        self.turntable.pause(number);
+                    } else {
+                        self.turntable.resume(number);
+                    }
                     continue;
                 }
                 Ok(RenderMsg::Presentation(reader)) => {
@@ -3105,6 +3151,7 @@ impl Run {
                     measure,
                 }) => {
                     let origin = measure.origin;
+                    self.turntable.play_starts();
                     self.measure.start(*measure);
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
                     mode = Mode::Play {
@@ -3267,6 +3314,9 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            // The frame's one instant: a play frame's chart time and the
+            // turntable's state time and tick are all of it.
+            let frame_at = self.clock.now();
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -3354,9 +3404,10 @@ impl Run {
                     if view.generation != *rearms {
                         *rearms = view.generation;
                         screen.rearm();
+                        self.turntable.play_starts();
                     }
                     let origin = view.origin.unwrap_or(*origin);
-                    let now = TimeUs(self.clock.now().0 - origin.0);
+                    let now = TimeUs(frame_at.0 - origin.0);
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -3379,6 +3430,7 @@ impl Run {
                         gauge: *gauge,
                         overlay: &overlay[..shown],
                         target: screen.target(),
+                        turntable: self.turntable.angle(),
                     };
                     let built = screen.build(&f);
                     #[cfg(feature = "dev-tools")]
@@ -3438,6 +3490,7 @@ impl Run {
                             sampled,
                             update.as_deref(),
                             snapshot.as_ref(),
+                            self.turntable.angle(),
                         );
                         match screen.loading(page, update.as_deref(), *changed, &frame) {
                             Ok(Ok(t)) => Ok(t),
@@ -3584,6 +3637,18 @@ impl Run {
             };
             if !minimized {
                 self.granted = false;
+            }
+            // The play state's turntable ticks on each presented frame of
+            // the practice page, loading and play, after it drew.
+            if let Ok((timing, chart)) = &drawn
+                && timing.presented
+                && matches!(mode, Mode::Play { .. } | Mode::Menu { .. })
+            {
+                let scratch = self
+                    .presentation
+                    .as_mut()
+                    .map_or(game::ScratchInput::NONE, |r| r.read().scratch);
+                self.turntable.presented(frame_at, *chart, scratch);
             }
             if matches!(mode, Mode::Result) && drawn.is_ok() {
                 self.after_result_frame();
@@ -3808,11 +3873,15 @@ impl Run {
                 },
                 declarative: p.skin.is_some(),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
+                scratch_notes: Vec::new(),
                 #[cfg(feature = "dev-tools")]
                 ready: p.attempt.ready(),
                 #[cfg(feature = "dev-tools")]
                 gauge_looks: p.attempt.gauge_looks(),
             });
+        }
+        if let (Some(prepared), Some(p)) = (&mut self.prepared, &mut self.attempt) {
+            prepared.scratch_notes = p.attempt.take_scratch_notes();
         }
         if answer.is_err() {
             self.drop_screen();
@@ -3893,6 +3962,7 @@ impl Run {
             .get(ScreenKind::Play)
             .and_then(|i| i.bundle().skin().close());
         self.current = Some(p.presentation);
+        self.turntable.attempt(p.scratch_notes);
         #[cfg(feature = "dev-tools")]
         {
             self.ready = Some(p.ready);
@@ -5496,6 +5566,148 @@ pub(crate) mod tests {
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
         }
+    }
+
+    /// A loading frame's turntable angle and its time on the loading clock.
+    type Turned = (i32, TimeUs);
+
+    /// A screen noting every loading frame's turntable angle ([`Turned`]).
+    struct Turning(Arc<std::sync::Mutex<Vec<Turned>>>);
+
+    impl Screen for Turning {
+        fn load(
+            &mut self,
+            _chart: &Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
+            Ok(true)
+        }
+        fn menu(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _changed: bool,
+        ) -> Result<FrameTiming, RenderError> {
+            Ok(timing(true))
+        }
+        fn loading(
+            &mut self,
+            _page: &crate::menu_screen::MenuPage,
+            _update: Option<&LoadingUpdate>,
+            _changed: bool,
+            frame: &render::LoadingFrame<'_>,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            self.0.lock().unwrap().push((frame.turntable, frame.now));
+            Ok(Ok(timing(true)))
+        }
+        #[cfg(feature = "dev-tools")]
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// The loading frames carry the play state's turntable (docs/stage3.md,
+    /// offset 1): its first presented frame reads 0 and sets the baseline,
+    /// idle frames turn it on by their time, a pause of its number holds
+    /// it whatever is drawn, its resume goes on from the held angle with a
+    /// fresh baseline, another number's signals change nothing, and a new
+    /// play state starts it over.
+    #[test]
+    fn loading_frames_carry_the_play_states_turntable() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        let count = || seen.lock().unwrap().len();
+        let last = || seen.lock().unwrap().last().copied().unwrap();
+        let state = |number| game::PlayState {
+            number,
+            origin: clock.now(),
+        };
+        link.play_state(state(1));
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| count() >= 1));
+        assert_eq!(seen.lock().unwrap()[0].0, 0, "the first frame adds 0");
+        std::thread::sleep(Duration::from_millis(60));
+        let n = count();
+        assert!(wait_until(|| count() > n + 1));
+        // Idle: +1/6° per ms after negation, one unit a µs. A frame draws
+        // what the ticks before it left: the angle of the last frame is the
+        // time from the first to the one before it; the frames' times are
+        // sampled apart from the ticks, so a 5 ms tolerance.
+        let (angle, previous, first) = {
+            let s = seen.lock().unwrap();
+            (s[s.len() - 1].0, s[s.len() - 2].1, s[0].1)
+        };
+        let off = i64::from(angle) - (previous.0 - first.0);
+        assert!(
+            off.abs() < 5_000,
+            "{angle} after {} µs",
+            previous.0 - first.0
+        );
+        // Another number's pause changes nothing; its own holds it: every
+        // frame after both were taken draws one angle.
+        link.turntable(2, true);
+        link.turntable(1, true);
+        assert!(link.fence(Duration::from_secs(5)));
+        let n = count();
+        assert!(wait_until(|| count() > n + 3));
+        let held = seen.lock().unwrap()[n].0;
+        assert!(
+            seen.lock().unwrap()[n..].iter().all(|f| f.0 == held),
+            "paused"
+        );
+        // Its resume: it turns on from the held angle, by no more than the
+        // time since.
+        let resumed = clock.now();
+        link.turntable(1, false);
+        assert!(link.fence(Duration::from_secs(5)));
+        let n = count();
+        assert!(wait_until(|| count() > n + 3));
+        let turned = i64::from(last().0) - i64::from(held);
+        let since = clock.now().0 - resumed.0;
+        assert!(
+            turned > 0 && turned <= since,
+            "from the held angle after the resume: {turned} in {since} µs"
+        );
+        // A new play state starts over at its first frame.
+        link.end_loading().unwrap();
+        link.play_state(state(2));
+        let n = count();
+        link.loading().show(one_line("M"));
+        assert!(wait_until(|| count() > n));
+        assert_eq!(
+            seen.lock().unwrap()[n].0,
+            0,
+            "the new play state's first frame"
+        );
+        link.end_loading().unwrap();
+        link.exit();
     }
 
     /// A render thread drawing on a [`ClockedLoading`], and its frames.
@@ -9687,7 +9899,7 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let level = |lifetime, u: Option<&LoadingUpdate>| {
-            super::loading_frame_of(lifetime, TimeUs(1_000), u, None).play_level
+            super::loading_frame_of(lifetime, TimeUs(1_000), u, None, 0).play_level
         };
         assert_eq!(level(1, None), None);
         assert_eq!(level(1, Some(&update(1, Some(12)))), Some(12));
@@ -9712,7 +9924,7 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let read = |lifetime, u: Option<&LoadingUpdate>| {
-            let f = super::loading_frame_of(lifetime, TimeUs(1_000), u, None);
+            let f = super::loading_frame_of(lifetime, TimeUs(1_000), u, None, 0);
             (f.difficulty, f.bga)
         };
         assert_eq!(read(1, None), (None, None));
@@ -9743,7 +9955,7 @@ pub(crate) mod tests {
                 crate::loading_state::LifetimeState::new(1, TimeUs(0), &text, None)
                     .apply(LoadInput::Stage(Stage::Chart))
             });
-            let frame = super::loading_frame_of(1, TimeUs(1_000), update.as_ref(), None);
+            let frame = super::loading_frame_of(1, TimeUs(1_000), update.as_ref(), None, 0);
             batch.clear();
             skin.build_loading(&mut loading, &frame.model(), &uvs, &mut batch)
                 .unwrap();
@@ -9800,7 +10012,7 @@ pub(crate) mod tests {
         let before = this_thread();
         let mut read = [(None, None); 4];
         for (r, u) in read.iter_mut().zip(updates.iter().map(Some).chain([None])) {
-            let f = super::loading_frame_of(1, TimeUs(1_000), u, None);
+            let f = super::loading_frame_of(1, TimeUs(1_000), u, None, 0);
             *r = std::hint::black_box((f.difficulty, f.bga));
         }
         assert_eq!(this_thread(), before, "a loading frame allocated");
@@ -9829,7 +10041,7 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let autoplay = |u: Option<&LoadingUpdate>| {
-            super::loading_frame_of(1, TimeUs(1_000), u, None)
+            super::loading_frame_of(1, TimeUs(1_000), u, None, 0)
                 .model()
                 .autoplay
         };

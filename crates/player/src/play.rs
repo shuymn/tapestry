@@ -155,6 +155,9 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
+    /// The run's play states, for the turntable (docs/stage3.md, offset
+    /// 1).
+    pub play_states: game::PlayStates,
     /// READY's length: from the opening to chart time 0, as the
     /// current play's opening was given it.
     pub lead_in: TimeUs,
@@ -1274,12 +1277,20 @@ impl Rig for PlayerRig<'_> {
         // The attempt attached last is the one prepared: its epoch is
         // the frames'.
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
+        // Autoplay's turntable presses its scratch notes; a play by hand
+        // has none.
+        let notes = if self.autoplay {
+            game::scratch_notes(loaded.chart(), loaded.chart().meta.ln_mode)
+        } else {
+            Vec::new()
+        };
         let attempt = AttemptContext::new(
             loaded.attempt(),
             SIMPLE_SCRATCH,
             epoch.unwrap_or(0),
             self.autoplay,
-        );
+        )
+        .with_scratch_notes(notes);
         // The adjustments are served while the screen prepares, so an
         // adjustment then is published before the preparation ends.
         let mut adjust = self.adjust.take();
@@ -1710,6 +1721,23 @@ impl Rig for PlayerRig<'_> {
             settings.player.set_options(&driver.options());
         }
         self.input_offset_us = t.input_offset_us;
+    }
+
+    fn play_state_began(&mut self) {
+        let state = self.play_states.begin(self.clock.now());
+        self.render.play_state(state);
+    }
+
+    fn turntable_paused(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, true);
+        }
+    }
+
+    fn turntable_resumed(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, false);
+        }
     }
 
     fn ended(&mut self, report: &PlayReport) {
