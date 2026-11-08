@@ -975,6 +975,10 @@ struct Shared {
     barrier: Mutex<ResultBarrier>,
     /// What the render thread shows of the result kind.
     result_status: Mutex<ResultReport>,
+    /// Result frames hold after their lifetime's check while set, and
+    /// whether one holds (tests).
+    #[cfg(test)]
+    result_frame_hold: [AtomicBool; 2],
 }
 
 impl Shared {
@@ -1001,7 +1005,23 @@ impl Shared {
             result: Mutex::new(ResultSlot::default()),
             barrier: Mutex::new(ResultBarrier::default()),
             result_status: Mutex::new(ResultReport::default()),
+            #[cfg(test)]
+            result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
         }
+    }
+
+    /// Holds a result frame while a test says so.
+    #[cfg(test)]
+    fn hold_result_frame(&self) {
+        let [held, waiting] = &self.result_frame_hold;
+        if !held.load(Ordering::SeqCst) {
+            return;
+        }
+        waiting.store(true, Ordering::SeqCst);
+        while held.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        waiting.store(false, Ordering::SeqCst);
     }
 
     fn result_slot(&self) -> std::sync::MutexGuard<'_, ResultSlot> {
@@ -1451,7 +1471,16 @@ impl RenderLink {
     /// point only the overlay merges. Taken under the lock the commit
     /// point holds, so the view returned is the one presented at that
     /// instant.
-    pub fn pin_result(&self, at: TimeUs) -> (Option<ViewKey>, Option<skin_model::ResultTiming>) {
+    ///
+    /// With `gate` (a pressed command: the result's start), the view
+    /// presented judges it first under the same lock: while its input time
+    /// has not passed from `gate` at `at`, nothing is set and `None` is
+    /// given (the S10-09i design's D6).
+    pub fn pin_result(
+        &self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let mut b = self.shared.barrier();
         if b.lifetime != lifetime {
@@ -1460,9 +1489,12 @@ impl RenderLink {
                 ..ResultBarrier::default()
             };
         }
+        if game::gated(b.timing.map(crate::play::flow_timing), at, gate) == game::Outro::Gated {
+            return None;
+        }
         b.pinned = b.presented;
         b.fadeout = Some(at);
-        (b.pinned, b.timing)
+        Some((b.pinned, b.timing))
     }
 
     /// The timing of the current result lifetime's presented view, while
@@ -1937,8 +1969,12 @@ impl crate::result_present::Publish for RenderLink {
     fn show(&mut self, p: ResultPresentation) {
         self.show_result(p);
     }
-    fn pin(&mut self, at: TimeUs) -> (Option<ViewKey>, Option<skin_model::ResultTiming>) {
-        self.pin_result(at)
+    fn pin(
+        &mut self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
+        self.pin_result(at, gate)
     }
     fn timing(&self) -> Option<skin_model::ResultTiming> {
         self.presented_timing()
@@ -3269,6 +3305,12 @@ impl Run {
                 self.drop_result();
                 mode = Mode::Idle;
                 continue;
+            }
+            // A test holds a result frame here, after its lifetime's
+            // check: a new lifetime may begin before its commit point.
+            #[cfg(test)]
+            if matches!(mode, Mode::Result) {
+                self.shared.hold_result_frame();
             }
             let Some(screen) = &mut self.screen else {
                 continue;

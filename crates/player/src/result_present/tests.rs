@@ -43,9 +43,16 @@ impl Publish for Sent {
         self.presented = Some(p.payload.key);
         self.shown.push(p);
     }
-    fn pin(&mut self, _at: TimeUs) -> (Option<ViewKey>, Option<skin_model::ResultTiming>) {
+    fn pin(
+        &mut self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
+        if game::gated(self.timing.map(crate::play::flow_timing), at, gate) == game::Outro::Gated {
+            return None;
+        }
         self.pinned = self.presented;
-        (self.pinned, self.timing)
+        Some((self.pinned, self.timing))
     }
     fn timing(&self) -> Option<skin_model::ResultTiming> {
         self.timing
@@ -222,7 +229,7 @@ fn the_barrier_keeps_the_view_and_merges_the_overlay() {
     p.begin(&mut sent, TimeUs(0));
     let k1 = p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin));
-    assert_eq!(p.pin(&mut sent, TimeUs(40)).0, Some(k1));
+    assert_eq!(p.pin(&mut sent, TimeUs(40), None).unwrap().0, Some(k1));
     p.want(snapshot("v2"));
     p.land(&mut sent, Some(&skin));
     p.lines(&mut sent, vec!["NOTICE".to_owned()]);
@@ -338,14 +345,30 @@ fn the_timing_is_the_presented_views_while_a_lifetime_is() {
     };
     let mut p = Presenter::default();
     assert_eq!(p.timing(&sent), None, "no lifetime");
-    assert_eq!(p.pin(&mut sent, TimeUs(1)), (None, None), "no lifetime");
+    assert_eq!(
+        p.pin(&mut sent, TimeUs(1), None),
+        Some((None, None)),
+        "no lifetime"
+    );
     p.begin(&mut sent, TimeUs(0));
     assert_eq!(p.timing(&sent), Some(t));
     // A payload published last has no say: built-in here.
     p.want(snapshot("v1"));
     p.land(&mut sent, Some(&Published::BuiltIn));
     assert_eq!(p.timing(&sent), Some(t));
-    assert_eq!(p.pin(&mut sent, TimeUs(5)).1, Some(t));
+    // A press its input time gates pins nothing and publishes nothing.
+    sent.timing = Some(skin_model::ResultTiming {
+        input: TimeUs(1_000),
+        ..t
+    });
+    let shown = sent.shown.len();
+    assert_eq!(p.pin(&mut sent, TimeUs(5), Some(TimeUs(0))), None);
+    assert_eq!((sent.shown.len(), sent.pinned), (shown, None));
+    p.want(snapshot("v2"));
+    p.land(&mut sent, Some(&Published::BuiltIn));
+    assert_eq!(sent.shown.len(), shown + 1, "not pinned: views publish");
+    sent.timing = Some(t);
+    assert_eq!(p.pin(&mut sent, TimeUs(5), None).unwrap().1, Some(t));
     p.end(&mut sent);
     assert_eq!(p.timing(&sent), None, "the lifetime ended");
 }

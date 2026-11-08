@@ -648,7 +648,7 @@ fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
     rig.gate.hold();
     show(&rig.link, lifetime, 2, &b, &Overlay::default());
     rig.gate.step();
-    assert_eq!(rig.link.pin_result(TimeUs(5)).0, Some(1));
+    assert_eq!(rig.link.pin_result(TimeUs(5), None).unwrap().0, Some(1));
     let notice = Overlay {
         lines: vec!["NOTICE".to_owned()],
         fadeout: Some(TimeUs(5)),
@@ -675,7 +675,11 @@ fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
         graphs: None,
     });
     assert!(rig.link.fence(Duration::from_secs(10)));
+    // Only the refused frame runs: the next waits before its commit
+    // point, so the timing is cleared by the refusal itself (T8).
+    rig.gate.hold();
     rig.faults.refuse.store(true, Ordering::Release);
+    rig.gate.step();
     assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
     let Some(Drawn::Page(page)) = rig.drawn().last().cloned() else {
         panic!();
@@ -688,6 +692,7 @@ fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
     );
     assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
     assert_eq!(rig.link.presented_timing(), None, "no skin draws (T8)");
+    rig.gate.release();
     // Disabled for the run: a selection is refused, and later views draw
     // the built-in page.
     assert!(matches!(
@@ -721,7 +726,7 @@ fn a_screen_built_again_draws_the_revision_presented() {
         let Some(Drawn::Skin(ref_a, 1)) = rig.drawn().last().cloned() else {
             panic!();
         };
-        assert_eq!(rig.link.pin_result(TimeUs(5)).0, Some(1));
+        assert_eq!(rig.link.pin_result(TimeUs(5), None).unwrap().0, Some(1));
         let revision = rig.link.result_status().revision;
         rig.faults.refuse_restore.store(refuse, Ordering::Release);
         rig.faults.lose.store(true, Ordering::Release);
@@ -1799,7 +1804,10 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
         assert!(p.result_timing().is_some(), "the skin's timing applies");
         let hold = SettleHold::new();
         let at = p.now();
-        assert!(p.begin_outro(at).is_some(), "the pinned view's timing");
+        assert!(
+            matches!(p.begin_outro(at, None), game::Outro::Begun(Some(_))),
+            "the pinned view's timing"
+        );
         let frames = std::thread::scope(|s| {
             let watch = s.spawn(move || {
                 let hold = hold;
@@ -1862,7 +1870,11 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                 );
                 let lifetime = p.render.result_status().lifetime;
                 let at = p.now();
-                assert_eq!(p.begin_outro(at), Some(t), "the pinned view's timing");
+                assert_eq!(
+                    p.begin_outro(at, None),
+                    game::Outro::Begun(Some(t)),
+                    "the pinned view's timing"
+                );
                 p.accept_leaving(game::MenuCommand::Back);
                 let asked = p.result_skin.requests();
                 p.show_end(report, screen);
@@ -1887,7 +1899,21 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                 } else {
                     assert!(wait_until(|| last_skin(drawn).is_some()));
                     let after = fade_alpha(drawn).expect("the fade draws");
-                    assert!(after >= before, "timer 2 goes on: {before} then {after}");
+                    let all: Vec<Option<f32>> = drawn
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|d| match d {
+                            Drawn::Skin(q, _) => q.iter().find(|q| fading(q)).map(|q| q.color[3]),
+                            Drawn::Page(_) => None,
+                        })
+                        .collect();
+                    let b = p.render.shared.barrier().clone();
+                    assert!(
+                        after >= before,
+                        "timer 2 goes on ({fadeout} ms outro): {before} then {after}; {all:?}; at {at:?} now {:?} barrier {b:?}",
+                        p.now()
+                    );
                     assert_eq!(p.result_timing(), Some(t));
                     assert_eq!(p.render.result_status().pinned, Some(1));
                 }
@@ -1929,7 +1955,7 @@ fn the_timing_is_the_presented_views() {
         rig.gate.step();
         assert_eq!(rig.link.presented_timing(), want, "B is not presented");
         if pin {
-            assert_eq!(rig.link.pin_result(TimeUs(5)), (Some(1), want));
+            assert_eq!(rig.link.pin_result(TimeUs(5), None), Some((Some(1), want)));
             rig.clear();
             rig.gate.release();
             assert!(rig.until(|d| skin_frame(d).is_some()));
@@ -1951,6 +1977,81 @@ fn the_timing_is_the_presented_views() {
     }
 }
 
+/// Holds one link's result frames after their lifetime's check while it
+/// lives, and lets them go when dropped, a panic's unwinding included.
+struct FrameHold<'a>(&'a RenderLink);
+
+impl<'a> FrameHold<'a> {
+    fn new(link: &'a RenderLink) -> Self {
+        link.shared.result_frame_hold[0].store(true, Ordering::SeqCst);
+        Self(link)
+    }
+
+    fn holding(&self) -> bool {
+        self.0.shared.result_frame_hold[1].load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for FrameHold<'_> {
+    fn drop(&mut self) {
+        self.0.shared.result_frame_hold[0].store(false, Ordering::SeqCst);
+    }
+}
+
+/// The gate and the pin judge one view (T13): with built-in view A
+/// sampled (no gate), skin view B, whose input time is 5 s, commits before
+/// the pin; a press then is refused under the pin's lock, nothing set,
+/// and one after B's input time is pinned with B's timing.
+#[test]
+fn the_gate_and_the_pin_judge_one_view() {
+    let (_dir, skin) = lua_skin("skin.input = 5000\n", "");
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, None, 1_111, &[]);
+    let b = payload(2, Some(&skin), 2_222, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    assert_eq!(rig.link.presented_timing(), None, "A: no gate sampled");
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let t = skin.skin().result_timing();
+    assert_eq!(t.input, TimeUs(5_000_000));
+    let start = TimeUs(0);
+    assert_eq!(rig.link.pin_result(TimeUs(1_000_000), Some(start)), None);
+    assert_eq!(rig.link.result_status().pinned, None);
+    assert_eq!(
+        rig.link.pin_result(TimeUs(5_000_000), Some(start)),
+        Some((Some(2), Some(t)))
+    );
+    rig.link.exit();
+}
+
+/// A frame of the old result held after its lifetime's check while a new
+/// lifetime begins records the old view's timing at its commit point; the
+/// new lifetime does not read it (T12).
+#[test]
+fn a_frame_of_the_old_lifetime_gives_the_new_one_no_timing() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(rig.link.presented_timing().is_some());
+    let hold = FrameHold::new(&rig.link);
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        ..Overlay::default()
+    };
+    show(&rig.link, lifetime, 2, &a, &notice);
+    assert!(wait_until(|| hold.holding()));
+    rig.link.begin_result();
+    drop(hold);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    assert_eq!(rig.link.presented_timing(), None);
+    rig.link.exit();
+}
+
 /// A command accepted on a built-in view pins it all the same: a skin view
 /// prepared before the frame's wait never commits after it, and the pin
 /// gives no timing, so the command acts at once (T2).
@@ -1966,7 +2067,7 @@ fn a_built_in_view_is_pinned_over_a_prepared_skin() {
     rig.gate.hold();
     show(&rig.link, lifetime, 2, &b, &Overlay::default());
     rig.gate.step();
-    assert_eq!(rig.link.pin_result(TimeUs(5)), (Some(1), None));
+    assert_eq!(rig.link.pin_result(TimeUs(5), None), Some((Some(1), None)));
     rig.clear();
     rig.gate.release();
     assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
@@ -1984,7 +2085,7 @@ fn a_built_in_view_is_pinned_over_a_prepared_skin() {
     // same, and a skin view arriving after never draws.
     let rig = Rig::new();
     let lifetime = installed(&rig, &skin);
-    assert_eq!(rig.link.pin_result(TimeUs(5)), (None, None));
+    assert_eq!(rig.link.pin_result(TimeUs(5), None), Some((None, None)));
     rig.clear();
     show(&rig.link, lifetime, 1, &b, &Overlay::default());
     assert!(wait_until(|| !rig.drawn().is_empty()), "a frame drew");

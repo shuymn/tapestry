@@ -1179,15 +1179,19 @@ impl Rig for PlayerRig<'_> {
 
     /// The barrier is set at `at` (D4), for every accepted command: the
     /// view presented then stays, and timer 2 starts, before the command
-    /// settles the result skin. The pinned view's timing, read with it.
-    fn begin_outro(&mut self, at: TimeUs) -> Option<game::ResultTiming> {
-        let (pinned, timing) = self.presenter.pin(&mut self.render, at);
+    /// settles the result skin. The pinned view's timing, read with it; a
+    /// pressed command that view's input time still gates is refused under
+    /// the same lock, nothing set.
+    fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
+        let Some((pinned, timing)) = self.presenter.pin(&mut self.render, at, gate) else {
+            return game::Outro::Gated;
+        };
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
         #[cfg(not(feature = "dev-tools"))]
         let _ = pinned;
-        timing.map(flow_timing)
+        game::Outro::Begun(timing.map(flow_timing))
     }
 
     /// The flow serves the leaving command: the result is left from here.
@@ -1906,7 +1910,7 @@ pub(crate) const fn preparation_stops(
 }
 
 /// A result skin's timing in the flow's terms.
-const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTiming {
+pub(crate) const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTiming {
     game::ResultTiming {
         outro: t.outro,
         input: t.input,

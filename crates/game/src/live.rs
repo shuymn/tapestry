@@ -432,14 +432,16 @@ pub trait Rig {
     fn result_timing(&self) -> Option<ResultTiming> {
         None
     }
-    /// A leaving command is accepted at `at`, whatever the timing: the
-    /// view on screen is pinned and the fade-out starts at `at`, before
-    /// [`accept_leaving`](Self::accept_leaving) settles anything. Gives the
-    /// pinned view's timing, read with the pin, which the command's outro
-    /// plays. By default, [`result_timing`](Self::result_timing).
-    fn begin_outro(&mut self, at: TimeUs) -> Option<ResultTiming> {
-        let _ = at;
-        self.result_timing()
+    /// A leaving command at `at`, judged and pinned against one view, the
+    /// one on screen: with `gate` (a pressed command, the result's start)
+    /// a view whose input time has not passed from it refuses it
+    /// ([`Outro::Gated`]: dropped, nothing pinned). Otherwise, whatever the
+    /// timing, the view is pinned and the fade-out starts at `at`, before
+    /// [`accept_leaving`](Self::accept_leaving) settles anything, and the
+    /// pinned view's timing, which the outro plays, is given. By default,
+    /// judged on [`result_timing`](Self::result_timing).
+    fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> Outro {
+        gated(self.result_timing(), at, gate)
     }
     /// The flow serves the leaving command `cmd` accepted on the result:
     /// the result is left from here, so the next screen's preparation (a
@@ -803,6 +805,27 @@ pub struct ResultTiming {
     pub scene: Option<TimeUs>,
 }
 
+/// How [`Rig::begin_outro`] took a leaving command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outro {
+    /// The view on screen's input time has not passed: the command is
+    /// dropped and nothing is pinned.
+    Gated,
+    /// The view on screen is pinned, with its timing (`None` built-in).
+    Begun(Option<ResultTiming>),
+}
+
+/// How a leaving command at `at` is taken on a view with `timing`: with
+/// `gate` (the result's start, for a pressed command), gated until the
+/// view's input time has passed from it.
+#[must_use]
+pub fn gated(timing: Option<ResultTiming>, at: TimeUs, gate: Option<TimeUs>) -> Outro {
+    match (timing, gate) {
+        (Some(t), Some(start)) if at.0 < start.0.saturating_add(t.input.0) => Outro::Gated,
+        _ => Outro::Begun(timing),
+    }
+}
+
 /// What Closing has latched: a retry or a suspend taken since its
 /// admission, the play's last steps' suspend included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -944,14 +967,21 @@ pub fn run_chart<R: Rig>(
             let mut open = true;
             if outro.is_none() {
                 open = timing.is_none_or(|t| now.0 >= start.0.saturating_add(t.input.0));
+                // A retry or back is judged against the view on screen as
+                // it is pinned, so the gate and the outro are one view's;
+                // a preset step pins nothing and takes the gate as sampled.
+                // The scene time is no press: the gate does not hold it.
                 let mut accepted = None;
                 while let Some(c) = rig.take_menu() {
                     match c {
-                        _ if !open => {}
                         MenuCommand::Retry | MenuCommand::Back => {
-                            accepted = Some(c);
-                            break;
+                            let at = rig.now();
+                            if let Outro::Begun(t) = rig.begin_outro(at, Some(start)) {
+                                accepted = Some((c, at, t));
+                                break;
+                            }
                         }
+                        _ if !open => {}
                         MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
                         MenuCommand::PrevPreset => {
                             dirty |= screen.step(-1, &report, loaded.chart())
@@ -962,15 +992,20 @@ pub fn run_chart<R: Rig>(
                     && let Some(scene) = timing.and_then(|t| t.scene)
                     && now.0 >= start.0.saturating_add(scene.0)
                 {
-                    accepted = Some(MenuCommand::Back);
-                }
-                if let Some(cmd) = accepted {
-                    // Every accepted command pins the view on screen and
-                    // starts the fade-out before the rig settles its work
-                    // for it; its outro is the pinned view's.
                     let at = rig.now();
-                    let pinned = rig.begin_outro(at);
+                    if let Outro::Begun(t) = rig.begin_outro(at, None) {
+                        accepted = Some((MenuCommand::Back, at, t));
+                    }
+                }
+                if let Some((cmd, at, pinned)) = accepted {
+                    // The view was pinned and the fade-out started before
+                    // the rig settles its work for the command; its outro is
+                    // the pinned view's. A close during the settle ends the
+                    // run before anything else.
                     rig.accept_leaving(cmd);
+                    if rig.quitting() {
+                        return leave(rig);
+                    }
                     let length = pinned.map_or(0, |t| t.outro.0);
                     outro = Some((cmd, TimeUs(at.0.saturating_add(length))));
                 }
