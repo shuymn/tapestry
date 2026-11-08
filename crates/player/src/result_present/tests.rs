@@ -281,3 +281,38 @@ fn the_overlay_lines_keep_their_order() {
     };
     assert_eq!(long.lines(None, None)[0].chars().count(), 76);
 }
+
+/// A play whose best cannot be set shows why on the strip, whether it was
+/// counted without setting one or not counted at all; an eligible play
+/// shows no such line (C12's projection of each best fact, through the
+/// real report and result screen).
+#[test]
+fn either_ineligible_best_has_its_strip_line() {
+    use crate::end_screen::tests::{report, screen};
+    let dir = tempfile::tempdir().unwrap();
+    let mut played = report(rules::tapestry());
+    let best = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l.starts_with("BEST NOT UPDATED"))
+            .cloned()
+            .collect()
+    };
+    let shown = screen(dir.path(), &played);
+    assert!(best(&super::view_lines(&played, &shown)).is_empty());
+    played.best = Some(game::BestView::NotCounted("failed: disk full".to_owned()));
+    assert_eq!(
+        best(&super::view_lines(&played, &shown)),
+        ["BEST NOT UPDATED: failed: disk full"]
+    );
+    played.best = Some(game::BestView::Counted {
+        play: (11, 24),
+        previous: None,
+        current: game::BestScore::default(),
+        ineligible: Some("autoplay".to_owned()),
+    });
+    assert_eq!(
+        best(&super::view_lines(&played, &shown)),
+        ["BEST NOT UPDATED: autoplay"]
+    );
+}

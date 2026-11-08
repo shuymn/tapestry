@@ -194,10 +194,15 @@ pub fn view_lines(report: &PlayReport, screen: &ResultScreen) -> Vec<String> {
     if !coverage.is_empty() {
         lines.push(coverage);
     }
-    if let Some(game::BestView::Counted {
-        ineligible: Some(why),
-        ..
-    }) = &report.best
+    // Ineligible either way: counted without setting a best, or not
+    // counted at all.
+    if let Some(
+        game::BestView::Counted {
+            ineligible: Some(why),
+            ..
+        }
+        | game::BestView::NotCounted(why),
+    ) = &report.best
     {
         lines.push(format!("BEST NOT UPDATED: {why}"));
     }

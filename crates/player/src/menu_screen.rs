@@ -986,6 +986,11 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    #[cfg(feature = "dev-tools")]
+    fn atlas_uploads(&self) -> u64 {
+        self.renderer.atlas_uploads()
+    }
+
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.renderer.result_quads()

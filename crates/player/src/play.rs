@@ -312,6 +312,11 @@ impl PlayerRig<'_> {
         let chart = crate::result_skin::attempt_chart(loaded);
         self.result_chart = Some(chart);
         self.result_labels = Some(crate::result_present::labels_of(&loaded.attempt().labels));
+        // Once the run disabled the result skin, no skin work is done: the
+        // built-in result shows the chart and labels taken above.
+        if self.result_run_disabled() {
+            return crate::result_skin::Staged::Ready;
+        }
         let mut result = std::mem::take(&mut self.result_skin);
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
@@ -325,6 +330,21 @@ impl PlayerRig<'_> {
             self.result_skin.staged_line()
         );
         staged
+    }
+
+    /// Whether the render thread disabled the result skin for the run (the
+    /// S10-09i design's D7), as the presenter now knows too.
+    fn result_run_disabled(&mut self) -> bool {
+        let status = self.render.result_status();
+        self.presenter.status(&status);
+        self.presenter.disabled().is_some()
+    }
+
+    /// Whether the result's skin work is suppressed: the attempt's
+    /// fallback or the run's (no image stage, layout or upload; the
+    /// built-in result is still presented).
+    fn result_skin_suppressed(&mut self) -> bool {
+        self.presenter.attempt_fallen().is_some() || self.result_run_disabled()
     }
 
     /// Whether the run ends: the window's close, or a failure of the input
@@ -359,12 +379,13 @@ impl PlayerRig<'_> {
     /// The result's view of `screen` after `report`, as the end page just
     /// built shows it, becomes the desired one: its snapshot is kept until
     /// its layout lands. A result lifetime begins with the result's first
-    /// show. Nothing without a result skin, or once the run disabled it.
+    /// show. Nothing without a result skin; once the run disabled it, each
+    /// view is still presented, as the built-in result with the reason.
     fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
         let (Some(chart), Some(page)) = (self.result_chart, self.end_page.clone()) else {
             return;
         };
-        if !self.result_skin.has_skin() || self.presenter.disabled().is_some() {
+        if !self.result_skin.has_skin() {
             return;
         }
         if !self.presenter.current() {
@@ -412,6 +433,10 @@ impl PlayerRig<'_> {
 
     /// The result's lifetime ends: nothing of it is drawn any more.
     pub(crate) fn leave_result(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        if self.presenter.current() {
+            crate::dev::print_result_work("left");
+        }
         self.presenter.end(&mut self.render);
         self.result_facts = None;
         self.result_offset = None;
@@ -1163,6 +1188,8 @@ impl Rig for PlayerRig<'_> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared_close)?;
         self.upload_result();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("commit");
         Ok(())
     }
 
@@ -1481,6 +1508,8 @@ impl Rig for PlayerRig<'_> {
         self.ready_state_at = Some(ready_state_at);
         self.origin = Some(origin);
         println!("play started");
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("ready");
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
             && self.retry_from.is_none()
@@ -1672,6 +1701,8 @@ impl Rig for PlayerRig<'_> {
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("ended");
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",
@@ -1715,20 +1746,22 @@ impl Rig for PlayerRig<'_> {
     /// P: the own view's layout, asked for once its best is compared, with
     /// the view's final facts (design D11; the S10-09i design's Q1).
     fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
-        // The own view's best as the request takes it (dev-tools).
-        #[cfg(feature = "dev-tools")]
+        if let Some(chart) = self.result_chart
+            && !self.result_skin_suppressed()
         {
-            let best = match screen.status() {
-                game::ViewStatus::Ready(s) => match s.best {
-                    None => "none",
-                    Some(game::BestCompare::Unavailable) => "unavailable",
-                    Some(game::BestCompare::Known(_)) => "known",
-                },
-                _ => "no view",
-            };
-            println!("dev: result layout requested: best {best}");
-        }
-        if let Some(chart) = self.result_chart {
+            // The own view's best as the request takes it (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            {
+                let best = match screen.status() {
+                    game::ViewStatus::Ready(s) => match s.best {
+                        None => "none",
+                        Some(game::BestCompare::Unavailable) => "unavailable",
+                        Some(game::BestCompare::Known(_)) => "known",
+                    },
+                    _ => "no view",
+                };
+                println!("dev: result layout requested: best {best}");
+            }
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
             #[cfg(feature = "dev-tools")]
@@ -1761,7 +1794,7 @@ impl Rig for PlayerRig<'_> {
         // A switch: its layout is requested; the current generation stays
         // until it lands (design D11). The attempt's fallback requests none.
         if let Some(chart) = self.result_chart
-            && self.presenter.attempt_fallen().is_none()
+            && !self.result_skin_suppressed()
         {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));

@@ -2058,6 +2058,63 @@ pub fn hold_result_upload() {
     RESULT_UPLOAD_WAITING.store(false, Ordering::SeqCst);
 }
 
+/// The result's stagings on the render thread (each selection, upload and
+/// view staging of the result kind) and the texture arrays they uploaded,
+/// so far (development builds: the S10-09i design's C6 and C7).
+static RESULT_STAGINGS: AtomicU64 = AtomicU64::new(0);
+static RESULT_UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+/// One staging of the result kind on the render thread, which uploaded
+/// `uploads` texture arrays.
+pub fn result_staged(uploads: u64) {
+    RESULT_STAGINGS.fetch_add(1, Ordering::SeqCst);
+    RESULT_UPLOADS.fetch_add(uploads, Ordering::SeqCst);
+}
+
+/// Prints the result's stagings and uploads so far, at `at` in the flow.
+pub fn print_result_work(at: &str) {
+    println!(
+        "dev: result work at {at}: stagings {} uploads {}",
+        RESULT_STAGINGS.load(Ordering::SeqCst),
+        RESULT_UPLOADS.load(Ordering::SeqCst)
+    );
+}
+
+/// The environment variable of the result's injected refusals (tests of
+/// the real flow): a comma list of `select<N>`, the N-th selection or
+/// upload of the result kind refused, and `stage<N>`, the N-th view
+/// staging refused, both counted from 1 on the render thread.
+pub const RESULT_FAULTS_ENV: &str = "TAPESTRY_DEV_RESULT_FAULTS";
+
+/// The result's selections and view stagings asked for so far.
+static RESULT_SELECTS_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESULT_STAGES_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`RESULT_FAULTS_ENV`] names `prefix` with `n`.
+fn result_fault(prefix: &str, n: u64) -> bool {
+    std::env::var(RESULT_FAULTS_ENV).is_ok_and(|list| {
+        list.split(',')
+            .filter_map(|f| f.trim().strip_prefix(prefix))
+            .any(|k| k.parse() == Ok(n))
+    })
+}
+
+/// Whether this selection or upload of the result kind is refused.
+pub fn refuse_result_select() -> bool {
+    result_fault(
+        "select",
+        RESULT_SELECTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
+    )
+}
+
+/// Whether this view staging of the result kind is refused.
+pub fn refuse_result_staging() -> bool {
+    result_fault(
+        "stage",
+        RESULT_STAGES_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{adler32, crc32, png, read_bounded, read_limited};

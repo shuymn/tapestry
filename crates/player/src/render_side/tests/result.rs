@@ -66,6 +66,10 @@ struct Faults {
     refuse: AtomicBool,
     /// A screen built again refuses to restore the result's installation.
     refuse_restore: AtomicBool,
+    /// The next result text prepared is refused by the skin.
+    refuse_text: AtomicBool,
+    /// The next built-in page drawn fails as a lost device.
+    lose_page: AtomicBool,
 }
 
 /// A WARP menu screen that records what each result frame drew.
@@ -132,6 +136,11 @@ impl Screen for Recorded {
         kind: ScreenKind,
         pages: &Arc<skin_model::PackedPages>,
     ) -> Result<(), render::RenderError> {
+        if kind == ScreenKind::Result && self.faults.refuse_restore.load(Ordering::Acquire) {
+            return Err(render::RenderError::Skin(render::SkinError {
+                reason: "the restore was refused".to_owned(),
+            }));
+        }
         self.menu.restore_pages(kind, pages)
     }
     fn disable_result(&mut self) {
@@ -153,6 +162,9 @@ impl Screen for Recorded {
         view: &skin_model::ResultView,
         labels: &ResultLabels,
     ) -> Result<Result<(), String>, render::RenderError> {
+        if self.faults.refuse_text.swap(false, Ordering::AcqRel) {
+            self.menu.refuse_next_result(true);
+        }
         self.menu.prepare_result(skin, state, view, labels)
     }
     fn install_result_text(&mut self) -> bool {
@@ -189,6 +201,9 @@ impl Screen for Recorded {
         Ok(t)
     }
     fn end(&mut self, page: &EndPage) -> Result<bool, render::RenderError> {
+        if self.faults.lose_page.swap(false, Ordering::AcqRel) {
+            return Err(render::RenderError::SurfaceLost);
+        }
         let p = self.menu.end(page)?;
         self.drawn
             .lock()
@@ -304,26 +319,74 @@ impl Rig {
 /// A fixed Lua result skin (it reads no result fact): its EX number, the
 /// marker every view draws differently, and a status image.
 pub(crate) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    lua_skin("", "")
+}
+
+/// [`fixed_skin`] with `texts` texts of the chart's title (text 10) in a
+/// bitmap font of one glyph, `A`: a view's title is drawn as its glyphs.
+pub(crate) fn text_skin(texts: usize) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let elements: String = (0..texts)
+        .map(|i| format!("{{ id = \"t{i}\", font = \"f\", size = 100, ref = 10 }},"))
+        .collect();
+    let places: String = (0..texts)
+        .map(|i| {
+            format!(
+                "{{ id = \"t{i}\", dst = {{ {{ x = {}, y = {}, w = 200, h = 10 }} }} }},",
+                (i % 8) * 220,
+                500 + (i / 8) * 12
+            )
+        })
+        .collect();
+    lua_skin(
+        &format!(
+            "skin.font = {{ {{ id = \"f\", path = \"f.fnt\" }} }}\n\
+             skin.text = {{ {elements} }}\n"
+        ),
+        &places,
+    )
+}
+
+/// A fixed Lua result skin as [`fixed_skin`], with `head` before its
+/// destinations and `places` among them; the bitmap font `f.fnt` beside
+/// it.
+fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
     let d = tempfile::tempdir().unwrap();
-    let file = std::fs::File::create(d.path().join("s.png")).unwrap();
-    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 16);
-    e.set_color(png::ColorType::Rgba);
-    e.set_depth(png::BitDepth::Eight);
-    let data: Vec<u8> = (0..64 * 16).flat_map(|_| [9, 9, 9, 255]).collect();
-    e.write_header().unwrap().write_image_data(&data).unwrap();
+    let image = |name: &str, w: u32, h: u32| {
+        let file = std::fs::File::create(d.path().join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let data: Vec<u8> = (0..w * h).flat_map(|_| [9, 9, 9, 255]).collect();
+        e.write_header().unwrap().write_image_data(&data).unwrap();
+    };
+    image("s.png", 64, 16);
+    image("f.png", 128, 128);
+    std::fs::write(
+        d.path().join("f.fnt"),
+        "info face=\"solid\" size=100 padding=0,0,0,0\n\
+         common lineHeight=100 base=100 scaleW=128 scaleH=128 pages=1\n\
+         page id=0 file=\"f.png\"\n\
+         char id=65 x=0 y=0 width=100 height=100 xoffset=0 yoffset=0 xadvance=100 \
+         page=0 chnl=15\n",
+    )
+    .unwrap();
     std::fs::write(
         d.path().join("s.luaskin"),
-        "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }\n\
-         if not skin_config then return skin end\n\
-         skin.source = { { id = \"s\", path = \"s.png\" } }\n\
-         skin.image = { { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }\n\
-         skin.value = { { id = \"ex\", src = \"s\", x = 0, y = 8, w = 40, h = 8, divx = 10, \
-                          digit = 4, ref = 71 } }\n\
-         skin.destination = {\n\
-           { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },\n\
-           { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } },\n\
-         }\n\
-         return skin\n",
+        format!(
+            "local skin = {{ type = 7, name = \"t\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
+             skin.image = {{ {{ id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }} }}\n\
+             skin.value = {{ {{ id = \"ex\", src = \"s\", x = 0, y = 8, w = 40, h = 8, divx = 10, \
+                              digit = 4, ref = 71 }} }}\n\
+             {head}\
+             skin.destination = {{\n\
+               {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }},\n\
+               {{ id = \"dot\", op = {{ 90 }}, dst = {{ {{ x = 0, y = 300, w = 8, h = 8 }} }} }},\n\
+               {places}\n\
+             }}\n\
+             return skin\n"
+        ),
     )
     .unwrap();
     let choice = game::SkinChoice {
@@ -362,6 +425,17 @@ fn payload(
     ex: u32,
     lines: &[&str],
 ) -> Arc<ViewPayload> {
+    titled(key, skin, ex, lines, "")
+}
+
+/// [`payload`] of a chart titled `title`.
+fn titled(
+    key: ViewKey,
+    skin: Option<&Arc<render::SkinBundle>>,
+    ex: u32,
+    lines: &[&str],
+    title: &str,
+) -> Arc<ViewPayload> {
     let mut view = crate::result_skin::probe_view(ResultChart::default());
     view.score.tally.ex_score = ex;
     Arc::new(ViewPayload {
@@ -369,7 +443,10 @@ fn payload(
         skin: skin.map(Arc::clone),
         why: None,
         view,
-        labels: ResultLabels::default(),
+        labels: ResultLabels {
+            title: title.to_owned(),
+            ..ResultLabels::default()
+        },
         lines: lines.iter().map(|l| (*l).to_owned()).collect(),
         page: EndPage {
             lines: (0..25).map(|i| format!("v{key} {i}")).collect(),
@@ -454,6 +531,12 @@ fn every_frame_draws_one_views_number_and_strip() {
     }
     // The last shown, b, is drawn in the end.
     assert!(rig.until(|d| *d == Drawn::Skin(ref_b.clone(), 2)));
+    // The status follows the frame.
+    assert!(
+        wait_until(|| rig.link.result_status().shown == Some((2, true))),
+        "{:?}",
+        rig.link.result_status()
+    );
     for d in rig.drawn() {
         let (q, n) = skin_frame(&d).expect("only the skin draws");
         assert!(
@@ -462,7 +545,6 @@ fn every_frame_draws_one_views_number_and_strip() {
         );
     }
     let status = rig.link.result_status();
-    assert_eq!(status.shown, Some((2, true)));
     assert_eq!(status.lifetime, lifetime);
     assert_eq!(status.installed, Some(skin.atlas_id()));
     // An overlay alone (a notice) merges over the view presented.
@@ -691,19 +773,225 @@ fn an_ended_lifetimes_presentation_is_not_drawn() {
     rig.link.exit();
 }
 
+/// A view committed on the pages the upload installed is what a screen
+/// built again restores: its layout draws again, the kind not disabled
+/// (the S10-09i design's D2 and D4, "Recovery").
+#[test]
+fn a_view_on_uploaded_pages_is_restored_with_its_layout() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    assert!(presented_on(
+        &rig,
+        crate::result_skin::Upload::Pages(Arc::clone(skin.atlas_pages())),
+        &skin
+    ));
+    let Some(Drawn::Skin(before, _)) = rig.drawn().last().cloned() else {
+        panic!("{:?}", rig.drawn().last());
+    };
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(
+        rig.until(|d| { skin_frame(d).is_some_and(|(q, _)| skin_quads(q) == skin_quads(&before)) })
+    );
+    let status = rig.link.result_status();
+    assert_eq!(status.disabled, None);
+    assert_eq!(status.installed, Some(skin.atlas_id()));
+    rig.link.exit();
+}
+
+/// Each view committed on another atlas (a union) becomes what the kind
+/// keeps: the atlas it replaced is released once drained, so only the one
+/// presented is retained, and a screen built again draws the newest (D2,
+/// §2.1 Q3).
+#[test]
+fn each_union_releases_the_atlas_it_replaces() {
+    let skins: Vec<_> = (0..3).map(|_| fixed_skin()).collect();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skins[0].1);
+    let mut last = Vec::new();
+    for (i, (_, skin)) in skins.iter().enumerate() {
+        let key = u64::try_from(i).unwrap() + 1;
+        let ex = 1_000 * u32::try_from(key).unwrap();
+        show(
+            &rig.link,
+            lifetime,
+            key,
+            &payload(key, Some(skin), ex, &[]),
+            &Overlay::default(),
+        );
+        assert!(
+            wait_until(|| {
+                let s = rig.link.result_status();
+                s.shown == Some((key, true)) && s.retained == [skin.atlas_id()]
+            }),
+            "{:?}",
+            rig.link.result_status()
+        );
+        assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+        assert!(rig.until(|d| skin_frame(d).is_some()));
+        let Some(Drawn::Skin(q, _)) = rig.drawn().last().cloned() else {
+            panic!();
+        };
+        last = q;
+    }
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(
+        rig.until(|d| { skin_frame(d).is_some_and(|(q, _)| skin_quads(q) == skin_quads(&last)) })
+    );
+    let status = rig.link.result_status();
+    assert_eq!(status.retained, [skins[2].1.atlas_id()]);
+    assert_eq!(status.disabled, None);
+    rig.link.exit();
+}
+
+/// The first presentation's text refused on a healthy device draws the
+/// built-in page of that very view, its rows and the reason, in the frame
+/// it would have drawn, and disables the kind (C17c): never an empty page.
+#[test]
+fn a_refused_first_presentation_draws_its_own_page() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.faults.refuse_text.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| !rig.drawn().is_empty()));
+    let Some(Drawn::Page(page)) = rig.drawn().first().cloned() else {
+        panic!("{:?}", rig.drawn().first());
+    };
+    assert_eq!(page.get(2).map(String::as_str), Some("v1 2"), "{page:?}");
+    assert!(
+        page.iter().any(|l| l.starts_with("RESULT SKIN NOT SHOWN")),
+        "{page:?}"
+    );
+    assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    assert_eq!(rig.link.result_status().shown, Some((1, false)));
+    rig.link.exit();
+}
+
+/// A result restore refused on a screen built again before any result was
+/// presented disables the kind for the run all the same (C17d): a later
+/// selection of it is refused.
+#[test]
+fn a_restore_refused_before_any_result_disables_the_kind() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.faults.refuse_restore.store(true, Ordering::Release);
+    rig.faults.lose_page.store(true, Ordering::Release);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+    });
+    assert!(wait_until(|| rig.link.failed()));
+    rig.link.prepare().unwrap();
+    let why = rig
+        .link
+        .result_status()
+        .disabled
+        .expect("disabled for the run");
+    assert!(why.contains("not restored"), "{why}");
+    rig.faults.refuse_restore.store(false, Ordering::Release);
+    assert!(matches!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Refused(_)
+    ));
+    rig.link.exit();
+}
+
+/// While views switch fast between two skin views and a built-in one,
+/// every frame draws one view's number, text and strip, or one view's
+/// built-in rows, never parts of two (C2's text and built-in rows).
+#[test]
+fn every_frame_draws_one_views_text_and_rows() {
+    let (_dir, skin) = text_skin(1);
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = titled(1, Some(&skin), 1_111, &[], "A");
+    let b = titled(2, Some(&skin), 2_222, &["VIEWING B"], "AAA");
+    let c = payload(3, None, 0, &["LINE C"]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let Some(Drawn::Skin(ref_a, 0)) = rig.drawn().last().cloned() else {
+        panic!("{:?}", rig.drawn().last());
+    };
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 1)));
+    let Some(Drawn::Skin(ref_b, 1)) = rig.drawn().last().cloned() else {
+        panic!();
+    };
+    // The title's glyphs: one for A, three for B, besides the numbers.
+    assert_eq!(
+        skin_quads(&ref_b).len(),
+        skin_quads(&ref_a).len() + 2,
+        "the views' texts differ"
+    );
+    rig.clear();
+    for i in 0..30_u64 {
+        let p = [&a, &b, &c][usize::try_from(i % 3).unwrap()];
+        show(&rig.link, lifetime, 3 + i, p, &Overlay::default());
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    // The last shown, c, draws its built-in page in the end.
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    let mut pages = 0;
+    for d in rig.drawn() {
+        match d {
+            Drawn::Skin(q, n) => assert!(
+                (q == ref_a && n == 0) || (q == ref_b && n == 1),
+                "a skin frame of two views: {n} lines"
+            ),
+            Drawn::Page(p) => {
+                pages += 1;
+                for row in [1, 2, 3, 4, 8, 9, 10, 11, 13, 14, 15] {
+                    assert_eq!(p[row], format!("v3 {row}"), "{p:?}");
+                }
+            }
+        }
+    }
+    assert!(pages > 0);
+    rig.link.exit();
+}
+
 /// The commit point and the build of a result frame allocate nothing
-/// (C11): each cycle commits a view prepared on the installed pages with
-/// its lines and its strip of all 13 lines, merges an overlay, and builds
-/// the skin's frame with the strip; the preparation and the submission
-/// stay outside the count. Unoptimized builds count the standard
-/// library's own allocations: CI runs it in release.
+/// (C11), with the skin at its text capacity (every text element filled,
+/// a new title each cycle) and all 13 strip lines: each cycle commits a
+/// view prepared on the installed pages with its lines and its strip,
+/// replacing the text installed, merges an overlay, and builds the skin's
+/// frame with the strip; then a frame the skin refuses, the refusal
+/// carried out unformatted. The preparation and the submission stay
+/// outside the count; a vector made inside it is counted (the control).
+/// Unoptimized builds count the standard library's own allocations: CI
+/// runs it in release.
 #[test]
 fn result_frame_alloc() {
     use super::super::{
         HeldView, PreparedView, ResultDrawn, ResultSide, Run, STRIP_PREPARED, STRIP_PRESENTED,
         Shared,
     };
-    let (_dir, skin) = fixed_skin();
+    // The widget quads' cap (16 384) admits 63 texts of 256 glyphs each
+    // beside the number and the image: the skin at its text capacity.
+    let texts = skin_model::MAX_TEXT_ELEMENTS - 1;
+    let (_dir, skin) = text_skin(texts);
     let r = render::Renderer::new(
         render::Target::Offscreen {
             width: 1_920,
@@ -730,11 +1018,13 @@ fn result_frame_alloc() {
     let mut counts = Vec::new();
     for cycle in 0..6_u64 {
         let request = cycle + 2;
-        let p = payload(
+        let title = "A".repeat(usize::try_from(cycle).unwrap() % 3 + 1);
+        let p = titled(
             cycle,
             Some(&skin),
             1_000 + u32::try_from(cycle).unwrap(),
             &[],
+            &title,
         );
         assert_eq!(
             screen.install(ScreenKind::Result, &skin, request).unwrap(),
@@ -769,10 +1059,29 @@ fn result_frame_alloc() {
         counts.push(crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         assert_eq!(screen.result_strip(), 13);
+        let quads = screen
+            .result_quads()
+            .unwrap()
+            .iter()
+            .filter(|q| q.layer != 0)
+            .count();
+        assert!(quads >= texts + 5, "every text drawn: {quads} quads");
         screen.submit_result().unwrap();
         side.dropped = [None, None];
         let _ = screen.drain_retired();
     }
+    // A frame the skin refuses allocates nothing either.
+    screen.refuse_next_result(false);
+    let before = crate::alloc_count::this_thread();
+    let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(2_000_000));
+    counts.push(crate::alloc_count::this_thread() - before);
+    assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
+    // The control: the count sees an allocation in the same window.
+    let before = crate::alloc_count::this_thread();
+    let made = std::hint::black_box(vec![0_u8; 64]);
+    let control = crate::alloc_count::this_thread() - before;
+    drop(made);
+    assert!(control > 0, "the count sees allocations");
     assert!(counts.iter().all(|&n| n == 0), "{counts:?}");
 }
 

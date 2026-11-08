@@ -337,6 +337,12 @@ pub trait Screen: Send {
     fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
         None
     }
+    /// How many texture arrays the screen uploaded so far (dev-tools);
+    /// none by default.
+    #[cfg(feature = "dev-tools")]
+    fn atlas_uploads(&self) -> u64 {
+        0
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {
@@ -2172,6 +2178,7 @@ pub fn spawn(
                 chart.as_deref(),
                 section.as_ref(),
                 false,
+                &mut None,
             ) {
                 Ok(screen) => {
                     thread_shared.built(screen.as_ref());
@@ -2512,13 +2519,16 @@ impl Committed {
 /// from then on, and its screen draws its built-in presentation; a
 /// pending play skin's specialization refused so keeps only the pending
 /// marker, the next attempt staging one again. Play's installed skin
-/// refused, and any failure, fails the build.
+/// refused, and any failure, fails the build. A result restore refused
+/// says why in `result_refused`, so its owner disables the kind for the
+/// run (the S10-09i design's D2, "Keying and recovery").
 fn build(
     make: &mut MakeScreen,
     committed: &mut Committed,
     chart: Option<&Chart>,
     section: Option<&Section>,
     disabled: bool,
+    result_refused: &mut Option<String>,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
     if disabled {
@@ -2534,6 +2544,12 @@ fn build(
                         Chain(&e)
                     );
                     committed.clear(kind);
+                    if kind == ScreenKind::Result {
+                        *result_refused = Some(format!(
+                            "the result skin was not restored on the screen built again: {}",
+                            Chain(&e)
+                        ));
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -2557,6 +2573,12 @@ fn build(
                     Chain(&e)
                 );
                 committed.clear(kind);
+                if kind == ScreenKind::Result {
+                    *result_refused = Some(format!(
+                        "the result skin was not restored on the screen built again: {}",
+                        Chain(&e)
+                    ));
+                }
             }
             Err(e) => return Err(e),
         }
@@ -3034,7 +3056,7 @@ impl Run {
                         Selected::Pending => self.pend(request, kind),
                         Selected::Pages(pages) => self.select_pages(request, kind, &pages),
                     };
-                    self.reconcile_result_release();
+                    self.reconcile_result();
                     let _ = reply.send(answer);
                     mode = after_preparing(mode);
                     continue;
@@ -3484,6 +3506,16 @@ impl Run {
                         &self.shared,
                         self.clock.now(),
                     );
+                    // A view committed: what the kind keeps to restore
+                    // follows it now, whatever the submission does.
+                    if let Some(side) = &mut self.result
+                        && std::mem::take(&mut side.reconcile)
+                    {
+                        self.reconcile_result();
+                    }
+                    let Some(screen) = &mut self.screen else {
+                        continue;
+                    };
                     let page = |side: Option<&ResultSide>, latest: &EndPage| match side
                         .and_then(|s| s.presented.as_ref())
                         .and_then(|h| h.page.as_ref())
@@ -3496,11 +3528,11 @@ impl Run {
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
-                        ResultDrawn::Refused(why) => {
+                        ResultDrawn::Refused(e) => {
                             // Refused on a healthy device: the built-in page
                             // draws in this frame, and the result kind is
                             // disabled for the run.
-                            self.disable_result(&why);
+                            self.disable_result(&e.to_string());
                             let page = self.result.as_ref().map_or_else(
                                 || self.end_page.1.clone(),
                                 |r| {
@@ -3589,8 +3621,17 @@ impl Run {
                     self.frames.frame(screen.as_ref(), &d);
                     // The end page drawn, for a script waiting on it
                     // (dev-tools).
+                    // A result's frame counts once nothing newer of it waits
+                    // to be prepared or committed.
                     #[cfg(feature = "dev-tools")]
-                    if matches!(mode, Mode::End) && timing.presented {
+                    if timing.presented
+                        && (matches!(mode, Mode::End)
+                            || matches!(mode, Mode::Result)
+                                && self
+                                    .result
+                                    .as_ref()
+                                    .is_none_or(|r| r.incoming.is_none() && r.prepared.is_none()))
+                    {
                         self.shared
                             .end_drawn
                             .store(self.end_page.0, Ordering::Release);
@@ -3634,10 +3675,18 @@ impl Run {
             // The committed bundle, from memory: never read again from its
             // files, never another skin in its place.
             let disabled = self.result_disabled.is_some();
-            let screen = build(&mut self.make, &mut self.committed, None, None, disabled)?;
+            let mut refused = None;
+            let screen = build(
+                &mut self.make,
+                &mut self.committed,
+                None,
+                None,
+                disabled,
+                &mut refused,
+            )?;
             self.built(screen.as_ref());
             self.screen = Some(screen);
-            self.result_rebuilt();
+            self.result_rebuilt(refused.as_deref());
             // The new screen takes the window's size afresh.
             self.applied = None;
         }
@@ -3751,7 +3800,7 @@ impl Run {
             self.screen = None;
             self.granted = false;
         }
-        self.reconcile_result_release();
+        self.reconcile_result();
         self.answer(answer);
     }
 
@@ -3884,8 +3933,18 @@ impl Run {
         #[cfg(feature = "dev-tools")]
         if kind == ScreenKind::Result {
             crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                return Ok(refusal("dev: the result's selection was refused"));
+            }
         }
-        match screen.install(kind, &bundle, request) {
+        #[cfg(feature = "dev-tools")]
+        let uploads = screen.atlas_uploads();
+        let installed = screen.install(kind, &bundle, request);
+        #[cfg(feature = "dev-tools")]
+        if kind == ScreenKind::Result {
+            crate::dev::result_staged(screen.atlas_uploads() - uploads);
+        }
+        match installed {
             Ok(Preparation::Ready) => {
                 // Held through the commit: a withdrawal waits for it, or
                 // it sees the withdrawal and installs nothing.
@@ -4031,6 +4090,7 @@ impl Run {
     fn prepare(&mut self) -> Result<(), RenderError> {
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
+        let mut refused = None;
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
@@ -4040,13 +4100,14 @@ impl Run {
                 chart,
                 section,
                 self.result_disabled.is_some(),
+                &mut refused,
             )
             .map(|s| {
                 self.built(s.as_ref());
                 self.screen = Some(s);
                 // The new screen takes the window's size afresh.
                 self.applied = None;
-                self.result_rebuilt();
+                self.result_rebuilt(refused.as_deref());
             }),
         };
         if ready.is_ok() {
@@ -4068,7 +4129,7 @@ enum ResultDrawn {
     BuiltIn,
     /// The skin refused its frame on a healthy device: nothing of it was
     /// staged.
-    Refused(String),
+    Refused(BuildError),
 }
 
 /// The strip's text slots, after the one drawn: the one prepared with a
@@ -4115,6 +4176,10 @@ struct ResultSide {
     discard: bool,
     /// A commit happened: what it replaced is drained after the frame.
     drain: bool,
+    /// A commit happened: what the result kind keeps to restore is
+    /// reconciled right after the commit point, before the frame is
+    /// submitted ([`Run::reconcile_result`]).
+    reconcile: bool,
     /// The screen was built again: the view presented is prepared again.
     reapply: bool,
     /// A newer end page came, or the run disabled the skin: the built-in
@@ -4137,6 +4202,7 @@ impl ResultSide {
             dropped: [None, None],
             discard: false,
             drain: false,
+            reconcile: false,
             reapply: false,
             end_changed: false,
             refused: None,
@@ -4223,18 +4289,12 @@ impl Run {
     /// it at its next frame, at the same revision (the S10-09i design's
     /// D4, "Recovery"), and a view prepared on the old screen is prepared
     /// again.
-    fn result_rebuilt(&mut self) {
+    fn result_rebuilt(&mut self, refused: Option<&str>) {
         // A restore refused on a healthy device disables the kind for the
-        // run (the S10-09i design's D2, "Keying and recovery").
-        let refused = self.result_disabled.is_none()
-            && self.committed.atlas(ScreenKind::Result).is_none()
-            && self
-                .result
-                .as_ref()
-                .and_then(|r| r.presented.as_ref())
-                .is_some_and(|h| h.payload.skin.is_some());
-        if refused {
-            self.disable_result("the result skin was not restored on the screen built again");
+        // run (the S10-09i design's D2, "Keying and recovery"), whether a
+        // result lifetime is current or not.
+        if let Some(why) = refused {
+            self.disable_result(why);
         }
         if let Some(side) = &mut self.result {
             side.reapply = true;
@@ -4251,15 +4311,29 @@ impl Run {
         }
     }
 
-    /// A staging of play released the result's installation to be
-    /// admitted: what a screen built again restores is reconciled.
-    fn reconcile_result_release(&mut self) {
-        if let Some(screen) = &mut self.screen
-            && screen.take_result_release()
-        {
-            self.committed.clear(ScreenKind::Result);
-            self.publish_result_status();
+    /// The one point that reconciles what the result kind keeps to
+    /// restore with what the screen has committed for it (the S10-09i
+    /// design's D2 and D7), after every event that changes it: a view's
+    /// commit (even when the frame's submission then fails), play's
+    /// release of the installation, the run's disable. The record follows
+    /// the screen's installation; a pages-only installation, which the
+    /// screen does not hand out, stays as its selection kept it. What the
+    /// record replaces is dropped here, outside the commit point. The
+    /// status is published after.
+    fn reconcile_result(&mut self) {
+        if let Some(screen) = &mut self.screen {
+            if self.result_disabled.is_some() || screen.take_result_release() {
+                self.committed.clear(ScreenKind::Result);
+            } else if let Some(i) = screen.installation(ScreenKind::Result)
+                && self
+                    .committed
+                    .get(ScreenKind::Result)
+                    .is_none_or(|c| !Arc::ptr_eq(c.bundle(), i.bundle()))
+            {
+                self.committed.set(ScreenKind::Result, Some(i));
+            }
         }
+        self.publish_result_status();
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i
@@ -4275,12 +4349,32 @@ impl Run {
         if let Some(screen) = &mut self.screen {
             screen.disable_result();
         }
-        self.committed.clear(ScreenKind::Result);
+        // Every view held draws the built-in page from now on, with its
+        // own rows: the one presented, else the one prepared, whose
+        // staging the screen dropped (it commits as the built-in page, the
+        // first presentation's rows and reason drawn in this frame).
         if let Some(side) = &mut self.result {
-            side.prepared = None;
-            side.end_changed = true;
+            let latest = &self.end_page.1;
+            let why = self.result_disabled.as_deref();
+            for h in side
+                .presented
+                .iter_mut()
+                .chain(side.prepared.iter_mut().map(|v| &mut v.held))
+            {
+                h.state = None;
+                h.page = Some(crate::result_present::compose_page(
+                    &h.payload.page,
+                    latest,
+                    why,
+                ));
+            }
+            if side.presented.is_some() {
+                side.prepared = None;
+            } else if let Some(v) = &mut side.prepared {
+                v.token = None;
+            }
         }
-        self.publish_result_status();
+        self.reconcile_result();
     }
 
     /// Prepares what the result side took, outside the commit point
@@ -4311,6 +4405,9 @@ impl Run {
             && let Some(h) = &mut side.presented
         {
             if let (Some(bundle), Some(state), false) = (&h.payload.skin, &mut h.state, disabled) {
+                // The layout presented is installed already: the screen
+                // built again restored what the result kind keeps, which
+                // follows each view's commit (`reconcile_result`).
                 match screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels) {
                     Ok(Ok(())) => {
                         screen.install_result_text();
@@ -4329,8 +4426,15 @@ impl Run {
         }
         if let Some(p) = side.incoming.take() {
             let same = |h: &HeldView| Arc::ptr_eq(&h.payload, &p.payload);
-            let known = side.presented.as_ref().is_some_and(same)
-                || side.prepared.as_ref().is_some_and(|v| same(&v.held));
+            let presented = side.presented.as_ref().is_some_and(same);
+            let known = presented || side.prepared.as_ref().is_some_and(|v| same(&v.held));
+            if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
+                // The newest is the view presented again: the other one
+                // prepared goes, so it is not committed after it.
+                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
+                    screen.discard();
+                }
+            }
             if !known {
                 // A new view payload: the one prepared before goes.
                 if side.prepared.take().is_some_and(|v| v.token.is_some()) {
@@ -4356,7 +4460,22 @@ impl Run {
                     // of it is prepared, and it is no view's refusal.
                     ok = false;
                 } else if let (Some(bundle), false) = (&p.payload.skin, disabled) {
-                    match screen.install(ScreenKind::Result, bundle, request) {
+                    #[cfg(feature = "dev-tools")]
+                    let uploads = screen.atlas_uploads();
+                    let installed = screen.install(ScreenKind::Result, bundle, request);
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::result_staged(screen.atlas_uploads() - uploads);
+                    // A refusal injected by a test of the real flow
+                    // (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    let installed = match installed {
+                        Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
+                            screen.discard();
+                            Ok(refusal("dev: the view's staging was refused"))
+                        }
+                        other => other,
+                    };
+                    match installed {
                         Ok(Preparation::Ready) => {
                             token = Some(PreparedToken {
                                 request,
@@ -4372,8 +4491,11 @@ impl Run {
                             ) {
                                 Ok(Ok(())) => held.state = Some(state),
                                 Ok(Err(why)) => {
+                                    // Disabled below; the first presentation
+                                    // still commits, as the built-in page with
+                                    // its own rows and the reason.
                                     refused = Some(why);
-                                    ok = false;
+                                    ok = side.presented.is_none();
                                 }
                                 Err(e) => {
                                     failed = Some(e);
@@ -4389,8 +4511,16 @@ impl Run {
                                 _ => "the staging was cancelled".to_owned(),
                             };
                             eprintln!("render: the result view's staging was refused: {why}");
+                            // The view draws the built-in page with its own
+                            // rows at once (scope view, the S10-09i design's
+                            // D7); the presenter's built-in payload for it
+                            // follows.
+                            held.page = Some(crate::result_present::compose_page(
+                                &held.payload.page,
+                                &self.end_page.1,
+                                Some(&why),
+                            ));
                             side.refused = Some((p.payload.key, why));
-                            ok = false;
                         }
                         Err(e) => {
                             failed = Some(e);
@@ -4399,7 +4529,7 @@ impl Run {
                     }
                 }
                 if ok {
-                    if held.payload.skin.is_none() || disabled {
+                    if held.page.is_none() && (held.state.is_none() || disabled) {
                         held.page = Some(crate::result_present::compose_page(
                             &held.payload.page,
                             &self.end_page.1,
@@ -4435,13 +4565,20 @@ impl Run {
         if std::mem::take(&mut side.end_changed) {
             let latest = &self.end_page.1;
             let why = self.result_disabled.as_deref();
+            let refused = side.refused.as_ref();
             for h in side
                 .presented
                 .iter_mut()
                 .chain(side.prepared.iter_mut().map(|v| &mut v.held))
             {
-                if h.payload.skin.is_none() || disabled {
-                    let why = why.or_else(|| h.payload.why.as_ref().map(|(_, w)| w.as_str()));
+                if h.state.is_none() || disabled {
+                    let why = why
+                        .or_else(|| h.payload.why.as_ref().map(|(_, w)| w.as_str()))
+                        .or_else(|| {
+                            refused
+                                .filter(|(k, _)| *k == h.payload.key)
+                                .map(|(_, w)| w.as_str())
+                        });
                     h.page = Some(crate::result_present::compose_page(
                         &h.payload.page,
                         latest,
@@ -4510,6 +4647,7 @@ impl Run {
                             Ok(()) => {
                                 screen.install_result_text();
                                 side.drain = true;
+                                side.reconcile = true;
                                 true
                             }
                             Err(_) => false,
@@ -4559,7 +4697,7 @@ impl Run {
             };
             return match screen.build_result(state, &frame) {
                 Ok(()) => ResultDrawn::Built,
-                Err(e) => ResultDrawn::Refused(e.to_string()),
+                Err(e) => ResultDrawn::Refused(e),
             };
         }
         ResultDrawn::BuiltIn
@@ -4618,7 +4756,7 @@ impl Run {
                 side.presented.as_ref().map(|h| {
                     (
                         h.payload.key,
-                        h.payload.skin.is_some() && self.result_disabled.is_none(),
+                        h.state.is_some() && self.result_disabled.is_none(),
                     )
                 }),
                 side.refused.as_ref(),
@@ -4672,8 +4810,18 @@ impl Run {
             return Err(RenderError::SurfaceLost);
         };
         #[cfg(feature = "dev-tools")]
-        crate::dev::hold_result_upload();
-        match screen.install_pages(kind, pages, request) {
+        {
+            crate::dev::hold_result_upload();
+            if crate::dev::refuse_result_select() {
+                return Ok(refusal("dev: the result's upload was refused"));
+            }
+        }
+        #[cfg(feature = "dev-tools")]
+        let uploads = screen.atlas_uploads();
+        let installed = screen.install_pages(kind, pages, request);
+        #[cfg(feature = "dev-tools")]
+        crate::dev::result_staged(screen.atlas_uploads() - uploads);
+        match installed {
             Ok(Preparation::Ready) => {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
