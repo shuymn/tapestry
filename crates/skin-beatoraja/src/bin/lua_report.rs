@@ -462,6 +462,9 @@ mod tests {
             scene: ScreenKind::Result,
             ..f
         };
+        // The frame's time budget out of reach: the call's status is not
+        // the clock's to decide.
+        skin_beatoraja::lua::vm_hooks::set_frame_time(Some(std::time::Duration::from_secs(3_600)));
         let s = survey_with(d.path(), "s.luaskin", &f, &Cancel::new(), false, &choice);
         assert_eq!(s.outcome, "imported");
         assert_eq!(s.outcomes.get("runtime"), Some(&1), "{:?}", s.outcomes);

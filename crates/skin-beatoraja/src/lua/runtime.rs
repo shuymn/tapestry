@@ -808,6 +808,10 @@ impl ScreenRuntime {
             let Some((site, f)) = self.sites.get(k) else {
                 break;
             };
+            #[cfg(feature = "dev-tools")]
+            if super::vm_hooks::expires_at(k) {
+                self.pass.ledger.expire_frame();
+            }
             let status = if out_of_budget {
                 CallStatus::Budget
             } else if site.gate.as_ref().is_some_and(|g| {
