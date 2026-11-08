@@ -226,6 +226,10 @@ pub struct PlayerRig<'a> {
     pub steps_dropped: u64,
     /// The figures of the play just over, until they are written.
     pub figures: Option<Figures>,
+    /// The current play's interval, from its start to its end: no screen
+    /// runtime runs while it is open (design.md "beatoraja Lua Skins",
+    /// Quiescence acknowledged).
+    pub interval: Option<crate::screens::PlayInterval>,
     /// The current play's number, as the audio thread knows it.
     pub generation: u64,
     /// The periods the next play queues on the audio output.
@@ -736,7 +740,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: result skin jobs: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -875,7 +879,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: specialization ended: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -896,7 +900,7 @@ impl PlayerRig<'_> {
     /// still from recording's open to the play's end.
     #[cfg(feature = "dev-tools")]
     fn print_lua(when: &str) {
-        use skin_beatoraja::lua::vm_hooks;
+        use skin_beatoraja::vm_hooks;
         println!(
             "dev: lua at {when}: live {} jobs {} passes {} steps {}",
             vm_hooks::live(),
@@ -1501,8 +1505,12 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         // With selection, the scan has acknowledged its pause before
-        // recording opens and READY starts.
+        // recording opens and READY starts; so has every screen runtime its
+        // parking (a render thread that ended holds none).
         self.pause_scan();
+        if !self.render.park_scripts() {
+            eprintln!("render: the screens' runtimes were not acknowledged parked");
+        }
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
         // inside a play or its READY state.
@@ -2003,6 +2011,7 @@ impl Rig for PlayerRig<'_> {
         // Every play follows a begun play state; the load's start stands
         // in for none.
         let state_origin = self.state_clock.origin().unwrap_or(self.load_start);
+        self.interval = Some(self.render.scripts().open_interval());
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
@@ -2055,6 +2064,18 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        // The interval closes; a render thread that ended meanwhile left
+        // its runtimes parked in the cell, destroyed here.
+        if let Some(closed) = self
+            .interval
+            .take()
+            .map(crate::screens::PlayInterval::close)
+            && self.render.scripts().orphaned()
+        {
+            self.render
+                .scripts()
+                .retire(crate::screens::Quiet::Closed(closed));
+        }
         #[cfg(feature = "dev-tools")]
         Self::print_lua("play end");
         #[cfg(feature = "dev-tools")]
@@ -2498,7 +2519,7 @@ mod tests {
 
         use game::Rig as _;
         use skin_beatoraja::JudgeClass;
-        use skin_beatoraja::lua::vm_hooks;
+        use skin_beatoraja::vm_hooks;
 
         use crate::imports::facts::tests::loaded;
         use crate::imports::tests as imports;

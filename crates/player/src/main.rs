@@ -49,6 +49,7 @@ mod result_input;
 mod result_present;
 mod result_skin;
 mod result_view;
+mod screens;
 mod select;
 mod selection;
 mod selection_skin;
@@ -830,6 +831,7 @@ fn rig<'a>(
         steps,
         steps_dropped: 0,
         figures: None,
+        interval: None,
         generation: 0,
         queue: game::QueueChoice::new(device.queued_periods),
         queue_most: None,
@@ -1609,7 +1611,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     println!(
         "dev: skin imports {} lua passes {}",
         imports::jobs_started(),
-        skin_beatoraja::lua::vm_hooks::passes()
+        skin_beatoraja::vm_hooks::passes()
     );
     #[cfg(feature = "dev-tools")]
     let script_failed = rig
@@ -2109,6 +2111,180 @@ mod tests {
         }
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
+        }
+    }
+
+    /// What a play frame saw of the screens' runtimes: whether a play's
+    /// interval was open, the selection runtime parked (its calls) and
+    /// whether its VM was gone.
+    #[cfg(feature = "dev-tools")]
+    type Rests = Arc<std::sync::Mutex<Vec<(bool, Option<(u64, bool)>, bool)>>>;
+
+    /// A screen that notes, at every play frame it builds, what
+    /// [`Rests`] holds of `scripts`, once set.
+    #[cfg(feature = "dev-tools")]
+    struct RestFrames {
+        scripts: Arc<std::sync::OnceLock<crate::screens::Scripts>>,
+        gone: Arc<std::sync::atomic::AtomicBool>,
+        seen: Rests,
+    }
+
+    #[cfg(feature = "dev-tools")]
+    impl crate::render_side::Screen for RestFrames {
+        fn load(
+            &mut self,
+            _chart: &bms_model::Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), render::RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            if let Some(s) = self.scripts.get() {
+                self.seen.lock().unwrap().push((
+                    s.inactive().is_none(),
+                    s.parked(skin_model::ScreenKind::Selection),
+                    self.gone.load(std::sync::atomic::Ordering::Acquire),
+                ));
+            }
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<render::FrameTiming, render::RenderError> {
+            Ok(render::FrameTiming {
+                cpu: std::time::Duration::from_micros(50),
+                sprites: 0,
+                dropped: 0,
+                presented: true,
+                present_count: None,
+            })
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {
+            Ok(true)
+        }
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            None
+        }
+    }
+
+    /// A play started and ended through the rig (`PlayerRig::start`, which
+    /// opens the play's interval, and `play_over`, which closes it after
+    /// the tail and Closing), its cell holding a parked selection runtime,
+    /// after the parking acknowledgment (`prepare_audio`): every play
+    /// frame sees the interval open, the runtime parked with no call made
+    /// and its VM alive. With `panic`, the render thread fails during the
+    /// play: no VM is destroyed until `play_over`, which retires them with
+    /// the interval's token. Without, the runtime is still parked after the
+    /// play, and the run's end destroys it (design.md "beatoraja Lua
+    /// Skins", Quiescence acknowledged).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_play_leaves_the_screens_runtimes_at_rest_until_its_end() {
+        let _serial = crate::imports::tests::serial();
+        use game::Rig as _;
+        use std::sync::atomic::Ordering;
+        for panic in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let settings = gauge_settings(0);
+            let loaded = loaded_under(dir.path(), &settings, "tapestry");
+            let fixture = crate::selection_skin::runtime_fixture();
+            let limits = skin_model::AtlasLimits {
+                max_side: 4_096,
+                max_layers: 16,
+                reserved_layers: render::RESERVED_LAYERS,
+            };
+            let (_, slot) =
+                crate::selection_skin::fixture_scripted(limits, fixture.path(), "rt.luaskin");
+            let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            slot.on_vm_drop(&gone);
+            let scripts = Arc::new(std::sync::OnceLock::new());
+            let seen = Rests::default();
+            let render = {
+                let (scripts, gone, seen) =
+                    (Arc::clone(&scripts), Arc::clone(&gone), Arc::clone(&seen));
+                crate::render_side::tests::spawn_empty(Box::new(move || {
+                    Ok(Box::new(RestFrames {
+                        scripts: Arc::clone(&scripts),
+                        gone: Arc::clone(&gone),
+                        seen: Arc::clone(&seen),
+                    })
+                        as Box<dyn crate::render_side::Screen>)
+                }))
+            };
+            render.load(Arc::new(loaded.chart().clone()), None).unwrap();
+            render
+                .scripts()
+                .commit(skin_model::ScreenKind::Selection, 1, slot);
+            let _ = scripts.set(render.scripts().clone());
+            let during = Rests::default();
+            on_rig_with(settings, render, |rig, settings| {
+                rig.prepare_audio().unwrap();
+                assert_eq!(
+                    rig.prepare_attempt(&loaded).unwrap(),
+                    game::Preparation::Ready
+                );
+                rig.commit_attempt().unwrap();
+                let device = settings.device.profile(&[input::DeviceKind::Keyboard], &[]);
+                let (_writer, reader) = input::source_queue(8);
+                let (_logic, side) = game::Logic::<input::SourceReader>::new(
+                    loaded.chart(),
+                    loaded.preset(),
+                    &device,
+                    &eval::InputStart::default(),
+                    vec![reader],
+                    game::LogicConfig {
+                        inputs: 8,
+                        effects: 8,
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+                let origin = bms_model::TimeSource::now(&rig.clock);
+                let (_sink, sounds) = game::audio_link_at(8, origin);
+                rig.start(origin, sounds, side);
+                assert!(crate::render_side::tests::wait_until(|| seen
+                    .lock()
+                    .unwrap()
+                    .len()
+                    >= 3));
+                let s = rig.render.scripts().clone();
+                if panic {
+                    rig.render.send(crate::render_side::RenderMsg::Panic);
+                    assert!(crate::render_side::tests::wait_until(|| s.orphaned()));
+                    assert!(!gone.load(Ordering::Acquire), "the interval is open");
+                }
+                // The frames up to the play's end: later ones may follow
+                // the close.
+                *during.lock().unwrap() = seen.lock().unwrap().clone();
+                rig.play_over();
+                assert!(s.inactive().is_some(), "the play's end closed the interval");
+                if panic {
+                    assert!(
+                        gone.load(Ordering::Acquire),
+                        "retired with the close's token"
+                    );
+                } else {
+                    assert_eq!(
+                        s.parked(skin_model::ScreenKind::Selection),
+                        Some((0, false))
+                    );
+                    assert!(!gone.load(Ordering::Acquire));
+                }
+            });
+            let frames = during.lock().unwrap().clone();
+            assert!(frames.len() >= 3, "{panic}: {frames:?}");
+            assert!(
+                frames.iter().all(|&f| f == (true, Some((0, false)), false)),
+                "{panic}: {frames:?}"
+            );
+            assert!(
+                gone.load(Ordering::Acquire),
+                "{panic}: retired by the run's end"
+            );
         }
     }
 

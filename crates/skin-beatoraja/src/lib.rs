@@ -63,6 +63,10 @@ pub use import::{
     Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
 };
 pub use lua::facts::{Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass};
+/// The VMs' development hooks, outside [`lua`] so that a crate kept
+/// from naming the Lua backend can use them (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub use lua::vm_hooks;
 pub use lua::{
     Cancel, LuaHeader, LuaImported, LuaLimit, LuaOutcome, LuaPending, LuaUsage, LuaWhy,
     read_lua_header,

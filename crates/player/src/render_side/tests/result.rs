@@ -481,7 +481,7 @@ fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBun
     );
     drop(serial);
     match built {
-        crate::imports::KindOutcome::Bundle(b, _) => (d, b),
+        crate::imports::KindOutcome::Bundle(b, ..) => (d, b),
         other => panic!("{other:?}"),
     }
 }

@@ -16,6 +16,7 @@ mod fixture;
 mod lint_fixtures;
 mod lints;
 mod portable;
+mod privacy;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -28,7 +29,7 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  check-arch                              check the architecture rules (R1-R4)
+  check-arch                              check the architecture rules (R1-R6, the privacy harness)
   check-lints                             check that the lints enforcing the design
                                           rules are configured and fire on their fixtures
   check-alloc-tests                       check that every allocation test runs in a
@@ -55,7 +56,12 @@ fn main() -> ExitCode {
     match command.to_str() {
         Some("check-arch") if rest.is_empty() => report(
             "check-arch",
-            arch::run(&workspace_manifest(), &["--locked"]),
+            arch::run(&workspace_manifest(), &["--locked"]).and_then(|mut d| {
+                let root = workspace_manifest();
+                let root = root.parent().context("the manifest has no folder")?;
+                d.extend(privacy::run(root)?);
+                Ok(d)
+            }),
         ),
         Some("check-lints") if rest.is_empty() => {
             report("check-lints", lints::run(&workspace_manifest()))

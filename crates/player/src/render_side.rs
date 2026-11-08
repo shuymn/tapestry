@@ -97,6 +97,7 @@ use crate::menu_screen::{MenuPage, SPLASH};
 use crate::result_present::{
     Overlay, ResultBarrier, ResultPresentation, ResultReport, ResultSlot, ViewKey, ViewPayload,
 };
+use crate::screens::{Quiet, ScriptSlot, Scripts};
 use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionSlot, SelectionUpdate};
 use crate::tuning::LiveTuning;
 use crate::ui_text::{Label, Message};
@@ -465,6 +466,12 @@ pub trait Screen: Send {
     fn selection_requests(&self) -> (Vec<String>, usize) {
         (Vec::new(), 0)
     }
+    /// The selection strip's lines last prepared, and whether the last
+    /// selection frame drew them (dev-tools tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_strip(&self) -> (Vec<String>, bool) {
+        (Vec::new(), false)
+    }
     /// The selection frame last built, its quads (dev-tools tests); none
     /// by default.
     #[cfg(all(test, feature = "dev-tools"))]
@@ -731,8 +738,9 @@ pub enum AttemptSkin {
 /// What a selection ([`RenderMsg::Select`]) selects for its kind.
 #[derive(Debug)]
 pub enum Selected {
-    /// The skin, or `None` for the skin in use.
-    Skin(Option<Arc<SkinBundle>>),
+    /// The skin, or `None` for the skin in use, with its screen's runtime
+    /// if its import kept one, parked at the installation's commit.
+    Skin(Option<Arc<SkinBundle>>, ScriptSlot),
     /// Play's skin is pending: no installation until an attempt's
     /// specialization is committed, and no attempt without one.
     Pending,
@@ -826,10 +834,16 @@ pub enum RenderMsg {
     /// state's presentation, so the play state's turntable is adopted,
     /// resumed when the game resumed it, and ticked on its frames.
     PracticePage(Box<MenuPage>),
+    /// Parks every runtime a screen holds, answered once it has: before
+    /// recording opens ([`RenderLink::park_scripts`]).
+    ParkScripts(mpsc::SyncSender<()>),
     /// Answer when taken (tests): the render thread has taken every
     /// message before it, and drawn the frame that followed them, if any.
     #[cfg(test)]
     Fence(mpsc::SyncSender<()>),
+    /// Makes the render thread panic (tests: its failure in a play).
+    #[cfg(all(test, feature = "dev-tools"))]
+    Panic,
     /// Draw the select screen from the newest update in the slot
     /// ([`RenderLink::show_selection`]), if it is newer than the one held
     /// and its lifetime current.
@@ -1391,11 +1405,29 @@ pub struct RenderLink {
     /// The loading clock, the render thread's: a loading lifetime's
     /// origin is stamped on it.
     clock: QpcClock,
+    /// The screens' runtimes, shared with the render thread
+    /// (design.md "beatoraja Lua Skins", Ownership).
+    scripts: Scripts,
     /// The result lifetimes begun.
     result_lifetimes: AtomicU64,
 }
 
 impl RenderLink {
+    /// The screens' runtimes' cell.
+    pub(crate) fn scripts(&self) -> &Scripts {
+        &self.scripts
+    }
+
+    /// Asks the render thread to park every runtime a screen holds and
+    /// waits at most the answer's bound: before recording opens
+    /// (design.md "beatoraja Lua Skins", Quiescence acknowledged).
+    /// Whether it answered; a thread that ended holds none.
+    pub fn park_scripts(&self) -> bool {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ParkScripts(tx));
+        rx.recv_timeout(self.answer_timeout).is_ok()
+    }
+
     /// Sends a message; a thread that already ended ignores it.
     pub fn send(&self, msg: RenderMsg) {
         let _ = self.tx.send(msg);
@@ -1560,7 +1592,7 @@ impl RenderLink {
     /// it is withdrawn when dropped unanswered.
     pub fn upload_result(&self, upload: crate::result_skin::Upload) -> PendingSelect {
         let skin = match upload {
-            crate::result_skin::Upload::Bundle(b) => Selected::Skin(Some(b)),
+            crate::result_skin::Upload::Bundle(b) => Selected::Skin(Some(b), ScriptSlot::default()),
             crate::result_skin::Upload::Pages(p) => Selected::Pages(p),
         };
         self.selecting(ScreenKind::Result, skin)
@@ -1803,7 +1835,19 @@ impl RenderLink {
     /// Startup selects each configured kind's skin
     /// ([`crate::imports::startup`]).
     pub fn select(&self, kind: ScreenKind, skin: Option<Arc<SkinBundle>>) -> PendingSelect {
-        self.selecting(kind, Selected::Skin(skin))
+        self.select_with(kind, skin, ScriptSlot::default())
+    }
+
+    /// [`select`](Self::select), with the runtime `script` the skin's
+    /// import kept for its screen, parked at the installation's commit
+    /// and retired if it does not commit.
+    pub(crate) fn select_with(
+        &self,
+        kind: ScreenKind,
+        skin: Option<Arc<SkinBundle>>,
+        script: ScriptSlot,
+    ) -> PendingSelect {
+        self.selecting(kind, Selected::Skin(skin, script))
     }
 
     /// Marks screen `kind`'s skin pending, as a selection is made
@@ -2019,7 +2063,7 @@ impl RenderLink {
     /// is [`RenderEnd::Stuck`], the window it draws into must stay open.
     pub fn exit(self) -> RenderEnd {
         self.send(RenderMsg::Exit);
-        match self.ended.recv_timeout(self.exit_timeout) {
+        let end = match self.ended.recv_timeout(self.exit_timeout) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Detached: a thread stuck in the screen's work must not
                 // hold up the exit. The caller keeps the window open.
@@ -2030,7 +2074,13 @@ impl RenderLink {
                 Ok(()) => RenderEnd::Joined,
                 Err(_) => RenderEnd::Panicked,
             },
+        };
+        // No play runs any more: the parked runtimes are destroyed here,
+        // unless an interval was left open, when they are leaked.
+        if let Some(token) = self.scripts.inactive() {
+            self.scripts.retire(Quiet::Inactive(token));
         }
+        end
     }
 
     /// Sets how long a preparation, a chart's load or a play's figures
@@ -2392,12 +2442,15 @@ pub fn spawn(
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared::new());
     let thread_shared = Arc::clone(&shared);
+    let scripts = Scripts::new();
+    let thread_scripts = scripts.clone();
     let (ended_tx, ended) = mpsc::sync_channel::<()>(0);
     let handle = std::thread::Builder::new()
         .name("render".into())
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
+            let _orphan = thread_scripts.orphan_guard();
             // A panic is the screen's failure, which the game sees: this
             // guard covers the startup build, `Run`'s own field the rest.
             let _unwinding = Unwinding(Arc::clone(&thread_shared));
@@ -2463,6 +2516,7 @@ pub fn spawn(
                 loading_stats: crate::dev::MenuStats::default(),
                 selection: None,
                 selection_states: 0,
+                scripts: thread_scripts,
                 result: None,
                 result_disabled: None,
                 #[cfg(feature = "dev-tools")]
@@ -2483,6 +2537,7 @@ pub fn spawn(
             end_pages: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             clock,
+            scripts,
             result_lifetimes: AtomicU64::new(0),
         }),
         Ok(Err(e)) => {
@@ -3047,6 +3102,8 @@ struct Run {
     selection: Option<ShownSelection>,
     /// The selection skin states made so far: each takes the next number.
     selection_states: u64,
+    /// The screens' runtimes, shared with the game thread.
+    scripts: Scripts,
     /// The result screen's presentations, while its lifetime is current.
     result: Option<ResultSide>,
     /// Why the result kind is disabled for the run (the S10-09i design's
@@ -3106,7 +3163,12 @@ impl Run {
     /// The selection skin's state for `shown`'s lifetime on the committed
     /// installation: made afresh for a new lifetime or installation, none
     /// without an installation.
-    fn selection_logic(committed: &Committed, shown: &mut ShownSelection, states: &mut u64) {
+    fn selection_logic(
+        committed: &Committed,
+        shown: &mut ShownSelection,
+        states: &mut u64,
+        scripts: &Scripts,
+    ) {
         match committed.get(ScreenKind::Selection) {
             None => shown.logic = None,
             Some(i)
@@ -3116,7 +3178,8 @@ impl Run {
                     .is_none_or(|l| !Arc::ptr_eq(&l.bundle, i.bundle())) =>
             {
                 *states = states.saturating_add(1);
-                shown.logic = Some(SelectionLogic::new(i.bundle(), *states));
+                let script = scripts.slot(ScreenKind::Selection, Arc::as_ptr(i.bundle()).addr());
+                shown.logic = Some(SelectionLogic::new(i.bundle(), *states).with_script(script));
             }
             Some(_) => {}
         }
@@ -3162,7 +3225,8 @@ impl Run {
                         | RenderMsg::PrepareAttempt { .. }
                         | RenderMsg::Commit { .. }
                         | RenderMsg::Ready { .. }
-                        | RenderMsg::Discard(_))
+                        | RenderMsg::Discard(_)
+                        | RenderMsg::ParkScripts(_))
                 )
             {
                 self.loading_stats.report("loading");
@@ -3213,6 +3277,13 @@ impl Run {
                 // the frame after them drawn.
                 #[cfg(test)]
                 Ok(RenderMsg::Fence(reply)) => {
+                    let _ = reply.send(());
+                    continue;
+                }
+                Ok(RenderMsg::ParkScripts(reply)) => {
+                    if let Some(logic) = self.selection.as_mut().and_then(|s| s.logic.as_mut()) {
+                        logic.script.park();
+                    }
                     let _ = reply.send(());
                     continue;
                 }
@@ -3384,7 +3455,7 @@ impl Run {
                     reply,
                 }) => {
                     let answer = match skin {
-                        Selected::Skin(skin) => self.select(request, kind, skin),
+                        Selected::Skin(skin, script) => self.select(request, kind, skin, script),
                         Selected::Pending => self.pend(request, kind),
                         Selected::Pages(pages) => self.select_pages(request, kind, &pages),
                     };
@@ -3456,6 +3527,8 @@ impl Run {
                         extent.acknowledge();
                     }
                 }
+                #[cfg(all(test, feature = "dev-tools"))]
+                Ok(RenderMsg::Panic) => panic!("the render thread fails (a test)"),
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3805,7 +3878,12 @@ impl Run {
                         mode = Mode::Idle;
                         continue;
                     };
-                    Self::selection_logic(&self.committed, shown, &mut self.selection_states);
+                    Self::selection_logic(
+                        &self.committed,
+                        shown,
+                        &mut self.selection_states,
+                        &self.scripts,
+                    );
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
                     // The settings the skin shows, the volume and the
@@ -3832,7 +3910,9 @@ impl Run {
                         );
                         screen.remove(ScreenKind::Selection);
                         self.committed.clear(ScreenKind::Selection);
+                        // Parked as the state goes, then retired.
                         shown.logic = None;
+                        self.scripts.retire_kind(ScreenKind::Selection);
                         *self
                             .shared
                             .selection_refused
@@ -4370,6 +4450,7 @@ impl Run {
         request: u64,
         kind: ScreenKind,
         skin: Option<Arc<SkinBundle>>,
+        script: ScriptSlot,
     ) -> Result<Preparation, RenderError> {
         if !self.newest(request) {
             return Ok(refusal("a newer request superseded it"));
@@ -4426,6 +4507,8 @@ impl Run {
                 commits.committed = commits.committed.max(request);
                 drop(commits);
                 self.committed.set(kind, screen.installation(kind));
+                self.scripts
+                    .commit(kind, Arc::as_ptr(&bundle).addr(), script);
                 if kind == ScreenKind::Play {
                     self.selected = Some(bundle);
                     self.play_selection = request;
@@ -4515,6 +4598,7 @@ impl Run {
         }
         screen.remove(kind);
         self.committed.clear(kind);
+        self.scripts.retire_kind(kind);
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
     }
@@ -11848,7 +11932,10 @@ pub(crate) mod tests {
         link.send(RenderMsg::Select {
             request: 1,
             kind: ScreenKind::Play,
-            skin: super::Selected::Skin(Some(Arc::clone(&late))),
+            skin: super::Selected::Skin(
+                Some(Arc::clone(&late)),
+                crate::screens::ScriptSlot::default(),
+            ),
             reply,
         });
         let answer = rx.recv().unwrap().unwrap();

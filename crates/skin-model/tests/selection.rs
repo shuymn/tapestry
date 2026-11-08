@@ -1559,3 +1559,42 @@ fn a_song_list_pays_its_visibilities_per_slot() {
     assert_eq!(ops(1), 10 * cost);
     assert_eq!(ops(2), 20 * cost);
 }
+
+/// The build of a frame the preparation filled keeps its timers: a `when`
+/// timer reading a runtime output stays as the preparation left it though
+/// the runtime writes that output between the two, and the next frame's
+/// preparation reads it (docs/stage3.md S7-07; design.md "beatoraja Lua
+/// Skins", the frame sequence).
+#[test]
+fn a_prepared_frame_is_built_without_its_timers_filled_again() {
+    let outs = [skin_model::output::OutTy::Bool];
+    let when = skin_model::compile(
+        "lua.0",
+        &skin_model::Scope::new(&skin_model::SELECTION).outputs(&outs),
+        skin_model::Ty::Bool,
+    )
+    .unwrap();
+    let mut e = element(Source::Image(4), [0, 0, 10, 10]);
+    e.timer = TimerRef::When(0);
+    e.track = keys(&[(0, [0, 0, 10, 10])]);
+    let mut def = skin_def(vec![e], WidgetDefs::default());
+    def.whens = vec![when];
+    let skin = Skin::new_selection(def, SelectionDefs::default())
+        .unwrap()
+        .with_outputs(1);
+    let mut fx = Fx::new(skin);
+    fx.view(&view(Vec::new(), None));
+    let prepare = |fx: &mut Fx, ms: i64| {
+        fx.skin
+            .prepare_selection_frame(&mut fx.sel, TimeUs(ms * 1_000), &fx.timers)
+            .unwrap();
+    };
+    prepare(&mut fx, 16);
+    // The runtime's step: its callback now answers true.
+    fx.sel.outputs_mut()[0] = 1;
+    fx.frame(16);
+    assert_eq!(fx.images(), Vec::<u32>::new(), "the timer as prepared: off");
+    prepare(&mut fx, 32);
+    fx.frame(32);
+    assert_eq!(fx.images(), [4], "the next preparation starts it");
+}
