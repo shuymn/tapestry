@@ -143,8 +143,13 @@ pub struct ResultBarrier {
     pub presented: Option<ViewKey>,
     /// The view pinned by the barrier, once set.
     pub pinned: Option<ViewKey>,
-    /// The fade-out's start the barrier was set with.
+    /// The fade-out's start the barrier was set with: set, the barrier
+    /// holds, a view pinned or none presented yet.
     pub fadeout: Option<TimeUs>,
+    /// The presented view's skin timing while its skin draws: `None` for
+    /// a built-in view, before the first commit and once the kind is
+    /// disabled (the S10-09i design's D6, D7).
+    pub timing: Option<skin_model::ResultTiming>,
 }
 
 /// What the render thread shows of the result kind, and the run's
@@ -414,12 +419,16 @@ pub trait Publish {
     /// Shows `p`.
     fn show(&mut self, p: ResultPresentation);
     /// Sets the barrier of the current lifetime with the fade-out's start
-    /// `at`: the view presented then.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
-    fn pin(&mut self, at: TimeUs) -> Option<ViewKey>;
+    /// `at`: the view presented then, and its skin's timing, read under
+    /// the same lock; `None`, nothing set, when that view's input time has
+    /// not passed from `gate`.
+    fn pin(
+        &mut self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)>;
+    /// The current lifetime's presented view's skin timing.
+    fn timing(&self) -> Option<skin_model::ResultTiming>;
 }
 
 /// The game thread's side of the result's presentation (D1, D4, D7): it
@@ -435,9 +444,9 @@ pub struct Presenter {
     desired: Option<(ViewKey, Snapshot)>,
     /// The payload published last.
     payload: Option<Arc<ViewPayload>>,
+    /// The overlay; its fade-out set, the barrier is: no view payload is
+    /// published any more.
     overlay: Overlay,
-    /// The barrier is set: no view payload is published any more.
-    pinned: bool,
     /// The attempt's fallback (D7), cleared by the next attempt.
     attempt: Option<String>,
     /// A view's fallback: its key and why.
@@ -459,7 +468,6 @@ impl Presenter {
         self.revision = 0;
         self.payload = None;
         self.desired = None;
-        self.pinned = false;
         self.view = None;
         self.overlay = Overlay {
             screen: now,
@@ -475,7 +483,6 @@ impl Presenter {
         }
         self.payload = None;
         self.desired = None;
-        self.pinned = false;
     }
 
     /// The next attempt: the attempt's fallback is forgotten.
@@ -505,7 +512,7 @@ impl Presenter {
     /// publication for the latest request): its payload is published,
     /// unless the barrier holds or it is the one published.
     pub fn land(&mut self, to: &mut impl Publish, shown: Option<&Published>) {
-        if self.pinned || self.lifetime.is_none() {
+        if self.overlay.fadeout.is_some() || self.lifetime.is_none() {
             return;
         }
         let Some((key, snapshot)) = &self.desired else {
@@ -580,19 +587,33 @@ impl Presenter {
     }
 
     /// Sets the barrier at `now` (D4): timer 2 starts, the view presented
-    /// then is pinned (returned), and from here no view payload is
-    /// published; the overlay with the fade-out follows.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
-    pub fn pin(&mut self, to: &mut impl Publish, now: TimeUs) -> Option<ViewKey> {
-        self.lifetime?;
+    /// then is pinned, and from here no view payload is published; the
+    /// overlay with the fade-out follows. Gives the pinned view and its
+    /// skin's timing, which the outro plays (D6); `None`, nothing pinned,
+    /// when the view on screen's input time has not passed from `gate`.
+    pub fn pin(
+        &mut self,
+        to: &mut impl Publish,
+        now: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
+        if self.lifetime.is_none() {
+            return Some((None, None));
+        }
+        let pinned = to.pin(now, gate)?;
         self.overlay.fadeout = Some(now);
-        let pinned = to.pin(now);
-        self.pinned = true;
         self.publish(to);
-        pinned
+        Some(pinned)
+    }
+
+    /// The timing of the result skin on screen (the S10-09i design's D6,
+    /// D7): the view the render thread presents, while its skin draws;
+    /// `None` outside a lifetime, for a built-in view, before the
+    /// lifetime's first frame and once the run disabled the kind. A view
+    /// published and not yet presented has no say.
+    pub fn timing(&self, to: &impl Publish) -> Option<skin_model::ResultTiming> {
+        self.lifetime?;
+        to.timing()
     }
 
     /// Publishes the payload published last with the overlay as it is,
