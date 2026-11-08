@@ -255,8 +255,25 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
             }
         }
     }
-    // R6 (metadata): the source scan knows the backend by its package's
-    // crate names, so the player may not rename it.
+    // R6 (metadata): the source scan knows the backend by its packages'
+    // crate names, so no backend package names its library otherwise.
+    for pkg in metadata
+        .packages
+        .iter()
+        .filter(|p| BACKEND_PACKAGES.contains(&p.name.as_str()))
+    {
+        let canonical = pkg.name.replace('-', "_");
+        for target in pkg.targets.iter().filter(|t| t.is_lib()) {
+            if target.name != canonical {
+                diagnostics.push(format!(
+                    "R6: `{}` names its library `{}`, not `{canonical}`; the backend's \
+                     crates keep their package's name (design.md \"beatoraja Lua Skins\")",
+                    pkg.name, target.name,
+                ));
+            }
+        }
+    }
+    // R6 (metadata): nor does the player rename its dependency on one.
     if let Some(player) = members.iter().find(|p| p.name.as_str() == PLAYER) {
         for dep in &player.dependencies {
             if let Some(rename) = dep
@@ -341,8 +358,9 @@ pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 /// The `#[path]` modules of `player` R6 allows, each the test fixtures
-/// another crate owns, used by `player`'s tests: the file declaring it,
-/// the attribute's path, and its owner. Each target's folder is scanned.
+/// another crate owns, used by `player`'s tests and declared
+/// `#[cfg(test)]`: the file declaring it, the attribute's path, and its
+/// owner. Each target's folder is scanned.
 const PATH_MODULES: &[(&str, &str, &str)] = &[
     (
         "crates/player/src/main.rs",
@@ -444,8 +462,9 @@ fn scan_tree(
                          (design.md \"beatoraja Lua Skins\")"
                     )
                 }));
-                for (line, value) in scan.paths {
+                for (line, value, test_only) in scan.paths {
                     let allowed = skip.is_some()
+                        && test_only
                         && value.as_deref().is_some_and(|v| {
                             PATH_MODULES.iter().any(|(f, p, _)| *f == shown && *p == v)
                         });
@@ -500,12 +519,65 @@ fn is_backend_root(segments: &[String]) -> bool {
 }
 
 /// What R6's scan found in one file: per finding, its line and what it
-/// is; and each module path set, its line and the path (`None` for a
-/// `cfg_attr` giving one).
+/// is; and each module path set, its line, the path (`None` for one a
+/// `cfg_attr` gives) and whether the module is `#[cfg(test)]`.
 #[derive(Default)]
 struct SourceScan {
     found: Vec<(usize, String)>,
-    paths: Vec<(usize, Option<String>)>,
+    paths: Vec<(usize, Option<String>, bool)>,
+}
+
+/// An attribute's name, its raw identifier read as plain; `None` for a
+/// path of more than one segment.
+fn attr_name(path: &syn::Path) -> Option<String> {
+    match path.segments.iter().collect::<Vec<_>>().as_slice() {
+        [only] if path.leading_colon.is_none() => Some(segment(&only.ident)),
+        _ => None,
+    }
+}
+
+/// Calls `found` for each module path `meta` sets: a `path` attribute
+/// (its value, `None` when under a `cfg_attr`), and every `path` a
+/// `cfg_attr` gives, however nested. A `cfg_attr` R6 cannot read counts
+/// as giving one.
+fn module_paths(meta: &syn::Meta, conditional: bool, found: &mut impl FnMut(Option<String>)) {
+    match attr_name(meta.path()).as_deref() {
+        Some("path") => {
+            let value = match meta {
+                syn::Meta::NameValue(syn::MetaNameValue {
+                    value:
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }),
+                    ..
+                }) => s.value(),
+                // A path R6 cannot read is never one of the listed.
+                _ => String::new(),
+            };
+            found((!conditional).then_some(value));
+        }
+        Some("cfg_attr") => {
+            let parsed = match meta {
+                syn::Meta::List(l) => l
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    )
+                    .ok(),
+                _ => None,
+            };
+            match parsed {
+                // The predicate first, then the attributes it gives.
+                Some(metas) => {
+                    for m in metas.iter().skip(1) {
+                        module_paths(m, true, found);
+                    }
+                }
+                None => found(None),
+            }
+        }
+        _ => {}
+    }
 }
 
 impl SourceScan {
@@ -651,38 +723,15 @@ impl<'ast> syn::visit::Visit<'ast> for SourceScan {
     }
 
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let line = m.ident.span().start().line;
+        let test_only = m.attrs.iter().any(|a| {
+            attr_name(a.path()).as_deref() == Some("cfg")
+                && matches!(&a.meta, syn::Meta::List(l) if l.tokens.to_string() == "test")
+        });
         for attr in &m.attrs {
-            let line = m.ident.span().start().line;
-            if attr.path().is_ident("path") {
-                let value = match &attr.meta {
-                    syn::Meta::NameValue(syn::MetaNameValue {
-                        value:
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(s),
-                                ..
-                            }),
-                        ..
-                    }) => s.value(),
-                    // A path R6 cannot read is never one of the listed.
-                    _ => String::new(),
-                };
-                self.paths.push((line, Some(value)));
-            } else if attr.path().is_ident("cfg_attr") {
-                let tokens: Vec<proc_macro2::TokenTree> = match &attr.meta {
-                    syn::Meta::List(l) => l.tokens.clone().into_iter().collect(),
-                    _ => Vec::new(),
-                };
-                let sets_path = tokens.windows(2).any(|w| {
-                    matches!(
-                        (&w[0], &w[1]),
-                        (proc_macro2::TokenTree::Ident(i), proc_macro2::TokenTree::Punct(p))
-                            if segment(i) == "path" && p.as_char() == '='
-                    )
-                });
-                if sets_path {
-                    self.paths.push((line, None));
-                }
-            }
+            module_paths(&attr.meta, false, &mut |value| {
+                self.paths.push((line, value, test_only));
+            });
         }
         syn::visit::visit_item_mod(self, m);
     }
@@ -1296,6 +1345,28 @@ mod tests {
         );
     }
 
+    /// A backend package whose library has another name would let the
+    /// player name the backend under a name the source scan does not know.
+    #[test]
+    fn r6_rejects_a_backend_library_named_otherwise() {
+        let mut crates = baseline();
+        crates.push(lib("skin-beatoraja", "[lib]\nname = \"backend\"\n"));
+        set(
+            &mut crates,
+            "player",
+            "[package.metadata.tapestry]\nwindows-only = true\n\
+             [features]\ndefault = []\ndev-tools = []\n\
+             [dependencies]\neval = { path = \"../eval\" }\n\
+             skin-beatoraja = { path = \"../skin-beatoraja\" }\n",
+        );
+        let found = r6(&crates);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].contains("`skin-beatoraja` names its library `backend`, not `skin_beatoraja`"),
+            "{found:#?}"
+        );
+    }
+
     /// A renamed backend dependency would let the player name the backend
     /// under a name the source scan does not know.
     #[test]
@@ -1401,6 +1472,26 @@ mod tests {
                 "#[path = \"../../render/tests/common/mod.rs\"]\nmod render_common;\n",
                 "a `#[path = \"../../render/tests/common/mod.rs\"]` module",
             ),
+            (
+                "main.rs",
+                "#[cfg_attr(all(), cfg_attr(all(), path = \"../../../outside/helper.rs\"))]\nmod helper;\n",
+                "a `cfg_attr` giving a module path",
+            ),
+            (
+                "main.rs",
+                "#[r#path = \"../../../outside/helper.rs\"]\nmod helper;\n",
+                "a `#[path = \"../../../outside/helper.rs\"]` module",
+            ),
+            (
+                "main.rs",
+                "#[r#cfg_attr(test, r#path = \"helper.rs\")]\nmod helper;\n",
+                "a `cfg_attr` giving a module path",
+            ),
+            (
+                "main.rs",
+                "#[path = \"../../render/tests/common/mod.rs\"]\nmod render_common;\n",
+                "a `#[path = \"../../render/tests/common/mod.rs\"]` module",
+            ),
         ] {
             let found = scan_files(&[(file, text)]);
             assert_eq!(found.len(), 1, "{text}: {found:#?}");
@@ -1427,6 +1518,23 @@ mod tests {
             super::check_player_sources(dir.path()).unwrap(),
             Vec::<String>::new()
         );
+        // Inside the fixture's folder, every path module is refused, a
+        // nested or raw one too.
+        for text in [
+            "#[cfg(test)]\n#[path = \"../../render/tests/common/mod.rs\"]\nmod again;\n",
+            "#[cfg_attr(all(), cfg_attr(all(), path = \"x.rs\"))]\nmod x;\n",
+            "#[r#path = \"x.rs\"]\nmod x;\n",
+        ] {
+            std::fs::write(fixture.join("more.rs"), text).unwrap();
+            let found = super::check_player_sources(dir.path()).unwrap();
+            assert_eq!(found.len(), 1, "{text}: {found:#?}");
+            assert!(
+                found[0].starts_with("R6: crates/render/tests/common/more.rs:")
+                    && found[0].contains("declares"),
+                "{text}: {found:#?}"
+            );
+        }
+        std::fs::write(fixture.join("more.rs"), "").unwrap();
         std::fs::write(
             fixture.join("more.rs"),
             "pub use skin_beatoraja::lua as backend;\n",
