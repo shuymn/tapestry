@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod decision;
 pub mod lanes;
 pub mod play;
 pub mod result;

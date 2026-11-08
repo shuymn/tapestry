@@ -14,6 +14,7 @@
 pub(crate) mod asset;
 mod budget;
 pub(crate) mod callback;
+pub(crate) mod decision;
 pub(crate) mod geom;
 #[cfg(feature = "dev-tools")]
 pub(crate) mod ledger;
@@ -32,10 +33,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, AngleFollow, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef,
-    LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef,
-    ResultDefs, ResultTiming, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef,
-    Track, Ty, WidgetDefs, compile, timer as slot,
+    Anchor, AngleFollow, Blend, CycleDef, DecisionDefs, DecisionTiming, Ease, ElementDef, Filter,
+    Fit, Follow, Grade, KeyDef, LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place,
+    Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind, SelectionDefs, Skin,
+    SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -204,16 +205,15 @@ const OFFSET_ALL: i32 = 10;
 const OFFSET_MAX: i32 = 199;
 
 /// Imports `def`, whose header `header` was read from it, with `config`
-/// into the `slot` kind's slot. A header of another kind than `slot`, or
-/// a slot no importer maps yet, refuses before anything is resolved or
-/// read; the play and selection kinds are mapped, selection through its
-/// profile ([`selection`]).
+/// into the `slot` kind's slot. A header of another kind than `slot`
+/// refuses before anything is resolved or read; selection, decision and
+/// result map their ids through their profiles ([`selection`],
+/// [`decision`], [`result`]).
 ///
 /// # Errors
 ///
 /// A skin of another kind than `slot`, by its header or by the `type` its
-/// resolution names ([`ImportError::Slot`]); a kind with no importer yet
-/// ([`ImportError::NoImporter`]); what resolution refuses; an importer
+/// resolution names ([`ImportError::Slot`]); what resolution refuses; an importer
 /// budget or aggregate asset limit ([`ImportError::Limit`]); geometry
 /// outside the model ([`ImportError::Range`]); a play-critical element
 /// the importer cannot reproduce ([`ImportError::Critical`],
@@ -232,12 +232,6 @@ pub fn import(
             slot,
             found: header.kind,
         });
-    }
-    if !matches!(
-        slot,
-        ScreenKind::Play | ScreenKind::Selection | ScreenKind::Result
-    ) {
-        return Err(ImportError::NoImporter { kind: slot });
     }
     let enabled = config.enabled();
     let mut resolved = resolve(def, &enabled)?;
@@ -1018,23 +1012,15 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
-        if self.kind == ScreenKind::Selection {
-            #[cfg(feature = "dev-tools")]
-            if let Some(e) = &mut self.element {
-                e.kind = Some(format!("{object:?}"));
-            }
-            return self.selection_destination(dst, object, orec);
-        }
-        if self.kind == ScreenKind::Result {
-            #[cfg(feature = "dev-tools")]
-            if let Some(e) = &mut self.element {
-                e.kind = Some(format!("{object:?}"));
-            }
-            return self.result_destination(dst, object, orec);
-        }
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
+        }
+        match self.kind {
+            ScreenKind::Selection => return self.selection_destination(dst, object, orec),
+            ScreenKind::Result => return self.result_destination(dst, object, orec),
+            ScreenKind::Decision => return self.decision_destination(dst, object, orec),
+            ScreenKind::Play => {}
         }
         // The source draws the character when its file exists and the
         // notes otherwise: one id cannot be both.
@@ -1597,7 +1583,8 @@ impl<'d> Cx<'d> {
         TimerRef::Builtin(match self.kind {
             ScreenKind::Selection => skin_model::selection_timer::SCREEN,
             ScreenKind::Result => skin_model::result_timer::SCREEN,
-            ScreenKind::Play | ScreenKind::Decision => slot::SCREEN,
+            ScreenKind::Decision => skin_model::decision_timer::SCREEN,
+            ScreenKind::Play => slot::SCREEN,
         })
     }
 
@@ -1911,9 +1898,48 @@ impl<'d> Cx<'d> {
         })
     }
 
+    /// A decision skin's declared timing (design.md "Play Lifecycle", the
+    /// decision screen), from the top-level `scene`, `fadeout` and `input`
+    /// in ms (`JsonSkin.java:14-16`, each 0 when absent; a Lua skin's table
+    /// converts to the same fields), in µs: a negative value is 0, and a
+    /// `scene` or `fadeout` past [`skin_model::MAX_DECISION_PHASE`] is
+    /// clamped to it with a deviation note. Each is read as every integer
+    /// field is: a value the reader refuses refuses the import.
+    fn decision_timing(&mut self) -> Result<DecisionTiming, ImportError> {
+        let fadeout = self.top_int("fadeout", 0)?;
+        let input = self.top_int("input", 0)?;
+        let scene = self.top_int("scene", 0)?;
+        Ok(DecisionTiming {
+            scene: self.decision_phase("scene", scene),
+            fadeout: self.decision_phase("fadeout", fadeout),
+            input: TimeUs(i64::from(input.max(0)) * 1_000),
+        })
+    }
+
+    /// The top-level `field`'s declared `ms` in µs, 0 for a negative value
+    /// and clamped to [`skin_model::MAX_DECISION_PHASE`] with a note.
+    fn decision_phase(&mut self, field: &'static str, ms: i32) -> TimeUs {
+        let us = TimeUs(i64::from(ms.max(0)) * 1_000);
+        if us <= skin_model::MAX_DECISION_PHASE {
+            return us;
+        }
+        let [f] = self.def.fields(self.def.top(), [field]);
+        let at = f.map(|f| self.arena_span(f));
+        self.note(
+            at,
+            Severity::Deviation,
+            NoteKind::DecisionClamped {
+                field,
+                declared_ms: ms,
+            },
+        );
+        skin_model::MAX_DECISION_PHASE
+    }
+
     fn finish(mut self, files: Vec<FileChoice>) -> Result<Imported, ImportError> {
         let selection = self.kind == ScreenKind::Selection;
         let result = self.kind == ScreenKind::Result;
+        let decision = self.kind == ScreenKind::Decision;
         if selection {
             self.selection_essentials()?;
         }
@@ -1923,7 +1949,12 @@ impl<'d> Cx<'d> {
         } else {
             ResultTiming::default()
         };
-        let (bomb_up_to, close) = if selection || result {
+        let decision_timing = if decision {
+            self.decision_timing()?
+        } else {
+            DecisionTiming::default()
+        };
+        let (bomb_up_to, close) = if selection || result || decision {
             (None, None)
         } else {
             (self.bomb_up_to()?, self.close()?)
@@ -1967,6 +1998,11 @@ impl<'d> Cx<'d> {
                 };
                 Skin::new_result(def, widgets)
             }
+        } else if decision {
+            let defs = DecisionDefs {
+                timing: decision_timing,
+            };
+            Skin::new_decision(def, defs)
         } else {
             Skin::new(def)
         };

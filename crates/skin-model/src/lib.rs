@@ -120,7 +120,10 @@ pub use atlas::{
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use decision::schema::{DECISION, timer as decision_timer};
-pub use decision::{DecisionError, DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming};
+pub use decision::{
+    DecisionError, DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming,
+    MAX_DECISION_PHASE,
+};
 #[cfg(feature = "dev-tools")]
 pub use expr::evaluations;
 pub use expr::{
@@ -205,7 +208,7 @@ pub use selection::{
     SelectionSettings, SelectionView, SpeedReference, SpeedView,
 };
 pub use skin::{
-    ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
+    DecisionDefs, ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
     MAX_WIDGET_QUADS, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef, Source,
     TimerRef, WidgetDefs,
 };

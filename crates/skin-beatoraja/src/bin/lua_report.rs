@@ -18,7 +18,9 @@
 //! history crossing its border in every column and a deviation in every
 //! ms slot, over which a result skin that imports is then drawn (its
 //! widget charge, quad capacity, the most quads a frame drew, the quads
-//! dropped and the chip quads); and prints its kind, what did not convert
+//! dropped and the chip quads), as a decision skin that imports is drawn
+//! over its declared scene and fade-out with placeholder labels; and
+//! prints its kind, what did not convert
 //! as allowlisted counts and outcomes, how many script and unread-entry
 //! roots its configured table holds, a record per callback consumer
 //! (where it is defined, its field, role, disposition and reason, why a

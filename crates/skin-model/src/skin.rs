@@ -148,6 +148,12 @@ pub struct ResultDefs {
     pub timing_graphs: Vec<TimingGraphDef>,
 }
 
+/// What only a decision skin has: the timing it declares.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecisionDefs {
+    pub timing: crate::decision::DecisionTiming,
+}
+
 /// The widgets only a selection skin draws.
 #[derive(Clone, Debug, Default)]
 pub struct SelectionDefs {
@@ -479,6 +485,8 @@ pub struct Skin {
     judge_graphs: Box<[JudgeGraph]>,
     /// A result skin's declared timing; the default for another kind.
     result_timing: crate::result::ResultTiming,
+    /// A decision skin's declared timing; the default for another kind.
+    decision_timing: crate::decision::DecisionTiming,
     gauge_graphs: Box<[GaugeGraph]>,
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
@@ -1529,22 +1537,25 @@ impl Skin {
 
     /// Loads a decision skin: the checks of [`new`](Self::new) over the
     /// decision schema ([`DECISION`](crate::DECISION), no field) and its
-    /// timers. An element may draw an image, an image choice whose
-    /// selector is a constant, or a text of the chart; the lanes, a
-    /// number, a gauge, a judge, a cover paint, the song list, a ratio
-    /// bar, a graph, a selection text or an image choice whose selector
-    /// is not a constant is refused ([`LoadError::SourceKind`]).
+    /// timers, with what only a decision skin has in `defs`. An element
+    /// may draw an image, an image choice whose selector is a constant,
+    /// or a text of the chart; the lanes, a number, a gauge, a judge, a
+    /// cover paint, the song list, a ratio bar, a graph, a selection text
+    /// or an image choice whose selector is not a constant is refused
+    /// ([`LoadError::SourceKind`]).
     ///
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new_decision(def: SkinDef) -> Result<Self, LoadError> {
-        Self::load(
+    pub fn new_decision(def: SkinDef, defs: DecisionDefs) -> Result<Self, LoadError> {
+        let mut skin = Self::load(
             def,
             ScreenKind::Decision,
             SelectionDefs::default(),
             ResultDefs::default(),
-        )
+        )?;
+        skin.decision_timing = defs.timing;
+        Ok(skin)
     }
 
     /// The checks of [`new`](Self::new) for a skin of `kind`, with the
@@ -1845,7 +1856,8 @@ impl Skin {
         let base = match kind {
             ScreenKind::Selection => crate::SELECTION.fields.len(),
             ScreenKind::Result => crate::RESULT.fields.len(),
-            ScreenKind::Play | ScreenKind::Decision => field::COUNT,
+            ScreenKind::Decision => crate::DECISION.fields.len(),
+            ScreenKind::Play => field::COUNT,
         };
         for (i, program) in whens
             .iter()
@@ -2154,6 +2166,7 @@ impl Skin {
             ratio_bars,
             judge_graphs,
             result_timing: res.timing,
+            decision_timing: crate::decision::DecisionTiming::default(),
             gauge_graphs,
             timing_graphs,
             sliders,
@@ -2174,6 +2187,13 @@ impl Skin {
     #[must_use]
     pub fn result_timing(&self) -> crate::result::ResultTiming {
         self.result_timing
+    }
+
+    /// What a decision skin declares for its screen's timing
+    /// ([`DecisionDefs::timing`]); every part 0 for another kind.
+    #[must_use]
+    pub fn decision_timing(&self) -> crate::decision::DecisionTiming {
+        self.decision_timing
     }
 
     /// The frames of the sheet's images: the length of the uv table
