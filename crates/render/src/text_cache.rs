@@ -4,8 +4,10 @@
 //! belongs to each set of resources (an atlas array with its text layer)
 //! and starts empty with it.
 //!
-//! **Entries.** A line is keyed by its font, its string and its em, the
-//! request's capped by the round ([`LineKey`]). Its rectangle is the one
+//! **Entries.** A line is keyed by the text scope it was placed in (the
+//! producer's bundle's, so bundles sharing one array never take each
+//! other's lines), its font, its string and its em, the request's capped
+//! by the round ([`LineKey`]). Its rectangle is the one
 //! `etagere` returned, never the size asked for: it is at most the side
 //! wide and 1 096 tall, and every texel of it is written when the line is
 //! uploaded, so a reused rectangle shows nothing stale. An entry is
@@ -52,18 +54,22 @@ pub const MAX_ROUNDS: u32 = 8;
 /// alignment.
 const ALIGN: u32 = skin_model::ALIGN;
 
-/// A line's key: its font, its string and the em it was laid out at, as
-/// `f32` bits.
+/// A line's key: the text scope it was laid out in, its font, its string
+/// and the em it was laid out at, as `f32` bits. A font names a file of its
+/// own skin's sheet, so two bundles sharing one text layer share no line
+/// unless they share their scope ([`TextCache::place`]'s `scope`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LineKey {
+    scope: u64,
     font: FontRef,
     text: String,
     em: u32,
 }
 
 impl LineKey {
-    fn of(req: &TextRequest, em: f32) -> Self {
+    fn of(req: &TextRequest, em: f32, scope: u64) -> Self {
         Self {
+            scope,
             font: req.font,
             text: req.text.clone(),
             em: em.to_bits(),
@@ -192,6 +198,9 @@ pub(crate) struct TextCache {
     entries: Vec<Entry>,
     aliases: Vec<Alias>,
     clock: u64,
+    /// The text scope the placement in progress keys its lines in
+    /// ([`place`](Self::place)'s `scope`).
+    scope: u64,
 }
 
 impl std::fmt::Debug for TextCache {
@@ -215,6 +224,7 @@ impl TextCache {
             entries: Vec::new(),
             aliases: Vec::new(),
             clock: 0,
+            scope: 0,
         }
     }
 
@@ -319,6 +329,9 @@ impl TextCache {
     }
 
     /// Places `requests` (at most 64, in slot order) within `bounds`,
+    /// keyed in text scope `scope` (the producer's bundle's,
+    /// [`SkinBundle::text_scope`](crate::SkinBundle::text_scope): a line
+    /// another scope placed is never a hit),
     /// laying out what it does not find with `layout`, never writing to
     /// or freeing an entry a holder of `held` holds. The new entries are
     /// allocated and unpublished: [`publish`](Self::publish) or
@@ -328,8 +341,10 @@ impl TextCache {
         requests: &[TextRequest],
         bounds: LineBounds,
         held: &[&Holder],
+        scope: u64,
         mut layout: impl FnMut(&TextRequest, f32, LineBounds) -> LineFit,
     ) -> Placement {
+        self.scope = scope;
         let mut counts = TextCounts::default();
         if self.alloc.is_none() {
             let slots = requests
@@ -359,7 +374,7 @@ impl TextCache {
         // Every round failed: published hits stay, the rest get nothing.
         let mut slots = Vec::with_capacity(requests.len());
         for r in requests {
-            let alias = LineKey::of(r, r.em_px);
+            let alias = LineKey::of(r, r.em_px, self.scope);
             let line = self
                 .aliases
                 .iter()
@@ -403,9 +418,9 @@ impl TextCache {
         let mut pins: Vec<LineKey> = Vec::new();
         let hits_before = counts.hits;
         for r in requests {
-            let alias = LineKey::of(r, r.em_px);
+            let alias = LineKey::of(r, r.em_px, self.scope);
             let em = r.em_px.min(cap);
-            let mut key = LineKey::of(r, em);
+            let mut key = LineKey::of(r, em, self.scope);
             if first
                 && let Some(a) = self.aliases.iter().find(|a| a.key == alias)
                 && self.entry(&a.line).is_some_and(|e| e.published)
@@ -679,7 +694,7 @@ mod tests {
         held: &[&Holder],
         layout: impl FnMut(&TextRequest, f32, LineBounds) -> LineFit,
     ) -> Settled {
-        let p = c.place(reqs, bounds(), held, layout);
+        let p = c.place(reqs, bounds(), held, 0, layout);
         let counts = p.counts;
         let (lines, holder, notes) = c.publish(p, 64, held);
         (lines, holder, notes, counts)
@@ -718,7 +733,7 @@ mod tests {
             req(2, "B", 100.0),
             req(3, "C", 100.0),
         ];
-        let p = c.place(&reqs, bounds(), &[&outside], small);
+        let p = c.place(&reqs, bounds(), &[&outside], 0, small);
         assert_eq!(p.new.len(), 2, "duplicate keys share one entry");
         assert_eq!(c.len(), 3);
         c.rollback(&p);
@@ -758,7 +773,7 @@ mod tests {
             }
         };
         let reqs = [req(0, "T", 200.0), req(1, "T", 220.0), req(2, "U", 230.0)];
-        let p = c.place(&reqs, bounds(), &[], big);
+        let p = c.place(&reqs, bounds(), &[], 0, big);
         // Round 0 fills the layer with the two T lines and U has no room;
         // round 1 sets all three at 128.
         assert_eq!(p.counts.rounds, 2);
@@ -766,14 +781,14 @@ mod tests {
         assert_eq!(c.len(), 2, "200 and 220 alias one entry");
         assert_eq!(c.aliases(), 3);
         // Their aliases find it again in the first round.
-        let p = c.place(&reqs[..2], bounds(), &[], big);
+        let p = c.place(&reqs[..2], bounds(), &[], 0, big);
         assert_eq!((p.counts.hits, p.new.len(), p.counts.rounds), (2, 0, 1));
         c.rollback(&p);
         // 320 more aliases: the held ones survive, the oldest others go.
         let small = |_: &TextRequest, em: f32, _: LineBounds| line(8, 8, em);
         for i in 0..MAX_ALIASES {
             let r = req(0, &format!("h{}", i % 8), 10.0 + (i / 8) as f32);
-            let p = c.place(std::slice::from_ref(&r), bounds(), &[&protected], small);
+            let p = c.place(std::slice::from_ref(&r), bounds(), &[&protected], 0, small);
             c.publish(p, 64, &[&protected]);
             assert!(c.aliases() <= MAX_ALIASES);
         }
