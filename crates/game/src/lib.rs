@@ -150,6 +150,6 @@ pub use tuning::{
     VOLUME_STEP_PERCENT,
 };
 pub use turntable::{
-    AnalogTurn, PlayState, PlayStates, ScratchInput, ScratchNote, ScratchNoteKind, Turn,
-    scratch_notes,
+    AnalogTurn, AutoplayScratch, PlayState, PlayStates, ScratchInput, ScratchNote, ScratchNoteKind,
+    Turn, TurntableClock, scratch_notes, state_ms,
 };

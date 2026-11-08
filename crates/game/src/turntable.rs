@@ -274,5 +274,216 @@ pub fn scratch_notes(chart: &Chart, ln_mode: Option<LnMode>) -> Vec<ScratchNote>
     out
 }
 
+/// One revolution in the clock's units: 2 160 sixths of a degree, each
+/// counted in thousandths (the rate per ms times µs).
+const REVOLUTION: i64 = 2_160_000;
+
+/// The turntable's angle on a play state's clock (docs/stage3.md, offset
+/// 1), as the source's turn accumulates it (`KeyInputProccessor.java:
+/// 92-108`): each tick after the first adds the time since the previous
+/// one times the rate of the direction the frame reads, in sixths of a
+/// degree per ms: −1 idle, +1 with Negative, −3 with Positive. Integers
+/// only: µs times the rate, modulo a revolution.
+///
+/// One clock lives for the play state it was given
+/// ([`adopt`](Self::adopt)): its first presented frame sets the baseline
+/// and adds 0; a pause (a practice round's result) stops the ticks and
+/// keeps the angle; a resume ticks again from a fresh baseline; another
+/// play state starts it over. Allocation-free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurntableClock {
+    /// The play state it belongs to.
+    number: Option<u64>,
+    /// The accumulated angle in the source's sense, in thousandths of a
+    /// sixth of a degree, within one revolution.
+    scratch: i64,
+    /// The previous tick's time; `None` until the first, and after a
+    /// pause or a resume.
+    prev: Option<TimeUs>,
+    paused: bool,
+}
+
+impl TurntableClock {
+    /// Takes play state `number`: another number than its own starts it
+    /// over (angle 0, no previous tick, running); its own changes nothing.
+    pub const fn adopt(&mut self, number: u64) {
+        if !matches!(self.number, Some(n) if n == number) {
+            *self = Self {
+                number: Some(number),
+                scratch: 0,
+                prev: None,
+                paused: false,
+            };
+        }
+    }
+
+    /// The play state it belongs to.
+    #[must_use]
+    pub const fn number(&self) -> Option<u64> {
+        self.number
+    }
+
+    /// Play state `number`'s pause: the ticks stop and the previous one
+    /// is forgotten; the angle stays. Another number's is ignored.
+    pub const fn pause(&mut self, number: u64) {
+        if matches!(self.number, Some(n) if n == number) {
+            self.paused = true;
+            self.prev = None;
+        }
+    }
+
+    /// Play state `number`'s resume: a paused clock ticks again, its next
+    /// tick a fresh baseline adding 0; a running one runs on. Another
+    /// number's is ignored.
+    pub const fn resume(&mut self, number: u64) {
+        if matches!(self.number, Some(n) if n == number) && self.paused {
+            self.paused = false;
+            self.prev = None;
+        }
+    }
+
+    /// The frame's tick at `now` on the frame clock with the direction
+    /// `turn`: the first records the time and adds 0, each later one adds
+    /// the time since the previous at `turn`'s rate. Nothing while paused
+    /// or without a play state.
+    pub fn tick(&mut self, now: TimeUs, turn: Turn) {
+        if self.paused || self.number.is_none() {
+            return;
+        }
+        if let Some(prev) = self.prev {
+            let dt = now.0.saturating_sub(prev.0).max(0);
+            let rate = match turn {
+                Turn::Idle => -1,
+                Turn::Negative => 1,
+                Turn::Positive => -3,
+            };
+            let turned = i128::from(dt) * rate % i128::from(REVOLUTION);
+            let turned = i64::try_from(turned).unwrap_or(0);
+            self.scratch = (self.scratch + turned).rem_euclid(REVOLUTION);
+        }
+        self.prev = Some(now);
+    }
+
+    /// The angle in the source's sense, in sixths of a degree, whole
+    /// ones (what the source's `scratch` holds): for comparisons.
+    #[must_use]
+    pub const fn source_sixths(&self) -> i64 {
+        self.scratch / 1_000
+    }
+
+    /// The angle a turntable follower adds, clockwise on y-down, in
+    /// sixths of a millidegree (`skin_model::TURNTABLE_UNITS_PER_DEGREE`):
+    /// the source's angle negated, as every source angle is.
+    #[must_use]
+    pub fn angle(&self) -> i32 {
+        // Within one revolution, so it fits.
+        i32::try_from(-self.scratch).unwrap_or(0)
+    }
+}
+
+/// How long autoplay's presentation keeps a press, ms
+/// (`JudgeManager.java:107`, `auto_minduration`).
+const AUTO_MIN_MS: i64 = 80;
+
+/// Autoplay's scratch presses as the source's judge keeps them
+/// (`JudgeManager.java:212-339, 562-576`), for the turntable: a press time
+/// per direction, in whole ms of the play state, and the long note being
+/// processed. Updated once per presented frame from the play's start with
+/// the frame's chart time and state time; fixed size, allocation-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoplayScratch {
+    /// The next note not yet crossed.
+    cursor: usize,
+    /// The previous update's chart time.
+    previous: TimeUs,
+    /// Positive's and Negative's press, in state ms.
+    press: [Option<i64>; 2],
+    /// The long note processing: its end, and whether it is a charge
+    /// note.
+    processing: Option<(TimeUs, bool)>,
+}
+
+impl Default for AutoplayScratch {
+    fn default() -> Self {
+        Self::NEW
+    }
+}
+
+impl AutoplayScratch {
+    /// Nothing crossed or pressed: the state at a play's start or a
+    /// round's (`JudgeManager.init`).
+    pub const NEW: Self = Self {
+        cursor: 0,
+        previous: TimeUs(0),
+        press: [None; 2],
+        processing: None,
+    };
+
+    /// Back to [`NEW`](Self::NEW), in place.
+    pub const fn reset(&mut self) {
+        *self = Self::NEW;
+    }
+
+    /// One update at chart time `t` and state time `ms` over `notes`, in
+    /// the source's order: every note crossed (after the previous update's
+    /// chart time, at or before `t`), then each press older than 80 ms
+    /// cleared while nothing processes, then a plain long note whose end
+    /// is before `t` completed.
+    pub fn update(&mut self, notes: &[ScratchNote], t: TimeUs, ms: i64) {
+        let [positive, negative] = &mut self.press;
+        while let Some(note) = notes.get(self.cursor) {
+            if note.time > t {
+                break;
+            }
+            self.cursor += 1;
+            if note.time <= self.previous {
+                continue;
+            }
+            match note.kind {
+                ScratchNoteKind::Tap => *positive = Some(ms),
+                ScratchNoteKind::LongStart { end, charge } => {
+                    if self.processing.is_none() {
+                        *positive = Some(ms);
+                        self.processing = Some((end, charge));
+                    }
+                }
+                ScratchNoteKind::LongEnd { charge: true } => {
+                    *positive = None;
+                    *negative = Some(ms);
+                    self.processing = None;
+                }
+                ScratchNoteKind::LongEnd { charge: false } => {}
+            }
+        }
+        if self.processing.is_none() {
+            for p in &mut self.press {
+                if p.is_some_and(|at| ms.saturating_sub(at) > AUTO_MIN_MS) {
+                    *p = None;
+                }
+            }
+        }
+        if let Some((end, false)) = self.processing
+            && end < t
+        {
+            self.processing = None;
+        }
+        self.previous = t;
+    }
+
+    /// Whether Positive and Negative are pressed.
+    #[must_use]
+    pub const fn pressed(&self) -> [bool; 2] {
+        let [p, n] = self.press;
+        [p.is_some(), n.is_some()]
+    }
+}
+
+/// A frame's state time: whole ms since the play state's origin, floored,
+/// as the source's state timer counts them (`TimerManager.java:33-35`).
+#[must_use]
+pub const fn state_ms(now: TimeUs, origin: TimeUs) -> i64 {
+    now.0.saturating_sub(origin.0).div_euclid(1_000)
+}
+
 #[cfg(test)]
 mod tests;
