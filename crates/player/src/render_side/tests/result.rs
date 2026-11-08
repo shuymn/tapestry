@@ -70,6 +70,8 @@ struct Faults {
     refuse_text: AtomicBool,
     /// The next built-in page drawn fails as a lost device.
     lose_page: AtomicBool,
+    /// The next frame wait times out.
+    time_out: AtomicBool,
 }
 
 /// A WARP menu screen that records what each result frame drew.
@@ -226,6 +228,9 @@ impl Screen for Recorded {
             std::thread::sleep(Duration::from_millis(1));
         }
         gate.held.store(false, Ordering::Release);
+        if self.faults.time_out.swap(false, Ordering::AcqRel) {
+            return false;
+        }
         !self.menu.paced() || self.menu.wait()
     }
     fn paced(&self) -> bool {
@@ -780,6 +785,39 @@ fn an_ended_lifetimes_presentation_is_not_drawn() {
     rig.link.exit();
 }
 
+/// The view presented shown again while another is prepared, its frame's
+/// wait timed out, is the newest: the one prepared is dropped, never
+/// committed after it (C2's newest drawn).
+#[test]
+fn the_view_presented_again_drops_the_one_prepared() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    let b = payload(2, Some(&skin), 2_222, &["VIEWING B"]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let Some(Drawn::Skin(ref_a, 0)) = rig.drawn().last().cloned() else {
+        panic!("{:?}", rig.drawn().last());
+    };
+    // b is prepared and held at the next frame's wait, which times out.
+    rig.gate.hold();
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    rig.gate.step();
+    rig.faults.time_out.store(true, Ordering::Release);
+    show(&rig.link, lifetime, 3, &a, &Overlay::default());
+    rig.gate.step();
+    rig.clear();
+    rig.gate.release();
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    std::thread::sleep(Duration::from_millis(100));
+    for d in rig.drawn() {
+        assert_eq!(d, Drawn::Skin(ref_a.clone(), 0), "only a draws");
+    }
+    assert_eq!(rig.link.result_status().shown, Some((1, true)));
+    rig.link.exit();
+}
+
 /// A view committed on the pages the upload installed is what a screen
 /// built again restores: its layout draws again, the kind not disabled
 /// (the S10-09i design's D2 and D4, "Recovery").
@@ -883,6 +921,41 @@ fn a_refused_first_presentation_draws_its_own_page() {
     );
     assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
     assert_eq!(rig.link.result_status().shown, Some((1, false)));
+    rig.link.exit();
+}
+
+/// A newer view's text refused on a healthy device, while a view is
+/// presented, draws the built-in page of the view presented, never the
+/// refused one's rows, and disables the kind (D1, C17c).
+#[test]
+fn a_refused_later_view_draws_the_presented_views_page() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.faults.refuse_text.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&skin), 2_222, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    std::thread::sleep(Duration::from_millis(100));
+    for d in rig.drawn() {
+        if let Drawn::Page(page) = d {
+            assert_eq!(page[2], "v1 2", "the presented view's rows: {page:?}");
+        }
+    }
+    assert!(rig.link.result_status().disabled.is_some());
     rig.link.exit();
 }
 
