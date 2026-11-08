@@ -472,6 +472,27 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
     }
 }
 
+/// The select screen frames a script's `drawn` step counts are the
+/// presented ones only: a frame skipped behind a slow GPU shows nothing,
+/// so a frame dump waiting on it would have nothing to write.
+#[test]
+fn only_presented_select_frames_count_as_drawn() {
+    let (link, frames, _, skip) = lossy_link(None);
+    link.enter_selection(1);
+    link.show_selection(with_page(1));
+    assert!(wait_until(|| !frames.0.lock().unwrap().is_empty()));
+    skip.store(true, Ordering::Release);
+    let n = frames.0.lock().unwrap().len();
+    assert!(wait_until(|| frames.0.lock().unwrap().len() > n + 2));
+    assert!(frames.0.lock().unwrap().iter().any(|f| !f.3));
+    // The sink sees a frame before it is counted.
+    assert!(wait_until(|| {
+        let presented = frames.0.lock().unwrap().iter().filter(|f| f.3).count();
+        usize::try_from(link.selection_drawn()).unwrap() == presented
+    }));
+    link.exit();
+}
+
 /// What a selection frame of the settings fixture showed: numbers 57 and
 /// 12 as drawn, the master gain's graph's width, and the views the skin
 /// had taken by then.
