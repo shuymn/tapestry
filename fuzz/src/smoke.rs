@@ -49,6 +49,7 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
             "count_beyond_data",
             "too_many_events",
             "zero_sources",
+            "tuning_tag",
             "trailing_bytes",
             "truncated",
         ],
@@ -112,6 +113,11 @@ fn replay_body_seeds_reach_sections_counts_and_successful_decodes() {
                 assert_eq!(result, Err(DecodeError::TooManyEvents(1 << 23)), "{name}");
             }
             "zero_sources" => assert_eq!(result, Err(DecodeError::NoSources), "{name}"),
+            "tuning_tag" => assert_eq!(
+                result,
+                Err(DecodeError::InvalidValue("speed mode")),
+                "{name}"
+            ),
             "trailing_bytes" => assert_eq!(result, Err(DecodeError::TrailingBytes), "{name}"),
             "truncated" => assert_eq!(result, Err(DecodeError::Truncated), "{name}"),
             _ => panic!("no expectation for seed {name}"),
