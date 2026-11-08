@@ -666,6 +666,9 @@ pub enum RenderMsg {
     /// message before it, and drawn the frame that followed them, if any.
     #[cfg(test)]
     Fence(mpsc::SyncSender<()>),
+    /// Makes the render thread panic (tests: its failure in a play).
+    #[cfg(all(test, feature = "dev-tools"))]
+    Panic,
     /// Draw the select screen from the newest update in the slot
     /// ([`RenderLink::show_selection`]), if it is newer than the one held
     /// and its lifetime current.
@@ -2815,6 +2818,8 @@ impl Run {
                         extent.acknowledge();
                     }
                 }
+                #[cfg(all(test, feature = "dev-tools"))]
+                Ok(RenderMsg::Panic) => panic!("the render thread fails (a test)"),
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }

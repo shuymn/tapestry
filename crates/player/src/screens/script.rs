@@ -217,6 +217,17 @@ impl Scripts {
         OrphanGuard(Arc::clone(&self.0))
     }
 
+    /// The calls `kind`'s parked runtime made so far, and whether it
+    /// stopped; `None` without a parked one (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn parked(&self, kind: ScreenKind) -> Option<(u64, bool)> {
+        let host = self.0.host();
+        match &host.entries.get(index(kind)?)?.held {
+            Held::Parked(rt) => Some((rt.counters().calls, rt.stopped().is_some())),
+            _ => None,
+        }
+    }
+
     /// An empty slot for `kind`'s screen of the installation keyed `key`.
     #[must_use]
     pub(crate) fn slot(&self, kind: ScreenKind, key: usize) -> ScriptSlot {

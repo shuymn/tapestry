@@ -612,3 +612,150 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
         });
     }
 }
+
+/// The runtime fixture's `entry`, with the runtime its import kept, built
+/// for a WARP target.
+fn scripted(
+    entry: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<render::SkinBundle>,
+    crate::screens::ScriptSlot,
+) {
+    let dir = crate::selection_skin::runtime_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (skin, script) = crate::selection_skin::fixture_scripted(limits, dir.path(), entry);
+    (dir, skin, script)
+}
+
+/// The quads of the newest frame once `frames` has `more` frames after
+/// the `seen` it had.
+fn quads_after(frames: &Frames, seen: usize, more: usize) -> Option<usize> {
+    assert!(wait_until(|| frames.0.lock().unwrap().len() >= seen + more));
+    frames.0.lock().unwrap().last().and_then(|f| f.0)
+}
+
+/// The selection skin's runtime runs in each frame on a real screen
+/// between the frame's preparation and its build: its callback's image
+/// draws, one quad more than the same skin without its runtime, whose
+/// callback has its constant (false). Before a play the game thread's
+/// acknowledgment parks it; while the play's interval is open no frame
+/// takes it (its callback's constant draws, and it makes no call); after
+/// the interval closes the screen takes it again, its Lua state kept
+/// (docs/stage3.md S7-07; design.md "beatoraja Lua Skins"). The run's
+/// end retires it.
+#[test]
+fn the_runtime_draws_each_frame_and_rests_through_a_play() {
+    let shown = |link: &RenderLink, frames: &Frames, lifetime: u64| {
+        link.enter_selection(lifetime);
+        link.show_selection(update_of(lifetime, 1, listed(SelectionPlace::All, "")));
+        let seen = frames.0.lock().unwrap().len();
+        quads_after(frames, seen, 3).unwrap()
+    };
+    // Without its runtime.
+    let (_dir, skin, _) = scripted("rt.luaskin");
+    let (link, frames) = warp_link(None);
+    link.select(ScreenKind::Selection, Some(skin))
+        .wait()
+        .unwrap();
+    let constant = shown(&link, &frames, 1);
+    link.exit();
+
+    let (_dir, skin, script) = scripted("rt.luaskin");
+    let gone = Arc::new(AtomicBool::new(false));
+    script.on_vm_drop(&gone);
+    let (link, frames) = warp_link(None);
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(skin), script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection),
+        Some((0, false))
+    );
+    assert_eq!(shown(&link, &frames, 1), constant + 1);
+    assert_eq!(link.scripts().parked(ScreenKind::Selection), None, "taken");
+
+    // A choice leaves selection; the play's preparation acknowledges.
+    link.leave_selection();
+    assert!(link.park_scripts());
+    let (calls, _) = link.scripts().parked(ScreenKind::Selection).unwrap();
+    assert!(calls >= 3, "{calls}");
+    let interval = link.scripts().open_interval();
+    assert_eq!(shown(&link, &frames, 2), constant);
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection),
+        Some((calls, false)),
+        "no call while the interval is open"
+    );
+
+    let _closed = interval.close();
+    let seen = frames.0.lock().unwrap().len();
+    assert_eq!(quads_after(&frames, seen, 3), Some(constant + 1));
+    link.leave_selection();
+    assert!(link.park_scripts());
+    let (after, _) = link.scripts().parked(ScreenKind::Selection).unwrap();
+    assert!(after > calls, "resumed: {after} after {calls}");
+    // The run's end, no interval open, retires it on the game thread.
+    assert!(!gone.load(Ordering::Acquire));
+    link.exit();
+    assert!(gone.load(Ordering::Acquire));
+}
+
+/// A runtime whose callback never returns stops after its budget frames,
+/// and the screen keeps drawing its frames with the callback's constant
+/// (docs/stage3.md S7-07's gate).
+#[test]
+fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
+    let (_dir, skin, script) = scripted("stop.luaskin");
+    let (link, frames) = warp_link(None);
+    link.select_with(ScreenKind::Selection, Some(skin), script)
+        .wait()
+        .unwrap();
+    link.enter_selection(1);
+    link.show_selection(update_of(1, 1, listed(SelectionPlace::All, "")));
+    let seen = frames.0.lock().unwrap().len();
+    let drawn = quads_after(&frames, seen, 8);
+    assert!(drawn.is_some_and(|n| n > 0));
+    let seen = frames.0.lock().unwrap().len();
+    assert_eq!(quads_after(&frames, seen, 3), drawn);
+    assert_eq!(link.take_selection_refusal(), None);
+    link.leave_selection();
+    assert!(link.park_scripts());
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection).map(|(_, s)| s),
+        Some(true)
+    );
+    link.exit();
+}
+
+/// The render thread failing while a play's interval is open destroys no
+/// VM: the runtime stays parked in the cell the link shares, and only the
+/// game thread's retirement with the interval's token destroys it
+/// (design.md "beatoraja Lua Skins", Quiescence acknowledged).
+#[test]
+fn a_render_failure_in_a_play_leaves_the_runtime_to_the_game_thread() {
+    let (_dir, skin, script) = scripted("rt.luaskin");
+    let gone = Arc::new(AtomicBool::new(false));
+    script.on_vm_drop(&gone);
+    let (link, frames) = warp_link(None);
+    link.select_with(ScreenKind::Selection, Some(skin), script)
+        .wait()
+        .unwrap();
+    link.enter_selection(1);
+    link.show_selection(update_of(1, 1, listed(SelectionPlace::All, "")));
+    let _ = quads_after(&frames, 0, 3);
+    link.leave_selection();
+    assert!(link.park_scripts());
+    let interval = link.scripts().open_interval();
+    link.send(crate::render_side::RenderMsg::Panic);
+    assert!(wait_until(|| link.scripts().orphaned()));
+    assert!(!gone.load(Ordering::Acquire));
+    assert!(link.scripts().inactive().is_none());
+    link.scripts()
+        .retire(crate::screens::Quiet::Closed(interval.close()));
+    assert!(gone.load(Ordering::Acquire));
+    assert_eq!(link.exit(), crate::render_side::RenderEnd::Panicked);
+}
