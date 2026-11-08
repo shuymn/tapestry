@@ -57,9 +57,12 @@
 //! or 1), the cover target (0 none, 1 SUDDEN+, 2 LIFT, 3 HIDDEN+), and the
 //! multiplier `H` (0 none; 1 followed by its numerator and denominator).
 //! Every value is checked against its range ([`StartTuning::invalid`]):
-//! steps on their grid, `H` in lowest terms within 0.01 to 20. A capture
-//! cancelled before playback writes none (the section is empty), and a
-//! played record always has one.
+//! steps on their grid, `H` in lowest terms within 0.01 to 20, when it is
+//! read; the encoder writes the tuning it is given, checking only that a
+//! played record has one, so a record the game writes decodes because its
+//! tuning comes from validated play options. A capture cancelled before
+//! playback writes none (the section is empty), and a played record always
+//! has one.
 //!
 //! The status section is the end status (0 played to the end, 1 ended
 //! midway, 2 cancelled before playback), then for a played attempt the
@@ -242,7 +245,9 @@ pub fn encode(rec: &PlayRecord) -> Vec<u8> {
 
 /// The canonical uncompressed body of `rec`. A capture cancelled before
 /// playback writes no winning opening: its `start`, `start_tuning`,
-/// `events`, `arrivals` and finalized watermark are not written.
+/// `events`, `arrivals` and finalized watermark are not written. The
+/// starting tuning is written as given, unchecked: decoding refuses one
+/// outside its ranges ([`StartTuning::invalid`]).
 ///
 /// # Panics
 ///
