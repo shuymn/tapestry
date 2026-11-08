@@ -741,3 +741,51 @@ fn result_bitmap_text_follows_the_view() {
         .prepare_result();
     fx.skin.attach_result_bitmap_text(&mut foreign);
 }
+
+/// The build of a result frame the preparation filled keeps its timers: a
+/// `when` timer reading a runtime output stays as the preparation left it
+/// though the runtime writes that output between the two, and the next
+/// frame's preparation reads it (docs/stage3.md S7-07; design.md
+/// "beatoraja Lua Skins", the frame sequence). A selection skin refuses
+/// the result's preparation.
+#[test]
+fn a_prepared_result_frame_is_built_without_its_timers_filled_again() {
+    let outs = [skin_model::output::OutTy::Bool];
+    let when = skin_model::compile(
+        "lua.0",
+        &skin_model::Scope::new(&skin_model::RESULT).outputs(&outs),
+        skin_model::Ty::Bool,
+    )
+    .unwrap();
+    let mut e = relement(Source::Image(4), [0, 0, 10, 10], None);
+    e.timer = TimerRef::When(0);
+    let mut def = selection_support::skin_def(vec![e], WidgetDefs::default());
+    def.whens = vec![when];
+    let skin = Skin::new_result(def, ResultDefs::default())
+        .unwrap()
+        .with_outputs(1);
+    let mut fx = RFx::new(skin);
+    fx.view(&ready(1, BestView::Unavailable, 1));
+    let prepare = |fx: &mut RFx, ms: i64| {
+        fx.skin
+            .prepare_result_frame(&mut fx.res, TimeUs(ms * 1_000), &fx.timers)
+            .unwrap();
+    };
+    prepare(&mut fx, 16);
+    fx.res.outputs_mut()[0] = 1;
+    fx.frame(16);
+    assert_eq!(fx.at_y(0.0), vec![], "the timer as prepared: off");
+    prepare(&mut fx, 32);
+    fx.frame(32);
+    assert_eq!(fx.at_y(0.0), vec![(4, 0)], "the next preparation starts it");
+    // Unprepared, the build fills the timers itself.
+    fx.res.outputs_mut()[0] = 0;
+    fx.frame(48);
+    assert_eq!(fx.at_y(0.0), vec![]);
+    let sel =
+        selection_support::load(Vec::new(), WidgetDefs::default(), Default::default()).unwrap();
+    assert_eq!(
+        sel.prepare_result_frame(&mut fx.res, TimeUs(0), &fx.timers),
+        Err(BuildError::Kind)
+    );
+}
