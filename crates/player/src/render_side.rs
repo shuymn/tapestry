@@ -217,8 +217,10 @@ pub trait Screen: Send {
     }
     /// Stages the result kind's pages-only installation of `pages` for
     /// request `request` ([`render::Renderer::install_pages`]): nothing
-    /// is uploaded when they are installed. A refusal keeps every
-    /// installation in use. The default refuses.
+    /// is uploaded when they are installed. Other pages release the
+    /// result's installation first, so a refusal (or a withdrawal before
+    /// the commit) leaves the result kind with none; every other kind's
+    /// stays. The default refuses.
     ///
     /// # Errors
     ///
@@ -254,10 +256,11 @@ pub trait Screen: Send {
     fn drain_retired(&mut self) -> Option<AtlasId> {
         None
     }
-    /// Whether play's admission released the result's installation since
-    /// the last call. Never by default.
-    fn take_result_release(&mut self) -> bool {
-        false
+    /// The result kind's pages-only installation's pages, if it has one
+    /// ([`render::Renderer::installed_pages`]). None by default.
+    fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<PackedPages>> {
+        let _ = kind;
+        None
     }
     /// The atlases the screen holds for `kind`: committed, staged and
     /// retired. None by default.
@@ -2170,6 +2173,8 @@ pub fn spawn(
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
+            // A panic is the screen's failure, which the game sees.
+            let _unwinding = Unwinding(Arc::clone(&thread_shared));
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
             let screen = match build(
@@ -2409,6 +2414,18 @@ fn after_preparing(mode: Mode) -> Mode {
             loading: Some(_), ..
         } => loading,
         _ => Mode::Idle,
+    }
+}
+
+/// Marks the screen failed when the render thread unwinds from a panic,
+/// so [`RenderLink::failed`] reports it: its resources are gone with it.
+struct Unwinding(Arc<Shared>);
+
+impl Drop for Unwinding {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.failed.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -3532,42 +3549,17 @@ impl Run {
                             // Refused on a healthy device: the built-in page
                             // draws in this frame, and the result kind is
                             // disabled for the run.
+                            // The disable composed the view presented's page.
                             self.disable_result(&e.to_string());
-                            let page = self.result.as_ref().map_or_else(
-                                || self.end_page.1.clone(),
-                                |r| {
-                                    r.builtin_page(
-                                        &self.end_page.1,
-                                        self.result_disabled.as_deref(),
-                                    )
-                                },
-                            );
+                            let page = page(self.result.as_ref(), &self.end_page.1);
                             let Some(screen) = &mut self.screen else {
                                 continue;
                             };
-                            screen.end(&page).map(|presented| {
-                                let timing = FrameTiming {
-                                    cpu: Duration::ZERO,
-                                    sprites: 0,
-                                    dropped: 0,
-                                    presented,
-                                    present_count: None,
-                                };
-                                (timing, None)
-                            })
+                            screen.end(&page).map(|p| (timing_of(p), None))
                         }
                     }
                 }
-                Mode::End => screen.end(&self.end_page.1).map(|presented| {
-                    let timing = FrameTiming {
-                        cpu: Duration::ZERO,
-                        sprites: 0,
-                        dropped: 0,
-                        presented,
-                        present_count: None,
-                    };
-                    (timing, None)
-                }),
+                Mode::End => screen.end(&self.end_page.1).map(|p| (timing_of(p), None)),
             };
             if !minimized {
                 self.granted = false;
@@ -3643,7 +3635,7 @@ impl Run {
                         self.measure.failed(&effects);
                     }
                     eprintln!("render: {}", Chain(&e));
-                    self.screen = None;
+                    self.drop_screen();
                     self.shared.failed.store(true, Ordering::Release);
                     mode = Mode::Idle;
                 }
@@ -3676,17 +3668,22 @@ impl Run {
             // files, never another skin in its place.
             let disabled = self.result_disabled.is_some();
             let mut refused = None;
-            let screen = build(
+            let built = build(
                 &mut self.make,
                 &mut self.committed,
                 None,
                 None,
                 disabled,
                 &mut refused,
-            )?;
+            );
+            // A restore refused stands for the run, whatever the build.
+            if let Some(why) = refused {
+                self.disable_result(&why);
+            }
+            let screen = built?;
             self.built(screen.as_ref());
             self.screen = Some(screen);
-            self.result_rebuilt(refused.as_deref());
+            self.result_rebuilt();
             // The new screen takes the window's size afresh.
             self.applied = None;
         }
@@ -3797,10 +3794,11 @@ impl Run {
             });
         }
         if answer.is_err() {
-            self.screen = None;
+            self.drop_screen();
             self.granted = false;
+        } else {
+            self.reconcile_result();
         }
-        self.reconcile_result();
         self.answer(answer);
     }
 
@@ -3971,7 +3969,6 @@ impl Run {
                 }
                 if kind == ScreenKind::Result {
                     let _ = screen.drain_retired();
-                    self.publish_result_status();
                 }
                 Ok(Preparation::Ready)
             }
@@ -3980,7 +3977,7 @@ impl Run {
                 Ok(refused)
             }
             Err(e) => {
-                self.screen = None;
+                self.drop_screen();
                 self.granted = false;
                 self.shared.failed.store(true, Ordering::Release);
                 Err(e)
@@ -4094,21 +4091,27 @@ impl Run {
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
-            (None, _) => build(
-                &mut self.make,
-                &mut self.committed,
-                chart,
-                section,
-                self.result_disabled.is_some(),
-                &mut refused,
-            )
-            .map(|s| {
-                self.built(s.as_ref());
-                self.screen = Some(s);
-                // The new screen takes the window's size afresh.
-                self.applied = None;
-                self.result_rebuilt(refused.as_deref());
-            }),
+            (None, _) => {
+                let built = build(
+                    &mut self.make,
+                    &mut self.committed,
+                    chart,
+                    section,
+                    self.result_disabled.is_some(),
+                    &mut refused,
+                );
+                // A restore refused stands for the run, whatever the build.
+                if let Some(why) = refused.take() {
+                    self.disable_result(&why);
+                }
+                built.map(|s| {
+                    self.built(s.as_ref());
+                    self.screen = Some(s);
+                    // The new screen takes the window's size afresh.
+                    self.applied = None;
+                    self.result_rebuilt();
+                })
+            }
         };
         if ready.is_ok() {
             self.shared.failed.store(false, Ordering::Release);
@@ -4182,8 +4185,7 @@ struct ResultSide {
     reconcile: bool,
     /// The screen was built again: the view presented is prepared again.
     reapply: bool,
-    /// A newer end page came, or the run disabled the skin: the built-in
-    /// pages are composed again.
+    /// A newer end page came: the built-in pages are composed again.
     end_changed: bool,
     /// A view whose staging was refused, with why.
     refused: Option<(ViewKey, String)>,
@@ -4224,23 +4226,6 @@ impl ResultSide {
     const fn shows(&self) -> bool {
         self.incoming.is_some() || self.prepared.is_some() || self.presented.is_some()
     }
-
-    /// The built-in page of the view presented (or, before one is, the
-    /// view prepared), over the newest `latest` page, with the reason the
-    /// skin is not shown: the run's `disabled`, else the payload's own.
-    fn builtin_page(&self, latest: &EndPage, disabled: Option<&str>) -> EndPage {
-        let held = self
-            .presented
-            .as_ref()
-            .or_else(|| self.prepared.as_ref().map(|p| &p.held));
-        match held {
-            Some(h) => {
-                let why = disabled.or_else(|| h.payload.why.as_ref().map(|(_, w)| w.as_str()));
-                crate::result_present::compose_page(&h.payload.page, latest, why)
-            }
-            None => latest.clone(),
-        }
-    }
 }
 
 /// The strip's lines of a view payload's and an overlay's, in order.
@@ -4268,6 +4253,9 @@ impl Run {
         {
             self.drop_result();
             self.result = Some(ResultSide::new(p.lifetime));
+            // The lifetime's page base is its own complete page, sent with
+            // it, never an earlier attempt's: its own `End` follows.
+            self.end_page.1 = p.payload.page.clone();
         }
         if let Some(side) = &mut self.result {
             side.incoming = Some(p);
@@ -4289,13 +4277,15 @@ impl Run {
     /// it at its next frame, at the same revision (the S10-09i design's
     /// D4, "Recovery"), and a view prepared on the old screen is prepared
     /// again.
-    fn result_rebuilt(&mut self, refused: Option<&str>) {
-        // A restore refused on a healthy device disables the kind for the
-        // run (the S10-09i design's D2, "Keying and recovery"), whether a
-        // result lifetime is current or not.
-        if let Some(why) = refused {
-            self.disable_result(why);
+    fn result_rebuilt(&mut self) {
+        // A restore refused while it was built disabled the kind: the new
+        // screen is disabled too. What it restored is what the kind keeps.
+        if self.result_disabled.is_some()
+            && let Some(screen) = &mut self.screen
+        {
+            screen.disable_result();
         }
+        self.reconcile_result();
         if let Some(side) = &mut self.result {
             side.reapply = true;
             if let Some(p) = side.prepared.take() {
@@ -4311,29 +4301,51 @@ impl Run {
         }
     }
 
-    /// The one point that reconciles what the result kind keeps to
-    /// restore with what the screen has committed for it (the S10-09i
-    /// design's D2 and D7), after every event that changes it: a view's
-    /// commit (even when the frame's submission then fails), play's
-    /// release of the installation, the run's disable. The record follows
-    /// the screen's installation; a pages-only installation, which the
-    /// screen does not hand out, stays as its selection kept it. What the
-    /// record replaces is dropped here, outside the commit point. The
-    /// status is published after.
+    /// The one point that sets what the result kind keeps to restore (the
+    /// S10-09i design's D2 and D7): exactly what the screen has installed
+    /// for it, read from the screen, never from notifications of what
+    /// changed it. An installation is kept as its bundle, a pages-only one
+    /// as its pages, none as none. It runs after every event that can
+    /// change it (a selection or upload answered, a view's commit before
+    /// its frame is submitted, play's staging, the run's disable, a screen
+    /// built again) and before a screen is dropped; with no screen it
+    /// keeps what it had. What the record replaces is dropped here, outside
+    /// the commit point. The status is published after.
     fn reconcile_result(&mut self) {
-        if let Some(screen) = &mut self.screen {
-            if self.result_disabled.is_some() || screen.take_result_release() {
-                self.committed.clear(ScreenKind::Result);
-            } else if let Some(i) = screen.installation(ScreenKind::Result)
-                && self
-                    .committed
-                    .get(ScreenKind::Result)
-                    .is_none_or(|c| !Arc::ptr_eq(c.bundle(), i.bundle()))
-            {
-                self.committed.set(ScreenKind::Result, Some(i));
+        if let Some(screen) = &self.screen {
+            match (
+                screen.installation(ScreenKind::Result),
+                screen.installed_pages(ScreenKind::Result),
+            ) {
+                (Some(i), _) => {
+                    if self
+                        .committed
+                        .get(ScreenKind::Result)
+                        .is_none_or(|c| !Arc::ptr_eq(c.bundle(), i.bundle()))
+                    {
+                        self.committed.set(ScreenKind::Result, Some(i));
+                    }
+                }
+                (None, Some(pages)) => {
+                    if self
+                        .committed
+                        .pages(ScreenKind::Result)
+                        .is_none_or(|c| !Arc::ptr_eq(c, &pages))
+                    {
+                        self.committed.set_pages(ScreenKind::Result, pages);
+                    }
+                }
+                (None, None) => self.committed.clear(ScreenKind::Result),
             }
         }
         self.publish_result_status();
+    }
+
+    /// The screen failed: what the result kind keeps is read from it one
+    /// last time, then it is dropped.
+    fn drop_screen(&mut self) {
+        self.reconcile_result();
+        self.screen = None;
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i
@@ -4599,7 +4611,7 @@ impl Run {
         }
         if let Some(e) = failed {
             eprintln!("render: {}", Chain(&e));
-            self.screen = None;
+            self.drop_screen();
             self.granted = false;
             self.shared.failed.store(true, Ordering::Release);
             return;
@@ -4875,8 +4887,6 @@ impl Run {
                 let _ = screen.drain_retired();
                 commits.committed = commits.committed.max(request);
                 drop(commits);
-                self.committed.set_pages(kind, Arc::clone(pages));
-                self.publish_result_status();
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
@@ -4884,7 +4894,7 @@ impl Run {
                 Ok(refused)
             }
             Err(e) => {
-                self.screen = None;
+                self.drop_screen();
                 self.granted = false;
                 self.shared.failed.store(true, Ordering::Release);
                 Err(e)

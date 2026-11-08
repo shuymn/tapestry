@@ -382,7 +382,15 @@ impl PlayerRig<'_> {
     /// show. Nothing without a result skin; once the run disabled it, each
     /// view is still presented, as the built-in result with the reason.
     fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
-        let (Some(chart), Some(page)) = (self.result_chart, self.end_page.clone()) else {
+        // The page exactly as the end screen is sent it, its settings
+        // lines included: the render side's page base for the lifetime's
+        // first frame, before that page arrives.
+        let (Some(chart), Some(page)) = (
+            self.result_chart,
+            self.end_page.as_ref().map(|base| {
+                end_screen::with_settings(base, self.controls.tuning().get(), self.speed_line())
+            }),
+        ) else {
             return;
         };
         if !self.result_skin.has_skin() {
@@ -793,7 +801,6 @@ impl PlayerRig<'_> {
         if tuned.is_some() || speed != self.shown_speed {
             self.shown_speed = speed;
             self.send_end(tuned.unwrap_or_else(|| self.controls.tuning().get()));
-            self.present_overlay();
         }
     }
 
@@ -1088,6 +1095,9 @@ impl Rig for PlayerRig<'_> {
         }
         self.serve_adjustments();
         self.sync();
+        // The result's own path, after the adjustments: an offset changed
+        // by them reaches the strip's guidance.
+        self.present_overlay();
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

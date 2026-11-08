@@ -72,6 +72,15 @@ struct Faults {
     lose_page: AtomicBool,
     /// The next frame wait times out.
     time_out: AtomicBool,
+    /// The next strip prepared for a view prepared fails as a lost device.
+    fail_strip: AtomicBool,
+    /// The next chart load fails as a lost device.
+    fail_load: AtomicBool,
+    /// The next play selection releases the result's installation, then
+    /// fails as a lost device (as play's admission releases it first).
+    release_then_fail: AtomicBool,
+    /// The next built-in page drawn panics.
+    panic_page: AtomicBool,
 }
 
 /// A WARP menu screen that records what each result frame drew.
@@ -88,6 +97,9 @@ impl Screen for Recorded {
         chart: &bms_model::Chart,
         section: Option<&eval::Section>,
     ) -> Result<(), render::RenderError> {
+        if self.faults.fail_load.swap(false, Ordering::AcqRel) {
+            return Err(render::RenderError::SurfaceLost);
+        }
         self.menu.load(chart, section)
     }
     fn device(&self) -> u64 {
@@ -105,6 +117,10 @@ impl Screen for Recorded {
         skin: &Arc<render::SkinBundle>,
         request: u64,
     ) -> Result<Preparation, render::RenderError> {
+        if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
+            self.menu.remove(ScreenKind::Result);
+            return Err(render::RenderError::SurfaceLost);
+        }
         self.menu.install(kind, skin, request)
     }
     fn installation(&self, kind: ScreenKind) -> Option<render::Installation> {
@@ -151,8 +167,8 @@ impl Screen for Recorded {
     fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
         self.menu.drain_retired()
     }
-    fn take_result_release(&mut self) -> bool {
-        self.menu.take_result_release()
+    fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
+        self.menu.installed_pages(kind)
     }
     fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
         self.menu.retained_atlases(kind)
@@ -177,6 +193,11 @@ impl Screen for Recorded {
         which: usize,
         lines: &[&str],
     ) -> Result<(), render::RenderError> {
+        if which == crate::render_side::STRIP_PREPARED
+            && self.faults.fail_strip.swap(false, Ordering::AcqRel)
+        {
+            return Err(render::RenderError::SurfaceLost);
+        }
         self.menu.prepare_result_strip(which, lines)
     }
     fn use_result_strip(&mut self, which: usize) {
@@ -206,6 +227,10 @@ impl Screen for Recorded {
         if self.faults.lose_page.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
+        assert!(
+            !self.faults.panic_page.swap(false, Ordering::AcqRel),
+            "the render thread panics (a test's fault)"
+        );
         let p = self.menu.end(page)?;
         self.drawn
             .lock()
@@ -409,6 +434,9 @@ fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBun
         size: [1_920, 1_080],
         default_font: || Ok(crate::render_outline::default_font()),
     };
+    // The importer's tests count its VMs and jobs: one import at a time
+    // with them.
+    let serial = crate::imports::tests::serial();
     let built = crate::imports::build(
         ScreenKind::Result,
         &choice,
@@ -416,6 +444,7 @@ fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBun
         &target,
         &skin_beatoraja::Cancel::new(),
     );
+    drop(serial);
     match built {
         crate::imports::KindOutcome::Bundle(b, _) => (d, b),
         other => panic!("{other:?}"),
@@ -714,16 +743,12 @@ fn a_withdrawn_upload_installs_nothing_when_released() {
     assert_eq!(status.installed, None);
     assert!(!status.retained.contains(&skin.atlas_id()), "{status:?}");
     // The positive control: the same upload answered installs its pages.
-    let mut pending = rig
+    let pending = rig
         .link
         .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
             skin.atlas_pages(),
         )));
-    let answer = loop {
-        if let Some(a) = pending.poll(Duration::from_millis(5)) {
-            break a;
-        }
-    };
+    let answer = pending.wait();
     assert_eq!(answer.unwrap(), Preparation::Ready);
     assert!(rig.link.fence(Duration::from_secs(10)));
     assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
@@ -738,16 +763,12 @@ fn a_withdrawn_upload_installs_nothing_when_released() {
 fn a_view_draws_on_the_pages_uploaded() {
     let (_dir, skin) = fixed_skin();
     let rig = Rig::new();
-    let mut pending = rig
+    let pending = rig
         .link
         .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
             skin.atlas_pages(),
         )));
-    let answer = loop {
-        if let Some(a) = pending.poll(Duration::from_millis(5)) {
-            break a;
-        }
-    };
+    let answer = pending.wait();
     assert_eq!(answer.unwrap(), Preparation::Ready);
     let lifetime = rig.link.begin_result();
     show(
@@ -1052,6 +1073,211 @@ fn every_frame_draws_one_views_text_and_rows() {
     rig.link.exit();
 }
 
+/// A pages upload of other pages releases the installed result first; if
+/// it is then withdrawn (or refused), the kind keeps nothing, not the
+/// installation it released (the record read from the screen): nothing
+/// is reported installed or retained, and a screen built again restores
+/// nothing of it.
+#[test]
+fn a_withdrawn_pages_replacement_leaves_nothing_installed() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_a_dir, a) = fixed_skin();
+    let (_b_dir, b) = fixed_skin();
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&a)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert_eq!(rig.link.result_status().installed, Some(a.atlas_id()));
+    crate::dev::hold_result_uploads(true);
+    let pending = rig
+        .link
+        .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+            b.atlas_pages(),
+        )));
+    assert!(wait_until(crate::dev::result_upload_holding));
+    drop(pending);
+    crate::dev::hold_result_uploads(false);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None, "{status:?}");
+    assert!(!status.retained.contains(&a.atlas_id()), "{status:?}");
+    assert!(!status.retained.contains(&b.atlas_id()), "{status:?}");
+    rig.link.exit();
+}
+
+/// Play's staging that released the result's installation and then fails
+/// on the device leaves the kind with nothing to restore: the record is
+/// read from the screen before it is dropped.
+#[test]
+fn a_release_before_a_device_error_is_kept() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.faults.release_then_fail.store(true, Ordering::Release);
+    assert!(
+        rig.link
+            .select(ScreenKind::Play, Some(Arc::clone(&skin)))
+            .wait()
+            .is_err()
+    );
+    assert_eq!(rig.link.result_status().installed, None);
+    rig.link.prepare().unwrap();
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None, "{status:?}");
+    assert_eq!(status.retained, [], "{status:?}");
+    rig.link.exit();
+}
+
+/// A result restore refused by a screen built again whose chart load then
+/// fails still disables the kind for the run: the next build, which has
+/// nothing of it left to restore, does not forget it.
+#[test]
+fn a_restore_refusal_stands_when_the_build_fails() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    rig.faults.lose_page.store(true, Ordering::Release);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+    });
+    assert!(wait_until(|| rig.link.failed()));
+    rig.faults.refuse_restore.store(true, Ordering::Release);
+    rig.faults.fail_load.store(true, Ordering::Release);
+    // The screen built again with the chart: the result's restore
+    // refused, then the chart's load fails.
+    assert!(rig.link.load(Arc::clone(&chart), None).is_err());
+    rig.faults.refuse_restore.store(false, Ordering::Release);
+    rig.link.load(chart, None).unwrap();
+    let why = rig
+        .link
+        .result_status()
+        .disabled
+        .expect("disabled for the run");
+    assert!(why.contains("not restored"), "{why}");
+    rig.link.exit();
+}
+
+/// A view presented (A) with a newer one prepared (B) when the screen
+/// fails, and the result's restore refused on the screen built again:
+/// the built-in page drawn is A's, the one presented, never B's (D1).
+#[test]
+fn a_refused_restore_draws_the_presented_view_not_the_prepared() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.faults.refuse_restore.store(true, Ordering::Release);
+    rig.faults.fail_strip.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&skin), 2_222, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    std::thread::sleep(Duration::from_millis(100));
+    for d in rig.drawn() {
+        let Drawn::Page(page) = d else {
+            panic!("the skin drew after its restore was refused");
+        };
+        assert_eq!(page[2], "v1 2", "the presented view's rows: {page:?}");
+    }
+    assert!(rig.link.result_status().disabled.is_some());
+    rig.link.exit();
+}
+
+/// The first fallback frame of a new lifetime draws that lifetime's own
+/// page, whole, before its `End` arrives: no row of the previous attempt's
+/// page shows (D1).
+#[test]
+fn a_new_lifetimes_first_fallback_has_no_earlier_row() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let first = installed(&rig, &skin);
+    rig.link.show_end(EndPage {
+        lines: (0..25).map(|i| format!("old {i}")).collect(),
+        graphs: None,
+    });
+    show(
+        &rig.link,
+        first,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.link.end_result();
+    let second = rig.link.begin_result();
+    rig.clear();
+    rig.faults.refuse_text.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        second,
+        1,
+        &payload(2, Some(&skin), 2_222, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    let Some(Drawn::Page(page)) = rig
+        .drawn()
+        .into_iter()
+        .find(|d| matches!(d, Drawn::Page(_)))
+    else {
+        unreachable!();
+    };
+    assert!(
+        page.iter().all(|l| !l.starts_with("old ")),
+        "a row of the previous attempt: {page:?}"
+    );
+    assert_eq!(page[0], "v2 0", "{page:?}");
+    rig.link.exit();
+}
+
+/// A panic on the render thread is a screen failure the game sees: the
+/// link reports it failed.
+#[test]
+fn a_render_thread_panic_is_a_failure() {
+    let rig = Rig::new();
+    rig.faults.panic_page.store(true, Ordering::Release);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+    });
+    assert!(wait_until(|| rig.link.failed()));
+}
+
 /// The commit point and the build of a result frame allocate nothing
 /// (C11), with the skin at its text capacity (every text element filled,
 /// a new title each cycle) and all 13 strip lines: each cycle commits a
@@ -1210,8 +1436,12 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
                 let at = stopper.join().unwrap();
                 returned.duration_since(at)
             });
+            // One slice, which a timed wait on Windows rounds up to the
+            // system timer's period (about 15.6 ms), and the scheduling of
+            // two threads on a loaded machine.
+            println!("{stop}: the wait ended {waited:?} after");
             assert!(
-                waited < crate::render_side::SELECT_SLICE + Duration::from_millis(100),
+                waited < crate::render_side::SELECT_SLICE + Duration::from_millis(50),
                 "{stop}: the wait ended {waited:?} after"
             );
             assert!(p.result_withdrawn, "{stop}");
@@ -1249,12 +1479,8 @@ pub(crate) fn presented_on(
     bundle: &Arc<render::SkinBundle>,
 ) -> bool {
     let atlas = upload.atlas();
-    let mut pending = rig.link.upload_result(upload);
-    let answer = loop {
-        if let Some(a) = pending.poll(Duration::from_millis(5)) {
-            break a;
-        }
-    };
+    let pending = rig.link.upload_result(upload);
+    let answer = pending.wait();
     if !matches!(answer, Ok(Preparation::Ready)) {
         return false;
     }

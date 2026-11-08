@@ -894,8 +894,8 @@ impl Screen for MenuScreen {
         self.renderer.drain_retired()
     }
 
-    fn take_result_release(&mut self) -> bool {
-        self.renderer.take_result_release()
+    fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
+        self.renderer.installed_pages(kind).cloned()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

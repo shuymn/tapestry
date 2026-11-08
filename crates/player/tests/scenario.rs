@@ -2480,11 +2480,22 @@ fn the_result_layout_takes_the_compared_best() {
     );
 }
 
+/// What a self-made result skin reads while it loads.
+#[derive(Clone, Copy, Debug)]
+enum Reads {
+    /// Nothing: fixed, installed at startup.
+    Nothing,
+    /// The chart's play level (number 96): one bundle for every view of
+    /// the attempt, uploaded after its commit.
+    Chart,
+    /// The view's next-rank difference (number 154): each view laid out on
+    /// the pages uploaded after the attempt's commit.
+    View,
+}
+
 /// A self-made Lua result skin under `fx`, chosen in `player.toml`: its EX
-/// number and a status image; `pending`, it reads number 154 while it
-/// loads, so each view is laid out on the pages uploaded after the
-/// attempt's commit; else it reads no fact and is installed at startup.
-fn result_skin(fx: &Fixture, pending: bool) {
+/// number and a status image, reading `reads` while it loads.
+fn result_skin(fx: &Fixture, reads: Reads) {
     let skin = fx.base.join("result");
     fs::create_dir_all(&skin).unwrap();
     let file = fs::File::create(skin.join("s.png")).unwrap();
@@ -2493,10 +2504,10 @@ fn result_skin(fx: &Fixture, pending: bool) {
     e.set_depth(png::BitDepth::Eight);
     let texels: Vec<u8> = (0..64 * 16).flat_map(|_| [9, 9, 9, 255]).collect();
     e.write_header().unwrap().write_image_data(&texels).unwrap();
-    let reads = if pending {
-        "local ms = require(\"main_state\")\nlocal nr = ms.number(154)\n"
-    } else {
-        ""
+    let reads = match reads {
+        Reads::Nothing => "",
+        Reads::Chart => "local ms = require(\"main_state\")\nlocal lv = ms.number(96)\n",
+        Reads::View => "local ms = require(\"main_state\")\nlocal nr = ms.number(154)\n",
     };
     fs::write(
         skin.join("result.luaskin"),
@@ -2541,19 +2552,19 @@ fn result_work(stdout: &str) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
-/// The S10-09i design's C6 and C7 through the real flow, for a fixed and
-/// a pending result skin: the result's texture is uploaded once, at
-/// startup (fixed) or after the first attempt's commit (pending); from
+/// The S10-09i design's C6 and C7 through the real flow, for a fixed, a
+/// chart-only and a pending result skin: the result's texture is uploaded
+/// once, at startup (fixed) or after the first attempt's commit; from
 /// READY through the play's end and its Closing nothing of the result is
 /// staged or uploaded; the views on the result stage with no upload; and
 /// the retry, its atlas installed, stages and uploads nothing at its
 /// commit (G4's warm reuse).
 #[test]
 fn the_result_uploads_once_and_never_in_play() {
-    for pending in [false, true] {
+    for reads in [Reads::Nothing, Reads::Chart, Reads::View] {
         let fx = Fixture::new();
         write_chart(&fx.library(), "a", "譜面A");
-        result_skin(&fx, pending);
+        result_skin(&fx, reads);
         let (out, stdout, stderr) = fx.run(&scenario(&[
             "select = { path = \"library/a/a.bms\" }",
             "play = { input = \"auto\", until = \"end\" }",
@@ -2576,7 +2587,7 @@ fn the_result_uploads_once_and_never_in_play() {
         let (commit, ready, ended, left) = (&work[0], &work[1], &work[2], &work[3]);
         // One upload, before READY: the startup's selection, or the
         // attempt's pages after its commit.
-        assert_eq!((commit.1, commit.2), (1, 1), "pending {pending}: {stdout}");
+        assert_eq!((commit.1, commit.2), (1, 1), "{reads:?}: {stdout}");
         // Nothing from READY through the play's end and its Closing.
         assert_eq!((ready.1, ready.2), (commit.1, commit.2), "{stdout}");
         assert_eq!((ended.1, ended.2), (ready.1, ready.2), "{stdout}");
@@ -2586,12 +2597,7 @@ fn the_result_uploads_once_and_never_in_play() {
         // The retry: its atlas installed, its commit does nothing; nothing
         // in its play either.
         for w in &work[4..7] {
-            assert_eq!(
-                (w.1, w.2),
-                (left.1, left.2),
-                "{} pending {pending}: {stdout}",
-                w.0
-            );
+            assert_eq!((w.1, w.2), (left.1, left.2), "{} {reads:?}: {stdout}", w.0);
         }
         assert_eq!(work[7].2, left.2, "{stdout}");
         assert!(
@@ -2608,7 +2614,7 @@ fn the_result_uploads_once_and_never_in_play() {
 fn a_refused_view_staging_shows_that_view_built_in() {
     let fx = Fixture::new();
     write_chart(&fx.library(), "a", "譜面A");
-    result_skin(&fx, false);
+    result_skin(&fx, Reads::Nothing);
     let (out, stdout, stderr) = fx.run_with(
         &scenario(&[
             "select = { path = \"library/a/a.bms\" }",
@@ -2633,14 +2639,14 @@ fn a_refused_view_staging_shows_that_view_built_in() {
     assert!(!stderr.contains("draws from now on"), "{stderr}");
 }
 
-/// C17b and finding 6 through the real flow: the after-commit upload
+/// C17b through the real flow: the after-commit upload
 /// refused shows the built-in result for every view of the attempt, with
 /// no layout asked for; the retry uploads again and shows the skin.
 #[test]
 fn a_refused_upload_shows_the_attempt_built_in() {
     let fx = Fixture::new();
     write_chart(&fx.library(), "a", "譜面A");
-    result_skin(&fx, true);
+    result_skin(&fx, Reads::View);
     let (out, stdout, stderr) = fx.run_with(
         &scenario(&[
             "select = { path = \"library/a/a.bms\" }",
@@ -2680,7 +2686,7 @@ fn a_refused_upload_shows_the_attempt_built_in() {
 fn the_run_fallback_keeps_presenting_the_built_in_result() {
     let fx = Fixture::new();
     write_chart(&fx.library(), "a", "譜面A");
-    result_skin(&fx, true);
+    result_skin(&fx, Reads::View);
     let (out, stdout, stderr) = fx.run_with(
         &scenario(&[
             "select = { path = \"library/a/a.bms\" }",
