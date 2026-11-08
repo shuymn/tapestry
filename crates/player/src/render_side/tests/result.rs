@@ -1842,10 +1842,12 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
         }
         assert!(alphas.windows(2).all(|w| w[0] <= w[1]), "{alphas:?}");
         assert!(alphas.last() > alphas.first(), "the fade rises: {alphas:?}");
-        // Timer 2 itself: started at the pin, and running.
+        // Timer 2 itself: started at the pin, and running (how far it ran
+        // is the rising fade above; the last frame may be built up to a
+        // frame before the hold's sleep ends, so no wall-clock bound).
         let (now, start) = faults.timers.lock().unwrap().expect("a frame built");
         assert_eq!(start, Some(at), "timer 2 starts at the pin");
-        assert!(now.0 - at.0 >= 600_000, "{now:?} {at:?}");
+        assert!(now.0 > at.0, "{now:?} {at:?}");
         assert_eq!(p.render.result_status().pinned, Some(1));
     });
 }
