@@ -3503,6 +3503,7 @@ fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
         "before play",
         "audio",
         "attempt",
+        "ready",
         "commit",
         "end loading",
         "open",
@@ -3546,6 +3547,89 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     // Fresh per attempt: its own number, from the same chart.
     assert_eq!((one.number, two.number), (1, 2));
     assert_eq!(one.kind, two.kind);
+    // The retry's preparation is keyed with the refreshed preset, and the
+    // settings lent to the play again.
+    let [first, second] = &rig.begun[..] else {
+        panic!("{:?}", rig.begun);
+    };
+    let changed = first.changes(second);
+    assert!(changed.preset && changed.settings, "{changed:?}");
+    assert!(
+        !(changed.chart || changed.speed || changed.kind),
+        "{changed:?}"
+    );
+}
+
+/// A final readiness answering `Stale` because the screen's structural
+/// inputs changed after the staging (a device rebuilt) is never repaired
+/// in place: the preparation is begun again at once with the new key, and
+/// its readiness then opens the play, committed once (design.md "Play
+/// Lifecycle", preparing each attempt).
+#[test]
+fn a_stale_readiness_with_a_changed_screen_prepares_again_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    let rebuilt = game::ScreenKey {
+        device: 2,
+        target: [1_920, 1_080],
+        skin: 0,
+    };
+    rig.stale = vec![rebuilt];
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.opens, 1);
+    assert_eq!(
+        rig.steps,
+        [
+            "screen",
+            "before play",
+            "audio",
+            "attempt",
+            "ready",
+            "attempt",
+            "ready",
+            "commit",
+            "end loading",
+            "open",
+        ]
+    );
+    let [first, second] = &rig.begun[..] else {
+        panic!("{:?}", rig.begun);
+    };
+    // Begun again with the screen as it is now, nothing else changed.
+    assert_eq!(first.screen(), None);
+    assert_eq!(second.screen(), Some(rebuilt));
+    // The same attempt both times: its number, asked of each readiness.
+    assert_eq!(rig.readied, [(1, 1), (1, 2)]);
+    assert_eq!(rig.attempts.len(), 2);
+    assert!(rig.attempts.iter().all(|a| a.number == 1));
+}
+
+/// A final readiness answering `Stale` with nothing structural changed
+/// (the staging lost) ends the run with the screen's error and is never
+/// retried: one preparation, no commit, what it staged discarded.
+#[test]
+fn a_stale_readiness_with_an_unchanged_key_ends_the_run_untried() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.stale = vec![game::ScreenKey::default(), game::ScreenKey::default()];
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.begun.len(), 1, "{:?}", rig.steps);
+    assert_eq!(rig.readied.len(), 1);
+    assert_eq!(rig.opens, 0);
+    assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "ready", "discard"]),
+        "{:?}",
+        rig.steps
+    );
 }
 
 /// A screen lost while a held START defers the opening ends the run as
@@ -3616,6 +3700,7 @@ fn a_hold_at_the_opening_defers_it_with_or_without_a_loading_lifetime() {
                 "before play",
                 "audio",
                 "attempt",
+                "ready",
                 "commit",
                 "end loading",
                 "deferred",
@@ -3828,7 +3913,7 @@ fn a_quit_pending_at_an_immediate_preparation_commits_nothing() {
     assert_eq!((rig.opens, rig.reports.len()), (0, 0));
     assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
     assert!(
-        rig.steps.ends_with(&["attempt", "discard"]),
+        rig.steps.ends_with(&["attempt", "ready", "discard"]),
         "{:?}",
         rig.steps
     );
