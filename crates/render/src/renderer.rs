@@ -90,12 +90,12 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 /// The level-0 texels every screen kind's committed installation shares
-/// with a candidate ([`Renderer::admit`]): 576 Mi, sized so that the
+/// with a candidate ([`Renderer::admit`]): 768 Mi, sized so that the
 /// largest skins of each kind fit together with their VM charges, and at
 /// least twice one atlas array's cap ([`skin_model::MAX_ATLAS_TEXELS`]),
 /// so any skin that fits alone is admitted on its own and two at that cap
 /// fit together. A provisional limit, raised when a real case hits it.
-pub const SHARED_TEXELS: u64 = 576 << 20;
+pub const SHARED_TEXELS: u64 = 768 << 20;
 
 // Two kinds' installations at the per-atlas cap must fit in the shared
 // budget at once: a candidate at the cap beside another kind committed at

@@ -60,6 +60,7 @@ fn record(
         ),
     };
     PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: Implementation::STANDARD_VERSION,
             app: "0.0.0-test".to_owned(),
@@ -239,4 +240,65 @@ fn the_reservation_charges_the_arenas_actual_capacity() {
         HistoryRecorder::bytes(usize::MAX),
         HistoryRecorder::bytes(replay::MAX_HELD)
     );
+}
+
+proptest::proptest! {
+    /// Every starting tuning the game can write, made by the production
+    /// conversion (`PlayOptions::start_tuning`) from options over their
+    /// whole accepted domain, every reference and cover target, and any
+    /// multiplier within 0.01 to 20 (large terms included), passes the
+    /// record's checks and comes back unchanged from a played record.
+    #[test]
+    fn every_valid_tuning_round_trips_through_the_record(
+        (mode, reference) in (0_u8..2, 0_u8..4),
+        (classic, classic_step, floating_fives, green) in (1_u32..=2_000, 1_u32..=100, 1_u32..=20, 1_u32..=6_000),
+        covers in proptest::array::uniform3((0_u16..=game::MAX_COVER, proptest::bool::ANY)),
+        target in 0_u8..4,
+        hispeed in proptest::option::of((1_u64..=u64::MAX / 20, 0_u64..=u64::MAX)),
+    ) {
+        use game::{Cover, CoverKind, Covers, HiSpeedReference, HiSpeedSettings, PlayOptions, Ratio, SpeedMode};
+        let cover = |(amount, on)| Cover { amount, on };
+        let options = PlayOptions::new(
+            HiSpeedSettings {
+                mode: if mode == 0 { SpeedMode::Classic } else { SpeedMode::Floating },
+                reference: match reference {
+                    0 => HiSpeedReference::Start,
+                    1 => HiSpeedReference::Maximum,
+                    2 => HiSpeedReference::Main,
+                    _ => HiSpeedReference::Minimum,
+                },
+                classic_hispeed_x100: classic,
+                classic_step_x100: classic_step,
+                floating_step_x100: floating_fives * 5,
+                green_target: green,
+            },
+            Covers {
+                sudden: cover(covers[0]),
+                lift: cover(covers[1]),
+                hidden: cover(covers[2]),
+            },
+        )
+        .unwrap();
+        let target = match target {
+            0 => None,
+            1 => Some(CoverKind::Sudden),
+            2 => Some(CoverKind::Lift),
+            _ => Some(CoverKind::Hidden),
+        };
+        // A multiplier from 1/100 to 20 of denominator `den`: `pick`
+        // spread over the numerators in range, then reduced.
+        let hispeed = hispeed.map(|(den, pick)| {
+            let low = den.div_ceil(100);
+            let high = den * 20;
+            Ratio::new(low + pick % (high - low + 1), den).unwrap()
+        });
+        let tuning = options.start_tuning(hispeed, target);
+        proptest::prop_assert_eq!(tuning.invalid(), None, "{:?}", tuning);
+        let rec = PlayRecord {
+            start_tuning: Some(tuning),
+            ..record(ReadyHistory::default(), Some((InputStart::default(), Vec::new())))
+        };
+        let back = replay::decode(&replay::encode(&rec), &DecodeLimits::STANDARD).unwrap();
+        proptest::prop_assert_eq!(back.start_tuning, Some(tuning));
+    }
 }

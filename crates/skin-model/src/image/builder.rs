@@ -341,7 +341,8 @@ impl SheetBuilder {
     /// the cycle's period; a grid of a column and a row with at most
     /// [`MAX_IMAGE_FRAMES`](super::MAX_IMAGE_FRAMES) frames, and at most
     /// [`MAX_SKIN_FRAMES`](super::MAX_SKIN_FRAMES) across the images; the
-    /// rectangle inside the file; non-empty frames. Nothing is kept unless
+    /// rectangle starting inside the file, which it may run past
+    /// ([`ImageDef::rect`]); non-empty frames. Nothing is kept unless
     /// every check passes.
     ///
     /// # Errors
@@ -965,7 +966,7 @@ mod tests {
             }),
             (
                 ImageDef {
-                    rect: Some([1, 0, 4, 4]),
+                    rect: Some([4, 0, 1, 1]),
                     ..image(0, [1, 1])
                 },
                 |e| matches!(e, ImageError::RectOutside { image: 0 }),

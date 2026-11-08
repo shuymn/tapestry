@@ -255,6 +255,7 @@ fn record() -> impl Strategy<Value = PlayRecord> {
                 let n = u16::try_from(sources.len()).unwrap();
                 let source = |raw: u16| SourceId(raw % n);
                 PlayRecord {
+                    start_tuning: Some(replay::StartTuning::default()),
                     versions,
                     chart,
                     preset,
