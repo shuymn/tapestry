@@ -346,6 +346,12 @@ pub trait Screen: Send {
     fn atlas_uploads(&self) -> u64 {
         0
     }
+    /// The last texture array upload's timing, taken once (dev-tools: the
+    /// S10-09i design's §8.1 G1); none by default.
+    #[cfg(feature = "dev-tools")]
+    fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
+        None
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {
@@ -2456,6 +2462,8 @@ pub fn spawn(
                 selection_states: 0,
                 result: None,
                 result_disabled: None,
+                #[cfg(feature = "dev-tools")]
+                probe_view: None,
             };
             r.run(&rx);
         })
@@ -3040,6 +3048,10 @@ struct Run {
     /// D7): kept apart from the screen, so a screen built again is
     /// disabled before it restores anything.
     result_disabled: Option<String>,
+    /// Development builds: the view the last presented result frame drew
+    /// with its skin, for G5's end (the S10-09i design's §8.1).
+    #[cfg(feature = "dev-tools")]
+    probe_view: Option<crate::result_present::ViewKey>,
 }
 
 impl Run {
@@ -3554,6 +3566,10 @@ impl Run {
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it.
             let frame_at = self.clock.now();
+            // Whether a result frame was built with its skin (dev-tools:
+            // G3's and G5's ends).
+            #[cfg(feature = "dev-tools")]
+            let mut skin_built = false;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -3846,6 +3862,10 @@ impl Run {
                         }
                         other => other,
                     };
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        skin_built = matches!(built, ResultDrawn::Built);
+                    }
                     // A view committed: what the kind keeps to restore
                     // follows it now, whatever the submission does.
                     if let Some(side) = &mut self.result
@@ -3922,6 +3942,10 @@ impl Run {
             }
             if matches!(mode, Mode::Result) && drawn.is_ok() {
                 self.after_result_frame();
+            }
+            #[cfg(feature = "dev-tools")]
+            if skin_built && drawn.as_ref().is_ok_and(|(t, _)| t.presented) {
+                self.probe_result_frame();
             }
             let Some(screen) = &mut self.screen else {
                 continue;
@@ -5161,6 +5185,29 @@ impl Run {
         ResultDrawn::BuiltIn
     }
 
+    /// Development builds: the ends of G3 and G5 (the S10-09i design's
+    /// §8.1) at a presented frame drawn with the result skin, printed
+    /// after the frame: the first one since the result's preparation
+    /// began, and the first one of another view since a preset step.
+    #[cfg(feature = "dev-tools")]
+    fn probe_result_frame(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(us) = game::probe::take_since(&game::probe::RESULT_BEGAN, now) {
+            eprintln!("dev: probe G3 save to first result: {us} us");
+        }
+        let view = self
+            .result
+            .as_ref()
+            .and_then(|s| s.presented.as_ref())
+            .map(|h| h.payload.key);
+        if view != self.probe_view {
+            self.probe_view = view;
+            if let Some(us) = game::probe::take_since(&game::probe::STEP_ACCEPTED, now) {
+                eprintln!("dev: probe G5 switch: {us} us");
+            }
+        }
+    }
+
     /// After a result frame: what the commit point discarded or replaced
     /// is dropped, the array a commit released drained (the S10-09i
     /// design's §2.1 Q3), and the status published.
@@ -5298,11 +5345,28 @@ impl Run {
                 return Ok(refusal("dev: the result's upload was refused"));
             }
         }
+        // G1's cold precondition (dev-tools `cold`): the installation
+        // removed and nothing retained, so the pages upload again.
+        #[cfg(feature = "dev-tools")]
+        let cold = crate::dev::result_cold();
+        #[cfg(feature = "dev-tools")]
+        if cold {
+            screen.remove(kind);
+            let _ = screen.drain_retired();
+        }
+        #[cfg(feature = "dev-tools")]
+        let retained = screen.retained_atlases(kind).iter().flatten().count();
+        #[cfg(feature = "dev-tools")]
+        let _ = screen.take_upload_timing();
         #[cfg(feature = "dev-tools")]
         let uploads = screen.atlas_uploads();
         let installed = screen.install_pages(kind, pages, request);
         #[cfg(feature = "dev-tools")]
         crate::dev::result_staged(screen.atlas_uploads() - uploads);
+        #[cfg(feature = "dev-tools")]
+        if let Some(t) = screen.take_upload_timing() {
+            crate::dev::print_upload(cold, retained, t);
+        }
         match installed {
             Ok(Preparation::Ready) => {
                 let shared = Arc::clone(&self.shared);

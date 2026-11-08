@@ -539,6 +539,31 @@ fn bundles_on_one_array_keep_their_own_lines() {
     );
 }
 
+/// G1's timing (the S10-09i design's §8.1): one per upload, taken once,
+/// with the queue's report of the submitted work; none for pages already
+/// installed, and one again after the installation is removed (G1's cold
+/// precondition).
+#[test]
+fn an_upload_times_itself_once() {
+    let mut r = offscreen(W, H);
+    let x = bundles(&r);
+    let pages = x.a.atlas_pages();
+    let _ = r.take_upload_timing();
+    let token = r.install_pages(ScreenKind::Result, pages, 1).unwrap();
+    let t = r.take_upload_timing().expect("the upload's timing");
+    assert!(t.done.is_some(), "the queue reported the work done");
+    assert!(r.take_upload_timing().is_none(), "taken once");
+    r.commit(token).unwrap();
+    let token = r.install_pages(ScreenKind::Result, pages, 2).unwrap();
+    assert!(r.take_upload_timing().is_none(), "installed: no upload");
+    r.commit(token).unwrap();
+    r.remove(ScreenKind::Result);
+    assert_eq!(r.retained_atlases(ScreenKind::Result), [None; 3]);
+    let token = r.install_pages(ScreenKind::Result, pages, 3).unwrap();
+    assert!(r.take_upload_timing().is_some(), "cold: uploaded again");
+    r.commit(token).unwrap();
+}
+
 /// The pages-only installation: uploaded and charged with no layout
 /// drawing; a layout on it then uploads nothing; the same pages again
 /// upload nothing; other pages release the installation before they are

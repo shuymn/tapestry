@@ -2619,6 +2619,64 @@ fn the_result_uploads_once_and_never_in_play() {
     }
 }
 
+/// The S10-09i design's §8.1 probes through the real flow, one line per
+/// sample: G1 at each upload of the result's pages (the first attempt's;
+/// with `cold`, the retry's too, its installation removed and nothing
+/// retained first), G2 at each opening with what the result step did, G3
+/// at each result's first frame drawn with the skin, and G5 at the step's
+/// first frame of the new view.
+#[test]
+fn the_probes_fire_once_per_sample() {
+    for (faults, uploads, steps) in [
+        ("", 1, ["uploaded", "reused"]),
+        ("cold", 2, ["uploaded", "uploaded"]),
+    ] {
+        let fx = Fixture::new();
+        write_chart(&fx.library(), "a", "譜面A");
+        result_skin(&fx, Reads::View);
+        let (out, stdout, stderr) = fx.run_with(
+            &scenario(&[
+                "select = { path = \"library/a/a.bms\" }",
+                "play = { input = \"auto\", until = \"end\" }",
+                "result = \"next-preset\"",
+                "result = \"retry\"",
+                "play = { input = \"auto\", until = \"end\" }",
+                "result = \"back\"",
+                "quit = {}",
+            ]),
+            faults,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{stdout}
+{stderr}"
+        );
+        let g1 = lines(&stderr, "dev: probe G1 upload: ");
+        assert_eq!(g1.len(), uploads, "{faults}: {stderr}");
+        let cold = format!("cold {} retained 0 ", faults == "cold");
+        for l in &g1 {
+            assert!(l.contains(&cold), "{l}");
+            assert!(!l.ends_with("done none"), "the queue's report: {l}");
+        }
+        let g2: Vec<&str> = lines(&stderr, "dev: probe G2 ready to open: ")
+            .iter()
+            .map(|l| l.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(g2, steps, "{faults}: {stderr}");
+        assert_eq!(
+            lines(&stderr, "dev: probe G3 save to first result: ").len(),
+            2,
+            "{faults}: {stderr}"
+        );
+        assert_eq!(
+            lines(&stderr, "dev: probe G5 switch: ").len(),
+            1,
+            "{faults}: {stderr}"
+        );
+    }
+}
+
 /// C17a through the real flow: a view whose staging is refused shows the
 /// built-in result with why, the next view the skin again; the run is not
 /// disabled.
