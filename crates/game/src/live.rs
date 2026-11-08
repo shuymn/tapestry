@@ -1019,9 +1019,16 @@ pub fn run_chart<R: Rig>(
                             }
                         }
                         _ if !open => {}
-                        MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
+                        // Each step stamps G5's start (dev-tools).
+                        MenuCommand::NextPreset => {
+                            #[cfg(feature = "dev-tools")]
+                            crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
+                            dirty |= screen.step(1, &report, loaded.chart());
+                        }
                         MenuCommand::PrevPreset => {
-                            dirty |= screen.step(-1, &report, loaded.chart())
+                            #[cfg(feature = "dev-tools")]
+                            crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
+                            dirty |= screen.step(-1, &report, loaded.chart());
                         }
                     }
                 }

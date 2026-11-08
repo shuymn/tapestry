@@ -33,6 +33,8 @@ mod practice_screen;
 mod prep;
 mod prepare;
 pub mod presets;
+#[cfg(feature = "dev-tools")]
+pub mod probe;
 mod queue;
 pub mod readouts;
 mod ready_history;
