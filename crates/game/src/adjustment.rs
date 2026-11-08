@@ -260,6 +260,15 @@ impl TempoMap for NoTempo {
     }
 }
 
+impl PresentationSnapshot {
+    /// The record's starting tuning: these options, the multiplier `H`
+    /// and the cover target ([`replay::StartTuning`]).
+    #[must_use]
+    pub fn start_tuning(&self) -> replay::StartTuning {
+        self.options.start_tuning(self.hispeed, self.target)
+    }
+}
+
 /// What the reducer publishes: everything a frame and the readouts need,
 /// from one drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -430,6 +439,9 @@ pub struct Adjustment {
     diagnostics: Diagnostics,
     published: u64,
     epoch: u64,
+    /// The state the last opening started with, taken once its phase was
+    /// reduced ([`Self::opened`]).
+    opened: Option<PresentationSnapshot>,
 }
 
 impl Adjustment {
@@ -465,6 +477,7 @@ impl Adjustment {
             diagnostics: Diagnostics::default(),
             published: 0,
             epoch: 0,
+            opened: None,
         };
         a.hispeed = match options.hispeed().mode {
             SpeedMode::Classic => Some(Ratio::from_hundredths(
@@ -604,6 +617,15 @@ impl Adjustment {
         self.lost || self.starts > 0 || self.selects > 0
     }
 
+    /// The state the last opening started with (design.md "Input Log
+    /// Format", the starting tuning): taken where its phase is reduced in
+    /// the ordered stream, so every adjustment ordered before it is in it
+    /// and none after; replaced by the next opening, a rearm's included.
+    #[must_use]
+    pub const fn opened(&self) -> Option<&PresentationSnapshot> {
+        self.opened.as_ref()
+    }
+
     /// The state to publish. A group still open at the latest time is not
     /// in it until a later observation closes it.
     #[must_use]
@@ -712,6 +734,12 @@ impl Adjustment {
                 }
                 self.head = head;
                 self.generation = generation;
+                // An opening (the head on the clock): its starting tuning,
+                // with every adjustment ordered before it reduced and its
+                // open group closed by the new generation's context end.
+                if matches!(head, Head::Clock { .. }) {
+                    self.opened = Some(self.snapshot());
+                }
             }
             Event::Prepare { references, speed } => {
                 let _ = self.prepare(Some(references), speed, tempo);

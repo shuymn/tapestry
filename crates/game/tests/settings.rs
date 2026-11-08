@@ -773,6 +773,7 @@ fn records_are_numbered_per_chart() {
 
 fn sample() -> replay::PlayRecord {
     replay::PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: replay::Versions {
             evaluator: 1,
             app: "test".to_owned(),

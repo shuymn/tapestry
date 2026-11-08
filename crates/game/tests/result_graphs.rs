@@ -43,6 +43,7 @@ fn record(
 ) -> PlayRecord {
     let dev = device(&[0]);
     PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: Implementation::STANDARD_VERSION,
             app: "0.0.0-test".to_owned(),
