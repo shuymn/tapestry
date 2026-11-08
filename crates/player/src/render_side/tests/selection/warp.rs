@@ -788,3 +788,41 @@ fn a_render_failure_in_a_play_leaves_the_runtime_to_the_game_thread() {
     assert!(gone.load(Ordering::Acquire));
     assert_eq!(link.exit(), crate::render_side::RenderEnd::Panicked);
 }
+
+/// A menu page (the loading or practice page) taken before selection's
+/// cleanup keeps the select screen's state, its runtime checked out; the
+/// acknowledgment before recording opens parks it (design.md "beatoraja
+/// Lua Skins", Quiescence acknowledged).
+#[test]
+fn a_menu_page_before_selections_cleanup_leaves_the_runtime_to_the_acknowledgment() {
+    let (_dir, skin, script) = scripted("rt.luaskin");
+    let (link, frames) = warp_link(None);
+    link.select_with(ScreenKind::Selection, Some(skin), script)
+        .wait()
+        .unwrap();
+    link.enter_selection(1);
+    link.show_selection(update_of(1, 1, listed(SelectionPlace::All, "")));
+    let _ = quads_after(&frames, 0, 3);
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection),
+        None,
+        "taken by the screen"
+    );
+    link.send(crate::render_side::RenderMsg::Menu(Box::default()));
+    assert!(link.fence(std::time::Duration::from_secs(10)));
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection),
+        None,
+        "after the menu"
+    );
+    link.leave_selection();
+    assert!(link.fence(std::time::Duration::from_secs(10)));
+    assert_eq!(
+        link.scripts().parked(ScreenKind::Selection),
+        None,
+        "the select screen's state holds its runtime"
+    );
+    assert!(link.park_scripts());
+    assert!(link.scripts().parked(ScreenKind::Selection).is_some());
+    link.exit();
+}
