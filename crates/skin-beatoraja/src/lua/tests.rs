@@ -287,8 +287,16 @@ fn a_panic_in_a_host_function_closes_the_vm_in_the_hooks() {
     assert_eq!(super::vm_hooks::thread_live(), base);
 }
 
+/// Gives this thread's imports a time cap they cannot reach: a test of
+/// something else than the time cap, whose outcome a loaded machine's
+/// wall clock must not decide.
+fn no_time_cap() {
+    TIME_LIMIT.with(|t| t.set(Some(std::time::Duration::MAX)));
+}
+
 #[test]
 fn every_pass_drops_its_vm_on_every_outcome() {
+    no_time_cap();
     let ok = folder("return { type = 0 }");
     let h = header(ok.path(), &Cancel::new()).unwrap();
     assert_eq!(live(), 0);
@@ -465,6 +473,7 @@ fn kind_import(ty: i32, scene: ScreenKind) -> (Result<super::LuaOutcome, ImportE
 #[test]
 fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
     use ScreenKind::{Play, Result, Selection};
+    no_time_cap();
     for (ty, scene, found) in [(5, Play, Selection), (0, Result, Play)] {
         let (r, passes, admits) = kind_import(ty, scene);
         match r {
