@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 
+use replay::{CoverRecord, HiSpeedRatio, StartTuning, TuningCover, TuningMode, TuningReference};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -242,10 +243,11 @@ impl Default for HiSpeedSettings {
     }
 }
 
-/// The smallest and largest target green number.
-pub const GREEN_TARGETS: (u32, u32) = (1, 6000);
-/// The largest cover amount, ‰.
-pub const MAX_COVER: u16 = 1000;
+/// The smallest and largest target green number, as the record checks it
+/// ([`replay::GREEN_TARGET`]).
+pub const GREEN_TARGETS: (u32, u32) = (*replay::GREEN_TARGET.start(), *replay::GREEN_TARGET.end());
+/// The largest cover amount, ‰, as the record checks it.
+pub const MAX_COVER: u16 = replay::MAX_COVER;
 
 /// One lane cover: its configured amount, kept while it is off, and its
 /// switch.
@@ -388,6 +390,46 @@ impl PlayOptions {
     pub(crate) const fn parts_mut(&mut self) -> (&mut HiSpeedSettings, &mut Covers) {
         (&mut self.hispeed, &mut self.covers)
     }
+
+    /// The record's starting tuning (design.md "Input Log Format"): these
+    /// options with the multiplier `hispeed` in effect and the cover
+    /// `target` the controls adjust, each `None` when there is none.
+    #[must_use]
+    pub fn start_tuning(&self, hispeed: Option<Ratio>, target: Option<CoverKind>) -> StartTuning {
+        let h = self.hispeed;
+        let cover = |c: Cover| CoverRecord {
+            amount: c.amount,
+            on: c.on,
+        };
+        StartTuning {
+            mode: match h.mode {
+                SpeedMode::Classic => TuningMode::Classic,
+                SpeedMode::Floating => TuningMode::Floating,
+            },
+            reference: match h.reference {
+                HiSpeedReference::Start => TuningReference::Start,
+                HiSpeedReference::Maximum => TuningReference::Maximum,
+                HiSpeedReference::Main => TuningReference::Main,
+                HiSpeedReference::Minimum => TuningReference::Minimum,
+            },
+            classic_hispeed_x100: h.classic_hispeed_x100,
+            classic_step_x100: h.classic_step_x100,
+            floating_step_x100: h.floating_step_x100,
+            green_target: h.green_target,
+            sudden: cover(self.covers.sudden),
+            lift: cover(self.covers.lift),
+            hidden: cover(self.covers.hidden),
+            target: target.map(|k| match k {
+                CoverKind::Sudden => TuningCover::Sudden,
+                CoverKind::Lift => TuningCover::Lift,
+                CoverKind::Hidden => TuningCover::Hidden,
+            }),
+            hispeed: hispeed.map(|r| HiSpeedRatio {
+                num: r.num(),
+                den: r.den(),
+            }),
+        }
+    }
 }
 
 fn check(
@@ -411,25 +453,26 @@ fn check_hispeed(h: &HiSpeedSettings) -> Result<(), PlayOptionsError> {
     check(
         "classic_hispeed_x100",
         h.classic_hispeed_x100,
-        (1..=2000).contains(&h.classic_hispeed_x100),
+        replay::CLASSIC_HISPEED_X100.contains(&h.classic_hispeed_x100),
         "1 to 2000",
     )?;
     check(
         "classic_step_x100",
         h.classic_step_x100,
-        (1..=100).contains(&h.classic_step_x100),
+        replay::CLASSIC_STEP_X100.contains(&h.classic_step_x100),
         "1 to 100",
     )?;
     check(
         "floating_step_x100",
         h.floating_step_x100,
-        (5..=100).contains(&h.floating_step_x100) && h.floating_step_x100.is_multiple_of(5),
+        replay::FLOATING_STEP_X100.contains(&h.floating_step_x100)
+            && h.floating_step_x100.is_multiple_of(5),
         "5 to 100 in steps of 5",
     )?;
     check(
         "green_target",
         h.green_target,
-        (GREEN_TARGETS.0..=GREEN_TARGETS.1).contains(&h.green_target),
+        replay::GREEN_TARGET.contains(&h.green_target),
         "1 to 6000",
     )
 }

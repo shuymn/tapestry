@@ -385,6 +385,13 @@ impl Arena {
         })
     }
 
+    /// Whether node `id` is a scalar of a Lua skin's converted table (a
+    /// number, string, boolean or function): not a table, and not a value
+    /// of a JSON file the Lua skin included.
+    pub(crate) fn is_lua_scalar(&self, id: u32) -> bool {
+        matches!(self.node(id).kind, Kind::Lua)
+    }
+
     /// Whether node `id` is read as an array: a JSON array, or an empty
     /// Lua table.
     pub(crate) fn is_array(&self, id: u32) -> bool {

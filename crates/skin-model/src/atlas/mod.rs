@@ -760,7 +760,7 @@ impl Sheet {
             places.extend((start..end).filter_map(|i| {
                 let place = packing.places.get(i)?;
                 Some(Placement {
-                    rect: *rects.get(i)?,
+                    rect: in_file(*rects.get(i)?, version.dims),
                     page: usize::try_from(place.page).ok()?,
                     alloc: place.alloc,
                 })
@@ -802,6 +802,23 @@ impl Sheet {
         }
         Ok(())
     }
+}
+
+/// The part of cell rectangle `[x, y, w, h]` its file of `[fw, fh]`
+/// texels holds, at least its edge texel line: the cell's content is
+/// written from it, and each texel past it repeats the nearest one, as
+/// the allocation's gutter does ([`mip::scatter`], [`mip::complete`]), so
+/// a cell past the file's right or bottom edge samples as a texture
+/// clamped to its edge ([`crate::ImageDef::rect`]).
+fn in_file([x, y, w, h]: [u32; 4], [fw, fh]: [u32; 2]) -> [u32; 4] {
+    let x = x.min(fw.saturating_sub(1));
+    let y = y.min(fh.saturating_sub(1));
+    [
+        x,
+        y,
+        w.min(fw.saturating_sub(x)),
+        h.min(fh.saturating_sub(y)),
+    ]
 }
 
 /// Page `page`'s level 0.

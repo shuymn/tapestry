@@ -278,7 +278,7 @@ fn strip(screen: &ResultScreen) -> String {
 }
 
 /// What the view shows, on its line.
-fn view_label(status: ViewStatus<'_>, name: &str) -> String {
+pub(crate) fn view_label(status: ViewStatus<'_>, name: &str) -> String {
     match status {
         ViewStatus::Ready(s) if s.as_played => "AS PLAYED".to_owned(),
         ViewStatus::Ready(_) => format!("WHAT-IF UNDER {name}"),
@@ -290,7 +290,7 @@ fn view_label(status: ViewStatus<'_>, name: &str) -> String {
 }
 
 /// What a what-if's input covers, on its own line; blank as played.
-fn coverage_line(status: ViewStatus<'_>) -> String {
+pub(crate) fn coverage_line(status: ViewStatus<'_>) -> String {
     match status {
         ViewStatus::Ready(s) if !s.as_played => match s.coverage {
             Coverage::NoInputAfter(t) => format!("NO INPUT AFTER {} S", seconds(t)),
@@ -301,7 +301,7 @@ fn coverage_line(status: ViewStatus<'_>) -> String {
     }
 }
 
-fn notice_line(n: &Notice) -> String {
+pub(crate) fn notice_line(n: &Notice) -> String {
     match n {
         Notice::Reloaded(name) => format!("{name} RELOADED"),
         Notice::NextPlayUsesIt(_) => "THE NEXT PLAY USES IT".to_owned(),
@@ -1448,6 +1448,7 @@ pub(crate) mod tests {
     /// A record of an aborted play with no input, incomplete for `reasons`.
     fn record(preset: &rules::RulePreset, reasons: replay::Incomplete) -> replay::PlayRecord {
         replay::PlayRecord {
+            start_tuning: Some(replay::StartTuning::default()),
             versions: replay::Versions {
                 evaluator: rules::Implementation::STANDARD_VERSION,
                 app: "0.0.0-test".to_owned(),

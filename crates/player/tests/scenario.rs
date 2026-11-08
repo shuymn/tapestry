@@ -105,6 +105,7 @@ fn write_log(path: &Path, events: &[PhysicalInputEvent], sources: usize) {
         axis_out_of_range: 0,
     };
     let rec = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: 1,
             app: "test".to_owned(),
@@ -185,7 +186,17 @@ impl Fixture {
     }
 
     fn run(&self, text: &str) -> (Output, String, String) {
-        let out = self.command(text).output().unwrap();
+        self.output(&mut self.command(text))
+    }
+
+    /// [`run`](Self::run) with the result's injected refusals `faults`
+    /// (`TAPESTRY_DEV_RESULT_FAULTS`).
+    fn run_with(&self, text: &str, faults: &str) -> (Output, String, String) {
+        self.output(self.command(text).env("TAPESTRY_DEV_RESULT_FAULTS", faults))
+    }
+
+    fn output(&self, command: &mut Command) -> (Output, String, String) {
+        let out = command.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         (out, stdout, stderr)
@@ -369,6 +380,12 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         EndStatus::EndedMidway,
     ];
     assert_eq!(decoded[0].events, log);
+    // Each starts with the tuning its opening took from the adjustment
+    // controls: a solved multiplier, which only the reducer has.
+    for rec in &decoded {
+        let tuning = rec.start_tuning.expect("a played record's tuning");
+        assert!(tuning.hispeed.is_some(), "{tuning:?}");
+    }
     for ((rec, path), status) in decoded.iter().zip(&records).zip(statuses) {
         assert_eq!(rec.status.end, status, "{}", path.display());
         assert!(
@@ -2468,4 +2485,243 @@ fn the_result_layout_takes_the_compared_best() {
         ["dev: result skin settled: accepted"; 3],
         "{stdout}"
     );
+}
+
+/// What a self-made result skin reads while it loads.
+#[derive(Clone, Copy, Debug)]
+enum Reads {
+    /// Nothing: fixed, installed at startup.
+    Nothing,
+    /// The chart's play level (number 96): one bundle for every view of
+    /// the attempt, uploaded after its commit.
+    Chart,
+    /// The view's next-rank difference (number 154): each view laid out on
+    /// the pages uploaded after the attempt's commit.
+    View,
+}
+
+/// A self-made Lua result skin under `fx`, chosen in `player.toml`: its EX
+/// number and a status image, reading `reads` while it loads.
+fn result_skin(fx: &Fixture, reads: Reads) {
+    let skin = fx.base.join("result");
+    fs::create_dir_all(&skin).unwrap();
+    let file = fs::File::create(skin.join("s.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels: Vec<u8> = (0..64 * 16).flat_map(|_| [9, 9, 9, 255]).collect();
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+    let reads = match reads {
+        Reads::Nothing => "",
+        Reads::Chart => "local ms = require(\"main_state\")\nlocal lv = ms.number(96)\n",
+        Reads::View => "local ms = require(\"main_state\")\nlocal nr = ms.number(154)\n",
+    };
+    fs::write(
+        skin.join("result.luaskin"),
+        format!(
+            "local skin = {{ type = 7, name = \"r\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             {reads}\
+             skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
+             skin.image = {{ {{ id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }} }}\n\
+             skin.value = {{ {{ id = \"ex\", src = \"s\", x = 0, y = 8, w = 40, h = 8, divx = 10, digit = 4, ref = 71 }} }}\n\
+             skin.destination = {{ {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }},\n\
+               {{ id = \"dot\", op = {{ 90 }}, dst = {{ {{ x = 0, y = 300, w = 8, h = 8 }} }} }} }}\n\
+             return skin\n"
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.result]\nroot = '{}'\nentry = 'result.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The result's stagings and uploads printed at each point of the flow,
+/// in order: `(point, stagings, uploads)`.
+fn result_work(stdout: &str) -> Vec<(String, u64, u64)> {
+    lines(stdout, "dev: result work at ")
+        .iter()
+        .map(|l| {
+            let rest = l.strip_prefix("dev: result work at ").unwrap();
+            let (at, counts) = rest.split_once(": ").unwrap();
+            let n: Vec<u64> = counts
+                .split_whitespace()
+                .filter_map(|w| w.parse().ok())
+                .collect();
+            (at.to_owned(), n[0], n[1])
+        })
+        .collect()
+}
+
+/// The S10-09i design's C6 and C7 through the real flow, for a fixed, a
+/// chart-only and a pending result skin: the result's texture is uploaded
+/// once, at startup (fixed) or after the first attempt's commit; from
+/// READY through the play's end and its Closing nothing of the result is
+/// staged or uploaded; the views on the result stage with no upload; and
+/// the retry, its atlas installed, stages and uploads nothing at its
+/// commit (G4's warm reuse).
+#[test]
+fn the_result_uploads_once_and_never_in_play() {
+    for reads in [Reads::Nothing, Reads::Chart, Reads::View] {
+        let fx = Fixture::new();
+        write_chart(&fx.library(), "a", "譜面A");
+        result_skin(&fx, reads);
+        let (out, stdout, stderr) = fx.run(&scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"next-preset\"",
+            "result = \"retry\"",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]));
+        assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+        let work = result_work(&stdout);
+        let at: Vec<&str> = work.iter().map(|(a, ..)| a.as_str()).collect();
+        assert_eq!(
+            at,
+            [
+                "commit", "ready", "ended", "left", "commit", "ready", "ended", "left"
+            ],
+            "{stdout}"
+        );
+        let (commit, ready, ended, left) = (&work[0], &work[1], &work[2], &work[3]);
+        // One upload, before READY: the startup's selection, or the
+        // attempt's pages after its commit.
+        assert_eq!((commit.1, commit.2), (1, 1), "{reads:?}: {stdout}");
+        // Nothing from READY through the play's end and its Closing.
+        assert_eq!((ready.1, ready.2), (commit.1, commit.2), "{stdout}");
+        assert_eq!((ended.1, ended.2), (ready.1, ready.2), "{stdout}");
+        // The views staged on the result, with no upload.
+        assert!(left.1 > ended.1, "P staged: {stdout}");
+        assert_eq!(left.2, ended.2, "no upload on the result: {stdout}");
+        // The retry: its atlas installed, its commit does nothing; nothing
+        // in its play either.
+        for w in &work[4..7] {
+            assert_eq!((w.1, w.2), (left.1, left.2), "{} {reads:?}: {stdout}", w.0);
+        }
+        assert_eq!(work[7].2, left.2, "{stdout}");
+        assert!(
+            lines(&stdout, "dev: result shown: built-in").is_empty(),
+            "{stdout}"
+        );
+    }
+}
+
+/// C17a through the real flow: a view whose staging is refused shows the
+/// built-in result with why, the next view the skin again; the run is not
+/// disabled.
+#[test]
+fn a_refused_view_staging_shows_that_view_built_in() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::Nothing);
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"next-preset\"",
+            "result = \"prev-preset\"",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "stage2",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        lines(&stdout, "dev: result shown: "),
+        [
+            "dev: result shown: skin",
+            "dev: result shown: built-in: dev: the view's staging was refused",
+            "dev: result shown: skin",
+        ],
+        "{stdout}"
+    );
+    assert!(!stderr.contains("draws from now on"), "{stderr}");
+}
+
+/// C17b through the real flow: the after-commit upload
+/// refused shows the built-in result for every view of the attempt, with
+/// no layout asked for; the retry uploads again and shows the skin.
+#[test]
+fn a_refused_upload_shows_the_attempt_built_in() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::View);
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"next-preset\"",
+            "result = \"retry\"",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "select1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let why = "dev: result shown: built-in: dev: the result's upload was refused";
+    assert_eq!(
+        lines(&stdout, "dev: result shown: "),
+        [why, why, "dev: result shown: skin"],
+        "{stdout}"
+    );
+    // Only the retry's P asked for a layout.
+    assert_eq!(
+        lines(&stdout, "dev: result layout requested: ").len(),
+        1,
+        "{stdout}"
+    );
+    let work = result_work(&stdout);
+    assert_eq!((work[0].0.as_str(), work[0].2), ("commit", 0), "{stdout}");
+    assert_eq!((work[4].0.as_str(), work[4].2), ("commit", 1), "{stdout}");
+}
+
+/// The run's fallback through the real flow (C17c, P5): a view's text
+/// refused disables the result skin for the run; the views of that result
+/// and of the next attempt are still presented, each the built-in result
+/// with why, and no skin work is done for the retry (no image stage, no
+/// layout, no upload).
+#[test]
+fn the_run_fallback_keeps_presenting_the_built_in_result() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::View);
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"next-preset\"",
+            "result = \"retry\"",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"next-preset\"",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "text1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let why = "dev: result shown: built-in: dev: the view's text was refused";
+    assert_eq!(lines(&stdout, "dev: result shown: "), [why; 4], "{stdout}");
+    // The retry did no skin work.
+    assert_eq!(
+        lines(&stdout, "dev: result image stage: ").len(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        lines(&stdout, "dev: result layout requested: ").len(),
+        1,
+        "{stdout}"
+    );
+    let work = result_work(&stdout);
+    assert_eq!(work[4].0, "commit", "{stdout}");
+    assert_eq!((work[4].1, work[4].2), (work[3].1, work[3].2), "{stdout}");
 }

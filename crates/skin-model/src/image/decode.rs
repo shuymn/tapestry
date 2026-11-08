@@ -354,7 +354,10 @@ fn png_mode(bytes: &[u8]) -> Result<Result<Mode, Unbanded>, DecodeError> {
 /// original (2E); decoding holds the encoded bytes and the native image
 /// (E + 8T at most); the encoded bytes go with the decoder, then the
 /// conversion holds the native image and the RGBA8 copy (12T at most, none
-/// when the native image is already RGBA8).
+/// when the native image is already RGBA8). With `E` at most
+/// [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES) (64 MiB) and `T` at most
+/// [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS) (12 Mi), that is at most
+/// 160 MiB.
 pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, DecodeError> {
     let [w, h] = dims;
     let native = u64::from(w) * u64::from(h) * NATIVE_TEXEL_BYTES;

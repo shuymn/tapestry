@@ -7,9 +7,10 @@ use sha2::{Digest, Sha256};
 
 use crate::wire::Writer;
 use crate::{
-    Arrival, BuildProvenance, ChartRecord, DecodeError, DecodeLimits, DeviceKind, DeviceRecord,
-    EndStatus, FORMAT_VERSION, Incomplete, InitialGauge, MAGIC, PlayRecord, PlayType, Practice,
-    PresetRecord, ReceiveMethod, Section, SourceRecord, Status, TransformRecord, Versions,
+    Arrival, BuildProvenance, ChartRecord, CoverRecord, DecodeError, DecodeLimits, DeviceKind,
+    DeviceRecord, EndStatus, FORMAT_VERSION, HiSpeedRatio, Incomplete, InitialGauge, MAGIC,
+    PlayRecord, PlayType, Practice, PresetRecord, ReceiveMethod, Section, SourceRecord,
+    StartTuning, Status, TransformRecord, TuningCover, TuningMode, TuningReference, Versions,
     WakePolicy, body_bytes, decode, encode, preset_hash, write_events, write_status,
 };
 
@@ -103,6 +104,7 @@ fn sample(n_events: usize) -> PlayRecord {
         events.push(control(src, at, 0x1e + (i % 8) as u32, value));
     }
     PlayRecord {
+        start_tuning: Some(crate::StartTuning::default()),
         versions: Versions {
             evaluator: 1,
             app: "0.1.0".to_owned(),
@@ -611,9 +613,50 @@ fn section_length_beyond_remaining_bytes_is_an_error() {
     );
 }
 
+/// The golden record's starting tuning: Classic from MAIN, the multiplier,
+/// steps and target green number off their defaults, SUDDEN+ and HIDDEN+ on
+/// with SUDDEN+ the target, LIFT at its default, `H` = 3/2.
+fn golden_tuning() -> StartTuning {
+    StartTuning {
+        mode: TuningMode::Classic,
+        reference: TuningReference::Main,
+        classic_hispeed_x100: 150,
+        classic_step_x100: 10,
+        floating_step_x100: 25,
+        green_target: 450,
+        sudden: CoverRecord {
+            amount: 300,
+            on: true,
+        },
+        lift: CoverRecord::default(),
+        hidden: CoverRecord {
+            amount: 120,
+            on: true,
+        },
+        target: Some(TuningCover::Sudden),
+        hispeed: Some(HiSpeedRatio { num: 3, den: 2 }),
+    }
+}
+
+/// [`golden_tuning`]'s section, written by hand from the layout in the
+/// crate documentation: each value a LEB128 varint.
+const GOLDEN_TUNING: [u8; 19] = [
+    0, // Classic
+    2, // MAIN
+    0x96, 0x01, // 150
+    10, 25, //
+    0xc2, 0x03, // 450
+    0xac, 0x02, 1, // SUDDEN+ 300, on
+    0, 0, // LIFT 0, off
+    120, 1, // HIDDEN+ 120, on
+    1, // target SUDDEN+
+    1, 3, 2, // H = 3/2
+];
+
 /// The fixed record of [`golden`], before its axes.
 fn golden_base() -> PlayRecord {
     PlayRecord {
+        start_tuning: Some(golden_tuning()),
         versions: Versions {
             evaluator: 3,
             app: "0.1.0".to_owned(),
@@ -716,9 +759,15 @@ fn golden() -> PlayRecord {
     rec
 }
 
-/// SHA-256 of `body_bytes(&golden())`, computed by a separate encoder
-/// written from the layout in the crate documentation.
-const GOLDEN_BODY_SHA256: &str = "084307354a6c395baa664d6b428549053c61d3cb81f1f040339dc4859465c7ef";
+/// SHA-256 of `body_bytes(&golden())`: format 8's golden body
+/// ([`GOLDEN_BODY_SHA256_8`]) with [`GOLDEN_TUNING`] inserted as its
+/// tuning section, which `golden_body` checks piece by piece.
+const GOLDEN_BODY_SHA256: &str = "0e85d830f5db1279d5fa79cb49878211e882e8262ab8a3632f17864888d7b6d3";
+/// The same body without its tuning section: format 8's golden body,
+/// computed by a separate encoder written from the layout in the crate
+/// documentation.
+const GOLDEN_BODY_SHA256_8: &str =
+    "084307354a6c395baa664d6b428549053c61d3cb81f1f040339dc4859465c7ef";
 
 #[test]
 fn golden_body() {
@@ -726,6 +775,15 @@ fn golden_body() {
     let file = encode(&rec);
     assert_eq!(file[4..6], FORMAT_VERSION.to_le_bytes());
     let body = body_bytes(&rec);
+    // The tuning section, then the rest: format 8's body with that section
+    // taken out is unchanged.
+    let mut sections = split_sections(&body);
+    assert_eq!(sections[Section::Tuning as usize], GOLDEN_TUNING);
+    sections.remove(Section::Tuning as usize);
+    assert_eq!(
+        hex(&Sha256::digest(join_sections(&sections))),
+        GOLDEN_BODY_SHA256_8
+    );
     assert_eq!(hex(&Sha256::digest(&body)), GOLDEN_BODY_SHA256);
     // Another zstd encoding of the same body decodes to the same record.
     for level in [1, 3, 19] {
@@ -1024,7 +1082,7 @@ fn split_sections(body: &[u8]) -> Vec<Vec<u8>> {
         out.push(rest[4..4 + len].to_vec());
         rest = &rest[4 + len..];
     }
-    assert_eq!(out.len(), 10);
+    assert_eq!(out.len(), 11);
     out
 }
 
@@ -1064,11 +1122,26 @@ fn forged_counts_are_refused_before_allocating() {
         // Held controls, after `opened_at`.
         (5, payload(&[0], huge, &[]), beyond(huge), limits()),
         // Events, with the event limit out of the way.
-        (6, payload(&[], huge, &[]), beyond(huge), no_event_limit),
+        (
+            Section::Events as usize,
+            payload(&[], huge, &[]),
+            beyond(huge),
+            no_event_limit,
+        ),
         // Two events take at least six bytes; five are left.
-        (6, payload(&[], 2, &[0, 0, 1, 0, 0]), beyond(2), limits()),
+        (
+            Section::Events as usize,
+            payload(&[], 2, &[0, 0, 1, 0, 0]),
+            beyond(2),
+            limits(),
+        ),
         // Arrivals.
-        (7, payload(&[], huge, &[]), beyond(huge), limits()),
+        (
+            Section::Arrivals as usize,
+            payload(&[], huge, &[]),
+            beyond(huge),
+            limits(),
+        ),
     ];
     for (index, forged_payload, expected, lim) in cases {
         let mut forged = sections.clone();
@@ -1082,3 +1155,4 @@ fn forged_counts_are_refused_before_allocating() {
 }
 
 mod history;
+mod tuning;
