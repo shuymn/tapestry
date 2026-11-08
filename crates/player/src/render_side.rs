@@ -5743,19 +5743,21 @@ pub(crate) mod tests {
     }
 
     /// A generic page (a preparation's wait) is no play state's
-    /// presentation: drawn after a play state's creation, it neither adopts
-    /// nor ticks the turntable, so the play state's first loading frame
-    /// still reads 0.
+    /// presentation: a play state adopted at its attempt's preparation,
+    /// with no loading (a direct play, a retry the bank covers), takes its
+    /// baseline from its next play-state frame (READY's; here a loading
+    /// frame stands in), not from the wait page drawn between.
     #[test]
     fn a_generic_page_does_not_turn_the_turntable() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         let make: MakeScreen =
             Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let clock = QpcClock::start();
         let link = spawn(
             make,
-            None,
+            Some(Arc::clone(&chart)),
             None,
             clock,
             view(),
@@ -5767,11 +5769,14 @@ pub(crate) mod tests {
             number: 1,
             origin: clock.now(),
         });
+        link.prepare().unwrap();
+        let ready = link.prepare_attempt(attempt(&chart, None), || false);
+        assert_eq!(ready.unwrap(), Preparation::Ready);
         link.send(RenderMsg::Menu(Box::new(one_line("wait"))));
         std::thread::sleep(Duration::from_millis(150));
         link.loading().show(one_line("L"));
         assert!(wait_until(|| !seen.lock().unwrap().is_empty()));
-        assert_eq!(seen.lock().unwrap()[0].0, 0, "the generic page turned it");
+        assert_eq!(seen.lock().unwrap()[0].0, 0, "the wait page turned it");
         link.end_loading().unwrap();
         link.exit();
     }
