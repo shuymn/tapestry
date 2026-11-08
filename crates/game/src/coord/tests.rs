@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,15 +35,6 @@ const ONE_EACH: Caps = Caps {
     speculative: 1,
 };
 
-/// When the test binary's first watchdog started.
-static STARTED: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-
-/// A stop that never says stop, and panics once the binary has run past
-/// the watchdog (see [`watchdog`]).
-const NEVER: &(dyn Fn() -> bool + Sync) = &|| {
-    assert!(STARTED.elapsed() <= *WATCHDOG, "the watchdog ran out");
-    false
-};
 const NOTHING: &(dyn Fn(Class) + Sync) = &|_| {};
 
 fn key(name: &str) -> JobKey {
@@ -53,9 +44,10 @@ fn key(name: &str) -> JobKey {
     }
 }
 
-/// A stop that never says stop, and panics once the watchdog has run out:
-/// the coordinator catches that as the job's panic, so a wait that should
-/// have ended fails the test instead of passing as a cancel.
+/// A stop that never says stop, and panics once the watchdog has run out
+/// since it was made (each run makes its own): the coordinator catches
+/// that as the job's panic, so a wait that should have ended fails the
+/// test instead of passing as a cancel.
 fn watchdog() -> impl Fn() -> bool + Sync {
     let begun = Instant::now();
     move || {
@@ -164,7 +156,7 @@ fn permits_stop_at_their_cap_and_maintenance_is_never_refused() {
     assert_eq!(kept.len(), 100);
     assert_eq!(none.held(Class::Maintenance), 100);
     assert!(none.try_lease(Class::Speculative).is_none());
-    assert!(none.lease(Class::Speculative, NEVER).is_none());
+    assert!(none.lease(Class::Speculative, &watchdog()).is_none());
     drop(kept);
     assert_eq!(none.held(Class::Maintenance), 0);
 }
@@ -201,7 +193,7 @@ fn a_job_holds_no_permit_while_it_waits() {
     let coord = Coordinator::new(CAPS);
     let outcome = coord
         .task::<(Option<(usize, bool)>, usize)>(Class::Speculative)
-        .run(NEVER, NOTHING, |ctx| {
+        .run(&watchdog(), NOTHING, |ctx| {
             let during = ctx.idle(|| {
                 let other = coord.try_lease(Class::Speculative);
                 (coord.held(Class::Speculative), other.is_some())
@@ -211,11 +203,12 @@ fn a_job_holds_no_permit_while_it_waits() {
     assert_eq!(outcome, Outcome::Done((Some((1, true)), 1)));
     assert_eq!(coord.held(Class::Speculative), 0);
 
-    let outcome = coord
-        .task::<Option<usize>>(Class::Maintenance)
-        .run(NEVER, NOTHING, |ctx| {
-            ctx.idle(|| coord.held(Class::Maintenance))
-        });
+    let outcome =
+        coord
+            .task::<Option<usize>>(Class::Maintenance)
+            .run(&watchdog(), NOTHING, |ctx| {
+                ctx.idle(|| coord.held(Class::Maintenance))
+            });
     assert_eq!(outcome, Outcome::Done(Some(0)));
 }
 
@@ -227,7 +220,10 @@ fn a_current_subscriber_begins_a_job_and_takes_its_result() {
     let (handle, runner) =
         coord.begin::<u32>(key("a"), Class::Foreground, coord.subscriber(Scope::Choice));
     assert_eq!(coord.take(&handle), Taken::Pending);
-    assert_eq!(runner.unwrap().run(NEVER, NOTHING, |_| 5), Outcome::Done(5));
+    assert_eq!(
+        runner.unwrap().run(&watchdog(), NOTHING, |_| 5),
+        Outcome::Done(5)
+    );
     assert_eq!(coord.take(&handle), Taken::Ready(Outcome::Done(5)));
     assert_eq!(held(&coord), (0, 0));
 }
@@ -241,7 +237,7 @@ fn a_stale_subscriber_begins_a_job_already_cancelled() {
     coord.advance(Scope::Choice);
     let (handle, runner) = coord.begin::<u32>(key("a"), Class::Speculative, stale);
     let runs = AtomicUsize::new(0);
-    let outcome = runner.unwrap().run(NEVER, NOTHING, |_| {
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |_| {
         runs.fetch_add(1, Ordering::SeqCst);
         1
     });
@@ -263,25 +259,29 @@ fn an_advanced_scope_cancels_its_running_job() {
         Class::Speculative,
         coord.subscriber(Scope::Cursor),
     );
-    let (started, other) = (Event::new(), Event::new());
+    let (started, other, checked) = (Event::new(), Event::new(), Event::new());
+    let after_other = Mutex::new(None);
     let stop = watchdog();
     let (before, outcome) = thread::scope(|s| {
         let running = s.spawn(|| {
             runner.unwrap().run(&stop, NOTHING, |ctx| {
                 started.fire();
                 other.wait("the other scope's advance");
-                let after_other = ctx.checkpoint();
+                *after_other.lock().unwrap() = Some(ctx.checkpoint());
+                checked.fire();
                 until_cancelled(ctx);
-                if after_other { 0 } else { 7 }
+                7
             })
         });
         started.wait("the job's start");
         let before = (held(&coord), coord.take(&handle));
         coord.advance(Scope::Folder);
         other.fire();
+        checked.wait("the checkpoint after the other scope's advance");
         coord.advance(Scope::Cursor);
         (before, running.join().unwrap())
     });
+    assert_eq!(*after_other.lock().unwrap(), Some(false));
     assert_eq!(before, ((1, 0), Taken::Pending));
     assert_eq!(outcome, Outcome::Cancelled);
     assert_eq!(held(&coord), (0, 0));
@@ -382,9 +382,11 @@ fn a_stale_handles_drop_leaves_a_job_with_a_current_subscriber() {
     assert!(joined.is_none());
     drop(old);
     drop(late);
-    let outcome = runner
-        .unwrap()
-        .run(NEVER, NOTHING, |ctx| if ctx.checkpoint() { 0 } else { 3 });
+    let outcome = runner.unwrap().run(
+        &watchdog(),
+        NOTHING,
+        |ctx| if ctx.checkpoint() { 0 } else { 3 },
+    );
     assert_eq!(outcome, Outcome::Done(3));
     assert_eq!(coord.take(&new), Taken::Ready(Outcome::Done(3)));
 }
@@ -400,7 +402,7 @@ fn a_stale_join_does_not_withdraw_a_cancel() {
     let (late, joined) = coord.begin::<u32>(key("a"), Class::Speculative, first);
     assert!(joined.is_none());
     let runs = AtomicUsize::new(0);
-    let outcome = runner.unwrap().run(NEVER, NOTHING, |_| {
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |_| {
         runs.fetch_add(1, Ordering::SeqCst);
         1
     });
@@ -424,7 +426,7 @@ fn returning_before_the_cancel_is_seen_joins_the_running_job() {
     let runs = AtomicUsize::new(0);
     let (joined, back, outcome) = thread::scope(|s| {
         let running = s.spawn(|| {
-            runner.unwrap().run(NEVER, NOTHING, |ctx| {
+            runner.unwrap().run(&watchdog(), NOTHING, |ctx| {
                 runs.fetch_add(1, Ordering::SeqCst);
                 started.fire();
                 go.wait("the return to A");
@@ -497,8 +499,182 @@ fn a_seen_cancel_is_terminal_and_a_return_begins_afresh() {
     assert_eq!(old_outcome, Outcome::Cancelled);
     let fresh = fresh.expect("a fresh job");
     assert_eq!(coord.take(&new), Taken::Pending);
-    assert_eq!(fresh.run(NEVER, NOTHING, |_| 5), Outcome::Done(5));
+    assert_eq!(fresh.run(&watchdog(), NOTHING, |_| 5), Outcome::Done(5));
     assert_eq!(coord.take(&new), Taken::Ready(Outcome::Done(5)));
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// Running × owner stop: once the job's owner says stop at a checkpoint,
+/// the stop is terminal. A return to the key begins a fresh job, and the
+/// old one ends cancelled although its cleanup returns a value, which no
+/// subscriber ever sees.
+#[test]
+fn an_owner_stop_seen_is_terminal_and_a_return_begins_afresh() {
+    let coord = Coordinator::new(CAPS);
+    let (old, runner) = coord.begin::<u32>(
+        key("a"),
+        Class::Speculative,
+        coord.subscriber(Scope::Cursor),
+    );
+    let stopping = AtomicBool::new(false);
+    let (seen, go) = (Event::new(), Event::new());
+    let wd = watchdog();
+    let stop = || wd() || stopping.load(Ordering::SeqCst);
+    let (old_outcome, new, fresh) = thread::scope(|s| {
+        let running = s.spawn(|| {
+            runner.unwrap().run(&stop, NOTHING, |ctx| {
+                stopping.store(true, Ordering::SeqCst);
+                let stopped = ctx.checkpoint();
+                seen.fire();
+                go.wait("the return to A");
+                if stopped { 99 } else { 0 }
+            })
+        });
+        seen.wait("the owner stop seen");
+        let (new, fresh) = coord.begin::<u32>(
+            key("a"),
+            Class::Speculative,
+            coord.subscriber(Scope::Cursor),
+        );
+        go.fire();
+        (running.join().unwrap(), new, fresh)
+    });
+    assert_eq!(old_outcome, Outcome::Cancelled);
+    assert_eq!(coord.take(&old), Taken::Ready(Outcome::Cancelled));
+    let fresh = fresh.expect("a fresh job");
+    assert_eq!(fresh.run(&watchdog(), NOTHING, |_| 5), Outcome::Done(5));
+    assert_eq!(coord.take(&new), Taken::Ready(Outcome::Done(5)));
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// Idle continuation × owner stop or cancel: a re-admission refused after
+/// a wait is terminal. The idle gives nothing, the key begins afresh, and
+/// the job ends cancelled whatever its work returns.
+#[test]
+fn a_refused_continuation_is_terminal() {
+    for by_owner in [true, false] {
+        let coord = Coordinator::new(CAPS);
+        let (old, runner) = coord.begin::<u32>(
+            key("a"),
+            Class::Speculative,
+            coord.subscriber(Scope::Choice),
+        );
+        let stopping = AtomicBool::new(false);
+        let wd = watchdog();
+        let stop = || wd() || stopping.load(Ordering::SeqCst);
+        let mut seen = None;
+        let outcome = runner.unwrap().run(&stop, NOTHING, |ctx| {
+            let idle = ctx.idle(|| {
+                if by_owner {
+                    stopping.store(true, Ordering::SeqCst);
+                } else {
+                    coord.advance(Scope::Choice);
+                }
+            });
+            let (_, fresh) = coord.begin::<u32>(
+                key("a"),
+                Class::Speculative,
+                coord.subscriber(Scope::Choice),
+            );
+            seen = Some((idle.is_some(), fresh.is_some(), ctx.class()));
+            99
+        });
+        assert_eq!(outcome, Outcome::Cancelled, "by owner: {by_owner}");
+        assert_eq!(seen, Some((false, true, None)), "by owner: {by_owner}");
+        let expected = if by_owner {
+            Taken::Ready(Outcome::Cancelled)
+        } else {
+            Taken::Stale
+        };
+        assert_eq!(coord.take(&old), expected, "by owner: {by_owner}");
+        assert_eq!(held(&coord), (0, 0));
+    }
+}
+
+/// Running × a cancel requested and never checked: the work returns a
+/// value without a checkpoint after the request, and the job still ends
+/// cancelled.
+#[test]
+fn a_job_returning_with_an_unseen_cancel_ends_cancelled() {
+    let coord = Coordinator::new(CAPS);
+    let (handle, runner) = coord.begin::<u32>(
+        key("a"),
+        Class::Speculative,
+        coord.subscriber(Scope::Choice),
+    );
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |_| {
+        coord.advance(Scope::Choice);
+        5
+    });
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(coord.take(&handle), Taken::Stale);
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// Queued × a cancel between the admission's look at its owner and its
+/// taking a free permit: the cancel is read under the lock that takes the
+/// permit, so the job never computes.
+#[test]
+fn a_cancel_just_before_the_permit_is_taken_runs_nothing() {
+    let coord = Coordinator::new(CAPS);
+    let (_handle, runner) = coord.begin::<u32>(
+        key("a"),
+        Class::Speculative,
+        coord.subscriber(Scope::Choice),
+    );
+    let (looking, go) = (Event::new(), Event::new());
+    let runs = AtomicUsize::new(0);
+    let wd = watchdog();
+    let first = AtomicBool::new(true);
+    let outcome = thread::scope(|s| {
+        let running = s.spawn(|| {
+            let stop = || {
+                if first.swap(false, Ordering::SeqCst) {
+                    // The owner's look, the permit free: held here.
+                    looking.fire();
+                    go.wait("the cancel");
+                }
+                wd()
+            };
+            runner.unwrap().run(&stop, NOTHING, |_| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                1
+            })
+        });
+        looking.wait("the admission's look");
+        coord.advance(Scope::Choice);
+        go.fire();
+        running.join().unwrap()
+    });
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(held(&coord), (0, 0));
+}
+
+/// Idle on another thread × a cancel: nothing runs and the permit is not
+/// touched; the job ends cancelled.
+#[test]
+fn idle_on_another_thread_after_a_cancel_runs_nothing() {
+    let coord = Coordinator::new(CAPS);
+    let (_handle, runner) = coord.begin::<u32>(
+        key("a"),
+        Class::Speculative,
+        coord.subscriber(Scope::Choice),
+    );
+    let mut seen = None;
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |ctx| {
+        coord.advance(Scope::Choice);
+        let ran = AtomicBool::new(false);
+        let idle = thread::scope(|s| {
+            s.spawn(|| ctx.idle(|| ran.store(true, Ordering::SeqCst)))
+                .join()
+                .unwrap()
+        });
+        seen = Some((idle.is_some(), ran.load(Ordering::SeqCst), held(&coord)));
+        1
+    });
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(seen, Some((false, false, (1, 0))));
     assert_eq!(held(&coord), (0, 0));
 }
 
@@ -509,7 +685,10 @@ fn a_stale_take_gets_nothing() {
     let coord = Coordinator::new(CAPS);
     let (handle, runner) =
         coord.begin::<u32>(key("a"), Class::Foreground, coord.subscriber(Scope::Choice));
-    assert_eq!(runner.unwrap().run(NEVER, NOTHING, |_| 5), Outcome::Done(5));
+    assert_eq!(
+        runner.unwrap().run(&watchdog(), NOTHING, |_| 5),
+        Outcome::Done(5)
+    );
     assert_eq!(coord.take(&handle), Taken::Ready(Outcome::Done(5)));
     coord.advance(Scope::Choice);
     assert_eq!(coord.take(&handle), Taken::Stale);
@@ -524,9 +703,9 @@ fn a_panic_is_returned_without_policy() {
     let (handle, runner) = coord.begin::<u32>(key("a"), Class::Speculative, sub);
     let (joined, none) = coord.begin::<u32>(key("a"), Class::Speculative, sub);
     assert!(none.is_none());
-    let outcome = runner
-        .unwrap()
-        .run(NEVER, NOTHING, |_| -> u32 { panic!("a job failed (test)") });
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |_| -> u32 {
+        panic!("a job failed (test)")
+    });
     let panicked = Outcome::Panicked(JobPanic("a job failed (test)".to_owned()));
     assert_eq!(outcome, panicked);
     assert_eq!(coord.take(&handle), Taken::Ready(panicked.clone()));
@@ -562,7 +741,7 @@ fn a_panic_in_the_admission_or_a_hook_is_caught() {
 
     let task = coord.task::<u32>(Class::Speculative);
     task.promoter().promote();
-    let outcome = task.run(NEVER, &|_| panic!("the hook failed (test)"), |_| 1);
+    let outcome = task.run(&watchdog(), &|_| panic!("the hook failed (test)"), |_| 1);
     assert_eq!(
         outcome,
         Outcome::Panicked(JobPanic("the hook failed (test)".to_owned()))
@@ -596,7 +775,7 @@ fn promotion_moves_the_permit() {
         coord.subscriber(Scope::Choice),
     );
     let mut seen = Vec::new();
-    let outcome = runner.unwrap().run(NEVER, &|c| hook.call(c), |ctx| {
+    let outcome = runner.unwrap().run(&watchdog(), &|c| hook.call(c), |ctx| {
         seen.push((ctx.class(), held(&coord)));
         handle.promote();
         assert!(!ctx.checkpoint());
@@ -679,6 +858,7 @@ fn promotion_while_queued_admits_in_the_foreground() {
             task.run(&stop, &|c| hook.call(c), |ctx| (ctx.class(), held(&coord)))
         });
         asked.wait("the admission's first look");
+        asked.wait("the admission's look after a blocked wait");
         promoter.promote();
         running.join().unwrap()
     });
@@ -696,7 +876,7 @@ fn demotion_moves_the_permit_back() {
     let hook = Hook::default();
     let task = coord.task::<Vec<(usize, usize)>>(Class::Speculative);
     let promoter = task.promoter();
-    let outcome = task.run(NEVER, &|c| hook.call(c), |ctx| {
+    let outcome = task.run(&watchdog(), &|c| hook.call(c), |ctx| {
         promoter.promote();
         let _ = ctx.checkpoint();
         let promoted = held(&coord);
@@ -771,6 +951,7 @@ fn demotion_while_queued_admits_in_its_own_class() {
             task.run(&stop, &|c| hook.call(c), |ctx| ctx.class())
         });
         asked.wait("the admission's first look");
+        asked.wait("the admission's look after a blocked wait");
         promoter.demote();
         drop(spec);
         running.join().unwrap()
@@ -790,7 +971,7 @@ fn only_the_jobs_thread_changes_its_permit() {
     let hook = Hook::default();
     let task = coord.task::<Vec<(Option<Class>, (usize, usize))>>(Class::Speculative);
     let promoter = task.promoter();
-    let outcome = task.run(NEVER, &|c| hook.call(c), |ctx| {
+    let outcome = task.run(&watchdog(), &|c| hook.call(c), |ctx| {
         promoter.promote();
         let other = thread::scope(|s| {
             s.spawn(|| {
@@ -834,12 +1015,12 @@ fn a_task_stops_when_its_owner_says_so() {
     drop(blocker);
     let outcome = coord
         .task::<u32>(Class::Speculative)
-        .run(NEVER, NOTHING, |ctx| u32::from(ctx.checkpoint()));
+        .run(&watchdog(), NOTHING, |ctx| u32::from(ctx.checkpoint()));
     assert_eq!(outcome, Outcome::Done(0));
 
     let off = Coordinator::new(Caps::for_machine(1, 2));
     let outcome = off
         .task::<u32>(Class::Speculative)
-        .run(NEVER, NOTHING, |_| 1);
+        .run(&watchdog(), NOTHING, |_| 1);
     assert_eq!(outcome, Outcome::Cancelled);
 }

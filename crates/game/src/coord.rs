@@ -16,10 +16,13 @@
 //!   ([`Coordinator::begin`]) has subscribers, each of a scope and a
 //!   generation. Once none of them is current the job is asked to cancel;
 //!   a current subscriber arriving before the job sees the request
-//!   withdraws it (A→B→A joins the running job). A cancel the job has seen
-//!   is terminal: the job can no longer be joined, a later begin of its
-//!   key starts a fresh job, and it ends [`Outcome::Cancelled`], never
-//!   done with what it had when it stopped.
+//!   withdraws it (A→B→A joins the running job). An end the job has seen
+//!   (a cancel, its owner's stop, or a refused admission) is terminal: the
+//!   job can no longer be joined, a later begin of its key starts a fresh
+//!   job, and it ends [`Outcome::Cancelled`], never done with what it had
+//!   when it stopped. The admission reads the cancel under the lock that
+//!   takes its permit, so a job cancelled before it has one never
+//!   computes.
 //! - **Promotion** follows foreground interest ([`Handle::promote`],
 //!   [`Promoter::promote`] and their `demote`): a promoted speculative job
 //!   runs on a foreground permit, taken at its admission or moved at its
@@ -304,22 +307,29 @@ impl State {
         };
     }
 
-    /// Whether job `id` is cancelled; a request is latched as seen, and the
-    /// job can no longer be joined.
+    /// Whether job `id` is cancelled; a request is latched as seen
+    /// ([`terminate`](Self::terminate)).
     fn observe(&mut self, id: u64) -> bool {
-        let Some(job) = self.jobs.get_mut(&id) else {
-            return false;
-        };
-        if job.cancel == Cancel::No {
+        let cancel = self.jobs.get(&id).map_or(Cancel::No, |job| job.cancel);
+        if cancel == Cancel::No {
             return false;
         }
+        self.terminate(id);
+        true
+    }
+
+    /// Job `id` has seen its end (a cancel, its owner's stop, or a refused
+    /// admission): terminal, and the job can no longer be joined.
+    fn terminate(&mut self, id: u64) {
+        let Some(job) = self.jobs.get_mut(&id) else {
+            return;
+        };
         job.cancel = Cancel::Observed;
         if let Some(key) = job.key.take()
             && self.keys.get(&key) == Some(&id)
         {
             self.keys.remove(&key);
         }
-        true
     }
 
     /// Removes a finished job.
@@ -874,11 +884,19 @@ impl Ctx<'_> {
         thread::current().id() == self.thread
     }
 
-    /// Whether the job is cancelled (latched once seen), or its owner's
-    /// `stop` says to stop.
+    /// Whether the job is cancelled, or its owner's `stop` says to stop.
+    /// Either, once seen, is terminal: the job can no longer be joined and
+    /// it ends [`Outcome::Cancelled`] whatever its work returns.
     #[must_use]
     pub fn cancelled(&self) -> bool {
-        self.shared.lock().observe(self.id) || (self.stop)()
+        if self.shared.lock().observe(self.id) {
+            return true;
+        }
+        if (self.stop)() {
+            self.shared.lock().terminate(self.id);
+            return true;
+        }
+        false
     }
 
     /// The class of its permit; none while it waits without one.
@@ -900,11 +918,12 @@ impl Ctx<'_> {
 
     /// Runs `wait` without its permit and takes one again after, of the
     /// class the job should run in then: none when the job is cancelled
-    /// or stopped meanwhile. On another thread, `wait` runs with the
-    /// permit kept.
+    /// or stopped meanwhile. On another thread, the permit is not touched:
+    /// none when the job is cancelled or stopped, otherwise `wait` runs
+    /// with the permit kept.
     pub fn idle<R>(&self, wait: impl FnOnce() -> R) -> Option<R> {
         if !self.owner() {
-            return Some(wait());
+            return (!self.cancelled()).then(wait);
         }
         *self.lease() = None;
         let out = wait();
@@ -942,16 +961,24 @@ impl Ctx<'_> {
     }
 
     /// Waits, holding no permit, for one of the class wanted, read again
-    /// at each wake (a promotion or a demotion meanwhile); `false` once
-    /// the job is cancelled or stopped, or when that class has no permit.
+    /// at each wake (a promotion or a demotion meanwhile); `false`, and
+    /// terminal, once the job is cancelled or stopped, or when that class
+    /// has no permit. The cancel is read under the same lock that picks
+    /// the class and takes the permit, so a job cancelled before it takes
+    /// one never computes.
     fn admit(&self) -> bool {
         loop {
-            if self.cancelled() {
+            if (self.stop)() {
+                self.shared.lock().terminate(self.id);
                 return false;
             }
             let mut state = self.shared.lock();
+            if state.observe(self.id) {
+                return false;
+            }
             let want = state.jobs.get(&self.id).map_or(self.base, Job::want);
             if self.shared.caps.of(want) == Some(0) {
+                state.terminate(self.id);
                 return false;
             }
             if state.take_permit(self.shared.caps, want) {
@@ -973,16 +1000,13 @@ impl Ctx<'_> {
     }
 
     /// Calls the hook when `class` differs from the class the thread's
-    /// mode was last set for.
+    /// mode was last set for, and records it once the hook returned: a
+    /// hook that unwinds leaves the record as it was.
     fn apply(&self, class: Class) {
-        let changed = {
-            let mut mode = self.mode.lock().unwrap_or_else(PoisonError::into_inner);
-            let changed = *mode != class;
-            *mode = class;
-            changed
-        };
+        let changed = *self.mode.lock().unwrap_or_else(PoisonError::into_inner) != class;
         if changed {
             (self.on_class)(class);
+            *self.mode.lock().unwrap_or_else(PoisonError::into_inner) = class;
         }
     }
 }
