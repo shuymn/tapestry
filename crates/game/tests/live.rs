@@ -293,6 +293,10 @@ struct Fake {
     /// Each screen's preparation once a result showed moves the clock this
     /// much further.
     prepare_cost: i64,
+    /// A screen's preparation once a result showed takes the skin's timing
+    /// away when it returns: a rebuild whose result restore was refused (a
+    /// fallback for the run).
+    falls_back_in_prepare: bool,
     /// Each settle at acceptance moves the clock this much further (a held
     /// layout job).
     settle_cost: i64,
@@ -480,6 +484,7 @@ impl Fake {
             served: Vec::new(),
             turntable: Vec::new(),
             prepare_cost: 0,
+            falls_back_in_prepare: false,
             settle_cost: 0,
             pinned_timing: None,
             menu_pressed: std::sync::Arc::default(),
@@ -624,6 +629,9 @@ impl Rig for Fake {
         self.prepares += 1;
         if self.shows > 0 {
             self.clock.advance(TimeUs(self.prepare_cost));
+            if self.falls_back_in_prepare {
+                self.timing_until = self.timing_until.min(self.clock.now().0);
+            }
         }
         if !self.preps.is_empty()
             && let Some(what) = self.in_rebuild.take()
@@ -5904,6 +5912,43 @@ fn a_fallback_during_an_outro_serves_the_command() {
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Back);
     assert_eq!(rig.clock.now().0, s + 2_000_000);
+}
+
+/// C17f with C23 (T16): a screen lost while back waits on a 5 s outro is
+/// built again, its result restore refused (the skin's timing gone), and
+/// back is served at the first look after the rebuild, well before the
+/// outro's end, however long the rebuild took.
+#[test]
+fn a_screen_lost_mid_outro_serves_back_after_its_refused_rebuild() {
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), s + 10_000_000);
+    press(&mut rig, &[(s + 1_000_000, game::MenuCommand::Back)]);
+    rig.screen_fails_at = s + 1_100_000;
+    rig.prepare_cost = 2_500_000;
+    rig.falls_back_in_prepare = true;
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    // One rebuild, during the outro, after the screen failed.
+    let rebuilt: Vec<i64> = rig
+        .screen_at
+        .iter()
+        .copied()
+        .filter(|&t| t >= s + 1_100_000)
+        .collect();
+    assert_eq!(rebuilt.len(), 1, "{:?}", rig.screen_at);
+    let ready = rebuilt[0] + 2_500_000;
+    // Served once, at the first look after the rebuild returned, before the
+    // outro's end (s + 6 s).
+    assert_eq!(rig.served.len(), 1, "{:?}", rig.served);
+    let (cmd, at) = rig.served[0];
+    assert_eq!(cmd, game::MenuCommand::Back);
+    assert!(
+        (ready..=ready + game::POLL_INTERVAL.0).contains(&at),
+        "served at {at}, rebuilt by {ready}"
+    );
+    assert!(at < s + 6_000_000, "before the outro's end: {at}");
 }
 
 /// The turntable's signals across the result's outro (docs/stage3.md,
