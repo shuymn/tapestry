@@ -1779,8 +1779,9 @@ fn fading(q: &Quad) -> bool {
     q.rect[0] == 100.0
 }
 
-/// A dot whose alpha rises from 0 to 255 over 2 s of timer 2.
-const TIMER2_DOT: &str = "{ id = \"dot\", timer = 2, dst = { { time = 0, x = 100, y = 600, w = 8, h = 8, a = 0 }, \
+/// A dot whose alpha rises from 0 to 255 over 2 s of timer 2, then holds
+/// (`loop = 2000`: the default loop of 0 would wrap it every 2 s).
+const TIMER2_DOT: &str = "{ id = \"dot\", timer = 2, loop = 2000, dst = { { time = 0, x = 100, y = 600, w = 8, h = 8, a = 0 }, \
      { time = 2000, x = 100, y = 600, w = 8, h = 8, a = 255 } } },";
 
 /// The fade-out dot's alpha in the last skin frame drawn.
@@ -1846,15 +1847,25 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
 /// and a 1 ms one already over, as after a settle held past it): a view
 /// shown again asks for no layout, though it does before (D4). A screen
 /// built again keeps the lifetime, the skin's timing and timer 2's
-/// progress (C22), until the flow serves the command, after which the
-/// next screen's preparation leaves; one whose result restore is refused
+/// progress (C22: also when the screen is lost after the fade has ended,
+/// which a restart would show as a lower alpha), until the flow serves
+/// the command, after which the next screen's preparation leaves; one
+/// whose result restore is refused
 /// draws the pinned view's built-in page and takes the timing away, so
 /// the flow serves the command at its next look (C23's timing half; the
 /// flow's half is `game`'s fallback-during-an-outro test).
 #[test]
 fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
     use game::Rig as _;
-    for (fadeout, refuse) in [(5_000, false), (5_000, true), (1, false)] {
+    // The fade read `wait` ms after the outro began, and again `after` ms
+    // after the screen is built again: the last case reads at 1.8 s and
+    // past 2 s, across the end of the fade.
+    for (fadeout, refuse, wait, after) in [
+        (5_000, false, 400, 0),
+        (5_000, true, 400, 0),
+        (1, false, 400, 0),
+        (5_000, false, 1_800, 400),
+    ] {
         on_shown_result(
             &format!("skin.fadeout = {fadeout}\n"),
             TIMER2_DOT,
@@ -1879,7 +1890,7 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                 let asked = p.result_skin.requests();
                 p.show_end(report, screen);
                 assert_eq!(p.result_skin.requests(), asked, "no layout while leaving");
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(wait));
                 let before = fade_alpha(drawn).expect("the fade draws");
                 assert!(before > 0.0, "{before}");
                 faults.refuse_restore.store(refuse, Ordering::Release);
@@ -1898,6 +1909,7 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                     assert_eq!(p.result_timing(), None, "served at the next look");
                 } else {
                     assert!(wait_until(|| last_skin(drawn).is_some()));
+                    std::thread::sleep(Duration::from_millis(after));
                     let after = fade_alpha(drawn).expect("the fade draws");
                     let all: Vec<Option<f32>> = drawn
                         .lock()
