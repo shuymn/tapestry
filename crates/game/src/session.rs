@@ -440,7 +440,16 @@ pub struct Loaded {
     /// the gauge the page shows in its place
     /// ([`replacement`](Self::replacement)).
     lost: Vec<(String, Option<String>)>,
+    /// The loaded chart's identity, which a preparation's key reads: each
+    /// load is another ([`prep_key`](Self::prep_key)).
+    generation: u64,
+    /// The settings' version: it moves whenever they are lent to be
+    /// changed ([`settings_mut`](Self::settings_mut)).
+    settings_version: u64,
 }
+
+/// The identity of the next chart loaded.
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What one read of a chart's file gave: the chart, its record, its labels
 /// and what the loader skipped or assumed, all from one ingestion.
@@ -661,6 +670,10 @@ impl Loaded {
                     practiced: None,
                     fitted: None,
                     lost: Vec::new(),
+                    generation: GENERATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .wrapping_add(1),
+                    settings_version: 0,
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -1073,7 +1086,38 @@ impl Loaded {
 
     /// The settings, to change between plays.
     pub(crate) const fn settings_mut(&mut self) -> &mut Settings {
+        self.settings_version = self.settings_version.wrapping_add(1);
         &mut self.settings
+    }
+
+    /// What the coming attempt's preparation reads, the screen's
+    /// structural inputs aside (design.md "Play Lifecycle", preparing each
+    /// attempt): the chart loaded and its speed, the whole chart's lead-in
+    /// or the round's section and initial gauges, the play preset and the
+    /// settings' version.
+    #[must_use]
+    pub fn prep_key(&self) -> crate::prep::PrepKey {
+        use std::hash::Hasher as _;
+        let mut preset = std::hash::DefaultHasher::new();
+        self.preset.write_canonical(|b| preset.write(b));
+        let kind = match self.section() {
+            Some(section) => crate::AttemptKind::Section(section.clone()),
+            None => crate::AttemptKind::Full {
+                lead_in: self.config.lead_in,
+            },
+        };
+        crate::prep::PrepKey {
+            chart: self.generation,
+            speed: self.config.speed,
+            kind,
+            gauges: self
+                .practice()
+                .map(|p| p.initial_gauges.clone())
+                .unwrap_or_default(),
+            preset: preset.finish(),
+            settings: self.settings_version,
+            screen: None,
+        }
     }
 
     /// The session's fixed choices.

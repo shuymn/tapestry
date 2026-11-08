@@ -193,6 +193,15 @@ struct Fake {
     attempts: Vec<game::Attempt>,
     /// How each preparation ends, in order; then ready.
     preparations: Vec<Preparation>,
+    /// The key of each preparation begun, in order.
+    begun: Vec<game::PrepKey>,
+    /// Each final readiness asked: the attempt's number and the ticket.
+    readied: Vec<(u32, u64)>,
+    /// The screen's structural inputs a ready preparation is staged with.
+    screen: game::ScreenKey,
+    /// The final readinesses that answer `Stale`, in order, each with the
+    /// screen's inputs it then has; then ready.
+    stale: Vec<game::ScreenKey>,
     /// The audio output failed.
     output_failed: bool,
     /// Waits each preparation takes, a quit or a close during which
@@ -302,6 +311,29 @@ impl Drop for FakePrep {
 }
 
 impl Fake {
+    /// How preparation `ticket` ends: [`Self::prepare_waits`] waits, a
+    /// quit or a close during which cancels it, then the next of
+    /// [`Self::preparations`], or ready.
+    fn prepare_ended(&mut self, ticket: u64) -> Result<Preparation, SurfaceLost> {
+        let _ = ticket;
+        for _ in 0..self.prepare_waits {
+            self.wait();
+            let now = self.clock.now().0;
+            let quit = self
+                .commands
+                .iter()
+                .any(|&(at, c)| at <= now && c == Command::Quit);
+            if self.quitting() || quit {
+                return Ok(Preparation::Cancelled);
+            }
+        }
+        if self.preparations.is_empty() {
+            Ok(Preparation::Ready)
+        } else {
+            Ok(self.preparations.remove(0))
+        }
+    }
+
     fn new(items: Vec<ScriptItem>, commands: &[(i64, Command)], quit_at: i64) -> Self {
         let mut items = items;
         items.push(ScriptItem {
@@ -359,6 +391,10 @@ impl Fake {
             steps: Vec::new(),
             attempts: Vec::new(),
             preparations: Vec::new(),
+            begun: Vec::new(),
+            readied: Vec::new(),
+            screen: game::ScreenKey::default(),
+            stale: Vec::new(),
             output_failed: false,
             prepare_waits: 0,
             side: None,
@@ -521,27 +557,45 @@ impl Rig for Fake {
         self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
     }
 
-    /// Takes [`Self::prepare_waits`] waits, servicing the quit key and a
-    /// close at each, as the player's rig does while the screen prepares.
-    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, SurfaceLost> {
+    fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
         self.steps.push("attempt");
         self.attempts.push(loaded.attempt());
-        for _ in 0..self.prepare_waits {
-            self.wait();
-            let now = self.clock.now().0;
-            let quit = self
-                .commands
-                .iter()
-                .any(|&(at, c)| at <= now && c == Command::Quit);
-            if self.quitting() || quit {
-                return Ok(Preparation::Cancelled);
-            }
+        self.begun.push(key.clone());
+        game::PrepHandle::new(key, self.begun.len() as u64)
+    }
+
+    /// Takes [`Self::prepare_waits`] waits, servicing the quit key and a
+    /// close at each, as the player's rig does while the screen prepares;
+    /// ready, staged with [`Self::screen`].
+    fn poll_preparation(
+        &mut self,
+        handle: &mut game::PrepHandle,
+        _deadline: std::time::Instant,
+    ) -> Result<game::PrepPoll<Preparation>, SurfaceLost> {
+        let done = self.prepare_ended(handle.ticket())?;
+        if done == Preparation::Ready {
+            handle.staged_with(self.screen);
         }
-        if self.preparations.is_empty() {
-            Ok(Preparation::Ready)
-        } else {
-            Ok(self.preparations.remove(0))
+        Ok(game::PrepPoll::Done(done))
+    }
+
+    /// Stale with the next of [`Self::stale`], the screen then being it;
+    /// else ready.
+    fn ready_attempt(
+        &mut self,
+        number: u32,
+        handle: &game::PrepHandle,
+    ) -> Result<game::Readiness<SurfaceLost>, SurfaceLost> {
+        self.steps.push("ready");
+        self.readied.push((number, handle.ticket()));
+        if self.stale.is_empty() {
+            return Ok(game::Readiness::Ready);
         }
+        self.screen = self.stale.remove(0);
+        Ok(game::Readiness::Stale(game::Stale {
+            screen: self.screen,
+            lost: SurfaceLost,
+        }))
     }
 
     fn commit_attempt(&mut self) -> Result<(), SurfaceLost> {
