@@ -4,6 +4,7 @@
 
 use skin_model::{End, MAX_KEY_US, Native};
 
+use super::asset::Axis;
 use super::geom::{Q, Rect};
 use super::report::TrackWhy;
 use crate::error::ImportError;
@@ -388,6 +389,108 @@ pub(crate) fn stretch(mode: Stretch, r: Rect, [iw, ih]: [u32; 2]) -> Option<(Rec
         }
         Stretch::NoResize => (fit_height(fit_width(r, iw)?, ih)?, 0b1),
     })
+}
+
+/// A trimmed stretch that maps (`StretchType.java:47-80`); 10, which
+/// crops at the frame's native size, has no case and stays unsupported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrimMode {
+    /// 3: the larger scale covers the destination.
+    Cover,
+    /// 5: the width's scale.
+    Width,
+    /// 7: the height's scale.
+    Height,
+}
+
+impl TrimMode {
+    pub(crate) fn of(mode: i32) -> Option<Self> {
+        match mode {
+            3 => Some(Self::Cover),
+            5 => Some(Self::Width),
+            7 => Some(Self::Height),
+            _ => None,
+        }
+    }
+}
+
+/// What a trimmed stretch makes of one key's destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trim {
+    /// The scaled frame fits: the destination shrinks and recentres to
+    /// it, and the whole frame draws.
+    Fit(Rect),
+    /// The scaled frame overflows `axis`: the destination stays, and the
+    /// frame keeps `kept` texels about its middle on that axis.
+    Crop { axis: Axis, kept: Q },
+}
+
+/// The texels a frame `[i_len, i_other]` texels long keeps on the axis
+/// where the destination is `len` long, when a trimmed stretch takes its
+/// scale from the other axis, `other` long, exactly
+/// (`skin/StretchType.java:131-153`): it trims when the destination is
+/// shorter than the scaled frame, `len < other · i_len / i_other`, and
+/// keeps `len · i_other / other` of them. The test is made as
+/// `len · i_other < other · i_len`, so a negative or zero `other` takes
+/// the source's branch; a zero `other` trims only a negative `len`, which
+/// the source cuts by a zero scale: its kept texels are `len`, negative,
+/// a crop of nothing. `Some(None)` when nothing is trimmed; `None` on
+/// overflow.
+pub(crate) fn kept(len: Q, other: Q, [i_len, i_other]: [u32; 2]) -> Option<Option<Q>> {
+    let (i_len, i_other) = (Q::int(i_len), Q::int(i_other));
+    if len.mul(i_other)? >= other.mul(i_len)? {
+        return Some(None);
+    }
+    if other == Q::ZERO {
+        return Some(Some(len));
+    }
+    Some(Some(len.mul(i_other)?.div(other)?))
+}
+
+/// The texels a frame at `at`, `len` long on one axis, keeps when it
+/// keeps `kept` texels about its middle, its edges rounded half up as D1
+/// rounds where the source truncates in `f32`: the first and the count.
+/// `None` when nothing is left or on overflow.
+pub(crate) fn crop_middle(at: u32, len: u32, kept: Q) -> Option<[u32; 2]> {
+    let first = Q::int(at).add(Q::int(len).sub(kept)?.half()?)?;
+    let (start, end) = (first.round()?, first.add(kept)?.round()?);
+    let n = u32::try_from(end.checked_sub(start)?)
+        .ok()
+        .filter(|&n| n > 0)?;
+    Some([u32::try_from(start).ok()?, n])
+}
+
+/// `r` under trimmed stretch `mode` against a native frame of `[iw, ih]`
+/// texels (`skin/StretchType.java:47-80, 119-153`); `None` on overflow.
+/// Mode 3 takes the larger scale, the width's on a tie, and so always
+/// crops (or meets the destination exactly); 5 and 7 crop when the scaled
+/// frame overflows and fit otherwise, an exact meeting fitting.
+pub(crate) fn trim(mode: TrimMode, r: Rect, cell: [u32; 2]) -> Option<Trim> {
+    let [iw, ih] = cell;
+    let rows = |r: Rect| -> Option<Trim> {
+        Some(match kept(r.h, r.w, [ih, iw])? {
+            Some(kept) => Trim::Crop {
+                axis: Axis::Rows,
+                kept,
+            },
+            None => Trim::Fit(fit_height(r, Q::int(ih).mul(r.w)?.div(Q::int(iw))?)?),
+        })
+    };
+    let cols = |r: Rect| -> Option<Trim> {
+        Some(match kept(r.w, r.h, [iw, ih])? {
+            Some(kept) => Trim::Crop {
+                axis: Axis::Cols,
+                kept,
+            },
+            None => Trim::Fit(fit_width(r, Q::int(iw).mul(r.h)?.div(Q::int(ih))?)?),
+        })
+    };
+    match mode {
+        // scaleX ≥ scaleY, `r.w / iw ≥ r.h / ih`.
+        TrimMode::Cover if r.w.mul(Q::int(ih))? >= r.h.mul(Q::int(iw))? => rows(r),
+        TrimMode::Cover | TrimMode::Height => cols(r),
+        TrimMode::Width => rows(r),
+    }
 }
 
 /// Whether the intersection of every key's branches keeps one: a

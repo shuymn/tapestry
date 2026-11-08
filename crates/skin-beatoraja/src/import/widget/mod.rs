@@ -17,12 +17,12 @@ pub(super) mod text;
 
 use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
-use super::asset::{self, Crop, Failed, ImageKey, NotAdded, Path};
+use super::asset::{self, Axis, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
 use super::policy::{self, Role};
 use super::property::{self, IndexProp};
 use super::report::{NoteKind, Object, Span};
-use super::track::{self, Stretch};
+use super::track::{self, Stretch, Trim, TrimMode};
 use super::{Common, Cx, Dst, Opts, Prop};
 use crate::error::ImportError;
 use crate::lua::residual::Conv;
@@ -261,7 +261,8 @@ impl Cx<'_> {
     /// What `crop` returns for model rect `rect` of `grid` frames of
     /// `cell`, asked with the frame the source cuts ([`nominal`]); `None`
     /// once `c` is dropped as its role says, for a crop `crop` refuses or
-    /// any crop of a frame taller than one row cut to the file's last row.
+    /// any crop along an axis of a frame longer than one texel cut to the
+    /// file's last column or row.
     fn frame_crop(
         &mut self,
         c: &Common,
@@ -270,9 +271,9 @@ impl Cx<'_> {
         grid: [u32; 2],
         crop: impl FnOnce(&Self, [u32; 4]) -> Result<Result<Option<Crop>, NoteKind>, ImportError>,
     ) -> Result<Option<Option<Crop>>, ImportError> {
-        let (frame, rows_cut) = nominal(rect, cell, grid);
+        let (frame, cut) = nominal(rect, cell, grid);
         let why = match crop(self, frame)? {
-            Ok(Some(_)) if rows_cut => NoteKind::SourceRect,
+            Ok(Some(c)) if cut[c.axis.index()] => NoteKind::SourceRect,
             Ok(crop) => return Ok(Some(crop)),
             Err(why) => why,
         };
@@ -481,7 +482,11 @@ impl Cx<'_> {
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
         }
-        if Stretch::of(dst.stretch) == Stretch::Trimmed {
+        // Trimmed stretches 3, 5 and 7 map on a plain image
+        // ([`Self::trimmed_image`]); 10 and a group's stay unsupported.
+        if Stretch::of(dst.stretch) == Stretch::Trimmed
+            && (group || TrimMode::of(dst.stretch).is_none())
+        {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         if group {
@@ -531,10 +536,83 @@ impl Cx<'_> {
         rec: u32,
         s: &SrcImage,
     ) -> Result<Option<Painted>, ImportError> {
+        if let Some(mode) = TrimMode::of(c.stretch_mode) {
+            return self.trimmed_image(c, rec, s, mode);
+        }
         let Some((image, cell)) = self.add_src_image(c, rec, s, s.div)? else {
             return Ok(None);
         };
         self.baked_image(c, image, cell)
+    }
+
+    /// [`Self::src_image_rects`] under trimmed stretch `mode`
+    /// (`skin/StretchType.java:47-80, 131-153`), decided per key on exact
+    /// rationals ([`track::trim`]): when every key fits, each key's rect
+    /// shrinks and recentres to its scaled frame; when every key crops
+    /// one axis keeping the same texels, which a single frame alone can,
+    /// the frame is cut about its middle once ([`track::crop_middle`])
+    /// and the keys stay. Keys mixing the branches, or cropping different
+    /// amounts as keys changing aspect do, drop `c` with its stretch's
+    /// note, as a crop leaving nothing drops it with `dst`'s.
+    fn trimmed_image(
+        &mut self,
+        c: &Common,
+        rec: u32,
+        s: &SrcImage,
+        mode: TrimMode,
+    ) -> Result<Option<Painted>, ImportError> {
+        let (at, grid) = (c.span, s.div);
+        let stretch = NoteKind::Stretch(c.stretch_mode);
+        let mut fit = None;
+        let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [x, y, w, h]| {
+            let cell = [w / grid[0].max(1), h / grid[1].max(1)];
+            let mut rects = Vec::with_capacity(c.track.keys.len());
+            let mut crop = None;
+            for k in &c.track.keys {
+                let r = cx.key_rect(c, k)?;
+                match track::trim(mode, r, cell).ok_or_else(|| cx.range(at, "dst"))? {
+                    Trim::Fit(r) if crop.is_none() => rects.push(r),
+                    Trim::Crop { axis, kept }
+                        if rects.is_empty() && crop.is_none_or(|p| p == (axis, kept)) =>
+                    {
+                        crop = Some((axis, kept));
+                    }
+                    _ => return Ok(Err(stretch)),
+                }
+            }
+            let Some((axis, kept)) = crop else {
+                fit = Some(rects);
+                return Ok(Ok(None));
+            };
+            if grid != [1, 1] {
+                return Ok(Err(stretch));
+            }
+            let (from, len) = match axis {
+                Axis::Cols => (x, w),
+                Axis::Rows => (y, h),
+            };
+            let Some([at, len]) = track::crop_middle(from, len, kept) else {
+                return Ok(Err(NoteKind::UnsupportedField { field: "dst" }));
+            };
+            Ok(Ok(Some(Crop { axis, at, len })))
+        })?;
+        let Some((image, _)) = found else {
+            return Ok(None);
+        };
+        let rects = match fit {
+            Some(rects) => rects,
+            None => c
+                .track
+                .keys
+                .iter()
+                .map(|k| self.key_rect(c, k))
+                .collect::<Result<_, _>>()?,
+        };
+        let rects = rects
+            .into_iter()
+            .map(|r| r.model_from(self.flip).ok_or_else(|| self.range(at, "dst")))
+            .collect::<Result<_, _>>()?;
+        Ok(Some((image, rects, None)))
     }
 
     /// Admitted `image` of `cell` with `c`'s keys baked against it
@@ -698,11 +776,12 @@ fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<[u32; 2]> {
 }
 
 /// The rect of `grid` frames of `cell` that model rect `rect` stands
-/// for (`rect`'s corner, the source's size), and whether its rows were
-/// cut to the file's last row ([`cut_axis`]), seen for a frame taller
-/// than one row: a one-row frame cut there is that row either way.
-fn nominal(rect: [u32; 4], cell: [u32; 2], grid: [u32; 2]) -> ([u32; 4], bool) {
+/// for (`rect`'s corner, the source's size), and whether its columns and
+/// its rows were cut to the file's last line ([`cut_axis`]), seen for a
+/// frame longer than one texel: a one-texel frame cut there is that line
+/// either way.
+fn nominal(rect: [u32; 4], cell: [u32; 2], grid: [u32; 2]) -> ([u32; 4], [bool; 2]) {
     let w = cell[0].saturating_mul(grid[0]);
     let h = cell[1].saturating_mul(grid[1]);
-    ([rect[0], rect[1], w, h], rect[3] != h)
+    ([rect[0], rect[1], w, h], [rect[2] != w, rect[3] != h])
 }

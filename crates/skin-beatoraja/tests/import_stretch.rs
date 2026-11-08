@@ -1,7 +1,7 @@
 //! Stretch: the affine modes baked per key, the piecewise modes
-//! only within one branch, the trimmed modes refused, 8 and 9 kept in
-//! target pixels at placement, and numbers only with the identity, 8
-//! or 9.
+//! only within one branch, the trimmed modes 3, 5 and 7 fitting or
+//! cropping once, 8 and 9 kept in target pixels at placement, and
+//! numbers only with the identity, 8 or 9.
 
 mod common;
 
@@ -85,28 +85,246 @@ fn mode5_source_region(ms: u8) -> [i32; 2] {
     }
 }
 
+/// A texel naming its own place in files up to 4 096 texels a side:
+/// column `x`'s low byte in red, row `y`'s in green, their high nibbles
+/// in blue.
+fn wide_coord(x: u32, y: u32) -> [u8; 4] {
+    let byte = |v: u32| u8::try_from(v & 0xFF).unwrap();
+    [byte(x), byte(y), byte(((x >> 8) << 4) | (y >> 8)), 255]
+}
+
+/// The column and row [`wide_coord`] painted `t`.
+fn place(t: [u8; 4]) -> [u32; 2] {
+    let [r, g, b, _] = t.map(u32::from);
+    [r | ((b >> 4) << 8), g | ((b & 0xF) << 8)]
+}
+
+/// Image `i`, frame `frame` (`"x": …, "w": …`) of a `file`-sized a.png,
+/// with `stretch` over `keys`, in a 1920×1080 skin.
+fn cut(file: [u32; 2], frame: &str, stretch: i32, keys: &str) -> common::Loaded {
+    import_sized(
+        [1_920, 1_080],
+        &format!(
+            r#""image": [{{"id": "i", "src": "a", {frame}}}],
+               "destination": [{{"id": "i", "timer": 41, "loop": 100, "stretch": {stretch},
+                                 "dst": [{keys}]}}]"#
+        ),
+        &[("a.png", file[0], file[1])],
+    )
+}
+
+/// The one quad of `l` at `ms`, a.png (`file`) painted with
+/// [`wide_coord`] first: its rounded rect and the places of the texels at
+/// its top left and bottom right, the first and the last it draws.
+#[track_caller]
+fn drawn(l: common::Loaded, file: [u32; 2], ms: i64) -> ([i32; 4], [[u32; 2]; 2]) {
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    common::png_with(l.dir.path(), "a.png", file[0], file[1], wide_coord);
+    let atlas = l
+        .ok()
+        .skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let quads = l.quads(ms);
+    let [q] = quads.as_slice() else {
+        panic!("{quads:?}")
+    };
+    let at = |u, v| place(common::play::texel_at(&atlas, q, u, v));
+    (
+        common::play::round(q.rect),
+        [at(0.0001, 0.0001), at(0.9999, 0.9999)],
+    )
+}
+
 #[test]
-fn trimmed_modes_are_refused() {
-    // The f32 crop of mode 5 drops source rows: a 2×3 frame from 2×3 to
-    // 4×6 over 7 ms.
-    let loaded = image(
-        [2, 3],
-        5,
-        r#"{"time": 0, "w": 2, "h": 3}, {"time": 7, "w": 4, "h": 6}"#,
+fn stretch_three_covers_and_crops_the_middle() {
+    // An 802×1080 frame over 400×1080: its height's scale is the larger,
+    // so it covers the box and keeps its middle 400 columns, 201 to 600,
+    // the box unchanged (`StretchType.java:47-56, 131-141`; the pinned
+    // source gives region [201, 0, 400, 1080]).
+    let file = [802, 1_080];
+    let frame = r#""w": 802, "h": 1080"#;
+    let l = cut(file, frame, 3, r#"{"x": 0, "y": 0, "w": 400, "h": 1080}"#);
+    assert_eq!(
+        drawn(l, file, 0),
+        ([0, 0, 400, 1_080], [[201, 0], [600, 1_079]])
     );
-    assert!(has(loaded.report(), NoteKind::Stretch(5)));
-    assert_eq!(loaded.report().usage.images, 0);
-    assert!(loaded.quads(3).is_empty());
-    // At 6 ms the source crops its frame in f32 (`StretchType.java:16-146`
-    // at `0.8.9`, interpolating as `SkinObject.java:384-411`): the exact
-    // region keeps all three rows, the source's keeps two.
+    // Over 802×540, its middle 540 rows, 270 to 809 (region [0, 270,
+    // 802, 540]).
+    let l = cut(file, frame, 3, r#"{"x": 0, "y": 0, "w": 802, "h": 540}"#);
+    assert_eq!(
+        drawn(l, file, 0),
+        ([0, 540, 802, 540], [[0, 270], [801, 809]])
+    );
+    // Over its own size it draws whole.
+    let l = cut(file, frame, 3, r#"{"x": 0, "y": 0, "w": 802, "h": 1080}"#);
+    assert_eq!(
+        drawn(l, file, 0),
+        ([0, 0, 802, 1_080], [[0, 0], [801, 1_079]])
+    );
+    // Keys moving only `y` keep one crop: 100 px up over 100 ms.
+    let l = cut(
+        file,
+        frame,
+        3,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 400, "h": 1080},
+           {"time": 100, "x": 0, "y": 100, "w": 400, "h": 1080}"#,
+    );
+    assert_eq!(
+        drawn(l, file, 50),
+        ([0, -50, 400, 1_080], [[201, 0], [600, 1_079]])
+    );
+}
+
+#[test]
+fn stretch_five_and_seven_fit_or_crop() {
+    let file = [100, 100];
+    let frame = r#""w": 100, "h": 100"#;
+    let at = |mode, keys| drawn(cut(file, frame, mode, keys), file, 0);
+    let whole = [[0, 0], [99, 99]];
+    // Mode 5 in 100×200: the frame fits, the box shrinks to 100×100 about
+    // its middle, y 50 up (the pinned source's rect [0, 50, 100, 100]).
+    assert_eq!(
+        at(5, r#"{"x": 0, "y": 0, "w": 100, "h": 200}"#),
+        ([0, 930, 100, 100], whole)
+    );
+    // In 100×50 it overflows: the box stays and the middle 50 rows draw
+    // (region [0, 25, 100, 50]).
+    assert_eq!(
+        at(5, r#"{"x": 0, "y": 0, "w": 100, "h": 50}"#),
+        ([0, 1_030, 100, 50], [[0, 25], [99, 74]])
+    );
+    // Mode 7, transposed: 200×100 fits at x 50 (rect [50, 0, 100, 100]),
+    // 50×100 keeps columns 25 to 74 (region [25, 0, 50, 100]).
+    assert_eq!(
+        at(7, r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#),
+        ([50, 980, 100, 100], whole)
+    );
+    assert_eq!(
+        at(7, r#"{"x": 0, "y": 0, "w": 50, "h": 100}"#),
+        ([0, 980, 50, 100], [[25, 0], [74, 99]])
+    );
+    // An exact meeting fits: the box and the whole frame.
+    assert_eq!(
+        at(5, r#"{"x": 0, "y": 0, "w": 100, "h": 100}"#),
+        ([0, 980, 100, 100], whole)
+    );
+    // Fitting keys are each baked: 100×200 then 200×400, at 50 ms
+    // 150×300 holding 150×150 from y 75 up.
+    let l = cut(
+        file,
+        frame,
+        5,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 100, "h": 200},
+           {"time": 100, "x": 0, "y": 0, "w": 200, "h": 400}"#,
+    );
+    assert_eq!(drawn(l, file, 50), ([0, 855, 150, 150], whole));
+    // A crop's edges round half up (D1) where the source truncates: 51 of
+    // the rows of a frame at row 20 keep 45 to 95, the source's region
+    // [10, 44, 100, 51].
+    let file = [120, 130];
+    let l = cut(
+        file,
+        r#""x": 10, "y": 20, "w": 100, "h": 100"#,
+        5,
+        r#"{"x": 0, "y": 0, "w": 100, "h": 51}"#,
+    );
+    assert_eq!(
+        drawn(l, file, 0),
+        ([0, 1_029, 100, 51], [[10, 45], [109, 95]])
+    );
+}
+
+#[test]
+fn a_column_crop_past_the_edge_draws_the_edge_column() {
+    // A 16×16 frame at x 56 of a 64-wide file runs 8 columns past its
+    // edge; mode 7 over 4×16 keeps its middle 4, 62 to 65, padded with
+    // the edge column 63.
+    let file = [64, 64];
+    let l = cut(
+        file,
+        r#""x": 56, "y": 0, "w": 16, "h": 16"#,
+        7,
+        r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
+    );
+    assert_eq!(drawn(l, file, 0), ([0, 1_064, 4, 16], [[62, 0], [63, 15]]));
+    // Starting past the edge (x 60, columns 66 to 69), only the edge
+    // column draws, as the source's clamped texture samples it.
+    let l = cut(
+        file,
+        r#""x": 60, "y": 0, "w": 16, "h": 16"#,
+        7,
+        r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
+    );
+    assert_eq!(drawn(l, file, 0), ([0, 1_064, 4, 16], [[63, 0], [63, 15]]));
+    // A frame wholly past the edge is cut to the edge column: cropping its
+    // columns is refused.
+    let l = cut(
+        file,
+        r#""x": 64, "y": 0, "w": 16, "h": 16"#,
+        7,
+        r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
+    );
+    assert!(has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
+}
+
+#[test]
+fn trimmed_modes_the_model_cannot_follow_are_refused() {
+    let file = [100, 100];
+    let frame = r#""w": 100, "h": 100"#;
+    let refused = |mode, frame: &str, keys| {
+        let l = cut(file, frame, mode, keys);
+        assert!(has(l.report(), NoteKind::Stretch(mode)), "{mode} {keys}");
+        assert!(l.quads(0).is_empty(), "{mode} {keys}");
+    };
+    // Keys changing aspect crop different amounts.
+    refused(
+        3,
+        frame,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 50, "h": 100},
+           {"time": 100, "x": 0, "y": 0, "w": 40, "h": 100}"#,
+    );
+    // Keys mixing the branches: fit, then crop.
+    refused(
+        5,
+        frame,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 100, "h": 200},
+           {"time": 100, "x": 0, "y": 0, "w": 100, "h": 50}"#,
+    );
+    // Two keys cropping different axes under mode 3.
+    refused(
+        3,
+        frame,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 50, "h": 100},
+           {"time": 100, "x": 0, "y": 0, "w": 100, "h": 50}"#,
+    );
+    // An animation of two frames can fit but not crop.
+    let grid = r#""w": 200, "h": 100, "divx": 2"#;
+    refused(7, grid, r#"{"x": 0, "y": 0, "w": 50, "h": 100}"#);
+    let l = cut(
+        [200, 100],
+        grid,
+        7,
+        r#"{"x": 0, "y": 0, "w": 200, "h": 100}"#,
+    );
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    assert_eq!(l.rects(0), [[50, 980, 100, 100]]);
+    // Mode 10 has no mapping.
+    refused(10, frame, r#"{"x": 0, "y": 0, "w": 50, "h": 100}"#);
+    // A track whose keys all meet the frame exactly fits at every key, its
+    // exact rationals keeping all three rows where the source's `f32`
+    // crops one at 6 ms (D1): a 2×3 frame from 2×3 to 4×6 over 7 ms.
+    let l = import_sized(
+        [1_920, 1_080],
+        r#""image": [{"id": "i", "src": "a", "w": 2, "h": 3}],
+           "destination": [{"id": "i", "timer": 41, "loop": 7, "stretch": 5,
+                            "dst": [{"time": 0, "w": 2, "h": 3}, {"time": 7, "w": 4, "h": 6}]}]"#,
+        &[("a.png", 2, 3)],
+    );
+    assert_eq!(drawn(l, [2, 3], 6).1, [[0, 0], [1, 2]]);
     assert_eq!(mode5_source_region(6), [2, 2]);
     assert_eq!(mode5_source_region(0), [2, 3]);
     assert_eq!(mode5_source_region(7), [2, 3]);
-    for mode in [3, 7, 10] {
-        let loaded = image([2, 3], mode, r#"{"w": 4, "h": 6}"#);
-        assert!(has(loaded.report(), NoteKind::Stretch(mode)), "{mode}");
-    }
     // Unknown modes are the identity.
     let r = image([3, 2], 11, r#"{"x": 0, "y": 0, "w": 10, "h": 4}"#).rects(0);
     assert_eq!(r, [[0, 1_076, 10, 4]]);
