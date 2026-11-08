@@ -1257,6 +1257,45 @@ fn a_rearm_starts_with_what_was_adjusted_while_waiting() {
     saved_decodes(&report);
 }
 
+/// At the history's limit: 64 READYs cancelled by a START hold, one F2
+/// step taken in each wait, and the 65th wins with every step (1.00 +
+/// 64 × 0.25 = 17.00); an F2 in its play is not its start.
+#[test]
+fn the_65th_opening_starts_with_every_step_taken_in_64_waits() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    let mut items = vec![connect(0)];
+    let mut zero = 0;
+    for _ in 0..replay::MAX_CANCELLED_OPENINGS {
+        let at = zero - 400;
+        items.push(raw(at, 0, E, 1));
+        items.extend(f2(at + 50));
+        items.push(raw(at + 150, 0, E, 0));
+        zero = at + 150 + 1_000;
+    }
+    items.extend(f2(zero + 1_500));
+    items.extend(notes_from(zero));
+    let report = s.play(script(items, &[])).unwrap();
+
+    let r = record(&report);
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(r.history.openings.len(), replay::MAX_CANCELLED_OPENINGS);
+    assert!(
+        r.history
+            .openings
+            .iter()
+            .all(|o| o.reason == CancelReason::Held)
+    );
+    let t = r.start_tuning.unwrap();
+    assert_eq!(t.hispeed, h(1_700));
+    assert_eq!(t.classic_hispeed_x100, 1_700);
+    assert_eq!(
+        s.presentation().unwrap().hispeed,
+        Some(Ratio::from_hundredths(1_725))
+    );
+    saved_decodes(&report);
+}
+
 #[test]
 fn a_session_without_the_gate_starts_with_the_settings_options() {
     let (_dir, root) = temp_root();
