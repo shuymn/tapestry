@@ -775,6 +775,12 @@ impl ScreenRuntime {
         Ok(())
     }
 
+    /// Whether it holds a permit.
+    #[must_use]
+    pub fn holds_permit(&self) -> bool {
+        self.permit.is_some()
+    }
+
     /// Calls `f` when the VM is destroyed, from the VM's own teardown
     /// (dev-tools): a test observes what holds at that moment.
     #[cfg(feature = "dev-tools")]

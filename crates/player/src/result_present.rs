@@ -55,6 +55,8 @@ pub struct ViewPayload {
     pub key: ViewKey,
     /// The layout that draws it; `None` for the built-in result.
     pub skin: Option<Arc<SkinBundle>>,
+    /// Its runtime's generation, when the layout's callbacks run one.
+    pub script: Option<crate::screens::ScriptGen>,
     /// Why the built-in result shows, when it does for a skin.
     pub why: Option<(Scope, String)>,
     /// The view the skin is updated with.
@@ -518,12 +520,13 @@ impl Presenter {
         let Some((key, snapshot)) = &self.desired else {
             return;
         };
-        let (skin, why) = match (shown, &self.disabled, &self.attempt, &self.view) {
-            (_, Some(why), _, _) => (None, Some((Scope::Run, why.clone()))),
-            (_, _, Some(why), _) => (None, Some((Scope::Attempt, why.clone()))),
-            (_, _, _, Some((k, why))) if k == key => (None, Some((Scope::View, why.clone()))),
-            (Some(Published::Skin(b, _)), _, _, _) => (Some(Arc::clone(b)), None),
+        let (skin, script, why) = match (shown, &self.disabled, &self.attempt, &self.view) {
+            (_, Some(why), _, _) => (None, None, Some((Scope::Run, why.clone()))),
+            (_, _, Some(why), _) => (None, None, Some((Scope::Attempt, why.clone()))),
+            (_, _, _, Some((k, why))) if k == key => (None, None, Some((Scope::View, why.clone()))),
+            (Some(Published::Skin(b, _, s)), _, _, _) => (Some(Arc::clone(b)), *s, None),
             (Some(Published::BuiltIn), _, _, _) => (
+                None,
                 None,
                 Some((Scope::View, "the view's layout was refused".to_owned())),
             ),
@@ -531,6 +534,7 @@ impl Presenter {
         };
         let same = self.payload.as_ref().is_some_and(|p| {
             p.key == *key
+                && p.script == script
                 && match (&p.skin, &skin) {
                     (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                     (None, None) => true,
@@ -543,6 +547,7 @@ impl Presenter {
         let payload = Arc::new(ViewPayload {
             key: *key,
             skin,
+            script,
             why,
             view: snapshot.view.clone(),
             labels: snapshot.labels.clone(),

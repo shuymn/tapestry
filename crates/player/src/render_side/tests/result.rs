@@ -510,6 +510,7 @@ fn titled(
     Arc::new(ViewPayload {
         key,
         skin: skin.map(Arc::clone),
+        script: None,
         why: None,
         view,
         labels: ResultLabels {
@@ -1231,7 +1232,7 @@ fn a_new_lifetimes_page_base_has_its_settings_lines() {
     let dir = tempfile::tempdir().unwrap();
     crate::tests::on_rig_with(settings, link, |p, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let chart = ResultChart::default();
         let _ = p.result_skin.image_stage(chart, None, || false, || false);
@@ -1437,7 +1438,7 @@ fn a_panic_in_the_upload_fails_the_screen_before_its_teardown() {
     };
     crate::tests::on_rig_with(settings, link, |p, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let _ = p
             .result_skin
@@ -1518,6 +1519,7 @@ fn result_frame_alloc() {
     );
     screen.commit(token(1, &screen)).unwrap();
     let shared = Shared::new();
+    let scripts = crate::screens::Scripts::new();
     let mut side = ResultSide::new(1);
     let lines: Vec<String> = (0..13).map(|i| format!("FACT {i}")).collect();
     let strip: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -1556,12 +1558,19 @@ fn result_frame_alloc() {
                 overlay: Overlay::default(),
                 state: Some(state),
                 page: None,
+                script: crate::screens::ScriptSlot::default(),
             },
             token: Some(token(request, &screen)),
         });
         side.overlay = Some((cycle + 1, overlay));
         let before = crate::alloc_count::this_thread();
-        let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(1_000_000));
+        let drawn = Run::result_frame(
+            &mut screen,
+            Some(&mut side),
+            &shared,
+            &scripts,
+            TimeUs(1_000_000),
+        );
         counts.push(crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         assert_eq!(screen.result_strip(), 13);
@@ -1579,7 +1588,13 @@ fn result_frame_alloc() {
     // A frame the skin refuses allocates nothing either.
     screen.refuse_next_result(false);
     let before = crate::alloc_count::this_thread();
-    let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(2_000_000));
+    let drawn = Run::result_frame(
+        &mut screen,
+        Some(&mut side),
+        &shared,
+        &scripts,
+        TimeUs(2_000_000),
+    );
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
     // The control: the count sees an allocation in the same window.
@@ -1612,7 +1627,7 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
         };
         crate::tests::on_rig_with(settings, link, |p, _| {
             p.result_skin = crate::result_skin::ResultSkin::new(Some(
-                crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+                crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
             ));
             let _ = p
                 .result_skin
@@ -1724,7 +1739,7 @@ fn on_shown_result(
     let dir = tempfile::tempdir().unwrap();
     crate::tests::on_rig_hooked(settings, link, clock, |p, _, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let chart = ResultChart::default();
         let _ = p.result_skin.image_stage(chart, None, || false, || false);

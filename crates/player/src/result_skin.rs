@@ -24,6 +24,7 @@ use skin_model::{
 };
 
 use crate::imports::{self, ImportTarget, Job, Ran};
+use crate::screens::{ScriptGen, ScriptPermit, ScriptSlot, Scripts};
 
 /// A result skin whose base import read a fact the base snapshot has
 /// pending: what each image stage and layout starts from, and the skin
@@ -90,7 +91,9 @@ impl ImageEntry {
 #[derive(Clone, Debug)]
 pub enum Published {
     BuiltIn,
-    Skin(Arc<SkinBundle>, Option<Arc<ImageEntry>>),
+    /// A bundle, its prepared atlas, and its runtime's generation when its
+    /// callbacks run one (s7-07-design §3.7.1).
+    Skin(Arc<SkinBundle>, Option<Arc<ImageEntry>>, Option<ScriptGen>),
 }
 
 /// A view a layout is asked for: its fields, or `None` for an unavailable
@@ -105,6 +108,8 @@ struct Specialized {
     bundle: Arc<SkinBundle>,
     facts: FactDeps,
     entry: Option<Arc<ImageEntry>>,
+    /// Its runtime's generation, once offered; reused only while live.
+    script: Option<ScriptGen>,
 }
 
 /// Why a layout gave no specialization.
@@ -129,14 +134,17 @@ struct LayoutOut {
     request: u64,
     view: ViewFacts,
     laid: Laid,
+    /// The runtime its import kept, offered when it lands.
+    script: ScriptSlot,
 }
 
 /// The attempt's result skin, as its image stage left it.
 #[derive(Clone, Debug)]
 enum ForAttempt {
-    /// A bundle for every view, with the prepared atlas it is bound to: a
-    /// fixed skin, or one that read no fact of the viewed result.
-    Every(Arc<SkinBundle>, Option<Arc<ImageEntry>>),
+    /// A bundle for every view, with the prepared atlas it is bound to
+    /// and its runtime's generation: a fixed skin, or one that read no
+    /// fact of the viewed result.
+    Every(Arc<SkinBundle>, Option<Arc<ImageEntry>>, Option<ScriptGen>),
     /// The built-in result.
     BuiltIn,
     /// Laid out per view.
@@ -146,8 +154,9 @@ enum ForAttempt {
 /// The kind's skin, as startup left it.
 #[derive(Debug)]
 pub enum ResultStart {
-    /// Imported with no fact pending: one bundle for every chart.
-    Fixed(Arc<SkinBundle>),
+    /// Imported with no fact pending: one bundle for every chart, with its
+    /// runtime's generation, retained for the run.
+    Fixed(Arc<SkinBundle>, Option<ScriptGen>),
     /// Built per attempt and view.
     Pending(Arc<PendingResult>),
 }
@@ -227,6 +236,11 @@ pub struct ResultSkin {
     /// The cells of an image entry whose pages a deferred build dropped
     /// (D13), a union base until a build packs them.
     cells: Option<Sheet>,
+    /// The result runtimes' cell: their generations, permits and eviction.
+    scripts: Scripts,
+    /// A request whose job waits for a permit (s7-07-design §4 rule 4):
+    /// tried again at each poll.
+    permit_wait: Option<(u64, ViewFacts)>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -385,6 +399,7 @@ type ImageOut = (
     FactDeps,
     Option<Images>,
     Option<Needs>,
+    ScriptSlot,
 );
 
 /// How [`ResultSkin::begin_image_stage`] began.
@@ -451,7 +466,7 @@ impl Laid {
 /// taken from `slot` and what is not shown released, then, unless the
 /// atlases live besides it (`others`, with the entry when kept) and the
 /// new one would pass two, the plan packed (the S10-09i design's Q3).
-#[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
+#[expect(clippy::too_many_arguments, reason = "the job's inputs, moved in once")]
 fn layout(
     pending: &PendingResult,
     view: ViewFacts,
@@ -460,23 +475,65 @@ fn layout(
     base: Option<Arc<ImageEntry>>,
     others: Vec<AtlasId>,
     cancel: &Cancel,
-) -> Laid {
+    permit: Option<ScriptPermit>,
+) -> (Laid, ScriptSlot) {
     #[cfg(all(test, feature = "dev-tools"))]
     tests::layout_starts();
     let Some(fields) = view.0 else {
-        return Laid::refused("the view is unavailable".to_owned());
+        return (
+            Laid::refused("the view is unavailable".to_owned()),
+            ScriptSlot::default(),
+        );
     };
     let facts = result_facts(fields, class);
-    let imported = match pending
-        .header
-        .import_reading(&pending.config, &facts, cancel)
-    {
+    // A layout that is shown keeps its runtime, under the permit taken
+    // for it; the probe's, never shown, keeps none.
+    let outcome = if permit.is_some() {
+        pending
+            .header
+            .import_runtime_reading(&pending.config, &facts, cancel)
+    } else {
+        pending
+            .header
+            .import_reading(&pending.config, &facts, cancel)
+    };
+    let mut imported = match outcome {
         Ok(LuaOutcome::Imported(i)) => i,
         Ok(LuaOutcome::Pending(p)) => {
-            return Laid::refused(format!("the skin reads {:?}, pending here", p.pending));
+            return (
+                Laid::refused(format!("the skin reads {:?}, pending here", p.pending)),
+                ScriptSlot::default(),
+            );
         }
-        Err(refused) => return Laid::refused(imports::chain(&refused.0)),
+        Err(refused) => {
+            return (
+                Laid::refused(imports::chain(&refused.0)),
+                ScriptSlot::default(),
+            );
+        }
     };
+    let script = ScriptSlot::staged_with(imported.runtime.take(), permit);
+    let laid = lay_out(pending, imported, slot, base, others, cancel);
+    // A layout that gave no specialization keeps no runtime: it goes here,
+    // on the job's thread.
+    let script = if laid.result.is_ok() {
+        script
+    } else {
+        ScriptSlot::default()
+    };
+    (laid, script)
+}
+
+/// [`layout`]'s atlas step and bundle, from its import `imported`.
+#[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
+fn lay_out(
+    pending: &PendingResult,
+    imported: skin_beatoraja::LuaImported,
+    slot: &Slot,
+    base: Option<Arc<ImageEntry>>,
+    others: Vec<AtlasId>,
+    cancel: &Cancel,
+) -> Laid {
     let deps = imported.facts;
     let skin = imported.imported.skin;
     let scratch = imported.imported.scratch;
@@ -584,6 +641,7 @@ fn layout(
             bundle,
             facts: deps,
             entry,
+            script: None,
         })
         .map_err(Unbuilt::from);
     Laid {
@@ -601,6 +659,14 @@ impl ResultSkin {
         s
     }
 
+    /// The result runtimes' cell, the render thread's ([`Scripts`]): the
+    /// generations it gives are that cell's.
+    #[must_use]
+    pub fn with_scripts(mut self, scripts: Scripts) -> Self {
+        self.scripts = scripts;
+        self
+    }
+
     /// The pending skin, if the kind has one.
     fn pending(&self) -> Option<&Arc<PendingResult>> {
         match &self.start {
@@ -613,7 +679,7 @@ impl ResultSkin {
     /// set, the latest publication's binding and the layout entry's.
     fn others(&self) -> Vec<AtlasId> {
         let mut v = self.retained.clone();
-        if let Some(Published::Skin(b, _)) = &self.published {
+        if let Some(Published::Skin(b, _, _)) = &self.published {
             v.push(b.atlas_pages().id());
         }
         if let Some(l) = &self.layout {
@@ -650,7 +716,7 @@ impl ResultSkin {
     /// The published generation's prepared atlas.
     fn shown_entry(&self) -> Option<Arc<ImageEntry>> {
         match &self.published {
-            Some(Published::Skin(_, e)) => e.clone(),
+            Some(Published::Skin(_, e, _)) => e.clone(),
             _ => None,
         }
     }
@@ -678,7 +744,7 @@ impl ResultSkin {
     /// result or before an image stage.
     pub fn upload(&self) -> Option<Upload> {
         match &self.attempt {
-            Some(ForAttempt::Every(b, _)) => Some(Upload::Bundle(Arc::clone(b))),
+            Some(ForAttempt::Every(b, _, _)) => Some(Upload::Bundle(Arc::clone(b))),
             Some(ForAttempt::Pending) => self
                 .image
                 .as_ref()
@@ -761,8 +827,8 @@ impl ResultSkin {
         self.class = Some(class);
         let pending = match &self.start {
             None => return ImageStage::Ready(Staged::Ready),
-            Some(ResultStart::Fixed(b)) => {
-                self.attempt = Some(ForAttempt::Every(Arc::clone(b), None));
+            Some(ResultStart::Fixed(b, script)) => {
+                self.attempt = Some(ForAttempt::Every(Arc::clone(b), None, *script));
                 return ImageStage::Ready(Staged::Ready);
             }
             Some(ResultStart::Pending(p)) => Arc::clone(p),
@@ -772,15 +838,25 @@ impl ResultSkin {
             self.attempt = Some(reused);
             return ImageStage::Ready(Staged::Ready);
         }
+        // A bundle for every view keeps its runtime: the probe's import
+        // keeps one under a permit, taken after the eviction; laid out per
+        // view, it goes on the job's thread.
+        let permit = self.scripts.result_permit(None);
         let slot = self.slot_for_job();
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
         let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
             let slot = theirs;
-            let o = pending
-                .header
-                .import_reading(&pending.config, &facts, cancel);
+            let o = if permit.is_some() {
+                pending
+                    .header
+                    .import_runtime_reading(&pending.config, &facts, cancel)
+            } else {
+                pending
+                    .header
+                    .import_reading(&pending.config, &facts, cancel)
+            };
             let deps = match &o {
                 Ok(LuaOutcome::Imported(i)) => i.facts.clone(),
                 Ok(LuaOutcome::Pending(p)) => p.facts.clone(),
@@ -788,7 +864,8 @@ impl ResultSkin {
             };
             let read = reads_result(&deps);
             match o {
-                Ok(LuaOutcome::Imported(i)) if !read => {
+                Ok(LuaOutcome::Imported(mut i)) if !read => {
+                    let script = ScriptSlot::staged_with(i.runtime.take(), permit);
                     // A skin that reads no fact of the viewed result:
                     // one bundle for every view, packed as any kind's
                     // once its plan fits and what is not shown is
@@ -802,12 +879,13 @@ impl ResultSkin {
                             deps,
                             None,
                             None,
+                            ScriptSlot::default(),
                         );
                     }
                     let images = lock(&slot).take().unwrap_or_default();
                     let (images, room) = release(images, base.as_ref(), others);
                     if !room {
-                        return (None, deps, Some(images), None);
+                        return (None, deps, Some(images), None, ScriptSlot::default());
                     }
                     #[cfg(any(test, feature = "dev-tools"))]
                     BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -817,14 +895,28 @@ impl ResultSkin {
                         .and_then(|a| {
                             imports::bundle_of(skin, i.imported.scratch, a, &pending.target, cancel)
                         });
-                    (Some(r.map(Some)), deps, Some(images), None)
+                    let script = if r.is_ok() {
+                        script
+                    } else {
+                        ScriptSlot::default()
+                    };
+                    (Some(r.map(Some)), deps, Some(images), None, script)
                 }
                 Ok(LuaOutcome::Imported(_)) => {
                     let view = ViewFacts(Some(match facts.result {
                         Fact::Known(f) => f,
-                        _ => return (None, deps, None, None),
+                        _ => return (None, deps, None, None, ScriptSlot::default()),
                     }));
-                    let laid = layout(&pending, view, Some(class), &slot, base, others, cancel);
+                    let (laid, _) = layout(
+                        &pending,
+                        view,
+                        Some(class),
+                        &slot,
+                        base,
+                        others,
+                        cancel,
+                        None,
+                    );
                     // The probe's layout is never shown: its atlas is.
                     (
                         Some(laid.result.map(|_| None).map_err(|e| match e {
@@ -834,10 +926,17 @@ impl ResultSkin {
                         deps,
                         laid.taken,
                         laid.needs,
+                        ScriptSlot::default(),
                     )
                 }
-                Err(_) if !read => (Some(Err("refused".to_owned())), deps, None, None),
-                _ => (None, deps, None, None),
+                Err(_) if !read => (
+                    Some(Err("refused".to_owned())),
+                    deps,
+                    None,
+                    None,
+                    ScriptSlot::default(),
+                ),
+                _ => (None, deps, None, None, ScriptSlot::default()),
             }
         });
         match spawned {
@@ -872,16 +971,19 @@ impl ResultSkin {
     /// job's images handed back through `slot`.
     fn finish_image_stage(&mut self, slot: &Slot, ran: Ran<ImageOut>) -> Staged {
         match ran {
-            Ran::Done((outcome, deps, taken, needs)) => {
+            Ran::Done((outcome, deps, taken, needs, script)) => {
                 self.restore(taken, slot);
                 match outcome {
-                    // A bundle for every view, cached with what it read.
+                    // A bundle for every view, cached with what it read and
+                    // its runtime's generation.
                     Some(Ok(Some(bundle))) => {
-                        self.attempt = Some(ForAttempt::Every(Arc::clone(&bundle), None));
+                        let script = self.scripts.offer_result(script, false);
+                        self.attempt = Some(ForAttempt::Every(Arc::clone(&bundle), None, script));
                         self.layout = Some(Specialized {
                             bundle,
                             facts: deps,
                             entry: None,
+                            script,
                         });
                         self.probe = None;
                     }
@@ -927,9 +1029,10 @@ impl ResultSkin {
         self.deferred = None;
         match self.attempt.clone() {
             None => {}
-            Some(ForAttempt::Every(b, entry)) => {
-                if !matches!(&self.published, Some(Published::Skin(p, _)) if Arc::ptr_eq(p, &b)) {
-                    self.publish(Published::Skin(b, entry));
+            Some(ForAttempt::Every(b, entry, script)) => {
+                if !matches!(&self.published, Some(Published::Skin(p, _, _)) if Arc::ptr_eq(p, &b))
+                {
+                    self.publish(Published::Skin(b, entry, script));
                 }
             }
             Some(ForAttempt::BuiltIn) => self.publish(Published::BuiltIn),
@@ -962,6 +1065,12 @@ impl ResultSkin {
         let Some(pending) = self.pending().map(Arc::clone) else {
             return;
         };
+        // Reuse was checked first (`layout_for`); then the eviction and the
+        // permit, without which the request waits for one.
+        let Some(permit) = self.scripts.result_permit(None) else {
+            self.permit_wait = Some((request, view));
+            return;
+        };
         // The entry goes to the job, which hands it back; the layout entry
         // bound to an unshown one goes with it, dropped only with its pages.
         let slot = self.slot_for_job();
@@ -969,10 +1078,23 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
-        match imports::spawn_job(move |cancel: &Cancel| LayoutOut {
-            request,
-            view,
-            laid: layout(&pending, view, class, &theirs, base, others, cancel),
+        match imports::spawn_job(move |cancel: &Cancel| {
+            let (laid, script) = layout(
+                &pending,
+                view,
+                class,
+                &theirs,
+                base,
+                others,
+                cancel,
+                Some(permit),
+            );
+            LayoutOut {
+                request,
+                view,
+                laid,
+                script,
+            }
         }) {
             Ok(job) => self.job = Some((job, request, slot)),
             Err(why) => {
@@ -988,6 +1110,7 @@ impl ResultSkin {
     fn supersede(&mut self, p: Published) {
         self.waiting = None;
         self.deferred = None;
+        self.permit_wait = None;
         self.publish(p);
     }
 
@@ -1007,8 +1130,13 @@ impl ResultSkin {
         if let Some(l) = &self.layout
             && !reads_result(&l.facts)
             && l.facts.holds(facts)
+            && self.scripts.result_live(l.script)
         {
-            return Some(ForAttempt::Every(Arc::clone(&l.bundle), l.entry.clone()));
+            return Some(ForAttempt::Every(
+                Arc::clone(&l.bundle),
+                l.entry.clone(),
+                l.script,
+            ));
         }
         if let (Some((deps, needs)), Some(e)) = (&self.probe, &self.image)
             && deps.holds(facts)
@@ -1024,14 +1152,17 @@ impl ResultSkin {
     /// it reads no fact of the viewed result and its reads hold the
     /// attempt's.
     fn reuse_for_view(&self, view: ViewFacts) -> Option<Published> {
-        let l = self.layout.as_ref()?;
+        let l = self
+            .layout
+            .as_ref()
+            .filter(|l| self.scripts.result_live(l.script))?;
         let holds = match view.0 {
             Some(fields) => l.facts.holds(&result_facts(fields, self.class)),
             None => {
                 !reads_result(&l.facts) && self.attempt_facts().is_some_and(|f| l.facts.holds(&f))
             }
         };
-        holds.then(|| Published::Skin(Arc::clone(&l.bundle), l.entry.clone()))
+        holds.then(|| Published::Skin(Arc::clone(&l.bundle), l.entry.clone(), l.script))
     }
 
     /// The image side a job may release, in its slot: the image entry, the
@@ -1040,7 +1171,7 @@ impl ResultSkin {
     fn slot_for_job(&mut self) -> Slot {
         let shown = matches!(
             (&self.published, &self.layout),
-            (Some(Published::Skin(p, _)), Some(l)) if Arc::ptr_eq(p, &l.bundle)
+            (Some(Published::Skin(p, _, _)), Some(l)) if Arc::ptr_eq(p, &l.bundle)
         );
         Arc::new(Mutex::new(Some(Images {
             entry: self.image.take(),
@@ -1093,7 +1224,18 @@ impl ResultSkin {
         if self.deferred.is_some() && self.job.is_none() && self.others().len() < 2 {
             self.retry_deferred();
         }
-        self.job.is_none() && self.waiting.is_none() && self.deferred.is_none()
+        // A permit wait tries the eviction and the take again at each poll,
+        // whatever was released, for the latest request only.
+        if self.job.is_none()
+            && let Some((request, view)) = self.permit_wait.take()
+            && self.latest.map(|(r, _)| r) == Some(request)
+        {
+            self.layout_for(request, view);
+        }
+        self.job.is_none()
+            && self.waiting.is_none()
+            && self.deferred.is_none()
+            && self.permit_wait.is_none()
     }
 
     fn landed(&mut self, out: LayoutOut, slot: &Slot) {
@@ -1101,6 +1243,21 @@ impl ResultSkin {
         let Laid { result, taken, .. } = out.laid;
         self.restore(taken, slot);
         let latest = self.latest.map(|(r, _)| r);
+        // Its runtime is the cell's from now when the latest request or the
+        // cache keeps its layout (retired by a later eviction once neither
+        // does); otherwise it is retired now.
+        let kept = match &result {
+            Ok(_) if latest == Some(out.request) => true,
+            Ok(_) => self.latest.is_some_and(|(_, v)| v == out.view),
+            Err(_) => false,
+        };
+        let script = if kept {
+            self.scripts.offer_result(out.script, false)
+        } else {
+            self.scripts.discard(out.script);
+            None
+        };
+        let result = result.map(|spec| Specialized { script, ..spec });
         match result {
             Ok(spec) if latest == Some(out.request) => {
                 // The facts the published layout read (dev-tools).
@@ -1113,7 +1270,7 @@ impl ResultSkin {
                         .map(|r| format!(" {:?}={:?}", r.fact, r.value))
                         .collect::<String>()
                 );
-                let p = Published::Skin(Arc::clone(&spec.bundle), spec.entry.clone());
+                let p = Published::Skin(Arc::clone(&spec.bundle), spec.entry.clone(), spec.script);
                 self.layout = Some(spec);
                 self.publish(p);
             }
@@ -1145,7 +1302,22 @@ impl ResultSkin {
     /// Whether a job runs or waits.
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn busy(&self) -> bool {
-        self.job.is_some() || self.waiting.is_some() || self.deferred.is_some()
+        self.job.is_some()
+            || self.waiting.is_some()
+            || self.deferred.is_some()
+            || self.permit_wait.is_some()
+    }
+
+    /// Whether a request waits for a permit (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn permit_waiting(&self) -> bool {
+        self.permit_wait.is_some()
+    }
+
+    /// The result runtimes' cell (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn scripts(&self) -> &Scripts {
+        &self.scripts
     }
 
     /// Cancels the job, if any, and waits for its thread: with no bound
@@ -1159,9 +1331,14 @@ impl ResultSkin {
         crate::dev::hold_result_settle();
         self.waiting = None;
         self.deferred = None;
+        self.permit_wait = None;
         if let Some((job, _, slot)) = self.job.take() {
             match job.finish(|| true, end_run) {
-                Ran::Done(out) => self.restore(out.laid.taken, &slot),
+                Ran::Done(out) => {
+                    self.restore(out.laid.taken, &slot);
+                    // No request wants it: the cell retires it.
+                    self.scripts.discard(out.script);
+                }
                 Ran::Refused(_) => self.restore(None, &slot),
                 // Its thread is detached and may still take the slot.
                 Ran::Abandoned => {}

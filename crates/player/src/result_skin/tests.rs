@@ -46,6 +46,7 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
          {reads}\n\
+         local rt_draw\n\
          {pre}\n\
          skin.source = {{ {{ id = \"s\", path = \"s.png\" }}, {{ id = \"b\", path = \"big.png\" }} }}\n\
          skin.image = {images}\n\
@@ -53,7 +54,7 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
                            digit = 4, ref = 71 }} }}\n\
          local d = {{ {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 4, h = 8 }} }} }} }}\n\
          for i, im in ipairs(skin.image) do\n\
-           d[#d + 1] = {{ id = im.id, op = {{ 90 }}, dst = {{ {{ x = 0, y = 300 + 20 * i, w = 8, h = 8 }} }} }}\n\
+           d[#d + 1] = {{ id = im.id, op = {{ 90 }}, draw = rt_draw, dst = {{ {{ x = 0, y = 300 + 20 * i, w = 8, h = 8 }} }} }}\n\
          end\n\
          skin.destination = d\n\
          return skin\n"
@@ -126,7 +127,7 @@ fn settled(rs: &mut ResultSkin) {
 /// The published bundle and the pages it shares.
 fn shown(rs: &ResultSkin) -> Arc<render::SkinBundle> {
     match rs.published().0 {
-        Some(Published::Skin(b, _)) => Arc::clone(b),
+        Some(Published::Skin(b, _, _)) => Arc::clone(b),
         other => panic!("{other:?}"),
     }
 }
@@ -433,7 +434,7 @@ impl Seen {
         if let Some(e) = rs.image() {
             self.0.push(Arc::downgrade(e.pages()));
         }
-        if let Some(Published::Skin(b, _)) = rs.published().0 {
+        if let Some(Published::Skin(b, _, _)) = rs.published().0 {
             self.0.push(Arc::downgrade(b.atlas_pages()));
         }
     }
@@ -1439,4 +1440,92 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     );
     assert_eq!(jobs_joined() - joined, 1, "the job's thread joined");
     assert!(!rs.busy());
+}
+
+/// A pending result skin whose dots' draw runs in the runtime.
+fn scripted_skin() -> tempfile::TempDir {
+    skin(
+        "local calls = 0 rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    )
+}
+
+/// The generation the published layout runs.
+fn shown_script(rs: &ResultSkin) -> crate::screens::ScriptGen {
+    match rs.published().0 {
+        Some(Published::Skin(_, _, Some(g))) => *g,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// s7-07-design §4 rule 4 (plan r2 MEDIUM): with both permits held, a
+/// view's request waits for one; a permit returned after the failed take
+/// is taken at the next poll, with no further release, and the layout
+/// lands with its runtime's generation.
+#[test]
+fn a_permit_wait_takes_a_permit_returned_after_the_failed_take() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    let held = [
+        rs.scripts().result_permit(None).unwrap(),
+        rs.scripts().result_permit(None).unwrap(),
+    ];
+    rs.request(view(5));
+    assert!(rs.permit_waiting() && !rs.has_job());
+    assert!(!rs.poll());
+    let [first, _second] = held;
+    drop(first);
+    settled(&mut rs);
+    let g = shown_script(&rs);
+    assert!(rs.scripts().result_live(Some(g)));
+}
+
+/// §3.7.1 M3: a cached layout is reused only while its generation lives:
+/// evicted, the same view lays out again, with a new generation.
+#[test]
+fn a_layout_is_reused_only_while_its_runtime_lives() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    rs.request(view(5));
+    settled(&mut rs);
+    let g = shown_script(&rs);
+    rs.request(view(5));
+    assert!(!rs.busy(), "reused");
+    // Nothing presented it: the eviction before a take retires it.
+    drop(rs.scripts().result_permit(None));
+    assert!(!rs.scripts().result_live(Some(g)));
+    rs.request(view(5));
+    assert!(rs.busy(), "laid out again");
+    settled(&mut rs);
+    assert_ne!(shown_script(&rs), g);
+}
+
+/// §3.7.1 M2 (plan r2 HIGH): the fixed skin's generation is retained:
+/// a view of it dropped (its staging refused) and an eviction leave it,
+/// and the next attempt publishes the same one.
+#[test]
+fn the_fixed_generation_serves_every_attempt() {
+    let _s = serial();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "rt.luaskin");
+    let scripts = crate::screens::Scripts::new();
+    let g = scripts.offer_result(slot, true);
+    assert!(g.is_some());
+    let mut rs = ResultSkin::new(Some(ResultStart::Fixed(bundle, g))).with_scripts(scripts.clone());
+    staged(&mut rs);
+    rs.request(view(5));
+    assert_eq!(Some(shown_script(&rs)), g);
+    drop(scripts.result_slot(g));
+    drop(scripts.result_permit(None));
+    rs.next_attempt();
+    staged(&mut rs);
+    rs.request(view(6));
+    assert_eq!(Some(shown_script(&rs)), g);
+    assert!(scripts.result_live(g));
 }

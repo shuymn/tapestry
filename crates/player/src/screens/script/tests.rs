@@ -343,3 +343,194 @@ fn a_stop_is_reported_once_per_screen() {
         None
     );
 }
+
+/// A result generation of the runtime fixture: the cell's generation and
+/// the flag its VM's destruction sets.
+fn offered(
+    scripts: &Scripts,
+    retained: bool,
+) -> (tempfile::TempDir, super::ScriptGen, Arc<AtomicBool>) {
+    let (dir, slot, vm) = staged();
+    let g = scripts.offer_result(slot, retained).expect("a generation");
+    (dir, g, vm)
+}
+
+fn live(scripts: &Scripts, g: super::ScriptGen) -> bool {
+    matches!(scripts.result_state(g), super::GenState::Live { .. })
+}
+
+/// s7-07-design §3.7.1 M1, C10: two result generations hold the two
+/// permits; a third offer is refused and its VM retired; generations are
+/// unique in the cell, and another cell's is gone here.
+#[test]
+fn two_result_generations_hold_the_permits() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, ga, va) = offered(&scripts, false);
+    let (_b, gb, vb) = offered(&scripts, false);
+    assert_ne!(ga, gb);
+    assert_eq!((scripts.permits_free(), scripts.result_entries()), (0, 2));
+    let (_c, third, vc) = staged();
+    assert_eq!(scripts.offer_result(third, false), None);
+    assert!(gone(&vc) && !gone(&va) && !gone(&vb));
+    assert!(!live(&Scripts::new(), ga), "another cell's generation");
+    // The run's end: a token retires both.
+    assert!(scripts.retire(Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(gone(&va) && gone(&vb));
+    assert_eq!(scripts.permits_free(), 2);
+}
+
+/// §4 rule 2, M5: the eviction before a take retires every parked
+/// generation but the presented one, the fixed skin's and the one kept;
+/// a view of an evicted generation is not committed, its commit not run.
+#[test]
+fn the_eviction_spares_the_presented_retained_and_kept() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, presented, va) = offered(&scripts, false);
+    let (_b, other, vb) = offered(&scripts, false);
+    assert_eq!(
+        scripts.commit_view(Some(presented), || true),
+        super::ViewCommit::Committed
+    );
+    let permit = scripts.result_permit(None).expect("the evicted permit");
+    assert!(gone(&vb) && !gone(&va));
+    assert!(live(&scripts, presented) && !live(&scripts, other));
+    let mut ran = false;
+    assert_eq!(
+        scripts.commit_view(Some(other), || {
+            ran = true;
+            true
+        }),
+        super::ViewCommit::Gone
+    );
+    assert!(!ran);
+    drop(permit);
+    // A kept generation survives; the presented mark moves with a commit,
+    // so the formerly presented one is evicted after.
+    let (_c, kept, vc) = offered(&scripts, false);
+    assert_eq!(
+        scripts.commit_view(None, || true),
+        super::ViewCommit::Committed
+    );
+    let again = scripts.result_permit(Some(kept));
+    assert!(again.is_some());
+    assert!(gone(&va) && !gone(&vc));
+    let scripts = Scripts::new();
+    let (_d, fixed, vd) = offered(&scripts, true);
+    assert!(scripts.result_permit(None).is_some());
+    assert!(!gone(&vd) && live(&scripts, fixed));
+}
+
+/// M9 (plan r2 HIGH): a view discarded (a refusal, the pin, a switch)
+/// releases only its reference: a same-generation prepared slot dropped
+/// while the presented one runs keeps the generation live and running,
+/// its permit held, and the runtime resumes after parking.
+#[test]
+fn a_discarded_view_of_the_presented_generation_retires_nothing() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, g, vm) = offered(&scripts, false);
+    let notes = super::ScriptNotes::default();
+    let mut presented = scripts.result_slot(Some(g));
+    assert!(presented.result_running(&notes).is_some());
+    let prepared = scripts.result_slot(Some(g));
+    drop(prepared);
+    assert!(!gone(&vm) && live(&scripts, g));
+    assert_eq!(scripts.permits_free(), 1);
+    assert!(presented.result_running(&notes).is_some(), "still running");
+    presented.park();
+    assert!(
+        scripts
+            .result_slot(Some(g))
+            .result_running(&notes)
+            .is_some()
+    );
+}
+
+/// A switch that keeps the layout moves the running runtime to the new
+/// view's slot; a slot of another generation takes nothing from it.
+#[test]
+fn a_same_generation_switch_moves_the_running_runtime() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, g, _) = offered(&scripts, false);
+    let (_b, h, _) = offered(&scripts, false);
+    let notes = super::ScriptNotes::default();
+    let mut old = scripts.result_slot(Some(g));
+    assert!(old.result_running(&notes).is_some());
+    let mut other = scripts.result_slot(Some(h));
+    other.transfer_from(&mut old);
+    assert!(old.runs() && !other.runs());
+    let mut new = scripts.result_slot(Some(g));
+    new.transfer_from(&mut old);
+    assert!(new.runs() && !old.runs());
+}
+
+/// M9: a slot re-reads its generation at each use: once disabled, the
+/// runtime it holds is given back and retired, nothing runs, and a later
+/// offer is refused.
+#[test]
+fn a_running_slot_rechecks_its_generation() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, g, vm) = offered(&scripts, false);
+    let notes = super::ScriptNotes::default();
+    let mut slot = scripts.result_slot(Some(g));
+    assert!(slot.result_running(&notes).is_some());
+    scripts.disable_result();
+    assert!(!gone(&vm), "running: retired as its slot gives it back");
+    assert!(slot.result_running(&notes).is_none());
+    assert!(gone(&vm));
+    assert_eq!(scripts.permits_free(), 2);
+    let (_b, late, vl) = staged();
+    assert_eq!(scripts.offer_result(late, false), None);
+    assert!(gone(&vl));
+}
+
+/// C6, C11 on result: while a play's interval is open no result slot
+/// takes its runtime, and a retirement then destroys nothing until the
+/// close's token.
+#[test]
+fn a_result_runtime_waits_out_the_interval() {
+    let _serial = crate::imports::tests::serial();
+    let scripts = Scripts::new();
+    let (_a, g, vm) = offered(&scripts, false);
+    let notes = super::ScriptNotes::default();
+    let mut slot = scripts.result_slot(Some(g));
+    assert!(slot.result_running(&notes).is_some());
+    slot.park();
+    let interval = scripts.open_interval();
+    assert!(slot.result_running(&notes).is_none());
+    scripts.disable_result();
+    assert!(!gone(&vm));
+    let closed = interval.close();
+    assert!(scripts.retire(Quiet::Closed(closed)));
+    assert!(gone(&vm));
+}
+
+/// O6, M7: a slot taking its runtime gives it the lifetime's notes.
+#[test]
+fn a_taken_runtime_writes_to_the_lifetimes_notes() {
+    let _serial = crate::imports::tests::serial();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) =
+        crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "stop.luaskin");
+    let scripts = Scripts::new();
+    let g = scripts.offer_result(slot, false).unwrap();
+    let notes = super::ScriptNotes::default();
+    let mut s = scripts.result_slot(Some(g));
+    let mut sel = bundle.skin().prepare_selection();
+    for _ in 0..4 {
+        if let Some(rt) = s.result_running(&notes) {
+            let (fields, timers) = sel.runtime_parts();
+            rt.frame(fields, timers);
+        }
+    }
+    let (kept, _) = notes.notes();
+    assert!(
+        kept.iter()
+            .any(|n| matches!(n, skin_beatoraja::lua::runtime::RuntimeNote::Stopped(_))),
+        "{kept:?}"
+    );
+}

@@ -30,20 +30,29 @@
 //!   destroys only when the token is this cell's, of the current epoch,
 //!   and no interval is open, and otherwise retires the runtimes into the
 //!   deferred set, as the render thread does during the interval.
+//! - **Result generations.** The result kind keeps up to
+//!   [`RESULT_VMS`] runtimes, each a generation ([`ScriptGen`]) unique in
+//!   the cell, apart from the result's GPU installations (s7-07-design
+//!   §3.7.1): one enters by an import's [`Scripts::offer_result`] and
+//!   leaves by a retirement only: the game's eviction before a permit is
+//!   taken ([`Scripts::result_permit`]), the run's disable, or the run's
+//!   end. A view's slot names its generation; the presented view's slot
+//!   takes the runtime at its frame and re-reads the entry at each use.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use skin_beatoraja::lua::runtime::{ScreenRuntime, Stopped};
+use skin_beatoraja::lua::runtime::{NoteBook, Permit, Pool, ScreenRuntime, Stopped};
 use skin_model::ScreenKind;
 
 /// The kinds that keep a runtime, by their index in [`ScriptHost`].
 pub(in crate::screens) const fn index(kind: ScreenKind) -> Option<usize> {
     match kind {
         ScreenKind::Selection => Some(0),
-        ScreenKind::Result => Some(1),
-        ScreenKind::Play | ScreenKind::Decision => None,
+        // The result's runtimes are generations apart from its GPU
+        // installations ([`Scripts::offer_result`]).
+        ScreenKind::Result | ScreenKind::Play | ScreenKind::Decision => None,
     }
 }
 
@@ -70,12 +79,36 @@ pub(in crate::screens) struct Entry {
     pub(in crate::screens) held: Held,
 }
 
+/// The result runtimes the cell keeps at most: its permits.
+pub(in crate::screens) const RESULT_VMS: usize = 2;
+
+/// A result generation's entry.
+#[derive(Debug)]
+pub(in crate::screens) struct ResultEntry {
+    pub(in crate::screens) generation: u64,
+    pub(in crate::screens) held: Held,
+    /// The fixed skin's: never evicted, only disabled or retired at the
+    /// run's end.
+    pub(in crate::screens) retained: bool,
+}
+
 /// Every kind's entry, the runtimes retired while the interval was open
 /// (destroyed at the next retirement outside it), and the interval's
 /// state.
 #[derive(Debug, Default)]
 pub(in crate::screens) struct ScriptHost {
     pub(in crate::screens) entries: [Entry; 2],
+    /// The result generations with a runtime, parked or running; a
+    /// running one retired stays as `Retired` until its slot gives the
+    /// runtime back.
+    pub(in crate::screens) results: Vec<ResultEntry>,
+    /// The generation of the view presented last, protected from eviction
+    /// even while parked.
+    pub(in crate::screens) presented: Option<u64>,
+    /// The last generation given: one counter for the cell.
+    pub(in crate::screens) generations: u64,
+    /// The run's result kind is disabled: no runtime is offered again.
+    pub(in crate::screens) results_disabled: bool,
     pub(in crate::screens) doomed: Vec<ScreenRuntime>,
     /// The play intervals open: from a play's start to its end.
     pub(in crate::screens) open: u32,
@@ -95,6 +128,97 @@ impl ScriptHost {
             self.doomed.clear();
         }
     }
+
+    /// The entry of result generation `generation`, if it has one.
+    pub(in crate::screens) fn result(&mut self, generation: u64) -> Option<&mut ResultEntry> {
+        self.results.iter_mut().find(|e| e.generation == generation)
+    }
+
+    /// Retires every result entry `doomed` picks among the parked ones,
+    /// and marks the running ones it picks retired: their slots give
+    /// their runtimes back.
+    pub(in crate::screens) fn retire_results(
+        &mut self,
+        mut doomed: impl FnMut(&ResultEntry) -> bool,
+    ) {
+        let mut i = 0;
+        while let Some(e) = self.results.get_mut(i) {
+            if !doomed(e) {
+                i += 1;
+                continue;
+            }
+            if matches!(e.held, Held::Running | Held::Retired) {
+                e.held = Held::Retired;
+                i += 1;
+                continue;
+            }
+            let e = self.results.swap_remove(i);
+            if let Held::Parked(rt) = e.held {
+                self.retire_runtime(rt);
+            }
+        }
+    }
+
+    /// A runtime of result generation `generation` given back by its
+    /// slot: parked while its entry is running, else retired with its
+    /// entry.
+    pub(in crate::screens) fn give_back(&mut self, generation: u64, rt: Box<ScreenRuntime>) {
+        match self.result(generation) {
+            Some(e) if matches!(e.held, Held::Running) => e.held = Held::Parked(rt),
+            _ => {
+                self.results
+                    .retain(|e| !(e.generation == generation && matches!(e.held, Held::Retired)));
+                self.retire_runtime(rt);
+            }
+        }
+    }
+}
+
+/// A result generation: its cell and the cell's generation number, unique
+/// in the process together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptGen {
+    pub(in crate::screens) cell: u64,
+    pub(in crate::screens) generation: u64,
+}
+
+/// What a result generation is now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GenState {
+    /// Parked or running; `stopped` when its runtime stopped.
+    Live { stopped: bool },
+    /// Retired, or never this cell's: a view of it runs nothing and is
+    /// not reused.
+    Gone,
+}
+
+/// How [`Scripts::commit_view`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewCommit {
+    /// The view's generation is gone: nothing was committed.
+    Gone,
+    /// The commit itself failed.
+    Refused,
+    /// Committed and marked presented.
+    Committed,
+}
+
+/// A result permit, taken for a job that may keep a runtime: returned when
+/// dropped, or with the runtime it is attached to.
+#[derive(Debug)]
+pub(crate) struct ScriptPermit(pub(in crate::screens) Permit);
+
+/// The notes of one result lifetime, shared by every runtime that runs in
+/// it (s7-07-design §3.7.1 M7).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScriptNotes(pub(in crate::screens) NoteBook);
+
+impl ScriptNotes {
+    /// The notes kept, and the further ones counted (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn notes(&self) -> (Vec<skin_beatoraja::lua::runtime::RuntimeNote>, u64) {
+        self.0.notes()
+    }
 }
 
 /// The cells made so far: each takes the next number, so a token names
@@ -109,14 +233,23 @@ pub(in crate::screens) struct ScriptCell {
     pub(in crate::screens) host: Mutex<ScriptHost>,
     /// The render thread has ended, however it ended.
     pub(in crate::screens) orphaned: AtomicBool,
+    /// The result runtimes' permits.
+    pub(in crate::screens) pool: Pool,
 }
 
 impl Default for ScriptCell {
     fn default() -> Self {
         Self {
             id: CELLS.fetch_add(1, Ordering::Relaxed),
-            host: Mutex::default(),
+            // Retirements during an interval wait here: room for every
+            // runtime the cell can hold, so none allocates then.
+            host: Mutex::new(ScriptHost {
+                doomed: Vec::with_capacity(RESULT_VMS + 2),
+                results: Vec::with_capacity(RESULT_VMS),
+                ..ScriptHost::default()
+            }),
             orphaned: AtomicBool::default(),
+            pool: Pool::new(RESULT_VMS),
         }
     }
 }
@@ -237,6 +370,19 @@ impl Scripts {
                 host.doomed.push(*rt);
             }
         }
+        let mut i = 0;
+        while let Some(e) = host.results.get_mut(i) {
+            if let Held::Parked(_) = e.held {
+                let e = host.results.swap_remove(i);
+                if let Held::Parked(rt) = e.held {
+                    host.doomed.push(*rt);
+                }
+            } else {
+                e.held = Held::Retired;
+                i += 1;
+            }
+        }
+        host.results_disabled = true;
         let quiet = stamp.cell == self.0.id && stamp.epoch == host.epoch && host.open == 0;
         if quiet {
             // Under the lock: no interval opens while they are destroyed.
@@ -267,6 +413,154 @@ impl Scripts {
         match &host.entries.get(index(kind)?)?.held {
             Held::Parked(rt) => Some((rt.counters().calls, rt.stopped().is_some())),
             _ => None,
+        }
+    }
+
+    /// Keeps the runtime `staged` carries, if any, as a new result
+    /// generation, parked; `retained` for the fixed skin's, which no
+    /// eviction retires. The runtime takes a permit if it holds none. On
+    /// the game thread, when an import lands. `None`, the runtime retired,
+    /// once the run's result kind is disabled or with no permit free.
+    pub(crate) fn offer_result(&self, staged: ScriptSlot, retained: bool) -> Option<ScriptGen> {
+        let mut rt = staged.into_staged()?;
+        let mut host = self.0.host();
+        if !host.results_disabled && !rt.holds_permit() {
+            match self.0.pool.take() {
+                Some(p) => {
+                    let _ = rt.attach_permit(p);
+                }
+                None => {
+                    host.retire_runtime(rt);
+                    return None;
+                }
+            }
+        }
+        if host.results_disabled {
+            host.retire_runtime(rt);
+            return None;
+        }
+        host.generations = host.generations.wrapping_add(1);
+        let generation = host.generations;
+        host.results.push(ResultEntry {
+            generation,
+            held: Held::Parked(rt),
+            retained,
+        });
+        Some(ScriptGen {
+            cell: self.0.id,
+            generation,
+        })
+    }
+
+    /// Retires the runtime `staged` carries, if any: a landing no request
+    /// keeps. Through the cell, so it waits for an open interval's end.
+    pub(crate) fn discard(&self, staged: ScriptSlot) {
+        if let Some(rt) = staged.into_staged() {
+            self.0.host().retire_runtime(rt);
+        }
+    }
+
+    /// What result generation `g` is now.
+    #[must_use]
+    pub(crate) fn result_state(&self, g: ScriptGen) -> GenState {
+        if g.cell != self.0.id {
+            return GenState::Gone;
+        }
+        let mut host = self.0.host();
+        match host.result(g.generation).map(|e| &e.held) {
+            Some(Held::Parked(rt)) => GenState::Live {
+                stopped: rt.stopped().is_some(),
+            },
+            Some(Held::Running) => GenState::Live { stopped: false },
+            _ => GenState::Gone,
+        }
+    }
+
+    /// Whether result generation `g`, if any, can still run: `None` (no
+    /// runtime needed) or live.
+    #[must_use]
+    pub(crate) fn result_live(&self, g: Option<ScriptGen>) -> bool {
+        g.is_none_or(|g| matches!(self.result_state(g), GenState::Live { .. }))
+    }
+
+    /// A permit for a job that may keep a result runtime, after the
+    /// eviction (s7-07-design §4 rule 2): every parked result generation
+    /// but the presented one, the fixed skin's and `keep` is retired
+    /// first. `None` when both permits stay held. On the game thread.
+    pub(crate) fn result_permit(&self, keep: Option<ScriptGen>) -> Option<ScriptPermit> {
+        {
+            let mut host = self.0.host();
+            let presented = host.presented;
+            let kept = keep.filter(|k| k.cell == self.0.id).map(|k| k.generation);
+            host.retire_results(|e| {
+                matches!(e.held, Held::Parked(_))
+                    && !e.retained
+                    && Some(e.generation) != presented
+                    && Some(e.generation) != kept
+            });
+        }
+        self.0.pool.take().map(ScriptPermit)
+    }
+
+    /// The permits free now (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn permits_free(&self) -> usize {
+        self.0.pool.free()
+    }
+
+    /// The result generations with an entry (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_entries(&self) -> usize {
+        self.0.host().results.len()
+    }
+
+    /// The run's result kind is disabled: every result generation retires,
+    /// a running one as its slot gives it back, and none is offered again.
+    pub(crate) fn disable_result(&self) {
+        let mut host = self.0.host();
+        host.results_disabled = true;
+        host.presented = None;
+        host.retire_results(|_| true);
+    }
+
+    /// Commits a view of result generation `next` (none for a view with no
+    /// runtime) under one hold of the host's lock: its generation checked
+    /// live, then `commit` (the GPU commit, which must neither park nor
+    /// drop a slot), then the generation marked presented. A generation
+    /// gone is not committed, so an evicted view never presents.
+    pub(crate) fn commit_view(
+        &self,
+        next: Option<ScriptGen>,
+        commit: impl FnOnce() -> bool,
+    ) -> ViewCommit {
+        let mut host = self.0.host();
+        if let Some(g) = next {
+            let live = g.cell == self.0.id
+                && host
+                    .result(g.generation)
+                    .is_some_and(|e| matches!(e.held, Held::Parked(_) | Held::Running));
+            if !live {
+                return ViewCommit::Gone;
+            }
+        }
+        if !commit() {
+            return ViewCommit::Refused;
+        }
+        host.presented = next.map(|g| g.generation);
+        ViewCommit::Committed
+    }
+
+    /// A result view's slot for generation `g`; empty for none.
+    #[must_use]
+    pub(crate) fn result_slot(&self, g: Option<ScriptGen>) -> ScriptSlot {
+        match g {
+            Some(g) if g.cell == self.0.id => ScriptSlot(Slot::Result {
+                cell: Arc::clone(&self.0),
+                generation: g.generation,
+                running: None,
+                noticed: false,
+            }),
+            _ => ScriptSlot::default(),
         }
     }
 
@@ -356,6 +650,15 @@ pub(in crate::screens) enum Slot {
         /// Its runtime's stop was reported.
         noticed: bool,
     },
+    /// A result view's slot for its generation, with the runtime it took
+    /// when it is the presented view's.
+    Result {
+        cell: Arc<ScriptCell>,
+        generation: u64,
+        running: Option<Box<ScreenRuntime>>,
+        /// Its runtime's stop was reported.
+        noticed: bool,
+    },
 }
 
 /// Why a screen's runtime stopped, reported once per screen
@@ -402,6 +705,103 @@ impl ScriptSlot {
     #[must_use]
     pub(crate) fn staged(runtime: Option<ScreenRuntime>) -> Self {
         Self(runtime.map_or(Slot::Empty, |rt| Slot::Staged(Box::new(rt))))
+    }
+
+    /// [`staged`](Self::staged), the runtime holding `permit`; with no
+    /// runtime the permit returns here.
+    #[must_use]
+    pub(crate) fn staged_with(
+        runtime: Option<ScreenRuntime>,
+        permit: Option<ScriptPermit>,
+    ) -> Self {
+        let Some(mut rt) = runtime else {
+            return Self::default();
+        };
+        if let Some(ScriptPermit(p)) = permit {
+            let _ = rt.attach_permit(p);
+        }
+        Self(Slot::Staged(Box::new(rt)))
+    }
+
+    /// The runtime of the presented result view's slot this frame, its
+    /// notes going to `notes` once taken: the one it holds while its
+    /// generation is still running, else its generation's parked one,
+    /// taken unless a play's interval is open; `None` without one. A
+    /// runtime whose generation was retired is given back to be retired,
+    /// and nothing runs.
+    pub(in crate::screens) fn result_running(
+        &mut self,
+        notes: &ScriptNotes,
+    ) -> Option<&mut ScreenRuntime> {
+        let Slot::Result {
+            cell,
+            generation,
+            running,
+            ..
+        } = &mut self.0
+        else {
+            return None;
+        };
+        let mut host = cell.host();
+        let live = host
+            .result(*generation)
+            .is_some_and(|e| matches!(e.held, Held::Running));
+        if let Some(rt) = running.take_if(|_| !live) {
+            host.give_back(*generation, rt);
+        }
+        if running.is_none()
+            && host.open == 0
+            && let Some(e) = host.result(*generation)
+            && matches!(e.held, Held::Parked(_))
+            && let Held::Parked(rt) = std::mem::replace(&mut e.held, Held::Running)
+        {
+            rt.use_notes(&notes.0);
+            *running = Some(rt);
+        }
+        drop(host);
+        running.as_deref_mut()
+    }
+
+    /// Moves the runtime `old` holds into this slot when both are slots of
+    /// one result generation: a view switch that keeps its layout, at its
+    /// successful commit.
+    pub(crate) fn transfer_from(&mut self, old: &mut Self) {
+        if let (
+            Slot::Result {
+                generation: g,
+                running,
+                noticed,
+                ..
+            },
+            Slot::Result {
+                generation: og,
+                running: orun,
+                noticed: onoticed,
+                ..
+            },
+        ) = (&mut self.0, &mut old.0)
+            && g == og
+            && running.is_none()
+        {
+            *running = orun.take();
+            *noticed = *onoticed;
+        }
+    }
+
+    /// Whether it holds a running runtime (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub(crate) fn runs(&self) -> bool {
+        matches!(
+            self.0,
+            Slot::Result {
+                running: Some(_),
+                ..
+            } | Slot::Bound {
+                running: Some(_),
+                ..
+            }
+        )
     }
 
     /// Whether it holds a runtime (tests).
@@ -459,13 +859,18 @@ impl ScriptSlot {
     /// Why the runtime it holds stopped, the first time it is asked after
     /// the stop; `None` before, after, and without one.
     pub(in crate::screens) fn stop(&mut self) -> Option<ScriptStop> {
-        let Slot::Bound {
-            running: Some((rt, _)),
-            noticed,
-            ..
-        } = &mut self.0
-        else {
-            return None;
+        let (rt, noticed) = match &mut self.0 {
+            Slot::Bound {
+                running: Some((rt, _)),
+                noticed,
+                ..
+            }
+            | Slot::Result {
+                running: Some(rt),
+                noticed,
+                ..
+            } => (rt, noticed),
+            _ => return None,
         };
         let stopped = rt.stopped().filter(|_| !*noticed)?;
         *noticed = true;
@@ -475,6 +880,18 @@ impl ScriptSlot {
     /// Puts the runtime it holds back in the cell, parked when its
     /// generation is still current, else retired.
     pub(crate) fn park(&mut self) {
+        if let Slot::Result {
+            cell,
+            generation,
+            running,
+            ..
+        } = &mut self.0
+        {
+            if let Some(rt) = running.take() {
+                cell.host().give_back(*generation, rt);
+            }
+            return;
+        }
         let Slot::Bound {
             cell,
             kind,
@@ -510,9 +927,12 @@ impl ScriptSlot {
     /// replaces an earlier [`on_vm_drop`](Self::on_vm_drop).
     pub(crate) fn on_vm_teardown(&self, f: impl FnOnce() + Send + 'static) {
         let rt = match &self.0 {
-            Slot::Staged(rt) => Some(rt),
+            Slot::Staged(rt)
+            | Slot::Result {
+                running: Some(rt), ..
+            } => Some(rt),
             Slot::Bound { running, .. } => running.as_ref().map(|(rt, _)| rt),
-            Slot::Empty => None,
+            Slot::Empty | Slot::Result { .. } => None,
         };
         if let Some(rt) = rt {
             rt.on_vm_drop(f);

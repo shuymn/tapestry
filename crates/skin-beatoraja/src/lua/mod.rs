@@ -1038,6 +1038,21 @@ impl LuaHeader {
             .map_err(|refused| refused.0)
     }
 
+    /// [`Self::import_runtime`], a refusal with the facts it read, as
+    /// [`Self::import_reading`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import_runtime`] refuses, with the facts read.
+    pub fn import_runtime_reading(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
+        self.import_keeping(config, facts, cancel, true)
+    }
+
     fn import_keeping(
         &self,
         config: &Config,

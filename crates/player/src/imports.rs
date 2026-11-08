@@ -546,14 +546,14 @@ fn built(
     let config = config(pass.header(), choice)?;
     // 4. The import.
     let header = pass.header().clone();
-    // A selection skin keeps its configured VM for the callbacks only its
-    // runtime runs (docs/stage3.md S7-07).
+    // A selection or result skin keeps its configured VM for the callbacks
+    // only its runtime runs (docs/stage3.md S7-07).
     let mut script = ScriptSlot::default();
     let imported: Result<Imported, ImportError> = match pass {
         Pass::Json(mut def, _) => skin_beatoraja::import(&mut def, &header, &config, kind),
         Pass::Lua(h) => {
             let facts = ImportFacts::base(kind, Fact::Known(autoplay));
-            let outcome = if kind == ScreenKind::Selection {
+            let outcome = if matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
                 h.import_runtime(&config, &facts, cancel)
             } else {
                 h.import(&config, &facts, cancel)
@@ -1279,8 +1279,16 @@ pub fn startup(
             // A result skin with no fact pending: installed as the result
             // kind's, for every chart (the S10-09i design's D2). Refused, it
             // is tried again after each attempt's commit.
-            Ran::Done(KindOutcome::Bundle(bundle, summary, _)) if kind == ScreenKind::Result => {
-                started.result = Some(crate::result_skin::ResultStart::Fixed(Arc::clone(&bundle)));
+            // Its runtime is the run's, whatever its installation does
+            // (s7-07-design §3.7.1 M2): offered here, retained.
+            Ran::Done(KindOutcome::Bundle(bundle, summary, script))
+                if kind == ScreenKind::Result =>
+            {
+                let script = render.scripts().offer_result(script, true);
+                started.result = Some(crate::result_skin::ResultStart::Fixed(
+                    Arc::clone(&bundle),
+                    script,
+                ));
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 match answered(kind, render.select(kind, Some(bundle)), &mut stop)? {
                     None => {

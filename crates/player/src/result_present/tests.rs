@@ -120,11 +120,20 @@ fn a_switch_under_the_same_bundle_publishes_a_new_revision() {
     let b = bundle();
     p.begin(&mut sent, TimeUs(5));
     let k1 = p.want(snapshot("v1"));
-    p.land(&mut sent, Some(&Published::Skin(Arc::clone(&b), None)));
+    p.land(
+        &mut sent,
+        Some(&Published::Skin(Arc::clone(&b), None, None)),
+    );
     // The same layout landing again publishes nothing.
-    p.land(&mut sent, Some(&Published::Skin(Arc::clone(&b), None)));
+    p.land(
+        &mut sent,
+        Some(&Published::Skin(Arc::clone(&b), None, None)),
+    );
     let k2 = p.want(snapshot("v2"));
-    p.land(&mut sent, Some(&Published::Skin(Arc::clone(&b), None)));
+    p.land(
+        &mut sent,
+        Some(&Published::Skin(Arc::clone(&b), None, None)),
+    );
     let got: Vec<(u64, ViewKey, u64)> = sent
         .shown
         .iter()
@@ -149,7 +158,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
     let b = bundle();
-    let skin = Published::Skin(Arc::clone(&b), None);
+    let skin = Published::Skin(Arc::clone(&b), None, None);
     p.begin(&mut sent, TimeUs(0));
     let k1 = p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin));
@@ -191,7 +200,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
 fn attempt_and_run_fallbacks_show_the_built_in_result() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
-    let skin = Published::Skin(bundle(), None);
+    let skin = Published::Skin(bundle(), None, None);
     p.attempt_fallback("refused upload".to_owned());
     p.begin(&mut sent, TimeUs(0));
     p.want(snapshot("v1"));
@@ -225,7 +234,7 @@ fn attempt_and_run_fallbacks_show_the_built_in_result() {
 fn the_barrier_keeps_the_view_and_merges_the_overlay() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
-    let skin = Published::Skin(bundle(), None);
+    let skin = Published::Skin(bundle(), None, None);
     p.begin(&mut sent, TimeUs(0));
     let k1 = p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin));
