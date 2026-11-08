@@ -960,6 +960,62 @@ mod tests {
         }
     }
 
+    /// Ids the result profile bridges to an equal id read the same state
+    /// as it, and 426 and 427 sum their counts: with no result every one
+    /// is hidden; with one, each gives its bridged id's value.
+    #[test]
+    fn equal_result_ids_read_as_their_bridged_id() {
+        use skin_model::result_field as f;
+        let mut s = Screen::new(Result);
+        s.fields = vec![0; skin_model::RESULT.fields.len()];
+        let ids = [
+            45, 80, 84, 101, 105, 106, 108, 115, 116, 128, 153, 155, 156, 174, 177, 426, 427,
+        ];
+        for id in ids {
+            assert_eq!(s.number(id), Some(HIDDEN), "{id}");
+        }
+        for (field, v) in [
+            (f::RESULT_VALID, 1),
+            (f::RESULT_RATE_VALID, 1),
+            (f::CHART_NOTES_VALID, 1),
+            (f::CHART_LEVEL_VALID, 1),
+            (f::CHART_LEVEL, 12),
+            (f::EX_SCORE, 1_234),
+            (f::MAX_COMBO, 56),
+            (f::RESULT_BP, 7),
+            (f::CHART_NOTES, 900),
+            (f::COUNT_PERFECT, 500),
+            (f::COUNT_BAD, 3),
+            (f::COUNT_POOR, 4),
+            (f::COUNT_EMPTY_POOR, 5),
+            (f::RATE_CURRENT_BP, 6_855),
+        ] {
+            s.fields[usize::from(field)] = v;
+        }
+        for (id, want) in [
+            (45, 12),
+            (49, 12),
+            (80, 500),
+            (84, 4),
+            (101, 1_234),
+            (108, 1_234),
+            (128, 1_234),
+            (153, 1_234),
+            (105, 56),
+            (174, 56),
+            (106, 900),
+            (177, 7),
+            (115, 68),
+            (155, 68),
+            (116, 55),
+            (156, 55),
+            (426, 9),
+            (427, 12),
+        ] {
+            assert_eq!(s.number(id), Some(want), "{id}");
+        }
+    }
+
     /// O8: the source's values with the feature absent, row by row; ids
     /// with no such value, or a present one, give none.
     #[test]

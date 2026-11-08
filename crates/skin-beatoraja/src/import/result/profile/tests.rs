@@ -38,24 +38,25 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
 /// 51 N, 34 D.
 const NUMERIC: &[(i32, i32, C)] = &[
     (21, 25, C::D),
+    (45, 49, C::N),
     (71, 71, C::N),
     (74, 76, C::N),
+    (80, 84, C::N),
     (90, 91, C::N),
     (96, 96, C::N),
-    (102, 103, C::N),
-    (107, 107, C::N),
-    (110, 114, C::N),
+    (101, 103, C::N),
+    (105, 108, C::N),
+    (110, 116, C::N),
+    (128, 128, C::N),
     (150, 150, C::N),
     (151, 151, C::D),
-    (152, 152, C::N),
-    (153, 153, C::D),
-    (154, 154, C::N),
+    (152, 156, C::N),
     (157, 158, C::D),
     (170, 172, C::N),
     (173, 173, C::D),
+    (174, 174, C::N),
     (175, 175, C::D),
-    (176, 176, C::N),
-    (178, 178, C::N),
+    (176, 178, C::N),
     (179, 180, C::D),
     (182, 182, C::D),
     (183, 184, C::N),
@@ -63,7 +64,7 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (370, 375, C::N),
     (380, 399, C::D),
     (407, 407, C::N),
-    (410, 425, C::N),
+    (410, 427, C::N),
     (1163, 1164, C::N),
 ];
 
@@ -139,7 +140,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (51, 34));
+    assert_eq!((count(C::N), count(C::D)), (75, 33));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
@@ -182,7 +183,7 @@ fn every_profile_id_has_its_class() {
     };
     for id in 0..=3_000 {
         let want = match id {
-            71 | 171 => Some(EssentialPart::ResultScore),
+            71 | 101 | 171 => Some(EssentialPart::ResultScore),
             370 => Some(EssentialPart::ResultStatus),
             _ => None,
         };
