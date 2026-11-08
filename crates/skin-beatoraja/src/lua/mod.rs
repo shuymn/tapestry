@@ -1196,6 +1196,7 @@ impl LuaHeader {
     /// kind ([`ImportError::Slot`]), or of a kind no importer maps yet
     /// ([`ImportError::NoImporter`]), refuses before the configured pass
     /// runs, so no asset or configured-only include is read.
+    #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn configured(
         &self,
         config: &Config,

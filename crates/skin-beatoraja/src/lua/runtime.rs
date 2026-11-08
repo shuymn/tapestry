@@ -463,7 +463,8 @@ impl Drop for Permit {
 /// its permit, so a permit returns only once the VM is destroyed.
 pub struct ScreenRuntime {
     sites: Vec<(Site, Function)>,
-    lua: Lua,
+    /// The VM, held so its functions stay callable.
+    _lua: Lua,
     pass: Arc<Pass>,
     status: Vec<CallStatus>,
     stopped: Option<Stopped>,
@@ -528,7 +529,7 @@ impl ScreenRuntime {
         let status = vec![CallStatus::Skipped; sites.len()];
         Some(Self {
             sites,
-            lua,
+            _lua: lua,
             pass,
             status,
             stopped: None,
@@ -707,10 +708,7 @@ impl ScreenRuntime {
             Some(LuaWhy::Limit(LuaLimit::Memory)) => Why::Memory,
             Some(LuaWhy::Limit(_)) => Why::Budget,
             Some(LuaWhy::ImportOnly) => Why::ImportOnly,
-            _ => {
-                let _ = &self.lua;
-                Why::Error
-            }
+            _ => Why::Error,
         }
     }
 }
