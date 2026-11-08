@@ -320,14 +320,16 @@ fn file_attempts() {
 
 #[test]
 fn total_file_bytes() {
-    // Valid headers padded (sparsely) to the per-file maximum: 16 reach
-    // the total exactly; one more byte is past it.
-    let per = MAX_TOTAL_FILE_BYTES / 16;
+    // Valid headers padded (sparsely) to the per-file maximum: eight reach
+    // the total exactly; a ninth, one byte or more, is past it.
+    const N: usize = 8;
+    let per = skin_model::MAX_FILE_BYTES;
+    assert_eq!(per * N as u64, MAX_TOTAL_FILE_BYTES);
     let padded = |n: usize, last: u64| {
         move |d: &std::path::Path| {
             for i in 0..n {
                 png(d, &format!("p{i}.png"), 1, 1);
-                let len = if i == 16 { last } else { per };
+                let len = if i == N { last } else { per };
                 let f = fs::OpenOptions::new()
                     .write(true)
                     .open(d.join(format!("p{i}.png")))
@@ -336,18 +338,18 @@ fn total_file_bytes() {
             }
         }
     };
-    let l = load_bare(&files_skin(16), padded(16, 0));
-    assert_eq!(l.report().usage.files, 16);
+    let l = load_bare(&files_skin(N), padded(N, 0));
+    assert_eq!(l.report().usage.files, as_u32(N));
     let small = fs::metadata(l.dir.path().join("p0.png")).unwrap().len();
     assert_eq!(small, per);
-    // The 17th is a one-texel PNG of its own length.
+    // The ninth is a one-texel PNG of its own length.
     let png_len = {
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "x.png", 1, 1);
         fs::metadata(d.path().join("x.png")).unwrap().len()
     };
     limit(
-        load_bare(&files_skin(17), padded(17, png_len)),
+        load_bare(&files_skin(N + 1), padded(N + 1, png_len)),
         ImportLimit::FileTotals,
     );
 }
