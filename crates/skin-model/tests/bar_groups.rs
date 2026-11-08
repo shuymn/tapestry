@@ -50,6 +50,7 @@ fn group(image: u32, r: [i32; 4], follow: Follow) -> BarGroupDef {
         place: Place {
             region: Region::Playfield,
             follow,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         },
     }

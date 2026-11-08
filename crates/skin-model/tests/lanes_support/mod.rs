@@ -153,6 +153,7 @@ pub fn bar_group(y: i32, h: i32) -> BarGroupDef {
             region: Region::Playfield,
             bind: Bind::Lanes,
             follow: Follow::Lift,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         },
     }
@@ -332,6 +333,7 @@ pub fn paint(index: u32, r: [i32; 4], follow: Follow) -> ElementDef {
         place: Place {
             region: Region::Playfield,
             follow,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         },
     }

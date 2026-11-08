@@ -512,6 +512,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                     place: Place {
                         bind: Bind::Lanes,
                         follow: Follow::Lift,
+                        angle: skin_model::AngleFollow::None,
                         ..Place::SCREEN
                     },
                 }]
@@ -542,6 +543,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                     timer: TimerRef::Builtin(skin_model::timer::SCREEN),
                     place: Place {
                         follow,
+                        angle: skin_model::AngleFollow::None,
                         ..Place::SCREEN
                     },
                     ..image(rect, false)

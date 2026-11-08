@@ -32,10 +32,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef, LanesDef,
-    LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef, ResultDefs,
-    ResultTiming, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty,
-    WidgetDefs, compile, timer as slot,
+    Anchor, AngleFollow, Blend, CycleDef, Ease, ElementDef, Filter, Fit, Follow, Grade, KeyDef,
+    LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place, Program, Region, RegionDef,
+    ResultDefs, ResultTiming, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef,
+    Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -189,6 +189,9 @@ const REGIONS: [RegionDef; Region::COUNT] = [RegionDef {
 
 /// The runtime offsets the play sets (`SkinProperty.java:943-947`).
 const RUNTIME_OFFSETS: std::ops::RangeInclusive<i32> = 1..=5;
+/// The offset the 1P turntable's angle sets
+/// (`play/KeyInputProccessor.java:92-108`).
+const OFFSET_TURNTABLE: i32 = 1;
 /// The offset that moves with LIFT (`SkinProperty.java:944`).
 const OFFSET_LIFT: i32 = 3;
 /// The offset SUDDEN+ moves (`SkinProperty.java:947`).
@@ -345,6 +348,11 @@ struct Opts<'a> {
     /// Offsets 3 and 4 become [`Follow`]: the element moves with LIFT and
     /// SUDDEN+ (`play/LaneRenderer.java:332-333`).
     follow: bool,
+    /// Offset 1 becomes [`AngleFollow::Turntable`]: the element turns
+    /// with the turntable (`skin/SkinObject.java:526-543`). A text accepts
+    /// it and stays unrotated, as the source draws text
+    /// (`skin/SkinTextImage.java:122`).
+    turntable: bool,
     /// A relative element (a judge's combo): offsets 3 and 4 are taken
     /// and move nothing, as the source skips a relative element's own
     /// translation and attaches it to its grade (`skin/SkinObject.java:
@@ -382,6 +390,9 @@ struct Common {
     offset: Offset,
     /// The covers it moves with, from offsets 3 and 4.
     follow: Follow,
+    /// Whether it turns with the turntable (offset 1): an image, an image
+    /// choice or a number only.
+    turntable: bool,
     stretch: Stretch,
     stretch_mode: i32,
     untimed: bool,
@@ -1337,6 +1348,7 @@ impl<'d> Cx<'d> {
         let mut offset = Offset::default();
         let mut alpha: Vec<i64> = Vec::new();
         let (mut lift, mut cover) = (false, false);
+        let mut turntable = false;
         if o.no_offsets && !ids.is_empty() {
             self.ignored(at, NoteKind::Ignored { field: "offset" });
             ids.clear();
@@ -1358,7 +1370,8 @@ impl<'d> Cx<'d> {
         let play = self.kind == ScreenKind::Play;
         let reserved = |id: i32| {
             play && (o.allow.contains(&id)
-                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative)))
+                || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative))
+                || (id == OFFSET_TURNTABLE && (o.turntable || o.text)))
         };
         let moved = o.allow.iter().chain(&ids).copied().find(|&id| {
             reserved(id)
@@ -1378,6 +1391,7 @@ impl<'d> Cx<'d> {
                     lift |= id == OFFSET_LIFT;
                     cover |= id == OFFSET_LANECOVER;
                 }
+                turntable |= id == OFFSET_TURNTABLE && o.turntable;
                 continue;
             }
             if RUNTIME_OFFSETS.contains(&id) && !play {
@@ -1501,6 +1515,7 @@ impl<'d> Cx<'d> {
                 (false, true) => Follow::Cover,
                 (true, true) => Follow::LiftAndCover,
             },
+            turntable,
             stretch: Stretch::of(dst.stretch),
             stretch_mode: dst.stretch,
             untimed,
@@ -1716,6 +1731,11 @@ impl<'d> Cx<'d> {
                 pivot: c.pivot,
                 native,
                 follow: c.follow,
+                angle: if c.turntable {
+                    AngleFollow::Turntable
+                } else {
+                    AngleFollow::None
+                },
                 ..Place::SCREEN
             },
         });

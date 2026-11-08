@@ -454,6 +454,7 @@ impl Harness {
             complete: self.complete,
             target: self.target,
             layout: &self.layout,
+            turntable: 0,
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,

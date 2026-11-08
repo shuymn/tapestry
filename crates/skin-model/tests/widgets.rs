@@ -252,6 +252,7 @@ fn followed_widgets_move_once_by_the_covers() {
     };
     let at = |follow| Place {
         follow,
+        angle: skin_model::AngleFollow::None,
         ..Place::SCREEN
     };
     let mut j = judge_all([800, 500, 200, 80]);
@@ -329,6 +330,7 @@ fn followers_keep_the_transform_order() {
     let follower = |follow| {
         let place = Place {
             follow,
+            angle: skin_model::AngleFollow::None,
             pivot: skin_model::Anchor::Center,
             ..lanes_support::bound(Bind::Lane(bms_model::Lane::SCRATCH))
         };
@@ -413,6 +415,7 @@ fn judges_follow_only_through_their_grades() {
         place: Place {
             region: Region::Judge,
             follow: Follow::Cover,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         },
         ..judge_element(0)

@@ -634,6 +634,7 @@ fn a_following_line_moves_without_changing_its_request() {
         };
         let place = Place {
             follow,
+            angle: skin_model::AngleFollow::None,
             pivot: Anchor::Center,
             ..Place::SCREEN
         };

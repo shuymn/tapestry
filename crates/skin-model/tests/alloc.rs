@@ -620,6 +620,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             fill: Fill::None,
             native: Some(Native::NoLarger([4, 4])),
             follow: Follow::None,
+            angle: skin_model::AngleFollow::None,
         },
         Place {
             region: Region::Left,
@@ -646,6 +647,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             TimerRef::Builtin(timer::READY),
             Place {
                 follow: FOLLOWS[usize::from(i) % 4],
+                angle: skin_model::AngleFollow::None,
                 ..place
             },
         ));
@@ -674,6 +676,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 region,
                 pivot: Anchor::ALL[usize::from(i)],
                 follow: FOLLOWS[usize::from(i) % 4],
+                angle: skin_model::AngleFollow::None,
                 ..Place::SCREEN
             },
         ));
@@ -795,6 +798,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     let top = Place {
         region: Region::Top,
         follow: Follow::Cover,
+        angle: skin_model::AngleFollow::None,
         ..Place::SCREEN
     };
     let fixed = lanes_support::rect([900, 20, 300, TEXT_H]);
@@ -993,6 +997,7 @@ fn image_choices(
             TimerRef::Builtin(timer::READY),
             Place {
                 follow: FOLLOWS[usize::from(i) % 4],
+                angle: skin_model::AngleFollow::None,
                 ..place
             },
         ));
@@ -1089,6 +1094,7 @@ fn skin() -> Loaded {
                     _ => None,
                 },
                 follow: FOLLOWS[usize::from(i / 4) % 4],
+                angle: skin_model::AngleFollow::None,
             },
         });
     }
@@ -1286,6 +1292,7 @@ fn loading_skin() -> Loaded {
                 Place {
                     pivot: Anchor::ALL[usize::from(i)],
                     follow: FOLLOWS[usize::from(i) % 4],
+                    angle: skin_model::AngleFollow::None,
                     ..Place::SCREEN
                 },
             )
@@ -1779,6 +1786,7 @@ fn stretch(
             complete: now > last,
             target: TARGETS[target_no],
             layout: &views.layouts[layout_no],
+            turntable: 0,
             lanes: view,
             readouts: stretch_readouts(frame_no, view),
             playing: true,
@@ -2159,6 +2167,7 @@ fn build_does_not_allocate() {
         complete: false,
         target: TARGETS[0],
         layout: &views.layouts[0],
+        turntable: 0,
         lanes: views.lanes[0],
         readouts: readouts_for(views.lanes[0]),
         playing: true,
@@ -2235,6 +2244,7 @@ fn build_does_not_allocate() {
             complete: false,
             target: TARGETS[0],
             layout: &views.layouts[0],
+            turntable: 0,
             lanes: views.lanes[0],
             readouts: readouts_for(views.lanes[0]),
             playing: true,
@@ -2278,6 +2288,7 @@ fn build_does_not_allocate() {
             },
             target: TARGETS[0],
             layout: &views.layouts[0],
+            turntable: 0,
             lanes: views.lanes[0],
             covers: readouts_for(views.lanes[0]).covers,
             gauge: None,
@@ -2320,6 +2331,7 @@ fn loading_frame<'a>(
         },
         target: TARGETS[(no / 5) % TARGETS.len()],
         layout: &views.layouts[(no / 11) % views.layouts.len()],
+        turntable: 0,
         lanes: view,
         covers: readouts_for(view).covers,
         gauge: (no % 3 != 2).then(|| LoadingGauge::of(no % 2, &descs[no % 2])),
@@ -2554,6 +2566,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             complete: false,
             target: TARGETS[i % TARGETS.len()],
             layout: &layout,
+            turntable: 0,
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
@@ -2667,6 +2680,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 complete: false,
                 target: TARGETS[i % TARGETS.len()],
                 layout: &layout,
+                turntable: 0,
                 lanes,
                 readouts: readouts_for(lanes),
                 playing: true,
@@ -2706,6 +2720,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 complete: false,
                 target: TARGETS[0],
                 layout: &layout,
+                turntable: 0,
                 lanes,
                 readouts: bad,
                 playing: true,
@@ -2852,6 +2867,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     complete: false,
                     target: TARGETS[i % TARGETS.len()],
                     layout: &layout,
+                    turntable: 0,
                     lanes,
                     readouts: readouts_for(lanes),
                     playing: true,
@@ -2896,6 +2912,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         complete: false,
                         target: TARGETS[0],
                         layout: &layout,
+                        turntable: 0,
                         lanes,
                         readouts: readouts_for(lanes),
                         playing: true,
@@ -2931,6 +2948,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     complete: false,
                     target: TARGETS[0],
                     layout: &layout,
+                    turntable: 0,
                     lanes,
                     readouts: bad,
                     playing: true,
@@ -3154,6 +3172,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             complete: false,
             target: TARGETS[i / 5 % TARGETS.len()],
             layout: &layout,
+            turntable: 0,
             lanes,
             readouts,
             playing: true,
@@ -3210,6 +3229,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             complete: false,
             target: TARGETS[0],
             layout: &layout,
+            turntable: 0,
             lanes,
             readouts: bad,
             playing: true,
@@ -3260,6 +3280,7 @@ fn bar_group_defs() -> Vec<skin_model::BarGroupDef> {
         .map(|&follow| skin_model::BarGroupDef {
             place: Place {
                 follow,
+                angle: skin_model::AngleFollow::None,
                 ..base.place
             },
             ..base.clone()
@@ -3341,6 +3362,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         complete: false,
         target,
         layout: &layout,
+        turntable: 0,
         lanes,
         readouts,
         playing: true,
@@ -3599,6 +3621,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
             complete: false,
             target,
             layout: &layout,
+            turntable: 0,
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
@@ -3697,6 +3720,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
     for (k, def) in defs.into_iter().enumerate() {
         let place = Place {
             follow: Follow::LiftAndCover,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         };
         let elements = vec![
@@ -3750,6 +3774,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 complete: false,
                 target: TARGETS[no % TARGETS.len()],
                 layout: &views.layouts[(no / 11) % views.layouts.len()],
+                turntable: 0,
                 lanes: view,
                 readouts: readouts_for(view),
                 playing: true,
@@ -3905,6 +3930,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         complete: false,
         target: TARGETS[0],
         layout: &SkinLayout::AUTHOR,
+        turntable: 0,
         lanes,
         readouts,
         playing: true,

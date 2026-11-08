@@ -1420,6 +1420,7 @@ fn the_lanes_draw_in_one_run_with_the_widgets_color() {
 fn follower(x: i32, follow: Follow) -> skin_model::ElementDef {
     let place = Place {
         follow,
+        angle: skin_model::AngleFollow::None,
         ..in_region(Region::Playfield)
     };
     image(WHITE, [x, 400, 10, 10], place)
@@ -1527,6 +1528,7 @@ fn only_drawing_widgets_follow_within_the_coordinate_range() {
     let lanes_following = skin_model::ElementDef {
         place: Place {
             follow: Follow::Cover,
+            angle: skin_model::AngleFollow::None,
             ..in_region(Region::Playfield)
         },
         ..lanes_element()
@@ -1540,6 +1542,7 @@ fn only_drawing_widgets_follow_within_the_coordinate_range() {
     let at = |y: i32| {
         let place = Place {
             follow: Follow::Lift,
+            angle: skin_model::AngleFollow::None,
             ..in_region(Region::Playfield)
         };
         image(WHITE, [0, y, 10, 10], place)

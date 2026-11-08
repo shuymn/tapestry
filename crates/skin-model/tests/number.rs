@@ -583,6 +583,7 @@ fn offsets_are_target_pixels_at_any_resolution() {
         Place {
             region: Region::Playfield,
             follow: Follow::Cover,
+            angle: skin_model::AngleFollow::None,
             ..Place::SCREEN
         },
     ];

@@ -150,7 +150,8 @@ pub use observation::{
 };
 pub use pixmap::Rgba8;
 pub use place::{
-    Affine, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement, RegionPlacement,
+    Affine, AngleFollow, Bind, Fill, Follow, MIN_VISIBLE, Native, Place, Placement,
+    RegionPlacement, TURNTABLE_UNITS_PER_DEGREE,
 };
 pub use play::loading::{
     Loading, LoadingField, LoadingFrame, LoadingGauge, LoadingTimer, loading_field, loading_timer,

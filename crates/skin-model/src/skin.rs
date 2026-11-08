@@ -18,7 +18,9 @@ use crate::expr::State;
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
-use crate::place::{Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union};
+use crate::place::{
+    AngleFollow, Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union,
+};
 use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
@@ -366,6 +368,7 @@ struct Element {
     fill: Fill,
     native: Option<Native>,
     follow: Follow,
+    angle: AngleFollow,
     /// What its visibility and its number's value or image selector need
     /// to be read while loading.
     loading: Need,
@@ -391,6 +394,9 @@ struct Scene<'a> {
     complete: bool,
     /// Whether HIDDEN+ is on, which its paint shows only while.
     hidden_enabled: bool,
+    /// The turntable angle a turntable follower adds
+    /// ([`AngleFollow::Turntable`]).
+    turntable: i32,
     phase: Phase<'a>,
 }
 
@@ -632,6 +638,16 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
     let moved_out = |t: &Track| track_moved_outside(t, reach, reach);
     for (element, e) in def.elements.iter().enumerate() {
         let follow = e.place.follow;
+        // The turntable turns an image or a number; a text accepts it and
+        // stays unrotated.
+        if e.place.angle != AngleFollow::None
+            && !matches!(
+                e.source,
+                Source::Image(_) | Source::ImageChoice(_) | Source::Number(_) | Source::Text(_)
+            )
+        {
+            return Err(LoadError::UnsupportedFollow { element });
+        }
         let paint = match e.source {
             Source::CoverPaint(p) => def.widgets.cover_paints.get(index(p)),
             _ => None,
@@ -2027,6 +2043,7 @@ impl Skin {
                 fill: e.place.fill,
                 native: e.place.native,
                 follow: e.place.follow,
+                angle: e.place.angle,
             })
             .collect();
         let whens_need = def.whens.iter().map(|w| Need::of(Some(w))).collect();
@@ -2692,6 +2709,7 @@ impl Skin {
             bitmap: shown.bitmap(),
         };
         let scene = Scene {
+            turntable: frame.turntable,
             now: frame.now,
             display: TimeUs(frame.now.0.saturating_add(frame.display_offset.0)),
             lanes: frame.lanes,
@@ -2761,6 +2779,7 @@ impl Skin {
             bitmap: loading.bitmap(),
         };
         let scene = Scene {
+            turntable: frame.turntable,
             now: frame.now,
             display: frame.now,
             lanes: frame.lanes,
@@ -3094,6 +3113,7 @@ impl Skin {
             bitmap: &sel.bitmap,
         };
         let scene = Scene {
+            turntable: 0,
             now: frame.now,
             display: frame.now,
             lanes: LaneView::NONE,
@@ -3284,6 +3304,7 @@ impl Skin {
             bitmap: &res.bitmap,
         };
         let scene = Scene {
+            turntable: 0,
             now: frame.now,
             display: frame.now,
             lanes: LaneView::NONE,
@@ -3499,12 +3520,18 @@ impl Skin {
                 }
                 None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };
+            // A text stays unrotated by the turntable, as the source draws
+            // it.
+            let turn = match e.kind {
+                Kind::Text(..) => 0.0,
+                _ => e.angle.degrees(scene.turntable),
+            };
             let brush = Brush {
                 key: e.key,
                 affine,
                 map,
                 pivot: e.pivot,
-                angle: radians(s.angle),
+                angle: radians(s.angle + turn),
                 color: s.color,
                 native: choice.map_or(e.native, |p| p.native),
                 scale: canvas.scale(),
