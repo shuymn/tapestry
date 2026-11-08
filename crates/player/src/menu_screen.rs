@@ -355,10 +355,6 @@ pub struct MenuScreen {
     preset: Option<MenuText>,
     /// The strip's lines prepared.
     strip_lines: usize,
-    /// The notice of the selection state numbered `.0`'s stopped runtime
-    /// (design.md "beatoraja Lua Skins", failures): the strip's notice
-    /// line while the game's update has none.
-    script_notice: Option<(u64, &'static str)>,
     /// The strip's lines last prepared, and whether the last selection
     /// frame drew the strip (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -495,7 +491,6 @@ impl MenuScreen {
             strip: None,
             preset: None,
             strip_lines: 0,
-            script_notice: None,
             #[cfg(all(test, feature = "dev-tools"))]
             strip_shown: (Vec::new(), false),
             strip_underline: None,
@@ -538,7 +533,7 @@ impl MenuScreen {
         }
         self.selection_key = None;
         self.page_caret = self.prepare_page(&u.page, LEFT, TOP)?;
-        let notice = self.script_notice_of(logic.id);
+        let notice = logic.script_stop.map(crate::screens::ScriptStop::notice);
         self.prepare_strip(&u.strip, notice)?;
         let skin = Arc::clone(logic.bundle.skin());
         #[cfg(all(test, feature = "dev-tools"))]
@@ -728,25 +723,20 @@ impl MenuScreen {
         Ok(area)
     }
 
-    /// The selection state numbered `id`'s runtime stopped: its notice
-    /// goes to standard error and, from this frame, the strip's while the screen shows
-    /// that state.
+    /// The runtime of `logic`, the selection state shown, stopped: the
+    /// stop is kept in the state, whose strip shows its notice from this
+    /// frame for as long as the state lasts (a screen built again lays it
+    /// out from the state), and said once on standard error.
     #[cold]
     fn script_stopped(
         &mut self,
         u: &SelectionUpdate,
-        id: u64,
+        logic: &mut SelectionLogic,
         stop: crate::screens::ScriptStop,
     ) -> Result<(), RenderError> {
         eprintln!("render: selection skin: {}", stop.notice());
-        self.script_notice = Some((id, stop.notice()));
+        logic.script_stop = Some(stop);
         self.prepare_strip(&u.strip, Some(stop.notice()))
-    }
-
-    /// The notice of the selection state numbered `id`'s stopped runtime.
-    fn script_notice_of(&self, id: u64) -> Option<&'static str> {
-        self.script_notice
-            .and_then(|(of, notice)| (of == id).then_some(notice))
     }
 
     /// Lays out the strip `strip` over a selection skin: its search line
@@ -1205,7 +1195,7 @@ impl Screen for MenuScreen {
             ) {
                 Ok(stop) => {
                     if let Some(stop) = stop {
-                        self.script_stopped(u, logic.id, stop)?;
+                        self.script_stopped(u, logic, stop)?;
                     }
                     self.build_selection_frame(u, logic, now)
                         .err()

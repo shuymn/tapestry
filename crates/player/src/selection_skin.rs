@@ -309,6 +309,10 @@ pub struct SelectionLogic {
     /// The installation's runtime, while the screen runs it
     /// (docs/stage3.md S7-07): dropped with the state, it parks.
     pub script: ScriptSlot,
+    /// Why that runtime stopped, once a visit reported it: the strip's
+    /// notice for as long as this state lasts, a screen built again
+    /// after a device loss included (design.md "beatoraja Lua Skins").
+    pub(crate) script_stop: Option<crate::screens::ScriptStop>,
 }
 
 impl SelectionLogic {
@@ -320,6 +324,7 @@ impl SelectionLogic {
             bundle: Arc::clone(bundle),
             id,
             script: ScriptSlot::default(),
+            script_stop: None,
         }
     }
 

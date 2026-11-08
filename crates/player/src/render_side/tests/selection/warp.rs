@@ -764,15 +764,16 @@ fn the_runtime_draws_each_frame_and_rests_through_a_play() {
 /// A runtime whose callback never returns stops after its budget frames,
 /// and the screen keeps drawing its frames with the callback's constant
 /// (docs/stage3.md S7-07's gate), the stop's notice on its strip
-/// (design.md "beatoraja Lua Skins", failures). A later visit of the
-/// stopped runtime shows the notice again.
+/// (design.md "beatoraja Lua Skins", failures), through a new update and
+/// a device loss with the screen built again for the same lifetime. A
+/// later visit of the stopped runtime shows the notice again.
 #[test]
 fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
     let _serial = crate::imports::tests::serial();
     let notice = crate::screens::ScriptStop::Budget.notice();
     let strip_of = |frames: &Frames| frames.0.lock().unwrap().last().unwrap().5.clone();
     let (_dir, skin, script) = scripted("stop.luaskin");
-    let (link, frames) = warp_link(None);
+    let (link, frames, lose, _) = lossy_link(None);
     link.select_with(ScreenKind::Selection, Some(skin), script)
         .wait()
         .unwrap();
@@ -790,6 +791,27 @@ fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
     let seen = frames.0.lock().unwrap().len();
     let _ = quads_after(&frames, seen, 3);
     assert_eq!(strip_of(&frames), (vec![notice.to_owned()], true));
+    // The device lost: the screen built again for the same lifetime lays
+    // the strip out from the state, the notice with it.
+    let device = frames.0.lock().unwrap().last().unwrap().2;
+    lose.store(true, Ordering::Release);
+    assert!(wait_until(|| link.failed()));
+    link.prepare().unwrap();
+    link.show_selection(update_of(1, 3, listed(SelectionPlace::All, "")));
+    let recovered = |frames: &Frames| {
+        frames
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.2 != device && f.3 && f.0.is_some())
+            .count()
+    };
+    assert!(wait_until(|| recovered(&frames) > 2));
+    let last = frames.0.lock().unwrap().last().unwrap().clone();
+    assert_ne!(last.2, device);
+    assert_eq!(last.0, drawn);
+    assert_eq!(last.5, (vec![notice.to_owned()], true));
     link.leave_selection();
     assert!(link.park_scripts());
     assert_eq!(
