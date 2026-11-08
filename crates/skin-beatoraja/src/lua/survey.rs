@@ -1469,6 +1469,36 @@ return { type = 0 }",
         );
     }
 
+    /// A Lua decision skin's `main_state.timer(2)` lowers to the decision
+    /// schema's fade-out timer, by name in the generated expression.
+    #[test]
+    fn a_decision_timer_read_lowers_to_the_fade_out() {
+        let entry = "local skin = { type = 6, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }\n\
+             skin.destination = { { id = \"i\", \
+               draw = function() return ms.timer(2) ~= ms.timer_off_value end, \
+               dst = { { w = 8, h = 8 } } } }\n\
+             return skin\n";
+        let d = folder(&[("s.luaskin", entry)]);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Decision),
+            &Cancel::new(),
+            true,
+        );
+        let lowered: Vec<_> = s
+            .consumers
+            .iter()
+            .filter_map(|c| c.local.as_ref()?.lowered.as_ref())
+            .map(|l| l.src.clone())
+            .collect();
+        assert_eq!(lowered.len(), 1, "{:?}", s.consumers);
+        assert!(lowered[0].contains("on(fadeout)"), "{lowered:?}");
+    }
     #[test]
     fn screen_kind_refusals_have_their_labels_and_locations() {
         let run = |entry: &str| {

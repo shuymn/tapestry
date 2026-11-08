@@ -11,8 +11,8 @@ use common::decision::{
     Dec, folder, import_decision, lua_decision, lua_folder, lua_folder_with, lua_outcome,
 };
 use skin_beatoraja::{
-    Fact, FactId, ImportError, ImportFacts, LuaOutcome, NoteKind, Object, PropertyKind, Report,
-    Severity,
+    Fact, FactId, ImportError, ImportFacts, JudgeClass, LuaOutcome, NoteKind, Object, PropertyKind,
+    Report, Severity,
 };
 use skin_model::{DecisionTiming, MAX_DECISION_PHASE, ScreenKind, Skin};
 use tempfile::TempDir;
@@ -57,8 +57,8 @@ const TEXT_IDS: [i32; 8] = [10, 11, 12, 13, 14, 15, 16, 1_003];
 
 /// C2: texts 10 to 16 show the chosen chart's labels as play builds them
 /// (12 and 16 joined), through the outline lines the skin requests and
-/// the bitmap font's layout, JSON by `ref` and Lua by `ref` or a
-/// `main_state.text` read alike; 1003 drops with a note.
+/// the bitmap font's layout, JSON by `ref` and Lua by a `main_state.text`
+/// read alike; 1003 drops with a note.
 #[test]
 fn decision_texts_show_the_chart_labels() {
     let mut texts = Vec::new();
@@ -73,8 +73,9 @@ fn decision_texts_show_the_chart_labels() {
         dsts.push(format!(
             r#"{{"id": "t{id}", "dst": [{{"x": 200, "y": {y}, "w": 300, "h": 8}}]}}"#
         ));
-        // The odd labels read through a callback, the rest by `ref`.
-        let source = if id % 2 == 1 && *id < 1_000 {
+        // Lua reads every label through a callback, the table's line by
+        // `ref`.
+        let source = if *id < 1_000 {
             format!("value = function() return ms.text({id}) end")
         } else {
             format!("ref = {id}")
@@ -140,9 +141,14 @@ const OPTIONS: &[(i32, bool)] = &[
     (160, true),
     (-160, false),
     (161, false),
+    (162, false),
+    (163, false),
+    (-163, true),
     (164, false),
     (-164, true),
     (280, false),
+    (281, false),
+    (282, false),
     (283, false),
     (289, false),
     (290, false),
@@ -263,7 +269,8 @@ fn a_lua_decision_skin_reads_the_constants_while_it_loads() {
                if ms.option(50) and not ms.option(51) and ms.option(160) \
                and not ms.option(161) and not ms.option(32) and not ms.option(33) \
                and not ms.option(290) and ms.option(-290) and not ms.option(1008) \
-               and not ms.option(283) and not ms.option(289) then x = 300 end";
+               and not ms.option(283) and not ms.option(289) and not ms.option(164) \
+               and not ms.option(280) and ms.option(-51) then x = 300 end";
     let body =
         "skin.destination = { { id = \"dot\", dst = { { x = x, y = 100, w = 8, h = 8 } } } }";
     let d = lua_folder(pre, body);
@@ -280,6 +287,25 @@ fn a_lua_decision_skin_reads_the_constants_while_it_loads() {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::JudgeClass),
         other => panic!("{other:?}"),
     }
+    // Known at the choice, the class reads as its option alone, recorded.
+    let d = lua_folder(
+        "local x = (ms.option(181) and not ms.option(180) and not ms.option(182) \
+         and not ms.option(183) and not ms.option(184)) and 300 or 0",
+        body,
+    );
+    let known = ImportFacts {
+        judge_class: Fact::Known(Some(JudgeClass::Hard)),
+        ..ImportFacts::unavailable(ScreenKind::Decision)
+    };
+    let Ok(LuaOutcome::Imported(i)) = lua_outcome(d.path(), &known) else {
+        panic!("a known class imports");
+    };
+    assert!(
+        !i.facts.reads.is_empty() && i.facts.reads.iter().all(|r| r.fact == FactId::JudgeClass),
+        "{:?}",
+        i.facts.reads
+    );
+    assert_eq!(Dec::new(i.imported.skin).frame(0)[0].rect[0], 300.0);
     // A built-in outside the profile is live state.
     let d = lua_folder("local c = ms.option(190)", body);
     let r = lua_outcome(d.path(), &base);
@@ -483,4 +509,63 @@ fn what_the_decision_does_not_show_is_noted() {
     let (lua_index, lua_rest) = index(&lua_report);
     assert_eq!((json_index, lua_index), (1, 1));
     assert_eq!(json_rest, lua_rest);
+}
+
+/// C3: a built-in wins over a configured option of the same id, as the
+/// source's factory answers built-ins first: an item numbered 32, on by
+/// default, still reads false on the decision screen, JSON and Lua alike.
+#[test]
+fn a_built_in_wins_over_a_configured_option_of_its_id() {
+    let json = r#""property": [{"name": "m", "item": [{"name": "on", "op": 32}], "def": "on"}],
+        "destination": [
+            {"id": "dot", "op": [32], "dst": [{"x": 0, "y": 100, "w": 8, "h": 8}]},
+            {"id": "lab", "op": [-32], "dst": [{"x": 0, "y": 200, "w": 8, "h": 8}]}]"#;
+    let header =
+        "property = { { name = \"m\", item = { { name = \"on\", op = 32 } }, def = \"on\" } },";
+    let lua = "skin.destination = { \
+        { id = \"dot\", op = { 32 }, dst = { { x = 0, y = 100, w = 8, h = 8 } } }, \
+        { id = \"lab\", op = { -32 }, dst = { { x = 0, y = 200, w = 8, h = 8 } } } }";
+    for (path, (skin, _, _dir)) in ["json", "lua"]
+        .into_iter()
+        .zip(both_with(json, header, lua))
+    {
+        assert_eq!(Dec::new(skin).tops(0), [top(200, 8)], "{path}");
+    }
+}
+
+/// Timers 0 and 1 never start on the decision screen (the input start is
+/// never set, design §3.4), whether named by a custom timer's alias in
+/// JSON or read by a Lua callback; an alias of timer 2 is the fade-out.
+#[test]
+fn timers_0_and_1_never_start_by_alias_or_callback() {
+    let json = r#""customTimers": [{"id": 10000, "timer": 0}, {"id": 10001, "timer": 1},
+                                 {"id": 10002, "timer": 2}],
+        "destination": [
+            {"id": "b0", "timer": 10000, "dst": [{"x": 0, "y": 100, "w": 8, "h": 8}]},
+            {"id": "b1", "timer": 10001, "dst": [{"x": 0, "y": 110, "w": 8, "h": 8}]},
+            {"id": "bar", "timer": 10002, "dst": [{"x": 0, "y": 120, "w": 8, "h": 8}]}]"#;
+    let d = folder(json);
+    let mut j = Dec::new(
+        import_decision(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .skin,
+    );
+    j.timers.fadeout = Some(TimeUs(0));
+    assert_eq!(j.tops(0), [top(120, 8)]);
+    let lua = "skin.destination = { \
+        { id = \"b0\", draw = function() return ms.timer(0) ~= ms.timer_off_value end, \
+          dst = { { x = 0, y = 100, w = 8, h = 8 } } }, \
+        { id = \"b1\", draw = function() return ms.timer(1) ~= ms.timer_off_value end, \
+          dst = { { x = 0, y = 110, w = 8, h = 8 } } }, \
+        { id = \"lab\", draw = function() return ms.timer(1) == ms.timer_off_value end, \
+          dst = { { x = 0, y = 120, w = 8, h = 8 } } } }";
+    let d = lua_folder("", lua);
+    let mut l = Dec::new(
+        lua_decision(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .imported
+            .skin,
+    );
+    l.timers.fadeout = Some(TimeUs(0));
+    assert_eq!(l.tops(0), [top(120, 8)]);
 }

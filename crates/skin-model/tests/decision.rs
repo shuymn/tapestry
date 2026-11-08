@@ -597,3 +597,25 @@ fn the_fade_out_starts_at_the_scene() {
         }
     }
 }
+
+/// A decision skin's output slots start after the decision schema's
+/// fields, which are none: with no program, a visibility reading output 0
+/// is refused, where a base past play's fields would let it through.
+#[test]
+fn a_decision_output_read_starts_at_the_schema_s_end() {
+    use skin_model::output::OutTy;
+    assert!(DECISION.fields.is_empty());
+    let outputs = [OutTy::Bool];
+    let visible = compile("lua.0", &Scope::new(&DECISION).outputs(&outputs), Ty::Bool).unwrap();
+    let e = ElementDef {
+        visible: Some(visible),
+        ..delement(Source::Image(0), [0, 0, 10, 10])
+    };
+    assert!(matches!(
+        Skin::new_decision(
+            skin_def(vec![e], WidgetDefs::default()),
+            DecisionDefs::default()
+        ),
+        Err(LoadError::OutputRead)
+    ));
+}
