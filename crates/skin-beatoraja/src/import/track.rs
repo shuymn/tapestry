@@ -143,35 +143,56 @@ pub(crate) fn read(
 pub(crate) struct Accepted {
     pub(crate) keys: Vec<SrcKey>,
     pub(crate) end: End,
+    /// What stays the same over every key as authored, keys `keys` no
+    /// longer holds included.
+    fixed: Fixed,
+}
+
+/// What stays the same over a list of keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fixed {
+    /// Every value.
+    all: bool,
+    /// The colour, alpha included.
+    color: bool,
+    /// The rect, the angle and the colour apart from alpha.
+    but_alpha: bool,
+}
+
+impl Fixed {
+    fn of(keys: &[SrcKey]) -> Self {
+        let all = |f: fn(&SrcKey, &SrcKey) -> bool| {
+            keys.windows(2).all(|w| match w {
+                [a, b] => f(a, b),
+                _ => true,
+            })
+        };
+        Self {
+            all: all(SrcKey::same_values),
+            color: all(|a, b| a.color == b.color),
+            but_alpha: all(|a, b| {
+                let ([_, rgb_a @ ..], [_, rgb_b @ ..]) = (a.color, b.color);
+                a.rect == b.rect && a.angle == b.angle && rgb_a == rgb_b
+            }),
+        }
+    }
 }
 
 impl Accepted {
     /// Whether every key shows the same values.
     pub(crate) fn identical(&self) -> bool {
-        self.keys.windows(2).all(|w| match w {
-            [a, b] => a.same_values(b),
-            _ => true,
-        })
+        self.fixed.all
     }
 
     /// Whether the colour is the same at every key.
     pub(crate) fn fixed_color(&self) -> bool {
-        self.keys.windows(2).all(|w| match w {
-            [a, b] => a.color == b.color,
-            _ => true,
-        })
+        self.fixed.color
     }
 
     /// Whether every key shows the same placement (rect and angle) and
     /// the same colour apart from alpha.
     pub(crate) fn fixed_but_alpha(&self) -> bool {
-        self.keys.windows(2).all(|w| match w {
-            [a, b] => {
-                let ([_, rgb_a @ ..], [_, rgb_b @ ..]) = (a.color, b.color);
-                a.rect == b.rect && a.angle == b.angle && rgb_a == rgb_b
-            }
-            _ => true,
-        })
+        self.fixed.but_alpha
     }
 
     /// Leaves one key at 0: the last, whose rect, colour and angle stand
@@ -181,6 +202,7 @@ impl Accepted {
         for k in &mut self.keys {
             k.at = 0;
         }
+        self.fixed = Fixed::of(&self.keys);
     }
 }
 
@@ -193,6 +215,9 @@ impl Accepted {
 pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, TrackWhy> {
     // `SkinObject.java:240-255` inserts before the first later key.
     keys.sort_by_key(|k| k.at);
+    // The source decides what stays fixed over every key it was given
+    // (`SkinObject.java:198-216`), the keys pruned below included.
+    let fixed = Fixed::of(&keys);
     // Of keys sharing a time, the source draws the last at it and moves
     // toward the first before it (`SkinObject.java:545-575`): the keys
     // between them never draw. A run whose first and last show the same
@@ -256,7 +281,11 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         // is before it, so the source never draws it.
         return Ok(None);
     };
-    Ok(Some(Accepted { keys: out, end }))
+    Ok(Some(Accepted {
+        keys: out,
+        end,
+        fixed,
+    }))
 }
 
 /// A stretch mode (`StretchType.java:16-105`).
