@@ -2503,6 +2503,11 @@ enum Reads {
 /// A self-made Lua result skin under `fx`, chosen in `player.toml`: its EX
 /// number and a status image, reading `reads` while it loads.
 fn result_skin(fx: &Fixture, reads: Reads) {
+    result_skin_with(fx, reads, "");
+}
+
+/// [`result_skin`] with `header` in its header table (its timing).
+fn result_skin_with(fx: &Fixture, reads: Reads, header: &str) {
     let skin = fx.base.join("result");
     fs::create_dir_all(&skin).unwrap();
     let file = fs::File::create(skin.join("s.png")).unwrap();
@@ -2519,7 +2524,7 @@ fn result_skin(fx: &Fixture, reads: Reads) {
     fs::write(
         skin.join("result.luaskin"),
         format!(
-            "local skin = {{ type = 7, name = \"r\", w = 1920, h = 1080 }}\n\
+            "local skin = {{ type = 7, name = \"r\", w = 1920, h = 1080{header} }}\n\
              if not skin_config then return skin end\n\
              {reads}\
              skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
@@ -2724,4 +2729,133 @@ fn the_run_fallback_keeps_presenting_the_built_in_result() {
     let work = result_work(&stdout);
     assert_eq!(work[4].0, "commit", "{stdout}");
     assert_eq!((work[4].1, work[4].2), (work[3].1, work[3].2), "{stdout}");
+}
+
+/// How long after its outro began each result was left (dev-tools'
+/// line), in µs.
+fn left_after_outro(stdout: &str) -> Vec<i64> {
+    lines(stdout, "dev: result left ")
+        .iter()
+        .map(|l| {
+            l.strip_prefix("dev: result left ")
+                .and_then(|r| r.split_once(" us"))
+                .unwrap()
+                .0
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// C14 through the real flow (P4): a skin's declared `fadeout` delays back
+/// and retry until its outro has played, never less; the view is pinned
+/// when each is accepted.
+#[test]
+fn the_skins_outro_delays_back_and_retry() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 400, input = 0");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"retry\"",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let left = left_after_outro(&stdout);
+    assert_eq!(left.len(), 2, "{stdout}");
+    assert!(left.iter().all(|&us| us >= 400_000), "{left:?}");
+    assert_eq!(
+        lines(&stdout, "dev: result outro began, view Some(").len(),
+        2,
+        "{stdout}"
+    );
+}
+
+/// C16 through the real flow: a positive `scene` with no command leaves
+/// the result (back) after its outro, so selection takes the next step.
+#[test]
+fn the_skins_scene_time_leaves_the_result() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 200, scene = 1500");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"stay\"",
+        // Reached only once the first result left on its own.
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let left = left_after_outro(&stdout);
+    assert_eq!(left.len(), 2, "{stdout}");
+    assert!(left.iter().all(|&us| us >= 200_000), "{left:?}");
+}
+
+/// C17f, C23 joined: a screen lost under a 5 s outro's barrier whose
+/// result restore is refused falls back for the run, and the flow serves
+/// back (accepted by the scene time) at its next look, well before the
+/// outro's end (T16).
+#[test]
+fn a_screen_lost_mid_outro_with_its_restore_refused_serves_back() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 5000, scene = 500");
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            // Back is accepted by the scene time; the result shown again
+            // after the rebuild takes no step.
+            "result = \"stay\"",
+            "quit = {}",
+        ]),
+        "lostpinned3",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("dev: the result's restore was refused"),
+        "the screen was built again, its result restore refused: {stderr}"
+    );
+    let left = left_after_outro(&stdout);
+    assert_eq!(left.len(), 1, "{stdout}");
+    assert!(left[0] < 3_000_000, "served at the fallback: {left:?}");
+    assert_eq!(
+        lines(&stdout, "dev: result shown: built-in").len(),
+        1,
+        "{stdout}"
+    );
+}
+
+/// C17f through the real flow (P5): a frame refused on a healthy device
+/// while back waits on a 5 s outro disables the skin for the run, and back
+/// is served at the next look, not at the outro's end.
+#[test]
+fn a_fallback_during_the_outro_serves_back_at_once() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 5000");
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "pinned3",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let left = left_after_outro(&stdout);
+    assert_eq!(left.len(), 1, "{stdout}");
+    assert!(left[0] < 3_000_000, "served at the fallback: {left:?}");
+    assert_eq!(
+        lines(&stdout, "dev: result shown: built-in").len(),
+        1,
+        "{stdout}"
+    );
 }
