@@ -573,9 +573,9 @@ fn an_image_choice_selects_by_a_result_field() {
     assert_eq!(fx.at_y(0.0), vec![(5, 0)]);
 }
 
-/// On result a number draws nothing for `i32::MIN` or `i32::MAX` and draws
-/// every value between; a selection number still draws both extremes (play
-/// and loading are `number.rs`' and `loading.rs`').
+/// On result and on selection a number draws nothing for `i32::MIN` or
+/// `i32::MAX` and draws every value between (`SkinNumber.java:135-147`;
+/// play and loading, which draw both, are `number.rs`' and `loading.rs`').
 #[test]
 fn a_result_number_leaves_out_the_i32_extremes() {
     let srcs = ["2147483647", "2147483646", "-2147483647 - 1", "-2147483647"];
@@ -643,8 +643,10 @@ fn a_result_number_leaves_out_the_i32_extremes() {
             .filter_map(|(f, _)| f)
             .collect()
     };
-    assert_eq!(at(100.0), d("2147483647"));
-    assert_eq!(at(300.0), d("2147483648"));
+    assert_eq!(at(100.0), vec![]);
+    assert_eq!(at(200.0), d("2147483646"));
+    assert_eq!(at(300.0), vec![]);
+    assert_eq!(at(400.0), d("2147483647"));
 }
 
 /// Bitmap text on result: laid out from the last view's chart strings by
