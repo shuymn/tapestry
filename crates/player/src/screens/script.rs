@@ -14,8 +14,8 @@
 //! - **The play interval.** The game thread opens it at a play's start
 //!   ([`Scripts::open_interval`]) and closes it at the play's end,
 //!   getting [`IntervalClosed`]; while it is open no visit takes a
-//!   runtime, and a retirement on the render thread only moves the runtime
-//!   aside to be destroyed later.
+//!   runtime, and a retirement only moves the runtime aside to be
+//!   destroyed later. Each opening is a new epoch of the cell.
 //! - **Destruction.** Only a retirement destroys a VM: the render
 //!   thread's, outside the interval, of a runtime superseded or removed;
 //!   or [`Scripts::retire`] on the game thread, with a [`Quiet`] token.
@@ -23,9 +23,16 @@
 //!   goes without that retirement (the game thread unwinding, or the link
 //!   dropped unretired), its runtimes are leaked until the process exits,
 //!   never dropped there, where the interval might be open.
+//! - **One lock.** The interval's state lives in the host, so opening it,
+//!   taking a runtime for a visit and every destruction are ordered by the
+//!   host's lock, and a VM is destroyed while that lock is held. A token
+//!   names its cell and the epoch it was made in; [`Scripts::retire`]
+//!   destroys only when the token is this cell's, of the current epoch,
+//!   and no interval is open, and otherwise retires the runtimes into the
+//!   deferred set, as the render thread does during the interval.
 
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use skin_beatoraja::lua::runtime::ScreenRuntime;
@@ -63,22 +70,55 @@ pub(in crate::screens) struct Entry {
     pub(in crate::screens) held: Held,
 }
 
-/// Every kind's entry, and the runtimes retired while the interval was
-/// open, destroyed at the next retirement outside it.
+/// Every kind's entry, the runtimes retired while the interval was open
+/// (destroyed at the next retirement outside it), and the interval's
+/// state.
 #[derive(Debug, Default)]
 pub(in crate::screens) struct ScriptHost {
     pub(in crate::screens) entries: [Entry; 2],
     pub(in crate::screens) doomed: Vec<ScreenRuntime>,
+    /// The play intervals open: from a play's start to its end.
+    pub(in crate::screens) open: u32,
+    /// The intervals opened so far: a token is good only in its epoch.
+    pub(in crate::screens) epoch: u64,
 }
 
+impl ScriptHost {
+    /// Destroys `rt` now, outside the interval, or keeps it to be
+    /// destroyed by the next retirement outside it. The caller holds the
+    /// lock, so no interval opens during the destruction.
+    pub(in crate::screens) fn retire_runtime(&mut self, rt: Box<ScreenRuntime>) {
+        if self.open > 0 {
+            self.doomed.push(*rt);
+        } else {
+            drop(rt);
+            self.doomed.clear();
+        }
+    }
+}
+
+/// The cells made so far: each takes the next number, so a token names
+/// its cell.
+static CELLS: AtomicU64 = AtomicU64::new(0);
+
 /// The cell the render thread and `RenderLink` share.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(in crate::screens) struct ScriptCell {
+    /// This cell's number, unique in the process.
+    pub(in crate::screens) id: u64,
     pub(in crate::screens) host: Mutex<ScriptHost>,
-    /// A play's interval is open: from its start to its end.
-    pub(in crate::screens) open: AtomicBool,
     /// The render thread has ended, however it ended.
     pub(in crate::screens) orphaned: AtomicBool,
+}
+
+impl Default for ScriptCell {
+    fn default() -> Self {
+        Self {
+            id: CELLS.fetch_add(1, Ordering::Relaxed),
+            host: Mutex::default(),
+            orphaned: AtomicBool::default(),
+        }
+    }
 }
 
 impl ScriptCell {
@@ -86,21 +126,6 @@ impl ScriptCell {
     /// assignment, so a panic leaves it whole.
     pub(in crate::screens) fn host(&self) -> MutexGuard<'_, ScriptHost> {
         self.host.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    pub(in crate::screens) fn interval_open(&self) -> bool {
-        self.open.load(Ordering::Acquire)
-    }
-
-    /// Destroys `rt` here, on the render thread outside the interval, or
-    /// keeps it to be destroyed by the next retirement outside it.
-    pub(in crate::screens) fn retire_runtime(&self, host: &mut ScriptHost, rt: Box<ScreenRuntime>) {
-        if self.interval_open() {
-            host.doomed.push(*rt);
-        } else {
-            drop(rt);
-            host.doomed.clear();
-        }
     }
 }
 
@@ -132,8 +157,7 @@ impl Scripts {
         let rt = staged.into_staged();
         let Some(i) = index(kind) else {
             if let Some(rt) = rt {
-                let mut host = self.0.host();
-                self.0.retire_runtime(&mut host, rt);
+                self.0.host().retire_runtime(rt);
             }
             return;
         };
@@ -151,7 +175,7 @@ impl Scripts {
             },
         );
         if let Held::Parked(old) = old.held {
-            self.0.retire_runtime(&mut host, old);
+            host.retire_runtime(old);
         }
     }
 
@@ -168,39 +192,57 @@ impl Scripts {
         };
         let held = std::mem::replace(&mut entry.held, Held::Retired);
         if let Held::Parked(rt) = held {
-            self.0.retire_runtime(&mut host, rt);
+            host.retire_runtime(rt);
         }
     }
 
     /// Opens a play's interval, after the render thread acknowledged its
-    /// runtimes parked: no visit takes one until it closes.
+    /// runtimes parked: no visit takes one until it closes. A new epoch:
+    /// every token made before it no longer destroys.
     pub(crate) fn open_interval(&self) -> PlayInterval {
-        self.0.open.store(true, Ordering::Release);
-        PlayInterval(Arc::clone(&self.0))
+        let mut host = self.0.host();
+        host.open = host.open.saturating_add(1);
+        host.epoch = host.epoch.wrapping_add(1);
+        PlayInterval {
+            cell: Arc::clone(&self.0),
+            epoch: host.epoch,
+        }
     }
 
     /// The token that no play's interval is open: before the first play,
-    /// and between plays.
+    /// and between plays. It destroys only until the next interval opens.
     #[must_use]
     pub(crate) fn inactive(&self) -> Option<Inactive> {
-        (!self.0.interval_open()).then_some(Inactive(()))
+        let host = self.0.host();
+        (host.open == 0).then_some(Inactive(Stamp {
+            cell: self.0.id,
+            epoch: host.epoch,
+        }))
     }
 
-    /// Destroys every parked runtime, and those kept for later, on the
-    /// game thread: `token` proves the interval closed or never opened.
-    /// Each entry is retired, terminal for its generation; a runtime a
-    /// visit holds is retired when it parks.
-    pub(crate) fn retire(&self, token: Quiet) {
-        let _ = token;
-        let mut host = self.0.host();
-        let mut retired = std::mem::take(&mut host.doomed);
+    /// Retires every parked runtime on the game thread, terminal for each
+    /// entry's generation; a runtime a visit holds is retired when it
+    /// parks. They and those kept for later are destroyed here when
+    /// `token` is this cell's, of the current epoch, and no interval is
+    /// open; otherwise they are kept for the next retirement outside the
+    /// interval, or leaked with the cell. Returns whether it destroyed.
+    pub(crate) fn retire(&self, token: Quiet) -> bool {
+        let stamp = match token {
+            Quiet::Closed(IntervalClosed(s)) | Quiet::Inactive(Inactive(s)) => s,
+        };
+        let mut guard = self.0.host();
+        let host = &mut *guard;
         for entry in &mut host.entries {
             if let Held::Parked(rt) = std::mem::replace(&mut entry.held, Held::Retired) {
-                retired.push(*rt);
+                host.doomed.push(*rt);
             }
         }
-        drop(host);
-        drop(retired);
+        let quiet = stamp.cell == self.0.id && stamp.epoch == host.epoch && host.open == 0;
+        if quiet {
+            // Under the lock: no interval opens while they are destroyed.
+            host.doomed.clear();
+        }
+        quiet
     }
 
     /// Whether the render thread has ended.
@@ -241,26 +283,42 @@ impl Scripts {
 }
 
 /// A play's open interval, held by the game thread until the play's end.
+/// Dropped without [`close`](Self::close) (the game thread unwinding), the
+/// interval stays open: nothing is destroyed after it.
 #[derive(Debug)]
 #[must_use]
-pub(crate) struct PlayInterval(pub(in crate::screens) Arc<ScriptCell>);
+pub(crate) struct PlayInterval {
+    pub(in crate::screens) cell: Arc<ScriptCell>,
+    pub(in crate::screens) epoch: u64,
+}
 
 impl PlayInterval {
     /// Closes the interval: the play has ended (its audio tail, Closing or
     /// abort).
     pub(crate) fn close(self) -> IntervalClosed {
-        self.0.open.store(false, Ordering::Release);
-        IntervalClosed(())
+        let mut host = self.cell.host();
+        host.open = host.open.saturating_sub(1);
+        IntervalClosed(Stamp {
+            cell: self.cell.id,
+            epoch: self.epoch,
+        })
     }
+}
+
+/// Where and when a token was made: its cell and the epoch.
+#[derive(Debug)]
+pub(in crate::screens) struct Stamp {
+    pub(in crate::screens) cell: u64,
+    pub(in crate::screens) epoch: u64,
 }
 
 /// The token a play's interval closed with.
 #[derive(Debug)]
-pub(crate) struct IntervalClosed(pub(in crate::screens) ());
+pub(crate) struct IntervalClosed(pub(in crate::screens) Stamp);
 
 /// The token that no play's interval is open.
 #[derive(Debug)]
-pub(crate) struct Inactive(pub(in crate::screens) ());
+pub(crate) struct Inactive(pub(in crate::screens) Stamp);
 
 /// A token that no VM can be in use by a play.
 #[derive(Debug)]
@@ -347,9 +405,10 @@ impl ScriptSlot {
         else {
             return None;
         };
-        if running.is_none() && !cell.interval_open() {
+        if running.is_none() {
             let mut host = cell.host();
-            if let Some(entry) = index(*kind).and_then(|i| host.entries.get_mut(i))
+            if host.open == 0
+                && let Some(entry) = index(*kind).and_then(|i| host.entries.get_mut(i))
                 && entry.key == *key
                 && matches!(entry.held, Held::Parked(_))
                 && let Held::Parked(rt) = std::mem::replace(&mut entry.held, Held::Running)
@@ -381,7 +440,7 @@ impl ScriptSlot {
             .filter(|e| e.generation == generation && matches!(e.held, Held::Running));
         match current {
             Some(entry) => entry.held = Held::Parked(rt),
-            None => cell.retire_runtime(&mut host, rt),
+            None => host.retire_runtime(rt),
         }
     }
 }
@@ -391,13 +450,19 @@ impl ScriptSlot {
     /// Sets `gone` when the VM of the runtime it holds is destroyed.
     pub(crate) fn on_vm_drop(&self, gone: &Arc<AtomicBool>) {
         let gone = Arc::clone(gone);
+        self.on_vm_teardown(move || gone.store(true, Ordering::Release));
+    }
+
+    /// Calls `f` from the teardown of the VM of the runtime it holds; it
+    /// replaces an earlier [`on_vm_drop`](Self::on_vm_drop).
+    pub(crate) fn on_vm_teardown(&self, f: impl FnOnce() + Send + 'static) {
         let rt = match &self.0 {
             Slot::Staged(rt) => Some(rt),
             Slot::Bound { running, .. } => running.as_ref().map(|(rt, _)| rt),
             Slot::Empty => None,
         };
         if let Some(rt) = rt {
-            rt.on_vm_drop(move || gone.store(true, Ordering::Release));
+            rt.on_vm_drop(f);
         }
     }
 }

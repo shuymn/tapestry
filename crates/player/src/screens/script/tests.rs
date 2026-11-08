@@ -152,3 +152,145 @@ fn the_orphan_mark_neither_locks_nor_waits() {
     assert!(scripts.orphaned());
     drop(held);
 }
+
+/// The cell with a committed runtime, and the flag its VM's destruction
+/// sets.
+fn committed() -> (tempfile::TempDir, Scripts, Arc<AtomicBool>) {
+    let (dir, slot, vm) = staged();
+    let scripts = Scripts::new();
+    scripts.commit(ScreenKind::Selection, 1, slot);
+    (dir, scripts, vm)
+}
+
+/// The retirement-token table (the S7-07b revert table's token rows):
+/// each way of holding a token against each order of opening, closing
+/// and retiring. A token destroys only when it is the cell's, of the
+/// current epoch, with no interval open; otherwise the runtime is retired
+/// into the deferred set, and the next good token destroys it.
+#[test]
+fn an_inactive_token_destroys_before_any_play() {
+    let (_dir, scripts, vm) = committed();
+    let token = scripts.inactive().unwrap();
+    assert!(scripts.retire(Quiet::Inactive(token)));
+    assert!(gone(&vm));
+}
+
+#[test]
+fn an_inactive_token_kept_across_an_opening_destroys_nothing() {
+    let (_dir, scripts, vm) = committed();
+    let stale = scripts.inactive().unwrap();
+    let interval = scripts.open_interval();
+    assert!(!scripts.retire(Quiet::Inactive(stale)));
+    assert!(!gone(&vm), "the play's interval is open");
+    // Retired all the same: the visit after takes nothing.
+    let closed = interval.close();
+    assert!(scripts.slot(ScreenKind::Selection, 1).running().is_none());
+    assert!(!gone(&vm));
+    assert!(scripts.retire(Quiet::Closed(closed)));
+    assert!(gone(&vm), "the close's token destroys what was deferred");
+}
+
+#[test]
+fn an_inactive_token_from_before_a_finished_play_destroys_nothing() {
+    let (_dir, scripts, vm) = committed();
+    let stale = scripts.inactive().unwrap();
+    let _closed = scripts.open_interval().close();
+    assert!(!scripts.retire(Quiet::Inactive(stale)));
+    assert!(!gone(&vm));
+    assert!(scripts.retire(Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(gone(&vm));
+}
+
+#[test]
+fn a_saved_close_token_destroys_nothing_in_the_next_play() {
+    let (_dir, scripts, vm) = committed();
+    let saved = scripts.open_interval().close();
+    let next = scripts.open_interval();
+    assert!(!scripts.retire(Quiet::Closed(saved)));
+    assert!(!gone(&vm));
+    assert!(scripts.retire(Quiet::Closed(next.close())));
+    assert!(gone(&vm));
+}
+
+#[test]
+fn a_close_token_of_one_of_two_open_intervals_destroys_nothing() {
+    let (_dir, scripts, vm) = committed();
+    let first = scripts.open_interval();
+    let second = scripts.open_interval();
+    assert!(!scripts.retire(Quiet::Closed(second.close())));
+    assert!(!gone(&vm), "the first interval is still open");
+    assert!(scripts.slot(ScreenKind::Selection, 1).running().is_none());
+    // The first's token is of an older epoch; a fresh one destroys.
+    assert!(!scripts.retire(Quiet::Closed(first.close())));
+    assert!(!gone(&vm));
+    assert!(scripts.retire(Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(gone(&vm));
+}
+
+#[test]
+fn another_cells_tokens_destroy_nothing() {
+    let (_dir, scripts, vm) = committed();
+    let other = Scripts::new();
+    let interval = scripts.open_interval();
+    assert!(!scripts.retire(Quiet::Inactive(other.inactive().unwrap())));
+    assert!(!scripts.retire(Quiet::Closed(other.open_interval().close())));
+    assert!(!gone(&vm));
+    assert!(scripts.retire(Quiet::Closed(interval.close())));
+    assert!(gone(&vm));
+}
+
+#[test]
+fn another_cells_token_destroys_nothing_with_no_interval_open() {
+    let (_dir, scripts, vm) = committed();
+    let other = Scripts::new();
+    assert!(!scripts.retire(Quiet::Inactive(other.inactive().unwrap())));
+    assert!(!gone(&vm));
+}
+
+/// An interval dropped unclosed (the game thread unwinding) stays open:
+/// no token is quiet, and the cell's drop leaks the runtime.
+#[test]
+fn an_interval_dropped_unclosed_keeps_every_runtime() {
+    let (_dir, scripts, vm) = committed();
+    let stale = scripts.inactive().unwrap();
+    drop(scripts.open_interval());
+    assert!(scripts.inactive().is_none());
+    assert!(!scripts.retire(Quiet::Inactive(stale)));
+    drop(scripts);
+    assert!(!gone(&vm));
+}
+
+/// An opening asked while a retirement destroys waits for it: the VM is
+/// destroyed under the cell's lock, never with an interval open.
+#[test]
+fn no_interval_opens_while_a_retirement_destroys() {
+    let (_dir, slot, _) = staged();
+    let scripts = Scripts::new();
+    let during = Arc::new(AtomicBool::new(false));
+    let opener = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (scripts, during, opener) = (scripts.clone(), Arc::clone(&during), Arc::clone(&opener));
+        slot.on_vm_teardown(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let s = scripts.clone();
+            let t = std::thread::spawn(move || {
+                let interval = s.open_interval();
+                let _ = tx.send(());
+                interval
+            });
+            // The opener had time to open, were it not held back.
+            let opened = rx.recv_timeout(Duration::from_millis(200)).is_ok();
+            during.store(opened, Ordering::Release);
+            *opener.lock().unwrap() = Some((t, rx));
+        });
+    }
+    scripts.commit(ScreenKind::Selection, 1, slot);
+    assert!(scripts.retire(Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(
+        !during.load(Ordering::Acquire),
+        "an interval opened during the destruction"
+    );
+    let (t, rx) = opener.lock().unwrap().take().unwrap();
+    assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    let _closed = t.join().unwrap().close();
+}
