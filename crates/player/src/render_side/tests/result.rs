@@ -1934,6 +1934,14 @@ fn the_timing_is_the_presented_views() {
             rig.gate.release();
             assert!(rig.until(|d| skin_frame(d).is_some()));
             assert_eq!(rig.link.presented_timing(), want, "A stays pinned");
+            // A new lifetime: what the render thread still draws of the
+            // old one gives no timing.
+            rig.link.begin_result();
+            rig.clear();
+            rig.link.show_end(EndPage::default());
+            assert!(rig.link.fence(Duration::from_secs(10)));
+            assert!(wait_until(|| !rig.drawn().is_empty()));
+            assert_eq!(rig.link.presented_timing(), None, "another lifetime's");
         } else {
             rig.gate.release();
             assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
@@ -1970,5 +1978,20 @@ fn a_built_in_view_is_pinned_over_a_prepared_skin() {
     let status = rig.link.result_status();
     assert_eq!((status.pinned, status.shown), (Some(1), Some((1, false))));
     assert_eq!(rig.link.presented_timing(), None);
+    rig.link.exit();
+
+    // Accepted before anything was presented: the barrier holds all the
+    // same, and a skin view arriving after never draws.
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    assert_eq!(rig.link.pin_result(TimeUs(5)), (None, None));
+    rig.clear();
+    show(&rig.link, lifetime, 1, &b, &Overlay::default());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        rig.drawn().iter().all(|d| skin_frame(d).is_none()),
+        "nothing of the skin draws"
+    );
+    assert_eq!(rig.link.result_status().shown, None);
     rig.link.exit();
 }
