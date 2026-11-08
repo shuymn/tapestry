@@ -26,8 +26,9 @@
 //!
 //! What a fold or a binding rests on is decided apart, for every root at
 //! once, by [`admit`]: the effect walk ([`super::effects`]) checks every
-//! root's reach against the modeled subset, which writes no table,
-//! upvalue, global or module member, calls only host readers, pure
+//! root's reach against the modeled subset, which writes no table, global
+//! or module member and an upvalue only as a located write
+//! ([`Analysis::written`]), calls only host readers, pure
 //! library functions and closures of the same subset, and reaches no
 //! metamethod. With [`Analysis::open`] unset after it (no construct
 //! outside the subset, and no script, unread listed entry or font
@@ -183,9 +184,10 @@ pub(crate) struct Open {
     pub(crate) why: Unsupported,
 }
 
-/// A located write: where a binding cell is first written at frame time,
-/// and the integer numerals it may get (`None` once anything else).
-pub(crate) type Written = (Site, Option<Vec<i64>>);
+/// A located write: the line of its file where a binding cell is first
+/// written at frame time, and the integer numerals it may get (`None` once
+/// anything else).
+pub(crate) type Written = (u32, Option<Vec<i64>>);
 
 /// A function prototype with its captured values: its file, its function
 /// and the values, in its upvalues' order.
@@ -413,16 +415,24 @@ impl Analysis {
     /// Where binding cell `d` of `file` is first written at frame time,
     /// when it is ([`Self::written`]).
     pub(crate) fn written_at(&self, file: u16, d: u32) -> Option<Site> {
-        self.written.borrow().get(&(file, d)).map(|w| w.0)
+        self.written
+            .borrow()
+            .get(&(file, d))
+            .map(|w| Site::Code { file, line: w.0 })
     }
 
-    /// The integer numerals frame time may write to binding cell `d` of
-    /// `file`: `Some(empty)` for a cell never written, `None` when an
-    /// assignment writes anything else.
-    pub(crate) fn written_ints(&self, file: u16, d: u32) -> Option<Vec<i64>> {
+    /// `f` of the integer numerals frame time may write to binding cell
+    /// `d` of `file`, borrowed: `Some(empty)` for a cell never written,
+    /// `None` when an assignment writes anything else.
+    pub(crate) fn with_written_ints<T>(
+        &self,
+        file: u16,
+        d: u32,
+        f: impl FnOnce(Option<&[i64]>) -> T,
+    ) -> T {
         match self.written.borrow().get(&(file, d)) {
-            None => Some(Vec::new()),
-            Some((_, ints)) => ints.clone(),
+            None => f(Some(&[])),
+            Some((_, ints)) => f(ints.as_deref()),
         }
     }
 
@@ -531,9 +541,11 @@ pub(crate) enum Callee {
 /// the host module, its proxy unchanged, `f` one of its APIs; or an
 /// upvalue whose final binding is a closure instance, a helper. That
 /// holds at frame time only while the candidate is closed: the effect
-/// walk found every root inside the modeled subset, which writes nothing,
-/// and no code the analysis does not see runs ([`Analysis::open`] unset),
-/// which lowering checks before it resolves a call.
+/// walk found every root inside the modeled subset, which writes no
+/// table, global or module member, and no code the analysis does not see
+/// runs ([`Analysis::open`] unset), which lowering checks before it
+/// resolves a call; an upvalue a root writes reads as unknown
+/// ([`Analysis::upvalue`]), so it resolves no callee.
 /// `H.f` with `f` a `main_state` API and `H` bound to anything else is
 /// [`Unsupported::Binding`].
 pub(crate) fn resolve_callee(

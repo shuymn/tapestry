@@ -1083,15 +1083,24 @@ fn a_small_modulo_composes() {
 /// one writing a critical id is unknown too.
 #[test]
 fn a_rebound_callee_is_never_its_captured_value() {
-    let poison = "local cfg = skin_config\n\
-        local f = function() return true end\n\
-        local poison = function() cfg.option.fc = 905 return true end\n\
-        table.insert(skin.destination, { id = \"i\", draw = function() f = poison return f() end,\n\
-          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
-        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
-        table.insert(skin.destination, { id = \"g\", draw = function() return en() end,\n\
-          dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
-    match import(&folder(&skin(poison)), 906) {
+    // A helper `f`, its replacement `poison` writing the configuration,
+    // the decorative `callers`, and the critical configuration reader.
+    let rebound = |callers: &str| {
+        format!(
+            "local cfg = skin_config\n\
+             local f = function() return true end\n\
+             local poison = function() cfg.option.fc = 905 return true end\n\
+             {callers}\n\
+             skin.gauge = {{ id = \"g\", nodes = {{ \"n0\", \"n1\", \"n2\", \"n3\" }}, parts = 10 }}\n\
+             table.insert(skin.destination, {{ id = \"g\", draw = function() return en() end,\n\
+               dst = {{ {{ x = 100, y = 500, w = 100, h = 10 }} }} }})"
+        )
+    };
+    let poison = rebound(
+        "table.insert(skin.destination, { id = \"i\", draw = function() f = poison return f() end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })",
+    );
+    match import(&folder(&skin(&poison)), 906) {
         Err(ImportError::Lua {
             why:
                 LuaWhy::Critical {
@@ -1104,19 +1113,15 @@ fn a_rebound_callee_is_never_its_captured_value() {
     }
     // The rebinding met after the call: the walk repeats until no new cell
     // is written, so the earlier root's call is of an unknown function too.
-    let later = "local cfg = skin_config\n\
-        local f = function() return true end\n\
-        local poison = function() cfg.option.fc = 905 return true end\n\
-        table.insert(skin.destination, { id = \"i\", draw = function() return f() end,\n\
-          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
-        table.insert(skin.destination, { id = \"i\", draw = function() f = poison return true end,\n\
-          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
-        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
-        table.insert(skin.destination, { id = \"g\", draw = function() return en() end,\n\
-          dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
+    let later = rebound(
+        "table.insert(skin.destination, { id = \"i\", draw = function() return f() end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+         table.insert(skin.destination, { id = \"i\", draw = function() f = poison return true end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })",
+    );
     assert!(
         matches!(
-            import(&folder(&skin(later)), 906),
+            import(&folder(&skin(&later)), 906),
             Err(ImportError::Lua {
                 why: LuaWhy::Critical {
                     why: Unsupported::Interference,
@@ -1140,8 +1145,8 @@ fn a_rebound_callee_is_never_its_captured_value() {
 
 /// A critical callback's refusal is located at the write that voided its
 /// own proof, whatever the role scan reads afterwards: with `x` written on
-/// line 11 and `y` on line 13, a reader of `x` that reads `y` only in a
-/// branch never taken refuses at line 11.
+/// line 12 and `y` on line 14, a reader of `x` that reads `y` only in a
+/// branch never taken refuses at line 12.
 #[test]
 fn an_interference_is_located_at_the_proofs_write() {
     let body = "local x, y = 1, 1\n\

@@ -18,7 +18,8 @@
 //!   folds whatever its kind; module members; locals; helper
 //!   calls, inlined with their arguments; operators on known operands;
 //!   `if`, `elseif` and `else` with a known condition. Each capture read
-//!   holds only while the candidate is closed ([`Unsupported::Interference`]
+//!   holds only while the candidate is closed and its binding cell is
+//!   never written at frame time ([`Unsupported::Interference`]
 //!   otherwise).
 //! - **Integers follow the source's doubles**: a numeral the parser
 //!   records as wide ([`super::syntax::Ast::wide_numerals`]) and a
@@ -529,9 +530,8 @@ impl<'a> Eval<'a> {
     /// time.
     fn bound(&self, file: u16, d: u32) -> R<()> {
         if !self.an.cell_holds(file, d) {
-            if self.interfered.get().is_none() {
-                self.interfered.set(self.an.written_at(file, d));
-            }
+            // The first failure ends the evaluation: its place is the one.
+            self.interfered.set(self.an.written_at(file, d));
             return refuse(Unsupported::Interference);
         }
         Ok(())

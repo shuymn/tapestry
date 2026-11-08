@@ -936,7 +936,9 @@ struct Ids<'a> {
     /// Its parameters' joins over its call sites.
     own: &'a [Scan],
     open: bool,
-    /// Its file, whose written binding cells resolve nothing.
+    /// Its file: an id read from one of its binding cells written at frame
+    /// time resolves to the join of the cell's captured value and the
+    /// integer numerals written to it.
     file: u16,
 }
 
@@ -975,8 +977,8 @@ impl Ids<'_> {
             None if self.open => Ok(Scan::unresolved("id")),
             // A cell frame time writes holds its captured value or one of
             // the integer numerals written to it.
-            None => {
-                let Some(ints) = self.an.written_ints(self.file, d) else {
+            None => self.an.with_written_ints(self.file, d, |ints| {
+                let Some(ints) = ints else {
                     return Ok(Scan::unresolved("id"));
                 };
                 self.an.charge(units(ints.len())).map_err(stop)?;
@@ -986,10 +988,8 @@ impl Ids<'_> {
                     Some(Captured::Nil) if !ints.is_empty() => Scan::default(),
                     _ => Scan::unresolved("id"),
                 };
-                Ok(ints
-                    .into_iter()
-                    .fold(captured, |s, n| s.join(number_part(n))))
-            }
+                Ok(ints.iter().fold(captured, |s, &n| s.join(number_part(n))))
+            }),
         }
     }
 }
@@ -1461,8 +1461,9 @@ impl Cx<'_> {
         // The expressions first; on play, a draw or a number's value they
         // refuse goes to the program, whose refusal is then the reason.
         let program = self.kind == ScreenKind::Play && matches!(conv, Conv::Truthy | Conv::Int);
-        let interfered = std::cell::Cell::new(None);
-        let r = residual::evaluate(adm, inst, conv, &cancelled, &interfered).and_then(
+        // The interference this lowering meets, for its refusal's place.
+        self.interference.set(None);
+        let r = residual::evaluate(adm, inst, conv, &cancelled, &self.interference).and_then(
             |res: Residual| {
                 l.attach(&res)?;
                 // Every reached operation is checked whichever backend takes
@@ -1478,8 +1479,6 @@ impl Cx<'_> {
                 }
             },
         );
-        // The interference this lowering met, for its refusal's place.
-        self.interference.set(interfered.get());
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
@@ -1622,9 +1621,8 @@ impl Cx<'_> {
             return Ok(Err(Unsupported::Writes));
         }
         let cancelled = || def.cancelled(|| None).is_err();
-        let interfered = std::cell::Cell::new(None);
-        let r = residual::evaluate(adm, inst, Conv::Text, &cancelled, &interfered);
-        self.interference.set(interfered.get());
+        self.interference.set(None);
+        let r = residual::evaluate(adm, inst, Conv::Text, &cancelled, &self.interference);
         match r.and_then(|res: Residual| text_fold(an, &res, self.kind)) {
             Ok(fold) => Ok(Ok(fold)),
             Err(Stop::Unsupported(why)) => Ok(Err(why)),

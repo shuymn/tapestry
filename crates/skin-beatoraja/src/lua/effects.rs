@@ -371,7 +371,7 @@ impl<'a> Walk<'a> {
         let mut written = self.an.written.borrow_mut();
         let entry = written
             .entry((b.file, d))
-            .or_insert((Site::Code { file: b.file, line }, Some(Vec::new())));
+            .or_insert((line, Some(Vec::new())));
         match (&mut entry.1, int) {
             (Some(ints), Some(n)) => {
                 if !ints.contains(&n) {
