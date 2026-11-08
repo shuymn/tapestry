@@ -3520,9 +3520,12 @@ impl Skin {
                 }
                 None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };
-            // A text's glyphs are drawn unrotated whatever the angle, so
-            // the turntable leaves it as the source does.
-            let turn = e.angle.degrees(scene.turntable);
+            // A text keeps its own angle but never turns with the
+            // turntable, as the source draws text unrotated by it.
+            let turn = match e.kind {
+                Kind::Text(..) => 0.0,
+                _ => e.angle.degrees(scene.turntable),
+            };
             let brush = Brush {
                 key: e.key,
                 affine,
