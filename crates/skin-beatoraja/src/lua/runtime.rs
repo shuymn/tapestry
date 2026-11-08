@@ -318,6 +318,9 @@ impl Screen {
 /// - 380-389, an IR ranking's EX score, and 390-399, its index, with no or
 ///   an empty ranking: `Integer.MIN_VALUE` (`IPF:876-907`, through
 ///   `:985-986`; `RankingData.java:188-206`).
+/// - 92, 350-353, 360-365 (main BPM, note counts per class, density), song
+///   information, which no bridge supplies yet: `Integer.MIN_VALUE`, as
+///   with no song information (`IPF:167-173`, `:319-388`).
 ///
 /// Selection:
 /// - 75, 78-89, the best's max combo, clear and fail counts, judgment
@@ -327,6 +330,10 @@ impl Screen {
 ///   their differences) and 370-377 (clear type, timing statistics),
 ///   play or result only: `Integer.MIN_VALUE` (`IPF:184-185`, `:233-238`,
 ///   `:396-440`, `:658-688`, `:712-753`).
+/// - 243-249 (the last play's date), 320-330 (a folder's lamps) and 368
+///   (gauge TOTAL), which no bridge supplies yet: `Integer.MIN_VALUE`, as
+///   with no score, no folder row or no song information (`IPF:281-287`,
+///   `:770-810`, `:389-395`, `:996-999`).
 /// - 122, 135, 157, the rival's rate, with no rival: 100, the rate being
 ///   1.0 (`IPF:190`, `:193`, `:202`; `ScoreDataProperty.java:56-60`); 123,
 ///   136, 158 give 0.
@@ -337,6 +344,9 @@ impl Screen {
 ///   `MainState.java:141-144`).
 ///
 /// Result:
+/// - 173, 175 (the best's max combo and its difference), which no bridge
+///   supplies yet: `Integer.MIN_VALUE`, as with no best (`IPF:233`,
+///   `:235`, `:734-753`).
 /// - 77-79 (play, clear and fail counts), 300 (a folder's songs) and
 ///   320-330 (a folder's lamps), selection only: `Integer.MIN_VALUE`
 ///   (`IPF:133-153`, `:289`, `:800-810`, `:996-999`).
@@ -358,10 +368,27 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
             | 202..=220
             | 222..=242
             | 280..=289
-            | 380..=399,
+            | 380..=399
+            | 92
+            | 350..=353
+            | 360..=365,
         )
-        | (Selection, 75 | 78..=89 | 107 | 407 | 173 | 175 | 176 | 178 | 370..=377)
-        | (Result, 77..=79 | 300 | 320..=330) => Some(HIDDEN),
+        | (
+            Selection,
+            75
+            | 78..=89
+            | 107
+            | 407
+            | 173
+            | 175
+            | 176
+            | 178
+            | 370..=377
+            | 243..=249
+            | 320..=330
+            | 368,
+        )
+        | (Result, 77..=79 | 300 | 320..=330 | 173 | 175) => Some(HIDDEN),
         (Selection, 122 | 135 | 157) => Some(100),
         (Selection, 271 | 410..=427) => Some(0),
         _ => None,
@@ -845,6 +872,21 @@ mod tests {
             (Result, 426, None),
             (Selection, 428, None),
             (Selection, 65_536, None),
+            (Selection, 92, Some(HIDDEN)),
+            (Result, 92, Some(HIDDEN)),
+            (Result, 353, Some(HIDDEN)),
+            (Selection, 354, None),
+            (Selection, 360, Some(HIDDEN)),
+            (Result, 365, Some(HIDDEN)),
+            (Selection, 243, Some(HIDDEN)),
+            (Selection, 249, Some(HIDDEN)),
+            (Result, 243, None),
+            (Selection, 330, Some(HIDDEN)),
+            (Selection, 368, Some(HIDDEN)),
+            (Result, 368, None),
+            (Result, 173, Some(HIDDEN)),
+            (Result, 175, Some(HIDDEN)),
+            (Result, 174, None),
         ] {
             assert_eq!(absent(kind, id), want, "{kind:?} {id}");
         }
