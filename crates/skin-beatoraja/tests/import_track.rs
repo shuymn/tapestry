@@ -387,7 +387,7 @@ fn keys_at_one_time_draw_as_the_source() {
 /// A loop point below −1 wraps into negative times, as the source
 /// (`SkinObject.java:358-374` at `0.8.9`): `t' = (t − L) mod (kn − L) + L`,
 /// nothing drawn where `t'` falls before the first key. Keys at 100 and
-/// 200 ms with the loop at −50 draw over [100, 200] and again from 350 ms.
+/// 200 ms with the loop at −50 draw over [100, 200) and again from 350 ms.
 #[test]
 fn a_loop_below_minus_one_wraps_as_the_source() {
     let pair = [(100, R), (200, [110, 20, 60, 40])];

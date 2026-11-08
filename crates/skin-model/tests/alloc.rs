@@ -298,8 +298,8 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
     out
 }
 
-/// A 3-key track at x near `i`, growing wider and flatter; every 5th
-/// turns, and every 4th jumps at 100 ms (two keys at that time).
+/// A track of three keys at x near `i`, growing wider and flatter; every
+/// 5th turns, and every 4th jumps at 100 ms with a fourth key there.
 fn track(i: u16, ease: Ease, end: End) -> Track {
     let turns = i.is_multiple_of(5);
     let key = |at: i64, x: i32, alpha: i32| {

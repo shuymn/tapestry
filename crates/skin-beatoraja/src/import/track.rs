@@ -151,8 +151,6 @@ pub(crate) struct Accepted {
 /// What stays the same over a list of keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fixed {
-    /// Every value.
-    all: bool,
     /// The colour, alpha included.
     color: bool,
     /// The rect, the angle and the colour apart from alpha.
@@ -168,7 +166,6 @@ impl Fixed {
             })
         };
         Self {
-            all: all(SrcKey::same_values),
             color: all(|a, b| a.color == b.color),
             but_alpha: all(|a, b| {
                 let ([_, rgb_a @ ..], [_, rgb_b @ ..]) = (a.color, b.color);
@@ -181,7 +178,8 @@ impl Fixed {
 impl Accepted {
     /// Whether every key shows the same values.
     pub(crate) fn identical(&self) -> bool {
-        self.fixed.all
+        // Between them the two cover the rect, the angle and the colour.
+        self.fixed.color && self.fixed.but_alpha
     }
 
     /// Whether the colour is the same at every key.
@@ -245,14 +243,13 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
     if kn.saturating_mul(1000) > MAX_KEY_US {
         return Err(TrackWhy::Limits);
     }
-    // Every key at one time: the source's single-key cases.
-    let single = k0 == kn;
     // The source's sampler (`SkinObject.java:361-376`).
     let end = if l == -1 {
         End::Hide
-    } else if kn == 0 {
-        // No loop applies; after 0 the source's search finds no segment
-        // and shows the first key, the last only at 0.
+    } else if kn == 0 || l > kn {
+        // No loop applies with the last key at 0, and none reaches past
+        // the last key: after it the source's search finds no segment and
+        // shows the first key.
         if first.same_values(last) {
             End::Hold
         } else {
@@ -260,7 +257,11 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         }
     } else if l == kn {
         End::Hold
-    } else if l < kn && !(single && l < k0) {
+    } else if k0 == kn {
+        // Every key at one time after its loop point (`l < kn` here):
+        // every wrapped time is before it, so the source never draws it.
+        return Ok(None);
+    } else {
         // A loop point before the first key, a negative one included,
         // wraps into a gap where nothing draws (`SkinObject.java:358-374`).
         let from = l * 1000;
@@ -270,16 +271,6 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         End::Loop {
             from: bms_model::TimeUs(from),
         }
-    } else if l > kn {
-        if first.same_values(last) {
-            End::Hold
-        } else {
-            return Err(TrackWhy::FallbackToFirst);
-        }
-    } else {
-        // Every key at one time after its loop point: every wrapped time
-        // is before it, so the source never draws it.
-        return Ok(None);
     };
     Ok(Some(Accepted {
         keys: out,
