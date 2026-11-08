@@ -22,7 +22,9 @@
 //!   and the thread enters background mode again, checked, while the
 //!   measurement goes on. A refused leave is said and the measurement goes
 //!   on at background priority; a refused entry is said, the measurement
-//!   goes on, and the thread ends after it, its result kept.
+//!   goes on, and the thread ends after it, its result kept. A mode call
+//!   that unwinds leaves the thread's mode unknown: the job ends failed (or,
+//!   after it ended, its result is kept) and the thread ends.
 //! - **The queue** holds at most [`WAITING`] jobs besides the running one,
 //!   none of a chart already waiting or running. When full, the oldest
 //!   waiting job is dropped, never the running one; a dropped chart is
@@ -459,24 +461,34 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
             }
             stop
         };
-        // Whether the thread is out of background mode (promoted), and
-        // whether entering it again was refused.
-        let (left, refused) = (AtomicBool::new(false), AtomicBool::new(false));
-        let on_class = |class: Class| match class {
-            Class::Foreground => match mode.leave_background() {
-                Ok(()) => left.store(true, Ordering::Relaxed),
-                Err(e) => warn(&format!(
-                    "loudness: {}: background mode could not be left ({e}); measured at background priority",
-                    job.name
-                )),
-            },
-            _ if left.load(Ordering::Relaxed) => {
-                left.store(false, Ordering::Relaxed);
-                if !entered(mode) {
-                    refused.store(true, Ordering::Relaxed);
+        // Whether the thread is out of background mode (promoted), cleared
+        // only once an entry succeeded; whether an entry was refused; and
+        // whether a mode call unwound, leaving the thread's mode unknown.
+        let (left, refused, unwound) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let on_class = |class: Class| {
+            unwound.store(true, Ordering::Relaxed);
+            match class {
+                Class::Foreground => match mode.leave_background() {
+                    Ok(()) => left.store(true, Ordering::Relaxed),
+                    Err(e) => warn(&format!(
+                        "loudness: {}: background mode could not be left ({e}); measured at background priority",
+                        job.name
+                    )),
+                },
+                _ if left.load(Ordering::Relaxed) => {
+                    if entered(mode) {
+                        left.store(false, Ordering::Relaxed);
+                    } else {
+                        refused.store(true, Ordering::Relaxed);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            unwound.store(false, Ordering::Relaxed);
         };
         let outcome = match task.run(&stop, &on_class, |ctx| measure(&job, &|| ctx.checkpoint())) {
             coord::Outcome::Done(outcome) => outcome,
@@ -487,9 +499,26 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
                 "the background measurement stopped unexpectedly: {p}"
             )),
         };
-        // Back in background mode before the next job, or no more jobs.
-        let resumed =
-            !refused.load(Ordering::Relaxed) && (!left.load(Ordering::Relaxed) || entered(mode));
+        // A mode call that unwound is not the measurement's failure: the
+        // thread's mode is unknown, so it runs no further job.
+        let unknown = unwound.load(Ordering::Relaxed);
+        if unknown {
+            warn(
+                "loudness: a background mode call failed unexpectedly; the background measurement is off for this run",
+            );
+        }
+        // Back in background mode before the next job, or no more jobs. An
+        // entry that unwinds here counts as refused, after the job's result
+        // is kept.
+        let resumed = !unknown
+            && !refused.load(Ordering::Relaxed)
+            && (!left.load(Ordering::Relaxed)
+                || coord::catch(|| entered(mode)).unwrap_or_else(|p| {
+                    warn(&format!(
+                        "loudness: entering background mode failed unexpectedly ({p}); the background measurement is off for this run"
+                    ));
+                    false
+                }));
         let mut s = shared.lock();
         s.promoter = None;
         let measured = match outcome {
@@ -744,7 +773,7 @@ pub(crate) mod tests {
         /// none.
         pub(crate) refuse_entry_from: AtomicUsize,
         pub(crate) refuse_leave: AtomicBool,
-        /// The entry panics.
+        /// The next entry panics (once).
         pub(crate) panics: AtomicBool,
         calls: Mutex<Option<Sender<ModeCall>>>,
     }
@@ -767,7 +796,7 @@ pub(crate) mod tests {
     impl ThreadMode for Mode {
         fn enter_background(&self) -> Result<(), PriorityError> {
             assert!(
-                !self.panics.load(Ordering::SeqCst),
+                !self.panics.swap(false, Ordering::SeqCst),
                 "the entry failed (test)"
             );
             let n = self.enters.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1389,6 +1418,61 @@ pub(crate) mod tests {
         assert!(worker.wait_ended(*WATCHDOG));
         assert_eq!(worker.queue(job("b")), Queued::Ended);
         assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// A mode call that unwinds (the entry at a demotion) is not a
+    /// measurement's failure: the job is published failed, the thread's
+    /// mode is unknown, so the worker ends and takes no further job.
+    #[test]
+    fn an_unwinding_entry_at_the_demotion_ends_the_worker() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let (worker, stepper) = stepped(&coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.queue(job("a"));
+        assert_eq!(stepper.said(), Said::Block(0));
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        assert_eq!(stepper.said(), Said::Block(1));
+        mode.panics.store(true, Ordering::SeqCst);
+        worker.demote(Path::new("a"));
+        stepper.step();
+        assert_eq!(
+            results(&worker, 1),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: None,
+            }]
+        );
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert_eq!(worker.queue(job("b")), Queued::Ended);
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// An entry that unwinds after a measurement that ended promoted keeps
+    /// its result, and the worker ends.
+    #[test]
+    fn an_unwinding_entry_after_a_promoted_job_keeps_its_result() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let (worker, stepper) = stepped(&coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.queue(job("a"));
+        assert_eq!(stepper.said(), Said::Block(0));
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        assert_eq!(stepper.said(), Said::Block(1));
+        mode.panics.store(true, Ordering::SeqCst);
+        stepper.finish();
+        assert_eq!(results(&worker, 1), vec![measured("a")]);
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert_eq!(worker.queue(job("b")), Queued::Ended);
         assert_eq!(held(&coord), (0, 0));
     }
 

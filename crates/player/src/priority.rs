@@ -177,6 +177,9 @@ mod tests {
         let coord = Coordinator::new(Caps::for_machine(1, 16));
         let (stepper, measure) = Stepper::new();
         let worker = Worker::start(measure, coord.clone(), Arc::new(Checked::SYSTEM)).unwrap();
+        // Declared after the worker, so dropped before it: a failing test
+        // closes the step channel before the worker's drop joins its thread.
+        let stepper = stepper;
         let held = || {
             (
                 coord.held(Class::Speculative),
