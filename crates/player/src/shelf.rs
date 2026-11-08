@@ -603,7 +603,9 @@ impl Shelf {
     /// for the choice's pause and dropped its bank, so this load's bank,
     /// the engine's and the background's are never held together. Every
     /// [`BACKGROUND_SLICE`] it asks `cancelled` whether to give up:
-    /// [`game::Loading::Cancelled`] then, and the measurement goes on.
+    /// [`game::Loading::Cancelled`] then, and the measurement goes on. The
+    /// chart's measurement runs in the foreground only while this wait
+    /// lasts ([`Worker::promote`]), and back in the background after it.
     pub fn wait_background(
         &mut self,
         chart: &Path,
@@ -630,13 +632,19 @@ impl Shelf {
         log::info!("{line}");
         #[cfg(feature = "dev-tools")]
         crate::dev::release_background();
+        worker.promote(chart);
+        let mut waited = game::Loading::Ready;
         while !worker.wait_done(chart, BACKGROUND_SLICE) {
             if cancelled() {
-                return game::Loading::Cancelled;
+                waited = game::Loading::Cancelled;
+                break;
             }
         }
-        self.adopt();
-        game::Loading::Ready
+        worker.demote(chart);
+        if waited == game::Loading::Ready {
+            self.adopt();
+        }
+        waited
     }
 
     /// Keeps the background's measurements in memory, those still wanted.
@@ -876,14 +884,18 @@ pub(crate) mod tests {
 
     /// How long a test waits for something that must happen however late a
     /// loaded machine runs it: it only catches what never happens.
-    const WATCHDOG: Duration = Duration::from_secs(600);
+    static WATCHDOG: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        // `TAPESTRY_TEST_WATCHDOG` (seconds) shortens it for mutation runs.
+        let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+        Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
+    });
 
     /// Polls until the running pass has ended. The pass runs in background
     /// mode, which a loaded machine can starve for seconds.
     fn pass_ends(shelf: &mut Shelf) {
         let begun = Instant::now();
         while shelf.has_scan() {
-            assert!(begun.elapsed() < WATCHDOG, "the pass never ended");
+            assert!(begun.elapsed() < *WATCHDOG, "the pass never ended");
             shelf.poll(Instant::now());
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1161,7 +1173,7 @@ pub(crate) mod tests {
         // The gate stays shut until the drop returns, so the pass cannot
         // end first: only the stop bound ends the drop, which never waits
         // for the pass.
-        let Ok(took) = dropped.recv_timeout(WATCHDOG) else {
+        let Ok(took) = dropped.recv_timeout(*WATCHDOG) else {
             // Let the pass and the drop end before failing.
             open_gate(&gate);
             let _ = dropping.join();
@@ -1175,7 +1187,7 @@ pub(crate) mod tests {
         // end.
         let begun = Instant::now();
         while open(&root).is_err() {
-            assert!(begun.elapsed() < WATCHDOG, "the lock stayed");
+            assert!(begun.elapsed() < *WATCHDOG, "the lock stayed");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1183,6 +1195,11 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use game::coord::Class;
+
+    use crate::background::tests::{
+        Mode, ModeCall, ROW as FAKE_ROW, Said, Stepper, key as fake_key,
+    };
     use crate::background::{Job, Queued, Worker};
 
     /// Background mode refused.
@@ -1196,6 +1213,25 @@ pub(crate) mod tests {
         fn leave_background(&self) -> Result<(), PriorityError> {
             Err(PriorityError("refused (test)".to_owned()))
         }
+    }
+
+    /// A load cancelled during its measurement, then the chart's next
+    /// choice: its wait finds no background measurement, and its load
+    /// measures the chart itself.
+    fn measured_at_next_choice(
+        shelf: &mut Shelf,
+        c: &bms_model::Chart,
+        b: &Arc<audio::SoundBank>,
+        path: &Path,
+    ) {
+        cancelled_load(shelf, c, b, path);
+        assert_eq!(
+            shelf.wait_background(path, "a.bms", || false, || {}),
+            game::Loading::Ready
+        );
+        let mut host = Host::default();
+        shelf.loaded(c, b, "a.bms", path, &mut host);
+        assert_eq!(host.measuring, 1);
     }
 
     /// Without a speculative permit (two cores, or speculation off) no
@@ -1215,14 +1251,7 @@ pub(crate) mod tests {
                 &Coordinator::new(caps),
             );
             assert!(shelf.background.is_none());
-            cancelled_load(&mut shelf, &c, &b, &path);
-            assert_eq!(
-                shelf.wait_background(&path, "a.bms", || false, || {}),
-                game::Loading::Ready
-            );
-            let mut host = Host::default();
-            shelf.loaded(&c, &b, "a.bms", &path, &mut host);
-            assert_eq!(host.measuring, 1);
+            measured_at_next_choice(&mut shelf, &c, &b, &path);
         }
     }
 
@@ -1241,19 +1270,114 @@ pub(crate) mod tests {
             library::ScanOptions::default(),
             || super::background_worker(&coordinator(), Arc::new(Refused)),
         );
-        until("the background's end", || {
-            worker(&shelf).queue(job(Path::new("x.bms"))) == Queued::Ended
-        });
-        cancelled_load(&mut shelf, &c, &b, &path);
+        assert!(worker(&shelf).wait_ended(*WATCHDOG));
+        assert_eq!(worker(&shelf).queue(job(&path)), Queued::Ended);
+        measured_at_next_choice(&mut shelf, &c, &b, &path);
         assert!(!worker(&shelf).holds(&path));
-        assert_eq!(
-            shelf.wait_background(&path, "a.bms", || false, || {}),
-            game::Loading::Ready
-        );
-        let mut host = Host::default();
-        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
-        assert_eq!(host.measuring, 1);
         assert_eq!(wait(&mut shelf), Paused::Idle);
+    }
+
+    /// A shelf whose background measures with a stepped measurement, on
+    /// `coord`, with `mode`.
+    fn stepped_shelf(dir: &Path, coord: &Coordinator, mode: &Arc<Mode>) -> (Shelf, Stepper) {
+        let (library, _) = open_library(dir);
+        let (stepper, measure) = Stepper::new();
+        let mode: Arc<dyn ThreadMode> = Arc::clone(mode) as _;
+        let shelf = Shelf::with_worker(
+            library,
+            Vec::new(),
+            Duration::from_secs(60),
+            library::ScanOptions::default(),
+            || Worker::start(measure, coord.clone(), mode),
+        );
+        (shelf, stepper)
+    }
+
+    fn held(coord: &Coordinator) -> (usize, usize) {
+        (
+            coord.held(Class::Speculative),
+            coord.held(Class::Foreground),
+        )
+    }
+
+    /// A choice with no load waiting (practice's page before its Start)
+    /// leaves the chart's running background measurement in the
+    /// background: it goes on through the pause on its speculative permit,
+    /// and the thread stays in background mode.
+    #[test]
+    fn a_choice_without_a_load_does_not_promote_the_background_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, _, path) = song(dir.path());
+        let coord = coordinator();
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let (mut shelf, stepper) = stepped_shelf(dir.path(), &coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker(&shelf).queue(job(&path));
+        assert_eq!(stepper.said(), Said::Block(0));
+        shelf.choose(&path);
+        stepper.step();
+        assert_eq!(stepper.said(), Said::Block(1));
+        assert_eq!(held(&coord), (1, 0));
+        assert!(calls.none());
+        shelf.release();
+        stepper.finish();
+        assert!(worker(&shelf).wait_results(1, *WATCHDOG));
+        let finished = worker(&shelf).take_results();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].measured, Some((fake_key(&path), FAKE_ROW)));
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// The load's wait for the chart's background measurement promotes it
+    /// (a foreground permit, background mode left). Its cancellation
+    /// demotes it: the permit back to the speculative class and background
+    /// mode entered again on the worker's thread, while the measurement
+    /// goes on to its result.
+    #[test]
+    fn a_cancelled_wait_demotes_the_measurement_which_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, _, path) = song(dir.path());
+        let coord = coordinator();
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let (mut shelf, stepper) = stepped_shelf(dir.path(), &coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker(&shelf).queue(job(&path));
+        assert_eq!(stepper.said(), Said::Block(0));
+        shelf.choose(&path);
+        let mut during = None;
+        let waited = shelf.wait_background(
+            &path,
+            "a.bms",
+            || {
+                // The quit key, once the wait's measurement ran promoted.
+                if during.is_none() {
+                    stepper.step();
+                    during = Some((calls.next(), stepper.said(), held(&coord)));
+                }
+                true
+            },
+            || {},
+        );
+        assert_eq!(waited, game::Loading::Cancelled);
+        assert_eq!(
+            during,
+            Some((ModeCall::Leave(true), Said::Block(1), (0, 1)))
+        );
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        assert_eq!(stepper.said(), Said::Block(2));
+        assert_eq!(held(&coord), (1, 0));
+        assert!(worker(&shelf).holds(&path));
+        stepper.finish();
+        assert!(worker(&shelf).wait_results(1, *WATCHDOG));
+        let finished = worker(&shelf).take_results();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].measured, Some((fake_key(&path), FAKE_ROW)));
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
     }
     use crate::loudness::fixture::{self as sound, Host, bank, square, write_sound};
 
@@ -1377,7 +1501,7 @@ pub(crate) mod tests {
     fn until(what: &str, mut done: impl FnMut() -> bool) {
         let begun = Instant::now();
         while !done() {
-            assert!(begun.elapsed() < WATCHDOG, "{what} never happened");
+            assert!(begun.elapsed() < *WATCHDOG, "{what} never happened");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -1556,7 +1680,7 @@ pub(crate) mod tests {
                     let _ = go_tx.send(());
                 }
                 // A pause never acknowledged fails the test, not hangs it.
-                begun.elapsed() > WATCHDOG
+                begun.elapsed() > *WATCHDOG
             },
             || panic!("another chart's measurement is not this load's"),
         );
@@ -1652,7 +1776,7 @@ pub(crate) mod tests {
             let _ = dropped_tx.send(());
         });
         // A join that waits for the stuck ones fails here, not hangs.
-        let ended = dropped.recv_timeout(WATCHDOG);
+        let ended = dropped.recv_timeout(*WATCHDOG);
         let took = begun.elapsed();
         open.store(true, Ordering::SeqCst);
         open_gate(&gate);
@@ -1730,14 +1854,7 @@ pub(crate) mod tests {
             library::ScanOptions::default(),
             || Err(std::io::Error::other("no thread (test)")),
         );
-        cancelled_load(&mut shelf, &c, &b, &path);
-        assert_eq!(
-            shelf.wait_background(&path, "a.bms", || false, || {}),
-            game::Loading::Ready
-        );
-        let mut host = Host::default();
-        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
-        assert_eq!(host.measuring, 1);
+        measured_at_next_choice(&mut shelf, &c, &b, &path);
         assert_eq!(wait(&mut shelf), Paused::Idle);
     }
 
@@ -1774,7 +1891,7 @@ pub(crate) mod tests {
         let dropping = std::thread::spawn(move || drop(shelf));
         let begun = Instant::now();
         while !dropping.is_finished() {
-            assert!(begun.elapsed() < WATCHDOG);
+            assert!(begun.elapsed() < *WATCHDOG);
             std::thread::sleep(Duration::from_millis(10));
         }
         open_gate(&gate);
@@ -1785,7 +1902,7 @@ pub(crate) mod tests {
             if let Ok((library, _)) = open(&root) {
                 break library;
             }
-            assert!(begun.elapsed() < WATCHDOG, "the lock stayed");
+            assert!(begun.elapsed() < *WATCHDOG, "the lock stayed");
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(library.loudness(&key).unwrap(), None);

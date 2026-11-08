@@ -100,7 +100,8 @@ fn set_current(priority: THREAD_PRIORITY) -> windows::core::Result<()> {
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use game::ChartSource;
     use game::coord::{Caps, Class, Coordinator};
@@ -108,7 +109,7 @@ mod tests {
     use windows::Win32::System::Threading::{THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY};
 
     use super::{Checked, ThreadMode};
-    use crate::background::{Job, Outcome, Queued, Worker};
+    use crate::background::{Job, Queued, Worker};
 
     /// The system's calls are checked: entering and leaving succeed on a
     /// thread of its own, and a second entry, or a leave outside
@@ -133,78 +134,74 @@ mod tests {
         super::set_current(priority)
     }
 
+    fn job(name: &str) -> Job {
+        Job {
+            source: ChartSource::new(PathBuf::from(name), 0, [0; 32]),
+            rate: 8_000,
+            name: name.to_owned(),
+        }
+    }
+
     /// A worker whose entry into background mode is refused (through the
-    /// seam) runs no speculative job: its thread ends, and a job handed to
-    /// it is not queued.
+    /// seam) runs no speculative job: its thread ends with no measurement
+    /// begun, and a job handed to it is not queued.
     #[test]
     fn a_refused_entry_runs_no_speculative_job() {
-        let measure: crate::background::Measure =
-            Box::new(|_, _| panic!("a measurement ran (test)"));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let measure: crate::background::Measure = Box::new(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            crate::background::Outcome::Stopped
+        });
         let worker = Worker::start(
             measure,
             Coordinator::new(Caps::for_machine(1, 16)),
             Arc::new(Checked::with(refuse_entry)),
         )
         .unwrap();
-        let job = Job {
-            source: ChartSource::new(PathBuf::from("a"), 0, [0; 32]),
-            rate: 8_000,
-            name: "a".to_owned(),
-        };
-        let begun = Instant::now();
-        while worker.queue(job.clone()) != Queued::Ended {
-            assert!(begun.elapsed() < Duration::from_secs(600), "never ended");
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        worker.queue(job("a"));
+        assert!(worker.wait_ended(Duration::from_secs(600)));
+        assert_eq!(worker.queue(job("b")), Queued::Ended);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
         assert!(worker.take_results().is_empty());
     }
 
-    /// With the system's calls, a promoted measurement leaves background
-    /// mode on the worker's own thread and enters it again after: a call
-    /// made on another thread, or a missed leave, would refuse the second
-    /// entry and end the worker before the next job.
+    /// With the system's calls, a promotion leaves background mode on the
+    /// worker's own thread, and the demotion enters it again there while
+    /// the measurement goes on: a call made on another thread, or a missed
+    /// leave, would refuse the entry (a thread already in background mode)
+    /// and end the worker before the next job.
     #[test]
-    fn a_promotion_leaves_and_reenters_on_the_workers_thread() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    fn a_promotion_leaves_and_its_demotion_reenters_on_the_workers_thread() {
+        use crate::background::tests::{Said, Stepper};
         let coord = Coordinator::new(Caps::for_machine(1, 16));
-        let go = Arc::new(AtomicBool::new(false));
-        let let_go = Arc::clone(&go);
-        let measure: crate::background::Measure = Box::new(move |_, stop| {
-            while !let_go.load(Ordering::SeqCst) && !stop() {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Outcome::Failed("measured nothing (test)".to_owned())
-        });
+        let (stepper, measure) = Stepper::new();
         let worker = Worker::start(measure, coord.clone(), Arc::new(Checked::SYSTEM)).unwrap();
-        let job = |name: &str| Job {
-            source: ChartSource::new(PathBuf::from(name), 0, [0; 32]),
-            rate: 8_000,
-            name: name.to_owned(),
-        };
-        let until = |what: &str, done: &dyn Fn() -> bool| {
-            let begun = Instant::now();
-            while !done() {
-                assert!(begun.elapsed() < Duration::from_secs(600), "{what}");
-                std::thread::sleep(Duration::from_millis(2));
-            }
+        let held = || {
+            (
+                coord.held(Class::Speculative),
+                coord.held(Class::Foreground),
+            )
         };
         worker.queue(job("a"));
-        until("a's permit", &|| coord.held(Class::Speculative) == 1);
-        worker.request_pause(Some(Path::new("a")));
-        until("the promotion", &|| coord.held(Class::Foreground) == 1);
-        go.store(true, Ordering::SeqCst);
-        assert!(worker.wait_done(Path::new("a"), Duration::from_secs(600)));
-        worker.release();
+        assert_eq!(stepper.said(), Said::Block(0));
+        assert_eq!(held(), (1, 0));
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(stepper.said(), Said::Block(1));
+        assert_eq!(held(), (0, 1));
+        worker.demote(Path::new("a"));
+        stepper.step();
+        assert_eq!(stepper.said(), Said::Block(2));
+        assert_eq!(held(), (1, 0));
+        stepper.finish();
+        assert!(worker.wait_results(1, Duration::from_secs(600)));
         assert_eq!(worker.queue(job("b")), Queued::Added);
-        let results = std::cell::RefCell::new(Vec::new());
-        until("b's end", &|| {
-            let mut results = results.borrow_mut();
-            results.extend(worker.take_results().into_iter().map(|f| f.path));
-            results.len() == 2
-        });
-        assert_eq!(
-            results.into_inner(),
-            vec![PathBuf::from("a"), PathBuf::from("b")]
-        );
+        assert_eq!(stepper.said(), Said::Block(0));
+        stepper.finish();
+        assert!(worker.wait_results(2, Duration::from_secs(600)));
+        let paths: Vec<PathBuf> = worker.take_results().into_iter().map(|f| f.path).collect();
+        assert_eq!(paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(held(), (0, 0));
     }
 }
