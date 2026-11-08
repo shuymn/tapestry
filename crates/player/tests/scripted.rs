@@ -63,6 +63,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
     let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(chart, &profile.sources[0]).unwrap();
     let rec = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: 1,
             app: "test".to_owned(),
@@ -569,6 +570,14 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     // F2 is in no opening.
     let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
     assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
+    // Nor in the starting tuning: the winning opening started at 4.00,
+    // before the play's step to 4.50 (design.md "Input Log Format").
+    assert_eq!(
+        rec.start_tuning.and_then(|t| t.hispeed),
+        Some(replay::HiSpeedRatio { num: 4, den: 1 }),
+        "{:?}",
+        rec.start_tuning
+    );
     assert!(
         stdout.contains("adjust: hi-speed 4.50 floating"),
         "{stdout}"
@@ -1810,10 +1819,13 @@ fn dev_start_inside_a_lone_long_note_exits_one() {
 /// 1.5 s, with recording closed, defers an opening asked meanwhile; the
 /// loading script goes on feeding through the deferral, so its release
 /// opens it, and the play's script takes over on the same devices.
-/// Nothing of the loading script is recorded. A load that outlasts the
-/// hold opens without a deferral; either way nothing is cancelled and the
-/// play keeps the timeline of the opening first asked for, so every
-/// recorded press is the log's, shifted by one amount of zero or more.
+/// None of the loading script's input packets is recorded, and one F2 edit
+/// made under the hold (Classic 1.00, step 0.25) is the play's starting
+/// tuning: 1.25, `H` 5/4 (design.md "Input Log Format"). A load that
+/// outlasts the hold opens without a deferral; either way nothing is
+/// cancelled and the play keeps the timeline of the opening first asked
+/// for, so every recorded press is the log's, shifted by one amount of
+/// zero or more.
 /// The exact shift is
 /// `a_deferred_opening_keeps_the_scripts_timeline` (src/input_side.rs).
 #[test]
@@ -1827,8 +1839,22 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
         appdata,
         ..
     } = fixture();
+    // Classic 1.00 in steps of 0.25: an edit acts before the tempo is
+    // attached as after.
+    let root = appdata.join("tapestry");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("player.toml"),
+        "[hispeed]
+mode = \"classic\"
+classic_hispeed_x100 = 100
+classic_step_x100 = 25
+",
+    )
+    .unwrap();
+    // START (0x12) holds the opening while F2 (0x3C) makes one edit.
     let out = scripted_play(&chart_path, &log, &appdata)
-        .args(["--dev-loading", "10@0-1500"])
+        .args(["--dev-loading", "12@0-1500,3c@100-150"])
         .output()
         .expect("run tapestry");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1840,6 +1866,17 @@ fn a_loading_script_press_defers_the_opening_and_its_release_opens_it() {
     let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
     // No cancelled candidate: an opening was deferred, not cancelled.
     assert!(rec.history.openings.is_empty(), "{:?}", rec.history);
+    // The edit made while the opening was held is the play's starting
+    // tuning (design.md "Input Log Format"), and F2 is recorded nowhere.
+    let tuning = rec.start_tuning.expect("a played record's tuning");
+    assert_eq!(tuning.classic_hispeed_x100, 125, "{tuning:?}");
+    assert_eq!(
+        tuning.hispeed,
+        Some(replay::HiSpeedRatio { num: 5, den: 4 }),
+        "{tuning:?}"
+    );
+    let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
+    assert!(!rec.events.iter().any(f2) && !rec.history.events.iter().any(f2));
     // The script keeps the timeline of the opening first asked for; a
     // play opened later, at the release, has the log's presses that much
     // earlier on its chart time. A shift large enough to put the first

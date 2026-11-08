@@ -44,6 +44,7 @@ fn what_if_on_a_chart_near_the_object_limit() {
             .final_deadline();
     let inputs = events.len();
     let record = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: Implementation::STANDARD_VERSION,
             app: "0.0.0-test".to_owned(),

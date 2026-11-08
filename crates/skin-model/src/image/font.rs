@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 
 use super::path::PathError;
 use super::source::FileSource;
-use super::{MAX_FILE_BYTES, Sheet, Total};
+use super::{Sheet, Total};
 
 /// The most font files one skin may name.
 pub const MAX_FONTS: usize = 16;
-/// The largest font file, in bytes.
-pub const MAX_FONT_BYTES: u64 = MAX_FILE_BYTES;
+/// The largest font file, in bytes: a cap of its own, below the image
+/// files' [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES), since the font
+/// libraries' working memory is not bounded (design.md "Threat Model").
+pub const MAX_FONT_BYTES: u64 = 32 << 20;
 /// The most bytes across one skin's font files.
 pub const MAX_TOTAL_FONT_BYTES: u64 = 64 << 20;
 
@@ -80,15 +82,20 @@ impl FontError {
 }
 
 /// Font `font`'s name resolved inside the canonical skin folder `root`,
-/// with its length.
+/// with its length: a regular file of at most [`MAX_FONT_BYTES`].
 pub(crate) fn resolve(
     src: &FileSource,
     root: &Path,
     font: usize,
     name: &str,
 ) -> Result<(PathBuf, u64), FontError> {
-    src.resolve(root, name)
-        .map_err(|e| FontError::path(font, e))
+    let (p, len) = src
+        .resolve(root, name)
+        .map_err(|e| FontError::path(font, e))?;
+    if len > MAX_FONT_BYTES {
+        return Err(FontError::TooLarge { font });
+    }
+    Ok((p, len))
 }
 
 /// Whether `bytes` start with a TrueType, OpenType or collection magic.

@@ -393,6 +393,10 @@ pub struct PlayRecord {
     /// capture cancelled before playback has no winning opening: this is
     /// `InputStart::default()` and is not written.
     pub start: InputStart,
+    /// The play adjustments the winning opening started with: present
+    /// exactly when the record has a played attempt, and written only
+    /// then.
+    pub start_tuning: Option<StartTuning>,
     /// The winning opening's physical input events in stream order, the
     /// only input evaluated; empty for a capture cancelled before playback.
     pub events: Vec<PhysicalInputEvent>,
@@ -411,5 +415,176 @@ impl PlayRecord {
     #[must_use]
     pub const fn played(&self) -> bool {
         self.status.end.played()
+    }
+}
+
+/// How the hi-speed multiplier followed the settings (design.md "Play
+/// Adjustments").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuningMode {
+    /// A saved multiplier, edited directly.
+    Classic,
+    /// The multiplier solved from the target green number.
+    #[default]
+    Floating,
+}
+
+/// The chart tempo a Floating preparation solves from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TuningReference {
+    /// The chart's initial tempo.
+    #[default]
+    Start,
+    /// The highest tempo.
+    Maximum,
+    /// The tempo weighted by its notes.
+    Main,
+    /// The lowest tempo.
+    Minimum,
+}
+
+/// Which lane cover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuningCover {
+    /// SUDDEN+.
+    Sudden,
+    /// LIFT.
+    Lift,
+    /// HIDDEN+.
+    Hidden,
+}
+
+/// One lane cover: its configured amount, kept while it is off, and its
+/// switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoverRecord {
+    /// ‰, 0 to [`MAX_COVER`].
+    pub amount: u16,
+    /// Whether it is on.
+    pub on: bool,
+}
+
+/// The exact multiplier `H`, a ratio in lowest terms within
+/// [`HISPEED_MIN`] and [`HISPEED_MAX`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HiSpeedRatio {
+    /// The numerator.
+    pub num: u64,
+    /// The denominator, never 0.
+    pub den: u64,
+}
+
+/// The play adjustments' state a played attempt's winning opening started
+/// with (design.md "Input Log Format", the starting tuning): presentation
+/// only, which the evaluator never reads. Its default is the settings'
+/// defaults with no multiplier solved and no cover target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartTuning {
+    /// Classic or Floating.
+    pub mode: TuningMode,
+    /// What a Floating preparation solves from.
+    pub reference: TuningReference,
+    /// Classic's saved multiplier in hundredths, in [`CLASSIC_HISPEED_X100`].
+    pub classic_hispeed_x100: u32,
+    /// Classic's step in hundredths, in [`CLASSIC_STEP_X100`].
+    pub classic_step_x100: u32,
+    /// Floating's step in hundredths, in [`FLOATING_STEP_X100`] and a
+    /// multiple of 5.
+    pub floating_step_x100: u32,
+    /// The target green number, in [`GREEN_TARGET`].
+    pub green_target: u32,
+    /// SUDDEN+.
+    pub sudden: CoverRecord,
+    /// LIFT.
+    pub lift: CoverRecord,
+    /// HIDDEN+.
+    pub hidden: CoverRecord,
+    /// The cover the controls adjusted; `None` with no active cover.
+    pub target: Option<TuningCover>,
+    /// The multiplier `H` in effect; `None` when none was solved (a play
+    /// without the adjustment controls, or a chart with no reference
+    /// tempo).
+    pub hispeed: Option<HiSpeedRatio>,
+}
+
+impl Default for StartTuning {
+    fn default() -> Self {
+        Self {
+            mode: TuningMode::Floating,
+            reference: TuningReference::Start,
+            classic_hispeed_x100: 100,
+            classic_step_x100: 25,
+            floating_step_x100: 50,
+            green_target: 300,
+            sudden: CoverRecord::default(),
+            lift: CoverRecord::default(),
+            hidden: CoverRecord::default(),
+            target: None,
+            hispeed: None,
+        }
+    }
+}
+
+/// Classic's saved multiplier, in hundredths: 0.01 to 20.
+pub const CLASSIC_HISPEED_X100: std::ops::RangeInclusive<u32> = 1..=2000;
+/// Classic's step, in hundredths: 0.01 to 1.00.
+pub const CLASSIC_STEP_X100: std::ops::RangeInclusive<u32> = 1..=100;
+/// Floating's step, in hundredths: 0.05 to 1.00, in multiples of 5.
+pub const FLOATING_STEP_X100: std::ops::RangeInclusive<u32> = 5..=100;
+/// The target green number.
+pub const GREEN_TARGET: std::ops::RangeInclusive<u32> = 1..=6000;
+/// The largest cover amount, ‰.
+pub const MAX_COVER: u16 = 1000;
+/// The smallest multiplier, 1/100.
+pub const HISPEED_MIN: HiSpeedRatio = HiSpeedRatio { num: 1, den: 100 };
+/// The largest multiplier, 20.
+pub const HISPEED_MAX: HiSpeedRatio = HiSpeedRatio { num: 20, den: 1 };
+
+impl HiSpeedRatio {
+    /// Whether it is in lowest terms, its denominator positive, and within
+    /// [`HISPEED_MIN`] and [`HISPEED_MAX`].
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        let Self { num, den } = self;
+        let (n, d) = (u128::from(num), u128::from(den));
+        den != 0
+            && gcd(num, den) == 1
+            && n * u128::from(HISPEED_MIN.den) >= u128::from(HISPEED_MIN.num) * d
+            && n * u128::from(HISPEED_MAX.den) <= u128::from(HISPEED_MAX.num) * d
+    }
+}
+
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+impl StartTuning {
+    /// The first field outside its range, by name; `None` when every
+    /// field is valid.
+    #[must_use]
+    pub fn invalid(&self) -> Option<&'static str> {
+        let covers = [self.sudden, self.lift, self.hidden];
+        if !CLASSIC_HISPEED_X100.contains(&self.classic_hispeed_x100) {
+            Some("classic hi-speed")
+        } else if !CLASSIC_STEP_X100.contains(&self.classic_step_x100) {
+            Some("classic step")
+        } else if !FLOATING_STEP_X100.contains(&self.floating_step_x100)
+            || !self.floating_step_x100.is_multiple_of(5)
+        {
+            Some("floating step")
+        } else if !GREEN_TARGET.contains(&self.green_target) {
+            Some("green target")
+        } else if covers.iter().any(|c| c.amount > MAX_COVER) {
+            Some("cover amount")
+        } else if self.hispeed.is_some_and(|h| !h.is_valid()) {
+            Some("hi-speed")
+        } else {
+            None
+        }
     }
 }

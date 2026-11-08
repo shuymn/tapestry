@@ -55,6 +55,7 @@ fn played_from(text: &str, seed: u64, offset: i64) -> (TempDir, PlayRecord) {
     };
     let chart = load_bms(text.as_bytes(), dir.path(), &opts).unwrap().chart;
     let record = PlayRecord {
+        start_tuning: Some(crate::StartTuning::default()),
         versions: Versions {
             evaluator: rules::Implementation::STANDARD_VERSION,
             app: "test".to_owned(),
@@ -934,6 +935,7 @@ fn cancelled() -> (TempDir, PlayRecord) {
         arrivals: Vec::new(),
     };
     record.status.end = EndStatus::CancelledBeforePlayback;
+    record.start_tuning = None;
     record.status.finalized = TimeUs(0);
     (dir, record)
 }

@@ -43,8 +43,9 @@ pub const MAX_IMAGE_FRAMES: u32 = 1_024;
 pub const MAX_SKIN_FRAMES: usize = 65_536;
 /// The longest file name, in bytes.
 pub const MAX_PATH_BYTES: usize = 1_024;
-/// The largest file, in bytes, encoded.
-pub const MAX_FILE_BYTES: u64 = 32 << 20;
+/// The largest image file, in bytes, encoded. Font files have their own
+/// cap ([`MAX_FONT_BYTES`](crate::MAX_FONT_BYTES)).
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
 /// The most bytes read to find a file's header.
 pub const HEADER_BYTES: u64 = 1 << 20;
 /// The most encoded bytes across one variant's files.
@@ -52,14 +53,14 @@ pub const MAX_TOTAL_FILE_BYTES: u64 = 512 << 20;
 /// The largest width or height of a file.
 pub const MAX_SIDE: u32 = 16_384;
 /// The most texels of one file decoded whole. With [`MAX_FILE_BYTES`] it
-/// bounds one file's decoding at 144 MiB: the larger of 2 × 32 MiB
-/// encoded, 32 MiB encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi
+/// bounds one file's decoding at 160 MiB: the larger of 2 × 64 MiB
+/// encoded, 64 MiB encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi
 /// native and RGBA8.
 pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// The most texels of one file decoded in bands of rows: a PNG past
 /// [`MAX_IMAGE_TEXELS`], neither interlaced nor animated. With
 /// [`MAX_FILE_BYTES`] its reading and decoding stay within the larger of
-/// 2 × 32 MiB and 32 MiB + 16 MiB, whatever its texels, beside the
+/// 2 × 64 MiB and 64 MiB + 16 MiB, whatever its texels, beside the
 /// atlas's pages and tables
 /// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
@@ -89,7 +90,10 @@ pub struct ImageDef {
     /// An index into the files.
     pub file: u32,
     /// Left, top, width, height in the file's 1x pixels; `None` is the
-    /// whole file.
+    /// whole file. It starts inside the file and may run past its right
+    /// or bottom edge: a texel there repeats the file's nearest edge
+    /// texel, as a texture clamped to its edge samples, so a cell wholly
+    /// past an edge is that edge's texel line.
     pub rect: Option<[u32; 4]>,
     /// Columns, rows. Frames run row by row; a remainder of the rectangle
     /// is not part of any frame.
@@ -245,7 +249,7 @@ pub enum ImageError {
     SolidGrid { image: usize },
     #[error("generated image {image} passes {MAX_TOTAL_TEXELS} texels in a variant")]
     SolidTotalTooLarge { image: usize },
-    #[error("image {image}'s rectangle is outside its file")]
+    #[error("image {image}'s rectangle does not start inside its file")]
     RectOutside { image: usize },
     #[error("image {image}'s frames are empty")]
     EmptyCell { image: usize },
@@ -606,13 +610,18 @@ fn read_file(
 }
 
 /// Image `image`'s rectangle in its file of 1x size `dims` and its cell
-/// size: the rectangle inside the file and the cells not empty.
+/// size: the rectangle starting inside the file, ending where a `u32` and
+/// its @2x double hold it, and the cells not empty. Cells past the file's
+/// edge are padded from it ([`ImageDef::rect`]), each charged at its full
+/// size as any cell is.
 fn cut(image: usize, def: &ImageDef, dims: [u32; 2]) -> Result<([u32; 4], [u32; 2]), ImageError> {
     let [fw, fh] = dims;
     let rect = def.rect.unwrap_or([0, 0, fw, fh]);
     let [x, y, w, h] = rect;
-    let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
-    if !inside(x, w, fw) || !inside(y, h, fh) {
+    let starts = |at: u32, len: u32, max: u32| {
+        at < max && at.checked_add(len).and_then(|e| e.checked_mul(2)).is_some()
+    };
+    if !starts(x, w, fw) || !starts(y, h, fh) {
         return Err(ImageError::RectOutside { image });
     }
     let [cols, rows] = def.grid;
@@ -770,7 +779,8 @@ impl Sheet {
     /// each variant's running byte total; then each header (at most
     /// [`HEADER_BYTES`] read): its format, its size, each variant's
     /// running texel total, and an @2x version at exactly twice the size;
-    /// then each image's rectangle inside its file and a non-empty frame.
+    /// then each image's rectangle starting inside its file, which it may
+    /// run past ([`ImageDef::rect`]), and a non-empty frame.
     ///
     /// These counts check what was built. A front end enforces the file,
     /// image and frame limits cumulatively while it builds the input.

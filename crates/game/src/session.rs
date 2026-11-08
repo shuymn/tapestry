@@ -575,6 +575,10 @@ pub struct PlayOutcome {
     /// The attempt's cancelled READY openings, with the gate; `None`
     /// without it, where none is ever cancelled.
     pub history: Option<ReadyHistory>,
+    /// The winning opening's starting tuning, as the rig's adjustment
+    /// controls took it ([`crate::Rig::start_tuning`]); `None` for a rig
+    /// without them, whose plays record the settings' options.
+    pub start_tuning: Option<replay::StartTuning>,
     /// The play's Closing, if it entered one (design.md "Play Lifecycle",
     /// Closing).
     pub closing: Option<ClosingReport>,
@@ -1491,6 +1495,7 @@ impl Loaded {
             mut incomplete,
             played,
             history,
+            start_tuning,
             closing,
         } = outcome;
         incomplete.suspend |= end == PlayEnd::Aborted(AbortCause::Suspend);
@@ -1573,6 +1578,19 @@ impl Loaded {
             play_type,
             speed: config.speed,
             start,
+            // A played attempt's tuning: its winning opening's, or, for a
+            // rig without the adjustment controls, the settings' options
+            // with no multiplier solved and no cover target. None without
+            // a played attempt (design.md "Input Log Format").
+            start_tuning: played.then(|| {
+                start_tuning.unwrap_or_else(|| {
+                    settings
+                        .player
+                        .options()
+                        .unwrap_or_default()
+                        .start_tuning(None, None)
+                })
+            }),
             events,
             arrivals: arrivals.iter().map(arrival).collect(),
             status: Status {
@@ -2218,6 +2236,10 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
             },
             crate::start_gate::ScriptedGate::state,
         )
+    }
+
+    fn start_tuning(&self, generation: u32) -> Option<replay::StartTuning> {
+        self.gate.as_ref().and_then(|g| g.adjust.opened(generation))
     }
 
     fn settle_candidate(&mut self, generation: u32) -> bool {

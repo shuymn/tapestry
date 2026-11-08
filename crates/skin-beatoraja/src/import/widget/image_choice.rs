@@ -228,20 +228,12 @@ impl Cx<'_> {
     ) -> Result<Result<(u32, [u32; 2]), Unplaced>, ImportError> {
         let key = choice_key(c, rec, s);
         if let Some(found) = self.assets.image(key, None) {
-            // A cached cut past its file's edge is noted for this
-            // destination too, with no reload or charge.
-            if self.overruns.contains(&key) {
-                self.overrun_note(c.span);
-            }
             return Ok(Ok(found));
         }
         let (def, cell) = match self.place_choice(c, s)? {
             Ok(placed) => placed,
             Err(u) => return Ok(Err(u)),
         };
-        if self.cut_overran {
-            self.overruns.insert(key);
-        }
         Ok(self
             .assets
             .add_image(key, None, def, cell)
@@ -370,19 +362,9 @@ impl Cx<'_> {
             };
             let key = choice_key(&c, rec, &s);
             let cell = match (placed.get(&key), self.assets.image(key, None)) {
-                (Some(&cell), _) | (None, Some((_, cell))) => {
-                    // A cached cut past its file's edge is noted for this
-                    // destination too, with no reload or charge.
-                    if self.overruns.contains(&key) {
-                        self.overrun_note(c.span);
-                    }
-                    cell
-                }
+                (Some(&cell), _) | (None, Some((_, cell))) => cell,
                 (None, None) => match self.place_choice(&c, &s)? {
                     Ok((def, cell)) => {
-                        if self.cut_overran {
-                            self.overruns.insert(key);
-                        }
                         placed.insert(key, cell);
                         to_add.push((key, def, cell));
                         cell

@@ -595,6 +595,14 @@ pub trait Rig {
     fn gate_exchange(&self) -> usize {
         0
     }
+    /// The starting tuning of READY candidate `generation`, the attempt's
+    /// winning opening, as the rig's adjustment controls took it where the
+    /// opening's phase was reduced (design.md "Input Log Format"). `None`
+    /// for a rig without them, whose plays record the settings' options.
+    fn start_tuning(&self, generation: u32) -> Option<replay::StartTuning> {
+        let _ = generation;
+        None
+    }
 }
 
 /// Where a result's preparation stands ([`Rig::poll_result`]).
@@ -1659,6 +1667,9 @@ fn play_and_next<R: Rig>(
         g.history.history(last)
     });
 
+    // The last candidate's tuning, read before the rig's play is over;
+    // the record keeps it only when that candidate played.
+    let start_tuning = rig.start_tuning(generation);
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
         start,
@@ -1676,6 +1687,7 @@ fn play_and_next<R: Rig>(
         incomplete,
         played,
         history,
+        start_tuning,
         closing: closing_report,
     });
     // A completed play's tail took the carried command.

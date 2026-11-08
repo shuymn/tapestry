@@ -56,7 +56,7 @@ impl Cx<'_> {
                 return Ok(());
             }
         }
-        match object {
+        let r = match object {
             Object::Image => self.image(dst, rec),
             Object::ImageSet => self.image_set(dst, rec),
             Object::Value => self.number(dst, rec),
@@ -65,7 +65,9 @@ impl Cx<'_> {
             Object::GaugeGraph => self.gauge_graph(dst, rec),
             Object::TimingDistribution => self.timing_graph(dst, rec),
             _ => self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object }),
-        }
+        };
+        self.end_value_gate();
+        r
     }
 
     /// Records what a retained element of `role` shows of the essential

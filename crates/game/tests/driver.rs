@@ -959,3 +959,23 @@ fn a_failed_wait_is_terminal_even_when_the_input_recovers() {
         recovered.asked
     );
 }
+
+/// The driver gives an opening's starting tuning for its own candidate
+/// only (design.md "Input Log Format"): candidate 1's tuning once its
+/// opening is drained, nothing for another generation, and none before
+/// any opening.
+#[test]
+fn an_openings_tuning_is_given_for_its_own_candidate_only() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 100, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.tap(10 * MS, F2);
+    rig.drain();
+    assert_eq!(rig.driver.opened(1), None, "no opening yet");
+    rig.open(20 * MS, 1_020 * MS, 1);
+    rig.drain();
+    let t = rig.driver.opened(1).unwrap();
+    assert_eq!(t.hispeed, Some(replay::HiSpeedRatio { num: 5, den: 4 }));
+    assert_eq!(rig.driver.opened(2), None, "another candidate");
+    assert_eq!(rig.driver.opened(0), None, "another candidate");
+}

@@ -28,6 +28,7 @@ pub(crate) use lex::is_tail;
 pub use program::evaluations;
 pub use program::{Program, State};
 
+use crate::output::OutTy;
 use crate::schema::{Schema, Ty};
 
 /// The longest expression source, in bytes, checked before lexing.
@@ -82,6 +83,9 @@ pub enum OptionDef<'a> {
 pub struct Scope<'a> {
     schema: &'a Schema,
     options: &'a [OptionDef<'a>],
+    /// The callbacks' outputs, after the schema's fields
+    /// ([`crate::output::output`]).
+    outputs: &'a [OutTy],
 }
 
 impl<'a> Scope<'a> {
@@ -91,6 +95,7 @@ impl<'a> Scope<'a> {
         Self {
             schema,
             options: &[],
+            outputs: &[],
         }
     }
 
@@ -98,6 +103,19 @@ impl<'a> Scope<'a> {
     #[must_use]
     pub fn options(self, options: &'a [OptionDef<'a>]) -> Self {
         Self { options, ..self }
+    }
+
+    /// This scope with the callbacks' `outputs`: `lua.<k>` and
+    /// `lua.<k>.ok` resolve after the schema's fields; a schema field of
+    /// the same name wins.
+    #[must_use]
+    pub fn outputs(self, outputs: &'a [OutTy]) -> Self {
+        Self { outputs, ..self }
+    }
+
+    /// Output `name`'s slot, type and whether it is the `ok` flag.
+    pub(crate) fn output(&self, name: &str) -> Option<(u16, OutTy, bool)> {
+        crate::output::output(self.schema.fields.len(), self.outputs, name)
     }
 }
 
