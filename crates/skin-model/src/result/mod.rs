@@ -100,6 +100,41 @@ impl Strings {
             genre: &self.genre,
         }
     }
+
+    /// Sets the strings to `labels`, each cut to twice
+    /// [`MAX_TEXT_BYTES`]. Allocates only to replace a string too small
+    /// for its new text, with one of exactly that text's length, so each
+    /// keeps at most twice [`MAX_TEXT_BYTES`] however often it grows.
+    pub(crate) fn set(&mut self, labels: &ResultLabels) {
+        for (to, from) in [
+            (&mut self.title, &labels.title),
+            (&mut self.subtitle, &labels.subtitle),
+            (&mut self.artist, &labels.artist),
+            (&mut self.subartist, &labels.subartist),
+            (&mut self.genre, &labels.genre),
+        ] {
+            let from = cut(from);
+            if to.capacity() < from.len() {
+                *to = String::with_capacity(from.len());
+            }
+            to.clear();
+            to.push_str(from);
+        }
+    }
+
+    /// The bytes the strings hold.
+    pub(crate) fn capacity(&self) -> usize {
+        [
+            &self.title,
+            &self.subtitle,
+            &self.artist,
+            &self.subartist,
+            &self.genre,
+        ]
+        .into_iter()
+        .map(String::capacity)
+        .sum()
+    }
 }
 
 /// The result screen's state as of its last view and build.
@@ -225,11 +260,7 @@ impl ResultScreen {
     /// memory witness; it allocates nothing.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        let s = &self.strings;
-        let strings = [&s.title, &s.subtitle, &s.artist, &s.subartist, &s.genre]
-            .into_iter()
-            .map(String::capacity)
-            .sum::<usize>();
+        let strings = self.strings.capacity();
         let bytes = size_of::<Self>()
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
@@ -275,21 +306,7 @@ impl ResultScreen {
             self.has_deviations = true;
         }
         self.areas = view.timing_areas.filter(|_| ready);
-        let s = &mut self.strings;
-        for (to, from) in [
-            (&mut s.title, &labels.title),
-            (&mut s.subtitle, &labels.subtitle),
-            (&mut s.artist, &labels.artist),
-            (&mut s.subartist, &labels.subartist),
-            (&mut s.genre, &labels.genre),
-        ] {
-            let from = cut(from);
-            if to.capacity() < from.len() {
-                *to = String::with_capacity(from.len());
-            }
-            to.clear();
-            to.push_str(from);
-        }
+        self.strings.set(labels);
     }
 
     /// Fills this frame's timers: the built-in ones from `timers`, then
