@@ -187,6 +187,8 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Chosen,      // chart.bga_valid
         Unavailable, // chart.judge_class
         Unavailable, // chart.judge_class_valid
+        // The point, 110: from the counts, unavailable as they are.
+        Unavailable, // point
     ]
 };
 
