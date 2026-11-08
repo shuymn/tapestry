@@ -27,6 +27,7 @@ mod verify;
 
 use crate::expr::Program;
 
+pub use crate::output::OutTy;
 #[cfg(feature = "dev-tools")]
 pub use exec::invocations;
 pub use verify::PresentError;
@@ -186,13 +187,6 @@ pub struct CallbackDef {
     pub after: Option<u16>,
 }
 
-/// An output's type: `lua.<k>` is a boolean or an `i32`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutTy {
-    Bool,
-    Int,
-}
-
 impl OutTy {
     /// The output type a conversion gives.
     #[must_use]
@@ -214,28 +208,6 @@ pub struct PresentDef {
     pub callbacks: Vec<CallbackDef>,
     /// Per callback, its output's type ([`OutTy::of`] its conversion).
     pub signature: Vec<OutTy>,
-}
-
-/// Output `name`'s slot, type and whether it is the `ok` flag, among
-/// `signature`'s outputs after `base` schema fields: `lua.<k>` at
-/// `base + 2k`, `lua.<k>.ok` at `base + 2k + 1`.
-#[must_use]
-pub fn output(base: usize, signature: &[OutTy], name: &str) -> Option<(u16, OutTy, bool)> {
-    let rest = name.strip_prefix("lua.")?;
-    let (k, ok) = match rest.strip_suffix(".ok") {
-        Some(k) => (k, true),
-        None => (rest, false),
-    };
-    if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) || (k.len() > 1 && k.starts_with('0'))
-    {
-        return None;
-    }
-    let k: usize = k.parse().ok()?;
-    let ty = *signature.get(k)?;
-    let slot = base
-        .checked_add(k.checked_mul(2)?)?
-        .checked_add(usize::from(ok))?;
-    Some((u16::try_from(slot).ok()?, ty, ok))
 }
 
 /// A verified program, ready to run.

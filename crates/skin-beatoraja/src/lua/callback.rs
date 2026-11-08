@@ -125,6 +125,9 @@ pub enum Disposition {
     Compiled,
     /// A decorative callback replaced by a reported constant.
     Replaced(Unsupported),
+    /// Run each frame by a selection or result screen's runtime
+    /// (docs/stage3.md S7-07), its output read by its consumer.
+    Runtime,
     /// The candidate was refused at it.
     Refused,
 }
@@ -252,6 +255,9 @@ pub(crate) struct Analysis {
     /// by callable, for the report.
     #[cfg(feature = "dev-tools")]
     pub(crate) unused: RefCell<HashMap<u32, Unused>>,
+    /// The callbacks a selection or result screen's runtime runs, in
+    /// import order: their outputs are `lua.<k>` by index.
+    pub(crate) runtime: RefCell<Vec<super::runtime::Site>>,
 }
 
 /// The witness that [`admit`] walked every root of an [`Analysis`]:

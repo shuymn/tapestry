@@ -112,7 +112,8 @@ pub struct ResultScreen {
     pub(crate) live: bool,
     /// The identity of the skin that made it.
     pub(crate) skin: u64,
-    fields: [i32; field::COUNT],
+    /// The schema's fields, then the callbacks' output slots.
+    fields: Box<[i32]>,
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
@@ -148,12 +149,19 @@ const NO_GAUGE: GaugeHistory = GaugeHistory {
 impl ResultScreen {
     /// A fresh state with `whens` `when` timers and `text_slots` text
     /// slots; `live` when a result skin makes it.
-    pub(crate) fn new(skin: u64, live: bool, whens: usize, text_slots: usize) -> Self {
+    pub(crate) fn new(
+        skin: u64,
+        live: bool,
+        whens: usize,
+        text_slots: usize,
+        outputs: usize,
+    ) -> Self {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
             live,
             skin,
-            fields: [0; field::COUNT],
+            fields: vec![0; field::COUNT.saturating_add(crate::output::slots(outputs))]
+                .into_boxed_slice(),
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             strings: Strings::default(),
@@ -172,7 +180,7 @@ impl ResultScreen {
     /// A state with no timer or text slot, which a skin of another kind
     /// gives: nothing accepts it.
     pub(crate) fn inert(skin: u64) -> Self {
-        let mut s = Self::new(skin, false, 0, 0);
+        let mut s = Self::new(skin, false, 0, 0, 0);
         s.starts = Box::default();
         s.ms = Box::default();
         s
@@ -212,6 +220,13 @@ impl ResultScreen {
     /// The view's judge areas; `None` without them or a result.
     pub(crate) fn areas(&self) -> Option<[[i16; 2]; 5]> {
         self.areas
+    }
+
+    /// The callbacks' output slots, after the schema's fields: what the
+    /// screen's runtime writes each frame before the build reads them
+    /// (docs/stage3.md S7-07).
+    pub fn outputs_mut(&mut self) -> &mut [i32] {
+        self.fields.get_mut(field::COUNT..).unwrap_or_default()
     }
 
     /// Whether the view is ready: its result's fields are valid.
@@ -260,7 +275,9 @@ impl ResultScreen {
     /// grows; and to copy the timelines, at most
     /// [`MAX_TIMELINE_BINS`](view::MAX_TIMELINE_BINS) bins.
     pub(crate) fn update(&mut self, view: &ResultView, labels: &ResultLabels) {
-        self.fields = ResultFields::of(view).0;
+        if let Some(to) = self.fields.get_mut(..field::COUNT) {
+            to.copy_from_slice(&ResultFields::of(view).0);
+        }
         let ready = view.status == ResultStatus::Ready;
         self.timing = view.timing.filter(|_| ready);
         self.timelines = view.timelines.clone().filter(|_| ready);

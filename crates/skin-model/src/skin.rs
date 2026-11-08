@@ -473,6 +473,10 @@ pub struct Skin {
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
+    /// The callbacks whose outputs a selection or result state carries
+    /// after its fields ([`crate::output`]): the screen's runtime writes
+    /// them (docs/stage3.md S7-07).
+    outputs: usize,
     /// This skin's identity, which a selection state it makes carries: a
     /// clone keeps it, another load takes the next.
     id: u64,
@@ -1789,7 +1793,11 @@ impl Skin {
             .enumerate()
         {
             ops.charge(program).map_err(LoadError::Ops)?;
-            check_outputs(program, base, signature, i < whens.len())?;
+            // A selection or result screen's outputs are its runtime's,
+            // which the importer counts after the build ([`Skin::with_outputs`]).
+            if matches!(kind, ScreenKind::Play | ScreenKind::Decision) {
+                check_outputs(program, base, signature, i < whens.len())?;
+            }
         }
         // V1 to V5, its per-frame cost charged with the expressions'.
         let present = present
@@ -2086,6 +2094,7 @@ impl Skin {
             gauge_graphs,
             timing_graphs,
             sliders,
+            outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -2636,10 +2645,10 @@ impl Skin {
     }
 
     /// The output slots the presentation program writes, two a callback.
-    fn outputs(&self) -> usize {
+    fn program_slots(&self) -> usize {
         self.present
             .as_ref()
-            .map_or(0, |p| p.len().saturating_mul(2))
+            .map_or(0, |p| crate::output::slots(p.len()))
     }
 
     /// A fresh [`Play`] for one attempt of `chart`; a retry or the next
@@ -2656,7 +2665,7 @@ impl Skin {
         Play::new(
             chart,
             ctx,
-            self.outputs(),
+            self.program_slots(),
             self.whens.len(),
             self.lanes.is_some(),
             self.bar_group_count(),
@@ -2715,7 +2724,7 @@ impl Skin {
         }
         play.check()?;
         if play.slots() != usize::from(BUILTIN) + self.whens.len()
-            || play.field_count() != field::COUNT + self.outputs()
+            || play.field_count() != field::COUNT + self.program_slots()
             || play.bar_capacity() != self.bar_group_count()
             || uvs.sheet_id() != self.sheet_id
             || uvs.frames().len() != self.frame_count
@@ -2837,6 +2846,22 @@ impl Skin {
         self.song_list.as_ref().map_or(0, |l| l.center)
     }
 
+    /// This skin with `n` callback outputs after a selection or result
+    /// state's fields ([`crate::output`]): the importer's count of the
+    /// callbacks the screen's runtime runs, whose `lua.<k>` names its
+    /// expressions read.
+    #[must_use]
+    pub fn with_outputs(mut self, n: usize) -> Self {
+        self.outputs = n;
+        self
+    }
+
+    /// The callback outputs a selection or result state carries.
+    #[must_use]
+    pub fn outputs(&self) -> usize {
+        self.outputs
+    }
+
     /// A fresh selection state ([`Selection`]): every timer off, every
     /// field 0, every row and text slot empty until a view and a text
     /// table. One a play skin makes is inert: it draws nothing.
@@ -2852,6 +2877,7 @@ impl Skin {
             self.text_slots(),
             self.song_list_slots(),
             self.sliders,
+            self.outputs,
         )
     }
 
@@ -3166,7 +3192,13 @@ impl Skin {
         if self.kind != ScreenKind::Result {
             return ResultScreen::inert(self.id);
         }
-        ResultScreen::new(self.id, true, self.whens.len(), self.text_slots())
+        ResultScreen::new(
+            self.id,
+            true,
+            self.whens.len(),
+            self.text_slots(),
+            self.outputs,
+        )
     }
 
     /// Whether `res` is a state this result skin made.
@@ -3553,13 +3585,12 @@ impl Skin {
                         let v = n.value.eval(state);
                         #[cfg(feature = "dev-tools")]
                         out.observed_value(i64::from(v));
-                        // Outside selection a number draws nothing for the
-                        // values a source number reserves
-                        // (`SkinNumber.java:135-146` at `0.8.9`): a hidden
-                        // result value reads `i32::MIN`, and a play skin's
-                        // value may give either.
+                        // A number draws nothing for the values a source
+                        // number reserves (`SkinNumber.java:135-147`): a
+                        // hidden value, a resolved value the source hides,
+                        // or a play skin's program value reads one.
                         let reserved = v == i32::MIN || v == i32::MAX;
-                        if !reserved || matches!(scene.phase, Phase::Selection { .. }) {
+                        if !reserved {
                             n.digits.draw(v, rect, &brush, &at, out);
                         }
                     }

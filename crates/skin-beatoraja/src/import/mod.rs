@@ -440,6 +440,15 @@ pub(crate) struct Cx<'d> {
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
+    /// The output types of the callbacks a selection or result screen's
+    /// runtime runs, by index: `lua.<k>` in the expressions.
+    outputs: Vec<skin_model::output::OutTy>,
+    /// The current element's runtime value, which the source reads before
+    /// its draws and which gates them: a number's draws run only when its
+    /// value is not a sentinel (`SkinNumber.java:138-150`), an image set's
+    /// only when its value is not negative (`SkinImage.java:127-132`).
+    /// Cleared after each element.
+    value_gate: Option<String>,
     ranks: [Option<u16>; 3],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
@@ -545,6 +554,8 @@ impl<'d> Cx<'d> {
             choices,
             items,
             whens: Vec::new(),
+            outputs: Vec::new(),
+            value_gate: None,
             when_spans: Vec::new(),
             present: skin_model::present::PresentDef::default(),
             number_value: None,
@@ -1571,12 +1582,21 @@ impl<'d> Cx<'d> {
         })
     }
 
+    /// The callback outputs the screen's expressions read: play's program
+    /// or a selection or result screen's runtime.
+    fn outputs(&self) -> &[skin_model::output::OutTy] {
+        match self.kind {
+            ScreenKind::Play | ScreenKind::Decision => &self.present.signature,
+            ScreenKind::Selection | ScreenKind::Result => &self.outputs,
+        }
+    }
+
     /// Compiles `src` against the screen's schema and charges its
     /// operations before it is kept.
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
         trace(Event::Compile);
-        let scope = Scope::new(self.schema()).outputs(&self.present.signature);
+        let scope = Scope::new(self.schema()).outputs(self.outputs());
         let p = compile(src, &scope, want).map_err(|source| ImportError::Expr {
             at: self.loc(at),
             source,
@@ -1926,10 +1946,12 @@ impl<'d> Cx<'d> {
         } else {
             Skin::new(def)
         };
-        let skin = loaded.map_err(|source| {
-            let at = self.load_loc(&source);
-            ImportError::Model { at, source }
-        })?;
+        let skin = loaded
+            .map(|s| s.with_outputs(self.outputs.len()))
+            .map_err(|source| {
+                let at = self.load_loc(&source);
+                ImportError::Model { at, source }
+            })?;
         #[cfg(feature = "dev-tools")]
         let notes = self
             .located
