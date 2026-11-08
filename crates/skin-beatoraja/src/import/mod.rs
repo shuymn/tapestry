@@ -831,6 +831,13 @@ impl<'d> Cx<'d> {
         let mut ids = self.ints(offsets, "offsets")?;
         ids.push(self.int_or(offset, "offset", 0)?);
         let ops = self.ops(op)?;
+        // `ops` accepted it: a Lua skin's `op` that is not a table.
+        if let Some(op) = op
+            && !self.def.arena.is_array(op)
+        {
+            let at = self.arena_span(op);
+            self.ignored(at, NoteKind::Ignored { field: "op" });
+        }
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
         let timer = self.callback_prop(timer, "timer")?;
@@ -858,12 +865,22 @@ impl<'d> Cx<'d> {
     }
 
     /// A destination's `op` items: numbers, names and Lua functions,
-    /// `null` items skipped.
+    /// `null` items skipped. A Lua skin's `op` that is not a table (a
+    /// number, string, boolean or function) is no condition, as the
+    /// source's Lua loader reads any array field
+    /// (`skin/lua/LuaSkinLoader.java:171-186` at `0.8.9`); a JSON skin's
+    /// fails the skin, as the source's does
+    /// (`skin/json/JSONSkinLoader.java:109`).
     fn ops(&mut self, op: Option<u32>) -> Result<Vec<Op>, ImportError> {
         let mut ops = Vec::new();
         if let Some(op) = op {
             if !self.def.arena.is_array(op) {
-                return Err(self.def.type_error(op, "op", "an array"));
+                // A Lua table with string keys is still a table there,
+                // whose values the source would read in hash order.
+                if self.def.arena.lua.is_none() || self.def.arena.is_object(op) {
+                    return Err(self.def.type_error(op, "op", "an array"));
+                }
+                return Ok(ops);
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
             for item in items {
