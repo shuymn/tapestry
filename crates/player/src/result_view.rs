@@ -5,11 +5,6 @@
 //! `skin_model`'s result types, with each lamp and the gauge given its
 //! gauge's look under the view's preset. `skin_model` holds no `game` type and `game` no library type,
 //! so the conversion is the player's.
-// S10-09i installs the result view; until then only the tests read it.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "S10-09i installs the result view")
-)]
 
 use game::{BestCompare, BestLamp, Rate, ResultBasis, ResultGraphs, ViewSummary};
 use rules::RulePreset;
