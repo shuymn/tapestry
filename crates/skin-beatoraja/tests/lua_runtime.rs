@@ -454,6 +454,95 @@ fn notes_are_capped() {
     assert_eq!(runtime(&mut i).counters().bridges, 0);
 }
 
+/// C14, O6: the runtimes of one screen lifetime share its note book: a
+/// callback's error, keyed by its source site (not its index), is kept
+/// once whichever import's runtime raises it, and a fresh book (the next lifetime) keeps
+/// it again.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_shared_book_keeps_a_sites_error_once_per_lifetime() {
+    use skin_beatoraja::lua::runtime::NoteBook;
+    untimed();
+    let text = entry(
+        "local k = 0",
+        &["function() k = k + 1 error(\"x\") end"],
+        "function() return true end",
+    );
+    let (mut a, mut b) = (import(&text), import(&text));
+    let errors = |book: &NoteBook| {
+        book.notes()
+            .0
+            .iter()
+            .filter(|n| matches!(n, RuntimeNote::CallbackError { .. }))
+            .count()
+    };
+    let book = NoteBook::new();
+    runtime(&mut a).use_notes(&book);
+    runtime(&mut b).use_notes(&book);
+    for i in [&mut a, &mut b] {
+        let n = runtime(i).outputs();
+        runtime(i).frame(&mut fields(n, &[]), &[]);
+        assert_eq!(runtime(i).status(), [CallStatus::Error]);
+    }
+    assert_eq!(errors(&book), 1);
+    // The same callback index at another line is another site.
+    let mut c = import(&entry(
+        "local k = 0
+local pad = 1",
+        &["function() k = k + 1 error(\"x\") end"],
+        "function() return true end",
+    ));
+    runtime(&mut c).use_notes(&book);
+    let n = runtime(&mut c).outputs();
+    runtime(&mut c).frame(&mut fields(n, &[]), &[]);
+    assert_eq!(errors(&book), 2);
+    let fresh = NoteBook::new();
+    runtime(&mut b).use_notes(&fresh);
+    let n = runtime(&mut b).outputs();
+    runtime(&mut b).frame(&mut fields(n, &[]), &[]);
+    assert_eq!((errors(&fresh), errors(&book)), (1, 2));
+}
+
+/// C14: the cap is the book's: once one runtime filled it, another's new
+/// note is counted, not kept.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_shared_book_caps_every_runtime_together() {
+    use skin_beatoraja::lua::runtime::NoteBook;
+    untimed();
+    let mut a = import(&entry(
+        "local k = 0",
+        &["function() k = k + 1 return ms.number(100000 + k) end"],
+        "function() return true end",
+    ));
+    let mut b = import(&entry(
+        "",
+        &["function() return ms.number(99999) / 2 end"],
+        "function() return true end",
+    ));
+    let book = NoteBook::new();
+    runtime(&mut a).use_notes(&book);
+    runtime(&mut b).use_notes(&book);
+    let cap = skin_beatoraja::limits::MAX_NOTES;
+    let mut frames = 0;
+    while book.notes().0.len() < cap && frames < 2 * cap {
+        let n = runtime(&mut a).outputs();
+        runtime(&mut a).frame(&mut fields(n, &[]), &[]);
+        frames += 1;
+    }
+    let before = book.notes().1;
+    let n = runtime(&mut b).outputs();
+    runtime(&mut b).frame(&mut fields(n, &[]), &[]);
+    let (notes, dropped) = book.notes();
+    assert_eq!(notes.len(), cap);
+    assert_eq!(dropped, before + 1);
+    assert!(
+        !notes
+            .iter()
+            .any(|n| matches!(n, RuntimeNote::Absent { id: 99999, .. }))
+    );
+}
+
 /// C2: with no callback for the runtime, or through `import`, no VM is
 /// kept.
 #[test]

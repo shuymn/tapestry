@@ -383,7 +383,7 @@ pub(crate) struct Pass {
     /// The screen the runtime's host reads answer from.
     pub(crate) screen: SyncRefCell<Option<runtime::Screen>>,
     /// The runtime's notes.
-    pub(crate) runtime_notes: SyncRefCell<runtime::Notes>,
+    pub(crate) runtime_notes: SyncRefCell<runtime::NoteBook>,
 }
 
 /// What [`LuaHeader::timed`] gives: the stages' times of an import, or
@@ -446,7 +446,7 @@ impl Pass {
             timings: SyncCell::new(Timings::default()),
             runtime: SyncCell::new(false),
             screen: SyncRefCell::new(None),
-            runtime_notes: SyncRefCell::new(runtime::Notes::default()),
+            runtime_notes: SyncRefCell::new(runtime::NoteBook::default()),
         }
     }
 
