@@ -80,7 +80,8 @@ pub enum ResultError {
     Kind,
 }
 
-/// The chart strings a result skin's text shows, as of the last view.
+/// The chart strings a result or decision skin's text shows, as of the
+/// last view or labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Strings {
     title: String,
@@ -99,6 +100,41 @@ impl Strings {
             subartist: &self.subartist,
             genre: &self.genre,
         }
+    }
+
+    /// Sets the strings to `labels`, each as [`kept`] keeps it.
+    /// Allocates only to replace a string too small for its new text, with
+    /// one of exactly that text's length, so each keeps at most twice
+    /// [`MAX_TEXT_BYTES`] however often it grows.
+    pub(crate) fn set(&mut self, labels: &ResultLabels) {
+        for (to, from) in [
+            (&mut self.title, &labels.title),
+            (&mut self.subtitle, &labels.subtitle),
+            (&mut self.artist, &labels.artist),
+            (&mut self.subartist, &labels.subartist),
+            (&mut self.genre, &labels.genre),
+        ] {
+            let len = kept(from).map(char::len_utf8).sum();
+            if to.capacity() < len {
+                *to = String::with_capacity(len);
+            }
+            to.clear();
+            to.extend(kept(from));
+        }
+    }
+
+    /// The bytes the strings hold.
+    pub(crate) fn capacity(&self) -> usize {
+        [
+            &self.title,
+            &self.subtitle,
+            &self.artist,
+            &self.subartist,
+            &self.genre,
+        ]
+        .into_iter()
+        .map(String::capacity)
+        .sum()
     }
 }
 
@@ -240,11 +276,7 @@ impl ResultScreen {
     /// memory witness; it allocates nothing.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        let s = &self.strings;
-        let strings = [&s.title, &s.subtitle, &s.artist, &s.subartist, &s.genre]
-            .into_iter()
-            .map(String::capacity)
-            .sum::<usize>();
+        let strings = self.strings.capacity();
         let bytes = size_of::<Self>()
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
@@ -292,21 +324,7 @@ impl ResultScreen {
             self.has_deviations = true;
         }
         self.areas = view.timing_areas.filter(|_| ready);
-        let s = &mut self.strings;
-        for (to, from) in [
-            (&mut s.title, &labels.title),
-            (&mut s.subtitle, &labels.subtitle),
-            (&mut s.artist, &labels.artist),
-            (&mut s.subartist, &labels.subartist),
-            (&mut s.genre, &labels.genre),
-        ] {
-            let from = cut(from);
-            if to.capacity() < from.len() {
-                *to = String::with_capacity(from.len());
-            }
-            to.clear();
-            to.push_str(from);
-        }
+        self.strings.set(labels);
     }
 
     /// Fills this frame's timers: the built-in ones from `timers`, then
@@ -332,14 +350,24 @@ impl ResultScreen {
     }
 }
 
-/// `src` cut to twice [`MAX_TEXT_BYTES`] at a character boundary: the
-/// text requests cut every string to [`MAX_TEXT_BYTES`] anyway.
-fn cut(src: &str) -> &str {
-    let mut end = src.len().min(MAX_TEXT_BYTES * 2);
-    while !src.is_char_boundary(end) {
-        end -= 1;
-    }
-    src.get(..end).unwrap_or_default()
+/// The characters of `src` a label keeps: its characters but control
+/// characters, in order, while they fit twice [`MAX_TEXT_BYTES`]. The text
+/// drops control characters before it cuts a line to [`MAX_TEXT_BYTES`]
+/// (`text::clean`), so dropping them first and keeping more than a line
+/// gives the lines play gives. A label of control characters alone keeps
+/// its first one, which the text drops: its field stays not empty as
+/// written, which a joined field reads (`TextValue::resolve`).
+fn kept(src: &str) -> impl Iterator<Item = char> + '_ {
+    let mut len = 0_usize;
+    let shown = src
+        .chars()
+        .filter(|c| !c.is_control())
+        .take_while(move |c| {
+            len += c.len_utf8();
+            len <= MAX_TEXT_BYTES * 2
+        });
+    let only_control = !src.is_empty() && src.chars().all(char::is_control);
+    shown.chain(src.chars().next().filter(|_| only_control))
 }
 
 /// `v` as a signed field value, within ±[`VALUE_MAX`].
