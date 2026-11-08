@@ -43,8 +43,9 @@ pub const MAX_IMAGE_FRAMES: u32 = 1_024;
 pub const MAX_SKIN_FRAMES: usize = 65_536;
 /// The longest file name, in bytes.
 pub const MAX_PATH_BYTES: usize = 1_024;
-/// The largest file, in bytes, encoded.
-pub const MAX_FILE_BYTES: u64 = 32 << 20;
+/// The largest image file, in bytes, encoded. Font files have their own
+/// cap ([`MAX_FONT_BYTES`](crate::MAX_FONT_BYTES)).
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
 /// The most bytes read to find a file's header.
 pub const HEADER_BYTES: u64 = 1 << 20;
 /// The most encoded bytes across one variant's files.
@@ -52,14 +53,14 @@ pub const MAX_TOTAL_FILE_BYTES: u64 = 512 << 20;
 /// The largest width or height of a file.
 pub const MAX_SIDE: u32 = 16_384;
 /// The most texels of one file decoded whole. With [`MAX_FILE_BYTES`] it
-/// bounds one file's decoding at 144 MiB: the larger of 2 × 32 MiB
-/// encoded, 32 MiB encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi
+/// bounds one file's decoding at 160 MiB: the larger of 2 × 64 MiB
+/// encoded, 64 MiB encoded + 8 B × 12 Mi native, and (8 + 4) B × 12 Mi
 /// native and RGBA8.
 pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// The most texels of one file decoded in bands of rows: a PNG past
 /// [`MAX_IMAGE_TEXELS`], neither interlaced nor animated. With
 /// [`MAX_FILE_BYTES`] its reading and decoding stay within the larger of
-/// 2 × 32 MiB and 32 MiB + 16 MiB, whatever its texels, beside the
+/// 2 × 64 MiB and 64 MiB + 16 MiB, whatever its texels, beside the
 /// atlas's pages and tables
 /// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;

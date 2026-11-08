@@ -3,7 +3,10 @@
 use std::fs::File;
 use std::path::Path;
 
-use skin_model::{FontDef, FontError, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES, Sheet};
+use skin_model::{
+    FontAdmitError, FontDef, FontError, MAX_FILE_BYTES, MAX_FONT_BYTES, MAX_FONTS,
+    MAX_TOTAL_FONT_BYTES, Root, Sheet, SheetBuilder,
+};
 
 /// Writes `name` in `dir`: `head`, then zeros to `len` bytes (sparse).
 fn write(dir: &Path, name: &str, head: &[u8], len: u64) {
@@ -53,9 +56,30 @@ fn a_sheet_names_at_most_16_fonts() {
 fn a_font_is_at_most_32_mib_and_the_fonts_64_mib() {
     assert_eq!(MAX_FONT_BYTES, 32 << 20);
     assert_eq!(MAX_TOTAL_FONT_BYTES, 64 << 20);
+    // The fonts' cap is their own, below an image file's.
+    const { assert!(MAX_FONT_BYTES < MAX_FILE_BYTES) };
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "cap.ttf", &TRUETYPE, MAX_FONT_BYTES);
     write(d.path(), "over.ttf", &TRUETYPE, MAX_FONT_BYTES + 1);
+    write(d.path(), "image.ttf", &TRUETYPE, MAX_FILE_BYTES);
+    let err = with(d.path(), &["image.ttf"]).unwrap_err();
+    assert!(matches!(err, FontError::TooLarge { font: 0 }), "{err:?}");
+    // A builder's admission checks the same cap.
+    let mut b = SheetBuilder::new(&Root::new(d.path()).unwrap());
+    assert_eq!(
+        b.admit_font(FontDef {
+            path: "cap.ttf".into()
+        })
+        .unwrap(),
+        0
+    );
+    for name in ["over.ttf", "image.ttf"] {
+        let err = b.admit_font(FontDef { path: name.into() }).unwrap_err();
+        assert!(
+            matches!(err, FontAdmitError::File(FontError::TooLarge { font: 1 })),
+            "{name}: {err:?}"
+        );
+    }
     write(d.path(), "small.ttf", &TRUETYPE, 4);
     write(d.path(), "cap2.ttf", &TRUETYPE, MAX_FONT_BYTES);
     with(d.path(), &["cap.ttf"]).unwrap();
@@ -144,10 +168,13 @@ fn font_reader_budgets() {
         matches!(err, FontError::TotalTooLarge { font: 2 }),
         "{err:?}"
     );
-    // Each file's own cap holds even with the budget left.
-    write(d.path(), "f3.ttf", &TRUETYPE, MAX_FONT_BYTES + 1);
-    let err = FontReader::new(&sheet).read(3).unwrap_err();
-    assert!(matches!(err, FontError::TooLarge { font: 3 }), "{err:?}");
+    // Each file's own cap holds even with the budget left, an image
+    // file's length included.
+    for len in [MAX_FONT_BYTES + 1, MAX_FILE_BYTES] {
+        write(d.path(), "f3.ttf", &TRUETYPE, len);
+        let err = FontReader::new(&sheet).read(3).unwrap_err();
+        assert!(matches!(err, FontError::TooLarge { font: 3 }), "{err:?}");
+    }
     let err = FontReader::new(&sheet).read(16).unwrap_err();
     assert!(matches!(err, FontError::Unknown { font: 16 }), "{err:?}");
 }
