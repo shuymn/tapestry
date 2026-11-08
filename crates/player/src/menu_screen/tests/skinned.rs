@@ -501,6 +501,7 @@ fn measure_on(adapter: render::AdapterChoice) {
 /// (docs/stage3.md S7-07; design.md "Scope of No Allocation").
 #[test]
 fn selection_runtime_frame_alloc() {
+    let _serial = crate::imports::tests::serial();
     let mut r = warp();
     let dir = crate::selection_skin::runtime_fixture();
     let (b, script) =

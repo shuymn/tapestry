@@ -48,6 +48,7 @@ fn gone(flag: &AtomicBool) -> bool {
 /// it: its VM is not destroyed.
 #[test]
 fn a_cell_dropped_unretired_leaks_its_runtime() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, slot, vm) = staged();
     let scripts = Scripts::new();
     scripts.commit(ScreenKind::Selection, 1, slot);
@@ -59,6 +60,7 @@ fn a_cell_dropped_unretired_leaks_its_runtime() {
 /// terminal: a visit after it takes nothing.
 #[test]
 fn a_retired_runtime_is_destroyed_and_never_resumed() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, slot, vm) = staged();
     let scripts = Scripts::new();
     scripts.commit(ScreenKind::Selection, 1, slot);
@@ -77,6 +79,7 @@ fn a_retired_runtime_is_destroyed_and_never_resumed() {
 /// cell is quiet; the interval's close gives the token that destroys it.
 #[test]
 fn nothing_is_taken_or_destroyed_while_a_play_runs() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, slot, vm) = staged();
     let scripts = Scripts::new();
     scripts.commit(ScreenKind::Selection, 1, slot);
@@ -95,6 +98,7 @@ fn nothing_is_taken_or_destroyed_while_a_play_runs() {
 /// the same VM, its Lua state kept (owner decision O7 (a)).
 #[test]
 fn a_dropped_visit_parks_and_the_next_resumes() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, bundle, slot, vm) = staged_bundle();
     let scripts = Scripts::new();
     scripts.commit(ScreenKind::Selection, 1, slot);
@@ -117,6 +121,7 @@ fn a_dropped_visit_parks_and_the_next_resumes() {
 /// its visit parks it, and the new generation's runtime is the one taken.
 #[test]
 fn a_superseded_generation_is_retired_as_it_parks() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, first, old) = staged();
     let (_dir2, second, new) = staged();
     let scripts = Scripts::new();
@@ -134,6 +139,7 @@ fn a_superseded_generation_is_retired_as_it_parks() {
 /// holds the cell's lock: it neither locks nor waits.
 #[test]
 fn the_orphan_mark_neither_locks_nor_waits() {
+    let _serial = crate::imports::tests::serial();
     let scripts = Scripts::new();
     let held = scripts.0.host();
     let guard = scripts.orphan_guard();
@@ -169,6 +175,7 @@ fn committed() -> (tempfile::TempDir, Scripts, Arc<AtomicBool>) {
 /// into the deferred set, and the next good token destroys it.
 #[test]
 fn an_inactive_token_destroys_before_any_play() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let token = scripts.inactive().unwrap();
     assert!(scripts.retire(Quiet::Inactive(token)));
@@ -177,6 +184,7 @@ fn an_inactive_token_destroys_before_any_play() {
 
 #[test]
 fn an_inactive_token_kept_across_an_opening_destroys_nothing() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let stale = scripts.inactive().unwrap();
     let interval = scripts.open_interval();
@@ -192,6 +200,7 @@ fn an_inactive_token_kept_across_an_opening_destroys_nothing() {
 
 #[test]
 fn an_inactive_token_from_before_a_finished_play_destroys_nothing() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let stale = scripts.inactive().unwrap();
     let _closed = scripts.open_interval().close();
@@ -203,6 +212,7 @@ fn an_inactive_token_from_before_a_finished_play_destroys_nothing() {
 
 #[test]
 fn a_saved_close_token_destroys_nothing_in_the_next_play() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let saved = scripts.open_interval().close();
     let next = scripts.open_interval();
@@ -214,6 +224,7 @@ fn a_saved_close_token_destroys_nothing_in_the_next_play() {
 
 #[test]
 fn a_close_token_of_one_of_two_open_intervals_destroys_nothing() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let first = scripts.open_interval();
     let second = scripts.open_interval();
@@ -229,6 +240,7 @@ fn a_close_token_of_one_of_two_open_intervals_destroys_nothing() {
 
 #[test]
 fn another_cells_tokens_destroy_nothing() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let other = Scripts::new();
     let interval = scripts.open_interval();
@@ -241,6 +253,7 @@ fn another_cells_tokens_destroy_nothing() {
 
 #[test]
 fn another_cells_token_destroys_nothing_with_no_interval_open() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let other = Scripts::new();
     assert!(!scripts.retire(Quiet::Inactive(other.inactive().unwrap())));
@@ -251,6 +264,7 @@ fn another_cells_token_destroys_nothing_with_no_interval_open() {
 /// no token is quiet, and the cell's drop leaks the runtime.
 #[test]
 fn an_interval_dropped_unclosed_keeps_every_runtime() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, scripts, vm) = committed();
     let stale = scripts.inactive().unwrap();
     drop(scripts.open_interval());
@@ -264,6 +278,7 @@ fn an_interval_dropped_unclosed_keeps_every_runtime() {
 /// destroyed under the cell's lock, never with an interval open.
 #[test]
 fn no_interval_opens_while_a_retirement_destroys() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, slot, _) = staged();
     let scripts = Scripts::new();
     let during = Arc::new(AtomicBool::new(false));
@@ -299,6 +314,7 @@ fn no_interval_opens_while_a_retirement_destroys() {
 /// the stopped runtime reports it again, for its own notice.
 #[test]
 fn a_stop_is_reported_once_per_screen() {
+    let _serial = crate::imports::tests::serial();
     let dir = crate::selection_skin::runtime_fixture();
     let (bundle, slot) =
         crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "stop.luaskin");

@@ -519,6 +519,7 @@ impl FrameSink for SettingsFrames {
 /// granted after the key, with no view taken.
 #[test]
 fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
+    let _serial = crate::imports::tests::serial();
     use game::{Adjust, AppRig as _};
     let dir = crate::selection_skin::settings_fixture();
     let limits = crate::render_common::offscreen(1_920, 1_080);
@@ -664,6 +665,7 @@ fn quads_after(frames: &Frames, seen: usize, more: usize) -> Option<usize> {
 /// end retires it.
 #[test]
 fn the_runtime_draws_each_frame_and_rests_through_a_play() {
+    let _serial = crate::imports::tests::serial();
     let shown = |link: &RenderLink, frames: &Frames, lifetime: u64| {
         link.enter_selection(lifetime);
         link.show_selection(update_of(lifetime, 1, listed(SelectionPlace::All, "")));
@@ -729,6 +731,7 @@ fn the_runtime_draws_each_frame_and_rests_through_a_play() {
 /// stopped runtime shows the notice again.
 #[test]
 fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
+    let _serial = crate::imports::tests::serial();
     let notice = crate::screens::ScriptStop::Budget.notice();
     let strip_of = |frames: &Frames| frames.0.lock().unwrap().last().unwrap().5.clone();
     let (_dir, skin, script) = scripted("stop.luaskin");
@@ -771,6 +774,7 @@ fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
 /// (design.md "beatoraja Lua Skins", Quiescence acknowledged).
 #[test]
 fn a_render_failure_in_a_play_leaves_the_runtime_to_the_game_thread() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, skin, script) = scripted("rt.luaskin");
     let gone = Arc::new(AtomicBool::new(false));
     script.on_vm_drop(&gone);
@@ -800,6 +804,7 @@ fn a_render_failure_in_a_play_leaves_the_runtime_to_the_game_thread() {
 /// Lua Skins", Quiescence acknowledged).
 #[test]
 fn a_menu_page_before_selections_cleanup_leaves_the_runtime_to_the_acknowledgment() {
+    let _serial = crate::imports::tests::serial();
     let (_dir, skin, script) = scripted("rt.luaskin");
     let (link, frames) = warp_link(None);
     link.select_with(ScreenKind::Selection, Some(skin), script)

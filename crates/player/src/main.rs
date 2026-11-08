@@ -2172,6 +2172,7 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_play_leaves_the_screens_runtimes_at_rest_until_its_end() {
+        let _serial = crate::imports::tests::serial();
         use game::Rig as _;
         use std::sync::atomic::Ordering;
         for panic in [false, true] {

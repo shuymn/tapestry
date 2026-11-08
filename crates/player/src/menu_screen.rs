@@ -729,7 +729,7 @@ impl MenuScreen {
     }
 
     /// The selection state numbered `id`'s runtime stopped: its notice
-    /// is logged and, from this frame, the strip's while the screen shows
+    /// goes to standard error and, from this frame, the strip's while the screen shows
     /// that state.
     #[cold]
     fn script_stopped(
@@ -738,7 +738,7 @@ impl MenuScreen {
         id: u64,
         stop: crate::screens::ScriptStop,
     ) -> Result<(), RenderError> {
-        log::warn!("selection skin: {}", stop.notice());
+        eprintln!("render: selection skin: {}", stop.notice());
         self.script_notice = Some((id, stop.notice()));
         self.prepare_strip(&u.strip, Some(stop.notice()))
     }
