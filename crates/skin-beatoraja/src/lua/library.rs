@@ -106,7 +106,7 @@
 //! no metamethod a native would call. Lua runs no other skin code
 //! itself.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use mlua::chunk::ChunkMode;
 use mlua::{Function, Lua, Table, Value};
@@ -143,7 +143,7 @@ const FINALIZER: i64 = 0;
 
 /// Installs the library in `env`, from the natives of `base`, the VM's
 /// own globals, which no skin reaches.
-pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> mlua::Result<()> {
+pub(super) fn install(lua: &Lua, pass: &Arc<Pass>, env: &Table, base: &Table) -> mlua::Result<()> {
     let string: Table = base.raw_get("string")?;
     let table: Table = base.raw_get("table")?;
     let math: Table = base.raw_get("math")?;
@@ -172,7 +172,7 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
     }
     native.raw_set("mathtype", math.raw_get::<Function>("type")?)?;
 
-    let p = Rc::clone(pass);
+    let p = Arc::clone(pass);
     // Each returns its status, never a Rust error: `library.lua` raises
     // the fault in Lua.
     let charge = lua.create_function(move |lua, n: i64| {
@@ -182,7 +182,7 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
             .and_then(|()| p.ledger.native(lua, n))
             .is_ok())
     })?;
-    let p = Rc::clone(pass);
+    let p = Arc::clone(pass);
     let refuse = lua.create_function(move |lua, code: i64| {
         let why = if code == FINALIZER {
             LuaWhy::Finalizer
@@ -198,7 +198,7 @@ pub(super) fn install(lua: &Lua, pass: &Rc<Pass>, env: &Table, base: &Table) -> 
         Ok(false)
     })?;
     let bridge = lua.create_table()?;
-    let p = Rc::clone(pass);
+    let p = Arc::clone(pass);
     bridge.raw_set(
         "metatable",
         lua.create_function(move |lua, ()| {

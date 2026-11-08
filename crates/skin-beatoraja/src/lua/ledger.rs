@@ -6,7 +6,7 @@
 //! instruction step and protected call raises it again, so a Lua
 //! protected call cannot catch it or reset a budget.
 
-use std::cell::{Cell, RefCell};
+use super::sync::{SyncCell, SyncRefCell};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +26,7 @@ use crate::lua::LuaLimit;
 /// the test set on its thread (`tests::TIME_LIMIT`).
 fn time_limit() -> Duration {
     #[cfg(test)]
-    if let Some(limit) = super::tests::TIME_LIMIT.with(Cell::get) {
+    if let Some(limit) = super::tests::TIME_LIMIT.with(std::cell::Cell::get) {
         return limit;
     }
     MAX_LUA_TIME
@@ -125,29 +125,76 @@ pub(crate) enum Stop {
 
 /// One pass's accounting.
 pub(crate) struct Ledger {
-    counts: Cell<Counts>,
-    fault: RefCell<Option<Stop>>,
-    faulted: Cell<bool>,
+    counts: SyncCell<Counts>,
+    fault: SyncRefCell<Option<Stop>>,
+    faulted: SyncCell<bool>,
     cancel: Cancel,
     /// The time the candidate's earlier passes ran, and when this one
     /// started, for [`MAX_LUA_TIME`].
     spent: Duration,
     started: Instant,
     /// The time this pass ran Lua, once its execution ended.
-    stopped: Cell<Option<Duration>>,
+    stopped: SyncCell<Option<Duration>>,
+    /// In a screen's runtime, the frame being run: its own instruction,
+    /// host-call and time budget in place of the candidate's
+    /// (docs/stage3.md S7-07).
+    frame: SyncCell<Option<Frame>>,
+    /// The instruction steps run since a fault, before the hook raises it
+    /// again ([`super::sandbox`]); reset with each frame.
+    after_fault: SyncCell<u32>,
+}
+
+/// A runtime frame's budget: the counts at its start and its deadline.
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    start: Counts,
+    deadline: Instant,
 }
 
 impl Ledger {
     pub(crate) fn new(counts: Counts, spent: Duration, cancel: Cancel) -> Self {
         Self {
-            counts: Cell::new(counts),
-            fault: RefCell::new(None),
-            faulted: Cell::new(false),
+            counts: SyncCell::new(counts),
+            fault: SyncRefCell::new(None),
+            faulted: SyncCell::new(false),
             cancel,
             spent,
             started: Instant::now(),
-            stopped: Cell::new(None),
+            stopped: SyncCell::new(None),
+            frame: SyncCell::new(None),
+            after_fault: SyncCell::new(0),
         }
+    }
+
+    /// Starts a runtime frame: the last frame's stop cleared, and this
+    /// frame's budget counted from now ([`super::limits::RUNTIME_INSTRUCTIONS`],
+    /// [`super::limits::RUNTIME_HOST_CALLS`], [`super::limits::RUNTIME_FRAME_TIME`]).
+    pub(crate) fn begin_frame(&self) {
+        self.clear_fault();
+        #[cfg(feature = "dev-tools")]
+        let budget = super::vm_hooks::frame_time();
+        #[cfg(not(feature = "dev-tools"))]
+        let budget = super::limits::RUNTIME_FRAME_TIME;
+        self.frame.set(Some(Frame {
+            start: self.counts(),
+            deadline: Instant::now() + budget,
+        }));
+    }
+
+    /// Clears a runtime call's fault, so the next call of the frame runs:
+    /// the frame's budget stays counted.
+    pub(crate) fn clear_fault(&self) {
+        self.fault.borrow_mut().take();
+        self.faulted.set(false);
+        self.after_fault.set(0);
+    }
+
+    /// One instruction step after a fault: whether the hook lets it run,
+    /// so the fault's error unwinds before the hook raises it again.
+    pub(crate) fn step_after_fault(&self, allowed: u32) -> bool {
+        let n = self.after_fault.get().saturating_add(1);
+        self.after_fault.set(n);
+        n <= allowed
     }
 
     /// Ends this pass's Lua time: the conversion and the teardown after
@@ -178,6 +225,14 @@ impl Ledger {
     /// Whether a fault was recorded.
     pub(crate) fn faulted(&self) -> bool {
         self.faulted.get()
+    }
+
+    /// The recorded fault's reason, if a Lua refusal is recorded.
+    pub(crate) fn peek_why(&self) -> Option<LuaWhy> {
+        match self.fault.borrow().as_ref() {
+            Some(Stop::Fault(ImportError::Lua { why, .. })) => Some(*why),
+            _ => None,
+        }
     }
 
     /// The recorded stop, taken.
@@ -224,8 +279,15 @@ impl Ledger {
         if self.cancel.is_cancelled() {
             return Err(self.fail_lua(lua, LuaWhy::Cancelled));
         }
-        if self.spent() > time_limit() {
-            return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
+        match self.frame.get() {
+            Some(f) if Instant::now() > f.deadline => {
+                return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
+            }
+            Some(_) => {}
+            None if self.spent() > time_limit() => {
+                return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Time)));
+            }
+            None => {}
         }
         Ok(())
     }
@@ -247,7 +309,12 @@ impl Ledger {
             .counts()
             .instructions
             .saturating_add(u64::from(INSTRUCTION_STEP));
-        if next >= MAX_INSTRUCTIONS {
+        let cap = self.frame.get().map_or(MAX_INSTRUCTIONS, |f| {
+            f.start
+                .instructions
+                .saturating_add(super::limits::RUNTIME_INSTRUCTIONS)
+        });
+        if next >= cap {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Instructions)));
         }
         self.update(|c| c.instructions = next);
@@ -259,7 +326,12 @@ impl Ledger {
     pub(crate) fn host_call(&self, lua: &Lua) -> mlua::Result<()> {
         self.check(lua)?;
         let calls = self.counts().host_calls;
-        if calls >= MAX_HOST_CALLS {
+        let cap = self.frame.get().map_or(MAX_HOST_CALLS, |f| {
+            f.start
+                .host_calls
+                .saturating_add(super::limits::RUNTIME_HOST_CALLS)
+        });
+        if calls >= cap {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::HostCalls)));
         }
         self.update(|c| c.host_calls = calls + 1);
@@ -271,7 +343,10 @@ impl Ledger {
     /// `work` units of native library work, charged before the call.
     pub(crate) fn native(&self, lua: &Lua, work: u64) -> mlua::Result<()> {
         let next = self.counts().native_work.saturating_add(work);
-        if next > MAX_NATIVE_WORK {
+        let cap = self.frame.get().map_or(MAX_NATIVE_WORK, |f| {
+            f.start.native_work.saturating_add(MAX_NATIVE_WORK)
+        });
+        if next > cap {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::NativeWork)));
         }
         self.update(|c| c.native_work = next);

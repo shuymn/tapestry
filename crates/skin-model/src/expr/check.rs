@@ -10,6 +10,7 @@ use super::interval::Iv;
 use super::parse::{Ast, BinOp, Func, Id, Kind, UnOp};
 use super::program::{Binary, Op, Unary};
 use super::{MAX_ELAPSED_MS, OptionDef, Scope, TIMER_OFF};
+use crate::output::OutTy;
 use crate::schema::{FieldTy, SchemaError, Ty};
 
 /// A checked tree, ready to fold and emit.
@@ -126,7 +127,21 @@ impl Checker<'_, '_> {
     fn field(&self, id: Id) -> Result<Typed, CompileError> {
         let name = self.ast.text(id);
         let Some((slot, field)) = self.scope.schema.field(name) else {
-            return Err(self.err(id, ErrorKind::UnknownName { name: name.into() }));
+            // A callback's output: an integer value, or a boolean draw or
+            // `ok` flag, read from its slot after the schema's fields.
+            return match self.scope.output(name) {
+                Some((slot, OutTy::Int, false)) => self.int(
+                    id,
+                    T::Read(Op::Load {
+                        slot,
+                        lo: i32::MIN,
+                        hi: i32::MAX,
+                    }),
+                    Iv::new(i32::MIN, i32::MAX),
+                ),
+                Some((slot, _, _)) => Ok(Self::boolean(T::Read(Op::Load { slot, lo: 0, hi: 1 }))),
+                None => Err(self.err(id, ErrorKind::UnknownName { name: name.into() })),
+            };
         };
         let load = |lo, hi| T::Read(Op::Load { slot, lo, hi });
         match field.ty {

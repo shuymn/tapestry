@@ -26,7 +26,7 @@
 //! decides the definition it returns. Of entries sharing a name, the
 //! last declared wins. An entry without a name is absent.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use mlua::{Function, Lua, Table, Value};
 use skin_model::MAX_PATH_BYTES;
@@ -101,7 +101,7 @@ impl Bridge {
 /// the pass may change, built afresh for it.
 pub(super) fn install(
     lua: &Lua,
-    pass: &Rc<Pass>,
+    pass: &Arc<Pass>,
     env: &Table,
     bridge: &Bridge,
 ) -> mlua::Result<()> {
@@ -135,6 +135,7 @@ pub(super) fn install(
     // The library checks the argument; the host returns a path or nil and
     // never raises an error.
     let native = host(lua, pass, 1, |lua, pass, args| {
+        pass.import_only(lua)?;
         // Its length is checked before any copy, as the library's is.
         let path = match args.front() {
             Some(Value::String(p)) if p.as_bytes().len() <= MAX_PATH_BYTES => p

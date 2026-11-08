@@ -168,7 +168,7 @@ pub(super) fn convert(
     value: Value,
     entry: &FileId,
     modules: Vec<String>,
-) -> Result<(Arena, u32), ImportError> {
+) -> Result<(Arena, u32, Vec<Function>), ImportError> {
     #[cfg(test)]
     super::tests::conversion_witness();
     let Value::Table(t) = value else {
@@ -223,6 +223,7 @@ pub(super) fn convert(
         bytes: Vec::new(),
         values: Vec::new(),
         callables: Vec::new(),
+        functions: Vec::new(),
         seen: HashMap::new(),
         path: Vec::new(),
         decoded: 0,
@@ -248,6 +249,7 @@ pub(super) fn convert(
         bytes,
         values,
         callables,
+        functions,
         mut analysis,
         ..
     } = c;
@@ -271,8 +273,9 @@ pub(super) fn convert(
         modules,
         callables,
         analysis,
+        kept: None,
     }));
-    Ok((arena, top))
+    Ok((arena, top, functions))
 }
 
 /// A span of the converted bytes.
@@ -322,6 +325,9 @@ struct Conv<'a> {
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
     callables: Vec<Callable>,
+    /// Each callable's function, by its index: what a screen's runtime
+    /// calls when the import keeps the VM.
+    functions: Vec<Function>,
     /// Callables by the function's address.
     seen: HashMap<usize, u32>,
     /// The tables on the path from the root, by address.
@@ -450,6 +456,7 @@ impl Conv<'_> {
                         let i = u32::try_from(self.callables.len())
                             .map_err(|_| self.input(InputLimit::Nodes))?;
                         self.callables.push(callable);
+                        self.functions.push(f.clone());
                         self.seen.insert(addr, i);
                         i
                     }

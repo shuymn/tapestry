@@ -14,7 +14,7 @@
 //! [`super::LuaLimit::AnalysisTime`], fatal, located at the callable the
 //! phase retained, or nowhere when it retained none.
 
-use std::cell::Cell;
+use super::sync::SyncCell;
 use std::time::Duration;
 
 use super::Unsupported;
@@ -58,7 +58,7 @@ fn since(s: Stamp) -> Duration {
 
 #[cfg(test)]
 fn now() -> Stamp {
-    fake::NOW.with(Cell::get)
+    fake::NOW.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -70,11 +70,11 @@ fn since(s: Stamp) -> Duration {
 #[derive(Debug, Default)]
 pub(crate) struct AnalysisClock {
     /// The time of the phases left.
-    spent: Cell<Duration>,
+    spent: SyncCell<Duration>,
     /// When the current phase was entered, if one is.
-    since: Cell<Option<Stamp>>,
+    since: SyncCell<Option<Stamp>>,
     /// The node of the callable the current phase is at, if any.
-    at: Cell<Option<u32>>,
+    at: SyncCell<Option<u32>>,
 }
 
 impl AnalysisClock {
