@@ -77,9 +77,6 @@ pub struct ImportTarget {
 pub enum KindOutcome {
     /// Built: the bundle to select, and the import's report.
     Bundle(Arc<SkinBundle>, Summary),
-    /// The kind has no importer yet: its screen stays built in, for the
-    /// reason given.
-    BuiltIn(String),
     /// Refused, with the located reason: nothing is selected.
     Refused(String),
     /// A Lua play skin whose base import read a fact the base snapshot
@@ -384,7 +381,6 @@ pub fn build(
 ) -> KindOutcome {
     match built(kind, choice, autoplay, target, cancel) {
         Ok(Built::Bundle(b, summary)) => KindOutcome::Bundle(b, summary),
-        Ok(Built::NoImporter(why)) => KindOutcome::BuiltIn(why),
         Ok(Built::Pending(p, note)) => KindOutcome::Pending(p, note),
         Ok(Built::ResultPending(p, note)) => KindOutcome::ResultPending(p, note),
         Err(why) => KindOutcome::Refused(why),
@@ -394,7 +390,6 @@ pub fn build(
 /// What [`built`] made.
 enum Built {
     Bundle(Arc<SkinBundle>, Summary),
-    NoImporter(String),
     Pending(Arc<PendingPlay>, PendingNote),
     ResultPending(Arc<crate::result_skin::PendingResult>, PendingNote),
 }
@@ -505,11 +500,7 @@ fn built(
             }
         }
     };
-    let imported = match imported {
-        Ok(i) => i,
-        Err(e @ ImportError::NoImporter { .. }) => return Ok(Built::NoImporter(text(&e))),
-        Err(e) => return Err(text(&e)),
-    };
+    let imported = imported.map_err(|e| text(&e))?;
     stopped()?;
     // 5. The pack.
     let (bundle, summary) = pack(imported, &header, target, cancel)?;
@@ -844,8 +835,6 @@ fn spawn(body: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHa
 pub enum Shown {
     /// Its skin is installed.
     Installed,
-    /// Its screen stays built in, for the reason.
-    BuiltIn(String),
     /// Its skin was refused, for the reason.
     Refused(String),
     /// Its skin is pending: it reads this chart fact as it is built, and
@@ -854,8 +843,7 @@ pub enum Shown {
 }
 
 /// The stdout line of `kind`: `skin: <kind>: installed`, `skin: <kind>:
-/// built-in: <reason>`, `skin: <kind>: refused: <reason>` or `skin:
-/// <kind>: pending: <what it reads>`.
+/// refused: <reason>` or `skin: <kind>: pending: <what it reads>`.
 pub fn line(kind: ScreenKind, shown: &Shown) -> String {
     let kind = name(kind);
     match shown {
@@ -864,13 +852,11 @@ pub fn line(kind: ScreenKind, shown: &Shown) -> String {
             "skin: {kind}: pending: reads {} as it is built; built for each chart before its play",
             fact_name(*fact)
         ),
-        Shown::BuiltIn(why) => format!("skin: {kind}: built-in: {why}"),
         Shown::Refused(why) => format!("skin: {kind}: refused: {why}"),
     }
 }
 
-/// The select screen's notice of a refused or built-in kind other than
-/// play: one line naming the kind and the reason. Play's refusal is its
+/// The select screen's notice of a refused kind other than play: one line naming the kind and the reason. Play's refusal is its
 /// admission notice instead ([`crate::render_side::SkinState`]).
 pub fn notice(kind: ScreenKind, why: &str) -> String {
     let screen = match kind {
@@ -1153,7 +1139,6 @@ pub fn startup(
                     Some(why) => Shown::Refused(why),
                 }
             }
-            Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::ResultPending(result, note)) => {
                 started.result = Some(crate::result_skin::ResultStart::Pending(result));
                 Shown::Pending(note.fact)
@@ -1197,7 +1182,7 @@ pub fn startup(
         report(kind, &shown);
         match shown {
             Shown::Installed | Shown::Pending(_) => {}
-            Shown::Refused(why) | Shown::BuiltIn(why) if kind == ScreenKind::Play => {
+            Shown::Refused(why) if kind == ScreenKind::Play => {
                 if launch == Launch::Direct {
                     return Err(StartupEnd::Failed(anyhow::anyhow!(
                         "the play skin cannot be used: {why}"
@@ -1205,7 +1190,7 @@ pub fn startup(
                 }
                 started.play = Some(Message::SkinUnusable { why: &why }.text());
             }
-            Shown::Refused(why) | Shown::BuiltIn(why) => notices.push(notice(kind, &why)),
+            Shown::Refused(why) => notices.push(notice(kind, &why)),
         }
     }
     if !notices.is_empty() {

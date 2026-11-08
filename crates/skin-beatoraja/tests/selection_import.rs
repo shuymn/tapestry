@@ -264,16 +264,6 @@ fn ratio_bars_draw_their_ratios() {
     assert_eq!(4 * hit.value.numerator, 3 * hit.value.denominator);
 }
 
-/// C20: a decision skin still has no importer.
-#[test]
-fn decision_skins_have_no_importer() {
-    let kind = skin_model::ScreenKind::Decision;
-    let d = common::skin(&[("s.json", r#"{"type": 6}"#)]);
-    let (mut def, h) = skin_beatoraja::read_header(d.path(), "s.json").unwrap();
-    let r = skin_beatoraja::import(&mut def, &h, &skin_beatoraja::Config::defaults(&h), kind);
-    assert!(matches!(r, Err(ImportError::NoImporter { kind: k }) if k == kind));
-}
-
 /// An active `listoff` the list does not give: slot 1's unselected arm
 /// with only slot 0's `listoff` written refuses the song list, where
 /// the inactive `listoff` of the center slot missing is only noted.

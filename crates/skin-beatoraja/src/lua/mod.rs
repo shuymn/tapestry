@@ -986,8 +986,7 @@ impl LuaHeader {
     ///
     /// What [`read_lua_header`] refuses; a snapshot of another scene than
     /// the skin's kind ([`ImportError::Slot`]), by its header or by the
-    /// `type` the configured pass returns, or of a kind no importer maps
-    /// yet ([`ImportError::NoImporter`]); a fact it has unavailable
+    /// `type` the configured pass returns; a fact it has unavailable
     /// ([`LuaWhy::Unavailable`]) or a bad id ([`LuaWhy::FactArgument`]);
     /// and what [`crate::import`] refuses of the converted definition.
     pub fn import(
@@ -1198,8 +1197,7 @@ impl LuaHeader {
     /// candidate's snapshots, its usage and the facts it read; on failure
     /// or a pending fact, the stop with the usage, the snapshots and the
     /// facts read so far. A snapshot of another scene than the header's
-    /// kind ([`ImportError::Slot`]), or of a kind no importer maps yet
-    /// ([`ImportError::NoImporter`]), refuses before the configured pass
+    /// kind ([`ImportError::Slot`]) refuses before the configured pass
     /// runs, so no asset or configured-only include is read.
     #[cfg(any(test, feature = "dev-tools"))]
     pub(crate) fn configured(
@@ -1226,8 +1224,6 @@ impl LuaHeader {
                 slot: facts.scene,
                 found: self.header.kind,
             })
-        } else if facts.scene == ScreenKind::Decision {
-            Some(ImportError::NoImporter { kind: facts.scene })
         } else {
             None
         };

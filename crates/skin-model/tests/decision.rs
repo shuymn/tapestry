@@ -10,12 +10,12 @@ use bms_model::{ChartBuilder, TimeUs};
 use result_support::labels;
 use selection_support::{frame_of, rect, skin_def, uvs};
 use skin_model::{
-    Attempt, Blend, BuildError, ChartMetadata, ChartText, DECISION, DecisionError, DecisionFrame,
-    DecisionScreen, DecisionTimers, ElementDef, FontRef, ImageChoiceDef, ImageChoicePart,
-    ImageSpan, KeyDef, Layout, LoadError, Overflow, PastTable, Place, PlayContext, PrepareError,
-    Program, QuadBatch, ResultLabels, Scope, ScreenKind, SelectionText, Side, Skin, SkinDef,
-    Source, TextDef, TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef, Ty,
-    UvTable, WidgetDefs, compile, decision_timer,
+    Attempt, Blend, BuildError, ChartMetadata, ChartText, DECISION, DecisionDefs, DecisionError,
+    DecisionFrame, DecisionScreen, DecisionTimers, ElementDef, FontRef, ImageChoiceDef,
+    ImageChoicePart, ImageSpan, KeyDef, Layout, LoadError, Overflow, PastTable, Place, PlayContext,
+    PrepareError, Program, QuadBatch, ResultLabels, Scope, ScreenKind, SelectionText, Side, Skin,
+    SkinDef, Source, TextDef, TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef,
+    Ty, UvTable, WidgetDefs, compile, decision_timer,
 };
 
 fn dint(src: &str) -> Program {
@@ -108,7 +108,7 @@ struct DFx {
 
 impl DFx {
     fn new(def: SkinDef) -> Self {
-        let skin = Skin::new_decision(def).unwrap();
+        let skin = Skin::new_decision(def, DecisionDefs::default()).unwrap();
         let dec = skin.prepare_decision();
         Self {
             uvs: uvs(&skin),
@@ -177,7 +177,8 @@ fn a_decision_skin_refuses_what_other_screens_draw() {
         delement(Source::ImageChoice(0), [0, 20, 10, 10]),
         delement(Source::Text(0), [0, 40, 100, 20]),
     ];
-    let skin = Skin::new_decision(skin_def(ok.clone(), widgets())).unwrap();
+    let skin =
+        Skin::new_decision(skin_def(ok.clone(), widgets()), DecisionDefs::default()).unwrap();
     assert_eq!(skin.kind(), ScreenKind::Decision);
     // The constant choice draws its entry 1: image 1's first frame.
     let mut fx = DFx::new(skin_def(ok.clone(), widgets()));
@@ -199,7 +200,7 @@ fn a_decision_skin_refuses_what_other_screens_draw() {
     ] {
         let mut elements = ok.clone();
         elements.push(delement(refused, [0, 60, 10, 10]));
-        let got = Skin::new_decision(skin_def(elements, widgets()));
+        let got = Skin::new_decision(skin_def(elements, widgets()), DecisionDefs::default());
         assert!(
             matches!(
                 got,
@@ -219,7 +220,7 @@ fn a_decision_skin_refuses_what_other_screens_draw() {
         ..delement(Source::Image(0), [0, 0, 10, 10])
     });
     assert!(matches!(
-        Skin::new_decision(skin_def(elements, widgets())),
+        Skin::new_decision(skin_def(elements, widgets()), DecisionDefs::default()),
         Err(LoadError::UnknownTimer { element: 3 })
     ));
 }
@@ -291,7 +292,11 @@ fn decision_entry_points_refuse_other_kinds() {
         Err(BuildError::Kind)
     );
     // Another decision skin's state.
-    let other = Skin::new_decision(skin_def(elements(), WidgetDefs::default())).unwrap();
+    let other = Skin::new_decision(
+        skin_def(elements(), WidgetDefs::default()),
+        DecisionDefs::default(),
+    )
+    .unwrap();
     let mut foreign = other.prepare_decision();
     assert_eq!(
         fx.skin.update_decision(&mut foreign, &labels()),
@@ -323,7 +328,11 @@ fn decision_entry_points_refuse_other_kinds() {
         .build_decision(&mut foreign, &frame, &fx.uvs, &mut fx.batch)
         .unwrap();
     assert!(fx.batch.quads().is_empty());
-    let other_uvs = uvs(&Skin::new_decision(skin_def(elements(), WidgetDefs::default())).unwrap());
+    let other_uvs = uvs(&Skin::new_decision(
+        skin_def(elements(), WidgetDefs::default()),
+        DecisionDefs::default(),
+    )
+    .unwrap());
     assert_ne!(other_uvs.sheet_id(), fx.uvs.sheet_id());
     fx.skin
         .build_decision(&mut fx.dec, &frame, &other_uvs, &mut fx.batch)
@@ -424,7 +433,7 @@ fn decision_bitmap_text_follows_the_labels() {
         },
     );
     def.sheet = sheet;
-    let skin = Skin::new_decision(def.clone()).unwrap();
+    let skin = Skin::new_decision(def.clone(), DecisionDefs::default()).unwrap();
     let mut dec = skin.prepare_decision();
     let atlas_uvs = |skin: &Skin| {
         skin.sheet()
@@ -482,7 +491,7 @@ fn decision_bitmap_text_follows_the_labels() {
     assert_eq!(glyphs_at(&mut dec), [2, 1]);
     // A state of another skin of the same definition is left as it is:
     // its own skin still draws no glyph for it.
-    let other = Skin::new_decision(def).unwrap();
+    let other = Skin::new_decision(def, DecisionDefs::default()).unwrap();
     let other_uvs = atlas_uvs(&other);
     let mut foreign = other.prepare_decision();
     other

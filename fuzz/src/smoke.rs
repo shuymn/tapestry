@@ -552,13 +552,12 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                 }
             }
             "header_decision" => {
-                // Imported into its own slot, which has no importer yet.
+                // Imported into its own slot: with no essential part, an
+                // empty decision skin imports.
                 let h = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 assert_eq!(h.kind, ScreenKind::Decision, "{name}");
                 match imported {
-                    Some(Err(ImportError::NoImporter { kind })) => {
-                        assert_eq!(kind, ScreenKind::Decision, "{name}");
-                    }
+                    Some(Ok(i)) => assert_eq!(i.skin.kind(), ScreenKind::Decision, "{name}"),
                     other => panic!("{name}: {:?}", other.map(|r| r.map(|i| i.report))),
                 }
             }
