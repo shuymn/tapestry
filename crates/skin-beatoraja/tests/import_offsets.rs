@@ -118,6 +118,20 @@ fn alpha_folds_on_fixed_colour_with_one_sign() {
     // Without an alpha delta, animated colour takes the offset.
     let loaded = load([1_920, 1_080], animated, |c| set(c, 40, ov(5, 0, 0, 0)));
     assert!(loaded.report().notes.is_empty());
+    // A colour that varies only on a key between two at one time, which
+    // never draws, still animates the colour as the source counts it
+    // (`SkinObject.java:198-216`): unsupported as well.
+    let hidden = r#""offset": 40, "loop": 200, "dst": [
+        {"time": 0, "w": 10, "h": 10, "a": 100}, {"time": 100, "a": 100},
+        {"time": 100, "a": 200}, {"time": 100, "a": 100}, {"time": 200, "a": 100}]"#;
+    let loaded = load([1_920, 1_080], hidden, |c| set(c, 40, alpha(50)));
+    assert!(has(loaded.report(), NoteKind::OffsetAlpha));
+    assert!(loaded.quads(0).is_empty());
+    // The same keys without that middle key take the offset.
+    let plain = hidden.replace(r#"{"time": 100, "a": 200}, "#, "");
+    let loaded = load([1_920, 1_080], &plain, |c| set(c, 40, alpha(50)));
+    assert!(loaded.ok().report.notes.is_empty());
+    assert!((loaded.quads(0)[0].color[3] - 150.0 / 255.0).abs() < 1e-6);
 }
 
 #[test]

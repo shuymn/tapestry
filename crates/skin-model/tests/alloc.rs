@@ -303,8 +303,8 @@ fn effects(chart: &Chart, section: Option<&Section>, clean: bool) -> Vec<JudgeEv
     out
 }
 
-/// A 3-key track at x near `i`, growing wider and flatter; every 5th
-/// turns.
+/// A track of three keys at x near `i`, growing wider and flatter; every
+/// 5th turns, and every 4th jumps at 100 ms with a fourth key there.
 fn track(i: u16, ease: Ease, end: End) -> Track {
     let turns = i.is_multiple_of(5);
     let key = |at: i64, x: i32, alpha: i32| {
@@ -322,16 +322,15 @@ fn track(i: u16, ease: Ease, end: End) -> Track {
         }
     };
     let x = i32::from(i);
-    Track::new(
-        &[
-            key(0, x, 0),
-            key(100 * MS, x + 10, 255),
-            key(500 * MS, x + 40, 128),
-        ],
-        ease,
-        end,
-    )
-    .unwrap()
+    let mut keys = vec![
+        key(0, x, 0),
+        key(100 * MS, x + 10, 255),
+        key(500 * MS, x + 40, 128),
+    ];
+    if i % 4 == 3 {
+        keys.insert(2, key(100 * MS, x + 20, 200));
+    }
+    Track::new(&keys, ease, end).unwrap()
 }
 
 /// Images drawn by the elements on `when` timers, after one image per
@@ -1062,6 +1061,10 @@ fn skin() -> Loaded {
         let end = match i % 3 {
             0 => End::Hold,
             1 => End::Hide,
+            // Half the loops start before 0, the time wrapped in `i128`.
+            _ if i % 2 == 0 => End::Loop {
+                from: TimeUs(-50 * MS),
+            },
             _ => End::Loop {
                 from: TimeUs(100 * MS),
             },

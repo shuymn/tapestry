@@ -85,6 +85,11 @@ fn settling(kind: fn(&str) -> Loaded) {
     assert_held(&kind(&back), &kind(&still()), "loop past the last key");
     let late = format!(r#""loop": 500, "dst": [{{"time": 100, {A}}}, {{"time": 500, {B}}}]"#);
     assert_held(&kind(&late), &kind(&still()), "a first key after 0");
+    // Two keys at the last time: the later one is the last key.
+    let pair = format!(
+        r#""loop": 500, "dst": [{{"time": 0, {A}}}, {{"time": 500, {A}}}, {{"time": 500, {B}}}]"#
+    );
+    assert_held(&kind(&pair), &kind(&still()), "two keys at the last time");
 }
 
 /// A `loop` before the last key repeats and one of -1 hides, each still
@@ -261,6 +266,28 @@ fn alpha_is_held_with_the_pose_and_a_fade_alone_stays_d3() {
     let l = gauge(&fade);
     assert_eq!((d20(&l), d3_notes(&l)), (0, 1));
     assert_eq!(alphas(&fade, 250), [0.5; 10]);
+}
+
+/// A change only on a key between two at one time, which never draws,
+/// still counts as a change (`SkinObject.java:198-216`): a pose there makes
+/// the track settle (D20), and an alpha there keeps its fade on `screen`
+/// (D3), though the keys kept are the same at both times.
+#[test]
+fn a_change_on_a_key_that_never_draws_still_counts() {
+    let posed = format!(
+        r#""loop": 500, "dst": [{{"time": 0, {B}}}, {{"time": 500, {B}}}, {{"time": 500, {A}}}, {{"time": 500, {B}}}]"#
+    );
+    let l = gauge(&posed);
+    assert_eq!((d20(&l), d3_notes(&l)), (1, 0));
+    let faded = format!(
+        r#""loop": 500, "dst": [{{"time": 0, {B}}}, {{"time": 500, {B}}}, {{"time": 500, {B}, "a": 100}}, {{"time": 500, {B}}}]"#
+    );
+    let l = gauge(&faded);
+    assert_eq!((d20(&l), d3_notes(&l)), (0, 1));
+    // Without the middle key, neither.
+    let plain = format!(r#""loop": 500, "dst": [{{"time": 0, {B}}}, {{"time": 500, {B}}}]"#);
+    let l = gauge(&plain);
+    assert_eq!((d20(&l), d3_notes(&l)), (0, 0));
 }
 
 /// A gauge in `track` under offset 41, set to `v`.
