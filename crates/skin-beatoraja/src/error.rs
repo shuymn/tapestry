@@ -185,10 +185,6 @@ pub enum ImportError {
         slot: ScreenKind,
         found: ScreenKind,
     },
-    /// A skin of a kind no importer maps yet, imported into its own slot.
-    NoImporter {
-        kind: ScreenKind,
-    },
     /// The skin's size is not one of [`crate::SIZES`].
     Resolution {
         at: Option<Loc>,
@@ -287,7 +283,6 @@ impl fmt::Display for ImportError {
             Self::Slot { at, slot, found } => {
                 write!(f, "{}a {found} skin in the {slot} slot", At(at))
             }
-            Self::NoImporter { kind } => write!(f, "{kind} skins are not imported yet"),
             Self::Resolution { at, w, h } => {
                 write!(f, "{}an unsupported skin size {w}x{h}", At(at))
             }

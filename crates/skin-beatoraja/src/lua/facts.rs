@@ -413,6 +413,13 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
             Some(Class::Bridge(ResOption::Expr(_))) => FactId::ResultOption(id),
             _ => return OptionRead::LiveState,
         },
+        // The decision profile's constants.
+        _ if facts.scene == ScreenKind::Decision => {
+            match crate::import::decision::profile::option(id) {
+                Some(Class::Bridge(ResOption::Constant(b))) => return constant(b),
+                _ => return OptionRead::LiveState,
+            }
+        }
         _ => return OptionRead::LiveState,
     };
     match facts.value(fact) {
