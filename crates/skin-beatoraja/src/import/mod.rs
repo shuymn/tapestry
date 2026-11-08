@@ -456,6 +456,9 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
+    /// The Lua scalar `op` values already noted ignored: a destination
+    /// read twice (the lanes read ahead, a selected row) notes once.
+    ignored_ops: BTreeSet<Span>,
     /// The cached images, by key, whose cut runs past its file's edge
     /// (D22); whether the cut placed last did; and the destinations noted
     /// for one.
@@ -555,6 +558,7 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
+            ignored_ops: BTreeSet::new(),
             overruns: BTreeSet::new(),
             cut_overran: false,
             overrun_at: BTreeSet::new(),
@@ -835,7 +839,9 @@ impl<'d> Cx<'d> {
             && self.def.arena.is_lua_scalar(op)
         {
             let at = self.arena_span(op);
-            self.ignored(at, NoteKind::Ignored { field: "op" });
+            if self.ignored_ops.insert(at) {
+                self.ignored(at, NoteKind::Ignored { field: "op" });
+            }
         }
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
