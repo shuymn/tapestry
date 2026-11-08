@@ -211,14 +211,13 @@ fn decision_options_are_the_screen_s_constants() {
             .zip(both_with(&json, LUA_PROPERTY, &lua))
     {
         assert_eq!(Dec::new(skin).tops(0), want, "{path}");
-        // A folded condition known false is noted as ignored, nothing
-        // else.
-        assert!(
-            notes(&report)
-                .iter()
-                .all(|n| *n == (Severity::Ignored, NoteKind::Ignored { field: "op" })),
-            "{path}: {:?}",
-            notes(&report)
+        // Each condition known false is folded and noted as ignored, on
+        // both paths, and nothing else is noted.
+        let off = OPTIONS.iter().filter(|(_, on)| !on).count();
+        assert_eq!(
+            notes(&report),
+            vec![(Severity::Ignored, NoteKind::Ignored { field: "op" }); off],
+            "{path}"
         );
     }
 }
