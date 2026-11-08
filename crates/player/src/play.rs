@@ -208,8 +208,8 @@ pub struct PlayerRig<'a> {
     /// runs from it.
     pub(crate) state_clock: crate::state_clock::StateClock,
     /// The retries a result has taken since the play was prepared, by
-    /// receipt, and when its flow served the one it accepted: only the
-    /// one it acts on becomes the next play's.
+    /// receipt: only the one its flow acts on becomes the next play's
+    /// retry, whose load time runs from it.
     pub(crate) result_retries: ResultRetries,
     /// Load times shown on the end screen.
     pub times: LoadTimes,
@@ -1484,14 +1484,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     /// The flow serves the leaving command: the result is left from here.
-    /// A served retry enters the next play state now, at the outro's end
-    /// or at once: its state clock starts here, its load time at the
-    /// retry's receipt.
-    fn serve_leaving(&mut self, cmd: MenuCommand) {
+    fn serve_leaving(&mut self, _cmd: MenuCommand) {
         self.result_leaving = true;
-        if cmd == MenuCommand::Retry {
-            self.result_retries.served = Some(self.clock.now());
-        }
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1579,15 +1573,9 @@ impl Rig for PlayerRig<'_> {
         }
         self.leave_result();
         self.retry_from = self.pending_retry.take();
-        // A retry a result served enters the play state when served;
-        // any other at its receipt.
-        let served = self.result_retries.served;
         // What a result offered before this preparation is no later
         // result's.
         self.result_retries = ResultRetries::default();
-        if let Some(at) = served.or(self.retry_from) {
-            self.state_clock.retry(at);
-        }
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
         prepare_render(&mut self.end_page, &self.render)
@@ -2012,8 +2000,8 @@ impl Rig for PlayerRig<'_> {
         };
         #[cfg(feature = "dev-tools")]
         self.scenario_started();
-        // A play without a scene entered (a direct launch) entered its
-        // state at the load's start.
+        // Every play follows a begun play state; the load's start stands
+        // in for none.
         let state_origin = self.state_clock.origin().unwrap_or(self.load_start);
         self.render.send(RenderMsg::Play {
             side: screen,
@@ -2157,8 +2145,13 @@ impl Rig for PlayerRig<'_> {
         self.input_offset_us = t.input_offset_us;
     }
 
+    /// The state clock starts with the play state's turntable, at the
+    /// same instant, except within a practice session, which keeps its
+    /// first origin.
     fn play_state_began(&mut self) {
         let state = self.play_states.begin(self.clock.now());
+        let practicing = self.selection.as_ref().is_some_and(|s| s.practicing);
+        self.state_clock.began(state.origin, practicing);
         self.render.play_state(state);
     }
 
@@ -2327,13 +2320,11 @@ impl Rig for PlayerRig<'_> {
 /// The retries a result's flow took (`take_menu`), by receipt, since the
 /// play was prepared: the result's preparation is withdrawn by the first
 /// command taken, and the result accepts the command it has just taken,
-/// so the first and the latest are kept; and when the flow served the
-/// accepted retry (`serve_leaving`), the next play state's entry.
+/// so the first and the latest are kept.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResultRetries {
     first: Option<TimeUs>,
     last: Option<TimeUs>,
-    served: Option<TimeUs>,
 }
 
 impl ResultRetries {
