@@ -30,7 +30,7 @@
 //!   privacy that keeps the runtime in `screens`.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context as _, bail};
@@ -255,8 +255,31 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
             }
         }
     }
+    // R6 (metadata): the source scan knows the backend by its package's
+    // crate names, so the player may not rename it.
+    if let Some(player) = members.iter().find(|p| p.name.as_str() == PLAYER) {
+        for dep in &player.dependencies {
+            if let Some(rename) = dep
+                .rename
+                .as_ref()
+                .filter(|_| BACKEND_PACKAGES.contains(&dep.name.as_str()))
+            {
+                diagnostics.push(format!(
+                    "R6: `{PLAYER}` names its dependency `{}` `{rename}`; the backend's \
+                     dependencies keep their package's name (design.md \"beatoraja Lua Skins\")",
+                    dep.name,
+                ));
+            }
+        }
+    }
     Ok(diagnostics)
 }
+
+/// The package whose sources R6 scans.
+const PLAYER: &str = "player";
+/// The packages whose crates R6's source scan knows by name: a
+/// `player` dependency on either keeps its package's name.
+const BACKEND_PACKAGES: &[&str] = &["skin-beatoraja", MLUA];
 
 /// The packages R6 lets reach `mlua`: the player, whose `screens` tree
 /// holds the runtime, and the importer that defines it.
@@ -292,14 +315,105 @@ fn in_play_packages() -> BTreeSet<&'static str> {
 /// `crate::skin_beatoraja::lua` and `r#skin_beatoraja::r#lua` are the
 /// backend too. Macros are not expanded; their tokens are scanned for such
 /// a path.
+///
+/// A `#[path]` module (or a `cfg_attr` giving one) is refused, so no
+/// module of the crate lies outside the scanned files, unless it is one of
+/// [`PATH_MODULES`]; each of those targets' folders is scanned by the same
+/// rules.
 pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
     let src = root.join(PLAYER_SRC);
     let mut diagnostics = Vec::new();
     if !src.is_dir() {
         return Ok(diagnostics);
     }
-    let mut stack = vec![src];
-    let screens = root.join(SCREENS);
+    let mut targets = Vec::new();
+    scan_tree(
+        root,
+        &src,
+        Some(&root.join(SCREENS)),
+        &mut targets,
+        &mut diagnostics,
+    )?;
+    for dir in targets {
+        scan_tree(root, &dir, None, &mut Vec::new(), &mut diagnostics)?;
+    }
+    Ok(diagnostics)
+}
+
+/// The `#[path]` modules of `player` R6 allows, each the test fixtures
+/// another crate owns, used by `player`'s tests: the file declaring it,
+/// the attribute's path, and its owner. Each target's folder is scanned.
+const PATH_MODULES: &[(&str, &str, &str)] = &[
+    (
+        "crates/player/src/main.rs",
+        "../../render/tests/font_support/mod.rs",
+        "render's test fixtures",
+    ),
+    (
+        "crates/player/src/main.rs",
+        "../../render/tests/common/mod.rs",
+        "render's test fixtures",
+    ),
+    (
+        "crates/player/src/main.rs",
+        "../../render/tests/decl_support/mod.rs",
+        "render's test fixtures",
+    ),
+    (
+        "crates/player/src/main.rs",
+        "../../render/tests/json_support/mod.rs",
+        "render's test fixtures",
+    ),
+    (
+        "crates/player/src/main.rs",
+        "../../render/tests/outline_support/mod.rs",
+        "render's test fixtures",
+    ),
+    (
+        "crates/player/src/bests.rs",
+        "../../library/tests/common/mod.rs",
+        "library's test fixtures",
+    ),
+];
+
+/// `p` with its `..` and `.` components resolved lexically.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn path_refusal(shown: &str, line: usize, value: Option<&str>) -> String {
+    let what = value.map_or_else(
+        || "a `cfg_attr` giving a module path".to_owned(),
+        |v| format!("a `#[path = \"{v}\"]` module"),
+    );
+    format!(
+        "R6: {shown}:{line} declares {what}; R6 scans the crate's own files, so only \
+         the listed fixture modules may set a path (design.md \"beatoraja Lua Skins\")"
+    )
+}
+
+/// Scans every `.rs` file under `dir` but `skip`. In the player's own
+/// tree (`skip` given), a `#[path]` module of [`PATH_MODULES`] puts its
+/// target's folder in `targets`; every other `#[path]` module is refused,
+/// in a target's folder all of them.
+fn scan_tree(
+    root: &Path,
+    dir: &Path,
+    skip: Option<&Path>,
+    targets: &mut Vec<PathBuf>,
+    diagnostics: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let mut stack = vec![dir.to_owned()];
     while let Some(dir) = stack.pop() {
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .with_context(|| format!("reading {}", dir.display()))?
@@ -307,7 +421,7 @@ pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
         entries.sort_by_key(std::fs::DirEntry::path);
         for entry in entries {
             let path = entry.path();
-            if path == screens {
+            if skip.is_some_and(|s| path == s) {
                 continue;
             }
             if path.is_dir() {
@@ -330,10 +444,25 @@ pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
                          (design.md \"beatoraja Lua Skins\")"
                     )
                 }));
+                for (line, value) in scan.paths {
+                    let allowed = skip.is_some()
+                        && value.as_deref().is_some_and(|v| {
+                            PATH_MODULES.iter().any(|(f, p, _)| *f == shown && *p == v)
+                        });
+                    match value {
+                        Some(v) if allowed => {
+                            let target = lexical(&path.parent().unwrap_or(root).join(v));
+                            if let Some(folder) = target.parent().filter(|f| f.is_dir()) {
+                                targets.push(folder.to_owned());
+                            }
+                        }
+                        value => diagnostics.push(path_refusal(&shown, line, value.as_deref())),
+                    }
+                }
             }
         }
     }
-    Ok(diagnostics)
+    Ok(())
 }
 
 /// `segments` without its leading `crate`, `self` and `super`: the path
@@ -370,10 +499,13 @@ fn is_backend_root(segments: &[String]) -> bool {
     }
 }
 
-/// What R6's scan found in one file: per finding, its line and what it is.
+/// What R6's scan found in one file: per finding, its line and what it
+/// is; and each module path set, its line and the path (`None` for a
+/// `cfg_attr` giving one).
 #[derive(Default)]
 struct SourceScan {
     found: Vec<(usize, String)>,
+    paths: Vec<(usize, Option<String>)>,
 }
 
 impl SourceScan {
@@ -516,6 +648,43 @@ impl<'ast> syn::visit::Visit<'ast> for SourceScan {
                 .push((line, format!("names `{}`", segments.join("::"))));
         }
         syn::visit::visit_path(self, p);
+    }
+
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        for attr in &m.attrs {
+            let line = m.ident.span().start().line;
+            if attr.path().is_ident("path") {
+                let value = match &attr.meta {
+                    syn::Meta::NameValue(syn::MetaNameValue {
+                        value:
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(s),
+                                ..
+                            }),
+                        ..
+                    }) => s.value(),
+                    // A path R6 cannot read is never one of the listed.
+                    _ => String::new(),
+                };
+                self.paths.push((line, Some(value)));
+            } else if attr.path().is_ident("cfg_attr") {
+                let tokens: Vec<proc_macro2::TokenTree> = match &attr.meta {
+                    syn::Meta::List(l) => l.tokens.clone().into_iter().collect(),
+                    _ => Vec::new(),
+                };
+                let sets_path = tokens.windows(2).any(|w| {
+                    matches!(
+                        (&w[0], &w[1]),
+                        (proc_macro2::TokenTree::Ident(i), proc_macro2::TokenTree::Punct(p))
+                            if segment(i) == "path" && p.as_char() == '='
+                    )
+                });
+                if sets_path {
+                    self.paths.push((line, None));
+                }
+            }
+        }
+        syn::visit::visit_item_mod(self, m);
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -1127,6 +1296,47 @@ mod tests {
         );
     }
 
+    /// A renamed backend dependency would let the player name the backend
+    /// under a name the source scan does not know.
+    #[test]
+    fn r6_rejects_a_renamed_backend_dependency_of_the_player() {
+        for dep in [
+            "backend = { package = \"skin-beatoraja\", path = \"../skin-beatoraja\" }",
+            "lua = { package = \"mlua\", path = \"../mlua\" }",
+        ] {
+            let mut crates = baseline();
+            crates.push(lib("mlua", ""));
+            crates.push(lib("skin-beatoraja", ""));
+            set(
+                &mut crates,
+                "player",
+                &format!(
+                    "[package.metadata.tapestry]\nwindows-only = true\n\
+                     [features]\ndefault = []\ndev-tools = []\n\
+                     [dependencies]\neval = {{ path = \"../eval\" }}\n{dep}\n"
+                ),
+            );
+            let found = r6(&crates);
+            assert_eq!(found.len(), 1, "{dep}: {found:#?}");
+            assert!(
+                found[0].contains("`player` names its dependency"),
+                "{found:#?}"
+            );
+        }
+        // Unrenamed, it passes.
+        let mut crates = baseline();
+        crates.push(lib("skin-beatoraja", ""));
+        set(
+            &mut crates,
+            "player",
+            "[package.metadata.tapestry]\nwindows-only = true\n\
+             [features]\ndefault = []\ndev-tools = []\n\
+             [dependencies]\neval = { path = \"../eval\" }\n\
+             skin-beatoraja = { path = \"../skin-beatoraja\" }\n",
+        );
+        assert_eq!(r6(&crates), Vec::<String>::new());
+    }
+
     #[test]
     fn r6_lets_the_player_reach_mlua() {
         let mut crates = baseline();
@@ -1162,6 +1372,72 @@ mod tests {
             std::fs::write(src.join(path), text).unwrap();
         }
         super::check_player_sources(dir.path()).unwrap()
+    }
+
+    /// A `#[path]` module outside the listed fixtures is refused, whatever
+    /// its target: a file outside the scanned tree, a non-`.rs` file, one
+    /// given through `cfg_attr`, and a listed path declared from another
+    /// file. A listed one is allowed, and its target's folder scanned.
+    #[test]
+    fn r6_refuses_path_modules_but_the_listed_fixtures() {
+        for (file, text, what) in [
+            (
+                "main.rs",
+                "#[path = \"../../../outside/helper.rs\"]\nmod helper;\n",
+                "a `#[path = \"../../../outside/helper.rs\"]` module",
+            ),
+            (
+                "main.rs",
+                "#[path = \"helper.txt\"]\nmod helper;\n",
+                "a `#[path = \"helper.txt\"]` module",
+            ),
+            (
+                "main.rs",
+                "#[cfg_attr(test, path = \"helper.rs\")]\nmod helper;\n",
+                "a `cfg_attr` giving a module path",
+            ),
+            (
+                "render_side.rs",
+                "#[path = \"../../render/tests/common/mod.rs\"]\nmod render_common;\n",
+                "a `#[path = \"../../render/tests/common/mod.rs\"]` module",
+            ),
+        ] {
+            let found = scan_files(&[(file, text)]);
+            assert_eq!(found.len(), 1, "{text}: {found:#?}");
+            assert!(
+                found[0].starts_with(&format!("R6: crates/player/src/{file}:"))
+                    && found[0].contains(what),
+                "{text}: {found:#?}"
+            );
+        }
+        // A listed fixture module is allowed; its folder is scanned.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("crates/player/src");
+        let fixture = dir.path().join("crates/render/tests/common");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "#[cfg(test)]\n#[path = \"../../render/tests/common/mod.rs\"]\nmod render_common;\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.join("mod.rs"), "pub mod more;\n").unwrap();
+        std::fs::write(fixture.join("more.rs"), "").unwrap();
+        assert_eq!(
+            super::check_player_sources(dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+        std::fs::write(
+            fixture.join("more.rs"),
+            "pub use skin_beatoraja::lua as backend;\n",
+        )
+        .unwrap();
+        let found = super::check_player_sources(dir.path()).unwrap();
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("R6: crates/render/tests/common/more.rs:1 aliases"),
+            "{found:#?}"
+        );
     }
 
     /// A crate root that binds the backend, and a sibling file that names
