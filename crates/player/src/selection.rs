@@ -4835,11 +4835,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A controller whose key 7 retries on a result, with its result
+    /// input taken over by a showing result (`controller_with`).
+    #[cfg(feature = "dev-tools")]
+    fn result_controller() -> (
+        ResultInput,
+        input::SourceSet,
+        crate::input_side::Hook,
+        crate::input_side::InputLink,
+    ) {
+        let config = game::KeyConfig {
+            lanes: vec![game::LaneKey {
+                control: 17,
+                lane: 7,
+            }],
+            retry: None,
+            quit: None,
+            ..game::KeyConfig::default()
+        };
+        let bindings = crate::select::menu_bindings(
+            &config,
+            Some(controller_product()),
+            &game::ScratchConfig::default(),
+        )
+        .unwrap();
+        let (mut menus, mut set, hook, link, _controls) = controller_with(bindings);
+        menus.release();
+        assert!(menus.enter());
+        set.menu_mut().unwrap().set_active(true);
+        (menus, set, hook, link)
+    }
+
+    /// Each step a later instant on the rig's clock.
+    #[cfg(feature = "dev-tools")]
+    fn later(rig: &crate::play::PlayerRig<'_>) -> TimeUs {
+        use bms_model::TimeSource as _;
+        let t = rig.clock.now();
+        while rig.clock.now() == t {}
+        rig.clock.now()
+    }
+
     /// The play state's clock starts where a play state is entered
     /// (design.md "beatoraja Lua Skins", the state clock): afresh before a
-    /// chosen chart's loading state and at a retry's receipt; a practice
-    /// session keeps the first of its page's and loading states' origin
-    /// through its Starts and retries, until selection is entered again.
+    /// chosen chart's loading state; a practice session, entered by its
+    /// page or by a Start's loading state, keeps its first origin through
+    /// its Starts, rounds, retries (the retry key's and a controller's)
+    /// and page, until selection is entered again.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_state_clock_starts_where_a_play_state_is_entered() {
@@ -4850,53 +4891,110 @@ pub(crate) mod tests {
         let chart = roots[0].join("a.bms");
         let screens = crate::render_side::tests::Installers::default();
         on_selection(sel, &screens, screens.spawn_bare(), |rig| {
-            // Each step a later instant on the clock.
-            let later = |rig: &crate::play::PlayerRig<'_>| {
-                let t = rig.clock.now();
-                while rig.clock.now() == t {}
-                rig.clock.now()
-            };
-            let practicing = |rig: &mut crate::play::PlayerRig<'_>, on: bool| {
-                rig.selection.as_mut().unwrap().practicing = on;
-            };
             // A chart chosen to play: its loading state's entry.
             let before = later(rig);
             rig.entered_loading(&chart);
             let play = rig.state_clock.origin().unwrap();
             assert!(play >= before && play <= rig.clock.now(), "{play:?}");
-            // A retry: its receipt.
-            let retry = later(rig);
-            rig.pending_retry = Some(retry);
-            rig.prepare_screen().unwrap();
-            assert_eq!(rig.state_clock.origin(), Some(retry));
             // Back to selection, then another chart: afresh.
             rig.entered_selection();
             let before = later(rig);
             rig.entered_loading(&chart);
             let next = rig.state_clock.origin().unwrap();
-            assert!(next >= before && next > retry);
-            // A practice session: its page first.
-            rig.entered_selection();
-            practicing(rig, true);
+            assert!(next >= before && next > play);
             let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
             let page = game::PracticeScreen::new(&c, &rules::tapestry(), 0);
-            let before = later(rig);
-            rig.entered_practice(&page);
-            let session = rig.state_clock.origin().unwrap();
-            assert!(session >= before);
-            // Its Starts' loading states, a retry and the page again keep it.
-            later(rig);
-            rig.entered_loading(&chart);
-            rig.pending_retry = Some(later(rig));
-            rig.prepare_screen().unwrap();
-            rig.entered_practice(&page);
-            rig.entered_loading(&chart);
-            assert_eq!(rig.state_clock.origin(), Some(session));
+            // A practice session, entered by its page or by a Start's
+            // loading state first.
+            for page_first in [true, false] {
+                rig.entered_selection();
+                rig.selection.as_mut().unwrap().practicing = true;
+                let before = later(rig);
+                if page_first {
+                    rig.entered_practice(&page);
+                } else {
+                    rig.entered_loading(&chart);
+                }
+                let session = rig.state_clock.origin().unwrap();
+                assert!(session >= before, "{page_first}");
+                // Its Starts' loading states, consecutive rounds (each
+                // prepared without a retry), retries and the page again.
+                later(rig);
+                rig.entered_loading(&chart);
+                rig.prepare_screen().unwrap();
+                later(rig);
+                rig.prepare_screen().unwrap();
+                rig.controls.command(game::Command::Retry);
+                assert_eq!(rig.take(), Some(game::Command::Retry));
+                rig.prepare_screen().unwrap();
+                let (menus, mut set, mut hook, _link) = result_controller();
+                rig.result_input = menus;
+                press(&mut set, &mut hook, 17, later(rig).0);
+                assert_eq!(rig.take_menu(), Some(game::MenuCommand::Retry));
+                rig.prepare_screen().unwrap();
+                rig.entered_practice(&page);
+                rig.entered_loading(&chart);
+                assert_eq!(rig.state_clock.origin(), Some(session), "{page_first}");
+            }
             // Selection ends it: the next session starts afresh.
             rig.entered_selection();
             let before = later(rig);
             rig.entered_practice(&page);
             assert!(rig.state_clock.origin().unwrap() >= before);
+        });
+    }
+
+    /// Every way the game thread accepts a retry outside practice starts
+    /// the next play's state clock at the retry's receipt (design.md
+    /// "beatoraja Lua Skins", the state clock): the retry key (the
+    /// window's, and every scripted retry, through `Controls::command`)
+    /// taken as READY, a play, its tail and the save take it (`Rig::take`),
+    /// as Closing does (`take_closing`) and as the result's preparation and
+    /// the result do (`take_menu`), and a controller's key on a result
+    /// (`take_menu`), received when taken.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn every_accepted_retry_starts_the_state_clock_afresh() {
+        use bms_model::TimeSource as _;
+        use game::{AppRig as _, Command, MenuCommand, Rig as _};
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, roots) = tree(dir.path(), &[&["a.bms"]]);
+        let chart = roots[0].join("a.bms");
+        let screens = crate::render_side::tests::Installers::default();
+        on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+            rig.entered_loading(&chart);
+            // Each acceptance: whether the retry was taken.
+            type Takes = fn(&mut crate::play::PlayerRig<'_>) -> bool;
+            let key: [(&str, Takes); 3] = [
+                ("take", |rig| rig.take() == Some(Command::Retry)),
+                ("take_closing", |rig| {
+                    rig.take_closing() == Some(Command::Retry)
+                }),
+                ("take_menu", |rig| {
+                    rig.take_menu() == Some(MenuCommand::Retry)
+                }),
+            ];
+            for (taken_by, take) in key {
+                let before = rig.state_clock.origin().unwrap();
+                later(rig);
+                rig.controls.command(Command::Retry);
+                assert!(take(rig), "{taken_by}");
+                rig.prepare_screen().unwrap();
+                let receipt = rig.controls.retry_at().unwrap();
+                assert!(receipt > before, "{taken_by}");
+                assert_eq!(rig.state_clock.origin(), Some(receipt), "{taken_by}");
+            }
+            // A controller's retry on a result.
+            let (menus, mut set, mut hook, _link) = result_controller();
+            rig.result_input = menus;
+            press(&mut set, &mut hook, 17, later(rig).0);
+            let before = later(rig);
+            assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
+            let after = rig.clock.now();
+            rig.prepare_screen().unwrap();
+            let origin = rig.state_clock.origin().unwrap();
+            assert!(origin >= before && origin <= after, "{origin:?}");
+            assert_eq!(rig.retry_from, Some(origin));
         });
     }
 

@@ -1359,7 +1359,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     /// The retry and quit keys first (a suspend means nothing on a result),
-    /// then, while a result shows, its own keys and controller events.
+    /// then, while a result shows, its own keys and controller events. A
+    /// controller's retry carries no receipt of its own: it is received
+    /// when taken here, and kept as the next play's retry as the retry
+    /// key's is.
     fn take_menu(&mut self) -> Option<MenuCommand> {
         loop {
             match self.take() {
@@ -1369,7 +1372,11 @@ impl Rig for PlayerRig<'_> {
                 None => break,
             }
         }
-        self.result_input.take()
+        let c = self.result_input.take();
+        if c == Some(MenuCommand::Retry) {
+            self.pending_retry = Some(self.clock.now());
+        }
+        c
     }
 
     /// A withdrawn preparation cancels the result skin's layout job and
