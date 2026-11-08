@@ -218,8 +218,14 @@ impl Screen {
         compile(src, &Scope::new(schema), ty).ok()
     }
 
+    /// The bridges compiled so far: one per profile-known id read.
+    fn bridges(&self) -> usize {
+        self.numbers.len() + self.options.len()
+    }
+
     /// `main_state.number(id)`: the bridge's value, `HIDDEN` while its
-    /// guard is false; `None` for an id the profile does not bridge.
+    /// guard is false; `None` for an id the profile does not bridge, which
+    /// is classified again at each read and never cached.
     pub(crate) fn number(&mut self, id: i32) -> Option<i32> {
         if !self.numbers.contains_key(&id) {
             let src = match self.kind {
@@ -232,8 +238,8 @@ impl Screen {
                     _ => None,
                 },
                 ScreenKind::Play | ScreenKind::Decision => None,
-            };
-            let b = src.and_then(|(guard, expr)| {
+            }?;
+            let b = Some(src).and_then(|(guard, expr)| {
                 Some(Bridged {
                     guard: Some(self.compile(guard, Ty::Bool)?),
                     value: self.compile(expr, Ty::Int)?,
@@ -252,9 +258,17 @@ impl Screen {
 
     /// `main_state.option(id)` for a positive `id`: the bridge's value,
     /// false while its guard is false; `None` for an id the profile does
-    /// not bridge.
+    /// not bridge, never cached.
     pub(crate) fn option(&mut self, id: i32) -> Option<bool> {
         if !self.options.contains_key(&id) {
+            let known = match self.kind {
+                ScreenKind::Selection => matches!(sel::option(id), Some(sel::Class::Bridge(_))),
+                ScreenKind::Result => matches!(res::option(id), Some(sel::Class::Bridge(_))),
+                ScreenKind::Play | ScreenKind::Decision => false,
+            };
+            if !known {
+                return None;
+            }
             let b = match self.kind {
                 ScreenKind::Selection => match sel::option(id) {
                     Some(sel::Class::Bridge(sel::SelOption::Expr(src))) => self
@@ -287,28 +301,69 @@ impl Screen {
 }
 
 /// The source's value of number `id` on a `kind` screen when the feature
-/// it reads is absent, where the pinned source defines one (owner
+/// it reads is absent here, where the pinned source defines one (owner
 /// decision O8; docs/stage3.md S7-07). `None`: no such value, the typed
-/// constant applies.
+/// constant 0 applies. `IntegerPropertyFactory.java` is cited as `IPF`.
 ///
-/// - 410-419, a judgment's early or late count, and 420-426, the miss,
-///   early and late miss, total early, total late, combo break and poor
-///   plus miss counts: 0 with no score (`IntegerPropertyFactory.java:516-519`,
-///   `:444-463`, over `MainState.getJudgeCount`, `MainState.java:141-143`).
-/// - 271, the rival's EX score: 0 with no rival
-///   (`ScoreDataProperty.java:55-58`, `:261`).
-/// - 283 and 284, the rival's judgment counts: `Integer.MIN_VALUE` with no
-///   rival (`IntegerPropertyFactory.java:521-525`).
-/// - 380-389, an IR ranking's EX score, and 390-399, its index:
-///   `Integer.MIN_VALUE` with no ranking data
-///   (`IntegerPropertyFactory.java:876-905`).
+/// Both screens:
+/// - 14, 314-316 (lane cover, lift, hidden) and 160, 163, 164 (current BPM,
+///   time left), play only: `Integer.MIN_VALUE` (`IPF:68-92`, `:204`,
+///   `:207-222`).
+/// - 179, 180, 182, 200, 202-220, 222-242, the IR's ranks, players and
+///   clear counts and rates, with no ranking (selection) or an empty one
+///   (result, `MusicResult.java:78`): `Integer.MIN_VALUE` (`IPF:239-279`,
+///   `:757-765`, `:812-874`, `:987-995`); 221 has no property.
+/// - 280-289, the rival's judgment counts and rates, with no rival:
+///   `Integer.MIN_VALUE` (`IPF:521-532`).
+/// - 380-389, an IR ranking's EX score, and 390-399, its index, with no or
+///   an empty ranking: `Integer.MIN_VALUE` (`IPF:876-907`, through
+///   `:985-986`; `RankingData.java:188-206`).
+///
+/// Selection:
+/// - 75, 78-89, the best's max combo, clear and fail counts, judgment
+///   counts and rates, none kept here: `Integer.MIN_VALUE`, as with no
+///   score (`IPF:131`, `:140-153`, `:500-511`, `:627-632`).
+/// - 107, 407 (the gauge), 173, 175, 176, 178 (the best's combo and BP and
+///   their differences) and 370-377 (clear type, timing statistics),
+///   play or result only: `Integer.MIN_VALUE` (`IPF:184-185`, `:233-238`,
+///   `:396-440`, `:658-688`, `:712-753`).
+/// - 122, 135, 157, the rival's rate, with no rival: 100, the rate being
+///   1.0 (`IPF:190`, `:193`, `:202`; `ScoreDataProperty.java:56-60`); 123,
+///   136, 158 give 0.
+/// - 271, the rival's EX score, with no rival: 0 (`IPF:288`;
+///   `ScoreDataProperty.java:55-58`).
+/// - 410-427, the early and late counts and their sums, with no score: 0
+///   (`IPF:444-467`, `:516-520`, over `MainState.getJudgeCount`,
+///   `MainState.java:141-144`).
+///
+/// Result:
+/// - 77-79 (play, clear and fail counts), 300 (a folder's songs) and
+///   320-330 (a folder's lamps), selection only: `Integer.MIN_VALUE`
+///   (`IPF:133-153`, `:289`, `:800-810`, `:996-999`).
 #[must_use]
 pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
+    use ScreenKind::{Result, Selection};
     match (kind, id) {
-        (ScreenKind::Selection | ScreenKind::Result, 410..=426) => Some(0),
-        (ScreenKind::Selection, 271) => Some(0),
-        (ScreenKind::Selection, 283 | 284) => Some(HIDDEN),
-        (ScreenKind::Selection | ScreenKind::Result, 380..=399) => Some(HIDDEN),
+        (
+            Selection | Result,
+            14
+            | 314..=316
+            | 160
+            | 163
+            | 164
+            | 179
+            | 180
+            | 182
+            | 200
+            | 202..=220
+            | 222..=242
+            | 280..=289
+            | 380..=399,
+        )
+        | (Selection, 75 | 78..=89 | 107 | 407 | 173 | 175 | 176 | 178 | 370..=377)
+        | (Result, 77..=79 | 300 | 320..=330) => Some(HIDDEN),
+        (Selection, 122 | 135 | 157) => Some(100),
+        (Selection, 271 | 410..=427) => Some(0),
         _ => None,
     }
 }
@@ -497,6 +552,8 @@ pub struct Counters {
     pub calls: u64,
     pub instructions: u64,
     pub host_calls: u64,
+    /// The host reads' bridges compiled and kept, profile-known ids only.
+    pub bridges: usize,
 }
 
 impl ScreenRuntime {
@@ -582,6 +639,12 @@ impl ScreenRuntime {
             calls: self.calls,
             instructions: c.instructions,
             host_calls: u64::from(c.host_calls),
+            bridges: self
+                .pass
+                .screen
+                .borrow()
+                .as_ref()
+                .map_or(0, Screen::bridges),
         }
     }
 
@@ -749,7 +812,42 @@ pub(crate) fn stop_why(stop: Option<&Stop>) -> Option<LuaWhy> {
 mod tests {
     use mlua::{Lua, Value};
 
-    use super::{Pool, to_bool, to_int};
+    use skin_model::ScreenKind::{Result, Selection};
+
+    use super::{HIDDEN, Pool, absent, to_bool, to_int};
+
+    /// O8: the source's values with the feature absent, row by row; ids
+    /// with no such value, or a present one, give none.
+    #[test]
+    fn absent_features_answer_the_sources_values() {
+        for (kind, id, want) in [
+            (Selection, 14, Some(HIDDEN)),
+            (Result, 316, Some(HIDDEN)),
+            (Selection, 75, Some(HIDDEN)),
+            (Selection, 89, Some(HIDDEN)),
+            (Result, 89, None),
+            (Selection, 122, Some(100)),
+            (Selection, 123, None),
+            (Result, 122, None),
+            (Selection, 220, Some(HIDDEN)),
+            (Selection, 221, None),
+            (Result, 242, Some(HIDDEN)),
+            (Selection, 271, Some(0)),
+            (Result, 280, Some(HIDDEN)),
+            (Selection, 289, Some(HIDDEN)),
+            (Result, 300, Some(HIDDEN)),
+            (Selection, 300, None),
+            (Selection, 377, Some(HIDDEN)),
+            (Result, 377, None),
+            (Result, 399, Some(HIDDEN)),
+            (Selection, 427, Some(0)),
+            (Result, 426, None),
+            (Selection, 428, None),
+            (Selection, 65_536, None),
+        ] {
+            assert_eq!(absent(kind, id), want, "{kind:?} {id}");
+        }
+    }
 
     /// A permit returns exactly once, by its drop, on any thread; a return
     /// of an id not outstanding frees nothing.

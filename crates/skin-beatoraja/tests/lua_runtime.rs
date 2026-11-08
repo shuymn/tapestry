@@ -175,6 +175,8 @@ fn callbacks_run_on_the_kept_vm() {
     );
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(outputs(&f), [0, 7, i32::MIN, 0, 0, 0, 0]);
+    // One bridge per profile-known id read (77), kept across frames.
+    assert_eq!(runtime(&mut i).counters().bridges, 1);
 }
 
 /// C3's gate: a draw whose `op` before it is false is not called; every
@@ -273,6 +275,8 @@ fn notes_are_capped() {
     let (notes, dropped) = runtime(&mut i).notes();
     assert_eq!(notes.len(), cap);
     assert!(dropped >= 10, "{dropped}");
+    // Unknown ids are not cached: no bridge was kept for them.
+    assert_eq!(runtime(&mut i).counters().bridges, 0);
 }
 
 /// C2: with no callback for the runtime, or through `import`, no VM is
