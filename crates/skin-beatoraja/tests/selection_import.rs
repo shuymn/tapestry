@@ -118,10 +118,10 @@ fn the_selected_row_must_draw_after_folding() {
 }
 
 /// A bar image cut 10 texels wider than its 800-wide file: the selected
-/// row draws it, the file's columns stretched over the bar, with a D22
-/// note, rather than refusing the row.
+/// row draws it, its last ten columns repeating the file's last column,
+/// with no note, rather than refusing the row.
 #[test]
-fn a_bar_cut_past_its_file_s_edge_is_stretched() {
+fn a_bar_cut_past_its_file_s_edge_repeats_its_edge() {
     let body = format!(
         r#""source": [{{"id": "s", "path": "s.png"}}, {{"id": "w", "path": "w.png"}}],
            "image": [{{"id": "wide", "src": "w", "w": 810, "h": 60}}],
@@ -133,13 +133,16 @@ fn a_bar_cut_past_its_file_s_edge_is_stretched() {
     let d = folder(&body);
     common::png(d.path(), "w.png", 800, 300);
     let i = import_selection(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
-    assert!(common::has(
-        &i.report,
-        NoteKind::Deviation(skin_beatoraja::DeviationId::D22)
-    ));
+    assert!(
+        !i.report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Deviation(_))),
+        "{:?}",
+        i.report
+    );
     // The file's last ten columns red, painted before the atlas is built:
-    // the bar samples red at its right end, not at 791/810 across, where
-    // an unstretched cut would.
+    // the bar samples red from column 790 to its right end.
     common::png_with(d.path(), "w.png", 800, 300, |x, _| {
         if x >= 790 {
             [255, 0, 0, 255]
@@ -154,7 +157,7 @@ fn a_bar_cut_past_its_file_s_edge_is_stretched() {
     assert_eq!(rects, [[0.0, 520.0, 810.0, 60.0]]);
     let q = quads[0];
     let at = |fu| common::play::texel_at(&s.atlas, &q, fu, 0.5)[0];
-    assert_eq!((at(0.5), at(0.995), at(791.0 / 810.0)), (0, 255, 0));
+    assert_eq!((at(0.5), at(0.995), at(791.0 / 810.0)), (0, 255, 255));
 }
 
 /// The selected row's image file missing: refused as the selected row,

@@ -85,7 +85,7 @@ fn counts_come_before_the_disk() {
 }
 
 #[test]
-fn rectangles_and_frames_fit_their_file() {
+fn rectangles_start_in_their_file_and_frames_are_not_empty() {
     let d = dir();
     save(d.path(), "a.png", &solid(10, 6, [255; 4]));
     let rect = |r: [u32; 4], cols: u16, rows: u16| ImageDef {
@@ -93,14 +93,22 @@ fn rectangles_and_frames_fit_their_file() {
         grid: [cols, rows],
         ..whole(0)
     };
+    // Starting at or past an edge, or past what a `u32` and its @2x
+    // double hold.
     for r in [
-        [0, 0, 11, 6],
-        [1, 0, 10, 6],
-        [0, 5, 10, 2],
+        [10, 0, 1, 6],
+        [0, 6, 10, 1],
         [u32::MAX, 0, 2, 2],
+        [0, 0, u32::MAX / 2 + 1, 6],
     ] {
         let err = load(d.path(), vec![file("a.png")], vec![rect(r, 1, 1)]).unwrap_err();
         assert!(matches!(err, ImageError::RectOutside { image: 0 }), "{r:?}");
+    }
+    // Starting inside and running past the right or bottom edge: padded
+    // from it at the atlas build.
+    for r in [[0, 0, 11, 6], [1, 0, 10, 6], [0, 5, 10, 2], [9, 5, 4, 4]] {
+        load(d.path(), vec![file("a.png")], vec![rect(r, 1, 1)])
+            .unwrap_or_else(|e| panic!("{r:?}: {e:?}"));
     }
     let err = load(
         d.path(),
