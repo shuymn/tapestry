@@ -10,7 +10,7 @@ use bms_model::TimeUs;
 use common::result::{
     Res, best, facts, folder, import_result, lua_outcome, lua_result, ready, sheet, unavailable,
 };
-use common::selection::{B0, B1, BAR, DIGITS, DOT, LABEL as LAB, LAMP};
+use common::selection::{B0, B1, BAR, DIGITS, DOT, LABEL as LAB, LAMP, lua_images};
 use skin_beatoraja::{
     Cancel, Config, EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts,
     LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
@@ -63,23 +63,6 @@ fn json_body() -> String {
                {{"id": "lamp", "timer": 173, "dst": [{{"x": 0, "y": 750, "w": 8, "h": 8}}]}},
                {{"id": "gg", "dst": [{{"x": 0, "y": 800, "w": 8, "h": 8}}]}}]"#
     )
-}
-
-/// The selection fixtures' images as a Lua table's entries.
-fn lua_images() -> String {
-    [
-        ("b0", 0),
-        ("b1", 8),
-        ("b5", 16),
-        ("lamp", 24),
-        ("lab", 32),
-        ("bar", 40),
-        ("dot", 48),
-    ]
-    .iter()
-    .map(|(id, x)| format!("{{ id = \"{id}\", src = \"s\", x = {x}, y = 0, w = 8, h = 8 }}"))
-    .collect::<Vec<_>>()
-    .join(", ")
 }
 
 /// A Lua result skin: `pre` statements after the images, then `values`,

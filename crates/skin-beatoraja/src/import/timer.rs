@@ -151,17 +151,19 @@ impl Custom {
     }
 
     /// Timer `id` (non-negative) on a `kind` screen, resolved through the
-    /// custom timers: play's ([`Self::resolve`]), or the selection or
-    /// result profile's ([`super::selection::profile::timer`],
+    /// custom timers: play's ([`Self::resolve`]), or the selection,
+    /// decision or result profile's ([`super::selection::profile::timer`],
+    /// [`super::decision::profile::timer`],
     /// [`super::result::profile::timer`]), where any other
     /// built-in, play's among them, is undefined and 0 is never set.
     pub(crate) fn resolve_in(&self, kind: ScreenKind, id: i32) -> Timer {
         let builtin = |id: i32| match kind {
             ScreenKind::Result => super::result::profile::timer(id),
+            ScreenKind::Decision => super::decision::profile::timer(id),
             _ if id == 0 => Timer::Unset,
             _ => super::selection::profile::timer(id).map_or(Timer::Unsupported, Timer::Builtin),
         };
-        if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
+        if kind == ScreenKind::Play {
             return self.resolve(id);
         }
         if id <= BUILTIN_MAX {

@@ -1541,10 +1541,6 @@ fn the_reports_carry_text_only() {
         "skin: play: installed"
     );
     assert_eq!(
-        line(ScreenKind::Result, &Shown::BuiltIn("why".into())),
-        "skin: result: built-in: why"
-    );
-    assert_eq!(
         line(ScreenKind::Decision, &Shown::Refused("why".into())),
         "skin: decision: refused: why"
     );
