@@ -932,7 +932,29 @@ mod tests {
 
     use skin_model::ScreenKind::{Result, Selection};
 
-    use super::{HIDDEN, Pool, absent, to_bool, to_int};
+    use super::{HIDDEN, Pool, Screen, absent, to_bool, to_int};
+
+    /// Ids the selection profile bridges to an equal id read the same
+    /// state as it: EX ids hide with no best, while the EX differences
+    /// (the rival's, target's and best's EX are 0 on selection) read the
+    /// selected EX, 0 with no best; with a best of 1234, all give 1234.
+    #[test]
+    fn equal_selection_ids_read_as_their_bridged_id() {
+        use skin_model::selection_field as f;
+        let mut s = Screen::new(Selection);
+        s.fields = vec![0; f::COUNT];
+        for id in [71, 101, 171] {
+            assert_eq!(s.number(id), Some(HIDDEN), "{id}");
+        }
+        for id in [108, 128, 152, 153, 172] {
+            assert_eq!(s.number(id), Some(0), "{id}");
+        }
+        s.fields[usize::from(f::SELECTED_BEST)] = 1;
+        s.fields[usize::from(f::SELECTED_EX)] = 1_234;
+        for id in [71, 101, 171, 108, 128, 152, 153, 172] {
+            assert_eq!(s.number(id), Some(1_234), "{id}");
+        }
+    }
 
     /// O8: the source's values with the feature absent, row by row; ids
     /// with no such value, or a present one, give none.
