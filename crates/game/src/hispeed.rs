@@ -243,10 +243,11 @@ impl Default for HiSpeedSettings {
     }
 }
 
-/// The smallest and largest target green number.
-pub const GREEN_TARGETS: (u32, u32) = (1, 6000);
-/// The largest cover amount, ‰.
-pub const MAX_COVER: u16 = 1000;
+/// The smallest and largest target green number, as the record checks it
+/// ([`replay::GREEN_TARGET`]).
+pub const GREEN_TARGETS: (u32, u32) = (*replay::GREEN_TARGET.start(), *replay::GREEN_TARGET.end());
+/// The largest cover amount, ‰, as the record checks it.
+pub const MAX_COVER: u16 = replay::MAX_COVER;
 
 /// One lane cover: its configured amount, kept while it is off, and its
 /// switch.
@@ -452,25 +453,26 @@ fn check_hispeed(h: &HiSpeedSettings) -> Result<(), PlayOptionsError> {
     check(
         "classic_hispeed_x100",
         h.classic_hispeed_x100,
-        (1..=2000).contains(&h.classic_hispeed_x100),
+        replay::CLASSIC_HISPEED_X100.contains(&h.classic_hispeed_x100),
         "1 to 2000",
     )?;
     check(
         "classic_step_x100",
         h.classic_step_x100,
-        (1..=100).contains(&h.classic_step_x100),
+        replay::CLASSIC_STEP_X100.contains(&h.classic_step_x100),
         "1 to 100",
     )?;
     check(
         "floating_step_x100",
         h.floating_step_x100,
-        (5..=100).contains(&h.floating_step_x100) && h.floating_step_x100.is_multiple_of(5),
+        replay::FLOATING_STEP_X100.contains(&h.floating_step_x100)
+            && h.floating_step_x100.is_multiple_of(5),
         "5 to 100 in steps of 5",
     )?;
     check(
         "green_target",
         h.green_target,
-        (GREEN_TARGETS.0..=GREEN_TARGETS.1).contains(&h.green_target),
+        replay::GREEN_TARGET.contains(&h.green_target),
         "1 to 6000",
     )
 }
