@@ -492,7 +492,8 @@ impl PoolInner {
         };
         st.out.swap_remove(at);
         st.free += 1;
-        drop(st);
+        // Under the same lock as the take and the removal: a waiter that
+        // sees the release also sees the permit free.
         self.released.fetch_add(1, Ordering::AcqRel);
         true
     }
