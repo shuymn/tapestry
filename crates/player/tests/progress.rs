@@ -169,6 +169,7 @@ impl<'a> Rig<'a> {
             self.play.rearm();
         }
         let f = FrameInput {
+            state_us: 0,
             now,
             display_offset: TimeUs(0),
             lanes: LaneView::NONE,
