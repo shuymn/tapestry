@@ -248,6 +248,8 @@ where
 {
     let pass = Arc::clone(pass);
     lua.create_function(move |lua, args: MultiValue| -> mlua::Result<MultiValue> {
+        #[cfg(feature = "dev-tools")]
+        super::vm_hooks::host_call();
         let r = pass
             .ledger
             .host_call(lua)

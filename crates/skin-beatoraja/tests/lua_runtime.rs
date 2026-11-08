@@ -464,3 +464,38 @@ fn a_dropped_runtime_returns_its_permit() {
     std::thread::spawn(move || drop(rt)).join().unwrap();
     assert_eq!((pool.free(), pool.releases()), (1, 1));
 }
+
+/// C8: a panic in a host function stops the runtime, even under a `pcall`;
+/// every slot is its constant from then on and frames keep running.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_host_panic_stops_the_runtime() {
+    let mut i = import(&entry(
+        "",
+        &[
+            "function() pcall(function() return ms.number(77) end) return 3 end",
+            "function() return ms.number(77) / 2 end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [3, i32::MIN / 2]);
+    skin_beatoraja::lua::vm_hooks::panic_next_host_call();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Panic));
+    assert_eq!(outputs(&f), [0, 0]);
+    let (notes, _) = runtime(&mut i).notes();
+    assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Panic)));
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [0, 0]);
+    assert!(
+        runtime(&mut i)
+            .status()
+            .iter()
+            .all(|s| *s == CallStatus::Stopped)
+    );
+}

@@ -119,6 +119,25 @@ impl Drop for Open {
     }
 }
 
+thread_local! {
+    /// Whether this thread's next host call panics ([`panic_next_host_call`]).
+    static PANIC_HOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes this thread's next host call panic, as a defect in a host
+/// function would: the tests of a runtime's panic stop.
+pub fn panic_next_host_call() {
+    PANIC_HOST.with(|p| p.set(true));
+}
+
+/// A host call starts: panics when [`panic_next_host_call`] asked.
+pub(super) fn host_call() {
+    assert!(
+        !PANIC_HOST.with(|p| p.replace(false)),
+        "an injected host panic"
+    );
+}
+
 /// One instruction hook step.
 pub(super) fn step() {
     STEPS.fetch_add(1, Ordering::SeqCst);
