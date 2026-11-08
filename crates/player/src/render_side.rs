@@ -4483,12 +4483,22 @@ impl Run {
                                 kind: ScreenKind::Result,
                             });
                             let mut state = bundle.skin().prepare_result();
-                            match screen.prepare_result(
+                            let prepared = screen.prepare_result(
                                 bundle,
                                 &mut state,
                                 &p.payload.view,
                                 &p.payload.labels,
-                            ) {
+                            );
+                            // A refusal injected by a test of the real flow
+                            // (dev-tools).
+                            #[cfg(feature = "dev-tools")]
+                            let prepared = match prepared {
+                                Ok(Ok(())) if crate::dev::refuse_result_text() => {
+                                    Ok(Err("dev: the view's text was refused".to_owned()))
+                                }
+                                other => other,
+                            };
+                            match prepared {
                                 Ok(Ok(())) => held.state = Some(state),
                                 Ok(Err(why)) => {
                                     // Disabled below; the first presentation
@@ -4779,6 +4789,30 @@ impl Run {
                 .eq(ids().into_iter().flatten());
         if same {
             return;
+        }
+        // What is shown, once it changes (dev-tools: tests of the real
+        // flow read it).
+        #[cfg(feature = "dev-tools")]
+        if status.shown != shown
+            && let Some((_, skin)) = shown
+        {
+            let why = self.result_disabled.as_deref().or_else(|| {
+                self.result
+                    .as_ref()
+                    .and_then(|r| r.presented.as_ref())
+                    .and_then(|h| {
+                        h.payload
+                            .why
+                            .as_ref()
+                            .map(|(_, w)| w.as_str())
+                            .or_else(|| refused.map(|(_, w)| w.as_str()))
+                    })
+            });
+            match (skin, why) {
+                (true, _) => println!("dev: result shown: skin"),
+                (false, Some(why)) => println!("dev: result shown: built-in: {why}"),
+                (false, None) => println!("dev: result shown: built-in"),
+            }
         }
         status.installed = installed;
         status.disabled.clone_from(&self.result_disabled);

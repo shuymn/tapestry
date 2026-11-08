@@ -451,7 +451,7 @@ impl PlayerRig<'_> {
     /// slices: on any of them the upload is withdrawn, so a late staging
     /// installs nothing, and the end of loading does not wait on the
     /// render thread. A refusal shows the built-in result for the attempt.
-    fn upload_result(&mut self) {
+    pub(crate) fn upload_result(&mut self) {
         self.result_withdrawn = false;
         let status = self.render.result_status();
         if status.disabled.is_some() {

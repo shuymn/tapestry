@@ -2082,13 +2082,15 @@ pub fn print_result_work(at: &str) {
 
 /// The environment variable of the result's injected refusals (tests of
 /// the real flow): a comma list of `select<N>`, the N-th selection or
-/// upload of the result kind refused, and `stage<N>`, the N-th view
-/// staging refused, both counted from 1 on the render thread.
+/// upload of the result kind refused, `stage<N>`, the N-th view staging
+/// refused, and `text<N>`, the N-th view's text refused on a healthy
+/// device (the run's fallback), each counted from 1 on the render thread.
 pub const RESULT_FAULTS_ENV: &str = "TAPESTRY_DEV_RESULT_FAULTS";
 
 /// The result's selections and view stagings asked for so far.
 static RESULT_SELECTS_SEEN: AtomicU64 = AtomicU64::new(0);
 static RESULT_STAGES_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESULT_TEXTS_SEEN: AtomicU64 = AtomicU64::new(0);
 
 /// Whether [`RESULT_FAULTS_ENV`] names `prefix` with `n`.
 fn result_fault(prefix: &str, n: u64) -> bool {
@@ -2105,6 +2107,11 @@ pub fn refuse_result_select() -> bool {
         "select",
         RESULT_SELECTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
     )
+}
+
+/// Whether this view's text preparation is refused.
+pub fn refuse_result_text() -> bool {
+    result_fault("text", RESULT_TEXTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1)
 }
 
 /// Whether this view staging of the result kind is refused.

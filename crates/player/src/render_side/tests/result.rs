@@ -675,12 +675,19 @@ fn a_screen_built_again_draws_the_revision_presented() {
     }
 }
 
+/// The tests that hold the result's uploads, one at a time: the hold is
+/// the process's.
+static HOLDS: Mutex<()> = Mutex::new(());
+
 /// An upload held on the render thread is withdrawn at once when its
 /// pending selection is dropped, and once released installs nothing: the
 /// status names no installation and retains nothing of it (C10's render
 /// half).
 #[test]
 fn a_withdrawn_upload_installs_nothing_when_released() {
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (_dir, skin) = fixed_skin();
     let rig = Rig::new();
     crate::dev::hold_result_uploads(true);
@@ -1083,6 +1090,75 @@ fn result_frame_alloc() {
     drop(made);
     assert!(control > 0, "the count sees allocations");
     assert!(counts.iter().all(|&n| n == 0), "{counts:?}");
+}
+
+/// C10's flow half through the real `PlayerRig` and its WARP render
+/// thread: while the render thread holds the after-commit upload, a quit,
+/// a close or an input thread's failure ends the rig's wait within the
+/// slice bound, the attempt's upload withdrawn; the end of loading then
+/// does not wait on the render thread, still held; released, the late
+/// staging installs nothing and nothing of it is retained.
+#[test]
+fn a_held_upload_is_withdrawn_by_the_flow() {
+    use game::Rig as _;
+    let _held = HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for stop in ["quit", "close", "input"] {
+        let (_dir, skin) = fixed_skin();
+        let Rig { link, .. } = Rig::new();
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings::default(),
+        };
+        crate::tests::on_rig_with(settings, link, |p, _| {
+            p.result_skin = crate::result_skin::ResultSkin::new(Some(
+                crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            ));
+            let _ = p
+                .result_skin
+                .image_stage(ResultChart::default(), None, || false, || false);
+            crate::dev::hold_result_uploads(true);
+            let controls = p.controls;
+            let fail = p.input.failer();
+            let waited = std::thread::scope(|s| {
+                let stopper = s.spawn(|| {
+                    assert!(wait_until(crate::dev::result_upload_holding));
+                    let at = Instant::now();
+                    match stop {
+                        "quit" => controls.command(game::Command::Quit),
+                        "close" => controls.close(),
+                        _ => fail(),
+                    }
+                    at
+                });
+                p.upload_result();
+                let returned = Instant::now();
+                let at = stopper.join().unwrap();
+                returned.duration_since(at)
+            });
+            assert!(
+                waited < crate::render_side::SELECT_SLICE + Duration::from_millis(100),
+                "{stop}: the wait ended {waited:?} after"
+            );
+            assert!(p.result_withdrawn, "{stop}");
+            assert!(crate::dev::result_upload_holding(), "{stop}: still held");
+            let ended = Instant::now();
+            p.end_loading().unwrap();
+            assert!(
+                ended.elapsed() < Duration::from_millis(100),
+                "{stop}: the end of loading waited"
+            );
+            crate::dev::hold_result_uploads(false);
+            assert!(p.render.fence(Duration::from_secs(10)));
+            let status = p.render.result_status();
+            assert_eq!(status.installed, None, "{stop}");
+            assert!(
+                !status.retained.contains(&skin.atlas_id()),
+                "{stop}: {status:?}"
+            );
+        });
+    }
 }
 
 impl Rig {

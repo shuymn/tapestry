@@ -862,6 +862,15 @@ pub fn script_result(
         script.done();
         script.announce();
     }
+    // A command acts on the result once it is drawn: a skin's view
+    // committed, or its built-in page, each frame of it (the S10-09i
+    // design's D1). A result that never draws still gets its command.
+    if matches!(
+        script.front(),
+        Some(SelectStep::Back | SelectStep::Retry | SelectStep::Next | SelectStep::Prev)
+    ) {
+        let _ = render.wait_end_drawn(crate::dev::STEP_TIMEOUT);
+    }
     match script.front() {
         Some(SelectStep::Back) => {
             script.done();
