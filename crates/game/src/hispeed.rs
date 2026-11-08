@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 
+use replay::{CoverRecord, HiSpeedRatio, StartTuning, TuningCover, TuningMode, TuningReference};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -387,6 +388,46 @@ impl PlayOptions {
     /// The reducer's write path, its values already held in range.
     pub(crate) const fn parts_mut(&mut self) -> (&mut HiSpeedSettings, &mut Covers) {
         (&mut self.hispeed, &mut self.covers)
+    }
+
+    /// The record's starting tuning (design.md "Input Log Format"): these
+    /// options with the multiplier `hispeed` in effect and the cover
+    /// `target` the controls adjust, each `None` when there is none.
+    #[must_use]
+    pub fn start_tuning(&self, hispeed: Option<Ratio>, target: Option<CoverKind>) -> StartTuning {
+        let h = self.hispeed;
+        let cover = |c: Cover| CoverRecord {
+            amount: c.amount,
+            on: c.on,
+        };
+        StartTuning {
+            mode: match h.mode {
+                SpeedMode::Classic => TuningMode::Classic,
+                SpeedMode::Floating => TuningMode::Floating,
+            },
+            reference: match h.reference {
+                HiSpeedReference::Start => TuningReference::Start,
+                HiSpeedReference::Maximum => TuningReference::Maximum,
+                HiSpeedReference::Main => TuningReference::Main,
+                HiSpeedReference::Minimum => TuningReference::Minimum,
+            },
+            classic_hispeed_x100: h.classic_hispeed_x100,
+            classic_step_x100: h.classic_step_x100,
+            floating_step_x100: h.floating_step_x100,
+            green_target: h.green_target,
+            sudden: cover(self.covers.sudden),
+            lift: cover(self.covers.lift),
+            hidden: cover(self.covers.hidden),
+            target: target.map(|k| match k {
+                CoverKind::Sudden => TuningCover::Sudden,
+                CoverKind::Lift => TuningCover::Lift,
+                CoverKind::Hidden => TuningCover::Hidden,
+            }),
+            hispeed: hispeed.map(|r| HiSpeedRatio {
+                num: r.num(),
+                den: r.den(),
+            }),
+        }
     }
 }
 

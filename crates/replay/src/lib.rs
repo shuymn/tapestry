@@ -49,6 +49,18 @@
 //! [`eval::MAX_BINDINGS`], [`eval::MAX_AXES`]), checked as each count is
 //! read, before anything is allocated for it.
 //!
+//! The tuning section, after the start section, is the starting tuning
+//! ([`StartTuning`]): the speed mode (0 Classic, 1 Floating), the
+//! reference (0 start, 1 maximum, 2 main, 3 minimum), the Classic
+//! multiplier and step, the Floating step and the target green number, the
+//! SUDDEN+, LIFT and HIDDEN+ covers (each its amount in ‰ and its switch, 0
+//! or 1), the cover target (0 none, 1 SUDDEN+, 2 LIFT, 3 HIDDEN+), and the
+//! multiplier `H` (0 none; 1 followed by its numerator and denominator).
+//! Every value is checked against its range ([`StartTuning::invalid`]):
+//! steps on their grid, `H` in lowest terms within 0.01 to 20. A capture
+//! cancelled before playback writes none (the section is empty), and a
+//! played record always has one.
+//!
 //! The status section is the end status (0 played to the end, 1 ended
 //! midway, 2 cancelled before playback), then for a played attempt the
 //! finalized watermark, then the incomplete reasons as bits. A capture
@@ -98,11 +110,16 @@ pub use record::{
     PresetRecord, ReadyHistory, ReceiveMethod, SourceRecord, Status, TransformId, TransformRecord,
     Versions, WakePolicy,
 };
+pub use record::{
+    CLASSIC_HISPEED_X100, CLASSIC_STEP_X100, CoverRecord, FLOATING_STEP_X100, GREEN_TARGET,
+    HISPEED_MAX, HISPEED_MIN, HiSpeedRatio, MAX_COVER, StartTuning, TuningCover, TuningMode,
+    TuningReference,
+};
 
 use wire::{Reader, Writer};
 
 /// The format version this crate writes, and the only one it reads.
-pub const FORMAT_VERSION: u16 = 8;
+pub const FORMAT_VERSION: u16 = 9;
 
 /// The first bytes of every input log.
 pub const MAGIC: [u8; 4] = *b"TPRL";
@@ -224,13 +241,14 @@ pub fn encode(rec: &PlayRecord) -> Vec<u8> {
 }
 
 /// The canonical uncompressed body of `rec`. A capture cancelled before
-/// playback writes no winning opening: its `start`, `events`, `arrivals`
-/// and finalized watermark are not written.
+/// playback writes no winning opening: its `start`, `start_tuning`,
+/// `events`, `arrivals` and finalized watermark are not written.
 ///
 /// # Panics
 ///
-/// If a section exceeds `u32::MAX` bytes, or a cancelled opening's event
-/// range does not lie in the history's arena.
+/// If a section exceeds `u32::MAX` bytes, a cancelled opening's event
+/// range does not lie in the history's arena, or a played record has no
+/// starting tuning.
 #[must_use]
 pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
     let PlayRecord {
@@ -242,6 +260,7 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
         play_type,
         speed,
         start,
+        start_tuning,
         events,
         arrivals,
         status,
@@ -277,6 +296,14 @@ pub fn body_bytes(rec: &PlayRecord) -> Vec<u8> {
     section(&|w| {
         if played {
             write_start(w, start);
+        }
+    });
+    section(&|w| {
+        if played {
+            let tuning = start_tuning
+                .as_ref()
+                .expect("a played record has its starting tuning");
+            write_tuning(w, tuning);
         }
     });
     section(&|w| {
@@ -689,22 +716,25 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
     // The winning opening's sections are read once the status says there
     // is one; a capture cancelled before playback leaves them empty.
     let mut start_r = section(&mut r, Section::Start)?;
+    let mut tuning_r = section(&mut r, Section::Tuning)?;
     let mut events_r = section(&mut r, Section::Events)?;
     let mut arrivals_r = section(&mut r, Section::Arrivals)?;
     let status = read_section(&mut r, Section::Status, read_status)?;
-    let (start, events, arrivals) = if status.end.played() {
+    let (start, start_tuning, events, arrivals) = if status.end.played() {
         let start = read_start(&mut start_r, n_sources)?;
         start_r.finish()?;
+        let tuning = read_tuning(&mut tuning_r)?;
+        tuning_r.finish()?;
         let events = read_events(&mut events_r, n_sources, start.opened_at, limits.max_events)?;
         events_r.finish()?;
         let arrivals = read_arrivals(&mut arrivals_r)?;
         arrivals_r.finish()?;
-        (start, events, arrivals)
+        (start, Some(tuning), events, arrivals)
     } else {
-        for sub in [&start_r, &events_r, &arrivals_r] {
+        for sub in [&start_r, &tuning_r, &events_r, &arrivals_r] {
             sub.finish()?;
         }
-        (InputStart::default(), Vec::new(), Vec::new())
+        (InputStart::default(), None, Vec::new(), Vec::new())
     };
     let history = read_section(&mut r, Section::History, |r| {
         read_history(r, n_sources, status.end, start.opened_at)
@@ -719,11 +749,125 @@ fn decode_body(body: &[u8], limits: &DecodeLimits) -> Result<PlayRecord, DecodeE
         play_type,
         speed,
         start,
+        start_tuning,
         events,
         arrivals,
         status,
         history,
     })
+}
+
+fn write_tuning(w: &mut Writer, t: &StartTuning) {
+    let StartTuning {
+        mode,
+        reference,
+        classic_hispeed_x100,
+        classic_step_x100,
+        floating_step_x100,
+        green_target,
+        sudden,
+        lift,
+        hidden,
+        target,
+        hispeed,
+    } = t;
+    w.uint(match mode {
+        TuningMode::Classic => 0,
+        TuningMode::Floating => 1,
+    });
+    w.uint(match reference {
+        TuningReference::Start => 0,
+        TuningReference::Maximum => 1,
+        TuningReference::Main => 2,
+        TuningReference::Minimum => 3,
+    });
+    for v in [
+        classic_hispeed_x100,
+        classic_step_x100,
+        floating_step_x100,
+        green_target,
+    ] {
+        w.uint(u64::from(*v));
+    }
+    for CoverRecord { amount, on } in [sudden, lift, hidden] {
+        w.uint(u64::from(*amount));
+        w.uint(u64::from(*on));
+    }
+    w.uint(match target {
+        None => 0,
+        Some(TuningCover::Sudden) => 1,
+        Some(TuningCover::Lift) => 2,
+        Some(TuningCover::Hidden) => 3,
+    });
+    match hispeed {
+        None => w.uint(0),
+        Some(HiSpeedRatio { num, den }) => {
+            w.uint(1);
+            w.uint(*num);
+            w.uint(*den);
+        }
+    }
+}
+
+fn read_tuning(r: &mut Reader<'_>) -> Result<StartTuning, DecodeError> {
+    let mode = match r.uint()? {
+        0 => TuningMode::Classic,
+        1 => TuningMode::Floating,
+        _ => return Err(DecodeError::InvalidValue("speed mode")),
+    };
+    let reference = match r.uint()? {
+        0 => TuningReference::Start,
+        1 => TuningReference::Maximum,
+        2 => TuningReference::Main,
+        3 => TuningReference::Minimum,
+        _ => return Err(DecodeError::InvalidValue("hi-speed reference")),
+    };
+    let classic_hispeed_x100 = r.u32()?;
+    let classic_step_x100 = r.u32()?;
+    let floating_step_x100 = r.u32()?;
+    let green_target = r.u32()?;
+    let mut cover = || -> Result<CoverRecord, DecodeError> {
+        let amount = r.u16()?;
+        let on = match r.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(DecodeError::InvalidValue("cover switch")),
+        };
+        Ok(CoverRecord { amount, on })
+    };
+    let (sudden, lift, hidden) = (cover()?, cover()?, cover()?);
+    let target = match r.uint()? {
+        0 => None,
+        1 => Some(TuningCover::Sudden),
+        2 => Some(TuningCover::Lift),
+        3 => Some(TuningCover::Hidden),
+        _ => return Err(DecodeError::InvalidValue("cover target")),
+    };
+    let hispeed = match r.uint()? {
+        0 => None,
+        1 => Some(HiSpeedRatio {
+            num: r.uint()?,
+            den: r.uint()?,
+        }),
+        _ => return Err(DecodeError::InvalidValue("hi-speed")),
+    };
+    let tuning = StartTuning {
+        mode,
+        reference,
+        classic_hispeed_x100,
+        classic_step_x100,
+        floating_step_x100,
+        green_target,
+        sudden,
+        lift,
+        hidden,
+        target,
+        hispeed,
+    };
+    match tuning.invalid() {
+        Some(field) => Err(DecodeError::InvalidValue(field)),
+        None => Ok(tuning),
+    }
 }
 
 fn read_versions(r: &mut Reader<'_>) -> Result<(Versions, u32), DecodeError> {

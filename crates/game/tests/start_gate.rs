@@ -511,6 +511,9 @@ fn assert_cancelled(report: &PlayReport, reason: CancelReason) {
     assert!(r.events.is_empty() && r.arrivals.is_empty());
     assert_eq!(r.start, eval::InputStart::default());
     assert!(report.result.is_none() && report.best.is_none());
+    // No winning opening, so no starting tuning (design.md "Input Log
+    // Format").
+    assert_eq!(r.start_tuning, None);
     let last = r.history.openings.last().unwrap();
     assert_eq!(last.origin, TimeUs(0));
     assert_eq!(last.reason, reason);
@@ -1186,4 +1189,95 @@ fn a_withdrawn_attempt_re_solves_with_a_new_epoch() {
     let second = s.presentation().unwrap().epoch;
     assert!(second > first, "{first} then {second}");
     assert_eq!(s.adjustments().unwrap().active(), Some(second));
+}
+
+/// F2 (one Classic step up) pressed by keyboard 0 at `at` ms.
+fn f2(at: i64) -> [ScriptItem; 2] {
+    let key = ControlId(0x3C);
+    [raw(at, 0, key, 1), raw(at + 20, 0, key, 0)]
+}
+
+/// The multiplier `H` as the record keeps it.
+fn h(hundredths: u32) -> Option<replay::HiSpeedRatio> {
+    let r = Ratio::from_hundredths(hundredths);
+    Some(replay::HiSpeedRatio {
+        num: r.num(),
+        den: r.den(),
+    })
+}
+
+#[test]
+fn the_record_starts_with_its_single_openings_tuning() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    // F2 once the chart plays: an in-play change, not the start.
+    let mut items = vec![connect(0)];
+    items.extend(f2(500));
+    items.extend(notes_from(0));
+    let report = s.play(script(items, &[])).unwrap();
+
+    let t = record(&report).start_tuning.unwrap();
+    assert_eq!(t.mode, replay::TuningMode::Classic);
+    assert_eq!(t.hispeed, h(100));
+    assert_eq!(t.classic_hispeed_x100, 100);
+    assert_eq!(
+        s.presentation().unwrap().hispeed,
+        Some(Ratio::from_hundredths(125))
+    );
+    saved_decodes(&report);
+}
+
+#[test]
+fn a_rearm_starts_with_what_was_adjusted_while_waiting() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &Events::default());
+    // START held at −300 ms cancels the first READY; F2 at 0 and again at
+    // 150 ms while waiting; the release at 200 ms rearms; F2 at 1.5 s, in
+    // the winning READY's play, is after its opening.
+    let mut items = vec![connect(0), raw(-300, 0, E, 1)];
+    items.extend(f2(0));
+    items.extend(f2(150));
+    items.push(raw(200, 0, E, 0));
+    items.extend(f2(1_500));
+    items.extend(notes_from(1_200));
+    let report = s.play(script(items, &[])).unwrap();
+
+    let r = record(&report);
+    assert_eq!(r.status.end, EndStatus::PlayedToEnd);
+    assert_eq!(r.history.openings.len(), 1);
+    // The winning opening's tuning: both steps taken while waiting, none
+    // after; the cancelled opening's (1.00) is not written.
+    let t = r.start_tuning.unwrap();
+    assert_eq!(t.hispeed, h(150));
+    assert_eq!(t.classic_hispeed_x100, 150);
+    assert_eq!(
+        s.presentation().unwrap().hispeed,
+        Some(Ratio::from_hundredths(175))
+    );
+    saved_decodes(&report);
+}
+
+#[test]
+fn a_session_without_the_gate_starts_with_the_settings_options() {
+    let (_dir, root) = temp_root();
+    let device = audio::SimDevice::new(audio::SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let out = audio::RecordingOutput::new(device, 0);
+    let mut s = session_of(
+        &root,
+        &Events::default(),
+        &chart(),
+        common::sources(),
+        out,
+        false,
+    );
+    let mut items = vec![connect(0)];
+    items.extend(notes_from(0));
+    let report = s.play(script(items, &[])).unwrap();
+
+    let options = tapestry_settings(&root).player.options().unwrap();
+    let t = record(&report).start_tuning.unwrap();
+    assert_eq!(t, options.start_tuning(None, None));
+    // No reducer solved a multiplier, and no cover is adjusted.
+    assert_eq!((t.hispeed, t.target), (None, None));
+    saved_decodes(&report);
 }

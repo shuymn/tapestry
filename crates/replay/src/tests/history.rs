@@ -14,7 +14,7 @@ use crate::{
 };
 
 /// The history section's index in the body.
-const HISTORY: usize = 9;
+const HISTORY: usize = 10;
 
 fn opening(
     opened: i64,
@@ -81,6 +81,7 @@ fn cancelled() -> PlayRecord {
     rec.events.clear();
     rec.arrivals.clear();
     rec.status.end = EndStatus::CancelledBeforePlayback;
+    rec.start_tuning = None;
     rec.status.finalized = TimeUs(0);
     rec
 }
@@ -129,10 +130,10 @@ fn a_capture_cancelled_before_playback_has_no_winning_opening() {
     assert!(!rec.played());
     let body = body_bytes(&rec);
     let sections = split_sections(&body);
-    // No start, events or arrivals, and the status holds no watermark:
-    // the end tag and the reason bits (suspend).
-    assert!(sections[5..8].iter().all(Vec::is_empty));
-    assert_eq!(sections[8], [2, 4]);
+    // No start, tuning, events or arrivals, and the status holds no
+    // watermark: the end tag and the reason bits (suspend).
+    assert!(sections[5..9].iter().all(Vec::is_empty));
+    assert_eq!(sections[9], [2, 4]);
     assert_eq!(decode(&encode(&rec), &limits()), Ok(rec));
 }
 

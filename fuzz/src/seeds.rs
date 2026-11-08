@@ -94,6 +94,7 @@ fn two_sources() -> PlayRecord {
     ];
     controller.axis_out_of_range = 4;
     PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: 3,
             app: "0.1.0".to_owned(),
@@ -340,8 +341,9 @@ fn join_sections(sections: &[Vec<u8>]) -> Vec<u8> {
 /// Section indexes in the body (`replay::Section` order).
 const DEVICES: usize = 4;
 const START: usize = 5;
-const EVENTS: usize = 6;
-const HISTORY: usize = 9;
+const TUNING: usize = 6;
+const EVENTS: usize = 7;
+const HISTORY: usize = 10;
 
 /// A history section of one opening (opened at 0, nothing held, origin
 /// −1, closed at 0, a hold) with the ranges and counts given.
@@ -450,6 +452,8 @@ pub fn replay_bodies() -> Vec<Seed> {
 
     // A devices section with no source.
     seeds.push(("zero_sources", with_section(DEVICES, vec![0, 0, 0])));
+    // A starting tuning whose speed mode has no tag.
+    seeds.push(("tuning_tag", with_section(TUNING, vec![2])));
 
     // A byte after the last section.
     let mut trailing = body.clone();

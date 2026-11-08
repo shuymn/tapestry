@@ -63,6 +63,7 @@ fn write_log(chart: &bms_model::Chart, path: &Path) -> Vec<eval::PhysicalInputEv
     let profile = DeviceSettings::default().profile(&[DeviceKind::Keyboard], &[]);
     let events = input::autoplay(chart, &profile.sources[0]).unwrap();
     let rec = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: 1,
             app: "test".to_owned(),
@@ -569,6 +570,14 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
     // F2 is in no opening.
     let f2 = |e: &eval::PhysicalInputEvent| matches!(e.kind, eval::InputKind::Control { control, .. } if control.0 == 0x3C);
     assert!(!rec.events.iter().any(f2) && !h.events.iter().any(f2));
+    // Nor in the starting tuning: the winning opening started at 4.00,
+    // before the play's step to 4.50 (design.md "Input Log Format").
+    assert_eq!(
+        rec.start_tuning.and_then(|t| t.hispeed),
+        Some(replay::HiSpeedRatio { num: 4, den: 1 }),
+        "{:?}",
+        rec.start_tuning
+    );
     assert!(
         stdout.contains("adjust: hi-speed 4.50 floating"),
         "{stdout}"

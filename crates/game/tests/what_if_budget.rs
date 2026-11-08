@@ -92,6 +92,7 @@ fn what_if_peak_stays_within_its_budget() {
             .unwrap()
             .final_deadline();
     let record = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: Implementation::STANDARD_VERSION,
             app: "0.0.0-test".to_owned(),
