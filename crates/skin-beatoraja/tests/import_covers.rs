@@ -1007,6 +1007,79 @@ fn a_trimmed_cover_past_the_edge_crops_its_cells_rows() {
 }
 
 #[test]
+fn a_trimmed_cover_cropped_past_the_bottom_edge_draws_the_last_row() {
+    // An 8×64 frame from row 240 of a.png (64×256) fit to 80 would be 640
+    // high: stretch 5 keeps the 320 px destination and the frame's middle
+    // 32 rows, 256 to 287, wholly below the file, where the source
+    // samples its last row throughout.
+    let frame = r#"{"id": "ce", "src": "a", "x": 0, "y": 240, "w": 8, "h": 64}"#;
+    let paint = stretched("ce", 5).replace(r#""w": 430, "h": 600"#, r#""w": 80, "h": 320"#);
+    let plain = r#"{"id": "ce", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let ends = [(0.1, 0.01), (0.9, 0.01), (0.1, 0.99), (0.9, 0.99)];
+    for dsts in [vec![&*paint], vec![plain, &paint], vec![&paint, plain]] {
+        let l = tall(frame, &dsts);
+        assert!(!has(l.report(), NoteKind::SourceRect), "{dsts:?}");
+        let got = edge_paint(&l, [20.0, 560.0, 80.0, 320.0], &ends);
+        let want = [0, 7, 0, 7].map(|x| common::coord(x, 255));
+        assert_eq!(got, want, "{dsts:?}");
+    }
+    // From row 220 it keeps rows 236 to 267: in the file down to its last
+    // row, which repeats below it.
+    let partly = frame.replace(r#""y": 240"#, r#""y": 220"#);
+    let l = tall(&partly, &[&paint]);
+    let got = edge_paint(&l, [20.0, 560.0, 80.0, 320.0], &ends);
+    let want = [(0, 236), (7, 236), (0, 255), (7, 255)].map(|(x, y)| common::coord(x, y));
+    assert_eq!(got, want);
+}
+
+/// The texels at the middle of each end of every quad 430 px wide at x
+/// 20 in the frame at 1,000 ms, with LIFT at `lift` ‰ and HIDDEN+ on at
+/// `hidden` ‰ when it is not 0, `a.png` (64×64) painted with
+/// [`common::coord`] first.
+fn cover_ends(l: &Loaded, lift: u16, hidden: u16) -> Vec<[u8; 4]> {
+    common::png_with(l.dir.path(), "a.png", 64, 64, common::coord);
+    let atlas = l
+        .ok()
+        .skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    (d.view.lift, d.view.hidden) = (lift, hidden);
+    let mut readouts = common::play::readouts_for(d.view);
+    (readouts.covers.hidden, readouts.covers.hidden_enabled) = (hidden, hidden > 0);
+    d.readouts = Some(readouts);
+    d.frame(1_000, &[])
+        .iter()
+        .filter(|q| {
+            let [x, _, w, _] = common::play::round(q.rect);
+            (x, w) == (20, 430)
+        })
+        .flat_map(|q| {
+            [(0.1, 0.5), (0.9, 0.5)].map(|(u, v)| common::play::texel_at(&atlas, q, u, v))
+        })
+        .collect()
+}
+
+#[test]
+fn trimmed_lift_and_hidden_covers_cropped_past_the_bottom_edge_draw_the_last_row() {
+    // An 8×64 frame from row 40 of a.png (64×64) under stretch 5: LIFT's
+    // 430×200 destination keeps its rows 70 to 73 and HIDDEN+'s 430×600
+    // its rows 66 to 77, wholly below the file, where the source samples
+    // its last row throughout.
+    let frame = r#""x": 0, "y": 40, "w": 8, "h": 64"#;
+    let want = [common::coord(0, 63), common::coord(7, 63)];
+    let object = lift_object("").replace(r#""x": 16, "y": 24, "w": 16, "h": 16"#, frame);
+    let l = with(&object, &[&lift(r#""stretch": 5"#)]);
+    assert!(!has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
+    assert_eq!(cover_ends(&l, 200, 0), want);
+    let object = hidden_object("").replace(r#""x": 32, "y": 24, "w": 16, "h": 16"#, frame);
+    let l = with(&object, &[&hidden(r#""stretch": 5"#)]);
+    assert!(!has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
+    assert_eq!(cover_ends(&l, 0, 200), want);
+}
+
+#[test]
 fn a_trimmed_hidden_cover_cut_to_the_last_row_drops() {
     // HIDDEN+'s paint is decorative: an 8×64 frame below a.png's last row
     // (64×64), cropped under stretch 5, drops with `SourceRect`.
