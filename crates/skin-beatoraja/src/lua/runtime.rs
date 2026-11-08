@@ -318,9 +318,10 @@ impl Screen {
 ///   with no song information (`IPF:167-173`, `:319-388`).
 ///
 /// Selection:
-/// - 75, 78-89, the best's max combo, clear and fail counts, judgment
-///   counts and rates, none kept here: `Integer.MIN_VALUE`, as with no
-///   score (`IPF:131`, `:140-153`, `:500-511`, `:627-632`).
+/// - 75, 105, 174 (the best's max combo), 78-89 (its clear and fail
+///   counts, judgment counts and rates), none kept here:
+///   `Integer.MIN_VALUE`, as with no score (`IPF:131`, `:140-153`, `:182`,
+///   `:234`, `:500-511`, `:627-632`).
 /// - 107, 407 (the gauge), 173, 175, 176, 178 (the best's combo and BP and
 ///   their differences) and 370-377 (clear type, timing statistics),
 ///   play or result only: `Integer.MIN_VALUE` (`IPF:184-185`, `:233-238`,
@@ -371,6 +372,8 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
         | (
             Selection,
             75
+            | 105
+            | 174
             | 78..=89
             | 107
             | 407
