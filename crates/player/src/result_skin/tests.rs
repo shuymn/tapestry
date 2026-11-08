@@ -1529,3 +1529,33 @@ fn the_fixed_generation_serves_every_attempt() {
     assert_eq!(Some(shown_script(&rs)), g);
     assert!(scripts.result_live(g));
 }
+
+/// §3.7.1 M3 at the attempt's entrance: a bundle for every view is reused
+/// by the next attempt only while its runtime lives; evicted, the next
+/// attempt's image stage imports it again, with a new generation.
+#[test]
+fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)\nif lv == 7 then local nr = ms.number(154) end",
+        "local calls = 0 rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view_at(8, 5));
+    let g = shown_script(&rs);
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(view_at(8, 6));
+    assert_eq!(shown_script(&rs), g, "reused while it lives");
+    drop(rs.scripts().result_permit(None));
+    assert!(!rs.scripts().result_live(Some(g)));
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(view_at(8, 7));
+    let again = shown_script(&rs);
+    assert_ne!(again, g);
+    assert!(rs.scripts().result_live(Some(again)));
+}

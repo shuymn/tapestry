@@ -2364,7 +2364,15 @@ fn a_disabled_result_retires_its_runtime() {
         &Overlay::default(),
     );
     assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(
+        !rig.link.scripts().result_parked(g),
+        "the presented view runs it"
+    );
     assert!(rig.link.park_scripts());
+    assert!(
+        rig.link.scripts().result_parked(g),
+        "parked before the play"
+    );
     let interval = rig.link.scripts().open_interval();
     assert!(!gone.load(Ordering::Acquire));
     let _closed = interval.close();

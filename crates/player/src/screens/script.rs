@@ -513,6 +513,15 @@ impl Scripts {
         self.0.pool.free()
     }
 
+    /// Whether result generation `g` is parked in the cell (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_parked(&self, g: ScriptGen) -> bool {
+        self.0
+            .host()
+            .result(g.generation)
+            .is_some_and(|e| matches!(e.held, Held::Parked(_)))
+    }
+
     /// The result generations with an entry (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn result_entries(&self) -> usize {
