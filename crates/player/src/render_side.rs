@@ -9119,6 +9119,8 @@ pub(crate) mod tests {
         /// The request whose staging is held unanswered
         /// (`hold_staged`).
         held: Option<u64>,
+        /// The target's size as last applied (1920×1080 until a resize).
+        target: [u32; 2],
     }
 
     impl Installer {
@@ -9132,6 +9134,14 @@ pub(crate) mod tests {
     }
 
     impl Screen for Installer {
+        fn resize(&mut self, width: u32, height: u32) {
+            if width > 0 && height > 0 {
+                self.target = [width, height];
+            }
+        }
+        fn target(&self) -> [u32; 2] {
+            self.target
+        }
         fn load(
             &mut self,
             _chart: &Chart,
@@ -9546,6 +9556,7 @@ pub(crate) mod tests {
                     staged: None,
                     installed: super::Committed::default(),
                     held: None,
+                    target: [1_920, 1_080],
                 }) as Box<dyn Screen>)
             });
             let clock = QpcClock::start();
@@ -10631,6 +10642,95 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// Only the target's size, or only the play skin's selection, changed
+    /// after the staging: the final readiness answers `Stale` with that
+    /// input now, the others as staged, and prepares nothing.
+    #[test]
+    fn a_final_readiness_answers_stale_for_a_new_target_or_skin_selection() {
+        for case in ["target", "skin"] {
+            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let skin = bundle();
+            let screens = Installers::default();
+            let link = screens.spawn(&chart, &skin);
+            let mut pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
+            let answered = loop {
+                if let Some(a) = pending.wait_until(None, || false) {
+                    break a.unwrap();
+                }
+            };
+            assert_eq!(answered.preparation, Preparation::Ready, "{case}");
+            let staged = answered.screen;
+            let request = pending.request();
+            assert_eq!(
+                link.ready_attempt(request, 3).unwrap(),
+                super::ReadyAnswer::Ready,
+                "{case}"
+            );
+            let extent = Arc::new(super::Extent::default());
+            if case == "target" {
+                link.follow(&extent);
+                extent.publish(staged.target[0] / 2, staged.target[1] / 2);
+                assert!(
+                    wait_until(
+                        || link.ready_attempt(request, 3).unwrap() != super::ReadyAnswer::Ready
+                    ),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    link.select(ScreenKind::Play, None).wait().unwrap(),
+                    Preparation::Ready
+                );
+            }
+            let super::ReadyAnswer::Stale(now) = link.ready_attempt(request, 3).unwrap() else {
+                panic!("{case}: ready after the change");
+            };
+            if case == "target" {
+                assert_eq!(now.target, [staged.target[0] / 2, staged.target[1] / 2]);
+                assert_eq!((now.device, now.skin), (staged.device, staged.skin));
+            } else {
+                assert_ne!(now.skin, staged.skin);
+                assert_eq!((now.device, now.target), (staged.device, staged.target));
+            }
+            link.exit();
+        }
+    }
+
+    /// A reply found disconnected, by an attempt's request waited for or
+    /// by its final readiness, latches the screen's failure before its
+    /// error is returned.
+    #[test]
+    fn a_disconnected_attempt_or_readiness_reply_latches_the_failure() {
+        for case in ["attempt", "ready"] {
+            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let skin = bundle();
+            let screens = Installers::default();
+            let link = screens.spawn(&chart, &skin);
+            // The thread ends; nothing answers any more.
+            link.send(RenderMsg::Exit);
+            assert!(wait_until(
+                || link.ended.try_recv() == Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ));
+            assert!(!link.failed(), "{case}");
+            if case == "attempt" {
+                let mut pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
+                assert!(
+                    matches!(
+                        pending.wait_until(None, || false),
+                        Some(Err(ScreenError::Ended))
+                    ),
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    matches!(link.ready_attempt(1, 0), Err(ScreenError::Ended)),
+                    "{case}"
+                );
+            }
+            assert!(link.failed(), "{case}");
+        }
+    }
+
     /// An attempt's request dropped unanswered, or answered but not taken,
     /// is discarded: its staging never installs.
     #[test]
@@ -10640,6 +10740,15 @@ pub(crate) mod tests {
         let screens = Installers::default();
         let link = screens.spawn(&chart, &skin);
         drop(link.begin_attempt(titled(&chart), super::AttemptSkin::InUse));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        // Answered, its reply sent (the render thread answers it before it
+        // takes the readiness that finds it staged), but not taken.
+        let pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
+        let request = pending.request();
+        assert!(wait_until(
+            || link.ready_attempt(request, 0).unwrap() == super::ReadyAnswer::Ready
+        ));
+        drop(pending);
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
         // A request answered ready and taken stays for its commit.
         let mut pending = link.begin_attempt(titled(&chart), super::AttemptSkin::InUse);
