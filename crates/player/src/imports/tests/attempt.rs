@@ -19,13 +19,13 @@ fn facts(text: &str) -> ImportFacts {
     attempt_facts(&loaded(text, "tapestry"), false)
 }
 
-/// The jobs started and joined, and the VMs open (dev-tools; zeros
-/// without).
+/// The jobs this test started and joined, and the VMs open (dev-tools;
+/// zeros without).
 fn counters() -> (u64, u64, usize) {
     #[cfg(feature = "dev-tools")]
     return (
-        crate::imports::jobs_started(),
-        crate::imports::jobs_joined(),
+        super::jobs_started(),
+        super::jobs_joined(),
         skin_beatoraja::lua::vm_hooks::live(),
     );
     #[cfg(not(feature = "dev-tools"))]
@@ -197,8 +197,11 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
         if held {
             vm_hooks::hold();
         }
+        // The attempt's thread counts its job into this test's tally.
+        let tally = super::tally();
         let (got, took) = std::thread::scope(|scope| {
             let attempt = scope.spawn(|| {
+                super::adopt(tally);
                 let (got, _) = skin.attempt(
                     facts("#PLAYLEVEL 12\n"),
                     || {},

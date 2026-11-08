@@ -789,6 +789,9 @@ pub struct Job<T> {
     attempt_cancelled: bool,
     /// The run's end came: the job is cancelled and given up at this time.
     stop_by: Option<Instant>,
+    /// The tally of the test thread that started it (tests).
+    #[cfg(test)]
+    tally: Arc<tests::Tally>,
 }
 
 /// Starts `job` on a spawned `skin-import` thread, its panic caught and
@@ -831,6 +834,8 @@ pub fn spawn_job<T: Send + 'static>(
         outcome: None,
         attempt_cancelled: false,
         stop_by: None,
+        #[cfg(test)]
+        tally: tests::spawning(),
     })
 }
 
@@ -859,7 +864,7 @@ impl<T> Job<T> {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
             #[cfg(test)]
-            tests::worker_joined();
+            self.tally.joined();
             #[cfg(feature = "dev-tools")]
             JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }

@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,34 +35,79 @@ static EXIT_OPENED: Condvar = Condvar::new();
 /// one included: what [`serial`] drains between tests.
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-thread_local! {
-    /// The jobs started and joined from this thread: a runner's own,
-    /// whatever jobs other tests run meanwhile ([`own_counted`]).
-    static OWN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
 /// A job thread is about to start; its [`WorkerEnd`], or
 /// [`spawn_failed`], counts its end.
 pub(super) fn worker_starting() {
     WORKERS.fetch_add(1, Ordering::SeqCst);
-    OWN.with(|c| c.set((c.get().0 + 1, c.get().1)));
 }
 
 /// The job thread counted by [`worker_starting`] did not start.
 pub(super) fn spawn_failed() {
     WORKERS.fetch_sub(1, Ordering::SeqCst);
-    OWN.with(|c| c.set((c.get().0 - 1, c.get().1)));
 }
 
-/// A job's thread was joined.
-pub(super) fn worker_joined() {
-    OWN.with(|c| c.set((c.get().0, c.get().1 + 1)));
+/// The jobs one test started and whose threads were joined. Each job
+/// carries the tally of the thread that started it, so a test counts its
+/// own jobs only, whatever jobs other tests run meanwhile: the
+/// process-wide counters ([`super::jobs_started`]) move with every test's.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    started: AtomicU64,
+    joined: AtomicU64,
 }
 
-/// The jobs this thread started and joined.
+impl Tally {
+    /// Its job's thread was joined.
+    pub(super) fn joined(&self) {
+        self.joined.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+thread_local! {
+    /// This thread's tally: a test thread's own, or the one a runner the
+    /// test started was handed ([`adopt`]).
+    static TALLY: std::cell::RefCell<Arc<Tally>> = std::cell::RefCell::default();
+}
+
+/// This thread's tally.
+fn tally() -> Arc<Tally> {
+    TALLY.with(|t| Arc::clone(&t.borrow()))
+}
+
+/// Has this thread, a runner a test started, count into the test's
+/// `tally`.
+fn adopt(tally: Arc<Tally>) {
+    TALLY.with(|t| *t.borrow_mut() = tally);
+}
+
+/// A job is started from this thread: its tally, the start counted.
+pub(super) fn spawning() -> Arc<Tally> {
+    let t = tally();
+    t.started.fetch_add(1, Ordering::SeqCst);
+    t
+}
+
+/// The jobs this thread's tally counted started, then joined.
 #[cfg(feature = "dev-tools")]
-fn own_counted() -> (u64, u64) {
-    OWN.with(std::cell::Cell::get)
+pub(crate) fn jobs_counted() -> (u64, u64) {
+    let t = tally();
+    (
+        t.started.load(Ordering::SeqCst),
+        t.joined.load(Ordering::SeqCst),
+    )
+}
+
+/// The jobs this thread's tally counted started ([`jobs_counted`]).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn jobs_started() -> u64 {
+    jobs_counted().0
+}
+
+/// The job threads this thread's tally counted joined
+/// ([`jobs_counted`]).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn jobs_joined() -> u64 {
+    jobs_counted().1
 }
 
 /// Held by a job thread's body: its drop, past [`exit_gate`] or in an
@@ -1025,7 +1070,9 @@ fn started_job<T: Send + 'static>(
     let signals = Signals::default();
     let s = signals.clone();
     let (tx, rx) = std::sync::mpsc::channel();
+    let tally = tally();
     std::thread::spawn(move || {
+        adopt(tally);
         let ran = run_job(
             job,
             || s.attempt.load(Ordering::SeqCst),
@@ -1036,10 +1083,10 @@ fn started_job<T: Send + 'static>(
     (signals, rx)
 }
 
-/// The jobs started and joined so far (dev-tools).
+/// The jobs this test started and joined so far (dev-tools).
 #[cfg(feature = "dev-tools")]
 fn counted() -> (u64, u64) {
-    (super::jobs_started(), super::jobs_joined())
+    jobs_counted()
 }
 
 /// Runs `job` on another thread with a stop the test sets: the runner's
@@ -1050,29 +1097,11 @@ fn started<T: Send + 'static>(
     let stop = Arc::new(AtomicBool::new(false));
     let theirs = Arc::clone(&stop);
     let (tx, rx) = std::sync::mpsc::channel();
+    let tally = tally();
     std::thread::spawn(move || {
+        adopt(tally);
         let ran = run_cancellable(job, move || theirs.load(Ordering::SeqCst));
         let _ = tx.send(ran);
-    });
-    (stop, rx)
-}
-
-/// A runner's answer with the jobs it started and joined itself.
-#[cfg(feature = "dev-tools")]
-type OwnAnswer<T> = std::sync::mpsc::Receiver<(Ran<T>, (u64, u64))>;
-
-/// [`started`], the runner also answering the jobs it started and joined
-/// itself: its own job's, unmoved by other tests' jobs.
-#[cfg(feature = "dev-tools")]
-fn started_own<T: Send + 'static>(
-    job: impl FnOnce(&Cancel) -> T + Send + 'static,
-) -> (Arc<AtomicBool>, OwnAnswer<T>) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let theirs = Arc::clone(&stop);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let ran = run_cancellable(job, move || theirs.load(Ordering::SeqCst));
-        let _ = tx.send((ran, own_counted()));
     });
     (stop, rx)
 }
@@ -1175,11 +1204,10 @@ const LATE: Duration = Duration::from_millis(750);
 const HELD_FOR: Duration = Duration::from_secs(7);
 
 /// A VM held past the stop bound when the run ends: the runner gives up
-/// at the bound, the VM still counted and its job started but not joined
-/// (counted by the runner itself, so another test's job meanwhile does not
-/// move it). Ending the test's serialization releases the VM and waits for
+/// at the bound, the VM still counted and the job started but not
+/// joined. Ending the test's serialization releases the VM and waits for
 /// the abandoned thread: by then its outcome, finding nobody, has been
-/// dropped on its own thread, and the runner never joins it. Unheld and
+/// dropped on its own thread, and it is joined by nobody. Unheld and
 /// uncancelled, the looping fixture would run to the sandbox's 5 s Lua
 /// time cap; held, it never ends before the release.
 #[cfg(feature = "dev-tools")]
@@ -1190,25 +1218,24 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
+    let (started_before, joined) = counted();
     vm_hooks::hold();
-    let (stop, rx) = started_own(looping_job(dir.path(), &dropped));
+    let (stop, rx) = started(looping_job(dir.path(), &dropped));
     executing(base);
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
-    let answered = rx.recv_timeout(HELD_FOR);
+    let ran = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
-    let Ok((ran, own)) = answered else {
-        panic!("{answered:?}");
-    };
-    assert!(matches!(ran, Ran::Abandoned), "{ran:?}");
+    assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
     assert!(after >= STOP_WAIT, "{after:?}");
     assert!(after < STOP_WAIT + LATE, "{after:?}");
     assert_eq!(vm_hooks::live(), base + 1);
-    assert_eq!(own, (1, 0), "its job started, not joined");
+    assert_eq!(counted(), (started_before + 1, joined));
     drop(serial);
     assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
     assert_eq!(vm_hooks::live(), base);
+    assert_eq!(counted(), (started_before + 1, joined));
 }
 
 /// An outcome already received does not end the wait for the thread: held

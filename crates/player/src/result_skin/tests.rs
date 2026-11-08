@@ -13,10 +13,11 @@ use skin_beatoraja::{Config, JudgeClass, read_lua_header};
 use skin_model::{AtlasLimits, ResultChart, ResultFields, Root};
 
 use super::{Published, ResultSkin, ResultStart, Staged, ViewFacts, builds, probe_view};
-use crate::imports::{ImportTarget, jobs_joined, jobs_started};
-// The builds and jobs a test counts are its own: these tests run one at a
-// time with the importer's tests, which count jobs too.
-use crate::imports::tests::serial;
+use crate::imports::ImportTarget;
+// The jobs a test counts are its own (each job carries the tally of the
+// test that started it); its builds are, as these tests run one at a time
+// with the importer's tests.
+use crate::imports::tests::{jobs_joined, jobs_started, serial};
 
 /// `dir/name`, a `w`×`h` PNG of one colour.
 fn png(dir: &Path, name: &str, w: u32, h: u32) {
