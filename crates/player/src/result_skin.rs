@@ -152,6 +152,25 @@ pub enum ResultStart {
     Pending(Arc<PendingResult>),
 }
 
+/// What an attempt's result uploads after its commit.
+#[derive(Clone, Debug)]
+pub enum Upload {
+    /// An installation of this bundle.
+    Bundle(Arc<SkinBundle>),
+    /// A pages-only installation of a prepared atlas.
+    Pages(Arc<skin_model::PackedPages>),
+}
+
+impl Upload {
+    /// The atlas it uploads.
+    pub fn atlas(&self) -> AtlasId {
+        match self {
+            Self::Bundle(b) => b.atlas_pages().id(),
+            Self::Pages(p) => p.id(),
+        }
+    }
+}
+
 /// How an image stage ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Staged {
@@ -243,7 +262,7 @@ pub fn probe_fields(chart: ResultChart) -> ResultFields {
 }
 
 /// The view of [`probe_fields`].
-fn probe_view(chart: ResultChart) -> ResultView {
+pub(crate) fn probe_view(chart: ResultChart) -> ResultView {
     let one = PerJudgment {
         perfect: 1,
         great: 1,
@@ -611,10 +630,6 @@ impl ResultSkin {
     /// report without an id releases it here. A deferred build is tried
     /// again once fewer than two atlases are live (the S10-09i design's
     /// Q3).
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(dead_code, reason = "S10-09i reports what its renderer retains")
-    )]
     pub fn set_retained(&mut self, ids: &[AtlasId]) {
         self.retained = ids.to_vec();
         if self.others().len() < 2 {
@@ -644,6 +659,32 @@ impl ResultSkin {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn published(&self) -> (Option<&Published>, u64) {
         (self.published.as_ref(), self.generation)
+    }
+
+    /// What the result slot holds: the latest request's publication once
+    /// [`poll`](Self::poll) says it is published.
+    pub const fn shown(&self) -> Option<&Published> {
+        self.published.as_ref()
+    }
+
+    /// Whether the kind has a skin, fixed or laid out per view.
+    pub const fn has_skin(&self) -> bool {
+        self.start.is_some()
+    }
+
+    /// What the attempt's result uploads after its commit (the S10-09i
+    /// design's D2): a fixed skin's or a chart-only specialization's
+    /// bundle, or a prepared atlas's pages; nothing for the built-in
+    /// result or before an image stage.
+    pub fn upload(&self) -> Option<Upload> {
+        match &self.attempt {
+            Some(ForAttempt::Every(b, _)) => Some(Upload::Bundle(Arc::clone(b))),
+            Some(ForAttempt::Pending) => self
+                .image
+                .as_ref()
+                .map(|e| Upload::Pages(Arc::clone(e.pages()))),
+            Some(ForAttempt::BuiltIn) | None => None,
+        }
     }
 
     /// The prepared atlas, if one is live.
@@ -1178,28 +1219,8 @@ pub fn attempt_class(loaded: &game::Loaded) -> Option<JudgeClass> {
 /// The facts of `screen`'s view with `chart`: its fields while it is
 /// ready, else unavailable (D7).
 pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts {
-    let (game::ViewStatus::Ready(summary), Some(preset)) = (
-        screen.status(),
-        screen.viewed().and_then(|e| e.preset.as_deref()),
-    ) else {
-        return ViewFacts(None);
-    };
-    let parts = crate::result_view::result_parts(summary, preset, &screen.basis());
-    let view = ResultView {
-        status: ResultStatus::Ready,
-        chart: ResultChart {
-            notes: Some(parts.notes),
-            ..chart
-        },
-        score: parts.score,
-        best: parts.best,
-        timing: parts.timing,
-        timelines: parts.timelines,
-        gauge: parts.gauge,
-        deviations: Some(parts.deviations),
-        timing_areas: Some(parts.timing_areas),
-    };
-    ViewFacts(Some(ResultFields::of(&view)))
+    let view = crate::result_present::view_of(screen, chart);
+    ViewFacts((view.status == ResultStatus::Ready).then(|| ResultFields::of(&view)))
 }
 
 #[cfg(all(test, feature = "dev-tools"))]
