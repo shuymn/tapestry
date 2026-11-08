@@ -35,15 +35,34 @@ static EXIT_OPENED: Condvar = Condvar::new();
 /// one included: what [`serial`] drains between tests.
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// The jobs started and joined from this thread: a runner's own,
+    /// whatever jobs other tests run meanwhile ([`own_counted`]).
+    static OWN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// A job thread is about to start; its [`WorkerEnd`], or
 /// [`spawn_failed`], counts its end.
 pub(super) fn worker_starting() {
     WORKERS.fetch_add(1, Ordering::SeqCst);
+    OWN.with(|c| c.set((c.get().0 + 1, c.get().1)));
 }
 
 /// The job thread counted by [`worker_starting`] did not start.
 pub(super) fn spawn_failed() {
     WORKERS.fetch_sub(1, Ordering::SeqCst);
+    OWN.with(|c| c.set((c.get().0 - 1, c.get().1)));
+}
+
+/// A job's thread was joined.
+pub(super) fn worker_joined() {
+    OWN.with(|c| c.set((c.get().0, c.get().1 + 1)));
+}
+
+/// The jobs this thread started and joined.
+#[cfg(feature = "dev-tools")]
+fn own_counted() -> (u64, u64) {
+    OWN.with(std::cell::Cell::get)
 }
 
 /// Held by a job thread's body: its drop, past [`exit_gate`] or in an
@@ -1038,6 +1057,26 @@ fn started<T: Send + 'static>(
     (stop, rx)
 }
 
+/// A runner's answer with the jobs it started and joined itself.
+#[cfg(feature = "dev-tools")]
+type OwnAnswer<T> = std::sync::mpsc::Receiver<(Ran<T>, (u64, u64))>;
+
+/// [`started`], the runner also answering the jobs it started and joined
+/// itself: its own job's, unmoved by other tests' jobs.
+#[cfg(feature = "dev-tools")]
+fn started_own<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+) -> (Arc<AtomicBool>, OwnAnswer<T>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let theirs = Arc::clone(&stop);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ran = run_cancellable(job, move || theirs.load(Ordering::SeqCst));
+        let _ = tx.send((ran, own_counted()));
+    });
+    (stop, rx)
+}
+
 /// The refusal a cancelled Lua pass gives, as its outcome's text ends.
 #[cfg(feature = "dev-tools")]
 #[track_caller]
@@ -1136,10 +1175,11 @@ const LATE: Duration = Duration::from_millis(750);
 const HELD_FOR: Duration = Duration::from_secs(7);
 
 /// A VM held past the stop bound when the run ends: the runner gives up
-/// at the bound, the VM still counted and the job started but not
-/// joined. Ending the test's serialization releases the VM and waits for
+/// at the bound, the VM still counted and its job started but not joined
+/// (counted by the runner itself, so another test's job meanwhile does not
+/// move it). Ending the test's serialization releases the VM and waits for
 /// the abandoned thread: by then its outcome, finding nobody, has been
-/// dropped on its own thread, and it is joined by nobody. Unheld and
+/// dropped on its own thread, and the runner never joins it. Unheld and
 /// uncancelled, the looping fixture would run to the sandbox's 5 s Lua
 /// time cap; held, it never ends before the release.
 #[cfg(feature = "dev-tools")]
@@ -1150,24 +1190,25 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
-    let (started_before, joined) = counted();
     vm_hooks::hold();
-    let (stop, rx) = started(looping_job(dir.path(), &dropped));
+    let (stop, rx) = started_own(looping_job(dir.path(), &dropped));
     executing(base);
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
-    let ran = rx.recv_timeout(HELD_FOR);
+    let answered = rx.recv_timeout(HELD_FOR);
     let after = stopped.elapsed();
-    assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    let Ok((ran, own)) = answered else {
+        panic!("{answered:?}");
+    };
+    assert!(matches!(ran, Ran::Abandoned), "{ran:?}");
     assert!(after >= STOP_WAIT, "{after:?}");
     assert!(after < STOP_WAIT + LATE, "{after:?}");
     assert_eq!(vm_hooks::live(), base + 1);
-    assert_eq!(counted(), (started_before + 1, joined));
+    assert_eq!(own, (1, 0), "its job started, not joined");
     drop(serial);
     assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
     assert_eq!(dropped.lock().unwrap().as_deref(), Some("skin-import"));
     assert_eq!(vm_hooks::live(), base);
-    assert_eq!(counted(), (started_before + 1, joined));
 }
 
 /// An outcome already received does not end the wait for the thread: held

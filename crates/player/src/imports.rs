@@ -858,6 +858,8 @@ impl<T> Job<T> {
     fn join(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+            #[cfg(test)]
+            tests::worker_joined();
             #[cfg(feature = "dev-tools")]
             JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
