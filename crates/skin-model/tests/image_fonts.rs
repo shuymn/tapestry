@@ -179,6 +179,29 @@ fn font_reader_budgets() {
     assert!(matches!(err, FontError::Unknown { font: 16 }), "{err:?}");
 }
 
+/// The reader checks the font cap on the file it opens, not only on the
+/// length its resolution gave: a cache keeps a font's resolution from
+/// admission, at 4 bytes, and the file grows past the font cap, within an
+/// image file's, before it is read for installation.
+#[test]
+fn font_reader_checks_the_cap_on_the_opened_file() {
+    use skin_model::{FileSource, FontReader, ResourceCache};
+    let d = tempfile::tempdir().unwrap();
+    write(d.path(), "g.ttf", &TRUETYPE, 4);
+    let root = Root::new(d.path()).unwrap();
+    let cache = ResourceCache::new(&root);
+    let root = root.with_source(FileSource::cached(cache));
+    let mut b = SheetBuilder::new(&root);
+    b.admit_font(FontDef {
+        path: "g.ttf".into(),
+    })
+    .unwrap();
+    let sheet = b.finish();
+    write(d.path(), "g.ttf", &TRUETYPE, MAX_FONT_BYTES + 1);
+    let err = FontReader::new(&sheet).read(0).unwrap_err();
+    assert!(matches!(err, FontError::TooLarge { font: 0 }), "{err:?}");
+}
+
 #[test]
 fn font_reader_checks_the_files_again() {
     use skin_model::FontReader;
