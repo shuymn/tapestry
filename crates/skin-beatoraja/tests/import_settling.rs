@@ -85,6 +85,11 @@ fn settling(kind: fn(&str) -> Loaded) {
     assert_held(&kind(&back), &kind(&still()), "loop past the last key");
     let late = format!(r#""loop": 500, "dst": [{{"time": 100, {A}}}, {{"time": 500, {B}}}]"#);
     assert_held(&kind(&late), &kind(&still()), "a first key after 0");
+    // Two keys at the last time: the later one is the last key.
+    let pair = format!(
+        r#""loop": 500, "dst": [{{"time": 0, {A}}}, {{"time": 500, {A}}}, {{"time": 500, {B}}}]"#
+    );
+    assert_held(&kind(&pair), &kind(&still()), "two keys at the last time");
 }
 
 /// A `loop` before the last key repeats and one of -1 hides, each still

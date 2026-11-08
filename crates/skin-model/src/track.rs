@@ -91,15 +91,18 @@ pub enum End {
     Hold,
     /// Nothing: drawn while `t ≤ kn`.
     Hide,
-    /// Loops back to `from` (`0 ≤ from < kn`): for `t > from`, the track
-    /// shows `from + (t − from) mod (kn − from)`, so `kn` already shows
-    /// `from`. A loop point before the first key leaves a gap each period
-    /// where nothing draws, as before the first key.
+    /// Loops back to `from` (`−MAX_KEY_US ≤ from < kn`): for `t > from`,
+    /// the track shows `from + (t − from) mod (kn − from)`, so `kn` already
+    /// shows `from`. A loop point before the first key, a negative one
+    /// included, leaves a gap each period where nothing draws, as before
+    /// the first key.
     Loop { from: TimeUs },
 }
 
-/// A validated track: key times strictly increasing from `k0 ≥ 0`, values
-/// densified (every key holds all nine props).
+/// A validated track: key times non-decreasing from `k0 ≥ 0`, values
+/// densified (every key holds all nine props). Of keys sharing a time, the
+/// last draws at it and the track before it moves toward the first
+/// (`SkinObject.java:240-255, 545-575` at `0.8.9`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Track {
     at: Box<[i64]>,
@@ -128,11 +131,11 @@ pub enum TrackError {
     TooManyKeys { n: usize },
     #[error("the first key is at {at} µs, before 0")]
     NegativeStart { at: i64 },
-    #[error("key {index} is not after the key before it")]
+    #[error("key {index} is before the key before it")]
     NotIncreasing { index: usize },
     #[error("key {index} is after {MAX_KEY_US} µs")]
     KeyTooLate { index: usize },
-    #[error("the loop point {from} µs is outside [0, {last}) µs")]
+    #[error("the loop point {from} µs is outside [-{MAX_KEY_US}, {last}) µs")]
     LoopOutside { from: i64, last: i64 },
     #[error("key {index}'s {prop:?} is out of range")]
     OutOfRange { index: usize, prop: Prop },
@@ -141,9 +144,9 @@ pub enum TrackError {
 impl Track {
     /// Validates and densifies `keys` (stage3.md R2): 1 to
     /// [`MAX_TRACK_KEYS`] keys, checked before anything is allocated, at
-    /// strictly increasing times from 0 to [`MAX_KEY_US`]; a loop point in
-    /// `[0, kn)`; color and alpha in `0..=255`, geometry and angle within
-    /// ±[`MAX_GEOMETRY`].
+    /// non-decreasing times from 0 to [`MAX_KEY_US`]; a loop point in
+    /// `[−MAX_KEY_US, kn)`; color and alpha in `0..=255`, geometry and
+    /// angle within ±[`MAX_GEOMETRY`].
     ///
     /// # Errors
     ///
@@ -160,7 +163,7 @@ impl Track {
         }
         for (index, pair) in keys.windows(2).enumerate() {
             if let [a, b] = pair
-                && b.at <= a.at
+                && b.at < a.at
             {
                 return Err(TrackError::NotIncreasing { index: index + 1 });
             }
@@ -169,7 +172,7 @@ impl Track {
             return Err(TrackError::KeyTooLate { index });
         }
         if let End::Loop { from } = end
-            && !(0 <= from.0 && from < last.at)
+            && !(-MAX_KEY_US <= from.0 && from < last.at)
         {
             return Err(TrackError::LoopOutside {
                 from: from.0,
@@ -257,13 +260,12 @@ impl Track {
             End::Hold => t_us,
             End::Hide if t_us > kn => return None,
             End::Hide => t_us,
-            // `from ≥ 0` and `t_us > from`, so neither subtraction
-            // overflows, and `kn − from > 0`.
-            End::Loop { from } if t_us > from.0 => from.0 + (t_us - from.0).rem_euclid(kn - from.0),
+            End::Loop { from } if t_us > from.0 => wrap(t_us, from.0, kn)?,
             End::Loop { .. } => t_us,
         };
         // A loop point before the first key wraps into the gap before it:
-        // no key is at or before such a `t`, so it draws nothing.
+        // no key is at or before such a `t`, so it draws nothing. Of keys
+        // sharing a time, `i` is the last, so the next key is later.
         let i = self.at.partition_point(|&k| k <= t).checked_sub(1)?;
         let a = self.v.get(i)?;
         let (Some(&at_a), Some(&at_b), Some(b)) =
@@ -271,7 +273,8 @@ impl Track {
         else {
             return Some(Self::exact(a));
         };
-        // Keys lie in [0, MAX_KEY_US], so 0 < d < 2^34 and 0 ≤ x < d.
+        // Keys lie in [0, MAX_KEY_US] and `at_b > at_a`, so 0 < d < 2^34
+        // and 0 ≤ x < d.
         let d = i128::from(at_b - at_a);
         let x = i128::from(t - at_a);
         let (num, den) = match self.ease {
@@ -300,6 +303,18 @@ impl Track {
             angle,
         }
     }
+}
+
+/// `from + (t − from) mod (kn − from)`, in `i128`, since `t − from` may
+/// pass `i64` for a negative `from`. The result lies in `[from, kn)`, so it
+/// fits `i64`; `None` only for `kn ≤ from`, which [`Track::new`] refuses.
+fn wrap(t: i64, from: i64, kn: i64) -> Option<i64> {
+    let (t, from, kn) = (i128::from(t), i128::from(from), i128::from(kn));
+    let period = kn - from;
+    if period <= 0 {
+        return None;
+    }
+    i64::try_from(from + (t - from).rem_euclid(period)).ok()
 }
 
 /// `a + (b − a) · num / den`, for `0 ≤ num < den`.

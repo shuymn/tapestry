@@ -137,7 +137,8 @@ pub(crate) fn read(
     })
 }
 
-/// An accepted track: keys strictly increasing from 0 or later.
+/// An accepted track: keys non-decreasing from 0 or later, at most two
+/// at one time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Accepted {
     pub(crate) keys: Vec<SrcKey>,
@@ -192,16 +193,23 @@ impl Accepted {
 pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, TrackWhy> {
     // `SkinObject.java:240-255` inserts before the first later key.
     keys.sort_by_key(|k| k.at);
-    // Equal-time keys must show the same values (equality is transitive,
-    // so neighbours suffice); one of each run is kept.
-    if keys
-        .windows(2)
-        .any(|w| matches!(w, [a, b] if a.at == b.at && !a.same_values(b)))
-    {
-        return Err(TrackWhy::EqualTime);
+    // Of keys sharing a time, the source draws the last at it and moves
+    // toward the first before it (`SkinObject.java:545-575`): the keys
+    // between them never draw. A run whose first and last show the same
+    // values keeps one.
+    let mut out: Vec<SrcKey> = Vec::with_capacity(keys.len());
+    let mut iter = keys.into_iter().peekable();
+    while let Some(k) = iter.next() {
+        let keep = match out.last().filter(|p| p.at == k.at) {
+            // The first of its time.
+            None => true,
+            // The last of its time, unless it shows the first's values.
+            Some(first) => iter.peek().is_none_or(|n| n.at != k.at) && !first.same_values(&k),
+        };
+        if keep {
+            out.push(k);
+        }
     }
-    keys.dedup_by(|b, a| a.at == b.at);
-    let out = keys;
     let (Some(first), Some(last)) = (out.first(), out.last()) else {
         return Ok(None);
     };
@@ -212,17 +220,30 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
     if kn.saturating_mul(1000) > MAX_KEY_US {
         return Err(TrackWhy::Limits);
     }
-    let single = out.len() == 1;
+    // Every key at one time: the source's single-key cases.
+    let single = k0 == kn;
     // The source's sampler (`SkinObject.java:361-376`).
     let end = if l == -1 {
         End::Hide
-    } else if kn == 0 || l == kn {
+    } else if kn == 0 {
+        // No loop applies; after 0 the source's search finds no segment
+        // and shows the first key, the last only at 0.
+        if first.same_values(last) {
+            End::Hold
+        } else {
+            return Err(TrackWhy::FallbackToFirst);
+        }
+    } else if l == kn {
         End::Hold
-    } else if (0..kn).contains(&l) && !(single && l < k0) {
-        // A loop point before the first key wraps into a gap where nothing
-        // draws (`SkinObject.java:358-374`).
+    } else if l < kn && !(single && l < k0) {
+        // A loop point before the first key, a negative one included,
+        // wraps into a gap where nothing draws (`SkinObject.java:358-374`).
+        let from = l * 1000;
+        if from < -MAX_KEY_US {
+            return Err(TrackWhy::Limits);
+        }
         End::Loop {
-            from: bms_model::TimeUs(l * 1000),
+            from: bms_model::TimeUs(from),
         }
     } else if l > kn {
         if first.same_values(last) {
@@ -230,12 +251,10 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         } else {
             return Err(TrackWhy::FallbackToFirst);
         }
-    } else if single && l < k0 {
-        // A single key after its loop point: every wrapped time is before
-        // it, so the source never draws it.
-        return Ok(None);
     } else {
-        return Err(TrackWhy::NegativeLoop);
+        // Every key at one time after its loop point: every wrapped time
+        // is before it, so the source never draws it.
+        return Ok(None);
     };
     Ok(Some(Accepted { keys: out, end }))
 }
@@ -403,19 +422,53 @@ mod tests {
                 from: bms_model::TimeUs(0)
             }
         );
-        assert_eq!(two(-5), Err(TrackWhy::NegativeLoop));
+        // Below −1 the source wraps into negative times too.
+        assert_eq!(
+            two(-5).unwrap().unwrap().end,
+            End::Loop {
+                from: bms_model::TimeUs(-5_000)
+            }
+        );
+        let earliest = i32::try_from(MAX_KEY_US / 1000).unwrap();
+        assert_eq!(
+            two(-earliest).unwrap().unwrap().end,
+            End::Loop {
+                from: bms_model::TimeUs(-MAX_KEY_US)
+            }
+        );
+        assert_eq!(two(-earliest - 1), Err(TrackWhy::Limits));
     }
 
     #[test]
-    fn equal_times_keep_one_identical_key() {
+    fn equal_times_keep_the_first_and_last_of_a_run() {
+        let xs = |t: &Accepted| t.keys.iter().map(|k| (k.at, k.rect[0])).collect::<Vec<_>>();
         let t = accept(vec![key(0, 0), key(10, 0), key(10, 0)], 0)
             .unwrap()
             .unwrap();
-        assert_eq!(t.keys.len(), 2);
-        assert_eq!(
-            accept(vec![key(0, 0), key(10, 0), key(10, 100)], 0),
-            Err(TrackWhy::EqualTime)
-        );
+        assert_eq!(xs(&t), [(0, 0), (10, 0)]);
+        let t = accept(
+            vec![key(0, 0), key(10, 1), key(10, 2), key(10, 3), key(20, 4)],
+            -1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(xs(&t), [(0, 0), (10, 1), (10, 3), (20, 4)]);
+        // A run whose ends agree keeps one, whatever lies between.
+        let t = accept(vec![key(10, 1), key(10, 2), key(10, 1)], 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(xs(&t), [(10, 1)]);
+        // Every key at 0: the last shows at 0 and the first after, unless
+        // they agree or the track hides.
+        let zero = |l| accept(vec![key(0, 0), key(0, 5)], l);
+        assert_eq!(zero(0), Err(TrackWhy::FallbackToFirst));
+        assert_eq!(zero(-5), Err(TrackWhy::FallbackToFirst));
+        assert_eq!(zero(-1).unwrap().unwrap().end, End::Hide);
+        // Every key at one later time behaves as a single key there.
+        let late = |l| accept(vec![key(10, 0), key(10, 5)], l);
+        assert_eq!(late(10).unwrap().unwrap().end, End::Hold);
+        assert_eq!(late(5), Ok(None));
+        assert_eq!(late(-5), Ok(None));
         assert_eq!(
             accept(vec![key(-10, 0), key(10, 20)], -1),
             Err(TrackWhy::NegativeStart)

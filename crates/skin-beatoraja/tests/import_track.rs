@@ -296,18 +296,16 @@ fn a_result_graph_loop_before_its_first_key_leaves_the_same_gap() {
 fn tracks_the_model_cannot_follow_are_dropped() {
     let x = |x| [x, 0, 10, 10];
     for (keys, l, why) in [
-        (
-            vec![(0, x(0)), (10, x(0)), (10, x(100))],
-            0,
-            TrackWhy::EqualTime,
-        ),
         (vec![(-10, x(0)), (10, x(20))], -1, TrackWhy::NegativeStart),
-        (vec![(0, x(0)), (100, x(20))], -5, TrackWhy::NegativeLoop),
         (
             vec![(0, x(0)), (100, x(20))],
             150,
             TrackWhy::FallbackToFirst,
         ),
+        // Every key at 0 with different values: the first shows after 0.
+        (vec![(0, x(0)), (0, x(20))], 0, TrackWhy::FallbackToFirst),
+        // A loop point before the earliest the model loops from (4 h).
+        (vec![(0, x(0)), (100, x(20))], -14_400_001, TrackWhy::Limits),
     ] {
         let loaded = import_body(&body(&keys, 0, l));
         assert!(
@@ -321,6 +319,102 @@ fn tracks_the_model_cannot_follow_are_dropped() {
     agrees(&[(0, x(0)), (10, x(5))], 0, 0);
     let dup = body(&[(0, x(0)), (10, x(5)), (10, x(5))], 0, 0);
     assert!(import_body(&dup).report().notes.is_empty());
+}
+
+/// Keys sharing a time, as the source keeps and samples them
+/// (`SkinObject.java:240-255, 545-575` at `0.8.9`): the last of them
+/// draws at that time, the track before it moves toward the first, and
+/// the keys between never draw. Every ms under every acceleration agrees
+/// with the reference port, whose values a run of the source's sampler
+/// gave: 99 ms → x 49.5, 100 ms → x 200, 101 ms → x 201, 199 ms → x 299.
+#[test]
+fn keys_at_one_time_draw_as_the_source() {
+    let x = |x| [x, 0, 10, 10];
+    let jump = [(0, x(0)), (100, x(50)), (100, x(200)), (200, x(300))];
+    let three = [
+        (0, x(0)),
+        (100, x(50)),
+        (100, x(120)),
+        (100, x(200)),
+        (200, x(300)),
+    ];
+    let at_zero = [(0, x(0)), (0, x(40)), (100, x(140))];
+    let end_group = [(0, x(0)), (200, x(100)), (200, x(30))];
+    for acc in 0..=3 {
+        for l in [-1, 0, 50, 100, 200] {
+            agrees(&jump, acc, l);
+            agrees(&three, acc, l);
+            agrees(&end_group, acc, l);
+        }
+        for l in [-1, 0, 50, 100] {
+            agrees(&at_zero, acc, l);
+        }
+    }
+    // The source's values, y up as authored.
+    let loaded = import_body(&body(&jump, 0, 200));
+    let mut drawn = loaded.drawn();
+    for (t, want) in [(99, 49.5), (100, 200.0), (101, 201.0), (199, 299.0)] {
+        let q = drawn.frame(t, &[]);
+        assert!(
+            (q[0].rect[0] - want).abs() < 1e-3,
+            "{t} ms: {:?}",
+            q[0].rect
+        );
+    }
+    // Step and ease-in just before the shared time.
+    for (acc, want) in [(3, 0.0), (1, 49.005)] {
+        let loaded = import_body(&body(&jump, acc, 200));
+        let mut drawn = loaded.drawn();
+        let q = drawn.frame(99, &[]);
+        assert!(
+            (q[0].rect[0] - want).abs() < 1e-3,
+            "acc {acc}: {:?}",
+            q[0].rect
+        );
+        assert!((drawn.frame(100, &[])[0].rect[0] - 200.0).abs() < 1e-3);
+    }
+    // The end group under hide: its last key at 200, nothing after.
+    let loaded = import_body(&body(&end_group, 0, -1));
+    let mut drawn = loaded.drawn();
+    assert!((drawn.frame(200, &[])[0].rect[0] - 30.0).abs() < 1e-3);
+    assert!(drawn.frame(201, &[]).is_empty());
+    // Two keys at 100 under loop 0: never drawn.
+    let loaded = import_body(&body(&[(100, x(0)), (100, x(50))], 0, 0));
+    assert!(has(loaded.report(), NoteKind::Track(TrackWhy::NeverDrawn)));
+    assert_eq!(loaded.ok().report.usage.images, 0);
+}
+
+/// A loop point below −1 wraps into negative times, as the source
+/// (`SkinObject.java:358-374` at `0.8.9`): `t' = (t − L) mod (kn − L) + L`,
+/// nothing drawn where `t'` falls before the first key. Keys at 100 and
+/// 200 ms with the loop at −50 draw over [100, 200] and again from 350 ms.
+#[test]
+fn a_loop_below_minus_one_wraps_as_the_source() {
+    let pair = [(100, R), (200, [110, 20, 60, 40])];
+    for acc in 0..=3 {
+        for l in [-2, -50, -300] {
+            agrees(&pair, acc, l);
+        }
+    }
+    let loaded = import_body(&body(&pair, 0, -50));
+    let mut drawn = loaded.drawn();
+    for (t, shown) in [
+        (99, false),
+        (100, true),
+        (199, true),
+        (200, false),
+        (349, false),
+        (350, true),
+        (449, true),
+        (450, false),
+    ] {
+        assert_eq!(!drawn.frame(t, &[]).is_empty(), shown, "{t} ms");
+    }
+    // The earliest loop point the model keeps: 4 h before 0.
+    let loaded = import_body(&body(&pair, 0, -14_400_000));
+    assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
+    let mut drawn = loaded.drawn();
+    assert!(!drawn.frame(150, &[]).is_empty());
 }
 
 #[test]
