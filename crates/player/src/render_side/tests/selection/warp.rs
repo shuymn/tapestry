@@ -85,10 +85,14 @@ impl Gate {
 
 /// A [`MenuScreen`] whose next selection frame fails as a lost device
 /// while `lose` is set (a real device loss: the screen is built again on a
-/// new device), and whose frames `gate` paces.
+/// new device), whose next selection frame is reported not presented while
+/// `skip` is set (as the renderer skips an offscreen frame whose previous
+/// frame the GPU has not done in time, a slow WARP on a loaded machine),
+/// and whose frames `gate` paces.
 struct Lossy {
     menu: MenuScreen,
     lose: Arc<AtomicBool>,
+    skip: Arc<AtomicBool>,
     gate: Arc<Gate>,
 }
 
@@ -176,7 +180,11 @@ impl Screen for Lossy {
         if self.lose.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
-        self.menu.selection(update, logic, changed, now)
+        let mut drawn = self.menu.selection(update, logic, changed, now)?;
+        if self.skip.swap(false, Ordering::AcqRel) {
+            drawn.timing.presented = false;
+        }
+        Ok(drawn)
     }
     fn selection_requests(&self) -> (Vec<String>, usize) {
         self.menu.selection_requests()
@@ -208,14 +216,16 @@ impl Screen for Lossy {
 /// selection frame, or its first selection text with `text` (`None`:
 /// neither), and its frames.
 fn warp_link(fault: Option<bool>) -> (RenderLink, Frames) {
-    let (link, frames, _) = lossy_link(fault);
+    let (link, frames, ..) = lossy_link(fault);
     (link, frames)
 }
 
-/// [`warp_link`] on [`Lossy`] screens, with their flag.
-fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>) {
+/// [`warp_link`] on [`Lossy`] screens, with their `lose` and `skip` flags.
+fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>, Arc<AtomicBool>) {
     let lose = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&lose);
+    let skip = Arc::new(AtomicBool::new(false));
+    let skipping = Arc::clone(&skip);
     let built = Arc::new(AtomicBool::new(false));
     let make: MakeScreen = Box::new(move || {
         let r = render::Renderer::new(
@@ -233,6 +243,7 @@ fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>) {
         Ok(Box::new(Lossy {
             menu: s,
             lose: Arc::clone(&flag),
+            skip: Arc::clone(&skipping),
             gate: Arc::default(),
         }) as Box<dyn Screen>)
     });
@@ -248,7 +259,7 @@ fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>) {
         Box::new(frames.clone()),
     )
     .unwrap();
-    (link, frames, lose)
+    (link, frames, lose, skip)
 }
 
 fn row(key: RowKey, kind: RowKind, title: &str) -> RowView {
@@ -394,7 +405,7 @@ fn with_page(revision: u64) -> crate::selection_skin::SelectionUpdate {
 fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
     for text in [false, true] {
         let (_dir, skin) = skin();
-        let (link, frames, lose) = lossy_link(Some(text));
+        let (link, frames, lose, skip) = lossy_link(Some(text));
         assert_eq!(
             link.select(ScreenKind::Selection, Some(skin))
                 .wait()
@@ -428,9 +439,13 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
                 .all(|(q, ..)| q.is_none())
         );
         // The device lost: the screen built again on another restores no
-        // selection skin, and draws the page.
+        // selection skin, and draws the page. Its first frame is skipped,
+        // as a slow GPU skips an offscreen frame: a frame skipped draws
+        // nothing, the skin neither, and the page draws in the frames
+        // presented.
         lose.store(true, Ordering::Release);
         assert!(wait_until(|| link.failed()));
+        skip.store(true, Ordering::Release);
         link.prepare().unwrap();
         link.show_selection(with_page(2));
         let other = |f: &Frame| f.2 != device;
@@ -439,7 +454,7 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|f| other(f))
+            .filter(|f| other(f) && f.3)
             .count()
             > 2));
         let after: Vec<Frame> = frames
@@ -451,7 +466,7 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
             .cloned()
             .collect();
         assert!(after.iter().all(|(q, ..)| q.is_none()), "{text}");
-        assert!(after.iter().all(|f| f.3), "{text}");
+        assert!(after.iter().any(|f| !f.3), "{text}: no frame skipped");
         assert_eq!(link.take_selection_refusal(), None);
         link.exit();
     }
@@ -526,6 +541,7 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
             Ok(Box::new(Lossy {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 lose: Arc::default(),
+                skip: Arc::default(),
                 gate: Arc::clone(&paced),
             }) as Box<dyn Screen>)
         });
