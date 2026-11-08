@@ -232,6 +232,7 @@ impl Cx<'_> {
         }
         let o = Opts {
             follow: true,
+            turntable: true,
             guard: value.and_then(|v| v.guard.as_deref()),
             ..Opts::default()
         };

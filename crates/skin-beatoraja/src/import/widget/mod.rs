@@ -425,6 +425,24 @@ impl Cx<'_> {
         self.common_with(role, dst, o)
     }
 
+    /// [`image_common`](Self::image_common) of an image or image choice
+    /// drawn as an element of its own, which turns with the turntable
+    /// (offset 1); a cover's paint does not.
+    pub(super) fn turning_image_common(
+        &mut self,
+        dst: &Dst,
+        charged: bool,
+        role: Role,
+    ) -> Result<Option<Common>, ImportError> {
+        let o = Opts {
+            follow: true,
+            turntable: true,
+            charged,
+            ..Opts::default()
+        };
+        self.common_with(role, dst, o)
+    }
+
     /// Whether an image or image set's destination lists offset 4, its
     /// keys then charged once, and what it lowers to: SUDDEN+'s paint
     /// unless it cannot reach the lanes, where it follows SUDDEN+.
@@ -478,7 +496,7 @@ impl Cx<'_> {
             let selector = (src, index.deviates());
             return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
-        let Some(c) = self.image_common(&dst, charged, role)? else {
+        let Some(c) = self.turning_image_common(&dst, charged, role)? else {
             return Ok(());
         };
         let Some((image, t, native)) = self.src_image_track(&c, rec, &s)? else {

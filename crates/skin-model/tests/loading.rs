@@ -148,6 +148,7 @@ impl Loader {
             },
             target: [1_920, 1_080],
             layout: &layout,
+            turntable: 0,
             lanes: VIEW,
             covers: self.covers,
             gauge: self.gauge,

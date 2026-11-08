@@ -1357,6 +1357,7 @@ mod tests {
             gauge: 0,
             overlay: &[],
             target: [1920, 1080],
+            turntable: 0,
         }
     }
 

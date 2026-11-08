@@ -2428,6 +2428,7 @@ dependencies = [
  "bms-parser",
  "criterion",
  "eval",
+ "game",
  "image",
  "mlua",
  "png",

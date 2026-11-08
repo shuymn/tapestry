@@ -155,6 +155,9 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
+    /// The run's play states, for the turntable (docs/stage3.md, offset
+    /// 1).
+    pub play_states: game::PlayStates,
     /// READY's length: from the opening to chart time 0, as the
     /// current play's opening was given it.
     pub lead_in: TimeUs,
@@ -334,6 +337,9 @@ pub struct AttemptPrep {
     /// The chart's strings the attempt's result shows, until the result
     /// skin's stage takes them.
     labels: Option<skin_model::ResultLabels>,
+    /// Autoplay's scratch notes for the turntable, built with the attempt;
+    /// none for a play by hand.
+    scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
     /// When the render thread was asked.
@@ -441,7 +447,8 @@ impl PlayerRig<'_> {
         // the frames'.
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
-            AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay);
+            AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
+                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -1555,6 +1562,12 @@ impl Rig for PlayerRig<'_> {
             chart: crate::result_skin::attempt_chart(loaded),
             class: crate::result_skin::attempt_class(loaded),
             labels: Some(labels),
+            // Autoplay's turntable presses its scratch notes.
+            scratch_notes: if self.autoplay {
+                game::scratch_notes(loaded.chart(), loaded.chart().meta.ln_mode)
+            } else {
+                Vec::new()
+            },
             specialized: false,
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
@@ -2086,6 +2099,23 @@ impl Rig for PlayerRig<'_> {
             settings.player.set_options(&driver.options());
         }
         self.input_offset_us = t.input_offset_us;
+    }
+
+    fn play_state_began(&mut self) {
+        let state = self.play_states.begin(self.clock.now());
+        self.render.play_state(state);
+    }
+
+    fn turntable_paused(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, true);
+        }
+    }
+
+    fn turntable_resumed(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, false);
+        }
     }
 
     fn ended(&mut self, report: &PlayReport) {

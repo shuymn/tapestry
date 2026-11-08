@@ -334,6 +334,8 @@ pub struct LoadingFrame<'a> {
     pub bga: Option<bool>,
     /// Whether the attempt being loaded is autoplay.
     pub autoplay: bool,
+    /// The turntable's angle, as [`SkinFrame::turntable`](crate::SkinFrame::turntable).
+    pub turntable: i32,
 }
 
 impl LoadingFrame<'_> {

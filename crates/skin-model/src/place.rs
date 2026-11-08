@@ -40,6 +40,9 @@ pub struct Place {
     /// The covers the element moves with; only an image, a number, a
     /// gauge or a text may follow them.
     pub follow: Follow,
+    /// What the element's angle turns with; only an image or a number
+    /// may follow one, and a text ignores it, staying unrotated.
+    pub angle: AngleFollow,
 }
 
 impl Place {
@@ -52,7 +55,35 @@ impl Place {
         fill: Fill::None,
         native: None,
         follow: Follow::None,
+        angle: AngleFollow::None,
     };
+}
+
+/// What an element's angle turns with, added to its sampled angle in
+/// play and loading frames alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AngleFollow {
+    #[default]
+    None,
+    /// The turntable: the frame's turntable angle
+    /// ([`SkinFrame::turntable`](crate::SkinFrame::turntable)).
+    Turntable,
+}
+
+/// The turntable angle's units per degree: a frame carries it as an
+/// integer of sixths of a millidegree.
+pub const TURNTABLE_UNITS_PER_DEGREE: i32 = 6_000;
+
+impl AngleFollow {
+    /// The degrees it adds to a sampled angle, clockwise on y-down, for
+    /// the frame's turntable angle `turntable`.
+    pub(crate) fn degrees(self, turntable: i32) -> f32 {
+        match self {
+            Self::None => 0.0,
+            Self::Turntable => f32_of(f64::from(turntable) / f64::from(TURNTABLE_UNITS_PER_DEGREE)),
+        }
+    }
 }
 
 /// The covers an element or a judge's grade moves with, vertically and

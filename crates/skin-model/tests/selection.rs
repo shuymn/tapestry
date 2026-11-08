@@ -1325,6 +1325,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
         },
         target: [1_920, 1_080],
         layout: &layout,
+        turntable: 0,
         lanes: skin_model::LaneView::NONE,
         covers: skin_model::CoverSettings {
             cover: 0,

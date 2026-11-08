@@ -539,6 +539,7 @@ fn followed(follow: Follow) -> Skin {
     let left = |r, follow| {
         let place = Place {
             follow,
+            angle: skin_model::AngleFollow::None,
             ..in_region(Region::Left)
         };
         image(WHITE, r, place)

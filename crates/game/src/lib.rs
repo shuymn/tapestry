@@ -52,6 +52,7 @@ mod sound;
 mod start_gate;
 mod tempo;
 mod tuning;
+mod turntable;
 
 pub use adjust_keys::{
     AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, AdjustmentPlan,
@@ -151,4 +152,8 @@ pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, SPEED_KEYS, Tuning,
     VOLUME_STEP_PERCENT,
+};
+pub use turntable::{
+    AnalogTurn, AutoplayScratch, PlayState, PlayStates, ScratchInput, ScratchNote, ScratchNoteKind,
+    Turn, TurntableClock, scratch_notes, state_ms,
 };
