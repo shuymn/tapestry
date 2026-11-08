@@ -1840,7 +1840,8 @@ impl Skin {
         let base = match kind {
             ScreenKind::Selection => crate::SELECTION.fields.len(),
             ScreenKind::Result => crate::RESULT.fields.len(),
-            ScreenKind::Play | ScreenKind::Decision => field::COUNT,
+            ScreenKind::Decision => crate::DECISION.fields.len(),
+            ScreenKind::Play => field::COUNT,
         };
         for (i, program) in whens
             .iter()
