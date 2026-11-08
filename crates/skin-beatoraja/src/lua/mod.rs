@@ -1207,7 +1207,7 @@ impl LuaHeader {
 
     /// [`Self::configured`], keeping the VM for a selection or result
     /// screen's runtime when `keep`.
-    fn configured_keeping(
+    pub(crate) fn configured_keeping(
         &self,
         config: &Config,
         facts: &ImportFacts,
