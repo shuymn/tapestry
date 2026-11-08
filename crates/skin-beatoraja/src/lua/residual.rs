@@ -18,7 +18,8 @@
 //!   folds whatever its kind; module members; locals; helper
 //!   calls, inlined with their arguments; operators on known operands;
 //!   `if`, `elseif` and `else` with a known condition. Each capture read
-//!   holds only while the candidate is closed ([`Unsupported::Interference`]
+//!   holds only while the candidate is closed and its binding cell is
+//!   never written at frame time ([`Unsupported::Interference`]
 //!   otherwise).
 //! - **Integers follow the source's doubles**: a numeral the parser
 //!   records as wide ([`super::syntax::Ast::wide_numerals`]) and a
@@ -377,6 +378,9 @@ struct Frame<'a> {
 }
 
 struct Eval<'a> {
+    /// Where the first proof this evaluation needed was voided by a
+    /// frame-time write, carried with its refusal.
+    interfered: &'a std::cell::Cell<Option<super::callback::Site>>,
     an: &'a Analysis,
     cancelled: &'a dyn Fn() -> bool,
     res: Residual,
@@ -395,8 +399,10 @@ pub(crate) fn evaluate(
     inst: u32,
     conv: Conv,
     cancelled: &dyn Fn() -> bool,
+    interfered: &std::cell::Cell<Option<super::callback::Site>>,
 ) -> R<Residual> {
     let mut ev = Eval {
+        interfered,
         an: adm.analysis(),
         cancelled,
         res: Residual::default(),
@@ -519,9 +525,13 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// What a proof resting on captured state needs: the candidate closed.
-    fn bound(&self) -> R<()> {
-        if self.an.open.get().is_some() {
+    /// What a proof resting on the captured binding cell `d` of `file`
+    /// needs: the candidate closed and the cell never written at frame
+    /// time.
+    fn bound(&self, file: u16, d: u32) -> R<()> {
+        if !self.an.cell_holds(file, d) {
+            // The first failure ends the evaluation: its place is the one.
+            self.interfered.set(self.an.written_at(file, d));
             return refuse(Unsupported::Interference);
         }
         Ok(())
@@ -887,7 +897,7 @@ impl<'a> Eval<'a> {
         {
             return Ok(v);
         }
-        self.bound()?;
+        self.bound(f.file, d)?;
         match self.an.upvalue(f.inst, d) {
             Some(c) => self.captured(c, Some((f.ast, f.file, d))),
             None => refuse(Unsupported::Capture("an upvalue")),
@@ -899,7 +909,7 @@ impl<'a> Eval<'a> {
         if env != CHUNK_ENV && self.slot(f, env)?.is_some() {
             return construct("_ENV");
         }
-        self.bound()?;
+        self.bound(f.file, env)?;
         match self.an.global(f.inst, env, f.ast.str(name)).map_err(stop)? {
             Some(c) => self.captured(c, None),
             None => refuse(Unsupported::Capture("an entry no path copied")),
