@@ -35,7 +35,7 @@ use std::process::Command;
 
 use anyhow::{Context as _, bail};
 use cargo_metadata::{
-    CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId, Resolve,
+    CargoOpt, DependencyKind, Metadata, MetadataCommand, Package, PackageId, Resolve, TargetKind,
 };
 
 /// The evaluator package checked by R1.
@@ -263,7 +263,7 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
         .filter(|p| BACKEND_PACKAGES.contains(&p.name.as_str()))
     {
         let canonical = pkg.name.replace('-', "_");
-        for target in pkg.targets.iter().filter(|t| t.is_lib()) {
+        for target in pkg.targets.iter().filter(|t| is_library(&t.kind)) {
             if target.name != canonical {
                 diagnostics.push(format!(
                     "R6: `{}` names its library `{}`, not `{canonical}`; the backend's \
@@ -290,6 +290,22 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(diagnostics)
+}
+
+/// Whether a target of `kinds` is a crate other packages link: any kind
+/// but a binary, an example, a test, a bench or a build script (`lib`,
+/// `rlib`, `dylib`, `cdylib`, `staticlib`, `proc-macro`).
+fn is_library(kinds: &[TargetKind]) -> bool {
+    kinds.iter().any(|k| {
+        !matches!(
+            k,
+            TargetKind::Bin
+                | TargetKind::Example
+                | TargetKind::Test
+                | TargetKind::Bench
+                | TargetKind::CustomBuild
+        )
+    })
 }
 
 /// The package whose sources R6 scans.
@@ -354,7 +370,124 @@ pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
     for dir in targets {
         scan_tree(root, &dir, None, &mut Vec::new(), &mut diagnostics)?;
     }
+    scan_screens(root, &root.join(SCREENS), &mut diagnostics)?;
     Ok(diagnostics)
+}
+
+/// R6 (sources) inside `screens`, which may name the backend: no item
+/// visible outside its module (`pub`, `pub(crate)`, `pub(super)`,
+/// `pub(in …)`) re-exports or aliases a path of `skin_beatoraja` or
+/// `mlua`, a `use` or a `type`, so play code cannot reach the backend
+/// through `screens`.
+fn scan_screens(root: &Path, dir: &Path, diagnostics: &mut Vec<String>) -> anyhow::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut stack = vec![dir.to_owned()];
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .collect::<Result<_, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let file = syn::parse_file(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let shown = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let mut scan = ScreensScan::default();
+                syn::visit::Visit::visit_file(&mut scan, &file);
+                diagnostics.extend(scan.found.into_iter().map(|(line, what)| {
+                    format!(
+                        "R6: {shown}:{line} {what} visible outside its module; `screens` keeps \
+                         the backend to itself (design.md \"beatoraja Lua Skins\")"
+                    )
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `segments` lie under `skin_beatoraja` or `mlua`.
+fn is_backend_path(segments: &[String]) -> bool {
+    unqualified(segments)
+        .first()
+        .is_some_and(|f| f == "skin_beatoraja" || f == MLUA)
+}
+
+/// Every full path a `use` tree names, raw identifiers read as plain.
+fn use_paths(prefix: &mut Vec<String>, tree: &syn::UseTree, out: &mut Vec<(usize, Vec<String>)>) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            prefix.push(segment(&p.ident));
+            use_paths(prefix, &p.tree, out);
+            prefix.pop();
+        }
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                use_paths(prefix, t, out);
+            }
+        }
+        syn::UseTree::Name(n) => out.push((n.ident.span().start().line, full(prefix, &n.ident))),
+        syn::UseTree::Rename(r) => out.push((r.ident.span().start().line, full(prefix, &r.ident))),
+        syn::UseTree::Glob(g) => out.push((g.star_token.span.start().line, prefix.clone())),
+    }
+}
+
+/// What R6 found inside `screens`: each backend path an item visible
+/// outside its module re-exports or aliases.
+#[derive(Default)]
+struct ScreensScan {
+    found: Vec<(usize, String)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for ScreensScan {
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        if !matches!(u.vis, syn::Visibility::Inherited) {
+            let mut paths = Vec::new();
+            use_paths(&mut Vec::new(), &u.tree, &mut paths);
+            for (line, path) in paths.into_iter().filter(|(_, p)| is_backend_path(p)) {
+                self.found
+                    .push((line, format!("re-exports `{}`", path.join("::"))));
+            }
+        }
+        syn::visit::visit_item_use(self, u);
+    }
+
+    fn visit_item_type(&mut self, t: &'ast syn::ItemType) {
+        if !matches!(t.vis, syn::Visibility::Inherited) {
+            let mut paths = PathCollect::default();
+            syn::visit::Visit::visit_type(&mut paths, &t.ty);
+            if paths.0.iter().any(|p| is_backend_path(p)) {
+                self.found.push((
+                    t.ident.span().start().line,
+                    format!("aliases a backend type as `{}`", t.ident),
+                ));
+            }
+        }
+        syn::visit::visit_item_type(self, t);
+    }
+}
+
+/// Every path a syntax tree names, raw identifiers read as plain.
+#[derive(Default)]
+struct PathCollect(Vec<Vec<String>>);
+
+impl<'ast> syn::visit::Visit<'ast> for PathCollect {
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        self.0
+            .push(p.segments.iter().map(|s| segment(&s.ident)).collect());
+        syn::visit::visit_path(self, p);
+    }
 }
 
 /// The `#[path]` modules of `player` R6 allows, each the test fixtures
@@ -1349,22 +1482,82 @@ mod tests {
     /// player name the backend under a name the source scan does not know.
     #[test]
     fn r6_rejects_a_backend_library_named_otherwise() {
-        let mut crates = baseline();
-        crates.push(lib("skin-beatoraja", "[lib]\nname = \"backend\"\n"));
-        set(
-            &mut crates,
-            "player",
-            "[package.metadata.tapestry]\nwindows-only = true\n\
-             [features]\ndefault = []\ndev-tools = []\n\
-             [dependencies]\neval = { path = \"../eval\" }\n\
-             skin-beatoraja = { path = \"../skin-beatoraja\" }\n",
-        );
-        let found = r6(&crates);
-        assert_eq!(found.len(), 1, "{found:#?}");
-        assert!(
-            found[0].contains("`skin-beatoraja` names its library `backend`, not `skin_beatoraja`"),
-            "{found:#?}"
-        );
+        for (package, canonical) in [("skin-beatoraja", "skin_beatoraja"), ("mlua", "mlua")] {
+            for kind in [
+                "",
+                "crate-type = [\"rlib\"]\n",
+                "crate-type = [\"dylib\"]\n",
+                "proc-macro = true\n",
+            ] {
+                let mut crates = baseline();
+                crates.push(lib(package, &format!("[lib]\nname = \"backend\"\n{kind}")));
+                set(
+                    &mut crates,
+                    "player",
+                    &format!(
+                        "[package.metadata.tapestry]\nwindows-only = true\n\
+                         [features]\ndefault = []\ndev-tools = []\n\
+                         [dependencies]\neval = {{ path = \"../eval\" }}\n\
+                         {package} = {{ path = \"../{package}\" }}\n"
+                    ),
+                );
+                let found = r6(&crates);
+                assert_eq!(found.len(), 1, "{package} {kind}: {found:#?}");
+                assert!(
+                    found[0].contains(&format!(
+                        "`{package}` names its library `backend`, not `{canonical}`"
+                    )),
+                    "{package} {kind}: {found:#?}"
+                );
+            }
+        }
+    }
+
+    /// `screens` may name the backend, but nothing it makes visible
+    /// outside its module may re-export or alias it: play code would name
+    /// the backend through `crate::screens`.
+    #[test]
+    fn r6_refuses_backend_re_exports_out_of_screens() {
+        for (text, what) in [
+            (
+                "pub(crate) use skin_beatoraja::lua as backend;\n",
+                "re-exports `skin_beatoraja::lua`",
+            ),
+            ("pub use ::mlua::Lua;\n", "re-exports `mlua::Lua`"),
+            (
+                "pub(super) use skin_beatoraja::lua::*;\n",
+                "re-exports `skin_beatoraja::lua`",
+            ),
+            (
+                "pub(in crate::screens) use r#skin_beatoraja::{lua::runtime};\n",
+                "re-exports `skin_beatoraja::lua::runtime`",
+            ),
+            (
+                "pub(crate) type Rt = skin_beatoraja::lua::runtime::ScreenRuntime;\n",
+                "aliases a backend type as `Rt`",
+            ),
+        ] {
+            let found = scan_files(&[
+                ("screens/mod.rs", text),
+                (
+                    "render_side.rs",
+                    "fn f(_: crate::screens::backend::runtime::ScreenRuntime) {}\n",
+                ),
+            ]);
+            assert_eq!(found.len(), 1, "{text}: {found:#?}");
+            assert!(
+                found[0].starts_with("R6: crates/player/src/screens/mod.rs:1 ")
+                    && found[0].contains(what),
+                "{text}: {found:#?}"
+            );
+        }
+        // Private uses and a re-export of the crate's own items pass.
+        let found = scan_files(&[(
+            "screens/mod.rs",
+            "use skin_beatoraja::lua::runtime::ScreenRuntime;\npub(crate) use script::Scripts;\n\
+             type Rt = skin_beatoraja::lua::runtime::ScreenRuntime;\n",
+        )]);
+        assert_eq!(found, Vec::<String>::new());
     }
 
     /// A renamed backend dependency would let the player name the backend
@@ -1436,7 +1629,7 @@ mod tests {
         std::fs::create_dir_all(src.join("screens/script")).unwrap();
         std::fs::write(
             src.join("screens/script/tests.rs"),
-            "use mlua::Lua;\nuse skin_beatoraja::lua::runtime::ScreenRuntime;\npub use skin_beatoraja::lua;\n",
+            "use mlua::Lua;\nuse skin_beatoraja::lua::runtime::ScreenRuntime;\nuse skin_beatoraja::lua;\n",
         )
         .unwrap();
         for (path, text) in files {
