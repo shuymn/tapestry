@@ -12,7 +12,9 @@
 //! [`MAX_DECODED_BYTES`](crate::limits::MAX_DECODED_BYTES)).
 
 /// The most Lua-managed memory a VM holds at once, compilation included:
-/// an allocation past it fails. Only one VM is alive at a time.
+/// an allocation past it fails. One pass's VM is alive at a time per
+/// import; a VM kept for a screen's runtime is capped at
+/// [`RUNTIME_MEMORY`] instead.
 pub const MAX_LUA_MEMORY: usize = 64 << 20;
 /// The most Lua VM instructions across both passes, counted on every VM
 /// thread in steps of [`INSTRUCTION_STEP`]: the step that reaches it
@@ -107,3 +109,23 @@ pub const MAX_REWRITTEN_BYTES: u64 = 1 << 26;
 /// callbacks makes in all ([`super::residual`]), each charged before it
 /// is pushed; past it, fatal.
 pub const MAX_EXPANDED_NODES: u64 = 1 << 20;
+
+/// A kept VM's memory cap on a screen's runtime (docs/stage3.md S7-07,
+/// provisional): lowered from [`MAX_LUA_MEMORY`] when the import keeps
+/// the VM, twenty times the largest configured pass the surveyed skins
+/// measured.
+pub const RUNTIME_MEMORY: usize = 16 << 20;
+/// The most instructions a screen's runtime runs in one frame, all its
+/// callbacks together (provisional): the import's [`MAX_INSTRUCTIONS`]
+/// over 50 frames.
+pub const RUNTIME_INSTRUCTIONS: u64 = MAX_INSTRUCTIONS / 50;
+/// The most host calls a screen's runtime makes in one frame
+/// (provisional): the import's [`MAX_HOST_CALLS`] over 50 frames.
+pub const RUNTIME_HOST_CALLS: u32 = MAX_HOST_CALLS / 50;
+/// The most monotonic time a screen's runtime runs Lua in one frame
+/// (provisional), checked cooperatively at each instruction step and host
+/// call: a check, not a deadline.
+pub const RUNTIME_FRAME_TIME: std::time::Duration = std::time::Duration::from_millis(2);
+/// Consecutive frames past the budget after which a runtime stops for
+/// its screen's installation.
+pub const RUNTIME_STOP_FRAMES: u32 = 3;

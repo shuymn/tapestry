@@ -434,6 +434,15 @@ pub(crate) struct Cx<'d> {
     items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
+    /// The output types of the callbacks a selection or result screen's
+    /// runtime runs, by index: `lua.<k>` in the expressions.
+    outputs: Vec<skin_model::output::OutTy>,
+    /// The current element's runtime value, which the source reads before
+    /// its draws and which gates them: a number's draws run only when its
+    /// value is not a sentinel (`SkinNumber.java:138-150`), an image set's
+    /// only when its value is not negative (`SkinImage.java:127-132`).
+    /// Cleared after each element.
+    value_gate: Option<String>,
     ranks: [Option<u16>; 3],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
@@ -539,6 +548,8 @@ impl<'d> Cx<'d> {
             choices,
             items,
             whens: Vec::new(),
+            outputs: Vec::new(),
+            value_gate: None,
             when_spans: Vec::new(),
             ranks: [None; 3],
             elements: Vec::new(),
@@ -1568,11 +1579,11 @@ impl<'d> Cx<'d> {
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
         trace(Event::Compile);
-        let p =
-            compile(src, &Scope::new(self.schema()), want).map_err(|source| ImportError::Expr {
-                at: self.loc(at),
-                source,
-            })?;
+        let scope = Scope::new(self.schema()).outputs(&self.outputs);
+        let p = compile(src, &scope, want).map_err(|source| ImportError::Expr {
+            at: self.loc(at),
+            source,
+        })?;
         self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
         Ok(p)
     }
@@ -1905,10 +1916,12 @@ impl<'d> Cx<'d> {
         } else {
             Skin::new(def)
         };
-        let skin = loaded.map_err(|source| {
-            let at = self.load_loc(&source);
-            ImportError::Model { at, source }
-        })?;
+        let skin = loaded
+            .map(|s| s.with_outputs(self.outputs.len()))
+            .map_err(|source| {
+                let at = self.load_loc(&source);
+                ImportError::Model { at, source }
+            })?;
         #[cfg(feature = "dev-tools")]
         let notes = self
             .located

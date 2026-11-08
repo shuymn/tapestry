@@ -516,8 +516,9 @@ fn files_grown_since_load_are_charged_again() {
         matches!(err, AtlasError::Image(ImageError::FileTooLarge { at: AT0 })),
         "{err:?}"
     );
-    // Seventeen files grown to the per-file cap pass the build's total.
-    let names: Vec<String> = (0..17).map(|i| format!("{i}.png")).collect();
+    // Nine files grown to the per-file cap pass the build's total, which
+    // eight fill.
+    let names: Vec<String> = (0..9).map(|i| format!("{i}.png")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     for n in &names {
         save(root, n, &solid(4, 4, [255; 4]));
@@ -527,16 +528,13 @@ fn files_grown_since_load_are_charged_again() {
         let f = File::options().write(true).open(root.join(n)).unwrap();
         f.set_len(MAX_FILE_BYTES).unwrap();
     }
-    const { assert!(17 * MAX_FILE_BYTES > MAX_TOTAL_FILE_BYTES) };
+    assert_eq!(8 * MAX_FILE_BYTES, MAX_TOTAL_FILE_BYTES);
     let err = sheet.atlas(Variant::Lo, LIMITS, &|| false).unwrap_err();
     assert!(
         matches!(
             err,
             AtlasError::Image(ImageError::TotalBytesTooLarge {
-                at: FileAt {
-                    file: 16,
-                    hi: false
-                }
+                at: FileAt { file: 8, hi: false }
             })
         ),
         "{err:?}"
@@ -545,7 +543,17 @@ fn files_grown_since_load_are_charged_again() {
 
 #[test]
 fn one_file_decodes_within_its_bound() {
-    // The widest format at the texel cap: 16-bit RGBA, 4 096 × 3 072.
+    // The widest format at the texel cap: 16-bit RGBA, 4 096 × 3 072,
+    // as encoded and padded after `IEND` to the per-file cap.
+    for padded in [false, true] {
+        one_file_decodes_within_its_bound_at(padded);
+    }
+}
+
+/// [`one_file_decodes_within_its_bound`]'s file, its encoded bytes as
+/// written or, when `padded`, at [`MAX_FILE_BYTES`]: 64 MiB beside the
+/// 96 MiB native image, the whole-decode bound's `E + 8T` = 160 MiB.
+fn one_file_decodes_within_its_bound_at(padded: bool) {
     let d = dir();
     let (w, h) = (4_096_u32, 3_072_u32);
     let texels = i64::from(w) * i64::from(h);
@@ -557,6 +565,13 @@ fn one_file_decodes_within_its_bound() {
             .write_image(&pixels, w, h, ExtendedColorType::Rgba16)
             .unwrap();
         f.flush().unwrap();
+    }
+    if padded {
+        let f = File::options()
+            .write(true)
+            .open(d.path().join("deep.png"))
+            .unwrap();
+        f.set_len(MAX_FILE_BYTES).unwrap();
     }
     let encoded =
         i64::try_from(std::fs::metadata(d.path().join("deep.png")).unwrap().len()).unwrap();
@@ -578,8 +593,13 @@ fn one_file_decodes_within_its_bound() {
         "peak {peak}, bound {}",
         pages + file + MIB
     );
-    // The bound is reached: the conversion did run beside the native image.
+    // The bound is reached: the conversion did run beside the native
+    // image, and a padded file's bytes were live beside it.
     assert!(peak >= 12 * texels, "peak {peak}");
+    if padded {
+        assert_eq!(file, 160 * MIB);
+        assert!(peak >= encoded + 8 * texels, "peak {peak}");
+    }
 }
 
 /// Writes a `w`×`h` 8-bit RGBA PNG at `path`, row by row, texel `(x, y)`
@@ -760,8 +780,8 @@ fn stream_png16(path: &std::path::Path, w: u32, h: u32, texel: impl Fn(u32, u32)
 /// 32 769 cells of 1×1 in its first band; `deep.png` is 16 384 × 1 025
 /// RGBA16 (16.8 Mi texels, decoded in bands: each band 16 rows × 16 384
 /// texels, 2 MiB native beside 1 MiB RGBA8), padded after `IEND` to
-/// `E` = 32 MiB, so its bound is `max(2E, E + 16 MiB) + 1 MiB` =
-/// 64 MiB + 1 MiB beside the pages. Built with `many.png` read first, the
+/// `E` = 64 MiB, so its bound is `max(2E, E + 16 MiB) + 1 MiB` =
+/// 128 MiB + 1 MiB beside the pages. Built with `many.png` read first, the
 /// peak past the pages is that of the build reading `deep.png` first:
 /// none of `many.png`'s routing (about 1.5 MiB for its cells) is live
 /// while `deep.png` is read and decoded.
@@ -776,6 +796,7 @@ fn one_files_routing_is_freed_before_the_next_file_is_read() {
     f.set_len(MAX_FILE_BYTES).unwrap();
     drop(f);
     let encoded = i64::try_from(MAX_FILE_BYTES).unwrap();
+    assert_eq!(banded_bound(encoded), 129 * MIB);
     let images = |many: u32, deep: u32| {
         let mut v: Vec<ImageDef> = (0..16)
             .flat_map(|r| {
@@ -847,11 +868,11 @@ fn grow_once(path: &std::path::Path, grown: &std::cell::Cell<bool>) -> bool {
 /// for a rectangle and 20 B for a place) + 4 096 files × 24 B =
 /// 2 457 600 B, live while every file is read. Here
 /// 65 536 cells of 1×1 (64 images of 1 024 frames) cut a 16 384 × 1 025
-/// RGBA16 file, 1 MiB when it is admitted, that grows to `E` = 32 MiB as
+/// RGBA16 file, 1 MiB when it is admitted, that grows to `E` = 64 MiB as
 /// it is read (the cancel's first ask, before the first piece, extends
-/// it): the read's last step holds the old 31 MiB beside the new 32 MiB.
+/// it): the read's last step holds the old 63 MiB beside the new 64 MiB.
 /// The peak stays within pages + tables + `max(2E, E + 16 MiB) + 1 MiB`
-/// = pages + 2 457 600 B + 65 MiB, and passes pages + 65 MiB, the bound
+/// = pages + 2 457 600 B + 129 MiB, and passes pages + 129 MiB, the bound
 /// without the tables.
 #[test]
 fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
@@ -895,10 +916,10 @@ fn the_most_cells_and_a_file_grown_while_read_stay_within_the_bound() {
 /// No file's canonical path is kept while another is read: 4 096 files
 /// with cells under a skin folder whose canonical path is past 1 024 B,
 /// the first a 16 384 × 1 025 RGBA16 file of 61 440 cells that grows from
-/// 1 MiB to `E` = 32 MiB as it is read, the others 1×1 files of one cell
+/// 1 MiB to `E` = 64 MiB as it is read, the others 1×1 files of one cell
 /// each (65 535 cells in all). The peak stays within pages +
 /// [`ATLAS_TABLE_BYTES`] + `max(2E, E + 16 MiB) + 1 MiB` = pages +
-/// 2 457 600 B + 65 MiB; the 4 095 other paths kept beside the read would
+/// 2 457 600 B + 129 MiB; the 4 095 other paths kept beside the read would
 /// add more than 4 MiB.
 #[test]
 fn no_files_path_is_kept_while_another_is_read() {

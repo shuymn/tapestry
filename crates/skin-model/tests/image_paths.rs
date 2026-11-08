@@ -166,6 +166,7 @@ fn a_fifo_is_refused_without_opening_it() {
 
 #[test]
 fn files_over_the_size_cap_are_refused_before_reading() {
+    assert_eq!(MAX_FILE_BYTES, 64 << 20);
     let d = dir();
     // Sparse files: their length, not their blocks.
     File::create(d.path().join("big.png"))

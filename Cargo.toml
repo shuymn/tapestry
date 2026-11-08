@@ -101,7 +101,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # skin-beatoraja: the Lua skins' VM (design.md "beatoraja Lua Skins"),
 # Lua 5.4 built from the vendored C source, no async, serialization or
 # module mode
-mlua = { version = "0.12.2", default-features = false, features = ["lua54", "vendored"] }
+mlua = { version = "0.12.2", default-features = false, features = ["lua54", "vendored", "send"] }
 
 # bms-parser and xtask, library (dev only)
 encoding_rs = "0.8.42"
