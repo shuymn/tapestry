@@ -7234,7 +7234,7 @@ pub(crate) mod tests {
     /// of so far.
     struct RearmedFrames {
         /// Each frame's rearms so far, chart time and state clock.
-        frames: Arc<std::sync::Mutex<Vec<(u32, TimeUs, i64)>>>,
+        frames: Noted,
         rearms: u32,
     }
 
@@ -7274,20 +7274,35 @@ pub(crate) mod tests {
         }
     }
 
-    /// A READY rearm reaches the screen through the render thread: the
-    /// logic step's rearm tells the screen once, before its first frame
-    /// drawn from the rearmed candidate's origin.
-    #[test]
-    fn a_rearm_reaches_the_screen_before_its_first_frame() {
-        let chart = ChartBuilder::new(120_000)
+    /// The frames [`RearmedFrames`] notes.
+    type Noted = Arc<std::sync::Mutex<Vec<(u32, TimeUs, i64)>>>;
+
+    /// A chart with one tap at 60 s.
+    fn late_tap() -> Chart {
+        ChartBuilder::new(120_000)
             .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
             .build()
-            .unwrap();
-        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
-        let (mut logic, side) = Logic::<SourceReader>::new(
-            &chart,
-            &rule,
-            &device,
+            .unwrap()
+    }
+
+    /// A render thread drawing [`RearmedFrames`], its attempt over `chart`
+    /// with `rule` prepared: the logic that rearms it, the side its play
+    /// takes, the frames noted, the clock and the link.
+    fn rearmed_play<'a>(
+        chart: &'a Chart,
+        rule: &'a rules::RulePreset,
+        device: &'a DeviceProfile,
+    ) -> (
+        Logic<'a, SourceReader>,
+        game::RenderSide,
+        Noted,
+        QpcClock,
+        super::RenderLink,
+    ) {
+        let (logic, side) = Logic::<SourceReader>::new(
+            chart,
+            rule,
+            device,
             &InputStart::default(),
             Vec::new(),
             LogicConfig {
@@ -7319,6 +7334,16 @@ pub(crate) mod tests {
         .unwrap();
         let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
         assert_eq!(ready.unwrap(), Preparation::Ready);
+        (logic, side, frames, clock, link)
+    }
+
+    /// A READY rearm reaches the screen through the render thread: the
+    /// logic step's rearm tells the screen once, before its first frame
+    /// drawn from the rearmed candidate's origin.
+    #[test]
+    fn a_rearm_reaches_the_screen_before_its_first_frame() {
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) = rearmed_play(&chart, &rule, &device);
         link.send(RenderMsg::Play {
             state_origin: TimeUs(0),
             side,
@@ -7347,46 +7372,8 @@ pub(crate) mod tests {
     /// state clock): real time through READY, never reset by a rearm.
     #[test]
     fn the_state_clock_runs_from_the_play_state_through_a_rearm() {
-        let chart = ChartBuilder::new(120_000)
-            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
-            .build()
-            .unwrap();
-        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
-        let (mut logic, side) = Logic::<SourceReader>::new(
-            &chart,
-            &rule,
-            &device,
-            &InputStart::default(),
-            Vec::new(),
-            LogicConfig {
-                inputs: 0,
-                effects: 16,
-            },
-            Vec::new(),
-        )
-        .unwrap();
-        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let noted = Arc::clone(&frames);
-        let make: MakeScreen = Box::new(move || {
-            Ok(Box::new(RearmedFrames {
-                frames: Arc::clone(&noted),
-                rearms: 0,
-            }) as Box<dyn Screen>)
-        });
-        let clock = QpcClock::start();
-        let shared_chart = Arc::new(chart.clone());
-        let link = spawn(
-            make,
-            Some(Arc::clone(&shared_chart)),
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
-        let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
-        assert_eq!(ready.unwrap(), Preparation::Ready);
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) = rearmed_play(&chart, &rule, &device);
         // The state entered 7 s ago; the first candidate's chart time 0
         // lies 2 s ahead, so its first frames are READY's.
         let state_origin = TimeUs(clock.now().0 - 7_000_000);
