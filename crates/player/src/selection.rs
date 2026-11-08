@@ -4839,7 +4839,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A controller whose key 7 retries on a result, with its result
+    /// A controller whose key 7 retries and key 2 goes back on a result,
+    /// with its result
     /// input taken over by a showing result (`controller_with`).
     #[cfg(feature = "dev-tools")]
     fn result_controller() -> (
@@ -4848,11 +4849,11 @@ pub(crate) mod tests {
         crate::input_side::Hook,
         crate::input_side::InputLink,
     ) {
+        // Key 7 retries and key 2, a black key, goes back.
         let config = game::KeyConfig {
-            lanes: vec![game::LaneKey {
-                control: 17,
-                lane: 7,
-            }],
+            lanes: [(12, 2), (17, 7)]
+                .map(|(control, lane)| game::LaneKey { control, lane })
+                .to_vec(),
             retry: None,
             quit: None,
             ..game::KeyConfig::default()
@@ -4969,11 +4970,11 @@ pub(crate) mod tests {
     /// acts on: the first taken while the result is prepared, which
     /// withdraws it (`withdraw_result`), at its receipt; or the one the
     /// result accepts (`accept_leaving`), when the flow serves it
-    /// (`serve_leaving`: after its outro, or at once on the input
-    /// thread's failure, the skin's fallback or an outro of no length),
-    /// its load time still from its receipt. A retry gated, queued behind
-    /// the accepted command, taken while the outro plays or left from an
-    /// earlier result is no play's.
+    /// (`serve_leaving`, called here after an outro or at once, as the
+    /// flow calls it; when it serves at once is the flow's, guarded by its
+    /// own tests), its load time still from its receipt. A retry gated,
+    /// queued behind the accepted command or behind a back, taken while
+    /// the outro plays or left from an earlier result is no play's.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn every_accepted_retry_starts_the_state_clock_afresh() {
@@ -5015,14 +5016,26 @@ pub(crate) mod tests {
             assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
             pad_retry(&mut set, &mut hook, later(rig));
             assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
-            rig.withdraw_result();
+            rig.withdraw_result(Some(MenuCommand::Retry));
+            rig.prepare_screen().unwrap();
+            assert_eq!(rig.state_clock.origin(), Some(first));
+            // ResultPreparing withdrawn by a controller's back: a retry
+            // queued behind it is no play's.
+            rig.result_input.enter();
+            set.menu_mut().unwrap().set_active(true);
+            press(&mut set, &mut hook, 12, later(rig).0);
+            pad_retry(&mut set, &mut hook, later(rig));
+            assert_eq!(rig.take_menu(), Some(MenuCommand::Back));
+            assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
+            rig.withdraw_result(Some(MenuCommand::Back));
+            assert_eq!(rig.pending_retry, None);
             rig.prepare_screen().unwrap();
             assert_eq!(rig.state_clock.origin(), Some(first));
             // Result: a gated retry dropped, then one accepted, served
             // after its outro (what is taken while it plays dropped) or at
-            // once (the input thread's failure, the skin's fallback, an
-            // outro of no length): the next play state is entered when it
-            // is served, its load time runs from the accepted receipt.
+            // once through the same serve hook: the next play state is
+            // entered when it is served, its load time runs from the
+            // accepted receipt.
             for after_outro in [true, false] {
                 // A result shows again (the preparation left the last).
                 rig.result_input.enter();
@@ -5070,16 +5083,19 @@ pub(crate) mod tests {
             assert!(received >= before && received <= after, "{received:?}");
             let origin = rig.state_clock.origin().unwrap();
             assert!(origin >= served && origin > received, "{origin:?}");
-            // A retry an earlier result offered and never acted on: a
-            // later result's preparation withdrawn by back keeps the
-            // origin, and the served retry is no later play's either.
+            // A retry an earlier result offered and never acted on is no
+            // later result's: a later preparation withdrawn by its own
+            // retry starts at that one's receipt, and the served retry is
+            // no later play's either.
             key(rig);
             assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
             rig.prepare_screen().unwrap();
-            rig.withdraw_result();
+            let withdrawing = key(rig);
+            assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
+            rig.withdraw_result(Some(MenuCommand::Retry));
             rig.prepare_screen().unwrap();
-            assert_eq!(rig.retry_from, None);
-            assert_eq!(rig.state_clock.origin(), Some(origin));
+            assert_eq!(rig.retry_from, Some(withdrawing));
+            assert_eq!(rig.state_clock.origin(), Some(withdrawing));
             let receipt = key(rig);
             assert_eq!(rig.take(), Some(Command::Retry));
             rig.prepare_screen().unwrap();

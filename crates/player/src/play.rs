@@ -1404,11 +1404,16 @@ impl Rig for PlayerRig<'_> {
 
     /// A withdrawn preparation cancels the result skin's layout job and
     /// waits for its thread (design D11, "Cancellation"); the run's end
-    /// bounds the wait.
-    fn withdraw_result(&mut self) {
+    /// bounds the wait. Withdrawn by a retry, that retry is the next
+    /// play's.
+    fn withdraw_result(&mut self, by: Option<MenuCommand>) {
         // The first command taken withdraws the preparation, and those
-        // queued behind it are dropped: a retry's is the first offered.
-        if let Some(at) = self.result_retries.first.take() {
+        // queued behind it are dropped: a withdrawing retry is the first
+        // offered, and a retry queued behind a back is none.
+        let first = self.result_retries.first.take();
+        if by == Some(MenuCommand::Retry)
+            && let Some(at) = first
+        {
             self.pending_retry = Some(at);
         }
         self.settle_result();

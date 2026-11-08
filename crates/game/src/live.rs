@@ -449,11 +449,14 @@ pub trait Rig {
         let _ = (prep, deadline);
         Polled::Ready
     }
-    /// The result's preparation was withdrawn (a fresh quit, back or
-    /// retry, or a close, during ResultPreparing): the rig cancels the
-    /// work it began for it and waits for it (design.md "State Model",
-    /// ResultPreparing). By default, nothing.
-    fn withdraw_result(&mut self) {}
+    /// The result's preparation was withdrawn by `by` (a fresh quit or
+    /// back, `Back`, or retry, `Retry`) or a close (`None`) during
+    /// ResultPreparing: the rig cancels the work it began for it and waits
+    /// for it (design.md "State Model", ResultPreparing). By default,
+    /// nothing.
+    fn withdraw_result(&mut self, by: Option<MenuCommand>) {
+        let _ = by;
+    }
     /// The Result state accepts the leaving command `cmd` (retry, or back
     /// or the quit key as back, or back when the skin's scene time passed):
     /// called at its acceptance, after [`begin_outro`](Self::begin_outro),
@@ -1156,7 +1159,7 @@ fn prepare_result<R: Rig>(
 /// `None` when nothing withdraws it.
 fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
     if rig.quitting() {
-        rig.withdraw_result();
+        rig.withdraw_result(None);
         return Some(Prepared::Leave);
     }
     while let Some(c) = rig.take_menu() {
@@ -1166,7 +1169,7 @@ fn withdrawn<R: Rig>(rig: &mut R) -> Option<Prepared> {
             MenuCommand::NextPreset | MenuCommand::PrevPreset => continue,
         };
         while rig.take_menu().is_some() {}
-        rig.withdraw_result();
+        rig.withdraw_result(Some(c));
         return Some(withdrawn);
     }
     None
