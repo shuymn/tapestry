@@ -472,9 +472,14 @@ fn kind_import(ty: i32, scene: ScreenKind) -> (Result<super::LuaOutcome, ImportE
 
 #[test]
 fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
-    use ScreenKind::{Play, Result, Selection};
+    use ScreenKind::{Decision, Play, Result, Selection};
     no_time_cap();
-    for (ty, scene, found) in [(5, Play, Selection), (0, Result, Play)] {
+    for (ty, scene, found) in [
+        (5, Play, Selection),
+        (0, Result, Play),
+        (6, Play, Decision),
+        (0, Decision, Play),
+    ] {
         let (r, passes, admits) = kind_import(ty, scene);
         match r {
             Err(ImportError::Slot {
@@ -494,12 +499,24 @@ fn a_lua_skin_in_another_slot_refuses_before_the_configured_pass() {
     assert!(admits >= 1);
 }
 
+/// C1: a Lua decision skin passes the kind gate, its configured pass
+/// runs, and its number, which the decision does not show, is dropped
+/// with a note before its file is read.
 #[test]
-fn a_lua_kind_with_no_importer_refuses_before_the_configured_pass() {
+fn a_lua_decision_skin_imports_into_its_own_slot() {
+    no_time_cap();
     let (r, passes, admits) = kind_import(6, ScreenKind::Decision);
-    match r {
-        Err(ImportError::NoImporter { kind }) => assert_eq!(kind, ScreenKind::Decision),
-        other => panic!("{other:?}"),
-    }
-    assert_eq!((passes, admits), (1, 0));
+    let Ok(super::LuaOutcome::Imported(i)) = r else {
+        panic!("{r:?}");
+    };
+    assert_eq!(i.imported.skin.kind(), ScreenKind::Decision);
+    assert!(
+        i.imported.report.notes.iter().any(|n| n.kind
+            == crate::import::NoteKind::Unsupported {
+                object: crate::import::Object::Value,
+            }),
+        "{:?}",
+        i.imported.report.notes
+    );
+    assert_eq!((passes, admits), (2, 0));
 }

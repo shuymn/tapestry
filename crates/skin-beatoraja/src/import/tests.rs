@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::asset::ADMITS;
 use super::report::WALKED;
-use super::{Config, Event, Imported, NoteKind, Severity, TRACE, import};
+use super::{Config, Event, Imported, NoteKind, Object, Severity, TRACE, import};
 use crate::error::ImportError;
 use skin_model::ScreenKind;
 
@@ -567,8 +567,13 @@ fn into_slot(ty: i32, slot: ScreenKind, trap: bool) -> (Result<Imported, ImportE
 
 #[test]
 fn a_skin_in_another_slot_refuses_before_anything_is_read() {
-    use ScreenKind::{Play, Result, Selection};
-    for (ty, slot, found) in [(5, Play, Selection), (0, Result, Play)] {
+    use ScreenKind::{Decision, Play, Result, Selection};
+    for (ty, slot, found) in [
+        (5, Play, Selection),
+        (0, Result, Play),
+        (6, Play, Decision),
+        (0, Decision, Play),
+    ] {
         // No trap file: a resolution would refuse on reading it.
         let (r, admits) = into_slot(ty, slot, false);
         match r {
@@ -592,13 +597,27 @@ fn a_skin_in_another_slot_refuses_before_anything_is_read() {
     assert!(admits >= 1);
 }
 
+/// C1: a decision skin passes the kind gate into its own slot and
+/// resolves past the trap; its number, which the decision does not show,
+/// is dropped with a note before its file is read.
 #[test]
-fn a_kind_with_no_importer_refuses_before_anything_is_read() {
-    let (r, admits) = into_slot(6, ScreenKind::Decision, false);
-    match r {
-        Err(ImportError::NoImporter { kind }) => assert_eq!(kind, ScreenKind::Decision),
-        other => panic!("{:?}", other.map(|i| i.report)),
-    }
+fn a_decision_skin_imports_into_its_own_slot() {
+    let (r, admits) = into_slot(6, ScreenKind::Decision, true);
+    let i = r.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(i.skin.kind(), ScreenKind::Decision);
+    let dropped = i
+        .report
+        .notes
+        .iter()
+        .filter(|n| {
+            n.severity == Severity::Dropped
+                && n.kind
+                    == NoteKind::Unsupported {
+                        object: Object::Value,
+                    }
+        })
+        .count();
+    assert_eq!(dropped, 1, "{:?}", i.report.notes);
     assert_eq!(admits, 0);
 }
 

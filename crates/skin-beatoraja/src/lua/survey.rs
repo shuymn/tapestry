@@ -87,7 +87,8 @@ pub struct Survey {
     /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
     pub frame_ops: Option<(usize, usize)>,
     /// A result import drawn over [`Choice::result`], when one was given
-    /// and the import completed.
+    /// and the import completed, or a decision import that completed,
+    /// drawn over its declared timing ([`decision_frames`]).
     pub frames: Option<Frames>,
     /// The screen's runtime run for one frame over a state whose fields
     /// are all 0, when the import routed a callback to it.
@@ -134,10 +135,10 @@ pub struct Choice {
     pub result: Option<skin_model::ResultView>,
 }
 
-/// A result import drawn over [`Choice::result`]: its widget charge, its
-/// quad capacity, and over frames at 0, 0.25, 1 and 5 s of the screen
-/// timer the most quads one drew, the quads every one dropped, and the
-/// last one's chip quads (drawn on a chip grid).
+/// A result or decision import drawn ([`frames`], [`decision_frames`]):
+/// its widget charge, its quad capacity, and over its frames the most
+/// quads one drew, the quads every one dropped, and the last one's chip
+/// quads (drawn on a chip grid).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frames {
     pub widget_quads: u32,
@@ -154,8 +155,64 @@ const SURVEY_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
     reserved_layers: 1,
 };
 
-/// `skin` drawn over `view` ([`Frames`]); `None` when its atlas cannot
-/// be built or a build is refused.
+/// Decision skin `skin` drawn ([`Frames`]) with placeholder labels in
+/// every field and its `.fnt` text laid out (an outline font's lines need
+/// the renderer and draw nothing here), at the choice, just before and at
+/// the fade-out's start, and just before the screen ends; `None` when its
+/// atlas cannot be built or a build is refused.
+fn decision_frames(skin: &skin_model::Skin, widget_quads: u32) -> Option<Frames> {
+    use bms_model::TimeUs;
+    use skin_model::{
+        DecisionFrame, DecisionTimers, Filter, Layout, QuadBatch, ResultLabels, Variant,
+    };
+    let atlas = skin.atlas(Variant::Lo, SURVEY_LIMITS, &|| false).ok()?;
+    let mut dec = skin.prepare_decision();
+    let labels = ResultLabels {
+        title: "Title".into(),
+        subtitle: "Subtitle".into(),
+        artist: "Artist".into(),
+        subartist: "Subartist".into(),
+        genre: "Genre".into(),
+    };
+    skin.update_decision(&mut dec, &labels).ok()?;
+    skin.attach_decision_bitmap_text(&mut dec);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut f = Frames {
+        widget_quads,
+        capacity: skin.quad_capacity(),
+        ..Frames::default()
+    };
+    let layout = Layout::AUTHOR;
+    let t = skin.decision_timing();
+    let end = TimeUs(t.scene.0 + t.fadeout.0);
+    let before = |at: TimeUs| TimeUs((at.0 - 1_000).max(0));
+    for now in [TimeUs(0), before(t.scene), t.scene, before(end)] {
+        batch.clear();
+        let frame = DecisionFrame {
+            now,
+            target: [1_920, 1_080],
+            layout: &layout,
+            timers: DecisionTimers {
+                screen: Some(TimeUs(0)),
+                fadeout: (now >= t.scene).then_some(t.scene),
+            },
+        };
+        skin.build_decision(&mut dec, &frame, atlas.uvs(), &mut batch)
+            .ok()?;
+        f.most = f.most.max(batch.quads().len());
+        f.dropped = f.dropped.saturating_add(batch.dropped());
+    }
+    f.chips = batch
+        .quads()
+        .iter()
+        .filter(|q| q.filter == Filter::NearestBase)
+        .count();
+    Some(f)
+}
+
+/// `skin` drawn over `view` ([`Frames`]) at 0, 0.25, 1 and 5 s of the
+/// screen timer; `None` when its atlas cannot be built or a build is
+/// refused.
 fn frames(
     skin: &skin_model::Skin,
     widget_quads: u32,
@@ -373,7 +430,6 @@ fn label(e: &ImportError) -> String {
         ImportError::Range { field, .. } => format!("range `{field}`"),
         ImportError::UnsupportedKind { .. } => "unsupported screen kind".into(),
         ImportError::Slot { .. } => "skin in another slot".into(),
-        ImportError::NoImporter { kind } => format!("no importer for {kind:?}"),
         ImportError::Resolution { w, h, .. } => format!("size {w}x{h}"),
         ImportError::Limit { limit, .. } => format!("limit {limit:?}"),
         ImportError::Critical { part, why, .. } => format!("critical {part:?}: {}", note(why)),
@@ -474,7 +530,6 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
         | ImportError::Critical { at, .. }
         | ImportError::Expr { at, .. }
         | ImportError::Asset { at, .. } => Some(at),
-        ImportError::NoImporter { .. } => None,
     }
 }
 
@@ -686,7 +741,8 @@ fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> Ru
 }
 
 /// Records an import that completed: its outcome, its notes by kind, and
-/// for a `kind` result skin with [`Choice::result`], its frames.
+/// its frames for a `kind` result skin with [`Choice::result`] or a
+/// decision skin.
 fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, choice: &Choice) {
     s.outcome = "imported".into();
     s.frame_ops = Some((
@@ -696,11 +752,13 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
     for n in &imported.report.notes {
         *s.notes.entry(note(&n.kind)).or_default() += 1;
     }
+    let charge = imported.report.usage.widget_quads;
     if kind == ScreenKind::Result
         && let Some(view) = &choice.result
     {
-        let charge = imported.report.usage.widget_quads;
         s.frames = frames(&imported.skin, charge, view);
+    } else if kind == ScreenKind::Decision {
+        s.frames = decision_frames(&imported.skin, charge);
     }
 }
 
@@ -1411,6 +1469,36 @@ return { type = 0 }",
         );
     }
 
+    /// A Lua decision skin's `main_state.timer(2)` lowers to the decision
+    /// schema's fade-out timer, by name in the generated expression.
+    #[test]
+    fn a_decision_timer_read_lowers_to_the_fade_out() {
+        let entry = "local skin = { type = 6, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }\n\
+             skin.destination = { { id = \"i\", \
+               draw = function() return ms.timer(2) ~= ms.timer_off_value end, \
+               dst = { { w = 8, h = 8 } } } }\n\
+             return skin\n";
+        let d = folder(&[("s.luaskin", entry)]);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Decision),
+            &Cancel::new(),
+            true,
+        );
+        let lowered: Vec<_> = s
+            .consumers
+            .iter()
+            .filter_map(|c| c.local.as_ref()?.lowered.as_ref())
+            .map(|l| l.src.clone())
+            .collect();
+        assert_eq!(lowered.len(), 1, "{:?}", s.consumers);
+        assert!(lowered[0].contains("on(fadeout)"), "{lowered:?}");
+    }
     #[test]
     fn screen_kind_refusals_have_their_labels_and_locations() {
         let run = |entry: &str| {
@@ -1431,7 +1519,7 @@ return { type = 0 }",
         assert_eq!((module, line), (0, 0));
         for (ty, kind, label) in [
             (5, ScreenKind::Selection, "essential SongList missing"),
-            (6, ScreenKind::Decision, "no importer for Decision"),
+            (6, ScreenKind::Decision, "imported"),
             (7, ScreenKind::Result, "essential ResultScore missing"),
         ] {
             let s = run(&format!("return {{ type = {ty} }}"));
@@ -1439,6 +1527,8 @@ return { type = 0 }",
                 (s.outcome.as_str(), s.at, s.kind),
                 (label, None, Some(kind))
             );
+            // A decision import is drawn over its declared timing.
+            assert_eq!(s.frames.is_some(), kind == ScreenKind::Decision, "{ty}");
         }
         let s = run("if skin_config then return { type = 7 } end\nreturn { type = 0 }");
         assert_eq!(s.outcome, "skin in another slot");
