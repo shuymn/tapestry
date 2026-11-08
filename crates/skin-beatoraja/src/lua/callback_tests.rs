@@ -168,7 +168,7 @@ fn refusals_name_their_reason_and_run_no_handler() {
             "",
             image("function() return ms.number(110) / 2 > 0 end"),
             None,
-            vec![Replaced(Unsupported::Construct("/"))],
+            vec![super::callback::Disposition::Compiled],
         ),
         // A global nothing set folds to nil.
         ("", image("function() return flag end"), None, vec![Lowered]),
@@ -261,12 +261,12 @@ fn refusals_name_their_reason_and_run_no_handler() {
             None,
             vec![Lowered],
         ),
-        // A float.
+        // A float: the program's.
         (
             "",
             image("function() return ms.number(110) > 1.0 end"),
             None,
-            vec![Replaced(Unsupported::Construct("float"))],
+            vec![super::callback::Disposition::Compiled],
         ),
     ] {
         let entry = skin(body, &dst);

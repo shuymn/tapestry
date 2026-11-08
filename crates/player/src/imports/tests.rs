@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,70 @@ pub(super) fn worker_starting() {
 /// The job thread counted by [`worker_starting`] did not start.
 pub(super) fn spawn_failed() {
     WORKERS.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// The jobs one test started and whose threads were joined. Each job
+/// carries the tally of the thread that started it, so a test counts its
+/// own jobs only, whatever jobs other tests run meanwhile: the
+/// process-wide counters ([`super::jobs_started`]) move with every test's.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    started: AtomicU64,
+    joined: AtomicU64,
+}
+
+impl Tally {
+    /// Its job's thread was joined.
+    pub(super) fn joined(&self) {
+        self.joined.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+thread_local! {
+    /// This thread's tally: a test thread's own, or the one a runner the
+    /// test started was handed ([`adopt`]).
+    static TALLY: std::cell::RefCell<Arc<Tally>> = std::cell::RefCell::default();
+}
+
+/// This thread's tally.
+fn tally() -> Arc<Tally> {
+    TALLY.with(|t| Arc::clone(&t.borrow()))
+}
+
+/// Has this thread, a runner a test started, count into the test's
+/// `tally`.
+fn adopt(tally: Arc<Tally>) {
+    TALLY.with(|t| *t.borrow_mut() = tally);
+}
+
+/// A job is started from this thread: its tally, the start counted.
+pub(super) fn spawning() -> Arc<Tally> {
+    let t = tally();
+    t.started.fetch_add(1, Ordering::SeqCst);
+    t
+}
+
+/// The jobs this thread's tally counted started, then joined.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn jobs_counted() -> (u64, u64) {
+    let t = tally();
+    (
+        t.started.load(Ordering::SeqCst),
+        t.joined.load(Ordering::SeqCst),
+    )
+}
+
+/// The jobs this thread's tally counted started ([`jobs_counted`]).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn jobs_started() -> u64 {
+    jobs_counted().0
+}
+
+/// The job threads this thread's tally counted joined
+/// ([`jobs_counted`]).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn jobs_joined() -> u64 {
+    jobs_counted().1
 }
 
 /// Held by a job thread's body: its drop, past [`exit_gate`] or in an
@@ -209,7 +273,7 @@ fn critical_skin(dir: &Path, entry: &str, path: &str) {
 }
 
 /// The choice of `entry` in `root`, nothing named.
-fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
+pub(crate) fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
     SkinChoice {
         root: root.into(),
         entry: entry.to_owned(),
@@ -219,7 +283,7 @@ fn choice(root: impl Into<PathBuf>, entry: &str) -> SkinChoice {
 }
 
 /// What `r` packs for, with the generated default font.
-fn target(r: &Renderer) -> ImportTarget {
+pub(crate) fn target(r: &Renderer) -> ImportTarget {
     ImportTarget {
         limits: r.atlas_limits(),
         size: [1_920, 1_080],
@@ -228,7 +292,7 @@ fn target(r: &Renderer) -> ImportTarget {
 }
 
 /// Builds `choice` as a play skin for `t`.
-fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
+pub(crate) fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
     build(ScreenKind::Play, choice, false, t, &Cancel::new())
 }
 
@@ -249,7 +313,7 @@ fn refused(o: KindOutcome) -> String {
 }
 
 #[track_caller]
-fn pending(o: KindOutcome) -> (Arc<PendingPlay>, PendingNote) {
+pub(crate) fn pending(o: KindOutcome) -> (Arc<PendingPlay>, PendingNote) {
     match o {
         KindOutcome::Pending(p, note) => (p, note),
         other => panic!("{other:?}"),
@@ -644,7 +708,7 @@ fn tagged_and_directory_choices_are_chosen_by_name() {
 
 /// A Lua play skin whose configured pass runs `body` with `ms` the host
 /// module, drawing a 64×64 red `a.png` at `x`, which `body` sets.
-fn lua_skin(body: &str) -> tempfile::TempDir {
+pub(crate) fn lua_skin(body: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let entry = format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
@@ -702,7 +766,7 @@ const FRAME_CLASS: [i32; 4] = [300, 100, 100, 100];
 /// chart (option 183) and `red.png` otherwise, at [`COLOUR`], and which
 /// draws the same image at [`FRAME_CLASS`] while a frame's `option(183)`
 /// holds.
-fn class_skin() -> tempfile::TempDir {
+pub(crate) fn class_skin() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let [x, y, w, h] = COLOUR;
     let [fx, fy, fw, fh] = FRAME_CLASS;
@@ -1006,7 +1070,9 @@ fn started_job<T: Send + 'static>(
     let signals = Signals::default();
     let s = signals.clone();
     let (tx, rx) = std::sync::mpsc::channel();
+    let tally = tally();
     std::thread::spawn(move || {
+        adopt(tally);
         let ran = run_job(
             job,
             || s.attempt.load(Ordering::SeqCst),
@@ -1017,10 +1083,10 @@ fn started_job<T: Send + 'static>(
     (signals, rx)
 }
 
-/// The jobs started and joined so far (dev-tools).
+/// The jobs this test started and joined so far (dev-tools).
 #[cfg(feature = "dev-tools")]
 fn counted() -> (u64, u64) {
-    (super::jobs_started(), super::jobs_joined())
+    jobs_counted()
 }
 
 /// Runs `job` on another thread with a stop the test sets: the runner's
@@ -1031,7 +1097,9 @@ fn started<T: Send + 'static>(
     let stop = Arc::new(AtomicBool::new(false));
     let theirs = Arc::clone(&stop);
     let (tx, rx) = std::sync::mpsc::channel();
+    let tally = tally();
     std::thread::spawn(move || {
+        adopt(tally);
         let ran = run_cancellable(job, move || theirs.load(Ordering::SeqCst));
         let _ = tx.send(ran);
     });

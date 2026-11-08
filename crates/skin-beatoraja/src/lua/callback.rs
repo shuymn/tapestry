@@ -121,6 +121,8 @@ pub enum Disposition {
     ClassifiedOnly,
     /// Converted into an expression.
     Lowered,
+    /// Compiled into the presentation program.
+    Compiled,
     /// A decorative callback replaced by a reported constant.
     Replaced(Unsupported),
     /// Run each frame by a selection or result screen's runtime

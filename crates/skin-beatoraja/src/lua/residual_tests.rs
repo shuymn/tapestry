@@ -342,18 +342,16 @@ fn a_helper_with_known_arguments_lowers_as_a_conditional() {
 #[test]
 fn r4_conditionals_need_all_four_proofs() {
     use Disposition::{Lowered, Replaced};
-    // int-or-bool: a string value, and a raw timer value.
-    for value in [
-        "function() return ms.text(1) end",
-        "function() return ms.timer(41) end",
+    // int-or-bool: a string value is no type a number takes; a raw timer
+    // value is an integer of no known bound (its start or the off value),
+    // which a number's value may not convert.
+    for (value, why) in [
+        ("function() return ms.text(1) end", Unsupported::Type),
+        ("function() return ms.timer(41) end", Unsupported::Range),
     ] {
         let entry = number("", value);
         assert!(closed(&entry), "{value}");
-        assert_eq!(
-            run(&entry).callbacks,
-            [Replaced(Unsupported::Type)],
-            "{value}"
-        );
+        assert_eq!(run(&entry).callbacks, [Replaced(why)], "{value}");
     }
     // total: a definite Lua error on a reached path; control: behind a
     // condition folded false.
@@ -370,13 +368,10 @@ fn r4_conditionals_need_all_four_proofs() {
         (r.callbacks, r.lowered),
         (vec![Lowered], vec!["0".to_owned()])
     );
-    // pure: a library call.
+    // pure: a library call, which only the program takes.
     let entry = number("", "function() return math.max(ms.number(110), 0) end");
     assert!(closed(&entry));
-    assert_eq!(
-        run(&entry).callbacks,
-        [Replaced(Unsupported::Construct("library call"))]
-    );
+    assert_eq!(run(&entry).callbacks, [Disposition::Compiled]);
     // range: an arm whose interval leaves `i32`.
     let (_, notes) = PLAY.field("notes").unwrap();
     assert!(
@@ -387,7 +382,8 @@ fn r4_conditionals_need_all_four_proofs() {
         "function() if ms.option(271) then return ms.number(106) * ms.number(106) end return 0 end",
     );
     assert!(closed(&entry));
-    assert_eq!(run(&entry).callbacks, [Replaced(Unsupported::Range)]);
+    // Past `i32` but within ±2^53: the program's, whose integers are Lua's.
+    assert_eq!(run(&entry).callbacks, [Disposition::Compiled]);
     // range: 17 nested integer conditionals, within the bytes, the ops
     // and the nesting, past R4's stack.
     let arms: String = (0..17)
@@ -408,7 +404,8 @@ fn r4_conditionals_need_all_four_proofs() {
     let entry = number("", &value);
     assert!(closed(&entry));
     TRIED.with(|t| *t.borrow_mut() = None);
-    assert_eq!(run(&entry).callbacks, [Replaced(LIMITS)]);
+    // Past R4's stack: the program takes it, a register a level.
+    assert_eq!(run(&entry).callbacks, [Disposition::Compiled]);
     let (src, kind) = TRIED.with(|t| t.borrow().clone()).unwrap();
     assert!(src.len() < skin_model::MAX_SOURCE_BYTES, "{}", src.len());
     let ops = src
@@ -432,22 +429,14 @@ fn r4_conditionals_need_all_four_proofs() {
         matches!(kind, Some(ErrorKind::StackTooDeep { .. })),
         "{kind:?}"
     );
-    // Critical, the same shape refuses at its definition.
+    // Critical, the same shape is compiled too.
     let critical = number(
         "",
         &value.replace("return 0 end end", "return ms.number(101) end end"),
     );
-    match run(&critical).r {
-        Err(ImportError::Lua {
-            why:
-                LuaWhy::Critical {
-                    field: "value",
-                    why,
-                },
-            ..
-        }) => assert_eq!(why, LIMITS),
-        other => panic!("{other:?}"),
-    }
+    let r = run(&critical);
+    assert!(r.r.is_ok(), "{:?}", r.r);
+    assert_eq!(r.callbacks, [Disposition::Compiled]);
 }
 
 #[test]
@@ -626,12 +615,9 @@ fn a_frames_play_level_read_lowers_under_its_validity() {
     ));
     assert_eq!(r.callbacks, [Disposition::Lowered]);
     assert_eq!(r.lowered, ["chart.level_valid && ((chart.level) >= 12)"]);
+    // What could leave `i32` is the program's, whose integers are Lua's.
     let r = run(&number("", "function() return ms.number(96) + 2 end"));
-    assert!(
-        matches!(r.callbacks[..], [Disposition::Replaced(_)]),
-        "{:?}",
-        r.callbacks
-    );
+    assert_eq!(r.callbacks, [Disposition::Compiled]);
 }
 
 #[test]
@@ -822,12 +808,6 @@ fn what_partial_evaluation_leaves_follows_the_role() {
             "function() while false do end return true end",
             c("while"),
         ),
-        ("", "function() return ms.number(110) > 1.5 end", c("float")),
-        (
-            "",
-            "function() return math.max(1, 2) > 0 end",
-            c("library call"),
-        ),
         (
             "",
             "function() return (\"\"):len() > 0 end",
@@ -836,9 +816,11 @@ fn what_partial_evaluation_leaves_follows_the_role() {
         ("", "function() return {} end", c("table")),
         ("", "function() return \"a\" .. \"b\" end", c("..")),
         ("", "function() return #\"ab\" > 0 end", c("#")),
-        ("", "function() return ms.number(110) / 2 > 0 end", c("/")),
-        ("", "function() return 3 // 2 > 0 end", c("//")),
-        ("", "function() return ms.number(110) % 2 > 0 end", c("%")),
+        (
+            "",
+            "function() return string.len(\"a\") > 0 end",
+            c("library call"),
+        ),
         (
             "local function r(n) return r(n) end",
             "function() return r(1) end",
@@ -847,6 +829,33 @@ fn what_partial_evaluation_leaves_follows_the_role() {
     ] {
         let r = run(&skin(body, &image(draw)));
         assert_eq!(r.callbacks, [Disposition::Replaced(why)], "{draw}");
+    }
+    // Floats, `/ // %` and `math` the expressions refuse go to the
+    // program; known operands fold.
+    for (draw, want) in [
+        (
+            "function() return ms.number(110) > 1.5 end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() return math.max(ms.number(110), 2) > 0 end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() return ms.number(110) / 2 > 0 end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() return ms.number(110) % 2 > 0 end",
+            Disposition::Compiled,
+        ),
+        ("function() return 3 // 2 > 0 end", Disposition::Lowered),
+        (
+            "function() return math.max(1, 2) > 0 end",
+            Disposition::Lowered,
+        ),
+    ] {
+        assert_eq!(run(&skin("", &image(draw))).callbacks, [want], "{draw}");
     }
 }
 

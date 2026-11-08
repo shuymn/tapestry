@@ -31,6 +31,34 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("skin_lua", skin_luas()),
         ("skin_fnt", skin_fnts()),
         ("skin_png", skin_pngs()),
+        ("present", presents()),
+    ]
+}
+
+/// `present` seeds ([`crate::present_def`]): a value reading the combo
+/// and a draw gated on it after that value, accepted; a backward jump; a
+/// read of an enumeration.
+#[must_use]
+pub fn presents() -> Vec<Seed> {
+    let accepted = [
+        2, // two callbacks
+        0, 2, 2, 1, 1, 255, 255, // a value: start 0, length 2, `Int`
+        2, 3, 2, 0, 1, 1, 0, // a draw: start 2, length 3, gate 1, after 0
+        1, 0, 0, 0, // Read r0 <- 0
+        11, 0, 0, 0, // Ret r0
+        0, 0, 1, 0, // Const r0 <- true
+        6, 0, 0, 0, // Not r0
+        11, 0, 0, 0, // Ret r0
+    ];
+    let mut jump = accepted.to_vec();
+    jump[27..31].copy_from_slice(&[9, 0, 0, 0]);
+    let mut kind = accepted.to_vec();
+    kind[0] |= 0x80;
+    kind[16] = 3;
+    vec![
+        ("accepted", accepted.to_vec()),
+        ("jump_back", jump),
+        ("enum_read", kind),
     ]
 }
 

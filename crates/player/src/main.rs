@@ -862,6 +862,8 @@ fn rig<'a>(
         panels: None,
         result_skin: crate::result_skin::ResultSkin::default(),
         result_chart: None,
+        prep: None,
+        preps: 0,
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,
         result_withdrawn: false,
@@ -2164,7 +2166,6 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_settings_gauge_survives_a_preset_without_it() {
-        use game::Rig as _;
         let dir = tempfile::tempdir().unwrap();
         let settings = gauge_settings(5);
         let short = loaded_under(dir.path(), &settings, "tapestry");
@@ -2245,7 +2246,9 @@ mod tests {
 
     /// The rig answers the Closing duration the play skin declares from
     /// the attempt's commit receipt: none before the first commit, the
-    /// committed skin's after it.
+    /// committed skin's after it. The attempt is prepared as the flow
+    /// prepares it: ready, its handle holds the screen's inputs it was
+    /// staged with, and its final readiness is ready.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_rig_declares_the_committed_skins_close() {
@@ -2285,10 +2288,26 @@ mod tests {
         );
         let (declared, _) = on_rig_with(settings, render, |rig, _| {
             let before = rig.declared_close();
-            assert_eq!(
-                rig.prepare_attempt(&loaded).unwrap(),
-                game::Preparation::Ready
-            );
+            let mut handle = rig.begin_preparation(&loaded, loaded.prep_key());
+            assert_eq!(handle.key().screen(), None);
+            let ended = loop {
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(10);
+                if let game::PrepPoll::Done(ended) =
+                    rig.poll_preparation(&mut handle, until).unwrap()
+                {
+                    break ended;
+                }
+            };
+            assert_eq!(ended, game::Preparation::Ready);
+            let staged = handle
+                .key()
+                .screen()
+                .expect("staged with the screen's inputs");
+            assert_eq!(staged.target, [1_920, 1_080]);
+            assert!(matches!(
+                rig.ready_attempt(1, &handle).unwrap(),
+                game::Readiness::Ready
+            ));
             rig.commit_attempt().unwrap();
             (before, rig.declared_close())
         });

@@ -193,6 +193,32 @@ struct Fake {
     attempts: Vec<game::Attempt>,
     /// How each preparation ends, in order; then ready.
     preparations: Vec<Preparation>,
+    /// The key of each preparation begun, in order.
+    begun: Vec<game::PrepKey>,
+    /// Each final readiness asked: the attempt's number and the ticket.
+    readied: Vec<(u32, u64)>,
+    /// The screen's structural inputs a ready preparation is staged with.
+    screen: game::ScreenKey,
+    /// The final readinesses that answer `Stale`, in order, each with the
+    /// screen's inputs it then has; then ready.
+    stale: Vec<game::ScreenKey>,
+    /// What happens at the first final readiness answering `Stale`, all
+    /// at once.
+    in_stale: Vec<FirstPoll>,
+    /// A preparation begun builds a failed screen again, as the render
+    /// thread's recovery does when asked to prepare an attempt.
+    prep_recovers: bool,
+    /// Polls of each preparation answering pending before it ends.
+    pending_polls: usize,
+    /// Pending polls left of the preparation begun last.
+    pending_left: usize,
+    /// Each poll of an attempt's preparation.
+    prep_polls: usize,
+    /// Every poll of an attempt's preparation fails with the screen's
+    /// error.
+    poll_fails: bool,
+    /// Every final readiness fails with the screen's error.
+    ready_fails: bool,
     /// The audio output failed.
     output_failed: bool,
     /// Waits each preparation takes, a quit or a close during which
@@ -289,6 +315,10 @@ enum FirstPoll {
     Close,
     /// The screen fails.
     ScreenFails,
+    /// The input thread fails.
+    InputFails,
+    /// The audio output fails.
+    AudioFails,
 }
 
 impl Fake {
@@ -299,6 +329,8 @@ impl Fake {
             FirstPoll::Menu(c) => self.menu.push((i64::MIN, c)),
             FirstPoll::Close => self.quitting = true,
             FirstPoll::ScreenFails => self.screen_fails_at = self.clock.now().0,
+            FirstPoll::InputFails => self.failed = Some(InputWaitError::Gone),
+            FirstPoll::AudioFails => self.output_failed = true,
         }
     }
 }
@@ -323,6 +355,28 @@ impl Drop for FakePrep {
 }
 
 impl Fake {
+    /// How a preparation ends: [`Self::prepare_waits`] waits, a
+    /// quit or a close during which cancels it, then the next of
+    /// [`Self::preparations`], or ready.
+    fn prepare_ended(&mut self) -> Result<Preparation, SurfaceLost> {
+        for _ in 0..self.prepare_waits {
+            self.wait();
+            let now = self.clock.now().0;
+            let quit = self
+                .commands
+                .iter()
+                .any(|&(at, c)| at <= now && c == Command::Quit);
+            if self.quitting() || quit {
+                return Ok(Preparation::Cancelled);
+            }
+        }
+        if self.preparations.is_empty() {
+            Ok(Preparation::Ready)
+        } else {
+            Ok(self.preparations.remove(0))
+        }
+    }
+
     fn new(items: Vec<ScriptItem>, commands: &[(i64, Command)], quit_at: i64) -> Self {
         let mut items = items;
         items.push(ScriptItem {
@@ -380,6 +434,17 @@ impl Fake {
             steps: Vec::new(),
             attempts: Vec::new(),
             preparations: Vec::new(),
+            begun: Vec::new(),
+            readied: Vec::new(),
+            screen: game::ScreenKey::default(),
+            stale: Vec::new(),
+            in_stale: Vec::new(),
+            prep_recovers: false,
+            pending_polls: 0,
+            pending_left: 0,
+            prep_polls: 0,
+            poll_fails: false,
+            ready_fails: false,
             output_failed: false,
             prepare_waits: 0,
             side: None,
@@ -575,27 +640,63 @@ impl Rig for Fake {
         self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
     }
 
-    /// Takes [`Self::prepare_waits`] waits, servicing the quit key and a
-    /// close at each, as the player's rig does while the screen prepares.
-    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, SurfaceLost> {
+    fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
         self.steps.push("attempt");
         self.attempts.push(loaded.attempt());
-        for _ in 0..self.prepare_waits {
-            self.wait();
-            let now = self.clock.now().0;
-            let quit = self
-                .commands
-                .iter()
-                .any(|&(at, c)| at <= now && c == Command::Quit);
-            if self.quitting() || quit {
-                return Ok(Preparation::Cancelled);
-            }
+        self.begun.push(key.clone());
+        self.pending_left = self.pending_polls;
+        if self.prep_recovers && self.screen_failed() {
+            self.screen_fails_at = i64::MAX;
         }
-        if self.preparations.is_empty() {
-            Ok(Preparation::Ready)
-        } else {
-            Ok(self.preparations.remove(0))
+        game::PrepHandle::new(key, self.begun.len() as u64)
+    }
+
+    /// Takes [`Self::prepare_waits`] waits, servicing the quit key and a
+    /// close at each, as the player's rig does while the screen prepares;
+    /// ready, staged with [`Self::screen`].
+    fn poll_preparation(
+        &mut self,
+        handle: &mut game::PrepHandle,
+        _deadline: std::time::Instant,
+    ) -> Result<game::PrepPoll<Preparation>, SurfaceLost> {
+        self.prep_polls += 1;
+        if self.poll_fails {
+            return Err(SurfaceLost);
         }
+        if self.pending_left > 0 {
+            self.pending_left -= 1;
+            return Ok(game::PrepPoll::Pending);
+        }
+        let done = self.prepare_ended()?;
+        if done == Preparation::Ready {
+            handle.staged_with(self.screen);
+        }
+        Ok(game::PrepPoll::Done(done))
+    }
+
+    /// Stale with the next of [`Self::stale`], the screen then being it;
+    /// else ready.
+    fn ready_attempt(
+        &mut self,
+        number: u32,
+        handle: &game::PrepHandle,
+    ) -> Result<game::Readiness<SurfaceLost>, SurfaceLost> {
+        self.steps.push("ready");
+        self.readied.push((number, handle.ticket()));
+        if self.ready_fails {
+            return Err(SurfaceLost);
+        }
+        if self.stale.is_empty() {
+            return Ok(game::Readiness::Ready);
+        }
+        self.screen = self.stale.remove(0);
+        for what in std::mem::take(&mut self.in_stale) {
+            self.happen(what);
+        }
+        Ok(game::Readiness::Stale(game::Stale {
+            screen: self.screen,
+            lost: SurfaceLost,
+        }))
     }
 
     fn commit_attempt(&mut self) -> Result<(), SurfaceLost> {
@@ -3509,6 +3610,7 @@ fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
         "before play",
         "audio",
         "attempt",
+        "ready",
         "commit",
         "end loading",
         "open",
@@ -3552,6 +3654,267 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     // Fresh per attempt: its own number, from the same chart.
     assert_eq!((one.number, two.number), (1, 2));
     assert_eq!(one.kind, two.kind);
+    // The retry's preparation is keyed with the refreshed preset, and the
+    // settings lent to the play again.
+    let [first, second] = &rig.begun[..] else {
+        panic!("{:?}", rig.begun);
+    };
+    let changed = first.changes(second);
+    assert!(changed.preset && changed.settings, "{changed:?}");
+    assert!(
+        !(changed.chart || changed.speed || changed.kind),
+        "{changed:?}"
+    );
+}
+
+/// A final readiness answering `Stale` because the screen's structural
+/// inputs changed after the staging (a device rebuilt) is never repaired
+/// in place: the preparation is begun again at once with the new key, and
+/// its readiness then opens the play, committed once (design.md "Play
+/// Lifecycle", preparing each attempt).
+#[test]
+fn a_stale_readiness_with_a_changed_screen_prepares_again_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    let rebuilt = game::ScreenKey {
+        device: 2,
+        target: [1_920, 1_080],
+        skin: 0,
+    };
+    rig.stale = vec![rebuilt];
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.opens, 1);
+    assert_eq!(
+        rig.steps,
+        [
+            "screen",
+            "before play",
+            "audio",
+            "attempt",
+            "ready",
+            "attempt",
+            "ready",
+            "commit",
+            "end loading",
+            "open",
+        ]
+    );
+    let [first, second] = &rig.begun[..] else {
+        panic!("{:?}", rig.begun);
+    };
+    // Begun again with the screen as it is now, nothing else changed.
+    assert_eq!(first.screen(), None);
+    assert_eq!(second.screen(), Some(rebuilt));
+    // The same attempt both times: its number, asked of each readiness.
+    assert_eq!(rig.readied, [(1, 1), (1, 2)]);
+    assert_eq!(rig.attempts.len(), 2);
+    assert!(rig.attempts.iter().all(|a| a.number == 1));
+}
+
+/// A final readiness answering `Stale` with nothing structural changed
+/// (the staging lost) ends the run with the screen's error and is never
+/// retried: one preparation, no commit, what it staged discarded.
+#[test]
+fn a_stale_readiness_with_an_unchanged_key_ends_the_run_untried() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.stale = vec![game::ScreenKey::default(), game::ScreenKey::default()];
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.begun.len(), 1, "{:?}", rig.steps);
+    assert_eq!(rig.readied.len(), 1);
+    assert_eq!(rig.opens, 0);
+    assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "ready", "discard"]),
+        "{:?}",
+        rig.steps
+    );
+}
+
+/// `n` screens, each structurally different from the one before: a
+/// final readiness answering `Stale` with each would begin the
+/// preparation again every time.
+fn changed_screens(n: u64) -> Vec<game::ScreenKey> {
+    (1..=n)
+        .map(|device| game::ScreenKey {
+            device,
+            target: [1_920, 1_080],
+            skin: 0,
+        })
+        .collect()
+}
+
+/// A screen that failed after the attempt was staged, seen at a `Stale`
+/// final readiness, ends the run before recording opens (design.md "Play
+/// Lifecycle", preparing each attempt): the preparation is not begun
+/// again, though beginning it would build the screen again and hide the
+/// failure; nothing is committed and the staging is discarded.
+#[test]
+fn a_screen_failed_after_staging_ends_the_run_at_a_stale_readiness() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.stale = changed_screens(1);
+    rig.in_stale = vec![FirstPoll::ScreenFails];
+    rig.prep_recovers = true;
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
+    assert_eq!(rig.begun.len(), 1, "{:?}", rig.steps);
+    assert_eq!(rig.opens, 0);
+    assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
+    assert!(
+        rig.steps.ends_with(&["attempt", "ready", "discard"]),
+        "{:?}",
+        rig.steps
+    );
+}
+
+/// A quit key, a close, a failure of the input thread or the audio
+/// output, or a screen failed after the staging, coming at a `Stale`
+/// final readiness ends the play at once, at the first `Stale`, whether
+/// the key changed (the readiness keeps answering `Stale` with genuine
+/// changes) or not (the staging lost): a thread's failure is the run's
+/// end with its cause, a failed screen the run's end as lost, a quit or a
+/// close leaves the play. The preparation is not begun again, nothing is
+/// committed, recording never opens.
+#[test]
+fn a_terminal_event_at_a_stale_readiness_ends_the_play_at_once() {
+    let cases = [
+        ("quit key", FirstPoll::Command(Command::Quit)),
+        ("close", FirstPoll::Close),
+        ("input", FirstPoll::InputFails),
+        ("audio", FirstPoll::AudioFails),
+        ("screen", FirstPoll::ScreenFails),
+    ];
+    for changed in [true, false] {
+        for (case, what) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut loaded = loaded(dir.path());
+            let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+            let mut rig = Fake::new(items, &[], 12_500_000);
+            rig.stale = if changed {
+                changed_screens(64)
+            } else {
+                vec![game::ScreenKey::default(); 2]
+            };
+            rig.in_stale = vec![what];
+            rig.prep_recovers = true;
+            let ran = game::live::run_chart(&mut loaded, &mut rig);
+            let case = format!("{case}, changed {changed}");
+            match &*case {
+                c if c.starts_with("input") => {
+                    assert!(matches!(ran, Err(LiveError::Input(_))), "{case}: {ran:?}");
+                }
+                c if c.starts_with("audio") => {
+                    assert!(matches!(ran, Err(LiveError::Output(_))), "{case}: {ran:?}");
+                }
+                c if c.starts_with("screen") => {
+                    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{case}: {ran:?}");
+                }
+                _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+            }
+            assert_eq!(rig.begun.len(), 1, "{case}: {:?}", rig.steps);
+            assert_eq!(rig.readied.len(), 1, "{case}");
+            assert_eq!(rig.opens, 0, "{case}");
+            assert!(!rig.steps.contains(&"commit"), "{case}: {:?}", rig.steps);
+            assert!(rig.steps.contains(&"discard"), "{case}: {:?}", rig.steps);
+        }
+    }
+}
+
+/// Terminal events coming together at a `Stale` final readiness end the
+/// play with the commit's precedence: the input thread's failure, then
+/// the audio output's, then a screen failed after the staging, then a
+/// quit or a close. Each case drops the event that won the one before.
+#[test]
+fn terminal_events_together_at_a_stale_readiness_keep_the_commits_precedence() {
+    let all = [
+        FirstPoll::InputFails,
+        FirstPoll::AudioFails,
+        FirstPoll::ScreenFails,
+        FirstPoll::Close,
+        FirstPoll::Command(Command::Quit),
+    ];
+    for (dropped, wins) in ["input", "audio", "screen", "quit"].into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let mut rig = Fake::new(items, &[], 12_500_000);
+        rig.stale = changed_screens(64);
+        rig.in_stale = all[dropped..].to_vec();
+        rig.prep_recovers = true;
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        match wins {
+            "input" => assert!(matches!(ran, Err(LiveError::Input(_))), "{wins}: {ran:?}"),
+            "audio" => assert!(matches!(ran, Err(LiveError::Output(_))), "{wins}: {ran:?}"),
+            "screen" => assert!(matches!(ran, Err(LiveError::ScreenLost)), "{wins}: {ran:?}"),
+            _ => assert!(ran.is_ok(), "{wins}: {ran:?}"),
+        }
+        assert_eq!(rig.begun.len(), 1, "{wins}: {:?}", rig.steps);
+        assert_eq!(rig.opens, 0, "{wins}");
+    }
+}
+
+/// A preparation polled while still pending is polled again until it
+/// ends, then readied once and committed once: the flow's slices, not
+/// one wait.
+#[test]
+fn a_pending_preparation_is_polled_until_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 12_500_000);
+    rig.pending_polls = 3;
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.prep_polls, 4);
+    assert_eq!((rig.begun.len(), rig.readied.len(), rig.opens), (1, 1, 1));
+    assert_eq!(
+        rig.steps.iter().filter(|&&s| s == "commit").count(),
+        1,
+        "{:?}",
+        rig.steps
+    );
+}
+
+/// A screen error while the preparation is polled, or at its final
+/// readiness, ends the run with it: nothing is committed and the staging
+/// is discarded.
+#[test]
+fn a_screen_error_while_preparing_or_readying_ends_the_run() {
+    for case in ["poll", "ready"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let mut rig = Fake::new(items, &[], 12_500_000);
+        if case == "poll" {
+            rig.poll_fails = true;
+        } else {
+            rig.ready_fails = true;
+        }
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        assert!(
+            matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+            "{case}: {ran:?}"
+        );
+        assert_eq!(rig.begun.len(), 1, "{case}");
+        assert_eq!(rig.readied.len(), usize::from(case == "ready"), "{case}");
+        assert_eq!(rig.opens, 0, "{case}");
+        assert!(!rig.steps.contains(&"commit"), "{case}: {:?}", rig.steps);
+        assert!(
+            rig.steps.last() == Some(&"discard"),
+            "{case}: {:?}",
+            rig.steps
+        );
+    }
 }
 
 /// A screen lost while a held START defers the opening ends the run as
@@ -3622,6 +3985,7 @@ fn a_hold_at_the_opening_defers_it_with_or_without_a_loading_lifetime() {
                 "before play",
                 "audio",
                 "attempt",
+                "ready",
                 "commit",
                 "end loading",
                 "deferred",
@@ -3834,7 +4198,7 @@ fn a_quit_pending_at_an_immediate_preparation_commits_nothing() {
     assert_eq!((rig.opens, rig.reports.len()), (0, 0));
     assert!(!rig.steps.contains(&"commit"), "{:?}", rig.steps);
     assert!(
-        rig.steps.ends_with(&["attempt", "discard"]),
+        rig.steps.ends_with(&["attempt", "ready", "discard"]),
         "{:?}",
         rig.steps
     );

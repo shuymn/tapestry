@@ -1908,7 +1908,7 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                             Drawn::Page(_) => None,
                         })
                         .collect();
-                    let b = p.render.shared.barrier().clone();
+                    let b = *p.render.shared.barrier();
                     assert!(
                         after >= before,
                         "timer 2 goes on ({fadeout} ms outro): {before} then {after}; {all:?}; at {at:?} now {:?} barrier {b:?}",

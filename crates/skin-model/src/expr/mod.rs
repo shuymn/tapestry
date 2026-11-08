@@ -147,7 +147,17 @@ impl SkinOps {
     /// pass [`MAX_SKIN_OPS`]. The error's span is empty: the program's
     /// source is the caller's.
     pub fn charge(&mut self, program: &Program) -> Result<(), CompileError> {
-        let total = self.0.saturating_add(program.op_count());
+        self.charge_ops(program.op_count())
+    }
+
+    /// Adds `n` operations a frame (the presentation program's cost), or
+    /// refuses them as [`charge`](Self::charge) does.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::TooManySkinOps`] past [`MAX_SKIN_OPS`].
+    pub fn charge_ops(&mut self, n: usize) -> Result<(), CompileError> {
+        let total = self.0.saturating_add(n);
         if total > MAX_SKIN_OPS {
             return Err(CompileError::new(
                 Span::default(),
