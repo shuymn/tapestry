@@ -820,6 +820,7 @@ fn rig<'a>(
         window: None,
         retry_from: None,
         state_clock: state_clock::StateClock::default(),
+        result_retries: play::ResultRetries::default(),
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,

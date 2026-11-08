@@ -204,6 +204,9 @@ pub struct PlayerRig<'a> {
     /// Where the play state was entered: each play frame's state clock
     /// runs from it.
     pub(crate) state_clock: crate::state_clock::StateClock,
+    /// The retries a result has taken since the play was prepared, by
+    /// receipt: only the one its flow acts on becomes the next play's.
+    pub(crate) result_retries: ResultRetries,
     /// Load times shown on the end screen.
     pub times: LoadTimes,
     /// When the current play's READY state started, on the clock.
@@ -1372,13 +1375,20 @@ impl Rig for PlayerRig<'_> {
 
     /// The retry and quit keys first (a suspend means nothing on a result),
     /// then, while a result shows, its own keys and controller events. A
-    /// controller's retry carries no receipt of its own: it is received
-    /// when taken here, and kept as the next play's retry as the retry
-    /// key's is.
+    /// retry taken here is only offered ([`ResultRetries`]): the result's
+    /// flow drops some (gated, queued behind the command it accepts, or
+    /// while its outro plays), and only the one it acts on becomes the
+    /// next play's. A controller's retry carries no receipt of its own: it
+    /// is received when taken here.
     fn take_menu(&mut self) -> Option<MenuCommand> {
         loop {
-            match self.take() {
-                Some(Command::Retry) => return Some(MenuCommand::Retry),
+            match self.controls.take() {
+                Some(Command::Retry) => {
+                    if let Some(at) = self.controls.retry_at() {
+                        self.result_retries.offer(at);
+                    }
+                    return Some(MenuCommand::Retry);
+                }
                 Some(Command::Quit) => return Some(MenuCommand::Back),
                 Some(Command::Suspend) => {}
                 None => break,
@@ -1386,7 +1396,7 @@ impl Rig for PlayerRig<'_> {
         }
         let c = self.result_input.take();
         if c == Some(MenuCommand::Retry) {
-            self.pending_retry = Some(self.clock.now());
+            self.result_retries.offer(self.clock.now());
         }
         c
     }
@@ -1395,6 +1405,11 @@ impl Rig for PlayerRig<'_> {
     /// waits for its thread (design D11, "Cancellation"); the run's end
     /// bounds the wait.
     fn withdraw_result(&mut self) {
+        // The first command taken withdraws the preparation, and those
+        // queued behind it are dropped: a retry's is the first offered.
+        if let Some(at) = self.result_retries.first.take() {
+            self.pending_retry = Some(at);
+        }
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: withdrawn");
@@ -1403,7 +1418,13 @@ impl Rig for PlayerRig<'_> {
     /// A leaving command the Result state acts on cancels a switch's
     /// layout job and waits for its thread before it is served (D11); the
     /// run's end bounds the wait.
-    fn accept_leaving(&mut self, _cmd: MenuCommand) {
+    fn accept_leaving(&mut self, cmd: MenuCommand) {
+        // The accepted command is the one just taken.
+        if cmd == MenuCommand::Retry
+            && let Some(at) = self.result_retries.last
+        {
+            self.pending_retry = Some(at);
+        }
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
@@ -1519,6 +1540,9 @@ impl Rig for PlayerRig<'_> {
         }
         self.leave_result();
         self.retry_from = self.pending_retry.take();
+        // What a result offered before this preparation is no later
+        // result's.
+        self.result_retries = ResultRetries::default();
         if let Some(at) = self.retry_from {
             self.state_clock.retry(at);
         }
@@ -2220,6 +2244,24 @@ impl Rig for PlayerRig<'_> {
         } else {
             self.end_shown = Some(std::time::Instant::now());
         }
+    }
+}
+
+/// The retries a result's flow took (`take_menu`), by receipt, since the
+/// play was prepared: the result's preparation is withdrawn by the first
+/// command taken, and the result accepts the command it has just taken,
+/// so the first and the latest are kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResultRetries {
+    first: Option<TimeUs>,
+    last: Option<TimeUs>,
+}
+
+impl ResultRetries {
+    /// A retry received at `at` taken.
+    fn offer(&mut self, at: TimeUs) {
+        self.first.get_or_insert(at);
+        self.last = Some(at);
     }
 }
 
