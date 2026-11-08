@@ -356,24 +356,33 @@ fn promotion_waits_for_a_foreground_permit() {
     };
     let task = coord.task::<Option<Class>>(Class::Speculative);
     let promoter = task.promoter();
-    thread::scope(|s| {
+    let asked = AtomicUsize::new(0);
+    let (returned, before) = thread::scope(|s| {
         let running = s.spawn(|| {
             task.run(NEVER, &on_promote, |ctx| {
                 promoter.promote();
+                asked.store(1, Ordering::SeqCst);
                 assert!(!ctx.checkpoint());
                 ctx.class()
             })
         });
-        until("the speculative permit's return", || {
-            coord.held(Class::Speculative) == 0
-        });
-        assert_eq!(promoted.load(Ordering::SeqCst), 0);
+        until("the promotion asked", || asked.load(Ordering::SeqCst) == 1);
+        // Not `until`: a failure must still let the job go.
+        let begun = Instant::now();
+        while coord.held(Class::Speculative) != 0 && begun.elapsed() < WATCHDOG {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let returned = coord.held(Class::Speculative) == 0;
+        let before = promoted.load(Ordering::SeqCst);
         drop(blocker);
         assert_eq!(
             running.join().unwrap(),
             Outcome::Done(Some(Class::Foreground))
         );
+        (returned, before)
     });
+    assert!(returned, "the speculative permit was kept while waiting");
+    assert_eq!(before, 0);
     assert_eq!(promoted.load(Ordering::SeqCst), 1);
 
     let task = coord.task::<Option<Class>>(Class::Speculative);
