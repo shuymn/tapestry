@@ -74,9 +74,8 @@ pub enum DecisionError {
 /// draws nothing.
 #[derive(Clone, Debug)]
 pub struct DecisionScreen {
-    /// Whether a decision skin made it.
-    pub(crate) live: bool,
-    /// The identity of the skin that made it.
+    /// The identity of the skin that made it: a state of another kind's
+    /// skin carries that skin's, which no decision skin accepts.
     pub(crate) skin: u64,
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
@@ -89,11 +88,10 @@ pub struct DecisionScreen {
 
 impl DecisionScreen {
     /// A fresh state with `whens` `when` timers and `text_slots` text
-    /// slots; `live` when a decision skin makes it.
-    pub(crate) fn new(skin: u64, live: bool, whens: usize, text_slots: usize) -> Self {
+    /// slots.
+    pub(crate) fn new(skin: u64, whens: usize, text_slots: usize) -> Self {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
-            live,
             skin,
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
@@ -103,10 +101,11 @@ impl DecisionScreen {
         }
     }
 
-    /// A state with no timer or text slot, which a skin of another kind
-    /// gives: nothing accepts it.
+    /// The state a skin of another kind gives: its built-in timers off,
+    /// no `when` timer and no text slot. No decision skin accepts it, since
+    /// it carries the other skin's identity.
     pub(crate) fn inert(skin: u64) -> Self {
-        Self::new(skin, false, 0, 0)
+        Self::new(skin, 0, 0)
     }
 
     /// The timer readings as of the last build; there is no field.

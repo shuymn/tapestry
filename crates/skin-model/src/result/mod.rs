@@ -80,7 +80,8 @@ pub enum ResultError {
     Kind,
 }
 
-/// The chart strings a result skin's text shows, as of the last view.
+/// The chart strings a result or decision skin's text shows, as of the
+/// last view or labels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Strings {
     title: String,

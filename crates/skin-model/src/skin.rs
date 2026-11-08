@@ -452,7 +452,7 @@ pub struct Skin {
     widget_quads: u32,
     bomb_up_to: Option<Grade>,
     close: Option<TimeUs>,
-    /// The screen the skin is made for: play, or selection.
+    /// The screen the skin is made for.
     kind: ScreenKind,
     song_list: Option<SongList>,
     ratio_bars: Box<[RatioBar]>,
@@ -463,8 +463,8 @@ pub struct Skin {
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
-    /// This skin's identity, which a selection state it makes carries: a
-    /// clone keeps it, another load takes the next.
+    /// This skin's identity, which a selection, result or decision state
+    /// it makes carries: a clone keeps it, another load takes the next.
     id: u64,
 }
 
@@ -3235,18 +3235,7 @@ impl Skin {
         res: &mut ResultScreen,
         table: TextTable,
     ) -> Result<(), TextTableError> {
-        if !self.owns_result(res) {
-            return Err(TextTableError::Foreign);
-        }
-        let expected = self.text_slots();
-        if table.len() != expected {
-            return Err(TextTableError::Len {
-                expected,
-                got: table.len(),
-            });
-        }
-        res.text = table;
-        Ok(())
+        self.attach_table(self.owns_result(res), &mut res.text, table)
     }
 
     /// Lays out `res`'s lines in bitmap fonts, chosen and cleaned as
@@ -3282,17 +3271,9 @@ impl Skin {
         uvs: &UvTable,
         out: &mut QuadBatch,
     ) -> Result<(), BuildError> {
-        if self.kind != ScreenKind::Result {
-            return Err(BuildError::Kind);
-        }
-        if !self.owns_result(res)
-            || uvs.sheet_id() != self.sheet_id
-            || uvs.frames().len() != self.frame_count
-        {
+        if !self.screen_draws(ScreenKind::Result, self.owns_result(res), uvs)? {
             return Ok(());
         }
-        let canvas = self.canvas(frame.target);
-        let placement = self.placement(&canvas, frame.layout, Side::Left);
         res.fill(frame.now, &frame.timers, &self.whens);
         let res = &*res;
         let rt = Runtime {
@@ -3301,15 +3282,8 @@ impl Skin {
             text: &res.text,
             bitmap: &res.bitmap,
         };
-        let scene = Scene {
-            now: frame.now,
-            display: frame.now,
-            lanes: LaneView::NONE,
-            complete: false,
-            hidden_enabled: false,
-            phase: Phase::Result { res },
-        };
-        self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
+        let at = (frame.now, frame.target, frame.layout);
+        self.draw_screen(&rt, Phase::Result { res }, at, uvs, out);
         Ok(())
     }
 
@@ -3321,13 +3295,12 @@ impl Skin {
         if self.kind != ScreenKind::Decision {
             return DecisionScreen::inert(self.id);
         }
-        DecisionScreen::new(self.id, true, self.whens.len(), self.text_slots())
+        DecisionScreen::new(self.id, self.whens.len(), self.text_slots())
     }
 
     /// Whether `dec` is a state this decision skin made.
     fn owns_decision(&self, dec: &DecisionScreen) -> bool {
         self.kind == ScreenKind::Decision
-            && dec.live
             && dec.skin == self.id
             && dec.slots() == usize::from(decision_timer::BUILTIN) + self.whens.len()
             && dec.text.len() == self.text_slots()
@@ -3384,18 +3357,7 @@ impl Skin {
         dec: &mut DecisionScreen,
         table: TextTable,
     ) -> Result<(), TextTableError> {
-        if !self.owns_decision(dec) {
-            return Err(TextTableError::Foreign);
-        }
-        let expected = self.text_slots();
-        if table.len() != expected {
-            return Err(TextTableError::Len {
-                expected,
-                got: table.len(),
-            });
-        }
-        dec.text = table;
-        Ok(())
+        self.attach_table(self.owns_decision(dec), &mut dec.text, table)
     }
 
     /// Lays out `dec`'s lines in bitmap fonts, chosen and cleaned as
@@ -3429,17 +3391,9 @@ impl Skin {
         uvs: &UvTable,
         out: &mut QuadBatch,
     ) -> Result<(), BuildError> {
-        if self.kind != ScreenKind::Decision {
-            return Err(BuildError::Kind);
-        }
-        if !self.owns_decision(dec)
-            || uvs.sheet_id() != self.sheet_id
-            || uvs.frames().len() != self.frame_count
-        {
+        if !self.screen_draws(ScreenKind::Decision, self.owns_decision(dec), uvs)? {
             return Ok(());
         }
-        let canvas = self.canvas(frame.target);
-        let placement = self.placement(&canvas, frame.layout, Side::Left);
         dec.fill(frame.now, &frame.timers, &self.whens);
         let dec = &*dec;
         let rt = Runtime {
@@ -3448,16 +3402,81 @@ impl Skin {
             text: &dec.text,
             bitmap: &dec.bitmap,
         };
+        let at = (frame.now, frame.target, frame.layout);
+        self.draw_screen(&rt, Phase::Decision, at, uvs, out);
+        Ok(())
+    }
+
+    /// Attaches `table` as a screen state's text, the state `owned` by
+    /// this skin.
+    ///
+    /// # Errors
+    ///
+    /// [`TextTableError::Foreign`] for a state this skin did not make,
+    /// then [`TextTableError::Len`] for a table whose length is not the
+    /// text slots; nothing changes.
+    fn attach_table(
+        &self,
+        owned: bool,
+        text: &mut TextTable,
+        table: TextTable,
+    ) -> Result<(), TextTableError> {
+        if !owned {
+            return Err(TextTableError::Foreign);
+        }
+        let expected = self.text_slots();
+        if table.len() != expected {
+            return Err(TextTableError::Len {
+                expected,
+                got: table.len(),
+            });
+        }
+        *text = table;
+        Ok(())
+    }
+
+    /// Whether a build of a `kind` screen's state draws: not for a state
+    /// this skin did not make (`owned`) or a uv table of another sheet or
+    /// length.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin of another kind.
+    fn screen_draws(
+        &self,
+        kind: ScreenKind,
+        owned: bool,
+        uvs: &UvTable,
+    ) -> Result<bool, BuildError> {
+        if self.kind != kind {
+            return Err(BuildError::Kind);
+        }
+        Ok(owned && uvs.sheet_id() == self.sheet_id && uvs.frames().len() == self.frame_count)
+    }
+
+    /// Draws a filled screen state's frame: `at` is the frame's time,
+    /// target size and layout; no lanes, the regions placed for the
+    /// left-hand scratch.
+    fn draw_screen(
+        &self,
+        rt: &Runtime<'_>,
+        phase: Phase<'_>,
+        at: (TimeUs, [u32; 2], &Layout),
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) {
+        let (now, target, layout) = at;
+        let canvas = self.canvas(target);
+        let placement = self.placement(&canvas, layout, Side::Left);
         let scene = Scene {
-            now: frame.now,
-            display: frame.now,
+            now,
+            display: now,
             lanes: LaneView::NONE,
             complete: false,
             hidden_enabled: false,
-            phase: Phase::Decision,
+            phase,
         };
-        self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
-        Ok(())
+        self.draw(rt, &scene, None, uvs, &canvas, &placement, out);
     }
 
     /// The elements of a build once its state is filled, the lanes drawing
