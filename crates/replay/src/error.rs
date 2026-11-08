@@ -15,6 +15,8 @@ pub enum Section {
     Devices,
     /// The held-input snapshot.
     Start,
+    /// The starting tuning.
+    Tuning,
     /// The physical input events.
     Events,
     /// Devices that arrived during play.

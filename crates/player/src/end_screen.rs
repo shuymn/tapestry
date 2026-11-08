@@ -1448,6 +1448,7 @@ pub(crate) mod tests {
     /// A record of an aborted play with no input, incomplete for `reasons`.
     fn record(preset: &rules::RulePreset, reasons: replay::Incomplete) -> replay::PlayRecord {
         replay::PlayRecord {
+            start_tuning: Some(replay::StartTuning::default()),
             versions: replay::Versions {
                 evaluator: rules::Implementation::STANDARD_VERSION,
                 app: "0.0.0-test".to_owned(),
