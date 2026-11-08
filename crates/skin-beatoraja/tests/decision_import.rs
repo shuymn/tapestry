@@ -390,6 +390,7 @@ fn a_decision_skin_declares_its_timing_clamped() {
 fn what_the_decision_does_not_show_is_noted() {
     let json = r#""value": [{"id": "ex", "src": "s", "x": 0, "y": 32, "w": 40, "h": 8, "divx": 10, "digit": 4, "ref": 71}],
         "judgegraph": [{"id": "jg", "type": 0}],
+        "judge": [{"id": "jd"}],
         "slider": [{"id": "sl", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "angle": 0, "range": 10, "type": 0}],
         "imageset": [{"id": "clr", "ref": 370, "images": ["b0", "b1"]},
                      {"id": "set", "images": ["b5", "b1"]},
@@ -404,10 +405,13 @@ fn what_the_decision_does_not_show_is_noted() {
             {"id": "bar", "timer": 2, "dst": [{"x": 0, "y": 160, "w": 8, "h": 8}]},
             {"id": "b0", "timer": 1, "dst": [{"x": 0, "y": 170, "w": 8, "h": 8}]},
             {"id": "b1", "timer": 0, "dst": [{"x": 0, "y": 180, "w": 8, "h": 8}]},
-            {"id": "lamp", "timer": 41, "dst": [{"x": 0, "y": 190, "w": 8, "h": 8}]}]"#;
+            {"id": "lamp", "timer": 41, "dst": [{"x": 0, "y": 190, "w": 8, "h": 8}]},
+            {"id": "dot", "timer": 2, "dst": [{"x": 0, "y": 200, "w": 8, "h": 8}]},
+            {"id": "jd", "dst": [{"x": 0, "y": 210, "w": 8, "h": 8}]}]"#;
     let lua = "skin.value = { { id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4, \
                  value = function() return ms.number(71) end } }\n\
                skin.judgegraph = { { id = \"jg\", type = 0 } }\n\
+               skin.judge = { { id = \"jd\" } }\n\
                skin.slider = { { id = \"sl\", src = \"s\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 10, type = 0 } }\n\
                skin.imageset = { { id = \"clr\", value = function() return ms.event_index(370) end, images = { \"b0\", \"b1\" } }, \
                  { id = \"set\", images = { \"b5\", \"b1\" } }, \
@@ -422,7 +426,10 @@ fn what_the_decision_does_not_show_is_noted() {
                  { id = \"bar\", timer = 2, dst = { { x = 0, y = 160, w = 8, h = 8 } } },\n\
                  { id = \"b0\", timer = 1, dst = { { x = 0, y = 170, w = 8, h = 8 } } },\n\
                  { id = \"b1\", timer = 0, dst = { { x = 0, y = 180, w = 8, h = 8 } } },\n\
-                 { id = \"lamp\", timer = 41, dst = { { x = 0, y = 190, w = 8, h = 8 } } } }";
+                 { id = \"lamp\", timer = 41, dst = { { x = 0, y = 190, w = 8, h = 8 } } },\n\
+                 { id = \"dot\", draw = function() return ms.timer(2) ~= ms.timer_off_value end, \
+                   dst = { { x = 0, y = 200, w = 8, h = 8 } } },\n\
+                 { id = \"jd\", dst = { { x = 0, y = 210, w = 8, h = 8 } } } }";
     let [(json_skin, json_report, _j), (lua_skin, lua_report, _l)] = both(json, lua);
     let dropped = |object| (Severity::Dropped, NoteKind::Unsupported { object });
     let n = notes(&json_report);
@@ -431,6 +438,8 @@ fn what_the_decision_does_not_show_is_noted() {
         dropped(Object::JudgeGraph),
         dropped(Object::Slider),
         (Severity::Ignored, NoteKind::Ignored { field: "act" }),
+        // Play's own objects are not looked up on the decision screen.
+        (Severity::Ignored, NoteKind::UndefinedObject),
     ] {
         assert!(n.contains(&want), "{want:?} in {n:?}");
     }
@@ -448,7 +457,10 @@ fn what_the_decision_does_not_show_is_noted() {
     let lab = ([36, 4], top(150, 8));
     let bar = ([44, 4], top(160, 8));
     assert_eq!(before, &vec![b5, lab]);
-    assert_eq!(after, &vec![b5, lab, bar]);
+    // The fade-out's timer, read by `timer` in JSON and by a callback's
+    // `main_state.timer(2)` in Lua.
+    let dot = ([52, 4], top(200, 8));
+    assert_eq!(after, &vec![b5, lab, bar, dot]);
     assert_eq!(frames[0], frames[1], "json and lua draw alike");
     // The image index 370 is noted by each path's own reader: JSON's `ref`
     // as the property, Lua's `event_index` read as its callback (the
