@@ -381,7 +381,7 @@ impl PlayerRig<'_> {
     /// its layout lands. A result lifetime begins with the result's first
     /// show. Nothing without a result skin; once the run disabled it, each
     /// view is still presented, as the built-in result with the reason.
-    fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
+    pub(crate) fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
         // The page exactly as the end screen is sent it, its settings
         // lines included: the render side's page base for the lifetime's
         // first frame, before that page arrives.
@@ -807,7 +807,7 @@ impl PlayerRig<'_> {
     /// The hi-speed the end screen shows: the adjustments' newest state,
     /// its green number at the attempt's reference tempo.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn speed_line(&self) -> end_screen::SpeedLine {
+    pub(crate) fn speed_line(&self) -> end_screen::SpeedLine {
         let Some(driver) = &self.adjust else {
             return end_screen::SpeedLine::default();
         };

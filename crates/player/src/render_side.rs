@@ -1595,7 +1595,7 @@ impl RenderLink {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left.min(CANCEL_POLL)) {
                 Ok(answer) => return Ok(answer?),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.ended()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if cancelled() {
@@ -1645,7 +1645,7 @@ impl RenderLink {
                 commits.withdrawn = commits.withdrawn.max(request);
                 Err(ScreenError::NoAnswer)
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.ended()),
         }
     }
 
@@ -1849,7 +1849,7 @@ impl RenderLink {
             Ok(LoadingEnd::Lost) => Err(ScreenError::Lost),
             Ok(LoadingEnd::Refused(e)) => Err(ScreenError::LoadingRefused(e)),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.ended()),
         }
     }
 
@@ -1859,13 +1859,20 @@ impl RenderLink {
         match rx.recv_timeout(self.answer_timeout) {
             Ok(ready) => Ok(ready?),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScreenError::Ended),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.ended()),
         }
     }
 
-    /// Whether a frame failed since the last preparation.
+    /// Whether a frame failed since the last preparation, or the render
+    /// thread ended.
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
+    }
+
+    /// A reply found disconnected: the render thread ended, which is the
+    /// screen's failure, latched before the reply's error is returned.
+    fn ended(&self) -> ScreenError {
+        ended(&self.shared)
     }
 
     /// The figures of the play that ended at `end`; `None` when the render
@@ -1959,7 +1966,7 @@ impl PendingLoad {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.0.recv_timeout(left.min(CANCEL_POLL)) {
                 Ok(ready) => return Ok(ready?),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ScreenError::Ended),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(link.ended()),
                 Err(mpsc::RecvTimeoutError::Timeout) if left.is_zero() => {
                     return Err(ScreenError::NoAnswer);
                 }
@@ -2006,7 +2013,7 @@ impl PendingSelect {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 self.settled = true;
-                Some(Err(ScreenError::Ended))
+                Some(Err(ended(&self.shared)))
             }
             Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= self.deadline => {
                 Some(if self.withdraw() {
@@ -2173,7 +2180,8 @@ pub fn spawn(
         .spawn(move || {
             // Dropped when the thread ends, however it ends.
             let _ended = ended_tx;
-            // A panic is the screen's failure, which the game sees.
+            // A panic is the screen's failure, which the game sees: this
+            // guard covers the startup build, `Run`'s own field the rest.
             let _unwinding = Unwinding(Arc::clone(&thread_shared));
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
@@ -2196,6 +2204,7 @@ pub fn spawn(
                 }
             };
             let mut r = Run {
+                _unwinding: Unwinding(Arc::clone(&thread_shared)),
                 screen: Some(screen),
                 started: Instant::now(),
                 make,
@@ -2415,6 +2424,15 @@ fn after_preparing(mode: Mode) -> Mode {
         } => loading,
         _ => Mode::Idle,
     }
+}
+
+/// The render thread ended with a reply outstanding: the screen's failure
+/// is latched in `shared` before [`ScreenError::Ended`] is returned, so
+/// a waiter that sees the reply gone sees the failure too, whatever the
+/// order the thread's teardown takes.
+fn ended(shared: &Shared) -> ScreenError {
+    shared.failed.store(true, Ordering::Release);
+    ScreenError::Ended
 }
 
 /// Marks the screen failed when the render thread unwinds from a panic,
@@ -2679,6 +2697,9 @@ struct Prepared {
 }
 
 struct Run {
+    /// The first field, so it drops first: an unwinding thread publishes
+    /// its failure before the screen's resources are destroyed.
+    _unwinding: Unwinding,
     screen: Option<Box<dyn Screen>>,
     /// When the render thread started: the launch screen's time runs from it.
     started: Instant,

@@ -81,6 +81,23 @@ struct Faults {
     release_then_fail: AtomicBool,
     /// The next built-in page drawn panics.
     panic_page: AtomicBool,
+    /// The next installation of the result kind panics.
+    panic_install: AtomicBool,
+    /// The next chart load (an attempt's preparation) releases the
+    /// result's installation, then fails as a lost device.
+    release_then_fail_load: AtomicBool,
+    /// The screen's drop holds while set; `dropping` says it reached it.
+    hold_drop: AtomicBool,
+    dropping: AtomicBool,
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        self.faults.dropping.store(true, Ordering::Release);
+        while self.faults.hold_drop.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// A WARP menu screen that records what each result frame drew.
@@ -100,6 +117,14 @@ impl Screen for Recorded {
         if self.faults.fail_load.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
+        if self
+            .faults
+            .release_then_fail_load
+            .swap(false, Ordering::AcqRel)
+        {
+            self.menu.remove(ScreenKind::Result);
+            return Err(render::RenderError::SurfaceLost);
+        }
         self.menu.load(chart, section)
     }
     fn device(&self) -> u64 {
@@ -117,6 +142,11 @@ impl Screen for Recorded {
         skin: &Arc<render::SkinBundle>,
         request: u64,
     ) -> Result<Preparation, render::RenderError> {
+        assert!(
+            !(kind == ScreenKind::Result
+                && self.faults.panic_install.swap(false, Ordering::AcqRel)),
+            "the render thread panics in the upload (a test's fault)"
+        );
         if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
             self.menu.remove(ScreenKind::Result);
             return Err(render::RenderError::SurfaceLost);
@@ -1140,6 +1170,103 @@ fn a_release_before_a_device_error_is_kept() {
     rig.link.exit();
 }
 
+/// An attempt's preparation that released the result's installation and
+/// then fails on the device leaves the kind with nothing to restore: the
+/// record is read from the screen before it is dropped.
+#[test]
+fn a_release_before_an_attempts_device_error_is_kept() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(Arc::clone(&skin)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    rig.faults
+        .release_then_fail_load
+        .store(true, Ordering::Release);
+    assert!(
+        rig.link
+            .prepare_attempt(super::attempt(&chart, None), || false)
+            .is_err()
+    );
+    assert_eq!(rig.link.result_status().installed, None);
+    rig.link.prepare().unwrap();
+    let status = rig.link.result_status();
+    assert_eq!(status.installed, None, "{status:?}");
+    assert_eq!(status.retained, [], "{status:?}");
+    rig.link.exit();
+}
+
+/// The page a new lifetime's first presentation carries is the end page
+/// exactly as it is sent, its settings lines included, through the real
+/// `present_view`: its first fallback frame, before that page arrives,
+/// draws every one of its rows.
+#[test]
+fn a_new_lifetimes_page_base_has_its_settings_lines() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let faults = Arc::clone(&rig.faults);
+    let drawn = Arc::clone(&rig.drawn);
+    let Rig { link, .. } = rig;
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    crate::tests::on_rig_with(settings, link, |p, _| {
+        p.result_skin = crate::result_skin::ResultSkin::new(Some(
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+        ));
+        let chart = ResultChart::default();
+        let _ = p.result_skin.image_stage(chart, None, || false, || false);
+        let report = crate::end_screen::tests::report(rules::tapestry());
+        let screen = crate::end_screen::tests::screen(dir.path(), &report);
+        let _ = p
+            .result_skin
+            .request(crate::result_skin::view_facts(&screen, chart));
+        p.result_chart = Some(chart);
+        let base = EndPage {
+            lines: (0..20).map(|i| format!("base {i}")).collect(),
+            graphs: None,
+        };
+        p.end_page = Some(base.clone());
+        faults.refuse_text.store(true, Ordering::Release);
+        p.present_view(&report, &screen);
+        let sent =
+            crate::end_screen::with_settings(&base, p.controls.tuning().get(), p.speed_line());
+        assert!(
+            sent.lines.len() > base.lines.len(),
+            "settings lines: {sent:?}"
+        );
+        assert!(wait_until(|| drawn
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| matches!(d, Drawn::Page(_)))));
+        let page = drawn
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|d| match d {
+                Drawn::Page(p) => Some(p.clone()),
+                Drawn::Skin(..) => None,
+            })
+            .unwrap();
+        for (i, want) in sent.lines.iter().enumerate() {
+            assert!(
+                page[i] == *want || page[i].starts_with("RESULT SKIN NOT SHOWN"),
+                "row {i}: {:?}, sent {want:?}",
+                page[i]
+            );
+        }
+    });
+}
+
 /// A result restore refused by a screen built again whose chart load then
 /// fails still disables the kind for the run: the next build, which has
 /// nothing of it left to restore, does not forget it.
@@ -1266,16 +1393,78 @@ fn a_new_lifetimes_first_fallback_has_no_earlier_row() {
 }
 
 /// A panic on the render thread is a screen failure the game sees: the
-/// link reports it failed.
+/// link reports it failed before the screen's resources are destroyed
+/// (its teardown held here), with no reply outstanding to latch it.
 #[test]
 fn a_render_thread_panic_is_a_failure() {
     let rig = Rig::new();
+    rig.faults.hold_drop.store(true, Ordering::Release);
     rig.faults.panic_page.store(true, Ordering::Release);
     rig.link.show_end(EndPage {
         lines: vec!["page".to_owned()],
         graphs: None,
     });
-    assert!(wait_until(|| rig.link.failed()));
+    assert!(wait_until(|| rig.faults.dropping.load(Ordering::Acquire)));
+    assert!(rig.link.failed(), "failed before the teardown");
+    rig.faults.hold_drop.store(false, Ordering::Release);
+}
+
+/// A panic on the render thread during the after-commit upload is a
+/// failure the game sees when the upload's wait returns, while the
+/// screen's teardown is still held: the screen counts as failed, so the
+/// preparation's last check stops before recording opens.
+#[test]
+fn a_panic_in_the_upload_fails_the_screen_before_its_teardown() {
+    use game::Rig as _;
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let faults = Arc::clone(&rig.faults);
+    let Rig { link, .. } = rig;
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    crate::tests::on_rig_with(settings, link, |p, _| {
+        p.result_skin = crate::result_skin::ResultSkin::new(Some(
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+        ));
+        let _ = p
+            .result_skin
+            .image_stage(ResultChart::default(), None, || false, || false);
+        faults.hold_drop.store(true, Ordering::Release);
+        faults.panic_install.store(true, Ordering::Release);
+        p.upload_result();
+        let failed = p.render.failed();
+        let preflight_stops = p.screen_failed();
+        assert!(failed, "the failure is seen when the wait returns");
+        assert!(preflight_stops, "recording does not open");
+        assert!(wait_until(|| faults.dropping.load(Ordering::Acquire)));
+        assert!(p.render.failed(), "with the teardown held");
+        faults.hold_drop.store(false, Ordering::Release);
+    });
+}
+
+/// A reply found disconnected latches the screen's failure before its
+/// error is returned, whatever the teardown's order.
+#[test]
+fn a_disconnected_reply_latches_the_failure() {
+    let rig = Rig::new();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    drop(tx);
+    let mut pending = crate::render_side::PendingSelect {
+        request: rig.link.next_request(),
+        rx,
+        deadline: Instant::now() + Duration::from_secs(10),
+        shared: Arc::clone(&rig.link.shared),
+        settled: false,
+    };
+    assert!(!rig.link.failed());
+    assert!(matches!(
+        pending.poll(Duration::from_millis(5)),
+        Some(Err(crate::render_side::ScreenError::Ended))
+    ));
+    assert!(rig.link.failed());
+    rig.link.exit();
 }
 
 /// The commit point and the build of a result frame allocate nothing
