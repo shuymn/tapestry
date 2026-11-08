@@ -18,6 +18,7 @@ use super::{
     RoundedDuration, SkinFrame,
 };
 use crate::expr::{Program, State, TIMER_OFF};
+use crate::present::Present;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::LaneView;
 
@@ -501,8 +502,9 @@ impl Play {
     }
 
     /// Fills this frame's fields and timers: effects through the reducer,
-    /// the snapshot into the fields, the built-in starts, then each `when`
-    /// timer from its condition over the built-in timers only.
+    /// the snapshot into the fields, the built-in starts, each `when`
+    /// timer from its condition over the built-in timers only, then the
+    /// presentation program's outputs ([`Present::run`]).
     ///
     /// A poisoned play ([`Play::check`]), a snapshot with more counted
     /// empty POORs than POORs, or invalid readouts ([`Play::readouts`]),
@@ -513,6 +515,7 @@ impl Play {
         &mut self,
         frame: &SkinFrame<'_>,
         whens: &[Program],
+        present: Option<&Present>,
     ) -> Result<(), BuildError> {
         self.check()?;
         let Some(judged) = judged_targets(frame.tally, self.empty_poor_counted) else {
@@ -539,6 +542,17 @@ impl Play {
             whens,
             |_| true,
         );
+        // The presentation program, last: its callbacks read this frame's
+        // fields and timers and write only its outputs.
+        if let Some(p) = present
+            && let Some((fields, outs)) = self.fields.split_at_mut_checked(field::COUNT)
+        {
+            let state = State {
+                fields,
+                timers: &self.ms,
+            };
+            p.run(&state, outs);
+        }
         Ok(())
     }
 

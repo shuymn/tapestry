@@ -86,6 +86,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "present"
+path = "fuzz_targets/present.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "skin_png"
 path = "fuzz_targets/skin_png.rs"
 test = false

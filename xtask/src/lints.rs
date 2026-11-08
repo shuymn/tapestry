@@ -370,6 +370,8 @@ pub const IN_PLAY: &[Site] = &[
     // A skin's per-frame expressions and quad batch.
     Site::File("crates/skin-model/src/expr/arith.rs"),
     Site::File("crates/skin-model/src/expr/program.rs"),
+    Site::File("crates/skin-model/src/present/exec.rs"),
+    Site::File("crates/skin-model/src/present/num.rs"),
     Site::File("crates/skin-model/src/quad.rs"),
     // A skin's per-frame build: the reducer, the timers and the tracks.
     Site::File("crates/skin-model/src/skin.rs"),

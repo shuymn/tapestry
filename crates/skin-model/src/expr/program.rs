@@ -9,6 +9,7 @@
 
 use super::arith::{floor_div, floor_mod};
 use super::{MAX_ELAPSED_MS, MAX_STACK, TIMER_OFF};
+use crate::output::OutTy;
 use crate::schema::Ty;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,14 @@ pub(crate) enum Op {
         slot: u16,
         lo: i32,
         hi: i32,
+    },
+    /// Reads presentation output `slot`, resolved by name to the program's
+    /// output of type `ty` (its `ok` flag with `ok`): a boolean clamped
+    /// into `[0, 1]`, an integer as it is; a missing slot reads 0.
+    Output {
+        slot: u16,
+        ty: OutTy,
+        ok: bool,
     },
     /// Timer `slot`'s elapsed ms, clamped into `[-1, MAX_ELAPSED_MS]`;
     /// negative or missing reads as off (-1).
@@ -139,8 +148,15 @@ impl Program {
     /// every operation, so both arms of a conditional that survived
     /// folding are read.
     pub(crate) fn fields(&self) -> impl Iterator<Item = u16> + '_ {
+        self.loads().map(|(slot, _)| slot)
+    }
+
+    /// The slot reads: each field read's slot with `None`, each output
+    /// read's with its resolved type and whether it is the `ok` flag.
+    pub(crate) fn loads(&self) -> impl Iterator<Item = (u16, Option<(OutTy, bool)>)> + '_ {
         self.ops.iter().filter_map(|op| match *op {
-            Op::Load { slot, .. } => Some(slot),
+            Op::Load { slot, .. } => Some((slot, None)),
+            Op::Output { slot, ty, ok } => Some((slot, Some((ty, ok)))),
             _ => None,
         })
     }
@@ -167,6 +183,14 @@ impl Program {
                 Op::Load { slot, lo, hi } => {
                     let v = state.fields.get(usize::from(slot)).copied();
                     st.push(v.map_or(lo, |v| v.max(lo).min(hi)));
+                }
+                Op::Output { slot, ty, ok } => {
+                    let v = state.fields.get(usize::from(slot)).copied().unwrap_or(0);
+                    st.push(if ok || ty == OutTy::Bool {
+                        v.clamp(0, 1)
+                    } else {
+                        v
+                    });
                 }
                 Op::Elapsed(t) => st.push(timer(state, t)),
                 Op::On(t) => st.push(i32::from(timer(state, t) >= 0)),

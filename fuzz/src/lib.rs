@@ -2523,6 +2523,7 @@ fn check_callbacks(i: &LuaImported) {
     for d in &i.callbacks {
         match d {
             Disposition::Lowered
+            | Disposition::Compiled
             | Disposition::ClassifiedOnly
             | Disposition::Inert
             | Disposition::Captured => {}
@@ -3218,3 +3219,266 @@ pub fn canary(data: &[u8]) {
 
 #[cfg(test)]
 mod smoke;
+
+/// The reads a fuzzed program may name: an integer, a boolean, and an
+/// integer guarded; with `bad`, also an enumeration and an output, which
+/// the verifier refuses.
+fn present_reads(bad: bool) -> Vec<skin_model::present::ReadDef> {
+    use skin_model::present::{OutTy, ReadDef};
+    use skin_model::{PLAY, Scope, Ty, compile};
+    let p = |src: &str, ty, outs: &[OutTy]| {
+        compile(src, &Scope::new(&PLAY).outputs(outs), ty).expect("a fixed read compiles")
+    };
+    let kind = match PLAY.field("gauge.kind").map(|(_, f)| f.ty) {
+        Some(skin_model::FieldTy::Enum(e)) => Ty::Enum(e),
+        _ => Ty::Int,
+    };
+    let mut reads = vec![
+        ReadDef {
+            value: p("combo", Ty::Int, &[]),
+            guard: None,
+        },
+        ReadDef {
+            value: p("combo > 3", Ty::Bool, &[]),
+            guard: None,
+        },
+        ReadDef {
+            value: p("combo * 7", Ty::Int, &[]),
+            guard: Some(p("combo > 5", Ty::Bool, &[])),
+        },
+    ];
+    if bad {
+        reads.extend([
+            ReadDef {
+                value: p("gauge.kind", kind, &[]),
+                guard: None,
+            },
+            ReadDef {
+                value: p("lua.0.ok", Ty::Bool, &[OutTy::Bool]),
+                guard: None,
+            },
+        ]);
+    }
+    reads
+}
+
+/// A presentation program decoded from `data`: one byte of callback
+/// count (its high bit adding the reads the verifier refuses), then per callback seven bytes (its start, its length, its
+/// registers, its conversion and its signature, its gate, its `after`),
+/// then four-byte instructions to the end; the constants are a fixed table
+/// of integers, floats, nil and booleans, the reads [`present_reads`].
+#[must_use]
+pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
+    use skin_model::present::{
+        Arith, CallbackDef, Cmp, Conv, Insn, MathFn, OutTy, PresentDef, Val,
+    };
+    let consts = vec![
+        Val::Nil,
+        Val::Bool(true),
+        Val::Bool(false),
+        Val::Int(0),
+        Val::Int(3),
+        Val::Int(-7),
+        Val::Int(i64::MAX),
+        Val::Int(i64::MIN),
+        Val::Int(i64::from(i32::MAX)),
+        Val::Float(0.5),
+        Val::Float(-0.0),
+        Val::Float(f64::NAN),
+        Val::Float(f64::INFINITY),
+        Val::Float(4_294_967_296.0),
+    ];
+    let (n, rest) = data.split_first().map_or((0, data), |(&n, r)| (n % 8, r));
+    let (head, body) = rest.split_at((usize::from(n) * 7).min(rest.len()));
+    let mut def = PresentDef {
+        consts,
+        reads: present_reads(data.first().is_some_and(|b| b & 0x80 != 0)),
+        ..PresentDef::default()
+    };
+    for &[start, len, regs, conv, sig, gate, after] in head.as_chunks::<7>().0 {
+        let conv = if conv % 2 == 0 {
+            Conv::Truthy
+        } else {
+            Conv::Int
+        };
+        def.callbacks.push(CallbackDef {
+            start: u32::from(start),
+            len: u16::from(len),
+            regs,
+            conv,
+            gate: (gate < 8).then_some(u16::from(gate)),
+            after: (after < 8).then_some(u16::from(after)),
+        });
+        // A signature that may not match its conversion.
+        let ty = match (sig % 5 == 0, conv) {
+            (false, Conv::Truthy) | (true, Conv::Int) => OutTy::Bool,
+            _ => OutTy::Int,
+        };
+        def.signature.push(ty);
+    }
+    let arith = [
+        Arith::Add,
+        Arith::Sub,
+        Arith::Mul,
+        Arith::Div,
+        Arith::IDiv,
+        Arith::Mod,
+    ];
+    let cmp = [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le];
+    let math = [MathFn::Floor, MathFn::Ceil, MathFn::Abs];
+    for &[op, a, b, c] in body.as_chunks::<4>().0 {
+        def.code.push(match op % 12 {
+            0 => Insn::Const {
+                dst: a,
+                k: u16::from(b),
+            },
+            1 => Insn::Read {
+                dst: a,
+                read: u16::from(b),
+            },
+            2 => Insn::Move { dst: a, src: b },
+            3 => Insn::Arith {
+                op: arith[usize::from(c) % 6],
+                dst: a,
+                a: b,
+                b: c / 6,
+            },
+            4 => Insn::Neg { dst: a, a: b },
+            5 => Insn::Cmp {
+                op: cmp[usize::from(c) % 4],
+                dst: a,
+                a: b,
+                b: c / 4,
+            },
+            6 => Insn::Not { dst: a, a: b },
+            7 => Insn::Math {
+                f: math[usize::from(c) % 3],
+                dst: a,
+                a: b,
+            },
+            8 => Insn::Extreme {
+                max: c % 2 == 0,
+                dst: a,
+                a: b,
+                b: c / 2,
+            },
+            9 => Insn::Jump { to: u16::from(a) },
+            10 => Insn::Test {
+                cond: a,
+                when: b % 2 == 0,
+                to: u16::from(c),
+            },
+            _ => Insn::Ret { src: a },
+        });
+    }
+    def
+}
+
+/// A play skin with the program `data` decodes ([`present_def`]), each
+/// output drawn by nothing: `Skin::new` verifies it, never panicking; an
+/// accepted one, its per-frame cost within the skin's operation total,
+/// builds frames over a moving combo, each output's flag 0 or 1. Its
+/// callback count when accepted.
+#[must_use]
+pub fn present(data: &[u8]) -> Option<usize> {
+    use bms_model::{ChartBuilder, TimeUs};
+    use eval::{GaugeState, Tally};
+    use rules::GaugeValue;
+    use skin_model::{
+        Anchor, Attempt, Fit, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Region,
+        RegionDef, Side, Skin, SkinDef, SkinFrame, Variant, field,
+    };
+    let def = present_def(data);
+    let n = def.callbacks.len();
+    let skin = Skin::new(SkinDef {
+        fit: Fit::Adapt,
+        regions: [RegionDef {
+            anchor: Anchor::TopLeft,
+            optional: false,
+        }; Region::COUNT],
+        whens: Vec::new(),
+        sheet: skin_model::Sheet::empty(),
+        lanes: None,
+        elements: Vec::new(),
+        widgets: skin_model::WidgetDefs::default(),
+        bomb_up_to: None,
+        close: None,
+        present: Some(def),
+    })
+    .ok()?;
+    assert!(
+        skin.ops().total() <= skin_model::MAX_SKIN_OPS,
+        "past the frame cost"
+    );
+    let limits = skin_model::AtlasLimits {
+        max_side: 256,
+        max_layers: 2,
+        reserved_layers: 1,
+    };
+    let uvs = skin
+        .atlas(Variant::Lo, limits, &|| false)
+        .expect("an empty sheet builds its atlas")
+        .into_parts()
+        .1;
+    let chart = ChartBuilder::new(150_000).build().expect("an empty chart");
+    let gauges = [GaugeDesc {
+        start: GaugeValue(20 * GaugeValue::PERCENT),
+        max: GaugeValue::FULL,
+        look: GaugeLook::Normal,
+        border: GaugeValue(80 * GaugeValue::PERCENT),
+    }];
+    let ctx = PlayContext {
+        autoplay: false,
+        gauges: &gauges,
+        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(0),
+        bpm_range: None,
+        bpm_whole_change: None,
+        play_level: None,
+        meta: skin_model::ChartMetadata::UNKNOWN,
+    };
+    let mut play = skin.prepare(&chart, &ctx).expect("the skin prepares");
+    let states = [GaugeState {
+        value: gauges[0].start,
+        reference: gauges[0].start,
+        failed_at: None,
+    }];
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    for combo in [0_u32, 4, 9] {
+        let tally = Tally {
+            combo,
+            max_combo: combo,
+            ..Default::default()
+        };
+        let frame = SkinFrame {
+            now: TimeUs(i64::from(combo) * 16_000),
+            display_offset: TimeUs(0),
+            tally: &tally,
+            gauges: &states,
+            gauge: 0,
+            effects: &[],
+            notes: &eval::NoteFacts::default(),
+            input: &eval::InputFacts::NONE,
+            complete: false,
+            target: [1_920, 1_080],
+            layout: &Layout::AUTHOR,
+            lanes: LANES_OFF,
+            readouts: readouts_for(LANES_OFF),
+            playing: true,
+            closing: None,
+        };
+        batch.clear();
+        skin.build(&mut play, &frame, &uvs, &mut batch)
+            .expect("the frame builds");
+        let f = play.state().fields;
+        assert_eq!(f.len(), field::COUNT + 2 * n, "the outputs prepared");
+        for k in 0..n {
+            assert!(matches!(f[field::COUNT + 2 * k + 1], 0 | 1), "an ok flag");
+        }
+    }
+    Some(n)
+}
