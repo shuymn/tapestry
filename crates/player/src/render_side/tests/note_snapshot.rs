@@ -316,6 +316,7 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
     )
     .unwrap();
     link.send(RenderMsg::Play {
+        state_origin: TimeUs(0),
         side,
         gauge: 0,
         measure: play_measure(clock.now()),
@@ -444,6 +445,7 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
     let ready = link.prepare_attempt(super::attempt(&chart, None), || false);
     assert_eq!(ready.unwrap(), Preparation::Ready);
     link.send(RenderMsg::Play {
+        state_origin: TimeUs(0),
         side,
         gauge: 0,
         measure: play_measure(clock.now()),
