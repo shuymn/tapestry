@@ -33,9 +33,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: ./.github/actions/setup-mise
         with:
-          version: 2026.11.3
           install: false
           cache: false
 

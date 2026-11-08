@@ -1051,9 +1051,9 @@ pub struct Started {
     /// The installed selection skin's song list: its center slot and its
     /// placements, which the select screen's view is made for.
     pub selection: Option<(usize, usize)>,
-    /// The result kind's skin, kept on the CPU: nothing draws a result
-    /// skin until S10-09i, so it is never selected, pended or installed
-    /// on the render thread (design D13, "Publication").
+    /// The result kind's skin: a fixed one installed at startup, or one
+    /// laid out per attempt and view, its prepared atlas uploaded after
+    /// each attempt's commit (the S10-09i design's D2).
     pub result: Option<crate::result_skin::ResultStart>,
 }
 
@@ -1158,11 +1158,21 @@ pub fn startup(
                 started.result = Some(crate::result_skin::ResultStart::Pending(result));
                 Shown::Pending(note.fact)
             }
-            // A result skin with no fact pending: kept for every chart, on
-            // the CPU only.
-            Ran::Done(KindOutcome::Bundle(bundle, _)) if kind == ScreenKind::Result => {
-                started.result = Some(crate::result_skin::ResultStart::Fixed(bundle));
-                Shown::Installed
+            // A result skin with no fact pending: installed as the result
+            // kind's, for every chart (the S10-09i design's D2). Refused, it
+            // is tried again after each attempt's commit.
+            Ran::Done(KindOutcome::Bundle(bundle, summary)) if kind == ScreenKind::Result => {
+                started.result = Some(crate::result_skin::ResultStart::Fixed(Arc::clone(&bundle)));
+                let (texels, side) = (bundle.atlas_texels(), bundle.side());
+                match answered(kind, render.select(kind, Some(bundle)), &mut stop)? {
+                    None => {
+                        committed = committed.saturating_add(texels);
+                        let atlas = Atlas { texels, side };
+                        log_installed(kind, &summary, atlas, committed, log::logger());
+                        Shown::Installed
+                    }
+                    Some(why) => Shown::Refused(why),
+                }
             }
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());

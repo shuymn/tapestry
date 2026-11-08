@@ -40,6 +40,12 @@
 //! which a number does not draw, and an unavailable one has its validity
 //! field false.
 //!
+//! A decision skin ([`Skin::new_decision`]) draws images, constant image
+//! choices and the chosen chart's text through the [`DECISION`] schema,
+//! which has timers and no field: its [`DecisionScreen`] takes the chart's
+//! [`ResultLabels`] ([`Skin::update_decision`]) and is built per frame
+//! ([`Skin::build_decision`]).
+//!
 //! A [`Skin`] holds elements in draw order, each an image, a number, a
 //! gauge, a judgment display, a line of text or the lanes widget on a
 //! keyframe [`Track`] on a timer, placed in one of seven [`Region`]s, and
@@ -84,6 +90,7 @@
 
 mod atlas;
 mod canvas;
+mod decision;
 mod expr;
 mod image;
 mod layout;
@@ -112,6 +119,8 @@ pub use atlas::{
     downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
+pub use decision::schema::{DECISION, timer as decision_timer};
+pub use decision::{DecisionError, DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming};
 #[cfg(feature = "dev-tools")]
 pub use expr::evaluations;
 pub use expr::{

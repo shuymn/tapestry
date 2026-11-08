@@ -522,13 +522,15 @@ impl Selection {
 
     /// Runs the scripted steps due on the select screen. A step that types
     /// puts its input on the window's queue, as the window does, and the
-    /// steps stop there until the queue is taken: `true` then. A scenario's
+    /// steps stop there until the queue is taken: `true` then. `drawn` is
+    /// how many select screen frames were presented so far. A scenario's
     /// captures are armed from `captures`.
     #[cfg(feature = "dev-tools")]
     fn script(
         &mut self,
         controls: &Controls,
         wakes: u64,
+        drawn: u64,
         captures: Option<&crate::dev::scenario::Captures>,
     ) -> bool {
         let listed = |screen: &SelectScreen, name: &str| {
@@ -760,9 +762,18 @@ impl Selection {
                     controls.close();
                     return false;
                 }
+                Some(SelectStep::Drawn) => {
+                    let from = *script.drawn_from.get_or_insert(drawn);
+                    if drawn <= from {
+                        if script.expired() {
+                            script.fail("the select screen was not drawn".to_owned());
+                            controls.close();
+                        }
+                        return false;
+                    }
+                }
                 Some(
-                    step @ (SelectStep::Drawn
-                    | SelectStep::Back
+                    step @ (SelectStep::Back
                     | SelectStep::Retry
                     | SelectStep::Next
                     | SelectStep::Prev),
@@ -861,6 +872,15 @@ pub fn script_result(
         }
         script.done();
         script.announce();
+    }
+    // A command acts on the result once it is drawn: a skin's view
+    // committed, or its built-in page, each frame of it (the S10-09i
+    // design's D1). A result that never draws still gets its command.
+    if matches!(
+        script.front(),
+        Some(SelectStep::Back | SelectStep::Retry | SelectStep::Next | SelectStep::Prev)
+    ) {
+        let _ = render.wait_end_drawn(crate::dev::STEP_TIMEOUT);
     }
     match script.front() {
         Some(SelectStep::Back) => {
@@ -1387,6 +1407,7 @@ impl PlayerRig<'_> {
             && sel.script(
                 self.controls,
                 self.input.wakes(),
+                self.render.selection_drawn(),
                 self.scenario.as_ref().map(|s| &s.captures),
             )
         {
@@ -2140,6 +2161,7 @@ impl AppRig for PlayerRig<'_> {
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
+        self.leave_result();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2189,6 +2211,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.leave_result();
         self.enter_scene();
         self.render.leave_selection();
         recover(
@@ -4086,7 +4109,7 @@ pub(crate) mod tests {
                 begun.elapsed() < Duration::from_secs(600),
                 "the steps never ended"
             );
-            if sel.script(&controls, 0, None) {
+            if sel.script(&controls, 0, 0, None) {
                 // Each batch typed is at most half the queue's keys.
                 let mut batch = Vec::new();
                 while let Some(input) = sel.menu.pop() {
@@ -4210,10 +4233,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut sel, gate) = gated(dir.path(), "pick=c.bms");
         let controls = crate::controls::Controls::new(input::QpcClock::start());
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         // The step's timeout passes while the pass runs, listing nothing.
         sel.script.as_mut().unwrap().age(crate::dev::STEP_TIMEOUT);
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         assert_eq!(sel.script.as_ref().unwrap().failure(), None);
         // The pass goes on and lists the chart: the step picks it.
         open_gate(&gate);
@@ -4226,7 +4249,7 @@ pub(crate) mod tests {
             if sel.shelf.poll(Instant::now()) {
                 sel.refresh();
             }
-            if sel.script(&controls, 0, None) {
+            if sel.script(&controls, 0, 0, None) {
                 assert!(sel.drain(&mut Pad::default()).is_none());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -4234,6 +4257,39 @@ pub(crate) mod tests {
         assert_eq!(sel.script.as_ref().unwrap().failure(), None);
         let chosen = sel.screen.selected().unwrap().path.clone();
         assert_eq!(chosen.file_name().unwrap(), "c.bms");
+    }
+
+    /// `drawn` on the select screen holds the steps after it until a
+    /// select frame is presented after it began, however many were
+    /// before, and fails once the step's timeout passes without one.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn drawn_on_the_select_screen_waits_for_a_presented_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, gate) = gated(dir.path(), "drawn,close");
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        assert!(!sel.script(&controls, 0, 5, None));
+        assert!(!sel.script(&controls, 0, 5, None));
+        assert_eq!(
+            sel.script.as_ref().unwrap().front(),
+            Some(&crate::dev::SelectStep::Drawn)
+        );
+        assert!(!sel.script(&controls, 0, 6, None));
+        assert_eq!(sel.script.as_ref().unwrap().front(), None);
+        assert_eq!(sel.script.as_ref().unwrap().failure(), None);
+
+        open_gate(&gate);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, gate) = gated(dir.path(), "drawn,close");
+        assert!(!sel.script(&controls, 0, 5, None));
+        sel.script.as_mut().unwrap().age(crate::dev::STEP_TIMEOUT);
+        assert!(!sel.script(&controls, 0, 5, None));
+        assert_eq!(
+            sel.script.as_ref().unwrap().failure(),
+            Some("the select screen was not drawn")
+        );
+        open_gate(&gate);
     }
 
     /// A pass that never ends fails the pick once the watchdog has run out,
@@ -4244,9 +4300,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut sel, gate) = gated(dir.path(), "pick=c.bms");
         let controls = crate::controls::Controls::new(input::QpcClock::start());
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         sel.script.as_mut().unwrap().age(crate::dev::STEP_WATCHDOG);
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         let failure = sel.script.as_ref().unwrap().failure().unwrap().to_owned();
         assert!(failure.contains("scan passes included"), "{failure}");
         open_gate(&gate);
@@ -4271,10 +4327,10 @@ pub(crate) mod tests {
         }
         sel.script = Some(crate::dev::SelectScript::parse("pick=z.bms").unwrap());
         let controls = crate::controls::Controls::new(input::QpcClock::start());
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         assert_eq!(sel.script.as_ref().unwrap().failure(), None);
         sel.script.as_mut().unwrap().age(crate::dev::STEP_TIMEOUT);
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         let failure = sel.script.as_ref().unwrap().failure().unwrap().to_owned();
         assert!(failure.contains("waited 20 s"), "{failure}");
     }
@@ -4309,12 +4365,12 @@ pub(crate) mod tests {
                 o,
             )]));
             sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
-            assert!(!sel.script(&controls, 0, None));
+            assert!(!sel.script(&controls, 0, 0, None));
             let script = sel.script.as_mut().unwrap();
             assert_eq!(script.failure(), None);
             assert!(script.front().is_some());
             script.age(STEP_WATCHDOG);
-            assert!(!sel.script(&controls, 0, None));
+            assert!(!sel.script(&controls, 0, 0, None));
             let failure = sel.script.as_ref().unwrap().failure().unwrap();
             assert!(failure.contains(what), "{failure}");
         }
@@ -4341,10 +4397,10 @@ pub(crate) mod tests {
             o,
         )]));
         sel.script.as_mut().unwrap().age(STEP_TIMEOUT);
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         assert!(sel.script.as_ref().unwrap().front().is_some());
         std::fs::write(&go, "").unwrap();
-        sel.script(&controls, 0, None);
+        sel.script(&controls, 0, 0, None);
         let script = sel.script.as_ref().unwrap();
         assert_eq!((script.front(), script.failure()), (None, None));
         sel.script = Some(SelectScript::compiled(vec![(
@@ -4352,7 +4408,7 @@ pub(crate) mod tests {
             o,
         )]));
         sel.script.as_mut().unwrap().age(STEP_WATCHDOG);
-        assert!(!sel.script(&controls, 0, None));
+        assert!(!sel.script(&controls, 0, 0, None));
         let failure = sel.script.as_ref().unwrap().failure().unwrap();
         assert!(failure.contains("never appeared"), "{failure}");
     }

@@ -46,6 +46,7 @@ mod presentmon;
 mod recording;
 mod render_side;
 mod result_input;
+mod result_present;
 mod result_skin;
 mod result_view;
 mod select;
@@ -861,6 +862,12 @@ fn rig<'a>(
         panels: None,
         result_skin: crate::result_skin::ResultSkin::default(),
         result_chart: None,
+        presenter: crate::result_present::Presenter::default(),
+        result_labels: None,
+        result_withdrawn: false,
+        result_facts: None,
+        result_offset: None,
+        result_leaving: false,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
