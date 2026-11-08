@@ -96,10 +96,12 @@ fn floor_div(a: i128, b: i128) -> i128 {
     }
 }
 
-/// Every node of `res` checked, operands before the nodes that use them:
+/// Every node of `res` checked, operands before the nodes that use them,
+/// before either backend is chosen (a lowered expression too runs every
+/// reached operation in the source):
 /// its integer part's bounds, each arithmetic result's within ±2^53 and
 /// each integer `//`'s divisor proven nonzero.
-fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) -> R<Vec<Iv>> {
+pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) -> R<Vec<Iv>> {
     let n = res.len();
     let mut ivs: Vec<Iv> = Vec::with_capacity(n as usize);
     for r in 0..n {
@@ -132,11 +134,21 @@ fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) -> R<Vec<Iv>>
                             )));
                         }
                         Bin::IDiv => exact(corners(&floor_div))?,
-                        // `%`: smaller than the divisor in magnitude; NaN,
-                        // a float, for a zero divisor.
+                        // `%`, the source's `a - b * floor(a / b)` in
+                        // doubles: exact, so smaller than the divisor in
+                        // magnitude (NaN, a float, for a zero divisor),
+                        // while |a| + |b| < 2^53: `a / b` then rounds to no
+                        // integer it is not, and `b * floor(a / b)` and the
+                        // difference are exact. Past that it rounds, and
+                        // its integer is of no known bound.
                         _ => {
+                            let a_max = al.abs().max(ah.abs());
                             let m = bl.abs().max(bh.abs());
-                            (m > 0).then_some((1 - m, m - 1))
+                            if a_max + m < i128::from(EXACT) {
+                                (m > 0).then_some((1 - m, m - 1))
+                            } else {
+                                FULL
+                            }
                         }
                     }
                 }

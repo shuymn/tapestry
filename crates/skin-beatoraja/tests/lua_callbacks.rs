@@ -781,6 +781,22 @@ fn the_program_refuses_what_it_cannot_prove() {
             "function() local n = ms.number(110) return n * n * 1.0 end",
             Disposition::Compiled,
         ),
+        // Discarded, the result an integer or a folded truthiness: the
+        // expression backend would take it, but the product is reached.
+        (
+            "function() local n = ms.number(110) local unused = n * n * n * n return 1 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) local u = n * n * n * n return u ~= nil end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        // The source's `%` rounds once its dividend nears 2^53: its
+        // remainder is then of no known bound, so the product is refused.
+        (
+            "function() return ((ms.number(110) - 9007199254740991) % 5) * 2251799813685247 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
         (
             "function() return math.floor(ms.number(110) / 3) end",
             Disposition::Replaced(Unsupported::Range),
@@ -891,4 +907,24 @@ fn a_second_program_draw_follows_its_role() {
             Disposition::Replaced(Unsupported::Construct("a draw after a program draw"))
         ]
     );
+}
+
+/// The source's `%` of small integers is exact and below its divisor, so a
+/// product of it compiles and shows the source's value.
+#[test]
+fn a_small_modulo_composes() {
+    let d = folder(&value_skin(
+        "function() return (ms.number(110) % 5) * 1000 end",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 8);
+    for n in 0..7 {
+        p.tally.counts.perfect = n;
+        p.frame(1_000 + i64::from(n) * 16, &[]);
+        let f = p.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        let want = i32::try_from(n % 5 * 1000).unwrap();
+        assert_eq!([at(0), at(1)], [want, 1], "{n}");
+    }
 }

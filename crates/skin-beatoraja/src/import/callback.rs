@@ -1427,6 +1427,9 @@ impl Cx<'_> {
         let program = self.kind == ScreenKind::Play && matches!(conv, Conv::Truthy | Conv::Int);
         let r = residual::evaluate(adm, inst, conv, &cancelled).and_then(|res: Residual| {
             l.attach(&res)?;
+            // Every reached operation is checked whichever backend takes
+            // the callback, discarded ones included.
+            compile::intervals(an, &l, &res)?;
             match l.emit_root(&res, conv) {
                 Ok(src) => Ok(Ok(src)),
                 Err(Stop::Unsupported(_)) if program => {

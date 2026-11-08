@@ -3,6 +3,7 @@
 //!
 //! - Every operation the source's interpreter has (`+ - * / %`, the
 //!   comparisons, unary minus, `math.floor`, `ceil`, `abs`, `max`, `min`)
+//!   and the consumer's `toint()` of a number's value
 //!   is checked against `luaj_numerics.txt`, the source's results over a
 //!   grid of integers and floats (zeros of both signs, infinities, NaN,
 //!   values near 2^31 and 2^53), generated from the source's pinned
@@ -113,6 +114,7 @@ fn every_operation_matches_the_source_interpreter() {
                     "floor" => math(MathFn::Floor, a),
                     "ceil" => math(MathFn::Ceil, a),
                     "abs" => math(MathFn::Abs, a),
+                    "toint" => Ok(Val::Int(i64::from(to_int(a)))),
                     other => panic!("{other}"),
                 }
             }
