@@ -870,6 +870,7 @@ fn rig<'a>(
         result_facts: None,
         result_offset: None,
         result_leaving: false,
+        result_outro: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
