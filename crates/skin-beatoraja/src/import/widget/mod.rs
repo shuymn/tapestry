@@ -62,17 +62,6 @@ pub(super) struct SrcImage {
     pub(super) timing: [u32; 2],
 }
 
-impl Cx<'_> {
-    /// Notes D22 once for the destination at `at`: a source cut that runs
-    /// past its file's edge, its in-file part stretched to the frame.
-    fn overrun_note(&mut self, at: Span) {
-        if self.overrun_at.insert(at) {
-            let d22 = NoteKind::Deviation(super::DeviationId::D22);
-            self.note(Some(at), super::Severity::Deviation, d22);
-        }
-    }
-}
-
 impl SrcImage {
     /// The `source` id its `src` names.
     pub(super) fn src_name(&self) -> Option<&str> {
@@ -226,10 +215,6 @@ impl Cx<'_> {
         let key = (rec, linear, grid, false, s.timing);
         if let Some((def, cell)) = self.assets.base(key) {
             let rect = def.rect.unwrap_or_default();
-            // Each destination drawing a cut past its file's edge is noted.
-            if self.overruns.contains(&key) {
-                self.overrun_note(at);
-            }
             let Some(crop) = self.frame_crop(c, rect, cell, grid, crop)? else {
                 return Ok(None);
             };
@@ -256,9 +241,6 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        if self.cut_overran {
-            self.overruns.insert(key);
-        }
         let def = ImageDef {
             file,
             rect: Some(rect),
@@ -311,7 +293,6 @@ impl Cx<'_> {
         grid: [u32; 2],
         holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
-        self.cut_overran = false;
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
             Ok(Err(Unplaced {
@@ -387,19 +368,13 @@ impl Cx<'_> {
         };
         let [dx, dy] = s.div;
         let cell = [w / dx, h / dy];
-        let (Some(([x, w], ox)), Some(([y, h], oy))) = (
+        let (Some([x, w]), Some([y, h])) = (
             cut_axis(x, cell[0], grid[0], fw),
             cut_axis(y, cell[1], grid[1], fh),
         ) else {
             return refused(NoteKind::SourceRect);
         };
-        let rect = [x, y, w, h];
-        // Its caller records the overrun with the image's cache key.
-        self.cut_overran = ox || oy;
-        if self.cut_overran {
-            self.overrun_note(at);
-        }
-        Ok(Ok((file, rect, cell)))
+        Ok(Ok((file, [x, y, w, h], cell)))
     }
 
     /// Adds `def` cut to `crop` under `key`: a failure refuses a critical
@@ -676,31 +651,32 @@ impl Cx<'_> {
 }
 
 /// One axis of a source cut: `grid` frames of `cell` texels from `at` in
-/// a file `extent` texels long, as its model rect's offset and length, and
-/// whether it overruns the file's edge. The source cuts it unchecked from
-/// a texture clamped to its edge (`JsonSkinObjectLoader.java:601-621`,
-/// libGDX 1.9.9 `GLTexture` defaults): a single frame lying wholly at or
-/// past the far edge samples that edge's last texel line, which is cut in
-/// its place; a single frame partly past it repeats the edge's texels over
-/// the overrun, which the model cannot sample, so its in-file part is cut
-/// and stretched to the frame (D22). `None` for any other cut leaving the
-/// file (several frames on the axis), and for one whose frame coordinates
-/// leave the source's `int` sums, where its coordinates wrap and it draws
-/// no edge line.
-fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<([u32; 2], bool)> {
+/// a file `extent` texels long, as its model rect's offset and length. The
+/// source cuts it unchecked from a texture clamped to its edge
+/// (`JsonSkinObjectLoader.java:601-621`, libGDX 1.9.9 `GLTexture`
+/// defaults), so its texels past the far edge repeat that edge's last
+/// texel line:
+/// - a cut starting inside the file and running past it keeps its whole
+///   length, and the sheet pads each cell from the edge
+///   ([`skin_model::ImageDef::rect`]), whatever its frames;
+/// - a single frame lying wholly at or past the edge samples only that
+///   line, which is cut in its place, one texel long, rather than padded
+///   to its length.
+///
+/// `None` for several frames starting at or past the edge, and for a cut
+/// whose frame coordinates leave the source's `int` sums, where its
+/// coordinates wrap and it draws no edge line.
+fn cut_axis(at: u32, cell: u32, grid: u32, extent: u32) -> Option<[u32; 2]> {
     let len = cell.checked_mul(grid)?;
     let end = at.checked_add(len)?;
     i32::try_from(end).ok()?;
-    if end <= extent {
-        return Some(([at, len], false));
+    if end <= extent || at < extent {
+        return Some([at, len]);
     }
     if cell == 0 || extent == 0 || grid != 1 {
         return None;
     }
-    if at >= extent {
-        return Some(([extent - 1, 1], false));
-    }
-    Some(([at, extent - at], true))
+    Some([extent - 1, 1])
 }
 
 /// The rect of `grid` frames of `cell` that model rect `rect` stands

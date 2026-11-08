@@ -60,6 +60,7 @@ fn played_with(chart: &str, seed: u64) -> PlayRecord {
     };
     let chart = load_bms(chart.as_bytes(), dir.path(), &opts).unwrap().chart;
     PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: rules::Implementation::STANDARD_VERSION,
             app: "test".to_owned(),
