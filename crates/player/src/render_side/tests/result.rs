@@ -317,6 +317,7 @@ impl Screen for Recorded {
 /// A render thread on recorded WARP screens.
 pub(crate) struct Rig {
     link: RenderLink,
+    clock: QpcClock,
     gate: Arc<Gate>,
     faults: Arc<Faults>,
     drawn: Arc<Mutex<Vec<Drawn>>>,
@@ -356,6 +357,7 @@ impl Rig {
         .unwrap();
         Self {
             link,
+            clock,
             gate,
             faults,
             drawn,
@@ -1683,4 +1685,89 @@ pub(crate) fn presented_on(
     );
     rig.until(|d| skin_frame(d).is_some_and(|(q, _)| !skin_quads(q).is_empty()))
         && rig.link.result_status().installed == Some(atlas)
+}
+
+/// C5b through the real `PlayerRig`: a leaving command's outro begun
+/// (`begin_outro`), then its `accept_leaving`, whose settle of the result
+/// skin holds: meanwhile every frame keeps the pinned view, and the
+/// fade-out (timer 2) rises.
+#[test]
+fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
+    use game::Rig as _;
+    let (_dir, skin) = lua_skin(
+        "",
+        "{ id = \"dot\", timer = 2, dst = { { time = 0, x = 100, y = 600, w = 8, h = 8, a = 0 }, \
+         { time = 2000, x = 100, y = 600, w = 8, h = 8, a = 255 } } },",
+    );
+    let rig = Rig::new();
+    let clock = rig.clock;
+    let drawn = Arc::clone(&rig.drawn);
+    let Rig { link, .. } = rig;
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fading = |q: &Quad| q.rect[0] == 100.0;
+    let last_skin = || {
+        drawn.lock().unwrap().iter().rev().find_map(|d| match d {
+            Drawn::Skin(q, _) => Some(q.clone()),
+            Drawn::Page(_) => None,
+        })
+    };
+    crate::tests::on_rig_hooked(settings, link, clock, |p, _, _| {
+        p.result_skin = crate::result_skin::ResultSkin::new(Some(
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+        ));
+        let chart = ResultChart::default();
+        let _ = p.result_skin.image_stage(chart, None, || false, || false);
+        let report = crate::end_screen::tests::report(rules::tapestry());
+        let screen = crate::end_screen::tests::screen(dir.path(), &report);
+        let _ = p
+            .result_skin
+            .request(crate::result_skin::view_facts(&screen, chart));
+        p.result_chart = Some(chart);
+        p.end_page = Some(EndPage {
+            lines: vec!["base".to_owned()],
+            graphs: None,
+        });
+        p.present_view(&report, &screen);
+        assert!(wait_until(|| last_skin().is_some()), "the skin draws");
+        let view: Vec<Quad> = last_skin().unwrap();
+        assert!(!view.iter().any(fading), "no fade before the outro");
+        assert!(p.result_timing().is_some(), "the skin's timing applies");
+        crate::dev::hold_result_settles(true);
+        let at = p.now();
+        p.begin_outro(at);
+        let frames = std::thread::scope(|s| {
+            let watch = s.spawn(|| {
+                assert!(wait_until(crate::dev::result_settle_holding));
+                drawn.lock().unwrap().clear();
+                std::thread::sleep(Duration::from_millis(600));
+                let frames = drawn.lock().unwrap().clone();
+                crate::dev::hold_result_settles(false);
+                frames
+            });
+            p.accept_leaving(game::MenuCommand::Back);
+            watch.join().unwrap()
+        });
+        assert!(
+            frames.len() >= 3,
+            "frames drew during the hold: {}",
+            frames.len()
+        );
+        let mut alphas = Vec::new();
+        for d in &frames {
+            let Drawn::Skin(q, _) = d else {
+                panic!("the skin draws during the hold: {d:?}");
+            };
+            let rest: Vec<Quad> = q.iter().filter(|q| !fading(q)).copied().collect();
+            assert_eq!(rest, view, "the pinned view's quads");
+            let fade = q.iter().find(|q| fading(q)).expect("the fade draws");
+            alphas.push(fade.color[3]);
+        }
+        assert!(alphas.windows(2).all(|w| w[0] <= w[1]), "{alphas:?}");
+        assert!(alphas.last() > alphas.first(), "the fade rises: {alphas:?}");
+        assert_eq!(p.render.result_status().pinned, Some(1));
+    });
 }

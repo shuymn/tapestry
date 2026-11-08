@@ -1451,10 +1451,6 @@ impl RenderLink {
     /// point only the overlay merges. Taken under the lock the commit
     /// point holds, so the view returned is the one presented at that
     /// instant.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
     pub fn pin_result(&self, at: TimeUs) -> Option<ViewKey> {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let mut b = self.shared.barrier();
@@ -2185,6 +2181,8 @@ pub fn spawn(
             let _unwinding = Unwinding(Arc::clone(&thread_shared));
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
+            #[cfg(feature = "dev-tools")]
+            crate::dev::read_result_faults();
             let screen = match build(
                 &mut make,
                 &mut Committed::default(),
@@ -3544,6 +3542,18 @@ impl Run {
                         &self.shared,
                         self.clock.now(),
                     );
+                    // A frame under the barrier refused (dev-tools: the
+                    // fallback during an outro).
+                    #[cfg(feature = "dev-tools")]
+                    let built = match built {
+                        ResultDrawn::Built
+                            if self.shared.barrier().pinned.is_some()
+                                && crate::dev::refuse_pinned_frame() =>
+                        {
+                            ResultDrawn::Refused(skin_model::BuildError::Kind)
+                        }
+                        other => other,
+                    };
                     // A view committed: what the kind keeps to restore
                     // follows it now, whatever the submission does.
                     if let Some(side) = &mut self.result

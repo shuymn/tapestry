@@ -415,10 +415,6 @@ pub trait Publish {
     fn show(&mut self, p: ResultPresentation);
     /// Sets the barrier of the current lifetime with the fade-out's start
     /// `at`: the view presented then.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
     fn pin(&mut self, at: TimeUs) -> Option<ViewKey>;
 }
 
@@ -582,10 +578,6 @@ impl Presenter {
     /// Sets the barrier at `now` (D4): timer 2 starts, the view presented
     /// then is pinned (returned), and from here no view payload is
     /// published; the overlay with the fade-out follows.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
     pub fn pin(&mut self, to: &mut impl Publish, now: TimeUs) -> Option<ViewKey> {
         self.lifetime?;
         self.overlay.fadeout = Some(now);
@@ -593,6 +585,23 @@ impl Presenter {
         self.pinned = true;
         self.publish(to);
         pinned
+    }
+
+    /// The result skin's timing as the result shows now, the render
+    /// thread's status `s` read (the S10-09i design's D6, D7): the payload
+    /// published last's skin's, or `None` outside a lifetime, for a built-in
+    /// payload, once the run disabled the kind, or while the render thread
+    /// draws this lifetime's view built-in.
+    pub fn timing(&self, s: &ResultReport) -> Option<skin_model::ResultTiming> {
+        let lifetime = self.lifetime?;
+        if self.disabled.is_some()
+            || s.disabled.is_some()
+            || (s.lifetime == lifetime && matches!(s.shown, Some((_, false))))
+        {
+            return None;
+        }
+        let payload = self.payload.as_ref().filter(|p| p.why.is_none())?;
+        payload.skin.as_ref().map(|b| b.skin().result_timing())
     }
 
     /// Publishes the payload published last with the overlay as it is,

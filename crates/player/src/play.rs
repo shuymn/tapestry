@@ -298,8 +298,10 @@ pub struct PlayerRig<'a> {
     /// offset keys changed it in this lifetime (O6).
     pub result_offset: Option<(i64, bool)>,
     /// A leaving command was accepted on the result: the next screen's
-    /// preparation leaves its lifetime.
+    /// preparation leaves its lifetime, and no view's layout is asked for.
     pub result_leaving: bool,
+    /// When the result's outro began, while its lifetime is current.
+    pub result_outro: Option<TimeUs>,
 }
 
 impl PlayerRig<'_> {
@@ -445,10 +447,18 @@ impl PlayerRig<'_> {
         if self.presenter.current() {
             crate::dev::print_result_work("left");
         }
+        #[cfg(feature = "dev-tools")]
+        if let Some(at) = self.result_outro {
+            println!(
+                "dev: result left {} us after its outro began",
+                self.clock.now().0 - at.0
+            );
+        }
         self.presenter.end(&mut self.render);
         self.result_facts = None;
         self.result_offset = None;
         self.result_leaving = false;
+        self.result_outro = None;
     }
 
     /// The attempt's result is uploaded after its commit and before
@@ -1159,6 +1169,28 @@ impl Rig for PlayerRig<'_> {
         println!("dev: result skin settled: accepted");
     }
 
+    /// The shown result skin's timing (the S10-09i design's D6): `None`
+    /// on any built-in result, so a command pending is served at once.
+    fn result_timing(&self) -> Option<game::ResultTiming> {
+        let t = self.presenter.timing(&self.render.result_status())?;
+        Some(game::ResultTiming {
+            outro: t.outro,
+            input: t.input,
+            scene: t.scene,
+        })
+    }
+
+    /// The barrier is set at `at` (D4): the view presented then stays,
+    /// and timer 2 starts, before the command settles the result skin.
+    fn begin_outro(&mut self, at: TimeUs) {
+        let pinned = self.presenter.pin(&mut self.render, at);
+        self.result_outro = Some(at);
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result outro began, view {pinned:?} pinned");
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = pinned;
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn quitting(&self) -> bool {
         #[cfg(feature = "dev-tools")]
@@ -1808,7 +1840,10 @@ impl Rig for PlayerRig<'_> {
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
         // until it lands (design D11). The attempt's fallback requests none.
+        // Once a leaving command is accepted the view is pinned, and the
+        // result skin was settled: no layout is asked for (D4).
         if let Some(chart) = self.result_chart
+            && !self.result_leaving
             && !self.result_skin_suppressed()
         {
             self.result_skin
