@@ -88,6 +88,7 @@ mod image;
 mod layout;
 #[cfg(feature = "dev-tools")]
 mod observation;
+pub mod output;
 mod pixmap;
 mod place;
 mod play;

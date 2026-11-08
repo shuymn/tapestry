@@ -455,6 +455,10 @@ pub struct Skin {
     timing_graphs: Box<[TimingGraph]>,
     /// The slider elements that take a press.
     sliders: usize,
+    /// The callbacks whose outputs a selection or result state carries
+    /// after its fields ([`crate::output`]): the screen's runtime writes
+    /// them (docs/stage3.md S7-07).
+    outputs: usize,
     /// This skin's identity, which a selection state it makes carries: a
     /// clone keeps it, another load takes the next.
     id: u64,
@@ -2049,6 +2053,7 @@ impl Skin {
             gauge_graphs,
             timing_graphs,
             sliders,
+            outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
         })
     }
@@ -2777,6 +2782,22 @@ impl Skin {
         self.song_list.as_ref().map_or(0, |l| l.center)
     }
 
+    /// This skin with `n` callback outputs after a selection or result
+    /// state's fields ([`crate::output`]): the importer's count of the
+    /// callbacks the screen's runtime runs, whose `lua.<k>` names its
+    /// expressions read.
+    #[must_use]
+    pub fn with_outputs(mut self, n: usize) -> Self {
+        self.outputs = n;
+        self
+    }
+
+    /// The callback outputs a selection or result state carries.
+    #[must_use]
+    pub fn outputs(&self) -> usize {
+        self.outputs
+    }
+
     /// A fresh selection state ([`Selection`]): every timer off, every
     /// field 0, every row and text slot empty until a view and a text
     /// table. One a play skin makes is inert: it draws nothing.
@@ -2792,6 +2813,7 @@ impl Skin {
             self.text_slots(),
             self.song_list_slots(),
             self.sliders,
+            self.outputs,
         )
     }
 
@@ -3106,7 +3128,13 @@ impl Skin {
         if self.kind != ScreenKind::Result {
             return ResultScreen::inert(self.id);
         }
-        ResultScreen::new(self.id, true, self.whens.len(), self.text_slots())
+        ResultScreen::new(
+            self.id,
+            true,
+            self.whens.len(),
+            self.text_slots(),
+            self.outputs,
+        )
     }
 
     /// Whether `res` is a state this result skin made.
