@@ -1987,7 +1987,8 @@ fn a_built_in_view_is_pinned_over_a_prepared_skin() {
     assert_eq!(rig.link.pin_result(TimeUs(5)), (None, None));
     rig.clear();
     show(&rig.link, lifetime, 1, &b, &Overlay::default());
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(wait_until(|| !rig.drawn().is_empty()), "a frame drew");
+    std::thread::sleep(Duration::from_millis(100));
     assert!(
         rig.drawn().iter().all(|d| skin_frame(d).is_none()),
         "nothing of the skin draws"
