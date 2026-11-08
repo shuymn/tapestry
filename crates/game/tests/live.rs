@@ -202,8 +202,9 @@ struct Fake {
     /// The final readinesses that answer `Stale`, in order, each with the
     /// screen's inputs it then has; then ready.
     stale: Vec<game::ScreenKey>,
-    /// What happens at the first final readiness answering `Stale`.
-    in_stale: Option<FirstPoll>,
+    /// What happens at the first final readiness answering `Stale`, all
+    /// at once.
+    in_stale: Vec<FirstPoll>,
     /// A preparation begun builds a failed screen again, as the render
     /// thread's recovery does when asked to prepare an attempt.
     prep_recovers: bool,
@@ -416,7 +417,7 @@ impl Fake {
             readied: Vec::new(),
             screen: game::ScreenKey::default(),
             stale: Vec::new(),
-            in_stale: None,
+            in_stale: Vec::new(),
             prep_recovers: false,
             pending_polls: 0,
             pending_left: 0,
@@ -635,7 +636,7 @@ impl Rig for Fake {
             return Ok(game::Readiness::Ready);
         }
         self.screen = self.stale.remove(0);
-        if let Some(what) = self.in_stale.take() {
+        for what in std::mem::take(&mut self.in_stale) {
             self.happen(what);
         }
         Ok(game::Readiness::Stale(game::Stale {
@@ -3703,7 +3704,7 @@ fn a_screen_failed_after_staging_ends_the_run_at_a_stale_readiness() {
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     let mut rig = Fake::new(items, &[], 12_500_000);
     rig.stale = changed_screens(1);
-    rig.in_stale = Some(FirstPoll::ScreenFails);
+    rig.in_stale = vec![FirstPoll::ScreenFails];
     rig.prep_recovers = true;
     let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
@@ -3717,12 +3718,14 @@ fn a_screen_failed_after_staging_ends_the_run_at_a_stale_readiness() {
     );
 }
 
-/// A quit key, a close, or a failure of the input thread or the audio
-/// output that comes while the final readiness keeps answering `Stale`
-/// with genuine changes ends the play at once, at the first `Stale`, with
-/// the commit's precedence (a thread's failure is the run's end with its
-/// cause; a quit or a close leaves the play): the preparation is not
-/// begun again, nothing is committed, recording never opens.
+/// A quit key, a close, a failure of the input thread or the audio
+/// output, or a screen failed after the staging, coming at a `Stale`
+/// final readiness ends the play at once, at the first `Stale`, whether
+/// the key changed (the readiness keeps answering `Stale` with genuine
+/// changes) or not (the staging lost): a thread's failure is the run's
+/// end with its cause, a failed screen the run's end as lost, a quit or a
+/// close leaves the play. The preparation is not begun again, nothing is
+/// committed, recording never opens.
 #[test]
 fn a_terminal_event_at_a_stale_readiness_ends_the_play_at_once() {
     let cases = [
@@ -3730,25 +3733,74 @@ fn a_terminal_event_at_a_stale_readiness_ends_the_play_at_once() {
         ("close", FirstPoll::Close),
         ("input", FirstPoll::InputFails),
         ("audio", FirstPoll::AudioFails),
+        ("screen", FirstPoll::ScreenFails),
     ];
-    for (case, what) in cases {
+    for changed in [true, false] {
+        for (case, what) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut loaded = loaded(dir.path());
+            let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+            let mut rig = Fake::new(items, &[], 12_500_000);
+            rig.stale = if changed {
+                changed_screens(64)
+            } else {
+                vec![game::ScreenKey::default(); 2]
+            };
+            rig.in_stale = vec![what];
+            rig.prep_recovers = true;
+            let ran = game::live::run_chart(&mut loaded, &mut rig);
+            let case = format!("{case}, changed {changed}");
+            match &*case {
+                c if c.starts_with("input") => {
+                    assert!(matches!(ran, Err(LiveError::Input(_))), "{case}: {ran:?}");
+                }
+                c if c.starts_with("audio") => {
+                    assert!(matches!(ran, Err(LiveError::Output(_))), "{case}: {ran:?}");
+                }
+                c if c.starts_with("screen") => {
+                    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{case}: {ran:?}");
+                }
+                _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+            }
+            assert_eq!(rig.begun.len(), 1, "{case}: {:?}", rig.steps);
+            assert_eq!(rig.readied.len(), 1, "{case}");
+            assert_eq!(rig.opens, 0, "{case}");
+            assert!(!rig.steps.contains(&"commit"), "{case}: {:?}", rig.steps);
+            assert!(rig.steps.contains(&"discard"), "{case}: {:?}", rig.steps);
+        }
+    }
+}
+
+/// Terminal events coming together at a `Stale` final readiness end the
+/// play with the commit's precedence: the input thread's failure, then
+/// the audio output's, then a screen failed after the staging, then a
+/// quit or a close. Each case drops the event that won the one before.
+#[test]
+fn terminal_events_together_at_a_stale_readiness_keep_the_commits_precedence() {
+    let all = [
+        FirstPoll::InputFails,
+        FirstPoll::AudioFails,
+        FirstPoll::ScreenFails,
+        FirstPoll::Close,
+        FirstPoll::Command(Command::Quit),
+    ];
+    for (dropped, wins) in ["input", "audio", "screen", "quit"].into_iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();
         let mut loaded = loaded(dir.path());
         let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
         let mut rig = Fake::new(items, &[], 12_500_000);
         rig.stale = changed_screens(64);
-        rig.in_stale = Some(what);
+        rig.in_stale = all[dropped..].to_vec();
+        rig.prep_recovers = true;
         let ran = game::live::run_chart(&mut loaded, &mut rig);
-        match case {
-            "input" => assert!(matches!(ran, Err(LiveError::Input(_))), "{case}: {ran:?}"),
-            "audio" => assert!(matches!(ran, Err(LiveError::Output(_))), "{case}: {ran:?}"),
-            _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+        match wins {
+            "input" => assert!(matches!(ran, Err(LiveError::Input(_))), "{wins}: {ran:?}"),
+            "audio" => assert!(matches!(ran, Err(LiveError::Output(_))), "{wins}: {ran:?}"),
+            "screen" => assert!(matches!(ran, Err(LiveError::ScreenLost)), "{wins}: {ran:?}"),
+            _ => assert!(ran.is_ok(), "{wins}: {ran:?}"),
         }
-        assert_eq!(rig.begun.len(), 1, "{case}: {:?}", rig.steps);
-        assert_eq!(rig.readied.len(), 1, "{case}");
-        assert_eq!(rig.opens, 0, "{case}");
-        assert!(!rig.steps.contains(&"commit"), "{case}: {:?}", rig.steps);
-        assert!(rig.steps.contains(&"discard"), "{case}: {:?}", rig.steps);
+        assert_eq!(rig.begun.len(), 1, "{wins}: {:?}", rig.steps);
+        assert_eq!(rig.opens, 0, "{wins}");
     }
 }
 
