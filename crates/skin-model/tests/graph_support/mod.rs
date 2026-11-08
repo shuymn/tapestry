@@ -161,6 +161,7 @@ pub fn load_with(
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        present: None,
     };
     Skin::new_result(def, widgets)
 }

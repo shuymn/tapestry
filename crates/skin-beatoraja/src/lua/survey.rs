@@ -82,6 +82,10 @@ pub struct Survey {
     /// What the import made of each destination ([`ledger`]), only when
     /// asked for developer-local detail.
     pub destinations: Vec<DestinationEntry>,
+    /// An imported skin's verified per-frame cost: the operations its
+    /// expressions and presentation program run, of
+    /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
+    pub frame_ops: Option<(usize, usize)>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed.
     pub frames: Option<Frames>,
@@ -424,6 +428,7 @@ fn disposition(d: &Disposition) -> String {
         Disposition::Captured => "captured".into(),
         Disposition::ClassifiedOnly => "classified only".into(),
         Disposition::Lowered => "lowered".into(),
+        Disposition::Compiled => "compiled".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
         Disposition::Runtime => "runtime".into(),
         Disposition::Refused => "refused".into(),
@@ -684,6 +689,10 @@ fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> Ru
 /// for a `kind` result skin with [`Choice::result`], its frames.
 fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, choice: &Choice) {
     s.outcome = "imported".into();
+    s.frame_ops = Some((
+        imported.skin.ops().total(),
+        imported.skin.program_callbacks(),
+    ));
     for n in &imported.report.notes {
         *s.notes.entry(note(&n.kind)).or_default() += 1;
     }

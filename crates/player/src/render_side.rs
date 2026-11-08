@@ -9089,6 +9089,7 @@ pub(crate) mod tests {
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
             close,
+            present: None,
         })
         .unwrap();
         let limits = AtlasLimits {

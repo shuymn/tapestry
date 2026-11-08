@@ -188,7 +188,8 @@ fn the_combo_break_counts_sum_the_scored_judgments() {
 }
 
 /// A sum's range is its terms': arithmetic that could leave `i32` over it
-/// is refused, where the same factor stays inside over one count.
+/// is no expression, where the same factor stays inside over one count;
+/// within ±2^53 the program takes it.
 #[test]
 fn a_sums_range_bounds_a_callbacks_arithmetic() {
     let draw = |expr: &str| {
@@ -204,11 +205,7 @@ fn a_sums_range_bounds_a_callbacks_arithmetic() {
         "ms.number(427) * 100",
         "ms.judge(4) * 200",
     ] {
-        assert_eq!(
-            draw(expr),
-            [Disposition::Replaced(Unsupported::Range)],
-            "{expr}"
-        );
+        assert_eq!(draw(expr), [Disposition::Compiled], "{expr}");
     }
 }
 

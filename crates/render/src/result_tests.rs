@@ -185,6 +185,7 @@ fn skin(dir: &Path, d: Draws) -> Skin {
         widgets,
         bomb_up_to: None,
         close: None,
+        present: None,
     };
     Skin::new_result(def, ResultDefs::default()).unwrap()
 }
