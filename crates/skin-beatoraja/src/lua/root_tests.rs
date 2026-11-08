@@ -12,7 +12,7 @@ use crate::tree::Kind;
 
 /// A frame-time writer: walked as a root, it opens the analysis at its
 /// assignment.
-const WRITER: &str = "function() n = n + 1 return true end";
+const WRITER: &str = "function() t.n = 1 return true end";
 
 /// A critical gauge `draw` reading option `x`, which the body sets to 1.
 fn config_gauge() -> String {
@@ -20,11 +20,11 @@ fn config_gauge() -> String {
 }
 
 /// A skin whose configured pass sets option `x` to 1, declares the
-/// writer's counter `n`, then runs `body`, with the critical
+/// writer's table `t`, then runs `body`, with the critical
 /// configuration reader first among the destinations and `dst` after it.
 fn beside(body: &str, dst: &str) -> String {
     skin(
-        &format!("skin_config.option.x = 1\nlocal n = 0\n{body}"),
+        &format!("skin_config.option.x = 1\nlocal t = {{}}\n{body}"),
         &format!("{}{dst}", config_gauge()),
     )
 }

@@ -26,8 +26,9 @@
 //!
 //! What a fold or a binding rests on is decided apart, for every root at
 //! once, by [`admit`]: the effect walk ([`super::effects`]) checks every
-//! root's reach against the modeled subset, which writes no table,
-//! upvalue, global or module member, calls only host readers, pure
+//! root's reach against the modeled subset, which writes no table, global
+//! or module member and an upvalue only as a located write
+//! ([`Analysis::written`]), calls only host readers, pure
 //! library functions and closures of the same subset, and reaches no
 //! metamethod. With [`Analysis::open`] unset after it (no construct
 //! outside the subset, and no script, unread listed entry or font
@@ -186,6 +187,11 @@ pub(crate) struct Open {
     pub(crate) why: Unsupported,
 }
 
+/// A located write: the line of its file where a binding cell is first
+/// written at frame time, and the integer numerals it may get (`None` once
+/// anything else).
+pub(crate) type Written = (u32, Option<Vec<i64>>);
+
 /// A function prototype with its captured values: its file, its function
 /// and the values, in its upvalues' order.
 pub(crate) type ProtoKey = (u16, u32, Vec<Captured>);
@@ -224,6 +230,13 @@ pub(crate) struct Analysis {
     /// ([`Unsupported::Interference`]); unset after the walk, it is
     /// closed.
     pub(crate) open: Cell<Option<Open>>,
+    /// The located writes the effect walk met: each upvalue binding cell a
+    /// root may assign at frame time, by its file and declaration, to the
+    /// first place it does and the integer numerals every assignment to it
+    /// writes (`None` once one writes anything else). A proof whose access
+    /// path starts at one does not hold ([`Unsupported::Interference`]);
+    /// the candidate stays closed.
+    pub(crate) written: RefCell<HashMap<(u16, u32), Written>>,
     /// The root instances whose reach writes ([`super::effects`]): they
     /// never lower ([`Unsupported::Writes`]).
     pub(crate) writers: RefCell<std::collections::HashSet<u32>>,
@@ -405,6 +418,36 @@ impl Analysis {
         }
     }
 
+    /// Where binding cell `d` of `file` is first written at frame time,
+    /// when it is ([`Self::written`]).
+    pub(crate) fn written_at(&self, file: u16, d: u32) -> Option<Site> {
+        self.written
+            .borrow()
+            .get(&(file, d))
+            .map(|w| Site::Code { file, line: w.0 })
+    }
+
+    /// `f` of the integer numerals frame time may write to binding cell
+    /// `d` of `file`, borrowed: `Some(empty)` for a cell never written,
+    /// `None` when an assignment writes anything else.
+    pub(crate) fn with_written_ints<T>(
+        &self,
+        file: u16,
+        d: u32,
+        f: impl FnOnce(Option<&[i64]>) -> T,
+    ) -> T {
+        match self.written.borrow().get(&(file, d)) {
+            None => f(Some(&[])),
+            Some((_, ints)) => f(ints.as_deref()),
+        }
+    }
+
+    /// Whether a proof through binding cell `d` of `file` holds: the
+    /// candidate is closed and the cell is never written at frame time.
+    pub(crate) fn cell_holds(&self, file: u16, d: u32) -> bool {
+        self.open.get().is_none() && self.written_at(file, d).is_none()
+    }
+
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
         self.instances.get(i as usize)
     }
@@ -414,7 +457,22 @@ impl Analysis {
     }
 
     /// Instance `i`'s value for its function's upvalue `up`.
+    /// Upvalue `up` of instance `i` as the analysis may use it: its
+    /// captured final binding, or, for a cell frame time writes, an unknown
+    /// value ([`Captured::Other`]): every reader of a captured cell (the
+    /// effect walk, the residual, the role scan, callee resolution) goes
+    /// through here, so none takes a written cell for its captured value.
     pub(crate) fn upvalue(&self, i: u32, up: u32) -> Option<Captured> {
+        let inst = self.instance(i)?;
+        if self.written_at(inst.file, up).is_some() {
+            return Some(Captured::Other);
+        }
+        self.captured_upvalue(i, up)
+    }
+
+    /// Upvalue `up` of instance `i`'s captured final binding, written or
+    /// not: only for the role scan's join of what a written cell may hold.
+    pub(crate) fn captured_upvalue(&self, i: u32, up: u32) -> Option<Captured> {
         let inst = self.instance(i)?;
         let k = *self.slots.get(&(inst.file, inst.func, up))? as usize;
         let (start, len) = inst.values?;
@@ -489,9 +547,11 @@ pub(crate) enum Callee {
 /// the host module, its proxy unchanged, `f` one of its APIs; or an
 /// upvalue whose final binding is a closure instance, a helper. That
 /// holds at frame time only while the candidate is closed: the effect
-/// walk found every root inside the modeled subset, which writes nothing,
-/// and no code the analysis does not see runs ([`Analysis::open`] unset),
-/// which lowering checks before it resolves a call.
+/// walk found every root inside the modeled subset, which writes no
+/// table, global or module member, and no code the analysis does not see
+/// runs ([`Analysis::open`] unset), which lowering checks before it
+/// resolves a call; an upvalue a root writes reads as unknown
+/// ([`Analysis::upvalue`]), so it resolves no callee.
 /// `H.f` with `f` a `main_state` API and `H` bound to anything else is
 /// [`Unsupported::Binding`].
 pub(crate) fn resolve_callee(
