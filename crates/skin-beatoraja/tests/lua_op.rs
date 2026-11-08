@@ -56,8 +56,7 @@ fn included(dst: &str) -> TempDir {
 
 /// Both passes of `d`'s skin with the default configuration.
 fn lua(d: &TempDir) -> Result<skin_beatoraja::LuaImported, ImportError> {
-    let h = read_lua_header(d.path(), "s.luaskin", &Cancel::new())?;
-    common::lua_play(&h, &Config::defaults(h.header()), &Cancel::new())
+    common::lua_import(d.path())
 }
 
 /// The rects drawn at 0 ms by `d`'s Lua skin.
@@ -96,7 +95,8 @@ fn a_lua_op_that_is_not_a_table_is_no_condition() {
             [(Severity::Ignored, NoteKind::Ignored { field: "op" })],
             "{op}"
         );
-        assert_eq!(drawn(&d), [[0, 1_016, 64, 64]], "{op}");
+        let rects = common::play::Drawn::new(i.imported.skin, 100).rects(0);
+        assert_eq!(rects, [[0, 1_016, 64, 64]], "{op}");
     }
 }
 
@@ -207,12 +207,12 @@ fn a_lua_op_read_twice_is_noted_once() {
         other => panic!("{:?}", other.map(|i| i.imported.report.notes)),
     }
     let i = song_list("901").unwrap_or_else(|e| panic!("{e:?}"));
-    let notes: Vec<_> = i
+    let notes = i
         .imported
         .report
         .notes
         .iter()
         .filter(|n| n.kind == NoteKind::Ignored { field: "op" })
-        .collect();
-    assert_eq!(notes.len(), 1, "{:?}", i.imported.report.notes);
+        .count();
+    assert_eq!(notes, 1, "{:?}", i.imported.report.notes);
 }
