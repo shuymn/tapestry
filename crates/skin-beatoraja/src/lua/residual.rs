@@ -8,14 +8,14 @@
 //! callback's tree and the helpers it calls:
 //!
 //! - **Values known at import**: nil, booleans, integers of at most 2^53
-//!   in magnitude, strings (a captured one by its interned id, a literal
+//!   in magnitude, floats (by their bits), strings (a captured one by its interned id, a literal
 //!   by its bytes, compared by bytes), tables without a metatable,
 //!   closures, host modules, host functions and library functions; and
 //!   the host's off value ([`Val::OffValue`]).
 //! - **What folds**: captures (upvalues, and globals through an `_ENV`
 //!   without a metatable), table entries along the static paths
 //!   ([`Analysis::entry`]), `skin_config` included, so the configuration
-//!   folds whatever its kind but a float; module members; locals; helper
+//!   folds whatever its kind; module members; locals; helper
 //!   calls, inlined with their arguments; operators on known operands;
 //!   `if`, `elseif` and `else` with a known condition. Each capture read
 //!   holds only while the candidate is closed ([`Unsupported::Interference`]
@@ -32,8 +32,10 @@
 //!   the construction premise, whatever arithmetic gave them.
 //! - **What stays residual**: host reads with a known integer argument
 //!   ([`Node::Read`], each recorded in [`Residual::reads`] as it is
-//!   created on a reached path), `-`, `not`, integer `+ - *`,
-//!   comparisons, and [`Node::Select`]. `A and B` is `Select(A, B, A)`
+//!   created on a reached path), `-`, `not`, `+ - * / // %` of numbers,
+//!   `math.floor`, `ceil`, `abs`, `max` and `min` of numbers
+//!   ([`Node::Math`]), comparisons, and [`Node::Select`]; known operands
+//!   fold through the program's numerics (the source's, LuaJ's). `A and B` is `Select(A, B, A)`
 //!   and `A or B` `Select(A, A, B)` on `A`'s truthiness, only nil and
 //!   false being false; a known `A` short-circuits, and `B` is never
 //!   evaluated then. An operator on a [`Node::Select`] of mixed kinds
@@ -47,8 +49,8 @@
 //!   have happened travels as a condition and a value, so paths are never
 //!   split.
 //! - **Refused**, each [`Unsupported`] following the callback's role:
-//!   loops, `goto`, function constructors, floats, `/ // % ^`, bitwise
-//!   operators, `..`, `#`, library calls, method calls, table
+//!   loops, `goto`, function constructors, `^`, bitwise operators, `..`,
+//!   `#`, library calls but the five `math` functions, method calls, table
 //!   constructors, varargs, `return` lists, recursion, a host argument that
 //!   is not a known integer, a definite Lua error on a reached path, and
 //!   string arithmetic or ordering.

@@ -1433,11 +1433,12 @@ impl Cx<'_> {
             l.attach(&res)?;
             // Every reached operation is checked whichever backend takes
             // the callback, discarded ones included.
-            compile::intervals(an, &l, &res)?;
+            let ivs = compile::intervals(an, &l, &res)?;
+            let root = ivs.get(res.root as usize).copied().flatten();
             match l.emit_root(&res, conv) {
                 Ok(src) => Ok(Ok(src)),
                 Err(Stop::Unsupported(_)) if program => {
-                    compile::compile(an, &mut l, &res, conv).map(Err)
+                    compile::compile(an, &mut l, &res, conv, root).map(Err)
                 }
                 Err(e) => Err(e),
             }

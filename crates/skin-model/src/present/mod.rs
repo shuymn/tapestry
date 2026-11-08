@@ -16,8 +16,9 @@
 //! [`Present::verify`] checks a definition against the caps (rules V1 to
 //! V5 in [`verify`]; V6, the consumers' reads, is checked by
 //! [`crate::Skin::new`] over the skin's expressions), and
-//! [`Present::run`] runs it ([`exec`]); its numerics are Lua 5.4's
-//! ([`num`]), shared with the importer's folding. These floats are
+//! [`Present::run`] runs it ([`exec`]); its numerics are the source's
+//! interpreter's, LuaJ's doubles ([`num`]), shared with the importer's
+//! folding. These floats are
 //! presentation only and never reach the evaluator.
 
 mod exec;

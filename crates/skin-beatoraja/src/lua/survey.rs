@@ -82,12 +82,12 @@ pub struct Survey {
     /// What the import made of each destination ([`ledger`]), only when
     /// asked for developer-local detail.
     pub destinations: Vec<DestinationEntry>,
-    /// A result import drawn over [`Choice::result`], when one was given
-    /// and the import completed.
     /// An imported skin's verified per-frame cost: the operations its
     /// expressions and presentation program run, of
     /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
     pub frame_ops: Option<(usize, usize)>,
+    /// A result import drawn over [`Choice::result`], when one was given
+    /// and the import completed.
     pub frames: Option<Frames>,
 }
 

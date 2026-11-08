@@ -248,9 +248,7 @@ pub fn math(f: MathFn, a: Val) -> Result<Val, Fail> {
 ///
 /// [`Fail::Error`] for a non-number argument.
 pub fn extreme(max: bool, a: Val, b: Val) -> Result<Val, Fail> {
-    if num(a).is_none() || num(b).is_none() {
-        return Err(Fail::Error);
-    }
+    // `compare` refuses a non-number either way.
     let better = if max {
         compare(Cmp::Lt, a, b)?
     } else {

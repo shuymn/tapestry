@@ -148,10 +148,7 @@ impl Program {
     /// every operation, so both arms of a conditional that survived
     /// folding are read.
     pub(crate) fn fields(&self) -> impl Iterator<Item = u16> + '_ {
-        self.ops.iter().filter_map(|op| match *op {
-            Op::Load { slot, .. } | Op::Output { slot, .. } => Some(slot),
-            _ => None,
-        })
+        self.loads().map(|(slot, _)| slot)
     }
 
     /// The slot reads: each field read's slot with `None`, each output
