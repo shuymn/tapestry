@@ -146,6 +146,9 @@ thread_local! {
     /// [`super::limits::RUNTIME_FRAME_TIME`] ([`set_frame_time`]).
     static FRAME_TIME: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
+    /// The callback before which this thread's runtime frames spend their
+    /// time budget ([`expire_frame_at`]).
+    static EXPIRE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// Makes this thread's next runtime `number` read panic while it holds
@@ -167,6 +170,18 @@ pub(super) fn holding_context() {
 /// tells the time cap from the instruction and host-call caps.
 pub fn set_frame_time(t: Option<std::time::Duration>) {
     FRAME_TIME.with(|f| f.set(t));
+}
+
+/// Makes this thread's runtime frames spend their whole time budget just
+/// before callback `site` (`None`: never), as a loaded machine's clock
+/// may: a test reproduces a frame whose time ran out part way.
+pub fn expire_frame_at(site: Option<usize>) {
+    EXPIRE_AT.with(|e| e.set(site));
+}
+
+/// Whether this thread's frames spend their time just before `site`.
+pub(super) fn expires_at(site: usize) -> bool {
+    EXPIRE_AT.with(std::cell::Cell::get) == Some(site)
 }
 
 /// This thread's runtime frame time.

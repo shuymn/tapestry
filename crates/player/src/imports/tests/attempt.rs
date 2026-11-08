@@ -26,7 +26,7 @@ fn counters() -> (u64, u64, usize) {
     return (
         super::jobs_started(),
         super::jobs_joined(),
-        skin_beatoraja::lua::vm_hooks::live(),
+        skin_beatoraja::vm_hooks::live(),
     );
     #[cfg(not(feature = "dev-tools"))]
     (0, 0, 0)
@@ -133,7 +133,7 @@ fn a_kept_specialization_is_reused_after_its_files_change() {
     let one = u64::from(cfg!(feature = "dev-tools"));
     let passes = || {
         #[cfg(feature = "dev-tools")]
-        return skin_beatoraja::lua::vm_hooks::passes();
+        return skin_beatoraja::vm_hooks::passes();
         #[cfg(not(feature = "dev-tools"))]
         0
     };
@@ -181,7 +181,7 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
 
     use super::{LATE, STOP_WAIT, executing, lua_skin};
     let serial = serial();
