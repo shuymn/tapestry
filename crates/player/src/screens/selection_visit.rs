@@ -4,7 +4,7 @@
 use bms_model::TimeUs;
 use skin_model::{BuildError, Selection, SelectionTimers, Skin};
 
-use super::script::ScriptSlot;
+use super::script::{ScriptSlot, ScriptStop};
 
 /// Prepares `sel`'s frame at `now` for `skin`, its timers from `timers`
 /// ([`Skin::prepare_selection_frame`]), then runs the runtime `slot`'s
@@ -13,6 +13,10 @@ use super::script::ScriptSlot;
 /// the same frame then draws this state without refilling it. Called
 /// after the frame's view and settings are applied and before its build,
 /// outside the build's no-allocation span.
+///
+/// Returns why the runtime stopped, once for `slot`'s screen: on the
+/// frame it stops, or on the first frame of a screen resuming a stopped
+/// one. The caller shows the notice on the strip.
 ///
 /// # Errors
 ///
@@ -23,7 +27,7 @@ pub(crate) fn selection_visit(
     sel: &mut Selection,
     now: TimeUs,
     timers: &SelectionTimers,
-) -> Result<(), BuildError> {
+) -> Result<Option<ScriptStop>, BuildError> {
     skin.prepare_selection_frame(sel, now, timers)?;
     match slot.running() {
         Some(rt) if rt.outputs() == skin.outputs() => {
@@ -32,5 +36,5 @@ pub(crate) fn selection_visit(
         }
         _ => sel.outputs_mut().fill(0),
     }
-    Ok(())
+    Ok(slot.stop())
 }

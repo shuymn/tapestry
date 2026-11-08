@@ -355,6 +355,14 @@ pub struct MenuScreen {
     preset: Option<MenuText>,
     /// The strip's lines prepared.
     strip_lines: usize,
+    /// The notice of the selection state numbered `.0`'s stopped runtime
+    /// (design.md "beatoraja Lua Skins", failures): the strip's notice
+    /// line while the game's update has none.
+    script_notice: Option<(u64, &'static str)>,
+    /// The strip's lines last prepared, and whether the last selection
+    /// frame drew the strip (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    strip_shown: (Vec<String>, bool),
     /// The strip's composition, underlined.
     strip_underline: Option<[f32; 4]>,
     /// What the selection skin's text and the strip were prepared for.
@@ -487,6 +495,9 @@ impl MenuScreen {
             strip: None,
             preset: None,
             strip_lines: 0,
+            script_notice: None,
+            #[cfg(all(test, feature = "dev-tools"))]
+            strip_shown: (Vec::new(), false),
             strip_underline: None,
             selection_key: None,
             page_caret: None,
@@ -527,7 +538,8 @@ impl MenuScreen {
         }
         self.selection_key = None;
         self.page_caret = self.prepare_page(&u.page, LEFT, TOP)?;
-        self.prepare_strip(&u.strip)?;
+        let notice = self.script_notice_of(logic.id);
+        self.prepare_strip(&u.strip, notice)?;
         let skin = Arc::clone(logic.bundle.skin());
         #[cfg(all(test, feature = "dev-tools"))]
         {
@@ -716,16 +728,54 @@ impl MenuScreen {
         Ok(area)
     }
 
+    /// The selection state numbered `id`'s runtime stopped: its notice
+    /// is logged and, from this frame, the strip's while the screen shows
+    /// that state.
+    #[cold]
+    fn script_stopped(
+        &mut self,
+        u: &SelectionUpdate,
+        id: u64,
+        stop: crate::screens::ScriptStop,
+    ) -> Result<(), RenderError> {
+        log::warn!("selection skin: {}", stop.notice());
+        self.script_notice = Some((id, stop.notice()));
+        self.prepare_strip(&u.strip, Some(stop.notice()))
+    }
+
+    /// The notice of the selection state numbered `id`'s stopped runtime.
+    fn script_notice_of(&self, id: u64) -> Option<&'static str> {
+        self.script_notice
+            .and_then(|(of, notice)| (of == id).then_some(notice))
+    }
+
     /// Lays out the strip `strip` over a selection skin: its search line
     /// and notice from the top, the preset's name in a text of its own
     /// under them, which a frame draws only while it shows; the caret's
-    /// area goes to the window.
-    fn prepare_strip(&mut self, strip: &StripText) -> Result<(), RenderError> {
+    /// area goes to the window. `script`, the runtime's stop notice, is
+    /// the notice line while `strip` has none.
+    fn prepare_strip(
+        &mut self,
+        strip: &StripText,
+        script: Option<&str>,
+    ) -> Result<(), RenderError> {
         let fonts = match &mut self.fonts {
             Some(fonts) => fonts,
             none => none.insert(Fonts::runtime()?),
         };
-        let page = strip.page();
+        let mut page = strip.page();
+        if let Some(text) = script
+            && strip.notice.is_none()
+        {
+            page.lines.push(MenuLine {
+                text: text.to_owned(),
+                style: LineStyle::Notice,
+            });
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        {
+            self.strip_shown.0 = page.lines.iter().map(|l| l.text.clone()).collect();
+        }
         let (blocks, area) = lay_out(fonts, &page, LEFT, TOP);
         let refs: Vec<&TextBlock> = blocks.iter().collect();
         let text = self
@@ -1152,10 +1202,15 @@ impl Screen for MenuScreen {
                 &mut logic.sel,
                 now,
                 &u.events.timers(),
-            )
-            .and_then(|()| self.build_selection_frame(u, logic, now))
-            {
-                Ok(()) => None,
+            ) {
+                Ok(stop) => {
+                    if let Some(stop) = stop {
+                        self.script_stopped(u, logic.id, stop)?;
+                    }
+                    self.build_selection_frame(u, logic, now)
+                        .err()
+                        .map(|e| e.to_string())
+                }
                 Err(e) => Some(e.to_string()),
             },
             Err(why) => Some(why),
@@ -1182,6 +1237,10 @@ impl Screen for MenuScreen {
                 n += 1;
             }
         }
+        #[cfg(all(test, feature = "dev-tools"))]
+        {
+            self.strip_shown.1 = drawn[0].is_some() && self.strip_lines > 0;
+        }
         let timing = match drawn {
             [Some(a), Some(b)] => self.renderer.submit_selection(&[a, b]),
             [Some(a), None] => self.renderer.submit_selection(&[a]),
@@ -1198,6 +1257,11 @@ impl Screen for MenuScreen {
     fn selection_requests(&self) -> (Vec<String>, usize) {
         let (lines, rasterized) = self.renderer.selection_requests();
         (lines.to_vec(), rasterized)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_strip(&self) -> (Vec<String>, bool) {
+        self.strip_shown.clone()
     }
 
     #[cfg(all(test, feature = "dev-tools"))]

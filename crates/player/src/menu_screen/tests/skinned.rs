@@ -467,7 +467,7 @@ fn measure_on(adapter: render::AdapterChoice) {
         // The fallback page and the strip, laid out with glyphon.
         let begun = Instant::now();
         screen.prepare_page(&u.page, 60.0, 30.0).unwrap();
-        screen.prepare_strip(&u.strip).unwrap();
+        screen.prepare_strip(&u.strip, None).unwrap();
         times.push(begun.elapsed());
         // The skin's lines: the rows not cached rasterized and uploaded.
         let skin = std::sync::Arc::clone(logic.bundle.skin());

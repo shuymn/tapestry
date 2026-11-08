@@ -35,7 +35,7 @@ use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use skin_beatoraja::lua::runtime::ScreenRuntime;
+use skin_beatoraja::lua::runtime::{ScreenRuntime, Stopped};
 use skin_model::ScreenKind;
 
 /// The kinds that keep a runtime, by their index in [`ScriptHost`].
@@ -278,6 +278,7 @@ impl Scripts {
             kind,
             key,
             running: None,
+            noticed: false,
         })
     }
 }
@@ -352,7 +353,42 @@ pub(in crate::screens) enum Slot {
         kind: ScreenKind,
         key: usize,
         running: Option<(Box<ScreenRuntime>, u64)>,
+        /// Its runtime's stop was reported.
+        noticed: bool,
     },
+}
+
+/// Why a screen's runtime stopped, reported once per screen
+/// ([`ScriptSlot`]) for its notice on the strip (design.md "beatoraja Lua
+/// Skins", failures).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScriptStop {
+    /// It ran past its frame budget for frames in a row.
+    Budget,
+    /// It reached its memory cap.
+    Memory,
+    /// A call panicked.
+    Panic,
+}
+
+impl ScriptStop {
+    pub(in crate::screens) const fn of(stopped: Stopped) -> Self {
+        match stopped {
+            Stopped::Budget => Self::Budget,
+            Stopped::Memory => Self::Memory,
+            Stopped::Panic => Self::Panic,
+        }
+    }
+
+    /// The strip's notice.
+    #[must_use]
+    pub(crate) const fn notice(self) -> &'static str {
+        match self {
+            Self::Budget => "The skin's script stopped: it ran past its time budget",
+            Self::Memory => "The skin's script stopped: it ran out of memory",
+            Self::Panic => "The skin's script stopped: it failed",
+        }
+    }
 }
 
 /// A screen's hold on a runtime, opaque outside `screens`: an import's
@@ -401,6 +437,7 @@ impl ScriptSlot {
             kind,
             key,
             running,
+            ..
         } = &mut self.0
         else {
             return None;
@@ -417,6 +454,22 @@ impl ScriptSlot {
             }
         }
         running.as_mut().map(|(rt, _)| &mut **rt)
+    }
+
+    /// Why the runtime it holds stopped, the first time it is asked after
+    /// the stop; `None` before, after, and without one.
+    pub(in crate::screens) fn stop(&mut self) -> Option<ScriptStop> {
+        let Slot::Bound {
+            running: Some((rt, _)),
+            noticed,
+            ..
+        } = &mut self.0
+        else {
+            return None;
+        };
+        let stopped = rt.stopped().filter(|_| !*noticed)?;
+        *noticed = true;
+        Some(ScriptStop::of(stopped))
     }
 
     /// Puts the runtime it holds back in the cell, parked when its

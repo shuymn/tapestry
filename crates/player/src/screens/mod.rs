@@ -18,5 +18,5 @@
 mod script;
 mod selection_visit;
 
-pub(crate) use script::{PlayInterval, Quiet, ScriptSlot, Scripts};
+pub(crate) use script::{PlayInterval, Quiet, ScriptSlot, ScriptStop, Scripts};
 pub(crate) use selection_visit::selection_visit;

@@ -19,9 +19,17 @@ use crate::render_side::{FrameSink, RenderLink, Screen, spawn};
 struct Frames(Arc<Mutex<Vec<Frame>>>);
 
 /// One frame: its selection quads, the lines asked for, its device,
-/// whether it was presented, and for the first frames how many pixels
-/// differ from the top-left one (what it drew over the clear colour).
-type Frame = (Option<usize>, Vec<String>, u64, bool, Option<usize>);
+/// whether it was presented, for the first frames how many pixels differ
+/// from the top-left one (what it drew over the clear colour), and the
+/// strip's lines with whether the frame drew them.
+type Frame = (
+    Option<usize>,
+    Vec<String>,
+    u64,
+    bool,
+    Option<usize>,
+    (Vec<String>, bool),
+);
 
 /// The frames whose pixels [`Frames`] reads back.
 const READ_BACK: usize = 3;
@@ -39,7 +47,14 @@ impl FrameSink for Frames {
                 let corner = pixels[0];
                 pixels.iter().filter(|p| **p != corner).count()
             });
-        frames.push((quads, lines, screen.device(), drawn.timing.presented, lit));
+        frames.push((
+            quads,
+            lines,
+            screen.device(),
+            drawn.timing.presented,
+            lit,
+            screen.selection_strip(),
+        ));
     }
 }
 
@@ -180,6 +195,9 @@ impl Screen for Lossy {
     }
     fn selection_requests(&self) -> (Vec<String>, usize) {
         self.menu.selection_requests()
+    }
+    fn selection_strip(&self) -> (Vec<String>, bool) {
+        self.menu.selection_strip()
     }
     fn selection_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.menu.selection_quads()
@@ -416,7 +434,7 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
         // The refused frame, the first drawn, presented the page: its
         // refusal is said before the frame sink sees it.
         assert!(wait_until(|| !frames.0.lock().unwrap().is_empty()));
-        let (_, _, device, presented, lit) = frames.0.lock().unwrap()[0].clone();
+        let (_, _, device, presented, lit, _) = frames.0.lock().unwrap()[0].clone();
         assert!(presented, "{text}");
         assert!(lit.is_some_and(|n| n > 500), "{text}: {lit:?}");
         // From then on the page.
@@ -706,9 +724,13 @@ fn the_runtime_draws_each_frame_and_rests_through_a_play() {
 
 /// A runtime whose callback never returns stops after its budget frames,
 /// and the screen keeps drawing its frames with the callback's constant
-/// (docs/stage3.md S7-07's gate).
+/// (docs/stage3.md S7-07's gate), the stop's notice on its strip
+/// (design.md "beatoraja Lua Skins", failures). A later visit of the
+/// stopped runtime shows the notice again.
 #[test]
 fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
+    let notice = crate::screens::ScriptStop::Budget.notice();
+    let strip_of = |frames: &Frames| frames.0.lock().unwrap().last().unwrap().5.clone();
     let (_dir, skin, script) = scripted("stop.luaskin");
     let (link, frames) = warp_link(None);
     link.select_with(ScreenKind::Selection, Some(skin), script)
@@ -722,12 +744,19 @@ fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
     let seen = frames.0.lock().unwrap().len();
     assert_eq!(quads_after(&frames, seen, 3), drawn);
     assert_eq!(link.take_selection_refusal(), None);
+    assert_eq!(strip_of(&frames), (vec![notice.to_owned()], true));
     link.leave_selection();
     assert!(link.park_scripts());
     assert_eq!(
         link.scripts().parked(ScreenKind::Selection).map(|(_, s)| s),
         Some(true)
     );
+    // Back on the screen: a new state, the stopped runtime resumed.
+    link.enter_selection(2);
+    link.show_selection(update_of(2, 1, listed(SelectionPlace::All, "")));
+    let seen = frames.0.lock().unwrap().len();
+    assert_eq!(quads_after(&frames, seen, 3), drawn);
+    assert_eq!(strip_of(&frames), (vec![notice.to_owned()], true));
     link.exit();
 }
 

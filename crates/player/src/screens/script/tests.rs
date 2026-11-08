@@ -294,3 +294,36 @@ fn no_interval_opens_while_a_retirement_destroys() {
     assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
     let _closed = t.join().unwrap().close();
 }
+
+/// A slot reports its runtime's stop once; a later screen's slot resuming
+/// the stopped runtime reports it again, for its own notice.
+#[test]
+fn a_stop_is_reported_once_per_screen() {
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) =
+        crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "stop.luaskin");
+    let scripts = Scripts::new();
+    scripts.commit(ScreenKind::Selection, 1, slot);
+    let skin = bundle.skin();
+    let mut sel = skin.prepare_selection();
+    let timers = skin_model::SelectionTimers::default();
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    let mut stops = Vec::new();
+    for frame in 0..8 {
+        let at = bms_model::TimeUs(frame * 16_000);
+        stops.push(super::super::selection_visit(&mut visit, skin, &mut sel, at, &timers).unwrap());
+    }
+    let reported: Vec<_> = stops.iter().flatten().collect();
+    assert_eq!(reported, [&super::ScriptStop::Budget], "{stops:?}");
+    drop(visit);
+    let mut again = scripts.slot(ScreenKind::Selection, 1);
+    let at = bms_model::TimeUs(200_000);
+    assert_eq!(
+        super::super::selection_visit(&mut again, skin, &mut sel, at, &timers).unwrap(),
+        Some(super::ScriptStop::Budget)
+    );
+    assert_eq!(
+        super::super::selection_visit(&mut again, skin, &mut sel, at, &timers).unwrap(),
+        None
+    );
+}

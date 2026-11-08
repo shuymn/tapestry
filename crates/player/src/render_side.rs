@@ -460,6 +460,12 @@ pub trait Screen: Send {
     fn selection_requests(&self) -> (Vec<String>, usize) {
         (Vec::new(), 0)
     }
+    /// The selection strip's lines last prepared, and whether the last
+    /// selection frame drew them (dev-tools tests); none by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn selection_strip(&self) -> (Vec<String>, bool) {
+        (Vec::new(), false)
+    }
     /// The selection frame last built, its quads (dev-tools tests); none
     /// by default.
     #[cfg(all(test, feature = "dev-tools"))]
