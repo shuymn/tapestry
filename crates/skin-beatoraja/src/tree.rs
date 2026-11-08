@@ -89,6 +89,10 @@ pub(crate) struct LuaText {
     /// The configured pass's trees and captures; `None` for the header
     /// pass's table.
     pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
+    /// The configured pass's VM, kept for a selection or result screen's
+    /// runtime until the import decides whether a callback needs it
+    /// (docs/stage3.md S7-07).
+    pub(crate) kept: Option<crate::lua::runtime::Kept>,
 }
 
 /// A Lua scalar, its subtype and exact value kept: an integer as the

@@ -315,18 +315,13 @@ pub(super) fn vm(pass: &Arc<Pass>) -> mlua::Result<Lua> {
     #[cfg(test)]
     lua.set_app_data(super::tests::Live::new());
     let hook = Arc::clone(pass);
-    let after_fault = std::cell::Cell::new(0_u32);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(INSTRUCTION_STEP),
         move |lua, _| {
             #[cfg(feature = "dev-tools")]
             super::vm_hooks::step();
-            if hook.ledger.faulted() {
-                let n = after_fault.get().saturating_add(1);
-                after_fault.set(n);
-                if n <= STEPS_AFTER_FAULT {
-                    return Ok(VmState::Continue);
-                }
+            if hook.ledger.faulted() && hook.ledger.step_after_fault(STEPS_AFTER_FAULT) {
+                return Ok(VmState::Continue);
             }
             hook.ledger.step(lua)?;
             Ok(VmState::Continue)

@@ -109,7 +109,7 @@ pub(super) fn opened() -> Open {
 }
 
 /// A pass's VM counted open; its drop counts it closed.
-pub(super) struct Open;
+pub(crate) struct Open;
 
 impl Drop for Open {
     fn drop(&mut self) {

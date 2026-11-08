@@ -138,6 +138,9 @@ fn fact_id(lua: &Lua, pass: &Pass, args: &MultiValue, api: &str) -> mlua::Result
 /// the snapshot has pending stops the pass by the same fatal path.
 fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
     let n = fact_id(lua, pass, &args, "option")?;
+    if pass.in_runtime() {
+        return Ok(runtime_option(pass, n));
+    }
     let Some(snapshot) = &pass.facts else {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }));
     };
@@ -181,8 +184,11 @@ fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
 /// other id reads play state, refused. An argument that is not an
 /// integer within `i32` refuses ([`LuaWhy::FactArgument`]). Every refusal
 /// is fatal and located, as `option`'s.
-fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<i64> {
+fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<Value> {
     let n = fact_id(lua, pass, &args, "number")?;
+    if pass.in_runtime() {
+        return Ok(Value::Number(f64::from(runtime_number(pass, n))));
+    }
     let Some(snapshot) = &pass.facts else {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: NUMBER }));
     };
@@ -190,7 +196,7 @@ fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<i64> {
         NumberRead::Fact { value, read } => {
             pass.count_fact(|| format!("number {n} read"));
             pass.read_fact(read);
-            Ok(i64::from(value))
+            Ok(Value::Integer(i64::from(value)))
         }
         NumberRead::Pending(fact) => {
             pass.count_fact(|| format!("number {n} pending"));
@@ -215,6 +221,17 @@ fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<i64> {
 /// argument is checked as `number`'s.
 fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaString> {
     let n = fact_id(lua, pass, &args, "text")?;
+    if pass.in_runtime() {
+        // Texts are not bridged at runtime yet: the empty text, noted.
+        pass.runtime_notes
+            .borrow_mut()
+            .add(super::runtime::RuntimeNote::Absent {
+                api: "text",
+                id: n,
+                value: 0,
+            });
+        return lua.create_string("");
+    }
     let Some(snapshot) = &pass.facts else {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: TEXT }));
     };
@@ -228,6 +245,50 @@ fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaStrin
             Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: TEXT }))
         }
     }
+}
+
+/// `main_state.number(n)` on a screen's runtime: the profile's bridge
+/// over the frame's fields; for an id it omits, the source's value in the
+/// feature's absence ([`super::runtime::absent`]), else 0, noted once.
+fn runtime_number(pass: &Pass, n: i32) -> i32 {
+    let mut screen = pass.screen.borrow_mut();
+    let Some(s) = screen.as_mut() else {
+        return 0;
+    };
+    if let Some(v) = s.number(n) {
+        return v;
+    }
+    let value = super::runtime::absent(s.kind(), n).unwrap_or(0);
+    drop(screen);
+    pass.runtime_notes
+        .borrow_mut()
+        .add(super::runtime::RuntimeNote::Absent {
+            api: "number",
+            id: n,
+            value,
+        });
+    value
+}
+
+/// `main_state.option(n)` on a screen's runtime: the profile's bridge, a
+/// negative id negated; false for an id it omits, noted once.
+fn runtime_option(pass: &Pass, n: i32) -> bool {
+    let mut screen = pass.screen.borrow_mut();
+    let Some(s) = screen.as_mut() else {
+        return false;
+    };
+    if let Some(v) = s.option(n.unsigned_abs().try_into().unwrap_or(i32::MAX)) {
+        return v != (n < 0);
+    }
+    drop(screen);
+    pass.runtime_notes
+        .borrow_mut()
+        .add(super::runtime::RuntimeNote::Absent {
+            api: "option",
+            id: n,
+            value: 0,
+        });
+    false
 }
 
 /// The host modules' names.

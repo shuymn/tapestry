@@ -63,6 +63,7 @@ pub(crate) mod residual;
 mod residual_tests;
 #[cfg(test)]
 mod root_tests;
+pub mod runtime;
 mod sandbox;
 mod schema;
 #[cfg(feature = "dev-tools")]
@@ -204,6 +205,9 @@ pub enum LuaWhy {
     Callable { field: &'static str },
     /// A write to a host module's table, directly or through an alias.
     HostWrite,
+    /// A loader or another import-only capability called once the VM
+    /// runs as a screen's runtime (docs/stage3.md S7-07).
+    ImportOnly,
     /// A chunk Lua compiles whose bindings the analysis's parser cannot
     /// establish.
     Unbound,
@@ -314,6 +318,7 @@ impl fmt::Display for LuaWhy {
                 write!(f, "an unsupported function in `{field}`")
             }
             Self::HostWrite => f.write_str("a write to a host module"),
+            Self::ImportOnly => f.write_str("an import-only capability called at runtime"),
             Self::Unbound => f.write_str("a Lua chunk the analysis cannot bind"),
             Self::Critical { field, why } => {
                 write!(f, "a play-critical callback in `{field}`: {why}")
@@ -367,6 +372,17 @@ pub(crate) struct Pass {
     rewritten: SyncCell<usize>,
     #[cfg(feature = "dev-tools")]
     timings: SyncCell<Timings>,
+    /// Whether this configured pass keeps its VM for a selection or result
+    /// screen's runtime ([`LuaHeader::import_runtime`]).
+    keep_vm: SyncCell<bool>,
+    /// Whether the VM was kept for a screen's runtime: from then on every
+    /// import-only capability refuses (docs/stage3.md S7-07). Set once,
+    /// never cleared.
+    runtime: SyncCell<bool>,
+    /// The screen the runtime's host reads answer from.
+    pub(crate) screen: SyncRefCell<Option<runtime::Screen>>,
+    /// The runtime's notes.
+    pub(crate) runtime_notes: SyncRefCell<runtime::Notes>,
 }
 
 /// What [`LuaHeader::timed`] gives: the stages' times of an import, or
@@ -427,7 +443,33 @@ impl Pass {
             rewritten: SyncCell::new(0),
             #[cfg(feature = "dev-tools")]
             timings: SyncCell::new(Timings::default()),
+            keep_vm: SyncCell::new(false),
+            runtime: SyncCell::new(false),
+            screen: SyncRefCell::new(None),
+            runtime_notes: SyncRefCell::new(runtime::Notes::default()),
         }
+    }
+
+    /// Enters the runtime phase for a `kind` screen, irreversibly: no
+    /// setter clears it.
+    pub(crate) fn enter_runtime(&self, kind: ScreenKind) {
+        self.runtime.set(true);
+        *self.screen.borrow_mut() = Some(runtime::Screen::new(kind));
+    }
+
+    /// Whether the VM runs as a screen's runtime.
+    pub(crate) fn in_runtime(&self) -> bool {
+        self.runtime.get()
+    }
+
+    /// Refuses an import-only capability (a loader, a configuration
+    /// path) once the VM runs as a screen's runtime: the fault marker,
+    /// whatever reached the capability.
+    pub(crate) fn import_only(&self, lua: &Lua) -> mlua::Result<()> {
+        if self.in_runtime() {
+            return Err(self.ledger.fail_lua(lua, LuaWhy::ImportOnly));
+        }
+        Ok(())
     }
 
     fn source(
@@ -565,6 +607,10 @@ pub struct LuaImported {
     pub callbacks: Vec<Disposition>,
     /// The scene it was imported for and the facts it read.
     pub facts: FactDeps,
+    /// A selection or result skin's runtime, the configured pass's VM
+    /// kept to run the callbacks no expression represents
+    /// (docs/stage3.md S7-07); `None` when no callback needs it.
+    pub runtime: Option<runtime::ScreenRuntime>,
 }
 
 /// A configured pass that reached a fact its snapshot has pending: what
@@ -596,6 +642,8 @@ struct Converted {
     arena: Arena,
     top: u32,
     entry: FileId,
+    /// The VM, kept for a selection or result screen's runtime.
+    kept: Option<runtime::Kept>,
 }
 
 /// Runs one pass over `entry` in a fresh VM, starting from `counts` and
@@ -608,6 +656,7 @@ fn pass(
     (counts, spent): (Counts, Duration),
     cancel: &Cancel,
     bridge: Option<(Bridge, ImportFacts)>,
+    keep: bool,
 ) -> (
     Result<Converted, Stop>,
     Store,
@@ -618,6 +667,7 @@ fn pass(
     #[cfg(test)]
     tests::pass_witness();
     let pass = Arc::new(Pass::new(root, entry, store, counts, spent, cancel, bridge));
+    pass.keep_vm.set(keep);
     let r = run_pass(&pass, entry);
     let counts = pass.ledger.counts();
     let spent = pass.ledger.spent();
@@ -666,19 +716,48 @@ fn run_pass(pass: &Arc<Pass>, entry: &str) -> Result<Converted, Stop> {
         let converted = run.map(|(values, id)| {
             let value = values.into_iter().next().unwrap_or(Value::Nil);
             let modules = pass.modules.borrow().clone();
-            convert::convert(&lua, pass, value, &id, modules).map(|(arena, top)| Converted {
-                arena,
-                top,
-                entry: id,
-            })
+            convert::convert(&lua, pass, value, &id, modules)
+                .map(|(arena, top, functions)| (arena, top, id, functions))
         });
         #[cfg(feature = "dev-tools")]
         let done = std::time::Instant::now();
-        #[cfg(feature = "dev-tools")]
-        vm_hooks::closing();
-        drop(lua);
-        #[cfg(feature = "dev-tools")]
-        drop(open);
+        // A selection or result skin's configured pass keeps its VM for
+        // the screen's runtime, until the import decides whether a
+        // callback needs it (docs/stage3.md S7-07); every other pass drops
+        // it here.
+        let keep = pass.keep_vm.get()
+            && pass
+                .facts
+                .is_some_and(|f| matches!(f.scene, ScreenKind::Selection | ScreenKind::Result));
+        let converted = match converted {
+            Ok(Ok((arena, top, entry, functions))) if keep => Ok(Ok(Converted {
+                arena,
+                top,
+                entry,
+                kept: Some(runtime::Kept {
+                    lua,
+                    pass: Arc::clone(pass),
+                    functions,
+                    #[cfg(feature = "dev-tools")]
+                    open: Some(open),
+                }),
+            })),
+            other => {
+                #[cfg(feature = "dev-tools")]
+                vm_hooks::closing();
+                drop(lua);
+                #[cfg(feature = "dev-tools")]
+                drop(open);
+                other.map(|r| {
+                    r.map(|(arena, top, entry, _)| Converted {
+                        arena,
+                        top,
+                        entry,
+                        kept: None,
+                    })
+                })
+            }
+        };
         #[cfg(feature = "dev-tools")]
         pass.timings.set(Timings {
             execution: executed - start,
@@ -717,6 +796,8 @@ pub(crate) struct Outcome<T, E = ImportError> {
     /// The report's records of the callbacks ([`survey::records`]).
     #[cfg(feature = "dev-tools")]
     pub(crate) records: survey::Records,
+    /// A selection or result screen's runtime, when a callback needs it.
+    pub(crate) runtime: Option<runtime::ScreenRuntime>,
 }
 
 /// The header pass, with its metadata.
@@ -736,6 +817,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
                 reads: Vec::new(),
                 #[cfg(feature = "dev-tools")]
                 records: survey::Records::default(),
+                runtime: None,
             };
         }
     };
@@ -746,6 +828,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         (Counts::default(), Duration::ZERO),
         cancel,
         None,
+        false,
     );
     let result = match r {
         Ok(converted) => {
@@ -778,6 +861,7 @@ pub(crate) fn header_pass(root: &Path, entry: &str, cancel: &Cancel) -> Outcome<
         reads: Vec::new(),
         #[cfg(feature = "dev-tools")]
         records: survey::Records::default(),
+        runtime: None,
     }
 }
 
@@ -805,7 +889,7 @@ fn definition(
     store: Store,
     cancel: &Cancel,
 ) -> Definition {
-    Definition::from_lua(
+    let mut def = Definition::from_lua(
         root.clone(),
         c.entry,
         c.arena,
@@ -814,7 +898,11 @@ fn definition(
         counts.loads,
         store,
         cancel.clone(),
-    )
+    );
+    if let Some(l) = def.arena.lua.as_deref_mut() {
+        l.kept = c.kept;
+    }
+    def
 }
 
 /// Refuses a configured definition whose `type` names another kind than
@@ -926,7 +1014,36 @@ impl LuaHeader {
         facts: &ImportFacts,
         cancel: &Cancel,
     ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
-        let o = self.complete(config, facts, cancel);
+        self.import_keeping(config, facts, cancel, false)
+    }
+
+    /// [`Self::import`] for a selection or result screen whose runtime runs
+    /// the callbacks no expression represents (docs/stage3.md S7-07): the
+    /// configured pass's VM is kept, each such callback routed to it and
+    /// read as `lua.<k>`, and [`LuaImported::runtime`] holds it when one
+    /// was routed. On another scene it is [`Self::import`].
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses.
+    pub fn import_runtime(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<LuaOutcome, ImportError> {
+        self.import_keeping(config, facts, cancel, true)
+            .map_err(|refused| refused.0)
+    }
+
+    fn import_keeping(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+        keep: bool,
+    ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
+        let o = self.complete_keeping(config, facts, cancel, keep);
         let deps = FactDeps {
             scene: facts.scene,
             reads: o.reads,
@@ -938,6 +1055,7 @@ impl LuaHeader {
                 usage: o.counts,
                 callbacks: o.callbacks,
                 facts: deps,
+                runtime: o.runtime,
             })),
             Err(Stop::Pending(pending)) => Ok(LuaOutcome::Pending(LuaPending {
                 facts: deps,
@@ -987,15 +1105,28 @@ impl LuaHeader {
         Ok(LuaTimed::Imported(t))
     }
 
-    /// The configured pass and the common import, with the candidate's
-    /// metadata kept on every outcome.
+    /// [`Self::complete_keeping`] with no VM kept.
+    #[cfg(test)]
     pub(crate) fn complete(
         &self,
         config: &Config,
         facts: &ImportFacts,
         cancel: &Cancel,
     ) -> Outcome<Imported, Stop> {
-        let (def, counts, store, reads) = self.configured(config, facts, cancel);
+        self.complete_keeping(config, facts, cancel, false)
+    }
+
+    /// The configured pass and the common import, with the candidate's
+    /// metadata kept on every outcome, keeping the VM for a screen's
+    /// runtime when `keep`.
+    fn complete_keeping(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+        keep: bool,
+    ) -> Outcome<Imported, Stop> {
+        let (def, counts, store, reads) = self.configured_keeping(config, facts, cancel, keep);
         self.finish(def, counts, store, reads, config)
     }
 
@@ -1012,6 +1143,7 @@ impl LuaHeader {
     ) -> Outcome<Imported, Stop> {
         let slot = self.header.kind;
         let mut callbacks = Vec::new();
+        let mut runtime = None;
         #[cfg(feature = "dev-tools")]
         let mut records = survey::Records::default();
         let result = def.and_then(|mut def| {
@@ -1027,6 +1159,22 @@ impl LuaHeader {
                     records = survey::records(&def.arena, an, r.is_ok());
                 }
             }
+            // The kept VM becomes the screen's runtime when the import
+            // routed a callback to it; otherwise it is dropped here.
+            let sites = def
+                .arena
+                .lua
+                .as_deref()
+                .and_then(|l| l.analysis.as_deref())
+                .map(|an| an.runtime.take())
+                .unwrap_or_default();
+            if let Some(kept) = def.arena.lua.as_deref_mut().and_then(|l| l.kept.take()) {
+                if r.is_ok() {
+                    runtime = runtime::ScreenRuntime::new(slot, kept, sites);
+                } else {
+                    kept.close();
+                }
+            }
             r.map_err(Stop::Fault)
         });
         Outcome {
@@ -1037,6 +1185,7 @@ impl LuaHeader {
             reads,
             #[cfg(feature = "dev-tools")]
             records,
+            runtime,
         }
     }
 
@@ -1052,6 +1201,18 @@ impl LuaHeader {
         config: &Config,
         facts: &ImportFacts,
         cancel: &Cancel,
+    ) -> (Result<Definition, Stop>, Counts, Store, Vec<FactRead>) {
+        self.configured_keeping(config, facts, cancel, false)
+    }
+
+    /// [`Self::configured`], keeping the VM for a selection or result
+    /// screen's runtime when `keep`.
+    fn configured_keeping(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+        keep: bool,
     ) -> (Result<Definition, Stop>, Counts, Store, Vec<FactRead>) {
         let refused = if facts.scene != self.header.kind {
             Some(ImportError::Slot {
@@ -1080,6 +1241,7 @@ impl LuaHeader {
             (self.counts, self.spent),
             cancel,
             Some((bridge, *facts)),
+            keep,
         );
         match r {
             Ok(converted) => (

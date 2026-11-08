@@ -71,6 +71,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use skin_model::output::OutTy;
+
 use skin_model::{MAX_SOURCE_BYTES, PLAY, SELECTION, Scope, ScreenKind, Ty};
 
 use super::ops::{self, Cond};
@@ -1596,6 +1598,13 @@ impl Cx<'_> {
                 return Err(e);
             }
         };
+        if let Some(k) = self.runtime_site((c, id), field, role, OutTy::Bool, conds, at)? {
+            let out = format!("lua.{k}");
+            if !conds.contains(&out) {
+                conds.push(out);
+            }
+            return Ok(true);
+        }
         if critical {
             self.outcome((c, id), field, role, (Disposition::Refused, Some(why)));
             return Err(self.critical(id, field, why));
@@ -1609,6 +1618,48 @@ impl Cx<'_> {
         let note = self.callback_note(field, why);
         self.drop_el(Role::Decorative, at, note)?;
         Ok(false)
+    }
+
+    /// Callable `c` at node `id` in `field`, for an element of `role`, run
+    /// by the screen's runtime: on a selection or result skin whose VM the
+    /// configured pass kept, a callback no expression represents goes to
+    /// the runtime (design.md "beatoraja Lua Skins", backends), gated by
+    /// the conditions `gate` before it, and its output is `lua.<k>`, `k`
+    /// returned; `None` elsewhere.
+    fn runtime_site(
+        &mut self,
+        (c, id): (u32, u32),
+        field: &'static str,
+        role: Role,
+        ty: OutTy,
+        gate: &[String],
+        at: Span,
+    ) -> Result<Option<usize>, ImportError> {
+        let kept = self
+            .def
+            .arena
+            .lua
+            .as_deref()
+            .is_some_and(|l| l.kept.is_some());
+        if c == NONE || !kept || !matches!(self.kind, ScreenKind::Selection | ScreenKind::Result) {
+            return Ok(None);
+        }
+        let gate = if gate.is_empty() {
+            None
+        } else {
+            Some(self.compile(&gate.join(" && "), Ty::Bool, at)?)
+        };
+        let k = self.outputs.len();
+        self.outputs.push(ty);
+        if let Some(an) = self.analysis() {
+            an.runtime.borrow_mut().push(crate::lua::runtime::Site {
+                callable: c,
+                ty,
+                gate,
+            });
+        }
+        self.outcome((c, id), field, role, (Disposition::Runtime, None));
+        Ok(Some(k))
     }
 
     /// A number's `value` callback at node `id`, for the number at `at`
@@ -1653,6 +1704,14 @@ impl Cx<'_> {
             }
         };
         let role = self.scan_role(scan.part, base);
+        if let Some(k) = self.runtime_site((c, id), "value", role, OutTy::Int, &[], at)? {
+            return Ok(Some(NumberValue {
+                expr: format!("lua.{k}"),
+                guard: None,
+                role,
+                deviates: false,
+            }));
+        }
         if role != Role::Decorative || scan.unresolved.is_some() {
             let why = match (role, scan.unresolved) {
                 (Role::Decorative, Some(what))

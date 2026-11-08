@@ -403,6 +403,7 @@ fn disposition(d: &Disposition) -> String {
         Disposition::ClassifiedOnly => "classified only".into(),
         Disposition::Lowered => "lowered".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
+        Disposition::Runtime => "runtime".into(),
         Disposition::Refused => "refused".into(),
     }
 }
