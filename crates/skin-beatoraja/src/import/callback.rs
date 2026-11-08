@@ -1644,6 +1644,14 @@ impl Cx<'_> {
         if c == NONE || !kept || !matches!(self.kind, ScreenKind::Selection | ScreenKind::Result) {
             return Ok(None);
         }
+        // A draw runs after its element's runtime value, when that allows.
+        let gate: Vec<&str> = match ty {
+            OutTy::Bool => self.value_gate.as_deref().into_iter().collect(),
+            OutTy::Int => Vec::new(),
+        }
+        .into_iter()
+        .chain(gate.iter().map(String::as_str))
+        .collect();
         let gate = if gate.is_empty() {
             None
         } else {
@@ -1660,6 +1668,11 @@ impl Cx<'_> {
         }
         self.outcome((c, id), field, role, (Disposition::Runtime, None));
         Ok(Some(k))
+    }
+
+    /// Ends an element: its runtime value gates no later draw.
+    pub(super) fn end_value_gate(&mut self) {
+        self.value_gate = None;
     }
 
     /// A number's `value` callback at node `id`, for the number at `at`
@@ -1705,6 +1718,10 @@ impl Cx<'_> {
         };
         let role = self.scan_role(scan.part, base);
         if let Some(k) = self.runtime_site((c, id), "value", role, OutTy::Int, &[], at)? {
+            self.value_gate = Some(match conv {
+                Conv::Index => format!("lua.{k} >= 0"),
+                _ => format!("lua.{k} != {} && lua.{k} != {}", i32::MIN, i32::MAX),
+            });
             return Ok(Some(NumberValue {
                 expr: format!("lua.{k}"),
                 guard: None,

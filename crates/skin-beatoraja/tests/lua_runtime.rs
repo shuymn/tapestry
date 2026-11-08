@@ -8,11 +8,16 @@ mod common;
 use skin_beatoraja::lua::Disposition;
 use skin_beatoraja::lua::runtime::{CallStatus, RuntimeNote, ScreenRuntime, Stopped};
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
-use skin_model::{SELECTION, ScreenKind};
+use skin_model::{RESULT, SELECTION, ScreenKind};
 
 /// A Lua selection skin over the selection fixtures' sheet and font, its
 /// numbers' `value`s `values` and its `dot` image's `draw` `draw`.
 fn entry(prelude: &str, values: &[&str], draw: &str) -> String {
+    entry_with(prelude, values, "nil", draw)
+}
+
+/// [`entry`], the first number's destination drawn by `number_draw`.
+fn entry_with(prelude: &str, values: &[&str], number_draw: &str, draw: &str) -> String {
     let numbers: String = values
         .iter()
         .enumerate()
@@ -26,7 +31,8 @@ fn entry(prelude: &str, values: &[&str], draw: &str) -> String {
     let dsts: String = (0..values.len())
         .map(|i| {
             format!(
-                "{{ id = \"n{i}\", dst = {{ {{ x = 0, y = {}, w = 4, h = 8 }} }} }},\n",
+                "{{ id = \"n{i}\", draw = {}, dst = {{ {{ x = 0, y = {}, w = 4, h = 8 }} }} }},\n",
+                if i == 0 { number_draw } else { "nil" },
                 100 + 10 * i
             )
         })
@@ -323,4 +329,122 @@ fn the_runtime_is_send() {
     .join()
     .unwrap();
     assert_eq!(out, [4]);
+}
+
+/// C1: at runtime, every loader and import-only capability raises the
+/// fault marker however a callback reaches it: the global, a renamed
+/// local, an upvalue of a helper, a table field, and `require` of a module
+/// it already loaded, refused before the cached return.
+#[test]
+fn loaders_raise_at_runtime_however_reached() {
+    let mut i = import(&entry(
+        "local load = require\n\
+         local function via(f) return function() return f(\"main_state\") end end\n\
+         local up = via(require)\n\
+         local held = { r = require, d = dofile }\n\
+         local cfg = skin_config",
+        &[
+            "function() require(\"main_state\") return 5 end",
+            "function() load(\"main_state\") return 5 end",
+            "function() up() return 5 end",
+            "function() held.r(\"main_state\") return 5 end",
+            "function() held.d(\"x.lua\") return 5 end",
+            "function() dofile(\"x.lua\") return 5 end",
+            "function() cfg.get_path(\"s.png\") return 5 end",
+            "function() return 5 + ms.number(77) * 0 end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    let status = runtime(&mut i).status().to_vec();
+    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 5], "{status:?}");
+    assert!(
+        status[..7].iter().all(|s| *s == CallStatus::Error),
+        "{status:?}"
+    );
+    let (notes, _) = runtime(&mut i).notes();
+    assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
+    // The phase stays: the next frame raises again.
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 5]);
+}
+
+/// The source's object order (docs/stage3.md S7-07): a number's value is
+/// read first, and its draws run only when it is not a sentinel
+/// (`SkinNumber.java:138-150`).
+#[test]
+fn a_sentinel_value_skips_its_draws() {
+    let mut i = import(&entry_with(
+        "local calls = 0",
+        &[
+            "function() return ms.number(77) / 1 end",
+            "function() return calls end",
+        ],
+        "function() calls = calls + 1 return true end",
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 3);
+    // No chart under the cursor: the plays are hidden, the draw not run.
+    let mut f = fields(n, &[]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).status()[1], CallStatus::Skipped);
+    assert_eq!(outputs(&f), [i32::MIN, 0, 0]);
+    let mut f = fields(
+        n,
+        &[
+            ("selected.plays", 3),
+            ("selected.played", 1),
+            ("cursor.chart", 1),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [3, 1, 1]);
+}
+
+/// C4 on a result screen: a read answers through the result profile's
+/// bridge over the result state, absent-feature ids with the source's
+/// value.
+#[test]
+fn a_result_skin_runs_its_callbacks() {
+    let tables = "local ms = require(\"main_state\")\n\
+        skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return ms.number(71) / 2 end }\n\
+        skin.value[3] = { id = \"q\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return ms.number(385) + 1000 end }";
+    let dsts = "{ id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },\n\
+        { id = \"q\", dst = { { x = 0, y = 140, w = 4, h = 8 } } },";
+    let d = common::result::sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        common::result::graph_lua(tables, dsts).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = common::result::facts(None);
+    let LuaOutcome::Imported(mut i) = h
+        .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 2);
+    let mut f = vec![0; RESULT.fields.len() + 2 * n];
+    for (name, v) in [("result.valid", 1), ("ex_score", 9)] {
+        let (slot, _) = RESULT.field(name).unwrap();
+        f[usize::from(slot)] = v;
+    }
+    runtime(&mut i).frame(&mut f, &[]);
+    let out: Vec<i32> = f[RESULT.fields.len()..]
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect();
+    // 9 / 2; with no ranking data the IR score is `Integer.MIN_VALUE`, and
+    // the source's int arithmetic wraps where LuaJ's doubles convert.
+    assert_eq!(out, [4, -2_147_482_648], "{:?}", runtime(&mut i).status());
 }

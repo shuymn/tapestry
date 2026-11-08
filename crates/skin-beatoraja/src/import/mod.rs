@@ -437,6 +437,12 @@ pub(crate) struct Cx<'d> {
     /// The output types of the callbacks a selection or result screen's
     /// runtime runs, by index: `lua.<k>` in the expressions.
     outputs: Vec<skin_model::output::OutTy>,
+    /// The current element's runtime value, which the source reads before
+    /// its draws and which gates them: a number's draws run only when its
+    /// value is not a sentinel (`SkinNumber.java:138-150`), an image set's
+    /// only when its value is not negative (`SkinImage.java:127-132`).
+    /// Cleared after each element.
+    value_gate: Option<String>,
     ranks: [Option<u16>; 3],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
@@ -546,6 +552,7 @@ impl<'d> Cx<'d> {
             items,
             whens: Vec::new(),
             outputs: Vec::new(),
+            value_gate: None,
             when_spans: Vec::new(),
             ranks: [None; 3],
             elements: Vec::new(),

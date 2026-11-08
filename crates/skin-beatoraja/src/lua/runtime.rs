@@ -623,3 +623,47 @@ pub(crate) fn stop_why(stop: Option<&Stop>) -> Option<LuaWhy> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use mlua::{Lua, Value};
+
+    use super::{to_bool, to_int};
+
+    /// C12: the source's `toint` (`d2l; l2i`) and `toboolean`.
+    #[test]
+    fn results_convert_as_the_source_does() {
+        let lua = Lua::new();
+        let s = |t: &str| Value::String(lua.create_string(t).unwrap());
+        for (v, want) in [
+            (Value::Number(4.5), 4),
+            (Value::Number(-4.5), -4),
+            (Value::Number(-0.0), 0),
+            (Value::Number(4_294_967_296.0), 0),
+            (Value::Number(2_147_483_648.0), i32::MIN),
+            (Value::Number(-2_147_483_649.0), i32::MAX),
+            (Value::Number(f64::INFINITY), -1),
+            (Value::Number(f64::NEG_INFINITY), 0),
+            (Value::Number(f64::NAN), 0),
+            (Value::Integer(7), 7),
+            (Value::Integer(1 << 32), 0),
+            (s("12"), 12),
+            (s(" 2.5 "), 2),
+            (s("x"), 0),
+            (Value::Boolean(true), 0),
+            (Value::Nil, 0),
+        ] {
+            assert_eq!(to_int(&v), want, "{v:?}");
+        }
+        for (v, want) in [
+            (Value::Nil, false),
+            (Value::Boolean(false), false),
+            (Value::Boolean(true), true),
+            (Value::Number(0.0), true),
+            (Value::Integer(0), true),
+            (s(""), true),
+        ] {
+            assert_eq!(to_bool(&v), want, "{v:?}");
+        }
+    }
+}
