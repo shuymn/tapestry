@@ -290,6 +290,9 @@ pub struct PresentationSnapshot {
     /// The presentation epoch: which attempt's chart `hispeed` was solved
     /// for, 0 before any. A frame of another attempt reads no gain from it.
     pub epoch: u64,
+    /// The scratch directions the devices hold, for the turntable
+    /// (docs/stage3.md, offset 1).
+    pub scratch: crate::turntable::ScratchInput,
 }
 
 /// Why [`Adjustment::attach`] left a Floating `H` unknown.
@@ -442,6 +445,8 @@ pub struct Adjustment {
     /// The state the last opening started with, taken once its phase was
     /// reduced ([`Self::opened`]).
     opened: Option<PresentationSnapshot>,
+    /// The scratch directions the driver last set ([`Self::set_scratch`]).
+    scratch: crate::turntable::ScratchInput,
 }
 
 impl Adjustment {
@@ -478,6 +483,7 @@ impl Adjustment {
             published: 0,
             epoch: 0,
             opened: None,
+            scratch: crate::turntable::ScratchInput::NONE,
         };
         a.hispeed = match options.hispeed().mode {
             SpeedMode::Classic => Some(Ratio::from_hundredths(
@@ -639,7 +645,13 @@ impl Adjustment {
             generation: self.generation,
             sequence: self.published,
             epoch: self.epoch,
+            scratch: self.scratch,
         }
+    }
+
+    /// The scratch directions the next snapshot publishes.
+    pub const fn set_scratch(&mut self, scratch: crate::turntable::ScratchInput) {
+        self.scratch = scratch;
     }
 
     /// Takes a drain's observations, in receive order, then publishes one
@@ -662,12 +674,23 @@ impl Adjustment {
         tempo: &T,
         writer: &mut PresentationWriter,
     ) {
+        self.take(items, tempo);
+        self.publish(writer);
+    }
+
+    /// Takes a drain's items of the augmented stream in order, as
+    /// [`feed`](Self::feed) does, without publishing.
+    pub fn take<T: TempoMap>(&mut self, items: impl IntoIterator<Item = Augmented>, tempo: &T) {
         for item in items {
             match item {
                 Augmented::Obs(o) => self.observe(o, tempo),
                 Augmented::Cut(us) => self.cut(us, tempo),
             }
         }
+    }
+
+    /// Publishes one snapshot through `writer`.
+    pub fn publish(&mut self, writer: &mut PresentationWriter) {
         self.published = self.published.wrapping_add(1);
         writer.0.write(self.snapshot());
     }

@@ -178,6 +178,7 @@ impl<'a> Rig<'a> {
             gauge: 0,
             overlay: &[],
             target: [1_920, 1_080],
+            turntable: 0,
         };
         self.batch.clear();
         skin.build(

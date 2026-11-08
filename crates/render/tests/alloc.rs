@@ -1122,6 +1122,7 @@ fn snapshot(covers: game::Covers, h: u64) -> PresentationSnapshot {
         generation: 0,
         sequence: h,
         epoch: 0,
+        scratch: game::ScratchInput::NONE,
     }
 }
 

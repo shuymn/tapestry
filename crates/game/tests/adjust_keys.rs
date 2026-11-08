@@ -391,3 +391,54 @@ fn more_controls_than_the_tap_observes_are_refused() {
         Some(AdjustKeyError::TooMany)
     );
 }
+
+/// A relative turntable axis without an adjustment quantum steps no cover,
+/// yet its movement reaches the turntable's analog press through the
+/// driver's drain (docs/stage3.md, offset 1), before the plan's filter.
+#[test]
+fn an_axis_without_a_quantum_still_turns_the_turntable() {
+    use input::hid::AxisCap;
+    let plan = AdjustmentConfig::default()
+        .plan(&with_controller(), None, None)
+        .unwrap();
+    let options = PlayOptions::new(HiSpeedSettings::default(), Covers::default()).unwrap();
+    let (mut driver, tap, mut reader) = game::AdjustDriver::new(&plan, options, 0).unwrap();
+    let mut set = SourceSet::new(SourceConfig {
+        max_devices: 2,
+        max_sources: 2,
+        max_held: 8,
+        queue_capacity: 16,
+        max_arrivals: 2,
+    })
+    .unwrap();
+    set.begin_batch(TimeUs(0));
+    set.connect(DeviceId(3), DeviceKind::Controller);
+    set.set_product(DeviceId(3), PRODUCT);
+    set.add_axes(
+        DeviceId(3),
+        &[AxisCap {
+            control: axis_control(0x01, 0x30),
+            relative: true,
+            wrap: 0,
+            min: 0,
+            max: 0,
+            bits: 8,
+            signed: true,
+        }],
+    );
+    set.end_batch(TimeUs(1));
+    set.set_adjustment(tap);
+    set.begin_batch(TimeUs(10_000));
+    set.packet(&Packet {
+        device: DeviceId(3),
+        control: axis_control(0x01, 0x30),
+        value: 3,
+        background: false,
+    });
+    set.end_batch(TimeUs(10_001));
+    let _ = driver.drain(0);
+    let s = *reader.read();
+    let analog = s.scratch.analog.expect("the axis presses the turntable");
+    assert!(!analog.negative);
+    assert_eq!(s.options, options, "no cover moved");
+}

@@ -687,6 +687,7 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         closing: view.closing,
         target: f.target,
         layout: &Layout::AUTHOR,
+        turntable: f.turntable,
         lanes: f.lanes,
         readouts: f.readouts,
     }

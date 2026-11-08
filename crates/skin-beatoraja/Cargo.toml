@@ -25,6 +25,8 @@ skin-model.workspace = true
 bms-parser.workspace = true
 criterion.workspace = true
 eval.workspace = true
+# The turntable's clock drives the offset-1 frames as the player's does.
+game.workspace = true
 png.workspace = true
 proptest.workspace = true
 rules.workspace = true

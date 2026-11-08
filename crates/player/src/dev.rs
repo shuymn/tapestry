@@ -2110,6 +2110,40 @@ fn result_fault(prefix: &str, n: u64) -> bool {
     })
 }
 
+/// Whether [`RESULT_FAULTS_ENV`] names `cold`: G1's cold precondition
+/// (the S10-09i design's §8.1), the result's installation removed before
+/// each upload of its pages, so every attempt uploads them.
+pub fn result_cold() -> bool {
+    std::env::var(RESULT_FAULTS_ENV).is_ok_and(|list| list.split(',').any(|f| f.trim() == "cold"))
+}
+
+/// Prints G1's sample: an upload of the result's pages, whether `cold`
+/// removed the installation first, the atlases still retained before it,
+/// the texel writes, and the submission to the queue's report.
+pub fn print_upload(cold: bool, retained: usize, t: render::UploadTiming) {
+    let written = t.written.as_micros();
+    match t.done {
+        Some(d) => eprintln!(
+            "dev: probe G1 upload: cold {cold} retained {retained} written {written} us done {} us",
+            d.as_micros()
+        ),
+        None => eprintln!(
+            "dev: probe G1 upload: cold {cold} retained {retained} written {written} us done none"
+        ),
+    }
+}
+
+/// Prints G2's sample, if `ready` holds one: from the attempt's
+/// `commit_ready` returning to the opening, and what the result step did.
+pub fn print_ready_to_open(ready: Option<(Instant, &str)>) {
+    if let Some((at, step)) = ready {
+        eprintln!(
+            "dev: probe G2 ready to open: {} us result {step}",
+            at.elapsed().as_micros()
+        );
+    }
+}
+
 /// Whether this selection or upload of the result kind is refused.
 pub fn refuse_result_select() -> bool {
     result_fault(

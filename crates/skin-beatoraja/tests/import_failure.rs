@@ -303,7 +303,7 @@ fn an_unsupported_part_refuses_at_its_destination() {
         (r#""stretch": 3"#, NoteKind::Stretch(3)),
         (MOUSE, unsupported_field("mouseRect")),
         (r#""blend": 9"#, NoteKind::Blend(9)),
-        (r#""offset": 1"#, NoteKind::RuntimeOffset(1)),
+        (r#""offset": 2"#, NoteKind::RuntimeOffset(2)),
         (r#""op": ["a_script()"]"#, prop(PropertyKind::Boolean, None)),
         (r#""draw": "nothing""#, prop(PropertyKind::Boolean, None)),
         (r#""op": [171]"#, prop(PropertyKind::Boolean, Some(171))),

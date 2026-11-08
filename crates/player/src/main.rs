@@ -56,6 +56,7 @@ mod selection_skin;
 mod shelf;
 mod start_gate;
 mod tuning;
+mod turntable;
 mod ui_text;
 mod window;
 
@@ -804,6 +805,7 @@ fn rig<'a>(
         gauge: settings.player.displayed_gauge,
         attempt_gauge: settings.player.displayed_gauge,
         autoplay,
+        play_states: game::PlayStates::default(),
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(root.clone(), settings.clone()),
         seen: Delivered::default(),
@@ -873,6 +875,8 @@ fn rig<'a>(
         result_offset: None,
         result_leaving: false,
         result_outro: None,
+        #[cfg(feature = "dev-tools")]
+        probe_ready: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1182,6 +1186,8 @@ fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Res
         Ok(started) => {
             rig.pending = started.pending;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result);
+            // The direct play is the run's one play state until a retry.
+            game::live::Rig::play_state_began(rig);
             game::live::run_chart(loaded, rig)
                 .map(|_| ())
                 .map_err(anyhow::Error::from)

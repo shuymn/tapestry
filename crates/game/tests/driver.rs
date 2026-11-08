@@ -979,3 +979,20 @@ fn an_openings_tuning_is_given_for_its_own_candidate_only() {
     assert_eq!(rig.driver.opened(2), None, "another candidate");
     assert_eq!(rig.driver.opened(0), None, "another candidate");
 }
+
+/// The scratch's digital direction reaches the snapshot through a drain
+/// (docs/stage3.md, offset 1) and outlives an attempt's entry, which
+/// suppresses the hold for the adjustments only.
+#[test]
+fn the_snapshot_publishes_the_held_scratch_across_an_attempts_entry() {
+    const SCRATCH: u32 = 0x2a;
+    let mut rig = Rig::new(PlayOptions::default());
+    assert_eq!(rig.drain().scratch, game::ScratchInput::NONE);
+    rig.keys(10 * MS, &[(SCRATCH, true)]);
+    let s = rig.drain();
+    assert!(s.scratch.positive && !s.scratch.negative);
+    rig.enter(-2_000_000);
+    assert!(rig.drain().scratch.positive);
+    rig.keys(20 * MS, &[(SCRATCH, false)]);
+    assert_eq!(rig.drain().scratch, game::ScratchInput::NONE);
+}

@@ -67,35 +67,135 @@ struct SourceState {
     axes: Vec<(ControlId, usize)>,
 }
 
-/// Which way an axis moved.
+/// Which way an axis moved: toward higher values (or a positive relative
+/// report), or lower.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
+pub enum AxisDirection {
+    /// Toward higher values.
     Forward,
+    /// Toward lower values.
     Backward,
+}
+
+/// What one movement did to an axis's press ([`AxisTurn::step`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnStep {
+    /// Nothing: below the threshold, or no movement.
+    None,
+    /// It pressed, from released.
+    Press,
+    /// It turned the other way while pressed: a release and a new press.
+    Reverse,
+    /// It kept its press, the release later.
+    Hold,
+}
+
+/// The analog scratch rule past an axis's movement (design.md "Analog
+/// Scratch"): the press and hold thresholds, the direction it presses in
+/// and its release deadline. The conversion runs it on each bound axis;
+/// anything else that needs the direction the lane is pressed in steps
+/// its own with the same movements. Allocation-free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AxisTurn {
+    settings: ScratchSettings,
+    /// Movement since the last press, hold or change of direction, signed
+    /// forward.
+    moved: i64,
+    /// When the axis last moved.
+    last_move: Option<TimeUs>,
+    /// The direction it presses in and its pending release deadline,
+    /// while it presses its lane.
+    press: Option<(AxisDirection, TimeUs)>,
+}
+
+impl AxisTurn {
+    /// Released, with `settings`' thresholds and release time (its mode is
+    /// the movement's, which the caller has taken).
+    #[must_use]
+    pub const fn new(settings: ScratchSettings) -> Self {
+        Self {
+            settings,
+            moved: 0,
+            last_move: None,
+            press: None,
+        }
+    }
+
+    /// The direction it presses in and its release deadline, while it
+    /// presses. The press lasts until the deadline, where the conversion
+    /// releases it ([`release`](Self::release)).
+    #[must_use]
+    pub const fn pressed(&self) -> Option<(AxisDirection, TimeUs)> {
+        self.press
+    }
+
+    /// Released at its deadline: whether it was pressed.
+    pub const fn release(&mut self) -> bool {
+        let was = self.press.take().is_some();
+        self.moved = 0;
+        was
+    }
+
+    /// Back to released, as after a disconnect.
+    pub const fn clear(&mut self) {
+        self.moved = 0;
+        self.last_move = None;
+        self.press = None;
+    }
+
+    /// One signed movement `d` (forward positive) at `at`.
+    pub fn step(&mut self, d: i64, at: TimeUs) -> TurnStep {
+        if d == 0 {
+            return TurnStep::None;
+        }
+        let s = self.settings;
+        let release_after = i64::from(s.release_after_us);
+        // Movement adds up only in one direction and without a pause
+        // longer than the release time.
+        let paused = self
+            .last_move
+            .is_none_or(|m| at.0.saturating_sub(m.0) > release_after);
+        if paused || self.moved.signum() != d.signum() {
+            self.moved = 0;
+        }
+        self.moved = self.moved.saturating_add(d);
+        self.last_move = Some(at);
+        let direction = if self.moved > 0 {
+            AxisDirection::Forward
+        } else {
+            AxisDirection::Backward
+        };
+        let moved = self.moved.unsigned_abs();
+        // `moved` is at least 1 here, so a threshold of 0 acts as 1.
+        let press = u64::from(s.press_threshold);
+        let hold = u64::from(s.hold_threshold);
+        let step = match self.press {
+            None if moved >= press => TurnStep::Press,
+            Some((p, _)) if p != direction && moved >= press => TurnStep::Reverse,
+            Some((p, _)) if p == direction && moved >= hold => TurnStep::Hold,
+            _ => return TurnStep::None,
+        };
+        // A press, a reversal or a hold: the release moves later.
+        self.press = Some((direction, TimeUs(at.0.saturating_add(release_after))));
+        self.moved = 0;
+        step
+    }
 }
 
 /// One bound axis's scratch conversion.
 #[derive(Clone, Debug)]
 struct AxisState {
     lane: Lane,
-    settings: ScratchSettings,
+    mode: AxisMode,
     /// The last absolute report; `None` until the first.
     last: Option<i32>,
-    /// Movement since the last press, hold or change of direction, signed
-    /// forward.
-    moved: i64,
-    /// When the axis last moved.
-    last_move: Option<TimeUs>,
-    /// The direction it presses in, while it presses its lane.
-    pressed: Option<Direction>,
-    /// The pending release deadline, while it presses its lane.
-    release_at: Option<TimeUs>,
+    turn: AxisTurn,
 }
 
 impl AxisState {
     /// The movement a report means.
     fn movement(&mut self, value: i32) -> i64 {
-        match self.settings.mode {
+        match self.mode {
             AxisMode::Absolute { wrap } => match self.last.replace(value) {
                 // The first report only says where the axis is.
                 None => 0,
@@ -108,10 +208,7 @@ impl AxisState {
     /// Back to released and unknown, as after a disconnect.
     fn clear(&mut self) {
         self.last = None;
-        self.moved = 0;
-        self.last_move = None;
-        self.pressed = None;
-        self.release_at = None;
+        self.turn.clear();
     }
 }
 
@@ -203,12 +300,9 @@ impl ConversionState {
             });
             axes.extend(profile.axes.iter().map(|a| AxisState {
                 lane: a.lane,
-                settings: a.scratch,
+                mode: a.scratch.mode,
                 last: None,
-                moved: 0,
-                last_move: None,
-                pressed: None,
-                release_at: None,
+                turn: AxisTurn::new(a.scratch),
             }));
         }
         let mut state = Self {
@@ -267,7 +361,7 @@ impl ConversionState {
         self.axes
             .iter()
             .enumerate()
-            .filter_map(|(i, a)| a.release_at.map(|t| (t, a.lane, i)))
+            .filter_map(|(i, a)| a.turn.pressed().map(|(_, t)| (t, a.lane, i)))
             .min()
     }
 
@@ -277,9 +371,9 @@ impl ConversionState {
     /// nothing.
     pub fn release_due(&mut self, axis: usize) -> Option<LaneEdge> {
         let a = self.axes.get_mut(axis)?;
-        a.release_at.take()?;
-        a.pressed = None;
-        a.moved = 0;
+        if !a.turn.release() {
+            return None;
+        }
         let lane = a.lane;
         self.unhold(lane)
     }
@@ -325,7 +419,7 @@ impl ConversionState {
                 reason = "`axis_of` returns, and the evaluator passes, an index built into `axes` at construction"
             )]
             let a = &mut self.axes[i];
-            let was_pressed = a.pressed.is_some();
+            let was_pressed = a.turn.pressed().is_some();
             let lane = a.lane;
             a.clear();
             if was_pressed && let Some(edge) = self.unhold(lane) {
@@ -358,51 +452,23 @@ impl ConversionState {
         )]
         let a = &mut self.axes[i];
         let d = a.movement(value);
-        if d == 0 {
-            return;
-        }
-        let s = a.settings;
-        let release_after = i64::from(s.release_after_us);
-        // Movement adds up only in one direction and without a pause
-        // longer than the release time.
-        let paused = a
-            .last_move
-            .is_none_or(|m| at.0.saturating_sub(m.0) > release_after);
-        if paused || a.moved.signum() != d.signum() {
-            a.moved = 0;
-        }
-        a.moved = a.moved.saturating_add(d);
-        a.last_move = Some(at);
-        let direction = if a.moved > 0 {
-            Direction::Forward
-        } else {
-            Direction::Backward
-        };
-        let moved = a.moved.unsigned_abs();
-        // `moved` is at least 1 here, so a threshold of 0 acts as 1.
-        let press = u64::from(s.press_threshold);
-        let hold = u64::from(s.hold_threshold);
-        let reversal = match a.pressed {
-            None if moved >= press => false,
-            Some(p) if p != direction && moved >= press => true,
-            Some(p) if p == direction && moved >= hold => {
-                // Held: the release moves later.
-                a.release_at = Some(TimeUs(at.0.saturating_add(release_after)));
-                a.moved = 0;
-                return;
-            }
-            _ => return,
-        };
-        a.pressed = Some(direction);
-        a.release_at = Some(TimeUs(at.0.saturating_add(release_after)));
-        a.moved = 0;
         let lane = a.lane;
-        // A reversal is a new press.
-        if reversal && let Some(edge) = self.unhold(lane) {
-            edges.push(edge);
-        }
-        if let Some(edge) = self.hold(lane) {
-            edges.push(edge);
+        match a.turn.step(d, at) {
+            TurnStep::None | TurnStep::Hold => {}
+            TurnStep::Press => {
+                if let Some(edge) = self.hold(lane) {
+                    edges.push(edge);
+                }
+            }
+            // A reversal is a new press.
+            TurnStep::Reverse => {
+                if let Some(edge) = self.unhold(lane) {
+                    edges.push(edge);
+                }
+                if let Some(edge) = self.hold(lane) {
+                    edges.push(edge);
+                }
+            }
         }
     }
 
