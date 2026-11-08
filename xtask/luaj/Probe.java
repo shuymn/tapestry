@@ -67,6 +67,14 @@ public class Probe {
                 }
             }
         }
+        // The consumer's conversion of a number's value
+        // (`SkinLuaAccessor.java:640-651`), nil and booleans included.
+        for (String a : vals) {
+            System.out.println("toint " + a + " = i:" + num(a).toint());
+        }
+        System.out.println("toint nil = i:" + LuaValue.NIL.toint());
+        System.out.println("toint true = i:" + LuaValue.TRUE.toint());
+        System.out.println("toint false = i:" + LuaValue.FALSE.toint());
         String[] un = {"neg", "floor", "ceil", "abs"};
         for (String a : vals) {
             for (String u : un) {
