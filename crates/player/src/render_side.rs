@@ -5245,7 +5245,7 @@ impl Run {
     /// point, then the presented view's runtime ([`Self::result_visit`],
     /// not counted), then the build ([`Self::result_build`]). Returns the
     /// fade-out's start.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     fn result_frame(
         screen: &mut dyn Screen,
         mut side: Option<&mut ResultSide>,

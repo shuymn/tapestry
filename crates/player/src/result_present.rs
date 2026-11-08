@@ -49,7 +49,7 @@ pub enum Scope {
 }
 
 /// What a view snapshot shows, as one unit (D1).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ViewPayload {
     /// The snapshot it was made from.
     pub key: ViewKey,

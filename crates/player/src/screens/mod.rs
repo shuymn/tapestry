@@ -22,6 +22,8 @@ mod script;
 mod selection_visit;
 
 pub(crate) use result_visit::result_visit;
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) use script::GenState;
 pub(crate) use script::{
     PlayInterval, Quiet, ScriptGen, ScriptNotes, ScriptPermit, ScriptSlot, ScriptStop, Scripts,
     ViewCommit,

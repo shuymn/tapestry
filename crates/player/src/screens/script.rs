@@ -90,6 +90,8 @@ pub(in crate::screens) struct ResultEntry {
     /// The fixed skin's: never evicted, only disabled or retired at the
     /// run's end.
     pub(in crate::screens) retained: bool,
+    /// Its runtime stopped, as its slot last saw it while running.
+    pub(in crate::screens) stopped: bool,
 }
 
 /// Every kind's entry, the runtimes retired while the interval was open
@@ -445,6 +447,7 @@ impl Scripts {
             generation,
             held: Held::Parked(rt),
             retained,
+            stopped: false,
         });
         Some(ScriptGen {
             cell: self.0.id,
@@ -471,7 +474,9 @@ impl Scripts {
             Some(Held::Parked(rt)) => GenState::Live {
                 stopped: rt.stopped().is_some(),
             },
-            Some(Held::Running) => GenState::Live { stopped: false },
+            Some(Held::Running) => GenState::Live {
+                stopped: host.result(g.generation).is_some_and(|e| e.stopped),
+            },
             _ => GenState::Gone,
         }
     }
@@ -743,9 +748,13 @@ impl ScriptSlot {
             return None;
         };
         let mut host = cell.host();
-        let live = host
-            .result(*generation)
-            .is_some_and(|e| matches!(e.held, Held::Running));
+        let live = match host.result(*generation) {
+            Some(e) if matches!(e.held, Held::Running) => {
+                e.stopped = running.as_ref().is_some_and(|rt| rt.stopped().is_some());
+                true
+            }
+            _ => false,
+        };
         if let Some(rt) = running.take_if(|_| !live) {
             host.give_back(*generation, rt);
         }
