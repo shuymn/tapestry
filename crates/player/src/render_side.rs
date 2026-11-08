@@ -4700,6 +4700,7 @@ pub(crate) mod tests {
     /// an answer: WARP builds those 256 Mi texels on the CPU, which takes
     /// past [`LOAD_TIMEOUT`] on a loaded machine (the answer is then
     /// `NoAnswer` though nothing failed).
+    #[cfg(feature = "dev-tools")]
     const ATLAS_CAP_ANSWER: Duration = Duration::from_secs(180);
 
     /// A render thread on the screens `make` builds, with no chart, no
