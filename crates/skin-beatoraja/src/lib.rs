@@ -16,8 +16,7 @@
 //! does all three with no option enabled, as the source's own header pass
 //! does.
 //!
-//! [`import`] refuses a skin outside its slot, and a kind with no importer
-//! yet, before anything is read. It maps a play skin's images, numbers,
+//! [`import`] refuses a skin outside its slot before anything is read. It maps a play skin's images, numbers,
 //! text and play objects (the lanes, SUDDEN+, LIFT, the judge and the
 //! gauge) onto a [`skin_model::Skin`] for a [`Config`] (the selected
 //! options, file choices and offsets), and returns it with a [`Report`]:
@@ -64,6 +63,10 @@ pub use import::{
     Report, Rule, Severity, TimerWhy, TrackWhy, Usage, import,
 };
 pub use lua::facts::{Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, JudgeClass};
+/// The VMs' development hooks, outside [`lua`] so that a crate kept
+/// from naming the Lua backend can use them (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub use lua::vm_hooks;
 pub use lua::{
     Cancel, LuaHeader, LuaImported, LuaLimit, LuaOutcome, LuaPending, LuaUsage, LuaWhy,
     read_lua_header,

@@ -152,6 +152,7 @@ fn try_drawn(
         gauge: 0,
         overlay: &[],
         target: [1_920, 1_080],
+        turntable: 0,
     };
     skin.build(&mut play, &render::skin_frame(&f), uvs, &mut batch)
         .unwrap();

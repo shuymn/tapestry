@@ -329,6 +329,7 @@ fn followers_keep_the_transform_order() {
     let follower = |follow| {
         let place = Place {
             follow,
+            angle: skin_model::AngleFollow::None,
             pivot: skin_model::Anchor::Center,
             ..lanes_support::bound(Bind::Lane(bms_model::Lane::SCRATCH))
         };

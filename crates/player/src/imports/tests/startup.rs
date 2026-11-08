@@ -66,6 +66,7 @@ fn bundled(_: ScreenKind, _: &SkinChoice, _: bool, _: &ImportTarget, _: &Cancel)
             notes: Vec::new(),
             suppressed: 0,
         },
+        crate::screens::ScriptSlot::default(),
     )
 }
 
@@ -499,7 +500,7 @@ fn a_close_during_startup_ends_it() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_close_during_a_lua_job_ends_startup() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let _serial = serial();
     let dir = super::looping();
     let choices = SkinChoices {
@@ -651,5 +652,56 @@ fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
         assert!(notice.ends_with(&why), "{read}: {notice}");
         assert!(screens.log().is_empty(), "{read}: {:?}", screens.log());
         link.exit();
+    }
+}
+
+/// C8 (S10-09f): a Lua decision skin whose import completes is installed
+/// with no notice; one whose configured pass reads a chart fact (the
+/// judgment class, the play level), known only at the choice, ends
+/// pending and is refused at startup: nothing is installed, and the
+/// select screen's notice says why.
+#[test]
+fn a_lua_decision_skin_installs_or_is_refused_when_pending() {
+    let _serial = serial();
+    let build: Build = Arc::new(build);
+    let entry = |read: &str| {
+        format!(
+            "local skin = {{ type = 6, name = \"t\", w = 1920, h = 1080 }}\n\
+             if not skin_config then return skin end\n\
+             local ms = require(\"main_state\")\n\
+             skin.fact = {read}\n\
+             return skin\n"
+        )
+    };
+    let run = |read: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("d.luaskin"), entry(read)).unwrap();
+        let choices = SkinChoices {
+            decision: Some(choice(dir.path(), "d.luaskin")),
+            ..SkinChoices::default()
+        };
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        link.exit();
+        (started, screens.log())
+    };
+    let (started, log) = run("ms.option(50)");
+    assert_eq!(started.notice, None);
+    assert!(started.pending.is_none());
+    assert!(log.iter().any(|l| l.contains("commit")), "{log:?}");
+    for (read, fact) in [
+        ("ms.option(180)", "the chart's judgment class"),
+        ("ms.number(96)", "the chart's play level"),
+    ] {
+        let (started, log) = run(read);
+        assert!(started.pending.is_none(), "{read}");
+        let notice = started.notice.unwrap();
+        assert!(
+            notice.starts_with("決定のスキンは使えません（内蔵画面）: ")
+                && notice.contains(&format!("the skin reads {fact} as it is built")),
+            "{read}: {notice}"
+        );
+        assert!(log.is_empty(), "{read}: {log:?}");
     }
 }

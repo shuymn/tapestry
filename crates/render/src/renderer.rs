@@ -903,6 +903,11 @@ pub struct Renderer {
     /// Tests and development builds: atlas arrays uploaded so far.
     #[cfg(any(test, feature = "dev-tools"))]
     atlas_uploads: u64,
+    /// Tests and development builds: the last atlas array upload's timing
+    /// (the S10-09i design's §8.1 G1), until
+    /// [`take_upload_timing`](Self::take_upload_timing) takes it.
+    #[cfg(any(test, feature = "dev-tools"))]
+    upload_timing: Option<UploadTiming>,
     /// When the built frame's work began, until [`submit`](Self::submit)
     /// takes it.
     started: Option<Instant>,
@@ -1055,6 +1060,8 @@ impl Renderer {
             staged_result_text: None,
             #[cfg(any(test, feature = "dev-tools"))]
             atlas_uploads: 0,
+            #[cfg(any(test, feature = "dev-tools"))]
+            upload_timing: None,
             started: None,
             refused: None,
             loading_refused: None,
@@ -1739,6 +1746,12 @@ impl Renderer {
         {
             self.atlas_uploads += 1;
         }
+        #[cfg(any(test, feature = "dev-tools"))]
+        let began = Instant::now();
+        #[cfg(any(test, feature = "dev-tools"))]
+        let done = Arc::new(std::sync::OnceLock::new());
+        #[cfg(any(test, feature = "dev-tools"))]
+        let mut submitted = began;
         let device = self.gpu.device();
         let levels = page_levels(pages);
         let upload = AtlasPages {
@@ -1757,12 +1770,27 @@ impl Renderer {
             }
             let buffer = instances.map(|n| self.staged_buffer(n));
             self.gpu.queue().submit([]);
+            #[cfg(any(test, feature = "dev-tools"))]
+            {
+                submitted = Instant::now();
+                let done = Arc::clone(&done);
+                self.gpu.queue().on_submitted_work_done(move || {
+                    let _ = done.set(Instant::now());
+                });
+            }
             (atlas, bind, buffer)
         });
         if let Some(e) = refused {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
         wait_for_gpu(&self.gpu)?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            self.upload_timing = Some(UploadTiming {
+                written: submitted.saturating_duration_since(began),
+                done: done.get().map(|d| d.saturating_duration_since(submitted)),
+            });
+        }
         let text_cache = pages
             .text_layer()
             .map_or_else(TextCache::none, |layer| TextCache::new(atlas.side(), layer));
@@ -3453,6 +3481,13 @@ impl Renderer {
         self.atlas_uploads
     }
 
+    /// Tests and development builds: the timing of the atlas array upload
+    /// since the last call, if one ran.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub const fn take_upload_timing(&mut self) -> Option<UploadTiming> {
+        self.upload_timing.take()
+    }
+
     /// Submits and presents the staged batch through `projection`, each
     /// run under its scissor, then `text` in its own pass when there is
     /// one; `start` is when the frame's work began. While the window is
@@ -3761,6 +3796,19 @@ impl Renderer {
         }
         out
     }
+}
+
+/// Tests and development builds: one atlas array upload's timing (the
+/// S10-09i design's §8.1 G1).
+#[cfg(any(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Debug)]
+pub struct UploadTiming {
+    /// From the upload's start to its submission: the texel writes.
+    pub written: Duration,
+    /// From the submission to the queue's report that the submitted work
+    /// is done (`on_submitted_work_done`); `None` if the wait returned
+    /// without the report.
+    pub done: Option<Duration>,
 }
 
 /// The longest an offscreen frame waits for the previous frame's GPU work;

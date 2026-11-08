@@ -155,6 +155,9 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
+    /// The run's play states, for the turntable (docs/stage3.md, offset
+    /// 1).
+    pub play_states: game::PlayStates,
     /// READY's length: from the opening to chart time 0, as the
     /// current play's opening was given it.
     pub lead_in: TimeUs,
@@ -216,6 +219,10 @@ pub struct PlayerRig<'a> {
     pub steps_dropped: u64,
     /// The figures of the play just over, until they are written.
     pub figures: Option<Figures>,
+    /// The current play's interval, from its start to its end: no screen
+    /// runtime runs while it is open (design.md "beatoraja Lua Skins",
+    /// Quiescence acknowledged).
+    pub interval: Option<crate::screens::PlayInterval>,
     /// The current play's number, as the audio thread knows it.
     pub generation: u64,
     /// The periods the next play queues on the audio output.
@@ -308,6 +315,11 @@ pub struct PlayerRig<'a> {
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
+    /// Development builds: G2's start (the S10-09i design's §8.1), when
+    /// the attempt's `commit_ready` returned, and what its result step
+    /// did, until the opening prints it.
+    #[cfg(feature = "dev-tools")]
+    pub probe_ready: Option<(std::time::Instant, &'static str)>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -329,6 +341,9 @@ pub struct AttemptPrep {
     /// The chart's strings the attempt's result shows, until the result
     /// skin's stage takes them.
     labels: Option<skin_model::ResultLabels>,
+    /// Autoplay's scratch notes for the turntable, built with the attempt;
+    /// none for a play by hand.
+    scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
     /// When the render thread was asked.
@@ -436,7 +451,8 @@ impl PlayerRig<'_> {
         // the frames'.
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
-            AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay);
+            AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
+                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -645,7 +661,18 @@ impl PlayerRig<'_> {
         let Some(upload) = self.result_skin.upload() else {
             return;
         };
-        if status.installed == Some(upload.atlas()) {
+        // Development builds: `cold` asks for every upload (G1), and G2's
+        // sample says what the step did: `none` (no skin, or the kind
+        // disabled), `reused` (installed) or `uploaded` (asked for).
+        #[cfg(feature = "dev-tools")]
+        let installed = status.installed == Some(upload.atlas()) && !crate::dev::result_cold();
+        #[cfg(not(feature = "dev-tools"))]
+        let installed = status.installed == Some(upload.atlas());
+        #[cfg(feature = "dev-tools")]
+        if let Some((_, step)) = &mut self.probe_ready {
+            *step = if installed { "reused" } else { "uploaded" };
+        }
+        if installed {
             return;
         }
         let mut pending = self.render.upload_result(upload);
@@ -706,7 +733,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: result skin jobs: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -845,7 +872,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: specialization ended: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -866,7 +893,7 @@ impl PlayerRig<'_> {
     /// still from recording's open to the play's end.
     #[cfg(feature = "dev-tools")]
     fn print_lua(when: &str) {
-        use skin_beatoraja::lua::vm_hooks;
+        use skin_beatoraja::vm_hooks;
         println!(
             "dev: lua at {when}: live {} jobs {} passes {} steps {}",
             vm_hooks::live(),
@@ -1441,8 +1468,12 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         // With selection, the scan has acknowledged its pause before
-        // recording opens and READY starts.
+        // recording opens and READY starts; so has every screen runtime its
+        // parking (a render thread that ended holds none).
         self.pause_scan();
+        if !self.render.park_scripts() {
+            eprintln!("render: the screens' runtimes were not acknowledged parked");
+        }
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
         // inside a play or its READY state.
@@ -1466,6 +1497,10 @@ impl Rig for PlayerRig<'_> {
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared_close)?;
+        #[cfg(feature = "dev-tools")]
+        {
+            self.probe_ready = Some((std::time::Instant::now(), "none"));
+        }
         self.upload_result();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
@@ -1535,6 +1570,12 @@ impl Rig for PlayerRig<'_> {
             chart: crate::result_skin::attempt_chart(loaded),
             class: crate::result_skin::attempt_class(loaded),
             labels: Some(labels),
+            // Autoplay's turntable presses its scratch notes.
+            scratch_notes: if self.autoplay {
+                game::scratch_notes(loaded.chart(), loaded.chart().meta.ln_mode)
+            } else {
+                Vec::new()
+            },
             specialized: false,
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
@@ -1658,6 +1699,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        // G2's sample (dev-tools): `commit_ready`'s return to here.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_ready_to_open(self.probe_ready.take());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -1720,6 +1764,9 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
+        // G2's sample (dev-tools), as at [`open`](Rig::open).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_ready_to_open(self.probe_ready.take());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -1921,6 +1968,7 @@ impl Rig for PlayerRig<'_> {
         };
         #[cfg(feature = "dev-tools")]
         self.scenario_started();
+        self.interval = Some(self.render.scripts().open_interval());
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
@@ -1972,6 +2020,18 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        // The interval closes; a render thread that ended meanwhile left
+        // its runtimes parked in the cell, destroyed here.
+        if let Some(closed) = self
+            .interval
+            .take()
+            .map(crate::screens::PlayInterval::close)
+            && self.render.scripts().orphaned()
+        {
+            self.render
+                .scripts()
+                .retire(crate::screens::Quiet::Closed(closed));
+        }
         #[cfg(feature = "dev-tools")]
         Self::print_lua("play end");
         #[cfg(feature = "dev-tools")]
@@ -2062,6 +2122,23 @@ impl Rig for PlayerRig<'_> {
         self.input_offset_us = t.input_offset_us;
     }
 
+    fn play_state_began(&mut self) {
+        let state = self.play_states.begin(self.clock.now());
+        self.render.play_state(state);
+    }
+
+    fn turntable_paused(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, true);
+        }
+    }
+
+    fn turntable_resumed(&mut self) {
+        if let Some(s) = self.play_states.current() {
+            self.render.turntable(s.number, false);
+        }
+    }
+
     fn ended(&mut self, report: &PlayReport) {
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
@@ -2102,6 +2179,12 @@ impl Rig for PlayerRig<'_> {
     /// result's, and what comes from here on is fresh. The built-in result
     /// needs nothing more, so the preparation is ready at once.
     fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
+        // G3's start (dev-tools): the save phase's drain is over.
+        #[cfg(feature = "dev-tools")]
+        {
+            game::probe::stamp(&game::probe::RESULT_BEGAN);
+            game::probe::clear(&game::probe::STEP_ACCEPTED);
+        }
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
@@ -2369,7 +2452,7 @@ mod tests {
 
         use game::Rig as _;
         use skin_beatoraja::JudgeClass;
-        use skin_beatoraja::lua::vm_hooks;
+        use skin_beatoraja::vm_hooks;
 
         use crate::imports::facts::tests::loaded;
         use crate::imports::tests as imports;

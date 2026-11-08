@@ -320,9 +320,9 @@ pub fn stage_began(stage: SpecializingStage) {
     if let Some((s, at, from, _)) = armed.as_mut()
         && *at == stage
     {
-        *from = skin_beatoraja::lua::vm_hooks::steps();
+        *from = skin_beatoraja::vm_hooks::steps();
         if s.escalates() {
-            skin_beatoraja::lua::vm_hooks::hold();
+            skin_beatoraja::vm_hooks::hold();
         }
     }
 }
@@ -334,7 +334,7 @@ pub fn specialization_signal(controls: &crate::controls::Controls, fail_input: i
     let Some((s, _, from, quit_at)) = armed.as_mut() else {
         return;
     };
-    if skin_beatoraja::lua::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
+    if skin_beatoraja::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
         return;
     }
     let quit = || {
@@ -2108,6 +2108,40 @@ fn result_fault(prefix: &str, n: u64) -> bool {
             .filter_map(|f| f.trim().strip_prefix(prefix))
             .any(|k| k.parse() == Ok(n))
     })
+}
+
+/// Whether [`RESULT_FAULTS_ENV`] names `cold`: G1's cold precondition
+/// (the S10-09i design's §8.1), the result's installation removed before
+/// each upload of its pages, so every attempt uploads them.
+pub fn result_cold() -> bool {
+    std::env::var(RESULT_FAULTS_ENV).is_ok_and(|list| list.split(',').any(|f| f.trim() == "cold"))
+}
+
+/// Prints G1's sample: an upload of the result's pages, whether `cold`
+/// removed the installation first, the atlases still retained before it,
+/// the texel writes, and the submission to the queue's report.
+pub fn print_upload(cold: bool, retained: usize, t: render::UploadTiming) {
+    let written = t.written.as_micros();
+    match t.done {
+        Some(d) => eprintln!(
+            "dev: probe G1 upload: cold {cold} retained {retained} written {written} us done {} us",
+            d.as_micros()
+        ),
+        None => eprintln!(
+            "dev: probe G1 upload: cold {cold} retained {retained} written {written} us done none"
+        ),
+    }
+}
+
+/// Prints G2's sample, if `ready` holds one: from the attempt's
+/// `commit_ready` returning to the opening, and what the result step did.
+pub fn print_ready_to_open(ready: Option<(Instant, &str)>) {
+    if let Some((at, step)) = ready {
+        eprintln!(
+            "dev: probe G2 ready to open: {} us result {step}",
+            at.elapsed().as_micros()
+        );
+    }
 }
 
 /// Whether this selection or upload of the result kind is refused.

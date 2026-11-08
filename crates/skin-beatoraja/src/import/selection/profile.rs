@@ -42,6 +42,9 @@ impl<T> Class<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelValue {
     Ex,
+    /// The EX score less a rival's, a target's or the best's, none of
+    /// which selection has: the selected EX, 0 with no score.
+    ExDifference,
     MaxEx,
     Notes,
     Bp,
@@ -68,7 +71,7 @@ impl SelValue {
     /// Its expression over the selection schema.
     pub(crate) fn expr(self) -> &'static str {
         match self {
-            Self::Ex => "selected.ex",
+            Self::Ex | Self::ExDifference => "selected.ex",
             Self::MaxEx => "selected.max_ex",
             Self::Notes => "selected.notes",
             Self::Bp => "selected.bp",
@@ -102,7 +105,7 @@ impl SelValue {
             Self::Level => "cursor.chart",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
-            Self::DisplayOffset | Self::Volume => "true",
+            Self::ExDifference | Self::DisplayOffset | Self::Volume => "true",
             // A duration needs the chart's tempo in Classic.
             Self::Duration | Self::Green => "settings.floating",
         }
@@ -113,16 +116,23 @@ impl SelValue {
 pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
     use Class::{Bridge, Omit};
     Some(match id {
-        71 | 150 => Bridge(SelValue::Ex),
+        // The ids after the first of each arm are the same property, or
+        // give the same value on selection (`IntegerPropertyFactory.java`
+        // at `0.8.9`: `:155-159`, `:175`, `:183`, `:187-188`, `:200-201`,
+        // `:231`, `:237`).
+        71 | 101 | 150 | 171 => Bridge(SelValue::Ex),
+        // EX less the rival's, the target's or the best's, which are 0
+        // here (`:186`, `:192`, `:197-198`, `:232`, `:702-710`).
+        108 | 128 | 152 | 153 | 172 => Bridge(SelValue::ExDifference),
         72 => Bridge(SelValue::MaxEx),
-        74 => Bridge(SelValue::Notes),
-        76 => Bridge(SelValue::Bp),
+        74 | 106 => Bridge(SelValue::Notes),
+        76 | 177 => Bridge(SelValue::Bp),
         77 => Bridge(SelValue::Plays),
         90 => Bridge(SelValue::BpmMax),
         91 => Bridge(SelValue::BpmMin),
-        96 => Bridge(SelValue::Level),
-        102 => Bridge(SelValue::RatePercent),
-        103 => Bridge(SelValue::RateHundredths),
+        45..=49 | 96 => Bridge(SelValue::Level),
+        102 | 115 | 155 => Bridge(SelValue::RatePercent),
+        103 | 116 | 156 => Bridge(SelValue::RateHundredths),
         154 => Bridge(SelValue::NextRank),
         300 => Bridge(SelValue::Charts),
         1163 => Bridge(SelValue::LengthMin),
@@ -145,6 +155,8 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         | 78
         | 92
         | 100
+        | 105
+        | 174
         | 110..=114
         | 179
         | 180
@@ -431,6 +443,18 @@ mod tests {
 
     const NUMERIC: &[(i32, i32, C)] = &[
         (12, 12, C::N),
+        (45, 49, C::N),
+        (101, 101, C::N),
+        (105, 105, C::D),
+        (106, 106, C::N),
+        (108, 108, C::N),
+        (115, 116, C::N),
+        (128, 128, C::N),
+        (152, 153, C::N),
+        (155, 156, C::N),
+        (171, 172, C::N),
+        (174, 174, C::D),
+        (177, 177, C::N),
         (17, 31, C::D),
         (57, 57, C::N),
         (58, 59, C::D),

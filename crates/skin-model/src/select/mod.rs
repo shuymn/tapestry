@@ -118,6 +118,10 @@ pub struct Selection {
     pub(crate) master_volume: Option<Ratio>,
     /// Per slider element in draw order: its travel as last built.
     pub(crate) hits: Box<[Cell<Option<Hit>>]>,
+    /// The frame time [`Skin::prepare_selection_frame`](crate::Skin::prepare_selection_frame)
+    /// last prepared the timers for, which that frame's build takes
+    /// without refilling them.
+    pub(crate) prepared: Option<TimeUs>,
 }
 
 impl Selection {
@@ -152,6 +156,7 @@ impl Selection {
             ex_rate: None,
             master_volume: None,
             hits: vec![Cell::new(None); sliders].into_boxed_slice(),
+            prepared: None,
         }
     }
 
@@ -213,6 +218,15 @@ impl Selection {
     /// (docs/stage3.md S7-07).
     pub fn outputs_mut(&mut self) -> &mut [i32] {
         self.fields.get_mut(field::COUNT..).unwrap_or_default()
+    }
+
+    /// The fields (the schema's, then the callbacks' output slots) to
+    /// write, and the timer readings of the frame last prepared: what a
+    /// runtime frame reads and writes between
+    /// [`Skin::prepare_selection_frame`](crate::Skin::prepare_selection_frame)
+    /// and the build (docs/stage3.md S7-07).
+    pub fn runtime_parts(&mut self) -> (&mut [i32], &[i32]) {
+        (&mut self.fields, &self.ms)
     }
 
     pub(crate) fn slots(&self) -> usize {

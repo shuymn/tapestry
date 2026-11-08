@@ -129,6 +129,8 @@ pub struct Drawn {
     pub notes: NoteFacts,
     /// The lane input each frame gives.
     pub input: eval::InputFacts,
+    /// The turntable angle each frame gives: by default 0.
+    pub turntable: i32,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -375,6 +377,7 @@ impl Drawn {
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
+            turntable: 0,
         }
     }
 
@@ -437,6 +440,7 @@ impl Drawn {
             complete: false,
             target: self.target,
             layout: &Layout::AUTHOR,
+            turntable: self.turntable,
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,
@@ -527,6 +531,8 @@ pub struct Loader {
     pub adjusting: bool,
     /// Whether the attempt being loaded is autoplay: by default not.
     pub autoplay: bool,
+    /// The turntable angle each frame gives: by default 0.
+    pub turntable: i32,
 }
 
 impl Loader {
@@ -550,6 +556,7 @@ impl Loader {
             percent: 0,
             adjusting: false,
             autoplay: false,
+            turntable: 0,
         }
     }
 
@@ -570,6 +577,7 @@ impl Loader {
             },
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: self.turntable,
             lanes: view,
             covers,
             gauge: self.gauge,

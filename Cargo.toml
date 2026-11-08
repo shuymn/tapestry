@@ -120,9 +120,9 @@ cargo_metadata = "0.23.1"
 # The contract check reads design.md as CommonMark.
 pulldown-cmark = { version = "0.13.6", default-features = false }
 # The lint site check parses Rust source.
-proc-macro2 = { version = "1.0.107", default-features = false }
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 quote = { version = "1.0.47", default-features = false }
-syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing"] }
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]

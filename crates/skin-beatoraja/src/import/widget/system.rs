@@ -62,7 +62,7 @@ impl Cx<'_> {
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
-        let Some(c) = self.image_common(&dst, charged, role)? else {
+        let Some(c) = self.turning_image_common(&dst, charged, role)? else {
             return Ok(());
         };
         let Some((image, rects, native)) = self.system_rects(&c, color)? else {

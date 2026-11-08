@@ -521,6 +521,18 @@ pub trait Rig {
     /// [`begin_presentation`](Self::begin_presentation) attached is no
     /// longer the coming attempt's. Nothing by default.
     fn end_presentation(&mut self) {}
+    /// A play state begins (design.md "Play Lifecycle"): a chart chosen to
+    /// play, P, or a retry. Its turntable clock starts again
+    /// (docs/stage3.md, offset 1). Nothing by default.
+    fn play_state_began(&mut self) {}
+    /// The play goes on to its result's preparation, its save included:
+    /// the play state's turntable clock pauses whatever is presented.
+    /// Nothing by default.
+    fn turntable_paused(&mut self) {}
+    /// The practice page shows again after a Start: a paused turntable
+    /// clock resumes with a fresh baseline; a running one runs on.
+    /// Nothing by default.
+    fn turntable_resumed(&mut self) {}
     /// Whether this rig's plays run the start gate (design.md "Play
     /// Lifecycle", the start gate): each READY is a candidate that a hold
     /// of START or SELECT before its transport commits cancels, and the
@@ -922,15 +934,21 @@ pub fn run_chart<R: Rig>(
         else {
             return leave(rig);
         };
+        let retried = report.end == PlayEnd::Aborted(AbortCause::Retry)
+            || report.tail_cut == Some(AbortCause::Retry)
+            || report.closing.is_some_and(|c| c.end == ClosingEnd::Retry)
+            || next == Some(Command::Retry);
+        // A play going on to its result pauses the turntable through the
+        // save, the preparation and the result.
+        if !retried && !next_round && !counted_down {
+            rig.turntable_paused();
+        }
         rig.ended(&report);
         if rig.quitting() || counted_down {
             return leave(rig);
         }
-        if report.end == PlayEnd::Aborted(AbortCause::Retry)
-            || report.tail_cut == Some(AbortCause::Retry)
-            || report.closing.is_some_and(|c| c.end == ClosingEnd::Retry)
-            || next == Some(Command::Retry)
-        {
+        if retried {
+            rig.play_state_began();
             continue;
         }
         // A tail stage that ran to its end and repeats (a repeated round's
@@ -950,7 +968,10 @@ pub fn run_chart<R: Rig>(
         })?;
         match prepared {
             Prepared::Ready => {}
-            Prepared::Retry => continue,
+            Prepared::Retry => {
+                rig.play_state_began();
+                continue;
+            }
             Prepared::Leave => return leave(rig),
         }
         loaded.emit(&SessionEvent::Result {
@@ -1019,9 +1040,16 @@ pub fn run_chart<R: Rig>(
                             }
                         }
                         _ if !open => {}
-                        MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
+                        // Each step stamps G5's start (dev-tools).
+                        MenuCommand::NextPreset => {
+                            #[cfg(feature = "dev-tools")]
+                            crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
+                            dirty |= screen.step(1, &report, loaded.chart());
+                        }
                         MenuCommand::PrevPreset => {
-                            dirty |= screen.step(-1, &report, loaded.chart())
+                            #[cfg(feature = "dev-tools")]
+                            crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
+                            dirty |= screen.step(-1, &report, loaded.chart());
                         }
                     }
                 }
@@ -1060,6 +1088,8 @@ pub fn run_chart<R: Rig>(
                 {
                     rig.serve_leaving(cmd);
                     if cmd == MenuCommand::Retry {
+                        // A retry is the next play state.
+                        rig.play_state_began();
                         break;
                     }
                     return leave(rig);

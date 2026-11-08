@@ -375,8 +375,26 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     match imported.skin.kind() {
         ScreenKind::Selection => draw_selection(&imported.skin),
         ScreenKind::Result => draw_result(&imported.skin),
-        ScreenKind::Play | ScreenKind::Decision => draw_skin(imported, seed),
+        ScreenKind::Decision => draw_decision(&imported.skin),
+        ScreenKind::Play => draw_skin(imported, seed),
     }
+}
+
+/// `skin`'s atlas built within the harness's limits: its uv table.
+///
+/// # Panics
+///
+/// If the atlas is refused.
+fn atlas_uvs(skin: &skin_model::Skin) -> skin_model::UvTable {
+    let limits = skin_model::AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    skin.atlas(skin_model::Variant::Lo, limits, &|| false)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1
 }
 
 /// A result view of a 600-note play whose best is known with no BP
@@ -459,19 +477,8 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
 /// holds more quads than the skin's capacity.
 fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
     use bms_model::TimeUs;
-    use skin_model::{
-        AtlasLimits, Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers, Variant,
-    };
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    use skin_model::{Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers};
+    let uvs = atlas_uvs(skin);
     let labels = ResultLabels {
         title: "t".to_owned(),
         ..ResultLabels::default()
@@ -505,6 +512,67 @@ fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
     drawn
 }
 
+/// What an imported decision skin draws: the quads of frames at the
+/// choice, at the fade-out's start and at the screen's end, over the
+/// chart's labels with each outline line attached and the bitmap lines
+/// laid out, every frame within the skin's capacities.
+///
+/// # Panics
+///
+/// If the atlas, the labels or the text table is refused, or a frame is
+/// refused or holds more quads than the skin's capacity.
+fn draw_decision(skin: &skin_model::Skin) -> Vec<usize> {
+    use bms_model::TimeUs;
+    use skin_model::{
+        DecisionFrame, DecisionTimers, FrameUv, Layout, QuadBatch, ResultLabels, TextImage,
+        TextTable,
+    };
+    let uvs = atlas_uvs(skin);
+    let labels = ResultLabels {
+        title: "t".to_owned(),
+        artist: "a".to_owned(),
+        ..ResultLabels::default()
+    };
+    let mut dec = skin.prepare_decision();
+    skin.update_decision(&mut dec, &labels)
+        .expect("an imported decision skin takes labels");
+    let layout = Layout::AUTHOR;
+    let mut lines = vec![None; skin.text_slots()];
+    for r in skin.decision_text_requests(&dec, [1_920, 1_080], &layout) {
+        let uv = FrameUv {
+            uv: [0.0, 0.0, 0.5, 0.5],
+            layer: 1,
+        };
+        if let Some(slot) = lines.get_mut(usize::from(r.slot)) {
+            *slot = TextImage::new(uv, [0.0, 0.0, 1.0, 1.0], 1.0);
+        }
+    }
+    skin.attach_decision_text(&mut dec, TextTable::new(lines))
+        .expect("one line per slot");
+    skin.attach_decision_bitmap_text(&mut dec);
+    let t = skin.decision_timing();
+    let end = TimeUs(t.scene.0 + t.fadeout.0);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut drawn = Vec::new();
+    for now in [TimeUs(0), t.scene, end] {
+        batch.clear();
+        let frame = DecisionFrame {
+            now,
+            target: [1_920, 1_080],
+            layout: &layout,
+            timers: DecisionTimers {
+                screen: Some(TimeUs(0)),
+                fadeout: (now >= t.scene).then_some(t.scene),
+            },
+        };
+        skin.build_decision(&mut dec, &frame, &uvs, &mut batch)
+            .expect("an imported decision skin builds");
+        check_batch(skin, &batch);
+        drawn.push(batch.quads().len());
+    }
+    drawn
+}
+
 /// What an imported selection skin draws: the quads of frames at a few
 /// times over a view of a chart, a folder and the "all charts" row, the
 /// cursor on each, every frame within the skin's capacities; a press on
@@ -518,21 +586,11 @@ fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
 fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
     use bms_model::TimeUs;
     use skin_model::{
-        AtlasLimits, ChartLabels, Layout, QuadBatch, Ratio, RowKey, RowKind, RowScore, RowView,
-        SelectedChart, SelectionFrame, SelectionLabels, SelectionPlace, SelectionTimers,
-        SelectionView, Variant,
+        ChartLabels, Layout, QuadBatch, Ratio, RowKey, RowKind, RowScore, RowView, SelectedChart,
+        SelectionFrame, SelectionLabels, SelectionPlace, SelectionTimers, SelectionView,
     };
 
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let row = |kind: RowKind, title: &str| RowView {
         key: match kind {
             RowKind::Chart => RowKey::Chart(format!("{title}.bms").into()),
@@ -620,21 +678,12 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
     use skin_model::{
-        AtlasLimits, Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout,
-        PlayContext, QuadBatch, Side, SkinFrame, TextImage, TextTable, Variant,
+        Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout, PlayContext,
+        QuadBatch, Side, SkinFrame, TextImage, TextTable,
     };
 
     let skin = &imported.skin;
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let lane = Lane::new(1).expect("lane 1");
     let chart = (0..100_i64)
         .fold(ChartBuilder::new(150_000), |b, i| {
@@ -739,6 +788,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
@@ -790,6 +840,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: frame_lanes,
             readouts,
             playing: true,
@@ -886,6 +937,7 @@ fn lane_order_probes(
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: view,
             readouts: readouts_for(view),
             playing: true,
@@ -972,6 +1024,7 @@ fn gauge_probes(
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
+                turntable: 0,
                 lanes: LANES_OFF,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
@@ -992,21 +1045,11 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
     use skin_model::{
-        AtlasLimits, Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Side,
-        SkinFrame, Variant,
+        Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Side, SkinFrame,
     };
 
     let skin = &imported.skin;
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let chart = bms_model::ChartBuilder::new(150_000)
         .build()
         .expect("an empty chart");
@@ -1100,6 +1143,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
@@ -1217,6 +1261,7 @@ fn grade_anchor_probes(
                 complete: false,
                 target,
                 layout: &Layout::AUTHOR,
+                turntable: 0,
                 lanes: view,
                 readouts: readouts_for(view),
                 playing: true,
@@ -1285,6 +1330,7 @@ fn loading_probes(
             },
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes,
             covers: readouts_for(lanes).covers,
             gauge,
@@ -1306,6 +1352,7 @@ fn loading_probes(
         },
         target: [1_920, 1_080],
         layout: &Layout::AUTHOR,
+        turntable: 0,
         lanes: LANES_OFF,
         covers: readouts_for(LANES_OFF).covers,
         gauge: Some(normal),
@@ -1397,6 +1444,7 @@ fn digit_probes(
             complete: false,
             target,
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
@@ -1483,6 +1531,7 @@ fn long_note_probes(
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
+                turntable: 0,
                 lanes,
                 readouts: readouts_for(lanes),
                 playing: true,
@@ -1550,6 +1599,7 @@ fn bar_probes(
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes,
             readouts: readouts_for(lanes),
             playing: true,
@@ -1658,6 +1708,7 @@ fn choice_probes(
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,
@@ -1753,6 +1804,7 @@ fn rate_and_kind_probes(
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
+                turntable: 0,
                 lanes: LANES_OFF,
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
@@ -2030,6 +2082,7 @@ fn readout_probes(
                 complete: false,
                 target: [1_920, 1_080],
                 layout: &Layout::AUTHOR,
+                turntable: 0,
                 lanes,
                 readouts,
                 playing: true,
@@ -3466,6 +3519,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
             complete: false,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
+            turntable: 0,
             lanes: LANES_OFF,
             readouts: readouts_for(LANES_OFF),
             playing: true,

@@ -45,6 +45,7 @@ use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side, Skin};
 
 use crate::log_file;
 use crate::render_side::{RenderLink, SELECT_SLICE};
+use crate::screens::ScriptSlot;
 use crate::ui_text::{Label, Message};
 
 pub mod facts;
@@ -75,11 +76,10 @@ pub struct ImportTarget {
 /// How a kind's build ended.
 #[derive(Debug)]
 pub enum KindOutcome {
-    /// Built: the bundle to select, and the import's report.
-    Bundle(Arc<SkinBundle>, Summary),
-    /// The kind has no importer yet: its screen stays built in, for the
-    /// reason given.
-    BuiltIn(String),
+    /// Built: the bundle to select, the import's report, and the
+    /// selection screen's runtime, if its callbacks need one
+    /// (docs/stage3.md S7-07).
+    Bundle(Arc<SkinBundle>, Summary, ScriptSlot),
     /// Refused, with the located reason: nothing is selected.
     Refused(String),
     /// A Lua play skin whose base import read a fact the base snapshot
@@ -462,8 +462,7 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 ///    every file the skin names is. A skin of another kind refuses.
 /// 3. The configuration: each option and file choice by name, against the
 ///    header; an unknown name refuses.
-/// 4. The import, Lua against the base facts; a kind with no importer
-///    keeps its built-in screen. A Lua play skin reading a chart fact
+/// 4. The import, Lua against the base facts. A Lua play skin reading a chart fact
 ///    ends pending, built for each attempt ([`specialize`]); a Lua skin of
 ///    another kind reading one refuses.
 /// 5. The pack ([`pack`]).
@@ -474,21 +473,7 @@ pub fn build(
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> KindOutcome {
-    match built(kind, choice, autoplay, target, cancel) {
-        Ok(Built::Bundle(b, summary)) => KindOutcome::Bundle(b, summary),
-        Ok(Built::NoImporter(why)) => KindOutcome::BuiltIn(why),
-        Ok(Built::Pending(p, note)) => KindOutcome::Pending(p, note),
-        Ok(Built::ResultPending(p, note)) => KindOutcome::ResultPending(p, note),
-        Err(why) => KindOutcome::Refused(why),
-    }
-}
-
-/// What [`built`] made.
-enum Built {
-    Bundle(Arc<SkinBundle>, Summary),
-    NoImporter(String),
-    Pending(Arc<PendingPlay>, PendingNote),
-    ResultPending(Arc<crate::result_skin::PendingResult>, PendingNote),
+    built(kind, choice, autoplay, target, cancel).unwrap_or_else(KindOutcome::Refused)
 }
 
 /// The header pass's result, by format.
@@ -521,7 +506,7 @@ fn built(
     autoplay: bool,
     target: &ImportTarget,
     cancel: &Cancel,
-) -> Result<Built, String> {
+) -> Result<KindOutcome, String> {
     let stopped = || stopped(cancel);
     let text = |e: &ImportError| Chain(e).to_string();
     // 1. The folder.
@@ -561,12 +546,23 @@ fn built(
     let config = config(pass.header(), choice)?;
     // 4. The import.
     let header = pass.header().clone();
+    // A selection skin keeps its configured VM for the callbacks only its
+    // runtime runs (docs/stage3.md S7-07).
+    let mut script = ScriptSlot::default();
     let imported: Result<Imported, ImportError> = match pass {
         Pass::Json(mut def, _) => skin_beatoraja::import(&mut def, &header, &config, kind),
         Pass::Lua(h) => {
             let facts = ImportFacts::base(kind, Fact::Known(autoplay));
-            match h.import(&config, &facts, cancel) {
-                Ok(LuaOutcome::Imported(i)) => Ok(i.imported),
+            let outcome = if kind == ScreenKind::Selection {
+                h.import_runtime(&config, &facts, cancel)
+            } else {
+                h.import(&config, &facts, cancel)
+            };
+            match outcome {
+                Ok(LuaOutcome::Imported(i)) => {
+                    script = ScriptSlot::staged(i.runtime);
+                    Ok(i.imported)
+                }
                 Ok(LuaOutcome::Pending(p)) => {
                     let note = PendingNote {
                         fact: p.pending,
@@ -579,7 +575,7 @@ fn built(
                         let root = Root::new(&choice.root).map_err(|e| Chain(&e).to_string())?;
                         let pending =
                             crate::result_skin::PendingResult::new(h, config, *target, &root);
-                        return Ok(Built::ResultPending(Arc::new(pending), note));
+                        return Ok(KindOutcome::ResultPending(Arc::new(pending), note));
                     }
                     // Only play's and the result's facts are given per
                     // attempt: another kind's pending fact refuses.
@@ -591,21 +587,17 @@ fn built(
                         config,
                         target: *target,
                     };
-                    return Ok(Built::Pending(Arc::new(pending), note));
+                    return Ok(KindOutcome::Pending(Arc::new(pending), note));
                 }
                 Err(e) => Err(e),
             }
         }
     };
-    let imported = match imported {
-        Ok(i) => i,
-        Err(e @ ImportError::NoImporter { .. }) => return Ok(Built::NoImporter(text(&e))),
-        Err(e) => return Err(text(&e)),
-    };
+    let imported = imported.map_err(|e| text(&e))?;
     stopped()?;
     // 5. The pack.
     let (bundle, summary) = pack(imported, &header, target, cancel)?;
-    Ok(Built::Bundle(bundle, summary))
+    Ok(KindOutcome::Bundle(bundle, summary, script))
 }
 
 /// Builds `pending` for an attempt's `facts`, asking `cancel` between its
@@ -977,8 +969,6 @@ fn spawn(body: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHa
 pub enum Shown {
     /// Its skin is installed.
     Installed,
-    /// Its screen stays built in, for the reason.
-    BuiltIn(String),
     /// Its skin was refused, for the reason.
     Refused(String),
     /// Its skin is pending: it reads this chart fact as it is built, and
@@ -987,8 +977,7 @@ pub enum Shown {
 }
 
 /// The stdout line of `kind`: `skin: <kind>: installed`, `skin: <kind>:
-/// built-in: <reason>`, `skin: <kind>: refused: <reason>` or `skin:
-/// <kind>: pending: <what it reads>`.
+/// refused: <reason>` or `skin: <kind>: pending: <what it reads>`.
 pub fn line(kind: ScreenKind, shown: &Shown) -> String {
     let kind = name(kind);
     match shown {
@@ -997,13 +986,11 @@ pub fn line(kind: ScreenKind, shown: &Shown) -> String {
             "skin: {kind}: pending: reads {} as it is built; built for each chart before its play",
             fact_name(*fact)
         ),
-        Shown::BuiltIn(why) => format!("skin: {kind}: built-in: {why}"),
         Shown::Refused(why) => format!("skin: {kind}: refused: {why}"),
     }
 }
 
-/// The select screen's notice of a refused or built-in kind other than
-/// play: one line naming the kind and the reason. Play's refusal is its
+/// The select screen's notice of a refused kind other than play: one line naming the kind and the reason. Play's refusal is its
 /// admission notice instead ([`crate::render_side::SkinState`]).
 pub fn notice(kind: ScreenKind, why: &str) -> String {
     let screen = match kind {
@@ -1175,8 +1162,7 @@ pub struct Started {
     /// Play's admission notice when its skin was refused (song selection):
     /// no chart is admitted, and the built-in skin does not stand in.
     pub play: Option<String>,
-    /// The select screen's one notice line for the other kinds refused or
-    /// left built in.
+    /// The select screen's one notice line for the other kinds refused.
     pub notice: Option<String>,
     /// Play's pending skin, marked pending on the render thread: each
     /// attempt is prepared with its specialization ([`PendingSkin`]).
@@ -1226,8 +1212,8 @@ pub enum StartupEnd {
 /// - A play skin that cannot be used refuses every chart on the song
 ///   selection path ([`Started::play`]); on the direct path it fails the
 ///   run, whatever refused it, before the result kind's build starts.
-/// - Another kind refused, or with no importer yet, keeps its built-in
-///   screen, with one notice line ([`Started::notice`]).
+/// - Another kind refused keeps its built-in screen, with one notice line
+///   ([`Started::notice`]).
 /// - A healthy refusal of an installation moves on to the next kind.
 ///
 /// # Errors
@@ -1286,7 +1272,6 @@ pub fn startup(
                     Some(why) => Shown::Refused(why),
                 }
             }
-            Ran::Done(KindOutcome::BuiltIn(why)) => Shown::BuiltIn(why),
             Ran::Done(KindOutcome::ResultPending(result, note)) => {
                 started.result = Some(crate::result_skin::ResultStart::Pending(result));
                 Shown::Pending(note.fact)
@@ -1294,7 +1279,7 @@ pub fn startup(
             // A result skin with no fact pending: installed as the result
             // kind's, for every chart (the S10-09i design's D2). Refused, it
             // is tried again after each attempt's commit.
-            Ran::Done(KindOutcome::Bundle(bundle, summary)) if kind == ScreenKind::Result => {
+            Ran::Done(KindOutcome::Bundle(bundle, summary, _)) if kind == ScreenKind::Result => {
                 started.result = Some(crate::result_skin::ResultStart::Fixed(Arc::clone(&bundle)));
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 match answered(kind, render.select(kind, Some(bundle)), &mut stop)? {
@@ -1307,12 +1292,12 @@ pub fn startup(
                     Some(why) => Shown::Refused(why),
                 }
             }
-            Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
+            Ran::Done(KindOutcome::Bundle(bundle, summary, script)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 let skin = bundle.skin();
                 let window = (kind == ScreenKind::Selection)
                     .then(|| (skin.song_list_center(), skin.song_list_slots()));
-                let pending = render.select(kind, Some(bundle));
+                let pending = render.select_with(kind, Some(bundle), script);
                 match answered(kind, pending, &mut stop)? {
                     None => {
                         if window.is_some() {
@@ -1330,7 +1315,7 @@ pub fn startup(
         report(kind, &shown);
         match shown {
             Shown::Installed | Shown::Pending(_) => {}
-            Shown::Refused(why) | Shown::BuiltIn(why) if kind == ScreenKind::Play => {
+            Shown::Refused(why) if kind == ScreenKind::Play => {
                 if launch == Launch::Direct {
                     return Err(StartupEnd::Failed(anyhow::anyhow!(
                         "the play skin cannot be used: {why}"
@@ -1338,7 +1323,7 @@ pub fn startup(
                 }
                 started.play = Some(Message::SkinUnusable { why: &why }.text());
             }
-            Shown::Refused(why) | Shown::BuiltIn(why) => notices.push(notice(kind, &why)),
+            Shown::Refused(why) => notices.push(notice(kind, &why)),
         }
     }
     if !notices.is_empty() {
