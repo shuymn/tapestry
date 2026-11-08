@@ -416,7 +416,9 @@ pub struct Play {
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
     ms: Box<[i32]>,
-    fields: [i32; field::COUNT],
+    /// The fields, then the presentation program's outputs, two a
+    /// callback.
+    fields: Box<[i32]>,
     /// The attempt's exact playhead, which notes, bar lines and the beat
     /// sample; a rearm keeps it.
     playhead: ExactPlayhead,
@@ -491,6 +493,7 @@ impl Play {
         });
         let bytes = size_of::<Self>()
             + self.reducer.heap_bytes()
+            + size_of_val(&*self.fields)
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
             + self.playhead.heap_bytes()
@@ -502,12 +505,14 @@ impl Play {
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
-    /// A fresh attempt with `whens` `when` timers, keeping the chart's
+    /// A fresh attempt with `outputs` program output slots and `whens`
+    /// `when` timers, keeping the chart's
     /// notes and the work of `bar_groups` checked groups when the skin has
     /// `lanes`; grades up to `bomb_up_to` give a bomb.
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
+        outputs: usize,
         whens: usize,
         lanes: bool,
         bar_groups: usize,
@@ -580,7 +585,7 @@ impl Play {
             poisoned: None,
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
-            fields: [0; field::COUNT],
+            fields: vec![0; field::COUNT.saturating_add(outputs)].into_boxed_slice(),
             playhead,
             display: Position(0),
             beat: None,
@@ -635,6 +640,11 @@ impl Play {
     /// Takes back the work [`take_bars`](Self::take_bars) lent.
     pub(crate) fn restore_bars(&mut self, bars: Option<BarScratch>) {
         self.bars = bars;
+    }
+
+    /// The field slots, the program's outputs included.
+    pub(crate) fn field_count(&self) -> usize {
+        self.fields.len()
     }
 
     /// The number of timer slots, built-in and `when`.
@@ -818,6 +828,7 @@ mod tests {
             widgets: crate::WidgetDefs::default(),
             bomb_up_to: Some(crate::Grade::Bad),
             close: None,
+            present: None,
         })
         .unwrap();
         let limits = AtlasLimits {

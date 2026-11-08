@@ -98,6 +98,7 @@ fn skin_def(
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     }
 }
 

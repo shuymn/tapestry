@@ -94,6 +94,7 @@ fn graph_skin(dir: &std::path::Path, x: i32) -> Skin {
         widgets: WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        present: None,
     };
     let graph = JudgeGraphDef {
         kind: JudgeGraphKind::Judgment,

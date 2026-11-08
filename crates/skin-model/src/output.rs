@@ -4,10 +4,8 @@
 //! fields, its value `lua.<k>` and its availability `lua.<k>.ok`; an
 //! expression reads them by those names ([`crate::expr::Scope::outputs`]).
 //!
-//! The play presentation program (S7-06d) writes the same slots by the
-//! same names. This module is their shared home: the program's branch
-//! adds its own copy of [`OutTy`] and [`output`] until the two meet, and
-//! the second to land keeps this one.
+//! The play presentation program (S7-06d, [`crate::present`]) writes the
+//! same slots by the same names, its callbacks' types its signature.
 
 /// A callback output's type: a `draw` gives a boolean, a number's `value`
 /// an integer.

@@ -30,6 +30,7 @@ mod logic;
 mod policy;
 mod practice;
 mod practice_screen;
+mod prep;
 mod prepare;
 pub mod presets;
 mod queue;
@@ -96,6 +97,7 @@ pub use practice_screen::{
     LEAD_IN_STEP, MAX_LEAD_IN, MIN_LEAD_IN, PracticeActed, PracticeInput, PracticeRow,
     PracticeScreen, measures,
 };
+pub use prep::{Changes, PrepHandle, PrepKey, PrepPoll, Readiness, ScreenKey, Stale};
 pub use prepare::{
     BmsIngest, ChartIngest, ChartLabels, ChartTransform, IngestError, Ingested, Passthrough,
     TransformId,
