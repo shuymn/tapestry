@@ -991,6 +991,11 @@ impl Screen for MenuScreen {
         self.renderer.atlas_uploads()
     }
 
+    #[cfg(feature = "dev-tools")]
+    fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
+        self.renderer.take_upload_timing()
+    }
+
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.renderer.result_quads()

@@ -308,6 +308,11 @@ pub struct PlayerRig<'a> {
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
+    /// Development builds: G2's start (the S10-09i design's §8.1), when
+    /// the attempt's `commit_ready` returned, and what its result step
+    /// did, until the opening prints it.
+    #[cfg(feature = "dev-tools")]
+    pub probe_ready: Option<(std::time::Instant, &'static str)>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -645,7 +650,18 @@ impl PlayerRig<'_> {
         let Some(upload) = self.result_skin.upload() else {
             return;
         };
-        if status.installed == Some(upload.atlas()) {
+        // Development builds: `cold` asks for every upload (G1), and G2's
+        // sample says what the step did: `none` (no skin, or the kind
+        // disabled), `reused` (installed) or `uploaded` (asked for).
+        #[cfg(feature = "dev-tools")]
+        let installed = status.installed == Some(upload.atlas()) && !crate::dev::result_cold();
+        #[cfg(not(feature = "dev-tools"))]
+        let installed = status.installed == Some(upload.atlas());
+        #[cfg(feature = "dev-tools")]
+        if let Some((_, step)) = &mut self.probe_ready {
+            *step = if installed { "reused" } else { "uploaded" };
+        }
+        if installed {
             return;
         }
         let mut pending = self.render.upload_result(upload);
@@ -1466,6 +1482,10 @@ impl Rig for PlayerRig<'_> {
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared_close)?;
+        #[cfg(feature = "dev-tools")]
+        {
+            self.probe_ready = Some((std::time::Instant::now(), "none"));
+        }
         self.upload_result();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
@@ -1658,6 +1678,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
+        // G2's sample (dev-tools): `commit_ready`'s return to here.
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_ready_to_open(self.probe_ready.take());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -1720,6 +1743,9 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
+        // G2's sample (dev-tools), as at [`open`](Rig::open).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_ready_to_open(self.probe_ready.take());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -2102,6 +2128,12 @@ impl Rig for PlayerRig<'_> {
     /// result's, and what comes from here on is fresh. The built-in result
     /// needs nothing more, so the preparation is ready at once.
     fn begin_result(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
+        // G3's start (dev-tools): the save phase's drain is over.
+        #[cfg(feature = "dev-tools")]
+        {
+            game::probe::stamp(&game::probe::RESULT_BEGAN);
+            game::probe::clear(&game::probe::STEP_ACCEPTED);
+        }
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;

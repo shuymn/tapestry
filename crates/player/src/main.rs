@@ -871,6 +871,8 @@ fn rig<'a>(
         result_offset: None,
         result_leaving: false,
         result_outro: None,
+        #[cfg(feature = "dev-tools")]
+        probe_ready: None,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
