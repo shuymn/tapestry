@@ -1428,6 +1428,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn start_tuning(&self, generation: u32) -> Option<replay::StartTuning> {
+        self.adjust.as_ref().and_then(|a| a.opened(generation))
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn settle_candidate(&mut self, generation: u32) -> bool {
         self.gate.as_ref().is_some_and(|g| g.settle(generation))
     }
