@@ -745,6 +745,11 @@ fn a_runtime_past_its_budget_stops_and_the_screen_draws_on() {
     assert_eq!(quads_after(&frames, seen, 3), drawn);
     assert_eq!(link.take_selection_refusal(), None);
     assert_eq!(strip_of(&frames), (vec![notice.to_owned()], true));
+    // A new update lays the strip out again: the notice stays.
+    link.show_selection(update_of(1, 2, listed(SelectionPlace::All, "")));
+    let seen = frames.0.lock().unwrap().len();
+    let _ = quads_after(&frames, seen, 3);
+    assert_eq!(strip_of(&frames), (vec![notice.to_owned()], true));
     link.leave_selection();
     assert!(link.park_scripts());
     assert_eq!(
