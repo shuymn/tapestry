@@ -105,6 +105,7 @@ fn write_log(path: &Path, events: &[PhysicalInputEvent], sources: usize) {
         axis_out_of_range: 0,
     };
     let rec = PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: 1,
             app: "test".to_owned(),
@@ -369,6 +370,12 @@ fn exit_scenario_plays_select_result_retry_repeatedly() {
         EndStatus::EndedMidway,
     ];
     assert_eq!(decoded[0].events, log);
+    // Each starts with the tuning its opening took from the adjustment
+    // controls: a solved multiplier, which only the reducer has.
+    for rec in &decoded {
+        let tuning = rec.start_tuning.expect("a played record's tuning");
+        assert!(tuning.hispeed.is_some(), "{tuning:?}");
+    }
     for ((rec, path), status) in decoded.iter().zip(&records).zip(statuses) {
         assert_eq!(rec.status.end, status, "{}", path.display());
         assert!(

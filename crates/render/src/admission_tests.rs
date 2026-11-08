@@ -84,7 +84,7 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
     assert!(e.is_refusal());
 }
 
-/// The shared limit is 576 Mi, at least two atlases at the cap: big as
+/// The shared limit is 768 Mi, at least two atlases at the cap: big as
 /// the selection screen's candidate fits beside play's skin charged the
 /// cap; charged what the limit leaves beside big, play's skin puts the sum
 /// exactly at the limit, and one texel more past it; once a tiny result
@@ -92,7 +92,7 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
 /// big is refused.
 #[test]
 fn two_skins_at_the_atlas_cap_fit_together() {
-    assert_eq!(SHARED_TEXELS, 576 << 20);
+    assert_eq!(SHARED_TEXELS, 768 << 20);
     const { assert!(SHARED_TEXELS >= 2 * CAP) };
     let mut r = offscreen(1_920, 1_080);
     let big = big(&r);
@@ -118,6 +118,44 @@ fn two_skins_at_the_atlas_cap_fit_together() {
     let e = r.install(ScreenKind::Selection, &big, 3).unwrap_err();
     refused(&e, ScreenKind::Selection, SHARED_TEXELS + TINY);
     assert!(r.staged().is_none());
+}
+
+/// The largest supported skin of each kind fits with the others: play,
+/// selection and decision committed at the largest surveyed charges, a
+/// decision skin of seven 4 224-texel image pages charged with its reserved
+/// layer and no text layer, play and selection keeping a VM, beside a
+/// result candidate at an atlas's cap keeping one too, which is more than
+/// the largest result skin surveyed. That set is past the former 576 Mi.
+/// A VM charge after S7-07 (4 Mi) is smaller than [`VM_TEXELS`], so the
+/// same set fits under it too. At a replacement's peak the admitted
+/// texels and the replaced atlas are within 1 024 Mi.
+#[test]
+fn the_largest_skin_of_each_kind_fits_together() {
+    const M: u64 = 1_000_000;
+    const DECISION: u64 = 8 * 4_224 * 4_224;
+    assert_eq!(DECISION, 142_737_408);
+    const { assert!(4 << 20 <= VM_TEXELS) };
+    const { assert!(SHARED_TEXELS + CAP == 1_024 << 20) };
+    let mut r = offscreen(1_920, 1_080);
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    r.state_charge(&p, 111 * M + VM_TEXELS);
+    let s = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    r.state_charge(&s, 196_300_000 + VM_TEXELS);
+    let d = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &d, 3);
+    r.state_charge(&d, DECISION);
+    let result = Arc::new(
+        Arc::try_unwrap(atlas_cap_bundle(&r, GREEN))
+            .unwrap()
+            .keeping_vm(),
+    );
+    let needed: u64 = r.admission().committed.iter().sum::<u64>() + CAP + VM_TEXELS;
+    const { assert!(231_900_000 < CAP) };
+    assert!(needed > 576 << 20, "{needed}");
+    assert!(needed <= SHARED_TEXELS, "{needed}");
+    r.admit(ScreenKind::Result, &result).unwrap();
 }
 
 /// A candidate replaces its kind's committed installation: its charge is

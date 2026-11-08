@@ -1467,3 +1467,122 @@ fn a_step_applied_in_an_ended_context_is_never_taken_back() {
         assert_eq!(drained(o, &constant(150), &log, &[i]), whole, "split {i}");
     }
 }
+
+/// An opening's phase at `at` µs, the head on the clock, candidate
+/// `generation`.
+fn opening(at: i64, generation: u32) -> Event {
+    Event::Phase {
+        head: Head::Clock {
+            at: TimeUs(at),
+            chart: TimeUs(-1_000_000),
+        },
+        generation,
+    }
+}
+
+/// The starting tuning (design.md "Input Log Format") is the state where
+/// the opening's phase is reduced: a step ordered before it in the same
+/// microsecond is in it, its open group closed by the new generation, and
+/// one ordered after is not; a cancel keeps it until the rearm's opening
+/// replaces it.
+#[test]
+fn an_openings_tuning_is_taken_where_its_phase_is_reduced() {
+    let mut rig = Rig::prepared(
+        options(SpeedMode::Classic, 100, 300, Covers::default()),
+        constant(150),
+    );
+    assert_eq!(rig.a.opened(), None);
+    rig.at(10 * MS).tap(F2);
+    rig.ev(opening(10 * MS, 1)).tap(F2);
+    let opened = *rig.a.opened().unwrap();
+    assert_eq!(opened.generation, 1);
+    assert_eq!(opened.hispeed, Some(r(125, 100)));
+    assert_eq!(opened.options.hispeed().classic_hispeed_x100, 125);
+    assert_eq!(h(&rig.snap()), r(150, 100));
+    // A cancel (the head frozen, the same generation) keeps it.
+    rig.at(20 * MS).ev(Event::Phase {
+        head: Head::Frozen {
+            opens_at: TimeUs(-1_000_000),
+        },
+        generation: 1,
+    });
+    rig.at(30 * MS).tap(F2);
+    assert_eq!(rig.a.opened().unwrap().hispeed, Some(r(125, 100)));
+    // The rearm's opening takes what was adjusted while waiting.
+    rig.at(40 * MS).ev(opening(40 * MS, 2));
+    let rearmed = *rig.a.opened().unwrap();
+    assert_eq!(rearmed.generation, 2);
+    assert_eq!(rearmed.hispeed, Some(r(175, 100)));
+    assert_eq!(
+        rearmed.start_tuning().hispeed,
+        Some(replay::HiSpeedRatio { num: 7, den: 4 })
+    );
+}
+
+/// The record's checks of the starting tuning (`replay::StartTuning`)
+/// accept exactly the settings the play options accept, at and around
+/// every bound.
+#[test]
+fn the_records_tuning_bounds_are_the_play_options() {
+    let check = |hs: HiSpeedSettings, covers: Covers| {
+        let cover = |c: Cover| replay::CoverRecord {
+            amount: c.amount,
+            on: c.on,
+        };
+        let t = replay::StartTuning {
+            classic_hispeed_x100: hs.classic_hispeed_x100,
+            classic_step_x100: hs.classic_step_x100,
+            floating_step_x100: hs.floating_step_x100,
+            green_target: hs.green_target,
+            sudden: cover(covers.sudden),
+            lift: cover(covers.lift),
+            hidden: cover(covers.hidden),
+            ..replay::StartTuning::default()
+        };
+        assert_eq!(
+            PlayOptions::new(hs, covers).is_ok(),
+            t.invalid().is_none(),
+            "{hs:?} {covers:?}"
+        );
+    };
+    let d = HiSpeedSettings::default();
+    for v in 0..=2_100 {
+        check(
+            HiSpeedSettings {
+                classic_hispeed_x100: v,
+                ..d
+            },
+            Covers::default(),
+        );
+        check(
+            HiSpeedSettings {
+                green_target: v * 3,
+                ..d
+            },
+            Covers::default(),
+        );
+    }
+    for v in 0..=110 {
+        check(
+            HiSpeedSettings {
+                classic_step_x100: v,
+                ..d
+            },
+            Covers::default(),
+        );
+        check(
+            HiSpeedSettings {
+                floating_step_x100: v,
+                ..d
+            },
+            Covers::default(),
+        );
+    }
+    for amount in [0, 1, 999, 1_000, 1_001, u16::MAX] {
+        for kind in [CoverKind::Sudden, CoverKind::Lift, CoverKind::Hidden] {
+            let mut covers = Covers::default();
+            *covers.get_mut(kind) = Cover { amount, on: true };
+            check(d, covers);
+        }
+    }
+}

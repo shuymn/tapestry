@@ -422,6 +422,17 @@ impl AdjustDriver {
         self.reducer.snapshot()
     }
 
+    /// The starting tuning of READY candidate `generation`, once its
+    /// opening's phase was reduced ([`Adjustment::opened`]); `None` before
+    /// that, or for another candidate.
+    #[must_use]
+    pub fn opened(&self, generation: u32) -> Option<replay::StartTuning> {
+        self.reducer
+            .opened()
+            .filter(|s| s.generation == generation)
+            .map(PresentationSnapshot::start_tuning)
+    }
+
     /// What the reducer refused so far.
     #[must_use]
     pub const fn diagnostics(&self) -> Diagnostics {

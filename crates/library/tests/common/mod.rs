@@ -198,6 +198,7 @@ pub fn record_of(text: &str, seed: u64, events: Vec<PhysicalInputEvent>) -> Play
     .unwrap()
     .final_deadline();
     PlayRecord {
+        start_tuning: Some(replay::StartTuning::default()),
         versions: Versions {
             evaluator: rules::Implementation::STANDARD_VERSION,
             app: "test".to_owned(),
