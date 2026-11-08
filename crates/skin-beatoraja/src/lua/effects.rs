@@ -27,10 +27,12 @@
 //!
 //! Anything else opens the analysis at the first place the walk meets it
 //! ([`Analysis::open`]), after any place the conversion opened it at. An
-//! assignment to anything but a local of the same function, a writer
-//! host API, `table.insert`, `table.remove`, `table.sort` and
-//! `setmetatable` also make the roots that reach them writers, which
-//! never lower. The walk goes on past an open place, so every root's
+//! assignment to an upvalue is a located write instead: its binding cell
+//! is recorded ([`Analysis::written`]), voiding only the proofs through
+//! it, and the candidate stays as it is. Every assignment to anything but
+//! a local of the same function, a writer host API, `table.insert`,
+//! `table.remove`, `table.sort` and `setmetatable` also make the roots
+//! that reach them writers, which never lower. The walk goes on past an open place, so every root's
 //! writer bit is known; a cap, cancellation or the time budget stops it,
 //! fatal.
 
@@ -359,6 +361,27 @@ impl<'a> Walk<'a> {
         self.outside(b, line, why);
     }
 
+    /// A located write of upvalue `d` at line `line` of `b`, of integer
+    /// numeral `int` when it is one: `b`'s prototype writes, and the cell
+    /// is recorded with what it gets, the candidate left as it is.
+    fn write_cell(&mut self, b: &Body<'_>, d: u32, line: u32, int: Option<i64>) {
+        if let Some(w) = self.writes.get_mut(b.proto as usize) {
+            *w = true;
+        }
+        let mut written = self.an.written.borrow_mut();
+        let entry = written
+            .entry((b.file, d))
+            .or_insert((line, Some(Vec::new())));
+        match (&mut entry.1, int) {
+            (Some(ints), Some(n)) => {
+                if !ints.contains(&n) {
+                    ints.push(n);
+                }
+            }
+            (ints, _) => *ints = None,
+        }
+    }
+
     fn fatal(&self, b: &Body<'_>, line: u32, why: Unsupported) -> Found {
         Found {
             why,
@@ -675,7 +698,14 @@ impl<'a> Walk<'a> {
             Stmt::Assign { targets, exprs } => {
                 // Each target one unit.
                 self.charge_at(b, line, u64::from(targets.1))?;
-                for &t in ast.list(targets) {
+                let values = ast.list(exprs);
+                for (k, &t) in ast.list(targets).iter().enumerate() {
+                    // The value an upvalue gets: an integer numeral, when
+                    // it is one and the list does not expand past it.
+                    let int = match values.get(k).map(|&v| (v, ast.expr(v))) {
+                        Some((v, Expr::Int(n))) if !ast.wide(v) => Some(n),
+                        _ => None,
+                    };
                     match ast.expr(t) {
                         Expr::Local(d) if Self::own(b, d) => {}
                         Expr::Index { obj, key } => {
@@ -683,6 +713,8 @@ impl<'a> Walk<'a> {
                             self.one(b, key)?;
                             self.write(b, line, Unsupported::Construct("assignment"));
                         }
+                        // An upvalue: a located write of its binding cell.
+                        Expr::Local(d) => self.write_cell(b, d, line, int),
                         _ => self.write(b, line, Unsupported::Construct("assignment")),
                     }
                 }
@@ -1256,7 +1288,20 @@ pub(crate) fn walk(an: &Analysis, arena: &Arena) -> Result<(), (Option<u32>, Fou
     an.clock
         .enter(Phase::Walk, None)
         .map_err(|w| (None, unit(w)))?;
-    let r = Walk::new(an).roots(arena);
+    // A fixed point: a walk reads a cell some root writes as unknown only
+    // once the write is recorded, so the walks repeat, the conversion's
+    // open place and no writers restored, until no new cell is written.
+    // Cells only accumulate, so it ends within one walk a cell.
+    let open = an.open.get();
+    let r = loop {
+        let before = an.written.borrow().len();
+        an.open.set(open);
+        an.writers.borrow_mut().clear();
+        let r = Walk::new(an).roots(arena);
+        if r.is_err() || an.written.borrow().len() == before {
+            break r;
+        }
+    };
     let at = an.clock.retained();
     let left = an.clock.leave();
     r?;
