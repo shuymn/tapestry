@@ -440,6 +440,9 @@ pub(crate) struct Cx<'d> {
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
+    /// Where the last lowering's capture proof was voided by a frame-time
+    /// write: its refusal's place.
+    interference: std::cell::Cell<Option<crate::lua::callback::Site>>,
     ranks: [Option<u16>; 3],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
@@ -551,6 +554,7 @@ impl<'d> Cx<'d> {
             when_spans: Vec::new(),
             present: skin_model::present::PresentDef::default(),
             number_value: None,
+            interference: std::cell::Cell::new(None),
             ranks: [None; 3],
             elements: Vec::new(),
             element_spans: Vec::new(),

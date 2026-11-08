@@ -375,6 +375,9 @@ struct Frame<'a> {
 }
 
 struct Eval<'a> {
+    /// Where the first proof this evaluation needed was voided by a
+    /// frame-time write, carried with its refusal.
+    interfered: &'a std::cell::Cell<Option<super::callback::Site>>,
     an: &'a Analysis,
     cancelled: &'a dyn Fn() -> bool,
     res: Residual,
@@ -393,8 +396,10 @@ pub(crate) fn evaluate(
     inst: u32,
     conv: Conv,
     cancelled: &dyn Fn() -> bool,
+    interfered: &std::cell::Cell<Option<super::callback::Site>>,
 ) -> R<Residual> {
     let mut ev = Eval {
+        interfered,
         an: adm.analysis(),
         cancelled,
         res: Residual::default(),
@@ -522,6 +527,9 @@ impl<'a> Eval<'a> {
     /// time.
     fn bound(&self, file: u16, d: u32) -> R<()> {
         if !self.an.cell_holds(file, d) {
+            if self.interfered.get().is_none() {
+                self.interfered.set(self.an.written_at(file, d));
+            }
             return refuse(Unsupported::Interference);
         }
         Ok(())

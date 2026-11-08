@@ -980,7 +980,7 @@ impl Ids<'_> {
                     return Ok(Scan::unresolved("id"));
                 };
                 self.an.charge(units(ints.len())).map_err(stop)?;
-                let captured = match self.an.upvalue(self.inst, d) {
+                let captured = match self.an.captured_upvalue(self.inst, d) {
                     Some(Captured::Int(n)) => number_part(n),
                     // A cell captured nil before its first write.
                     Some(Captured::Nil) if !ints.is_empty() => Scan::default(),
@@ -1457,19 +1457,24 @@ impl Cx<'_> {
         // The expressions first; on play, a draw or a number's value they
         // refuse goes to the program, whose refusal is then the reason.
         let program = self.kind == ScreenKind::Play && matches!(conv, Conv::Truthy | Conv::Int);
-        let r = residual::evaluate(adm, inst, conv, &cancelled).and_then(|res: Residual| {
-            l.attach(&res)?;
-            // Every reached operation is checked whichever backend takes
-            // the callback, discarded ones included.
-            compile::intervals(an, &l, &res)?;
-            match l.emit_root(&res, conv) {
-                Ok(src) => Ok(Ok(src)),
-                Err(Stop::Unsupported(_)) if program => {
-                    compile::compile(an, &mut l, &res, conv).map(Err)
+        let interfered = std::cell::Cell::new(None);
+        let r = residual::evaluate(adm, inst, conv, &cancelled, &interfered).and_then(
+            |res: Residual| {
+                l.attach(&res)?;
+                // Every reached operation is checked whichever backend takes
+                // the callback, discarded ones included.
+                compile::intervals(an, &l, &res)?;
+                match l.emit_root(&res, conv) {
+                    Ok(src) => Ok(Ok(src)),
+                    Err(Stop::Unsupported(_)) if program => {
+                        compile::compile(an, &mut l, &res, conv).map(Err)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
-        });
+            },
+        );
+        // The interference this lowering met, for its refusal's place.
+        self.interference.set(interfered.get());
         #[cfg(test)]
         crate::lua::tests::memo_witness(l.memo.len());
         match r {
@@ -1494,7 +1499,8 @@ impl Cx<'_> {
         let open = match why {
             Unsupported::Interference => self
                 .analysis()
-                .and_then(|an| an.open.get().map(|o| o.site).or(an.interfered.get())),
+                .and_then(|an| an.open.get().map(|o| o.site))
+                .or(self.interference.get()),
             _ => None,
         };
         let at = match open {
@@ -1611,9 +1617,10 @@ impl Cx<'_> {
             return Ok(Err(Unsupported::Writes));
         }
         let cancelled = || def.cancelled(|| None).is_err();
-        match residual::evaluate(adm, inst, Conv::Text, &cancelled)
-            .and_then(|res: Residual| text_fold(an, &res, self.kind))
-        {
+        let interfered = std::cell::Cell::new(None);
+        let r = residual::evaluate(adm, inst, Conv::Text, &cancelled, &interfered);
+        self.interference.set(interfered.get());
+        match r.and_then(|res: Residual| text_fold(an, &res, self.kind)) {
             Ok(fold) => Ok(Ok(fold)),
             Err(Stop::Unsupported(why)) => Ok(Err(why)),
             Err(Stop::Fatal(why)) => Err(ImportError::Lua {

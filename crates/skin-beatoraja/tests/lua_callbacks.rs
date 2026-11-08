@@ -953,9 +953,10 @@ fn a_write_to_another_cell_leaves_a_proof_whole() {
 }
 
 /// A write that may reach a proof's path voids it: through a table entry
-/// (not located, so the candidate opens) and to the cell the reader's
-/// binding lives in (located): the critical pulse refuses, located at the
-/// write.
+/// (not located, so the candidate opens at the write) and to the cell the
+/// reader's binding lives in (located): the rebound `ms` is of an unknown
+/// value wherever a root reads it, so its index in the pulse opens the
+/// candidate there, and the critical pulse refuses at that read.
 #[test]
 fn a_write_on_a_proofs_path_voids_it() {
     // The host module held in a table, its entry written at frame time.
@@ -965,7 +966,7 @@ fn a_write_on_a_proofs_path_voids_it() {
     // The reader's own upvalue `ms`, rebound at frame time.
     let cell = "table.insert(skin.destination, { id = \"i\", draw = function() ms = nil return true end,\n\
           dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
-    for (writer, line) in [(entry, 12), (cell, 11)] {
+    for (writer, line) in [(entry, 12), (cell, 16)] {
         let d = folder(&skin(&format!("{writer}\n{SHAPE_C}")));
         match import(&d, 905) {
             Err(ImportError::Lua {
@@ -1071,5 +1072,97 @@ fn a_small_modulo_composes() {
         let at = |k: usize| f[skin_model::field::COUNT + k];
         let want = i32::try_from(n % 5 * 1000).unwrap();
         assert_eq!([at(0), at(1)], [want, 1], "{n}");
+    }
+}
+
+/// A written cell is never read as its captured value, wherever the
+/// analysis reads one. The effect walk: a decorative root rebinding a
+/// helper to one that writes the configuration, then calling it: the call
+/// is of an unknown function, which opens the candidate, so the critical
+/// configuration reader refuses. The role scan's join: a setter rebound to
+/// one writing a critical id is unknown too.
+#[test]
+fn a_rebound_callee_is_never_its_captured_value() {
+    let poison = "local cfg = skin_config\n\
+        local f = function() return true end\n\
+        local poison = function() cfg.option.fc = 905 return true end\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() f = poison return f() end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+        table.insert(skin.destination, { id = \"g\", draw = function() return en() end,\n\
+          dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
+    match import(&folder(&skin(poison)), 906) {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    // The rebinding met after the call: the walk repeats until no new cell
+    // is written, so the earlier root's call is of an unknown function too.
+    let later = "local cfg = skin_config\n\
+        local f = function() return true end\n\
+        local poison = function() cfg.option.fc = 905 return true end\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() return f() end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() f = poison return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+        table.insert(skin.destination, { id = \"g\", draw = function() return en() end,\n\
+          dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
+    assert!(
+        matches!(
+            import(&folder(&skin(later)), 906),
+            Err(ImportError::Lua {
+                why: LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+                ..
+            })
+        ),
+        "the call before its rebinding"
+    );
+    // The integer join: `id` gets 153 directly and 101 through a setter
+    // the root rebinds; the critical 101 is never missed.
+    let setter = "local id = 152\n\
+        local f = function() return true end\n\
+        local setid = function() id = 101 return true end\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+          value = function() id = 153 f = setid f() return ms.number(id) end } }\n\
+        table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })";
+    assert!(import(&folder(&skin(setter)), 905).is_err());
+}
+
+/// A critical callback's refusal is located at the write that voided its
+/// own proof, whatever the role scan reads afterwards: with `x` written on
+/// line 11 and `y` on line 13, a reader of `x` that reads `y` only in a
+/// branch never taken refuses at line 11.
+#[test]
+fn an_interference_is_located_at_the_proofs_write() {
+    let body = "local x, y = 1, 1\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() x = 2 return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() y = 3 return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+        table.insert(skin.destination, { id = \"g\", draw = function()\n\
+            if false then return ms.number(y) > 0 end\n\
+            return x == 1\n\
+          end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
+    match import(&folder(&skin(body)), 905) {
+        Err(ImportError::Lua {
+            at: Some(at),
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+        }) => assert_eq!(at.line, 12),
+        other => panic!("{other:?}"),
     }
 }

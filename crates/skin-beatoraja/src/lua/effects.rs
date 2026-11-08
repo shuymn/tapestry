@@ -1288,7 +1288,20 @@ pub(crate) fn walk(an: &Analysis, arena: &Arena) -> Result<(), (Option<u32>, Fou
     an.clock
         .enter(Phase::Walk, None)
         .map_err(|w| (None, unit(w)))?;
-    let r = Walk::new(an).roots(arena);
+    // A fixed point: a walk reads a cell some root writes as unknown only
+    // once the write is recorded, so the walks repeat, the conversion's
+    // open place and no writers restored, until no new cell is written.
+    // Cells only accumulate, so it ends within one walk a cell.
+    let open = an.open.get();
+    let r = loop {
+        let before = an.written.borrow().len();
+        an.open.set(open);
+        an.writers.borrow_mut().clear();
+        let r = Walk::new(an).roots(arena);
+        if r.is_err() || an.written.borrow().len() == before {
+            break r;
+        }
+    };
     let at = an.clock.retained();
     let left = an.clock.leave();
     r?;

@@ -232,9 +232,6 @@ pub(crate) struct Analysis {
     /// path starts at one does not hold ([`Unsupported::Interference`]);
     /// the candidate stays closed.
     pub(crate) written: RefCell<HashMap<(u16, u32), Written>>,
-    /// The located write the last refusal for a written cell met, where
-    /// the refusal of a critical callback is located.
-    pub(crate) interfered: Cell<Option<Site>>,
     /// The root instances whose reach writes ([`super::effects`]): they
     /// never lower ([`Unsupported::Writes`]).
     pub(crate) writers: RefCell<std::collections::HashSet<u32>>,
@@ -430,19 +427,9 @@ impl Analysis {
     }
 
     /// Whether a proof through binding cell `d` of `file` holds: the
-    /// candidate is closed and the cell is never written. A written one is
-    /// recorded as the refusal's place.
+    /// candidate is closed and the cell is never written at frame time.
     pub(crate) fn cell_holds(&self, file: u16, d: u32) -> bool {
-        if self.open.get().is_some() {
-            return false;
-        }
-        match self.written_at(file, d) {
-            Some(site) => {
-                self.interfered.set(Some(site));
-                false
-            }
-            None => true,
-        }
+        self.open.get().is_none() && self.written_at(file, d).is_none()
     }
 
     pub(crate) fn instance(&self, i: u32) -> Option<&Instance> {
@@ -454,7 +441,22 @@ impl Analysis {
     }
 
     /// Instance `i`'s value for its function's upvalue `up`.
+    /// Upvalue `up` of instance `i` as the analysis may use it: its
+    /// captured final binding, or, for a cell frame time writes, an unknown
+    /// value ([`Captured::Other`]): every reader of a captured cell (the
+    /// effect walk, the residual, the role scan, callee resolution) goes
+    /// through here, so none takes a written cell for its captured value.
     pub(crate) fn upvalue(&self, i: u32, up: u32) -> Option<Captured> {
+        let inst = self.instance(i)?;
+        if self.written_at(inst.file, up).is_some() {
+            return Some(Captured::Other);
+        }
+        self.captured_upvalue(i, up)
+    }
+
+    /// Upvalue `up` of instance `i`'s captured final binding, written or
+    /// not: only for the role scan's join of what a written cell may hold.
+    pub(crate) fn captured_upvalue(&self, i: u32, up: u32) -> Option<Captured> {
         let inst = self.instance(i)?;
         let k = *self.slots.get(&(inst.file, inst.func, up))? as usize;
         let (start, len) = inst.values?;
