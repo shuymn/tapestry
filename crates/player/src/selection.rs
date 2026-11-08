@@ -873,6 +873,15 @@ pub fn script_result(
         script.done();
         script.announce();
     }
+    // A command acts on the result once it is drawn: a skin's view
+    // committed, or its built-in page, each frame of it (the S10-09i
+    // design's D1). A result that never draws still gets its command.
+    if matches!(
+        script.front(),
+        Some(SelectStep::Back | SelectStep::Retry | SelectStep::Next | SelectStep::Prev)
+    ) {
+        let _ = render.wait_end_drawn(crate::dev::STEP_TIMEOUT);
+    }
     match script.front() {
         Some(SelectStep::Back) => {
             script.done();
@@ -2152,6 +2161,7 @@ impl AppRig for PlayerRig<'_> {
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
+        self.leave_result();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2201,6 +2211,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.leave_result();
         self.enter_scene();
         self.render.leave_selection();
         recover(

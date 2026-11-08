@@ -2032,6 +2032,102 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
+/// The result's next uploads hold on the render thread while set (tests
+/// and development builds: an upload's wait and its withdrawal).
+static RESULT_UPLOAD_HELD: AtomicBool = AtomicBool::new(false);
+/// Set while an upload holds.
+static RESULT_UPLOAD_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// Holds the result's uploads on the render thread from now on (`true`),
+/// or lets the one holding go (`false`) (tests).
+#[cfg(test)]
+pub fn hold_result_uploads(on: bool) {
+    RESULT_UPLOAD_HELD.store(on, Ordering::SeqCst);
+}
+
+/// Whether a result upload holds now (tests).
+#[cfg(test)]
+pub fn result_upload_holding() -> bool {
+    RESULT_UPLOAD_WAITING.load(Ordering::SeqCst)
+}
+
+/// Holds the result's upload on the render thread while
+/// [`hold_result_uploads`] says so, before anything of it is staged.
+pub fn hold_result_upload() {
+    if !RESULT_UPLOAD_HELD.load(Ordering::SeqCst) {
+        return;
+    }
+    RESULT_UPLOAD_WAITING.store(true, Ordering::SeqCst);
+    while RESULT_UPLOAD_HELD.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    RESULT_UPLOAD_WAITING.store(false, Ordering::SeqCst);
+}
+
+/// The result's stagings on the render thread (each selection, upload and
+/// view staging of the result kind) and the texture arrays they uploaded,
+/// so far (development builds: the S10-09i design's C6 and C7).
+static RESULT_STAGINGS: AtomicU64 = AtomicU64::new(0);
+static RESULT_UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+/// One staging of the result kind on the render thread, which uploaded
+/// `uploads` texture arrays.
+pub fn result_staged(uploads: u64) {
+    RESULT_STAGINGS.fetch_add(1, Ordering::SeqCst);
+    RESULT_UPLOADS.fetch_add(uploads, Ordering::SeqCst);
+}
+
+/// Prints the result's stagings and uploads so far, at `at` in the flow.
+pub fn print_result_work(at: &str) {
+    println!(
+        "dev: result work at {at}: stagings {} uploads {}",
+        RESULT_STAGINGS.load(Ordering::SeqCst),
+        RESULT_UPLOADS.load(Ordering::SeqCst)
+    );
+}
+
+/// The environment variable of the result's injected refusals (tests of
+/// the real flow): a comma list of `select<N>`, the N-th selection or
+/// upload of the result kind refused, `stage<N>`, the N-th view staging
+/// refused, and `text<N>`, the N-th view's text refused on a healthy
+/// device (the run's fallback), each counted from 1 on the render thread.
+pub const RESULT_FAULTS_ENV: &str = "TAPESTRY_DEV_RESULT_FAULTS";
+
+/// The result's selections and view stagings asked for so far.
+static RESULT_SELECTS_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESULT_STAGES_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESULT_TEXTS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether [`RESULT_FAULTS_ENV`] names `prefix` with `n`.
+fn result_fault(prefix: &str, n: u64) -> bool {
+    std::env::var(RESULT_FAULTS_ENV).is_ok_and(|list| {
+        list.split(',')
+            .filter_map(|f| f.trim().strip_prefix(prefix))
+            .any(|k| k.parse() == Ok(n))
+    })
+}
+
+/// Whether this selection or upload of the result kind is refused.
+pub fn refuse_result_select() -> bool {
+    result_fault(
+        "select",
+        RESULT_SELECTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
+    )
+}
+
+/// Whether this view's text preparation is refused.
+pub fn refuse_result_text() -> bool {
+    result_fault("text", RESULT_TEXTS_SEEN.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+/// Whether this view staging of the result kind is refused.
+pub fn refuse_result_staging() -> bool {
+    result_fault(
+        "stage",
+        RESULT_STAGES_SEEN.fetch_add(1, Ordering::SeqCst) + 1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{adler32, crc32, png, read_bounded, read_limited};
