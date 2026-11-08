@@ -6,9 +6,13 @@
 mod common;
 
 use skin_beatoraja::lua::Disposition;
-use skin_beatoraja::lua::runtime::{CallStatus, Pool, RuntimeNote, ScreenRuntime, Stopped};
+#[cfg(feature = "dev-tools")]
+use skin_beatoraja::lua::runtime::{CallStatus, RuntimeNote, Stopped};
+use skin_beatoraja::lua::runtime::{Pool, ScreenRuntime};
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
-use skin_model::{RESULT, SELECTION, ScreenKind};
+use skin_model::ScreenKind;
+#[cfg(feature = "dev-tools")]
+use skin_model::{RESULT, SELECTION};
 
 /// A Lua selection skin over the selection fixtures' sheet and font, its
 /// numbers' `value`s `values` and its `dot` image's `draw` `draw`.
@@ -91,6 +95,7 @@ fn import_with(text: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, LuaImp
 
 /// A selection state's fields for `skin`'s outputs, with `set` named
 /// fields given.
+#[cfg(feature = "dev-tools")]
 fn fields(outputs: usize, set: &[(&str, i32)]) -> Vec<i32> {
     let mut f = vec![0; SELECTION.fields.len() + 2 * outputs];
     for (name, v) in set {
@@ -101,6 +106,7 @@ fn fields(outputs: usize, set: &[(&str, i32)]) -> Vec<i32> {
 }
 
 /// Each output's value, after the schema's fields.
+#[cfg(feature = "dev-tools")]
 fn outputs(f: &[i32]) -> Vec<i32> {
     f[SELECTION.fields.len()..]
         .iter()
@@ -113,14 +119,27 @@ fn runtime(i: &mut LuaImported) -> &mut ScreenRuntime {
     i.runtime.as_mut().expect("a runtime")
 }
 
+/// Gives this thread's runtime frames a time budget no frame reaches
+/// (dev-tools): a test of something else than the time cap, whose outcome
+/// a loaded machine's clock must not decide. The tests that run frames
+/// therefore need dev-tools; the time cap itself is driven by
+/// [`vm_hooks::set_frame_time`](skin_beatoraja::lua::vm_hooks::set_frame_time)
+/// and [`vm_hooks::expire_frame_at`](skin_beatoraja::lua::vm_hooks::expire_frame_at).
+#[cfg(feature = "dev-tools")]
+fn untimed() {
+    skin_beatoraja::lua::vm_hooks::set_frame_time(Some(std::time::Duration::from_secs(3_600)));
+}
+
 /// C1, C4, C8, C12: callbacks no expression represents run on the kept
 /// VM; their reads answer from the screen's fields through the profile,
 /// an omitted id with the source's value in the feature's absence; a
 /// loader reached through a captured alias or a table field raises the
 /// fault marker; an ordinary error gives the source's 0; results convert
 /// as the source's `toint` and `toboolean`.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn callbacks_run_on_the_kept_vm() {
+    untimed();
     let mut i = import(&entry(
         "local req = require\nlocal held = { d = dofile }",
         &[
@@ -194,8 +213,10 @@ fn callbacks_run_on_the_kept_vm() {
 
 /// C3's gate: a draw whose `op` before it is false is not called; every
 /// slot is still written that frame.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_false_gate_skips_the_call() {
+    untimed();
     let mut i = import(&entry(
         "local calls = 0",
         &["function() return calls end"],
@@ -221,8 +242,10 @@ fn a_false_gate_skips_the_call() {
 /// C8: a callback past the frame's budget gives its constant; after three
 /// such frames the runtime stops, every slot its constant from then on,
 /// and frames keep running.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn the_budget_stops_the_runtime_after_three_frames() {
+    untimed();
     let mut i = import(&entry(
         "",
         &[
@@ -318,6 +341,7 @@ fn each_frame_cap_stops_a_call_alone() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_poisoned_context_is_read_through() {
+    untimed();
     let mut i = import(&entry(
         "",
         &["function() pcall(function() return ms.number(77) end) return 3 end"],
@@ -342,8 +366,10 @@ fn a_poisoned_context_is_read_through() {
 }
 
 /// C8: the kept VM's memory cap stops the runtime at once.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn the_memory_cap_stops_the_runtime() {
+    untimed();
     let mut i = import(&entry(
         "",
         &["function() local s = \"x\" for _ = 1, 40 do s = s .. s end return 1 end"],
@@ -402,8 +428,10 @@ t = nil"
 
 /// C14: the notes are capped; further occurrences are counted, and a
 /// fresh id each frame keeps no more.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn notes_are_capped() {
+    untimed();
     let mut i = import(&entry(
         "local k = 0",
         &["function() k = k + 1 return ms.number(100000 + k) end"],
@@ -411,8 +439,8 @@ fn notes_are_capped() {
     ));
     let n = runtime(&mut i).outputs();
     let cap = skin_beatoraja::limits::MAX_NOTES;
-    // A frame past the time budget under load reads no id, so frames run
-    // until ten reads past the cap were counted (bounded).
+    // Each frame reads one fresh id: frames run until ten reads past the
+    // cap were counted (bounded).
     let mut frames = 0;
     while runtime(&mut i).notes().1 < 10 && frames < 4 * cap {
         let mut f = fields(n, &[]);
@@ -454,6 +482,7 @@ fn no_runtime_without_a_routed_callback() {
 }
 
 /// The runtime moves to the screen's thread.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn the_runtime_is_send() {
     fn send<T: Send>() {}
@@ -466,6 +495,7 @@ fn the_runtime_is_send() {
     let mut rt = i.runtime.take().unwrap();
     let n = rt.outputs();
     let out = std::thread::spawn(move || {
+        untimed();
         let mut f = fields(
             n,
             &[
@@ -487,8 +517,10 @@ fn the_runtime_is_send() {
 /// local, an upvalue of a helper, a table field, and `require` of a module
 /// it already loaded, a host module or a file module the pass cached,
 /// refused before the cached return.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn loaders_raise_at_runtime_however_reached() {
+    untimed();
     let (_d, mut i) = import_with(
         &entry(
             "local load = require\n\
@@ -532,8 +564,10 @@ fn loaders_raise_at_runtime_however_reached() {
 /// The source's object order (docs/stage3.md S7-07): a number's value is
 /// read first, and its draws run only when it is not a sentinel
 /// (`SkinNumber.java:138-150`).
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_sentinel_value_skips_its_draws() {
+    untimed();
     let mut i = import(&entry_with(
         "local calls = 0",
         &[
@@ -565,8 +599,10 @@ fn a_sentinel_value_skips_its_draws() {
 /// The source hides a number whose value is a sentinel on every screen
 /// (`SkinNumber.java:135-147`): a selection number whose runtime value is
 /// `Integer.MIN_VALUE` draws no digit, beside one that draws its value.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_sentinel_number_draws_nothing_on_selection() {
+    untimed();
     let (_d, mut i) = import_in(&entry(
         "",
         &[
@@ -598,6 +634,7 @@ fn a_sentinel_number_draws_nothing_on_selection() {
 
 /// `text` with two image sets of one `dot` appended, chosen by `a` and
 /// `b`, each drawn by its own draw callback.
+#[cfg(feature = "dev-tools")]
 fn with_sets(text: &str, a: &str, a_draw: &str, b: &str, b_draw: &str) -> String {
     text.replace(
         "return skin\n",
@@ -619,8 +656,10 @@ fn with_sets(text: &str, a: &str, a_draw: &str, b: &str, b_draw: &str) -> String
 /// chart under the cursor) skips the set's runtime draw, so its side
 /// effect never reaches a later callback; a selector that is not negative
 /// lets it run.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_negative_selector_skips_its_runtime_draws() {
+    untimed();
     let text = with_sets(
         &entry(
             "local ca, cb = 0, 0",
@@ -678,8 +717,10 @@ fn a_negative_selector_skips_its_runtime_draws() {
 /// The same with a selector from `ref` alone (image index 370, the selected
 /// row's clear type, −1 with no played chart under the cursor): its runtime
 /// draw runs only when the selector is not negative.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_negative_ref_selector_skips_its_runtime_draws() {
+    untimed();
     let text = entry(
         "local c = 0",
         &["function() return c end"],
@@ -717,8 +758,10 @@ fn a_negative_ref_selector_skips_its_runtime_draws() {
 /// C4 on a result screen: a read answers through the result profile's
 /// bridge over the result state, absent-feature ids with the source's
 /// value.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_result_skin_runs_its_callbacks() {
+    untimed();
     let tables = "local ms = require(\"main_state\")\n\
         skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
             digit = 4, value = function() return ms.number(71) / 2 end }\n\
@@ -807,6 +850,7 @@ fn a_runtime_holds_one_permit() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_host_panic_stops_the_runtime() {
+    untimed();
     let mut i = import(&entry(
         "",
         &[
@@ -835,4 +879,37 @@ fn a_host_panic_stops_the_runtime() {
             .iter()
             .all(|s| *s == CallStatus::Stopped)
     );
+}
+
+/// C8: a frame whose time budget runs out part way (driven here, as a
+/// loaded machine's clock may) gives the call in progress and every later
+/// one the budget's constant, the earlier ones keeping their results; the
+/// next frame runs every call again.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_budget_spent_part_way_gives_the_rest_their_constant() {
+    use skin_beatoraja::lua::vm_hooks;
+    untimed();
+    let mut i = import(&entry(
+        "",
+        &[
+            "function() return 3 + ms.number(77) / 1 * 0 end",
+            "function() return 4 + ms.number(77) / 1 * 0 end",
+            "function() return 5 + ms.number(77) / 1 * 0 end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    vm_hooks::expire_frame_at(Some(1));
+    runtime(&mut i).frame(&mut f, &[]);
+    vm_hooks::expire_frame_at(None);
+    assert_eq!(
+        runtime(&mut i).status(),
+        [CallStatus::Ok, CallStatus::Budget, CallStatus::Budget]
+    );
+    assert_eq!(outputs(&f), [3, 0, 0]);
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [3, 4, 5]);
 }

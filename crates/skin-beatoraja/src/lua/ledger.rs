@@ -181,6 +181,19 @@ impl Ledger {
         }));
     }
 
+    /// Spends the frame's time budget now: its deadline is in the past
+    /// ([`super::vm_hooks::expire_frame_at`]).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn expire_frame(&self) {
+        if let Some(f) = self.frame.get() {
+            let now = Instant::now();
+            self.frame.set(Some(Frame {
+                deadline: now.checked_sub(Duration::from_nanos(1)).unwrap_or(now),
+                ..f
+            }));
+        }
+    }
+
     /// Clears a runtime call's fault, so the next call of the frame runs:
     /// the frame's budget stays counted.
     pub(crate) fn clear_fault(&self) {
