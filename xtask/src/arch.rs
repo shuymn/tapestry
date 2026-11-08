@@ -19,6 +19,15 @@
 //!   another package, by a normal, build or dev dependency (design.md
 //!   "Language and Crate Structure"): the player converts the library's
 //!   types into the game's.
+//! - R6 (design.md "beatoraja Lua Skins", Unreachable from play): no
+//!   package with an `IN_PLAY` site but `player` and `skin-beatoraja` has
+//!   `mlua` in its normal dependency closure; and no `player` file outside
+//!   `src/screens/` names `mlua` or `skin_beatoraja::lua` in a `use` or a
+//!   path (or a macro's tokens), aliases or glob-imports `skin_beatoraja`
+//!   or `skin_beatoraja::lua`, or re-exports anything of `skin_beatoraja`.
+//!   `use` trees are resolved to their full paths, grouped imports
+//!   included; macros are not expanded. [`crate::privacy`] checks the
+//!   privacy that keeps the runtime in `screens`.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -104,6 +113,9 @@ pub fn run(manifest: &Path, cargo_args: &[&str]) -> anyhow::Result<Vec<String>> 
             ),
     )?;
     let mut diagnostics = check_metadata(&metadata)?;
+    diagnostics.extend(check_player_sources(
+        manifest.parent().context("the manifest has no folder")?,
+    )?);
     for &(package, target) in PRODUCTION {
         diagnostics.extend(check_production_features(
             manifest, &metadata, package, target, cargo_args,
@@ -229,7 +241,251 @@ fn check_metadata(metadata: &Metadata) -> anyhow::Result<Vec<String>> {
             }
         }
     }
+
+    // R6 (metadata)
+    let in_play = in_play_packages();
+    for member in members.iter().filter(|p| in_play.contains(p.name.as_str())) {
+        for (id, path) in graph.closure(&member.id, false) {
+            if metadata[&id].name.as_str() == MLUA {
+                diagnostics.push(format!(
+                    "R6: in-play package `{}` depends on `{MLUA}` ({}); only {MLUA_ALLOWED:?} may (design.md \"beatoraja Lua Skins\")",
+                    member.name,
+                    describe_path(metadata, &path),
+                ));
+            }
+        }
+    }
     Ok(diagnostics)
+}
+
+/// The packages R6 lets reach `mlua`: the player, whose `screens` tree
+/// holds the runtime, and the importer that defines it.
+const MLUA_ALLOWED: &[&str] = &["player", "skin-beatoraja"];
+/// The Lua crate R6 keeps out of the in-play packages.
+const MLUA: &str = "mlua";
+/// The `player` sources R6 scans, and the tree inside them that may name
+/// the runtime, relative to the workspace root.
+const PLAYER_SRC: &str = "crates/player/src";
+const SCREENS: &str = "crates/player/src/screens";
+
+/// R6 (metadata): the packages with an in-play site ([`crate::lints::IN_PLAY`]),
+/// but [`MLUA_ALLOWED`].
+fn in_play_packages() -> BTreeSet<&'static str> {
+    crate::lints::IN_PLAY
+        .iter()
+        .filter_map(|s| {
+            let path = match s {
+                crate::lints::Site::File(p) | crate::lints::Site::Fns(p, _) => *p,
+            };
+            path.strip_prefix("crates/")?.split('/').next()
+        })
+        .filter(|p| !MLUA_ALLOWED.contains(p))
+        .collect()
+}
+
+/// R6 (sources): every `player` file outside `screens` under `root`, each
+/// use or path that names `mlua` or `skin_beatoraja::lua`, alias or glob
+/// of `skin_beatoraja` or `skin_beatoraja::lua`, and re-export of anything
+/// of `skin_beatoraja`. Macros are not expanded; their tokens are scanned
+/// for such a path.
+pub fn check_player_sources(root: &Path) -> anyhow::Result<Vec<String>> {
+    let src = root.join(PLAYER_SRC);
+    let mut diagnostics = Vec::new();
+    if !src.is_dir() {
+        return Ok(diagnostics);
+    }
+    let mut stack = vec![src];
+    let screens = root.join(SCREENS);
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .collect::<Result<_, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path == screens {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let file = syn::parse_file(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let shown = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let mut scan = SourceScan::default();
+                syn::visit::Visit::visit_file(&mut scan, &file);
+                diagnostics.extend(scan.found.into_iter().map(|(line, what)| {
+                    format!(
+                        "R6: {shown}:{line} {what}; only {SCREENS}/ names the Lua runtime \
+                         (design.md \"beatoraja Lua Skins\")"
+                    )
+                }));
+            }
+        }
+    }
+    Ok(diagnostics)
+}
+
+/// Whether `segments` name `mlua` or `skin_beatoraja::lua` or below.
+fn names_lua(segments: &[String]) -> bool {
+    match segments {
+        [first, ..] if first == MLUA => true,
+        [first, second, ..] => first == "skin_beatoraja" && second == "lua",
+        _ => false,
+    }
+}
+
+/// Whether `segments` is `skin_beatoraja` or `skin_beatoraja::lua`.
+fn is_backend_root(segments: &[String]) -> bool {
+    match segments {
+        [only] => only == "skin_beatoraja",
+        [first, second] => first == "skin_beatoraja" && second == "lua",
+        _ => false,
+    }
+}
+
+/// What R6's scan found in one file: per finding, its line and what it is.
+#[derive(Default)]
+struct SourceScan {
+    found: Vec<(usize, String)>,
+}
+
+impl SourceScan {
+    /// Every path a `use` tree names, with its prefix.
+    fn use_tree(&mut self, prefix: &mut Vec<String>, tree: &syn::UseTree, public: bool) {
+        match tree {
+            syn::UseTree::Path(p) => {
+                prefix.push(p.ident.to_string());
+                self.use_tree(prefix, &p.tree, public);
+                prefix.pop();
+            }
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    self.use_tree(prefix, t, public);
+                }
+            }
+            syn::UseTree::Name(n) => {
+                let full = full(prefix, &n.ident);
+                self.used(&full, n.ident.span(), public, None);
+            }
+            syn::UseTree::Rename(r) => {
+                let full = full(prefix, &r.ident);
+                self.used(&full, r.ident.span(), public, Some(&r.rename));
+            }
+            syn::UseTree::Glob(g) => {
+                let line = g.star_token.span.start().line;
+                if names_lua(prefix) || is_backend_root(prefix) {
+                    self.found
+                        .push((line, format!("glob-imports `{}::*`", prefix.join("::"))));
+                } else if public && prefix.first().is_some_and(|f| f == "skin_beatoraja") {
+                    self.found
+                        .push((line, format!("re-exports `{}::*`", prefix.join("::"))));
+                }
+            }
+        }
+    }
+
+    fn used(
+        &mut self,
+        full: &[String],
+        span: proc_macro2::Span,
+        public: bool,
+        rename: Option<&syn::Ident>,
+    ) {
+        let line = span.start().line;
+        let name = full.join("::");
+        if let Some(r) = rename.filter(|_| is_backend_root(full)) {
+            self.found
+                .push((line, format!("aliases `{name}` as `{r}`")));
+        } else if names_lua(full) {
+            self.found.push((line, format!("uses `{name}`")));
+        } else if public && full.first().is_some_and(|f| f == "skin_beatoraja") {
+            self.found.push((line, format!("re-exports `{name}`")));
+        }
+    }
+
+    /// Paths in a macro's tokens: `mlua ::` or `skin_beatoraja :: lua`.
+    fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
+        let flat: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+        for (i, t) in flat.iter().enumerate() {
+            match t {
+                proc_macro2::TokenTree::Group(g) => self.tokens(g.stream()),
+                proc_macro2::TokenTree::Ident(id) => {
+                    let after = |k: usize| flat.get(i + k);
+                    let colons = matches!(
+                        (after(1), after(2)),
+                        (
+                            Some(proc_macro2::TokenTree::Punct(a)),
+                            Some(proc_macro2::TokenTree::Punct(b))
+                        ) if a.as_char() == ':' && b.as_char() == ':'
+                    );
+                    let lua_next =
+                        matches!(after(3), Some(proc_macro2::TokenTree::Ident(n)) if n == "lua");
+                    if colons && (id == MLUA || (id == "skin_beatoraja" && lua_next)) {
+                        self.found.push((
+                            id.span().start().line,
+                            format!("names `{id}::…` in a macro's tokens"),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn full(prefix: &[String], last: &syn::Ident) -> Vec<String> {
+    let mut full = prefix.to_vec();
+    if last != "self" {
+        full.push(last.to_string());
+    }
+    full
+}
+
+impl<'ast> syn::visit::Visit<'ast> for SourceScan {
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        let public = !matches!(u.vis, syn::Visibility::Inherited);
+        self.use_tree(&mut Vec::new(), &u.tree, public);
+    }
+
+    fn visit_item_extern_crate(&mut self, c: &'ast syn::ItemExternCrate) {
+        let full = vec![c.ident.to_string()];
+        if let Some((_, rename)) = &c.rename {
+            if full[0] == MLUA || is_backend_root(&full) {
+                self.found.push((
+                    c.ident.span().start().line,
+                    format!("aliases `{}` as `{rename}`", c.ident),
+                ));
+            }
+        } else if full[0] == MLUA {
+            self.found
+                .push((c.ident.span().start().line, format!("uses `{MLUA}`")));
+        }
+    }
+
+    fn visit_path(&mut self, p: &'ast syn::Path) {
+        let segments: Vec<String> = p.segments.iter().map(|s| s.ident.to_string()).collect();
+        if names_lua(&segments) {
+            let line = p
+                .segments
+                .first()
+                .map_or(0, |s| s.ident.span().start().line);
+            self.found
+                .push((line, format!("names `{}`", segments.join("::"))));
+        }
+        syn::visit::visit_path(self, p);
+    }
+
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        self.tokens(m.tokens.clone());
+        syn::visit::visit_macro(self, m);
+    }
 }
 
 /// The resolved dependency graph: normal and build edges, plus dev edges
@@ -799,5 +1055,152 @@ mod tests {
              [dev-dependencies]\nxtask = { path = \"../xtask\" }\n",
         );
         assert_eq!(check(&crates), Vec::<String>::new());
+    }
+
+    /// The R6 diagnostics of `crates`.
+    fn r6(crates: &[Crate]) -> Vec<String> {
+        check(crates)
+            .into_iter()
+            .filter(|d| d.starts_with("R6:"))
+            .collect()
+    }
+
+    #[test]
+    fn r6_rejects_mlua_in_an_in_play_package_directly_and_through_another() {
+        let mut crates = baseline();
+        crates.push(lib("mlua", ""));
+        set(
+            &mut crates,
+            "audio",
+            "[dependencies]\nbms-model = { path = \"../bms-model\" }\n\
+             mlua = { path = \"../mlua\" }\n",
+        );
+        let found = r6(&crates);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(
+            found
+                .iter()
+                .any(|d| d.contains("`audio` depends on `mlua` (via audio -> mlua)")),
+            "{found:#?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|d| d.contains("`game` depends on `mlua` (via game -> audio -> mlua)")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn r6_lets_the_player_reach_mlua() {
+        let mut crates = baseline();
+        crates.push(lib("mlua", ""));
+        set(
+            &mut crates,
+            "player",
+            "[package.metadata.tapestry]\nwindows-only = true\n\
+             [features]\ndefault = []\ndev-tools = []\n\
+             [dependencies]\neval = { path = \"../eval\" }\nmlua = { path = \"../mlua\" }\n",
+        );
+        assert_eq!(r6(&crates), Vec::<String>::new());
+    }
+
+    /// R6's scan of a `player` tree holding `file` outside `screens`, and
+    /// a `screens` file naming the runtime.
+    fn scan(file: &str) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("crates/player/src");
+        std::fs::create_dir_all(src.join("screens/script")).unwrap();
+        std::fs::write(
+            src.join("screens/script/tests.rs"),
+            "use mlua::Lua;\nuse skin_beatoraja::lua::runtime::ScreenRuntime;\npub use skin_beatoraja::lua;\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("main.rs"), file).unwrap();
+        super::check_player_sources(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn r6_lets_screens_and_the_crate_roots_items_be() {
+        assert_eq!(scan(""), Vec::<String>::new());
+        assert_eq!(
+            scan(
+                "use skin_beatoraja::{Cancel, LuaOutcome};\n\
+                 fn f() { let _ = skin_beatoraja::vm_hooks::live(); println!(\"{}\", skin_beatoraja::limits::MAX_NOTES); }\n"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn r6_rejects_each_way_of_naming_the_backend_outside_screens() {
+        for (file, what) in [
+            ("use mlua::Lua;\n", "uses `mlua::Lua`"),
+            ("use mlua;\n", "uses `mlua`"),
+            (
+                "use skin_beatoraja::lua::runtime::ScreenRuntime;\n",
+                "uses `skin_beatoraja::lua::runtime::ScreenRuntime`",
+            ),
+            (
+                "fn f(_: skin_beatoraja::lua::runtime::ScreenRuntime) {}\n",
+                "names `skin_beatoraja::lua::runtime::ScreenRuntime`",
+            ),
+            (
+                "fn f() { let _ = ::mlua::Lua::new(); }\n",
+                "names `mlua::Lua::new`",
+            ),
+            (
+                "use skin_beatoraja::lua as backend;\nfn f(_: backend::runtime::ScreenRuntime) {}\n",
+                "aliases `skin_beatoraja::lua` as `backend`",
+            ),
+            (
+                "use skin_beatoraja as sb;\n",
+                "aliases `skin_beatoraja` as `sb`",
+            ),
+            (
+                "use skin_beatoraja::{self as sb, Cancel};\n",
+                "aliases `skin_beatoraja` as `sb`",
+            ),
+            (
+                "extern crate skin_beatoraja as sb;\n",
+                "aliases `skin_beatoraja` as `sb`",
+            ),
+            (
+                "use skin_beatoraja::{lua::runtime::ScreenRuntime, Cancel};\n",
+                "uses `skin_beatoraja::lua::runtime::ScreenRuntime`",
+            ),
+            (
+                "use skin_beatoraja::*;\n",
+                "glob-imports `skin_beatoraja::*`",
+            ),
+            (
+                "use skin_beatoraja::lua::*;\n",
+                "glob-imports `skin_beatoraja::lua::*`",
+            ),
+            (
+                "pub use skin_beatoraja::Cancel;\n",
+                "re-exports `skin_beatoraja::Cancel`",
+            ),
+            (
+                "pub(crate) use skin_beatoraja::lua;\n",
+                "uses `skin_beatoraja::lua`",
+            ),
+            (
+                "fn f() { m!(skin_beatoraja::lua::runtime::ScreenRuntime); }\n",
+                "names `skin_beatoraja::…` in a macro's tokens",
+            ),
+            (
+                "mod inner { fn f() { use skin_beatoraja::lua::runtime; } }\n",
+                "uses `skin_beatoraja::lua::runtime`",
+            ),
+        ] {
+            let found = scan(file);
+            assert_eq!(found.len(), 1, "{file}: {found:#?}");
+            assert!(found[0].contains(what), "{file}: {found:#?}");
+            assert!(
+                found[0].starts_with("R6: crates/player/src/main.rs:"),
+                "{found:#?}"
+            );
+        }
     }
 }

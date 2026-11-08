@@ -350,7 +350,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: result skin jobs: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -426,7 +426,7 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: specialization ended: live {} joined {} of {}",
-            skin_beatoraja::lua::vm_hooks::live(),
+            skin_beatoraja::vm_hooks::live(),
             crate::imports::jobs_joined(),
             crate::imports::jobs_started()
         );
@@ -447,7 +447,7 @@ impl PlayerRig<'_> {
     /// still from recording's open to the play's end.
     #[cfg(feature = "dev-tools")]
     fn print_lua(when: &str) {
-        use skin_beatoraja::lua::vm_hooks;
+        use skin_beatoraja::vm_hooks;
         println!(
             "dev: lua at {when}: live {} jobs {} passes {} steps {}",
             vm_hooks::live(),

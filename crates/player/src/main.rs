@@ -1592,7 +1592,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     println!(
         "dev: skin imports {} lua passes {}",
         imports::jobs_started(),
-        skin_beatoraja::lua::vm_hooks::passes()
+        skin_beatoraja::vm_hooks::passes()
     );
     #[cfg(feature = "dev-tools")]
     let script_failed = rig
