@@ -459,12 +459,6 @@ pub(crate) struct Cx<'d> {
     /// The Lua scalar `op` values already noted ignored: a destination
     /// read twice (the lanes read ahead, a selected row) notes once.
     ignored_ops: BTreeSet<Span>,
-    /// The cached images, by key, whose cut runs past its file's edge
-    /// (D22); whether the cut placed last did; and the destinations noted
-    /// for one.
-    overruns: BTreeSet<self::asset::ImageKey>,
-    cut_overran: bool,
-    overrun_at: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -559,9 +553,6 @@ impl<'d> Cx<'d> {
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
             ignored_ops: BTreeSet::new(),
-            overruns: BTreeSet::new(),
-            cut_overran: false,
-            overrun_at: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]

@@ -218,6 +218,60 @@ fn combos_sit_under_the_grade_centred() {
     );
 }
 
+/// A combo's glyphs cut past their file's right edge: ten 54-px cells
+/// from x 228 of a 766-px `n.png` run two columns past it, which repeat
+/// its last column (765) as the source's texture clamped to its edge
+/// samples (`JsonSkinObjectLoader.java:601-621`), whether that column is
+/// transparent or coloured.
+#[test]
+fn a_combo_cut_past_its_file_repeats_the_edge_column() {
+    let values = r#""value": [{"id": "edge", "src": "n", "x": 228, "w": 540, "h": 20,
+                                "divx": 10, "digit": 3}]"#;
+    let body = format!(
+        r#"{}, {values}, "judge": [{}], "destination": [{DST}]"#,
+        images(),
+        judge_rec(&grades(1), &[combo("edge", 10)], "")
+    );
+    let inner = |x: u32, y: u32| {
+        [
+            u8::try_from(x % 251).unwrap(),
+            u8::try_from(y).unwrap(),
+            90,
+            255,
+        ]
+    };
+    for edge in [[0, 0, 0, 0], [200, 10, 90, 255]] {
+        let l = import_sized([1_920, 1_080], &body, &[("n.png", 766, 20)]);
+        assert!(!has(l.report(), NoteKind::SourceRect), "{:?}", l.report());
+        common::png_with(l.dir.path(), "n.png", 766, 20, |x, y| {
+            if x == 765 { edge } else { inner(x, y) }
+        });
+        let skin = l.ok().skin.clone();
+        let atlas = skin
+            .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+            .unwrap();
+        let mut d = Drawn::new(skin, 100);
+        d.tally = tally(0, 9);
+        d.frame(1_000, &[event(1_000, of(Judgment::Perfect, 9))]);
+        // Glyph 9 (columns 714 to 767), one cell, beside the grade.
+        let glyphs: Vec<_> = d
+            .frame(1_001, &[])
+            .into_iter()
+            .filter(|q| common::play::round(q.rect)[2] == 10)
+            .collect();
+        let [q] = glyphs.as_slice() else {
+            panic!("{glyphs:?}")
+        };
+        let at = |col: f32| common::play::texel_at(&atlas, q, (col + 0.5) / 54.0, 0.5);
+        // Columns 760, 765 (the edge), and 766 and 767 past it.
+        assert_eq!(
+            [at(46.0), at(51.0), at(52.0), at(53.0)],
+            [inner(760, 10), edge, edge, edge],
+            "{edge:?}"
+        );
+    }
+}
+
 /// A combo of `ten` (three digits) with the keys `keys`.
 fn combo_keys(keys: &str) -> String {
     format!(r#"{{"id": "ten", "dst": [{keys}]}}"#)

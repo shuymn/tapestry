@@ -200,10 +200,6 @@ pub enum DeviationId {
     /// A critical untimed track that settles, drawn at its last key from
     /// the start: its entrance is lost.
     D20,
-    /// A source cut running past its file's edge: its in-file part is
-    /// stretched to the frame, where the source repeats the edge texels
-    /// over the overrun.
-    D22,
 }
 
 /// How the lanes and their covers are drawn differently from the source:

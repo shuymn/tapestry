@@ -1,7 +1,8 @@
 //! Atlas pages: no mip level mixes two frames, gutters repeat the edges
-//! through the whole allocation, the side is the cheapest counting the
-//! reserved layers, @2x files replace their 1x cells, shared rectangles
-//! share a frame's place, and the build is deterministic.
+//! through the whole allocation, cells past their file repeat its edge,
+//! the side is the cheapest counting the reserved layers, @2x files
+//! replace their 1x cells, shared rectangles share a frame's place, and
+//! the build is deterministic.
 
 mod image_support;
 
@@ -154,6 +155,65 @@ fn gutters_repeat_the_nearest_edge_through_the_allocation() {
                 [pre(r), pre(g), pre(b), al],
                 "at {tx}, {ty}"
             );
+        }
+    }
+}
+
+/// Cells past their file's right or bottom edge, on each axis alone and
+/// at a corner, partly and wholly: every texel of each allocation is the
+/// file's texel at the nominal cell texel clamped to the file, as a
+/// texture clamped to its edge samples (`ImageDef::rect`), the same from a
+/// PNG and a BMP; a decode in bands is checked against a whole one in the
+/// crate's band tests.
+#[test]
+fn cells_past_the_file_repeat_its_edge_through_the_allocation() {
+    let d = dir();
+    // Every texel of a 13×7 image distinct and opaque, so a BMP holds it.
+    let img = image::RgbImage::from_fn(13, 7, |x, y| image::Rgb([x as u8 * 19, y as u8 * 36, 7]));
+    img.save_with_format(d.path().join("a.png"), image::ImageFormat::Png)
+        .unwrap();
+    img.save_with_format(d.path().join("a.bmp"), image::ImageFormat::Bmp)
+        .unwrap();
+    let cut = |file: u32, rect: [u32; 4], grid: [u16; 2]| ImageDef {
+        rect: Some(rect),
+        grid,
+        ..whole(file)
+    };
+    // (rect, grid): two columns, the second wholly right of the file; two
+    // rows, the second wholly below it; one frame past both edges; one
+    // frame past the right edge only, inside rows.
+    let cases: [([u32; 4], [u16; 2]); 4] = [
+        ([8, 0, 10, 7], [2, 1]),
+        ([0, 4, 13, 6], [1, 2]),
+        ([10, 5, 6, 4], [1, 1]),
+        ([11, 1, 5, 3], [1, 1]),
+    ];
+    for (file, name) in [(0, "a.png"), (0, "a.bmp")] {
+        let images = cases.iter().map(|&(r, g)| cut(file, r, g)).collect();
+        let sheet = load(d.path(), vec![self::file(name)], images).unwrap();
+        let a = atlas(&sheet);
+        let mut frame = 0;
+        for &([rx, ry, rw, rh], [cols, rows]) in &cases {
+            let (cw, ch) = (rw / u32::from(cols), rh / u32::from(rows));
+            for r in 0..u32::from(rows) {
+                for c in 0..u32::from(cols) {
+                    let ([x, y, w, h], page) = content(&a, frame, 1);
+                    assert_eq!((w, h), (cw, ch), "{name} frame {frame}");
+                    for ty in y - 8..y + h + 8 {
+                        for tx in x - 8..x + w + 8 {
+                            let nx = rx + c * cw + tx.saturating_sub(x).min(w - 1);
+                            let ny = ry + r * ch + ty.saturating_sub(y).min(h - 1);
+                            let [cr, cg, cb] = img.get_pixel(nx.min(12), ny.min(6)).0;
+                            assert_eq!(
+                                texel(&a, page, 0, tx, ty),
+                                [cr, cg, cb, 255],
+                                "{name} frame {frame} at {tx}, {ty}"
+                            );
+                        }
+                    }
+                    frame += 1;
+                }
+            }
         }
     }
 }
