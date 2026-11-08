@@ -2528,7 +2528,8 @@ fn check_callbacks(i: &LuaImported) {
             | Disposition::Inert
             | Disposition::Captured => {}
             Disposition::Replaced(_) => replaced += 1,
-            Disposition::Refused | Disposition::NeverAnalysed => {
+            // `import` keeps no VM, so it routes nothing to a runtime.
+            Disposition::Refused | Disposition::NeverAnalysed | Disposition::Runtime => {
                 panic!("an imported candidate with a callback {d:?}")
             }
         }

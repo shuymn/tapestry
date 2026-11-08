@@ -89,6 +89,28 @@ pub struct Survey {
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed.
     pub frames: Option<Frames>,
+    /// The screen's runtime run for one frame over a state whose fields
+    /// are all 0, when the import routed a callback to it.
+    pub runtime: Option<RuntimeFrame>,
+}
+
+/// One runtime frame of a surveyed skin (docs/stage3.md S7-07): a first
+/// figure of its cost, not its budget.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeFrame {
+    /// The callbacks it runs.
+    pub outputs: usize,
+    /// Their statuses that frame, by name.
+    pub status: BTreeMap<String, u32>,
+    /// The notes it kept and the further occurrences it counted.
+    pub notes: (usize, u64),
+    /// The frame's instruction steps and host calls.
+    pub instructions: u64,
+    pub host_calls: u64,
+    /// The frame's wall time.
+    pub micros: u128,
+    /// Why it stopped, if it did.
+    pub stopped: Option<String>,
 }
 
 /// A configuration by the names the skin gives it.
@@ -408,6 +430,7 @@ fn disposition(d: &Disposition) -> String {
         Disposition::Lowered => "lowered".into(),
         Disposition::Compiled => "compiled".into(),
         Disposition::Replaced(why) => format!("replaced {}", unsupported(why)),
+        Disposition::Runtime => "runtime".into(),
         Disposition::Refused => "refused".into(),
     }
 }
@@ -557,7 +580,9 @@ pub fn survey_with(
     };
     // One configured pass: its functions counted, then its definition
     // imported.
-    let (def, counts, store, reads) = h.configured(&config, facts, cancel);
+    // The VM kept, as a selection or result screen keeps it, so the
+    // dispositions are the runtime's.
+    let (def, counts, store, reads) = h.configured_keeping(&config, facts, cancel, true);
     s.facts = LAST_FACTS.with(|f| f.take());
     if let Ok(def) = &def {
         {
@@ -584,7 +609,7 @@ pub fn survey_with(
     if local {
         s.resolved = Some(resolved(h.header(), &config));
     }
-    let o = if local {
+    let mut o = if local {
         let (o, destinations) = ledger::recording(|| h.finish(def, counts, store, reads, &config));
         s.destinations = destinations;
         o
@@ -614,6 +639,9 @@ pub fn survey_with(
     }
     s.usage = o.counts;
     s.modules = o.dependencies.len();
+    if let Some(rt) = o.runtime.as_mut() {
+        s.runtime = Some(runtime_frame(rt, kind));
+    }
     match o.result {
         Ok(imported) => {
             imported_into(&mut s, &imported, kind, choice);
@@ -625,6 +653,36 @@ pub fn survey_with(
         }
     }
     s
+}
+
+/// One frame of `rt` over a `kind` state whose fields are all 0.
+fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> RuntimeFrame {
+    let schema = match kind {
+        ScreenKind::Result => &skin_model::RESULT,
+        _ => &skin_model::SELECTION,
+    };
+    let n = rt.outputs();
+    let mut fields = vec![0; schema.fields.len() + skin_model::output::slots(n)];
+    let timers = vec![0; schema.timers.len()];
+    let before = rt.counters();
+    let start = std::time::Instant::now();
+    rt.frame(&mut fields, &timers);
+    let micros = start.elapsed().as_micros();
+    let after = rt.counters();
+    let mut status = BTreeMap::new();
+    for st in rt.status() {
+        *status.entry(format!("{st:?}").to_lowercase()).or_default() += 1;
+    }
+    let (notes, dropped) = rt.notes();
+    RuntimeFrame {
+        outputs: n,
+        status,
+        notes: (notes.len(), dropped),
+        instructions: after.instructions.saturating_sub(before.instructions),
+        host_calls: after.host_calls.saturating_sub(before.host_calls),
+        micros,
+        stopped: rt.stopped().map(|s| format!("{s:?}").to_lowercase()),
+    }
 }
 
 /// Records an import that completed: its outcome, its notes by kind, and

@@ -6,7 +6,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::Path;
-use std::rc::Rc;
 
 use super::{Cancel, LuaHeader, LuaLimit, LuaWhy, read_lua_header};
 use crate::error::ImportError;
@@ -317,7 +316,7 @@ fn the_instruction_hook_covers_a_thread_the_host_creates() {
     // drives the VM the passes build directly.
     let d = folder("return {}");
     let root = skin_model::Root::new(d.path()).unwrap();
-    let pass = Rc::new(super::test_pass(root));
+    let pass = std::sync::Arc::new(super::test_pass(root));
     let lua = super::sandbox::vm(&pass).unwrap();
     let f = lua.load("while true do end").into_function().unwrap();
     let thread = lua.create_thread(f).unwrap();

@@ -10,7 +10,7 @@ use super::interval::Iv;
 use super::parse::{Ast, BinOp, Func, Id, Kind, UnOp};
 use super::program::{Binary, Op, Unary};
 use super::{MAX_ELAPSED_MS, OptionDef, Scope, TIMER_OFF};
-use crate::present::OutTy;
+use crate::output::OutTy;
 use crate::schema::{FieldTy, SchemaError, Ty};
 
 /// A checked tree, ready to fold and emit.

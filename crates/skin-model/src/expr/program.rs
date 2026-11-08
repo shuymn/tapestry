@@ -9,7 +9,7 @@
 
 use super::arith::{floor_div, floor_mod};
 use super::{MAX_ELAPSED_MS, MAX_STACK, TIMER_OFF};
-use crate::present::OutTy;
+use crate::output::OutTy;
 use crate::schema::Ty;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

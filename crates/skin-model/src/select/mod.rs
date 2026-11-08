@@ -98,7 +98,8 @@ pub struct Selection {
     pub(crate) live: bool,
     /// The identity of the skin that made it.
     pub(crate) skin: u64,
-    fields: [i32; field::COUNT],
+    /// The schema's fields, then the callbacks' output slots.
+    fields: Box<[i32]>,
     /// Per timer slot (built-in, then `when`): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
@@ -130,12 +131,14 @@ impl Selection {
         text_slots: usize,
         rows: usize,
         sliders: usize,
+        outputs: usize,
     ) -> Self {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
         Self {
             live,
             skin,
-            fields: [0; field::COUNT],
+            fields: vec![0; field::COUNT.saturating_add(crate::output::slots(outputs))]
+                .into_boxed_slice(),
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             strings: Strings::default(),
@@ -155,7 +158,7 @@ impl Selection {
     /// A state with no timer, text, row or slider slot, which a skin of
     /// another kind gives: nothing accepts it.
     pub(crate) fn inert(skin: u64) -> Self {
-        let mut s = Self::new(skin, false, 0, 0, 0, 0);
+        let mut s = Self::new(skin, false, 0, 0, 0, 0, 0);
         s.starts = Box::default();
         s.ms = Box::default();
         s
@@ -205,6 +208,13 @@ impl Selection {
         Starts(&self.starts)
     }
 
+    /// The callbacks' output slots, after the schema's fields: what the
+    /// screen's runtime writes each frame before the build reads them
+    /// (docs/stage3.md S7-07).
+    pub fn outputs_mut(&mut self) -> &mut [i32] {
+        self.fields.get_mut(field::COUNT..).unwrap_or_default()
+    }
+
     pub(crate) fn slots(&self) -> usize {
         self.ms.len()
     }
@@ -218,10 +228,14 @@ impl Selection {
         let mut fields = fields(view, cursor);
         // The settings' fields stay as the settings left them.
         let from = usize::from(field::SETTINGS);
-        if let (Some(to), Some(kept)) = (fields.get_mut(from..), self.fields.get(from..)) {
+        if let (Some(to), Some(kept)) =
+            (fields.get_mut(from..), self.fields.get(from..field::COUNT))
+        {
             to.copy_from_slice(kept);
         }
-        self.fields = fields;
+        if let Some(to) = self.fields.get_mut(..field::COUNT) {
+            to.copy_from_slice(&fields);
+        }
         self.strings_from(view, labels, cursor);
         let at = view.cursor;
         for (i, (bind, s)) in self
