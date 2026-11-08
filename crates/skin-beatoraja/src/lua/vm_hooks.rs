@@ -138,6 +138,44 @@ pub(super) fn host_call() {
     );
 }
 
+thread_local! {
+    /// Whether this thread's next runtime read panics holding the host
+    /// context's lock ([`panic_holding_context`]).
+    static PANIC_HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's runtime frame time, in place of
+    /// [`super::limits::RUNTIME_FRAME_TIME`] ([`set_frame_time`]).
+    static FRAME_TIME: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes this thread's next runtime `number` read panic while it holds
+/// the host context's lock, poisoning it: the tests of a poisoned context.
+pub fn panic_holding_context() {
+    PANIC_HOLDING.with(|p| p.set(true));
+}
+
+/// A runtime read holds the context's lock: panics when
+/// [`panic_holding_context`] asked.
+pub(super) fn holding_context() {
+    assert!(
+        !PANIC_HOLDING.with(|p| p.replace(false)),
+        "an injected panic holding the context"
+    );
+}
+
+/// Sets this thread's runtime frame time (`None`: the limit's), so a test
+/// tells the time cap from the instruction and host-call caps.
+pub fn set_frame_time(t: Option<std::time::Duration>) {
+    FRAME_TIME.with(|f| f.set(t));
+}
+
+/// This thread's runtime frame time.
+pub(super) fn frame_time() -> std::time::Duration {
+    FRAME_TIME
+        .with(std::cell::Cell::get)
+        .unwrap_or(super::limits::RUNTIME_FRAME_TIME)
+}
+
 /// One instruction hook step.
 pub(super) fn step() {
     STEPS.fetch_add(1, Ordering::SeqCst);

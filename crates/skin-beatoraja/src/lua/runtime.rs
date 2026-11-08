@@ -317,7 +317,8 @@ impl Screen {
 ///   `Integer.MIN_VALUE` (`IPF:521-532`).
 /// - 380-389, an IR ranking's EX score, and 390-399, its index, with no or
 ///   an empty ranking: `Integer.MIN_VALUE` (`IPF:876-907`, through
-///   `:985-986`; `RankingData.java:188-206`).
+///   `:985-986`; `RankingData.java:188-193`, `getScore`, and `:201-206`,
+///   `getScoreRanking`).
 /// - 92, 350-353, 360-365 (main BPM, note counts per class, density), song
 ///   information, which no bridge supplies yet: `Integer.MIN_VALUE`, as
 ///   with no song information (`IPF:167-173`, `:319-388`).
@@ -397,7 +398,9 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
 
 /// A Lua value as the source's `toint` converts a number's value
 /// (`SkinLuaAccessor.java:644-650`, LuaJ 3.0.2): a number by `d2l; l2i`;
-/// a numeral string as its number; anything else 0.
+/// a string scanned as LuaJ's `LuaString.scannumber` scans it
+/// ([`scan_number`]), then the same, 0 when it is no numeral; anything
+/// else 0.
 ///
 /// The play presentation program (S7-06d) has the same conversion in its
 /// numerics; the second of the two to land keeps one shared function.
@@ -406,13 +409,73 @@ pub fn to_int(v: &Value) -> i32 {
     match v {
         Value::Integer(i) => d2l_l2i(*i as f64),
         Value::Number(n) => d2l_l2i(*n),
-        Value::String(s) => s
-            .to_str()
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .map_or(0, d2l_l2i),
+        Value::String(s) => scan_number(&s.as_bytes()).map_or(0, d2l_l2i),
         _ => 0,
     }
+}
+
+/// LuaJ 3.0.2's `LuaString.scannumber` over a string's bytes: spaces (only
+/// `' '`) trimmed at both ends; `0x`/`0X` and hexadecimal digits as a
+/// `long`; else decimal digits as a `long`, else at most the first 64
+/// bytes, all of `-+.eE0-9`, as Java's `parseDouble`. `None` where LuaJ
+/// gives NaN, or throws (a bare `0x`), which the source's accessor turns
+/// into 0.
+fn scan_number(b: &[u8]) -> Option<f64> {
+    let start = b.iter().position(|c| *c != b' ')?;
+    let end = b.iter().rposition(|c| *c != b' ')?.saturating_add(1);
+    let b = b.get(start..end)?;
+    if let [b'0', b'x' | b'X', rest @ ..] = b {
+        return scan_long(16, rest);
+    }
+    scan_long(10, b).or_else(|| scan_double(b))
+}
+
+/// LuaJ's `scanlong`: an optional `-`, then digits of `base`, accumulated
+/// in a wrapping `long`; NaN (`None`) at a non-digit or once the
+/// accumulator is negative.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the source converts its long to a double"
+)]
+fn scan_long(base: i64, b: &[u8]) -> Option<f64> {
+    let (neg, digits) = match b {
+        [] => return None,
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, b),
+    };
+    let mut x: i64 = 0;
+    for c in digits {
+        let base_of = |b: u8| i64::from(*c) - i64::from(b);
+        let digit = if base <= 10 || c.is_ascii_digit() {
+            base_of(b'0')
+        } else if c.is_ascii_uppercase() {
+            base_of(b'A') + 10
+        } else {
+            base_of(b'a') + 10
+        };
+        if !(0..base).contains(&digit) {
+            return None;
+        }
+        x = x.wrapping_mul(base).wrapping_add(digit);
+        if x < 0 {
+            return None;
+        }
+    }
+    Some(if neg { -(x as f64) } else { x as f64 })
+}
+
+/// LuaJ's `scandouble`: the first 64 bytes at most, each one of
+/// `-+.eE0-9`, parsed as a double (Java's `parseDouble` and Rust's parse
+/// agree on that alphabet); `None` otherwise.
+fn scan_double(b: &[u8]) -> Option<f64> {
+    let b = b.get(..b.len().min(64))?;
+    if !b
+        .iter()
+        .all(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+    {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok()
 }
 
 /// Java's `(int) (long) d`: NaN 0, the long saturating, then its low 32
@@ -588,10 +651,34 @@ impl ScreenRuntime {
     /// The runtime of `kept` for the callbacks `sites` on a `kind` screen,
     /// its phase entered and its memory cap lowered; `None` when no
     /// callback needs it, the VM dropped.
-    pub(crate) fn new(kind: ScreenKind, kept: Kept, sites: Vec<Site>) -> Option<Self> {
+    ///
+    /// # Errors
+    ///
+    /// The memory cap ([`LuaLimit::Memory`]) when the heap the configured
+    /// pass left is still over [`limits::RUNTIME_MEMORY`] after a full
+    /// collection: a lowered cap only refuses later allocations, so a kept
+    /// heap over it would stay for the runtime's whole life.
+    pub(crate) fn new(
+        kind: ScreenKind,
+        kept: Kept,
+        sites: Vec<Site>,
+    ) -> Result<Option<Self>, ImportError> {
         if sites.is_empty() {
             kept.close();
-            return None;
+            return Ok(None);
+        }
+        kept.pass.enter_runtime(kind);
+        let lua = &kept.lua;
+        let _ = lua.set_memory_limit(limits::RUNTIME_MEMORY);
+        // What the configured pass left and nothing still reaches is
+        // freed; what stays is the runtime's for its whole life.
+        let collected = lua.gc_collect().and_then(|()| lua.gc_collect());
+        if collected.is_err() || lua.used_memory() > limits::RUNTIME_MEMORY {
+            kept.close();
+            return Err(ImportError::Lua {
+                at: None,
+                why: LuaWhy::Limit(LuaLimit::Memory),
+            });
         }
         let Kept {
             lua,
@@ -600,10 +687,6 @@ impl ScreenRuntime {
             #[cfg(feature = "dev-tools")]
             open,
         } = kept;
-        pass.enter_runtime(kind);
-        // A lowered cap only refuses later allocations: the heap the
-        // configured pass left stays.
-        let _ = lua.set_memory_limit(limits::RUNTIME_MEMORY);
         let sites: Vec<(Site, Function)> = sites
             .into_iter()
             .filter_map(|s| {
@@ -612,7 +695,7 @@ impl ScreenRuntime {
             })
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
-        Some(Self {
+        Ok(Some(Self {
             sites,
             _lua: lua,
             pass,
@@ -623,15 +706,37 @@ impl ScreenRuntime {
             #[cfg(feature = "dev-tools")]
             _open: open,
             permit: None,
-        })
+        }))
     }
 
-    /// The runtime holding `permit`, returned when it is dropped, after
-    /// its VM.
-    #[must_use]
-    pub fn with_permit(mut self, permit: Permit) -> Self {
+    /// Makes the runtime hold `permit`, returned when the runtime is
+    /// dropped, after its VM.
+    ///
+    /// # Errors
+    ///
+    /// `permit` itself, unattached, when the runtime already holds one: a
+    /// permit held is never replaced, so none returns while its VM lives.
+    pub fn attach_permit(&mut self, permit: Permit) -> Result<(), Permit> {
+        if self.permit.is_some() {
+            return Err(permit);
+        }
         self.permit = Some(permit);
-        self
+        Ok(())
+    }
+
+    /// Calls `f` when the VM is destroyed, from the VM's own teardown
+    /// (dev-tools): a test observes what holds at that moment.
+    #[cfg(feature = "dev-tools")]
+    pub fn on_vm_drop(&self, f: impl FnOnce() + Send + 'static) {
+        struct Witness(Option<Box<dyn FnOnce() + Send>>);
+        impl Drop for Witness {
+            fn drop(&mut self) {
+                if let Some(f) = self.0.take() {
+                    f();
+                }
+            }
+        }
+        let _ = self._lua.set_app_data(Witness(Some(Box::new(f))));
     }
 
     /// The callbacks it runs: the outputs a state carries for it.
@@ -932,6 +1037,54 @@ mod tests {
             (s("12"), 12),
             (s(" 2.5 "), 2),
             (s("x"), 0),
+            // Strings, as the pinned LuaJ jar converts them (`toint`, its
+            // exception taken as the source's accessor takes it: 0).
+            (s(" 12 "), 12),
+            (s("\t12\t"), 0),
+            (s("\t12"), 0),
+            (s("12\n"), 0),
+            (s("0x10"), 16),
+            (s("0X1f"), 31),
+            (s("0x80000000"), i32::MIN),
+            (s("0xffffffff"), -1),
+            (s("0x100000000"), 0),
+            (s("0x"), 0),
+            (s("-0x10"), 0),
+            (s("0x-10"), -16),
+            (s("0x7fffffffffffffff"), -1),
+            (s("0x8000000000000000"), 0),
+            (s("0x10000000000000001"), 1),
+            (s("0x1g"), 0),
+            (s(" 0x10 "), 16),
+            (s("-"), 0),
+            (s(""), 0),
+            (s("  "), 0),
+            (s("+5"), 5),
+            (s("-5"), -5),
+            (s("1e2"), 100),
+            (s("1E2"), 100),
+            (s("+.5e1"), 5),
+            (s(".5"), 0),
+            (s("5."), 5),
+            (s("."), 0),
+            (s("1e"), 0),
+            (s("--5"), 0),
+            (s("2147483648"), i32::MIN),
+            (s("-2147483649"), i32::MAX),
+            (s("9223372036854775807"), -1),
+            (s("9223372036854775808"), -1),
+            (s("99999999999999999999"), -1),
+            (s("1e400"), -1),
+            (s("-1e400"), 0),
+            (s("12abc"), 0),
+            (s("1.5e3"), 1500),
+            (s("3.9"), 3),
+            (s("-3.9"), -3),
+            (s("00012"), 12),
+            (s(&"1234567890".repeat(7)), -1),
+            (s(&format!("{}1234", "0".repeat(63))), 1234),
+            (s("1_0"), 0),
+            (s("\u{661}\u{662}"), 0),
             (Value::Boolean(true), 0),
             (Value::Nil, 0),
         ] {

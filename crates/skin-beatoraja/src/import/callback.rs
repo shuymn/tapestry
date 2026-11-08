@@ -1670,7 +1670,28 @@ impl Cx<'_> {
         Ok(Some(k))
     }
 
-    /// Ends an element: its runtime value gates no later draw.
+    /// Gates the runtime draws of the element being imported by its value,
+    /// whatever backs it (an expression, a property, the runtime), as the
+    /// source checks the value before the draw conditions: a number's
+    /// draws run only when `src` is available (`guard`) and not a sentinel
+    /// (`SkinNumber.java:135-147`), an image set's only when its selector
+    /// is not negative (`SkinImage.java:127-132`). Only a selection or
+    /// result skin has a runtime.
+    pub(super) fn gate_by_value(&mut self, src: &str, guard: Option<&str>, conv: Conv) {
+        if !matches!(self.kind, ScreenKind::Selection | ScreenKind::Result) {
+            return;
+        }
+        let shown = match conv {
+            Conv::Index => format!("({src}) >= 0"),
+            _ => format!("({src}) != {} && ({src}) != {}", i32::MIN, i32::MAX),
+        };
+        self.value_gate = Some(match guard {
+            Some(g) => format!("({g}) && {shown}"),
+            None => shown,
+        });
+    }
+
+    /// Ends an element: its value gates no later draw.
     pub(super) fn end_value_gate(&mut self) {
         self.value_gate = None;
     }
@@ -1718,10 +1739,6 @@ impl Cx<'_> {
         };
         let role = self.scan_role(scan.part, base);
         if let Some(k) = self.runtime_site((c, id), "value", role, OutTy::Int, &[], at)? {
-            self.value_gate = Some(match conv {
-                Conv::Index => format!("lua.{k} >= 0"),
-                _ => format!("lua.{k} != {} && lua.{k} != {}", i32::MIN, i32::MAX),
-            });
             return Ok(Some(NumberValue {
                 expr: format!("lua.{k}"),
                 guard: None,

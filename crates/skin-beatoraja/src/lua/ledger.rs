@@ -173,9 +173,13 @@ impl Ledger {
         self.fault.borrow_mut().take();
         self.faulted.set(false);
         self.after_fault.set(0);
+        #[cfg(feature = "dev-tools")]
+        let budget = super::vm_hooks::frame_time();
+        #[cfg(not(feature = "dev-tools"))]
+        let budget = super::limits::RUNTIME_FRAME_TIME;
         self.frame.set(Some(Frame {
             start: self.counts(),
-            deadline: Instant::now() + super::limits::RUNTIME_FRAME_TIME,
+            deadline: Instant::now() + budget,
         }));
     }
 

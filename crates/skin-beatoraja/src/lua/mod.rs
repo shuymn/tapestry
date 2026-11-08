@@ -1025,7 +1025,9 @@ impl LuaHeader {
     ///
     /// # Errors
     ///
-    /// What [`Self::import`] refuses.
+    /// What [`Self::import`] refuses; and the memory cap
+    /// ([`LuaLimit::Memory`]) when the kept VM's heap is still over
+    /// [`limits::RUNTIME_MEMORY`] after a full collection.
     pub fn import_runtime(
         &self,
         config: &Config,
@@ -1147,7 +1149,7 @@ impl LuaHeader {
         #[cfg(feature = "dev-tools")]
         let mut records = survey::Records::default();
         let result = def.and_then(|mut def| {
-            let r =
+            let mut r =
                 admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));
             store = common_reads(&mut def, &mut counts);
             if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
@@ -1170,7 +1172,10 @@ impl LuaHeader {
                 .unwrap_or_default();
             if let Some(kept) = def.arena.lua.as_deref_mut().and_then(|l| l.kept.take()) {
                 if r.is_ok() {
-                    runtime = runtime::ScreenRuntime::new(slot, kept, sites);
+                    match runtime::ScreenRuntime::new(slot, kept, sites) {
+                        Ok(rt) => runtime = rt,
+                        Err(e) => r = Err(e),
+                    }
                 } else {
                     kept.close();
                 }

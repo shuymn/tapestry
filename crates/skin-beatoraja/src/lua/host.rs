@@ -252,6 +252,8 @@ fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaStrin
 /// feature's absence ([`super::runtime::absent`]), else 0, noted once.
 fn runtime_number(pass: &Pass, n: i32) -> i32 {
     let mut screen = pass.screen.borrow_mut();
+    #[cfg(feature = "dev-tools")]
+    super::vm_hooks::holding_context();
     let Some(s) = screen.as_mut() else {
         return 0;
     };

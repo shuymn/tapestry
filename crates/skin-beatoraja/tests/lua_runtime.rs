@@ -62,7 +62,20 @@ fn entry_with(prelude: &str, values: &[&str], number_draw: &str, draw: &str) -> 
 
 /// The configured pass of `text` on a selection scene, keeping its VM.
 fn import(text: &str) -> LuaImported {
+    import_in(text).1
+}
+
+/// [`import`], with the skin's folder, which its sheet is read from.
+fn import_in(text: &str) -> (tempfile::TempDir, LuaImported) {
+    import_with(text, &[])
+}
+
+/// [`import_in`], with `files` (name and text) beside the skin.
+fn import_with(text: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, LuaImported) {
     let d = common::selection::folder("");
+    for (name, body) in files {
+        common::write(d.path(), name, body.as_bytes());
+    }
     common::write(d.path(), "s.luaskin", text.as_bytes());
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
@@ -71,7 +84,7 @@ fn import(text: &str) -> LuaImported {
         .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
         .unwrap()
     {
-        LuaOutcome::Imported(i) => i,
+        LuaOutcome::Imported(i) => (d, i),
         LuaOutcome::Pending(p) => panic!("{p:?}"),
     }
 }
@@ -242,6 +255,92 @@ fn the_budget_stops_the_runtime_after_three_frames() {
     assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Budget)));
 }
 
+/// One frame of a runtime whose first callback is `body` and whose second
+/// reads a live id, with the frame time `time`: the statuses, and the
+/// instructions and host calls the frame spent.
+#[cfg(feature = "dev-tools")]
+fn over(body: &str, time: std::time::Duration) -> (Vec<CallStatus>, u64, u64) {
+    let mut i = import(&entry(
+        "",
+        &[body, "function() return ms.number(77) / 1 end"],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    let before = runtime(&mut i).counters();
+    skin_beatoraja::lua::vm_hooks::set_frame_time(Some(time));
+    runtime(&mut i).frame(&mut f, &[]);
+    skin_beatoraja::lua::vm_hooks::set_frame_time(None);
+    assert_eq!(outputs(&f), [0, 0]);
+    let after = runtime(&mut i).counters();
+    (
+        runtime(&mut i).status().to_vec(),
+        after.instructions - before.instructions,
+        after.host_calls - before.host_calls,
+    )
+}
+
+/// C8, §3.5: each of the frame's caps stops a call on its own, the frame's
+/// later calls given their constants: the instructions with time to
+/// spare, the host calls within the instructions and time, the time with
+/// instructions to spare.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_frame_cap_stops_a_call_alone() {
+    use skin_beatoraja::lua::limits::{INSTRUCTION_STEP, RUNTIME_HOST_CALLS, RUNTIME_INSTRUCTIONS};
+    let budget = [CallStatus::Budget, CallStatus::Budget];
+    let long = std::time::Duration::from_secs(60);
+    let (st, ins, _) = over("function() while true do end end", long);
+    assert_eq!(st, budget);
+    assert!(
+        ins + u64::from(INSTRUCTION_STEP) >= RUNTIME_INSTRUCTIONS,
+        "{ins}"
+    );
+    let (st, ins, calls) = over(
+        "function() for _ = 1, 3000 do ms.number(77) end return 1 end",
+        long,
+    );
+    assert_eq!(st, budget);
+    assert_eq!(calls, u64::from(RUNTIME_HOST_CALLS));
+    assert!(ins < RUNTIME_INSTRUCTIONS / 2, "{ins}");
+    let (st, ins, _) = over(
+        "function() while true do end end",
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(st, budget);
+    assert!(ins < RUNTIME_INSTRUCTIONS / 2, "{ins}");
+}
+
+/// C8: a panic while a host read holds the context's lock poisons it; the
+/// runtime stops through the panic, and the context is read through the
+/// poisoned lock from then on, with no second panic: frames, counters,
+/// notes and the drop.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_poisoned_context_is_read_through() {
+    let mut i = import(&entry(
+        "",
+        &["function() pcall(function() return ms.number(77) end) return 3 end"],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).counters().bridges, 1);
+    skin_beatoraja::lua::vm_hooks::panic_holding_context();
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Panic));
+    for _ in 0..2 {
+        let mut f = fields(n, &[("cursor.chart", 1)]);
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0]);
+    }
+    assert_eq!(runtime(&mut i).counters().bridges, 1);
+    let (notes, _) = runtime(&mut i).notes();
+    assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Panic)));
+    drop(i);
+}
+
 /// C8: the kept VM's memory cap stops the runtime at once.
 #[test]
 fn the_memory_cap_stops_the_runtime() {
@@ -255,6 +354,50 @@ fn the_memory_cap_stops_the_runtime() {
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Memory));
     assert_eq!(outputs(&f), [0]);
+}
+
+/// C8, §4: a configured pass that leaves more than the runtime's memory
+/// cap reachable from a routed callback is refused at the import, its VM
+/// not kept; one whose large heap nothing reaches keeps its VM.
+#[test]
+fn a_kept_heap_over_the_cap_refuses_the_import() {
+    // 64 distinct strings of 512 KiB: 32 MiB, under the import's cap.
+    let big = "local s = \"x\" for _ = 1, 19 do s = s .. s end
+               local t = {} for k = 1, 64 do t[k] = s .. k end";
+    let text = entry(
+        big,
+        &["function() return #t / 1 end"],
+        "function() return true end",
+    );
+    let d = common::selection::folder("");
+    common::write(d.path(), "s.luaskin", text.as_bytes());
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = ImportFacts::unavailable(ScreenKind::Selection);
+    let e = h
+        .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap_err();
+    assert!(
+        matches!(
+            e,
+            skin_beatoraja::ImportError::Lua {
+                why: skin_beatoraja::lua::LuaWhy::Limit(skin_beatoraja::lua::LuaLimit::Memory),
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    // The same heap, dropped before the callback is made, is collected.
+    let freed = format!(
+        "{big}
+t = nil"
+    );
+    let mut i = import(&entry(
+        &freed,
+        &["function() return ms.number(77) / 2 end"],
+        "function() return true end",
+    ));
+    assert_eq!(runtime(&mut i).outputs(), 1);
 }
 
 /// C14: the notes are capped; further occurrences are counted, and a
@@ -342,41 +485,48 @@ fn the_runtime_is_send() {
 /// C1: at runtime, every loader and import-only capability raises the
 /// fault marker however a callback reaches it: the global, a renamed
 /// local, an upvalue of a helper, a table field, and `require` of a module
-/// it already loaded, refused before the cached return.
+/// it already loaded, a host module or a file module the pass cached,
+/// refused before the cached return.
 #[test]
 fn loaders_raise_at_runtime_however_reached() {
-    let mut i = import(&entry(
-        "local load = require\n\
+    let (_d, mut i) = import_with(
+        &entry(
+            "local load = require\n\
+         local m = require(\"m\")\n\
          local function via(f) return function() return f(\"main_state\") end end\n\
          local up = via(require)\n\
          local held = { r = require, d = dofile }\n\
          local cfg = skin_config",
-        &[
-            "function() require(\"main_state\") return 5 end",
-            "function() load(\"main_state\") return 5 end",
-            "function() up() return 5 end",
-            "function() held.r(\"main_state\") return 5 end",
-            "function() held.d(\"x.lua\") return 5 end",
-            "function() dofile(\"x.lua\") return 5 end",
-            "function() cfg.get_path(\"s.png\") return 5 end",
-            "function() return 5 + ms.number(77) * 0 end",
-        ],
-        "function() return true end",
-    ));
+            &[
+                "function() require(\"main_state\") return 5 end",
+                "function() load(\"main_state\") return 5 end",
+                "function() up() return 5 end",
+                "function() held.r(\"main_state\") return 5 end",
+                "function() held.d(\"x.lua\") return 5 end",
+                "function() dofile(\"x.lua\") return 5 end",
+                "function() cfg.get_path(\"s.png\") return 5 end",
+                "function() require(\"m\") return 5 end",
+                "function() return m.v + 4 + ms.number(77) * 0 end",
+                "function() return 5 + ms.number(77) * 0 end",
+            ],
+            "function() return true end",
+        ),
+        &[("m.lua", "return { v = 1 }")],
+    );
     let n = runtime(&mut i).outputs();
     let mut f = fields(n, &[("cursor.chart", 1)]);
     runtime(&mut i).frame(&mut f, &[]);
     let status = runtime(&mut i).status().to_vec();
-    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 5], "{status:?}");
+    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 0, 5, 5], "{status:?}");
     assert!(
-        status[..7].iter().all(|s| *s == CallStatus::Error),
+        status[..8].iter().all(|s| *s == CallStatus::Error),
         "{status:?}"
     );
     let (notes, _) = runtime(&mut i).notes();
     assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
     // The phase stays: the next frame raises again.
     runtime(&mut i).frame(&mut f, &[]);
-    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 5]);
+    assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 0, 5, 5]);
 }
 
 /// The source's object order (docs/stage3.md S7-07): a number's value is
@@ -410,6 +560,119 @@ fn a_sentinel_value_skips_its_draws() {
     );
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(outputs(&f), [3, 1, 1]);
+}
+
+/// The source hides a number whose value is a sentinel on every screen
+/// (`SkinNumber.java:135-147`): a selection number whose runtime value is
+/// `Integer.MIN_VALUE` draws no digit, beside one that draws its value.
+#[test]
+fn a_sentinel_number_draws_nothing_on_selection() {
+    let (_d, mut i) = import_in(&entry(
+        "",
+        &[
+            "function() return ms.number(283) end",
+            "function() return ms.number(77) / 1 end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(
+        n,
+        &[
+            ("selected.plays", 42),
+            ("selected.played", 1),
+            ("cursor.chart", 1),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [i32::MIN, 42]);
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    s.sel
+        .outputs_mut()
+        .copy_from_slice(&f[SELECTION.fields.len()..]);
+    let digits = s.digits(0);
+    assert!(digits.ends_with("42"), "{digits}");
+    assert!(!digits.contains("3648"), "{digits}");
+    assert_eq!(digits.trim_start_matches('0'), "42", "{digits}");
+}
+
+/// `text` with two image sets of one `dot` appended, chosen by `a` and
+/// `b`, each drawn by its own draw callback.
+fn with_sets(text: &str, a: &str, a_draw: &str, b: &str, b_draw: &str) -> String {
+    text.replace(
+        "return skin\n",
+        &format!(
+            "skin.imageset[#skin.imageset + 1] = {{ id = \"sa\", images = {{ \"dot\" }}, value = {a} }}\n\
+             skin.imageset[#skin.imageset + 1] = {{ id = \"sb\", images = {{ \"dot\" }}, value = {b} }}\n\
+             skin.destination[#skin.destination + 1] = {{ id = \"sa\", draw = {a_draw},\n\
+               dst = {{ {{ x = 600, y = 0, w = 8, h = 8 }} }} }}\n\
+             skin.destination[#skin.destination + 1] = {{ id = \"sb\", draw = {b_draw},\n\
+               dst = {{ {{ x = 700, y = 0, w = 8, h = 8 }} }} }}\n\
+             return skin\n"
+        ),
+    )
+}
+
+/// The source checks an image set's selector before its draw conditions
+/// (`SkinImage.java:127-132`), whatever backs the selector: a negative
+/// lowered selector (a constant) or runtime one (a property hidden with no
+/// chart under the cursor) skips the set's runtime draw, so its side
+/// effect never reaches a later callback; a selector that is not negative
+/// lets it run.
+#[test]
+fn a_negative_selector_skips_its_runtime_draws() {
+    let text = with_sets(
+        &entry(
+            "local ca, cb = 0, 0",
+            &["function() return ca end", "function() return cb end"],
+            "function() return true end",
+        ),
+        "function() return -1 end",
+        "function() ca = ca + 1 return true end",
+        "function() return ms.number(77) end",
+        "function() cb = cb + 1 return true end",
+    );
+    let mut i = import(&text);
+    let n = runtime(&mut i).outputs();
+    // The two counters, the first set's draw, the second set's value and
+    // draw.
+    assert_eq!(n, 5, "{:?}", i.callbacks);
+    let set = |chart| {
+        fields(
+            n,
+            &[
+                ("selected.plays", 200),
+                ("selected.played", chart),
+                ("cursor.chart", chart),
+            ],
+        )
+    };
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        2,
+        "{:?}",
+        i.callbacks
+    );
+    // No chart: both selectors negative.
+    for _ in 0..2 {
+        let mut f = set(0);
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0, 0, 0, i32::MIN, 0]);
+        let st = runtime(&mut i).status().to_vec();
+        assert_eq!([st[2], st[4]], [CallStatus::Skipped; 2], "{st:?}");
+    }
+    // A chart with 200 plays: the property-backed selector is 200, its
+    // draw runs.
+    for _ in 0..2 {
+        let mut f = set(1);
+        runtime(&mut i).frame(&mut f, &[]);
+    }
+    let mut f = set(1);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [0, 2, 0, 200, 1]);
 }
 
 /// C4 on a result screen: a read answers through the result profile's
@@ -458,7 +721,9 @@ fn a_result_skin_runs_its_callbacks() {
 }
 
 /// A runtime's permit returns when the runtime is dropped, on the thread
-/// that drops it.
+/// that drops it, after the VM: when the VM is destroyed the permit is
+/// still out.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_dropped_runtime_returns_its_permit() {
     let pool = Pool::new(1);
@@ -467,10 +732,35 @@ fn a_dropped_runtime_returns_its_permit() {
         &["function() return ms.number(77) / 2 end"],
         "function() return true end",
     ));
-    let rt = i.runtime.unwrap().with_permit(pool.take().unwrap());
+    let mut rt = i.runtime.unwrap();
+    rt.attach_permit(pool.take().unwrap()).unwrap();
     assert_eq!(pool.free(), 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let seen = pool.clone();
+    rt.on_vm_drop(move || tx.send(seen.free()).unwrap());
     std::thread::spawn(move || drop(rt)).join().unwrap();
+    assert_eq!(rx.try_recv(), Ok(0), "the permit was out at the VM's end");
     assert_eq!((pool.free(), pool.releases()), (1, 1));
+}
+
+/// A runtime holds one permit: a second is refused and handed back, and
+/// the first stays out until the runtime is dropped.
+#[test]
+fn a_runtime_holds_one_permit() {
+    let pool = Pool::new(2);
+    let i = import(&entry(
+        "",
+        &["function() return ms.number(77) / 2 end"],
+        "function() return true end",
+    ));
+    let mut rt = i.runtime.unwrap();
+    rt.attach_permit(pool.take().unwrap()).unwrap();
+    let second = rt.attach_permit(pool.take().unwrap()).unwrap_err();
+    assert_eq!(pool.free(), 0);
+    drop(second);
+    assert_eq!((pool.free(), pool.releases()), (1, 1));
+    drop(rt);
+    assert_eq!((pool.free(), pool.releases()), (2, 2));
 }
 
 /// C8: a panic in a host function stops the runtime, even under a `pcall`;
