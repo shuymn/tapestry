@@ -575,7 +575,7 @@ impl Rig for Fake {
         self.quitting || self.clock.now().0 >= self.quit_at
     }
 
-    fn withdraw_result(&mut self) {
+    fn withdraw_result(&mut self, _by: Option<game::MenuCommand>) {
         self.withdraw_calls += 1;
     }
 

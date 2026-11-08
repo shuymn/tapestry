@@ -237,6 +237,7 @@ pub fn input<'a>(
     effects: &'a [JudgeEvent],
 ) -> FrameInput<'a> {
     FrameInput {
+        state_us: 0,
         now,
         display_offset,
         lanes: LANES,

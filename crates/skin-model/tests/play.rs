@@ -895,6 +895,72 @@ fn a_rate_floors_one_basis_point_value() {
     assert_eq!(source, (19, 49));
 }
 
+/// The point as of the last build, after a frame with `PERFECT`, `GREAT`
+/// and `GOOD` counts `pg`, `gr`, `gd` and the maximum combo `max` over
+/// `h`'s chart.
+fn point_after(h: &mut Harness, [pg, gr, gd]: [u32; 3], max: u32) -> i32 {
+    h.tally = eval::Tally {
+        max_combo: max,
+        ..scored([pg, gr, gd, 0, 0], 0, 0)
+    };
+    h.frame(0, &[]);
+    h.field(field::POINT)
+}
+
+/// The source's 7-key point with its intermediate widths
+/// (`ScoreDataProperty.java:76-79` at `0.8.9`); each expected value was
+/// computed by that expression in Java.
+#[test]
+fn the_point_follows_the_source_s_widths() {
+    let chart = |n: i64| taps(&(1..=n).map(|i| i * 10).collect::<Vec<_>>());
+    let mut four = Harness::empty(&chart(4), &full(0));
+    // Every target PERFECT, the maximum combo all of them.
+    assert_eq!(point_after(&mut four, [4, 0, 0], 4), 200_000);
+    // A broken current combo with a kept maximum: the maximum counts.
+    four.tally = eval::Tally {
+        combo: 1,
+        max_combo: 3,
+        ..scored([4, 0, 0, 0, 0], 0, 0)
+    };
+    four.frame(0, &[]);
+    assert_eq!(four.field(field::POINT), 187_500);
+    let mut seven = Harness::empty(&chart(7), &full(0));
+    assert_eq!(point_after(&mut seven, [1, 1, 1], 1), 45_713);
+    // GREAT's product wraps as an `int`: the r2 witness.
+    let mut many = Harness::empty(&chart(22_000), &full(0));
+    assert_eq!(point_after(&mut many, [0, 22_000, 0], 22_000), -45_225);
+    // GOOD's product wraps as an `int`.
+    assert_eq!(point_after(&mut many, [0, 0, 107_375], 0), -97_612);
+    // The PERFECT sum is a `long` whose quotient keeps its low 32 bits,
+    // and the last addition wraps.
+    let mut one = Harness::empty(&chart(1), &full(0));
+    assert_eq!(point_after(&mut one, [14_316, 0, 0], 2), -2_147_467_296);
+    // The PERFECT quotient past `i32` keeps its low 32 bits.
+    assert_eq!(point_after(&mut one, [14_317, 0, 0], 0), -2_147_417_296);
+    // The maximum combo's quotient keeps its low 32 bits.
+    assert_eq!(point_after(&mut one, [0, 0, 0], 50_000), -1_794_967_296);
+    // No target: 0, whatever the counts.
+    let none = ChartBuilder::new(BPM_150)
+        .mine(lane(4), TimeUs(1_000 * MS), 10)
+        .build()
+        .unwrap();
+    let mut none = Harness::empty(&none, &full(0));
+    assert_eq!(point_after(&mut none, [3, 2, 1], 3), 0);
+}
+
+/// During section practice the point is over the section's targets, as
+/// the source's practice counts only its section's notes
+/// (`pattern/PracticeModifier.java:30-40`, `play/JudgeManager.java:135`).
+#[test]
+fn a_sections_point_is_over_its_targets() {
+    // Four taps, two of them in the section.
+    let chart = taps(&[1_000, 31_000, 32_000, 61_000]);
+    let s = section(30_000, 60_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    assert_eq!(point_after(&mut h, [2, 0, 0], 2), 200_000);
+    assert_eq!(h.field(field::NOTES), 2);
+}
+
 #[test]
 fn a_rate_is_not_capped_and_never_overflows() {
     // A custom EX weighting: 3 for one target.
@@ -1042,6 +1108,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
         let tally = h.tally;
         let layout = h.layout;
         let f = skin_model::SkinFrame {
+            state_us: 0,
             now: TimeUs(now * MS),
             display_offset: TimeUs(0),
             tally: &tally,

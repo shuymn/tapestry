@@ -61,6 +61,36 @@ fn judged_targets(tally: &Tally, empty_poor_counted: bool) -> Option<u64> {
     )
 }
 
+/// The source's 7-key point of `t` over `targets`
+/// (`ScoreDataProperty.java:76-79` at `0.8.9`), with Java's intermediate
+/// widths: 0 with no target, else
+/// `(int)((150000L·PG + (int)(100000·GR) + (int)(20000·GD)) / N)
+/// + (int)(50000L·M / N)`, the last `+` wrapping, `M` the maximum combo.
+/// The `long` sum is below 2^50 and `50000 · M` below 2^47, so neither
+/// overflows `i64`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Java's `(int)` of a `long`: its low 32 bits"
+)]
+fn point(t: &Tally, targets: u32) -> i32 {
+    // The source's `int` counts; a count past `i32` never comes from a
+    // chart within the parser's caps.
+    let int = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
+    let n = i64::from(int(targets));
+    if n <= 0 {
+        return 0;
+    }
+    let c = &t.counts;
+    // `(long)150000 * PG + 100000 * GR + 20000 * GD`: the GREAT and GOOD
+    // products are `int`s, wrapping, then widened.
+    let sum = 150_000 * i64::from(int(c.perfect))
+        + i64::from(100_000_i32.wrapping_mul(int(c.great)))
+        + i64::from(20_000_i32.wrapping_mul(int(c.good)));
+    // Each `(int)` keeps the low 32 bits of a quotient truncated toward 0.
+    let low = |v: i64| v as i32;
+    low(sum / n).wrapping_add(low(50_000 * i64::from(int(t.max_combo)) / n))
+}
+
 /// The score rate of `ex` over `targets`, in basis points:
 /// `⌊10 000 · ex / (2 · targets)⌋`, 10 000 with no target. Not capped at
 /// 100 %: a custom EX weighting may pass it; only the field's `i32` range
@@ -662,7 +692,8 @@ impl Play {
                     .map(|(lane, j)| j.read(frame.input.lane(lane))),
             )
             .chain([r.progress_ppm])
-            .chain(self.chart_fields);
+            .chain(self.chart_fields)
+            .chain([point(t, self.reducer.targets())]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
