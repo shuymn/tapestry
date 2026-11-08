@@ -144,6 +144,12 @@ impl ScratchDevice {
                 } else {
                     delta
                 };
+                // A press whose deadline passed before this movement was
+                // released then, as the evaluator releases it; at the
+                // deadline itself the input comes first.
+                if self.turn.pressed().is_some_and(|(_, until)| until < o.at) {
+                    let _ = self.turn.release();
+                }
                 let _ = self.turn.step(d, o.at);
             }
             TapEvent::Lost => self.lost = true,

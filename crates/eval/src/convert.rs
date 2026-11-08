@@ -103,10 +103,9 @@ pub struct AxisTurn {
     moved: i64,
     /// When the axis last moved.
     last_move: Option<TimeUs>,
-    /// The direction it presses in, while it presses its lane.
-    pressed: Option<AxisDirection>,
-    /// The pending release deadline, while it presses its lane.
-    release_at: Option<TimeUs>,
+    /// The direction it presses in and its pending release deadline,
+    /// while it presses its lane.
+    press: Option<(AxisDirection, TimeUs)>,
 }
 
 impl AxisTurn {
@@ -118,8 +117,7 @@ impl AxisTurn {
             settings,
             moved: 0,
             last_move: None,
-            pressed: None,
-            release_at: None,
+            press: None,
         }
     }
 
@@ -128,16 +126,12 @@ impl AxisTurn {
     /// releases it ([`release`](Self::release)).
     #[must_use]
     pub const fn pressed(&self) -> Option<(AxisDirection, TimeUs)> {
-        match (self.pressed, self.release_at) {
-            (Some(d), Some(at)) => Some((d, at)),
-            _ => None,
-        }
+        self.press
     }
 
     /// Released at its deadline: whether it was pressed.
     pub const fn release(&mut self) -> bool {
-        let was = self.release_at.take().is_some();
-        self.pressed = None;
+        let was = self.press.take().is_some();
         self.moved = 0;
         was
     }
@@ -146,8 +140,7 @@ impl AxisTurn {
     pub const fn clear(&mut self) {
         self.moved = 0;
         self.last_move = None;
-        self.pressed = None;
-        self.release_at = None;
+        self.press = None;
     }
 
     /// One signed movement `d` (forward positive) at `at`.
@@ -176,15 +169,14 @@ impl AxisTurn {
         // `moved` is at least 1 here, so a threshold of 0 acts as 1.
         let press = u64::from(s.press_threshold);
         let hold = u64::from(s.hold_threshold);
-        let step = match self.pressed {
+        let step = match self.press {
             None if moved >= press => TurnStep::Press,
-            Some(p) if p != direction && moved >= press => TurnStep::Reverse,
-            Some(p) if p == direction && moved >= hold => TurnStep::Hold,
+            Some((p, _)) if p != direction && moved >= press => TurnStep::Reverse,
+            Some((p, _)) if p == direction && moved >= hold => TurnStep::Hold,
             _ => return TurnStep::None,
         };
         // A press, a reversal or a hold: the release moves later.
-        self.pressed = Some(direction);
-        self.release_at = Some(TimeUs(at.0.saturating_add(release_after)));
+        self.press = Some((direction, TimeUs(at.0.saturating_add(release_after))));
         self.moved = 0;
         step
     }

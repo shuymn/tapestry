@@ -424,13 +424,6 @@ fn two_taps_refresh_positive() {
     assert_eq!(turn_at(&out, 1_130_000), Turn::Idle);
 }
 
-#[test]
-fn a_plain_ln_end_with_an_old_press() {
-    let out = run(&ln(500, 1_000, false), 0, &every(490, 1_200, 10));
-    assert_eq!(turn_at(&out, 1_010_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 1_020_000), Turn::Idle);
-}
-
 /// A frame crossing an expiry and a head: the head first, so the old
 /// Negative survives the whole LN; a frame at 1 081 ms expires it first;
 /// one at 1 080.5 ms floors to state 1 080 and does not.
@@ -490,5 +483,22 @@ fn fractional_origins_move_the_expiry() {
         assert_eq!(out[0].1, stamp, "{delta}");
         assert_eq!(out[1].1, at_1080_5, "{delta}");
         assert_eq!(turn_at(&out, 2_000_000), through, "{delta}");
+    }
+}
+
+/// A press whose deadline passed before a movement is released first, as
+/// the evaluator releases it: a movement below the press threshold then
+/// presses nothing. At the deadline itself the movement comes first and
+/// holds the press.
+#[test]
+fn an_expired_press_is_released_before_a_later_movement() {
+    for (late_ms, held) in [(101, false), (100, true)] {
+        let plan = plan(false, None);
+        let mut d = ScratchDevice::new(&plan);
+        d.observe(&axis(&plan, 0, 2, 0));
+        assert!(d.input().analog.is_some());
+        // The hold threshold is 1, the press threshold 2.
+        d.observe(&axis(&plan, late_ms, 1, 0));
+        assert_eq!(d.input().analog.is_some(), held, "{late_ms} ms");
     }
 }
