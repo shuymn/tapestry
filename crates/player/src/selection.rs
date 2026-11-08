@@ -5072,13 +5072,18 @@ pub(crate) mod tests {
             assert!(origin >= served && origin > received, "{origin:?}");
             // A retry an earlier result offered and never acted on: a
             // later result's preparation withdrawn by back keeps the
-            // origin.
+            // origin, and the served retry is no later play's either.
             key(rig);
             assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
             rig.prepare_screen().unwrap();
             rig.withdraw_result();
             rig.prepare_screen().unwrap();
+            assert_eq!(rig.retry_from, None);
             assert_eq!(rig.state_clock.origin(), Some(origin));
+            let receipt = key(rig);
+            assert_eq!(rig.take(), Some(Command::Retry));
+            rig.prepare_screen().unwrap();
+            assert_eq!(rig.state_clock.origin(), Some(receipt));
         });
     }
 
