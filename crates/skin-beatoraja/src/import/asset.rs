@@ -523,6 +523,13 @@ impl Assets {
     /// Adds image `def` with cells of `cell` under `key`, its single
     /// frame cut to the rows of `crop` when there is one; returns the
     /// image and its cell. Checked as [`Self::check_image`] says.
+    ///
+    /// A crop of a frame running past its file's bottom edge may start at
+    /// or past that edge, where the source's texture, clamped to its edge,
+    /// samples only the file's last row: that row is cut in its place, one
+    /// row high, and the cell keeps the crop's rows. A crop starting inside
+    /// the file is cut as it is, the sheet padding its rows past the edge
+    /// ([`skin_model::ImageDef::rect`]).
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
@@ -533,7 +540,10 @@ impl Assets {
         let (added, added_cell) = match (crop, def.rect) {
             (Some([y, rows]), Some([x, _, w, _])) => (
                 ImageDef {
-                    rect: Some([x, y, w, rows]),
+                    rect: Some(match self.file_dims(def.file) {
+                        Some([_, fh]) if fh > 0 && y >= fh => [x, fh - 1, w, 1],
+                        _ => [x, y, w, rows],
+                    }),
                     ..def
                 },
                 [cell[0], rows],
