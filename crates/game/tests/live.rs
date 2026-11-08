@@ -5722,6 +5722,28 @@ fn the_gate_is_the_pinned_views() {
     assert_eq!(rig.served, [(Back, s + 6_000_000)]);
 }
 
+/// T9 at the gate: an input thread failed during the input time does not
+/// make a gated press end the run (it is dropped, nothing settled); the
+/// first press after the gate ends it with the input cause, at once.
+#[test]
+fn an_input_failure_during_the_gate_ends_the_run_at_the_first_accepted_press() {
+    use game::MenuCommand::Back;
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 3_000_000, None), i64::MAX);
+    rig.input_fails_at = s + 500_000;
+    press(&mut rig, &[(s + 1_000_000, Back), (s + 3_500_000, Back)]);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.result_order[0], ("gated", s + 1_000_000));
+    assert_eq!(rig.accepted, [Back]);
+    assert_eq!(rig.served, [(Back, s + 3_500_000)]);
+}
+
 /// T4: during a held settle, a second command is dropped, a fallback
 /// serves the command when the settle returns, and an input failure ends
 /// the run then, before a recovery.

@@ -89,6 +89,8 @@ struct Faults {
     /// The screen's drop holds while set; `dropping` says it reached it.
     hold_drop: AtomicBool,
     dropping: AtomicBool,
+    /// The last result frame built: its time and timer 2's start.
+    timers: Mutex<Option<(TimeUs, Option<TimeUs>)>>,
 }
 
 impl Drop for Recorded {
@@ -241,6 +243,7 @@ impl Screen for Recorded {
         if self.faults.refuse.swap(false, Ordering::AcqRel) {
             self.menu.refuse_next_result(false);
         }
+        *self.faults.timers.lock().unwrap() = Some((frame.now, frame.timers.fadeout));
         self.menu.build_result(state, frame)
     }
     fn submit_result(&mut self) -> Result<render::FrameTiming, render::RenderError> {
@@ -1799,7 +1802,7 @@ fn fade_alpha(drawn: &Mutex<Vec<Drawn>>) -> Option<f32> {
 #[test]
 fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
     use game::Rig as _;
-    on_shown_result("", TIMER2_DOT, |p, _, _, _, drawn| {
+    on_shown_result("", TIMER2_DOT, |p, _, _, faults, drawn| {
         let view: Vec<Quad> = last_skin(drawn).unwrap();
         assert!(!view.iter().any(fading), "no fade before the outro");
         assert!(p.result_timing().is_some(), "the skin's timing applies");
@@ -1839,6 +1842,10 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
         }
         assert!(alphas.windows(2).all(|w| w[0] <= w[1]), "{alphas:?}");
         assert!(alphas.last() > alphas.first(), "the fade rises: {alphas:?}");
+        // Timer 2 itself: started at the pin, and running.
+        let (now, start) = faults.timers.lock().unwrap().expect("a frame built");
+        assert_eq!(start, Some(at), "timer 2 starts at the pin");
+        assert!(now.0 - at.0 >= 600_000, "{now:?} {at:?}");
         assert_eq!(p.render.result_status().pinned, Some(1));
     });
 }
@@ -1858,13 +1865,15 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
 fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
     use game::Rig as _;
     // The fade read `wait` ms after the outro began, and again `after` ms
-    // after the screen is built again: the last case reads at 1.8 s and
-    // past 2 s, across the end of the fade.
+    // after the screen is built again: one case reads at 1.8 s and past
+    // 2 s, across the end of the fade, and one builds the screen again
+    // after the fade has finished.
     for (fadeout, refuse, wait, after) in [
         (5_000, false, 400, 0),
         (5_000, true, 400, 0),
         (1, false, 400, 0),
         (5_000, false, 1_800, 400),
+        (5_000, false, 2_200, 0),
     ] {
         on_shown_result(
             &format!("skin.fadeout = {fadeout}\n"),
@@ -1893,6 +1902,8 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                 std::thread::sleep(Duration::from_millis(wait));
                 let before = fade_alpha(drawn).expect("the fade draws");
                 assert!(before > 0.0, "{before}");
+                let (then, start) = faults.timers.lock().unwrap().expect("a frame built");
+                assert_eq!(start, Some(at), "timer 2 starts at the pin");
                 faults.refuse_restore.store(refuse, Ordering::Release);
                 faults.lose.store(true, Ordering::Release);
                 assert!(wait_until(|| p.screen_failed()));
@@ -1911,6 +1922,10 @@ fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
                     assert!(wait_until(|| last_skin(drawn).is_some()));
                     std::thread::sleep(Duration::from_millis(after));
                     let after = fade_alpha(drawn).expect("the fade draws");
+                    // Timer 2 itself goes on from the pin, not the rebuild.
+                    let (now, restarted) = faults.timers.lock().unwrap().expect("a frame built");
+                    assert_eq!(restarted, Some(at), "timer 2 keeps its start");
+                    assert!(now > then, "{then:?} then {now:?}");
                     let all: Vec<Option<f32>> = drawn
                         .lock()
                         .unwrap()

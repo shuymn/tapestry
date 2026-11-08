@@ -2797,6 +2797,41 @@ fn the_skins_scene_time_leaves_the_result() {
     assert!(left.iter().all(|&us| us >= 200_000), "{left:?}");
 }
 
+/// C17f, C23 joined: a screen lost under a 5 s outro's barrier whose
+/// result restore is refused falls back for the run, and the flow serves
+/// back (accepted by the scene time) at its next look, well before the
+/// outro's end (T16).
+#[test]
+fn a_screen_lost_mid_outro_with_its_restore_refused_serves_back() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 5000, scene = 500");
+    let (out, stdout, stderr) = fx.run_with(
+        &scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            // Back is accepted by the scene time; the result shown again
+            // after the rebuild takes no step.
+            "result = \"stay\"",
+            "quit = {}",
+        ]),
+        "lostpinned3",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("dev: the result's restore was refused"),
+        "the screen was built again, its result restore refused: {stderr}"
+    );
+    let left = left_after_outro(&stdout);
+    assert_eq!(left.len(), 1, "{stdout}");
+    assert!(left[0] < 3_000_000, "served at the fallback: {left:?}");
+    assert_eq!(
+        lines(&stdout, "dev: result shown: built-in").len(),
+        1,
+        "{stdout}"
+    );
+}
+
 /// C17f through the real flow (P5): a frame refused on a healthy device
 /// while back waits on a 5 s outro disables the skin for the run, and back
 /// is served at the next look, not at the outro's end.

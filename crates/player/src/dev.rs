@@ -2123,17 +2123,41 @@ pub fn refuse_result_select() -> bool {
 static PINNED_FAULT: AtomicU64 = AtomicU64::new(0);
 static PINNED_SEEN: AtomicU64 = AtomicU64::new(0);
 
-/// Reads [`RESULT_FAULTS_ENV`]'s `pinned<N>` before any frame, so a frame
-/// reads only atomics.
+/// The frame under the result's barrier lost as a device loss, counted
+/// from 1, with the result's restore on the screen built after it refused:
+/// `lostpinned<N>` in [`RESULT_FAULTS_ENV`]; 0 none.
+static LOST_PINNED_FAULT: AtomicU64 = AtomicU64::new(0);
+static LOST_PINNED_SEEN: AtomicU64 = AtomicU64::new(0);
+static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// Reads [`RESULT_FAULTS_ENV`]'s `pinned<N>` and `lostpinned<N>` before
+/// any frame, so a frame reads only atomics.
 pub fn read_result_faults() {
-    let n = std::env::var(RESULT_FAULTS_ENV)
-        .ok()
-        .and_then(|list| {
-            list.split(',')
-                .find_map(|f| f.trim().strip_prefix("pinned")?.parse().ok())
-        })
-        .unwrap_or(0);
-    PINNED_FAULT.store(n, Ordering::SeqCst);
+    let list = std::env::var(RESULT_FAULTS_ENV).unwrap_or_default();
+    let count = |prefix: &str| {
+        list.split(',')
+            .find_map(|f| f.trim().strip_prefix(prefix)?.parse().ok())
+            .unwrap_or(0)
+    };
+    PINNED_FAULT.store(count("pinned"), Ordering::SeqCst);
+    LOST_PINNED_FAULT.store(count("lostpinned"), Ordering::SeqCst);
+}
+
+/// Whether this result frame, built under the barrier, is lost as a
+/// device loss; the result's next restore is refused then.
+pub fn lose_pinned_frame() -> bool {
+    let n = LOST_PINNED_FAULT.load(Ordering::SeqCst);
+    let lost = n != 0 && LOST_PINNED_SEEN.fetch_add(1, Ordering::SeqCst) + 1 == n;
+    if lost {
+        RESTORE_REFUSED.store(true, Ordering::SeqCst);
+    }
+    lost
+}
+
+/// Whether this restore of the result's installation is refused (once,
+/// after [`lose_pinned_frame`]).
+pub fn refuse_result_restore() -> bool {
+    RESTORE_REFUSED.swap(false, Ordering::SeqCst)
 }
 
 /// Whether this result frame, built under the barrier, is refused.

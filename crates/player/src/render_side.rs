@@ -2779,7 +2779,18 @@ fn build(
         let Some(installation) = committed.get(kind).cloned() else {
             continue;
         };
-        match s.restore(kind, &installation) {
+        let restored = s.restore(kind, &installation);
+        // A refusal injected by a test of the real flow (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let restored = match restored {
+            Ok(()) if kind == ScreenKind::Result && crate::dev::refuse_result_restore() => {
+                Err(RenderError::Skin(render::SkinError {
+                    reason: "dev: the result's restore was refused".to_owned(),
+                }))
+            }
+            other => other,
+        };
+        match restored {
             Ok(()) => {}
             Err(e) if committed.pending(kind) && e.is_refusal() => {
                 eprintln!(
@@ -3800,6 +3811,15 @@ impl Run {
                         None => latest.clone(),
                     };
                     match built {
+                        // A device lost under the barrier (dev-tools: a
+                        // recovery during an outro).
+                        #[cfg(feature = "dev-tools")]
+                        ResultDrawn::Built
+                            if self.shared.barrier().fadeout.is_some()
+                                && crate::dev::lose_pinned_frame() =>
+                        {
+                            Err(RenderError::SurfaceLost)
+                        }
                         ResultDrawn::Built => screen.submit_result().map(|t| (t, None)),
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
