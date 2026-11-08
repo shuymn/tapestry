@@ -54,6 +54,7 @@ mod selection;
 mod selection_skin;
 mod shelf;
 mod start_gate;
+mod state_clock;
 mod tuning;
 mod ui_text;
 mod window;
@@ -818,6 +819,7 @@ fn rig<'a>(
         pending_retry: None,
         window: None,
         retry_from: None,
+        state_clock: state_clock::StateClock::default(),
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,

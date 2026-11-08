@@ -201,6 +201,9 @@ pub struct PlayerRig<'a> {
     pub pending_retry: Option<TimeUs>,
     /// The retry the current play started from.
     pub retry_from: Option<TimeUs>,
+    /// Where the play state was entered: each play frame's state clock
+    /// runs from it.
+    pub(crate) state_clock: crate::state_clock::StateClock,
     /// Load times shown on the end screen.
     pub times: LoadTimes,
     /// When the current play's READY state started, on the clock.
@@ -1468,6 +1471,9 @@ impl Rig for PlayerRig<'_> {
         }
         self.leave_result();
         self.retry_from = self.pending_retry.take();
+        if let Some(at) = self.retry_from {
+            self.state_clock.retry(at);
+        }
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
         prepare_render(&mut self.end_page, &self.render)
@@ -1880,10 +1886,14 @@ impl Rig for PlayerRig<'_> {
         };
         #[cfg(feature = "dev-tools")]
         self.scenario_started();
+        // A play without a scene entered (a direct launch) entered its
+        // state at the load's start.
+        let state_origin = self.state_clock.origin().unwrap_or(self.load_start);
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
             measure: Box::new(measure),
+            state_origin,
         });
     }
 

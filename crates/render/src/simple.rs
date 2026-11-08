@@ -1348,6 +1348,7 @@ mod tests {
 
     fn frame<'a>(view: &'a PlayView, now: i64, effects: &'a [JudgeEvent]) -> FrameInput<'a> {
         FrameInput {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             lanes: LANES,

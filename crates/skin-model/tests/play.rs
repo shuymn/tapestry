@@ -1093,6 +1093,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
         let tally = h.tally;
         let layout = h.layout;
         let f = skin_model::SkinFrame {
+            state_us: 0,
             now: TimeUs(now * MS),
             display_offset: TimeUs(0),
             tally: &tally,

@@ -444,6 +444,7 @@ impl Harness {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now_us),
             display_offset: self.offset,
             tally: &self.tally,

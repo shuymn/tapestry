@@ -668,8 +668,8 @@ fn a_reused_bundle_still_counts_both_attempts() {
 
 /// A frame's model input comes from the frame alone: the tally, the
 /// gauges, the completion and the play phase from its one view, the
-/// effects as drained, its target, lanes and readouts, and the author's
-/// layout.
+/// effects as drained, its target, state clock, lanes and readouts, and
+/// the author's layout.
 #[test]
 fn a_skin_frame_reads_one_view() {
     let mut v = view(5, 9);
@@ -687,6 +687,7 @@ fn a_skin_frame_reads_one_view() {
     }];
     let f = render::FrameInput {
         gauge: 0,
+        state_us: 7_654_321,
         lanes: skin_model::LaneView {
             gain: skin_model::Gain::new(16, 5),
             cover: 200,
@@ -710,8 +711,8 @@ fn a_skin_frame_reads_one_view() {
     assert_eq!((s.complete, s.playing), (true, false));
     assert!(std::ptr::eq(s.effects, effects.as_slice()));
     assert_eq!(
-        (s.now, s.display_offset, s.target),
-        (TimeUs(1_000), TimeUs(20), f.target)
+        (s.now, s.display_offset, s.state_us, s.target),
+        (TimeUs(1_000), TimeUs(20), 7_654_321, f.target)
     );
     assert_eq!(*s.layout, skin_model::Layout::AUTHOR);
     assert_eq!(s.lanes, f.lanes);

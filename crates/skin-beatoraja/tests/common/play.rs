@@ -426,6 +426,7 @@ impl Drawn {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
             tally: &self.tally,

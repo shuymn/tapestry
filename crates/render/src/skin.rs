@@ -25,6 +25,9 @@ pub struct FrameInput<'a> {
     /// expected to reach the screen (design.md "Rendering and Skins"), as
     /// the presentation snapshot holds it.
     pub display_offset: TimeUs,
+    /// The state clock: µs since the play state was entered, sampled with
+    /// `now` ([`SkinFrame::state_us`](skin_model::SkinFrame::state_us)).
+    pub state_us: i64,
     /// The lanes: the exact original-lane gain and the effective covers
     /// (design.md "Play readouts"), from the frame's presentation
     /// snapshot ([`presentation::frame`](crate::presentation::frame)).

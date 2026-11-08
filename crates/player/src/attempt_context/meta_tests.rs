@@ -143,6 +143,7 @@ fn try_drawn(
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let view = side.acquire(16, |_| {}).unwrap();
     let f = FrameInput {
+        state_us: 0,
         now: TimeUs(-500_000),
         display_offset: TimeUs(0),
         lanes: LaneView::NONE,

@@ -1789,6 +1789,10 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        // A play state is entered before its loading state shows; a
+        // practice session's Start keeps the session's.
+        let practicing = self.selection.as_ref().is_some_and(|s| s.practicing);
+        self.state_clock.enter(self.clock.now(), practicing);
         // The coming attempt's entry: its loading-time adjustments are its
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
@@ -2158,6 +2162,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
+        self.state_clock.leave();
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
@@ -2211,6 +2216,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.state_clock.enter(self.clock.now(), true);
         self.leave_result();
         self.enter_scene();
         self.render.leave_selection();
@@ -4827,6 +4833,71 @@ pub(crate) mod tests {
                 "{practice}: {drawn:?}"
             );
         }
+    }
+
+    /// The play state's clock starts where a play state is entered
+    /// (design.md "beatoraja Lua Skins", the state clock): afresh before a
+    /// chosen chart's loading state and at a retry's receipt; a practice
+    /// session keeps the first of its page's and loading states' origin
+    /// through its Starts and retries, until selection is entered again.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_state_clock_starts_where_a_play_state_is_entered() {
+        use bms_model::TimeSource as _;
+        use game::{AppRig as _, Rig as _};
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, roots) = tree(dir.path(), &[&["a.bms"]]);
+        let chart = roots[0].join("a.bms");
+        let screens = crate::render_side::tests::Installers::default();
+        on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+            // Each step a later instant on the clock.
+            let later = |rig: &crate::play::PlayerRig<'_>| {
+                let t = rig.clock.now();
+                while rig.clock.now() == t {}
+                rig.clock.now()
+            };
+            let practicing = |rig: &mut crate::play::PlayerRig<'_>, on: bool| {
+                rig.selection.as_mut().unwrap().practicing = on;
+            };
+            // A chart chosen to play: its loading state's entry.
+            let before = later(rig);
+            rig.entered_loading(&chart);
+            let play = rig.state_clock.origin().unwrap();
+            assert!(play >= before && play <= rig.clock.now(), "{play:?}");
+            // A retry: its receipt.
+            let retry = later(rig);
+            rig.pending_retry = Some(retry);
+            rig.prepare_screen().unwrap();
+            assert_eq!(rig.state_clock.origin(), Some(retry));
+            // Back to selection, then another chart: afresh.
+            rig.entered_selection();
+            let before = later(rig);
+            rig.entered_loading(&chart);
+            let next = rig.state_clock.origin().unwrap();
+            assert!(next >= before && next > retry);
+            // A practice session: its page first.
+            rig.entered_selection();
+            practicing(rig, true);
+            let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+            let page = game::PracticeScreen::new(&c, &rules::tapestry(), 0);
+            let before = later(rig);
+            rig.entered_practice(&page);
+            let session = rig.state_clock.origin().unwrap();
+            assert!(session >= before);
+            // Its Starts' loading states, a retry and the page again keep it.
+            later(rig);
+            rig.entered_loading(&chart);
+            rig.pending_retry = Some(later(rig));
+            rig.prepare_screen().unwrap();
+            rig.entered_practice(&page);
+            rig.entered_loading(&chart);
+            assert_eq!(rig.state_clock.origin(), Some(session));
+            // Selection ends it: the next session starts afresh.
+            rig.entered_selection();
+            let before = later(rig);
+            rig.entered_practice(&page);
+            assert!(rig.state_clock.origin().unwrap() >= before);
+        });
     }
 
     /// A selection skin refused at runtime is said on the select screen:
