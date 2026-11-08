@@ -263,8 +263,8 @@ impl Axis {
     }
 }
 
-/// The source texels an image keeps of its single frame on one axis: the
-/// first column or row and the count.
+/// The source texels an image keeps of its sheet on one axis, along which
+/// the sheet is one cell: the first column or row and the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Crop {
     pub(crate) axis: Axis,
@@ -543,8 +543,9 @@ impl Assets {
         }
     }
 
-    /// Adds image `def` with cells of `cell` under `key`, its single
-    /// frame cut to the columns or rows of `crop` when there is one;
+    /// Adds image `def` with cells of `cell` under `key`, its sheet cut
+    /// to the columns or rows of `crop` when there is one, a sheet of one
+    /// cell along that axis;
     /// returns the image and its cell. Checked as [`Self::check_image`]
     /// says.
     ///

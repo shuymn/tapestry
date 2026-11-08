@@ -291,7 +291,7 @@ pub(crate) enum Stretch {
     FitHeight,
     NoExpanding,
     NoResize,
-    /// 3, 5, 7, 10: they crop source rows in `f32`.
+    /// 3, 5, 7, 10: they crop source columns or rows in `f32`.
     Trimmed,
 }
 

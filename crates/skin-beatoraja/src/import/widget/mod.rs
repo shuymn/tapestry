@@ -19,6 +19,7 @@ use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
 use super::asset::{self, Axis, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
+use super::geom::Q;
 use super::policy::{self, Role};
 use super::property::{self, IndexProp};
 use super::report::{NoteKind, Object, Span};
@@ -186,13 +187,13 @@ impl Cx<'_> {
         self.add_src_image_cropped(c, rec, s, grid, |_, _| Ok(Ok(None)))
     }
 
-    /// [`Self::add_src_image`] with its frame's rows cut to what `crop`
-    /// returns for the uncropped rect `[x, y, w, h]` (texels, y down, the
-    /// source's size), asked once that rect is known; a cropped image is
-    /// cached apart from the uncropped one, sharing its file. A crop
-    /// `crop` refuses with a reason, or any crop of a frame taller than
-    /// one row cut to the file's last row, drops the element as its role
-    /// says.
+    /// [`Self::add_src_image`] with its sheet's columns or rows cut to
+    /// what `crop` returns for the uncropped rect `[x, y, w, h]` (texels,
+    /// y down, the source's size), asked once that rect is known; a
+    /// cropped image is cached apart from the uncropped one, sharing its
+    /// file. A crop `crop` refuses with a reason, or any crop along an
+    /// axis of a frame longer than one texel cut to the file's last
+    /// column or row, drops the element as its role says.
     pub(super) fn add_src_image_cropped(
         &mut self,
         c: &Common,
@@ -549,11 +550,13 @@ impl Cx<'_> {
     /// (`skin/StretchType.java:47-80, 131-153`), decided per key on exact
     /// rationals ([`track::trim`]): when every key fits, each key's rect
     /// shrinks and recentres to its scaled frame; when every key crops
-    /// one axis keeping the same texels, which a single frame alone can,
-    /// the frame is cut about its middle once ([`track::crop_middle`])
-    /// and the keys stay. Keys mixing the branches, or cropping different
-    /// amounts as keys changing aspect do, drop `c` with its stretch's
-    /// note, as a crop leaving nothing drops it with `dst`'s.
+    /// one axis keeping the same texels, the sheet is cut about its middle
+    /// on that axis once ([`track::crop_middle`]) and the keys stay. The
+    /// importer crops only a sheet of one cell along the cropped axis,
+    /// whose frames the model's grid then splits each cropped alike; keys
+    /// mixing the branches, cropping different amounts (cropping keys
+    /// changing aspect) or cropping across several cells drop `c` with its
+    /// stretch's note, as a crop leaving nothing drops it with `dst`'s.
     fn trimmed_image(
         &mut self,
         c: &Common,
@@ -563,28 +566,32 @@ impl Cx<'_> {
     ) -> Result<Option<Painted>, ImportError> {
         let (at, grid) = (c.span, s.div);
         let stretch = NoteKind::Stretch(c.stretch_mode);
-        let mut fit = None;
+        let mut walked = Vec::new();
         let found = self.add_src_image_cropped(c, rec, s, grid, |cx, [x, y, w, h]| {
             let cell = [w / grid[0].max(1), h / grid[1].max(1)];
+            // Each key's rect as it draws, and the branch every key took so
+            // far: `None` before the first key, then the crop or `None`
+            // for fitting.
             let mut rects = Vec::with_capacity(c.track.keys.len());
-            let mut crop = None;
+            let mut branch: Option<Option<(Axis, Q)>> = None;
             for k in &c.track.keys {
                 let r = cx.key_rect(c, k)?;
-                match track::trim(mode, r, cell).ok_or_else(|| cx.range(at, "dst"))? {
-                    Trim::Fit(r) if crop.is_none() => rects.push(r),
-                    Trim::Crop { axis, kept }
-                        if rects.is_empty() && crop.is_none_or(|p| p == (axis, kept)) =>
-                    {
-                        crop = Some((axis, kept));
-                    }
-                    _ => return Ok(Err(stretch)),
+                let (taken, r) =
+                    match track::trim(mode, r, cell).ok_or_else(|| cx.range(at, "dst"))? {
+                        Trim::Fit(fitted) => (None, fitted),
+                        Trim::Crop { axis, kept } => (Some((axis, kept)), r),
+                    };
+                if branch.is_some_and(|b| b != taken) {
+                    return Ok(Err(stretch));
                 }
+                branch = Some(taken);
+                rects.push(r);
             }
-            let Some((axis, kept)) = crop else {
-                fit = Some(rects);
+            walked = rects;
+            let Some((axis, kept)) = branch.flatten() else {
                 return Ok(Ok(None));
             };
-            if grid != [1, 1] {
+            if grid[axis.index()] != 1 {
                 return Ok(Err(stretch));
             }
             let (from, len) = match axis {
@@ -599,16 +606,7 @@ impl Cx<'_> {
         let Some((image, _)) = found else {
             return Ok(None);
         };
-        let rects = match fit {
-            Some(rects) => rects,
-            None => c
-                .track
-                .keys
-                .iter()
-                .map(|k| self.key_rect(c, k))
-                .collect::<Result<_, _>>()?,
-        };
-        let rects = rects
+        let rects = walked
             .into_iter()
             .map(|r| r.model_from(self.flip).ok_or_else(|| self.range(at, "dst")))
             .collect::<Result<_, _>>()?;

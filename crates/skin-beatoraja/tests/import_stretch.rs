@@ -174,6 +174,17 @@ fn stretch_three_covers_and_crops_the_middle() {
         drawn(l, file, 50),
         ([0, -50, 400, 1_080], [[201, 0], [600, 1_079]])
     );
+    // Cropping keys of one aspect changing size keep one crop: a 100×100
+    // frame from 50×100 to 100×200 keeps columns 25 to 74 throughout.
+    let file = [100, 100];
+    let l = cut(
+        file,
+        r#""w": 100, "h": 100"#,
+        3,
+        r#"{"time": 0, "x": 0, "y": 0, "w": 50, "h": 100},
+           {"time": 100, "x": 0, "y": 0, "w": 100, "h": 200}"#,
+    );
+    assert_eq!(drawn(l, file, 50), ([0, 930, 75, 150], [[25, 0], [74, 99]]));
 }
 
 #[test]
@@ -235,6 +246,68 @@ fn stretch_five_and_seven_fit_or_crop() {
     );
 }
 
+/// The column each of the four columns of the one quad of `l` draws, at
+/// its centre, a.png (`file`) painted with [`wide_coord`] first.
+#[track_caller]
+fn columns(l: common::Loaded, file: [u32; 2]) -> [u32; 4] {
+    common::png_with(l.dir.path(), "a.png", file[0], file[1], wide_coord);
+    let atlas = l
+        .ok()
+        .skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let quads = l.quads(0);
+    let [q] = quads.as_slice() else {
+        panic!("{quads:?}")
+    };
+    [0.125, 0.375, 0.625, 0.875].map(|u| place(common::play::texel_at(&atlas, q, u, 0.5))[0])
+}
+
+/// A 16×16 frame at column `x` of a.png (64×64) under mode 7 over 4×16.
+fn l2(x: u32) -> common::Loaded {
+    cut(
+        [64, 64],
+        &format!(r#""x": {x}, "y": 0, "w": 16, "h": 16"#),
+        7,
+        r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
+    )
+}
+
+#[test]
+fn an_animation_crops_along_an_axis_of_one_cell() {
+    // Two 100×100 frames side by side under mode 5 over 100×50: each keeps
+    // its rows 25 to 74, the sheet cut once to `[0, 25, 200, 50]` and
+    // split by its grid (the source crops each frame alike).
+    let file = [200, 100];
+    let l = cut(
+        file,
+        r#""w": 200, "h": 100, "divx": 2, "cycle": 100"#,
+        5,
+        r#"{"x": 0, "y": 0, "w": 100, "h": 50}"#,
+    );
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    common::png_with(l.dir.path(), "a.png", file[0], file[1], wide_coord);
+    let atlas = l
+        .ok()
+        .skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let mut d = l.drawn();
+    for (ms, first) in [(0, 0), (50, 100)] {
+        let quads = d.frame(ms, &[]);
+        let [q] = quads.as_slice() else {
+            panic!("{quads:?}")
+        };
+        let at = |u, v| place(common::play::texel_at(&atlas, q, u, v));
+        assert_eq!(common::play::round(q.rect), [0, 1_030, 100, 50], "{ms}");
+        assert_eq!(
+            [at(0.0001, 0.0001), at(0.9999, 0.9999)],
+            [[first, 25], [first + 99, 74]],
+            "{ms}"
+        );
+    }
+}
+
 #[test]
 fn a_column_crop_past_the_edge_draws_the_edge_column() {
     // A 16×16 frame at x 56 of a 64-wide file runs 8 columns past its
@@ -248,6 +321,7 @@ fn a_column_crop_past_the_edge_draws_the_edge_column() {
         r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
     );
     assert_eq!(drawn(l, file, 0), ([0, 1_064, 4, 16], [[62, 0], [63, 15]]));
+    assert_eq!(columns(l2(56), file), [62, 63, 63, 63]);
     // Starting past the edge (x 60, columns 66 to 69), only the edge
     // column draws, as the source's clamped texture samples it.
     let l = cut(
@@ -257,6 +331,7 @@ fn a_column_crop_past_the_edge_draws_the_edge_column() {
         r#"{"x": 0, "y": 0, "w": 4, "h": 16}"#,
     );
     assert_eq!(drawn(l, file, 0), ([0, 1_064, 4, 16], [[63, 0], [63, 15]]));
+    assert_eq!(columns(l2(60), file), [63; 4]);
     // A frame wholly past the edge is cut to the edge column: cropping its
     // columns is refused.
     let l = cut(
@@ -298,9 +373,25 @@ fn trimmed_modes_the_model_cannot_follow_are_refused() {
         r#"{"time": 0, "x": 0, "y": 0, "w": 50, "h": 100},
            {"time": 100, "x": 0, "y": 0, "w": 100, "h": 50}"#,
     );
-    // An animation of two frames can fit but not crop.
+    // An animation can crop only along an axis of one cell: two frames
+    // side by side cannot crop their columns, nor two stacked their rows.
     let grid = r#""w": 200, "h": 100, "divx": 2"#;
     refused(7, grid, r#"{"x": 0, "y": 0, "w": 50, "h": 100}"#);
+    let stacked = r#""w": 100, "h": 200, "divy": 2"#;
+    refused(5, stacked, r#"{"x": 0, "y": 0, "w": 100, "h": 50}"#);
+    // Trimmed image groups and image sets are not mapped.
+    refused(
+        5,
+        r#""w": 100, "h": 100, "len": 2"#,
+        r#"{"x": 0, "y": 0, "w": 100, "h": 50}"#,
+    );
+    let l = import_body(
+        r#""image": [{"id": "i", "src": "a", "w": 16, "h": 16}],
+           "imageset": [{"id": "s", "images": ["i"], "value": 71}],
+           "destination": [{"id": "s", "stretch": 3, "dst": [{"x": 0, "y": 0, "w": 8, "h": 16}]}]"#,
+    );
+    assert!(has(l.report(), NoteKind::Stretch(3)), "{:?}", l.report());
+    assert!(l.quads(0).is_empty());
     let l = cut(
         [200, 100],
         grid,
