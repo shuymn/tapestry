@@ -235,7 +235,10 @@ impl Cx<'_> {
             guard: value.and_then(|v| v.guard.as_deref()),
             ..Opts::default()
         };
-        let Some(c) = self.common_with(role, dst, o)? else {
+        self.number_value = value.map(|v| v.expr.clone());
+        let c = self.common_with(role, dst, o);
+        self.number_value = None;
+        let Some(c) = c? else {
             return Ok(None);
         };
         let program = match value {

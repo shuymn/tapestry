@@ -53,13 +53,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: ./.github/actions/setup-mise
         with:
-          version: 2026.11.3
-          install: true
           install_args: rust
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
       # The dependencies in the bench profile, from CI `linux`'s cache on `main`
       # ("Benchmarks run once" builds the same ones); restored only. Each
       # build starts from them: the merge base's directory gets a copy, which
@@ -146,13 +142,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: ./.github/actions/setup-mise
         with:
-          version: 2026.11.3
-          install: true
           install_args: rust
-          cache: true
-          cache_save: ${{ github.ref == 'refs/heads/main' }}
       # The dependencies in the bench profile, from CI `windows-release`'s cache on `main`
       # ("Benchmarks run once" builds the same ones); restored only. Each
       # build starts from them: the merge base's directory gets a copy, which

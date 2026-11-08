@@ -434,6 +434,15 @@ pub(crate) struct Cx<'d> {
     items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
+    /// The play presentation program, its callbacks in the order the
+    /// import consumes them.
+    present: skin_model::present::PresentDef,
+    /// While a number's destination is read, its value's expression: a
+    /// program draw after it runs only while the value is no sentinel.
+    number_value: Option<String>,
+    /// Where the last lowering's capture proof was voided by a frame-time
+    /// write: its refusal's place.
+    interference: std::cell::Cell<Option<crate::lua::callback::Site>>,
     /// The output types of the callbacks a selection or result screen's
     /// runtime runs, by index: `lua.<k>` in the expressions.
     outputs: Vec<skin_model::output::OutTy>,
@@ -551,6 +560,9 @@ impl<'d> Cx<'d> {
             outputs: Vec::new(),
             value_gate: None,
             when_spans: Vec::new(),
+            present: skin_model::present::PresentDef::default(),
+            number_value: None,
+            interference: std::cell::Cell::new(None),
             ranks: [None; 3],
             elements: Vec::new(),
             element_spans: Vec::new(),
@@ -1574,18 +1586,38 @@ impl<'d> Cx<'d> {
         })
     }
 
+    /// The callback outputs the screen's expressions read: play's program
+    /// or a selection or result screen's runtime.
+    fn outputs(&self) -> &[skin_model::output::OutTy] {
+        match self.kind {
+            ScreenKind::Play | ScreenKind::Decision => &self.present.signature,
+            ScreenKind::Selection | ScreenKind::Result => &self.outputs,
+        }
+    }
+
     /// Compiles `src` against the screen's schema and charges its
     /// operations before it is kept.
     fn compile(&mut self, src: &str, want: Ty, at: Span) -> Result<Program, ImportError> {
         #[cfg(test)]
         trace(Event::Compile);
-        let scope = Scope::new(self.schema()).outputs(&self.outputs);
+        let scope = Scope::new(self.schema()).outputs(self.outputs());
         let p = compile(src, &scope, want).map_err(|source| ImportError::Expr {
             at: self.loc(at),
             source,
         })?;
         self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
         Ok(p)
+    }
+
+    /// `src` compiled against the play schema and charged as
+    /// [`Self::compile`] does, or `None` when it does not compile: a
+    /// program read or gate past an expression's limits.
+    fn trial(&mut self, src: &str, want: Ty, at: Span) -> Result<Option<Program>, ImportError> {
+        let Ok(p) = compile(src, &Scope::new(self.schema()), want) else {
+            return Ok(None);
+        };
+        self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
+        Ok(Some(p))
     }
 
     /// The model reference of a mapped timer, adding a rank's `when`
@@ -1896,6 +1928,8 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
+            present: (!self.present.callbacks.is_empty())
+                .then(|| std::mem::take(&mut self.present)),
         };
         let loaded = if selection {
             let widgets = SelectionDefs {

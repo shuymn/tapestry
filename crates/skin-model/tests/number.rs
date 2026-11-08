@@ -129,8 +129,11 @@ fn zero_padding_keeps_cell_0_for_the_sign() {
     );
 }
 
+/// On play a number draws nothing for `i32::MIN` or `i32::MAX`
+/// (`SkinNumber.java:135-146` at `0.8.9`), and every digit of the values
+/// next to them.
 #[test]
-fn the_i32_extremes_show_every_digit() {
+fn the_i32_extremes_draw_nothing_on_play() {
     let min = digits(
         TWENTY_FOUR,
         GlyphSet::TwentyFour,
@@ -145,15 +148,32 @@ fn the_i32_extremes_show_every_digit() {
     let digits_of = |s: &str, half: u16| -> Vec<u16> {
         s.bytes().map(|b| u16::from(b - b'0') + half).collect()
     };
-    let mut want = vec![23];
-    want.extend(digits_of("2147483648", 12));
-    assert_eq!(frames, want);
-    let max = digits(TEN, GlyphSet::Ten, 10, Align::Right, Pad::Blank);
-    let frames: Vec<u16> = show(max, "2147483647")
+    assert_eq!(frames, [0_u16; 0]);
+    let near = digits(
+        TWENTY_FOUR,
+        GlyphSet::TwentyFour,
+        11,
+        Align::Right,
+        Pad::Zero,
+    );
+    let frames: Vec<u16> = show(near, "-2147483647")
         .into_iter()
         .map(|(f, _)| f)
         .collect();
-    assert_eq!(frames, digits_of("2147483647", 0));
+    let mut want = vec![23];
+    want.extend(digits_of("2147483647", 12));
+    assert_eq!(frames, want);
+    let max = digits(TEN, GlyphSet::Ten, 10, Align::Right, Pad::Blank);
+    let frames: Vec<u16> = show(max.clone(), "2147483647")
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
+    assert_eq!(frames, [0_u16; 0]);
+    let frames: Vec<u16> = show(max, "2147483646")
+        .into_iter()
+        .map(|(f, _)| f)
+        .collect();
+    assert_eq!(frames, digits_of("2147483646", 0));
     // Without signed glyphs a negative value shows its magnitude.
     assert_eq!(show(ten(Align::Right, Pad::Blank), "-5"), [(5, 166.0)]);
 }

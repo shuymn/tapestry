@@ -581,14 +581,25 @@ fn a_critical_callback_folds_configuration() {
 
 #[test]
 fn intermediates_out_of_range_do_not_convert() {
-    // In range at the end, out of range on the way: Lua's 64-bit
-    // integers and the expressions' 32-bit ones would agree only by luck.
+    // In range at the end, out of range on the way: past `i32`, which the
+    // expressions hold, but within Â±2^53, where the program's 64-bit
+    // integers and the source's doubles agree, so the program takes it.
     let d = folder(&skin(&format!(
         "{}\n{}",
         "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
         "table.insert(skin.destination, { id = \"g\", draw = function()\n\
            local big = ms.number(110) * 1000\n\
            return big * 1000 - big * 1000 + 1 > 0\n\
+         end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
+    )));
+    assert_eq!(import(&d, 905).unwrap().callbacks, [Disposition::Compiled]);
+    // Past Â±2^53, critical: refused.
+    let d = folder(&skin(&format!(
+        "{}\n{}",
+        "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
+        "table.insert(skin.destination, { id = \"g\", draw = function()\n\
+           local big = ms.number(110) * 1000000\n\
+           return big * big * big - big * big * big + 1 > 0\n\
          end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
     )));
     assert!(matches!(
@@ -683,5 +694,620 @@ fn a_configured_offset_folds_into_a_draw() {
         assert_eq!(i.callbacks, [Disposition::Lowered], "{a}");
         let quads = Drawn::new(i.imported.skin, 0).frame(1_000, &[]);
         assert_eq!(!quads.is_empty(), shown, "{a}");
+    }
+}
+
+/// A number `v` whose value callback is `value`, drawn at y 100.
+fn value_skin(value: &str) -> String {
+    skin(&format!(
+        "skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = {value} }} }}\n\
+         table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+    ))
+}
+
+/// The remaining-note ratios: the remaining notes over the total, a float
+/// division, times 100 and 10 000. Both compile into the program, and the
+/// numbers show the source's conversion of the float as the counts move.
+#[test]
+fn remaining_note_ratios_compile_into_the_program() {
+    let remain = "local function remain()\n\
+           return ms.number(106) - ms.number(110) - ms.number(111) - ms.number(112)\n\
+             - ms.number(113) - ms.number(114)\n\
+         end\n";
+    let d = folder(&skin(&format!(
+        "{remain}\
+         skin.value = {{\n\
+           {{ id = \"r\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 3,\n\
+             value = function() return remain() / ms.number(106) * 100 end }},\n\
+           {{ id = \"q\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 5,\n\
+             value = function() return remain() / ms.number(106) * 10000 end }} }}\n\
+         table.insert(skin.destination, {{ id = \"r\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"q\", dst = {{ {{ x = 0, y = 200, w = 6, h = 6 }} }} }})"
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled, Disposition::Compiled]);
+    // The digits each number draws, by its row.
+    let rows = |q: &[skin_model::Quad]| {
+        // The source's y is up: rows 100 and 200 of a 1080-high canvas.
+        let n = |y: f32| q.iter().filter(|q| (q.rect[1] - y).abs() < 1.0).count();
+        (n(974.0), n(874.0))
+    };
+    let out = |d: &Drawn| {
+        let f = d.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        [at(0), at(1), at(2), at(3)]
+    };
+    let mut p = Drawn::new(i.imported.skin.clone(), 8);
+    let q = p.frame(1_000, &[]);
+    // Nothing judged: 8 / 8 * 100.
+    assert_eq!(out(&p), [100, 1, 10_000, 1]);
+    assert_eq!(rows(&q), (3, 5));
+    // Three of eight judged: 62.5 and 6 250, the float truncated.
+    p.tally.counts.perfect = 2;
+    p.tally.counts.bad = 1;
+    let q = p.frame(1_016, &[]);
+    assert_eq!(out(&p), [62, 1, 6_250, 1]);
+    assert_eq!(rows(&q), (2, 4));
+    // No notes: 0 / 0 is NaN, which the source's conversion makes 0.
+    let mut p = Drawn::new(i.imported.skin, 0);
+    let q = p.frame(1_000, &[]);
+    assert_eq!(out(&p), [0, 1, 0, 1]);
+    assert_eq!(rows(&q), (1, 1));
+}
+
+/// What the program cannot prove is refused by role, also where the
+/// result discards it (Lua runs it all the same): an integer that could
+/// leave ±2^53, and a number's value converting a `math.floor` of a
+/// float, whose integer has no bound; each control compiles. The source's
+/// `%` by 0 is NaN, which the program keeps (no `//`: it is not in the
+/// source's grammar and opens the candidate).
+#[test]
+fn the_program_refuses_what_it_cannot_prove() {
+    for (value, want) in [
+        (
+            "function() return 10 % ms.number(110) end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() local n = ms.number(110) return n * n * n * n * 1.0 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) local unused = n * n * n * n return 1.0 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) return n * n * 1.0 end",
+            Disposition::Compiled,
+        ),
+        // Discarded, the result an integer or a folded truthiness: the
+        // expression backend would take it, but the product is reached.
+        (
+            "function() local n = ms.number(110) local unused = n * n * n * n return 1 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() local n = ms.number(110) local u = n * n * n * n return u ~= nil end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        // The source's `%` rounds once its dividend nears 2^53: its
+        // remainder is then of no known bound, so the product is refused.
+        (
+            "function() return ((ms.number(110) - 9007199254740991) % 5) * 2251799813685247 end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+        (
+            "function() return math.floor(ms.number(110) / 3) end",
+            Disposition::Replaced(Unsupported::Range),
+        ),
+    ] {
+        let i = import(&folder(&value_skin(value)), 905).unwrap();
+        assert_eq!(i.callbacks, [want], "{value}");
+    }
+    // A draw only compares the floor, which needs no bound.
+    let draw = "draw = function() return math.floor(ms.number(110) / 3) > 1 end,";
+    let i = import(&folder(&skin(&image_at(0, draw))), 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+}
+
+/// The numbers are the source's doubles: `(n + 0.5) % 0.1` is exactly 0
+/// there for every count, where Lua 5.4's `fmod` gives about 0.1, so the
+/// value shows 0 and the draw is false.
+#[test]
+fn a_float_modulo_shows_what_the_source_shows() {
+    let d = folder(&skin(&format!(
+        "{}\n{}",
+        "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() return (ms.number(110) + 0.5) % 0.1 * 1000 end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })",
+        image_at(
+            0,
+            "draw = function() return (ms.number(110) + 0.5) % 0.1 > 0 end,"
+        ),
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled, Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 8);
+    for n in 0..6 {
+        p.tally.counts.perfect = n;
+        p.frame(1_000 + i64::from(n) * 16, &[]);
+        let f = p.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        assert_eq!([at(0), at(1), at(2), at(3)], [0, 1, 0, 1], "{n}");
+    }
+}
+
+/// A read whose value is discarded still keeps its availability: with
+/// the play level unavailable the number draws nothing, as the source's
+/// `number(96)` would have no value.
+#[test]
+fn a_discarded_read_keeps_its_availability() {
+    let d = folder(&value_skin(
+        "function() local unused = ms.number(96) return 1.0 end",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let chart = common::play::chart(8);
+    for (level, drawn) in [(None, false), (Some(12), true)] {
+        let mut p = Drawn::over_level(i.imported.skin.clone(), &chart, level);
+        let q = p.frame(1_000, &[]);
+        assert_eq!(!q.is_empty(), drawn, "{level:?}");
+    }
+}
+
+/// A number whose expression value is `i32::MAX` draws nothing and skips
+/// the program draw after it (`SkinNumber.java:135-146`); any other value
+/// runs it.
+#[test]
+fn an_expression_sentinel_skips_a_program_draw() {
+    for (value, drawn) in [("2147483647", false), ("5", true)] {
+        let d = folder(&skin(&format!(
+            "skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+               value = function() return {value} end }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", draw = function() return ms.number(110) / 2 >= 0 end,\n\
+               dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+        )));
+        let i = import(&d, 905).unwrap();
+        // Dispositions are by callable; the value lowers, the draw compiles.
+        let mut got = i.callbacks.clone();
+        got.sort_by_key(|d| format!("{d:?}"));
+        assert_eq!(
+            got,
+            [Disposition::Compiled, Disposition::Lowered],
+            "{value}"
+        );
+        let mut p = Drawn::new(i.imported.skin, 8);
+        let q = p.frame(1_000, &[]);
+        let ok = p.play.state().fields[skin_model::field::COUNT + 1];
+        assert_eq!((!q.is_empty(), ok == 1), (drawn, drawn), "{value}");
+    }
+}
+
+/// The program has no gating of one draw callback by another: a second
+/// program draw on one element is refused by role.
+#[test]
+fn a_second_program_draw_follows_its_role() {
+    let i = import(
+        &folder(&skin(&image_at(
+            0,
+            "op = { function() return ms.number(110) / 2 >= 0 end },\n\
+             draw = function() return ms.number(111) / 2 >= 0 end,",
+        ))),
+        905,
+    )
+    .unwrap();
+    // Dispositions are by callable: the first consumed compiles.
+    let mut got = i.callbacks.clone();
+    got.sort_by_key(|d| format!("{d:?}"));
+    assert_eq!(
+        got,
+        [
+            Disposition::Compiled,
+            Disposition::Replaced(Unsupported::Construct("a draw after a program draw"))
+        ]
+    );
+}
+
+/// A latch: a closure whose frame-time body writes its own upvalue
+/// `state` (a located write), drawn by a decorative image.
+const LATCH: &str = "local latch = (function()\n\
+      local state = ms.timer_off_value\n\
+      return function()\n\
+        if state == ms.timer_off_value and ms.number(100) == 200000 then\n\
+          state = ms.time()\n\
+        end\n\
+        return state\n\
+      end\n\
+    end)()\n\
+    table.insert(skin.destination, { id = \"i\", draw = function() return latch() ~= 0 end,\n\
+      dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+
+/// How many callables lowered, compiled or were replaced for a write or
+/// an interference.
+fn tally(i: &LuaImported) -> (usize, usize, usize) {
+    let n = |f: fn(&Disposition) -> bool| i.callbacks.iter().filter(|d| f(d)).count();
+    (
+        n(|d| matches!(d, Disposition::Lowered | Disposition::Compiled)),
+        n(|d| *d == Disposition::Replaced(Unsupported::Writes)),
+        n(|d| *d == Disposition::Replaced(Unsupported::Interference)),
+    )
+}
+
+/// A frame-time write to an upvalue voids only the proofs through that
+/// cell: the critical gauge pulse beside a latch writing its own `state`
+/// still reads the host module through its upvalue and lowers, and shows
+/// as it does alone; the latch's root writes and is replaced.
+#[test]
+fn a_write_to_another_cell_leaves_a_proof_whole() {
+    let d = folder(&skin(&format!("{LATCH}\n{SHAPE_C}")));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 0));
+    let mut play = Drawn::with_look(i.imported.skin, 10, GaugeLook::Hazard);
+    let pulse = play
+        .frame(1_000, &[])
+        .iter()
+        .filter(|q| q.rect[0] >= 499.0)
+        .count();
+    assert!(pulse > 0);
+}
+
+/// A write that may reach a proof's path voids it: through a table entry
+/// (not located, so the candidate opens at the write) and to the cell the
+/// reader's binding lives in (located): the rebound `ms` is of an unknown
+/// value wherever a root reads it, so its index in the pulse opens the
+/// candidate there, and the critical pulse refuses at that read.
+#[test]
+fn a_write_on_a_proofs_path_voids_it() {
+    // The host module held in a table, its entry written at frame time.
+    let entry = "local holder = { m = ms }\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() holder.m = nil return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    // The reader's own upvalue `ms`, rebound at frame time.
+    let cell = "table.insert(skin.destination, { id = \"i\", draw = function() ms = nil return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    for (writer, line) in [(entry, 12), (cell, 16)] {
+        let d = folder(&skin(&format!("{writer}\n{SHAPE_C}")));
+        match import(&d, 905) {
+            Err(ImportError::Lua {
+                at: Some(at),
+                why:
+                    LuaWhy::Critical {
+                        why: Unsupported::Interference,
+                        ..
+                    },
+            }) => assert_eq!(at.line, line, "{writer}"),
+            other => panic!("{writer}: {other:?}"),
+        }
+    }
+}
+
+/// State one callback writes and another reads (a value storing the id it
+/// shows in a chunk local, a draw reading it): the writer and the reader
+/// follow their role, decorative constants here, and an unrelated
+/// critical callback lowers.
+#[test]
+fn a_callback_reading_a_written_cell_follows_its_role() {
+    let d = folder(&skin(&format!(
+        "local shown\n\
+         skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+           value = function() shown = 152 return 0 end }} }}\n\
+         table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"i\", draw = function() return shown ~= nil end,\n\
+           dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n\
+         {SHAPE_C}"
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 1));
+}
+
+/// An open reason that is not a located write keeps the whole candidate
+/// open: beside the latch, a method call opens it, and the critical pulse
+/// refuses at the method call.
+#[test]
+fn an_unlocated_opener_still_opens_the_candidate() {
+    let opener = "table.insert(skin.destination, { id = \"i\", draw = function() return (\"x\"):len() > 0 end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    let d = folder(&skin(&format!("{LATCH}\n{opener}\n{SHAPE_C}")));
+    match import(&d, 905) {
+        Err(ImportError::Lua {
+            at: Some(at),
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+        }) => assert_eq!(at.line, 22),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// An id read from a cell frame time writes resolves to its captured value
+/// and the integer numerals written to it (the Rm shape: a value choosing
+/// 152 or 153 and showing it): decorative ids leave the writer a decorative
+/// constant; a critical one among them refuses; a cell written anything
+/// else resolves nothing, which refuses as an unknown id does (the
+/// writer's reason, `Writes`, named).
+#[test]
+fn an_id_through_a_written_cell_resolves_to_what_is_written() {
+    let shape = |assign: &str| {
+        folder(&skin(&format!(
+            "local shown\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+               value = function() if ms.option(1) then {assign} else shown = 153 end return ms.number(shown) end }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})\n\
+             {SHAPE_C}"
+        )))
+    };
+    let i = import(&shape("shown = 152"), 905).unwrap();
+    assert_eq!(tally(&i), (1, 1, 0));
+    for (assign, why) in [
+        ("shown = 101", Unsupported::Writes),
+        ("shown = ms.number(1)", Unsupported::Writes),
+    ] {
+        match import(&shape(assign), 905) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Critical { why: w, .. },
+                ..
+            }) => assert_eq!(w, why, "{assign}"),
+            other => panic!("{assign}: {other:?}"),
+        }
+    }
+}
+
+/// The source's `%` of small integers is exact and below its divisor, so a
+/// product of it compiles and shows the source's value.
+#[test]
+fn a_small_modulo_composes() {
+    let d = folder(&value_skin(
+        "function() return (ms.number(110) % 5) * 1000 end",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 8);
+    for n in 0..7 {
+        p.tally.counts.perfect = n;
+        p.frame(1_000 + i64::from(n) * 16, &[]);
+        let f = p.play.state().fields;
+        let at = |k: usize| f[skin_model::field::COUNT + k];
+        let want = i32::try_from(n % 5 * 1000).unwrap();
+        assert_eq!([at(0), at(1)], [want, 1], "{n}");
+    }
+}
+
+/// A written cell is never read as its captured value, wherever the
+/// analysis reads one. The effect walk: a decorative root rebinding a
+/// helper to one that writes the configuration, then calling it: the call
+/// is of an unknown function, which opens the candidate, so the critical
+/// configuration reader refuses. The role scan's join: a setter rebound to
+/// one writing a critical id is unknown too.
+#[test]
+fn a_rebound_callee_is_never_its_captured_value() {
+    // A helper `f`, its replacement `poison` writing the configuration,
+    // the decorative `callers`, and the critical configuration reader.
+    let rebound = |callers: &str| {
+        format!(
+            "local cfg = skin_config\n\
+             local f = function() return true end\n\
+             local poison = function() cfg.option.fc = 905 return true end\n\
+             {callers}\n\
+             skin.gauge = {{ id = \"g\", nodes = {{ \"n0\", \"n1\", \"n2\", \"n3\" }}, parts = 10 }}\n\
+             table.insert(skin.destination, {{ id = \"g\", draw = function() return en() end,\n\
+               dst = {{ {{ x = 100, y = 500, w = 100, h = 10 }} }} }})"
+        )
+    };
+    let poison = rebound(
+        "table.insert(skin.destination, { id = \"i\", draw = function() f = poison return f() end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })",
+    );
+    match import(&folder(&skin(&poison)), 906) {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    // The rebinding met after the call: the walk repeats until no new cell
+    // is written, so the earlier root's call is of an unknown function too.
+    let later = rebound(
+        "table.insert(skin.destination, { id = \"i\", draw = function() return f() end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+         table.insert(skin.destination, { id = \"i\", draw = function() f = poison return true end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })",
+    );
+    assert!(
+        matches!(
+            import(&folder(&skin(&later)), 906),
+            Err(ImportError::Lua {
+                why: LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+                ..
+            })
+        ),
+        "the call before its rebinding"
+    );
+    // The integer join: `id` gets 153 directly and 101 through a setter
+    // the root rebinds; the critical 101 is never missed.
+    let setter = "local id = 152\n\
+        local f = function() return true end\n\
+        local setid = function() id = 101 return true end\n\
+        skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+          value = function() id = 153 f = setid f() return ms.number(id) end } }\n\
+        table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })";
+    assert!(import(&folder(&skin(setter)), 905).is_err());
+}
+
+/// A critical callback's refusal is located at the write that voided its
+/// own proof, whatever the role scan reads afterwards: with `x` written on
+/// line 12 and `y` on line 14, a reader of `x` that reads `y` only in a
+/// branch never taken refuses at line 12.
+#[test]
+fn an_interference_is_located_at_the_proofs_write() {
+    let body = "local x, y = 1, 1\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() x = 2 return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        table.insert(skin.destination, { id = \"i\", draw = function() y = 3 return true end,\n\
+          dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+        skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+        table.insert(skin.destination, { id = \"g\", draw = function()\n\
+            if false then return ms.number(y) > 0 end\n\
+            return x == 1\n\
+          end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })";
+    match import(&folder(&skin(body)), 905) {
+        Err(ImportError::Lua {
+            at: Some(at),
+            why:
+                LuaWhy::Critical {
+                    why: Unsupported::Interference,
+                    ..
+                },
+        }) => assert_eq!(at.line, 12),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The integer sources a play skin's callback can reach have a range, and
+/// arithmetic past ±2^53 over it is refused, discarded or not; a source
+/// with no mapped range (a timer's start or off value) is of no known
+/// bound, and the gauge's type is a Java `int`. Rows by source, most with
+/// a control that stays within the range (a timer's control compares it
+/// with the off value, the only use that bounds it). Not covered here:
+/// `event_index`, mapped off play only (the selection and result
+/// profiles, `-1` to `10`), and `//`, which no closed candidate holds.
+#[test]
+fn every_integer_source_is_bounded() {
+    let range = Disposition::Replaced(Unsupported::Range);
+    for (source, value, want) in [
+        // A literal: its own value; one past 2^53 does not fold.
+        (
+            "literal",
+            "function() return ms.number(110) * 4503599627 * 1.0 end",
+            range,
+        ),
+        (
+            "literal",
+            "function() return ms.number(110) * 2 * 1.0 end",
+            Disposition::Compiled,
+        ),
+        // A captured integer: its value.
+        (
+            "captured",
+            "function() return ms.number(110) * K * 1.0 end",
+            range,
+        ),
+        (
+            "captured",
+            "function() return (K + 1) * 1.0 end",
+            Disposition::Compiled,
+        ),
+        // A mapped number read: its field's range.
+        (
+            "number",
+            "function() local n = ms.number(110) local u = n * n * n * n return 1 end",
+            range,
+        ),
+        (
+            "number",
+            "function() local n = ms.number(110) local u = n * n return 1 end",
+            Disposition::Lowered,
+        ),
+        // A judgment count: its count's range.
+        (
+            "judge",
+            "function() local j = ms.judge(1) local u = j * j * j * j return 1 end",
+            range,
+        ),
+        (
+            "judge",
+            "function() local j = ms.judge(1) local u = j * j return 1 end",
+            Disposition::Lowered,
+        ),
+        // A timer read: of no known bound (its start or the off value).
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t return 1 end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t return unused ~= nil end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = -t return 1 end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = t + 1 return 1 end",
+            range,
+        ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = t == ms.timer_off_value return 1 end",
+            Disposition::Lowered,
+        ),
+        // The gauge's type: a Java `int`.
+        (
+            "gauge_type",
+            "function() local g = ms.gauge_type() local u = g * g * g return 1 end",
+            range,
+        ),
+        (
+            "gauge_type",
+            "function() local g = ms.gauge_type() local u = g + 1 return 1 end",
+            Disposition::Lowered,
+        ),
+        // Operators: each result's range from its operands'; a select's
+        // the hull of its arms (here converted as a number's value; the
+        // effect walk admits no arithmetic on a select of integers, its
+        // arms' kinds unknown).
+        (
+            "math.abs",
+            "function() local t = ms.timer(0) local u = math.abs(t) return 1 end",
+            range,
+        ),
+        (
+            "math.abs",
+            "function() local u = math.abs(ms.number(110)) * 2 return 1 end",
+            Disposition::Lowered,
+        ),
+        (
+            "math.max",
+            "function() local t = ms.timer(0) local u = math.max(t, 1) * 2 return 1 end",
+            range,
+        ),
+        (
+            "select",
+            "function() if ms.option(271) then return ms.timer(0) end return 0 end",
+            range,
+        ),
+        (
+            "math.floor",
+            "function() local u = math.floor(ms.number(110) / 3) * 2 return 1 end",
+            range,
+        ),
+        (
+            "%",
+            "function() local u = (ms.number(110) % 7) * 1000 return 1 end",
+            Disposition::Lowered,
+        ),
+    ] {
+        let body = format!(
+            "local K = 4503599627370496\n\
+             skin.value = {{ {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+               value = {value} }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+        );
+        let i = import(&folder(&skin(&body)), 905)
+            .unwrap_or_else(|e| panic!("{source}: {value}: {e:?}"));
+        assert_eq!(i.callbacks, [want], "{source}: {value}");
     }
 }

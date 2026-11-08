@@ -7,7 +7,10 @@
 //! keep one; the score rates and the gauge kind under both empty-POOR
 //! policies as the shown gauge switches, a refused inconsistent snapshot,
 //! and the readouts per round: known and unknown metrics, READY,
-//! a STOP, control changes, an invalid frame and the poisoned play.
+//! a STOP, control changes, an invalid frame and the poisoned play; and
+//! the presentation program's callbacks on every path: the first frame and
+//! later ones, a float result, a caught error, a false gate, a false
+//! guard, a sentinel suppressing the draws after it, and a poisoned play.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -17,6 +20,8 @@
 mod image_support;
 mod lanes_support;
 mod play_support;
+mod present_support;
+mod widget_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -1199,6 +1204,7 @@ fn load(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .unwrap();
     // A page of 256 holds only some of the frames.
@@ -2143,6 +2149,7 @@ fn build_does_not_allocate() {
     cover_trims_do_not_allocate(&chart, &full);
     grade_attachments_do_not_allocate(&full);
     large_gauges_do_not_allocate(&full, &views, &descs);
+    programs_do_not_allocate(&chart, &full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -2486,6 +2493,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .unwrap();
     (root, skin)
@@ -2618,6 +2626,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        present: None,
     })
     .unwrap();
     let uvs = play_support::uvs(&skin);
@@ -4001,4 +4010,211 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             (Some(4), 0, [true; 2])
         ]
     );
+}
+
+/// A program on every path (design.md "Scope of No Allocation", the
+/// program's executor): a float value and the draw after it, a sentinel
+/// value and the draw it suppresses, a gate and a guard that turn false
+/// and true as the combo moves, a caught error, and a branch; its first
+/// frame and later ones, then a poisoned play; with a positive control.
+fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    use present_support::{Builder, Cb, read, slot};
+    use skin_model::present::{Arith, Cmp, Conv, Insn, MathFn, Val};
+    let combo = || read("combo", skin_model::Ty::Int, None);
+    let mut b = Builder::default();
+    // combo / 4 * 100, a float, then its floor; and a draw after it.
+    let v = b.push(Cb::code(
+        vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Arith {
+                op: Arith::Div,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Const { dst: 1, k: 1 },
+            Insn::Arith {
+                op: Arith::Mul,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Math {
+                f: MathFn::Floor,
+                dst: 0,
+                a: 0,
+            },
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(4), Val::Float(100.0)],
+        vec![combo()],
+        Conv::Int,
+    ));
+    b.push(Cb::ret(Val::Bool(true), Conv::Truthy).after(v));
+    // A sentinel and the draw it suppresses.
+    let s = b.push(Cb::ret(Val::Int(i64::from(i32::MAX)), Conv::Int));
+    b.push(Cb::ret(Val::Bool(true), Conv::Truthy).after(s));
+    // A gate, then a guard, false at a low combo.
+    b.push(Cb::ret(Val::Bool(true), Conv::Truthy).gate(read(
+        "combo > 3",
+        skin_model::Ty::Bool,
+        None,
+    )));
+    b.push(Cb::code(
+        vec![Insn::Read { dst: 0, read: 0 }, Insn::Ret { src: 0 }],
+        vec![],
+        vec![read("combo", skin_model::Ty::Int, Some("combo > 5"))],
+        Conv::Int,
+    ));
+    // A caught error: nil + 1.
+    b.push(Cb::code(
+        vec![
+            Insn::Const { dst: 0, k: 0 },
+            Insn::Const { dst: 1, k: 1 },
+            Insn::Arith {
+                op: Arith::Add,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Nil, Val::Int(1)],
+        vec![],
+        Conv::Int,
+    ));
+    // A branch: combo < 2 and 1, or the combo.
+    b.push(Cb::code(
+        vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Cmp {
+                op: Cmp::Lt,
+                dst: 1,
+                a: 0,
+                b: 1,
+            },
+            Insn::Test {
+                cond: 1,
+                when: false,
+                to: 5,
+            },
+            Insn::Const { dst: 0, k: 1 },
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(2), Val::Int(1)],
+        vec![combo()],
+        Conv::Int,
+    ));
+    let sig = b.signature();
+    let n = sig.len();
+    let elements = (0..n)
+        .map(|k| {
+            let mut e = widget(
+                Source::Image(0),
+                track(0, Ease::Linear, End::Hold),
+                TimerRef::Builtin(timer::READY),
+                Place::SCREEN,
+            );
+            e.visible = Some(present_support::expr(
+                &format!("lua.{k}.ok"),
+                &sig,
+                skin_model::Ty::Bool,
+            ));
+            e
+        })
+        .collect();
+    let skin = present_support::load(
+        Some(b.0),
+        Vec::new(),
+        elements,
+        skin_model::WidgetDefs::default(),
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let notes = NoteFacts::default();
+    let layout = SkinLayout::AUTHOR;
+    let frame = |now: i64, t: &'static Tally| SkinFrame {
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &layout,
+        lanes: play_support::VIEW,
+        readouts: readouts_for(play_support::VIEW),
+        playing: true,
+        closing: None,
+    };
+    let tallies: &'static [Tally] =
+        Box::leak((0..10).map(tally).collect::<Vec<_>>().into_boxed_slice());
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    // Every ok bit seen 0 and 1 where a path makes it so.
+    let mut seen = vec![[false; 2]; n];
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..3_000 * MS).step_by(16 * MS as usize).enumerate() {
+        batch.clear();
+        skin.build(
+            &mut play,
+            &frame(now, &tallies[i / 7 % 10]),
+            &uvs,
+            &mut batch,
+        )
+        .expect("the frame builds");
+        let f = play.state().fields;
+        for (k, s) in seen.iter_mut().enumerate() {
+            s[usize::from(f[slot(k) + 1] != 0)] = true;
+        }
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "programs: allocations");
+    assert_eq!(
+        seen,
+        [
+            [false, true],
+            [false, true],
+            [true, false],
+            [true, false],
+            [true, true],
+            [true, true],
+            [false, true],
+            [false, true],
+        ],
+        "the paths each callback took"
+    );
+    // A poisoned play: refused, and refused again, without allocating.
+    let counted = PlayContext {
+        empty_poor_counted: true,
+        ..*ctx
+    };
+    let mut play = skin.prepare(chart, &counted).unwrap();
+    let bad: &'static Tally = Box::leak(Box::new(Tally {
+        empty_poor: 1,
+        ..tally(0)
+    }));
+    TRACK.with(|t| t.set(true));
+    let first = skin.build(&mut play, &frame(0, bad), &uvs, &mut batch);
+    let after = skin.build(&mut play, &frame(16 * MS, &tallies[0]), &uvs, &mut batch);
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "poisoned program: allocations"
+    );
+    assert_eq!(first, Err(BuildError::InconsistentTally));
+    assert_eq!(after, Err(BuildError::InconsistentTally));
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
 }

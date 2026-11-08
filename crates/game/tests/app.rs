@@ -688,9 +688,17 @@ impl Rig for Headless {
         Ok(())
     }
 
-    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<game::Preparation, SurfaceLost> {
+    fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
         self.order.push("attempt");
         self.attempts.push(loaded.attempt());
+        game::PrepHandle::new(key, 0)
+    }
+
+    fn poll_preparation(
+        &mut self,
+        _handle: &mut game::PrepHandle,
+        _deadline: std::time::Instant,
+    ) -> Result<game::PrepPoll<game::Preparation>, SurfaceLost> {
         match self.fails_after_attempt.take() {
             // A loading frame drops the prepared screen.
             Some(AfterAttempt::Screen) => self.screen_fails_at = self.at(),
@@ -699,16 +707,18 @@ impl Rig for Headless {
             None => {}
         }
         if self.cancel_at_failure {
-            return Ok(game::Preparation::Cancelled);
+            return Ok(game::PrepPoll::Done(game::Preparation::Cancelled));
         }
         if self.refuse_attempts > 0 {
             self.refuse_attempts -= 1;
-            return Ok(game::Preparation::Refused(game::PreparationRefusal {
-                location: Some("skin.json:3".to_owned()),
-                reason: "an unknown image".to_owned(),
-            }));
+            return Ok(game::PrepPoll::Done(game::Preparation::Refused(
+                game::PreparationRefusal {
+                    location: Some("skin.json:3".to_owned()),
+                    reason: "an unknown image".to_owned(),
+                },
+            )));
         }
-        Ok(game::Preparation::Ready)
+        Ok(game::PrepPoll::Done(game::Preparation::Ready))
     }
 
     fn commit_attempt(&mut self) -> Result<(), SurfaceLost> {

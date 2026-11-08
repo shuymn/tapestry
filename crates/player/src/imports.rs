@@ -194,7 +194,7 @@ impl ForAttempt {
 /// specialization ended (`answer`: staged and uploaded, refused,
 /// cancelled, or the screen's failure) and the time `took` from the
 /// request to its end.
-pub fn log_staged(took: Duration, answer: &Result<Preparation, crate::render_side::ScreenError>) {
+pub fn log_staged(took: Duration, answer: Result<&Preparation, &crate::render_side::ScreenError>) {
     let ms = took.as_millis();
     match answer {
         Ok(Preparation::Ready) => log::info!("skin: play: staged with the attempt in {ms} ms"),
@@ -229,6 +229,7 @@ impl PendingSkin {
     /// - Once either signal came the attempt is cancelled; a refusal,
     ///   a panic, a silent end or a thread that could not start refuses
     ///   it, with the reason.
+    #[cfg(test)]
     pub fn attempt(
         &mut self,
         facts: ImportFacts,
@@ -236,31 +237,56 @@ impl PendingSkin {
         mut quit: impl FnMut() -> bool,
         mut end_run: impl FnMut() -> bool,
     ) -> (ForAttempt, Specialized) {
+        match self.begin(facts, wait) {
+            Begun::Ready(skin, how) => (skin, how),
+            Begun::Running(mut job) => loop {
+                if let Some(ran) = job.wait_until(None, &mut quit, &mut end_run) {
+                    break (self.finish(&job, ran), Specialized::Ran);
+                }
+            },
+        }
+    }
+
+    /// [`attempt`](Self::attempt)'s start: the kept specialization when it
+    /// holds, else, once `wait` showed the wait, its job started and
+    /// returned at once ([`Begun::Running`]), to be waited for
+    /// ([`Specializing::wait_until`]) and finished
+    /// ([`finish`](Self::finish)).
+    pub fn begin(&mut self, facts: ImportFacts, wait: impl FnOnce()) -> Begun {
         if let Some(kept) = self.cached.as_ref().filter(|c| c.facts.holds(&facts)) {
-            return (
+            return Begun::Ready(
                 ForAttempt::Ready(Arc::clone(&kept.bundle)),
                 Specialized::Reused,
             );
         }
         drop(self.cached.take());
         wait();
-        let signaled = std::cell::Cell::new(false);
         let play = Arc::clone(&self.play);
         let from = Instant::now();
-        let ran = run_job(
-            move |cancel: &Cancel| specialize(&play, &facts, cancel),
-            || {
-                let seen = quit();
-                signaled.set(signaled.get() || seen);
-                seen
-            },
-            || {
-                let seen = end_run();
-                signaled.set(signaled.get() || seen);
-                seen
-            },
-        );
-        let took = from.elapsed();
+        let job = Specializing {
+            from,
+            signaled: std::cell::Cell::new(false),
+            job: None,
+        };
+        match spawn_job(move |cancel: &Cancel| specialize(&play, &facts, cancel)) {
+            Ok(j) => Begun::Running(Box::new(Specializing {
+                job: Some(j),
+                ..job
+            })),
+            Err(why) => Begun::Ready(self.finish(&job, Ran::Refused(why)), Specialized::Ran),
+        }
+    }
+
+    /// The attempt's skin from its specialization `job`'s outcome `ran`
+    /// ([`attempt`](Self::attempt)), the specialization kept whatever
+    /// signal came.
+    pub fn finish(
+        &mut self,
+        job: &Specializing,
+        ran: Ran<Result<Specialization, String>>,
+    ) -> ForAttempt {
+        let took = job.from.elapsed();
+        let signaled = &job.signaled;
         let skin = match ran {
             Ran::Done(Ok(s)) => {
                 let bundle = Arc::clone(&s.bundle);
@@ -277,12 +303,78 @@ impl PendingSkin {
             )),
             Ran::Abandoned => ForAttempt::Cancelled,
         };
-        let skin = if signaled.get() {
+        if signaled.get() {
             ForAttempt::Cancelled
         } else {
             skin
-        };
-        (skin, Specialized::Ran)
+        }
+    }
+
+    /// A specialization `job` no attempt waits for any more (its
+    /// preparation superseded or discarded): cancelled and waited for as
+    /// the run's end waits, at most [`STOP_WAIT`], and its outcome kept as
+    /// [`finish`](Self::finish) keeps it.
+    pub fn settle(&mut self, job: &mut Specializing) {
+        if let Some(ran) = job.wait_until(None, || false, || true) {
+            let _ = self.finish(job, ran);
+        }
+    }
+}
+
+/// How [`PendingSkin::begin`] began.
+pub enum Begun {
+    /// The attempt's skin is known at once: reused, or refused before a job
+    /// could start.
+    Ready(ForAttempt, Specialized),
+    /// The specialization's job runs.
+    Running(Box<Specializing>),
+}
+
+/// A specialization's job in flight ([`PendingSkin::begin`]).
+pub struct Specializing {
+    /// When it was begun.
+    from: Instant,
+    /// A quit or the run's end came while it ran: the attempt is
+    /// cancelled.
+    signaled: std::cell::Cell<bool>,
+    job: Option<Job<Result<Specialization, String>>>,
+}
+
+impl Specializing {
+    /// Whether its job's thread has ended, its outcome not yet taken
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn finished(&self) -> bool {
+        self.job
+            .as_ref()
+            .and_then(|j| j.handle.as_ref())
+            .is_some_and(thread::JoinHandle::is_finished)
+    }
+
+    /// [`Job::wait_until`]: `quit` (the attempt's quit key) cancels it and
+    /// waits for its thread's end; `end_run` cancels it and waits at most
+    /// [`STOP_WAIT`]. `None` at `until` with no outcome and no signal.
+    pub fn wait_until(
+        &mut self,
+        until: Option<Instant>,
+        mut quit: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
+    ) -> Option<Ran<Result<Specialization, String>>> {
+        let signaled = &self.signaled;
+        let job = self.job.as_mut()?;
+        job.wait_until(
+            until,
+            || {
+                let seen = quit();
+                signaled.set(signaled.get() || seen);
+                seen
+            },
+            || {
+                let seen = end_run();
+                signaled.set(signaled.get() || seen);
+                seen
+            },
+        )
     }
 }
 
@@ -702,6 +794,14 @@ pub struct Job<T> {
     rx: mpsc::Receiver<Result<T, &'static str>>,
     handle: Option<thread::JoinHandle<()>>,
     outcome: Option<Ran<T>>,
+    /// The attempt's quit came: the job is cancelled and waited for to its
+    /// thread's end ([`wait_until`](Self::wait_until)).
+    attempt_cancelled: bool,
+    /// The run's end came: the job is cancelled and given up at this time.
+    stop_by: Option<Instant>,
+    /// The tally of the test thread that started it (tests).
+    #[cfg(test)]
+    tally: Arc<tests::Tally>,
 }
 
 /// Starts `job` on a spawned `skin-import` thread, its panic caught and
@@ -742,6 +842,10 @@ pub fn spawn_job<T: Send + 'static>(
         rx,
         handle: Some(handle),
         outcome: None,
+        attempt_cancelled: false,
+        stop_by: None,
+        #[cfg(test)]
+        tally: tests::spawning(),
     })
 }
 
@@ -769,6 +873,8 @@ impl<T> Job<T> {
     fn join(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+            #[cfg(test)]
+            self.tally.joined();
             #[cfg(feature = "dev-tools")]
             JOINED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -785,25 +891,52 @@ impl<T> Job<T> {
         mut cancel_attempt: impl FnMut() -> bool,
         mut end_run: impl FnMut() -> bool,
     ) -> Ran<T> {
-        let mut deadline: Option<Instant> = None;
-        let mut attempt_cancelled = false;
         loop {
-            if deadline.is_none() && end_run() {
-                self.cancel.cancel();
-                deadline = Some(Instant::now() + STOP_WAIT);
+            if let Some(ran) = self.wait_until(None, &mut cancel_attempt, &mut end_run) {
+                return ran;
             }
-            if deadline.is_none() && !attempt_cancelled && cancel_attempt() {
+        }
+    }
+
+    /// [`finish`](Self::finish) until `until` at most: `None` once it
+    /// passes with no outcome, the job still running, and called again
+    /// to go on. Once `cancel_attempt` or `end_run` turned true, it waits
+    /// past `until` as `finish` does: the attempt's quit to the thread's
+    /// end, the run's end to [`STOP_WAIT`] from it.
+    pub fn wait_until(
+        &mut self,
+        until: Option<Instant>,
+        mut cancel_attempt: impl FnMut() -> bool,
+        mut end_run: impl FnMut() -> bool,
+    ) -> Option<Ran<T>> {
+        loop {
+            if self.stop_by.is_none() && end_run() {
                 self.cancel.cancel();
-                attempt_cancelled = true;
+                self.stop_by = Some(Instant::now() + STOP_WAIT);
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if self.stop_by.is_none() && !self.attempt_cancelled && cancel_attempt() {
+                self.cancel.cancel();
+                self.attempt_cancelled = true;
+            }
+            if self.stop_by.is_some_and(|d| Instant::now() >= d) {
                 // Detached: the handle and the receiver go, so a late
                 // outcome is dropped on its own thread.
                 self.handle = None;
-                return Ran::Abandoned;
+                return Some(Ran::Abandoned);
             }
+            let signaled = self.attempt_cancelled || self.stop_by.is_some();
+            let slice = match until {
+                Some(u) if !signaled => {
+                    let left = u.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    left.min(SELECT_SLICE)
+                }
+                _ => SELECT_SLICE,
+            };
             match self.outcome {
-                None => match self.rx.recv_timeout(SELECT_SLICE) {
+                None => match self.rx.recv_timeout(slice) {
                     Ok(Ok(done)) => self.outcome = Some(Ran::Done(done)),
                     Ok(Err(why)) => self.outcome = Some(Ran::Refused(why.to_owned())),
                     Err(RecvTimeoutError::Disconnected) => {
@@ -812,8 +945,8 @@ impl<T> Job<T> {
                     Err(RecvTimeoutError::Timeout) => {}
                 },
                 Some(_) => match self.poll() {
-                    Some(ran) => return ran,
-                    None => thread::sleep(SELECT_SLICE),
+                    Some(ran) => return Some(ran),
+                    None => thread::sleep(slice),
                 },
             }
         }
@@ -1051,9 +1184,9 @@ pub struct Started {
     /// The installed selection skin's song list: its center slot and its
     /// placements, which the select screen's view is made for.
     pub selection: Option<(usize, usize)>,
-    /// The result kind's skin, kept on the CPU: nothing draws a result
-    /// skin until S10-09i, so it is never selected, pended or installed
-    /// on the render thread (design D13, "Publication").
+    /// The result kind's skin: a fixed one installed at startup, or one
+    /// laid out per attempt and view, its prepared atlas uploaded after
+    /// each attempt's commit (the S10-09i design's D2).
     pub result: Option<crate::result_skin::ResultStart>,
 }
 
@@ -1158,11 +1291,21 @@ pub fn startup(
                 started.result = Some(crate::result_skin::ResultStart::Pending(result));
                 Shown::Pending(note.fact)
             }
-            // A result skin with no fact pending: kept for every chart, on
-            // the CPU only.
-            Ran::Done(KindOutcome::Bundle(bundle, _)) if kind == ScreenKind::Result => {
-                started.result = Some(crate::result_skin::ResultStart::Fixed(bundle));
-                Shown::Installed
+            // A result skin with no fact pending: installed as the result
+            // kind's, for every chart (the S10-09i design's D2). Refused, it
+            // is tried again after each attempt's commit.
+            Ran::Done(KindOutcome::Bundle(bundle, summary)) if kind == ScreenKind::Result => {
+                started.result = Some(crate::result_skin::ResultStart::Fixed(Arc::clone(&bundle)));
+                let (texels, side) = (bundle.atlas_texels(), bundle.side());
+                match answered(kind, render.select(kind, Some(bundle)), &mut stop)? {
+                    None => {
+                        committed = committed.saturating_add(texels);
+                        let atlas = Atlas { texels, side };
+                        log_installed(kind, &summary, atlas, committed, log::logger());
+                        Shown::Installed
+                    }
+                    Some(why) => Shown::Refused(why),
+                }
             }
             Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());

@@ -8,17 +8,18 @@
 //! callback's tree and the helpers it calls:
 //!
 //! - **Values known at import**: nil, booleans, integers of at most 2^53
-//!   in magnitude, strings (a captured one by its interned id, a literal
+//!   in magnitude, floats (by their bits), strings (a captured one by its interned id, a literal
 //!   by its bytes, compared by bytes), tables without a metatable,
 //!   closures, host modules, host functions and library functions; and
 //!   the host's off value ([`Val::OffValue`]).
 //! - **What folds**: captures (upvalues, and globals through an `_ENV`
 //!   without a metatable), table entries along the static paths
 //!   ([`Analysis::entry`]), `skin_config` included, so the configuration
-//!   folds whatever its kind but a float; module members; locals; helper
+//!   folds whatever its kind; module members; locals; helper
 //!   calls, inlined with their arguments; operators on known operands;
 //!   `if`, `elseif` and `else` with a known condition. Each capture read
-//!   holds only while the candidate is closed ([`Unsupported::Interference`]
+//!   holds only while the candidate is closed and its binding cell is
+//!   never written at frame time ([`Unsupported::Interference`]
 //!   otherwise).
 //! - **Integers follow the source's doubles**: a numeral the parser
 //!   records as wide ([`super::syntax::Ast::wide_numerals`]) and a
@@ -32,8 +33,10 @@
 //!   the construction premise, whatever arithmetic gave them.
 //! - **What stays residual**: host reads with a known integer argument
 //!   ([`Node::Read`], each recorded in [`Residual::reads`] as it is
-//!   created on a reached path), `-`, `not`, integer `+ - *`,
-//!   comparisons, and [`Node::Select`]. `A and B` is `Select(A, B, A)`
+//!   created on a reached path), `-`, `not`, `+ - * / // %` of numbers,
+//!   `math.floor`, `ceil`, `abs`, `max` and `min` of numbers
+//!   ([`Node::Math`]), comparisons, and [`Node::Select`]; known operands
+//!   fold through the program's numerics (the source's, LuaJ's). `A and B` is `Select(A, B, A)`
 //!   and `A or B` `Select(A, A, B)` on `A`'s truthiness, only nil and
 //!   false being false; a known `A` short-circuits, and `B` is never
 //!   evaluated then. An operator on a [`Node::Select`] of mixed kinds
@@ -47,8 +50,8 @@
 //!   have happened travels as a condition and a value, so paths are never
 //!   split.
 //! - **Refused**, each [`Unsupported`] following the callback's role:
-//!   loops, `goto`, function constructors, floats, `/ // % ^`, bitwise
-//!   operators, `..`, `#`, library calls, method calls, table
+//!   loops, `goto`, function constructors, `^`, bitwise operators, `..`,
+//!   `#`, library calls but the five `math` functions, method calls, table
 //!   constructors, varargs, `return` lists, recursion, a host argument that
 //!   is not a known integer, a definite Lua error on a reached path, and
 //!   string arithmetic or ordering.
@@ -73,6 +76,7 @@ use super::callback::{Admitted, Analysis, Captured, MAIN_STATE, fatal};
 use super::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
 use super::syntax::{Ast, Attrib, Bin, CHUNK_ENV, EXACT, Expr, List, NONE, Stmt, Un};
 use super::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
+use skin_model::present::{self, num};
 
 /// A residual's refusal for a shape the expressions cannot hold: nesting
 /// past [`skin_model::MAX_NESTING`], or a source the trial compile
@@ -87,8 +91,11 @@ pub(crate) const OFF: u8 = 8;
 pub(crate) const STR: u8 = 16;
 pub(crate) const TABLE: u8 = 32;
 pub(crate) const FUNC: u8 = 64;
+pub(crate) const FLT: u8 = 128;
+/// The number kinds.
+pub(crate) const NUM: u8 = INT | FLT;
 /// The kinds whose every value is true.
-const TRUTHY: u8 = INT | OFF | STR | TABLE | FUNC;
+const TRUTHY: u8 = INT | FLT | OFF | STR | TABLE | FUNC;
 
 /// A string known at import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +115,8 @@ pub(crate) enum Val {
     Bool(bool),
     /// At most [`EXACT`] in magnitude.
     Int(i64),
+    /// A float, by its bits.
+    Float(u64),
     /// The host's timer off value, only from a recorded provenance.
     OffValue,
     Str(S),
@@ -125,6 +134,7 @@ impl Val {
             Self::Nil => NIL,
             Self::Bool(_) => BOOL,
             Self::Int(_) => INT,
+            Self::Float(_) => FLT,
             Self::OffValue => OFF,
             Self::Str(_) => STR,
             Self::Table(_) => TABLE,
@@ -145,10 +155,13 @@ pub(crate) enum Node {
     },
     /// `not` of a boolean.
     Not(u32),
-    /// `-` of an integer.
+    /// `-` of a number.
     Neg(u32),
-    /// `+ - *` of integers.
+    /// `+ - * / // %` of numbers.
     Arith(Bin, u32, u32),
+    /// A `math` function of one number (both operands the same), or `max`
+    /// or `min` of two.
+    Math(MathOp, u32, u32),
     /// A comparison: integers, booleans (`==` and `~=`), a timer read
     /// against the off value (`==` and `~=`), or, for a text's value, a
     /// string read against `""` (`==` and `~=`).
@@ -161,6 +174,47 @@ pub(crate) enum Node {
     },
     /// A value no path gives: a return that did not happen.
     Unreachable,
+}
+
+/// A `math` function the residual keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathOp {
+    Floor,
+    Ceil,
+    Abs,
+    Max,
+    Min,
+}
+
+/// A known value as the program's numerics take it.
+pub(crate) fn num_val(v: Val) -> Option<present::Val> {
+    Some(match v {
+        Val::Nil => present::Val::Nil,
+        Val::Bool(b) => present::Val::Bool(b),
+        Val::Int(n) => present::Val::Int(n),
+        Val::Float(f) => present::Val::Float(f64::from_bits(f)),
+        _ => return None,
+    })
+}
+
+/// A value the program's numerics gave, as a known value: an integer past
+/// [`EXACT`] does not fold.
+fn known_of(v: present::Val) -> R<Val> {
+    Ok(match v {
+        present::Val::Nil => Val::Nil,
+        present::Val::Bool(b) => Val::Bool(b),
+        present::Val::Int(n) if n.unsigned_abs() <= EXACT => Val::Int(n),
+        present::Val::Int(_) => return refuse(Unsupported::Range),
+        present::Val::Float(f) => Val::Float(f.to_bits()),
+    })
+}
+
+/// A numeric operation's failure: a definite Lua error, or an overflow.
+fn failed<T>(f: present::Fail) -> R<T> {
+    match f {
+        present::Fail::Error => construct("a Lua error"),
+        present::Fail::Overflow | present::Fail::Unavailable => refuse(Unsupported::Range),
+    }
 }
 
 /// How the consumer converts the callback's result.
@@ -251,6 +305,11 @@ impl Residual {
             .unwrap_or(Node::Unreachable)
     }
 
+    /// The number of nodes.
+    pub(crate) fn len(&self) -> u32 {
+        u32::try_from(self.nodes.len()).unwrap_or(u32::MAX)
+    }
+
     pub(crate) fn kind(&self, r: u32) -> u8 {
         self.kinds.get(r as usize).copied().unwrap_or(0)
     }
@@ -319,6 +378,9 @@ struct Frame<'a> {
 }
 
 struct Eval<'a> {
+    /// Where the first proof this evaluation needed was voided by a
+    /// frame-time write, carried with its refusal.
+    interfered: &'a std::cell::Cell<Option<super::callback::Site>>,
     an: &'a Analysis,
     cancelled: &'a dyn Fn() -> bool,
     res: Residual,
@@ -337,8 +399,10 @@ pub(crate) fn evaluate(
     inst: u32,
     conv: Conv,
     cancelled: &dyn Fn() -> bool,
+    interfered: &std::cell::Cell<Option<super::callback::Site>>,
 ) -> R<Residual> {
     let mut ev = Eval {
+        interfered,
         an: adm.analysis(),
         cancelled,
         res: Residual::default(),
@@ -365,8 +429,30 @@ impl<'a> Eval<'a> {
             Node::Read { api, .. } => (reader(api).map_or(0, |(_, k)| k), 1),
             Node::Unreachable => (0, 1),
             Node::Not(x) => (BOOL, h(x)),
-            Node::Neg(x) => (INT, h(x)),
-            Node::Arith(_, a, b) => (INT, h(a).max(h(b))),
+            Node::Neg(x) => (k(x) & NUM, h(x)),
+            Node::Arith(op, a, b) => {
+                let (ka, kb) = (k(a), k(b));
+                let kind = if op == Bin::Div {
+                    FLT
+                } else if op == Bin::Mod {
+                    // The source's `%` by a zero integer is NaN.
+                    (if ka & kb & INT != 0 { INT | FLT } else { 0 }) | ((ka | kb) & FLT)
+                } else {
+                    (if ka & kb & INT != 0 { INT } else { 0 }) | ((ka | kb) & FLT)
+                };
+                (kind, h(a).max(h(b)))
+            }
+            Node::Math(f, a, b) => {
+                let ka = k(a);
+                let kind = match f {
+                    MathOp::Floor | MathOp::Ceil => {
+                        (if ka & NUM != 0 { INT } else { 0 }) | (ka & FLT)
+                    }
+                    MathOp::Abs => ka & NUM,
+                    MathOp::Max | MathOp::Min => (ka | k(b)) & NUM,
+                };
+                (kind, h(a).max(h(b)))
+            }
             Node::Cmp(_, a, b) => (BOOL, h(a).max(h(b))),
             Node::Select { cond, then, other } => {
                 (k(then) | k(other), h(cond).max(h(then)).max(h(other)))
@@ -439,9 +525,13 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// What a proof resting on captured state needs: the candidate closed.
-    fn bound(&self) -> R<()> {
-        if self.an.open.get().is_some() {
+    /// What a proof resting on the captured binding cell `d` of `file`
+    /// needs: the candidate closed and the cell never written at frame
+    /// time.
+    fn bound(&self, file: u16, d: u32) -> R<()> {
+        if !self.an.cell_holds(file, d) {
+            // The first failure ends the evaluation: its place is the one.
+            self.interfered.set(self.an.written_at(file, d));
             return refuse(Unsupported::Interference);
         }
         Ok(())
@@ -767,7 +857,7 @@ impl<'a> Eval<'a> {
                 }
                 self.known(Val::Int(n))
             }
-            Expr::Float(_) => construct("float"),
+            Expr::Float(bits) => self.known(Val::Float(bits)),
             Expr::Str(s) => self.known(Val::Str(S::Lit {
                 file: f.file,
                 id: s,
@@ -807,7 +897,7 @@ impl<'a> Eval<'a> {
         {
             return Ok(v);
         }
-        self.bound()?;
+        self.bound(f.file, d)?;
         match self.an.upvalue(f.inst, d) {
             Some(c) => self.captured(c, Some((f.ast, f.file, d))),
             None => refuse(Unsupported::Capture("an upvalue")),
@@ -819,7 +909,7 @@ impl<'a> Eval<'a> {
         if env != CHUNK_ENV && self.slot(f, env)?.is_some() {
             return construct("_ENV");
         }
-        self.bound()?;
+        self.bound(f.file, env)?;
         match self.an.global(f.inst, env, f.ast.str(name)).map_err(stop)? {
             Some(c) => self.captured(c, None),
             None => refuse(Unsupported::Capture("an entry no path copied")),
@@ -835,7 +925,7 @@ impl<'a> Eval<'a> {
             Captured::Int(n) if n.unsigned_abs() <= EXACT => Val::Int(n),
             Captured::Int(i64::MIN) if self.off_provenance(decl) => Val::OffValue,
             Captured::Int(_) => return refuse(Unsupported::Range),
-            Captured::Float(_) => return construct("float"),
+            Captured::Float(bits) => Val::Float(bits),
             Captured::Str(id) => Val::Str(S::Name(id)),
             Captured::Host(api) => Val::Host(api),
             Captured::Module(m) => Val::Module(m),
@@ -929,7 +1019,7 @@ impl<'a> Eval<'a> {
                     None => refuse(Unsupported::Capture("an entry no path copied")),
                 }
             }
-            (Some(Val::Nil | Val::Bool(_) | Val::Int(_) | Val::OffValue), _) => {
+            (Some(Val::Nil | Val::Bool(_) | Val::Int(_) | Val::Float(_) | Val::OffValue), _) => {
                 construct("a Lua error")
             }
             _ => construct("index"),
@@ -988,7 +1078,7 @@ impl<'a> Eval<'a> {
                 self.res.reads.push(r);
                 Ok(r)
             }
-            Some(Val::Lib(_)) => construct("library call"),
+            Some(Val::Lib(l)) => self.library(f, l, args),
             _ => refuse(Unsupported::Callee),
         }
     }
@@ -1040,7 +1130,8 @@ impl<'a> Eval<'a> {
     fn integer(&mut self, v: u32) -> R<u32> {
         self.visit()?;
         let k = self.kind(v);
-        if k == 0 || k == INT {
+        // A number stays: a float is the program's to convert.
+        if k & !NUM == 0 {
             return Ok(v);
         }
         if k & !(NIL | BOOL) == 0 {
@@ -1074,9 +1165,13 @@ impl<'a> Eval<'a> {
         }
         match self.kind(v) {
             0 => Ok(v),
-            INT => match self.val(v) {
-                Some(Val::Int(n)) => self.known(Val::Int(-n)),
-                _ => self.push(Node::Neg(v)),
+            k if k & !NUM == 0 => match self.val(v).and_then(num_val) {
+                Some(x) => {
+                    let r = num::neg(x).or_else(failed)?;
+                    let r = known_of(r)?;
+                    self.known(r)
+                }
+                None => self.push(Node::Neg(v)),
             },
             OFF => refuse(Unsupported::Range),
             STR => refuse(Unsupported::Type),
@@ -1086,9 +1181,6 @@ impl<'a> Eval<'a> {
 
     fn binary(&mut self, f: &mut Frame<'a>, op: Bin, a: u32, b: u32) -> R<u32> {
         match op {
-            Bin::Div => return construct("/"),
-            Bin::IDiv => return construct("//"),
-            Bin::Mod => return construct("%"),
             Bin::Pow => return construct("^"),
             Bin::Concat => return construct(".."),
             Bin::BAnd | Bin::BOr | Bin::BXor | Bin::Shl | Bin::Shr => return construct("bitwise"),
@@ -1140,19 +1232,13 @@ impl<'a> Eval<'a> {
         if ky == 0 {
             return Ok(y);
         }
-        let ints = match (self.val(x), self.val(y)) {
-            (Some(Val::Int(p)), Some(Val::Int(q))) => Some((p, q)),
+        // Both operands known numbers: what the program's numerics give.
+        let nums = match (self.val(x).and_then(num_val), self.val(y).and_then(num_val)) {
+            (Some(p), Some(q)) if kx & !NUM == 0 && ky & !NUM == 0 => Some((p, q)),
             _ => None,
         };
-        let exact = |n: i64| -> R<i64> {
-            if n.unsigned_abs() <= EXACT {
-                Ok(n)
-            } else {
-                refuse(Unsupported::Range)
-            }
-        };
         match op {
-            Bin::Add | Bin::Sub | Bin::Mul => {
+            Bin::Add | Bin::Sub | Bin::Mul | Bin::Div | Bin::IDiv | Bin::Mod => {
                 if (kx | ky) & (NIL | BOOL | TABLE | FUNC) != 0 {
                     return construct("a Lua error");
                 }
@@ -1162,14 +1248,10 @@ impl<'a> Eval<'a> {
                 if (kx | ky) & STR != 0 {
                     return refuse(Unsupported::Type);
                 }
-                if let Some((p, q)) = ints {
-                    let r = match op {
-                        Bin::Add => p.checked_add(q),
-                        Bin::Sub => p.checked_sub(q),
-                        _ => p.checked_mul(q),
-                    };
-                    let r = exact(r.ok_or(Stop::Unsupported(Unsupported::Range))?)?;
-                    return self.known(Val::Int(r));
+                if let Some((p, q)) = nums {
+                    let r = num::arith(arith(op), p, q).or_else(failed)?;
+                    let r = known_of(r)?;
+                    return self.known(r);
                 }
                 self.push(Node::Arith(op, x, y))
             }
@@ -1180,16 +1262,17 @@ impl<'a> Eval<'a> {
                 if kx == STR && ky == STR {
                     return refuse(Unsupported::Type);
                 }
-                if kx != INT || ky != INT {
+                if kx & !NUM != 0 || ky & !NUM != 0 {
                     return construct("a Lua error");
                 }
-                if let Some((p, q)) = ints {
+                if let Some((p, q)) = nums {
                     let r = match op {
-                        Bin::Lt => p < q,
-                        Bin::Le => p <= q,
-                        Bin::Gt => p > q,
-                        _ => p >= q,
-                    };
+                        Bin::Lt => num::compare(present::Cmp::Lt, p, q),
+                        Bin::Le => num::compare(present::Cmp::Le, p, q),
+                        Bin::Gt => num::compare(present::Cmp::Lt, q, p),
+                        _ => num::compare(present::Cmp::Le, q, p),
+                    }
+                    .or_else(failed)?;
                     return self.known(Val::Bool(r));
                 }
                 self.push(Node::Cmp(op, x, y))
@@ -1204,14 +1287,15 @@ impl<'a> Eval<'a> {
                     }
                     return refuse(Unsupported::Range);
                 }
-                if kx != ky {
+                let numbers = kx & !NUM == 0 && ky & !NUM == 0;
+                if kx != ky && !numbers {
                     return self.known(Val::Bool(!eq));
                 }
                 if let (Some(a), Some(b)) = (self.val(x), self.val(y)) {
                     let same = self.equal(a, b)?;
                     return self.known(Val::Bool(same == eq));
                 }
-                if kx == INT || kx == BOOL {
+                if numbers || kx == BOOL {
                     return self.push(Node::Cmp(op, x, y));
                 }
                 if self.text && kx == STR {
@@ -1233,6 +1317,68 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// A call of library function `l` with `args`: `math.floor`, `ceil`
+    /// and `abs` of one number, `max` and `min` of one or more, folded
+    /// when every argument is known; any other a refusal.
+    fn library(&mut self, f: &mut Frame<'a>, l: u16, args: &[u32]) -> R<u32> {
+        let name = super::sandbox::LIBS
+            .get(usize::from(l))
+            .copied()
+            .unwrap_or("");
+        let op = match name {
+            "math.floor" => MathOp::Floor,
+            "math.ceil" => MathOp::Ceil,
+            "math.abs" => MathOp::Abs,
+            "math.max" => MathOp::Max,
+            "math.min" => MathOp::Min,
+            _ => return construct("library call"),
+        };
+        charge(self.an, "list:lib", units(args.len()))?;
+        did("list:lib");
+        let xs = self.values(f, args, args.len())?;
+        let one = matches!(op, MathOp::Floor | MathOp::Ceil | MathOp::Abs);
+        if xs.is_empty() || (one && xs.len() != 1) {
+            return construct("library call");
+        }
+        for &x in &xs {
+            self.visit()?;
+            if self.kind(x) & !NUM != 0 {
+                return if self.mixed(x).is_some() {
+                    refuse(Unsupported::Type)
+                } else {
+                    construct("a Lua error")
+                };
+            }
+        }
+        let mut acc = *xs.first().ok_or(Stop::Unsupported(Unsupported::Type))?;
+        if one {
+            if let Some(v) = self.val(acc).and_then(num_val) {
+                let fun = match op {
+                    MathOp::Floor => present::MathFn::Floor,
+                    MathOp::Ceil => present::MathFn::Ceil,
+                    _ => present::MathFn::Abs,
+                };
+                let r = known_of(num::math(fun, v).or_else(failed)?)?;
+                return self.known(r);
+            }
+            return self.push(Node::Math(op, acc, acc));
+        }
+        for &x in xs.get(1..).unwrap_or(&[]) {
+            acc = match (
+                self.val(acc).and_then(num_val),
+                self.val(x).and_then(num_val),
+            ) {
+                (Some(a), Some(b)) => {
+                    let r = num::extreme(op == MathOp::Max, a, b).or_else(failed)?;
+                    let r = known_of(r)?;
+                    self.known(r)?
+                }
+                _ => self.push(Node::Math(op, acc, x))?,
+            };
+        }
+        Ok(acc)
+    }
+
     /// Whether known string `s` is empty.
     fn is_empty(&self, s: S) -> bool {
         match s {
@@ -1246,6 +1392,9 @@ impl<'a> Eval<'a> {
     /// bytes, charged.
     fn equal(&self, a: Val, b: Val) -> R<bool> {
         let (Val::Str(p), Val::Str(q)) = (a, b) else {
+            if let (Some(x), Some(y)) = (num_val(a), num_val(b)) {
+                return Ok(num::equal(x, y));
+            }
             return Ok(a == b);
         };
         match (p, q) {
@@ -1264,5 +1413,17 @@ impl<'a> Eval<'a> {
                 Ok(s == t)
             }
         }
+    }
+}
+
+/// The program's arithmetic operator for Lua operator `op`.
+pub(crate) fn arith(op: Bin) -> present::Arith {
+    match op {
+        Bin::Add => present::Arith::Add,
+        Bin::Sub => present::Arith::Sub,
+        Bin::Mul => present::Arith::Mul,
+        Bin::Div => present::Arith::Div,
+        Bin::IDiv => present::Arith::IDiv,
+        _ => present::Arith::Mod,
     }
 }

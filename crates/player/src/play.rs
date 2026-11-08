@@ -282,30 +282,234 @@ pub struct PlayerRig<'a> {
     pub result_skin: crate::result_skin::ResultSkin,
     /// The attempt's chart facts a result view carries.
     pub result_chart: Option<skin_model::ResultChart>,
+    /// The attempt's preparation begun last, until the next.
+    pub prep: Option<AttemptPrep>,
+    /// The preparations begun so far: each one's ticket.
+    pub preps: u64,
+    /// The result's presentation (the S10-09i design's D1): its lifetime,
+    /// the desired view and what was published.
+    pub presenter: crate::result_present::Presenter,
+    /// The chart's strings the attempt's result shows.
+    pub result_labels: Option<skin_model::ResultLabels>,
+    /// The attempt's result upload was withdrawn by a quit, a close or a
+    /// thread's failure: the end of loading does not wait on the render
+    /// thread, which may still be in it.
+    pub result_withdrawn: bool,
+    /// The facts behind the result strip's lines that do not depend on the
+    /// view, while a result lifetime is current.
+    pub result_facts: Option<crate::result_present::OverlayFacts>,
+    /// The input offset last seen while the result shows, and whether the
+    /// offset keys changed it in this lifetime (O6).
+    pub result_offset: Option<(i64, bool)>,
+    /// A leaving command was accepted on the result: the next screen's
+    /// preparation leaves its lifetime.
+    pub result_leaving: bool,
+}
+
+/// An attempt's preparation begun on the player's rig
+/// ([`Rig::begin_preparation`]): what it was begun with, and where it
+/// stands. Dropped, an unanswered render request is discarded.
+pub struct AttemptPrep {
+    /// The handle's ticket.
+    ticket: u64,
+    /// The attempt, until the render thread is asked.
+    attempt: Option<game::Attempt>,
+    /// The loading gauge's descriptor, from the refreshed play preset.
+    loading_gauge: Option<skin_model::LoadingGauge>,
+    /// The gauge the attempt shows, by its index in the preset.
+    displayed: usize,
+    /// The attempt's chart facts a result view carries.
+    chart: skin_model::ResultChart,
+    /// The attempt's judgment class.
+    class: Option<skin_beatoraja::JudgeClass>,
+    /// The chart's strings the attempt's result shows, until the result
+    /// skin's stage takes them.
+    labels: Option<skin_model::ResultLabels>,
+    /// Prepared with a pending play skin's specialization.
+    specialized: bool,
+    /// When the render thread was asked.
+    staging: Instant,
+    stage: PrepStage,
+}
+
+/// Where an attempt's preparation stands.
+enum PrepStage {
+    /// The pending play skin's specialization runs.
+    Skin(Box<crate::imports::Specializing>),
+    /// The result skin's image stage runs, the play skin known.
+    Image(AttemptSkin, Box<crate::result_skin::ImageJob>),
+    /// The render thread prepares the attempt.
+    Screen(crate::render_side::PendingAttempt),
+    /// It ended before the render thread answered ready.
+    Ended(Preparation),
+    /// Answered: with the render request answered ready, which the final
+    /// readiness and the commit name; `None` when it failed.
+    Answered(Option<u64>),
+}
+
+/// How the play skin's stage began.
+enum SkinStep {
+    /// Known at once.
+    Ready(AttemptSkin),
+    /// The specialization's job runs.
+    Running(Box<crate::imports::Specializing>),
 }
 
 impl PlayerRig<'_> {
-    /// The result skin's image stage for the attempt at `loaded` (design
-    /// D11), after the play skin's specialization and before READY: the
-    /// quit key cancels its job and waits for its thread; the window's
-    /// close and a failure of the input or audio thread end it within the
-    /// stop bound.
-    fn result_stage(&mut self, loaded: &Loaded) -> crate::result_skin::Staged {
-        let chart = crate::result_skin::attempt_chart(loaded);
-        self.result_chart = Some(chart);
-        let mut result = std::mem::take(&mut self.result_skin);
+    /// The result skin's image stage for the attempt (design D11), begun
+    /// after the play skin's specialization and before READY with what the
+    /// attempt's preparation began with, and its play skin `skin`: decided
+    /// at once, or its job running, waited for in the preparation's polls
+    /// ([`poll_image`](Self::poll_image)).
+    fn after_skin(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
+        self.result_chart = Some(prep.chart);
+        self.result_labels = prep.labels.take();
+        // Once the run disabled the result skin, no skin work is done: the
+        // built-in result shows the chart and labels taken above.
+        if self.result_run_disabled() {
+            return self.send_screen(prep, skin);
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
+        match self.result_skin.begin_image_stage(prep.chart, prep.class) {
+            crate::result_skin::ImageStage::Ready(staged) => self.after_image(prep, skin, staged),
+            crate::result_skin::ImageStage::Running(job) => PrepStage::Image(skin, job),
+        }
+    }
+
+    /// The result skin's image stage `job`, waited for until `until`: the
+    /// quit key cancels its job and waits for its thread; the window's
+    /// close and a failure of the input or audio thread end it within the
+    /// stop bound. `None` at `until` with the job still running.
+    fn poll_image(
+        &mut self,
+        job: &mut crate::result_skin::ImageJob,
+        until: Instant,
+    ) -> Option<crate::result_skin::Staged> {
+        let mut result = std::mem::take(&mut self.result_skin);
         let rig = &*self;
-        let class = crate::result_skin::attempt_class(loaded);
-        let staged = result.image_stage(chart, class, || rig.controls.leaving(), || rig.run_ends());
+        let staged = result.poll_image_stage(
+            job,
+            Some(until),
+            || rig.controls.leaving(),
+            || rig.run_ends(),
+        );
         self.result_skin = result;
+        staged
+    }
+
+    /// What follows the image stage's end `staged`: a cancelled attempt
+    /// ends, a ready one is asked of the render thread with `skin`.
+    fn after_image(
+        &mut self,
+        prep: &mut AttemptPrep,
+        skin: AttemptSkin,
+        staged: crate::result_skin::Staged,
+    ) -> PrepStage {
         #[cfg(feature = "dev-tools")]
         println!(
             "dev: result image stage: {}",
             self.result_skin.staged_line()
         );
-        staged
+        match staged {
+            crate::result_skin::Staged::Cancelled => PrepStage::Ended(Preparation::Cancelled),
+            crate::result_skin::Staged::Ready => self.send_screen(prep, skin),
+        }
+    }
+
+    /// Asks the render thread to prepare the attempt from its owned
+    /// context with play skin `skin`, and returns at once. The loading
+    /// lifetime's gauge descriptor is replaced from the preset the play
+    /// refreshed, with the gauge the attempt shows.
+    fn send_screen(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
+        let Some(attempt) = prep.attempt.take() else {
+            return PrepStage::Ended(Preparation::Cancelled);
+        };
+        prep.specialized = matches!(skin, AttemptSkin::Specialized(_));
+        self.attempt_gauge = prep.displayed;
+        refresh_loading_gauge(&self.render, self.loading_active(), prep.loading_gauge);
+        // The attempt attached last is the one prepared: its epoch is
+        // the frames'.
+        let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
+        let attempt =
+            AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay);
+        prep.staging = Instant::now();
+        PrepStage::Screen(self.render.begin_attempt(attempt, skin))
+    }
+
+    /// The render thread's answer to the attempt's preparation `pending`,
+    /// waited for until `until`, the adjustments served meanwhile, so an
+    /// adjustment then is published before the preparation ends; a quit
+    /// key, a close, or a failure of the input or audio thread stops the
+    /// wait ([`preparation_stops`]), and the game looks at the threads for
+    /// a failure's cause. `None` at `until` with no answer.
+    fn poll_screen(
+        &mut self,
+        prep: &AttemptPrep,
+        pending: &mut crate::render_side::PendingAttempt,
+        until: Instant,
+    ) -> Option<Result<crate::render_side::Answered, ScreenError>> {
+        let mut adjust = self.adjust.take();
+        let rig = &*self;
+        let answered = pending.wait_until(Some(until), || {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
+            preparation_stops(
+                rig.quitting(),
+                rig.controls.leaving(),
+                rig.input_failure(),
+                rig.audio_failure(),
+            )
+        });
+        self.adjust = adjust;
+        let answered = answered?;
+        // The render thread's staging and upload of the specialization,
+        // apart from the job's time.
+        if prep.specialized {
+            crate::imports::log_staged(
+                prep.staging.elapsed(),
+                answered.as_ref().map(|a| &a.preparation),
+            );
+        }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("preparing", self.adjust.as_ref());
+        Some(answered)
+    }
+
+    /// Whether the render thread disabled the result skin for the run (the
+    /// S10-09i design's D7), as the presenter now knows too.
+    fn result_run_disabled(&mut self) -> bool {
+        let status = self.render.result_status();
+        self.presenter.status(&status);
+        self.presenter.disabled().is_some()
+    }
+
+    /// Whether the result's skin work is suppressed: the attempt's
+    /// fallback or the run's (no image stage, layout or upload; the
+    /// built-in result is still presented).
+    fn result_skin_suppressed(&mut self) -> bool {
+        self.presenter.attempt_fallen().is_some() || self.result_run_disabled()
+    }
+
+    /// The preparation begun last dropped (design.md "Play Lifecycle",
+    /// preparing each attempt: the handle owns its subjobs). A job still
+    /// running is settled as the run's end settles it, within the stop
+    /// bound: the specialization's outcome kept, the image stage's images
+    /// handed back. An unanswered render request is discarded as it drops.
+    fn drop_prep(&mut self) {
+        let Some(mut prep) = self.prep.take() else {
+            return;
+        };
+        match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
+            PrepStage::Skin(mut job) => {
+                if let Some(pending) = self.pending.as_mut() {
+                    pending.settle(&mut job);
+                }
+            }
+            PrepStage::Image(_, mut job) => self.result_skin.settle_image_stage(&mut job),
+            PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered(_) => {}
+        }
     }
 
     /// Whether the run ends: the window's close, or a failure of the input
@@ -315,6 +519,150 @@ impl PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
         self.controls.quitting() || self.input_failure().is_some() || self.audio_failure().is_some()
+    }
+
+    /// The atlases the render thread retains for the result go to the
+    /// result skin (the S10-09i design's §2.1 Q3), then its finished job's
+    /// outcome is taken; while a result lifetime is current, the desired
+    /// view's payload is published once its layout is (D1), and a fallback
+    /// the render thread reported applies (D7). Returns whether the latest
+    /// request is published.
+    fn land_result(&mut self) -> bool {
+        let status = self.render.result_status();
+        self.result_skin.set_retained(&status.retained);
+        let ready = self.result_skin.poll();
+        if self.presenter.current() {
+            if self.presenter.status(&status) || ready {
+                self.presenter
+                    .land(&mut self.render, self.result_skin.shown());
+            }
+            self.present_overlay();
+        }
+        ready
+    }
+
+    /// The result's view of `screen` after `report`, as the end page just
+    /// built shows it, becomes the desired one: its snapshot is kept until
+    /// its layout lands. A result lifetime begins with the result's first
+    /// show. Nothing without a result skin; once the run disabled it, each
+    /// view is still presented, as the built-in result with the reason.
+    pub(crate) fn present_view(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        // The page exactly as the end screen is sent it, its settings
+        // lines included: the render side's page base for the lifetime's
+        // first frame, before that page arrives.
+        let (Some(chart), Some(page)) = (
+            self.result_chart,
+            self.end_page.as_ref().map(|base| {
+                end_screen::with_settings(base, self.controls.tuning().get(), self.speed_line())
+            }),
+        ) else {
+            return;
+        };
+        if !self.result_skin.has_skin() {
+            return;
+        }
+        if !self.presenter.current() {
+            self.presenter.begin(&mut self.render, self.clock.now());
+            self.result_leaving = false;
+            self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
+        }
+        self.presenter.want(crate::result_present::Snapshot {
+            view: crate::result_present::view_of(screen, chart),
+            labels: self.result_labels.clone().unwrap_or_default(),
+            lines: crate::result_present::view_lines(report, screen),
+            page,
+        });
+        self.result_facts = Some(crate::result_present::OverlayFacts::of(
+            report,
+            screen,
+            self.autoplay,
+        ));
+        self.land_result();
+    }
+
+    /// The strip's lines that do not depend on the view, as they stand:
+    /// the offset guidance once the offset keys changed the offset in this
+    /// lifetime, and a thread's failure.
+    fn present_overlay(&mut self) {
+        let Some(facts) = &self.result_facts else {
+            return;
+        };
+        let now = self.controls.tuning().get().input_offset_us;
+        let used = match &mut self.result_offset {
+            Some((seen, used)) => {
+                *used |= *seen != now;
+                *seen = now;
+                *used
+            }
+            None => false,
+        };
+        let failure = self
+            .input_failure()
+            .map(|e| format!("INPUT: {e}"))
+            .or_else(|| self.audio_failure().map(|e| format!("AUDIO: {e}")));
+        let lines = facts.lines(used.then_some(now), failure);
+        self.presenter.lines(&mut self.render, lines);
+    }
+
+    /// The result's lifetime ends: nothing of it is drawn any more.
+    pub(crate) fn leave_result(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        if self.presenter.current() {
+            crate::dev::print_result_work("left");
+        }
+        self.presenter.end(&mut self.render);
+        self.result_facts = None;
+        self.result_offset = None;
+        self.result_leaving = false;
+    }
+
+    /// The attempt's result is uploaded after its commit and before
+    /// recording opens (the S10-09i design's D2): a fixed skin reinstalled
+    /// when play's admission released it, a chart-only specialization, or
+    /// a prepared atlas, unless its atlas is installed. The wait looks at
+    /// the quit key, the close and the input and audio threads between
+    /// slices: on any of them the upload is withdrawn, so a late staging
+    /// installs nothing, and the end of loading does not wait on the
+    /// render thread. A refusal shows the built-in result for the attempt.
+    pub(crate) fn upload_result(&mut self) {
+        self.result_withdrawn = false;
+        let status = self.render.result_status();
+        if status.disabled.is_some() {
+            return;
+        }
+        let Some(upload) = self.result_skin.upload() else {
+            return;
+        };
+        if status.installed == Some(upload.atlas()) {
+            return;
+        }
+        let mut pending = self.render.upload_result(upload);
+        loop {
+            if preparation_stops(
+                self.quitting(),
+                self.controls.leaving(),
+                self.input_failure(),
+                self.audio_failure(),
+            ) {
+                // Withdrawn as it drops: a completion after it installs
+                // nothing.
+                drop(pending);
+                self.result_withdrawn = true;
+                #[cfg(feature = "dev-tools")]
+                println!("dev: result upload withdrawn");
+                return;
+            }
+            let why = match pending.poll(crate::render_side::SELECT_SLICE) {
+                None => continue,
+                Some(Ok(Preparation::Ready)) => return,
+                Some(Ok(Preparation::Refused(why))) => why.to_string(),
+                Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
+                Some(Err(e)) => Chain(&e).to_string(),
+            };
+            println!("skin: result: built-in for this attempt: {why}");
+            self.presenter.attempt_fallback(why);
+            return;
+        }
     }
 
     /// The result skin's running layout job cancelled and waited for; the
@@ -352,26 +700,18 @@ impl PlayerRig<'_> {
         );
     }
 
-    /// The play skin the attempt at `loaded` is prepared with: the skin in
-    /// use, or the pending play skin's specialization for the attempt's
-    /// facts ([`crate::imports::PendingSkin::attempt`]), reused while the
-    /// facts it read hold. A job's wait shows the stage line on the
-    /// loading state, or the preparation page without one (a retry, a
-    /// round). The quit key cancels the job and waits for its thread's
-    /// end; the window's close and a failure of the input or audio thread
-    /// end it within the stop bound. The adjustments and the dev presses
-    /// are served meanwhile.
-    ///
-    /// # Errors
-    ///
-    /// The attempt's preparation instead: cancelled once a signal came,
-    /// or refused with the reason the skin cannot be built.
-    fn attempt_skin(&mut self, loaded: &Loaded) -> Result<AttemptSkin, Preparation> {
+    /// The play skin the attempt at `loaded` is prepared with, begun: the
+    /// skin in use, or the pending play skin's specialization for the
+    /// attempt's facts ([`crate::imports::PendingSkin::begin`]), reused
+    /// while the facts it read hold, else its job started and waited for in
+    /// the preparation's polls ([`poll_skin`](Self::poll_skin)). A job's
+    /// wait shows the stage line on the loading state, or the preparation
+    /// page without one (a retry, a round).
+    fn begin_skin(&mut self, loaded: &Loaded) -> Result<SkinStep, Preparation> {
         let Some(mut pending) = self.pending.take() else {
-            return Ok(AttemptSkin::InUse);
+            return Ok(SkinStep::Ready(AttemptSkin::InUse));
         };
         let facts = crate::imports::facts::attempt_facts(loaded, self.autoplay);
-        let mut adjust = self.adjust.take();
         let rig = &*self;
         let wait = || {
             println!("skin: play: building for the chart");
@@ -402,6 +742,33 @@ impl PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             crate::dev::specialization_began();
         };
+        let begun = pending.begin(facts, wait);
+        self.pending = Some(pending);
+        match begun {
+            crate::imports::Begun::Ready(skin, how) => {
+                self.skin_ended(skin, &how).map(SkinStep::Ready)
+            }
+            crate::imports::Begun::Running(job) => Ok(SkinStep::Running(job)),
+        }
+    }
+
+    /// The pending play skin's specialization `job`, waited for until
+    /// `until`: the quit key cancels the job and waits for its thread's
+    /// end; the window's close and a failure of the input or audio thread
+    /// end it within the stop bound. The adjustments and the dev presses
+    /// are served meanwhile. `None` at `until` with the job still running.
+    ///
+    /// # Errors
+    ///
+    /// The attempt's preparation instead: cancelled once a signal came,
+    /// or refused with the reason the skin cannot be built.
+    fn poll_skin(
+        &mut self,
+        job: &mut crate::imports::Specializing,
+        until: Instant,
+    ) -> Option<Result<AttemptSkin, Preparation>> {
+        let mut adjust = self.adjust.take();
+        let rig = &*self;
         let quit = || {
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
@@ -411,12 +778,56 @@ impl PlayerRig<'_> {
         // A script's step on the specialization (dev-tools) is asked at
         // every look of the wait, an attempt's quit included.
         let end_run = || rig.run_ends();
-        let (skin, how) = pending.attempt(facts, wait, quit, end_run);
+        let ran = job.wait_until(Some(until), quit, end_run);
+        self.adjust = adjust;
+        let ran = ran?;
+        let mut pending = self.pending.take()?;
+        let skin = pending.finish(job, ran);
+        self.pending = Some(pending);
+        Some(self.skin_ended(skin, &crate::imports::Specialized::Ran))
+    }
+
+    /// The attempt at `loaded` prepared as the flow prepares it: begun,
+    /// polled to its end, and, ready, its final readiness taken (tests).
+    ///
+    /// # Errors
+    ///
+    /// The screen's failure, or [`ScreenError::Lost`] for a `Stale`
+    /// readiness.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+        use game::Rig as _;
+        let mut handle = self.begin_preparation(loaded, loaded.prep_key());
+        let ended = loop {
+            let until = Instant::now() + std::time::Duration::from_millis(10);
+            if let game::PrepPoll::Done(ended) = self.poll_preparation(&mut handle, until)? {
+                break ended;
+            }
+        };
+        if ended != Preparation::Ready {
+            return Ok(ended);
+        }
+        match self.ready_attempt(1, &handle)? {
+            game::Readiness::Ready => Ok(Preparation::Ready),
+            game::Readiness::Stale(stale) => Err(stale.lost),
+        }
+    }
+
+    /// The attempt's play skin once its specialization ended `skin`, as it
+    /// came `how`, reported.
+    ///
+    /// # Errors
+    ///
+    /// The attempt's preparation instead: cancelled once a signal came,
+    /// or refused with the reason the skin cannot be built.
+    fn skin_ended(
+        &self,
+        skin: crate::imports::ForAttempt,
+        how: &crate::imports::Specialized,
+    ) -> Result<AttemptSkin, Preparation> {
         #[cfg(feature = "dev-tools")]
         println!("dev: specialization wait left");
-        self.adjust = adjust;
-        self.pending = Some(pending);
-        skin.report(&how);
+        skin.report(how);
         // The job's thread has ended, and its VMs with it, before the
         // render thread prepares the attempt (dev-tools witness).
         #[cfg(feature = "dev-tools")]
@@ -555,6 +966,9 @@ impl PlayerRig<'_> {
     /// must stay open until the process exits.
     #[must_use]
     pub fn shut_down(mut self) -> RenderEnd {
+        // A preparation still running settles its job before the render
+        // thread and the skins go.
+        self.drop_prep();
         self.persist();
         let ended = self.render.exit();
         self.audio.exit();
@@ -624,7 +1038,7 @@ impl PlayerRig<'_> {
     /// The hi-speed the end screen shows: the adjustments' newest state,
     /// its green number at the attempt's reference tempo.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn speed_line(&self) -> end_screen::SpeedLine {
+    pub(crate) fn speed_line(&self) -> end_screen::SpeedLine {
         let Some(driver) = &self.adjust else {
             return end_screen::SpeedLine::default();
         };
@@ -780,11 +1194,9 @@ pub(crate) fn commit_ready(
 pub(crate) fn refresh_loading_gauge(
     render: &RenderLink,
     loading: bool,
-    preset: &rules::RulePreset,
-    gauge: usize,
+    gauge: Option<skin_model::LoadingGauge>,
 ) {
     if loading {
-        let gauge = shown_gauge(preset, gauge);
         render.loading().report(LoadInput::Gauge(gauge), None);
     }
 }
@@ -906,12 +1318,15 @@ impl Rig for PlayerRig<'_> {
         }
         // A switch's layout lands when its job is done; a close leaves its
         // wait within the stop bound.
-        self.result_skin.poll();
+        self.land_result();
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
         self.serve_adjustments();
         self.sync();
+        // The result's own path, after the adjustments: an offset changed
+        // by them reaches the strip's guidance.
+        self.present_overlay();
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -967,6 +1382,7 @@ impl Rig for PlayerRig<'_> {
     /// layout job and waits for its thread before it is served (D11); the
     /// run's end bounds the wait.
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
+        self.result_leaving = true;
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
@@ -1009,10 +1425,15 @@ impl Rig for PlayerRig<'_> {
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
-        commit_ready(&self.render, loading, &mut self.declared_close)
+        commit_ready(&self.render, loading, &mut self.declared_close)?;
+        self.upload_result();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("commit");
+        Ok(())
     }
 
     fn discard_attempt(&mut self) {
+        self.drop_prep();
         self.render.discard_attempt();
     }
 
@@ -1025,6 +1446,12 @@ impl Rig for PlayerRig<'_> {
             .as_mut()
             .and_then(|s| s.loading.take())
             .is_some();
+        // A withdrawn upload may still hold the render thread: the loading
+        // state ends without its answer, and recording does not open.
+        if std::mem::take(&mut self.result_withdrawn) {
+            self.render.clear_loading();
+            return Ok(());
+        }
         match &mut self.gate {
             Some(gate) => gate.end_loading(&self.render, loading),
             None if loading => self.render.end_loading(),
@@ -1033,73 +1460,160 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
+        // Within a result lifetime a screen built again is not a leaving:
+        // the render side draws on from what it presented (the S10-09i
+        // design's D4, "Recovery").
+        if self.presenter.current() && !self.result_leaving {
+            return self.render.prepare();
+        }
+        self.leave_result();
         self.retry_from = self.pending_retry.take();
         #[cfg(feature = "dev-tools")]
         self.scenario_pending();
         prepare_render(&mut self.end_page, &self.render)
     }
 
-    /// The render thread prepares the attempt from its owned context; a
-    /// quit key, a close, or a failure of the input or audio thread while
-    /// it does stops the wait ([`preparation_stops`]), and the game looks
-    /// at the threads for a failure's cause.
-    ///
-    /// A pending play skin is built for the attempt first
-    /// ([`attempt_skin`](Self::attempt_skin)), and the attempt prepared
-    /// with its specialization, staged with it. The loading lifetime's
-    /// gauge descriptor is replaced from the preset the play refreshed,
-    /// with the gauge the attempt shows.
-    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, ScreenError> {
+    /// The attempt's preparation begun (design.md "Play Lifecycle",
+    /// preparing each attempt): a pending play skin's specialization
+    /// started, or, without one, the result skin's image stage, or the
+    /// render thread asked; it returns at once, and the polls drive the
+    /// rest ([`poll_preparation`](Rig::poll_preparation)). A preparation
+    /// begun before is dropped, its unanswered request discarded.
+    fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
+        self.drop_prep();
         self.result_skin.next_attempt();
-        let skin = match self.attempt_skin(loaded) {
-            Ok(skin) => skin,
-            Err(stopped) => return Ok(stopped),
+        self.presenter.next_attempt();
+        self.preps += 1;
+        let attempt = loaded.attempt();
+        let labels = crate::result_present::labels_of(&attempt.labels);
+        let mut prep = AttemptPrep {
+            ticket: self.preps,
+            attempt: Some(attempt),
+            loading_gauge: shown_gauge(loaded.preset(), loaded.displayed().0),
+            displayed: loaded.displayed().0,
+            chart: crate::result_skin::attempt_chart(loaded),
+            class: crate::result_skin::attempt_class(loaded),
+            labels: Some(labels),
+            specialized: false,
+            staging: Instant::now(),
+            stage: PrepStage::Answered(None),
         };
-        if self.result_stage(loaded) == crate::result_skin::Staged::Cancelled {
-            return Ok(Preparation::Cancelled);
-        }
-        let specialized = matches!(skin, AttemptSkin::Specialized(_));
-        self.attempt_gauge = loaded.displayed().0;
-        refresh_loading_gauge(
-            &self.render,
-            self.loading_active(),
-            loaded.preset(),
-            self.attempt_gauge,
-        );
-        // The attempt attached last is the one prepared: its epoch is
-        // the frames'.
-        let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
-        let attempt = AttemptContext::new(
-            loaded.attempt(),
-            SIMPLE_SCRATCH,
-            epoch.unwrap_or(0),
-            self.autoplay,
-        );
-        // The adjustments are served while the screen prepares, so an
-        // adjustment then is published before the preparation ends.
-        let mut adjust = self.adjust.take();
-        let rig = &*self;
-        let staging = Instant::now();
-        let prepared = rig.render.prepare_attempt_with(attempt, skin, || {
-            #[cfg(feature = "dev-tools")]
-            crate::dev::press_due(rig.controls, crate::dev::LoadPhase::Preparing);
-            serve_adjustments(adjust.as_mut(), &rig.input, rig.controls.tuning());
-            preparation_stops(
-                rig.quitting(),
-                rig.controls.leaving(),
-                rig.input_failure(),
-                rig.audio_failure(),
-            )
-        });
-        self.adjust = adjust;
-        // The render thread's staging and upload of the specialization,
-        // apart from the job's time.
-        if specialized {
-            crate::imports::log_staged(staging.elapsed(), &prepared);
-        }
-        #[cfg(feature = "dev-tools")]
-        crate::dev::print_adjustments("preparing", self.adjust.as_ref());
-        prepared
+        prep.stage = match self.begin_skin(loaded) {
+            Ok(SkinStep::Ready(skin)) => self.after_skin(&mut prep, skin),
+            Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
+            Err(ended) => PrepStage::Ended(ended),
+        };
+        let handle = game::PrepHandle::new(key, prep.ticket);
+        self.prep = Some(prep);
+        handle
+    }
+
+    /// Drives the preparation until `deadline`: the specialization's job,
+    /// then the result skin's image stage, then the render thread's
+    /// answer, each waited for in slices that serve the player. Ready, the
+    /// handle holds the screen's structural inputs it was staged with.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn poll_preparation(
+        &mut self,
+        handle: &mut game::PrepHandle,
+        deadline: Instant,
+    ) -> Result<game::PrepPoll<Preparation>, ScreenError> {
+        let mut prep = match self.prep.take() {
+            Some(p) if p.ticket == handle.ticket() => p,
+            // Another handle's: it stays, for its own polls or its drop.
+            other => {
+                self.prep = other;
+                return Err(ScreenError::Lost);
+            }
+        };
+        let polled = loop {
+            match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
+                PrepStage::Skin(mut job) => match self.poll_skin(&mut job, deadline) {
+                    None => {
+                        prep.stage = PrepStage::Skin(job);
+                        break Ok(game::PrepPoll::Pending);
+                    }
+                    Some(Ok(skin)) => prep.stage = self.after_skin(&mut prep, skin),
+                    Some(Err(ended)) => prep.stage = PrepStage::Ended(ended),
+                },
+                PrepStage::Image(skin, mut job) => match self.poll_image(&mut job, deadline) {
+                    None => {
+                        prep.stage = PrepStage::Image(skin, job);
+                        break Ok(game::PrepPoll::Pending);
+                    }
+                    Some(staged) => prep.stage = self.after_image(&mut prep, skin, staged),
+                },
+                PrepStage::Screen(mut pending) => {
+                    match self.poll_screen(&prep, &mut pending, deadline) {
+                        None => {
+                            prep.stage = PrepStage::Screen(pending);
+                            break Ok(game::PrepPoll::Pending);
+                        }
+                        Some(Ok(answered)) => {
+                            if answered.preparation == Preparation::Ready {
+                                handle.staged_with(answered.screen);
+                                prep.stage = PrepStage::Answered(Some(pending.request()));
+                            }
+                            break Ok(game::PrepPoll::Done(answered.preparation));
+                        }
+                        Some(Err(e)) => break Err(e),
+                    }
+                }
+                // Ended or answered: it stays so, for its final readiness
+                // and its commit, however often it is polled again.
+                PrepStage::Ended(ended) => {
+                    prep.stage = PrepStage::Ended(ended.clone());
+                    break Ok(game::PrepPoll::Done(ended));
+                }
+                PrepStage::Answered(request) => {
+                    prep.stage = PrepStage::Answered(request);
+                    break Err(ScreenError::Lost);
+                }
+            }
+        };
+        self.prep = Some(prep);
+        polled
+    }
+
+    /// The render thread stamps the adjustment epoch on what the request
+    /// staged once it still fits the screen's device, target size and play
+    /// skin selection, and answers `Stale` with them otherwise; it prepares
+    /// nothing. The attempt's number is the flow's: nothing staged on the
+    /// render thread holds it. Nothing staged at all answers `Stale` with
+    /// the inputs the handle was staged with, which ends the run.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_attempt(
+        &mut self,
+        number: u32,
+        handle: &game::PrepHandle,
+    ) -> Result<game::Readiness<ScreenError>, ScreenError> {
+        let _ = number;
+        let lost = |screen| {
+            game::Readiness::Stale(game::Stale {
+                screen,
+                lost: ScreenError::Lost,
+            })
+        };
+        let Some(request) = self
+            .prep
+            .as_ref()
+            .filter(|p| p.ticket == handle.ticket())
+            .and_then(|p| match p.stage {
+                PrepStage::Answered(request) => request,
+                _ => None,
+            })
+        else {
+            return Ok(lost(handle.key().screen().unwrap_or_default()));
+        };
+        let epoch = self
+            .adjust
+            .as_mut()
+            .and_then(game::AdjustDriver::prepared)
+            .unwrap_or(0);
+        Ok(match self.render.ready_attempt(request, epoch)? {
+            crate::render_side::ReadyAnswer::Ready => game::Readiness::Ready,
+            crate::render_side::ReadyAnswer::Stale(now) => lost(now),
+        })
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -1318,6 +1832,8 @@ impl Rig for PlayerRig<'_> {
         self.ready_state_at = Some(ready_state_at);
         self.origin = Some(origin);
         println!("play started");
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("ready");
         // A chart's first play: a retry runs from its own receipt.
         if let Some(sel) = &self.selection
             && self.retry_from.is_none()
@@ -1509,6 +2025,8 @@ impl Rig for PlayerRig<'_> {
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_result_work("ended");
         if let Some(c) = self.figures.as_ref().and_then(|f| f.ready_state) {
             println!(
                 "ready: setup {} us, first frame {} after it started",
@@ -1552,20 +2070,22 @@ impl Rig for PlayerRig<'_> {
     /// P: the own view's layout, asked for once its best is compared, with
     /// the view's final facts (design D11; the S10-09i design's Q1).
     fn result_compared(&mut self, _report: &PlayReport, screen: &ResultScreen) {
-        // The own view's best as the request takes it (dev-tools).
-        #[cfg(feature = "dev-tools")]
+        if let Some(chart) = self.result_chart
+            && !self.result_skin_suppressed()
         {
-            let best = match screen.status() {
-                game::ViewStatus::Ready(s) => match s.best {
-                    None => "none",
-                    Some(game::BestCompare::Unavailable) => "unavailable",
-                    Some(game::BestCompare::Known(_)) => "known",
-                },
-                _ => "no view",
-            };
-            println!("dev: result layout requested: best {best}");
-        }
-        if let Some(chart) = self.result_chart {
+            // The own view's best as the request takes it (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            {
+                let best = match screen.status() {
+                    game::ViewStatus::Ready(s) => match s.best {
+                        None => "none",
+                        Some(game::BestCompare::Unavailable) => "unavailable",
+                        Some(game::BestCompare::Known(_)) => "known",
+                    },
+                    _ => "no view",
+                };
+                println!("dev: result layout requested: best {best}");
+            }
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
             #[cfg(feature = "dev-tools")]
@@ -1580,7 +2100,7 @@ impl Rig for PlayerRig<'_> {
             // A script's step on the layout (dev-tools), at every look.
             #[cfg(feature = "dev-tools")]
             crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
-            if self.result_skin.poll() {
+            if self.land_result() {
                 return game::Polled::Ready;
             }
             let left = deadline.0 - self.clock.now().0;
@@ -1596,8 +2116,10 @@ impl Rig for PlayerRig<'_> {
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
-        // until it lands (design D11).
-        if let Some(chart) = self.result_chart {
+        // until it lands (design D11). The attempt's fallback requests none.
+        if let Some(chart) = self.result_chart
+            && !self.result_skin_suppressed()
+        {
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
         }
@@ -1620,6 +2142,9 @@ impl Rig for PlayerRig<'_> {
             ),
             graphs: end_screen::view_graphs(screen),
         });
+        // The skin's presentation goes first, so the built-in page does not
+        // draw before it.
+        self.present_view(report, screen);
         self.send_end(tuning.get());
 
         self.result_shown();
@@ -1781,6 +2306,173 @@ mod tests {
     use game::Command;
 
     use super::{until_due, until_fired};
+
+    /// The player's rig's preparation (design.md "Play Lifecycle",
+    /// preparing each attempt): it owns its jobs, and its answer stays
+    /// for its final readiness.
+    mod preparation {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use game::Rig as _;
+        use skin_beatoraja::JudgeClass;
+        use skin_beatoraja::lua::vm_hooks;
+
+        use crate::imports::facts::tests::loaded;
+        use crate::imports::tests as imports;
+        use crate::play::PrepStage;
+        use crate::render_side::ScreenError;
+        use crate::render_side::tests::{Installers, bundle};
+        use crate::result_skin::tests as result;
+        use crate::result_skin::{ResultSkin, ResultStart};
+
+        fn settings() -> game::Settings {
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            }
+        }
+
+        /// A render thread with `loaded`'s chart.
+        fn render(loaded: &game::Loaded) -> crate::render_side::RenderLink {
+            Installers::default().spawn(&Arc::new(loaded.chart().clone()), &bundle())
+        }
+
+        /// The stage the rig's preparation stands at.
+        fn stage<'r>(rig: &'r crate::play::PlayerRig<'_>) -> Option<&'r PrepStage> {
+            rig.prep.as_ref().map(|p| &p.stage)
+        }
+
+        /// A pending play skin built from `body`.
+        fn pending_play(body: &str) -> (tempfile::TempDir, crate::imports::PendingSkin) {
+            let r = crate::render_common::offscreen(1_920, 1_080);
+            let t = imports::target(&r);
+            let dir = imports::lua_skin(body);
+            let (p, _) = imports::pending(imports::play(
+                &imports::choice(dir.path(), "play.luaskin"),
+                &t,
+            ));
+            (dir, crate::imports::PendingSkin::new(p))
+        }
+
+        /// A rig shut down while its preparation's specialization runs
+        /// settles the job through the preparation's drop: cancelled, its
+        /// thread joined and its VM closed.
+        #[test]
+        fn a_rig_shut_down_mid_specialization_settles_its_job() {
+            let _serial = imports::serial();
+            let (_dir, skin) = pending_play("if ms.number(96) == 12 then while true do end end");
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            let base = vm_hooks::live();
+            let before = imports::jobs_counted();
+            let (began, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.pending = Some(skin);
+                    let _handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    matches!(stage(rig), Some(PrepStage::Skin(_)))
+                });
+            assert!(began, "the specialization runs");
+            let after = imports::jobs_counted();
+            assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+            assert_eq!(vm_hooks::live(), base);
+        }
+
+        /// A preparation discarded once its specialization has ended,
+        /// its outcome not taken, keeps the specialization: the next
+        /// preparation with the same facts reuses it, with no job.
+        #[test]
+        fn a_discarded_preparation_keeps_its_finished_specialization() {
+            let _serial = imports::serial();
+            let r = crate::render_common::offscreen(1_920, 1_080);
+            let t = imports::target(&r);
+            let dir = imports::class_skin();
+            let (p, _) = imports::pending(imports::play(
+                &imports::choice(dir.path(), "play.luaskin"),
+                &t,
+            ));
+            let loaded = loaded("#RANK 2\n", "tapestry");
+            let before = imports::jobs_counted();
+            let ((ran, reused), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.pending = Some(crate::imports::PendingSkin::new(p));
+                    let _first = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let ran = matches!(stage(rig), Some(PrepStage::Skin(_)));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !matches!(stage(rig), Some(PrepStage::Skin(job)) if job.finished())
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    rig.discard_attempt();
+                    let _second = rig.begin_preparation(&loaded, loaded.prep_key());
+                    (ran, !matches!(stage(rig), Some(PrepStage::Skin(_))))
+                });
+            assert!(ran, "the first preparation runs the specialization");
+            assert!(reused, "the second reuses it");
+            assert_eq!(imports::jobs_counted().0 - before.0, 1);
+        }
+
+        /// A preparation discarded while the result skin's image stage
+        /// runs hands the stage's images back to the result skin.
+        #[test]
+        fn a_discarded_preparation_hands_the_image_stages_images_back() {
+            let _serial = imports::serial();
+            let d = result::skin(
+                "if ms.number(96) == 13 then while true do end end",
+                "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+            );
+            let p = result::pending(d.path(), result::LIMITS);
+            let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+            result::staged_at(&mut rs, 12, JudgeClass::Normal);
+            assert!(rs.image().is_some(), "the probe's images");
+            let loaded = loaded("#PLAYLEVEL 13\n", "tapestry");
+            let ((ran, back), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.result_skin = rs;
+                    let _handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let ran = matches!(stage(rig), Some(PrepStage::Image(..)));
+                    rig.discard_attempt();
+                    (ran, rig.result_skin.image().is_some())
+                });
+            assert!(ran, "the image stage runs");
+            assert!(back, "its images handed back");
+        }
+
+        /// A poll with another preparation's ticket leaves the rig's
+        /// preparation in place, and a poll after it ended keeps its
+        /// answer: its final readiness is still ready.
+        #[test]
+        fn a_foreign_or_late_poll_keeps_the_preparation() {
+            let loaded = loaded("", "tapestry");
+            let ((foreign, ended, late, ready), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let mut handle = rig.begin_preparation(&loaded, loaded.prep_key());
+                    let mut other = game::PrepHandle::new(loaded.prep_key(), handle.ticket() + 1);
+                    let foreign = matches!(
+                        rig.poll_preparation(&mut other, Instant::now()),
+                        Err(ScreenError::Lost)
+                    );
+                    let ended = loop {
+                        let until = Instant::now() + Duration::from_millis(10);
+                        if let game::PrepPoll::Done(ended) =
+                            rig.poll_preparation(&mut handle, until).unwrap()
+                        {
+                            break ended;
+                        }
+                    };
+                    let late = matches!(
+                        rig.poll_preparation(&mut handle, Instant::now()),
+                        Err(ScreenError::Lost)
+                    );
+                    let ready = matches!(rig.ready_attempt(1, &handle), Ok(game::Readiness::Ready));
+                    (foreign, ended, late, ready)
+                });
+            assert!(foreign, "another ticket's poll is lost");
+            assert_eq!(ended, game::Preparation::Ready);
+            assert!(late, "a poll after the end answers nothing new");
+            assert!(ready, "the answered request stays");
+        }
+    }
 
     /// The awake time the marker wait reads, set by the test.
     static AWAKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
