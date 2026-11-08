@@ -1,8 +1,11 @@
 //! A destination's `op` that is not a table, through the import path:
-//! a Lua skin's reads as no condition, as the source's Lua loader reads
-//! any array field (`skin/lua/LuaSkinLoader.java:171-186` at `0.8.9`),
-//! with an ignored note at the value; a JSON skin's, and a Lua table
-//! with string keys, still fail the skin (`skin/json/JSONSkinLoader.java:109`).
+//! one of a Lua skin's converted table reads as no condition, as the
+//! source's Lua loader reads any array field
+//! (`skin/lua/LuaSkinLoader.java:171-186` at `0.8.9`), with an ignored
+//! note at the value. Tables and JSON values keep their handling: a Lua
+//! table with string keys, whose entries the source reads, and a JSON
+//! value, a file the Lua skin includes too, still fail the skin
+//! (`skin/json/JSONSkinLoader.java:109`).
 
 mod common;
 
@@ -24,6 +27,23 @@ fn lua_skin(op: &str) -> TempDir {
     );
     let d = common::skin(&[("s.luaskin", &text)]);
     common::png(d.path(), "a.png", 64, 64);
+    d
+}
+
+/// [`lua_skin`]'s skin with its destination list read from an included
+/// `d.json` holding `dst`.
+fn included(dst: &str) -> TempDir {
+    let d = lua_skin("901");
+    let text = std::fs::read_to_string(d.path().join("s.luaskin")).unwrap();
+    let start = text.find("skin.destination").unwrap();
+    let end = text.rfind("return skin").unwrap();
+    let text = format!(
+        "{}skin.destination = {{ {{ include = \"d.json\" }} }}\n{}",
+        &text[..start],
+        &text[end..]
+    );
+    common::write(d.path(), "s.luaskin", text.as_bytes());
+    common::write(d.path(), "d.json", dst.as_bytes());
     d
 }
 
@@ -88,6 +108,27 @@ fn a_lua_op_table_with_string_keys_still_fails() {
             expected: "an array",
             ..
         }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_json_op_included_by_a_lua_skin_still_fails() {
+    let dst = |op: &str| {
+        format!(r#"{{"id": "i", "op": {op}, "dst": [{{"x": 0, "y": 0, "w": 64, "h": 64}}]}}"#)
+    };
+    // The control: an array there reads as conditions.
+    assert!(drawn(&included(&dst("[901]"))).is_empty());
+    match lua(&included(&dst("901"))) {
+        Err(ImportError::Type {
+            at,
+            field: "op",
+            expected: "an array",
+        }) => assert_eq!(
+            (at.file.as_str(), at.line, at.col),
+            ("d.json", 1, 19),
+            "{at:?}"
+        ),
         other => panic!("{other:?}"),
     }
 }
