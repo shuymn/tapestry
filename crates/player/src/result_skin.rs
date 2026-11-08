@@ -1155,6 +1155,8 @@ impl ResultSkin {
     pub fn settle(&mut self, end_run: impl FnMut() -> bool) {
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settle");
+        #[cfg(all(test, feature = "dev-tools"))]
+        crate::dev::hold_result_settle();
         self.waiting = None;
         self.deferred = None;
         if let Some((job, _, slot)) = self.job.take() {
@@ -1165,6 +1167,12 @@ impl ResultSkin {
                 Ran::Abandoned => {}
             }
         }
+    }
+
+    /// The requests made so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn requests(&self) -> u64 {
+        self.next_request
     }
 
     /// Whether a layout job runs.
