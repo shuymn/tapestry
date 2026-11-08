@@ -31,7 +31,6 @@
 //! accepts is Lua's syntax error.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use mlua::chunk::ChunkMode;
@@ -416,8 +415,9 @@ fn name_arg(lua: &Lua, pass: &Pass, args: &MultiValue) -> mlua::Result<Vec<u8>> 
 }
 
 /// The confined `require`.
-pub(super) fn require(lua: &Lua, pass: &Rc<Pass>) -> mlua::Result<Function> {
+pub(super) fn require(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<Function> {
     host(lua, pass, 1, |lua, pass, args| {
+        pass.import_only(lua)?;
         invocation(lua, pass)?;
         pass.ledger.update(|c| c.requires += 1);
         let name = name_arg(lua, pass, &args)?;
@@ -458,8 +458,9 @@ pub(super) fn require(lua: &Lua, pass: &Rc<Pass>) -> mlua::Result<Function> {
 }
 
 /// The confined `dofile`.
-pub(super) fn dofile(lua: &Lua, pass: &Rc<Pass>) -> mlua::Result<Function> {
+pub(super) fn dofile(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<Function> {
     host(lua, pass, 1, |lua, pass, args| {
+        pass.import_only(lua)?;
         invocation(lua, pass)?;
         pass.ledger.update(|c| c.dofiles += 1);
         let name = name_arg(lua, pass, &args)?;
