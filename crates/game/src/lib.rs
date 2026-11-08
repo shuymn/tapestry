@@ -78,7 +78,7 @@ pub use keys::{
 };
 pub use live::{
     CLOSE_FLOOR, Closing, ClosingEnd, InputWaitError, Leave, LiveError, Opening, Polled, Rearm,
-    Rig, closing_deadline, closing_time,
+    ResultTiming, Rig, closing_deadline, closing_time,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,

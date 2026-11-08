@@ -417,11 +417,27 @@ pub trait Rig {
     /// work it began for it and waits for it (design.md "State Model",
     /// ResultPreparing). By default, nothing.
     fn withdraw_result(&mut self) {}
-    /// The Result state acts on the leaving command `cmd` (retry, or back
-    /// or the quit key as back): called just before it is served, never
+    /// The Result state accepts the leaving command `cmd` (retry, or back
+    /// or the quit key as back, or back when the skin's scene time passed):
+    /// called at its acceptance, after [`begin_outro`](Self::begin_outro)
+    /// when the skin's timing applies, and before its outro plays; never
     /// for a command the flow drops. By default, nothing.
     fn accept_leaving(&mut self, cmd: MenuCommand) {
         let _ = cmd;
+    }
+    /// The result skin's timing as the result shows now (design.md "State
+    /// Model", Result): `None` while the built-in presentation shows, or
+    /// the skin fell back, so commands take effect at once. Read at every
+    /// look on the result, since a fallback changes it. By default, `None`.
+    fn result_timing(&self) -> Option<ResultTiming> {
+        None
+    }
+    /// A leaving command is accepted at `at` with the skin's timing: the
+    /// view on screen is pinned and the fade-out starts at `at`, before
+    /// [`accept_leaving`](Self::accept_leaving) settles anything. By
+    /// default, nothing.
+    fn begin_outro(&mut self, at: TimeUs) {
+        let _ = at;
     }
     /// Shows the end screen of a play that was not retried or quit in its
     /// READY state, with its result screen's view; called again whenever the
@@ -762,6 +778,28 @@ impl ClosingStage {
     }
 }
 
+/// What a result skin declares for its screen's timing, in the flow's own
+/// terms (design.md "State Model", Result): the outro retry, back and the
+/// quit key wait for once accepted, the time from the result's start before
+/// which commands are dropped, and when it leaves on its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResultTiming {
+    /// How long the fade-out plays before the accepted command is served.
+    pub outro: TimeUs,
+    /// How long from the result's start retry, back, the quit key and
+    /// preset steps are dropped.
+    pub input: TimeUs,
+    /// When back is accepted with no command, from the result's start;
+    /// `None` never.
+    pub scene: Option<TimeUs>,
+}
+
+/// Whether `timing`'s outro begun at `at` is over at `now`: at once with no
+/// timing (the built-in presentation, or a fallback).
+fn outro_over(timing: Option<ResultTiming>, at: TimeUs, now: TimeUs) -> bool {
+    timing.is_none_or(|t| now.0 >= at.0.saturating_add(t.outro.0))
+}
+
 /// What Closing has latched: a retry or a suspend taken since its
 /// admission, the play's last steps' suspend included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -855,13 +893,28 @@ pub fn run_chart<R: Rig>(
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
+        // The result's start: a skin's input and scene times count from it.
+        let start = rig.now();
         rig.show_end(&report, &screen);
+        // The leaving command accepted and its outro's start.
+        let mut outro: Option<(MenuCommand, TimeUs)> = None;
         loop {
             // The wait ends at the shelf's poll deadline at the latest, so
-            // a wake just before it does not put the check off.
+            // a wake just before it does not put the check off; with a
+            // skin, at the outro's end or the scene time too.
             let now = rig.now();
             let deadline = loaded.shelf().deadline().next(now);
-            rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
+            let mut until = now.0.saturating_add(IDLE_WAIT.0).min(deadline.0);
+            if let Some(t) = rig.result_timing() {
+                let due = match (outro, t.scene) {
+                    (Some((_, at)), _) => Some(at.0.saturating_add(t.outro.0)),
+                    (None, Some(scene)) => Some(start.0.saturating_add(scene.0)),
+                    (None, None) => None,
+                };
+                until = due.map_or(until, |d| until.min(d));
+            }
+            rig.idle_wait(TimeUs(until));
+            // The close ends the run at once, an outro playing included.
             if rig.quitting() {
                 return leave(rig);
             }
@@ -878,26 +931,65 @@ pub fn run_chart<R: Rig>(
             // Commands queued behind the one that leaves the result belong
             // to that result and are dropped with it. Every switch queued
             // is taken in one wake.
-            let mut retry = false;
-            while let Some(c) = rig.take_menu() {
-                match c {
-                    MenuCommand::Retry => {
-                        rig.accept_leaving(MenuCommand::Retry);
-                        retry = true;
-                        break;
+            // With a skin's timing, commands before its input time and
+            // while an outro plays are dropped; a positive scene time with
+            // no command accepts back. The skin's fallback takes the timing
+            // away: what waits on the outro is served at this look.
+            let now = rig.now();
+            let timing = rig.result_timing();
+            let mut served = None;
+            if let Some((cmd, at)) = outro {
+                while rig.take_menu().is_some() {}
+                if outro_over(timing, at, now) {
+                    served = Some(cmd);
+                }
+            } else {
+                let open = timing.is_none_or(|t| now.0 >= start.0.saturating_add(t.input.0));
+                let mut accepted = None;
+                while let Some(c) = rig.take_menu() {
+                    match c {
+                        _ if !open => {}
+                        MenuCommand::Retry | MenuCommand::Back => {
+                            accepted = Some(c);
+                            break;
+                        }
+                        MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
+                        MenuCommand::PrevPreset => {
+                            dirty |= screen.step(-1, &report, loaded.chart())
+                        }
                     }
-                    MenuCommand::Back => {
-                        rig.accept_leaving(MenuCommand::Back);
-                        while rig.take_menu().is_some() {}
-                        return leave(rig);
+                }
+                if accepted.is_none()
+                    && let Some(scene) = timing.and_then(|t| t.scene)
+                    && now.0 >= start.0.saturating_add(scene.0)
+                {
+                    accepted = Some(MenuCommand::Back);
+                }
+                if let Some(cmd) = accepted {
+                    // The view is pinned and the fade-out started before
+                    // the rig settles its work for the command.
+                    let at = rig.now();
+                    if timing.is_some() {
+                        rig.begin_outro(at);
                     }
-                    MenuCommand::NextPreset => dirty |= screen.step(1, &report, loaded.chart()),
-                    MenuCommand::PrevPreset => dirty |= screen.step(-1, &report, loaded.chart()),
+                    rig.accept_leaving(cmd);
+                    if outro_over(timing, at, at) {
+                        served = Some(cmd);
+                    } else {
+                        outro = Some((cmd, at));
+                    }
                 }
             }
-            if retry {
-                while rig.take_menu().is_some() {}
-                break;
+            match served {
+                Some(MenuCommand::Retry) => {
+                    while rig.take_menu().is_some() {}
+                    break;
+                }
+                Some(_) => {
+                    while rig.take_menu().is_some() {}
+                    return leave(rig);
+                }
+                None => {}
             }
             // The screen failed during the play, its tail or this wait: it
             // is built again, acknowledged, before the end screen shows
