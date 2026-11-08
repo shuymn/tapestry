@@ -39,8 +39,13 @@ use library::{
     ScanOptions, ScanReport, Score, Search, Sort,
 };
 
+use game::coord::Coordinator;
+
 use crate::background::{Job, Queued, Worker};
 use crate::loudness::{Host, Loudness};
+#[cfg(test)]
+use crate::priority::Unchanged;
+use crate::priority::{Checked, ThreadMode};
 use crate::ui_text::{Label, Message};
 
 /// How often a load's wait for its chart's background measurement looks
@@ -200,22 +205,22 @@ pub struct Shelf {
 
 impl Shelf {
     /// Keeps `library` current over `roots`, and its bests over the
-    /// records in `records`, if given, starting the first pass.
+    /// records in `records`, if given, starting the first pass; the
+    /// background measurement runs on `coord`'s speculative permits.
     pub fn new(
         library: Library,
         roots: Vec<PathBuf>,
         rescan_after: Duration,
         records: Option<PathBuf>,
+        coord: &Coordinator,
     ) -> Self {
         let options = ScanOptions {
             on_thread_start: Some(Arc::new(background_mode)),
             records,
             ..ScanOptions::default()
         };
-        // In background mode as the scan.
-        let hook = options.on_thread_start.clone();
         Self::with_worker(library, roots, rescan_after, options, || {
-            Worker::start(Box::new(crate::background::measure), hook)
+            background_worker(coord, Arc::new(Checked::SYSTEM))
         })
     }
 
@@ -229,7 +234,7 @@ impl Shelf {
         options: ScanOptions,
     ) -> Self {
         Self::with_worker(library, roots, rescan_after, options, || {
-            Worker::start(Box::new(crate::background::measure), None)
+            background_worker(&tests::coordinator(), Arc::new(Unchanged))
         })
     }
 
@@ -754,6 +759,17 @@ impl Drop for Shelf {
     }
 }
 
+/// The background measurement on `coord`, entering background mode through
+/// `mode`: none without a speculative permit (two cores or fewer, or
+/// speculation off), and a cancelled load's chart is then measured at its
+/// next choice.
+fn background_worker(coord: &Coordinator, mode: Arc<dyn ThreadMode>) -> std::io::Result<Worker> {
+    if coord.caps().speculative == 0 {
+        return Err(std::io::Error::other("no speculative permit"));
+    }
+    Worker::start(Box::new(crate::background::measure), coord.clone(), mode)
+}
+
 /// Waits for the scan, then the background measurement, both already told
 /// to stop, until `deadline` on the clock `now`: each wait gets only the
 /// time left, so the two share one bound. Whether the scan stopped (or
@@ -807,14 +823,30 @@ pub fn file_name(path: &Path) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     use game::DataRoot;
+    use game::coord::{Caps, Coordinator};
     use library::{Search, Sort};
 
     use super::{OpenError, PAUSE_SLICE, Paused, Shelf, open};
+    use crate::priority::{PriorityError, ThreadMode, Unchanged};
+
+    /// A coordinator with one speculative permit, whatever the machine.
+    pub(crate) fn coordinator() -> Coordinator {
+        Coordinator::new(Caps {
+            foreground: game::coord::FOREGROUND_PERMITS,
+            speculative: 1,
+        })
+    }
+
+    /// A background measurement with `measure` on [`coordinator`], its
+    /// thread keeping its priority.
+    fn start(measure: crate::background::Measure) -> std::io::Result<Worker> {
+        Worker::start(measure, coordinator(), Arc::new(Unchanged))
+    }
 
     fn chart(dir: &Path, name: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -869,10 +901,22 @@ mod tests {
         let charts = dir.path().join("charts");
         chart(&charts, "a.bms");
         let (library, _) = open(&DataRoot::new(dir.path().join("data"))).unwrap();
-        let shelf = Shelf::new(library, vec![charts], Duration::from_millis(20), None);
+        let shelf = Shelf::new(
+            library,
+            vec![charts],
+            Duration::from_millis(20),
+            None,
+            &coordinator(),
+        );
         assert_eq!(shelf.status(), "スキャン中");
         let (library, _) = open(&DataRoot::new(dir.path().join("none"))).unwrap();
-        let mut shelf = Shelf::new(library, Vec::new(), Duration::from_millis(20), None);
+        let mut shelf = Shelf::new(
+            library,
+            Vec::new(),
+            Duration::from_millis(20),
+            None,
+            &coordinator(),
+        );
         assert_eq!(
             shelf.status(),
             "device.toml に [library] roots がありません"
@@ -910,6 +954,7 @@ mod tests {
             vec![charts.clone()],
             Duration::from_millis(20),
             None,
+            &coordinator(),
         );
         pass_ends(&mut shelf);
         assert!(holds(&shelf, "refused.bms"));
@@ -946,7 +991,13 @@ mod tests {
             chart(&charts.join(format!("f{}", k / 50)), &format!("{k}.bms"));
         }
         let (library, _) = open(&root).unwrap();
-        let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60), None);
+        let mut shelf = Shelf::new(
+            library,
+            vec![charts],
+            Duration::from_secs(60),
+            None,
+            &coordinator(),
+        );
         assert!(shelf.has_scan());
         assert_eq!(wait(&mut shelf), Paused::Acknowledged);
         assert!(shelf.paused());
@@ -977,6 +1028,7 @@ mod tests {
                 vec![charts.clone()],
                 Duration::from_secs(60),
                 Some(root.records()),
+                &coordinator(),
             );
             pass_ends(&mut shelf);
             assert!(!shelf.library.bests_pending().unwrap());
@@ -1005,7 +1057,7 @@ mod tests {
 
     fn gated(dir: &Path) -> (Shelf, Gate) {
         gated_with(dir, || {
-            Worker::start(Box::new(crate::background::measure), None)
+            super::background_worker(&coordinator(), Arc::new(Unchanged))
         })
     }
 
@@ -1132,6 +1184,77 @@ mod tests {
     use std::sync::Arc;
 
     use crate::background::{Job, Queued, Worker};
+
+    /// Background mode refused.
+    struct Refused;
+
+    impl ThreadMode for Refused {
+        fn enter_background(&self) -> Result<(), PriorityError> {
+            Err(PriorityError("refused (test)".to_owned()))
+        }
+
+        fn leave_background(&self) -> Result<(), PriorityError> {
+            Err(PriorityError("refused (test)".to_owned()))
+        }
+    }
+
+    /// Without a speculative permit (two cores, or speculation off) no
+    /// background measurement starts, and a cancelled load's chart is
+    /// measured at its next choice, in the foreground.
+    #[test]
+    fn without_a_speculative_permit_a_cancelled_chart_is_measured_at_its_next_choice() {
+        for caps in [Caps::for_machine(1, 2), Caps::for_machine(0, 16)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (c, b, _, path) = song(dir.path());
+            let (library, _) = open_library(dir.path());
+            let mut shelf = Shelf::new(
+                library,
+                Vec::new(),
+                Duration::from_secs(60),
+                None,
+                &Coordinator::new(caps),
+            );
+            assert!(shelf.background.is_none());
+            cancelled_load(&mut shelf, &c, &b, &path);
+            assert_eq!(
+                shelf.wait_background(&path, "a.bms", || false, || {}),
+                game::Loading::Ready
+            );
+            let mut host = Host::default();
+            shelf.loaded(&c, &b, "a.bms", &path, &mut host);
+            assert_eq!(host.measuring, 1);
+        }
+    }
+
+    /// A background whose entry into background mode is refused runs no
+    /// job: a cancelled load's chart is not left to it, and its next
+    /// choice measures it in the foreground.
+    #[test]
+    fn with_background_mode_refused_a_cancelled_chart_is_measured_at_its_next_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, b, _, path) = song(dir.path());
+        let (library, _) = open_library(dir.path());
+        let mut shelf = Shelf::with_worker(
+            library,
+            Vec::new(),
+            Duration::from_secs(60),
+            library::ScanOptions::default(),
+            || super::background_worker(&coordinator(), Arc::new(Refused)),
+        );
+        until("the background's end", || {
+            worker(&shelf).queue(job(Path::new("x.bms"))) == Queued::Ended
+        });
+        cancelled_load(&mut shelf, &c, &b, &path);
+        assert!(!worker(&shelf).holds(&path));
+        assert_eq!(
+            shelf.wait_background(&path, "a.bms", || false, || {}),
+            game::Loading::Ready
+        );
+        let mut host = Host::default();
+        shelf.loaded(&c, &b, "a.bms", &path, &mut host);
+        assert_eq!(host.measuring, 1);
+        assert_eq!(wait(&mut shelf), Paused::Idle);
+    }
     use crate::loudness::fixture::{self as sound, Host, bank, square, write_sound};
 
     /// A shelf without roots (no scan).
@@ -1208,7 +1331,7 @@ mod tests {
             Vec::new(),
             Duration::from_secs(60),
             library::ScanOptions::default(),
-            || Worker::start(measure, None),
+            || start(measure),
         )
     }
 
@@ -1519,7 +1642,7 @@ mod tests {
             }
             crate::background::Outcome::Measured(key, ROW)
         });
-        let (shelf, gate) = gated_with(dir.path(), || Worker::start(measure, None));
+        let (shelf, gate) = gated_with(dir.path(), || start(measure));
         worker(&shelf).queue(job(&path));
         until("the background's start", || started.load(Ordering::SeqCst));
         let (dropped_tx, dropped) = std::sync::mpsc::channel();

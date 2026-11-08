@@ -2,12 +2,21 @@
 //! measurement, measured in the background (design.md "Algorithms",
 //! per-chart volume normalization), so the chart's next choice finds it.
 //!
-//! - **One thread** at background priority, as the scan's, measures the
-//!   jobs one at a time in the order they came. A job is the chart's file
-//!   and what its 1× read needs; the thread reads the chart again at 1×,
-//!   decodes its own 1× bank on itself and analyzes it, asking before each
-//!   file, packet, chunk and block whether to stop. It never keeps a
+//! - **One thread** in background mode measures the jobs one at a time in
+//!   the order they came, each on a speculative permit of the coordinator
+//!   ([`game::coord`]), held only while it measures. A job is the chart's
+//!   file and what its 1× read needs; the thread reads the chart again at
+//!   1×, decodes its own 1× bank on itself and analyzes it, asking before
+//!   each file, packet, chunk and block whether to stop. It never keeps a
 //!   cancelled load's bank.
+//! - **Priority** is checked ([`crate::priority`]): when the thread cannot
+//!   enter background mode, it runs no job and ends, said once, and a
+//!   cancelled load's chart is measured at its next choice, as when the
+//!   thread cannot start. The measurement of a chart chosen while it runs
+//!   is promoted: its permit moves to the foreground and the thread leaves
+//!   background mode until it ends (a refused leave is said, and the
+//!   measurement goes on at background priority); entering it again
+//!   before the next job is checked as the first entry.
 //! - **The queue** holds at most [`WAITING`] jobs besides the running one,
 //!   none of a chart already waiting or running. When full, the oldest
 //!   waiting job is dropped, never the running one; a dropped chart is
@@ -28,7 +37,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -36,10 +44,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use audio::{BankError, BankLimits, Speed};
+use game::coord::{self, Class, Coordinator, Promoter};
 use game::{Chain, ChartSource};
 use library::{LoudnessKey, LoudnessRow};
 
 use crate::loudness::{self, Analyzed};
+use crate::priority::ThreadMode;
 
 /// The most jobs waiting besides the running one.
 pub const WAITING: usize = 4;
@@ -118,6 +128,8 @@ struct State {
     shutdown: bool,
     /// The thread has ended, or is ending and will do nothing more.
     finished: bool,
+    /// Promotes the running measurement.
+    promoter: Option<Promoter>,
     /// Jobs ended and not yet taken.
     results: Vec<Finished>,
 }
@@ -210,27 +222,28 @@ impl std::fmt::Debug for Worker {
     }
 }
 
-/// What the thread runs first (the player's background mode).
-pub type StartHook = Arc<dyn Fn() + Send + Sync>;
-
 impl Worker {
-    /// Starts the thread, which runs `on_start` first and then measures
-    /// each job with `measure`.
+    /// Starts the thread, which enters background mode through `mode` and
+    /// then measures each job with `measure`, on a speculative permit of
+    /// `coord`.
     ///
     /// # Errors
     ///
     /// Why the thread cannot start.
-    pub fn start(measure: Measure, on_start: Option<StartHook>) -> io::Result<Self> {
+    pub fn start(
+        measure: Measure,
+        coord: Coordinator,
+        mode: Arc<dyn ThreadMode>,
+    ) -> io::Result<Self> {
         let shared = Arc::new(Shared::default());
         let ending = Ending(Arc::clone(&shared));
         let thread = thread::Builder::new()
             .name("loudness-background".to_owned())
             .spawn(move || {
                 let (ending, mut measure) = (ending, measure);
-                if let Some(hook) = &on_start {
-                    hook();
+                if entered(&*mode) {
+                    run(&ending.0, &mut measure, &coord, &*mode);
                 }
-                run(&ending.0, &mut measure);
             })?;
         Ok(Self {
             shared,
@@ -294,6 +307,12 @@ impl Worker {
             s.pause = true;
             s.pause_gen += 1;
             s.chosen = chosen.map(Path::to_owned);
+            if let Some(chosen) = chosen
+                && s.holds(chosen)
+                && let Some(promoter) = &s.promoter
+            {
+                promoter.promote();
+            }
         });
     }
 
@@ -353,9 +372,9 @@ impl Drop for Worker {
 
 /// The thread's loop: takes the jobs in order while nothing pauses it,
 /// acknowledges each pause, and ends at the shutdown.
-fn run(shared: &Shared, measure: &mut Measure) {
+fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn ThreadMode) {
     loop {
-        let job = {
+        let (job, task) = {
             let mut s = shared.lock();
             loop {
                 if s.shutdown {
@@ -367,7 +386,15 @@ fn run(shared: &Shared, measure: &mut Measure) {
                 if let Some(job) = &s.current
                     && s.may_run(job.path())
                 {
-                    break job.clone();
+                    let job = job.clone();
+                    let task = coord.task::<Outcome>(Class::Speculative);
+                    let promoter = task.promoter();
+                    // Chosen before it started: promoted from its start.
+                    if s.chosen.as_deref() == Some(job.path()) {
+                        promoter.promote();
+                    }
+                    s.promoter = Some(promoter);
+                    break (job, task);
                 }
                 if s.pause && s.acked_gen != s.pause_gen {
                     s.acked_gen = s.pause_gen;
@@ -391,16 +418,40 @@ fn run(shared: &Shared, measure: &mut Measure) {
             }
             stop
         };
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| measure(&job, &stop)))
-            .unwrap_or_else(|_| {
-                Outcome::Failed("the background measurement stopped unexpectedly".to_owned())
-            });
+        // Whether the thread left background mode for a promotion.
+        let left = AtomicBool::new(false);
+        let on_promote = || match mode.leave_background() {
+            Ok(()) => left.store(true, Ordering::Relaxed),
+            Err(e) => warn(&format!(
+                "loudness: {}: background mode could not be left ({e}); measured at background priority",
+                job.name
+            )),
+        };
+        let outcome = match task.run(&stop, &on_promote, |ctx| {
+            measure(&job, &|| ctx.checkpoint())
+        }) {
+            coord::Outcome::Done(outcome) => outcome,
+            // The wait for its permit stopped: as a stop it was told.
+            coord::Outcome::Cancelled if told.load(Ordering::Relaxed) => Outcome::Stopped,
+            coord::Outcome::Cancelled => Outcome::Failed("no speculative permit".to_owned()),
+            coord::Outcome::Panicked(p) => Outcome::Failed(format!(
+                "the background measurement stopped unexpectedly: {p}"
+            )),
+        };
+        // Back in background mode before the next job, or no more jobs.
+        let resumed = !left.load(Ordering::Relaxed) || entered(mode);
         let mut s = shared.lock();
+        s.promoter = None;
         let measured = match outcome {
             // Kept as the job in hand, even when the pause was released
             // meanwhile: measured again from the beginning once it may be,
             // or dropped at the shutdown.
-            Outcome::Stopped if told.load(Ordering::Relaxed) => continue,
+            Outcome::Stopped if told.load(Ordering::Relaxed) => {
+                if resumed {
+                    continue;
+                }
+                return;
+            }
             Outcome::Measured(key, row) => Some((key, row)),
             Outcome::Stopped => {
                 loudness::log_line(
@@ -421,7 +472,30 @@ fn run(shared: &Shared, measure: &mut Measure) {
         s.results.push(Finished { path, measured });
         drop(s);
         shared.changed.notify_all();
+        if !resumed {
+            return;
+        }
     }
+}
+
+/// Enters background mode through `mode`; `false`, said once (the thread
+/// then ends), when the system refuses it.
+fn entered(mode: &dyn ThreadMode) -> bool {
+    match mode.enter_background() {
+        Ok(()) => true,
+        Err(e) => {
+            warn(&format!(
+                "loudness: background mode refused ({e}); the background measurement is off for this run"
+            ));
+            false
+        }
+    }
+}
+
+/// A warning on the console and in the log.
+fn warn(line: &str) {
+    eprintln!("{line}");
+    log::warn!("{line}");
 }
 
 /// The player's measurement of a job: the chart read again at 1× with the
@@ -483,9 +557,11 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use game::ChartSource;
+    use game::coord::{Caps, Class, Coordinator};
     use library::{LoudnessKey, LoudnessRow};
 
     use super::{Finished, Job, Measure, Outcome, Queued, Worker};
+    use crate::priority::{PriorityError, ThreadMode, Unchanged};
 
     /// How long a test waits for what must happen however late a loaded
     /// machine runs it.
@@ -585,9 +661,72 @@ mod tests {
         }
     }
 
+    const CAPS: Caps = Caps {
+        foreground: 4,
+        speculative: 1,
+    };
+
+    /// A worker on a coordinator of its own whose thread keeps its
+    /// priority.
+    fn start(measure: Measure) -> Worker {
+        Worker::start(measure, Coordinator::new(CAPS), Arc::new(Unchanged)).unwrap()
+    }
+
+    /// A background mode that counts its calls and refuses what it is
+    /// told to.
+    #[derive(Default)]
+    struct Mode {
+        enters: AtomicUsize,
+        leaves: AtomicUsize,
+        /// Entries from this one on (counted from 1) are refused; 0 for
+        /// none.
+        refuse_entry_from: AtomicUsize,
+        refuse_leave: AtomicBool,
+        /// The entry panics.
+        panics: AtomicBool,
+    }
+
+    impl ThreadMode for Mode {
+        fn enter_background(&self) -> Result<(), PriorityError> {
+            assert!(
+                !self.panics.load(Ordering::SeqCst),
+                "the entry failed (test)"
+            );
+            let n = self.enters.fetch_add(1, Ordering::SeqCst) + 1;
+            let from = self.refuse_entry_from.load(Ordering::SeqCst);
+            if from != 0 && n >= from {
+                return Err(PriorityError("refused (test)".to_owned()));
+            }
+            Ok(())
+        }
+
+        fn leave_background(&self) -> Result<(), PriorityError> {
+            self.leaves.fetch_add(1, Ordering::SeqCst);
+            if self.refuse_leave.load(Ordering::SeqCst) {
+                return Err(PriorityError("refused (test)".to_owned()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A worker measuring with a probe, on `coord`, with `mode`.
+    fn moded(coord: &Coordinator, mode: &Arc<Mode>) -> (Worker, Arc<Probe>) {
+        let probe = Arc::new(Probe::default());
+        let mode: Arc<dyn ThreadMode> = Arc::clone(mode) as _;
+        let worker = Worker::start(fake(&probe), coord.clone(), mode).unwrap();
+        (worker, probe)
+    }
+
+    fn held(coord: &Coordinator) -> (usize, usize) {
+        (
+            coord.held(Class::Speculative),
+            coord.held(Class::Foreground),
+        )
+    }
+
     fn started() -> (Worker, Arc<Probe>) {
         let probe = Arc::new(Probe::default());
-        (Worker::start(fake(&probe), None).unwrap(), probe)
+        (start(fake(&probe)), probe)
     }
 
     fn paths(results: &[Finished]) -> Vec<PathBuf> {
@@ -776,7 +915,7 @@ mod tests {
             let _ = go.recv();
             Outcome::Stopped
         });
-        let worker = Worker::start(measure, None).unwrap();
+        let worker = start(measure);
         worker.queue(job("a"));
         until("a's start", || runs.load(Ordering::SeqCst) == 1);
         worker.request_pause(None);
@@ -811,7 +950,7 @@ mod tests {
             let _ = go.recv();
             Outcome::Stopped
         });
-        let worker = Worker::start(measure, None).unwrap();
+        let worker = start(measure);
         worker.queue(job("a"));
         started.recv_timeout(WATCHDOG).unwrap();
         worker.request_pause(None);
@@ -831,21 +970,157 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
-    /// A thread that ended (its start hook panicked) takes no job, holds
-    /// none, and counts as paused, so no READY state waits for it.
+    /// A thread that ended (its entry into background mode was refused, or
+    /// panicked) takes no job, holds none, and counts as paused, so no
+    /// READY state waits for it; nothing is measured.
     #[test]
     fn an_ended_thread_takes_nothing() {
-        let probe = Arc::new(Probe::default());
-        let worker = Worker::start(
-            fake(&probe),
-            Some(Arc::new(|| panic!("the start failed (test)"))),
-        )
-        .unwrap();
-        until("the end", || worker.queue(job("a")) == Queued::Ended);
-        assert!(!worker.holds(Path::new("a")));
+        for panics in [false, true] {
+            let mode = Arc::new(Mode::default());
+            mode.refuse_entry_from.store(1, Ordering::SeqCst);
+            mode.panics.store(panics, Ordering::SeqCst);
+            let (worker, probe) = moded(&Coordinator::new(CAPS), &mode);
+            until("the end", || worker.queue(job("a")) == Queued::Ended);
+            assert!(!worker.holds(Path::new("a")));
+            worker.request_pause(None);
+            assert!(worker.wait_paused(WATCHDOG));
+            assert!(worker.wait_done(Path::new("a"), Duration::ZERO));
+            assert!(probe.starts().is_empty());
+            assert!(worker.take_results().is_empty());
+        }
+    }
+
+    /// The worker holds its speculative permit only while it measures: none
+    /// while it waits for a job or is paused. With the permit taken, no
+    /// measurement starts; a pause meanwhile is acknowledged, and the job
+    /// runs once the permit is free and the pause released.
+    #[test]
+    fn the_permit_is_held_only_while_measuring() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let (worker, probe) = moded(&coord, &mode);
+        assert_eq!(held(&coord), (0, 0));
+        worker.queue(job("a"));
+        until("a's start", || !probe.starts().is_empty());
+        assert_eq!(held(&coord), (1, 0));
         worker.request_pause(None);
         assert!(worker.wait_paused(WATCHDOG));
-        assert!(worker.wait_done(Path::new("a"), Duration::ZERO));
-        assert!(probe.starts().is_empty());
+        assert_eq!(held(&coord), (0, 0));
+        let blocker = coord.try_lease(Class::Speculative).unwrap();
+        worker.release();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(probe.starts(), all(&["a"]));
+        worker.request_pause(None);
+        assert!(worker.wait_paused(WATCHDOG));
+        drop(blocker);
+        worker.release();
+        probe.open.store(true, Ordering::SeqCst);
+        assert_eq!(paths(&drain(&worker)), all(&["a"]));
+        assert_eq!(probe.starts(), all(&["a", "a"]));
+        assert_eq!(held(&coord), (0, 0));
+        assert_eq!(mode.leaves.load(Ordering::SeqCst), 0);
+    }
+
+    /// The measurement of the chart chosen while it runs is promoted: its
+    /// permit moves to the foreground and the thread leaves background mode
+    /// on itself; once it ends the thread enters background mode again and
+    /// measures the next job on a speculative permit.
+    #[test]
+    fn the_chosen_charts_measurement_is_promoted() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let (worker, probe) = moded(&coord, &mode);
+        worker.queue(job("a"));
+        until("a's start", || !probe.starts().is_empty());
+        assert_eq!(held(&coord), (1, 0));
+        worker.request_pause(Some(Path::new("a")));
+        until("the promotion", || held(&coord) == (0, 1));
+        assert_eq!(mode.leaves.load(Ordering::SeqCst), 1);
+        assert_eq!(mode.enters.load(Ordering::SeqCst), 1);
+        probe.open.store(true, Ordering::SeqCst);
+        assert!(worker.wait_done(Path::new("a"), WATCHDOG));
+        assert_eq!(
+            worker.take_results(),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: Some((key(Path::new("a")), ROW)),
+            }]
+        );
+        assert!(worker.wait_paused(WATCHDOG));
+        until("the entry again", || {
+            mode.enters.load(Ordering::SeqCst) == 2
+        });
+        until("the permit's return", || held(&coord) == (0, 0));
+        probe.open.store(false, Ordering::SeqCst);
+        worker.release();
+        worker.queue(job("b"));
+        until("b's start", || probe.starts().len() == 2);
+        assert_eq!(held(&coord), (1, 0));
+        probe.open.store(true, Ordering::SeqCst);
+        assert_eq!(paths(&drain(&worker)), all(&["b"]));
+        assert_eq!(mode.leaves.load(Ordering::SeqCst), 1);
+    }
+
+    /// A job kept by a pause and then chosen is promoted from its start.
+    #[test]
+    fn a_job_chosen_before_it_runs_again_is_promoted_from_its_start() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let (worker, probe) = moded(&coord, &mode);
+        worker.queue(job("a"));
+        until("a's start", || !probe.starts().is_empty());
+        worker.request_pause(None);
+        assert!(worker.wait_paused(WATCHDOG));
+        assert!(worker.holds(Path::new("a")));
+        worker.request_pause(Some(Path::new("a")));
+        until("a's second start", || probe.starts().len() == 2);
+        until("the promotion", || held(&coord) == (0, 1));
+        assert_eq!(mode.leaves.load(Ordering::SeqCst), 1);
+        probe.open.store(true, Ordering::SeqCst);
+        assert!(worker.wait_done(Path::new("a"), WATCHDOG));
+        assert_eq!(paths(&worker.take_results()), all(&["a"]));
+    }
+
+    /// A refused leave is said and the measurement goes on, on its
+    /// foreground permit at background priority; the thread, still in
+    /// background mode, enters nothing again and measures the next job.
+    #[test]
+    fn a_refused_leave_measures_on_at_background_priority() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        mode.refuse_leave.store(true, Ordering::SeqCst);
+        let (worker, probe) = moded(&coord, &mode);
+        worker.queue(job("a"));
+        until("a's start", || !probe.starts().is_empty());
+        worker.request_pause(Some(Path::new("a")));
+        until("the promotion", || held(&coord) == (0, 1));
+        assert_eq!(mode.leaves.load(Ordering::SeqCst), 1);
+        probe.open.store(true, Ordering::SeqCst);
+        assert!(worker.wait_done(Path::new("a"), WATCHDOG));
+        assert_eq!(paths(&worker.take_results()), all(&["a"]));
+        worker.release();
+        worker.queue(job("b"));
+        assert_eq!(paths(&drain(&worker)), all(&["b"]));
+        assert_eq!(mode.enters.load(Ordering::SeqCst), 1);
+    }
+
+    /// A refused entry after a promotion keeps the promoted job's result
+    /// and ends the thread: no further job is measured.
+    #[test]
+    fn a_refused_entry_after_a_promotion_ends_the_thread() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        mode.refuse_entry_from.store(2, Ordering::SeqCst);
+        let (worker, probe) = moded(&coord, &mode);
+        worker.queue(job("a"));
+        until("a's start", || !probe.starts().is_empty());
+        worker.request_pause(Some(Path::new("a")));
+        until("the promotion", || held(&coord) == (0, 1));
+        probe.open.store(true, Ordering::SeqCst);
+        assert!(worker.wait_done(Path::new("a"), WATCHDOG));
+        until("the end", || worker.queue(job("b")) == Queued::Ended);
+        assert_eq!(paths(&worker.take_results()), all(&["a"]));
+        assert_eq!(probe.starts(), all(&["a"]));
+        assert_eq!(held(&coord), (0, 0));
     }
 }
