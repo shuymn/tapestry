@@ -5101,7 +5101,7 @@ fn an_accepted_command_is_served_after_its_outro() {
     let dir = tempfile::tempdir().unwrap();
     let at = s + 1_000_000;
     let mut loaded = loaded(dir.path());
-    let mut rig = outro_rig(timing(500_000, 0, None), i64::MAX);
+    let mut rig = outro_rig(timing(500_000, 0, None), at + 5_000_000);
     press(
         &mut rig,
         &[
@@ -5151,7 +5151,7 @@ fn the_scene_time_accepts_back_with_its_outro() {
     let s = result_start();
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
-    let mut rig = outro_rig(timing(500_000, 1_000_000, Some(3_000_000)), i64::MAX);
+    let mut rig = outro_rig(timing(500_000, 1_000_000, Some(3_000_000)), s + 10_000_000);
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Back);
     assert_eq!(rig.accepted, [game::MenuCommand::Back]);
@@ -5181,7 +5181,7 @@ fn a_fallback_during_an_outro_serves_the_command() {
     let s = result_start();
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
-    let mut rig = outro_rig(timing(5_000_000, 0, None), i64::MAX);
+    let mut rig = outro_rig(timing(5_000_000, 0, None), s + 10_000_000);
     rig.timing_until = s + 2_000_000;
     press(&mut rig, &[(s + 1_000_000, game::MenuCommand::Back)]);
     rig.at.push((s + 2_000_000, Box::new(|| {})));
