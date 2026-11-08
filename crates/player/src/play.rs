@@ -441,6 +441,16 @@ impl PlayerRig<'_> {
         self.presenter.lines(&mut self.render, lines);
     }
 
+    /// Whether an accepted command's outro still plays: begun, with the
+    /// skin's timing, and not over. Once it is over (or the skin fell
+    /// back), the command is served, and a screen prepared then leaves.
+    fn outro_playing(&self) -> bool {
+        use game::Rig as _;
+        self.result_outro
+            .zip(self.result_timing())
+            .is_some_and(|(at, t)| self.clock.now().0 < at.0.saturating_add(t.outro.0))
+    }
+
     /// The result's lifetime ends: nothing of it is drawn any more.
     pub(crate) fn leave_result(&mut self) {
         #[cfg(feature = "dev-tools")]
@@ -1262,10 +1272,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
-        // Within a result lifetime a screen built again is not a leaving:
-        // the render side draws on from what it presented (the S10-09i
-        // design's D4, "Recovery").
-        if self.presenter.current() && !self.result_leaving {
+        // Within a result lifetime a screen built again is not a leaving,
+        // an outro still playing included: the render side draws on from
+        // what it presented (the S10-09i design's D4, "Recovery").
+        if self.presenter.current() && (!self.result_leaving || self.outro_playing()) {
             return self.render.prepare();
         }
         self.leave_result();

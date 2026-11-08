@@ -1104,6 +1104,12 @@ impl ResultSkin {
         }
     }
 
+    /// The requests made so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn requests(&self) -> u64 {
+        self.next_request
+    }
+
     /// Whether a layout job runs.
     pub fn has_job(&self) -> bool {
         self.job.is_some()

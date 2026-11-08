@@ -1687,34 +1687,32 @@ pub(crate) fn presented_on(
         && rig.link.result_status().installed == Some(atlas)
 }
 
-/// C5b through the real `PlayerRig`: a leaving command's outro begun
-/// (`begin_outro`), then its `accept_leaving`, whose settle of the result
-/// skin holds: meanwhile every frame keeps the pinned view, and the
-/// fade-out (timer 2) rises.
-#[test]
-fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
-    use game::Rig as _;
-    let (_dir, skin) = lua_skin(
-        "",
-        "{ id = \"dot\", timer = 2, dst = { { time = 0, x = 100, y = 600, w = 8, h = 8, a = 0 }, \
-         { time = 2000, x = 100, y = 600, w = 8, h = 8, a = 255 } } },",
-    );
+/// A fixed skin with `head` and `places` (as [`lua_skin`]) shown through
+/// the real `PlayerRig` on a WARP rig sharing its clock: `f` is given the
+/// rig, the result's report and screen, the faults and what was drawn,
+/// once the skin draws.
+fn on_shown_result(
+    head: &str,
+    places: &str,
+    f: impl FnOnce(
+        &mut crate::play::PlayerRig<'_>,
+        &game::PlayReport,
+        &game::ResultScreen,
+        &Faults,
+        &Mutex<Vec<Drawn>>,
+    ),
+) {
+    let (_dir, skin) = lua_skin(head, places);
     let rig = Rig::new();
     let clock = rig.clock;
     let drawn = Arc::clone(&rig.drawn);
+    let faults = Arc::clone(&rig.faults);
     let Rig { link, .. } = rig;
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings::default(),
     };
     let dir = tempfile::tempdir().unwrap();
-    let fading = |q: &Quad| q.rect[0] == 100.0;
-    let last_skin = || {
-        drawn.lock().unwrap().iter().rev().find_map(|d| match d {
-            Drawn::Skin(q, _) => Some(q.clone()),
-            Drawn::Page(_) => None,
-        })
-    };
     crate::tests::on_rig_hooked(settings, link, clock, |p, _, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
             crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
@@ -1732,42 +1730,129 @@ fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
             graphs: None,
         });
         p.present_view(&report, &screen);
-        assert!(wait_until(|| last_skin().is_some()), "the skin draws");
-        let view: Vec<Quad> = last_skin().unwrap();
-        assert!(!view.iter().any(fading), "no fade before the outro");
-        assert!(p.result_timing().is_some(), "the skin's timing applies");
-        crate::dev::hold_result_settles(true);
-        let at = p.now();
-        p.begin_outro(at);
-        let frames = std::thread::scope(|s| {
-            let watch = s.spawn(|| {
-                assert!(wait_until(crate::dev::result_settle_holding));
-                drawn.lock().unwrap().clear();
-                std::thread::sleep(Duration::from_millis(600));
-                let frames = drawn.lock().unwrap().clone();
-                crate::dev::hold_result_settles(false);
-                frames
-            });
-            p.accept_leaving(game::MenuCommand::Back);
-            watch.join().unwrap()
-        });
         assert!(
-            frames.len() >= 3,
-            "frames drew during the hold: {}",
-            frames.len()
+            wait_until(|| drawn
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| matches!(d, Drawn::Skin(..)))),
+            "the skin draws"
         );
-        let mut alphas = Vec::new();
-        for d in &frames {
-            let Drawn::Skin(q, _) = d else {
-                panic!("the skin draws during the hold: {d:?}");
-            };
-            let rest: Vec<Quad> = q.iter().filter(|q| !fading(q)).copied().collect();
-            assert_eq!(rest, view, "the pinned view's quads");
-            let fade = q.iter().find(|q| fading(q)).expect("the fade draws");
-            alphas.push(fade.color[3]);
-        }
-        assert!(alphas.windows(2).all(|w| w[0] <= w[1]), "{alphas:?}");
-        assert!(alphas.last() > alphas.first(), "the fade rises: {alphas:?}");
-        assert_eq!(p.render.result_status().pinned, Some(1));
+        f(p, &report, &screen, &faults, &drawn);
     });
+}
+
+/// The last skin frame drawn.
+fn last_skin(drawn: &Mutex<Vec<Drawn>>) -> Option<Vec<Quad>> {
+    drawn.lock().unwrap().iter().rev().find_map(|d| match d {
+        Drawn::Skin(q, _) => Some(q.clone()),
+        Drawn::Page(_) => None,
+    })
+}
+
+/// C5b through the real `PlayerRig`: a leaving command's outro begun
+/// (`begin_outro`), then its `accept_leaving`, whose settle of the result
+/// skin holds: meanwhile every frame keeps the pinned view, and the
+/// fade-out (timer 2) rises.
+#[test]
+fn a_held_settle_keeps_the_pinned_view_while_it_fades() {
+    use game::Rig as _;
+    let fading = |q: &Quad| q.rect[0] == 100.0;
+    on_shown_result(
+        "",
+        "{ id = \"dot\", timer = 2, dst = { { time = 0, x = 100, y = 600, w = 8, h = 8, a = 0 }, \
+         { time = 2000, x = 100, y = 600, w = 8, h = 8, a = 255 } } },",
+        |p, _, _, _, drawn| {
+            let view: Vec<Quad> = last_skin(drawn).unwrap();
+            assert!(!view.iter().any(fading), "no fade before the outro");
+            assert!(p.result_timing().is_some(), "the skin's timing applies");
+            crate::dev::hold_result_settles(true);
+            let at = p.now();
+            p.begin_outro(at);
+            let frames = std::thread::scope(|s| {
+                let watch = s.spawn(|| {
+                    assert!(wait_until(crate::dev::result_settle_holding));
+                    drawn.lock().unwrap().clear();
+                    std::thread::sleep(Duration::from_millis(600));
+                    let frames = drawn.lock().unwrap().clone();
+                    crate::dev::hold_result_settles(false);
+                    frames
+                });
+                p.accept_leaving(game::MenuCommand::Back);
+                watch.join().unwrap()
+            });
+            assert!(
+                frames.len() >= 3,
+                "frames drew during the hold: {}",
+                frames.len()
+            );
+            let mut alphas = Vec::new();
+            for d in &frames {
+                let Drawn::Skin(q, _) = d else {
+                    panic!("the skin draws during the hold: {d:?}");
+                };
+                let rest: Vec<Quad> = q.iter().filter(|q| !fading(q)).copied().collect();
+                assert_eq!(rest, view, "the pinned view's quads");
+                let fade = q.iter().find(|q| fading(q)).expect("the fade draws");
+                alphas.push(fade.color[3]);
+            }
+            assert!(alphas.windows(2).all(|w| w[0] <= w[1]), "{alphas:?}");
+            assert!(alphas.last() > alphas.first(), "the fade rises: {alphas:?}");
+            assert_eq!(p.render.result_status().pinned, Some(1));
+        },
+    );
+}
+
+/// Through the real `PlayerRig`, during a 5 s outro: a view shown again
+/// (a reload, a screen built again) asks for no layout once the command
+/// is accepted, though it does before (D4). A screen built again keeps
+/// the lifetime and the skin's timing (C22); one whose result restore is
+/// refused draws the pinned view's built-in page and takes the timing
+/// away, so the flow serves the command at its next look (C23's timing
+/// half; the flow's half is `game`'s fallback-during-an-outro test).
+#[test]
+fn a_screen_built_again_mid_outro_keeps_or_drops_the_timing() {
+    use game::Rig as _;
+    for refuse in [false, true] {
+        on_shown_result(
+            "skin.fadeout = 5000\n",
+            "",
+            |p, report, screen, faults, drawn| {
+                let t = p.result_timing().expect("the skin's timing");
+                assert_eq!(t.outro, TimeUs(5_000_000));
+                let asked = p.result_skin.requests();
+                p.show_end(report, screen);
+                assert_eq!(
+                    p.result_skin.requests(),
+                    asked + 1,
+                    "a view asks for its layout"
+                );
+                let at = p.now();
+                p.begin_outro(at);
+                p.accept_leaving(game::MenuCommand::Back);
+                let asked = p.result_skin.requests();
+                p.show_end(report, screen);
+                assert_eq!(p.result_skin.requests(), asked, "no layout while leaving");
+                faults.refuse_restore.store(refuse, Ordering::Release);
+                faults.lose.store(true, Ordering::Release);
+                assert!(wait_until(|| p.screen_failed()));
+                drawn.lock().unwrap().clear();
+                p.prepare_screen().unwrap();
+                assert!(p.presenter.current(), "the lifetime goes on mid-outro");
+                if refuse {
+                    assert!(wait_until(|| p.render.result_status().disabled.is_some()));
+                    assert!(wait_until(|| drawn
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|d| matches!(d, Drawn::Page(_)))));
+                    assert_eq!(p.result_timing(), None, "served at the next look");
+                } else {
+                    assert!(wait_until(|| last_skin(drawn).is_some()));
+                    assert_eq!(p.result_timing(), Some(t));
+                    assert_eq!(p.render.result_status().pinned, Some(1));
+                }
+            },
+        );
+    }
 }
