@@ -218,7 +218,9 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         End::Hide
     } else if kn == 0 || l == kn {
         End::Hold
-    } else if (k0..kn).contains(&l) {
+    } else if (0..kn).contains(&l) && !(single && l < k0) {
+        // A loop point before the first key wraps into a gap where nothing
+        // draws (`SkinObject.java:358-374`).
         End::Loop {
             from: bms_model::TimeUs(l * 1000),
         }
@@ -228,10 +230,10 @@ pub(crate) fn accept(mut keys: Vec<SrcKey>, l: i32) -> Result<Option<Accepted>, 
         } else {
             return Err(TrackWhy::FallbackToFirst);
         }
-    } else if single {
+    } else if single && l < k0 {
+        // A single key after its loop point: every wrapped time is before
+        // it, so the source never draws it.
         return Ok(None);
-    } else if l >= 0 {
-        return Err(TrackWhy::Gap);
     } else {
         return Err(TrackWhy::NegativeLoop);
     };
@@ -387,7 +389,20 @@ mod tests {
             }
         );
         assert_eq!(two(30), Err(TrackWhy::FallbackToFirst));
-        assert_eq!(two(5), Err(TrackWhy::Gap));
+        // A loop point before the first key wraps into a gap the model
+        // samples as the source does.
+        assert_eq!(
+            two(5).unwrap().unwrap().end,
+            End::Loop {
+                from: bms_model::TimeUs(5_000)
+            }
+        );
+        assert_eq!(
+            two(0).unwrap().unwrap().end,
+            End::Loop {
+                from: bms_model::TimeUs(0)
+            }
+        );
         assert_eq!(two(-5), Err(TrackWhy::NegativeLoop));
     }
 

@@ -146,8 +146,6 @@ pub enum TrackWhy {
     NegativeStart,
     /// After its last key the source shows the first key.
     FallbackToFirst,
-    /// The loop leaves a periodic gap before the first key.
-    Gap,
     /// The loop wraps into negative times.
     NegativeLoop,
     /// More than the model's keys, or a key after its last time.
