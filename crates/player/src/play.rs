@@ -304,9 +304,13 @@ pub struct PlayerRig<'a> {
     /// The input offset last seen while the result shows, and whether the
     /// offset keys changed it in this lifetime (O6).
     pub result_offset: Option<(i64, bool)>,
-    /// A leaving command was accepted on the result: the next screen's
-    /// preparation leaves its lifetime.
+    /// The flow served the result's leaving command: the next screen's
+    /// preparation leaves its lifetime. Until then a screen built again
+    /// keeps it, an outro playing included.
     pub result_leaving: bool,
+    /// When the accepted leaving command's outro began (the view pinned),
+    /// while the lifetime is current: no view's layout is asked for.
+    pub result_outro: Option<TimeUs>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -613,10 +617,18 @@ impl PlayerRig<'_> {
         if self.presenter.current() {
             crate::dev::print_result_work("left");
         }
+        #[cfg(feature = "dev-tools")]
+        if let Some(at) = self.result_outro {
+            println!(
+                "dev: result left {} us after its outro began",
+                self.clock.now().0 - at.0
+            );
+        }
         self.presenter.end(&mut self.render);
         self.result_facts = None;
         self.result_offset = None;
         self.result_leaving = false;
+        self.result_outro = None;
     }
 
     /// The attempt's result is uploaded after its commit and before
@@ -1392,10 +1404,38 @@ impl Rig for PlayerRig<'_> {
     /// layout job and waits for its thread before it is served (D11); the
     /// run's end bounds the wait.
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
-        self.result_leaving = true;
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
+    }
+
+    /// The presented result skin's timing (the S10-09i design's D6):
+    /// `None` on any built-in result, so a command pending is served at
+    /// once.
+    fn result_timing(&self) -> Option<game::ResultTiming> {
+        self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The barrier is set at `at` (D4), for every accepted command: the
+    /// view presented then stays, and timer 2 starts, before the command
+    /// settles the result skin. The pinned view's timing, read with it; a
+    /// pressed command that view's input time still gates is refused under
+    /// the same lock, nothing set.
+    fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
+        let Some((pinned, timing)) = self.presenter.pin(&mut self.render, at, gate) else {
+            return game::Outro::Gated;
+        };
+        self.result_outro = Some(at);
+        #[cfg(feature = "dev-tools")]
+        println!("dev: result outro began, view {pinned:?} pinned");
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = pinned;
+        game::Outro::Begun(timing.map(flow_timing))
+    }
+
+    /// The flow serves the leaving command: the result is left from here.
+    fn serve_leaving(&mut self, _cmd: MenuCommand) {
+        self.result_leaving = true;
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1470,7 +1510,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
-        // Within a result lifetime a screen built again is not a leaving:
+        // Within a result lifetime a screen built again is not a leaving,
+        // an outro playing included, until the flow serves the command:
         // the render side draws on from what it presented (the S10-09i
         // design's D4, "Recovery").
         if self.presenter.current() && !self.result_leaving {
@@ -2134,7 +2175,10 @@ impl Rig for PlayerRig<'_> {
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
         // until it lands (design D11). The attempt's fallback requests none.
+        // Once a leaving command is accepted the view is pinned, and the
+        // result skin was settled: no layout is asked for (D4).
         if let Some(chart) = self.result_chart
+            && self.result_outro.is_none()
             && !self.result_skin_suppressed()
         {
             self.result_skin
@@ -2189,6 +2233,15 @@ pub(crate) const fn preparation_stops(
     output: Option<OutputError>,
 ) -> bool {
     quitting || leaving || input.is_some() || output.is_some()
+}
+
+/// A result skin's timing in the flow's terms.
+pub(crate) const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTiming {
+    game::ResultTiming {
+        outro: t.outro,
+        input: t.input,
+        scene: t.scene,
+    }
 }
 
 /// Readies the screen for a play: the end screen, if it shows, is left

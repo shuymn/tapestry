@@ -762,6 +762,8 @@ impl Selection {
                     controls.close();
                     return false;
                 }
+                // The result left on its own.
+                Some(SelectStep::Stay) => {}
                 Some(SelectStep::Drawn) => {
                     let from = *script.drawn_from.get_or_insert(drawn);
                     if drawn <= from {
@@ -904,6 +906,8 @@ pub fn script_result(
             script.done();
             controls.close();
         }
+        // The result is left on its own; the select screen takes it.
+        Some(SelectStep::Stay) => {}
         Some(step) => {
             let why = format!("{step:?} on a result");
             script.fail(why);

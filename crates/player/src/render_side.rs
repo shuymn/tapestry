@@ -994,6 +994,10 @@ struct Shared {
     barrier: Mutex<ResultBarrier>,
     /// What the render thread shows of the result kind.
     result_status: Mutex<ResultReport>,
+    /// Result frames hold after their lifetime's check while set, and
+    /// whether one holds (tests).
+    #[cfg(test)]
+    result_frame_hold: [AtomicBool; 2],
 }
 
 impl Shared {
@@ -1022,7 +1026,23 @@ impl Shared {
             result: Mutex::new(ResultSlot::default()),
             barrier: Mutex::new(ResultBarrier::default()),
             result_status: Mutex::new(ResultReport::default()),
+            #[cfg(test)]
+            result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
         }
+    }
+
+    /// Holds a result frame while a test says so.
+    #[cfg(test)]
+    fn hold_result_frame(&self) {
+        let [held, waiting] = &self.result_frame_hold;
+        if !held.load(Ordering::SeqCst) {
+            return;
+        }
+        waiting.store(true, Ordering::SeqCst);
+        while held.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        waiting.store(false, Ordering::SeqCst);
     }
 
     fn result_slot(&self) -> std::sync::MutexGuard<'_, ResultSlot> {
@@ -1472,11 +1492,16 @@ impl RenderLink {
     /// point only the overlay merges. Taken under the lock the commit
     /// point holds, so the view returned is the one presented at that
     /// instant.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "S10-09i's i-4 sets it from the flow")
-    )]
-    pub fn pin_result(&self, at: TimeUs) -> Option<ViewKey> {
+    ///
+    /// With `gate` (a pressed command: the result's start), the view
+    /// presented judges it first under the same lock: while its input time
+    /// has not passed from `gate` at `at`, nothing is set and `None` is
+    /// given (the S10-09i design's D6).
+    pub fn pin_result(
+        &self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let mut b = self.shared.barrier();
         if b.lifetime != lifetime {
@@ -1485,9 +1510,21 @@ impl RenderLink {
                 ..ResultBarrier::default()
             };
         }
+        if game::gated(b.timing.map(crate::play::flow_timing), at, gate) == game::Outro::Gated {
+            return None;
+        }
         b.pinned = b.presented;
         b.fadeout = Some(at);
-        b.pinned
+        Some((b.pinned, b.timing))
+    }
+
+    /// The timing of the current result lifetime's presented view, while
+    /// its skin draws (the S10-09i design's D6): what the last commit point
+    /// recorded.
+    pub fn presented_timing(&self) -> Option<skin_model::ResultTiming> {
+        let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
+        let b = self.shared.barrier();
+        b.timing.filter(|_| b.lifetime == lifetime)
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -1989,8 +2026,15 @@ impl crate::result_present::Publish for RenderLink {
     fn show(&mut self, p: ResultPresentation) {
         self.show_result(p);
     }
-    fn pin(&mut self, at: TimeUs) -> Option<ViewKey> {
-        self.pin_result(at)
+    fn pin(
+        &mut self,
+        at: TimeUs,
+        gate: Option<TimeUs>,
+    ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)> {
+        self.pin_result(at, gate)
+    }
+    fn timing(&self) -> Option<skin_model::ResultTiming> {
+        self.presented_timing()
     }
 }
 
@@ -2327,6 +2371,8 @@ pub fn spawn(
             let _unwinding = Unwinding(Arc::clone(&thread_shared));
             #[cfg(feature = "dev-tools")]
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
+            #[cfg(feature = "dev-tools")]
+            crate::dev::read_result_faults();
             let screen = match build(
                 &mut make,
                 &mut Committed::default(),
@@ -2736,7 +2782,18 @@ fn build(
         let Some(installation) = committed.get(kind).cloned() else {
             continue;
         };
-        match s.restore(kind, &installation) {
+        let restored = s.restore(kind, &installation);
+        // A refusal injected by a test of the real flow (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let restored = match restored {
+            Ok(()) if kind == ScreenKind::Result && crate::dev::refuse_result_restore() => {
+                Err(RenderError::Skin(render::SkinError {
+                    reason: "dev: the result's restore was refused".to_owned(),
+                }))
+            }
+            other => other,
+        };
+        match restored {
             Ok(()) => {}
             Err(e) if committed.pending(kind) && e.is_refusal() => {
                 eprintln!(
@@ -3441,6 +3498,12 @@ impl Run {
                 mode = Mode::Idle;
                 continue;
             }
+            // A test holds a result frame here, after its lifetime's
+            // check: a new lifetime may begin before its commit point.
+            #[cfg(test)]
+            if matches!(mode, Mode::Result) {
+                self.shared.hold_result_frame();
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -3730,6 +3793,18 @@ impl Run {
                         &self.shared,
                         self.clock.now(),
                     );
+                    // A frame under the barrier refused (dev-tools: the
+                    // fallback during an outro).
+                    #[cfg(feature = "dev-tools")]
+                    let built = match built {
+                        ResultDrawn::Built
+                            if self.shared.barrier().fadeout.is_some()
+                                && crate::dev::refuse_pinned_frame() =>
+                        {
+                            ResultDrawn::Refused(skin_model::BuildError::Kind)
+                        }
+                        other => other,
+                    };
                     // A view committed: what the kind keeps to restore
                     // follows it now, whatever the submission does.
                     if let Some(side) = &mut self.result
@@ -3748,6 +3823,15 @@ impl Run {
                         None => latest.clone(),
                     };
                     match built {
+                        // A device lost under the barrier (dev-tools: a
+                        // recovery during an outro).
+                        #[cfg(feature = "dev-tools")]
+                        ResultDrawn::Built
+                            if self.shared.barrier().fadeout.is_some()
+                                && crate::dev::lose_pinned_frame() =>
+                        {
+                            Err(RenderError::SurfaceLost)
+                        }
                         ResultDrawn::Built => screen.submit_result().map(|t| (t, None)),
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
@@ -4647,6 +4731,8 @@ impl Run {
                 v.token = None;
             }
         }
+        // No skin draws: commands take effect at once (D6).
+        self.shared.barrier().timing = None;
         self.reconcile_result();
     }
 
@@ -4910,7 +4996,7 @@ impl Run {
                     ..ResultBarrier::default()
                 };
             }
-            if b.pinned.is_some() {
+            if b.fadeout.is_some() {
                 if let Some(v) = side.prepared.take() {
                     side.discard |= v.token.is_some();
                     side.drop_later(v.held);
@@ -4961,6 +5047,12 @@ impl Run {
                 }
             }
             b.presented = side.presented.as_ref().map(|h| h.payload.key);
+            b.timing = side
+                .presented
+                .as_ref()
+                .filter(|h| h.state.is_some())
+                .and_then(|h| h.payload.skin.as_ref())
+                .map(|s| s.skin().result_timing());
             fadeout = b
                 .fadeout
                 .or_else(|| side.presented.as_ref().and_then(|h| h.overlay.fadeout));

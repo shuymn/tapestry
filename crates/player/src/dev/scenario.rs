@@ -46,7 +46,9 @@
 //! # the quit key would leave the chart without one
 //!
 //! [[step]]
-//! result = "next-preset"         # "prev-preset" | "retry" | "back"
+//! result = "next-preset"         # "prev-preset" | "retry" | "back" | "stay"
+//! # "stay": nothing pressed once the result is drawn; it leaves on its
+//! # own (a result skin's scene time), and selection takes the next step
 //!
 //! [[step]]
 //! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
@@ -436,6 +438,7 @@ enum ResultKind {
     PrevPreset,
     Retry,
     Back,
+    Stay,
 }
 
 #[derive(Deserialize)]
@@ -787,6 +790,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     ResultKind::PrevPreset => (SelectStep::Prev, Seq::Result),
                     ResultKind::Retry => (SelectStep::Retry, Seq::Replay),
                     ResultKind::Back => (SelectStep::Back, Seq::Select),
+                    ResultKind::Stay => (SelectStep::Stay, Seq::Select),
                 };
                 steps.push((step, o));
                 next
