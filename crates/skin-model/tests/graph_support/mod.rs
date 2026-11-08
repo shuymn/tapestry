@@ -193,6 +193,7 @@ pub fn ready() -> ResultView {
             cleared: true,
             rate: None,
             next_rank: 0,
+            duration_us: None,
         },
         best: BestView::Unavailable,
         timing: None,

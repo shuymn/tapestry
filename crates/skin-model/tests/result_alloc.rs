@@ -180,6 +180,7 @@ fn skin() -> Skin {
             judge_graphs,
             gauge_graphs,
             timing_graphs,
+            ..ResultDefs::default()
         },
     )
     .unwrap()

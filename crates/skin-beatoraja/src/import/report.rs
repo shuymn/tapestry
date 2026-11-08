@@ -326,6 +326,11 @@ pub enum NoteKind {
         lane: u8,
         paint: NoteFallback,
     },
+    /// A result skin's `fadeout` of `declared_ms` past
+    /// [`skin_model::MAX_RESULT_OUTRO`], honoured only up to it.
+    OutroClamped {
+        declared_ms: i32,
+    },
     /// A colour in `field` that is not an optional `#` and 6 or 8 hex
     /// digits, drawn opaque red, as the source's distribution draws one.
     InvalidColour {
@@ -377,6 +382,11 @@ impl fmt::Display for NoteKind {
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
             Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
+            Self::OutroClamped { declared_ms } => write!(
+                f,
+                "a fade-out of {declared_ms} ms, honoured for {} ms",
+                skin_model::MAX_RESULT_OUTRO.0 / 1_000
+            ),
             Self::Callback { field, why } => {
                 write!(f, "a callback in `{field}` replaced by its constant: {why}")
             }

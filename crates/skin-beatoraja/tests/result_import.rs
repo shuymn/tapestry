@@ -6,6 +6,7 @@
 
 mod common;
 
+use bms_model::TimeUs;
 use common::result::{
     Res, best, facts, folder, import_result, lua_outcome, lua_result, ready, sheet, unavailable,
 };
@@ -14,7 +15,7 @@ use skin_beatoraja::{
     Cancel, Config, EssentialPart, Fact, FactId, FactRead, FactValue, ImportError, ImportFacts,
     LuaOutcome, LuaWhy, NoteKind, Object, Report, Severity, read_lua_header,
 };
-use skin_model::{BestView, ResultNumber, ResultView, ScreenKind};
+use skin_model::{BestView, MAX_RESULT_OUTRO, ResultNumber, ResultTiming, ResultView, ScreenKind};
 
 /// The top of a quad drawn from a source rect at `y` of height `h`.
 fn top(y: f32, h: f32) -> f32 {
@@ -800,6 +801,287 @@ fn a_lua_skin_reads_result_values_while_it_loads() {
         Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ResultNumber(154)),
         other => panic!("{other:?}"),
     }
+}
+
+/// A result skin with its essential parts and the top-level fields `top`,
+/// written as JSON (`"name": value, ...`, ending with a comma) and
+/// imported; its timing and report.
+fn json_timing(top: &str) -> (ResultTiming, Report) {
+    let d = minimal_json(top);
+    let i = import_result(d.path()).unwrap_or_else(|e| panic!("{top}: {e:?}"));
+    (i.skin.result_timing(), i.report)
+}
+
+/// [`json_timing`] as a Lua skin, `top` its statements setting the
+/// skin table's fields.
+fn lua_timing(top: &str) -> (ResultTiming, Report) {
+    let d = minimal_lua(top);
+    let i = lua_result(d.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{top}: {e:?}"));
+    (i.imported.skin.result_timing(), i.imported.report)
+}
+
+/// A JSON result skin with only its essential parts (an EX score and a
+/// status image) and the top-level fields `top` (`"name": value, ...`,
+/// ending with a comma).
+fn minimal_json(top: &str) -> tempfile::TempDir {
+    let values = value("ex", r#""ref": 71"#);
+    let dsts = dst("ex", "") + "," + &dst("dot", r#""op": [90],"#);
+    folder(&format!(
+        r#"{top} "value": [{values}], "destination": [{dsts}]"#
+    ))
+}
+
+/// [`minimal_json`] as a Lua skin, `pre` its statements run after the
+/// images.
+fn minimal_lua(pre: &str) -> tempfile::TempDir {
+    let d = sheet();
+    let values = lua_value("ex", 4, "ref = 71");
+    let dsts = lua_dst("ex", 100, 4, "") + ", " + &lua_dst("dot", 300, 8, "op = { 90 },");
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &values, "", &dsts).as_bytes(),
+    );
+    d
+}
+
+/// The outro clamp notes of `r`.
+fn clamps(r: &Report) -> Vec<(Severity, NoteKind)> {
+    r.notes
+        .iter()
+        .filter(|n| matches!(n.kind, NoteKind::OutroClamped { .. }))
+        .map(|n| (n.severity, n.kind))
+        .collect()
+}
+
+/// C1 (S10-09i): a result skin's `fadeout`, `input` and `scene` are read
+/// in µs from JSON and Lua alike: absent 0, negative 0, a `scene` of 0 or
+/// below none, and a `fadeout` past 10 s clamped to it with a deviation
+/// note naming the declaration.
+#[test]
+fn a_result_skin_declares_its_timing() {
+    let ms = |n: i64| TimeUs(n * 1_000);
+    let timing = |outro, input, scene| ResultTiming {
+        outro,
+        input,
+        scene,
+    };
+    let clamped = |declared_ms| vec![(Severity::Deviation, NoteKind::OutroClamped { declared_ms })];
+    for (json, lua, want, notes) in [
+        ("", "", timing(ms(0), ms(0), None), vec![]),
+        (
+            r#""fadeout": 500, "input": 1000, "scene": 3600000,"#,
+            "skin.fadeout = 500 skin.input = 1000 skin.scene = 3600000",
+            timing(ms(500), ms(1_000), Some(ms(3_600_000))),
+            vec![],
+        ),
+        (
+            r#""fadeout": -5, "input": -1, "scene": -7,"#,
+            "skin.fadeout = -5 skin.input = -1 skin.scene = -7",
+            timing(ms(0), ms(0), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 1, "input": 1, "scene": 0,"#,
+            "skin.fadeout = 1 skin.input = 1 skin.scene = 0",
+            timing(ms(1), ms(1), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 10000,"#,
+            "skin.fadeout = 10000",
+            timing(MAX_RESULT_OUTRO, ms(0), None),
+            vec![],
+        ),
+        (
+            r#""fadeout": 10001,"#,
+            "skin.fadeout = 10001",
+            timing(MAX_RESULT_OUTRO, ms(0), None),
+            clamped(10_001),
+        ),
+        (
+            r#""fadeout": 2147483647, "input": 2147483647, "scene": 2147483647,"#,
+            "skin.fadeout = 2147483647 skin.input = 2147483647 skin.scene = 2147483647",
+            timing(MAX_RESULT_OUTRO, ms(2_147_483_647), Some(ms(2_147_483_647))),
+            clamped(i32::MAX),
+        ),
+    ] {
+        let (j, jr) = json_timing(json);
+        assert_eq!(j, want, "json {json}");
+        assert_eq!(clamps(&jr), notes, "json {json}");
+        let (l, lr) = lua_timing(lua);
+        assert_eq!(l, want, "lua {lua}");
+        assert_eq!(clamps(&lr), notes, "lua {lua}");
+    }
+    assert_eq!(MAX_RESULT_OUTRO, ms(10_000));
+}
+
+/// S10-09i: number 152, the EX score's difference from the best, draws
+/// the best's difference as 172 does (`IntegerPropertyFactory.java:197`,
+/// `:232`, one function), and nothing without a best.
+#[test]
+fn number_152_is_the_best_difference() {
+    let d = folder(&format!(
+        r#""value": [{}, {}, {}],
+           "destination": [{}, {}, {}, {}]"#,
+        value("ex", r#""ref": 71"#),
+        value("d152", r#""ref": 152"#),
+        value("d172", r#""ref": 172"#),
+        dst("ex", ""),
+        r#"{"id": "d152", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]}"#,
+        r#"{"id": "d172", "dst": [{"x": 0, "y": 200, "w": 4, "h": 8}]}"#,
+        dst("dot", r#""op": [90],"#),
+    ));
+    let i = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut r = Res::new(i.skin);
+    r.view(&ready(1_000, true, best(ResultNumber::Shown(-3))));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "100");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "100");
+    r.view(&ready(1_000, true, BestView::Unavailable));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
+}
+
+/// A [`minimal_lua`] skin that reads each of the result numbers `ids`
+/// through `main_state.number` while it loads, in order.
+fn reads(ids: &[i32]) -> tempfile::TempDir {
+    let pre: String = ids
+        .iter()
+        .map(|id| format!("local n{id} = ms.number({id})\n"))
+        .collect();
+    minimal_lua(&pre)
+}
+
+/// The result numbers the fixture skin in `d` read under `view`, as (id, value) in read order.
+#[track_caller]
+fn read_values(d: &tempfile::TempDir, view: &ResultView) -> Vec<(i32, i32)> {
+    let i = lua_result(d.path(), &facts(Some(view))).unwrap();
+    i.facts
+        .reads
+        .iter()
+        .map(|r| match (r.fact, r.value) {
+            (FactId::ResultNumber(id), FactValue::Int(v)) => (id, v),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// A ready view whose best's EX difference is `diff`.
+fn ex_diff(diff: i32) -> ResultView {
+    let BestView::Known(mut b) = best(ResultNumber::Shown(-3)) else {
+        unreachable!()
+    };
+    b.ex_diff = diff;
+    ready(1_000, true, BestView::Known(b))
+}
+
+/// S10-09i: number 152 reads the best's EX difference, signed, as 172
+/// does: positive, negative and zero; and an unavailable best refuses the
+/// read of either, its validity false.
+#[test]
+fn number_152_reads_the_signed_best_difference() {
+    let d = reads(&[152, 172]);
+    for diff in [37, -42, 0] {
+        assert_eq!(
+            read_values(&d, &ex_diff(diff)),
+            [(152, diff), (172, diff)],
+            "{diff}"
+        );
+    }
+    for id in [152, 172] {
+        let d = reads(&[id]);
+        match lua_outcome(
+            d.path(),
+            &facts(Some(&ready(1_000, true, BestView::Unavailable))),
+        ) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Unavailable { id: got, .. },
+                ..
+            }) => assert_eq!(got, id),
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+}
+
+/// S10-09i: numbers 372 and 373, the mean absolute duration in whole ms
+/// and its hundredths (`IntegerPropertyFactory.java:410-420`), read and
+/// drawn from the view's duration; an all-miss view, with no timing
+/// sample, shows them; a view with no duration or no result draws none.
+#[test]
+fn numbers_372_and_373_are_the_mean_duration() {
+    let with = |us: Option<u32>, timing: bool| {
+        let mut v = ready(1_000, true, BestView::Unavailable);
+        v.score.duration_us = us;
+        if !timing {
+            v.timing = None;
+        }
+        v
+    };
+    let d = reads(&[372, 373]);
+    assert_eq!(
+        read_values(&d, &with(Some(123_456), true)),
+        [(372, 123), (373, 45)]
+    );
+    assert_eq!(
+        read_values(&d, &with(Some(1_000_000), false)),
+        [(372, 1_000), (373, 0)]
+    );
+    assert_eq!(read_values(&d, &with(Some(9), true)), [(372, 0), (373, 0)]);
+    // Past `i32::MAX` µs: a 40-minute long note released one second after
+    // its head, as a BAD (`IntegerPropertyFactory.java:410-420`).
+    assert_eq!(
+        read_values(&d, &with(Some(2_399_000_000), true)),
+        [(372, 2_399_000), (373, 0)]
+    );
+    assert_eq!(
+        read_values(&d, &with(Some(u32::MAX), true)),
+        [(372, 4_294_967), (373, 29)]
+    );
+    let j = folder(&format!(
+        r#""value": [{}, {}, {}],
+           "destination": [{}, {}, {}, {}]"#,
+        value("ex", r#""ref": 71"#),
+        value("dw", r#""ref": 372"#),
+        value("dh", r#""ref": 373"#),
+        dst("ex", ""),
+        r#"{"id": "dw", "dst": [{"x": 0, "y": 100, "w": 4, "h": 8}]}"#,
+        r#"{"id": "dh", "dst": [{"x": 0, "y": 200, "w": 4, "h": 8}]}"#,
+        dst("dot", r#""op": [90],"#),
+    ));
+    let mut r = Res::new(import_result(j.path()).unwrap().skin);
+    r.view(&with(Some(505_000), false));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "505");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "0");
+    r.view(&with(None, true));
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+    assert_eq!(r.digits(1_000, top(200.0, 8.0)), "");
+    r.view(&unavailable());
+    assert_eq!(r.digits(1_000, top(100.0, 8.0)), "");
+}
+
+/// S10-09i: a timing field the skin reader takes as no 32-bit integer
+/// refuses the import, as every other integer field of a skin does: in
+/// JSON, `null`, a string that is no number and a value past either end of
+/// `i32`; in Lua (which has no `null` field), a string that is no number
+/// and a value past `i32`. A numeric string reads as its number, as for
+/// the other fields.
+#[test]
+fn a_malformed_timing_field_refuses_the_import() {
+    for field in ["fadeout", "input", "scene"] {
+        for bad in ["null", r#""abc""#, "2147483648", "-2147483649"] {
+            let d = minimal_json(&format!(r#""{field}": {bad},"#));
+            let r = import_result(d.path());
+            assert!(r.is_err(), "json {field}: {bad} imported");
+        }
+        for bad in ["\"abc\"", "2147483648"] {
+            let d = minimal_lua(&format!("skin.{field} = {bad}"));
+            let r = lua_outcome(d.path(), &ImportFacts::unavailable(ScreenKind::Result));
+            assert!(r.is_err(), "lua {field} = {bad} imported");
+        }
+    }
+    let (t, _) = json_timing(r#""fadeout": "500","#);
+    assert_eq!(t.outro, TimeUs(500_000));
 }
 
 /// D11: a refusal carries the facts its run read before it, so the image

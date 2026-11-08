@@ -48,6 +48,7 @@ pub fn result_parts(
             cleared: f.cleared,
             rate: f.rate.map(rate),
             next_rank: f.next_rank,
+            duration_us: f.duration_us,
         },
         notes: f.notes,
         best: match summary.best {
@@ -205,6 +206,7 @@ mod tests {
                 clear: BestLamp::Cleared { gauge: 1 },
                 cleared: true,
                 gauge_permille: 1,
+                duration_us: Some(505_000),
                 timing: Some(game::TimingStats {
                     samples: 4,
                     mean_x100: -75,
@@ -266,6 +268,7 @@ mod tests {
             })
         );
         assert_eq!(parts.score.next_rank, 67);
+        assert_eq!(parts.score.duration_us, Some(505_000));
         let BestView::Known(b) = parts.best else {
             panic!("{:?}", parts.best);
         };

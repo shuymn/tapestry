@@ -113,7 +113,9 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         114 => count("count.poor"),
         150 | 170 => v("best.ex", BEST, (0, M)),
         154 => count("result.next_rank"),
-        172 => v("best.ex_diff", BEST, (-M, M)),
+        // One function in the source (`IntegerPropertyFactory.java:197`,
+        // `:232`): the EX score less the best's.
+        152 | 172 => v("best.ex_diff", BEST, (-M, M)),
         // Hidden with no previous BP, as the source's `MIN_VALUE`
         // (`IntegerPropertyFactory.java:712-732`).
         176 => v("best.bp", BEST, (HIDDEN, M)),
@@ -126,6 +128,11 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             ..v("result.clear", VALID, (0, i64::from(skin_model::CLEAR_MAX)))
         },
         371 => v("best.clear", BEST, (0, i64::from(skin_model::CLEAR_MAX))),
+        // The mean absolute duration in whole ms and its hundredths
+        // (`IntegerPropertyFactory.java:410-420`), shown with no timing
+        // sample too.
+        372 => v("duration_10us / 100", "duration.valid", (0, M / 100)),
+        373 => v("duration_10us % 100", "duration.valid", (0, 99)),
         374 => v(MEAN_WHOLE, "timing.valid", (-M / 100, M / 100)),
         375 => v(MEAN_HUNDREDTHS, "timing.valid", (-99, 99)),
         410..=419 => early_late(id)?,
@@ -147,8 +154,12 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             (0, 59),
         ),
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
-        // The clock is no result fact; no score target; no IR.
-        21..=25 | 151 | 153 | 157 | 158 | 179 | 180 | 182 | 380..=399 => return Some(Omit),
+        // The clock is no result fact; no score target; no IR. The best's
+        // max combo (173, and 175 the difference from it) is not kept with
+        // a best until stage3.md's row S10-14.
+        21..=25 | 151 | 153 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
+            return Some(Omit);
+        }
         _ => return None,
     }))
 }
