@@ -1573,12 +1573,9 @@ fn play_and_next<R: Rig>(
         g.history.history(last)
     });
 
-    // The winning opening's tuning, read before the rig's play is over.
-    let start_tuning = if played {
-        rig.start_tuning(generation)
-    } else {
-        None
-    };
+    // The last candidate's tuning, read before the rig's play is over;
+    // the record keeps it only when that candidate played.
+    let start_tuning = rig.start_tuning(generation);
     rig.play_over();
     let report = loaded.finish_play(PlayOutcome {
         start,
