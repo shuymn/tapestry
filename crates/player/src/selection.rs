@@ -2162,7 +2162,6 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
-        self.state_clock.leave();
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
@@ -4880,8 +4879,9 @@ pub(crate) mod tests {
     /// state clock), at the instant the turntable's play state starts: a
     /// chart chosen to play, before its loading state, which keeps it. A
     /// practice session, begun at its choice, keeps its first origin
-    /// through its page, Starts, rounds and retries (each a play state
-    /// begun again, as the flow does), until selection is entered again.
+    /// through its page, Starts, rounds and retries, until selection is
+    /// entered again, and so does its turntable's play state: the flow
+    /// begins none for a retry within practice.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_state_clock_starts_where_a_play_state_is_entered() {
@@ -4922,7 +4922,8 @@ pub(crate) mod tests {
             let session = rig.state_clock.origin().unwrap();
             assert!(session >= before);
             // Its page, a Start's loading state, consecutive rounds (each
-            // prepared again), a retry (a play state begun again) and the
+            // prepared again), a retry (which begins no play state within
+            // practice, the flow resuming the turntable instead) and the
             // page again.
             later(rig);
             rig.entered_practice(&page);
@@ -4931,11 +4932,14 @@ pub(crate) mod tests {
             later(rig);
             rig.prepare_screen().unwrap();
             later(rig);
-            rig.play_state_began();
+            rig.turntable_resumed();
             rig.prepare_screen().unwrap();
             rig.entered_practice(&page);
             rig.entered_loading(&chart);
             assert_eq!(rig.state_clock.origin(), Some(session));
+            // The turntable's play state and the state clock agree: one
+            // origin for the session.
+            assert_eq!(turntable(rig), Some(session));
             // Selection ends it: the next session starts afresh.
             rig.entered_selection();
             let before = later(rig);

@@ -280,6 +280,13 @@ struct Headless {
     waits_since_seal: usize,
     /// Waits after the seal before the audio tail ends.
     tail_waits: usize,
+    /// Waits a result's preparation stays pending
+    /// ([`Rig::poll_result`]), one per poll; a withdrawal ends them.
+    prep_pending: usize,
+    /// The flow's withdrawals of a preparation ([`Rig::withdraw_result`]).
+    withdrawals: Vec<Option<MenuCommand>>,
+    /// The plays prepared so far at each turntable resumption.
+    resumed_after: Vec<usize>,
     /// The play's sounds stopped, counted.
     cancels: usize,
     /// Recording opened and the play not yet handed over.
@@ -468,6 +475,9 @@ impl Headless {
             sealed: false,
             waits_since_seal: 0,
             tail_waits: TAIL_WAITS,
+            prep_pending: 0,
+            withdrawals: Vec::new(),
+            resumed_after: Vec::new(),
             cancels: 0,
             opened: false,
             in_selection: false,
@@ -911,6 +921,21 @@ impl Rig for Headless {
 
     fn turntable_resumed(&mut self) {
         self.turntable.push(Tt::Resumed(self.seen.len()));
+        self.resumed_after.push(self.prepares);
+    }
+
+    fn poll_result(&mut self, _prep: &mut (), _deadline: TimeUs) -> game::Polled {
+        if self.prep_pending == 0 {
+            return game::Polled::Ready;
+        }
+        self.prep_pending -= 1;
+        self.wait();
+        game::Polled::Pending
+    }
+
+    fn withdraw_result(&mut self, by: Option<MenuCommand>) {
+        self.withdrawals.push(by);
+        self.prep_pending = 0;
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
@@ -2652,6 +2677,104 @@ fn practice_screen_repeats_and_quits() {
     };
     assert_eq!(back.speed(), speed);
     assert_eq!(back.measures(), entered.measures());
+}
+
+/// The practice chart's page, its cursor on Start at 1×, Start (rounds
+/// repeat), then `after`, then the window closed.
+fn practice_round(after: &[(i64, Act)]) -> Vec<(i64, Act)> {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.push((10, Act::Page(PracticeInput::Confirm)));
+    acts.extend_from_slice(after);
+    acts.push((500, Act::Close));
+    acts
+}
+
+/// How many play states the flow began.
+fn began(rig: &Headless) -> usize {
+    rig.turntable
+        .iter()
+        .filter(|t| matches!(t, Tt::Began(_)))
+        .count()
+}
+
+/// A retry within a practice session keeps its play state, as the
+/// source's practice stays in its play state across rounds
+/// (`BMSPlayer.java:740-741, 772-773` at `0.8.9`; docs/stage3.md, offset
+/// 1), on each of the flow's retry paths: no play state begins but P's,
+/// and a turntable a round's result paused resumes for the next round.
+#[test]
+fn a_practice_retry_keeps_the_play_state() {
+    use game::MenuCommand::Retry;
+    // The retry during a round ends it and plays the next.
+    let (rig, _, ran) = run(
+        Refusal::Missing,
+        practice_round(&[(500, Act::Retry)]),
+        |_| {},
+    );
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let [(P, reports)] = &rig.loads[..] else {
+        panic!("{:?}", rig.seen);
+    };
+    assert_eq!(reports[0].end, PlayEnd::Aborted(AbortCause::Retry));
+    assert!(reports.len() >= 2, "{reports:?}");
+    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
+    assert_eq!(rig.turntable[..2], [Tt::Began(1), Tt::Resumed(3)]);
+
+    // The quit during round 2 shows its result; the retry withdrawing that
+    // result's preparation.
+    let quit_then_retry = [(14_000, Act::Quit), (1_500, Act::Retry)];
+    let (rig, _, ran) = run(Refusal::Missing, practice_round(&quit_then_retry), |r| {
+        r.prep_pending = 30_000;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.withdrawals, [Some(Retry)], "{:?}", rig.seen);
+    assert!(!rig.seen.iter().any(|s| matches!(s, Seen::Shown(_))));
+    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
+    assert_eq!(
+        rig.turntable[..3],
+        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(3)],
+        "{:?}",
+        rig.turntable
+    );
+    // Resumed for the next round, which is then prepared, not only at the
+    // return to the page.
+    assert!(
+        rig.resumed_after[0] < rig.prepares,
+        "{:?}",
+        rig.resumed_after
+    );
+
+    // The retry the shown result serves.
+    let (rig, _, ran) = run(Refusal::Missing, practice_round(&quit_then_retry), |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert!(rig.withdrawals.is_empty(), "{:?}", rig.withdrawals);
+    assert_eq!(
+        rig.seen[..4],
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Load(P),
+            Seen::Shown(2)
+        ]
+    );
+    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
+    assert_eq!(
+        rig.turntable[..3],
+        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(4)],
+        "{:?}",
+        rig.turntable
+    );
+    // Resumed for the next round, which is then prepared, not only at the
+    // return to the page.
+    assert!(
+        rig.resumed_after[0] < rig.prepares,
+        "{:?}",
+        rig.resumed_after
+    );
 }
 
 /// The quit key in a round's READY state, before its section starts (its

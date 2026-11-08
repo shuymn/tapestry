@@ -10,7 +10,8 @@
 //!   adjustment's quantum filters it. Priority is the frame's
 //!   ([`ScratchInput`]).
 //! - **Play states** ([`PlayStates`]): created by a chart chosen to play,
-//!   P, or a retry, each numbered and stamped with its origin on the
+//!   P, or a retry outside practice (a practice session's retries keep
+//!   its play state), each numbered and stamped with its origin on the
 //!   shared clock.
 //! - **Autoplay notes** ([`scratch_notes`]): the scratch lane's taps and
 //!   long notes as events, built before READY.
