@@ -67,7 +67,7 @@ pub(crate) struct Compiled {
 }
 
 /// An integer part's bounds, `None` for a node that is never an integer.
-type Iv = Option<(i128, i128)>;
+pub(crate) type Iv = Option<(i128, i128)>;
 
 const FULL: Iv = Some((i64::MIN as i128, i64::MAX as i128));
 
@@ -117,8 +117,10 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                 .range(r)
                 .map(|(lo, hi)| (i128::from(lo), i128::from(hi))),
             Node::Neg(x) => exact(get(x).map(|(lo, hi)| (-hi, -lo)))?,
-            Node::Arith(op, a, b) => match (get(a), get(b), ints(a) && ints(b)) {
-                (Some((al, ah)), Some((bl, bh)), true) => {
+            // Both operands bounded: both may be integers (bounds are
+            // given exactly to the nodes that may be).
+            Node::Arith(op, a, b) => match (get(a), get(b)) {
+                (Some((al, ah)), Some((bl, bh))) => {
                     let corners = |f: &dyn Fn(i128, i128) -> i128| {
                         let c = [f(al, bl), f(al, bh), f(ah, bl), f(ah, bh)];
                         let lo = c.iter().copied().min().unwrap_or(0);
@@ -157,7 +159,7 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                 _ => None,
             },
             Node::Math(f, a, b) => match f {
-                MathOp::Floor | MathOp::Ceil if res.kind(a) & FLT != 0 => hull(get(a), FULL),
+                MathOp::Floor | MathOp::Ceil if res.kind(a) & FLT != 0 => FULL,
                 MathOp::Floor | MathOp::Ceil => get(a),
                 MathOp::Abs => exact(get(a).map(|(lo, hi)| {
                     let low = if lo <= 0 && hi >= 0 {
@@ -174,8 +176,8 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
         };
         // "Of no known bound" is not "never an integer": a node that may
         // be an integer and that no rule above bounds (a timer read, whose
-        // start or off value is any `long`; the gauge's type) gets the
-        // whole of `i64`, so arithmetic on it meets the ±2^53 rule.
+        // start or off value is any `long`) gets the whole of `i64`, so
+        // arithmetic on it meets the ±2^53 rule.
         let iv = if ints(r) { iv.or(FULL) } else { None };
         ivs.push(iv);
     }
@@ -191,20 +193,28 @@ struct C<'a, L> {
 
 /// `res`, converted by `conv` (a `draw` or a number's value), compiled into
 /// one callback.
+///
+/// `root` is the root's integer bounds from [`intervals`], run before the
+/// backend was chosen; each node is charged again here, as the walk it
+/// replaces was.
 pub(crate) fn compile<L: Leaves>(
     an: &Analysis,
     leaves: &mut L,
     res: &Residual,
     conv: Conv,
+    root: Iv,
 ) -> R<Compiled> {
     let conv = match conv {
         Conv::Truthy => present::Conv::Truthy,
         Conv::Int => present::Conv::Int,
         Conv::Text | Conv::Index => return Err(Stop::Unsupported(Unsupported::Type)),
     };
-    let ivs = intervals(an, leaves, res)?;
+    for _ in 0..res.len() {
+        charge(an, "compile:interval", 1)?;
+        did("compile:interval");
+    }
     if conv == present::Conv::Int {
-        exact(ivs.get(res.root as usize).copied().flatten())?;
+        exact(root)?;
     }
     let guards = leaves.guards(res);
     let mut c = C {
@@ -299,13 +309,7 @@ impl<L: Leaves> C<'_, L> {
         let ty = || Err(Stop::Unsupported(Unsupported::Type));
         match res.node(r) {
             Node::Known(v) => {
-                let pv = match v {
-                    Val::Nil => present::Val::Nil,
-                    Val::Bool(b) => present::Val::Bool(b),
-                    Val::Int(n) => present::Val::Int(n),
-                    Val::Float(f) => present::Val::Float(f64::from_bits(f)),
-                    _ => return ty(),
-                };
+                let pv = residual::num_val(v).ok_or(Stop::Unsupported(Unsupported::Type))?;
                 let k = self.constant(pv)?;
                 self.push(Insn::Const { dst, k })?;
             }

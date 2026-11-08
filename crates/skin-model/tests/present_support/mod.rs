@@ -6,10 +6,8 @@
 
 use skin_model::present::{CallbackDef, Conv, Insn, OutTy, PresentDef, ReadDef, Val};
 use skin_model::{
-    ElementDef, Fit, LoadError, PLAY, Program, Scope, Skin, SkinDef, Ty, WidgetDefs, compile, field,
+    ElementDef, LoadError, PLAY, Program, Scope, Skin, SkinDef, Ty, WidgetDefs, compile, field,
 };
-
-use crate::play_support::REGIONS;
 
 /// An expression over the play schema and `sig`'s outputs.
 pub fn expr(src: &str, sig: &[OutTy], ty: Ty) -> Program {
@@ -140,15 +138,8 @@ pub fn load(
     widgets: WidgetDefs,
 ) -> Result<Skin, LoadError> {
     Skin::new(SkinDef {
-        fit: Fit::Adapt,
-        regions: REGIONS,
-        whens,
-        sheet: crate::widget_support::sheet(),
-        lanes: None,
-        elements,
         widgets,
-        bomb_up_to: Some(skin_model::Grade::Bad),
-        close: None,
         present,
+        ..crate::play_support::def(whens, crate::widget_support::sheet(), elements)
     })
 }

@@ -1167,11 +1167,14 @@ fn an_interference_is_located_at_the_proofs_write() {
     }
 }
 
-/// Every source of an integer the compiler accepts has a range, and
+/// The integer sources a play skin's callback can reach have a range, and
 /// arithmetic past ±2^53 over it is refused, discarded or not; a source
 /// with no mapped range (a timer's start or off value) is of no known
-/// bound, and the gauge's type is a Java `int`.
-/// One row a source, each with a control that stays within the range.
+/// bound, and the gauge's type is a Java `int`. Rows by source, most with
+/// a control that stays within the range (a timer's control compares it
+/// with the off value, the only use that bounds it). Not covered here:
+/// `event_index`, mapped off play only (the selection and result
+/// profiles, `-1` to `10`), and `//`, which no closed candidate holds.
 #[test]
 fn every_integer_source_is_bounded() {
     let range = Disposition::Replaced(Unsupported::Range);
@@ -1215,6 +1218,11 @@ fn every_integer_source_is_bounded() {
             "function() local j = ms.judge(1) local u = j * j * j * j return 1 end",
             range,
         ),
+        (
+            "judge",
+            "function() local j = ms.judge(1) local u = j * j return 1 end",
+            Disposition::Lowered,
+        ),
         // A timer read: of no known bound (its start or the off value).
         (
             "timer",
@@ -1236,11 +1244,21 @@ fn every_integer_source_is_bounded() {
             "function() local t = ms.timer(0) local u = t + 1 return 1 end",
             range,
         ),
+        (
+            "timer",
+            "function() local t = ms.timer(0) local u = t == ms.timer_off_value return 1 end",
+            Disposition::Lowered,
+        ),
         // The gauge's type: a Java `int`.
         (
             "gauge_type",
             "function() local g = ms.gauge_type() local u = g * g * g return 1 end",
             range,
+        ),
+        (
+            "gauge_type",
+            "function() local g = ms.gauge_type() local u = g + 1 return 1 end",
+            Disposition::Lowered,
         ),
         // Operators: each result's range from its operands'; a select's
         // the hull of its arms (here converted as a number's value; the
@@ -1250,6 +1268,11 @@ fn every_integer_source_is_bounded() {
             "math.abs",
             "function() local t = ms.timer(0) local u = math.abs(t) return 1 end",
             range,
+        ),
+        (
+            "math.abs",
+            "function() local u = math.abs(ms.number(110)) * 2 return 1 end",
+            Disposition::Lowered,
         ),
         (
             "math.max",
