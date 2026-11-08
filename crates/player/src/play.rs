@@ -461,7 +461,7 @@ impl PlayerRig<'_> {
                 Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
                 Some(Err(e)) => Chain(&e).to_string(),
             };
-            log::info!("skin: result: built-in for this attempt: {why}");
+            println!("skin: result: built-in for this attempt: {why}");
             self.presenter.attempt_fallback(why);
             return;
         }
