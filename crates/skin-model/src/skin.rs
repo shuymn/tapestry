@@ -31,7 +31,7 @@ use crate::result::{ResultError, ResultFrame, ResultScreen};
 use crate::schema::Ty;
 use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
-use crate::select::{Selection, SelectionError, SelectionFrame};
+use crate::select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
 use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
@@ -3048,10 +3048,37 @@ impl Skin {
         sel.row_bitmap = rows.into_boxed_slice();
     }
 
+    /// Prepares the timers of `sel`'s frame at `now` from `timers`: the
+    /// built-in timers start from the frame's starts and the `when` timers
+    /// over the fields, as the build would. The build of the same frame
+    /// (the same `now`) then takes them as they are, so what runs between
+    /// the two (the screen's runtime, docs/stage3.md S7-07) reads the
+    /// state the build draws. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a selection skin.
+    pub fn prepare_selection_frame(
+        &self,
+        sel: &mut Selection,
+        now: TimeUs,
+        timers: &SelectionTimers,
+    ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Selection {
+            return Err(BuildError::Kind);
+        }
+        if self.owns(sel) {
+            sel.fill(now, timers, &self.whens);
+            sel.prepared = Some(now);
+        }
+        Ok(())
+    }
+
     /// Builds one selection frame of `sel`, which must come from this
     /// skin's [`prepare_selection`](Self::prepare_selection): starts the
     /// built-in timers from the frame's starts and the `when` timers over
-    /// the fields, places the regions, then appends each drawn element's
+    /// the fields, unless [`prepare_selection_frame`](Self::prepare_selection_frame)
+    /// prepared them for this frame's time, places the regions, then appends each drawn element's
     /// quads to `out` in draw order (the caller clears `out`): images,
     /// image choices, numbers, text, the song list's slots and the ratio
     /// bars, recording each changeable slider's travel for
@@ -3085,7 +3112,9 @@ impl Skin {
         }
         let canvas = self.canvas(frame.target);
         let placement = self.placement(&canvas, frame.layout, Side::Left);
-        sel.fill(frame.now, &frame.timers, &self.whens);
+        if sel.prepared.take() != Some(frame.now) {
+            sel.fill(frame.now, &frame.timers, &self.whens);
+        }
         let sel = &*sel;
         let rt = Runtime {
             starts: sel.starts(),
