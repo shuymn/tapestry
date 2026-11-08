@@ -4859,6 +4859,9 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
         .events;
     assert_eq!(own.figures.timing, game::TimingStats::of(events));
     assert_eq!(own.figures.timing.map(|t| t.samples), Some(1));
+    // One press and one miss: its deviation and a second, over two notes.
+    assert_eq!(own.figures.duration_us, game::mean_duration(events, 2));
+    assert!(own.figures.duration_us.is_some_and(|d| d >= 500_000));
     assert_eq!(own.figures.rate, game::Rate::of(ex, 4));
     let rate = |best_ex| {
         Some(BestRate {

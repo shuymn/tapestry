@@ -72,6 +72,7 @@ fn every_graph_follows_the_view() {
         ],
         ResultDefs {
             judge_graphs: vec![graph(JudgeGraphKind::Judgment, GRID, false, 0)],
+            timing: skin_model::ResultTiming::default(),
             gauge_graphs: vec![GaugeGraphDef {
                 colors,
                 solid: SOLID,

@@ -58,6 +58,20 @@ pub struct JudgeEvent {
     pub kind: JudgeEventKind,
 }
 
+/// The deviation that decides a judgment's side (design.md "Evaluation
+/// Stages", accounting): for a long note finished by a release
+/// (`release`), whichever of its head's press (`deviation`) and its
+/// release lies farther from its time, the release on a tie; otherwise the
+/// press's, `None` for a miss. Pure; allocates nothing.
+#[must_use]
+pub fn side_deviation(deviation: Option<TimeUs>, release: Option<TimeUs>) -> Option<TimeUs> {
+    match (deviation, release) {
+        (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
+        (_, Some(r)) => Some(r),
+        (head, None) => head,
+    }
+}
+
 /// What a [`JudgeEvent`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JudgeEventKind {
@@ -1541,12 +1555,7 @@ impl<'a> Evaluator<'a> {
         // miss is late; a long note finished by a release takes the side of
         // whichever of its head and its release lies farther from its time,
         // the release on a tie; otherwise the press's side, 0 early.
-        let distance = match (deviation, release) {
-            (Some(head), Some(r)) if head.0.unsigned_abs() > r.0.unsigned_abs() => Some(head),
-            (_, Some(r)) => Some(r),
-            (head, None) => head,
-        };
-        let side = if distance.is_some_and(|d| d.0 <= 0) {
+        let side = if side_deviation(deviation, release).is_some_and(|d| d.0 <= 0) {
             &mut self.tally.early
         } else {
             &mut self.tally.late

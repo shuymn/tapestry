@@ -276,6 +276,7 @@ fn probe_view(chart: ResultChart) -> ResultView {
                 grade: 1,
             }),
             next_rank: 1,
+            duration_us: Some(1),
         },
         best: BestView::Known(BestFigures {
             ex: 1,
