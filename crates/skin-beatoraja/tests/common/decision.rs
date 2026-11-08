@@ -20,7 +20,7 @@ use skin_model::{
 use tempfile::TempDir;
 
 use super::play::{LIMITS, quad_texel};
-use super::selection::{IMAGES, SHEET};
+use super::selection::{IMAGES, SHEET, lua_images};
 use super::{coord, font, png_with, write};
 
 /// A decision skin folder holding `s.json` with `body` after the type,
@@ -71,23 +71,6 @@ pub fn json(body: &str) -> String {
 pub fn import_decision(root: &Path) -> Result<Imported, ImportError> {
     let (mut def, h) = read_header(root, "s.json")?;
     import(&mut def, &h, &Config::defaults(&h), ScreenKind::Decision)
-}
-
-/// The selection fixtures' images as a Lua table's entries.
-pub fn lua_images() -> String {
-    [
-        ("b0", 0),
-        ("b1", 8),
-        ("b5", 16),
-        ("lamp", 24),
-        ("lab", 32),
-        ("bar", 40),
-        ("dot", 48),
-    ]
-    .iter()
-    .map(|(id, x)| format!("{{ id = \"{id}\", src = \"s\", x = {x}, y = 0, w = 8, h = 8 }}"))
-    .collect::<Vec<_>>()
-    .join(", ")
 }
 
 /// A Lua decision skin in `root`'s `s.luaskin`: `pre` statements after the
@@ -152,7 +135,6 @@ pub fn labels() -> ResultLabels {
 pub struct Dec {
     pub skin: Skin,
     pub atlas: Atlas,
-    pub uvs: skin_model::UvTable,
     pub dec: DecisionScreen,
     pub batch: QuadBatch,
     pub timers: DecisionTimers,
@@ -161,14 +143,12 @@ pub struct Dec {
 impl Dec {
     pub fn new(skin: Skin) -> Self {
         let atlas = skin.atlas(Variant::Lo, LIMITS, &|| false).unwrap();
-        let uvs = atlas.uvs().clone();
         let mut dec = skin.prepare_decision();
         skin.update_decision(&mut dec, &labels()).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
             skin,
             atlas,
-            uvs,
             dec,
             batch,
             timers: DecisionTimers {
@@ -212,7 +192,7 @@ impl Dec {
             timers: self.timers,
         };
         self.skin
-            .build_decision(&mut self.dec, &frame, &self.uvs, &mut self.batch)
+            .build_decision(&mut self.dec, &frame, self.atlas.uvs(), &mut self.batch)
             .unwrap();
         self.batch.quads().to_vec()
     }

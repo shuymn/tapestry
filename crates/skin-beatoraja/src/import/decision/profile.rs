@@ -6,9 +6,13 @@
 //! else is unsupported with a note: numbers, image indices, sliders,
 //! graphs and events have no value on this screen.
 //!
-//! Every reader of an id goes through these functions: a JSON field's
-//! `ref` or `op`, a Lua callback's read, and a Lua read while the skin
-//! loads ([`crate::lua::facts`]), so they cannot differ.
+//! A JSON field's `ref` or `op` and a Lua callback's read go through these
+//! functions. A Lua read while the skin loads ([`crate::lua::facts`])
+//! answers from them too, except where `facts` answers every scene alike:
+//! options 32 and 33 (false off play), 290 and 1008 (false everywhere)
+//! and the judgment class (a fact of the snapshot), whose values agree
+//! with these, and texts, which read the difficulty table's lines as empty
+//! and anything else as live state.
 
 use skin_model::decision_timer;
 

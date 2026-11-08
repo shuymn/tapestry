@@ -35,6 +35,23 @@ pub const IMAGES: &str = r#"
     {"id": "bar", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8},
     {"id": "dot", "src": "s", "x": 48, "y": 0, "w": 8, "h": 8}"#;
 
+/// The selection fixtures' images as a Lua table's entries.
+pub fn lua_images() -> String {
+    [
+        ("b0", 0),
+        ("b1", 8),
+        ("b5", 16),
+        ("lamp", 24),
+        ("lab", 32),
+        ("bar", 40),
+        ("dot", 48),
+    ]
+    .iter()
+    .map(|(id, x)| format!("{{ id = \"{id}\", src = \"s\", x = {x}, y = 0, w = 8, h = 8 }}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// The middle texel of an image's cut, by its left column: what
 /// [`Sel::drawn`] names a quad by.
 pub fn image_at(x: u32, y: u32) -> [u8; 2] {

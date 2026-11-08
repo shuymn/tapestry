@@ -367,8 +367,7 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 ///    every file the skin names is. A skin of another kind refuses.
 /// 3. The configuration: each option and file choice by name, against the
 ///    header; an unknown name refuses.
-/// 4. The import, Lua against the base facts; a kind with no importer
-///    keeps its built-in screen. A Lua play skin reading a chart fact
+/// 4. The import, Lua against the base facts. A Lua play skin reading a chart fact
 ///    ends pending, built for each attempt ([`specialize`]); a Lua skin of
 ///    another kind reading one refuses.
 /// 5. The pack ([`pack`]).
@@ -379,19 +378,7 @@ pub fn build(
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> KindOutcome {
-    match built(kind, choice, autoplay, target, cancel) {
-        Ok(Built::Bundle(b, summary)) => KindOutcome::Bundle(b, summary),
-        Ok(Built::Pending(p, note)) => KindOutcome::Pending(p, note),
-        Ok(Built::ResultPending(p, note)) => KindOutcome::ResultPending(p, note),
-        Err(why) => KindOutcome::Refused(why),
-    }
-}
-
-/// What [`built`] made.
-enum Built {
-    Bundle(Arc<SkinBundle>, Summary),
-    Pending(Arc<PendingPlay>, PendingNote),
-    ResultPending(Arc<crate::result_skin::PendingResult>, PendingNote),
+    built(kind, choice, autoplay, target, cancel).unwrap_or_else(KindOutcome::Refused)
 }
 
 /// The header pass's result, by format.
@@ -424,7 +411,7 @@ fn built(
     autoplay: bool,
     target: &ImportTarget,
     cancel: &Cancel,
-) -> Result<Built, String> {
+) -> Result<KindOutcome, String> {
     let stopped = || stopped(cancel);
     let text = |e: &ImportError| Chain(e).to_string();
     // 1. The folder.
@@ -482,7 +469,7 @@ fn built(
                         let root = Root::new(&choice.root).map_err(|e| Chain(&e).to_string())?;
                         let pending =
                             crate::result_skin::PendingResult::new(h, config, *target, &root);
-                        return Ok(Built::ResultPending(Arc::new(pending), note));
+                        return Ok(KindOutcome::ResultPending(Arc::new(pending), note));
                     }
                     // Only play's and the result's facts are given per
                     // attempt: another kind's pending fact refuses.
@@ -494,7 +481,7 @@ fn built(
                         config,
                         target: *target,
                     };
-                    return Ok(Built::Pending(Arc::new(pending), note));
+                    return Ok(KindOutcome::Pending(Arc::new(pending), note));
                 }
                 Err(e) => Err(e),
             }
@@ -504,7 +491,7 @@ fn built(
     stopped()?;
     // 5. The pack.
     let (bundle, summary) = pack(imported, &header, target, cancel)?;
-    Ok(Built::Bundle(bundle, summary))
+    Ok(KindOutcome::Bundle(bundle, summary))
 }
 
 /// Builds `pending` for an attempt's `facts`, asking `cancel` between its
@@ -1028,8 +1015,7 @@ pub struct Started {
     /// Play's admission notice when its skin was refused (song selection):
     /// no chart is admitted, and the built-in skin does not stand in.
     pub play: Option<String>,
-    /// The select screen's one notice line for the other kinds refused or
-    /// left built in.
+    /// The select screen's one notice line for the other kinds refused.
     pub notice: Option<String>,
     /// Play's pending skin, marked pending on the render thread: each
     /// attempt is prepared with its specialization ([`PendingSkin`]).
@@ -1079,8 +1065,8 @@ pub enum StartupEnd {
 /// - A play skin that cannot be used refuses every chart on the song
 ///   selection path ([`Started::play`]); on the direct path it fails the
 ///   run, whatever refused it, before the result kind's build starts.
-/// - Another kind refused, or with no importer yet, keeps its built-in
-///   screen, with one notice line ([`Started::notice`]).
+/// - Another kind refused keeps its built-in screen, with one notice line
+///   ([`Started::notice`]).
 /// - A healthy refusal of an installation moves on to the next kind.
 ///
 /// # Errors

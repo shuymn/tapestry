@@ -380,6 +380,23 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     }
 }
 
+/// `skin`'s atlas built within the harness's limits: its uv table.
+///
+/// # Panics
+///
+/// If the atlas is refused.
+fn atlas_uvs(skin: &skin_model::Skin) -> skin_model::UvTable {
+    let limits = skin_model::AtlasLimits {
+        max_side: 4_096,
+        max_layers: 8,
+        reserved_layers: 1,
+    };
+    skin.atlas(skin_model::Variant::Lo, limits, &|| false)
+        .expect("an imported sheet builds its atlas")
+        .into_parts()
+        .1
+}
+
 /// A result view of a 600-note play whose best is known with no BP
 /// (hidden): ready, or with no result when not `ready`.
 #[must_use]
@@ -460,19 +477,8 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
 /// holds more quads than the skin's capacity.
 fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
     use bms_model::TimeUs;
-    use skin_model::{
-        AtlasLimits, Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers, Variant,
-    };
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    use skin_model::{Layout, QuadBatch, ResultFrame, ResultLabels, ResultTimers};
+    let uvs = atlas_uvs(skin);
     let labels = ResultLabels {
         title: "t".to_owned(),
         ..ResultLabels::default()
@@ -518,19 +524,10 @@ fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
 fn draw_decision(skin: &skin_model::Skin) -> Vec<usize> {
     use bms_model::TimeUs;
     use skin_model::{
-        AtlasLimits, DecisionFrame, DecisionTimers, FrameUv, Layout, QuadBatch, ResultLabels,
-        TextImage, TextTable, Variant,
+        DecisionFrame, DecisionTimers, FrameUv, Layout, QuadBatch, ResultLabels, TextImage,
+        TextTable,
     };
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let labels = ResultLabels {
         title: "t".to_owned(),
         artist: "a".to_owned(),
@@ -589,21 +586,11 @@ fn draw_decision(skin: &skin_model::Skin) -> Vec<usize> {
 fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
     use bms_model::TimeUs;
     use skin_model::{
-        AtlasLimits, ChartLabels, Layout, QuadBatch, Ratio, RowKey, RowKind, RowScore, RowView,
-        SelectedChart, SelectionFrame, SelectionLabels, SelectionPlace, SelectionTimers,
-        SelectionView, Variant,
+        ChartLabels, Layout, QuadBatch, Ratio, RowKey, RowKind, RowScore, RowView, SelectedChart,
+        SelectionFrame, SelectionLabels, SelectionPlace, SelectionTimers, SelectionView,
     };
 
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let row = |kind: RowKind, title: &str| RowView {
         key: match kind {
             RowKind::Chart => RowKey::Chart(format!("{title}.bms").into()),
@@ -691,21 +678,12 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
     use skin_model::{
-        AtlasLimits, Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout,
-        PlayContext, QuadBatch, Side, SkinFrame, TextImage, TextTable, Variant,
+        Attempt, ChartText, FrameUv, GaugeDesc, GaugeLook, LaneView, Layout, PlayContext,
+        QuadBatch, Side, SkinFrame, TextImage, TextTable,
     };
 
     let skin = &imported.skin;
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let lane = Lane::new(1).expect("lane 1");
     let chart = (0..100_i64)
         .fold(ChartBuilder::new(150_000), |b, i| {
@@ -1063,21 +1041,11 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     use eval::{GaugeState, JudgeEvent, JudgeEventKind, Tally};
     use rules::{GaugeValue, Judgment, PerJudgment};
     use skin_model::{
-        AtlasLimits, Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Side,
-        SkinFrame, Variant,
+        Attempt, GaugeDesc, GaugeLook, Layout, PlayContext, QuadBatch, Side, SkinFrame,
     };
 
     let skin = &imported.skin;
-    let limits = AtlasLimits {
-        max_side: 4_096,
-        max_layers: 8,
-        reserved_layers: 1,
-    };
-    let uvs = skin
-        .atlas(Variant::Lo, limits, &|| false)
-        .expect("an imported sheet builds its atlas")
-        .into_parts()
-        .1;
+    let uvs = atlas_uvs(skin);
     let chart = bms_model::ChartBuilder::new(150_000)
         .build()
         .expect("an empty chart");

@@ -997,30 +997,15 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
-        if self.kind == ScreenKind::Selection {
-            #[cfg(feature = "dev-tools")]
-            if let Some(e) = &mut self.element {
-                e.kind = Some(format!("{object:?}"));
-            }
-            return self.selection_destination(dst, object, orec);
-        }
-        if self.kind == ScreenKind::Result {
-            #[cfg(feature = "dev-tools")]
-            if let Some(e) = &mut self.element {
-                e.kind = Some(format!("{object:?}"));
-            }
-            return self.result_destination(dst, object, orec);
-        }
-        if self.kind == ScreenKind::Decision {
-            #[cfg(feature = "dev-tools")]
-            if let Some(e) = &mut self.element {
-                e.kind = Some(format!("{object:?}"));
-            }
-            return self.decision_destination(dst, object, orec);
-        }
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
+        }
+        match self.kind {
+            ScreenKind::Selection => return self.selection_destination(dst, object, orec),
+            ScreenKind::Result => return self.result_destination(dst, object, orec),
+            ScreenKind::Decision => return self.decision_destination(dst, object, orec),
+            ScreenKind::Play => {}
         }
         // The source draws the character when its file exists and the
         // notes otherwise: one id cannot be both.
