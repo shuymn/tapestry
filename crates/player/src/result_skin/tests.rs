@@ -1384,3 +1384,28 @@ fn a_lost_probe_entry_is_not_reused() {
         "B lacks the probe's A: prepared again"
     );
 }
+
+/// A Lua result skin laid out per view draws in a build with no switch of
+/// its own (O1 (b), the S10-09i design's C19): its prepared atlas uploaded
+/// as the attempt's upload says, then P's layout presented on those pages
+/// and drawn on WARP, nothing more uploaded.
+#[test]
+fn a_pending_lua_skin_draws_on_its_uploaded_pages() {
+    use crate::render_side::tests::result::{Rig, presented_on};
+    let _s = serial();
+    let d = skin(
+        "",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged(&mut rs);
+    let upload = rs.upload().expect("the prepared atlas is uploaded");
+    assert!(matches!(upload, super::Upload::Pages(_)));
+    rs.request(view(17));
+    settled(&mut rs);
+    let bundle = shown(&rs);
+    assert_eq!(bundle.atlas_id(), upload.atlas());
+    let rig = Rig::new();
+    assert!(presented_on(&rig, upload, &bundle));
+    rig.exit();
+}
