@@ -45,6 +45,7 @@ use skin_model::{AtlasLimits, FontReader, Layout, Root, ScreenKind, Side, Skin};
 
 use crate::log_file;
 use crate::render_side::{RenderLink, SELECT_SLICE};
+use crate::screens::ScriptSlot;
 use crate::ui_text::{Label, Message};
 
 pub mod facts;
@@ -75,8 +76,10 @@ pub struct ImportTarget {
 /// How a kind's build ended.
 #[derive(Debug)]
 pub enum KindOutcome {
-    /// Built: the bundle to select, and the import's report.
-    Bundle(Arc<SkinBundle>, Summary),
+    /// Built: the bundle to select, the import's report, and the
+    /// selection screen's runtime, if its callbacks need one
+    /// (docs/stage3.md S7-07).
+    Bundle(Arc<SkinBundle>, Summary, ScriptSlot),
     /// Refused, with the located reason: nothing is selected.
     Refused(String),
     /// A Lua play skin whose base import read a fact the base snapshot
@@ -543,12 +546,23 @@ fn built(
     let config = config(pass.header(), choice)?;
     // 4. The import.
     let header = pass.header().clone();
+    // A selection skin keeps its configured VM for the callbacks only its
+    // runtime runs (docs/stage3.md S7-07).
+    let mut script = ScriptSlot::default();
     let imported: Result<Imported, ImportError> = match pass {
         Pass::Json(mut def, _) => skin_beatoraja::import(&mut def, &header, &config, kind),
         Pass::Lua(h) => {
             let facts = ImportFacts::base(kind, Fact::Known(autoplay));
-            match h.import(&config, &facts, cancel) {
-                Ok(LuaOutcome::Imported(i)) => Ok(i.imported),
+            let outcome = if kind == ScreenKind::Selection {
+                h.import_runtime(&config, &facts, cancel)
+            } else {
+                h.import(&config, &facts, cancel)
+            };
+            match outcome {
+                Ok(LuaOutcome::Imported(i)) => {
+                    script = ScriptSlot::staged(i.runtime);
+                    Ok(i.imported)
+                }
                 Ok(LuaOutcome::Pending(p)) => {
                     let note = PendingNote {
                         fact: p.pending,
@@ -583,7 +597,7 @@ fn built(
     stopped()?;
     // 5. The pack.
     let (bundle, summary) = pack(imported, &header, target, cancel)?;
-    Ok(KindOutcome::Bundle(bundle, summary))
+    Ok(KindOutcome::Bundle(bundle, summary, script))
 }
 
 /// Builds `pending` for an attempt's `facts`, asking `cancel` between its
@@ -1265,7 +1279,7 @@ pub fn startup(
             // A result skin with no fact pending: installed as the result
             // kind's, for every chart (the S10-09i design's D2). Refused, it
             // is tried again after each attempt's commit.
-            Ran::Done(KindOutcome::Bundle(bundle, summary)) if kind == ScreenKind::Result => {
+            Ran::Done(KindOutcome::Bundle(bundle, summary, _)) if kind == ScreenKind::Result => {
                 started.result = Some(crate::result_skin::ResultStart::Fixed(Arc::clone(&bundle)));
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 match answered(kind, render.select(kind, Some(bundle)), &mut stop)? {
@@ -1278,12 +1292,12 @@ pub fn startup(
                     Some(why) => Shown::Refused(why),
                 }
             }
-            Ran::Done(KindOutcome::Bundle(bundle, summary)) => {
+            Ran::Done(KindOutcome::Bundle(bundle, summary, script)) => {
                 let (texels, side) = (bundle.atlas_texels(), bundle.side());
                 let skin = bundle.skin();
                 let window = (kind == ScreenKind::Selection)
                     .then(|| (skin.song_list_center(), skin.song_list_slots()));
-                let pending = render.select(kind, Some(bundle));
+                let pending = render.select_with(kind, Some(bundle), script);
                 match answered(kind, pending, &mut stop)? {
                     None => {
                         if window.is_some() {

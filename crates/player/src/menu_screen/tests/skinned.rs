@@ -467,7 +467,7 @@ fn measure_on(adapter: render::AdapterChoice) {
         // The fallback page and the strip, laid out with glyphon.
         let begun = Instant::now();
         screen.prepare_page(&u.page, 60.0, 30.0).unwrap();
-        screen.prepare_strip(&u.strip).unwrap();
+        screen.prepare_strip(&u.strip, None).unwrap();
         times.push(begun.elapsed());
         // The skin's lines: the rows not cached rasterized and uploaded.
         let skin = std::sync::Arc::clone(logic.bundle.skin());
@@ -494,4 +494,52 @@ fn measure_on(adapter: render::AdapterChoice) {
         skin_times[0],
     );
     println!("rasterized per move {:?}", &rasterized[1..8]);
+}
+
+/// A selection frame's build allocates nothing with the skin's runtime
+/// present and running each frame before it, outside the counted build
+/// (docs/stage3.md S7-07; design.md "Scope of No Allocation").
+#[test]
+fn selection_runtime_frame_alloc() {
+    let _serial = crate::imports::tests::serial();
+    let mut r = warp();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (b, script) =
+        crate::selection_skin::fixture_scripted(r.atlas_limits(), dir.path(), "rt.luaskin");
+    let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
+    r.commit(token).unwrap();
+    let key = std::sync::Arc::as_ptr(&b).addr();
+    let scripts = crate::screens::Scripts::new();
+    scripts.commit(ScreenKind::Selection, key, script);
+    let mut screen = MenuScreen::new(r, Some(Fonts::runtime().unwrap()));
+    let mut logic =
+        SelectionLogic::new(&b, 1).with_script(scripts.slot(ScreenKind::Selection, key));
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let u = update(&mut feed, &searching("", ""), 0);
+    screen
+        .prepare_selection(&u, &mut logic, true)
+        .unwrap()
+        .unwrap();
+    for k in 0..50 {
+        let now = TimeUs(k * 16_667);
+        crate::screens::selection_visit(
+            &mut logic.script,
+            logic.bundle.skin(),
+            &mut logic.sel,
+            now,
+            &u.events.timers(),
+        )
+        .unwrap();
+        let before = crate::alloc_count::this_thread();
+        screen.build_selection_frame(&u, &mut logic, now).unwrap();
+        assert_eq!(crate::alloc_count::this_thread() - before, 0, "frame {k}");
+        screen.renderer.submit_selection(&[]).unwrap();
+    }
+    logic.script.park();
+    assert_eq!(
+        scripts.parked(ScreenKind::Selection),
+        Some((50, false)),
+        "the runtime ran each frame"
+    );
 }
