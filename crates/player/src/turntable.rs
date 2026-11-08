@@ -36,6 +36,10 @@ pub(crate) struct Turntable {
     /// The committed attempt's scratch notes, for autoplay; none for a
     /// play by hand.
     notes: Vec<ScratchNote>,
+    /// A resume the game sent, applied when the practice page shows, so
+    /// no frame drawn before it (an old play frame after a withdrawn
+    /// result) takes the fresh baseline.
+    resume: Option<u64>,
 }
 
 impl Turntable {
@@ -61,9 +65,20 @@ impl Turntable {
         self.clock.pause(number);
     }
 
-    /// Play state `number`'s resume.
+    /// Play state `number`'s resume, applied by the practice page
+    /// ([`practice_page`](Self::practice_page)).
     pub(crate) const fn resume(&mut self, number: u64) {
-        self.clock.resume(number);
+        self.resume = Some(number);
+    }
+
+    /// The practice page shows: its play state's presentation begins, and
+    /// a resume the game sent applies now, the page's first frame its
+    /// baseline.
+    pub(crate) fn practice_page(&mut self) {
+        self.begin_presentation();
+        if let Some(n) = self.resume.take() {
+            self.clock.resume(n);
+        }
     }
 
     /// The committed attempt's scratch notes: autoplay's presses start
@@ -88,13 +103,15 @@ impl Turntable {
     /// at chart time `chart` when it is a play frame, with the devices'
     /// `scratch`: autoplay updates first, then the clock ticks.
     pub(crate) fn presented(&mut self, at: TimeUs, chart: Option<TimeUs>, scratch: ScratchInput) {
+        // Autoplay's judge starts with the play: READY's frames (before
+        // chart time 0) tick but update nothing.
         let auto = match chart {
-            Some(t) => {
+            Some(t) if t.0 >= 0 => {
                 let ms = game::state_ms(at, self.origin);
                 self.autoplay.update(&self.notes, t, ms);
                 self.autoplay.pressed()
             }
-            None => [false; 2],
+            _ => [false; 2],
         };
         self.clock.tick(at, scratch.direction(at, auto));
     }
@@ -169,7 +186,22 @@ mod tests {
         t.pause(1);
         t.presented(TimeUs(3_000 * MS), None, ScratchInput::NONE);
         assert_eq!(t.angle(), held);
+        // The resume comes before the page shows: old frames drawn
+        // between (a withdrawn result's play frames) neither tick nor
+        // take the baseline.
         t.resume(1);
+        t.presented(
+            TimeUs(5_000 * MS),
+            Some(TimeUs(9_000 * MS)),
+            ScratchInput::NONE,
+        );
+        t.presented(
+            TimeUs(5_500 * MS),
+            Some(TimeUs(9_500 * MS)),
+            ScratchInput::NONE,
+        );
+        assert_eq!(t.angle(), held, "old frames before the page");
+        t.practice_page();
         t.presented(TimeUs(6_200 * MS), None, ScratchInput::NONE);
         assert_eq!(t.angle(), held, "the first page frame adds 0");
         t.presented(TimeUs(6_210 * MS), None, ScratchInput::NONE);
@@ -187,8 +219,30 @@ mod tests {
         assert_eq!(t.angle(), 200 * 1_000);
         t.pause(2);
         t.resume(1);
+        t.practice_page();
         idle(&mut t, 210, 300);
         assert_eq!(t.angle(), 200 * 1_000);
+    }
+
+    /// READY's frames tick the clock but update no autoplay: a scratch
+    /// note at chart time 0 is never crossed, as the source's judge
+    /// starts at 0 with its previous time at 0.
+    #[test]
+    fn ready_frames_tick_but_autoplay_waits_for_the_play() {
+        let mut t = Turntable::default();
+        t.created(state(1, 0));
+        t.begin_presentation();
+        t.attempt(vec![ScratchNote {
+            time: TimeUs(0),
+            kind: ScratchNoteKind::Tap,
+        }]);
+        t.play_starts();
+        // READY at chart −20 and −10 ms, then the play at 0 and 10 ms.
+        let mut turned = Vec::new();
+        for chart in [-20, -10, 0, 10] {
+            turned.push(play_tick(&mut t, chart * MS, 1_000_000));
+        }
+        assert_eq!(turned, [0, 10_000, 10_000, 10_000], "idle throughout");
     }
 
     /// Autoplay presses on play frames only: a tap turns Positive and,
@@ -290,5 +344,64 @@ mod tests {
         // A rearm or a round: chart time starts over, the press is gone.
         t.play_starts();
         assert_eq!(play_tick(&mut t, 10_000, 1_000_000), 10_000, "idle");
+    }
+
+    /// The turntable's per-frame work allocates nothing (design.md "Scope
+    /// of No Allocation"): ticks with autoplay crossing taps, long notes and
+    /// charge ends, rearms and rounds, a pause and a resume through the
+    /// practice page, and a new play state's adoption.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn turntable_frames_alloc() {
+        use crate::alloc_count::this_thread;
+        let mut t = Turntable::default();
+        t.created(state(1, 0));
+        t.begin_presentation();
+        let mut notes = Vec::new();
+        for i in 0..50 {
+            let at = 1_000 + i * 400;
+            notes.push(ScratchNote {
+                time: TimeUs(at * MS),
+                kind: ScratchNoteKind::Tap,
+            });
+            notes.push(ScratchNote {
+                time: TimeUs((at + 100) * MS),
+                kind: ScratchNoteKind::LongStart {
+                    end: TimeUs((at + 250) * MS),
+                    charge: i % 2 == 0,
+                },
+            });
+            notes.push(ScratchNote {
+                time: TimeUs((at + 250) * MS),
+                kind: ScratchNoteKind::LongEnd { charge: i % 2 == 0 },
+            });
+        }
+        t.attempt(notes);
+        let next = state(2, 0);
+        let negative = ScratchInput {
+            negative: true,
+            ..ScratchInput::NONE
+        };
+        let before = this_thread();
+        for round in 0..3 {
+            t.play_starts();
+            for ms in (-500..21_000).step_by(7) {
+                let scratch = if ms % 300 < 50 {
+                    negative
+                } else {
+                    ScratchInput::NONE
+                };
+                t.presented(TimeUs((ms + 1_000) * MS), Some(TimeUs(ms * MS)), scratch);
+            }
+            t.pause(1);
+            t.presented(TimeUs(30_000 * MS), None, ScratchInput::NONE);
+            t.resume(1);
+            t.practice_page();
+            t.presented(TimeUs((31_000 + round) * MS), None, ScratchInput::NONE);
+        }
+        t.created(next);
+        t.begin_presentation();
+        t.presented(TimeUs(40_000 * MS), None, ScratchInput::NONE);
+        assert_eq!(this_thread(), before);
     }
 }

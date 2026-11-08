@@ -2234,7 +2234,7 @@ impl AppRig for PlayerRig<'_> {
                 e.header.title.clone().unwrap_or_else(|| file_name(&e.path))
             });
         let page = crate::practice_page::page(screen, &name);
-        self.render.send(RenderMsg::Menu(Box::new(page)));
+        self.render.send(RenderMsg::PracticePage(Box::new(page)));
         #[cfg(feature = "dev-tools")]
         if let Some(sc) = &mut self.scenario {
             sc.practice = Some(screen.clone());

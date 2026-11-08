@@ -804,6 +804,10 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
+    /// Draw the practice page: a [`Menu`](Self::Menu) that is its play
+    /// state's presentation, so the play state's turntable is adopted,
+    /// resumed when the game resumed it, and ticked on its frames.
+    PracticePage(Box<MenuPage>),
     /// Answer when taken (tests): the render thread has taken every
     /// message before it, and drawn the frame that followed them, if any.
     #[cfg(test)]
@@ -2251,6 +2255,7 @@ pub fn spawn(
                 prepared: None,
                 presentation: None,
                 turntable: crate::turntable::Turntable::default(),
+                page_turns: false,
                 tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
@@ -2782,6 +2787,9 @@ struct Run {
     presentation: Option<game::adjustment::PresentationReader>,
     /// The play state's turntable (docs/stage3.md, offset 1).
     turntable: crate::turntable::Turntable,
+    /// Whether the page drawn is the practice page
+    /// ([`RenderMsg::PracticePage`]), whose frames tick the turntable.
+    page_turns: bool,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
@@ -2902,7 +2910,7 @@ impl Run {
             // The select screen is left: its frames are reported; and the
             // loading state's, once it is left.
             #[cfg(feature = "dev-tools")]
-            if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_))) {
+            if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_))) {
                 self.menu_stats.report("select");
             }
             #[cfg(feature = "dev-tools")]
@@ -2969,25 +2977,17 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Menu(page)) => {
-                    // The practice page begins its play state's
-                    // presentation.
-                    self.turntable.begin_presentation();
-                    mode = match mode {
-                        // The launch screen shows out its time.
-                        Mode::Splash { .. }
-                            if Self::launch_elapsed(&self.shared, self.started) < SPLASH =>
-                        {
-                            Mode::Splash {
-                                pending: Some(page),
-                            }
-                        }
-                        _ => Mode::Menu {
-                            page,
-                            update: None,
-                            changed: true,
-                            loading: None,
-                        },
-                    };
+                    // A generic page (a preparation's wait, a notice) is
+                    // no play state's presentation: no turntable.
+                    self.page_turns = false;
+                    mode = Self::menu_mode(mode, page, &self.shared, self.started);
+                }
+                Ok(RenderMsg::PracticePage(page)) => {
+                    // The practice page begins or resumes its play
+                    // state's presentation.
+                    self.page_turns = true;
+                    self.turntable.practice_page();
+                    mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
@@ -3639,10 +3639,16 @@ impl Run {
                 self.granted = false;
             }
             // The play state's turntable ticks on each presented frame of
-            // the practice page, loading and play, after it drew.
+            // the practice page, loading and play, after it drew; a
+            // generic page's frames are no play state's.
+            let turns = match &mode {
+                Mode::Play { .. } => true,
+                Mode::Menu { loading, .. } => loading.is_some() || self.page_turns,
+                _ => false,
+            };
             if let Ok((timing, chart)) = &drawn
                 && timing.presented
-                && matches!(mode, Mode::Play { .. } | Mode::Menu { .. })
+                && turns
             {
                 let scratch = self
                     .presentation
@@ -3726,6 +3732,22 @@ impl Run {
                     mode = Mode::Idle;
                 }
             }
+        }
+    }
+
+    /// The mode a page sent now draws in: the launch screen shows out its
+    /// time with the page waiting, else the page.
+    fn menu_mode(mode: Mode, page: Box<MenuPage>, shared: &Shared, started: Instant) -> Mode {
+        match mode {
+            Mode::Splash { .. } if Self::launch_elapsed(shared, started) < SPLASH => Mode::Splash {
+                pending: Some(page),
+            },
+            _ => Mode::Menu {
+                page,
+                update: None,
+                changed: true,
+                loading: None,
+            },
         }
     }
 
@@ -3839,7 +3861,7 @@ impl Run {
             return;
         }
         let (Some(p), Some(screen), Some(chart)) =
-            (&self.attempt, &mut self.screen, self.chart.as_deref())
+            (&mut self.attempt, &mut self.screen, self.chart.as_deref())
         else {
             return;
         };
@@ -3873,15 +3895,12 @@ impl Run {
                 },
                 declarative: p.skin.is_some(),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
-                scratch_notes: Vec::new(),
+                scratch_notes: p.attempt.take_scratch_notes(),
                 #[cfg(feature = "dev-tools")]
                 ready: p.attempt.ready(),
                 #[cfg(feature = "dev-tools")]
                 gauge_looks: p.attempt.gauge_looks(),
             });
-        }
-        if let (Some(prepared), Some(p)) = (&mut self.prepared, &mut self.attempt) {
-            prepared.scratch_notes = p.attempt.take_scratch_notes();
         }
         if answer.is_err() {
             self.drop_screen();
@@ -5644,7 +5663,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         let count = || seen.lock().unwrap().len();
-        let last = || seen.lock().unwrap().last().copied().unwrap();
         let state = |number| game::PlayState {
             number,
             origin: clock.now(),
@@ -5682,18 +5700,32 @@ pub(crate) mod tests {
             seen.lock().unwrap()[n..].iter().all(|f| f.0 == held),
             "paused"
         );
-        // Its resume: it turns on from the held angle, by no more than the
-        // time since.
-        let resumed = clock.now();
+        // Its resume, before the practice page shows: the frames drawn
+        // between (here the loading lifetime's, as a withdrawn result's
+        // old play frames would be) neither tick nor take the baseline.
         link.turntable(1, false);
         assert!(link.fence(Duration::from_secs(5)));
         let n = count();
+        std::thread::sleep(Duration::from_millis(100));
         assert!(wait_until(|| count() > n + 3));
-        let turned = i64::from(last().0) - i64::from(held);
-        let since = clock.now().0 - resumed.0;
+        assert!(
+            seen.lock().unwrap()[n..].iter().all(|f| f.0 == held),
+            "frames before the page after the resume"
+        );
+        // The page shows and runs; a Start's loading then draws the held
+        // angle plus no more than the time since the page showed.
+        link.end_loading().unwrap();
+        let page = clock.now();
+        link.send(RenderMsg::PracticePage(Box::new(one_line("page"))));
+        std::thread::sleep(Duration::from_millis(60));
+        let n = count();
+        link.loading().show(one_line("Start"));
+        assert!(wait_until(|| count() > n + 1));
+        let turned = i64::from(seen.lock().unwrap()[n + 1].0) - i64::from(held);
+        let since = clock.now().0 - page.0;
         assert!(
             turned > 0 && turned <= since,
-            "from the held angle after the resume: {turned} in {since} µs"
+            "from the held angle at the page: {turned} in {since} µs"
         );
         // A new play state starts over at its first frame.
         link.end_loading().unwrap();
@@ -5706,6 +5738,40 @@ pub(crate) mod tests {
             0,
             "the new play state's first frame"
         );
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A generic page (a preparation's wait) is no play state's
+    /// presentation: drawn after a play state's creation, it neither adopts
+    /// nor ticks the turntable, so the play state's first loading frame
+    /// still reads 0.
+    #[test]
+    fn a_generic_page_does_not_turn_the_turntable() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(Turning(Arc::clone(&noted))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let link = spawn(
+            make,
+            None,
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.play_state(game::PlayState {
+            number: 1,
+            origin: clock.now(),
+        });
+        link.send(RenderMsg::Menu(Box::new(one_line("wait"))));
+        std::thread::sleep(Duration::from_millis(150));
+        link.loading().show(one_line("L"));
+        assert!(wait_until(|| !seen.lock().unwrap().is_empty()));
+        assert_eq!(seen.lock().unwrap()[0].0, 0, "the generic page turned it");
         link.end_loading().unwrap();
         link.exit();
     }
