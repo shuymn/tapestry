@@ -320,9 +320,9 @@ pub fn stage_began(stage: SpecializingStage) {
     if let Some((s, at, from, _)) = armed.as_mut()
         && *at == stage
     {
-        *from = skin_beatoraja::lua::vm_hooks::steps();
+        *from = skin_beatoraja::vm_hooks::steps();
         if s.escalates() {
-            skin_beatoraja::lua::vm_hooks::hold();
+            skin_beatoraja::vm_hooks::hold();
         }
     }
 }
@@ -334,7 +334,7 @@ pub fn specialization_signal(controls: &crate::controls::Controls, fail_input: i
     let Some((s, _, from, quit_at)) = armed.as_mut() else {
         return;
     };
-    if skin_beatoraja::lua::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
+    if skin_beatoraja::vm_hooks::steps() < from.saturating_add(SPECIALIZING_STEPS) {
         return;
     }
     let quit = || {

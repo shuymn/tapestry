@@ -973,7 +973,17 @@ impl Screen for MenuScreen {
             });
         };
         let refused = match self.prepare_selection(u, logic, changed)? {
-            Ok(()) => match self.build_selection_frame(u, logic, now) {
+            // The frame's timers, then the runtime over that state, then
+            // the build from it (docs/stage3.md S7-07).
+            Ok(()) => match crate::screens::selection_visit(
+                &mut logic.script,
+                logic.bundle.skin(),
+                &mut logic.sel,
+                now,
+                &u.events.timers(),
+            )
+            .and_then(|()| self.build_selection_frame(u, logic, now))
+            {
                 Ok(()) => None,
                 Err(e) => Some(e.to_string()),
             },

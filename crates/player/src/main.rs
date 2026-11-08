@@ -48,6 +48,7 @@ mod render_side;
 mod result_input;
 mod result_skin;
 mod result_view;
+mod screens;
 mod select;
 mod selection;
 mod selection_skin;
@@ -824,6 +825,7 @@ fn rig<'a>(
         steps,
         steps_dropped: 0,
         figures: None,
+        interval: None,
         generation: 0,
         queue: game::QueueChoice::new(device.queued_periods),
         queue_most: None,

@@ -37,6 +37,7 @@ use skin_model::{
 };
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage};
+use crate::screens::ScriptSlot;
 use crate::tuning::LiveTuning;
 
 /// How long the strip shows the preset's name after a preset step.
@@ -305,6 +306,9 @@ pub struct SelectionLogic {
     /// Its number, never another state's: text prepared over another
     /// state is prepared again.
     pub id: u64,
+    /// The installation's runtime, while the screen runs it
+    /// (docs/stage3.md S7-07): dropped with the state, it parks.
+    pub script: ScriptSlot,
 }
 
 impl SelectionLogic {
@@ -315,7 +319,15 @@ impl SelectionLogic {
             sel: bundle.skin().prepare_selection(),
             bundle: Arc::clone(bundle),
             id,
+            script: ScriptSlot::default(),
         }
+    }
+
+    /// This state, its screen's runtime held in `script`.
+    #[must_use]
+    pub fn with_script(mut self, script: ScriptSlot) -> Self {
+        self.script = script;
+        self
     }
 
     /// Applies `settings` (none before the flow gives them) to the state,
@@ -596,6 +608,66 @@ return skin
     dir
 }
 
+/// [`lua_fixture`] with two more entries whose callbacks only the
+/// screen's runtime runs (docs/stage3.md S7-07): `rt.luaskin` draws one
+/// more image, at 1500, 500, while its `draw` callback (counting its
+/// calls in an upvalue) returns true, and `stop.luaskin` draws it under a
+/// callback that never returns (dev-tools tests).
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn runtime_fixture() -> tempfile::TempDir {
+    let dir = lua_fixture();
+    let lua = std::fs::read_to_string(dir.path().join("s.luaskin")).unwrap();
+    for (name, body) in [
+        ("rt.luaskin", "calls = calls + 1; return calls > 0"),
+        ("stop.luaskin", "while true do end"),
+    ] {
+        let tail = format!(
+            r#"local calls = 0
+skin.image[#skin.image + 1] = {{ id = "rt", src = "s", x = 0, y = 0, w = 8, h = 8 }}
+skin.destination[#skin.destination + 1] = {{ id = "rt",
+  draw = function() {body} end,
+  dst = {{ {{ x = 1500, y = 500, w = 16, h = 16 }} }} }}
+return skin
+"#
+        );
+        let text = lua.replacen("\nreturn skin\n", &format!("\n{tail}"), 1);
+        std::fs::write(dir.path().join(name), text).unwrap();
+    }
+    dir
+}
+
+/// [`fixture_bundle`], with the runtime the import kept for the screen.
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) fn fixture_scripted(
+    limits: skin_model::AtlasLimits,
+    dir: &std::path::Path,
+    entry: &str,
+) -> (Arc<SkinBundle>, ScriptSlot) {
+    let choice = game::SkinChoice {
+        root: dir.to_owned(),
+        entry: entry.to_owned(),
+        options: Default::default(),
+        files: Default::default(),
+    };
+    let target = crate::imports::ImportTarget {
+        limits,
+        size: [1_920, 1_080],
+        default_font: || Ok(crate::render_outline::default_font()),
+    };
+    let cancel = skin_beatoraja::Cancel::new();
+    match crate::imports::build(
+        skin_model::ScreenKind::Selection,
+        &choice,
+        false,
+        &target,
+        &cancel,
+    ) {
+        crate::imports::KindOutcome::Bundle(b, _, script) => (b, script),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// The fixture's skin `entry` in `dir` built as the selection kind for `r`
 /// (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
@@ -623,7 +695,7 @@ pub(crate) fn fixture_bundle(
         &target,
         &cancel,
     ) {
-        crate::imports::KindOutcome::Bundle(b, _) => b,
+        crate::imports::KindOutcome::Bundle(b, ..) => b,
         other => panic!("{other:?}"),
     }
 }

@@ -66,6 +66,7 @@ fn bundled(_: ScreenKind, _: &SkinChoice, _: bool, _: &ImportTarget, _: &Cancel)
             notes: Vec::new(),
             suppressed: 0,
         },
+        crate::screens::ScriptSlot::default(),
     )
 }
 
@@ -480,7 +481,7 @@ fn a_close_during_startup_ends_it() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_close_during_a_lua_job_ends_startup() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let _serial = serial();
     let dir = super::looping();
     let choices = SkinChoices {

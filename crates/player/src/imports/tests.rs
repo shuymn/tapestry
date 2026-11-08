@@ -112,7 +112,7 @@ impl Drop for Serial {
         hold_exit(false);
         REFUSE_SPAWN.store(false, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
-        skin_beatoraja::lua::vm_hooks::release();
+        skin_beatoraja::vm_hooks::release();
         wait_until(|| WORKERS.load(Ordering::SeqCst) == 0);
     }
 }
@@ -235,7 +235,7 @@ fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
 #[track_caller]
 fn bundled(o: KindOutcome) -> (Arc<SkinBundle>, Summary) {
     match o {
-        KindOutcome::Bundle(b, s) => (b, s),
+        KindOutcome::Bundle(b, s, _) => (b, s),
         other => panic!("{other:?}"),
     }
 }
@@ -366,12 +366,12 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
         (choice(dir.path(), "r.luaskin"), "r.luaskin"),
     ] {
         #[cfg(feature = "dev-tools")]
-        let passes = skin_beatoraja::lua::vm_hooks::thread_passes();
+        let passes = skin_beatoraja::vm_hooks::thread_passes();
         let why = refused(build(ScreenKind::Result, &c2, false, &t, &c));
         assert!(!why.is_empty(), "{entry}");
         #[cfg(feature = "dev-tools")]
         assert_eq!(
-            skin_beatoraja::lua::vm_hooks::thread_passes() - passes,
+            skin_beatoraja::vm_hooks::thread_passes() - passes,
             if entry == "r.luaskin" { 2 } else { 0 },
             "{entry}"
         );
@@ -1064,7 +1064,7 @@ impl std::fmt::Debug for Witness {
 #[cfg(feature = "dev-tools")]
 #[track_caller]
 pub(super) fn executing(base: usize) {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     assert!(wait_until(|| vm_hooks::live() > base));
     let from = vm_hooks::steps();
     assert!(wait_until(|| vm_hooks::steps() >= from + LOOP_STEPS));
@@ -1082,7 +1082,7 @@ const LOOP_STEPS: u64 = 20;
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let _serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
@@ -1145,7 +1145,7 @@ const HELD_FOR: Duration = Duration::from_secs(7);
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_job_past_the_stop_wait_is_abandoned() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
@@ -1199,7 +1199,7 @@ fn a_received_outcome_still_waits_within_the_stop_bound() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn an_attempts_cancel_waits_for_the_thread_past_the_stop_bound() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let _serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));
@@ -1250,7 +1250,7 @@ fn an_attempts_cancel_never_abandons_a_held_thread() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_runs_end_during_an_attempts_cancel_abandons_within_the_bound() {
-    use skin_beatoraja::lua::vm_hooks;
+    use skin_beatoraja::vm_hooks;
     let serial = serial();
     let dir = looping();
     let dropped = Arc::new(Mutex::new(None));

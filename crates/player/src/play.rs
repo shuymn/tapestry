@@ -216,6 +216,10 @@ pub struct PlayerRig<'a> {
     pub steps_dropped: u64,
     /// The figures of the play just over, until they are written.
     pub figures: Option<Figures>,
+    /// The current play's interval, from its start to its end: no screen
+    /// runtime runs while it is open (design.md "beatoraja Lua Skins",
+    /// Quiescence acknowledged).
+    pub interval: Option<crate::screens::PlayInterval>,
     /// The current play's number, as the audio thread knows it.
     pub generation: u64,
     /// The periods the next play queues on the audio output.
@@ -985,8 +989,12 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
         // With selection, the scan has acknowledged its pause before
-        // recording opens and READY starts.
+        // recording opens and READY starts; so has every screen runtime its
+        // parking (a render thread that ended holds none).
         self.pause_scan();
+        if !self.render.park_scripts() {
+            eprintln!("render: the screens' runtimes were not acknowledged parked");
+        }
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
         // inside a play or its READY state.
@@ -1359,6 +1367,7 @@ impl Rig for PlayerRig<'_> {
         };
         #[cfg(feature = "dev-tools")]
         self.scenario_started();
+        self.interval = Some(self.render.scripts().open_interval());
         self.render.send(RenderMsg::Play {
             side: screen,
             gauge: self.attempt_gauge,
@@ -1410,6 +1419,18 @@ impl Rig for PlayerRig<'_> {
         // Measurement stops at the end of the play, before the save and the
         // re-evaluation, however long they take.
         self.figures = self.render.finish(self.clock.now());
+        // The interval closes; a render thread that ended meanwhile left
+        // its runtimes parked in the cell, destroyed here.
+        if let Some(closed) = self
+            .interval
+            .take()
+            .map(crate::screens::PlayInterval::close)
+            && self.render.scripts().orphaned()
+        {
+            self.render
+                .scripts()
+                .retire(crate::screens::Quiet::Closed(closed));
+        }
         #[cfg(feature = "dev-tools")]
         Self::print_lua("play end");
         #[cfg(feature = "dev-tools")]
