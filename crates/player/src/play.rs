@@ -297,10 +297,12 @@ pub struct PlayerRig<'a> {
     /// The input offset last seen while the result shows, and whether the
     /// offset keys changed it in this lifetime (O6).
     pub result_offset: Option<(i64, bool)>,
-    /// A leaving command was accepted on the result: the next screen's
-    /// preparation leaves its lifetime, and no view's layout is asked for.
+    /// The flow served the result's leaving command: the next screen's
+    /// preparation leaves its lifetime. Until then a screen built again
+    /// keeps it, an outro playing included.
     pub result_leaving: bool,
-    /// When the result's outro began, while its lifetime is current.
+    /// When the accepted leaving command's outro began (the view pinned),
+    /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
 }
 
@@ -439,16 +441,6 @@ impl PlayerRig<'_> {
             .or_else(|| self.audio_failure().map(|e| format!("AUDIO: {e}")));
         let lines = facts.lines(used.then_some(now), failure);
         self.presenter.lines(&mut self.render, lines);
-    }
-
-    /// Whether an accepted command's outro still plays: begun, with the
-    /// skin's timing, and not over. Once it is over (or the skin fell
-    /// back), the command is served, and a screen prepared then leaves.
-    fn outro_playing(&self) -> bool {
-        use game::Rig as _;
-        self.result_outro
-            .zip(self.result_timing())
-            .is_some_and(|(at, t)| self.clock.now().0 < at.0.saturating_add(t.outro.0))
     }
 
     /// The result's lifetime ends: nothing of it is drawn any more.
@@ -1173,32 +1165,34 @@ impl Rig for PlayerRig<'_> {
     /// layout job and waits for its thread before it is served (D11); the
     /// run's end bounds the wait.
     fn accept_leaving(&mut self, _cmd: MenuCommand) {
-        self.result_leaving = true;
         self.settle_result();
         #[cfg(feature = "dev-tools")]
         println!("dev: result skin settled: accepted");
     }
 
-    /// The shown result skin's timing (the S10-09i design's D6): `None`
-    /// on any built-in result, so a command pending is served at once.
+    /// The presented result skin's timing (the S10-09i design's D6):
+    /// `None` on any built-in result, so a command pending is served at
+    /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
-        let t = self.presenter.timing(&self.render.result_status())?;
-        Some(game::ResultTiming {
-            outro: t.outro,
-            input: t.input,
-            scene: t.scene,
-        })
+        self.presenter.timing(&self.render).map(flow_timing)
     }
 
-    /// The barrier is set at `at` (D4): the view presented then stays,
-    /// and timer 2 starts, before the command settles the result skin.
-    fn begin_outro(&mut self, at: TimeUs) {
-        let pinned = self.presenter.pin(&mut self.render, at);
+    /// The barrier is set at `at` (D4), for every accepted command: the
+    /// view presented then stays, and timer 2 starts, before the command
+    /// settles the result skin. The pinned view's timing, read with it.
+    fn begin_outro(&mut self, at: TimeUs) -> Option<game::ResultTiming> {
+        let (pinned, timing) = self.presenter.pin(&mut self.render, at);
         self.result_outro = Some(at);
         #[cfg(feature = "dev-tools")]
         println!("dev: result outro began, view {pinned:?} pinned");
         #[cfg(not(feature = "dev-tools"))]
         let _ = pinned;
+        timing.map(flow_timing)
+    }
+
+    /// The flow serves the leaving command: the result is left from here.
+    fn serve_leaving(&mut self, _cmd: MenuCommand) {
+        self.result_leaving = true;
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1273,9 +1267,10 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         // Within a result lifetime a screen built again is not a leaving,
-        // an outro still playing included: the render side draws on from
-        // what it presented (the S10-09i design's D4, "Recovery").
-        if self.presenter.current() && (!self.result_leaving || self.outro_playing()) {
+        // an outro playing included, until the flow serves the command:
+        // the render side draws on from what it presented (the S10-09i
+        // design's D4, "Recovery").
+        if self.presenter.current() && !self.result_leaving {
             return self.render.prepare();
         }
         self.leave_result();
@@ -1853,7 +1848,7 @@ impl Rig for PlayerRig<'_> {
         // Once a leaving command is accepted the view is pinned, and the
         // result skin was settled: no layout is asked for (D4).
         if let Some(chart) = self.result_chart
-            && !self.result_leaving
+            && self.result_outro.is_none()
             && !self.result_skin_suppressed()
         {
             self.result_skin
@@ -1908,6 +1903,15 @@ pub(crate) const fn preparation_stops(
     output: Option<OutputError>,
 ) -> bool {
     quitting || leaving || input.is_some() || output.is_some()
+}
+
+/// A result skin's timing in the flow's terms.
+const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTiming {
+    game::ResultTiming {
+        outro: t.outro,
+        input: t.input,
+        scene: t.scene,
+    }
 }
 
 /// Readies the screen for a play: the end screen, if it shows, is left

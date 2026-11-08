@@ -258,6 +258,15 @@ struct Fake {
     /// ([`Rig::begin_outro`], with its start) and `accept`
     /// ([`Rig::accept_leaving`]).
     result_order: Vec<(&'static str, i64)>,
+    /// The leaving commands the flow served ([`Rig::serve_leaving`]), with
+    /// their clock times.
+    served: Vec<(game::MenuCommand, i64)>,
+    /// Each screen's preparation once a result showed moves the clock this
+    /// much further.
+    prepare_cost: i64,
+    /// Each settle at acceptance moves the clock this much further (a held
+    /// layout job).
+    settle_cost: i64,
     /// Result commands pressed from another thread, as the window's keys:
     /// those pressed before a preparation begins are dropped there, as the
     /// player's result input drops what was queued before the result.
@@ -396,6 +405,9 @@ impl Fake {
             timing: None,
             timing_until: i64::MAX,
             result_order: Vec::new(),
+            served: Vec::new(),
+            prepare_cost: 0,
+            settle_cost: 0,
             menu_pressed: std::sync::Arc::default(),
         }
     }
@@ -496,6 +508,7 @@ impl Rig for Fake {
     fn accept_leaving(&mut self, cmd: game::MenuCommand) {
         self.accepted.push(cmd);
         self.result_order.push(("accept", self.clock.now().0));
+        self.clock.advance(TimeUs(self.settle_cost));
     }
 
     fn result_timing(&self) -> Option<game::ResultTiming> {
@@ -503,9 +516,14 @@ impl Rig for Fake {
             .filter(|_| self.clock.now().0 < self.timing_until)
     }
 
-    fn begin_outro(&mut self, at: TimeUs) {
+    fn begin_outro(&mut self, at: TimeUs) -> Option<game::ResultTiming> {
         assert_eq!(at, self.now(), "the outro starts as it is accepted");
         self.result_order.push(("outro", at.0));
+        self.result_timing()
+    }
+
+    fn serve_leaving(&mut self, cmd: game::MenuCommand) {
+        self.served.push((cmd, self.clock.now().0));
     }
 
     fn result_compared(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
@@ -516,6 +534,9 @@ impl Rig for Fake {
         self.steps.push("screen");
         self.screen_at.push(self.clock.now().0);
         self.prepares += 1;
+        if self.shows > 0 {
+            self.clock.advance(TimeUs(self.prepare_cost));
+        }
         if !self.preps.is_empty()
             && let Some(what) = self.in_rebuild.take()
         {
@@ -1744,19 +1765,25 @@ fn an_input_failure_on_the_end_screen_ends_the_run_at_the_retry() {
 /// run ends with the input cause without another preparation of the screen.
 #[test]
 fn a_retry_with_a_failed_input_thread_and_screen_ends_with_the_input_cause() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut loaded = loaded(dir.path());
-    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
-    rig.input_fails_at = 10_400_000;
-    rig.screen_fails_at = 10_600_000;
-    rig.prepare_fails_from = 2;
-    let ran = game::live::run_chart(&mut loaded, &mut rig);
-    assert!(
-        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
-        "{ran:?}"
-    );
-    assert_eq!((rig.prepares, rig.opens, rig.shows), (1, 1, 1));
+    // The built-in result, and a skin whose 500 ms outro the retry would
+    // wait on: the input cause comes first either way (S10-09i, T9).
+    for t in [None, timing(500_000, 0, None)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
+        rig.timing = t;
+        rig.input_fails_at = 10_400_000;
+        rig.screen_fails_at = 10_600_000;
+        rig.prepare_fails_from = 2;
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        assert!(
+            matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+            "{t:?}: {ran:?}"
+        );
+        assert_eq!((rig.prepares, rig.opens, rig.shows), (1, 1, 1), "{t:?}");
+        assert_eq!(rig.accepted, [game::MenuCommand::Retry], "{t:?}");
+    }
 }
 
 /// The tapestry preset named `mine`, as `presets/mine.toml` loads it.
@@ -5170,8 +5197,104 @@ fn with_no_skin_timing_commands_act_at_once() {
     press(&mut rig, &[(s + 1, game::MenuCommand::Back)]);
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Back);
-    assert_eq!(rig.result_order, [("accept", s + 1)]);
+    // Pinned all the same, so no view prepared meanwhile commits after it.
+    assert_eq!(rig.result_order, [("outro", s + 1), ("accept", s + 1)]);
+    assert_eq!(rig.served, [(game::MenuCommand::Back, s + 1)]);
     assert_eq!(rig.clock.now().0, s + 1);
+}
+
+/// T1 (the S10-09i i-4 state table): a press made before the input time,
+/// while a recovery that crosses it runs, is dropped as pressed before it,
+/// though it is taken only after; a press after it is accepted.
+#[test]
+fn a_press_before_the_input_time_is_dropped_after_a_recovery() {
+    use game::MenuCommand::Back;
+    let s = result_start();
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(0, 2_000_000, None), i64::MAX);
+    rig.screen_fails_at = s + 400_000;
+    rig.at.push((s + 400_000, Box::new(|| {})));
+    rig.prepare_cost = 2_000_000;
+    rig.menu.push((s + 500_000, Back));
+    press(&mut rig, &[(s + 3_000_000, Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert!(
+        rig.screen_at.contains(&(s + 400_000)),
+        "{:?}",
+        rig.screen_at
+    );
+    assert_eq!(rig.accepted, [Back]);
+    assert_eq!(rig.result_order[0], ("outro", s + 3_000_000));
+}
+
+/// T4: a settle held past the outro's end serves the command as soon as it
+/// returns, with no recovery or view shown first, though the screen failed
+/// meanwhile.
+#[test]
+fn a_settle_held_past_the_outro_serves_at_once() {
+    let s = result_start();
+    let at = s + 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(500_000, 0, None), i64::MAX);
+    rig.settle_cost = 800_000;
+    rig.screen_fails_at = at + 300_000;
+    press(&mut rig, &[(at, game::MenuCommand::Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.served, [(game::MenuCommand::Back, at + 800_000)]);
+    assert!(rig.screen_at.iter().all(|&t| t < s), "{:?}", rig.screen_at);
+    assert_eq!(rig.shows, 1);
+}
+
+/// T5, T12: a screen lost mid-outro is built again with the command still
+/// pending (no serve before it), and the command is served at the outro's
+/// end.
+#[test]
+fn a_screen_lost_mid_outro_keeps_the_command_pending() {
+    let s = result_start();
+    let at = s + 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), i64::MAX);
+    rig.screen_fails_at = at + 1_000_000;
+    rig.at.push((at + 1_000_000, Box::new(|| {})));
+    press(&mut rig, &[(at, game::MenuCommand::Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert!(
+        rig.screen_at.contains(&(at + 1_000_000)),
+        "{:?}",
+        rig.screen_at
+    );
+    assert_eq!(rig.served, [(game::MenuCommand::Back, at + 5_000_000)]);
+    assert_eq!(rig.result_order, [("outro", at), ("accept", at)]);
+}
+
+/// T9: the input thread failing while a command waits on its outro ends
+/// the run with its cause at the next look, before a recovery that would
+/// fail.
+#[test]
+fn an_input_failure_mid_outro_ends_the_run_before_a_recovery() {
+    let s = result_start();
+    let at = s + 1_000_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(5_000_000, 0, None), i64::MAX);
+    rig.input_fails_at = at + 1_000_000;
+    rig.screen_fails_at = at + 1_000_000;
+    rig.prepare_fails_from = 2;
+    rig.at.push((at + 1_000_000, Box::new(|| {})));
+    press(&mut rig, &[(at, game::MenuCommand::Back)]);
+    let ran = game::live::run_chart(&mut loaded, &mut rig);
+    assert!(
+        matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+        "{ran:?}"
+    );
+    assert_eq!(rig.prepares, 1);
+    assert_eq!(rig.clock.now().0, at + 1_000_000);
 }
 
 /// C17f's flow half: a skin falling back while a command waits on its

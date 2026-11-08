@@ -2138,7 +2138,9 @@ pub fn refuse_pinned_frame() -> bool {
 
 /// Holds the result skin's settles (the layout job's cancellation) while
 /// set (tests); [`RESULT_SETTLE_WAITING`] says one holds.
+#[cfg(test)]
 static RESULT_SETTLE_HELD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 static RESULT_SETTLE_WAITING: AtomicBool = AtomicBool::new(false);
 
 /// Holds the result skin's settles from now on (`true`), or lets the one
@@ -2155,6 +2157,7 @@ pub fn result_settle_holding() -> bool {
 }
 
 /// Holds a settle of the result skin while [`hold_result_settles`] says so.
+#[cfg(test)]
 pub fn hold_result_settle() {
     if !RESULT_SETTLE_HELD.load(Ordering::SeqCst) {
         return;

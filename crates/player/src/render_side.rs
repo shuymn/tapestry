@@ -1451,7 +1451,7 @@ impl RenderLink {
     /// point only the overlay merges. Taken under the lock the commit
     /// point holds, so the view returned is the one presented at that
     /// instant.
-    pub fn pin_result(&self, at: TimeUs) -> Option<ViewKey> {
+    pub fn pin_result(&self, at: TimeUs) -> (Option<ViewKey>, Option<skin_model::ResultTiming>) {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let mut b = self.shared.barrier();
         if b.lifetime != lifetime {
@@ -1462,7 +1462,16 @@ impl RenderLink {
         }
         b.pinned = b.presented;
         b.fadeout = Some(at);
-        b.pinned
+        (b.pinned, b.timing)
+    }
+
+    /// The timing of the current result lifetime's presented view, while
+    /// its skin draws (the S10-09i design's D6): what the last commit point
+    /// recorded.
+    pub fn presented_timing(&self) -> Option<skin_model::ResultTiming> {
+        let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
+        let b = self.shared.barrier();
+        b.timing.filter(|_| b.lifetime == lifetime)
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -1928,8 +1937,11 @@ impl crate::result_present::Publish for RenderLink {
     fn show(&mut self, p: ResultPresentation) {
         self.show_result(p);
     }
-    fn pin(&mut self, at: TimeUs) -> Option<ViewKey> {
+    fn pin(&mut self, at: TimeUs) -> (Option<ViewKey>, Option<skin_model::ResultTiming>) {
         self.pin_result(at)
+    }
+    fn timing(&self) -> Option<skin_model::ResultTiming> {
+        self.presented_timing()
     }
 }
 
@@ -3547,7 +3559,7 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let built = match built {
                         ResultDrawn::Built
-                            if self.shared.barrier().pinned.is_some()
+                            if self.shared.barrier().fadeout.is_some()
                                 && crate::dev::refuse_pinned_frame() =>
                         {
                             ResultDrawn::Refused(skin_model::BuildError::Kind)
@@ -4417,6 +4429,8 @@ impl Run {
                 v.token = None;
             }
         }
+        // No skin draws: commands take effect at once (D6).
+        self.shared.barrier().timing = None;
         self.reconcile_result();
     }
 
@@ -4680,7 +4694,7 @@ impl Run {
                     ..ResultBarrier::default()
                 };
             }
-            if b.pinned.is_some() {
+            if b.fadeout.is_some() {
                 if let Some(v) = side.prepared.take() {
                     side.discard |= v.token.is_some();
                     side.drop_later(v.held);
@@ -4731,6 +4745,12 @@ impl Run {
                 }
             }
             b.presented = side.presented.as_ref().map(|h| h.payload.key);
+            b.timing = side
+                .presented
+                .as_ref()
+                .filter(|h| h.state.is_some())
+                .and_then(|h| h.payload.skin.as_ref())
+                .map(|s| s.skin().result_timing());
             fadeout = b
                 .fadeout
                 .or_else(|| side.presented.as_ref().and_then(|h| h.overlay.fadeout));
