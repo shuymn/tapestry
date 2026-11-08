@@ -89,7 +89,10 @@ pub struct ImageDef {
     /// An index into the files.
     pub file: u32,
     /// Left, top, width, height in the file's 1x pixels; `None` is the
-    /// whole file.
+    /// whole file. It starts inside the file and may run past its right
+    /// or bottom edge: a texel there repeats the file's nearest edge
+    /// texel, as a texture clamped to its edge samples, so a cell wholly
+    /// past an edge is that edge's texel line.
     pub rect: Option<[u32; 4]>,
     /// Columns, rows. Frames run row by row; a remainder of the rectangle
     /// is not part of any frame.
@@ -245,7 +248,7 @@ pub enum ImageError {
     SolidGrid { image: usize },
     #[error("generated image {image} passes {MAX_TOTAL_TEXELS} texels in a variant")]
     SolidTotalTooLarge { image: usize },
-    #[error("image {image}'s rectangle is outside its file")]
+    #[error("image {image}'s rectangle does not start inside its file")]
     RectOutside { image: usize },
     #[error("image {image}'s frames are empty")]
     EmptyCell { image: usize },
@@ -606,13 +609,18 @@ fn read_file(
 }
 
 /// Image `image`'s rectangle in its file of 1x size `dims` and its cell
-/// size: the rectangle inside the file and the cells not empty.
+/// size: the rectangle starting inside the file, ending where a `u32` and
+/// its @2x double hold it, and the cells not empty. Cells past the file's
+/// edge are padded from it ([`ImageDef::rect`]), each charged at its full
+/// size as any cell is.
 fn cut(image: usize, def: &ImageDef, dims: [u32; 2]) -> Result<([u32; 4], [u32; 2]), ImageError> {
     let [fw, fh] = dims;
     let rect = def.rect.unwrap_or([0, 0, fw, fh]);
     let [x, y, w, h] = rect;
-    let inside = |at: u32, len: u32, max: u32| at.checked_add(len).is_some_and(|e| e <= max);
-    if !inside(x, w, fw) || !inside(y, h, fh) {
+    let starts = |at: u32, len: u32, max: u32| {
+        at < max && at.checked_add(len).and_then(|e| e.checked_mul(2)).is_some()
+    };
+    if !starts(x, w, fw) || !starts(y, h, fh) {
         return Err(ImageError::RectOutside { image });
     }
     let [cols, rows] = def.grid;

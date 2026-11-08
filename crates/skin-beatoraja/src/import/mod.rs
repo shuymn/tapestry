@@ -456,12 +456,6 @@ pub(crate) struct Cx<'d> {
     /// Image selectors compiled once, by source; each copy kept is
     /// charged.
     selectors: HashMap<String, Program>,
-    /// The cached images, by key, whose cut runs past its file's edge
-    /// (D22); whether the cut placed last did; and the destinations noted
-    /// for one.
-    overruns: BTreeSet<self::asset::ImageKey>,
-    cut_overran: bool,
-    overrun_at: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -555,9 +549,6 @@ impl<'d> Cx<'d> {
             judges: Vec::new(),
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
-            overruns: BTreeSet::new(),
-            cut_overran: false,
-            overrun_at: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]

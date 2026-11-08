@@ -965,7 +965,7 @@ mod tests {
             }),
             (
                 ImageDef {
-                    rect: Some([1, 0, 4, 4]),
+                    rect: Some([4, 0, 1, 1]),
                     ..image(0, [1, 1])
                 },
                 |e| matches!(e, ImageError::RectOutside { image: 0 }),
