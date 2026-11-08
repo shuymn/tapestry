@@ -250,6 +250,12 @@ fn report(index: usize, survey: &Survey) -> String {
         ));
     }
     line(&format!("  modules: {}", survey.modules));
+    if let Some((ops, callbacks)) = survey.frame_ops {
+        line(&format!(
+            "  frame: operations {ops} of {}, program callbacks {callbacks}",
+            skin_model::MAX_SKIN_OPS
+        ));
+    }
     let u = survey.usage;
     line(&format!(
         "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {}) \

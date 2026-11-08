@@ -265,11 +265,10 @@ pub fn row_text(r: [i32; 4]) -> RowTextDef {
     }
 }
 
-/// A song list of `slots` placements centered at `center` over a sheet of
-/// one image and a bitmap font (`A` and `B`, 4 wide and advancing 5), its
-/// chart rows' text in that font 20 above each placement's bottom; the
-/// folder must live while the skin draws.
-pub fn bitmap_list(slots: usize, center: u8) -> (tempfile::TempDir, Skin) {
+/// A sheet of one 2×2 image (image 0) and a bitmap font (font 0: `A` and
+/// `B`, 4 wide and advancing 5, on one 16×16 page), its files in a new
+/// folder that must live while the sheet is read or drawn.
+pub fn bitmap_sheet() -> (tempfile::TempDir, Sheet) {
     use skin_model::{Root, SheetBuilder};
     let dir = tempfile::tempdir().unwrap();
     RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
@@ -294,17 +293,26 @@ pub fn bitmap_list(slots: usize, center: u8) -> (tempfile::TempDir, Skin) {
             hi: None,
         })
         .unwrap();
-    let image = b
-        .add_image(ImageDef {
-            file,
-            rect: None,
-            grid: [1, 1],
-            cycle: None,
-            filter: Filter::Linear,
-        })
-        .unwrap();
+    b.add_image(ImageDef {
+        file,
+        rect: None,
+        grid: [1, 1],
+        cycle: None,
+        filter: Filter::Linear,
+    })
+    .unwrap();
     let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
     b.add_bitmap_font(f, &[]).unwrap();
+    (dir, b.finish())
+}
+
+/// A song list of `slots` placements centered at `center` over a sheet of
+/// one image and a bitmap font (`A` and `B`, 4 wide and advancing 5), its
+/// chart rows' text in that font 20 above each placement's bottom; the
+/// folder must live while the skin draws.
+pub fn bitmap_list(slots: usize, center: u8) -> (tempfile::TempDir, Skin) {
+    let (dir, sheet) = bitmap_sheet();
+    let image = 0;
     let mut def = list(slots, center);
     for p in &mut def.placements {
         for arm in p.iter_mut() {
@@ -315,7 +323,7 @@ pub fn bitmap_list(slots: usize, center: u8) -> (tempfile::TempDir, Skin) {
     style.font = FontRef::Bitmap(0);
     def.text = [Some(style), None, None];
     let mut sd = skin_def(vec![list_element()], WidgetDefs::default());
-    sd.sheet = b.finish();
+    sd.sheet = sheet;
     let skin = Skin::new_selection(
         sd,
         SelectionDefs {
@@ -348,6 +356,7 @@ pub fn skin_def(elements: Vec<ElementDef>, widgets: WidgetDefs) -> SkinDef {
         widgets,
         bomb_up_to: None,
         close: None,
+        present: None,
     }
 }
 

@@ -534,6 +534,54 @@ fn result_text_is_the_charts_and_bounded() {
     assert_eq!(lines, 1);
 }
 
+/// The result's lines are play's for the same strings: control
+/// characters are dropped before a line is cut, so 511 tabs inside a
+/// 513-byte title leave both of its letters.
+#[test]
+fn result_text_drops_control_characters_before_cutting() {
+    let mut fx = RFx::new(
+        rload(
+            vec![
+                relement(Source::Text(0), [0, 0, 300, 20], None),
+                relement(Source::Text(1), [0, 50, 300, 20], None),
+            ],
+            WidgetDefs {
+                texts: vec![
+                    text(TextValue::Field(TextField::Title)),
+                    text(TextValue::Field(TextField::FullArtist)),
+                ],
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap(),
+    );
+    let raw = ResultLabels {
+        title: format!("A{}B", "\t".repeat(511)),
+        subartist: "\t".to_owned(),
+        ..labels()
+    };
+    fx.skin
+        .update_result(&mut fx.res, &ready(1, BestView::Unavailable, 1), &raw)
+        .unwrap();
+    let texts = |r: Vec<skin_model::TextRequest>| -> Vec<String> {
+        r.into_iter().map(|r| r.text).collect()
+    };
+    let result = texts(fx.skin.result_text_requests(&fx.res, fx.target, &fx.layout));
+    let play = texts(fx.skin.text_requests(
+        &skin_model::ChartText {
+            title: &raw.title,
+            subtitle: &raw.subtitle,
+            artist: &raw.artist,
+            subartist: &raw.subartist,
+            genre: &raw.genre,
+        },
+        fx.target,
+        &fx.layout,
+    ));
+    assert_eq!(result, play);
+    assert_eq!(result.first().map(String::as_str), Some("AB"));
+}
+
 /// An image choice selects by a result field: the clear type.
 #[test]
 fn an_image_choice_selects_by_a_result_field() {
@@ -575,7 +623,8 @@ fn an_image_choice_selects_by_a_result_field() {
 
 /// On result and on selection a number draws nothing for `i32::MIN` or
 /// `i32::MAX` and draws every value between (`SkinNumber.java:135-147`;
-/// play and loading, which draw both, are `number.rs`' and `loading.rs`').
+/// play and loading, which hide them too, are `number.rs`' and
+/// `loading.rs`').
 #[test]
 fn a_result_number_leaves_out_the_i32_extremes() {
     let srcs = ["2147483647", "2147483646", "-2147483647 - 1", "-2147483647"];
@@ -654,41 +703,7 @@ fn a_result_number_leaves_out_the_i32_extremes() {
 /// before it is called, and laid out again for a new view.
 #[test]
 fn result_bitmap_text_follows_the_view() {
-    use image::{ImageFormat, Rgba, RgbaImage};
-    use skin_model::{FileDef, Filter, ImageDef, Root, SheetBuilder};
-    let dir = tempfile::tempdir().unwrap();
-    RgbaImage::from_pixel(2, 2, Rgba([255; 4]))
-        .save_with_format(dir.path().join("0.png"), ImageFormat::Png)
-        .unwrap();
-    std::fs::write(
-        dir.path().join("f.fnt"),
-        "info face=\"t\" size=10 padding=0,0,0,0\n\
-         common lineHeight=12 base=10 scaleW=16 scaleH=16 pages=1\n\
-         page id=0 file=\"f.png\"\n\
-         char id=65 x=0 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n\
-         char id=66 x=4 y=0 width=4 height=4 xoffset=0 yoffset=0 xadvance=5 page=0\n",
-    )
-    .unwrap();
-    RgbaImage::from_pixel(16, 16, Rgba([255; 4]))
-        .save_with_format(dir.path().join("f.png"), ImageFormat::Png)
-        .unwrap();
-    let mut b = SheetBuilder::new(&Root::new(dir.path()).unwrap());
-    let file = b
-        .admit_file(FileDef {
-            path: "0.png".into(),
-            hi: None,
-        })
-        .unwrap();
-    b.add_image(ImageDef {
-        file,
-        rect: None,
-        grid: [1, 1],
-        cycle: None,
-        filter: Filter::Linear,
-    })
-    .unwrap();
-    let f = b.admit_fnt("f.fnt", &mut |_| Ok(()), &|| false).unwrap();
-    b.add_bitmap_font(f, &[]).unwrap();
+    let (_dir, sheet) = selection_support::bitmap_sheet();
     let mut def = selection_support::skin_def(
         vec![relement(Source::Text(0), [0, 0, 200, 20], None)],
         WidgetDefs {
@@ -699,7 +714,7 @@ fn result_bitmap_text_follows_the_view() {
             ..WidgetDefs::default()
         },
     );
-    def.sheet = b.finish();
+    def.sheet = sheet;
     let mut fx = RFx::new(Skin::new_result(def, ResultDefs::default()).unwrap());
     let titled = |title: &str| ResultLabels {
         title: title.to_owned(),

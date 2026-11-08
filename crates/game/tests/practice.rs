@@ -1729,3 +1729,77 @@ fn input_before_the_lead_in_feeds_conversion_only() {
     assert!(re.as_played);
     assert_eq!(re.evaluation.events, report.live);
 }
+
+/// A preparation's key (design.md "Play Lifecycle", preparing each
+/// attempt) moves with each input the preparation reads: another load of
+/// the same chart, a practice section, its initial gauges and lead-in, and
+/// the speed, each naming only what changed; the attempt's number does not
+/// move it.
+#[test]
+fn a_preparations_key_moves_with_each_input_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let saves = || Saves {
+        clock: Rc::new(Cell::new(0)),
+        log: Log::default(),
+        delay: 0,
+        records: Rc::default(),
+    };
+    let mut loaded = load(dir.path(), example_chart(), saves(), config());
+    let full = loaded.prep_key();
+    let only = |c: game::Changes| {
+        let mut flags = Vec::new();
+        for (name, on) in [
+            ("chart", c.chart),
+            ("speed", c.speed),
+            ("kind", c.kind),
+            ("gauges", c.gauges),
+            ("preset", c.preset),
+            ("settings", c.settings),
+            ("screen", c.screen),
+        ] {
+            if on {
+                flags.push(name);
+            }
+        }
+        flags
+    };
+    // The number is not in the key.
+    let start = loaded.begin_play();
+    assert!(full.changes(&loaded.prep_key()).none());
+    loaded.withdraw(start);
+    // Another load of the same file is another chart.
+    let again = load(dir.path(), example_chart(), saves(), config());
+    assert_eq!(only(full.changes(&again.prep_key())), ["chart"]);
+    // A section.
+    let practice = example_practice(&loaded);
+    loaded.set_practice(Some(practice.clone())).unwrap();
+    let section = loaded.prep_key();
+    assert_eq!(only(full.changes(&section)), ["kind", "gauges"]);
+    // Its initial gauges, which the round's section carries too.
+    let pct = |n: i64| GaugeValue(n * GaugeValue::PERCENT);
+    let mut gauges = practice.clone();
+    gauges.initial_gauges[0] = pct(50);
+    loaded.set_practice(Some(gauges)).unwrap();
+    assert_eq!(
+        only(section.changes(&loaded.prep_key())),
+        ["kind", "gauges"]
+    );
+    // Its lead-in alone.
+    let mut lead_in = practice;
+    lead_in.lead_in = TimeUs(lead_in.lead_in.0 + 500 * MS);
+    loaded.set_practice(Some(lead_in)).unwrap();
+    assert_eq!(only(section.changes(&loaded.prep_key())), ["kind"]);
+    // The speed.
+    loaded.set_practice(None).unwrap();
+    loaded
+        .set_speed(Speed::from_twentieths(15).unwrap())
+        .unwrap();
+    assert_eq!(only(full.changes(&loaded.prep_key())), ["speed"]);
+    // The screen's structural inputs.
+    let staged = full.clone().with_screen(game::ScreenKey::default());
+    let rebuilt = full.clone().with_screen(game::ScreenKey {
+        device: 1,
+        ..game::ScreenKey::default()
+    });
+    assert_eq!(only(staged.changes(&rebuilt)), ["screen"]);
+}

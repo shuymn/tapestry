@@ -19,13 +19,13 @@ fn facts(text: &str) -> ImportFacts {
     attempt_facts(&loaded(text, "tapestry"), false)
 }
 
-/// The jobs started and joined, and the VMs open (dev-tools; zeros
-/// without).
+/// The jobs this test started and joined, and the VMs open (dev-tools;
+/// zeros without).
 fn counters() -> (u64, u64, usize) {
     #[cfg(feature = "dev-tools")]
     return (
-        crate::imports::jobs_started(),
-        crate::imports::jobs_joined(),
+        super::jobs_started(),
+        super::jobs_joined(),
         skin_beatoraja::vm_hooks::live(),
     );
     #[cfg(not(feature = "dev-tools"))]
@@ -197,8 +197,11 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
         if held {
             vm_hooks::hold();
         }
+        // The attempt's thread counts its job into this test's tally.
+        let tally = super::tally();
         let (got, took) = std::thread::scope(|scope| {
             let attempt = scope.spawn(|| {
+                super::adopt(tally);
                 let (got, _) = skin.attempt(
                     facts("#PLAYLEVEL 12\n"),
                     || {},
@@ -239,4 +242,82 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
         }
     }
     drop(serial);
+}
+
+/// A job waited for with a deadline ([`crate::imports::Job::wait_until`],
+/// what a begun preparation's polls use) returns at each deadline while
+/// nothing came and the job runs; once the attempt's quit came it waits
+/// past the deadline for the job's thread, which the quit cancelled.
+#[test]
+fn a_job_wait_returns_at_its_deadline_until_a_quit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::LATE;
+    use crate::imports::{Ran, spawn_job};
+    let mut job = spawn_job(|cancel: &crate::imports::Cancel| {
+        while !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The thread outlives the cancel a while: the quit waits for it.
+        std::thread::sleep(Duration::from_millis(200));
+        7
+    })
+    .unwrap();
+    let quit = AtomicBool::new(false);
+    for _ in 0..3 {
+        let asked = Instant::now();
+        let polled = job.wait_until(
+            Some(asked + Duration::from_millis(50)),
+            || quit.load(Ordering::SeqCst),
+            || false,
+        );
+        assert!(polled.is_none());
+        let took = asked.elapsed();
+        assert!(took >= Duration::from_millis(50) && took < LATE, "{took:?}");
+    }
+    quit.store(true, Ordering::SeqCst);
+    let asked = Instant::now();
+    let ran = job.wait_until(Some(asked), || quit.load(Ordering::SeqCst), || false);
+    assert!(matches!(ran, Some(Ran::Done(7))), "{:?}", ran.map(|_| ()));
+    assert!(
+        asked.elapsed() >= Duration::from_millis(200),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+/// A specialization whose preparation was superseded or discarded is
+/// settled, never detached (the S10 item 9 design's 9.2 ownership: the
+/// handle owns its subjobs): a job that would run forever is cancelled,
+/// its thread joined and its VMs closed within the stop bound.
+#[test]
+fn a_settled_specialization_is_cancelled_and_joined() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = super::lua_skin("if ms.number(96) == 12 then while true do end end");
+    let (p, _) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    let mut skin = PendingSkin::new(p);
+    let (s, j, live) = counters();
+    let crate::imports::Begun::Running(mut job) = skin.begin(
+        facts(
+            "#PLAYLEVEL 12
+",
+        ),
+        || {},
+    ) else {
+        panic!("a job runs");
+    };
+    let from = std::time::Instant::now();
+    skin.settle(&mut job);
+    assert!(
+        from.elapsed() < crate::imports::STOP_WAIT,
+        "{:?}",
+        from.elapsed()
+    );
+    let (s2, j2, live2) = counters();
+    let one = u64::from(cfg!(feature = "dev-tools"));
+    assert_eq!((s2 - s, j2 - j), (one, one), "started and joined");
+    assert_eq!(live2, live, "its VMs closed");
 }

@@ -85,6 +85,7 @@ use crate::bests::{BestKey, BestLookup};
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
+use crate::prep::{PrepHandle, PrepKey, PrepPoll, Readiness};
 use crate::render::RenderSide;
 use crate::restore::RestoreError;
 use crate::result_screen::ResultScreen;
@@ -213,28 +214,64 @@ pub trait Rig {
     /// Makes sure the screen and its device can draw (built again if they
     /// failed) and waits for it to acknowledge: the device's recovery, for
     /// a play and for the menus alike. It prepares no attempt, which
-    /// depends on the play preset ([`prepare_attempt`](Self::prepare_attempt)).
+    /// depends on the play preset ([`begin_preparation`](Self::begin_preparation)).
     ///
     /// # Errors
     ///
     /// Why the screen cannot draw, which ends the run.
     fn prepare_screen(&mut self) -> Result<(), Self::ScreenError>;
-    /// Prepares the screen for the attempt [`Loaded::attempt`] describes,
-    /// fresh for every play, after the play preset was refreshed for it and
-    /// before recording opens, and waits for it while servicing the
-    /// player: a quit key or a close during the wait cancels it
-    /// ([`Preparation::Cancelled`]) without waiting for the screen. A
-    /// refusal leaves the screen usable for the menus. By default, for rigs
-    /// without a screen, it is ready at once.
+    /// Begins preparing the screen for the attempt [`Loaded::attempt`]
+    /// describes, with what `key` holds (design.md "Play Lifecycle",
+    /// preparing each attempt), and returns at once: its subjobs run until
+    /// [`poll_preparation`](Self::poll_preparation) finds them done. It
+    /// supersedes a preparation begun before, whose late answer installs
+    /// nothing. Fresh for every play, after the play preset was refreshed
+    /// for it and before recording opens. By default, for rigs without a
+    /// screen, there is nothing to begin.
+    fn begin_preparation(&mut self, loaded: &Loaded, key: PrepKey) -> PrepHandle {
+        let _ = loaded;
+        PrepHandle::new(key, 0)
+    }
+    /// Drives the preparation `handle` until it is done or `deadline`
+    /// passes, servicing the player meanwhile: a quit key or a close
+    /// cancels it ([`Preparation::Cancelled`]) without waiting for the
+    /// screen, except that a quit during a pending play skin's
+    /// specialization waits for its job's thread. A refusal leaves the
+    /// screen usable for the menus. Ready, `handle` holds the screen's
+    /// structural inputs it was staged with
+    /// ([`PrepHandle::staged_with`]). By default it is ready at once.
     ///
     /// # Errors
     ///
     /// Why the screen or its device cannot draw at all, which ends the run.
-    fn prepare_attempt(&mut self, loaded: &Loaded) -> Result<Preparation, Self::ScreenError> {
-        let _ = loaded;
-        Ok(Preparation::Ready)
+    fn poll_preparation(
+        &mut self,
+        handle: &mut PrepHandle,
+        deadline: std::time::Instant,
+    ) -> Result<PrepPoll<Preparation>, Self::ScreenError> {
+        let _ = (handle, deadline);
+        Ok(PrepPoll::Done(Preparation::Ready))
     }
-    /// Finalizes the attempt [`prepare_attempt`](Self::prepare_attempt)
+    /// The attempt's final readiness, bounded: attempt `number` and the
+    /// current adjustment epoch are stamped on what `handle`'s
+    /// preparation staged, once the screen's structural inputs still are
+    /// those it was staged with. It prepares nothing, imports nothing and
+    /// decodes nothing: a mismatch, or staging lost, is
+    /// [`Readiness::Stale`] with the inputs now, and the flow decides
+    /// what follows. Ready by default.
+    ///
+    /// # Errors
+    ///
+    /// Why the screen did not answer, which ends the run.
+    fn ready_attempt(
+        &mut self,
+        number: u32,
+        handle: &PrepHandle,
+    ) -> Result<Readiness<Self::ScreenError>, Self::ScreenError> {
+        let _ = (number, handle);
+        Ok(Readiness::Ready)
+    }
+    /// Finalizes the attempt [`ready_attempt`](Self::ready_attempt)
     /// readied (design.md "Play Lifecycle"): what it prepared is installed
     /// for the play, after the attempt's readiness, a round's restore
     /// check and the look at a quit or a failure, and before the loading
@@ -248,7 +285,7 @@ pub trait Rig {
     fn commit_attempt(&mut self) -> Result<(), Self::ScreenError> {
         Ok(())
     }
-    /// Drops what [`prepare_attempt`](Self::prepare_attempt) readied and
+    /// Drops what the attempt's preparation readied and
     /// was not committed: the play was cancelled, refused or failed before
     /// its commit, so a preparation answered late never installs. Nothing
     /// by default.
@@ -1028,8 +1065,12 @@ pub fn play<R: Rig>(
 ///
 /// What [`play`] reports; a refused attempt is [`LiveError::Preparation`].
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
-    let ready = ready_to_commit(loaded, rig);
+fn ready_to_open<R: Rig>(
+    loaded: &Loaded,
+    number: u32,
+    rig: &mut R,
+) -> Result<bool, LiveError<R::ScreenError>> {
+    let ready = ready_to_commit(loaded, number, rig);
     if !matches!(ready, Ok(true)) {
         rig.discard_attempt();
         return ready;
@@ -1048,10 +1089,11 @@ fn ready_to_open<R: Rig>(loaded: &Loaded, rig: &mut R) -> Result<bool, LiveError
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn ready_to_commit<R: Rig>(
     loaded: &Loaded,
+    number: u32,
     rig: &mut R,
 ) -> Result<bool, LiveError<R::ScreenError>> {
     rig.prepare_audio().map_err(LiveError::Audio)?;
-    match rig.prepare_attempt(loaded).map_err(LiveError::Screen)? {
+    match prepare_attempt(loaded, number, rig)? {
         Preparation::Ready => {}
         // The player left, or another thread failed: a failure is the
         // run's end, with its cause.
@@ -1073,6 +1115,67 @@ fn ready_to_commit<R: Rig>(
     // before this play belongs to no play.
     preflight(rig)?;
     Ok(!(rig.quitting() || rig.take() == Some(Command::Quit)))
+}
+
+/// How long one poll of the attempt's preparation lasts at most before
+/// the flow polls it again.
+const PREP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The attempt's preparation, begun and polled to its end, then its final
+/// readiness for attempt `number` (design.md "Play Lifecycle", preparing
+/// each attempt). A `Stale` readiness is never repaired in place: the key
+/// is read again with the screen's structural inputs now, and a changed
+/// key begins the preparation again at once; an unchanged one (the
+/// staging lost with nothing structural changed) ends the run with the
+/// screen's error and is never retried. Before either, a thread's
+/// failure, a failed screen, a quit or a close ends it as at the commit.
+/// Each retry needs a real structural change, so none is capped.
+///
+/// # Errors
+///
+/// The screen's failure, or the unchanged key's.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn prepare_attempt<R: Rig>(
+    loaded: &Loaded,
+    number: u32,
+    rig: &mut R,
+) -> Result<Preparation, LiveError<R::ScreenError>> {
+    let mut key = loaded.prep_key();
+    loop {
+        let mut handle = rig.begin_preparation(loaded, key);
+        loop {
+            let deadline = std::time::Instant::now() + PREP_SLICE;
+            match rig
+                .poll_preparation(&mut handle, deadline)
+                .map_err(LiveError::Screen)?
+            {
+                PrepPoll::Pending => {}
+                PrepPoll::Done(Preparation::Ready) => break,
+                PrepPoll::Done(ended) => return Ok(ended),
+            }
+        }
+        match rig
+            .ready_attempt(number, &handle)
+            .map_err(LiveError::Screen)?
+        {
+            Readiness::Ready => return Ok(Preparation::Ready),
+            Readiness::Stale(stale) => {
+                // What ends the run or the play comes first, as at the
+                // commit: a thread's failure, then a screen that failed
+                // after the staging (the preparation begun again would
+                // build it again and hide it), then a quit or a close.
+                preflight(rig)?;
+                if rig.quitting() || rig.take() == Some(Command::Quit) {
+                    return Ok(Preparation::Cancelled);
+                }
+                let now = loaded.prep_key().with_screen(stale.screen);
+                if now == *handle.key() {
+                    return Err(LiveError::Screen(stale.lost));
+                }
+                key = now;
+            }
+        }
+    }
 }
 
 /// A play's report, and what follows it.
@@ -1115,7 +1218,7 @@ fn play_and_next<R: Rig>(
     // value the player set does not open, the reset its reason.
     let ready = match loaded.refit_practice() {
         Ok(()) => match rig.begin_presentation(loaded) {
-            Ok(None) => ready_to_open(loaded, rig),
+            Ok(None) => ready_to_open(loaded, start.attempt, rig),
             Ok(Some(refusal)) => Err(LiveError::Preparation(refusal)),
             Err(e) => Err(LiveError::Input(e)),
         },

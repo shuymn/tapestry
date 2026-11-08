@@ -345,6 +345,7 @@ fn when_bundle() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
             close: None,
+            present: None,
         },
         SelectionDefs::default(),
     )
