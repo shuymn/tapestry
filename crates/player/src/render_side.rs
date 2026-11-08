@@ -2558,7 +2558,8 @@ impl Run {
                         | RenderMsg::Prepare(_)
                         | RenderMsg::PrepareAttempt { .. }
                         | RenderMsg::Commit { .. }
-                        | RenderMsg::Discard(_))
+                        | RenderMsg::Discard(_)
+                        | RenderMsg::ParkScripts(_))
                 )
             {
                 self.loading_stats.report("loading");
