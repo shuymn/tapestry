@@ -935,6 +935,8 @@ fn the_point_follows_the_source_s_widths() {
     // and the last addition wraps.
     let mut one = Harness::empty(&chart(1), &full(0));
     assert_eq!(point_after(&mut one, [14_316, 0, 0], 2), -2_147_467_296);
+    // The PERFECT quotient past `i32` keeps its low 32 bits.
+    assert_eq!(point_after(&mut one, [14_317, 0, 0], 0), -2_147_417_296);
     // The maximum combo's quotient keeps its low 32 bits.
     assert_eq!(point_after(&mut one, [0, 0, 0], 50_000), -1_794_967_296);
     // No target: 0, whatever the counts.
@@ -944,6 +946,19 @@ fn the_point_follows_the_source_s_widths() {
         .unwrap();
     let mut none = Harness::empty(&none, &full(0));
     assert_eq!(point_after(&mut none, [3, 2, 1], 3), 0);
+}
+
+/// During section practice the point is over the section's targets, as
+/// the source's practice counts only its section's notes
+/// (`pattern/PracticeModifier.java:30-40`, `play/JudgeManager.java:135`).
+#[test]
+fn a_sections_point_is_over_its_targets() {
+    // Four taps, two of them in the section.
+    let chart = taps(&[1_000, 31_000, 32_000, 61_000]);
+    let s = section(30_000, 60_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    assert_eq!(point_after(&mut h, [2, 0, 0], 2), 200_000);
+    assert_eq!(h.field(field::NOTES), 2);
 }
 
 #[test]
