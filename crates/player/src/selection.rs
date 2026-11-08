@@ -4959,18 +4959,21 @@ pub(crate) mod tests {
     }
 
     /// Every way the game thread accepts a retry outside practice starts
-    /// the next play's state clock at the retry's receipt (design.md
-    /// "beatoraja Lua Skins", the state clock). The retry key (the
-    /// window's, and every scripted retry, through `Controls::command`)
-    /// taken as READY, a play, its tail and the save take it (`Rig::take`)
-    /// and as Closing does (`take_closing`), acted on at once; on a result
-    /// (`take_menu`), the retry key's or a controller's, received when
-    /// taken, only the retry the flow acts on: the first taken while the
-    /// result is prepared, which withdraws it (`withdraw_result`), or the
-    /// one the result accepts (`accept_leaving`), served after its outro
-    /// or at once when the input thread fails during it (`serve_leaving`).
-    /// A retry gated, queued behind the accepted command, taken while the
-    /// outro plays or left from an earlier result is no play's.
+    /// the next play's state clock where the next play state is entered
+    /// (design.md "beatoraja Lua Skins", the state clock). The retry key
+    /// (the window's, and every scripted retry, through
+    /// `Controls::command`) taken as READY, a play, its tail and the save
+    /// take it (`Rig::take`) and as Closing does (`take_closing`) is acted
+    /// on at once: its receipt. On a result (`take_menu`), the retry key's
+    /// or a controller's (received when taken), only the retry the flow
+    /// acts on: the first taken while the result is prepared, which
+    /// withdraws it (`withdraw_result`), at its receipt; or the one the
+    /// result accepts (`accept_leaving`), when the flow serves it
+    /// (`serve_leaving`: after its outro, or at once on the input
+    /// thread's failure, the skin's fallback or an outro of no length),
+    /// its load time still from its receipt. A retry gated, queued behind
+    /// the accepted command, taken while the outro plays or left from an
+    /// earlier result is no play's.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn every_accepted_retry_starts_the_state_clock_afresh() {
@@ -5017,7 +5020,9 @@ pub(crate) mod tests {
             assert_eq!(rig.state_clock.origin(), Some(first));
             // Result: a gated retry dropped, then one accepted, served
             // after its outro (what is taken while it plays dropped) or at
-            // once on the input thread's failure.
+            // once (the input thread's failure, the skin's fallback, an
+            // outro of no length): the next play state is entered when it
+            // is served, its load time runs from the accepted receipt.
             for after_outro in [true, false] {
                 // A result shows again (the preparation left the last).
                 rig.result_input.enter();
@@ -5032,22 +5037,39 @@ pub(crate) mod tests {
                     pad_retry(&mut set, &mut hook, later(rig));
                     assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
                 }
+                // The outro plays on after an early press.
+                if after_outro {
+                    let end = TimeUs(rig.clock.now().0 + 2_000);
+                    while rig.clock.now() < end {}
+                }
+                let before = later(rig);
                 rig.serve_leaving(MenuCommand::Retry);
+                let after = rig.clock.now();
                 rig.prepare_screen().unwrap();
-                assert_eq!(rig.state_clock.origin(), Some(accepted), "{after_outro}");
+                let origin = rig.state_clock.origin().unwrap();
+                assert!(
+                    origin >= before && origin <= after,
+                    "{after_outro} {origin:?}"
+                );
+                let outro = if after_outro { 2_000 } else { 1 };
+                assert!(origin.0 - accepted.0 >= outro, "{after_outro}");
+                assert_eq!(rig.retry_from, Some(accepted), "{after_outro}");
             }
-            // Result: a controller's retry accepted, received when taken.
+            // Result: a controller's retry accepted, received when taken
+            // (its load time), served after its outro (its state clock).
             rig.result_input.enter();
             pad_retry(&mut set, &mut hook, later(rig));
             let before = later(rig);
             assert_eq!(rig.take_menu(), Some(MenuCommand::Retry));
             let after = rig.clock.now();
             rig.accept_leaving(MenuCommand::Retry);
+            let served = later(rig);
             rig.serve_leaving(MenuCommand::Retry);
             rig.prepare_screen().unwrap();
+            let received = rig.retry_from.unwrap();
+            assert!(received >= before && received <= after, "{received:?}");
             let origin = rig.state_clock.origin().unwrap();
-            assert!(origin >= before && origin <= after, "{origin:?}");
-            assert_eq!(rig.retry_from, Some(origin));
+            assert!(origin >= served && origin > received, "{origin:?}");
             // A retry an earlier result offered and never acted on: a
             // later result's preparation withdrawn by back keeps the
             // origin.
