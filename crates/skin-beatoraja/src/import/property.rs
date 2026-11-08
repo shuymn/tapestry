@@ -614,7 +614,9 @@ pub(crate) fn int_in(kind: ScreenKind, id: i32) -> IntProp {
     let class = match kind {
         ScreenKind::Selection => selection::profile::number(id).map(|c| c.map(Value::Selection)),
         ScreenKind::Result => result::profile::number(id).map(|c| c.map(Value::Result)),
-        ScreenKind::Play | ScreenKind::Decision => return int_by_id(id),
+        // The decision shows no number.
+        ScreenKind::Decision => None,
+        ScreenKind::Play => return int_by_id(id),
     };
     match class {
         Some(Class::Bridge(v)) => IntProp::Shown(v),
@@ -843,7 +845,9 @@ pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
     let class = match kind {
         ScreenKind::Selection => selection::profile::image_index(id),
         ScreenKind::Result => result::profile::image_index(id),
-        ScreenKind::Play | ScreenKind::Decision => return index_by_id(id),
+        // The decision selects by no image index.
+        ScreenKind::Decision => None,
+        ScreenKind::Play => return index_by_id(id),
     };
     match class {
         Some(Class::Bridge(src)) => IndexProp::Selection(src),
@@ -911,12 +915,18 @@ pub(crate) enum StrProp {
 }
 
 /// String property `id` on a `kind` screen: play's mapping, or the
-/// selection or result profile's ([`selection::profile::text`],
-/// [`super::result::profile::text`]), an id outside it
+/// selection, decision or result profile's ([`selection::profile::text`],
+/// [`super::decision::profile::text`], [`super::result::profile::text`]),
+/// an id outside it
 /// as the factory knows it ([`str_by_id`]).
 pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
-    if kind == ScreenKind::Result {
-        return match result::profile::text(id) {
+    let profile = match kind {
+        ScreenKind::Result => Some(result::profile::text(id)),
+        ScreenKind::Decision => Some(super::decision::profile::text(id)),
+        ScreenKind::Play | ScreenKind::Selection => None,
+    };
+    if let Some(class) = profile {
+        return match class {
             Some(Class::Bridge(())) => str_by_id(id),
             Some(Class::Unavailable | Class::Omit) => StrProp::Unsupported(Some(id)),
             None => match str_by_id(id) {

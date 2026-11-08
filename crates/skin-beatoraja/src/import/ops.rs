@@ -483,10 +483,10 @@ pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
 }
 
 /// Numeric op `op` (non-zero) on a `kind` screen: play's [`numeric`], or
-/// the selection or result profile's built-ins before the declared items,
-/// a built-in outside the profile unsupported.
+/// the selection, decision or result profile's built-ins before the
+/// declared items, a built-in outside the profile unsupported.
 pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
-    if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
+    if kind == ScreenKind::Play {
         return numeric(op, items);
     }
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
@@ -502,31 +502,31 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 }
 
 /// Built-in `id` of a `kind` screen's profile (selection's
-/// [`profile::option`] or the result's
+/// [`profile::option`], the decision's
+/// [`super::decision::profile::option`] or the result's
 /// [`super::result::profile::option`]), negated for `negative`: its
 /// bridge, built in one allocation of [`MAX_COND_BYTES`], or its constant
 /// folded. A result option's validity
 /// ([`super::result::profile::option_guard`]) is joined outside the
 /// negation, so neither the option nor its negation holds on a view
 /// without the value. The result's judgment class is a
-/// load-time fact; the result schema has no field for it, so a frame
-/// condition on it is unsupported.
+/// load-time fact; neither the result nor the decision schema has a
+/// field for it, so a frame condition on it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
     use super::result::profile::{self as result, ResOption};
     let guard = match result::option_guard(id) {
         g if kind == ScreenKind::Result && g != "true" => Some(g),
         _ => None,
     };
-    let class = if kind == ScreenKind::Result {
-        result::option(id).map(|c| {
-            c.map(|o| match o {
-                ResOption::Expr(e) => Some(SelOption::Expr(e)),
-                ResOption::Constant(b) => Some(SelOption::Constant(b)),
-                ResOption::JudgeClass => None,
-            })
-        })
-    } else {
-        profile::option(id).map(|c| c.map(Some))
+    let own = |o: ResOption| match o {
+        ResOption::Expr(e) => Some(SelOption::Expr(e)),
+        ResOption::Constant(b) => Some(SelOption::Constant(b)),
+        ResOption::JudgeClass => None,
+    };
+    let class = match kind {
+        ScreenKind::Result => result::option(id).map(|c| c.map(own)),
+        ScreenKind::Decision => super::decision::profile::option(id).map(|c| c.map(own)),
+        ScreenKind::Play | ScreenKind::Selection => profile::option(id).map(|c| c.map(Some)),
     };
     match class {
         Some(Class::Bridge(Some(SelOption::Constant(on)))) => Cond::Fold(on != negative),
@@ -556,7 +556,7 @@ fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
 /// A boolean property named `name` on a `kind` screen ([`named`] through
 /// [`numeric_in`]'s built-ins).
 pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
-    if !matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
+    if kind == ScreenKind::Play {
         return named(name);
     }
     let mut negative = false;

@@ -32,6 +32,12 @@ pub struct DecisionTimers {
     pub fadeout: Option<TimeUs>,
 }
 
+/// The longest scene, and the longest fade-out, a decision skin's
+/// declaration is honoured for: 10 s each, so the screen lasts at most
+/// 20 s (a provisional interaction limit; design.md "Play Lifecycle", the
+/// decision screen). A longer declaration is clamped to it.
+pub const MAX_DECISION_PHASE: TimeUs = TimeUs(10_000_000);
+
 /// What a decision skin declares for its screen's timing, in µs: the
 /// source's `scene`, `fadeout` and `input`
 /// (`skin/json/JsonSkin.java:14-16`), each 0 when not declared. The

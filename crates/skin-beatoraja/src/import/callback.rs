@@ -212,7 +212,8 @@ pub(crate) fn schema(kind: ScreenKind) -> &'static skin_model::Schema {
     match kind {
         ScreenKind::Selection => &SELECTION,
         ScreenKind::Result => &skin_model::RESULT,
-        ScreenKind::Play | ScreenKind::Decision => &PLAY,
+        ScreenKind::Decision => &skin_model::DECISION,
+        ScreenKind::Play => &PLAY,
     }
 }
 
@@ -1721,13 +1722,10 @@ impl Cx<'_> {
                     }
                 }
                 *deviates |= l.deviates;
-                // On a selection or result skin a visibility known to be
-                // false folds as a JSON condition of the same id does:
-                // never drawn, so an essential part is missing rather than
-                // kept invisible.
-                if matches!(self.kind, ScreenKind::Selection | ScreenKind::Result)
-                    && l.known == Some(0)
-                {
+                // Off play a visibility known to be false folds as a JSON
+                // condition of the same id does: never drawn, so an
+                // essential part is missing rather than kept invisible.
+                if self.kind != ScreenKind::Play && l.known == Some(0) {
                     self.ignored(at, NoteKind::Ignored { field: "op" });
                     return Ok(false);
                 }
@@ -2086,11 +2084,12 @@ impl Cx<'_> {
     }
 
     /// The note of a decorative callback in `field` replaced for `why`.
-    /// On a selection or result skin a read the profile does not bridge is noted as
-    /// the JSON field of the same id is: the profile's own treatment, so
-    /// the two paths cannot differ (docs/stage3.md §3, Selection).
+    /// Off play a number or option read the profile does not bridge is
+    /// noted as the JSON field of the same id is, by the profile's own
+    /// treatment (docs/stage3.md §3, Selection); any other read keeps its
+    /// callback's note.
     fn callback_note(&self, field: &'static str, why: Unsupported) -> NoteKind {
-        if matches!(self.kind, ScreenKind::Selection | ScreenKind::Result)
+        if self.kind != ScreenKind::Play
             && let Unsupported::Unmapped { api, id } = why
             && let Ok(id) = i32::try_from(id)
         {
