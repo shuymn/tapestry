@@ -465,6 +465,16 @@ fn every_frame_draws_one_views_number_and_strip() {
     assert_eq!(status.shown, Some((2, true)));
     assert_eq!(status.lifetime, lifetime);
     assert_eq!(status.installed, Some(skin.atlas_id()));
+    // An overlay alone (a notice) merges over the view presented.
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        ..Overlay::default()
+    };
+    show(&rig.link, lifetime, 30, &b, &notice);
+    assert!(rig.until(|d| {
+        skin_frame(d).is_some_and(|(q, n)| n == 3 && skin_quads(q) == skin_quads(&ref_b))
+    }));
+    assert_eq!(rig.link.result_status().revision, 30);
     rig.link.exit();
 }
 
@@ -571,7 +581,8 @@ fn a_screen_built_again_draws_the_revision_presented() {
         rig.link.prepare().unwrap();
         if refuse {
             assert!(rig.until(|d| matches!(d, Drawn::Page(p) if p[2] == "v1 2")));
-            assert!(rig.link.result_status().disabled.is_some());
+            let why = rig.link.result_status().disabled.unwrap();
+            assert!(why.contains("not restored"), "{why}");
         } else {
             assert!(rig.until(|d| *d == Drawn::Skin(ref_a.clone(), 1)));
             let status = rig.link.result_status();

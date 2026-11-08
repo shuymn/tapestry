@@ -6040,12 +6040,14 @@ pub(crate) mod tests {
         let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
+        let id = result.atlas_id();
         assert_eq!(
             link.select(ScreenKind::Result, Some(result))
                 .wait()
                 .unwrap(),
             Preparation::Ready
         );
+        assert_eq!(link.result_status().installed, Some(id));
         assert_eq!(
             link.pend(ScreenKind::Play).wait().unwrap(),
             Preparation::Ready
@@ -6055,6 +6057,11 @@ pub(crate) mod tests {
             Preparation::Ready
         );
         assert!(!link.failed());
+        // The release is reconciled: nothing of the result is kept to
+        // restore, and the status says so (the S10-09i design's Q3).
+        let status = link.result_status();
+        assert_eq!(status.installed, None);
+        assert!(!status.retained.contains(&id), "{status:?}");
         link.commit_attempt().unwrap();
         link.exit();
     }
