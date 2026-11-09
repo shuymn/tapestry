@@ -143,11 +143,17 @@ impl Side<'_> {
 /// unacknowledged from before the lifetime begins.
 fn on_loading<R>(
     loaded: &mut game::Loaded,
-    pending: Option<crate::imports::PendingSkin>,
+    pending: Option<&str>,
     held_ack: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
     let _serial = imports::serial();
+    // Built under the lock: its base import's VM is counted by the
+    // serialized tests that read the live VM count.
+    let (_skin_dir, pending) = match pending.map(pending_play) {
+        Some((dir, skin)) => (Some(dir), Some(skin)),
+        None => (None, None),
+    };
     let screens = Installers::default();
     let chart = Arc::new(loaded.chart().clone());
     let render = if pending.is_some() {
@@ -284,31 +290,35 @@ fn the_final_readiness_stamps_the_attempts_epoch() {
 /// load's epoch, which the final readiness stamps.
 #[test]
 fn a_pending_skin_keeps_the_loads_epoch() {
-    let (_p, skin) = pending_play("local lv = ms.number(96)");
     let (_dir, mut loaded) = plain();
-    on_loading(&mut loaded, Some(skin), false, |rig, side, loaded| {
-        // The specialization's VM is held at its destruction: the job
-        // does not end until let go.
-        skin_beatoraja::vm_hooks::hold();
-        side.gates.refresh.hold(true);
-        side.loading_end.hold(true);
-        let ended = open_with(loaded, rig, side, || {
-            until("the specialization held", || {
-                skin_beatoraja::vm_hooks::waiting() > 0
+    on_loading(
+        &mut loaded,
+        Some("local lv = ms.number(96)"),
+        false,
+        |rig, side, loaded| {
+            // The specialization's VM is held at its destruction: the job
+            // does not end until let go.
+            skin_beatoraja::vm_hooks::hold();
+            side.gates.refresh.hold(true);
+            side.loading_end.hold(true);
+            let ended = open_with(loaded, rig, side, || {
+                until("the specialization held", || {
+                    skin_beatoraja::vm_hooks::waiting() > 0
+                });
+                until("the refresh", || side.gates.refresh.waiting());
+                // Still specializing at O5: let it go only now.
+                skin_beatoraja::vm_hooks::release();
+                side.gates.refresh.hold(false);
+                side.quit_at_the_end_of_loading();
             });
-            until("the refresh", || side.gates.refresh.waiting());
-            // Still specializing at O5: let it go only now.
             skin_beatoraja::vm_hooks::release();
-            side.gates.refresh.hold(false);
-            side.quit_at_the_end_of_loading();
-        });
-        skin_beatoraja::vm_hooks::release();
-        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
-        let (staged, committed) = rig.render.epochs();
-        assert!(staged > 0);
-        assert_eq!(committed, staged, "e1, the load's");
-        assert_eq!(side.gates.refresh.passed(), 1);
-    });
+            assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+            let (staged, committed) = rig.render.epochs();
+            assert!(staged > 0);
+            assert_eq!(committed, staged, "e1, the load's");
+            assert_eq!(side.gates.refresh.passed(), 1);
+        },
+    );
 }
 
 /// E3 (and A11's player half): a settings key pressed after the opening's
@@ -812,8 +822,8 @@ fn focus_lost_and_back_during_the_commit_reply_waits_a_quiet_second() {
 /// timing is the headless tests').
 #[test]
 fn a_committed_specializations_minimum_holds_the_end_of_loading() {
-    let (_p, skin) = pending_play("local lv = ms.number(96)\nskin.loadend = 3000");
     let (_dir, mut loaded) = plain();
+    let skin = "local lv = ms.number(96)\nskin.loadend = 3000";
     on_loading(&mut loaded, Some(skin), false, |rig, side, loaded| {
         side.loading_end.hold(true);
         let ended = open_with(loaded, rig, side, || side.quit_at_the_end_of_loading());
@@ -855,9 +865,8 @@ fn a_committed_specializations_minimum_holds_the_end_of_loading() {
 /// ends with the audio's failure, not back on the page.
 #[test]
 fn an_audio_failure_during_the_quits_settle_ends_the_run() {
-    let (_p, skin) =
-        pending_play("local lv = ms.number(96)\nif lv == 12 then while true do end end");
     let (_dir, mut loaded) = chart("#PLAYLEVEL 12\n#BPM 120\n#00111:01\n", covers());
+    let skin = "local lv = ms.number(96)\nif lv == 12 then while true do end end";
     on_loading(&mut loaded, Some(skin), false, |rig, side, loaded| {
         let base = skin_beatoraja::vm_hooks::live();
         skin_beatoraja::vm_hooks::hold();
