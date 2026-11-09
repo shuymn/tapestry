@@ -591,6 +591,40 @@ fn a_refused_continuation_is_terminal() {
     }
 }
 
+/// Idle continuation × a class with no permit: a speculative job admitted
+/// on a foreground permit while promoted, demoted during an idle wait,
+/// cannot be admitted again with no speculative permit: terminal. The idle
+/// gives nothing, the key begins afresh, and the job ends cancelled.
+#[test]
+fn a_continuation_in_a_class_with_no_permit_is_terminal() {
+    let coord = Coordinator::new(Caps {
+        foreground: 1,
+        speculative: 0,
+    });
+    let (old, runner) = coord.begin::<u32>(
+        key("a"),
+        Class::Speculative,
+        coord.subscriber(Scope::Choice),
+    );
+    old.promote();
+    let mut seen = None;
+    let outcome = runner.unwrap().run(&watchdog(), NOTHING, |ctx| {
+        let admitted = ctx.class();
+        let idle = ctx.idle(|| old.demote());
+        let (_, fresh) = coord.begin::<u32>(
+            key("a"),
+            Class::Speculative,
+            coord.subscriber(Scope::Choice),
+        );
+        seen = Some((admitted, idle.is_some(), fresh.is_some()));
+        99
+    });
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert_eq!(seen, Some((Some(Class::Foreground), false, true)));
+    assert_eq!(coord.take(&old), Taken::Ready(Outcome::Cancelled));
+    assert_eq!(held(&coord), (0, 0));
+}
+
 /// Running × a cancel requested and never checked: the work returns a
 /// value without a checkpoint after the request, and the job still ends
 /// cancelled.
