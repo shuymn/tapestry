@@ -46,6 +46,7 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
          {reads}\n\
+         local rt_draw\n\
          {pre}\n\
          skin.source = {{ {{ id = \"s\", path = \"s.png\" }}, {{ id = \"b\", path = \"big.png\" }} }}\n\
          skin.image = {images}\n\
@@ -55,6 +56,7 @@ fn skin_reading(reads: &str, pre: &str, images: &str) -> tempfile::TempDir {
          for i, im in ipairs(skin.image) do\n\
            d[#d + 1] = {{ id = im.id, op = {{ 90 }}, dst = {{ {{ x = 0, y = 300 + 20 * i, w = 8, h = 8 }} }} }}\n\
          end\n\
+         if rt_draw then d[#d + 1] = {{ id = skin.image[1].id, draw = rt_draw, dst = {{ {{ x = 100, y = 300, w = 8, h = 8 }} }} }} end\n\
          skin.destination = d\n\
          return skin\n"
     );
@@ -126,7 +128,7 @@ fn settled(rs: &mut ResultSkin) {
 /// The published bundle and the pages it shares.
 fn shown(rs: &ResultSkin) -> Arc<render::SkinBundle> {
     match rs.published().0 {
-        Some(Published::Skin(b, _)) => Arc::clone(b),
+        Some(Published::Skin(b, _, _)) => Arc::clone(b),
         other => panic!("{other:?}"),
     }
 }
@@ -433,7 +435,7 @@ impl Seen {
         if let Some(e) = rs.image() {
             self.0.push(Arc::downgrade(e.pages()));
         }
-        if let Some(Published::Skin(b, _)) = rs.published().0 {
+        if let Some(Published::Skin(b, _, _)) = rs.published().0 {
             self.0.push(Arc::downgrade(b.atlas_pages()));
         }
     }
@@ -1439,4 +1441,430 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     );
     assert_eq!(jobs_joined() - joined, 1, "the job's thread joined");
     assert!(!rs.busy());
+}
+
+/// A pending result skin whose dots' draw runs in the runtime.
+fn scripted_skin() -> tempfile::TempDir {
+    skin(
+        "local calls = 0 rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    )
+}
+
+/// The generation the published layout runs.
+fn shown_script(rs: &ResultSkin) -> crate::screens::ScriptGen {
+    match rs.published().0 {
+        Some(Published::Skin(_, _, Some(g))) => *g,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// s7-07-design §4 rule 4 (plan r2 MEDIUM): with both permits held, a
+/// view's request waits for one; a permit returned after the failed take
+/// is taken at the next poll, with no further release, and the layout
+/// lands with its runtime's generation.
+#[test]
+fn a_permit_wait_takes_a_permit_returned_after_the_failed_take() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    let held = [
+        rs.scripts().result_permit(&[]).unwrap(),
+        rs.scripts().result_permit(&[]).unwrap(),
+    ];
+    rs.request(view(5));
+    assert!(rs.permit_waiting() && !rs.has_job());
+    assert!(!rs.poll());
+    let [first, _second] = held;
+    drop(first);
+    settled(&mut rs);
+    let g = shown_script(&rs);
+    assert!(rs.scripts().result_live(Some(g)));
+}
+
+/// §3.7.1 M3: a cached layout is reused only while its generation lives:
+/// evicted, the same view lays out again, with a new generation.
+#[test]
+fn a_layout_is_reused_only_while_its_runtime_lives() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    rs.request(view(5));
+    settled(&mut rs);
+    let g = shown_script(&rs);
+    rs.request(view(5));
+    assert!(!rs.busy(), "reused");
+    // Neither presented nor published once the built-in result is: the
+    // eviction before a take retires it.
+    rs.request(ViewFacts(None));
+    drop(rs.scripts().result_permit(&[]));
+    assert!(!rs.scripts().result_live(Some(g)));
+    rs.request(view(5));
+    assert!(rs.busy(), "laid out again");
+    settled(&mut rs);
+    assert_ne!(shown_script(&rs), g);
+}
+
+/// §3.7.1 M2 (plan r2 HIGH): the fixed skin's generation is retained:
+/// a view of it dropped (its staging refused) and an eviction leave it,
+/// and the next attempt publishes the same one.
+#[test]
+fn the_fixed_generation_serves_every_attempt() {
+    let _s = serial();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "rt.luaskin");
+    let scripts = crate::screens::Scripts::new();
+    let g = scripts.offer_result(slot, true);
+    assert!(g.is_some());
+    let mut rs = ResultSkin::new(Some(ResultStart::Fixed(bundle, g))).with_scripts(scripts.clone());
+    staged(&mut rs);
+    rs.request(view(5));
+    assert_eq!(Some(shown_script(&rs)), g);
+    drop(scripts.result_slot(g));
+    drop(scripts.result_permit(&[]));
+    rs.next_attempt();
+    staged(&mut rs);
+    rs.request(view(6));
+    assert_eq!(Some(shown_script(&rs)), g);
+    assert!(scripts.result_live(g));
+}
+
+/// §3.7.1 M3 at the attempt's entrance: a bundle for every view is reused
+/// by the next attempt only while its runtime lives, its publication
+/// recorded for that attempt so its view commits in the next lifetime
+/// (code r4); unprotected after the following attempt begins, evicted,
+/// the next image stage imports it again, with a new generation.
+#[test]
+fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)\nif lv == 7 then local nr = ms.number(154) end",
+        "local calls = 0 rt_draw = function() calls = calls + 1 return calls > 0 end",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    assert!(rs.staged_line().starts_with("every view"));
+    let scripts = rs.scripts().clone();
+    scripts.enter_result(1);
+    rs.request(view_at(8, 5));
+    let g = shown_script(&rs);
+    assert_eq!(
+        scripts.commit_view(Some(g), 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    scripts.leave_result();
+    rs.next_attempt();
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    scripts.enter_result(2);
+    rs.request(view_at(8, 6));
+    assert_eq!(shown_script(&rs), g, "reused while it lives");
+    assert_eq!(
+        scripts.commit_view(Some(g), 2, || true),
+        crate::screens::ViewCommit::Committed,
+        "the next lifetime's view commits"
+    );
+    scripts.leave_result();
+    rs.next_attempt();
+    assert!(!scripts.protected(g), "neither published nor presented now");
+    drop(scripts.result_permit(&[]));
+    assert!(!rs.scripts().result_live(Some(g)));
+    staged_at(&mut rs, 8, JudgeClass::Normal);
+    rs.request(view_at(8, 7));
+    let again = shown_script(&rs);
+    assert_ne!(again, g);
+    assert!(rs.scripts().result_live(Some(again)));
+}
+
+/// §3.7.1 M8 (code r1 M1): A presented and running, B landed but not
+/// committed, then A's view asked again: A's layout is reused with its
+/// generation, no import starts, and its runtime runs on in its slot.
+#[test]
+fn the_presented_layout_is_reused_while_a_newer_one_waits() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    rs.request(view(5));
+    settled(&mut rs);
+    let a = shown_script(&rs);
+    let scripts = rs.scripts().clone();
+    scripts.enter_result(1);
+    assert_eq!(
+        scripts.commit_view(Some(a), 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    let notes = crate::screens::ScriptNotes::default();
+    let mut slot = scripts.result_slot(Some(a));
+    assert!(slot.runs_result(&notes));
+    rs.request(view(6));
+    settled(&mut rs);
+    let b = shown_script(&rs);
+    assert_ne!(a, b);
+    let jobs = jobs_started();
+    rs.request(view(5));
+    assert!(!rs.busy(), "no job: reused");
+    assert_eq!(jobs_started(), jobs);
+    assert_eq!(shown_script(&rs), a);
+    assert!(
+        slot.runs_result(&notes),
+        "its runtime runs on, uninterrupted"
+    );
+    assert!(scripts.result_live(Some(b)));
+    // The renderer had B prepared: A republished, B is protected by
+    // neither a publication nor a presentation, so its commit is
+    // withdrawn, as its reuse metadata would be dropped (code r3).
+    assert_eq!(
+        scripts.commit_view(Some(b), 1, || true),
+        crate::screens::ViewCommit::Gone
+    );
+    // An unavailable view publishes the built-in result in between: A,
+    // still presented, keeps its layout through a poll; its view asked
+    // again is still a reuse.
+    rs.request(ViewFacts(None));
+    rs.poll();
+    rs.set_retained(&[]);
+    rs.request(view(5));
+    assert!(!rs.busy());
+    assert_eq!(jobs_started(), jobs);
+    assert_eq!(shown_script(&rs), a, "A's runtime, not a fresh one");
+    // The built-in result presents, then a newer one is published: A is
+    // neither presented nor published any more. Its layout goes at the
+    // next poll (its atlas no longer counted), and a view of A the renderer
+    // still had prepared is withdrawn at its commit: disposal and commit
+    // eligibility agree.
+    rs.request(ViewFacts(None));
+    assert_eq!(
+        scripts.commit_view(None, 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    drop(slot);
+    rs.poll();
+    let mut ran = false;
+    assert_eq!(
+        scripts.commit_view(Some(a), 1, || {
+            ran = true;
+            true
+        }),
+        crate::screens::ViewCommit::Gone
+    );
+    assert!(!ran);
+}
+
+/// The script generation `rs` publishes, `None` for a layout without a
+/// runtime.
+fn published_script(rs: &ResultSkin) -> Option<crate::screens::ScriptGen> {
+    match rs.published().0 {
+        Some(Published::Skin(_, _, g)) => *g,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// C10 with runtimes (code r1 M2), through a renderer that lags: each
+/// view's cells differ, view 3's layout keeps no runtime. A third atlas
+/// defers its build, its runtime dropped with the deferral and its permit
+/// back; the renderer moving on retries it, and the eviction then takes
+/// the permit of the runtime no view references. A generation withdrawn
+/// by the eviction neither commits nor runs; a job that panics returns
+/// its permit; the latest view presents each time.
+#[test]
+fn a_lagging_renderer_presents_the_latest_view_with_runtimes() {
+    use crate::screens::{ScriptNotes, ViewCommit};
+    let _s = serial();
+    let d = skin(
+        "local calls = 0 if nr ~= 3 then rt_draw = function() calls = calls + 1 return calls > 0 end end",
+        "{ { id = \"dot\", src = \"s\", x = 8 * nr, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let scripts = rs.scripts().clone();
+    scripts.enter_result(1);
+    let notes = ScriptNotes::default();
+    let mut fake = FakeRenderer::default();
+    staged(&mut rs);
+    let step = |rs: &mut ResultSkin, nr: u32| {
+        rs.request(view(nr));
+        ran(rs);
+    };
+    // A presented, its runtime running.
+    step(&mut rs, 2);
+    let a = published_script(&rs).expect("A runs a runtime");
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    assert_eq!(
+        scripts.commit_view(Some(a), 1, || true),
+        ViewCommit::Committed
+    );
+    let mut slot_a = scripts.result_slot(Some(a));
+    assert!(slot_a.runs_result(&notes));
+    // B, with no runtime, published; the renderer stays on A.
+    step(&mut rs, 3);
+    assert_eq!(published_script(&rs), None);
+    // C: a third atlas; its runtime goes with the deferral, on the job's
+    // thread: its permit is back before the landing.
+    rs.request(view(4));
+    let end = Instant::now() + Duration::from_secs(20);
+    while scripts.permits_free() != 1 {
+        assert!(Instant::now() < end, "the deferred job kept its runtime");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    ran(&mut rs);
+    assert!(rs.deferred());
+    assert_eq!(scripts.permits_free(), 1, "only A's runtime holds one");
+    // The renderer presents B: A parks, unreferenced; C builds, the
+    // eviction retiring A for its permit.
+    assert_eq!(scripts.commit_view(None, 1, || true), ViewCommit::Committed);
+    drop(slot_a);
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    ran(&mut rs);
+    let c = published_script(&rs).expect("C runs a runtime");
+    assert!(!scripts.result_live(Some(a)), "A evicted");
+    // D before C presents: deferred again (B retained, C published).
+    step(&mut rs, 5);
+    assert!(rs.deferred());
+    assert_eq!(scripts.permits_free(), 1);
+    // C presents; D builds.
+    assert_eq!(
+        scripts.commit_view(Some(c), 1, || true),
+        ViewCommit::Committed
+    );
+    let mut slot_c = scripts.result_slot(Some(c));
+    assert!(slot_c.runs_result(&notes));
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    ran(&mut rs);
+    let dg = published_script(&rs).expect("D runs a runtime");
+    // C's view asked again: the presented layout is reused; D is now
+    // referenced by no view, so E's layout evicts it.
+    rs.request(view(4));
+    assert_eq!(published_script(&rs), Some(c));
+    let mut slot_d = scripts.result_slot(Some(dg));
+    step(&mut rs, 6);
+    let e = published_script(&rs).expect("E runs a runtime");
+    assert!(!scripts.result_live(Some(dg)));
+    // A renderer that had D prepared neither commits nor runs it.
+    let mut ran_commit = false;
+    assert_eq!(
+        scripts.commit_view(Some(dg), 1, || {
+            ran_commit = true;
+            true
+        }),
+        ViewCommit::Gone
+    );
+    assert!(!ran_commit && !slot_d.runs_result(&notes));
+    // The latest, E, presents and runs.
+    assert_eq!(
+        scripts.commit_view(Some(e), 1, || true),
+        ViewCommit::Committed
+    );
+    drop(slot_c);
+    let mut slot_e = scripts.result_slot(Some(e));
+    assert!(slot_e.runs_result(&notes));
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    // A job panicking returns its permit; the next view still lays out.
+    FAIL.store(3, std::sync::atomic::Ordering::SeqCst);
+    step(&mut rs, 2);
+    assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
+    assert_eq!(
+        scripts.permits_free(),
+        2 - scripts.result_entries(),
+        "every permit not held by an entry is back, the panicked job's too"
+    );
+    step(&mut rs, 5);
+    assert!(published_script(&rs).is_some());
+}
+
+/// The retry of Codex's code r2 HIGH: A presented in lifetime 1 and B
+/// landed but never committed when the retry ends the lifetime; the next
+/// attempt's image stage is reused (no job, no eviction there), both
+/// runtimes parked, holding both permits; lifetime 2 begins.
+fn retried() -> (
+    tempfile::TempDir,
+    ResultSkin,
+    crate::screens::Scripts,
+    [crate::screens::ScriptGen; 2],
+) {
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let scripts = rs.scripts().clone();
+    let notes = crate::screens::ScriptNotes::default();
+    staged(&mut rs);
+    scripts.enter_result(1);
+    rs.request(view(5));
+    settled(&mut rs);
+    let a = shown_script(&rs);
+    assert_eq!(
+        scripts.commit_view(Some(a), 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    let mut slot = scripts.result_slot(Some(a));
+    assert!(slot.runs_result(&notes));
+    rs.request(view(6));
+    settled(&mut rs);
+    let b = shown_script(&rs);
+    drop(slot);
+    scripts.leave_result();
+    rs.next_attempt();
+    let jobs = jobs_started();
+    staged(&mut rs);
+    assert_eq!(jobs_started(), jobs, "the image stage reused");
+    assert_eq!(scripts.permits_free(), 0, "A and B hold both");
+    scripts.enter_result(2);
+    (d, rs, scripts, [a, b])
+}
+
+/// §4/C10 (code r2 HIGH), protection decided where it is used: the old
+/// attempt's publication protects nothing, and neither does the ended
+/// lifetime's presentation; a different result C takes a permit and
+/// presents.
+#[test]
+fn an_earlier_attempts_publication_protects_nothing() {
+    let _s = serial();
+    let (_d, mut rs, scripts, [a, b]) = retried();
+    assert!(
+        !scripts.protected(b),
+        "B was published in the attempt before"
+    );
+    assert!(!scripts.protected(a), "A presented in the lifetime before");
+    rs.request(view(7));
+    settled(&mut rs);
+    let c = shown_script(&rs);
+    assert!(c != a && c != b);
+    assert_eq!(
+        scripts.commit_view(Some(c), 2, || true),
+        crate::screens::ViewCommit::Committed
+    );
+}
+
+/// §4/C10 (code r2 HIGH): an ended lifetime's presentation protects
+/// nothing. A different result D lands in lifetime 2 and stays
+/// uncommitted (published, so protected); E then takes A's permit, A
+/// presented only in lifetime 1, and presents.
+#[test]
+fn an_ended_lifetimes_presentation_protects_nothing() {
+    let _s = serial();
+    let (_d, mut rs, scripts, [a, b]) = retried();
+    let notes = crate::screens::ScriptNotes::default();
+    rs.request(view(7));
+    settled(&mut rs);
+    let d = shown_script(&rs);
+    assert!(!scripts.result_live(Some(b)), "the old publication evicted");
+    rs.request(view(8));
+    settled(&mut rs);
+    let e = shown_script(&rs);
+    assert!(e != a && e != d);
+    assert!(!scripts.result_live(Some(a)));
+    assert_eq!(
+        scripts.commit_view(Some(e), 2, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    assert!(scripts.result_slot(Some(e)).runs_result(&notes));
 }

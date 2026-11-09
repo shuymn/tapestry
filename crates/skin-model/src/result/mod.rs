@@ -166,6 +166,10 @@ pub struct ResultScreen {
     deviations: Box<[u32; DEVIATION_SLOTS]>,
     has_deviations: bool,
     areas: Option<[[i16; 2]; 5]>,
+    /// The frame time [`Skin::prepare_result_frame`](crate::Skin::prepare_result_frame)
+    /// last prepared the timers for, which that frame's build takes
+    /// without refilling them.
+    pub(crate) prepared: Option<TimeUs>,
 }
 
 /// An empty history, the gauge storage's first contents.
@@ -210,6 +214,7 @@ impl ResultScreen {
             deviations: Box::new([0; DEVIATION_SLOTS]),
             has_deviations: false,
             areas: None,
+            prepared: None,
         }
     }
 
@@ -263,6 +268,15 @@ impl ResultScreen {
     /// (docs/stage3.md S7-07).
     pub fn outputs_mut(&mut self) -> &mut [i32] {
         self.fields.get_mut(field::COUNT..).unwrap_or_default()
+    }
+
+    /// The fields (the schema's, then the callbacks' output slots) to
+    /// write, and the timer readings of the frame last prepared: what a
+    /// runtime frame reads and writes between
+    /// [`Skin::prepare_result_frame`](crate::Skin::prepare_result_frame)
+    /// and the build (docs/stage3.md S7-07).
+    pub fn runtime_parts(&mut self) -> (&mut [i32], &[i32]) {
+        (&mut self.fields, &self.ms)
     }
 
     /// Whether the view is ready: its result's fields are valid.
