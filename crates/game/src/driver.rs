@@ -93,6 +93,12 @@ pub struct AdjustDriver {
     fence_answered: u64,
     /// The acceptance to put in the stream at fence `n`'s answer.
     at_fence: Option<(u64, Acceptance)>,
+    /// A provisional close's fence: a drain stops right after its answer.
+    hold_after: Option<u64>,
+    /// The observations after a provisional close's answer wait in the
+    /// queue until [`commit_close`](Self::commit_close) or
+    /// [`reverse_close`](Self::reverse_close).
+    holding: bool,
     /// The speed and opening of the last attachment, while it stands and
     /// succeeded: set by a successful attachment, cleared by any other
     /// and by [`enter_attempt`](Self::enter_attempt).
@@ -130,6 +136,7 @@ impl AdjustDriver {
         tap.set_active(true);
         let [start, select] = plan.panel_roles();
         tap.set_panel_roles(start, select);
+        tap.set_tuning_controls(plan.tuning_controls());
         let reducer = Adjustment::new(options, plan.roles, TimeUs(0), display_offset_us);
         let (writer, reader) = presentation_link(&reducer.snapshot());
         Ok((
@@ -145,6 +152,8 @@ impl AdjustDriver {
                 fence_asked: 0,
                 fence_answered: 0,
                 at_fence: None,
+                hold_after: None,
+                holding: false,
                 attached: None,
                 opening: false,
                 cancelled: None,
@@ -164,6 +173,10 @@ impl AdjustDriver {
     /// then.
     #[must_use]
     pub fn drain(&mut self, display_offset_us: i64) -> bool {
+        if self.holding {
+            return self.receiver.owed();
+        }
+        let stopped = std::cell::Cell::new(false);
         let Self {
             receiver,
             plan,
@@ -175,16 +188,19 @@ impl AdjustDriver {
             offset,
             fence_answered,
             at_fence,
+            hold_after,
             opening,
             cancelled,
             ..
         } = self;
+        let hold_after = *hold_after;
         let cut = (display_offset_us != *offset).then(|| {
             *offset = display_offset_us;
             Augmented::Cut(display_offset_us)
         });
         let opens_at = *opens_at;
-        let observed = std::iter::from_fn(|| receiver.pop()).filter_map(|o| {
+        let popped = std::iter::from_fn(|| if stopped.get() { None } else { receiver.pop() });
+        let observed = popped.filter_map(|o| {
             // Every movement of the scratch axis turns the turntable,
             // before the plan drops one without an adjustment quantum.
             scratch.observe(&o);
@@ -212,6 +228,9 @@ impl AdjustDriver {
                 }
                 TapEvent::Fence(n) => {
                     *fence_answered = n;
+                    if hold_after == Some(n) {
+                        stopped.set(true);
+                    }
                     let (_, acceptance) = at_fence.take_if(|(m, _)| *m == n)?;
                     Some(Augmented::Obs(Observation {
                         time: o.at,
@@ -229,7 +248,11 @@ impl AdjustDriver {
         }
         reducer.set_scratch(scratch.input());
         reducer.publish(writer);
-        receiver.owed()
+        if stopped.get() {
+            self.hold_after = None;
+            self.holding = true;
+        }
+        self.receiver.owed()
     }
 
     /// One drain from `input`, waking it when the tap is owed room.
@@ -309,6 +332,57 @@ impl AdjustDriver {
     /// Why the input thread did not answer the fence: the run ends with it.
     pub fn close_acceptance(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
         self.fence_with(Some(Acceptance::Closed), input)
+    }
+
+    /// Closes the play adjustments' acceptance where the fence's answer is,
+    /// provisionally: what was observed after the answer waits in the
+    /// queue, taken under no acceptance yet, until the caller decides.
+    /// [`commit_close`](Self::commit_close) keeps the close, and the wait
+    /// is taken under it; [`reverse_close`](Self::reverse_close) reopens at
+    /// the answer's stamp, and the wait is taken open, so nothing observed
+    /// between the close and the decision is lost. Nothing drains until
+    /// then. Publishes the result.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence: the run ends with it.
+    pub fn close_provisionally(
+        &mut self,
+        input: &mut impl InputPump,
+    ) -> Result<(), InputWaitError> {
+        self.hold_after = Some(self.fence_asked.wrapping_add(1));
+        let closed = self.fence_with(Some(Acceptance::Closed), input);
+        if closed.is_err() {
+            self.hold_after = None;
+            self.holding = false;
+        }
+        closed
+    }
+
+    /// Keeps a provisional close ([`close_provisionally`](Self::close_provisionally)):
+    /// what waited is taken closed. Publishes the result.
+    pub fn commit_close(&mut self, input: &mut impl InputPump) {
+        self.holding = false;
+        self.pump(input);
+    }
+
+    /// Reverses a provisional close ([`close_provisionally`](Self::close_provisionally))
+    /// at its answer's stamp: acceptance is open again before anything
+    /// observed after the answer, which is then taken open. Publishes the
+    /// result.
+    pub fn reverse_close(&mut self, input: &mut impl InputPump) {
+        self.holding = false;
+        let (time, seq) = self.reducer.last().unwrap_or((TimeUs(i64::MIN), 0));
+        let reopen = Observation {
+            time,
+            seq,
+            event: Event::Acceptance(Acceptance::Open),
+        };
+        match &self.tempo {
+            Some(t) => self.reducer.take([Augmented::Obs(reopen)], t),
+            None => self.reducer.take([Augmented::Obs(reopen)], &NoTempo),
+        }
+        self.pump(input);
     }
 
     /// Reopens the play adjustments' acceptance where the fence's answer

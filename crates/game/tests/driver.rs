@@ -1149,6 +1149,83 @@ impl Rig {
         self.driver.reopen_acceptance(&mut pump).unwrap();
         self
     }
+
+    fn close_provisionally(&mut self) -> &mut Self {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.close_provisionally(&mut pump).unwrap();
+        self
+    }
+
+    /// Decides a provisional close: kept, or reversed.
+    fn decide(&mut self, keep: bool) -> PresentationSnapshot {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        if keep {
+            self.driver.commit_close(&mut pump);
+        } else {
+            self.driver.reverse_close(&mut pump);
+        }
+        *self.reader.read()
+    }
+}
+
+/// §2.10 R19 and R21 (A11's interleaving): the revalidation's close is
+/// provisional; F2 pressed after its fence's answer and before the
+/// decision waits undrained (a drain meanwhile takes nothing), and once
+/// the close is reversed at its fence it acts, open; held, its key
+/// repeat acts too, so nothing is left suppressed.
+#[test]
+fn a_press_after_the_closing_fence_acts_when_the_close_is_reversed() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let accepted = rig.driver.accepted();
+    rig.close_provisionally();
+    assert!(!rig.driver.accepting(), "closed at the fence");
+    rig.keys(10 * MS, &[(F2, true)]);
+    let waiting = rig.drain();
+    assert_eq!(waiting.hispeed, Some(r(320, 100)), "it waits");
+    assert_eq!(rig.driver.accepted(), accepted);
+    rig.decide(false);
+    assert!(rig.driver.accepting());
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)), "F2 acted, open");
+    // Still held: its repeat acts.
+    rig.keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(370, 100)));
+    assert_eq!(rig.driver.accepted(), accepted + 2);
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
+
+/// §2.10 R20: the same provisional close kept: the F2 press that waited
+/// is taken closed, discarded, and its repeat too; released and pressed
+/// afresh after a reopening, it acts.
+#[test]
+fn a_press_after_the_closing_fence_is_discarded_when_the_close_commits() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let accepted = rig.driver.accepted();
+    rig.close_provisionally();
+    rig.keys(10 * MS, &[(F2, true)]);
+    rig.decide(true);
+    assert!(!rig.driver.accepting());
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)), "discarded");
+    rig.keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)));
+    rig.reopen();
+    rig.keys(30 * MS, &[(F2, false)])
+        .keys(40 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)));
+    assert_eq!(rig.driver.accepted(), accepted + 1);
 }
 
 /// A10: the Loading opener's epoch refresh, with HIDDEN+ selected (LIFT

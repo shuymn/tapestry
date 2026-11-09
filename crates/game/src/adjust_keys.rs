@@ -258,6 +258,7 @@ impl AdjustmentConfig {
             reversed: self.reversed,
             scratch: self.scratch,
             panel_roles: [0; 2],
+            tuning: 0,
         };
         let [slower, faster] = SPEED_KEYS;
         let speed = [(slower, Adjust::Slower), (faster, Adjust::Faster)];
@@ -319,6 +320,9 @@ pub struct AdjustmentPlan {
     scratch: ScratchSettings,
     /// The numbers of START's and SELECT's controls, a bit each.
     panel_roles: [u128; 2],
+    /// The numbers of the tuning controls (START, SELECT, F1, F2), a bit
+    /// each.
+    tuning: u128,
 }
 
 impl AdjustmentPlan {
@@ -344,6 +348,12 @@ impl AdjustmentPlan {
             if matches!(role, Adjust::ScratchPositive | Adjust::ScratchNegative) {
                 self.bindings.repeating |= 1 << n;
             }
+            if matches!(
+                role,
+                Adjust::Start | Adjust::Select | Adjust::Slower | Adjust::Faster
+            ) {
+                self.tuning |= 1 << n;
+            }
         }
         Ok(n)
     }
@@ -353,6 +363,16 @@ impl AdjustmentPlan {
     #[must_use]
     pub const fn panel_roles(&self) -> [u128; 2] {
         self.panel_roles
+    }
+
+    /// The numbers of the tuning controls, a bit each: START, SELECT, F1
+    /// and F2, the roles that act without a modifier held, whose holds and
+    /// events the loading state's activity record counts
+    /// ([`input::AdjustmentTap::set_tuning_controls`]). Every other role
+    /// acts only under START or SELECT.
+    #[must_use]
+    pub const fn tuning_controls(&self) -> u128 {
+        self.tuning
     }
 
     /// The scratch axis's number, if it is tapped.
