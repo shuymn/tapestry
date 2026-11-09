@@ -1040,6 +1040,12 @@ struct Shared {
     /// before it takes the commits' lock (tests).
     #[cfg(test)]
     commit_timed_out: AtomicBool,
+    /// While set, a commit waits between its receipt and its loading
+    /// time's declaration, and says so in `declaration_held` (tests).
+    #[cfg(test)]
+    hold_declaration: AtomicBool,
+    #[cfg(test)]
+    declaration_held: AtomicBool,
     /// The atlas limits and the target size of the screen built last,
     /// written at each build: what a skin is packed for
     /// ([`RenderLink::atlas_limits`]).
@@ -1095,6 +1101,10 @@ impl Shared {
             commits: Mutex::new(Commits::default()),
             #[cfg(test)]
             commit_timed_out: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_declaration: AtomicBool::new(false),
+            #[cfg(test)]
+            declaration_held: AtomicBool::new(false),
             packing: Mutex::new(None),
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
@@ -1305,11 +1315,14 @@ struct Commits {
 /// declared Closing duration ([`skin_model::Skin::close`]) of the
 /// declarative installation the committed attempt draws with, the one it
 /// staged or the one already in use; `None` for a skin that declares
-/// none and for the simple skin.
+/// none and for the simple skin. A pending skin's specialization committed
+/// in the current loading lifetime also gives its declared loading time
+/// (`loadend`), which a game thread that stopped waiting declares itself.
 #[derive(Clone, Copy, Debug, Default)]
 struct Receipt {
     request: u64,
     close: Option<TimeUs>,
+    loadend: Option<Option<TimeUs>>,
 }
 
 /// The loading state's lifetime, its newest page and its newest state
@@ -1966,11 +1979,30 @@ impl RenderLink {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(test)]
-                self.shared.commit_timed_out.store(true, Ordering::Release);
+                {
+                    self.shared.commit_timed_out.store(true, Ordering::Release);
+                    // A test holding the render thread between the receipt
+                    // and the declaration reads the receipt only then.
+                    while self.shared.hold_declaration.load(Ordering::Acquire)
+                        && !self.shared.declaration_held.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 let mut commits = self.shared.commits();
                 if commits.committed >= request {
                     let r = commits.receipt;
-                    return Ok(if r.request == request { r.close } else { None });
+                    drop(commits);
+                    if r.request != request {
+                        return Ok(None);
+                    }
+                    // Declared before the opener reads the minimum again,
+                    // outside the commits' lock, whether or not the
+                    // render thread has declared it yet.
+                    if let Some(loadend) = r.loadend {
+                        self.shared.committed_loading(loadend);
+                    }
+                    return Ok(r.close);
                 }
                 commits.withdrawn = commits.withdrawn.max(request);
                 Err(ScreenError::NoAnswer)
@@ -4780,10 +4812,20 @@ impl Run {
             self.gauge_looks = Some(p.gauge_looks);
         }
         commits.committed = request;
-        commits.receipt = Receipt { request, close };
+        commits.receipt = Receipt {
+            request,
+            close,
+            loadend: declared,
+        };
         drop(commits);
+        #[cfg(test)]
+        while self.shared.hold_declaration.load(Ordering::Acquire) {
+            self.shared.declaration_held.store(true, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         // Before the answer, outside the commits' lock: the opener reads
-        // the minimum again once the commit is answered.
+        // the minimum again once the commit is answered (or, past the
+        // bound, once it read the receipt, which carries it too).
         if let Some(loadend) = declared {
             self.shared.committed_loading(loadend);
         }
@@ -11945,6 +11987,36 @@ pub(crate) mod tests {
             game::minimum_ends(at, link.loading_loadend()),
             TimeUs(at.0 + 3_000_000)
         );
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// O12a: a commit whose answer the game thread stopped waiting for,
+    /// its receipt published but its loading time not yet declared by the
+    /// render thread: the receipt declares it, so the minimum read after
+    /// the commit is the specialization's.
+    #[test]
+    fn a_timed_out_commit_declares_its_loading_time_from_the_receipt() {
+        let (chart, _screens, mut link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            specialized(&link, &chart, &declared).unwrap(),
+            Preparation::Ready
+        );
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
+        link.shared.declaration_held.store(false, Ordering::Release);
+        link.shared.hold_declaration.store(true, Ordering::Release);
+        link.commit_attempt().unwrap();
+        // Read past the bound, with the render thread held between the
+        // receipt and its own declaration: only the receipt declared it.
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
+        assert!(link.shared.declaration_held.load(Ordering::Acquire));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        link.shared.hold_declaration.store(false, Ordering::Release);
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
         link.end_loading().unwrap();
         link.exit();
     }
