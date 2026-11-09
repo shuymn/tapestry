@@ -826,6 +826,31 @@ impl ScreenRuntime {
         *self.pass.runtime_notes.borrow_mut() = book.clone();
     }
 
+    /// The VM's Lua heap now, in bytes (dev-tools: the screens' frame
+    /// probe).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn heap(&self) -> usize {
+        self._lua.used_memory()
+    }
+
+    /// The most Lua heap the VM held, in bytes, as sampled at each
+    /// instruction step since its configured pass (dev-tools): a peak
+    /// between two samples is not seen.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn peak_heap(&self) -> u64 {
+        self.pass.ledger.counts().peak_memory
+    }
+
+    /// Runs a full collection of the VM now (dev-tools: a stress
+    /// measurement). No skin Lua runs: the sandbox refuses finalizers.
+    /// Returns whether it ran: a stopped runtime's VM is left as it is.
+    #[cfg(feature = "dev-tools")]
+    pub fn collect(&mut self) -> bool {
+        self.stopped.is_none() && self._lua.gc_collect().is_ok()
+    }
+
     /// The calls, instruction steps and host calls so far.
     #[must_use]
     pub fn counters(&self) -> Counters {
