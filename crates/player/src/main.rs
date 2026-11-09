@@ -873,6 +873,7 @@ fn rig<'a>(
         result_skin: crate::result_skin::ResultSkin::default(),
         result_chart: None,
         prep: None,
+        accepted_at_o1: None,
         preps: 0,
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,

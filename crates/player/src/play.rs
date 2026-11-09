@@ -306,6 +306,11 @@ pub struct PlayerRig<'a> {
     pub result_chart: Option<skin_model::ResultChart>,
     /// The attempt's preparation begun last, until the next.
     pub prep: Option<AttemptPrep>,
+    /// The reducer's count of accepted adjustments when the loading
+    /// state's opening took its starting settings, read after a fence
+    /// ([`game::LoadingRig::apply_snapshot`]): what the revalidation
+    /// compares.
+    pub accepted_at_o1: Option<u64>,
     /// The preparations begun so far: each one's ticket.
     pub preps: u64,
     /// The result's presentation (the S10-09i design's D1): its lifetime,
@@ -2586,6 +2591,8 @@ pub(crate) fn scripted_end_over(after: Duration, shown: Duration, render: &Rende
     shown >= after
         && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
+
+mod loading;
 
 #[cfg(all(test, feature = "dev-tools"))]
 mod prep_tests;
