@@ -474,3 +474,17 @@ fn as_failure_presentation_an_uncompilable_value_refuses() {
     let lua = skin(2, "return ms.event_index(55)", "", "timer = 3,", false);
     assert!(load(&lua).is_err());
 }
+
+#[test]
+fn a_value_slider_s_keys_are_charged_once() {
+    // One key, as written: the same total as without the slider's value
+    // (a progress slider, charged once too).
+    let keys = |lua: &str| load(lua).unwrap().imported.report.usage.keys;
+    let value = keys(&skin(2, "return 0.5", "", "", false));
+    let progress = keys(
+        &skin(2, "return 0.5", "", "", false)
+            .replace(" value = function() return 0.5 end", " type = 6"),
+    );
+    assert_eq!(value, 1);
+    assert_eq!(value, progress);
+}
