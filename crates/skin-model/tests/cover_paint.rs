@@ -51,9 +51,9 @@ fn skin(elements: Vec<ElementDef>, defs: Vec<CoverPaintDef>) -> Skin {
 fn motion_skin() -> Skin {
     skin(
         vec![
-            paint(0, [160, -320, 544, 600], Follow::Cover),
-            paint(1, [160, 0, 544, 100], Follow::None),
-            paint(1, [160, 0, 544, 100], Follow::Cover),
+            paint(0, [160, -320, 544, 600], Follow::COVER),
+            paint(1, [160, 0, 544, 100], Follow::NONE),
+            paint(1, [160, 0, 544, 100], Follow::COVER),
         ],
         vec![cover_image(None), cover_image(Some(800))],
     )
@@ -116,7 +116,7 @@ fn a_progress_slider_moves_toward_its_direction() {
     ];
     let skin = skin(
         (0..4)
-            .map(|i| paint(i, [600, 500, 40, 20], Follow::None))
+            .map(|i| paint(i, [600, 500, 40, 20], Follow::NONE))
             .collect(),
         dirs.map(|d| progress_paint(400, d)).to_vec(),
     );
@@ -208,7 +208,7 @@ fn paint_never_changes_the_notes() {
     };
     let base = notes(Vec::new(), Vec::new(), Vec::new());
     assert_eq!(base.0.len(), 2);
-    let p = || paint(0, [160, -320, 544, 600], Follow::Cover);
+    let p = || paint(0, [160, -320, 544, 600], Follow::COVER);
     let mut clear = p();
     let mut props = [None; 9];
     props[..5].copy_from_slice(&[Some(160), Some(-320), Some(544), Some(600), Some(0)]);
@@ -265,14 +265,14 @@ fn paint_draws_its_whole_authored_rects() {
     // authored, its whole image, no lane cut; an explicit clip stays.
     let clipped = ElementDef {
         clip: Some(ClipId(1)),
-        ..paint(0, [160, -200, 544, 50], Follow::None)
+        ..paint(0, [160, -200, 544, 50], Follow::NONE)
     };
     let h = shown(
         skin(
             vec![
-                paint(0, [160, -100, 272, 500], Follow::None),
-                paint(0, [432, -100, 272, 500], Follow::None),
-                paint(0, [100, -50, 700, 80], Follow::None),
+                paint(0, [160, -100, 272, 500], Follow::NONE),
+                paint(0, [432, -100, 272, 500], Follow::NONE),
+                paint(0, [100, -50, 700, 80], Follow::NONE),
                 clipped,
             ],
             vec![cover_image(None)],
@@ -320,11 +320,11 @@ fn three_paints() -> Vec<CoverPaintDef> {
 }
 
 fn lift_paint() -> ElementDef {
-    paint(1, [160, 880, 544, 200], Follow::None)
+    paint(1, [160, 880, 544, 200], Follow::NONE)
 }
 
 fn hidden_paint() -> ElementDef {
-    paint(2, [160, 280, 544, 600], Follow::None)
+    paint(2, [160, 280, 544, 600], Follow::NONE)
 }
 
 #[test]
@@ -340,12 +340,12 @@ fn every_cover_paint_draws_in_list_order() {
     };
     let elements = vec![
         lanes_element(),
-        paint(0, [160, -320, 544, 600], Follow::Cover),
+        paint(0, [160, -320, 544, 600], Follow::COVER),
         add(image(WHITE, [0, 0, 10, 10], Place::SCREEN)),
         lift_paint(),
-        paint(0, [160, 0, 544, 100], Follow::None),
+        paint(0, [160, 0, 544, 100], Follow::NONE),
         hidden_paint(),
-        add(paint(0, [160, 100, 544, 100], Follow::None)),
+        add(paint(0, [160, 100, 544, 100], Follow::NONE)),
     ];
     let skin = def(Some(source()), elements, paints(three_paints())).unwrap();
     let h = shown(skin, [200, 100, 500]);
@@ -373,7 +373,7 @@ fn every_cover_paint_draws_in_list_order() {
     // Before the lanes too, reading this frame.
     let before = vec![
         hidden_paint(),
-        paint(0, [160, 0, 544, 100], Follow::None),
+        paint(0, [160, 0, 544, 100], Follow::NONE),
         lift_paint(),
         lanes_element(),
     ];
@@ -405,7 +405,7 @@ fn with_no_field_no_tap_or_mine_is_drawn() {
     chart.meta.ln_mode = Some(bms_model::LnMode::Cn);
     let elements = vec![
         lanes_element(),
-        paint(0, [160, 0, 544, 100], Follow::None),
+        paint(0, [160, 0, 544, 100], Follow::NONE),
         lift_paint(),
         hidden_paint(),
     ];
@@ -439,7 +439,7 @@ fn every_paint_keeps_its_own_clock() {
         let h = shown(skin, [200, 100, 500]);
         [COVER, HIDDEN, LIFT, NOTE].map(|part| rects(&h, part).len())
     };
-    let p = || paint(0, [160, 0, 544, 100], Follow::None);
+    let p = || paint(0, [160, 0, 544, 100], Follow::NONE);
     // The lanes' timer off, or the lanes hidden: no notes, every paint on
     // its own.
     let off = ElementDef {
@@ -506,7 +506,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
         }],
         ..WidgetDefs::default()
     };
-    let elements = vec![lanes_element(), paint(0, [160, 0, 544, 100], Follow::None)];
+    let elements = vec![lanes_element(), paint(0, [160, 0, 544, 100], Follow::NONE)];
     let skin = def(Some(source()), elements, widgets).unwrap();
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
     h.view.cover = 500;
@@ -541,7 +541,7 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
 fn paints_are_checked_at_load() {
     let load = |elements: Vec<ElementDef>, widgets: WidgetDefs| def(None, elements, widgets);
     let one = |d: CoverPaintDef| paints(vec![d]);
-    let p = |y: i32| paint(0, [0, y, 10, 10], Follow::None);
+    let p = |y: i32| paint(0, [0, y, 10, 10], Follow::NONE);
     let paint_err = |r: Result<Skin, LoadError>| match r {
         Err(LoadError::CoverPaint { paint, error }) => (paint, error),
         other => panic!("{other:?}"),
@@ -578,7 +578,7 @@ fn paints_are_checked_at_load() {
     ));
     // A progress slider's range counts toward its own direction, x for a
     // horizontal one.
-    let at = |x: i32, y: i32| paint(0, [x, y, 10, 10], Follow::None);
+    let at = |x: i32, y: i32| paint(0, [x, y, 10, 10], Follow::NONE);
     let slides = |d| one(progress_paint(limit, d));
     for (d, fits, out) in [
         (SliderDirection::Right, at(0, 0), at(1, 0)),
@@ -604,7 +604,7 @@ fn paints_are_checked_at_load() {
         (0, CoverPaintError::Range)
     );
     assert!(matches!(
-        load(vec![paint(1, [0; 4], Follow::None)], one(cover_image(None))),
+        load(vec![paint(1, [0; 4], Follow::NONE)], one(cover_image(None))),
         Err(LoadError::UnknownWidget { element: 0 })
     ));
     let max = vec![cover_image(None); MAX_ELEMENTS];
@@ -643,8 +643,8 @@ fn paints_are_checked_at_load() {
 fn a_paint_is_one_quad_and_the_lanes_reserve_only_the_line() {
     let skin = skin(
         vec![
-            paint(0, [0, 0, 10, 10], Follow::None),
-            paint(0, [0, 0, 10, 10], Follow::Cover),
+            paint(0, [0, 0, 10, 10], Follow::NONE),
+            paint(0, [0, 0, 10, 10], Follow::COVER),
             lift_paint(),
             hidden_paint(),
         ],
@@ -660,8 +660,8 @@ fn a_paint_is_one_quad_and_the_lanes_reserve_only_the_line() {
     let skin = def(
         None,
         vec![
-            paint(0, [0, 0, 10, 10], Follow::None),
-            paint(1, [0, 0, 10, 10], Follow::Cover),
+            paint(0, [0, 0, 10, 10], Follow::NONE),
+            paint(1, [0, 0, 10, 10], Follow::COVER),
         ],
         paints(vec![cover_image(Some(100)), cover_image(None)]),
     )

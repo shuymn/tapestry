@@ -339,8 +339,9 @@ struct Opts<'a> {
     unrotated: bool,
     /// Run-time offsets the receiving widget consumes itself (the covers).
     allow: &'a [i32],
-    /// Offsets 3 and 4 become [`Follow`]: the element moves with LIFT and
-    /// SUDDEN+ (`play/LaneRenderer.java:332-333`).
+    /// Offsets 3, 4 and 5 become [`Follow`]: the element moves with LIFT,
+    /// SUDDEN+ and HIDDEN+, and is not drawn while HIDDEN+ is off
+    /// (`play/LaneRenderer.java:332-346`).
     follow: bool,
     /// Offset 1 becomes [`AngleFollow::Turntable`]: the element turns
     /// with the turntable (`skin/SkinObject.java:526-543`). A text accepts
@@ -382,7 +383,7 @@ struct Common {
     filter: Filter,
     pivot: Anchor,
     offset: Offset,
-    /// The covers it moves with, from offsets 3 and 4.
+    /// The covers it moves with, from offsets 3, 4 and 5.
     follow: Follow,
     /// Whether it turns with the turntable (offset 1): an image, an image
     /// choice or a number only.
@@ -1345,7 +1346,7 @@ impl<'d> Cx<'d> {
         }
         let mut offset = Offset::default();
         let mut alpha: Vec<i64> = Vec::new();
-        let (mut lift, mut cover) = (false, false);
+        let (mut lift, mut cover, mut hidden) = (false, false, false);
         let mut turntable = false;
         if o.no_offsets && !ids.is_empty() {
             self.ignored(at, NoteKind::Ignored { field: "offset" });
@@ -1361,14 +1362,15 @@ impl<'d> Cx<'d> {
         // (`play/LaneRenderer.java:332-345`), so a configured y is
         // overridden; their other components, which the source adds too
         // (`skin/SkinObject.java:404-428`), are not reproduced. That holds
-        // for the ids a cover consumes, listed or added by the source, and
-        // for 3 and 4 on a follower or a relative part.
+        // for the ids a cover consumes, listed or added by the source, for
+        // 3, 4 and 5 on a follower, and for 3 and 4 on a relative part.
         // Only the play sets them: on another screen the run-time offsets
         // are undefined, ignored with a note.
         let play = self.kind == ScreenKind::Play;
         let reserved = |id: i32| {
             play && (o.allow.contains(&id)
                 || (matches!(id, OFFSET_LIFT | OFFSET_LANECOVER) && (o.follow || o.relative))
+                || (id == OFFSET_HIDDEN && o.follow)
                 || (id == OFFSET_TURNTABLE && (o.turntable || o.text)))
         };
         let moved = o.allow.iter().chain(&ids).copied().find(|&id| {
@@ -1388,6 +1390,7 @@ impl<'d> Cx<'d> {
                 if o.follow {
                     lift |= id == OFFSET_LIFT;
                     cover |= id == OFFSET_LANECOVER;
+                    hidden |= id == OFFSET_HIDDEN;
                 }
                 turntable |= id == OFFSET_TURNTABLE && o.turntable;
                 continue;
@@ -1507,11 +1510,10 @@ impl<'d> Cx<'d> {
             },
             pivot: pivot(dst.center),
             offset,
-            follow: match (lift, cover) {
-                (false, false) => Follow::None,
-                (true, false) => Follow::Lift,
-                (false, true) => Follow::Cover,
-                (true, true) => Follow::LiftAndCover,
+            follow: Follow {
+                lift,
+                cover,
+                hidden,
             },
             turntable,
             stretch: Stretch::of(dst.stretch),
@@ -1810,7 +1812,7 @@ impl<'d> Cx<'d> {
     /// Notes D9 [`LaneApprox::CoverMotion`] once for a retained element
     /// or grade that follows the covers.
     fn cover_motion(&mut self, c: &Common) -> Result<(), ImportError> {
-        if c.follow == Follow::None {
+        if c.follow == Follow::NONE {
             return Ok(());
         }
         let part = match c.role {

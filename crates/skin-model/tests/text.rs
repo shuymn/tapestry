@@ -686,8 +686,8 @@ fn a_following_line_moves_without_changing_its_request() {
         ..NO_CHART
     };
     assert_eq!(
-        requests(&skin(Follow::Cover), &chart),
-        requests(&skin(Follow::None), &chart)
+        requests(&skin(Follow::COVER), &chart),
+        requests(&skin(Follow::NONE), &chart)
     );
     let at = |follow, cover| {
         let mut h = widget_support::harness(skin(follow));
@@ -699,11 +699,11 @@ fn a_following_line_moves_without_changing_its_request() {
         let q = h.batch.quads()[0];
         (q.rect, q.pivot)
     };
-    let (rect, pivot) = at(Follow::None, 500);
-    assert_eq!(at(Follow::Cover, 0), (rect, pivot));
+    let (rect, pivot) = at(Follow::NONE, 500);
+    assert_eq!(at(Follow::COVER, 0), (rect, pivot));
     let [x, y, w, hh] = rect;
     assert_eq!(
-        at(Follow::Cover, 500),
+        at(Follow::COVER, 500),
         ([x, y + 400.0, w, hh], [pivot[0], pivot[1] + 400.0])
     );
 }

@@ -58,13 +58,14 @@
 //! 13. A bar line outside the accepted mapping is dropped with a note
 //!     instead of refusing the skin ([`super::widget::lanes`]).
 //! 14. Images, numbers, text, gauges and judgment grades that list LIFT
-//!     (offset 3) or SUDDEN+ (offset 4) follow them by this frame's lane
-//!     geometry (D9 item p); a combo drawn relative to its grade takes the
-//!     grade's motion and none of its own. A configured x, width, height,
+//!     (offset 3), SUDDEN+ (offset 4) or HIDDEN+ (offset 5) follow them by
+//!     this frame's lane geometry (D9 item p), a follower of HIDDEN+ not
+//!     drawn while HIDDEN+ is off; a combo drawn relative to its grade
+//!     takes the grade's motion and none of its own. A configured x, width, height,
 //!     angle or alpha on either id, or on an id SUDDEN+, LIFT or HIDDEN+
 //!     consumes (listed or added by the source), is refused as the
-//!     element's role says, its configured y ignored; offset 5 outside
-//!     HIDDEN+ and offset 2 stay refused. Offset 1 turns an image, an
+//!     element's role says, its configured y ignored; offset 5 on a combo
+//!     and offset 2 stay refused. Offset 1 turns an image, an
 //!     image choice or a number with the turntable
 //!     ([`skin_model::AngleFollow::Turntable`]), adding the negated source
 //!     angle as every source angle is negated; a text accepts it and stays

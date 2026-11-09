@@ -379,6 +379,12 @@ impl Judge {
         let Some(g) = resolve(&self.grades, slot) else {
             return;
         };
+        // A grade that follows HIDDEN+ hides with its combo while HIDDEN+
+        // is off, as the source's judge draws nothing when its grade does
+        // not (`play/SkinJudge.java:114-127`).
+        if g.follow.hides(d.lanes) {
+            return;
+        }
         let Some((gt, gs)) = super::sample(
             d.at.starts,
             d.at.now,

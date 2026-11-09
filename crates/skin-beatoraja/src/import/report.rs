@@ -224,7 +224,7 @@ pub enum LaneApprox {
     /// while the colour interpolates (`play/LaneRenderer.java:335-345`,
     /// `skin/SkinObject.java:480-519`).
     HiddenDisable,
-    /// p: what follows LIFT or SUDDEN+ (offsets 3 and 4), and LIFT's and
+    /// p: what follows LIFT, SUDDEN+ or HIDDEN+ (offsets 3, 4 and 5), and LIFT's and
     /// HIDDEN+'s paint, move by this frame's lane geometry, from the first
     /// frame and while the lanes are hidden or off, and not at all in a
     /// skin without lanes. The

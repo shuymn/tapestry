@@ -766,6 +766,9 @@ pub(crate) struct LaneFrameGeometry {
     pub(crate) cover_px: f64,
     /// How far the hidden cover rises by its own share, above the lift.
     pub(crate) hidden_px: f64,
+    /// Whether HIDDEN+ is on: a hidden-cover follower draws only then
+    /// ([`Follow::hides`](crate::Follow)).
+    pub(crate) hidden_on: bool,
     /// The raised judgment line.
     pub(crate) line_y: f64,
     /// The original lane's length, which the gain scales.
@@ -864,9 +867,13 @@ impl Lanes {
     }
 
     /// Group `g`'s template this frame, on the frame's clock: none while
-    /// its timer is off, it is hidden, its track does not draw, its image
-    /// shows no frame or its quad, natively sized, has no area.
+    /// its timer is off, it is hidden, it follows HIDDEN+ while HIDDEN+ is
+    /// off, its track does not draw, its image shows no frame or its quad,
+    /// natively sized, has no area.
     fn template(&self, d: &Draw<'_>, g: &BarGroup) -> Option<Template> {
+        if g.follow.hides(Some(d.frame)) {
+            return None;
+        }
         let (_, s) = sample(
             d.starts,
             d.now,
@@ -909,8 +916,9 @@ impl Lanes {
     /// cover takes its share of what the lift leaves, over the notes
     /// (`:335-345`). The source style's lane is its region's height, the
     /// simple style's the length from the top to the line. Edges keep
-    /// their fractions; only drawing converts them to `f32`.
-    pub(crate) fn frame_geometry(&self, view: LaneView) -> LaneFrameGeometry {
+    /// their fractions; only drawing converts them to `f32`. `hidden_on`
+    /// is whether HIDDEN+ is on.
+    pub(crate) fn frame_geometry(&self, view: LaneView, hidden_on: bool) -> LaneFrameGeometry {
         let (lift, cover, hidden) = (
             view.lift.min(1_000),
             view.cover.min(1_000),
@@ -935,6 +943,7 @@ impl Lanes {
             lift_px,
             cover_px: left - span,
             hidden_px: left * f64::from(hidden) / 1_000.0,
+            hidden_on,
             line_y: line - lift_px,
             len,
             span,
