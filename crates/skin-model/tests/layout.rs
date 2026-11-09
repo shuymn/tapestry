@@ -550,7 +550,7 @@ fn followed(follow: Follow) -> Skin {
         vec![
             lanes_element(),
             left([100, 100, 40, 20], follow),
-            left([200, 105, 40, 10], Follow::None),
+            left([200, 105, 40, 10], Follow::NONE),
         ],
     )
     .unwrap()
@@ -582,20 +582,20 @@ fn followers_are_placed_as_if_they_followed_nothing() {
     // canvas, moved −100 (counting the travel, −656).
     let pushed = with(&[(Region::Left, adjust(0, -4_000, 100))]);
     for (layout, y) in [(scaled, 90.0), (pushed, 0.0)] {
-        let (none, placed_none) = left_at(followed(Follow::None), layout, 0);
-        for follow in [Follow::Lift, Follow::Cover, Follow::LiftAndCover] {
+        let (none, placed_none) = left_at(followed(Follow::NONE), layout, 0);
+        for follow in [Follow::LIFT, Follow::COVER, Follow::LIFT_AND_COVER] {
             let (got, placed) = left_at(followed(follow), layout, 0);
             assert_eq!(got, none, "{follow:?}");
             assert_eq!(placed, placed_none, "{follow:?}");
         }
         assert_eq!(none[0][1], y);
     }
-    let (_, placed) = left_at(followed(Follow::Cover), pushed, 0);
+    let (_, placed) = left_at(followed(Follow::COVER), pushed, 0);
     assert_eq!(placed.affine.offset[1], -100.0);
     // A cover of 500 ‰ travels C = 300: the follower moves 600 at 200 %,
     // the other image and the region stay.
-    let (rest, placed_rest) = left_at(followed(Follow::Cover), scaled, 0);
-    let (moved, placed_moved) = left_at(followed(Follow::Cover), scaled, 500);
+    let (rest, placed_rest) = left_at(followed(Follow::COVER), scaled, 0);
+    let (moved, placed_moved) = left_at(followed(Follow::COVER), scaled, 500);
     assert_eq!(placed_moved, placed_rest);
     assert_eq!(moved[1], rest[1]);
     let [x, y, w, h] = rest[0];

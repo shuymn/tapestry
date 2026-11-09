@@ -251,7 +251,7 @@ pub enum LoadError {
     Coordinates { element: usize },
     #[error(
         "element {element} follows the covers, which only an image, a number, a gauge, a text or a \
-         cover paint may, and a moving cover's paint only SUDDEN+"
+         cover paint may, and a moving cover's paint not the lift nor HIDDEN+'s paint HIDDEN+"
     )]
     UnsupportedFollow { element: usize },
     #[error("element {element}'s widget track moves, sizes or rotates it")]
@@ -654,7 +654,7 @@ fn check_places(def: &SkinDef) -> Result<(), LoadError> {
 /// The follow checks of [`Skin::new`], in element order, with `reach` the
 /// lanes' length rounded up (0 without lanes): only an image, a number, a
 /// gauge, a text or a cover paint follows the covers, a moving cover's
-/// paint following SUDDEN+ alone, and every key of a follower or a moving
+/// paint never following the lift and HIDDEN+'s never HIDDEN+, and every key of a follower or a moving
 /// paint, its gate's among them, and of a followed grade of a judge an
 /// element draws, its attachment's among them, keeps its y within ±[`MAX_COORD`] when moved `reach`
 /// either way; a slider paint's keys keep it, their x or y, moved by its
@@ -690,14 +690,18 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             }
         });
         let motion = paint.map_or(CoverMotion::None, |p| p.motion);
-        if motion != CoverMotion::None && matches!(follow, Follow::Lift | Follow::LiftAndCover) {
+        // A moving paint already rises with the lift, and HIDDEN+'s with
+        // HIDDEN+ as well.
+        if motion != CoverMotion::None
+            && (follow.lift || (motion == CoverMotion::Hidden && follow.hidden))
+        {
             return Err(LoadError::UnsupportedFollow { element });
         }
-        if follow != Follow::None || slider.is_some() || motion != CoverMotion::None {
+        if follow != Follow::NONE || slider.is_some() || motion != CoverMotion::None {
             if matches!(e.source, Source::Lanes | Source::Judge(_)) {
                 return Err(LoadError::UnsupportedFollow { element });
             }
-            let moves = follow != Follow::None || motion != CoverMotion::None;
+            let moves = follow != Follow::NONE || motion != CoverMotion::None;
             let follows = if moves { reach } else { 0 };
             let (up, down) = (follows + s_up, follows + s_down);
             let out = |t: &Track| {
@@ -724,7 +728,7 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
                     .into_iter()
                     .zip(&j.grades)
                     .find_map(|(s, g)| {
-                        let g = g.as_ref().filter(|g| g.follow != Follow::None)?;
+                        let g = g.as_ref().filter(|g| g.follow != Follow::NONE)?;
                         if moved_out(&g.track) {
                             Some(JudgePart::Grade(s))
                         } else if g.attachment.as_ref().is_some_and(moved_out) {
@@ -1162,7 +1166,7 @@ fn check_bar_groups(
     }
     if let Some(g) = groups
         .iter()
-        .position(|g| g.place.follow != Follow::None && track_moved_outside(&g.track, reach, reach))
+        .position(|g| g.place.follow != Follow::NONE && track_moved_outside(&g.track, reach, reach))
     {
         return fail(g, BarGroupError::Coordinates);
     }
@@ -3681,7 +3685,10 @@ impl Skin {
         let bitmaps = rt.bitmap.len() == self.text_slots();
         // The lanes' geometry, once for every element, whether or not the
         // lanes draw.
-        let lanes = self.lanes.as_ref().map(|l| l.frame_geometry(scene.lanes));
+        let lanes = self
+            .lanes
+            .as_ref()
+            .map(|l| l.frame_geometry(scene.lanes, scene.hidden_enabled));
         let play = match scene.phase {
             Phase::Play { play, notes, .. } => Some((play, notes)),
             Phase::Loading { .. }
@@ -3789,8 +3796,11 @@ impl Skin {
                 Kind::CoverPaint(i) => self.cover_paints.get(i),
                 _ => None,
             };
-            // HIDDEN+'s paint shows only while HIDDEN+ is on, at any amount.
-            if paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled {
+            // HIDDEN+'s paint, and what follows HIDDEN+, show only while
+            // HIDDEN+ is on, at any amount.
+            if (paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled)
+                || e.follow.hides(lanes.as_ref())
+            {
                 #[cfg(feature = "dev-tools")]
                 out.observed(crate::observation::Outcome::HiddenOff);
                 continue;
