@@ -610,3 +610,111 @@ fn focus_lost_after_a_loading_opening_aborts_the_play() {
         assert_eq!(*end, game::PlayEnd::Aborted(game::AbortCause::FocusLoss));
     });
 }
+
+/// F2 on the keyboard: hi-speed faster through the play adjustments, a
+/// role that is not latched (no START or SELECT), so it moves neither the
+/// window's revision nor the input side's.
+const FASTER: u32 = game::SPEED_KEYS[1];
+
+/// A11 through the reducer alone: F2 pressed after the opening's copy and
+/// before the revalidation is a change only the reducer's count shows (no
+/// settings key, no START or SELECT, nothing held at O11). The opening
+/// retries locally and opens with the faster hi-speed at a new epoch.
+#[test]
+fn a_reducer_change_before_the_revalidation_retries() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let accepted = fenced(rig);
+        let hispeed = rig.adjust.as_ref().unwrap().snapshot().hispeed;
+        let window = rig.controls.tuning().snapshot().revision;
+        side.gates.revalidate.hold(true);
+        side.loading_end.hold(true);
+        let ended = open_with(loaded, rig, side, || {
+            until("the revalidation", || side.gates.revalidate.waiting());
+            side.keys.key(FASTER, 1);
+            side.keys.key(FASTER, 0);
+            side.gates.revalidate.hold(false);
+            side.quit_at_the_end_of_loading();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        let now = rig.controls.tuning().snapshot().revision;
+        assert_eq!(
+            (now.window, now.input),
+            (window.window, window.input),
+            "only the reducer saw it"
+        );
+        assert_eq!(fenced(rig), accepted + 1);
+        assert_ne!(rig.adjust.as_ref().unwrap().snapshot().hispeed, hispeed);
+        assert_eq!(side.gates.revalidate.passed(), 2, "one local retry");
+        let (staged, committed) = rig.render.epochs();
+        assert_eq!(committed, staged + 2);
+    });
+}
+
+/// A11's input half: after a local retry, the reducer's close at the
+/// revalidation was reversed, so START with SELECT pressed in the next
+/// wait acts (HIDDEN selected).
+#[test]
+fn a_local_retry_reopens_the_reducer() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let accepted = fenced(rig);
+        side.gates.revalidate.hold(true);
+        side.loading_end.hold(true);
+        let ended = open_with(loaded, rig, side, || {
+            until("the revalidation", || side.gates.revalidate.waiting());
+            side.tap(Adjust::DisplayOffsetUp);
+            side.gates.revalidate.hold(false);
+            until("the retry", || side.gates.revalidate.passed() == 1);
+            side.gates.revalidate.hold(true);
+            // In the wait again, before the next revalidation.
+            until("the second revalidation", || {
+                side.gates.revalidate.waiting()
+            });
+            side.keys.both();
+            side.gates.revalidate.hold(false);
+            side.quit_at_the_end_of_loading();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        assert_eq!(fenced(rig), accepted + 1, "START with SELECT acted");
+        assert_eq!(selected(rig), Some(CoverKind::Hidden));
+        assert_eq!(side.gates.revalidate.passed(), 3, "two local retries");
+    });
+}
+
+/// A18f by the latch alone: focus lost and back while the commit's reply
+/// is held, so it is back when the deferral is read. The opening defers
+/// for the loss, and asks again only a quiet second after the return.
+#[test]
+fn focus_lost_and_back_during_the_commit_reply_waits_a_quiet_second() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        side.screens.hold_commits(true);
+        side.loading_end.hold(true);
+        let mut returned = TimeUs(0);
+        let mut asked = TimeUs(0);
+        let ended = open_with(loaded, rig, side, || {
+            until("the commit held", || side.screens.commit_held());
+            side.controls.focus(false);
+            returned = side.clock.now();
+            side.controls.focus(true);
+            side.screens.hold_commits(false);
+            until("the end held", || side.loading_end.waiting());
+            side.loading_end.hold(false);
+            until("the deferral", || {
+                side.loading_end.passed() == 1 && side.tuning.acceptance() == Acceptance::Open
+            });
+            side.loading_end.hold(true);
+            until("the second end held", || side.loading_end.waiting());
+            asked = side.clock.now();
+            side.quit_at_the_end_of_loading();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        let waited = asked.0 - returned.0;
+        assert!(
+            (1_000_000..2_500_000).contains(&waited),
+            "{waited} us from the return"
+        );
+        assert_eq!(side.loading_end.passed(), 2);
+    });
+}

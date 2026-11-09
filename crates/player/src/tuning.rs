@@ -752,6 +752,32 @@ mod tests {
         assert!(t.close_unchanged(&back, 1));
     }
 
+    /// A4, a press routed after the loading state began but stamped
+    /// before its epoch (a key event the window thread took late): held
+    /// from before loading, so it holds the wait and steps nothing; its
+    /// repeat neither; its release counts.
+    #[test]
+    fn a_press_stamped_before_the_epoch_is_held_from_before_loading() {
+        let t = LiveTuning::new(start());
+        t.enter_loading(TimeUs(2 * S));
+        let began = t.snapshot();
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Press, TimeUs(S)));
+        assert_eq!(t.held(), [(Adjust::DisplayOffsetUp, HoldClass::PreLoading)]);
+        let pressed = t.snapshot();
+        assert!(pressed.held, "it holds the wait");
+        assert_eq!(pressed.values, began.values);
+        assert_eq!(pressed.revision, began.revision);
+        assert_eq!(pressed.last_activity, began.last_activity);
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Repeat, TimeUs(3 * S)));
+        assert_eq!(t.snapshot(), pressed);
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Release, TimeUs(3 * S)));
+        let released = t.snapshot();
+        assert!(t.held().is_empty());
+        assert!(!released.held);
+        assert_eq!(released.values, began.values);
+        assert_eq!(released.revision.window, began.revision.window + 1);
+    }
+
     /// A9: an input offset key while the end screen does not show is
     /// refused: its press, repeat and release change no value, move no
     /// revision or activity, and hold nothing.
