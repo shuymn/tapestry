@@ -1320,7 +1320,7 @@ mod tests {
                     }
                 }
             });
-            found("production tag", &format!("call {tag}"), &|run, _| {
+            found("production tag", &format!(": call {tag}"), &|run, _| {
                 for f in &mut run.frames {
                     for e in &mut f.events {
                         if let Event::Ran { call: c @ 2, .. } = e {
