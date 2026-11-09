@@ -1045,8 +1045,12 @@ impl ResultSkin {
         match self.attempt.clone() {
             None => {}
             Some(ForAttempt::Every(b, entry, script)) => {
-                if !matches!(&self.published, Some(Published::Skin(p, _, _)) if Arc::ptr_eq(p, &b))
-                {
+                if matches!(&self.published, Some(Published::Skin(p, _, _)) if Arc::ptr_eq(p, &b)) {
+                    // Published already, maybe in an earlier attempt: no
+                    // new publication, but its runtime is this attempt's
+                    // publication, which protects it (code r4).
+                    self.scripts.set_published(script);
+                } else {
                     self.publish(Published::Skin(b, entry, script));
                 }
             }

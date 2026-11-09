@@ -1534,8 +1534,10 @@ fn the_fixed_generation_serves_every_attempt() {
 }
 
 /// §3.7.1 M3 at the attempt's entrance: a bundle for every view is reused
-/// by the next attempt only while its runtime lives; evicted, the next
-/// attempt's image stage imports it again, with a new generation.
+/// by the next attempt only while its runtime lives, its publication
+/// recorded for that attempt so its view commits in the next lifetime
+/// (code r4); unprotected after the following attempt begins, evicted,
+/// the next image stage imports it again, with a new generation.
 #[test]
 fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
     let _s = serial();
@@ -1547,15 +1549,30 @@ fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(pending(d.path(), LIMITS))));
     staged_at(&mut rs, 8, JudgeClass::Normal);
     assert!(rs.staged_line().starts_with("every view"));
+    let scripts = rs.scripts().clone();
+    scripts.enter_result(1);
     rs.request(view_at(8, 5));
     let g = shown_script(&rs);
+    assert_eq!(
+        scripts.commit_view(Some(g), 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    scripts.leave_result();
     rs.next_attempt();
     staged_at(&mut rs, 8, JudgeClass::Normal);
+    scripts.enter_result(2);
     rs.request(view_at(8, 6));
     assert_eq!(shown_script(&rs), g, "reused while it lives");
-    drop(rs.scripts().result_permit(&[]));
-    assert!(!rs.scripts().result_live(Some(g)));
+    assert_eq!(
+        scripts.commit_view(Some(g), 2, || true),
+        crate::screens::ViewCommit::Committed,
+        "the next lifetime's view commits"
+    );
+    scripts.leave_result();
     rs.next_attempt();
+    assert!(!scripts.protected(g), "neither published nor presented now");
+    drop(scripts.result_permit(&[]));
+    assert!(!rs.scripts().result_live(Some(g)));
     staged_at(&mut rs, 8, JudgeClass::Normal);
     rs.request(view_at(8, 7));
     let again = shown_script(&rs);
