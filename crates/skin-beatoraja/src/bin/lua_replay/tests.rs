@@ -61,6 +61,7 @@ fn options(script: Script) -> Options {
         perturb: Vec::new(),
         isolation: Vec::new(),
         local: true,
+        all: true,
     }
 }
 
@@ -79,9 +80,9 @@ fn run(body: &str) -> Report {
 
 /// Asserts `r` passes, with `compiled` program callbacks, each compared.
 fn agrees(r: &Report, compiled: usize) {
-    assert!(r.passes(), "{}", r.text(0, true));
-    assert_eq!(r.compiled.len(), compiled, "{}", r.text(0, true));
-    assert!(compiled == 0 || r.matched > 0, "{}", r.text(0, true));
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    assert_eq!(r.compiled.len(), compiled, "{}", r.text(0, true, true));
+    assert!(compiled == 0 || r.matched > 0, "{}", r.text(0, true, true));
 }
 
 fn dst(id: &str, x: i32, fields: &str) -> String {
@@ -180,27 +181,49 @@ fn a_system_image_is_an_object() {
 }
 
 /// R6 and §7.1: a negative image-set selector stops the conditions and
-/// the timer in the source; production invokes the latch anyway, a
-/// finding until the production fix. The control, selector 0, agrees.
+/// the timer in the source; production invokes the latch anyway and
+/// stores its start early, a finding until the production fix: the
+/// latch sets at the first judgment in production, at 100 000 points in
+/// the source, so their starts and ages differ from then on. The
+/// control, selector 0, agrees.
 #[test]
 fn a_negative_selector_stops_the_conditions() {
     let set = |sel: &str| {
         format!(
-            "{LATCH}skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}, value = function() {sel} end }} }}\n\
+            "local latch = (function()\n\
+               local state = ms.timer_off_value\n\
+               return function()\n\
+                 if state == ms.timer_off_value and ms.number(100) > 0 then state = ms.time() end\n\
+                 return state\n\
+               end\n\
+             end)()\n\
+             skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}, value = function() {sel} end }} }}\n\
              table.insert(skin.destination, {{ id = \"s\", timer = latch, loop = 2000,\n\
                dst = {{ {{ time = 0, x = 0, y = 0, w = 10, h = 10 }}, {{ time = 2000, x = 100, y = 0, w = 10, h = 10 }} }} }})\n"
         )
     };
     let r = run(&set(
-        "if ms.number(100) < 200000 then return -1 end return 0",
+        "if ms.number(100) < 100000 then return -1 end return 0",
     ));
-    assert!(!r.passes(), "{}", r.text(0, true));
+    assert!(!r.passes(), "{}", r.text(0, true, true));
     assert!(
         r.findings
             .iter()
             .any(|f| f.what.contains("not in the source")),
         "{}",
-        r.text(0, true)
+        r.text(0, true, true)
+    );
+    // Once the source runs the latch, its start is later than
+    // production's: the stored start and the drawn age differ.
+    assert!(
+        r.findings.iter().any(|f| f.what.starts_with("raw")),
+        "{}",
+        r.text(0, true, true)
+    );
+    assert!(
+        r.findings.iter().any(|f| f.what.starts_with("timer:")),
+        "{}",
+        r.text(0, true, true)
     );
     let control = run(&set("return 0"));
     agrees(&control, 1);
@@ -251,7 +274,7 @@ fn luaj_differences_are_findings() {
             .iter()
             .any(|f| f.what.starts_with("raw") && f.what.contains("luaj-operator: / unary -")),
         "{}",
-        r.text(0, true)
+        r.text(0, true, true)
     );
 }
 
@@ -326,7 +349,7 @@ fn a_perturbed_read_is_found() {
     let mut o = options(Script::full());
     o.perturb = vec![(100, -1)];
     let r = run_with(&body, &o);
-    assert!(!r.findings.is_empty(), "{}", r.text(0, true));
+    assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
 }
 
 /// A writer stopped by a read the reference cannot answer, and a draw
@@ -342,36 +365,57 @@ fn site_of(r: &Report) -> u32 {
     r.stopped.first().map_or(0, |s| s.site.1)
 }
 
-/// R16: a stopped writer fails the run unless an entry names it, its
-/// write set and every reader with the record it carries.
+fn with_isolation(body: &str, text: &str) -> Report {
+    let mut o = options(Script::full());
+    o.isolation = isolation::parse(text).unwrap();
+    run_with(body, &o)
+}
+
+/// R16: a stopped writer fails the run unless an entry names it, every
+/// cell it writes with its readers, each reader's record matching its
+/// disposition and reason.
 #[test]
 fn stopped_roots_need_reviewed_entries() {
     let bare = run(WRITER);
-    assert!(!bare.passes(), "{}", bare.text(0, true));
+    assert!(!bare.passes(), "{}", bare.text(0, true, true));
     let line = site_of(&bare);
-    assert!(line > 0, "{}", bare.text(0, true));
+    assert!(line > 0, "{}", bare.text(0, true, true));
     let reader = line + 1;
-    let with = |text: &str| {
-        let mut o = options(Script::full());
-        o.isolation = isolation::parse(text).unwrap();
-        run_with(WRITER, &o)
-    };
-    // Every reader with its record: passes.
-    let ok = with(&format!(
-        "root s.luaskin {line} writes n\nreader s.luaskin {reader} draw replaced\n"
-    ));
-    assert!(ok.passes(), "{}", ok.text(0, true));
-    // The wrong record: fails.
-    let wrong = with(&format!(
-        "root s.luaskin {line} writes n\nreader s.luaskin {reader} draw dropped\n"
-    ));
-    assert!(!wrong.passes(), "{}", wrong.text(0, true));
-    // A reader that is not there: fails.
-    let missing = with(&format!(
-        "root s.luaskin {line} writes n\nreader s.luaskin {} draw replaced\n",
-        reader + 50
-    ));
-    assert!(!missing.passes(), "{}", missing.text(0, true));
+    let ok = with_isolation(
+        WRITER,
+        &format!(
+            "root s.luaskin {line} writes n\nreader n s.luaskin {reader} draw replaced Interference\n"
+        ),
+    );
+    assert!(ok.passes(), "{}", ok.text(0, true, true));
+    // The reader omitted: the cell has no reviewed readers.
+    let omitted = with_isolation(WRITER, &format!("root s.luaskin {line} writes n\n"));
+    assert!(!omitted.passes(), "{}", omitted.text(0, true, true));
+    assert!(
+        omitted
+            .stopped
+            .iter()
+            .any(|s| matches!(&s.covered, Err(e) if e.contains("no reviewed readers"))),
+        "{}",
+        omitted.text(0, true, true)
+    );
+    // The wrong disposition, and the wrong reason.
+    for wrong in ["dropped", "replaced Writes"] {
+        let r = with_isolation(
+            WRITER,
+            &format!("root s.luaskin {line} writes n\nreader n s.luaskin {reader} draw {wrong}\n"),
+        );
+        assert!(!r.passes(), "{wrong}: {}", r.text(0, true, true));
+    }
+    // A reader that is not there.
+    let missing = with_isolation(
+        WRITER,
+        &format!(
+            "root s.luaskin {line} writes n\nreader n s.luaskin {} draw replaced Interference\n",
+            reader + 50
+        ),
+    );
+    assert!(!missing.passes(), "{}", missing.text(0, true, true));
 }
 
 /// R16: a write-free stopped root passes with an empty write set.
@@ -383,83 +427,208 @@ fn a_write_free_entry_passes() {
         "draw = function() return ms.float_number(113) ~= 0 end,",
     );
     let bare = run(&body);
-    assert!(!bare.passes());
-    let mut o = options(Script::full());
-    o.isolation = isolation::parse(&format!("root s.luaskin {} writes\n", site_of(&bare))).unwrap();
-    let r = run_with(&body, &o);
-    assert!(r.passes(), "{}", r.text(0, true));
+    assert!(!bare.passes(), "{}", bare.text(0, true, true));
+    let r = with_isolation(
+        &body,
+        &format!("root s.luaskin {} writes\n", site_of(&bare)),
+    );
+    assert!(r.passes(), "{}", r.text(0, true, true));
 }
 
 /// R22 and s7-06e-design.md §7.3: the source's installation removes a
-/// number under a disabled option, an absent option and without a
-/// keyframe, so it never reads their values; production compiles each
-/// value and runs it every frame, found as invocations with no source
-/// point until the production fix. A number under the selected option is
-/// installed, and its value agrees on every frame.
+/// number under a disabled option, an absent option, without a keyframe,
+/// and under a named static condition that is false (`table_song`
+/// outside a table), so it never reads their values; production compiles
+/// each value and runs it every frame, found as invocations with no
+/// source point until the production fix. A number under the selected
+/// option, or under the negated static condition, is installed and
+/// agrees on every frame.
 #[test]
 fn pruning_invokes_nothing() {
     let v = "value = function() return ms.number(100) / 2 end";
     let body = format!(
-        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, {v} }} }}
-         table.insert(skin.destination, {{ id = \"m\", op = {{ 906 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
-         table.insert(skin.destination, {{ id = \"m\", op = {{ -950 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
-         table.insert(skin.destination, {{ id = \"m\", dst = {{}} }})
-"
+        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, {v} }} }}\n\
+         table.insert(skin.destination, {{ id = \"m\", op = {{ 906 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"m\", op = {{ -950 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"m\", dst = {{}} }})\n\
+         table.insert(skin.destination, {{ id = \"m\", op = {{ \"table_song\" }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n"
     );
     let r = run(&body);
-    assert_eq!(r.removed.len(), 3, "{}", r.text(0, true));
-    assert_eq!(r.points, 0, "{}", r.text(0, true));
+    assert_eq!(r.removed.len(), 4, "{}", r.text(0, true, true));
+    assert_eq!(r.points, 0, "{}", r.text(0, true, true));
     let extra = r
         .findings
         .iter()
-        .filter(|f| f.what.contains("with no source point"))
+        .filter(|f| f.what.starts_with("production invocation"))
         .count();
-    assert_eq!(extra, 3 * r.frames, "{}", r.text(0, true));
+    assert_eq!(
+        extra,
+        r.compiled.len() * r.frames,
+        "{}",
+        r.text(0, true, true)
+    );
+    assert!(r.compiled.len() >= 3, "{}", r.text(0, true, true));
     let selected = format!(
-        "{body}table.insert(skin.destination, {{ id = \"m\", op = {{ 905 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
-"
+        "{body}table.insert(skin.destination, {{ id = \"m\", op = {{ 905 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
+         table.insert(skin.destination, {{ id = \"m\", op = {{ \"!table_song\" }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n"
     );
     let r = run(&selected);
-    assert_eq!(r.removed.len(), 3, "{}", r.text(0, true));
-    assert_eq!(r.matched, r.frames, "{}", r.text(0, true));
-    assert_eq!(r.agreed, r.frames, "{}", r.text(0, true));
+    assert_eq!(r.removed.len(), 4, "{}", r.text(0, true, true));
+    assert_eq!(r.matched, 2 * r.frames, "{}", r.text(0, true, true));
+    assert_eq!(r.agreed, 2 * r.frames, "{}", r.text(0, true, true));
+}
+
+/// R22 (B1) and s7-06e-design.md §7.3: an image whose declared source
+/// does not load is removed by the source's installation, so its draw is
+/// never invoked; production keeps the compiled draw and runs it every
+/// frame, found as invocations with no source point until the production
+/// fix. A movie source makes the object unmodelled: its compiled draw is
+/// one finding.
+#[test]
+fn an_unloadable_image_is_removed() {
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"gone\", path = \"gone.png\" }})
+         table.insert(skin.source, {{ id = \"mov\", path = \"m.mp4\" }})
+         table.insert(skin.image, {{ id = \"g\", src = \"gone\", x = 0, y = 0, w = 8, h = 8 }})
+         table.insert(skin.image, {{ id = \"mv\", src = \"mov\", x = 0, y = 0, w = 8, h = 8 }})
+{}{}",
+        dst("\"g\"", 0, &format!("draw = {HALF_POINT},")),
+        dst("\"mv\"", 0, &format!("draw = {HALF_POINT},"))
+    );
+    let r = run(&body);
     assert!(
-        r.findings
-            .iter()
-            .all(|f| f.what.contains("with no source point")),
+        r.removed.iter().any(|l| l.what == "invalid"),
         "{}",
-        r.text(0, true)
+        r.text(0, true, true)
+    );
+    assert!(
+        r.unmodelled.iter().any(|l| l.what == "movie"),
+        "{}",
+        r.text(0, true, true)
+    );
+    assert_eq!(r.agreed, 0, "{}", r.text(0, true, true));
+    let count = |s: &str| r.findings.iter().filter(|f| f.what.contains(s)).count();
+    assert_eq!(
+        count("production invocation"),
+        r.frames,
+        "{}",
+        r.text(0, true, true)
+    );
+    assert_eq!(
+        count("compiled on a unmodelled object (movie)"),
+        1,
+        "{}",
+        r.text(0, true, true)
     );
 }
 
 /// R23: a plain image ignores `ref` and `value`; an image set's numeric
-/// `value` overrides a conflicting `ref`.
+/// `value` overrides a conflicting `ref`, a named one (`"point"`) too, a
+/// numeric one the factory does not know falls back to `ref`, and a
+/// missing `ref` selects 0; a numeric `draw` is a condition; a hole
+/// chosen by the selector runs the conditions and the timer, and the
+/// object is not sampled.
 #[test]
 fn constructors_choose_by_their_own_fields() {
     let body = format!(
         "skin.image[1].ref = 42\n\
-         skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}, value = 100, ref = 40 }} }}\n{}{}",
+         skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}, value = 100, ref = 40 }},\n\
+           {{ id = \"p\", images = {{ \"i\", \"j\" }}, value = \"point\", ref = 40 }},\n\
+           {{ id = \"u\", images = {{ \"i\", \"j\" }}, value = 99999 }},\n\
+           {{ id = \"d\", images = {{ \"i\", \"j\" }} }} }}\n{}{}{}{}{}{}",
         dst("\"i\"", 0, &format!("draw = {HALF_POINT},")),
-        dst("\"s\"", 100, &format!("draw = {HALF_POINT},"))
+        dst("\"s\"", 100, &format!("draw = {HALF_POINT},")),
+        dst("\"p\"", 200, &format!("draw = {HALF_POINT},")),
+        dst("\"u\"", 300, &format!("draw = {HALF_POINT},")),
+        dst("\"d\"", 400, &format!("draw = {HALF_POINT},")),
+        dst(
+            "\"i\"",
+            500,
+            &format!("op = {{ {HALF_POINT} }}, draw = 32,")
+        )
     );
     let r = run(&body);
-    agrees(&r, 2);
-    assert_eq!(r.matched, r.frames * 2);
+    agrees(&r, 6);
+    assert_eq!(r.matched, r.frames * 6, "{}", r.text(0, true, true));
+}
+
+/// R23 and B4: an image set whose selected entry is a hole runs its
+/// conditions and its timer, and is never sampled; production's sampler
+/// agrees.
+#[test]
+fn a_hole_runs_the_timer_and_draws_nothing() {
+    let body = format!(
+        "{LATCH}table.insert(skin.source, {{ id = \"gone\", path = \"gone.png\" }})\n\
+         table.insert(skin.image, {{ id = \"g\", src = \"gone\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         skin.imageset = {{ {{ id = \"h\", images = {{ \"g\", \"i\" }}, value = function() return ms.number(100) * 0 end }} }}\n{}",
+        dst("\"h\"", 0, "timer = latch, loop = -1,")
+    );
+    let r = run(&body);
+    assert!(
+        r.findings.iter().all(|f| !f.what.contains("sampled")),
+        "{}",
+        r.text(0, true, true)
+    );
+    assert!(r.passes(), "{}", r.text(0, true, true));
+}
+
+/// Identity: two destinations of one number definition are two value
+/// occurrences; the same function twice in one `op` list is two `op`
+/// occurrences.
+#[test]
+fn occurrences_are_told_apart() {
+    let body = format!(
+        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+           value = function() return ms.number(100) / 2 end }} }}\n\
+         local f = {HALF_POINT}\n{}{}{}",
+        dst("\"m\"", 0, ""),
+        dst("\"m\"", 100, ""),
+        dst("\"i\"", 200, "op = { f, f },")
+    );
+    let r = run(&body);
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    assert!(r.compiled.len() >= 2, "{}", r.text(0, true, true));
+}
+
+/// R17: an object of an unmodelled kind lists every callable it holds,
+/// its nested parts' included.
+#[test]
+fn nested_parts_are_listed() {
+    let body = "skin.judge = { { id = \"jd\", index = 0, images = {\n\
+           { id = \"i\", draw = function() return ms.number(100) / 2 >= 0 end, dst = { { x = 0, y = 0, w = 6, h = 6 } } } },\n\
+           numbers = {} } }\n\
+         table.insert(skin.destination, { id = \"jd\", draw = function() return true end, dst = { { x = 0, y = 0, w = 6, h = 6 } } })\n";
+    let r = run(body);
+    let judge = r
+        .unmodelled
+        .iter()
+        .find(|l| l.what == "judge")
+        .unwrap_or_else(|| panic!("{}", r.text(0, true, true)));
+    assert_eq!(judge.callables.len(), 2, "{}", r.text(0, true, true));
 }
 
 /// The isolation file's lines.
 #[test]
 fn isolation_entries_parse() {
     let e: Vec<Entry> = isolation::parse(
-        "# c\nroot a.lua 3 writes x y\nreader a.lua 5 draw replaced\nroot b.lua 9 writes\n",
+        "# c\nroot a.lua 3 writes x y\nreader x a.lua 5 draw replaced Interference\nreader y none\nroot b.lua 9 writes\n",
     )
     .unwrap();
     assert_eq!(e.len(), 2);
     assert_eq!(e[0].writes, ["x", "y"]);
     assert_eq!(e[0].readers.len(), 1);
+    assert_eq!(e[0].readers[0].reason, "Interference");
+    assert_eq!(e[0].unread, ["y"]);
     assert!(e[1].writes.is_empty());
-    assert!(isolation::parse("reader a.lua 5 draw replaced\n").is_err());
-    assert!(isolation::parse("root a.lua 3 writes\nreader a.lua 5 draw kept\n").is_err());
+    for bad in [
+        "reader x a.lua 5 draw replaced Interference\n",
+        "root a.lua 3 writes x\nreader z a.lua 5 draw dropped\n",
+        "root a.lua 3 writes x\nreader x a.lua 5 draw kept\n",
+        "root a.lua 3 writes x\nreader x a.lua 5 draw replaced\n",
+        "root a.lua 3 writes x\nreader x a.lua 5 draw dropped Writes\n",
+    ] {
+        assert!(isolation::parse(bad).is_err(), "{bad}");
+    }
     assert!(isolation::same_file("@C:/x/play/play.lua", "play/play.lua"));
     assert!(!isolation::same_file("@C:/x/play/xplay.lua", "play.lua"));
 }
@@ -480,12 +649,13 @@ pub fn pieces(body: &str) -> (crate::production::ProductionRun, crate::observed:
         crate::production::record(&i.imported.skin, rec, &o.script, Some(12)).unwrap();
     let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
     let vm = vm.unwrap();
-    let mut obs = crate::reference::Reference::new(&vm, &rec.items).run(&inputs);
+    let mut obs = crate::reference::Reference::new(&vm, &rec.items, &rec.sources).run(&inputs);
     obs.root = d.path().to_path_buf();
     (run, obs)
 }
 
-/// The latch on one destination, and a lowered draw on another.
+/// The latch on two destinations, a lowered draw, and a program draw its
+/// gate always skips (autoplay on, 33, is false).
 pub const TAMPERED: &str = "local latch = (function()\n\
        local state = ms.timer_off_value\n\
        return function()\n\
@@ -494,4 +664,6 @@ pub const TAMPERED: &str = "local latch = (function()\n\
        end\n\
      end)()\n\
      table.insert(skin.destination, { id = \"i\", timer = latch, loop = -1, dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
-     table.insert(skin.destination, { id = \"i\", draw = function() return ms.number(100) >= 0 end, dst = { { x = 100, y = 0, w = 64, h = 64 } } })\n";
+     table.insert(skin.destination, { id = \"i\", timer = latch, loop = -1, dst = { { x = 0, y = 70, w = 64, h = 64 } } })\n\
+     table.insert(skin.destination, { id = \"i\", draw = function() return ms.number(100) >= 0 end, dst = { { x = 100, y = 0, w = 64, h = 64 } } })\n\
+     table.insert(skin.destination, { id = \"i\", op = { 33 }, draw = function() return ms.number(100) / 2 >= 0 end, dst = { { x = 200, y = 0, w = 64, h = 64 } } })\n";

@@ -3,15 +3,16 @@
 //! installs it, and each installed object of a modelled kind prepared
 //! every frame by its own prepare path, its host answering from the
 //! recorded frame inputs (design.md "beatoraja Lua Skins", the reference
-//! executor; s7-06e-design.md §3.2-§3.3).
+//! executor; s7-06e-design.md §3.2-§3.3; s7-06e-1-r1-tables.md, B).
 //!
 //! Modelled kinds: system images, plain and grouped images, image sets
-//! and numbers. Every other kind is listed with the callables it holds.
+//! and numbers. Every other kind is listed with every callable it holds,
+//! its nested parts' included.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mlua::{Function, Table, Value};
-use skin_beatoraja::lua::replay::{Called, ReferenceVm};
+use skin_beatoraja::lua::replay::{Called, PropValue, ReferenceVm, SourceFact};
 use skin_beatoraja::lua::runtime::{to_bool, to_int};
 
 use crate::inputs::FrameInputs;
@@ -25,11 +26,17 @@ enum Sel {
     Callable(Function, Key),
     /// An image-index property (a group's or an image set's `ref`).
     Index(i32),
-    /// An integer property (a number's or an image set's numeric `value`,
+    /// An integer property (a number's or an image set's resolved `value`,
     /// or a number's `ref`).
-    Int(i32),
-    /// A named property the reference does not resolve.
-    Named,
+    Int(PropRef),
+    /// A name the factory does not know: a script the source runs.
+    Script,
+}
+
+/// An integer property, by id or by name.
+enum PropRef {
+    Id(i32),
+    Name(String),
 }
 
 enum Kind {
@@ -40,24 +47,31 @@ enum Kind {
 enum Cond {
     /// A numeric boolean property.
     Prop(i32),
-    /// A named one.
+    /// A named one (`!` negating it).
     Named(String),
     /// A function.
     Func(Function, Key),
+}
+
+/// Whether the source's loader would build a valid object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Validity {
+    Valid,
+    Invalid,
+    Unknown,
+    Movie,
 }
 
 struct Obj {
     dest: usize,
     kind: Kind,
     sel: Sel,
+    /// An image set's entries, each whether its source loads.
+    entries: Vec<bool>,
     conds: Vec<Cond>,
     timer: Option<(Function, Key)>,
-}
-
-/// A destination as the source reads it.
-struct Dest {
-    index: usize,
-    table: Table,
+    options: Vec<i32>,
+    validity: Validity,
 }
 
 fn raw(t: &Table, k: &str) -> Value {
@@ -96,6 +110,13 @@ fn int32(v: &Value) -> Option<i32> {
     int(v).and_then(|n| i32::try_from(n).ok())
 }
 
+fn string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => s.to_str().ok().map(|s| s.to_owned()),
+        _ => None,
+    }
+}
+
 /// The entry of list `name` whose `id` is `id`.
 fn find(skin: &Table, name: &str, id: &str) -> Option<Table> {
     list(&raw(skin, name)).into_iter().find_map(|e| match e {
@@ -104,40 +125,37 @@ fn find(skin: &Table, name: &str, id: &str) -> Option<Table> {
     })
 }
 
-/// Whether a `source` entry has id `id`.
-fn has_source(skin: &Table, src: &Value) -> bool {
-    id_string(src).is_some_and(|s| find(skin, "source", &s).is_some())
-}
-
-/// The top-level key of another kind holding an object with id `id`: a
-/// list of tables with `id`s, or one table with an `id`.
-fn other_kind(skin: &Table, id: &str) -> Option<String> {
+/// The top-level key of another kind holding an object with id `id`, and
+/// that object: a list of tables with `id`s, or one table with an `id`.
+fn other_kind(skin: &Table, id: &str) -> Option<(String, Table)> {
     let mut found = None;
     let _ = skin.for_each(|k: Value, v: Value| {
         let Some(name) = id_string(&k) else {
             return Ok(());
         };
-        if [
-            "image",
-            "imageset",
-            "value",
-            "destination",
-            "source",
-            "font",
-        ]
-        .contains(&name.as_str())
+        if found.is_some()
+            || [
+                "image",
+                "imageset",
+                "value",
+                "destination",
+                "source",
+                "font",
+            ]
+            .contains(&name.as_str())
         {
             return Ok(());
         }
         let hit = match &v {
-            Value::Table(t) if id_string(&raw(t, "id")).as_deref() == Some(id) => true,
-            Value::Table(_) => list(&v).iter().any(
-                |e| matches!(e, Value::Table(t) if id_string(&raw(t, "id")).as_deref() == Some(id)),
-            ),
-            _ => false,
+            Value::Table(t) if id_string(&raw(t, "id")).as_deref() == Some(id) => Some(t.clone()),
+            Value::Table(_) => list(&v).into_iter().find_map(|e| match e {
+                Value::Table(t) if id_string(&raw(&t, "id")).as_deref() == Some(id) => Some(t),
+                _ => None,
+            }),
+            _ => None,
         };
-        if hit && found.is_none() {
-            found = Some(name);
+        if let Some(t) = hit {
+            found = Some((name, t));
         }
         Ok(())
     });
@@ -147,17 +165,24 @@ fn other_kind(skin: &Table, id: &str) -> Option<String> {
 pub struct Reference<'a> {
     vm: &'a ReferenceVm,
     items: &'a BTreeMap<i32, bool>,
+    sources: &'a BTreeMap<String, SourceFact>,
     objects: Vec<Obj>,
     observed: Observed,
 }
 
 impl<'a> Reference<'a> {
-    /// Reads `vm`'s skin and resolves its destinations; installation waits
+    /// Reads `vm`'s skin and resolves its destinations against the option
+    /// items `items` and the source facts `sources`; installation waits
     /// for the first frame ([`Self::run`]).
-    pub fn new(vm: &'a ReferenceVm, items: &'a BTreeMap<i32, bool>) -> Self {
+    pub fn new(
+        vm: &'a ReferenceVm,
+        items: &'a BTreeMap<i32, bool>,
+        sources: &'a BTreeMap<String, SourceFact>,
+    ) -> Self {
         let mut r = Self {
             vm,
             items,
+            sources,
             objects: Vec::new(),
             observed: Observed::default(),
         };
@@ -167,7 +192,7 @@ impl<'a> Reference<'a> {
         r
     }
 
-    fn key(&mut self, f: &Function, dest: usize, field: &'static str) -> Key {
+    fn key(&mut self, f: &Function, dest: usize, field: &'static str, index: u32) -> Key {
         let callable = self.vm.callable(f).unwrap_or(u32::MAX);
         if let std::collections::btree_map::Entry::Vacant(e) = self.observed.sites.entry(callable) {
             let info = f.info();
@@ -183,22 +208,52 @@ impl<'a> Reference<'a> {
         Key {
             dest,
             field,
+            index,
             callable,
         }
     }
 
-    /// Every callable a destination holds, keyed.
-    fn dest_callables(&mut self, d: &Dest) -> Vec<Key> {
-        let mut out = Vec::new();
-        for v in list(&raw(&d.table, "op")) {
-            if let Value::Function(f) = v {
-                out.push(self.key(&f, d.index, "op"));
+    /// Every function under `t` (to a few levels, each table once): the
+    /// callables of an object the reference does not run, its nested
+    /// parts' included.
+    fn nested(
+        &mut self,
+        t: &Table,
+        dest: usize,
+        out: &mut Vec<Key>,
+        seen: &mut BTreeSet<usize>,
+        depth: u32,
+    ) {
+        if depth > 6 || !seen.insert(t.to_pointer().addr()) {
+            return;
+        }
+        let mut found: Vec<Value> = Vec::new();
+        let _ = t.for_each(|_: Value, v: Value| {
+            found.push(v);
+            Ok(())
+        });
+        for v in found {
+            match v {
+                Value::Function(f) => {
+                    let n = u32::try_from(out.len()).unwrap_or(u32::MAX);
+                    let k = self.key(&f, dest, "nested", n);
+                    if !out.iter().any(|o| o.callable == k.callable) {
+                        out.push(k);
+                    }
+                }
+                Value::Table(t) => self.nested(&t, dest, out, seen, depth + 1),
+                _ => {}
             }
         }
-        for field in ["draw", "timer"] {
-            if let Value::Function(f) = raw(&d.table, field) {
-                out.push(self.key(&f, d.index, field));
-            }
+    }
+
+    /// Every callable of destination `d` and its definition `def`.
+    fn all_callables(&mut self, d: usize, dest: &Table, def: Option<&Table>) -> Vec<Key> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        self.nested(dest, d, &mut out, &mut seen, 0);
+        if let Some(def) = def {
+            self.nested(def, d, &mut out, &mut seen, 0);
         }
         out
     }
@@ -221,90 +276,141 @@ impl<'a> Reference<'a> {
             let Value::Table(table) = d else {
                 continue;
             };
-            let d = Dest { index, table };
-            self.resolve_one(skin, &d);
+            self.resolve_one(skin, index, &table);
         }
     }
 
-    fn resolve_one(&mut self, skin: &Table, d: &Dest) {
-        let Some(id) = id_string(&raw(&d.table, "id")) else {
-            let callables = self.dest_callables(d);
+    /// The fact of source `src`: valid when it loads, invalid when it is
+    /// missing or undefined, a movie, or unknown when production never
+    /// reached it (s7-06e-design.md §3.8).
+    fn source(&self, skin: &Table, src: &Value) -> Validity {
+        let Some(id) = id_string(src) else {
+            return Validity::Invalid;
+        };
+        if find(skin, "source", &id).is_none() {
+            return Validity::Invalid;
+        }
+        match self.sources.get(&id) {
+            Some(SourceFact::Loaded) => Validity::Valid,
+            Some(SourceFact::Missing) => Validity::Invalid,
+            Some(SourceFact::Movie) => Validity::Movie,
+            Some(SourceFact::Unknown) | None => Validity::Unknown,
+        }
+    }
+
+    /// A number's or an image set's `value` as its serializer resolves
+    /// it (`LuaSkinLoader.java:155-167`): a function, an id, a name the
+    /// factory knows, or a script; an id or name the factory returns null
+    /// for falls back to `fallback` (`JsonSkinObjectLoader.java:85`,
+    /// `:119-124`).
+    fn value_sel(&mut self, v: &Value, index: usize, fallback: Sel) -> Sel {
+        match v {
+            Value::Function(f) => Sel::Callable(f.clone(), self.key(f, index, "value", 0)),
+            Value::Nil => fallback,
+            Value::String(_) => {
+                let name = string(v).unwrap_or_default();
+                match self.vm.named_number_property(&name) {
+                    None => Sel::Script,
+                    Some(PropValue::Null) => fallback,
+                    Some(_) => Sel::Int(PropRef::Name(name)),
+                }
+            }
+            other => match int32(other) {
+                Some(id) if self.vm.number_property(id) != PropValue::Null => {
+                    Sel::Int(PropRef::Id(id))
+                }
+                _ => fallback,
+            },
+        }
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one destination, as the loader reads it"
+    )]
+    fn resolve_one(&mut self, skin: &Table, index: usize, dest: &Table) {
+        let Some(id) = id_string(&raw(dest, "id")) else {
+            let callables = self.all_callables(index, dest, None);
             self.observed.unresolved.push(Listed {
-                dest: d.index,
+                dest: index,
                 what: "no id".into(),
                 callables,
             });
             return;
         };
         // `JSONSkinLoader.java:316-337`: a negative integer is a system
-        // image; else the object loader's lists, image first.
+        // image; else the object loader's lists, image first
+        // (`JsonSkinObjectLoader.java:42-124`).
         let system = id.parse::<i32>().is_ok_and(|n| n < 0);
-        let (kind, sel, valid) = if system {
-            (Kind::Image, Sel::Zero, true)
+        let mut entries = Vec::new();
+        let (kind, sel, validity) = if system {
+            (Kind::Image, Sel::Zero, Validity::Valid)
         } else if let Some(img) = find(skin, "image", &id) {
             let len = int(&raw(&img, "len")).unwrap_or(0);
-            let valid = has_source(skin, &raw(&img, "src"));
+            let validity = self.source(skin, &raw(&img, "src"));
+            // A plain image ignores `ref` and `value`; a group reads its
+            // image-index `ref` (`JsonSkinObjectLoader.java:49-64`).
             let sel = if len > 1 {
                 Sel::Index(int32(&raw(&img, "ref")).unwrap_or(0))
             } else {
                 Sel::Zero
             };
-            (Kind::Image, sel, valid)
+            (Kind::Image, sel, validity)
         } else if let Some(set) = find(skin, "imageset", &id) {
-            let valid = list(&raw(&set, "images")).iter().any(|i| {
-                id_string(i)
+            let mut validity = Validity::Invalid;
+            for i in list(&raw(&set, "images")) {
+                let v = id_string(&i)
                     .and_then(|i| find(skin, "image", &i))
-                    .is_some_and(|img| has_source(skin, &raw(&img, "src")))
-            });
-            let sel = match raw(&set, "value") {
-                Value::Function(f) => Sel::Callable(f.clone(), self.key(&f, d.index, "value")),
-                v @ (Value::Integer(_) | Value::Number(_)) => Sel::Int(int32(&v).unwrap_or(0)),
-                Value::String(_) => Sel::Named,
-                _ => Sel::Index(int32(&raw(&set, "ref")).unwrap_or(0)),
-            };
-            (Kind::Image, sel, valid)
-        } else if let Some(num) = find(skin, "value", &id) {
-            let sel = match raw(&num, "value") {
-                Value::Function(f) => Sel::Callable(f.clone(), self.key(&f, d.index, "value")),
-                v @ (Value::Integer(_) | Value::Number(_)) => Sel::Int(int32(&v).unwrap_or(0)),
-                Value::String(_) => Sel::Named,
-                _ => Sel::Int(int32(&raw(&num, "ref")).unwrap_or(0)),
-            };
-            (Kind::Number, sel, true)
-        } else {
-            let callables = self.dest_callables(d);
-            match other_kind(skin, &id) {
-                Some(what) => self.observed.unmodelled.push(Listed {
-                    dest: d.index,
-                    what,
-                    callables,
-                }),
-                None => self.observed.unresolved.push(Listed {
-                    dest: d.index,
-                    what: "unresolved id".into(),
-                    callables,
-                }),
+                    .map_or(Validity::Invalid, |img| {
+                        self.source(skin, &raw(&img, "src"))
+                    });
+                entries.push(v == Validity::Valid);
+                validity = match (validity, v) {
+                    (Validity::Movie, _) | (_, Validity::Movie) => Validity::Movie,
+                    (Validity::Valid, _) | (_, Validity::Valid) => Validity::Valid,
+                    (Validity::Unknown, _) | (_, Validity::Unknown) => Validity::Unknown,
+                    _ => Validity::Invalid,
+                };
             }
+            let by_ref = Sel::Index(int32(&raw(&set, "ref")).unwrap_or(0));
+            let sel = self.value_sel(&raw(&set, "value"), index, by_ref);
+            (Kind::Image, sel, validity)
+        } else if let Some(num) = find(skin, "value", &id) {
+            let by_ref = Sel::Int(PropRef::Id(int32(&raw(&num, "ref")).unwrap_or(0)));
+            let sel = self.value_sel(&raw(&num, "value"), index, by_ref);
+            (Kind::Number, sel, Validity::Valid)
+        } else {
+            let other = other_kind(skin, &id);
+            let callables = self.all_callables(index, dest, other.as_ref().map(|(_, t)| t));
+            let (list, what) = match other {
+                Some((kind, _)) => (&mut self.observed.unmodelled, kind),
+                None => (&mut self.observed.unresolved, "unresolved id".into()),
+            };
+            list.push(Listed {
+                dest: index,
+                what,
+                callables,
+            });
             return;
         };
         // A keyframe is needed (`SkinObject.java:577-579`).
-        let valid = valid && !list(&raw(&d.table, "dst")).is_empty();
+        let validity = if list(&raw(dest, "dst")).is_empty() {
+            Validity::Invalid
+        } else {
+            validity
+        };
         // Conditions: numeric properties, then names and functions, then
         // `draw` (`JSONSkinLoader.java:458-462`, `SkinObject.java:282-315`).
         let mut ids = Vec::new();
         let mut rest = Vec::new();
         let mut options = Vec::new();
-        for v in list(&raw(&d.table, "op")) {
+        for (i, v) in list(&raw(dest, "op")).into_iter().enumerate() {
             match &v {
                 Value::Function(f) => {
-                    let k = self.key(f, d.index, "op");
+                    let k = self.key(f, index, "op", u32::try_from(i).unwrap_or(u32::MAX));
                     rest.push(Cond::Func(f.clone(), k));
                 }
-                Value::String(s) => {
-                    rest.push(Cond::Named(
-                        s.to_str().map(|s| s.to_owned()).unwrap_or_default(),
-                    ));
-                }
+                Value::String(_) => rest.push(Cond::Named(string(&v).unwrap_or_default())),
                 _ => match int32(&v) {
                     Some(0) | None => {}
                     Some(n) if ReferenceVm::is_property(n) => {
@@ -318,43 +424,42 @@ impl<'a> Reference<'a> {
         }
         let mut conds: Vec<Cond> = ids.into_iter().map(Cond::Prop).collect();
         conds.extend(rest);
-        if let Value::Function(f) = raw(&d.table, "draw") {
-            let k = self.key(&f, d.index, "draw");
-            conds.push(Cond::Func(f, k));
-        }
-        let timer = match raw(&d.table, "timer") {
+        // `draw` by its serializer: a function, an id or a name
+        // (`LuaSkinLoader.java:120-122`, `:155-167`).
+        match raw(dest, "draw") {
             Value::Function(f) => {
-                let k = self.key(&f, d.index, "timer");
+                let k = self.key(&f, index, "draw", 0);
+                conds.push(Cond::Func(f, k));
+            }
+            v @ Value::String(_) => conds.push(Cond::Named(string(&v).unwrap_or_default())),
+            v => {
+                if let Some(n) = int32(&v).filter(|&n| n != 0) {
+                    conds.push(Cond::Prop(n));
+                }
+            }
+        }
+        let timer = match raw(dest, "timer") {
+            Value::Function(f) => {
+                let k = self.key(&f, index, "timer", 0);
                 Some((f, k))
             }
             _ => None,
         };
         let obj = Obj {
-            dest: d.index,
+            dest: index,
             kind,
             sel,
+            entries,
             conds,
             timer,
+            options,
+            validity,
         };
-        if !valid {
+        if obj.validity == Validity::Movie {
             let callables = obj_keys(&obj);
-            self.observed.removed.push(Listed {
-                dest: d.index,
-                what: "invalid".into(),
-                callables,
-            });
-            return;
-        }
-        // Options (`Skin.java:214-226`): an absent one reads -1.
-        let fails = options.iter().any(|&op| {
-            let want = op > 0;
-            self.items.get(&op.abs()).copied() != Some(want)
-        });
-        if fails {
-            let callables = obj_keys(&obj);
-            self.observed.removed.push(Listed {
-                dest: d.index,
-                what: "option".into(),
+            self.observed.unmodelled.push(Listed {
+                dest: index,
+                what: "movie".into(),
                 callables,
             });
             return;
@@ -362,27 +467,53 @@ impl<'a> Reference<'a> {
         self.objects.push(obj);
     }
 
-    /// Prunes static conditions on the first frame (`Skin.java:199-213`):
-    /// a false one removes the object, a true one is dropped.
+    /// The source's installation (`Skin.java:199-233`), on the first
+    /// frame: an object that does not validate, a false static condition
+    /// (numeric, named or negated, each keeping its property's class) or
+    /// an option not matching removes it; a true static one is dropped.
+    /// An object whose validity the facts leave unknown, or whose static
+    /// condition the model cannot evaluate, is unresolved unless another
+    /// step removes it.
     fn install(&mut self) {
         let objects = std::mem::take(&mut self.objects);
         for mut obj in objects {
-            let mut removed = None;
+            let mut removed: Option<&'static str> = None;
+            let mut unknown: Option<&'static str> = None;
+            match obj.validity {
+                Validity::Invalid => removed = Some("invalid"),
+                Validity::Unknown => unknown = Some("source not reached"),
+                Validity::Valid | Validity::Movie => {}
+            }
             let mut kept = Vec::new();
             for c in obj.conds.drain(..) {
-                match c {
-                    Cond::Prop(n) if ReferenceVm::is_static(n) => {
-                        match self.vm.condition(n, self.items) {
-                            Some(true) => {}
-                            Some(false) => removed = removed.or(Some("static condition")),
-                            None => removed = removed.or(Some("static condition unknown")),
-                        }
+                let stat = match &c {
+                    Cond::Prop(n) if ReferenceVm::is_static(*n) => {
+                        Some(self.vm.condition(*n, self.items))
                     }
-                    other => kept.push(other),
+                    Cond::Named(name)
+                        if ReferenceVm::condition_id(name).is_some_and(ReferenceVm::is_static) =>
+                    {
+                        Some(self.vm.named_condition(name))
+                    }
+                    _ => None,
+                };
+                match stat {
+                    None => kept.push(c),
+                    Some(Some(true)) => {}
+                    Some(Some(false)) => removed = removed.or(Some("static condition")),
+                    Some(None) => unknown = unknown.or(Some("static condition unknown")),
                 }
             }
             obj.conds = kept;
-            match removed {
+            // Options (`Skin.java:214-226`): an absent one reads -1.
+            if obj
+                .options
+                .iter()
+                .any(|&op| self.items.get(&op.abs()).copied() != Some(op > 0))
+            {
+                removed = removed.or(Some("option"));
+            }
+            match removed.or(unknown) {
                 None => self.objects.push(obj),
                 Some(why) => {
                     let callables = obj_keys(&obj);
@@ -391,7 +522,7 @@ impl<'a> Reference<'a> {
                         what: why.into(),
                         callables,
                     };
-                    if why == "static condition" {
+                    if removed.is_some() {
                         self.observed.removed.push(l);
                     } else {
                         self.observed.unresolved.push(l);
@@ -469,24 +600,45 @@ pub fn to_long(v: &Value) -> i64 {
 }
 
 /// Every remaining occurrence of `o` from condition `from` on, and its
-/// timer, not reached for `why`.
-fn not_reached(o: &Obj, from: usize, why: Cause, out: &mut RefFrame) {
+/// timer, not reached for `why`, stopped by `by`.
+fn not_reached(o: &Obj, from: usize, why: Cause, by: Option<Key>, out: &mut RefFrame) {
     for c in o.conds.iter().skip(from) {
         if let Cond::Func(_, k) = c {
-            out.points.push(Point::NotReached { key: *k, why });
+            out.points.push(Point::NotReached { key: *k, why, by });
         }
     }
     if let Some((_, k)) = &o.timer {
-        out.points.push(Point::NotReached { key: *k, why });
+        out.points.push(Point::NotReached { key: *k, why, by });
+    }
+}
+
+/// An integer property's value as the source's prepare reads it: a null
+/// one is `Integer.MIN_VALUE` for a number and 0 for an image
+/// (`SkinNumber.java:130-138`, `SkinImage.java:123-125`).
+fn prop(vm: &ReferenceVm, p: &PropRef, kind: &Kind) -> Result<i32, Cause> {
+    let v = match p {
+        PropRef::Id(id) => vm.number_property(*id),
+        PropRef::Name(n) => vm
+            .named_number_property(n)
+            .unwrap_or(PropValue::Unsupported),
+    };
+    match (v, kind) {
+        (PropValue::Value(n), _) => Ok(n),
+        (PropValue::Null, Kind::Number) => Ok(i32::MIN),
+        (PropValue::Null, Kind::Image) => Ok(0),
+        (PropValue::Unavailable, _) => Err(Cause::Unavailable),
+        (PropValue::Unsupported, _) => Err(Cause::Inconclusive),
     }
 }
 
 /// `o`'s prepare path on the frame the VM holds.
 fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
     // 1. The selector or value.
+    let mut by = None;
     let sel: Result<i32, Cause> = match &o.sel {
         Sel::Zero => Ok(0),
         Sel::Callable(f, k) => {
+            by = Some(*k);
             let c = vm.call(f);
             out.points.push(Point::Ran {
                 key: *k,
@@ -501,33 +653,26 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
             }
         }
         Sel::Index(id) => vm.index_property(*id).ok_or(Cause::Inconclusive),
-        Sel::Int(id) => match vm.number_property(*id) {
-            Some(Some(n)) => Ok(n),
-            Some(None) => Err(Cause::Unavailable),
-            None => Err(Cause::Inconclusive),
-        },
-        Sel::Named => Err(Cause::Inconclusive),
+        Sel::Int(p) => prop(vm, p, &o.kind),
+        Sel::Script => Err(Cause::Inconclusive),
     };
     let sel = match sel {
         Ok(v) => v,
-        Err(why) => return not_reached(o, 0, why, out),
+        Err(why) => return not_reached(o, 0, why, by, out),
     };
     // 2. The kind's own gate before the conditions.
     match o.kind {
-        Kind::Image if sel < 0 => return not_reached(o, 0, Cause::Selector, out),
+        Kind::Image if sel < 0 => return not_reached(o, 0, Cause::Selector, None, out),
         Kind::Number if sel == i32::MIN || sel == i32::MAX => {
-            return not_reached(o, 0, Cause::Sentinel, out);
+            return not_reached(o, 0, Cause::Sentinel, by, out);
         }
         _ => {}
     }
     // 3. The conditions, the first false stopping.
     for (i, c) in o.conds.iter().enumerate() {
-        let holds = match c {
-            Cond::Prop(n) => match vm.condition(*n, items) {
-                Some(b) => Ok(b),
-                None => Err(Cause::Inconclusive),
-            },
-            Cond::Named(name) => vm.named_condition(name).ok_or(Cause::Inconclusive),
+        let (holds, by) = match c {
+            Cond::Prop(n) => (vm.condition(*n, items).ok_or(Cause::Inconclusive), None),
+            Cond::Named(name) => (vm.named_condition(name).ok_or(Cause::Inconclusive), None),
             Cond::Func(f, k) => {
                 let r = vm.call(f);
                 out.points.push(Point::Ran {
@@ -535,18 +680,19 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
                     call: 1,
                     outcome: outcome(&r),
                 });
-                match &r {
+                let h = match &r {
                     Called::Value(v) => Ok(to_bool(v)),
                     Called::Error => Ok(false),
                     Called::Unavailable => Err(Cause::Unavailable),
                     Called::Unanswered(_) | Called::Budget => Err(Cause::Inconclusive),
-                }
+                };
+                (h, Some(*k))
             }
         };
         match holds {
             Ok(true) => {}
-            Ok(false) => return not_reached(o, i + 1, Cause::Condition, out),
-            Err(why) => return not_reached(o, i + 1, why, out),
+            Ok(false) => return not_reached(o, i + 1, Cause::Condition, by, out),
+            Err(why) => return not_reached(o, i + 1, why, by, out),
         }
     }
     // 4. The timer: once, and again unless off (`TimerProperty.java:8-22`).
@@ -578,6 +724,22 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
         } else {
             None
         };
-        out.timers.push(TimerOut { key: *k, on, start });
+        // 5. The chosen source (`SkinImage.java:133-139`): past the end
+        // selects 0; a hole hides the object after all this.
+        let shown = if o.entries.is_empty() {
+            true
+        } else {
+            let i = usize::try_from(sel)
+                .ok()
+                .filter(|&i| i < o.entries.len())
+                .unwrap_or(0);
+            o.entries.get(i).copied().unwrap_or(false)
+        };
+        out.timers.push(TimerOut {
+            key: *k,
+            on,
+            start,
+            shown,
+        });
     }
 }

@@ -28,6 +28,9 @@ pub(in crate::production) struct FrameTrace {
     pub(in crate::production) events: Vec<Event>,
     pub(in crate::production) now: TimeUs,
     pub(in crate::production) state_us: i64,
+    /// The program's output cells after the build: callback `k`'s value
+    /// at `2k`, whether it gave one at `2k + 1`, as expressions read them.
+    pub(in crate::production) outs: Vec<i32>,
 }
 
 /// What production did, owned and unreadable outside this module.
@@ -38,6 +41,8 @@ pub struct ProductionRun {
     pub(in crate::production) timer_slots: BTreeMap<u16, usize>,
     /// The program's callbacks.
     pub(in crate::production) callbacks: usize,
+    /// The program's structure ([`skin_model::Skin::program_structure`]).
+    pub(in crate::production) structure: String,
 }
 
 const LIMITS: AtlasLimits = AtlasLimits {
@@ -134,11 +139,13 @@ pub fn record(
             .map_err(|e| format!("build at {}: {e:?}", now.0))?;
         let st = play.state();
         let fields = st.fields.get(..field::COUNT).unwrap_or(st.fields);
+        let outs = st.fields.get(field::COUNT..).unwrap_or_default().to_vec();
         inputs.push(FrameInputs::new(fields, st.timers, state_us));
         frames.push(FrameTrace {
             events: trace::take(),
             now,
             state_us,
+            outs,
         });
         Ok(())
     });
@@ -164,25 +171,30 @@ pub fn record(
             frames,
             timer_slots,
             callbacks: skin.program_callbacks(),
+            structure: skin.program_structure(),
         },
         inputs,
     ))
 }
 
-/// Each node's last record: a later record of a node supersedes an
-/// earlier one.
-fn last_records(r: &Recorded) -> BTreeMap<u32, &skin_beatoraja::lua::replay::Occurrence> {
+/// An occurrence's identity: its destination, consumer, `op` index and
+/// node (s7-06e-1-r1-tables.md, A).
+type Identity = (Option<usize>, &'static str, u32, u32);
+
+/// Each occurrence's last record: a later record supersedes an earlier
+/// one of the same occurrence only.
+fn last_records(r: &Recorded) -> BTreeMap<Identity, &skin_beatoraja::lua::replay::Occurrence> {
     let mut out = BTreeMap::new();
     for o in &r.occurrences {
-        out.insert(o.node, o);
+        out.insert((o.destination, o.field, o.index, o.node), o);
     }
     out
 }
 
 impl ProductionRun {
-    /// The occurrence records production made: what [`crate`] checks the
-    /// reference import against, and only that.
-    pub fn same_import(&self, other: &Recorded) -> bool {
-        self.recorded.occurrences == other.occurrences
+    /// Whether the reference import is production's: the same
+    /// occurrence records and the same program structure.
+    pub fn same_import(&self, other: &Recorded, structure: &str) -> bool {
+        self.recorded.occurrences == other.occurrences && self.structure == structure
     }
 }

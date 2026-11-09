@@ -4,20 +4,30 @@
 //! ```text
 //! # a comment
 //! root <file> <line> writes [<cell>...]
-//! reader <file> <line> <field> replaced|dropped
+//! reader <cell> <file> <line> <field> replaced <reason words...>
+//! reader <cell> <file> <line> <field> dropped
+//! reader <cell> none
 //! ```
 //!
 //! A `root` names a stopped root by its definition and its write set
-//! (empty allowed); each `reader` after it names a reader of one of its
-//! cells and the record its occurrence must carry.
+//! (empty for a root that writes nothing); every cell it writes needs at
+//! least one `reader` line after it: a reader of that cell with the record
+//! its occurrence must carry (a replacement with the reason it must start
+//! with, or its destination dropped), or `none`. That the write set and
+//! the reader lists are complete is the reviewer's, read from the skin's
+//! source: the run checks only what the entry lists.
 
 /// One reader and the record its occurrence must carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reader {
+    pub cell: String,
     pub file: String,
     pub line: u32,
     pub field: String,
+    /// `replaced` or `dropped`.
     pub evidence: String,
+    /// The reason a replacement must start with.
+    pub reason: String,
 }
 
 /// One entry.
@@ -27,13 +37,16 @@ pub struct Entry {
     pub line: u32,
     pub writes: Vec<String>,
     pub readers: Vec<Reader>,
+    /// The cells declared to have no reader.
+    pub unread: Vec<String>,
 }
 
 /// Parses `text`.
 ///
 /// # Errors
 ///
-/// A line that is not a comment, a `root` or a `reader` after a root.
+/// A line that is not a comment, a `root` or a `reader` after a root, or
+/// a reader of a cell its root does not write.
 pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
     let mut out: Vec<Entry> = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -49,17 +62,30 @@ pub fn parse(text: &str) -> Result<Vec<Entry>, String> {
                 line: l.parse().map_err(|_| bad())?,
                 writes: cells.iter().map(|c| (*c).to_owned()).collect(),
                 readers: Vec::new(),
+                unread: Vec::new(),
             }),
-            ["reader", file, l, field, evidence] => {
+            ["reader", cell, "none"] => {
                 let e = out.last_mut().ok_or_else(bad)?;
-                if !matches!(*evidence, "replaced" | "dropped") {
+                if !e.writes.iter().any(|w| w == cell) {
+                    return Err(bad());
+                }
+                e.unread.push((*cell).to_owned());
+            }
+            ["reader", cell, file, l, field, evidence, reason @ ..] => {
+                let e = out.last_mut().ok_or_else(bad)?;
+                if !e.writes.iter().any(|w| w == cell)
+                    || !matches!(*evidence, "replaced" | "dropped")
+                    || (*evidence == "replaced") == reason.is_empty()
+                {
                     return Err(bad());
                 }
                 e.readers.push(Reader {
+                    cell: (*cell).to_owned(),
                     file: (*file).to_owned(),
                     line: l.parse().map_err(|_| bad())?,
                     field: (*field).to_owned(),
                     evidence: (*evidence).to_owned(),
+                    reason: reason.join(" "),
                 });
             }
             _ => return Err(bad()),

@@ -1,10 +1,15 @@
 //! What the reference observed, as plain data the comparator reads.
 
-/// A consumer occurrence: its destination, its field and its callable.
+/// A consumer occurrence: its destination, its consumer (`value`, `op`,
+/// `draw`, `timer`; `nested` for a part of an unmodelled object), its
+/// index (an `op` entry's position in the list; a nested part's ordinal;
+/// 0 otherwise) and its callable. Top-level objects have an empty object
+/// path; nested parts are only listed in e-1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub dest: usize,
     pub field: &'static str,
+    pub index: u32,
     pub callable: u32,
 }
 
@@ -53,9 +58,13 @@ pub enum Point {
         call: u8,
         outcome: Outcome,
     },
+    /// Not invoked for `why`; `by` is the invocation whose result stopped
+    /// it (a function's value or condition), `None` for a property, a
+    /// static selector or a constant.
     NotReached {
         key: Key,
         why: Cause,
+        by: Option<Key>,
     },
 }
 
@@ -67,6 +76,9 @@ pub struct TimerOut {
     pub on: bool,
     /// The second invocation's `tolong()`.
     pub start: Option<i64>,
+    /// Whether the object's selected source is available, so it draws
+    /// once its region does (`SkinImage.java:133-139`).
+    pub shown: bool,
 }
 
 /// One frame.
@@ -89,7 +101,8 @@ pub struct Listed {
 #[derive(Clone, Debug, Default)]
 pub struct Observed {
     pub frames: Vec<RefFrame>,
-    /// Objects of kinds the reference does not model.
+    /// Objects of kinds the reference does not model, their nested parts'
+    /// callables included.
     pub unmodelled: Vec<Listed>,
     /// Objects the source removes at installation.
     pub removed: Vec<Listed>,

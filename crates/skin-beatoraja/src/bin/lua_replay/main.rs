@@ -21,6 +21,7 @@
 //! `--local`. The exit status is 1 when any skin disagrees, 2 on a usage
 //! error or when the two imports differ.
 
+mod hints;
 mod inputs;
 mod isolation;
 mod observed;
@@ -43,7 +44,7 @@ use crate::script::Script;
 const USAGE: &str = "usage: lua_replay [--autoplay on|off] \
      [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>] \
      [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed] \
-     [--perturb <id>=<delta>]... [--isolation <file>] [--local] <root> <entry> [<root> <entry>]...";
+     [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
 
 /// What the flags ask for.
 #[derive(Debug)]
@@ -55,6 +56,8 @@ pub struct Options {
     pub perturb: Vec<(i32, i32)>,
     pub isolation: Vec<isolation::Entry>,
     pub local: bool,
+    /// Every finding printed, not only the first [`report::SHOWN`].
+    pub all: bool,
 }
 
 /// The options the flags at the front of `args` give, and the arguments
@@ -68,6 +71,7 @@ fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
         perturb: Vec::new(),
         isolation: Vec::new(),
         local: false,
+        all: false,
     };
     loop {
         match args {
@@ -81,6 +85,10 @@ fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
             }
             [flag, rest @ ..] if flag == "--local" => {
                 o.local = true;
+                args = rest;
+            }
+            [flag, rest @ ..] if flag == "--all" => {
+                o.all = true;
                 args = rest;
             }
             [flag, v, rest @ ..] if flag == "--script" => {
@@ -162,15 +170,18 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
     };
     let (prod, inputs) = production::record(&skin, recorded, &o.script, level).map_err(fail)?;
     let (out, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
-    out.map_err(|e| fail(format!("reference import: {e}")))?;
+    let structure = match out.map_err(|e| fail(format!("reference import: {e}")))? {
+        LuaOutcome::Imported(i) => i.imported.skin.program_structure(),
+        LuaOutcome::Pending(p) => return Err(fail(format!("pending {:?}", p.pending))),
+    };
     let vm = vm.ok_or_else(|| fail("the reference kept no VM".into()))?;
-    if !prod.same_import(&rec) {
+    if !prod.same_import(&rec, &structure) {
         return Err(Stop::Differs);
     }
     for &(id, d) in &o.perturb {
         vm.perturb(id, d);
     }
-    let mut observed = reference::Reference::new(&vm, &rec.items).run(&inputs);
+    let mut observed = reference::Reference::new(&vm, &rec.items, &rec.sources).run(&inputs);
     observed.root = root.to_path_buf();
     Ok(production::compare::compare(&prod, &observed, &o.isolation))
 }
@@ -190,7 +201,7 @@ fn main() {
         let [root, entry] = pair else { continue };
         match replay(Path::new(root), entry, &o) {
             Ok(r) => {
-                print!("{}", r.text(i, o.local));
+                print!("{}", r.text(i, o.local, o.all));
                 if !r.passes() {
                     status = status.max(1);
                 }

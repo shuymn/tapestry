@@ -56,7 +56,8 @@ impl Report {
     }
 
     /// The report as text; file names only under `local`.
-    pub fn text(&self, index: usize, local: bool) -> String {
+    /// Every finding under `all`, else the first [`SHOWN`].
+    pub fn text(&self, index: usize, local: bool, all: bool) -> String {
         let site = |s: &(String, u32)| {
             if local {
                 format!("{}:{}", short(&s.0), s.1)
@@ -119,7 +120,8 @@ impl Report {
             );
         }
         let _ = writeln!(o, "findings {}", self.findings.len());
-        for f in self.findings.iter().take(200) {
+        let shown = if all { usize::MAX } else { SHOWN };
+        for f in self.findings.iter().take(shown) {
             let _ = writeln!(
                 o,
                 "finding destination {} {} {} frame {}: {}",
@@ -130,6 +132,13 @@ impl Report {
                 f.what
             );
         }
+        if self.findings.len() > shown {
+            let _ = writeln!(
+                o,
+                "... {} more findings not printed (--all prints every one)",
+                self.findings.len() - shown
+            );
+        }
         let _ = writeln!(
             o,
             "result {}",
@@ -138,6 +147,9 @@ impl Report {
         o
     }
 }
+
+/// The findings a report prints without `--all`.
+pub const SHOWN: usize = 200;
 
 /// A chunk name without its directories.
 fn short(s: &str) -> &str {

@@ -23,7 +23,7 @@ pub(crate) mod ops;
 mod policy;
 mod property;
 #[cfg(feature = "dev-tools")]
-pub(crate) use property::{IndexProp, IntProp, index_in, int_in, judge_count};
+pub(crate) use property::{IndexProp, IntProp, index_in, int_in, int_named, judge_count};
 mod report;
 pub(crate) mod result;
 pub(crate) mod selection;
@@ -272,6 +272,8 @@ pub fn import(
     }
     #[cfg(feature = "dev-tools")]
     ledger.publish(&mut cx);
+    #[cfg(feature = "dev-tools")]
+    cx.record_unreached_sources();
     cx.finish(files)
 }
 
@@ -1866,6 +1868,44 @@ impl<'d> Cx<'d> {
             self.sources = Some(object::index(self.def, &recs, true)?);
         }
         Ok(src.and_then(|s| self.sources.as_ref().and_then(|m| m.get(s)).copied()))
+    }
+
+    /// Records what the source's loader would find of each source no
+    /// element reached (dev-tools, the reference's facts): a movie by its
+    /// extension, else whether its file exists, read through the root as
+    /// admission reads it; a glob is unknown.
+    #[cfg(feature = "dev-tools")]
+    fn record_unreached_sources(&mut self) {
+        use crate::lua::replay::{SourceFact, has_source, is_recording, record_source};
+        if !is_recording() {
+            return;
+        }
+        for rec in object::records(&self.tables, "source").to_vec() {
+            let [id] = self.def.fields(rec, ["id"]);
+            let Ok(Some(id)) = self.opt_string(id, "id") else {
+                continue;
+            };
+            if has_source(&id) {
+                continue;
+            }
+            let fact = match self.source_path(rec) {
+                Ok(Some(path)) if asset::is_movie(&path) => SourceFact::Movie,
+                Ok(Some(path)) => match self.choices.substitute(&path) {
+                    asset::Path::File(p) => {
+                        let name = asset::resolve(&self.entry_dir, &p);
+                        if self.def.root().read(&name, u64::MAX).is_ok() {
+                            SourceFact::Loaded
+                        } else {
+                            SourceFact::Missing
+                        }
+                    }
+                    asset::Path::Missing => SourceFact::Missing,
+                    asset::Path::Glob => SourceFact::Unknown,
+                },
+                _ => SourceFact::Missing,
+            };
+            record_source(&id, fact);
+        }
     }
 
     /// Source record `rec`'s `path`.

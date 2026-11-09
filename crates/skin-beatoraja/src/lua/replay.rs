@@ -45,6 +45,9 @@ pub struct Occurrence {
     pub destination: Option<usize>,
     /// The field holding it (`value`, `draw`, `op`, `timer`, …).
     pub field: &'static str,
+    /// Its position in the destination's `op` list for an `op` entry, 0
+    /// otherwise.
+    pub index: u32,
     /// The callable conversion gave the function.
     pub callable: u32,
     /// `lowered`, `compiled`, `replaced`, `runtime`, `refused`.
@@ -71,6 +74,58 @@ pub struct Recorded {
     pub destinations: Vec<DestinationEntry>,
     /// The declared option items, each by its op, whether selected.
     pub items: BTreeMap<i32, bool>,
+    /// What production's admission found of each source it reached, by
+    /// source id: immutable for the import (s7-06e-design.md §3.8).
+    pub sources: BTreeMap<String, SourceFact>,
+}
+
+/// What production's admission found of a source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceFact {
+    /// Its file loads.
+    Loaded,
+    /// Its file is missing or does not decode.
+    Missing,
+    /// A movie (by its extension).
+    Movie,
+    /// Refused by this importer before it was read (a glob).
+    Unknown,
+}
+
+/// Whether this thread's import is recording.
+pub(crate) fn is_recording() -> bool {
+    RECORDING.with(Cell::get)
+}
+
+/// Whether a fact of source `src` is recorded.
+pub(crate) fn has_source(src: &str) -> bool {
+    LAST.with(|l| l.borrow().sources.contains_key(src))
+}
+
+/// Records what admission found of source `src`, when recording; a later
+/// fact of a source keeps an earlier `Loaded`.
+pub(crate) fn record_source(src: &str, fact: SourceFact) {
+    if RECORDING.with(Cell::get) {
+        LAST.with(|l| {
+            let mut l = l.borrow_mut();
+            let e = l.sources.entry(src.to_owned()).or_insert(fact);
+            if *e != SourceFact::Loaded {
+                *e = fact;
+            }
+        });
+    }
+}
+
+/// Node `node`'s position in destination `dest`'s `op` list under the
+/// converted table's root `top`.
+fn op_index(arena: &Arena, top: u32, dest: usize, node: u32) -> Option<u32> {
+    let list = arena.last_member(top, "destination")?;
+    let d = arena.children(list).nth(dest)?;
+    let ops = arena.last_member(d, "op")?;
+    arena
+        .children(ops)
+        .position(|n| n == node)
+        .and_then(|i| u32::try_from(i).ok())
 }
 
 thread_local! {
@@ -92,8 +147,9 @@ pub(super) fn stash(kept: Kept) {
     KEPT.with(|k| *k.borrow_mut() = Some(kept));
 }
 
-/// Records the occurrences of `an` over `arena`, when recording.
-pub(super) fn record(arena: &Arena, an: &Analysis) {
+/// Records the occurrences of `an` over `arena`, whose root is `top`,
+/// when recording.
+pub(super) fn record(arena: &Arena, top: u32, an: &Analysis) {
     if !RECORDING.with(Cell::get) {
         return;
     }
@@ -104,10 +160,16 @@ pub(super) fn record(arena: &Arena, an: &Analysis) {
         .iter()
         .map(|c| {
             let at = arena.loc(c.node);
+            let destination = c.element.as_ref().map(|e| e.index);
+            let index = match (c.field, destination) {
+                ("op", Some(d)) => op_index(arena, top, d, c.node).unwrap_or(u32::MAX),
+                _ => 0,
+            };
             Occurrence {
                 node: c.node,
-                destination: c.element.as_ref().map(|e| e.index),
+                destination,
                 field: c.field,
+                index,
                 callable: callable.get(&c.node).copied().unwrap_or(u32::MAX),
                 disposition: label(&c.disposition),
                 reason: c.why.as_ref().map(super::survey::unsupported),
@@ -345,25 +407,45 @@ impl ReferenceVm {
         }
     }
 
-    /// Integer property `id` (a number's `ref` or value id) on the frame:
-    /// `None` when the mapping has no value for it, `Some(None)` while it
-    /// is unavailable.
+    /// Integer property `id` (a number's `ref`, or a numeric `value`) on
+    /// the frame.
     #[must_use]
-    pub fn number_property(&self, id: i32) -> Option<Option<i32>> {
-        let IntProp::Shown(v) = int_in(ScreenKind::Play, id) else {
-            return None;
+    pub fn number_property(&self, id: i32) -> PropValue {
+        self.int_prop(int_in(ScreenKind::Play, id), Some(id))
+    }
+
+    /// Integer property `name` (a named `value`): the factory's id for
+    /// it, else its name; `None` when the factory knows neither, so the
+    /// source runs the string as a script.
+    #[must_use]
+    pub fn named_number_property(&self, name: &str) -> Option<PropValue> {
+        let p = crate::import::int_named(ScreenKind::Play, name)?;
+        Some(self.int_prop(p.0, p.1))
+    }
+
+    fn int_prop(&self, p: IntProp, id: Option<i32>) -> PropValue {
+        let IntProp::Shown(v) = p else {
+            return match p {
+                IntProp::Null => PropValue::Null,
+                _ => PropValue::Unsupported,
+            };
         };
         let mut g = self.pass.replay.borrow_mut();
-        let f = g.as_mut()?;
-        let delta = f.perturb.get(&id).copied().unwrap_or(0);
-        match f.guarded(v.availability(), v.expr())? {
-            Ok(n) => Some(Some(n.saturating_add(delta))),
-            Err(()) => Some(None),
+        let Some(f) = g.as_mut() else {
+            return PropValue::Unsupported;
+        };
+        let delta = id.and_then(|i| f.perturb.get(&i)).copied().unwrap_or(0);
+        match f.guarded(v.availability(), v.expr()) {
+            Some(Ok(n)) => PropValue::Value(n.saturating_add(delta)),
+            Some(Err(())) => PropValue::Unavailable,
+            None => PropValue::Unsupported,
         }
     }
 
     /// Image-index property `id` (an image group's or an image set's
-    /// `ref`) on the frame: `None` when the mapping has no value for it.
+    /// `ref`) on the frame: `None` when the mapping has no value for it;
+    /// a property the factory does not know selects 0, as the source's
+    /// null `ref` does (`SkinImage.java:123-125`).
     #[must_use]
     pub fn index_property(&self, id: i32) -> Option<i32> {
         let p = index_in(ScreenKind::Play, id);
@@ -402,6 +484,13 @@ impl ReferenceVm {
         }
     }
 
+    /// The id of boolean property `name` (leading `!`s ignored), when the
+    /// factory names one: its static class is that id's.
+    #[must_use]
+    pub fn condition_id(name: &str) -> Option<i32> {
+        ops::named_id(name.trim_start_matches('!'))
+    }
+
     /// Whether numeric op `op` (either sign) names a built-in boolean
     /// property: otherwise it is an option of the destination.
     #[must_use]
@@ -415,6 +504,18 @@ impl ReferenceVm {
     pub fn is_static(op: i32) -> bool {
         i32::try_from(op.unsigned_abs()).is_ok_and(|id| STATIC_IN_PLAY.binary_search(&id).is_ok())
     }
+}
+
+/// An integer property's value on a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropValue {
+    /// The factory returns null for it.
+    Null,
+    /// The model has no value for it.
+    Unsupported,
+    /// Its availability guard is false.
+    Unavailable,
+    Value(i32),
 }
 
 /// The wall time one reference invocation may take.

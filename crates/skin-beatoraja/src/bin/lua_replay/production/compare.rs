@@ -14,7 +14,7 @@ use skin_model::present::{Fail, Val};
 
 use super::{ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
-use crate::observed::{Key, Observed, Outcome, Point, Raw};
+use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw};
 use crate::report::{Finding, Report, Stopped};
 
 /// LuaJ's `toint()` of a value (`SkinLuaAccessor.java:640-651`): the
@@ -126,9 +126,7 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
 }
 
 /// A hint naming the operators of callable `c`'s source where Lua 5.4
-/// and LuaJ differ (`/`, `%`, `//`, a unary minus), folded ones included,
-/// read from its lines: a candidate cause, settled against the LuaJ table
-/// by the developer.
+/// and LuaJ differ, from its tokens (strings and comments skipped).
 fn luaj_hint(obs: &Observed, c: u32) -> String {
     let Some((file, first)) = obs.sites.get(&c) else {
         return String::new();
@@ -137,29 +135,12 @@ fn luaj_hint(obs: &Observed, c: u32) -> String {
     let Ok(text) = std::fs::read_to_string(obs.root.join(file.trim_start_matches('@'))) else {
         return String::new();
     };
-    let lines: Vec<&str> = text
+    let body: Vec<&str> = text
         .lines()
         .skip(usize::try_from(first.saturating_sub(1)).unwrap_or(0))
         .take(usize::try_from(last - first + 1).unwrap_or(0))
-        .map(|l| l.split("--").next().unwrap_or(""))
         .collect();
-    let body = lines.join(
-        "
-",
-    );
-    let mut ops = Vec::new();
-    if body.contains("//") {
-        ops.push("//");
-    }
-    if body.replace("//", "").contains('/') {
-        ops.push("/");
-    }
-    if body.contains('%') {
-        ops.push("%");
-    }
-    if body.contains("(-") || body.contains("= -") || body.contains("return -") {
-        ops.push("unary -");
-    }
+    let ops = crate::hints::operators(&body.join("\n"));
     if ops.is_empty() {
         String::new()
     } else {
@@ -167,15 +148,29 @@ fn luaj_hint(obs: &Observed, c: u32) -> String {
     }
 }
 
+/// An occurrence's identity as the comparator joins on it.
+type Join = (usize, &'static str, u32, u32);
+
+fn join(k: &Key) -> Join {
+    (k.dest, k.field, k.index, k.callable)
+}
+
 /// Production's records, by occurrence.
 struct Cx<'a> {
-    by_key: BTreeMap<(usize, &'static str, u32), &'a Occurrence>,
+    by_key: BTreeMap<Join, &'a Occurrence>,
     run: &'a ProductionRun,
 }
 
 impl<'a> Cx<'a> {
     fn rec(&self, k: &Key) -> Option<&'a Occurrence> {
-        self.by_key.get(&(k.dest, k.field, k.callable)).copied()
+        self.by_key.get(&join(k)).copied()
+    }
+
+    /// Its program callback, when it is compiled.
+    fn compiled(&self, k: &Key) -> Option<u16> {
+        self.rec(k)
+            .filter(|o| o.disposition == "compiled")
+            .and_then(|o| o.program)
     }
 
     /// Why production did not run an occurrence the source ran: its own
@@ -210,13 +205,17 @@ impl<'a> Cx<'a> {
 /// installed.
 type TimerTrace = (bool, Option<i64>, Option<i64>, Option<bms_model::TimeUs>);
 
-/// One frame's production events, by callback.
+/// One invocation's raw result and its conversion.
+type Invocation = (Result<Val, Fail>, Converted);
+
+/// One frame's production events, by callback, every one kept.
 #[derive(Default)]
 struct ByK {
-    ran: BTreeMap<(u16, u8), (Result<Val, Fail>, Converted)>,
-    order: Vec<u16>,
-    timer: BTreeMap<u16, TimerTrace>,
-    skipped: BTreeMap<u16, Skip>,
+    ran: BTreeMap<(u16, u8), Vec<Invocation>>,
+    /// Every invocation in order.
+    order: Vec<(u16, u8)>,
+    timer: BTreeMap<u16, Vec<TimerTrace>>,
+    skipped: BTreeMap<u16, Vec<Skip>>,
     sampled: BTreeMap<usize, Vec<i64>>,
 }
 
@@ -230,10 +229,8 @@ fn by_k(events: &[Event]) -> ByK {
                 result,
                 conv,
             } => {
-                if call == 1 {
-                    b.order.push(k);
-                }
-                b.ran.insert((k, call), (result, conv));
+                b.order.push((k, call));
+                b.ran.entry((k, call)).or_default().push((result, conv));
             }
             Event::Timer {
                 k,
@@ -241,16 +238,41 @@ fn by_k(events: &[Event]) -> ByK {
                 start,
                 elapsed_ms,
                 installed,
-            } => {
-                b.timer.insert(k, (on, start, elapsed_ms, installed));
-            }
-            Event::Skipped { k, why } => {
-                b.skipped.insert(k, why);
-            }
+            } => b
+                .timer
+                .entry(k)
+                .or_default()
+                .push((on, start, elapsed_ms, installed)),
+            Event::Skipped { k, why } => b.skipped.entry(k).or_default().push(why),
             Event::Sampled { slot, age_us } => b.sampled.entry(slot).or_default().push(age_us),
         }
     }
     b
+}
+
+/// The skip causes production may give for a source's `NotReached` of
+/// `why`, stopped by `by` (s7-06e-1-r1-tables.md, A): through a compiled
+/// callback, the callback it follows (`After`); through an expression or
+/// a property, its gate. A negative selector has no production gate
+/// (§7.1): any skip is accepted, a production invocation there is the
+/// finding. `None` for a cause no skip may answer.
+fn allowed(why: Cause, by_compiled: Option<bool>) -> Option<&'static [Skip]> {
+    match (why, by_compiled) {
+        (Cause::Inconclusive, _) => None,
+        (Cause::Selector, _) => Some(&[Skip::Gate, Skip::After]),
+        (_, Some(true)) => Some(&[Skip::After]),
+        (_, _) => Some(&[Skip::Gate]),
+    }
+}
+
+/// What a consumer's output cells hold after the source's invocation:
+/// (value, given) as `Present::run` writes them.
+fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
+    match converted(field, o) {
+        Some(Converted::Bool(b)) => (i32::from(b), i32::from(o != Outcome::Unavailable)),
+        Some(Converted::Int(n, ok)) => (n, i32::from(ok)),
+        _ => (0, 0),
+    }
 }
 
 /// Compares `run` with `obs` under the isolation entries `iso`.
@@ -266,32 +288,34 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         ..Report::default()
     };
     let records = last_records(&run.recorded);
-    let mut by_key: BTreeMap<(usize, &'static str, u32), &Occurrence> = BTreeMap::new();
+    let mut by_key: BTreeMap<Join, &Occurrence> = BTreeMap::new();
+    let mut key_of: BTreeMap<u16, Key> = BTreeMap::new();
     for o in records.values() {
-        if let Some(d) = o.destination {
-            by_key.insert((d, o.field, o.callable), o);
+        if let Some(dest) = o.destination {
+            let key = Key {
+                dest,
+                field: o.field,
+                index: o.index,
+                callable: o.callable,
+            };
+            by_key.insert(join(&key), o);
+            if let (Some(k), "compiled") = (o.program, o.disposition) {
+                key_of.insert(k, key);
+            }
         }
     }
     let cx = Cx { by_key, run };
-    let rec = |k: &Key| cx.rec(k);
-    let mut key_of: BTreeMap<u16, Key> = BTreeMap::new();
-    for o in records.values() {
-        if let (Some(k), Some(dest)) = (o.program, o.destination) {
-            key_of.insert(
-                k,
-                Key {
-                    dest,
-                    field: o.field,
-                    callable: o.callable,
-                },
-            );
-        }
-    }
     let site = |k: &Key| obs.sites.get(&k.callable).cloned().unwrap_or_default();
     for (k, key) in &key_of {
         rep.compiled.push((*k, *key, site(key)));
     }
-    let attribute = |key: &Key| cx.attribute(key);
+    let unknown = Key {
+        dest: usize::MAX,
+        field: "?",
+        index: 0,
+        callable: u32::MAX,
+    };
+    let key_k = |k: u16| key_of.get(&k).copied().unwrap_or(unknown);
     let mut findings: Vec<Finding> = Vec::new();
     let mut find = |key: Key, frame: usize, what: String| {
         findings.push(Finding {
@@ -301,52 +325,123 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             what,
         });
     };
+    if run.frames.len() != obs.frames.len() {
+        find(
+            unknown,
+            0,
+            format!(
+                "frame count: production {}, reference {}",
+                run.frames.len(),
+                obs.frames.len()
+            ),
+        );
+    }
+    // A compiled callback on an object the reference does not run: one
+    // finding for the run, its frames not reported again.
+    let mut listed_k: BTreeSet<u16> = BTreeSet::new();
+    for (label, list) in [
+        ("unmodelled", &obs.unmodelled),
+        ("unresolved", &obs.unresolved),
+    ] {
+        for l in list {
+            for key in &l.callables {
+                match cx.rec(key).map(|o| o.disposition) {
+                    Some("compiled") => {
+                        if let Some(k) = cx.compiled(key) {
+                            listed_k.insert(k);
+                        }
+                        find(
+                            *key,
+                            0,
+                            format!("compiled on a {label} object ({})", l.what),
+                        );
+                    }
+                    Some("lowered") => {
+                        *rep.buckets
+                            .entry(format!("lowered on a {label} object (e-3)"))
+                            .or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     let mut stopped: BTreeMap<u32, (&'static str, usize, Key)> = BTreeMap::new();
+    let callbacks = u16::try_from(run.callbacks).unwrap_or(u16::MAX);
     for (i, (pf, rf)) in run.frames.iter().zip(&obs.frames).enumerate() {
         let p = by_k(&pf.events);
-        rep.production_runs += p.ran.len();
+        rep.production_runs += p.order.len();
+        // Cardinality: one of each (k, call), one skip, one timer at most.
+        for (&(k, call), v) in &p.ran {
+            if v.len() > 1 {
+                find(
+                    key_k(k),
+                    i,
+                    format!("duplicate invocation {k} call {call} ({}x)", v.len()),
+                );
+            }
+        }
+        for (&k, v) in &p.skipped {
+            if v.len() > 1 || p.ran.contains_key(&(k, 1)) {
+                find(
+                    key_k(k),
+                    i,
+                    format!("callback {k} skipped {}x and ran", v.len()),
+                );
+            }
+        }
+        for (&k, v) in &p.timer {
+            if v.len() > 1 {
+                find(key_k(k), i, format!("timer {k} traced {}x", v.len()));
+            }
+        }
         let mut used: BTreeSet<(u16, u8)> = BTreeSet::new();
-        let mut order: Vec<u16> = Vec::new();
+        let mut seen: BTreeSet<u16> = BTreeSet::new();
+        let mut order: Vec<(u16, u8)> = Vec::new();
+        let mut outs: BTreeMap<u16, (i32, i32)> = BTreeMap::new();
         for pt in &rf.points {
             rep.points += 1;
             match *pt {
                 Point::Ran { key, call, outcome } => {
-                    let k = rec(&key)
-                        .and_then(|o| o.program)
-                        .filter(|_| rec(&key).is_some_and(|o| o.disposition == "compiled"));
+                    let k = cx.compiled(&key);
                     let api = match outcome {
                         Outcome::Unanswered(a) => Some(a),
                         Outcome::Budget => Some("budget"),
                         _ => None,
                     };
-                    if let Some(api) = api {
-                        if k.is_some() {
-                            find(key, i, format!("reference could not complete ({api})"));
-                            continue;
-                        }
-                        let e = stopped.entry(key.callable).or_insert((api, 0, key));
-                        e.1 += 1;
+                    if let Some(api) = api
+                        && k.is_none()
+                    {
+                        stopped.entry(key.callable).or_insert((api, 0, key)).1 += 1;
                     }
                     let Some(k) = k else {
-                        match attribute(&key) {
+                        match cx.attribute(&key) {
                             Some(b) => *rep.buckets.entry(b).or_default() += 1,
                             None => find(key, i, "no production record of this occurrence".into()),
                         }
                         continue;
                     };
-                    if call == 1 {
-                        order.push(k);
-                    }
+                    seen.insert(k);
+                    order.push((k, call));
                     rep.matched += 1;
-                    let Some(&prod) = p.ran.get(&(k, call)) else {
+                    if let Some(api) = api {
+                        find(key, i, format!("reference could not complete ({api})"));
+                        used.insert((k, call));
+                        continue;
+                    }
+                    if call == 1 && key.field != "timer" {
+                        outs.insert(k, expected_out(key.field, outcome));
+                    }
+                    let Some(prod) = p.ran.get(&(k, call)).and_then(|v| v.first()).copied() else {
                         let why = p
                             .skipped
                             .get(&k)
+                            .and_then(|v| v.first())
                             .map_or("not traced".into(), |s| format!("{s:?}"));
                         find(
                             key,
                             i,
-                            format!("ran in the source, skipped in production ({why})"),
+                            format!("ran in the source, not in production ({why})"),
                         );
                         continue;
                     };
@@ -359,14 +454,13 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         }
                     }
                 }
-                Point::NotReached { key, why } => {
-                    let Some(k) = rec(&key)
-                        .filter(|o| o.disposition == "compiled")
-                        .and_then(|o| o.program)
-                    else {
+                Point::NotReached { key, why, by } => {
+                    let Some(k) = cx.compiled(&key) else {
                         continue;
                     };
+                    seen.insert(k);
                     rep.matched += 1;
+                    outs.insert(k, (0, 0));
                     if p.ran.contains_key(&(k, 1)) {
                         used.insert((k, 1));
                         used.insert((k, 2));
@@ -375,83 +469,111 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                             i,
                             format!("invoked in production, not in the source ({why:?})"),
                         );
-                    } else if p.skipped.get(&k) == Some(&Skip::SlotsOff) {
-                        find(key, i, "slots off on a fresh attempt".into());
-                    } else {
-                        rep.agreed += 1;
+                        continue;
+                    }
+                    let skip = p.skipped.get(&k).and_then(|v| v.first()).copied();
+                    let by_compiled = by.map(|b| cx.compiled(&b).is_some());
+                    match (skip, allowed(why, by_compiled)) {
+                        (None, _) => find(key, i, format!("no skip traced ({why:?})")),
+                        (Some(_), None) => {
+                            find(key, i, format!("reference could not decide ({why:?})"))
+                        }
+                        (Some(s), Some(ok)) if ok.contains(&s) => rep.agreed += 1,
+                        (Some(s), Some(ok)) => find(
+                            key,
+                            i,
+                            format!(
+                                "skip cause: production {s:?}, source {why:?} (expects {ok:?})"
+                            ),
+                        ),
                     }
                 }
             }
         }
-        // The order among program callbacks.
-        let prod_order: Vec<u16> = p
+        // Every compiled callback has a source point this frame, or its
+        // object is listed (one finding above).
+        for k in 0..callbacks {
+            if !seen.contains(&k) && !listed_k.contains(&k) {
+                find(
+                    key_k(k),
+                    i,
+                    format!("compiled callback {k} with no source point"),
+                );
+            }
+        }
+        // The full order of invocations: both calls.
+        let prod_order: Vec<(u16, u8)> = p
             .order
             .iter()
             .copied()
-            .filter(|k| order.contains(k))
+            .filter(|(k, _)| seen.contains(k))
             .collect();
-        if prod_order != order
-            && let Some(key) = order.first().and_then(|k| key_of.get(k))
-        {
+        if prod_order != order {
+            let key = order.first().map_or(unknown, |&(k, _)| key_k(k));
             find(
-                *key,
+                key,
                 i,
                 format!("order: production {prod_order:?}, source {order:?}"),
             );
         }
-        // Production invocations with no source point.
+        // Production invocations and skips with no source point.
         for &(k, call) in p.ran.keys() {
-            if !used.contains(&(k, call)) {
-                let key = key_of.get(&k).copied().unwrap_or(Key {
-                    dest: usize::MAX,
-                    field: "?",
-                    callable: u32::MAX,
-                });
+            if !used.contains(&(k, call)) && !listed_k.contains(&k) {
                 find(
-                    key,
+                    key_k(k),
                     i,
                     format!("production invocation {k} call {call} with no source point"),
                 );
             }
         }
+        for &k in p.skipped.keys() {
+            if !seen.contains(&k) && !listed_k.contains(&k) {
+                find(
+                    key_k(k),
+                    i,
+                    format!("production skip of {k} with no source point"),
+                );
+            }
+        }
         // Timers: start, elapsed, installed start, sampled age.
         for t in &rf.timers {
-            let Some(k) = rec(&t.key)
-                .filter(|o| o.disposition == "compiled")
-                .and_then(|o| o.program)
-            else {
+            let Some(k) = cx.compiled(&t.key) else {
                 continue;
             };
             let elapsed = t
                 .start
                 .map(|s| (pf.state_us / 1_000).saturating_sub(s / 1_000));
-            let drawn = t.on && elapsed.is_some_and(|e| e >= 0);
+            let installed_ok = t.on && elapsed.is_some_and(|e| e >= 0);
             let cap = i64::from(MAX_ELAPSED_MS);
-            let installed = elapsed.filter(|_| drawn).map(|e| {
+            let installed = elapsed.filter(|_| installed_ok).map(|e| {
                 bms_model::TimeUs(pf.now.0.saturating_sub(e.min(cap).saturating_mul(1_000)))
             });
+            outs.insert(k, (i32::from(t.on), 1));
             let want = (
                 t.on,
                 t.start.filter(|_| t.on),
                 elapsed.filter(|_| t.on),
                 installed,
             );
-            match p.timer.get(&k) {
+            match p.timer.get(&k).and_then(|v| v.first()) {
                 None => find(t.key, i, "timer not traced in production".into()),
-                Some(&got) if got != want => find(
-                    t.key,
-                    i,
-                    format!("timer: production {got:?}, reference {want:?}"),
-                ),
+                Some(&got) if got != want => {
+                    find(
+                        t.key,
+                        i,
+                        format!("timer: production {got:?}, reference {want:?}"),
+                    );
+                }
                 Some(_) => {}
             }
-            let slot = run.timer_slots.get(&k).copied();
-            let ages = slot
-                .and_then(|s| p.sampled.get(&s))
+            let ages = run
+                .timer_slots
+                .get(&k)
+                .and_then(|s| p.sampled.get(s))
                 .cloned()
                 .unwrap_or_default();
-            match (drawn, elapsed) {
-                (true, Some(e)) => {
+            match elapsed.filter(|_| installed_ok && t.shown) {
+                Some(e) => {
                     let age = e.min(cap).saturating_mul(1_000);
                     if ages.is_empty() {
                         find(t.key, i, "no sampled age where the source draws".into());
@@ -459,50 +581,36 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         find(t.key, i, format!("sampled ages {ages:?}, source {age}"));
                     }
                 }
-                _ => {
-                    if !ages.is_empty() {
-                        find(
-                            t.key,
-                            i,
-                            format!("sampled {ages:?} where the source draws nothing"),
-                        );
-                    }
+                None if !ages.is_empty() => {
+                    find(
+                        t.key,
+                        i,
+                        format!("sampled {ages:?} where the source draws nothing"),
+                    );
                 }
+                None => {}
             }
         }
-    }
-    // An object the reference did not run: a compiled callable on one of
-    // a kind it does not model, or whose id or installation it cannot
-    // resolve, cannot be compared, so it is a finding; a lowered one waits
-    // for e-3 and is counted. An object the source removes at
-    // installation invokes nothing, which the unmatched production
-    // invocations above already find.
-    for (label, list) in [
-        ("unmodelled", &obs.unmodelled),
-        ("unresolved", &obs.unresolved),
-    ] {
-        for l in list {
-            for key in &l.callables {
-                match rec(key).map(|o| o.disposition) {
-                    Some("compiled") => find(
-                        *key,
-                        0,
-                        format!("compiled on a {label} object ({})", l.what),
-                    ),
-                    Some("lowered") => {
-                        *rep.buckets
-                            .entry(format!("lowered on a {label} object"))
-                            .or_default() += 1;
-                    }
-                    _ => {}
-                }
+        // The output cells expressions read.
+        for (&k, &(v, ok)) in &outs {
+            let at = usize::from(k) * 2;
+            let got = (
+                pf.outs.get(at).copied().unwrap_or(i32::MIN),
+                pf.outs.get(at + 1).copied().unwrap_or(i32::MIN),
+            );
+            if got != (v, ok) {
+                find(
+                    key_k(k),
+                    i,
+                    format!("output: production {got:?}, source {:?}", (v, ok)),
+                );
             }
         }
     }
     // Stopped roots and their isolation entries.
     for (callable, (api, count, key)) in stopped {
         let s = obs.sites.get(&callable).cloned().unwrap_or_default();
-        let disposition = attribute(&key).unwrap_or_else(|| "compiled".into());
+        let disposition = cx.attribute(&key).unwrap_or_else(|| "compiled".into());
         let covered = cover(&s, iso, obs, &cx);
         rep.stopped.push(Stopped {
             site: s,
@@ -517,24 +625,36 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
 }
 
 /// Whether an isolation entry covers the root defined at `s`: it names
-/// the root, and each reader it lists carries its evidence.
+/// the root; every cell it writes has a reader line or `none`; and each
+/// listed reader's occurrences carry its disposition and reason, none of
+/// them compiled or lowered (s7-06e-1-r1-tables.md, A).
 fn cover(s: &(String, u32), iso: &[Entry], obs: &Observed, cx: &Cx<'_>) -> Result<(), String> {
-    let rec = |k: &Key| cx.rec(k);
-    let attribute = |k: &Key| cx.attribute(k);
     let Some(e) = iso
         .iter()
         .find(|e| e.line == s.1 && same_file(&s.0, &e.file))
     else {
         return Err("no entry".into());
     };
+    for cell in &e.writes {
+        if !e.readers.iter().any(|r| &r.cell == cell) && !e.unread.contains(cell) {
+            return Err(format!("cell {cell} has no reviewed readers"));
+        }
+    }
     for r in &e.readers {
-        let keys: Vec<Key> = obs
+        let keys: BTreeSet<Key> = obs
             .frames
             .iter()
             .flat_map(|f| f.points.iter())
             .map(|p| match p {
                 Point::Ran { key, .. } | Point::NotReached { key, .. } => *key,
             })
+            .chain(
+                obs.unmodelled
+                    .iter()
+                    .chain(&obs.removed)
+                    .chain(&obs.unresolved)
+                    .flat_map(|l| l.callables.iter().copied()),
+            )
             .filter(|k| {
                 k.field == r.field
                     && obs
@@ -542,24 +662,19 @@ fn cover(s: &(String, u32), iso: &[Entry], obs: &Observed, cx: &Cx<'_>) -> Resul
                         .get(&k.callable)
                         .is_some_and(|(f, l)| *l == r.line && same_file(f, &r.file))
             })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect();
         if keys.is_empty() {
-            return Err(format!("reader {}:{} not scheduled", r.file, r.line));
+            return Err(format!("reader {}:{} not found", r.file, r.line));
         }
         for k in keys {
-            if rec(&k).is_some_and(|o| matches!(o.disposition, "compiled" | "lowered")) {
-                return Err(format!(
-                    "reader {}:{} is {}",
-                    r.file,
-                    r.line,
-                    rec(&k).map_or("", |o| o.disposition)
-                ));
+            if let Some(o) = cx.rec(&k)
+                && matches!(o.disposition, "compiled" | "lowered")
+            {
+                return Err(format!("reader {}:{} is {}", r.file, r.line, o.disposition));
             }
-            let got = attribute(&k).unwrap_or_default();
+            let got = cx.attribute(&k).unwrap_or_default();
             let ok = match r.evidence.as_str() {
-                "replaced" => got.starts_with("replaced"),
+                "replaced" => got.starts_with(&format!("replaced {}", r.reason)),
                 "dropped" => got == "dropped",
                 _ => false,
             };
@@ -573,7 +688,7 @@ fn cover(s: &(String, u32), iso: &[Entry], obs: &Observed, cx: &Cx<'_>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use skin_model::present::trace::{Converted, Event};
+    use skin_model::present::trace::{Converted, Event, Skip};
 
     use super::compare;
     use crate::tests::{TAMPERED, pieces};
@@ -588,7 +703,7 @@ mod tests {
             let (mut run, obs) = pieces(TAMPERED);
             f(&mut run);
             let r = compare(&run, &obs, &[]);
-            assert!(!r.findings.is_empty(), "{}", r.text(0, true));
+            assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
         };
         // A changed conversion of an agreeing raw value.
         found(&|run| {
@@ -668,7 +783,7 @@ mod tests {
                 .iter()
                 .any(|f| f.what.contains("no production record")),
             "{}",
-            r.text(0, true)
+            r.text(0, true, true)
         );
         let (run, mut obs) = pieces(TAMPERED);
         let key = obs.frames[0].timers[0].key;
@@ -681,8 +796,87 @@ mod tests {
         assert!(
             r.findings.iter().any(|f| f.what.contains("unmodelled")),
             "{}",
-            r.text(0, true)
+            r.text(0, true, true)
         );
+    }
+
+    /// Completeness (s7-06e-1-r1-tables.md, A): a duplicated invocation,
+    /// a deleted or changed skip, reordered second calls, a changed output
+    /// cell, a missing frame and a missing source point are each found.
+    #[test]
+    fn incomplete_or_extra_events_are_found() {
+        type Tamper = dyn Fn(&mut super::ProductionRun, &mut crate::observed::Observed);
+        let found = |what: &str, f: &Tamper| {
+            let (mut run, mut obs) = pieces(TAMPERED);
+            f(&mut run, &mut obs);
+            let r = compare(&run, &obs, &[]);
+            assert!(!r.findings.is_empty(), "{what}: {}", r.text(0, true, true));
+        };
+        let (run, obs) = pieces(TAMPERED);
+        let r = compare(&run, &obs, &[]);
+        assert!(r.passes(), "{}", r.text(0, true, true));
+        assert!(
+            run.frames
+                .iter()
+                .any(|f| f.events.iter().any(|e| matches!(e, Event::Skipped { .. }))),
+            "the fixture skips"
+        );
+        found("duplicate", &|run, _| {
+            for f in &mut run.frames {
+                if let Some(e) = f
+                    .events
+                    .iter()
+                    .find(|e| matches!(e, Event::Ran { .. }))
+                    .copied()
+                {
+                    f.events.push(e);
+                }
+            }
+        });
+        found("skip deleted", &|run, _| {
+            for f in &mut run.frames {
+                f.events.retain(|e| !matches!(e, Event::Skipped { .. }));
+            }
+        });
+        found("skip cause changed", &|run, _| {
+            for f in &mut run.frames {
+                for e in &mut f.events {
+                    if let Event::Skipped { why, .. } = e {
+                        *why = Skip::After;
+                    }
+                }
+            }
+        });
+        found("second calls reordered", &|run, _| {
+            for f in &mut run.frames {
+                let at: Vec<usize> = f
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches!(e, Event::Ran { call: 2, .. }))
+                    .map(|(i, _)| i)
+                    .collect();
+                if let [a, b, ..] = at[..] {
+                    f.events.swap(a, b);
+                }
+            }
+        });
+        found("output changed", &|run, _| {
+            for f in &mut run.frames {
+                if let Some(v) = f.outs.first_mut() {
+                    *v += 1;
+                }
+            }
+        });
+        found("frame missing", &|run, _| {
+            run.frames.pop();
+        });
+        found("source point missing", &|_, obs| {
+            if let Some(f) = obs.frames.first_mut() {
+                f.points
+                    .retain(|p| !matches!(p, crate::observed::Point::NotReached { .. }));
+            }
+        });
     }
 
     /// R19: the reference import must equal production's.
@@ -690,10 +884,13 @@ mod tests {
     fn a_different_import_is_refused() {
         let (run, _) = pieces(TAMPERED);
         let mut other = run.recorded.clone();
-        assert!(run.same_import(&other));
+        assert!(run.same_import(&other, &run.structure));
         if let Some(o) = other.occurrences.first_mut() {
             o.program = Some(99);
         }
-        assert!(!run.same_import(&other));
+        assert!(!run.same_import(&other, &run.structure));
+        // The same records with another program structure.
+        let records = run.recorded.clone();
+        assert!(!run.same_import(&records, &format!("{} ", run.structure)));
     }
 }
