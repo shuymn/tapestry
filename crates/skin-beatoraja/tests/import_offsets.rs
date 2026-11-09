@@ -161,3 +161,19 @@ fn runtime_and_unknown_offsets() {
     let q = loaded.quads(0);
     assert_eq!(round(q[0].rect), [100, 960, 20, 20]);
 }
+
+#[test]
+fn offset_five_without_lanes_neither_moves_nor_hides() {
+    // Without lanes the play sets no offset, as the source draws no lane
+    // renderer: the follower stays where it is, HIDDEN+ on or off.
+    let dst = format!(r#""offset": 5, {RECT}"#);
+    let loaded = load([1_920, 1_080], &dst, |_| {});
+    assert!(!has(loaded.report(), NoteKind::RuntimeOffset(5)));
+    let mut d = loaded.drawn();
+    for on in [true, false] {
+        let mut readouts = common::play::readouts_for(d.view);
+        readouts.covers.hidden_enabled = on;
+        d.readouts = Some(readouts);
+        assert_eq!(d.rects(0), [[100, 960, 20, 20]], "{on}");
+    }
+}

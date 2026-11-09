@@ -488,7 +488,7 @@ fn a_follower_checks_every_entry_track() {
     let t = table("0", vec![Some(part(TEN, 0, 1)), Some(p)]);
     let mut e = chooser(0);
     e.place = Place {
-        follow: skin_model::Follow::Cover,
+        follow: skin_model::Follow::COVER,
         ..Place::SCREEN
     };
     // Without lanes the reach is 0: at the bound is inside.

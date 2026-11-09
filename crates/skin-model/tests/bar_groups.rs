@@ -81,7 +81,7 @@ fn a_bar_at_the_line_sits_where_its_group_is_authored() {
     // Whatever the notes' height or the source's offset: no note-centre
     // anchoring and no lane-wide width.
     let chart = chart_with_bars(&[1_000]);
-    let g = group(BAR, [100, 500, 300, 7], Follow::None);
+    let g = group(BAR, [100, 500, 300, 7], Follow::NONE);
     let mut tall = simple();
     tall.note_h = 40;
     let offset = source_with(|s| s.offset_y = 30.0);
@@ -101,8 +101,8 @@ fn travel_and_the_lift_each_move_a_bar_once() {
     let def = with_groups(
         def,
         vec![
-            group(BAR, [100, 500, 300, 2], Follow::Lift),
-            group(WHITE, [100, 400, 300, 2], Follow::None),
+            group(BAR, [100, 500, 300, 2], Follow::LIFT),
+            group(WHITE, [100, 400, 300, 2], Follow::NONE),
         ],
     );
     let chart = chart_with_bars(&[1_100]);
@@ -132,7 +132,7 @@ fn fading(image: u32, r: [i32; 4], timer: u16) -> BarGroupDef {
     BarGroupDef {
         track: Track::new(&[key(0, 0), key(10_000, 250)], Ease::Linear, End::Hold).unwrap(),
         timer: TimerRef::Builtin(timer),
-        ..group(image, r, Follow::None)
+        ..group(image, r, Follow::NONE)
     }
 }
 
@@ -216,10 +216,10 @@ fn order(h: &Harness, images: &[u32]) -> Vec<u32> {
 
 #[test]
 fn groups_keep_their_own_look_in_chart_then_group_order_before_the_notes() {
-    let mut add = group(WHITE, [300, 860, 20, 40], Follow::None);
+    let mut add = group(WHITE, [300, 860, 20, 40], Follow::NONE);
     add.blend = Blend::Add;
     add.track = rect_alpha([300, 860, 20, 40], 128);
-    let defs = vec![group(BAR, [160, 879, 544, 2], Follow::None), add];
+    let defs = vec![group(BAR, [160, 879, 544, 2], Follow::NONE), add];
     // Two bars 300 ms apart from the line and the tap on it.
     let chart = chart_with_bars(&[5_000, 5_300]);
     let mut h = harness(with_groups(simple(), defs), &chart);
@@ -242,17 +242,17 @@ fn groups_keep_their_own_look_in_chart_then_group_order_before_the_notes() {
 fn a_tall_displaced_turned_or_native_bar_draws_whole() {
     let chart = chart_with_bars(&[1_000]);
     // Reaching 10 px into the top of the lanes from above it.
-    let tall = group(BAR, [160, -310, 544, 400], Follow::None);
+    let tall = group(BAR, [160, -310, 544, 400], Follow::NONE);
     let mut h = harness(with_groups(simple(), vec![tall]), &chart);
     h.frame(1_000, &[]);
     assert_eq!(rects(&h, BAR), [[160.0, -310.0, 544.0, 400.0]]);
     // Touching the top (80) draws nothing.
-    let touching = group(BAR, [160, -320, 544, 400], Follow::None);
+    let touching = group(BAR, [160, -320, 544, 400], Follow::NONE);
     let mut h = harness(with_groups(simple(), vec![touching]), &chart);
     h.frame(1_000, &[]);
     assert!(rects(&h, BAR).is_empty());
     // Turned a quarter about its centre, its 2 px are 544 tall.
-    let mut turned = group(BAR, [160, 40, 544, 2], Follow::None);
+    let mut turned = group(BAR, [160, 40, 544, 2], Follow::NONE);
     turned.track = still([
         Some(160),
         Some(40),
@@ -272,13 +272,13 @@ fn a_tall_displaced_turned_or_native_bar_draws_whole() {
     assert_eq!(q[0].rect, [160.0, 40.0, 544.0, 2.0]);
     assert!(q[0].angle > 1.5);
     // A native 4×300 frame centred on a 2 px rect at the line.
-    let mut native = group(BAR, [400, 879, 10, 2], Follow::None);
+    let mut native = group(BAR, [400, 879, 10, 2], Follow::NONE);
     native.place.native = Some(Native::Exact([4, 300]));
     let mut h = harness(with_groups(simple(), vec![native]), &chart);
     h.frame(1_000, &[]);
     assert_eq!(rects(&h, BAR), [[403.0, 730.0, 4.0, 300.0]]);
     // A native frame gives an empty rect its area, as an image's.
-    let mut empty = group(BAR, [100, 500, 0, 0], Follow::None);
+    let mut empty = group(BAR, [100, 500, 0, 0], Follow::NONE);
     empty.place.native = Some(Native::Exact([4, 300]));
     let mut h = harness(with_groups(simple(), vec![empty]), &chart);
     h.frame(1_000, &[]);
@@ -305,17 +305,17 @@ fn hidden_and_off_groups_spend_no_visits() {
     // One drawn group at 8,191 bars spends 8,191 visits and quads; the
     // tap takes the last of each. Fifty hidden, fifty `play`-timed groups
     // before the play and fifty without height spend none.
-    let mut groups = vec![group(BAR, [160, 879, 544, 2], Follow::None)];
+    let mut groups = vec![group(BAR, [160, 879, 544, 2], Follow::NONE)];
     for _ in 0..50 {
         groups.push(BarGroupDef {
             visible: Some(bool_program("false")),
-            ..group(WHITE, [160, 879, 544, 2], Follow::None)
+            ..group(WHITE, [160, 879, 544, 2], Follow::NONE)
         });
         groups.push(BarGroupDef {
             timer: TimerRef::Builtin(timer::PLAY),
-            ..group(WHITE, [160, 879, 544, 2], Follow::None)
+            ..group(WHITE, [160, 879, 544, 2], Follow::NONE)
         });
-        groups.push(group(WHITE, [160, 879, 544, 0], Follow::None));
+        groups.push(group(WHITE, [160, 879, 544, 0], Follow::NONE));
     }
     let n = usize::try_from(LANE_QUADS).unwrap() - 1;
     let mut h = Harness::new(
@@ -365,7 +365,7 @@ fn rejected_candidates_spend_the_visits() {
         REGIONS,
         Some(with_groups(
             simple(),
-            vec![group(BAR, [160, 70, 544, 10], Follow::None)],
+            vec![group(BAR, [160, 70, 544, 10], Follow::NONE)],
         )),
         vec![lanes_element(), image(WHITE, [0, 0, 10, 10], Place::SCREEN)],
     )
@@ -388,7 +388,7 @@ fn the_group_table_is_capped_before_it_is_built() {
     let one = bool_program("cover.enabled");
     let g = BarGroupDef {
         visible: Some(one),
-        ..group(BAR, [160, 879, 544, 2], Follow::None)
+        ..group(BAR, [160, 879, 544, 2], Follow::NONE)
     };
     let at_cap = with_groups(simple(), vec![g.clone(); MAX_BAR_GROUPS]);
     let skin = lanes_skin(at_cap.clone());
@@ -415,7 +415,7 @@ fn lanes_err(def: LanesDef) -> LanesError {
 
 #[test]
 fn groups_are_checked_at_load() {
-    let ok = || group(BAR, [160, 879, 544, 2], Follow::None);
+    let ok = || group(BAR, [160, 879, 544, 2], Follow::NONE);
     let at = |g: BarGroupDef| with_groups(simple(), vec![ok(), g]);
     let bad = |error| LanesError::BarGroup { group: 1, error };
     assert_eq!(
@@ -461,7 +461,7 @@ fn groups_are_checked_at_load() {
     // A follower moved the lane's length (800) either way stays inside.
     let follower = |y| BarGroupDef {
         track: rect_alpha([0, y, 1, 1], 255),
-        ..group(BAR, [0; 4], Follow::Cover)
+        ..group(BAR, [0; 4], Follow::COVER)
     };
     assert!(
         skin_with(
@@ -498,7 +498,7 @@ fn each_group_visibility_is_charged_once() {
     let groups = vec![
         BarGroupDef {
             visible: Some(p.clone()),
-            ..group(BAR, [160, 879, 544, 2], Follow::None)
+            ..group(BAR, [160, 879, 544, 2], Follow::NONE)
         };
         3
     ];
@@ -547,7 +547,7 @@ fn a_play_of_another_group_count_draws_nothing() {
     let mut two_def = simple();
     two_def
         .bar_groups
-        .push(group(COVER, [0, 0, 5, 5], Follow::None));
+        .push(group(COVER, [0, 0, 5, 5], Follow::NONE));
     let two = lanes_skin(two_def);
     let mut h = Harness::new(one, &chart, &full(0));
     h.uvs = uvs(&two);
