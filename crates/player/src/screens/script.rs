@@ -532,6 +532,16 @@ impl Scripts {
         self.0.pool.free()
     }
 
+    /// The calls result generation `g`'s runtime made, while parked
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_calls(&self, g: ScriptGen) -> Option<u64> {
+        match &self.0.host().result(g.generation)?.held {
+            Held::Parked(rt) => Some(rt.counters().calls),
+            _ => None,
+        }
+    }
+
     /// Whether result generation `g` is parked in the cell (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn result_parked(&self, g: ScriptGen) -> bool {

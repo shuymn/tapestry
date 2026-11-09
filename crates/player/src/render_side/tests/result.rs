@@ -2377,3 +2377,154 @@ fn a_disabled_result_retires_its_runtime() {
     assert!(!rig.link.scripts().result_live(Some(g)));
     rig.link.exit();
 }
+
+/// Waits until `rig` drew `n` more skin frames.
+fn frames(rig: &Rig, n: usize) -> Vec<Vec<Quad>> {
+    let seen = rig.drawn().len();
+    assert!(wait_until(|| rig.drawn().len() >= seen + n));
+    rig.drawn()
+        .into_iter()
+        .skip(seen)
+        .filter_map(|d| skin_frame(&d).map(|(q, _)| q.to_vec()))
+        .collect()
+}
+
+/// C5, C6, C11 on result (code r1 M3): views of one generation switching
+/// fast (the presented, prepared and replaced holders taken), the parking
+/// before a play parks the runtime; while the play's interval is open the
+/// screen draws on with the callback's constant and no call is made; after
+/// the close the runtime resumes, its calls going on; the close's token
+/// destroys it.
+#[test]
+fn a_result_runtime_rests_through_a_play_and_resumes() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    for key in 1..=4 {
+        show(
+            &rig.link,
+            lifetime,
+            key,
+            &scripted(key, &skin, Some(g), &[]),
+            &Overlay::default(),
+        );
+    }
+    let dots = |q: &[Quad]| skin_quads(q).len();
+    let running = frames(&rig, 3);
+    let with = running.last().map(|q| dots(q)).unwrap();
+    assert!(rig.link.park_scripts());
+    let scripts = rig.link.scripts();
+    assert!(scripts.result_parked(g));
+    let calls = scripts.result_calls(g).unwrap();
+    assert!(calls >= 3, "{calls}");
+    let interval = scripts.open_interval();
+    show(
+        &rig.link,
+        lifetime,
+        5,
+        &scripted(5, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    for q in frames(&rig, 4) {
+        assert_eq!(
+            dots(&q),
+            with - 1,
+            "the constant while the interval is open"
+        );
+    }
+    assert_eq!(
+        scripts.result_calls(g),
+        Some(calls),
+        "no call in the interval"
+    );
+    let closed = interval.close();
+    assert!(wait_until(|| rig
+        .drawn()
+        .last()
+        .and_then(skin_frame)
+        .is_some_and(|(q, _)| dots(q) == with)));
+    assert!(rig.link.park_scripts());
+    assert!(scripts.result_calls(g).unwrap() > calls, "resumed");
+    assert!(!gone.load(Ordering::Acquire));
+    // The run's end, the interval closed: the token destroys it.
+    assert!(scripts.retire(crate::screens::Quiet::Closed(closed)));
+    assert!(gone.load(Ordering::Acquire));
+    rig.link.exit();
+}
+
+/// C13 on result: the render thread panicking while a play's interval is
+/// open (READY through Closing) destroys no result VM; the game thread's
+/// retirement with the close's token does.
+#[test]
+fn a_render_panic_in_a_play_leaves_the_result_runtime_to_the_game_thread() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let _ = frames(&rig, 3);
+    assert!(rig.link.park_scripts());
+    let scripts = rig.link.scripts().clone();
+    let interval = scripts.open_interval();
+    rig.link.send(crate::render_side::RenderMsg::Panic);
+    assert!(wait_until(|| scripts.orphaned()));
+    assert!(!gone.load(Ordering::Acquire));
+    assert!(scripts.inactive().is_none());
+    assert!(scripts.retire(crate::screens::Quiet::Closed(interval.close())));
+    assert!(gone.load(Ordering::Acquire));
+    assert_eq!(rig.link.exit(), crate::render_side::RenderEnd::Panicked);
+}
+
+/// C13 on result: a retirement while the view runs is terminal: the
+/// running slot gives its runtime back, which is destroyed; a recovery
+/// (a device lost, the screen built again) and a new lifetime draw the
+/// callback's constant, never resuming it.
+#[test]
+fn a_retired_result_runtime_is_not_resumed() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let dots = |q: &[Quad]| skin_quads(q).len();
+    let with = frames(&rig, 3).last().map(|q| dots(q)).unwrap();
+    let scripts = rig.link.scripts().clone();
+    assert!(scripts.retire(crate::screens::Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(
+        wait_until(|| gone.load(Ordering::Acquire)),
+        "given back and destroyed"
+    );
+    let after = frames(&rig, 3);
+    assert_eq!(after.last().map(|q| dots(q)), Some(with - 1));
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(q, _)| dots(q) == with - 1)));
+    let next = rig.link.begin_result();
+    show(
+        &rig.link,
+        next,
+        1,
+        &scripted(2, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    for q in frames(&rig, 3) {
+        assert_eq!(dots(&q), with - 1);
+    }
+    assert!(!scripts.result_live(Some(g)));
+    rig.link.exit();
+}
