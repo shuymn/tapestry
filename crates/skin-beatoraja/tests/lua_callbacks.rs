@@ -9,7 +9,9 @@ mod common;
 use common::play::Drawn;
 use rules::GaugeValue;
 use skin_beatoraja::lua::{Disposition, Unsupported};
-use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
+use skin_beatoraja::{
+    Cancel, Config, ImportError, ImportLimit, LuaImported, LuaWhy, NoteKind, read_lua_header,
+};
 use skin_model::{ChartText, GaugeLook, Layout, MAX_TEXT_BYTES};
 use tempfile::TempDir;
 
@@ -869,6 +871,44 @@ fn a_program_callback_is_charged_as_the_skin_counts_it() {
     assert_eq!(
         i.imported.report.usage.ops as usize,
         i.imported.skin.ops().total()
+    );
+}
+
+/// The program's per-frame cost counts against the skin's operation cap
+/// at import: as many program draws as fit import, every operation kept
+/// charged, and one more is refused there as the operation limit.
+#[test]
+fn a_program_past_the_operation_cap_is_refused_at_import() {
+    let body = |n: usize| {
+        skin(&format!(
+            "for k = 1, {n} do\n\
+               table.insert(skin.destination, {{ id = \"i\", draw = function()\n\
+                 return ms.number(110) % 7 + ms.number(111) % 5 > 3\n\
+               end, dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n\
+             end"
+        ))
+    };
+    let ops = |n: usize| {
+        let i = import(&folder(&body(n)), 905).unwrap();
+        assert_eq!(i.callbacks, vec![Disposition::Compiled; n]);
+        let charged = i.imported.report.usage.ops as usize;
+        assert_eq!(charged, i.imported.skin.ops().total(), "{n}");
+        charged
+    };
+    let (one, two) = (ops(1), ops(2));
+    let per = two - one;
+    let fit = 1 + (skin_model::MAX_SKIN_OPS - one) / per;
+    assert_eq!(ops(fit), one + (fit - 1) * per);
+    let e = import(&folder(&body(fit + 1)), 905).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            ImportError::Limit {
+                limit: ImportLimit::Ops,
+                ..
+            }
+        ),
+        "{e:?}"
     );
 }
 
