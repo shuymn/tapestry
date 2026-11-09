@@ -869,13 +869,14 @@ fn a_lifted_grade_carries_its_combo_once() {
 }
 
 #[test]
-fn a_grade_following_hidden_plus_hides_with_its_combo() {
+fn a_grade_following_hidden_plus_hides_alone() {
     use common::lanes::{NOTES, body, note};
     use common::play::readouts_for;
     // Over the default lanes (600 px), HIDDEN+ at 300 ‰ raises the grade
     // listing offset 5 by 180, its combo with it; while HIDDEN+ is off
-    // neither draws, as the source's judge draws nothing without its
-    // grade (`play/SkinJudge.java:114-127`).
+    // the grade is transparent and its combo still draws where it
+    // attaches, as the source only clears the grade's alpha
+    // (`skin/SkinObject.java:474-481`, `play/SkinJudge.java:121-137`).
     let judge = judge_rec(&[grade(0, r#", "offset": 5"#)], &[combo("ten", 10)], "");
     let objects = format!(r#"{}, {VALUES}, "judge": [{judge}]"#, note(""));
     let l = common::import_body(&body("", &objects, &[NOTES, DST]));
@@ -904,7 +905,8 @@ fn a_grade_following_hidden_plus_hides_with_its_combo() {
         .map(|&[x, y, w, h]| [x, y - 180, w, h])
         .collect();
     assert_eq!(at(300, true), raised);
-    assert!(at(300, false).is_empty());
+    // The combo's two cells, unmoved; no grade.
+    assert_eq!(at(300, false), still[..2]);
 }
 
 #[test]

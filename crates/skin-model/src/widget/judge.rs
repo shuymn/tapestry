@@ -379,12 +379,6 @@ impl Judge {
         let Some(g) = resolve(&self.grades, slot) else {
             return;
         };
-        // A grade that follows HIDDEN+ hides with its combo while HIDDEN+
-        // is off, as the source's judge draws nothing when its grade does
-        // not (`play/SkinJudge.java:114-127`).
-        if g.follow.hides(d.lanes) {
-            return;
-        }
         let Some((gt, gs)) = super::sample(
             d.at.starts,
             d.at.now,
@@ -442,6 +436,13 @@ impl Judge {
             if self.shift {
                 shift = width / 2.0;
             }
+        }
+        // A grade that follows HIDDEN+ is transparent while HIDDEN+ is off;
+        // its combo still draws, attached to it, as the source only clears
+        // the grade's alpha (`skin/SkinObject.java:474-481`,
+        // `play/SkinJudge.java:121-137`).
+        if g.follow.hides(d.lanes) {
+            return;
         }
         let Some(f) = g.image.frame(d.at.starts, d.at.now, d.at.uvs) else {
             return;

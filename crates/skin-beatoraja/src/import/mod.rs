@@ -1434,6 +1434,16 @@ impl<'d> Cx<'d> {
             );
             alpha.clear();
         }
+        // Offset 5 is an alpha offset too: −255 while HIDDEN+ is off, which
+        // the model reproduces by not drawing the follower. The source
+        // skips every alpha offset at an interpolated colour
+        // (`SkinObject.java:489-504`) and clamps each in turn (`:474-481`),
+        // so a follower of HIDDEN+ needs a fixed colour and no configured
+        // alpha above 0, or it would show where the model hides it.
+        if hidden && (!track.fixed_color() || alpha.iter().any(|&a| a > 0)) {
+            self.drop_el(role, at, NoteKind::OffsetAlpha)?;
+            return Ok(None);
+        }
         if !alpha.is_empty() {
             let same_sign = alpha.iter().all(|&a| a > 0) || alpha.iter().all(|&a| a < 0);
             if !track.fixed_color() || !same_sign {

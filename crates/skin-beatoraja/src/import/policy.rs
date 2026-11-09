@@ -60,8 +60,10 @@
 //! 14. Images, numbers, text, gauges and judgment grades that list LIFT
 //!     (offset 3), SUDDEN+ (offset 4) or HIDDEN+ (offset 5) follow them by
 //!     this frame's lane geometry (D9 item p), a follower of HIDDEN+ not
-//!     drawn while HIDDEN+ is off; a combo drawn relative to its grade
-//!     takes the grade's motion and none of its own. A configured x, width, height,
+//!     drawn while HIDDEN+ is off (a grade's combo still drawn) and
+//!     refused with `OffsetAlpha` on animated colour or with a configured
+//!     alpha above 0; a combo drawn relative to its grade takes the
+//!     grade's motion and none of its own. A configured x, width, height,
 //!     angle or alpha on either id, or on an id SUDDEN+, LIFT or HIDDEN+
 //!     consumes (listed or added by the source), is refused as the
 //!     element's role says, its configured y ignored; offset 5 on a combo

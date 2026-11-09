@@ -392,3 +392,57 @@ fn offsets_three_four_and_five_add() {
         );
     }
 }
+
+#[test]
+fn a_follower_of_hidden_plus_needs_a_fixed_colour_and_no_raised_alpha() {
+    // The source skips every alpha offset at an interpolated colour, so a
+    // fading follower would show while HIDDEN+ is off
+    // (`skin/SkinObject.java:489-504`): refused, as any alpha offset on
+    // animated colour is.
+    let number = r#""value": [{"id": "num", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 1, "ref": 71}]"#;
+    let objects = format!(
+        r#""offset": [{{"name": "a", "id": 42, "a": true}}], {}, {number}"#,
+        note("")
+    );
+    let num = |fields: &str, keys: &str| {
+        format!(r#"{{"id": "num", "offsets": [{fields}], "dst": [{keys}]}}"#)
+    };
+    let fading =
+        r#"{"time": 0, "x": 0, "y": 0, "w": 10, "h": 10, "a": 255}, {"time": 1000, "a": 0}"#;
+    let still = r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#;
+    let load = |d: &str, a: i32| {
+        common::import_config(
+            [1_920, 1_080],
+            &body("", &objects, &[NOTES, d]),
+            &[],
+            |c: &mut Config| {
+                c.offsets.insert(
+                    42,
+                    OffsetValue {
+                        a,
+                        ..OffsetValue::default()
+                    },
+                );
+            },
+        )
+    };
+    // The number shows the EX score, a critical part: refused.
+    let why = |l: Loaded| match l.err() {
+        ImportError::Critical { why, .. } => why,
+        e => panic!("{e:?}"),
+    };
+    assert_eq!(why(load(&num("5", fading), 0)), NoteKind::OffsetAlpha);
+    // Without offset 5 the fade imports.
+    assert!(!has(
+        load(&num("4", fading), 0).report(),
+        NoteKind::OffsetAlpha
+    ));
+    // A raised alpha after offset 5 clamps it back up in the source,
+    // 255 → 0 → 128 while HIDDEN+ is off: refused.
+    assert_eq!(why(load(&num("5, 42", still), 128)), NoteKind::OffsetAlpha);
+    // A lowered one keeps one sign: admitted and folded.
+    let l = load(&num("5, 42", still), -128);
+    assert!(!has(l.report(), NoteKind::OffsetAlpha));
+    assert_eq!(shown_held(&l, [0, 0, 0], true, false).len(), 1);
+    assert!(shown_held(&l, [0, 0, 0], false, false).is_empty());
+}
