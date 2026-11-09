@@ -3330,10 +3330,13 @@ fn present_reads(bad: bool) -> Vec<skin_model::present::ReadDef> {
 /// A presentation program decoded from `data`: one byte of callback
 /// count (its high bit adding the reads the verifier refuses), then per callback seven bytes (its start, its length, its
 /// registers, its conversion and its signature, its gate, its `after`),
-/// then four-byte instructions to the end; the constants are a fixed table
+/// then four-byte instructions to the end (an op byte from 240 the clock
+/// or a slot's load or store, a conversion byte's high bit a timer
+/// callback); the constants are a fixed table
 /// of integers, floats, nil, booleans and the off value, the reads
-/// [`present_reads`], and the slots and store domains a fixed table too,
-/// one slot's initial value outside its domain.
+/// [`present_reads`], and the slots and store domains a fixed table too
+/// (a slot or domain index past it, or a store whose domain is not its
+/// slot's, refused).
 #[must_use]
 pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
     use skin_model::present::{
@@ -3373,10 +3376,6 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
             init: Val::Int(0),
             domain: small,
         },
-        SlotDef {
-            init: Val::Int(9),
-            domain: small,
-        },
     ];
     let (n, rest) = data.split_first().map_or((0, data), |(&n, r)| (n % 8, r));
     let (head, body) = rest.split_at((usize::from(n) * 7).min(rest.len()));
@@ -3395,7 +3394,14 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
         ..PresentDef::default()
     };
     for &[start, len, regs, conv, sig, gate, after] in head.as_chunks::<7>().0 {
-        let conv = [Conv::Truthy, Conv::Int, Conv::Timer][usize::from(conv % 3)];
+        // The high bit a timer callback.
+        let conv = if conv & 0x80 != 0 {
+            Conv::Timer
+        } else if conv % 2 == 0 {
+            Conv::Truthy
+        } else {
+            Conv::Int
+        };
         def.callbacks.push(CallbackDef {
             start: u32::from(start),
             len: u16::from(len),
@@ -3423,7 +3429,13 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
     let cmp = [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le];
     let math = [MathFn::Floor, MathFn::Ceil, MathFn::Abs];
     for &[op, a, b, c] in body.as_chunks::<4>().0 {
-        def.code.push(match op % 15 {
+        // An op byte from 240 a clock or slot instruction.
+        let op = if op >= 240 {
+            12 + (op - 240) % 3
+        } else {
+            op % 12
+        };
+        def.code.push(match op {
             0 => Insn::Const {
                 dst: a,
                 k: u16::from(b),
@@ -3464,12 +3476,12 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
                 when: b % 2 == 0,
                 to: u16::from(c),
             },
-            11 => Insn::StateUs { dst: a },
-            12 => Insn::LoadSlot {
+            12 => Insn::StateUs { dst: a },
+            13 => Insn::LoadSlot {
                 dst: a,
                 slot: u16::from(b % 4),
             },
-            13 => Insn::StoreSlot {
+            14 => Insn::StoreSlot {
                 slot: u16::from(b % 4),
                 src: a,
                 domain: u16::from(c % 4),
