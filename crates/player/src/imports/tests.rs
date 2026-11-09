@@ -338,6 +338,7 @@ fn frame(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) -> Vec<u8> {
         context: &ctx,
         text: &text,
         target: r.target(),
+        continuation: skin_model::Continuation::Fresh,
     };
     let token = r.stage(b, &a, request).unwrap();
     r.commit(token).unwrap();
@@ -363,6 +364,7 @@ fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::
         context: &ctx,
         text: &text,
         target: r.target(),
+        continuation: skin_model::Continuation::Fresh,
     };
     let token = r.stage(b, &a, request).unwrap();
     r.commit(token).unwrap();
