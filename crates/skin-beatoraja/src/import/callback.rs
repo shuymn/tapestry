@@ -75,7 +75,8 @@
 //! reason; a critical one refuses the candidate at its definition, or,
 //! for [`Unsupported::Interference`] (a capture read while the candidate
 //! is open), at the open site. A root whose reach writes never lowers
-//! ([`Unsupported::Writes`]). A `value`'s role is its reads' ([`Lower::scan`]
+//! ([`Unsupported::Writes`]); only a timer root whose written cells are
+//! slots compiles (above). A `value`'s role is its reads' ([`Lower::scan`]
 //! over its whole tree and its helpers): one that reads the EX score or
 //! the max combo is critical, whether or not the rest lowers, and so is
 //! one with an id or callee the scan cannot resolve. A cap, cancellation
@@ -2163,11 +2164,7 @@ impl Cx<'_> {
         conds: &[String],
     ) -> Result<Result<TimerRef, NoteKind>, ImportError> {
         let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
-        let capped = match end {
-            skin_model::End::Hold => true,
-            skin_model::End::Hide => last.saturating_mul(1000) < skin_model::MAX_KEY_US,
-            skin_model::End::Loop { .. } => false,
-        };
+        let capped = end.settles_by_cap(last.saturating_mul(1000));
         let why = if capped {
             match self.lower(id, Conv::Timer) {
                 Ok(Lowering::Compiled(_, prog)) => {

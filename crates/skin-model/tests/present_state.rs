@@ -231,6 +231,52 @@ fn a_program_timers_track_ignores_the_cap() {
     assert_eq!(drawn(&h).len(), 1);
 }
 
+/// An image choice's entry replaces the element's track on the element's
+/// timer, so on a program timer each entry's track is held to the same
+/// rule as the element's: a loop, or a hidden end at 4 h, is refused; a
+/// held one is accepted.
+#[test]
+fn a_choice_entrys_track_on_a_program_timer_ignores_the_cap() {
+    use skin_model::{ImageChoiceDef, ImageChoicePart, ImageSpan, PastTable};
+    let max = MAX_KEY_US;
+    let with_entry = |track: Track| {
+        let mut b = Builder::default();
+        let k = b.push(Cb::ret(Val::Int(0), Conv::Timer));
+        let mut e = on_output(k, held());
+        e.source = Source::ImageChoice(0);
+        let entry = ImageChoicePart {
+            span: ImageSpan {
+                image: 0,
+                first: 0,
+                frames: 1,
+            },
+            cycle: None,
+            track: Some(track),
+            native: None,
+        };
+        let widgets = WidgetDefs {
+            image_choices: vec![ImageChoiceDef {
+                value: widget_support::int("0"),
+                past_table: PastTable::Hide,
+                choices: vec![Some(entry)],
+            }],
+            ..WidgetDefs::default()
+        };
+        load(Some(b.0), Vec::new(), vec![e], widgets)
+    };
+    for end in [End::Loop { from: TimeUs(0) }, End::Hide] {
+        assert!(
+            matches!(
+                with_entry(key_track(&[0, max], end)),
+                Err(LoadError::ProgramTimerTrack { element: 0 })
+            ),
+            "{end:?}"
+        );
+    }
+    assert!(with_entry(key_track(&[0, max], End::Hold)).is_ok());
+    assert!(with_entry(key_track(&[0, max - 1_000], End::Hide)).is_ok());
+}
+
 /// A timer gated by a program draw runs only while the draw is true.
 #[test]
 fn a_timer_after_a_false_draw_does_not_run() {

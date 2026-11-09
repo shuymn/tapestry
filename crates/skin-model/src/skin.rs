@@ -38,7 +38,7 @@ use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
 use crate::select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
-use crate::track::{End, MAX_KEY_US, Track};
+use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
@@ -532,13 +532,14 @@ fn screen_slot_of(timer: TimerRef, whens: usize, builtin: usize) -> Option<usize
 /// The slot an element's `timer` reads with `whens` `when` timers after
 /// `builtin` built-in ones and the program `present`: [`screen_slot_of`],
 /// or, for [`TimerRef::Output`] (V8), the timer of a timer callback after
-/// every `when` timer. A program timer's track must not depend on how far
-/// past [`crate::MAX_ELAPSED_MS`] it is, since its elapsed time is capped
-/// there: a held end, or a hidden end whose last key is before it, never a
-/// loop ([`LoadError::ProgramTimerTrack`]).
+/// every `when` timer. Every track sampled on a program timer, the
+/// element's, an image choice's entry's and a cover paint's gate, must not
+/// depend on how far past [`crate::MAX_ELAPSED_MS`] it is, since its
+/// elapsed time is capped there ([`End::settles_by_cap`];
+/// [`LoadError::ProgramTimerTrack`]).
 fn element_slot_of(
-    e: &ElementDef,
-    element: usize,
+    (e, element): (&ElementDef, usize),
+    def: &SkinDef,
     (whens, builtin): (usize, usize),
     present: Option<&PresentDef>,
 ) -> Result<usize, LoadError> {
@@ -555,12 +556,22 @@ fn element_slot_of(
         .take(k)
         .filter(|c| c.conv == crate::present::Conv::Timer)
         .count();
-    let accepted = match e.track.end() {
-        (End::Hold, _) => true,
-        (End::Hide, last) => last < MAX_KEY_US,
-        (End::Loop { .. }, _) => false,
+    let entries = choice_of(def, e.source)
+        .into_iter()
+        .flat_map(|c| c.choices.iter().flatten().filter_map(|p| p.track.as_ref()));
+    let gate = match e.source {
+        Source::CoverPaint(p) => def
+            .widgets
+            .cover_paints
+            .get(index(p))
+            .and_then(|c| c.gate_track.as_ref()),
+        _ => None,
     };
-    if !accepted {
+    if !std::iter::once(&e.track)
+        .chain(entries)
+        .chain(gate)
+        .all(Track::settles_by_cap)
+    {
         return Err(LoadError::ProgramTimerTrack { element });
     }
     Ok(builtin + whens + rank)
@@ -1752,7 +1763,8 @@ impl Skin {
         }
         let mut slots = Vec::with_capacity(elements.len());
         for (element, e) in elements.iter().enumerate() {
-            let slot = element_slot_of(e, element, (whens.len(), builtin), present.as_ref())?;
+            let slot =
+                element_slot_of((e, element), &def, (whens.len(), builtin), present.as_ref())?;
             slots.push(slot);
             if let Source::Judge(i) = e.source
                 && let Some((part, _)) = w
