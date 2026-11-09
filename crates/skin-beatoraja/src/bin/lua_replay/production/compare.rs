@@ -625,23 +625,20 @@ mod tests {
         // An extra invocation, and a missing one.
         found(&|run| {
             if let Some(f) = run.frames.first_mut()
-                && let Some(e) = f
+                && let Some(Event::Ran {
+                    k, result, conv, ..
+                }) = f
                     .events
                     .iter()
                     .find(|e| matches!(e, Event::Ran { .. }))
                     .copied()
             {
-                if let Event::Ran {
-                    k, result, conv, ..
-                } = e
-                {
-                    f.events.push(Event::Ran {
-                        k,
-                        call: 2,
-                        result,
-                        conv,
-                    });
-                }
+                f.events.push(Event::Ran {
+                    k,
+                    call: 2,
+                    result,
+                    conv,
+                });
             }
         });
         found(&|run| {
