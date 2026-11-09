@@ -39,7 +39,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mlua::{Function, Lua, Value};
@@ -549,8 +548,6 @@ pub struct Pool {
 #[derive(Debug)]
 struct PoolInner {
     state: Mutex<PoolState>,
-    /// The returns so far: a waiting request retries when it changes.
-    released: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -572,7 +569,6 @@ impl Pool {
                     next: 0,
                     out: Vec::with_capacity(n),
                 }),
-                released: AtomicU64::new(0),
             }),
         }
     }
@@ -600,11 +596,12 @@ impl Pool {
         self.inner.lock().free
     }
 
-    /// How many permits have been returned: a request waiting for one
-    /// retries when this changes.
+    /// How many permits have been returned: those handed out less those
+    /// still out, each valid return removing one.
     #[must_use]
     pub fn releases(&self) -> u64 {
-        self.inner.released.load(Ordering::Acquire)
+        let st = self.inner.lock();
+        st.next.wrapping_sub(st.out.len() as u64)
     }
 }
 
@@ -624,9 +621,6 @@ impl PoolInner {
         };
         st.out.swap_remove(at);
         st.free += 1;
-        // Under the same lock as the take and the removal: a waiter that
-        // sees the release also sees the permit free.
-        self.released.fetch_add(1, Ordering::AcqRel);
         true
     }
 }

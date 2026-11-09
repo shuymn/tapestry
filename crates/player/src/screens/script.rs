@@ -99,7 +99,7 @@ pub(in crate::screens) struct ResultEntry {
 /// state.
 #[derive(Debug, Default)]
 pub(in crate::screens) struct ScriptHost {
-    pub(in crate::screens) entries: [Entry; 2],
+    pub(in crate::screens) entries: [Entry; 1],
     /// The result generations with a runtime, parked or running; a
     /// running one retired stays as `Retired` until its slot gives the
     /// runtime back.
@@ -470,13 +470,18 @@ impl Scripts {
             return GenState::Gone;
         }
         let mut host = self.0.host();
-        match host.result(g.generation).map(|e| &e.held) {
-            Some(Held::Parked(rt)) => GenState::Live {
+        match host.result(g.generation) {
+            Some(ResultEntry {
+                held: Held::Parked(rt),
+                ..
+            }) => GenState::Live {
                 stopped: rt.stopped().is_some(),
             },
-            Some(Held::Running) => GenState::Live {
-                stopped: host.result(g.generation).is_some_and(|e| e.stopped),
-            },
+            Some(ResultEntry {
+                held: Held::Running,
+                stopped,
+                ..
+            }) => GenState::Live { stopped: *stopped },
             _ => GenState::Gone,
         }
     }
@@ -742,13 +747,12 @@ impl ScriptSlot {
         runtime: Option<ScreenRuntime>,
         permit: Option<ScriptPermit>,
     ) -> Self {
-        let Some(mut rt) = runtime else {
-            return Self::default();
-        };
-        if let Some(ScriptPermit(p)) = permit {
-            let _ = rt.attach_permit(p);
-        }
-        Self(Slot::Staged(Box::new(rt)))
+        Self::staged(runtime.map(|mut rt| {
+            if let Some(ScriptPermit(p)) = permit {
+                let _ = rt.attach_permit(p);
+            }
+            rt
+        }))
     }
 
     /// The runtime of the presented result view's slot this frame, its

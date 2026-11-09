@@ -34,8 +34,8 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
         .collect()
 }
 
-/// §A's numeric ids and the source's bundled skin's five more (S10-09i):
-/// 51 N, 34 D.
+/// §A's numeric ids, the source's bundled skin's five more (S10-09i) and
+/// the ids equal to or derived from bridged ones (S7-07c).
 const NUMERIC: &[(i32, i32, C)] = &[
     (21, 25, C::D),
     (45, 49, C::N),

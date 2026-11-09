@@ -1661,13 +1661,8 @@ fn result_frame_alloc() {
     // A frame the skin refuses allocates nothing either.
     screen.refuse_next_result(false);
     let before = crate::alloc_count::this_thread();
-    let drawn = Run::result_frame(
-        &mut screen,
-        Some(&mut side),
-        &shared,
-        &scripts,
-        TimeUs(2_000_000),
-    );
+    let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+    let drawn = Run::result_build(&mut screen, Some(&mut side), TimeUs(2_000_000), fadeout);
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
     // The control: the count sees an allocation in the same window.

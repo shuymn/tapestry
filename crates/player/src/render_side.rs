@@ -5232,37 +5232,17 @@ impl Run {
         self.publish_result_status();
     }
 
-    /// One result frame's app work (the S10-09i design's D1 and D3): the
-    /// commit point, under the barrier's lock, then the build of what is
-    /// presented. At the commit point a barrier set for the lifetime
-    /// discards the view prepared and merges only the overlay; otherwise
-    /// the view prepared is committed with its lines and its strip and
-    /// becomes the one presented, and then the overlay merges. The skin's
-    /// frame is built with the strip, or the built-in page is left to
-    /// draw. Allocates nothing.
-    ///
-    /// The frame runs in three steps (s7-07-design §3.4): this commit
-    /// point, then the presented view's runtime ([`Self::result_visit`],
-    /// not counted), then the build ([`Self::result_build`]). Returns the
-    /// fade-out's start.
-    #[cfg(all(test, feature = "dev-tools"))]
-    fn result_frame(
-        screen: &mut dyn Screen,
-        mut side: Option<&mut ResultSide>,
-        shared: &Shared,
-        scripts: &Scripts,
-        now: TimeUs,
-    ) -> ResultDrawn {
-        let fadeout = Self::result_commit(screen, side.as_deref_mut(), shared, scripts);
-        Self::result_build(screen, side, now, fadeout)
-    }
-
     /// The commit point of a result frame (the S10-09i design's D1 and
-    /// D3), under the barrier's lock: a view prepared is committed under
-    /// one hold of the result runtimes' lock, its generation checked live
-    /// first ([`Scripts::commit_view`]), and the running runtime moves to
-    /// it when it keeps the presented generation; nothing is destroyed.
-    /// Returns the fade-out's start. Allocates nothing.
+    /// D3), its first step; the presented view's runtime
+    /// ([`Self::result_visit`]) and the build ([`Self::result_build`])
+    /// follow. Under the barrier's lock: a barrier set for the lifetime
+    /// discards the view prepared and merges only the overlay; otherwise
+    /// the view prepared is committed with its lines and its strip, under
+    /// one hold of the result runtimes' lock with its generation checked
+    /// live first ([`Scripts::commit_view`]), and becomes the one
+    /// presented, the running runtime moving to it when it keeps the
+    /// presented generation; then the overlay merges. Nothing is
+    /// destroyed. Returns the fade-out's start. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn result_commit(
         screen: &mut dyn Screen,
