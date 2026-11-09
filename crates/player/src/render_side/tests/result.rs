@@ -2529,6 +2529,9 @@ fn a_retired_result_runtime_is_not_resumed() {
         &scripted(2, &skin, Some(g), &[]),
         &Overlay::default(),
     );
+    // Every frame drawn so far taken, the one after them drawn: no frame
+    // of the old lifetime arrives after the clear.
+    assert!(rig.link.fence(Duration::from_secs(10)));
     rig.clear();
     // A view of the retired generation never commits: the new lifetime
     // draws the built-in page, and no frame runs the runtime.
@@ -2538,5 +2541,38 @@ fn a_retired_result_runtime_is_not_resumed() {
     );
     assert!(rig.drawn().iter().filter_map(skin_frame).count() == 0);
     assert!(!scripts.result_live(Some(g)));
+    rig.link.exit();
+}
+
+/// The render link's lifetimes reach the cell (code r3 LOW): a view
+/// presented in a lifetime protects its generation while that lifetime is
+/// current, `end_result` ends that before the next lifetime begins, and
+/// the next lifetime starts with nothing presented.
+#[test]
+fn the_links_lifetimes_scope_the_presented_protection() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let gone = Arc::new(AtomicBool::new(false));
+    script.on_vm_drop(&gone);
+    let scripts = rig.link.scripts().clone();
+    let g = scripts.offer_result(script, false).unwrap();
+    let lifetime = installed(&rig, &skin);
+    scripts.set_published(Some(g));
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| scripts.presented() == Some(g)));
+    scripts.set_published(None);
+    assert!(scripts.protected(g), "presented in the current lifetime");
+    rig.link.end_result();
+    assert_eq!(scripts.presented(), None, "no lifetime is current");
+    assert!(!scripts.protected(g));
+    let _next = rig.link.begin_result();
+    assert_eq!(scripts.presented(), None);
+    assert!(!scripts.protected(g));
     rig.link.exit();
 }

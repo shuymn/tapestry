@@ -1498,7 +1498,9 @@ fn a_layout_is_reused_only_while_its_runtime_lives() {
     let g = shown_script(&rs);
     rs.request(view(5));
     assert!(!rs.busy(), "reused");
-    // Nothing presented it: the eviction before a take retires it.
+    // Neither presented nor published once the built-in result is: the
+    // eviction before a take retires it.
+    rs.request(ViewFacts(None));
     drop(rs.scripts().result_permit(&[]));
     assert!(!rs.scripts().result_live(Some(g)));
     rs.request(view(5));
@@ -1597,26 +1599,44 @@ fn the_presented_layout_is_reused_while_a_newer_one_waits() {
         "its runtime runs on, uninterrupted"
     );
     assert!(scripts.result_live(Some(b)));
-    // The renderer had B prepared: B commits while A, republished, waits;
-    // a poll between keeps A's layout, published in this attempt; A then
-    // commits, and its view asked again later is still a reuse.
+    // The renderer had B prepared: A republished, B is protected by
+    // neither a publication nor a presentation, so its commit is
+    // withdrawn, as its reuse metadata would be dropped (code r3).
     assert_eq!(
         scripts.commit_view(Some(b), 1, || true),
-        crate::screens::ViewCommit::Committed
+        crate::screens::ViewCommit::Gone
     );
-    drop(slot);
+    // An unavailable view publishes the built-in result in between: A,
+    // still presented, keeps its layout through a poll; its view asked
+    // again is still a reuse.
+    rs.request(ViewFacts(None));
     rs.poll();
     rs.set_retained(&[]);
-    assert_eq!(
-        scripts.commit_view(Some(a), 1, || true),
-        crate::screens::ViewCommit::Committed
-    );
-    rs.request(view(6));
-    assert_eq!(shown_script(&rs), b, "B's layout, cached");
     rs.request(view(5));
     assert!(!rs.busy());
     assert_eq!(jobs_started(), jobs);
     assert_eq!(shown_script(&rs), a, "A's runtime, not a fresh one");
+    // The built-in result presents, then a newer one is published: A is
+    // neither presented nor published any more. Its layout goes at the
+    // next poll (its atlas no longer counted), and a view of A the renderer
+    // still had prepared is withdrawn at its commit: disposal and commit
+    // eligibility agree.
+    rs.request(ViewFacts(None));
+    assert_eq!(
+        scripts.commit_view(None, 1, || true),
+        crate::screens::ViewCommit::Committed
+    );
+    drop(slot);
+    rs.poll();
+    let mut ran = false;
+    assert_eq!(
+        scripts.commit_view(Some(a), 1, || {
+            ran = true;
+            true
+        }),
+        crate::screens::ViewCommit::Gone
+    );
+    assert!(!ran);
 }
 
 /// The script generation `rs` publishes, `None` for a layout without a
@@ -1785,21 +1805,26 @@ fn retried() -> (
 }
 
 /// §4/C10 (code r2 HIGH), protection decided where it is used: the old
-/// attempt's publication protects nothing. Lifetime 2 presents A again
-/// first; a different result C then takes B's permit and presents.
+/// attempt's publication protects nothing, and neither does the ended
+/// lifetime's presentation; a different result C takes a permit and
+/// presents.
 #[test]
 fn an_earlier_attempts_publication_protects_nothing() {
     let _s = serial();
     let (_d, mut rs, scripts, [a, b]) = retried();
-    assert_eq!(
-        scripts.commit_view(Some(a), 2, || true),
-        crate::screens::ViewCommit::Committed
+    assert!(
+        !scripts.protected(b),
+        "B was published in the attempt before"
     );
+    assert!(!scripts.protected(a), "A presented in the lifetime before");
     rs.request(view(7));
     settled(&mut rs);
     let c = shown_script(&rs);
     assert!(c != a && c != b);
-    assert!(!scripts.result_live(Some(b)) && scripts.result_live(Some(a)));
+    assert_eq!(
+        scripts.commit_view(Some(c), 2, || true),
+        crate::screens::ViewCommit::Committed
+    );
 }
 
 /// §4/C10 (code r2 HIGH): an ended lifetime's presentation protects

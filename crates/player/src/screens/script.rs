@@ -110,6 +110,9 @@ pub(in crate::screens) struct ScriptHost {
     pub(in crate::screens) presented: Option<(u64, u64)>,
     /// The current result lifetime, 0 between lifetimes.
     pub(in crate::screens) result_lifetime: u64,
+    /// The generation the result skin's publication of the current
+    /// attempt runs, if any ([`Scripts::set_published`]).
+    pub(in crate::screens) published: Option<u64>,
     /// The last generation given: one counter for the cell.
     pub(in crate::screens) generations: u64,
     /// The run's result kind is disabled: no runtime is offered again.
@@ -141,6 +144,19 @@ impl ScriptHost {
         self.presented
             .filter(|&(_, l)| l != 0 && l == self.result_lifetime)
             .map(|(g, _)| g)
+    }
+
+    /// Whether result generation `generation` is protected now: the fixed
+    /// skin's, presented in the current result lifetime, or published in
+    /// the current attempt. The one predicate the eviction, the reuse and
+    /// the commit point all ask, each time (s7-07-design §3.7.1 M6).
+    pub(in crate::screens) fn protects(&self, generation: u64) -> bool {
+        self.presented_now() == Some(generation)
+            || self.published == Some(generation)
+            || self
+                .results
+                .iter()
+                .any(|e| e.generation == generation && e.retained)
     }
 
     /// The entry of result generation `generation`, if it has one.
@@ -515,11 +531,13 @@ impl Scripts {
         {
             let mut host = self.0.host();
             let presented = host.presented_now();
+            let published = host.published;
             let id = self.0.id;
             host.retire_results(|e| {
                 matches!(e.held, Held::Parked(_))
                     && !e.retained
                     && Some(e.generation) != presented
+                    && Some(e.generation) != published
                     && !keep
                         .iter()
                         .flatten()
@@ -530,7 +548,8 @@ impl Scripts {
     }
 
     /// The generation the view presented in the current result lifetime
-    /// runs, if any.
+    /// runs, if any (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
     #[must_use]
     pub(crate) fn presented(&self) -> Option<ScriptGen> {
         self.0.host().presented_now().map(|generation| ScriptGen {
@@ -544,6 +563,20 @@ impl Scripts {
     /// nothing from now on.
     pub(crate) fn enter_result(&self, lifetime: u64) {
         self.0.host().result_lifetime = lifetime;
+    }
+
+    /// The result skin published a layout running generation `g` (none
+    /// for one without a runtime or the built-in result), or a new attempt
+    /// began (`None`): the publication protecting a generation now.
+    pub(crate) fn set_published(&self, g: Option<ScriptGen>) {
+        self.0.host().published = g.filter(|g| g.cell == self.0.id).map(|g| g.generation);
+    }
+
+    /// Whether result generation `g` is protected now
+    /// ([`ScriptHost::protects`]).
+    #[must_use]
+    pub(crate) fn protected(&self, g: ScriptGen) -> bool {
+        g.cell == self.0.id && self.0.host().protects(g.generation)
     }
 
     /// The result lifetime ended: no presentation is current.
@@ -595,7 +628,8 @@ impl Scripts {
     /// runtime) of result lifetime `lifetime` under one hold of the host's lock: its generation checked
     /// live, then `commit` (the GPU commit, which must neither park nor
     /// drop a slot), then the generation marked presented. A generation
-    /// gone is not committed, so an evicted view never presents.
+    /// gone, or no longer protected, is not committed, so an evicted or
+    /// superseded view never presents.
     pub(crate) fn commit_view(
         &self,
         next: Option<ScriptGen>,
@@ -604,10 +638,14 @@ impl Scripts {
     ) -> ViewCommit {
         let mut host = self.0.host();
         if let Some(g) = next {
+            // Live and protected: a view whose generation no publication or
+            // presentation wants any more is withdrawn, as the reuse
+            // metadata of that generation is dropped (code r3).
             let live = g.cell == self.0.id
                 && host
                     .result(g.generation)
-                    .is_some_and(|e| matches!(e.held, Held::Parked(_) | Held::Running));
+                    .is_some_and(|e| matches!(e.held, Held::Parked(_) | Held::Running))
+                && host.protects(g.generation);
             if !live {
                 return ViewCommit::Gone;
             }

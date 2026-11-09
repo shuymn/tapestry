@@ -390,6 +390,7 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
     scripts.enter_result(1);
     let (_a, presented, va) = offered(&scripts, false);
     let (_b, other, vb) = offered(&scripts, false);
+    scripts.set_published(Some(presented));
     assert_eq!(
         scripts.commit_view(Some(presented), 1, || true),
         super::ViewCommit::Committed
@@ -410,6 +411,7 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
     // A kept generation survives; the presented mark moves with a commit,
     // so the formerly presented one is evicted after.
     let (_c, kept, vc) = offered(&scripts, false);
+    scripts.set_published(None);
     assert_eq!(
         scripts.commit_view(None, 1, || true),
         super::ViewCommit::Committed

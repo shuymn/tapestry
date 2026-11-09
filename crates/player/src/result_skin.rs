@@ -245,10 +245,6 @@ pub struct ResultSkin {
     /// generation was protected: a request for its view reuses it, its
     /// runtime running on (s7-07-design §3.7.1 M8).
     presented: Option<Specialized>,
-    /// The attempts begun so far, and the one the publication was made in:
-    /// a publication protects its runtime only in its own attempt.
-    attempts: u64,
-    published_in: u64,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -777,8 +773,13 @@ impl ResultSkin {
                 Published::Skin(..) => "skin",
             }
         );
+        // The cell's publication protects its runtime from now, and only
+        // it, until the next publication or attempt.
+        self.scripts.set_published(match &p {
+            Published::Skin(_, _, g) => *g,
+            Published::BuiltIn => None,
+        });
         self.published = Some(p);
-        self.published_in = self.attempts;
         self.generation += 1;
     }
 
@@ -1081,7 +1082,7 @@ impl ResultSkin {
         // permit, without which the request waits for one. The cached
         // layout holds no later view here (else it was reused), so it is
         // not spared: kept, it could hold a permit no view releases.
-        let Some(permit) = self.scripts.result_permit(&[self.published_now()]) else {
+        let Some(permit) = self.scripts.result_permit(&[]) else {
             self.permit_wait = Some((request, view));
             return;
         };
@@ -1408,23 +1409,14 @@ impl ResultSkin {
     pub fn next_attempt(&mut self) {
         self.attempt = None;
         self.latest = None;
-        self.attempts += 1;
+        self.scripts.set_published(None);
     }
 
-    /// The generation the publication of this attempt runs, if any.
-    fn published_now(&self) -> Option<ScriptGen> {
-        match &self.published {
-            Some(Published::Skin(_, _, g)) if self.published_in == self.attempts => *g,
-            _ => None,
-        }
-    }
-
-    /// Whether runtime generation `g` is protected now, as the eviction
-    /// and the reuse ask it each time: presented in the current result
-    /// lifetime, or published in this attempt (the fixed skin's is
-    /// retained by the cell).
+    /// Whether runtime generation `g` is protected now, as the cell
+    /// decides it for the eviction and the commit point alike
+    /// ([`Scripts::protected`]).
     fn protected(&self, g: Option<ScriptGen>) -> bool {
-        g.is_some() && (g == self.scripts.presented() || g == self.published_now())
+        g.is_some_and(|g| self.scripts.protected(g))
     }
 }
 
