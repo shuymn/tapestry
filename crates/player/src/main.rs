@@ -42,6 +42,7 @@ mod power;
 mod practice_page;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
+mod priority;
 #[cfg(feature = "dev-tools")]
 mod recording;
 mod render_side;
@@ -1319,11 +1320,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(not(feature = "dev-tools"))]
     let rescan = shelf::RESCAN_AFTER;
+    let coord = game::coord::Coordinator::new(game::coord::Caps::this_machine());
     #[cfg_attr(
         not(feature = "dev-tools"),
         expect(unused_mut, reason = "`--dev-stop-timeout` sets its bound")
     )]
-    let mut shelf = shelf::Shelf::new(library, roots.clone(), rescan, Some(root.records()));
+    let mut shelf = shelf::Shelf::new(library, roots.clone(), rescan, Some(root.records()), &coord);
     #[cfg(feature = "dev-tools")]
     if let Some(bound) = s.dev.stop_timeout {
         shelf.set_stop_timeout(bound);

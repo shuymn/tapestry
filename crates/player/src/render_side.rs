@@ -6552,6 +6552,110 @@ pub(crate) mod tests {
         assert!(pressed > 0, "no frame while the tap was pressed");
     }
 
+    /// A practice retry from a round's result (docs/stage3.md, offset 1):
+    /// the result pauses the play state's turntable, the retry resumes it
+    /// and the next round's attempt is prepared with no practice page
+    /// between. The resume applies as that preparation begins: the frames
+    /// drawn between hold the angle, and the next round's frames turn on
+    /// from it, its first adding 0.
+    #[test]
+    fn a_practice_retry_resumes_the_turntable_for_the_next_round() {
+        let chart = ChartBuilder::new(120_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(60_000_000))
+            .build()
+            .unwrap();
+        let (rule, device) = (rules::tapestry(), DeviceProfile::default());
+        let side = || {
+            Logic::<SourceReader>::new(
+                &chart,
+                &rule,
+                &device,
+                &InputStart::default(),
+                Vec::new(),
+                LogicConfig {
+                    inputs: 0,
+                    effects: 16,
+                },
+                Vec::new(),
+            )
+            .unwrap()
+            .1
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen =
+            Box::new(move || Ok(Box::new(PlayTurning(Arc::clone(&noted))) as Box<dyn Screen>));
+        let clock = QpcClock::start();
+        let shared_chart = Arc::new(chart.clone());
+        let link = spawn(
+            make,
+            Some(Arc::clone(&shared_chart)),
+            None,
+            clock,
+            view(),
+            measure(clock),
+            Box::new(NoFrames),
+        )
+        .unwrap();
+        link.play_state(game::PlayState {
+            number: 1,
+            origin: clock.now(),
+        });
+        let play = |link: &super::RenderLink| {
+            let ready = link.prepare_attempt(attempt(&shared_chart, None), || false);
+            assert_eq!(ready.unwrap(), Preparation::Ready);
+            link.commit_attempt().unwrap();
+            link.send(RenderMsg::Play {
+                state_origin: TimeUs(0),
+                side: side(),
+                gauge: 0,
+                measure: play_measure(TimeUs(clock.now().0 + 50_000)),
+            });
+        };
+        // Round 1 plays 200 ms, then goes on to its result: paused.
+        play(&link);
+        assert!(wait_until(|| seen
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|f| f.1.0 > 200_000)));
+        link.turntable(1, true);
+        assert!(link.fence(Duration::from_secs(5)));
+        let paused_at = seen.lock().unwrap().len();
+        // The retry resumes it; old play frames drawn before the next
+        // round's preparation hold the angle.
+        std::thread::sleep(Duration::from_millis(100));
+        link.turntable(1, false);
+        assert!(link.fence(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = link.finish(clock.now());
+        let round2 = seen.lock().unwrap().len();
+        let held = seen.lock().unwrap()[paused_at].0;
+        assert!(
+            seen.lock().unwrap()[paused_at..round2]
+                .iter()
+                .all(|f| f.0 == held),
+            "frames between the pause and the next round's preparation"
+        );
+        // Round 2, with no practice page between: its frames turn on from
+        // the held angle.
+        play(&link);
+        assert!(wait_until(|| seen.lock().unwrap().len() > round2 + 1
+            && seen.lock().unwrap().last().is_some_and(|f| f.1.0 > 100_000)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let f = seen.lock().unwrap().clone();
+        let next = &f[round2..];
+        assert_eq!(next[0].0, held, "the next round's first frame adds 0");
+        let last = next[next.len() - 1];
+        let turned = i64::from(last.0 - held).rem_euclid(2_160_000);
+        assert!(
+            turned > 50_000,
+            "the next round's frames turn on: {turned} units by {:?}",
+            last.1
+        );
+    }
+
     /// A render thread drawing on a [`ClockedLoading`], and its frames.
     fn clocked() -> (
         super::RenderLink,

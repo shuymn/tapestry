@@ -525,15 +525,16 @@ pub trait Rig {
     /// longer the coming attempt's. Nothing by default.
     fn end_presentation(&mut self) {}
     /// A play state begins (design.md "Play Lifecycle"): a chart chosen to
-    /// play, P, or a retry. Its turntable clock starts again
+    /// play, P, or a retry outside practice. Its turntable clock starts again
     /// (docs/stage3.md, offset 1). Nothing by default.
     fn play_state_began(&mut self) {}
     /// The play goes on to its result's preparation, its save included:
     /// the play state's turntable clock pauses whatever is presented.
     /// Nothing by default.
     fn turntable_paused(&mut self) {}
-    /// The practice page shows again after a Start: a paused turntable
-    /// clock resumes with a fresh baseline; a running one runs on.
+    /// The practice page shows again after a Start, or a retry within a
+    /// practice session begins its next round: a paused turntable clock
+    /// resumes with a fresh baseline; a running one runs on.
     /// Nothing by default.
     fn turntable_resumed(&mut self) {}
     /// Whether this rig's plays run the start gate (design.md "Play
@@ -898,6 +899,19 @@ enum Admit {
 /// How the plays of a chart are left: closing the window ends the run,
 /// anything else leaves the chart; a known input-thread failure ends the
 /// run with its cause.
+/// A retry the flow takes up: outside practice the next play state
+/// begins; within a practice session the play state stays, as the
+/// source's practice stays in its play state across rounds
+/// (`BMSPlayer.java:740-741, 772-773` at `0.8.9`), and a turntable its
+/// result paused resumes for the next round (docs/stage3.md, offset 1).
+fn retry_play_state<R: Rig>(loaded: &Loaded, rig: &mut R) {
+    if loaded.practice().is_some() {
+        rig.turntable_resumed();
+    } else {
+        rig.play_state_began();
+    }
+}
+
 fn leave<R: Rig>(rig: &R) -> Result<Leave, LiveError<R::ScreenError>> {
     run_over(rig)?;
     Ok(if rig.quitting() {
@@ -951,7 +965,7 @@ pub fn run_chart<R: Rig>(
             return leave(rig);
         }
         if retried {
-            rig.play_state_began();
+            retry_play_state(loaded, rig);
             continue;
         }
         // A tail stage that ran to its end and repeats (a repeated round's
@@ -972,7 +986,7 @@ pub fn run_chart<R: Rig>(
         match prepared {
             Prepared::Ready => {}
             Prepared::Retry => {
-                rig.play_state_began();
+                retry_play_state(loaded, rig);
                 continue;
             }
             Prepared::Leave => return leave(rig),
@@ -1091,8 +1105,7 @@ pub fn run_chart<R: Rig>(
                 {
                     rig.serve_leaving(cmd);
                     if cmd == MenuCommand::Retry {
-                        // A retry is the next play state.
-                        rig.play_state_began();
+                        retry_play_state(loaded, rig);
                         break;
                     }
                     return leave(rig);
