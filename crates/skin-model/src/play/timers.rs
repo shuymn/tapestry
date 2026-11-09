@@ -18,7 +18,7 @@ use super::{
     RoundedDuration, SkinFrame,
 };
 use crate::expr::{Program, State, TIMER_OFF};
-use crate::present::Present;
+use crate::present::{Clock, Io, Present};
 use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::LaneView;
 
@@ -573,15 +573,28 @@ impl Play {
             |_| true,
         );
         // The presentation program, last: its callbacks read this frame's
-        // fields and timers and write only its outputs.
+        // fields and timers and write only its outputs, its timers and its
+        // slots.
+        let program = usize::from(timer::BUILTIN).saturating_add(whens.len());
         if let Some(p) = present
             && let Some((fields, outs)) = self.fields.split_at_mut_checked(field::COUNT)
+            && let Some(timers) = self.starts.get_mut(program..)
         {
             let state = State {
                 fields,
                 timers: &self.ms,
             };
-            p.run(&state, outs);
+            p.run(&mut Io {
+                state: &state,
+                clock: Clock {
+                    state_us: frame.state_us,
+                    now: frame.now,
+                },
+                bank: &mut self.bank,
+                outs,
+                timers,
+                slots: self.slots_run,
+            });
         }
         Ok(())
     }

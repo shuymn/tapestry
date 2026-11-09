@@ -3330,12 +3330,17 @@ fn present_reads(bad: bool) -> Vec<skin_model::present::ReadDef> {
 /// A presentation program decoded from `data`: one byte of callback
 /// count (its high bit adding the reads the verifier refuses), then per callback seven bytes (its start, its length, its
 /// registers, its conversion and its signature, its gate, its `after`),
-/// then four-byte instructions to the end; the constants are a fixed table
-/// of integers, floats, nil and booleans, the reads [`present_reads`].
+/// then four-byte instructions to the end (an op byte from 240 the clock
+/// or a slot's load or store, a conversion byte's high bit a timer
+/// callback); the constants are a fixed table
+/// of integers, floats, nil, booleans and the off value, the reads
+/// [`present_reads`], and the slots and store domains a fixed table too
+/// (a slot or domain index past it, or a store whose domain is not its
+/// slot's, refused).
 #[must_use]
 pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
     use skin_model::present::{
-        Arith, CallbackDef, Cmp, Conv, Insn, MathFn, OutTy, PresentDef, Val,
+        Arith, CallbackDef, Cmp, Conv, Domain, Insn, MathFn, OFF, OutTy, PresentDef, SlotDef, Val,
     };
     let consts = vec![
         Val::Nil,
@@ -3352,16 +3357,47 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
         Val::Float(f64::NAN),
         Val::Float(f64::INFINITY),
         Val::Float(4_294_967_296.0),
+        OFF,
+    ];
+    let latch = Domain {
+        off: true,
+        ints: Some((0, 1 << 53)),
+    };
+    let small = Domain {
+        off: false,
+        ints: Some((0, 3)),
+    };
+    let slots = vec![
+        SlotDef {
+            init: OFF,
+            domain: latch,
+        },
+        SlotDef {
+            init: Val::Int(0),
+            domain: small,
+        },
     ];
     let (n, rest) = data.split_first().map_or((0, data), |(&n, r)| (n % 8, r));
     let (head, body) = rest.split_at((usize::from(n) * 7).min(rest.len()));
     let mut def = PresentDef {
         consts,
         reads: present_reads(data.first().is_some_and(|b| b & 0x80 != 0)),
+        slots,
+        domains: vec![
+            latch,
+            small,
+            Domain {
+                off: true,
+                ints: None,
+            },
+        ],
         ..PresentDef::default()
     };
     for &[start, len, regs, conv, sig, gate, after] in head.as_chunks::<7>().0 {
-        let conv = if conv % 2 == 0 {
+        // The high bit a timer callback.
+        let conv = if conv & 0x80 != 0 {
+            Conv::Timer
+        } else if conv % 2 == 0 {
             Conv::Truthy
         } else {
             Conv::Int
@@ -3377,6 +3413,7 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
         // A signature that may not match its conversion.
         let ty = match (sig % 5 == 0, conv) {
             (false, Conv::Truthy) | (true, Conv::Int) => OutTy::Bool,
+            (false, Conv::Timer) => OutTy::Timer,
             _ => OutTy::Int,
         };
         def.signature.push(ty);
@@ -3392,7 +3429,13 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
     let cmp = [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le];
     let math = [MathFn::Floor, MathFn::Ceil, MathFn::Abs];
     for &[op, a, b, c] in body.as_chunks::<4>().0 {
-        def.code.push(match op % 12 {
+        // An op byte from 240 a clock or slot instruction.
+        let op = if op >= 240 {
+            12 + (op - 240) % 3
+        } else {
+            op % 12
+        };
+        def.code.push(match op {
             0 => Insn::Const {
                 dst: a,
                 k: u16::from(b),
@@ -3432,6 +3475,16 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
                 cond: a,
                 when: b % 2 == 0,
                 to: u16::from(c),
+            },
+            12 => Insn::StateUs { dst: a },
+            13 => Insn::LoadSlot {
+                dst: a,
+                slot: u16::from(b % 4),
+            },
+            14 => Insn::StoreSlot {
+                slot: u16::from(b % 4),
+                src: a,
+                domain: u16::from(c % 4),
             },
             _ => Insn::Ret { src: a },
         });
