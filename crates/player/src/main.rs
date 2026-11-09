@@ -262,7 +262,7 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         },
         clock,
     );
-    let screens = dev::measured_screens();
+    let measured = dev::measured_screens();
     let stopped = capture.stop();
     ran?;
     stopped?;
@@ -271,21 +271,22 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
     if let Some(e) = error {
         return Err(anyhow::Error::new(e).context(csv.display().to_string()));
     }
-    for (i, s) in screens.iter().enumerate() {
-        let presents = (s.past == 0).then_some(s.present_times.as_slice());
+    // Every present the run issued, the screens' predecessors and
+    // successors included; none (N/A) once the log overflowed.
+    let presents = (measured.presents_past == 0).then_some(measured.presents.as_slice());
+    println!(
+        "measure: {} presents logged, {} past the log",
+        measured.presents.len(),
+        measured.presents_past
+    );
+    for s in &measured.screens {
+        let span = dev::screen_span(s.presents, &measured.presents);
         let counted = s.period_ns.map(|period| {
-            presentmon::count_capture(&frames, s.span, presents, s.presentation, period)
+            presentmon::count_capture(&frames, span, presents, s.presentation, period)
         });
         println!(
-            "measure: {} lifetime {i}: span {}..{} us, {} presents, presentation {:?}, \
-             period {:?} ns: {:?}",
-            s.screen,
-            s.span.0,
-            s.span.1,
-            s.present_times.len(),
-            s.presentation,
-            s.period_ns,
-            counted
+            "measure: {} lifetime {}: span {}..{} us, presentation {:?}, period {:?} ns,              frames past storage {}: {:?}",
+            s.screen, s.lifetime, span.0, span.1, s.presentation, s.period_ns, s.past, counted
         );
     }
     Ok(())

@@ -545,9 +545,8 @@ fn selection_runtime_frame_alloc() {
 }
 
 /// The whole frames' build mark (dev-tools, the S7-07d gate) is set
-/// before the selection skin's build: the build and the submission,
-/// which the frame's `cpu` counts, lie after it, so the preparation span
-/// never holds the build.
+/// before the selection skin's build begins, where the frame's `cpu`
+/// starts counting: the preparation span never holds the build.
 #[test]
 fn the_build_mark_precedes_the_selection_build() {
     let _serial = crate::imports::tests::serial();
@@ -573,13 +572,11 @@ fn the_build_mark_precedes_the_selection_build() {
     for k in 0..5 {
         let now = TimeUs(k * 16_667);
         let _ = crate::dev::take_build_mark();
+        let _ = render::take_build_start();
         screen.build_selection_frame(&u, &mut logic, now).unwrap();
-        let t = screen.renderer.submit_selection(&[]).unwrap();
-        let end = std::time::Instant::now();
+        screen.renderer.submit_selection(&[]).unwrap();
         let mark = crate::dev::take_build_mark().expect("the build marked");
-        assert!(
-            end.duration_since(mark) >= t.cpu,
-            "frame {k}: the build began before its mark"
-        );
+        let start = render::take_build_start().expect("the build began");
+        assert!(mark <= start, "frame {k}: the build began before its mark");
     }
 }

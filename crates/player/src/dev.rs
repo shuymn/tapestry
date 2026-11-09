@@ -1485,40 +1485,136 @@ pub struct ScreenFrame {
 
 /// A select or result screen's lifetime as `tapestry measure select`
 /// counts it against the capture (dev-tools).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ScreenCapture {
     /// "select" or "result".
     pub screen: &'static str,
-    /// The span, µs on the game's clock: the first present to the last.
-    pub span: (i64, i64),
-    /// Every present the lifetime's frames issued, µs, in order.
-    pub present_times: Vec<i64>,
+    /// The screen's lifetime.
+    pub lifetime: u64,
+    /// Its first and last skin frames' present times, µs on the game's
+    /// clock; the span ends at the next present after the last
+    /// ([`screen_span`]).
+    pub presents: (i64, i64),
     /// How the swap chain presented, when it said.
     pub presentation: Option<render::measure::Presentation>,
     /// One refresh, ns, measured from the lifetime's frame statistics.
     pub period_ns: Option<i64>,
-    /// Frames past the storage, whose presents are not listed: the span
-    /// is then N/A.
+    /// Frames past the storage, not kept.
     pub past: u64,
 }
 
-/// The lifetimes `tapestry measure select` counts, while it runs.
-static MEASURED_SCREENS: Mutex<Option<Vec<ScreenCapture>>> = Mutex::new(None);
+/// What `tapestry measure select` counts: each lifetime, and every
+/// present the render thread issued in the run, in order, so a lifetime's
+/// predecessor and successor, another screen's, are matched too.
+#[derive(Debug, Default)]
+pub struct Measured {
+    /// The lifetimes, in the order they ended.
+    pub screens: Vec<ScreenCapture>,
+    /// Every present's time, µs, until the log's storage was full.
+    pub presents: Vec<i64>,
+    /// Presents past the log's storage: the counts are then N/A.
+    pub presents_past: u64,
+}
 
-/// Starts keeping each select and result lifetime for the count.
+/// The run's measurement while `tapestry measure select` runs.
+static MEASURED_SCREENS: Mutex<Option<Measured>> = Mutex::new(None);
+
+/// The presents a run's log keeps: about 2.4 hours at 240 Hz.
+pub const PRESENT_LOG: usize = 1 << 21;
+
+/// Starts keeping each select and result lifetime and every present.
 pub fn measure_screens() {
     *MEASURED_SCREENS
         .lock()
-        .unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+        .unwrap_or_else(PoisonError::into_inner) = Some(Measured::default());
 }
 
-/// The lifetimes kept since [`measure_screens`], and stops keeping them.
-pub fn measured_screens() -> Vec<ScreenCapture> {
+/// Whether [`measure_screens`] runs.
+pub fn measuring_screens() -> bool {
+    MEASURED_SCREENS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
+}
+
+/// What was kept since [`measure_screens`], and stops keeping it.
+pub fn measured_screens() -> Measured {
     MEASURED_SCREENS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .take()
         .unwrap_or_default()
+}
+
+/// Hands the render thread's present log over at its end.
+pub fn keep_present_log(log: &mut PresentLog) {
+    if let Some(m) = MEASURED_SCREENS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()
+    {
+        m.presents = std::mem::take(&mut log.times);
+        m.presents_past = log.past;
+    }
+}
+
+/// The render thread's presents while `tapestry measure select` runs
+/// (dev-tools): storage made with the thread, none otherwise, so a present
+/// recorded allocates nothing.
+#[derive(Debug, Default)]
+pub struct PresentLog {
+    times: Vec<i64>,
+    past: u64,
+}
+
+impl PresentLog {
+    /// A log of `n` presents (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            times: Vec::with_capacity(n),
+            past: 0,
+        }
+    }
+
+    /// The presents kept (tests).
+    #[cfg(test)]
+    pub fn times(&self) -> &[i64] {
+        &self.times
+    }
+
+    /// A log for the run: [`PRESENT_LOG`] presents while measuring, none
+    /// otherwise.
+    #[must_use]
+    pub fn for_run() -> Self {
+        Self {
+            times: Vec::with_capacity(if measuring_screens() { PRESENT_LOG } else { 0 }),
+            past: 0,
+        }
+    }
+
+    /// A present at `at` (µs), taken right after it returned.
+    pub fn present(&mut self, at: i64) {
+        if self.times.capacity() == 0 {
+            return;
+        }
+        if self.times.len() < self.times.capacity() {
+            self.times.push(at);
+        } else {
+            self.past += 1;
+        }
+    }
+}
+
+/// The span `[a, b)` a lifetime presenting from `first` to `last` covers
+/// in the run's present `log`: from its first present to the next present
+/// after its last (another screen's), so its last interval counts; to just
+/// after its last without one.
+#[must_use]
+pub fn screen_span((first, last): (i64, i64), log: &[i64]) -> (i64, i64) {
+    let next = log.iter().copied().find(|&t| t > last);
+    (first, next.unwrap_or(last + 1))
 }
 
 /// A select or result screen's skin frames for one lifetime (dev-tools):
@@ -1528,7 +1624,8 @@ pub fn measured_screens() -> Vec<ScreenCapture> {
 #[derive(Debug)]
 pub struct ScreenFrames {
     frames: Vec<ScreenFrame>,
-    presents: Vec<i64>,
+    lifetime: Option<u64>,
+    presents: Option<(i64, i64)>,
     past: u64,
     filter: render::measure::StatsFilter,
     first_sync: Option<(i64, u32)>,
@@ -1543,13 +1640,25 @@ impl Default for ScreenFrames {
     }
 }
 
+/// What a select or result skin frame's present gave.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Presented {
+    /// When the present returned, µs; `None` when it was not presented.
+    pub at: Option<i64>,
+    /// The swap chain's frame statistics after it.
+    pub statistics: Option<render::measure::FrameStatistics>,
+    /// How the swap chain presents, when it says.
+    pub presentation: Option<render::measure::Presentation>,
+}
+
 impl ScreenFrames {
     /// Storage for `n` frames.
     #[must_use]
     pub fn with_capacity(n: usize) -> Self {
         Self {
             frames: Vec::with_capacity(n),
-            presents: Vec::with_capacity(n),
+            lifetime: None,
+            presents: None,
             past: 0,
             filter: render::measure::StatsFilter::default(),
             first_sync: None,
@@ -1557,6 +1666,12 @@ impl ScreenFrames {
             presentation: None,
             before_wait: Duration::ZERO,
         }
+    }
+
+    /// The lifetime whose frames it holds, if any.
+    #[must_use]
+    pub const fn lifetime(&self) -> Option<u64> {
+        self.lifetime
     }
 
     /// Preparation done before a frame wait, charged to the next
@@ -1570,15 +1685,22 @@ impl ScreenFrames {
         std::mem::take(&mut self.before_wait)
     }
 
-    /// One skin frame: its spans, its runtime's sample, whether it
-    /// switched views, and what its present gave (`d`).
+    /// One skin frame of `lifetime`: its spans, its runtime's sample,
+    /// whether it switched views, and what its present gave. Returns
+    /// whether it was kept: a frame of another lifetime than those held is
+    /// not (the caller reports them first).
     pub fn frame(
         &mut self,
+        lifetime: u64,
         spans: Spans,
         visit: crate::screens::VisitSample,
         switch: bool,
-        d: &crate::measure::Drawn<'_>,
-    ) {
+        p: Presented,
+    ) -> bool {
+        if self.lifetime.is_some_and(|l| l != lifetime) {
+            return false;
+        }
+        self.lifetime = Some(lifetime);
         let f = ScreenFrame {
             spans,
             visit,
@@ -1586,20 +1708,21 @@ impl ScreenFrames {
         };
         if self.frames.len() < self.frames.capacity() {
             self.frames.push(f);
-            if d.timing.presented && self.presents.len() < self.presents.capacity() {
-                self.presents.push(d.at.0);
-            }
         } else {
             self.past += 1;
         }
-        if d.presentation.is_some() {
-            self.presentation = d.presentation;
+        if let Some(at) = p.at {
+            self.presents = Some(self.presents.map_or((at, at), |(a, _)| (a, at)));
         }
-        if let Some(s) = self.filter.accept(d.statistics) {
+        if p.presentation.is_some() {
+            self.presentation = p.presentation;
+        }
+        if let Some(s) = self.filter.accept(p.statistics) {
             let sync = (s.sync_qpc_time, s.sync_refresh_count);
             self.first_sync.get_or_insert(sync);
             self.last_sync = Some(sync);
         }
+        true
     }
 
     /// The frames kept (tests).
@@ -1611,20 +1734,21 @@ impl ScreenFrames {
     /// Prints the lifetime's frames, if any, as `screen`'s, hands the
     /// lifetime to `tapestry measure select` when it runs (its period from
     /// the frame statistics at `freq` QPC ticks a second), and clears
-    /// them, keeping the storage.
+    /// them, keeping the storage. Called when the lifetime ends, outside
+    /// any frame.
     pub fn report(&mut self, screen: &'static str, freq: i64) {
-        if !self.frames.is_empty() {
-            self.print(screen);
-            if let Some(kept) = MEASURED_SCREENS
+        if let (Some(lifetime), false) = (self.lifetime, self.frames.is_empty()) {
+            self.print(screen, lifetime);
+            if let Some(m) = MEASURED_SCREENS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
-                && let (Some(&a), Some(&b)) = (self.presents.first(), self.presents.last())
+                && let Some(presents) = self.presents
             {
-                kept.push(ScreenCapture {
+                m.screens.push(ScreenCapture {
                     screen,
-                    span: (a, b),
-                    present_times: self.presents.clone(),
+                    lifetime,
+                    presents,
                     presentation: self.presentation,
                     period_ns: self
                         .first_sync
@@ -1635,7 +1759,8 @@ impl ScreenFrames {
             }
         }
         self.frames.clear();
-        self.presents.clear();
+        self.lifetime = None;
+        self.presents = None;
         self.past = 0;
         self.filter = render::measure::StatsFilter::default();
         self.first_sync = None;
@@ -1644,7 +1769,7 @@ impl ScreenFrames {
         self.before_wait = Duration::ZERO;
     }
 
-    fn print(&self, screen: &str) {
+    fn print(&self, screen: &str, lifetime: u64) {
         let q = |mut v: Vec<u64>| {
             v.sort_unstable();
             let at = |p: usize| {
@@ -1664,8 +1789,9 @@ impl ScreenFrames {
             pick(|f| f.spans.build_submit),
         );
         println!(
-            "dev: {screen} frames {} (past capacity {}), us p50/p99/max: whole {}/{}/{}, \
-             preparation {}/{}/{}, runtime {}/{}/{}, build and submission {}/{}/{}",
+            "dev: {screen} lifetime {lifetime} frames {} (past capacity {}), us p50/p99/max: \
+             whole {}/{}/{}, preparation {}/{}/{}, runtime {}/{}/{}, build and submission \
+             {}/{}/{}",
             f.len(),
             self.past,
             w.0,
@@ -1690,9 +1816,9 @@ impl ScreenFrames {
             .map(|f| ns(f.visit.collect_span))
             .collect());
         println!(
-            "dev: {screen} runtime frames {}: instructions max {}, host calls max {}; \
-             first use frames {} (whole max {} us, runtime max {} us); switch frames {} \
-             (whole max {} us); forced collections {} (span p50/p99/max {}/{}/{} us)",
+            "dev: {screen} lifetime {lifetime} runtime frames {}: instructions max {}, host \
+             calls max {}; first use frames {} (whole max {} us, runtime max {} us); switch \
+             frames {} (whole max {} us); forced collections {} (span p50/p99/max {}/{}/{} us)",
             ran.len(),
             max(&mut ran.iter().map(|f| f.visit.instructions)),
             max(&mut ran.iter().map(|f| f.visit.host_calls)),
@@ -1712,9 +1838,11 @@ impl ScreenFrames {
             c.1,
             c.2,
         );
-        // Per VM generation: the end-of-frame heap's maximum, the sampled
-        // high-water, and the frames whose end-of-frame heap fell (a
-        // diagnostic: not evidence of a collection).
+        // Per VM generation: the end-of-frame heap's maximum, the VM's
+        // sampled high-water while it ran as the runtime (unknown while no
+        // sample rose above its import's, the header pass included), and
+        // the frames whose end-of-frame heap fell (a diagnostic, not
+        // evidence of a collection).
         let mut generations: Vec<u64> = ran.iter().map(|f| f.visit.generation).collect();
         generations.sort_unstable();
         generations.dedup();
@@ -1724,14 +1852,18 @@ impl ScreenFrames {
                 .windows(2)
                 .filter(|w| w[1].visit.heap < w[0].visit.heap && !w[1].visit.collected)
                 .count();
+            let peak = of.iter().filter_map(|f| f.visit.runtime_peak).max();
             println!(
-                "dev: {screen} vm {g}: frames {}, heap at frame end max {} bytes, sampled \
-                 high-water {} bytes, frames whose heap fell {fell}",
+                "dev: {screen} lifetime {lifetime} vm {g}: frames {}, heap at frame end max {} \
+                 bytes, runtime high-water {}, frames whose heap fell {fell}",
                 of.len(),
                 max(&mut of
                     .iter()
                     .map(|f| u64::try_from(f.visit.heap).unwrap_or(u64::MAX))),
-                max(&mut of.iter().map(|f| f.visit.peak_heap)),
+                peak.map_or_else(
+                    || "not above the import's (unknown)".to_owned(),
+                    |p| format!("{p} bytes (sampled)")
+                ),
             );
         }
     }
@@ -2759,62 +2891,81 @@ mod tests {
         assert_eq!(seen, [false, false, true, false, true, false]);
     }
 
-    /// A frame drawn with nothing but its timing, as a select or result
-    /// skin frame gives it.
+    /// A lifetime's frames stay together across ordinary updates and are
+    /// reported only when it ends: a frame of another lifetime is not
+    /// kept while they are held, and after the report it starts its own.
+    /// The span runs from the lifetime's first present to its last.
     #[cfg(feature = "dev-tools")]
-    fn drawn(at: i64) -> crate::measure::Drawn<'static> {
-        crate::measure::Drawn {
-            play: None,
-            view: None,
-            loading_stamp: None,
-            menu: true,
-            loading: false,
-            skin_loading: None,
-            generation: None,
-            timing: render::FrameTiming {
-                cpu: std::time::Duration::from_micros(500),
-                sprites: 0,
-                dropped: 0,
-                presented: true,
-                present_count: Some(1),
-            },
-            statistics: None,
-            presentation: None,
-            effects: &[],
-            at: bms_model::TimeUs(at),
+    #[test]
+    fn a_lifetimes_frames_stay_together_until_it_ends() {
+        use super::{Presented, ScreenFrames, Spans};
+        let mut frames = ScreenFrames::with_capacity(16);
+        let at = |t| Presented {
+            at: Some(t),
+            ..Presented::default()
+        };
+        let s = crate::screens::VisitSample::default();
+        for t in [100, 200, 300] {
+            assert!(frames.frame(5, Spans::default(), s, false, at(t)));
         }
+        // Not presented: kept, its present not the span's end.
+        assert!(frames.frame(5, Spans::default(), s, false, Presented::default()));
+        assert_eq!((frames.lifetime(), frames.frames().len()), (Some(5), 4));
+        assert!(!frames.frame(6, Spans::default(), s, false, at(400)));
+        assert_eq!(frames.frames().len(), 4);
+        super::measure_screens();
+        frames.report("select", 10_000_000);
+        // Other tests' render threads may report while it measures: this
+        // lifetime's record is the one with its presents.
+        let kept = super::measured_screens();
+        assert!(
+            kept.screens
+                .iter()
+                .any(|c| c.screen == "select" && c.lifetime == 5 && c.presents == (100, 300)),
+            "{:?}",
+            kept.screens
+        );
+        assert_eq!(frames.lifetime(), None);
+        assert!(frames.frame(6, Spans::default(), s, false, at(400)));
     }
 
-    /// Recording a select or result frame allocates nothing: the first
-    /// write, the steady ones, those past the storage, and those after a
-    /// lifetime's report, which keeps the storage. A growing vector made
-    /// inside the count is counted (the control). Unoptimized builds
-    /// count the standard library's own allocations: CI runs it in
-    /// release.
+    /// Recording a select or result frame, and a present in the run's
+    /// log, allocates nothing: the first write, the steady ones, those past
+    /// the storage, and those after a lifetime's report, which keeps the
+    /// storage. A growing vector made inside the count is counted (the
+    /// control). Unoptimized builds count the standard library's own
+    /// allocations: CI runs it in release.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn screen_frames_record_alloc() {
-        use super::{ScreenFrames, Spans};
+        use super::{PresentLog, Presented, ScreenFrames, Spans};
         use crate::alloc_count::this_thread;
         let mut frames = ScreenFrames::with_capacity(4);
+        let mut log = PresentLog::with_capacity(4);
         let sample = crate::screens::VisitSample {
             ran: true,
             generation: 7,
             ..Default::default()
         };
-        let d = drawn(1_000);
+        let p = Presented {
+            at: Some(1_000),
+            ..Presented::default()
+        };
         let before = this_thread();
-        frames.frame(Spans::default(), sample, false, &d);
+        frames.frame(1, Spans::default(), sample, false, p);
+        log.present(1_000);
         let first = this_thread() - before;
         let before = this_thread();
-        for _ in 0..8 {
-            frames.frame(Spans::default(), sample, true, &d);
+        for k in 0..8 {
+            frames.frame(1, Spans::default(), sample, true, p);
+            log.present(2_000 + k);
         }
         let steady_and_past = this_thread() - before;
         assert_eq!(frames.frames().len(), 4);
+        assert_eq!(log.times().len(), 4);
         frames.report("select", 10_000_000);
         let before = this_thread();
-        frames.frame(Spans::default(), sample, false, &d);
+        frames.frame(2, Spans::default(), sample, false, p);
         let after_report = this_thread() - before;
         let before = this_thread();
         let mut grown: Vec<u64> = Vec::new();

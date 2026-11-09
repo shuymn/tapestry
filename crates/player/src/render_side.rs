@@ -2531,8 +2531,12 @@ pub fn spawn(
                 result_frames: crate::dev::ScreenFrames::default(),
                 #[cfg(feature = "dev-tools")]
                 frames_view: None,
+                #[cfg(feature = "dev-tools")]
+                present_log: crate::dev::PresentLog::for_run(),
             };
             r.run(&rx);
+            #[cfg(feature = "dev-tools")]
+            r.flush_screen_frames();
         })
         .map_err(ScreenError::Spawn)?;
     match ready_rx.recv() {
@@ -3134,6 +3138,10 @@ struct Run {
     /// switches (dev-tools).
     #[cfg(feature = "dev-tools")]
     frames_view: Option<crate::result_present::ViewKey>,
+    /// Every present's time while `tapestry measure select` runs
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    present_log: crate::dev::PresentLog,
 }
 
 impl Run {
@@ -3234,8 +3242,6 @@ impl Run {
             #[cfg(feature = "dev-tools")]
             if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_))) {
                 self.menu_stats.report("select");
-                self.select_frames
-                    .report("select", self.clock.frequency().hz());
             }
             #[cfg(feature = "dev-tools")]
             if msg.is_ok()
@@ -3557,6 +3563,18 @@ impl Run {
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
+            // The whole frames of a selection lifetime that ended, before
+            // any frame of what follows: updates, rebuilds and resizes of
+            // the same lifetime keep them (dev-tools, the S7-07d gate).
+            #[cfg(feature = "dev-tools")]
+            if self
+                .select_frames
+                .lifetime()
+                .is_some_and(|l| !self.shared.selection_current(l))
+            {
+                self.select_frames
+                    .report("select", self.clock.frequency().hz());
+            }
             self.poll_attempt();
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
@@ -3685,6 +3703,10 @@ impl Run {
             let mut frame_began: Option<Instant> = None;
             #[cfg(feature = "dev-tools")]
             let mut skin_frame = false;
+            // When a select or result skin frame's present returned, taken
+            // before any cleanup (dev-tools: matched against the capture).
+            #[cfg(feature = "dev-tools")]
+            let mut presented_at: Option<TimeUs> = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -3937,6 +3959,10 @@ impl Run {
                     let now = self.clock.now();
                     let changed = std::mem::replace(&mut shown.changed, false);
                     let drawn = screen.selection(&shown.update, shown.logic.as_mut(), changed, now);
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        presented_at = Some(self.clock.now());
+                    }
                     if let Ok(SelectionDrawn {
                         refused: Some(why), ..
                     }) = &drawn
@@ -4040,7 +4066,14 @@ impl Run {
                         {
                             Err(RenderError::SurfaceLost)
                         }
-                        ResultDrawn::Built => screen.submit_result().map(|t| (t, None)),
+                        ResultDrawn::Built => {
+                            let submitted = screen.submit_result();
+                            #[cfg(feature = "dev-tools")]
+                            {
+                                presented_at = Some(self.clock.now());
+                            }
+                            submitted.map(|t| (t, None))
+                        }
                         ResultDrawn::BuiltIn => screen
                             .end(&page(self.result.as_ref(), &self.end_page.1))
                             .map(|p| (timing_of(p), None)),
@@ -4060,6 +4093,9 @@ impl Run {
                 }
                 Mode::End => screen.end(&self.end_page.1).map(|p| (timing_of(p), None)),
             };
+            // Any other frame's present: right after its draw returned.
+            #[cfg(feature = "dev-tools")]
+            let presented_at = presented_at.unwrap_or_else(|| self.clock.now());
             if !minimized {
                 self.granted = false;
             }
@@ -4133,11 +4169,22 @@ impl Run {
                         effects: if play.is_some() { &effects } else { &[] },
                         at: self.clock.now(),
                     };
+                    // Every present, for `tapestry measure select`
+                    // (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if timing.presented {
+                        self.present_log.present(presented_at.0);
+                    }
                     // A select or result skin frame's spans and present
                     // (dev-tools: the whole frames, the S7-07d gate).
                     #[cfg(feature = "dev-tools")]
                     if let Some(began) = frame_began.filter(|_| skin_frame)
                         && let Some(built) = crate::dev::take_build_mark()
+                        && let Some(lifetime) = if matches!(mode, Mode::Result) {
+                            self.result.as_ref().map(|r| r.lifetime)
+                        } else {
+                            self.selection.as_ref().map(|s| s.update.lifetime)
+                        }
                     {
                         let result = matches!(mode, Mode::Result);
                         let switch = result
@@ -4164,7 +4211,20 @@ impl Run {
                             visit.span.saturating_add(visit.collect_span),
                             timing.cpu,
                         );
-                        frames.frame(spans, visit, switch, &d);
+                        let presented = crate::dev::Presented {
+                            at: timing.presented.then_some(presented_at.0),
+                            statistics: d.statistics,
+                            presentation: d.presentation,
+                        };
+                        if !frames.frame(lifetime, spans, visit, switch, presented) {
+                            // Another lifetime's frames still held: they end
+                            // here (a lifetime change the loop did not see).
+                            frames.report(
+                                if result { "result" } else { "select" },
+                                self.clock.frequency().hz(),
+                            );
+                            frames.frame(lifetime, spans, visit, switch, presented);
+                        }
                     }
                     // The app region's second interval: a play frame's
                     // measurement. The frame sink (the frame dump) stays
@@ -4955,6 +5015,17 @@ impl Run {
         if let Some(side) = &mut self.result {
             side.incoming = Some(p);
         }
+    }
+
+    /// The render loop ended (dev-tools): the select and result screens'
+    /// whole frames still held are reported, and the run's present log is
+    /// handed to `tapestry measure select`.
+    #[cfg(feature = "dev-tools")]
+    fn flush_screen_frames(&mut self) {
+        let freq = self.clock.frequency().hz();
+        self.select_frames.report("select", freq);
+        self.result_frames.report("result", freq);
+        crate::dev::keep_present_log(&mut self.present_log);
     }
 
     /// The result's lifetime ended: its staging is discarded and nothing

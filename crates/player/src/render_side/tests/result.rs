@@ -2578,9 +2578,8 @@ fn the_links_lifetimes_scope_the_presented_protection() {
 }
 
 /// The whole frames' build mark (dev-tools, the S7-07d gate) is set
-/// before the result skin's build: the build and the submission, which
-/// the frame's `cpu` counts, lie after it, so the preparation span never
-/// holds the build.
+/// before the result skin's build begins, where the frame's `cpu` starts
+/// counting: the preparation span never holds the build.
 #[test]
 fn the_build_mark_precedes_the_result_build() {
     use super::super::{HeldView, PreparedView, ResultDrawn, ResultSide, Run, Shared};
@@ -2642,15 +2641,13 @@ fn the_build_mark_precedes_the_result_build() {
         let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
         Run::result_visit(Some(&mut side), now, fadeout);
         let _ = crate::dev::take_build_mark();
+        let _ = render::take_build_start();
         let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
         assert_eq!(drawn, ResultDrawn::Built);
-        let t = screen.submit_result().unwrap();
-        let end = Instant::now();
+        screen.submit_result().unwrap();
         let mark = crate::dev::take_build_mark().expect("the build marked");
-        assert!(
-            end.duration_since(mark) >= t.cpu,
-            "frame {k}: the build began before its mark"
-        );
+        let start = render::take_build_start().expect("the build began");
+        assert!(mark <= start, "frame {k}: the build began before its mark");
         side.dropped = [None, None];
         let _ = screen.drain_retired();
     }

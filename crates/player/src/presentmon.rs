@@ -647,6 +647,36 @@ mod tests {
         assert_eq!(count_play(&close, &fig, T).count, None);
     }
 
+    /// A select or result screen's lifetime is counted with the run's
+    /// present log: its span reaches the next screen's first present, and
+    /// its predecessor, the previous screen's last present, is matched. With
+    /// the lifetime's own presents only, that predecessor is missing and
+    /// the span is N/A (the S7-07d gate's P5).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_screens_lifetime_counts_against_the_runs_presents() {
+        let frames: Vec<PmFrame> = [0, 4, 8, 12, 16]
+            .map(|p| frame(p * 1_000, Some(p * 1_000 + 1_000)))
+            .to_vec();
+        let log = [300, 4_300, 8_300, 12_300, 16_300];
+        let span = crate::dev::screen_span((4_300, 12_300), &log);
+        assert_eq!(span, (4_300, 16_300));
+        let shown = Some(render::measure::Presentation {
+            sync_interval: 1,
+            tearing: false,
+        });
+        let c = super::count_capture(&frames, span, Some(&log), shown, T);
+        assert_eq!(c.count.map(|s| s.lost), Some(0));
+        let own = [4_300, 8_300, 12_300];
+        let c = super::count_capture(&frames, span, Some(&own), shown, T);
+        assert_eq!(c.count, None);
+        // The last lifetime of a run: its span ends just after its last.
+        assert_eq!(
+            crate::dev::screen_span((4_300, 16_300), &log),
+            (4_300, 16_301)
+        );
+    }
+
     /// An empty capture, or a game without present times, has no figure.
     #[test]
     fn an_empty_or_unchecked_capture_has_no_figures() {
