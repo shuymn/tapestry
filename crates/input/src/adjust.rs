@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bms_model::TimeUs;
 use eval::ControlId;
 
+use crate::activity::{ActivityRecord, SectionValue};
 use crate::hid::{HidProduct, wrapped};
 use crate::sources::DeviceKind;
 
@@ -637,6 +638,17 @@ pub struct AdjustmentTap {
     panels: Arc<AtomicU64>,
     /// The focus losses counted at the level's last publication.
     panel_losses: u64,
+    /// The numbers of the tuning controls (START, SELECT, F1, F2), a bit
+    /// each, whose holds and events the activity record's input section
+    /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
+    tuning: u128,
+    /// The record the tap writes its section of, if any.
+    activity: Option<Arc<ActivityRecord>>,
+    /// The input section as last written.
+    written: SectionValue,
+    /// The latest time stamp the tap was given: what a recount or an
+    /// unverified state is stamped with.
+    seen_at: TimeUs,
 }
 
 /// The logic thread's end of the tap.
@@ -702,6 +714,10 @@ pub fn adjustment_queue(
             panel_roles: [0; 2],
             panels: Arc::new(AtomicU64::new(0)),
             panel_losses: 0,
+            tuning: 0,
+            activity: None,
+            written: SectionValue::default(),
+            seen_at: TimeUs(i64::MIN),
         },
         AdjustmentReceiver {
             queue: consumer,
@@ -749,6 +765,49 @@ impl AdjustmentTap {
     /// ([`publish_panels`](Self::publish_panels)).
     pub const fn set_panel_roles(&mut self, start: u128, select: u128) {
         self.panel_roles = [start, select];
+    }
+
+    /// Numbers `tuning` (a bit each) are the tuning controls: START,
+    /// SELECT, F1 and F2, whichever are tapped. Their holds and events go
+    /// to the activity record ([`set_activity`](Self::set_activity)),
+    /// whatever the latch reports.
+    pub const fn set_tuning_controls(&mut self, tuning: u128) {
+        self.tuning = tuning;
+    }
+
+    /// Writes the input section of `record` from now on (design.md "Play
+    /// Lifecycle", tuning while loading): at each press, key repeat and
+    /// release of a tuning control, before the tap queues it, and at each
+    /// change of whether one is held (a removed device, an unverified
+    /// held state), the revision moves and the last activity takes the
+    /// event's time. Written at once with what is held.
+    pub fn set_activity(&mut self, record: Arc<ActivityRecord>) {
+        self.written = SectionValue::default();
+        self.activity = Some(record);
+        if let Some(record) = &self.activity {
+            self.written.held = self.unverified || self.held_set() & self.tuning != 0;
+            record.input.publish(self.written);
+        }
+    }
+
+    /// Writes the input section: the revision moves when `counted` (an
+    /// event of a tuning control) or when whether one is held changed,
+    /// the last activity then taking `at`, else the latest time seen.
+    fn publish_activity(&mut self, at: Option<TimeUs>, counted: bool) {
+        let held = self.unverified || self.held_set() & self.tuning != 0;
+        if !counted && held == self.written.held {
+            return;
+        }
+        let at = at.unwrap_or(self.seen_at);
+        let w = &mut self.written;
+        w.revision = w.revision.wrapping_add(1);
+        w.held = held;
+        if at.0 != i64::MIN {
+            w.last = Some(w.last.map_or(at, |l| l.max(at)));
+        }
+        if let Some(record) = &self.activity {
+            record.input.publish(*w);
+        }
     }
 
     /// A handle on the panels' level.
@@ -895,6 +954,7 @@ impl AdjustmentTap {
         if self.active && (owners_changed || self.held_set() != before) {
             self.owed.push(Marker::Recovery { lost: false });
         }
+        // Writes the record too, held as recounted.
         self.set_unverified(unverified);
     }
 
@@ -930,6 +990,10 @@ impl AdjustmentTap {
         if let Some(generation) = self.store_latch() {
             self.cancelled = Some(generation);
         }
+        self.seen_at = self.seen_at.max(at);
+        // Written before the event is queued, so before any marker after it.
+        let tuning = self.tuning & (1_u128 << (n & 127)) != 0;
+        self.publish_activity(Some(at), tuning && event.is_some());
         if let Some(event) = event {
             self.observe(at, event, foreground);
         }
@@ -969,6 +1033,7 @@ impl AdjustmentTap {
         {
             self.owed.push(Marker::Cancelled { generation });
         }
+        self.publish_activity(None, false);
     }
 
     /// READY candidate `generation` opened at this boundary, its chart
@@ -992,6 +1057,7 @@ impl AdjustmentTap {
     /// Sends what is owed, stamped `at` or later, as far as the queue has
     /// room.
     pub(crate) fn send_owed(&mut self, at: TimeUs) {
+        self.seen_at = self.seen_at.max(at);
         if self.active {
             self.flush(at);
         }
@@ -1002,6 +1068,7 @@ impl AdjustmentTap {
     /// sent while a tapped control is held, and once more at a later time
     /// once nothing is, so the reducer's last group closes.
     pub fn tick(&mut self, at: TimeUs) {
+        self.seen_at = self.seen_at.max(at);
         if !self.active {
             return;
         }
@@ -1108,6 +1175,8 @@ impl AdjustmentTap {
                 WindowKeyEvent::Repeat if self.window_held & bit != 0 => TapEvent::Repeat(n),
                 _ => continue,
             };
+            let tuning = self.tuning & (1_u128 << (n & 127)) != 0;
+            self.publish_activity(Some(at), tuning);
             self.observe(at, tap, true);
         }
         if overflow
@@ -1171,6 +1240,9 @@ impl AdjustmentTap {
                             }
                         };
                     }
+                    // A baseline that changes what is held is written
+                    // before it is sent.
+                    self.publish_activity(Some(at), false);
                     let held = self.held_set();
                     self.send(at, TapEvent::Resync { held, verified });
                 }

@@ -170,6 +170,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // The input thread.
+    Site::File("crates/input/src/activity.rs"),
     Site::File("crates/input/src/adjust.rs"),
     Site::File("crates/input/src/autoplay.rs"),
     Site::File("crates/input/src/cadence.rs"),
