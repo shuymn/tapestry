@@ -2205,20 +2205,64 @@ impl Cx<'_> {
         self.follows_role(role, (c, id), "timer", why).map(Err)
     }
 
-    /// At the import's end: a slot root some destination's `timer` names
-    /// without a compiled consumer does not run on every play frame, so
-    /// its consumers are made never to run (their gate false) and follow
-    /// their role, a critical one refusing the candidate.
+    /// Every reference to closure instance `inst` the import can see: each
+    /// node of the converted definition holding it (a destination's or a
+    /// custom timer's `timer`, any other field), each other instance's
+    /// captured values and each captured table's copied entries.
+    fn references(&self, inst: u32) -> usize {
+        let Some(lua) = self.def.arena.lua.as_deref() else {
+            return 0;
+        };
+        let held = |c: u32| {
+            lua.callables
+                .get(c as usize)
+                .is_some_and(|k| k.instance == inst)
+        };
+        let nodes = crate::lua::callback::callable_nodes(&self.def.arena)
+            .filter(|&(_, c)| held(c))
+            .count();
+        let captured = self.analysis().map_or(0, |an| {
+            let closure = |c: &Captured| *c == Captured::Closure(inst);
+            let values = an
+                .instances
+                .iter()
+                .filter_map(|i| i.values)
+                .map(|(start, len)| {
+                    an.captured
+                        .get(start as usize..start.saturating_add(len) as usize)
+                        .map_or(0, |v| v.iter().filter(|c| closure(c)).count())
+                })
+                .sum::<usize>();
+            let entries = an
+                .tables
+                .iter()
+                .map(|t| t.values().filter(|c| closure(c)).count())
+                .sum::<usize>();
+            values + entries
+        });
+        nodes + captured
+    }
+
+    /// At the import's end: a slot root runs on every play frame the source
+    /// runs it only when every reference to it is a destination's `timer`
+    /// with a compiled consumer; otherwise (a destination dropped before its
+    /// timer, a custom timer, another field, another closure or a table
+    /// holding it) its consumers are made never to run (their gate false)
+    /// and follow their role, a critical one refusing the candidate.
     pub(super) fn close_slots(&mut self) -> Result<(), ImportError> {
         let roots = std::mem::take(&mut self.slot_roots);
         let mut roots: Vec<(u32, SlotRoot)> = roots.into_iter().collect();
         roots.sort_by_key(|&(inst, _)| inst);
         for (inst, root) in roots {
-            let sites = self.timer_sites.get(&inst).copied().unwrap_or(0);
-            if root.consumers.len() >= usize::try_from(sites).unwrap_or(usize::MAX) {
+            let sites = usize::try_from(self.timer_sites.get(&inst).copied().unwrap_or(0))
+                .unwrap_or(usize::MAX);
+            let why = if root.consumers.len() < sites {
+                Unsupported::Construct("a slot writer a dropped destination calls")
+            } else if self.references(inst) != sites {
+                Unsupported::Construct("a slot writer referenced beside its destinations' timers")
+            } else {
                 continue;
-            }
-            let why = Unsupported::Construct("a slot writer a dropped destination calls");
+            };
             for (k, role, at, span) in root.consumers {
                 let never = self.compile("false", Ty::Bool, span)?;
                 let read = self.present.reads.len();
