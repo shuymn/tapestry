@@ -393,6 +393,8 @@ pub struct Harness {
     pub readouts: Option<FrameReadouts>,
     /// The frames' turntable angle ([`SkinFrame::turntable`]).
     pub turntable: i32,
+    /// The state clock each frame gives: by default 0.
+    pub state_us: i64,
     /// The chart, which [`follow`] reads.
     pub chart: Chart,
     /// The note facts each frame gives, following its effects
@@ -423,6 +425,7 @@ impl Harness {
             view: VIEW,
             readouts: None,
             turntable: 0,
+            state_us: 0,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
@@ -447,7 +450,7 @@ impl Harness {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
-            state_us: 0,
+            state_us: self.state_us,
             now: TimeUs(now_us),
             display_offset: self.offset,
             tally: &self.tally,

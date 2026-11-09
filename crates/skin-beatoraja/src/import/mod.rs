@@ -348,6 +348,10 @@ struct Opts<'a> {
     /// it and stays unrotated, as the source draws text
     /// (`skin/SkinTextImage.java:122`).
     turntable: bool,
+    /// Blend 4 maps to [`Blend::Multiply`]: an image, an image choice or
+    /// a player-drawn image drawn as an element of its own. Elsewhere it
+    /// drops as an unsupported blend.
+    multiply: bool,
     /// A relative element (a judge's combo): offsets 3 and 4 are taken
     /// and move nothing, as the source skips a relative element's own
     /// translation and attaches it to its grade (`skin/SkinObject.java:
@@ -443,6 +447,11 @@ pub(crate) struct Cx<'d> {
     /// The play presentation program, its callbacks in the order the
     /// import consumes them.
     present: skin_model::present::PresentDef,
+    /// The program's slot roots, by instance: their slots and the timer
+    /// callbacks compiled for them.
+    slot_roots: HashMap<u32, callback::SlotRoot>,
+    /// Per callable instance, the play destinations whose `timer` it is.
+    timer_sites: HashMap<u32, u32>,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -567,6 +576,8 @@ impl<'d> Cx<'d> {
             value_gate: None,
             when_spans: Vec::new(),
             present: skin_model::present::PresentDef::default(),
+            slot_roots: HashMap::new(),
+            timer_sites: HashMap::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],
@@ -1003,6 +1014,7 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
+            self.count_timer_site(&dst.timer);
             return self.system(dst, n);
         }
         let role = Role::Decorative.or_failure(dst.failure);
@@ -1013,6 +1025,7 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
+        self.count_timer_site(&dst.timer);
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
@@ -1312,6 +1325,16 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
             }
+            Prop::Callable(id) if self.kind == ScreenKind::Play => {
+                let last = track.keys.iter().map(|k| k.at).max().unwrap_or(0);
+                match self.timer_callback(role, at, (id, track.end, last), &conds)? {
+                    Ok(t) => (t, false),
+                    Err(why) => {
+                        self.drop_el(role, at, why)?;
+                        return Ok(None);
+                    }
+                }
+            }
             Prop::Callable(id) => {
                 let why = self.unconsumed(role, id, "timer", "timer")?;
                 self.drop_el(role, at, why)?;
@@ -1457,7 +1480,7 @@ impl<'d> Cx<'d> {
             }
         }
 
-        // Blend (`Skin.java:654-665`). A neutral outer destination draws
+        // Blend (`Skin.java:655-665`). A neutral outer destination draws
         // nothing of its own: its parts keep their blend, so its own is
         // ignored.
         let blend = match dst.blend {
@@ -1474,6 +1497,7 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
                 Blend::Alpha
             }
+            4 if o.multiply => Blend::Multiply,
             4 | 9 => {
                 self.drop_el(role, at, NoteKind::Blend(dst.blend))?;
                 return Ok(None);
@@ -1623,15 +1647,12 @@ impl<'d> Cx<'d> {
         Ok(p)
     }
 
-    /// `src` compiled against the play schema and charged as
-    /// [`Self::compile`] does, or `None` when it does not compile: a
-    /// program read or gate past an expression's limits.
-    fn trial(&mut self, src: &str, want: Ty, at: Span) -> Result<Option<Program>, ImportError> {
-        let Ok(p) = compile(src, &Scope::new(self.schema()), want) else {
-            return Ok(None);
-        };
-        self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
-        Ok(Some(p))
+    /// `src` compiled against the play schema, or `None` when it does not
+    /// compile: a program read or gate past an expression's limits. It is
+    /// not charged: its callback charges it at each use
+    /// ([`skin_model::present::callback_cost`]).
+    fn trial(&self, src: &str, want: Ty) -> Option<Program> {
+        compile(src, &Scope::new(self.schema()), want).ok()
     }
 
     /// The model reference of a mapped timer, adding a rank's `when`
@@ -1991,8 +2012,10 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
-            present: (!self.present.callbacks.is_empty())
-                .then(|| std::mem::take(&mut self.present)),
+            present: {
+                self.close_slots()?;
+                (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))
+            },
         };
         let loaded = if selection {
             let widgets = SelectionDefs {

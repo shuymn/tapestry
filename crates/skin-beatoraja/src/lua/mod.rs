@@ -383,7 +383,7 @@ pub(crate) struct Pass {
     /// The screen the runtime's host reads answer from.
     pub(crate) screen: SyncRefCell<Option<runtime::Screen>>,
     /// The runtime's notes.
-    pub(crate) runtime_notes: SyncRefCell<runtime::Notes>,
+    pub(crate) runtime_notes: SyncRefCell<runtime::NoteBook>,
 }
 
 /// What [`LuaHeader::timed`] gives: the stages' times of an import, or
@@ -446,7 +446,7 @@ impl Pass {
             timings: SyncCell::new(Timings::default()),
             runtime: SyncCell::new(false),
             screen: SyncRefCell::new(None),
-            runtime_notes: SyncRefCell::new(runtime::Notes::default()),
+            runtime_notes: SyncRefCell::new(runtime::NoteBook::default()),
         }
     }
 
@@ -1036,6 +1036,21 @@ impl LuaHeader {
     ) -> Result<LuaOutcome, ImportError> {
         self.import_keeping(config, facts, cancel, true)
             .map_err(|refused| refused.0)
+    }
+
+    /// [`Self::import_runtime`], a refusal with the facts it read, as
+    /// [`Self::import_reading`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import_runtime`] refuses, with the facts read.
+    pub fn import_runtime_reading(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> Result<LuaOutcome, Box<(ImportError, FactDeps)>> {
+        self.import_keeping(config, facts, cancel, true)
     }
 
     fn import_keeping(

@@ -91,6 +91,9 @@ struct Faults {
     dropping: AtomicBool,
     /// The last result frame built: its time and timer 2's start.
     timers: Mutex<Option<(TimeUs, Option<TimeUs>)>>,
+    /// The strip's text per slot as prepared, and the one in use.
+    strips: Mutex<[Vec<String>; 3]>,
+    strip: Mutex<Vec<String>>,
 }
 
 impl Drop for Recorded {
@@ -230,9 +233,15 @@ impl Screen for Recorded {
         {
             return Err(render::RenderError::SurfaceLost);
         }
+        if let Some(t) = self.faults.strips.lock().unwrap().get_mut(which) {
+            *t = lines.iter().map(|l| (*l).to_owned()).collect();
+        }
         self.menu.prepare_result_strip(which, lines)
     }
     fn use_result_strip(&mut self, which: usize) {
+        if let Some(t) = self.faults.strips.lock().unwrap().get(which) {
+            self.faults.strip.lock().unwrap().clone_from(t);
+        }
         self.menu.use_result_strip(which);
     }
     fn build_result(
@@ -390,6 +399,20 @@ pub(crate) fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
 /// [`fixed_skin`] with `texts` texts of the chart's title (text 10) in a
 /// bitmap font of one glyph, `A`: a view's title is drawn as its glyphs.
 pub(crate) fn text_skin(texts: usize) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let (d, b, _) = text_skin_scripted(texts, "");
+    (d, b)
+}
+
+/// [`text_skin`] with `places` among its destinations, and the runtime
+/// its import kept.
+fn text_skin_scripted(
+    texts: usize,
+    more: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<render::SkinBundle>,
+    crate::screens::ScriptSlot,
+) {
     let elements: String = (0..texts)
         .map(|i| format!("{{ id = \"t{i}\", font = \"f\", size = 100, ref = 10 }},"))
         .collect();
@@ -402,12 +425,13 @@ pub(crate) fn text_skin(texts: usize) -> (tempfile::TempDir, Arc<render::SkinBun
             )
         })
         .collect();
-    lua_skin(
+    lua_skin_scripted(
         &format!(
-            "skin.font = {{ {{ id = \"f\", path = \"f.fnt\" }} }}\n\
+            "local calls = 0\n\
+             skin.font = {{ {{ id = \"f\", path = \"f.fnt\" }} }}\n\
              skin.text = {{ {elements} }}\n"
         ),
-        &places,
+        &format!("{places}{more}"),
     )
 }
 
@@ -415,6 +439,19 @@ pub(crate) fn text_skin(texts: usize) -> (tempfile::TempDir, Arc<render::SkinBun
 /// destinations and `places` among them; the bitmap font `f.fnt` beside
 /// it.
 fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>) {
+    let (d, b, _) = lua_skin_scripted(head, places);
+    (d, b)
+}
+
+/// [`lua_skin`], with the runtime its import kept.
+fn lua_skin_scripted(
+    head: &str,
+    places: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<render::SkinBundle>,
+    crate::screens::ScriptSlot,
+) {
     let d = tempfile::tempdir().unwrap();
     let image = |name: &str, w: u32, h: u32| {
         let file = std::fs::File::create(d.path().join(name)).unwrap();
@@ -481,9 +518,27 @@ fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBun
     );
     drop(serial);
     match built {
-        crate::imports::KindOutcome::Bundle(b, ..) => (d, b),
+        crate::imports::KindOutcome::Bundle(b, _, script) => (d, b, script),
         other => panic!("{other:?}"),
     }
+}
+
+/// [`fixed_skin`] with a dot at y = 700 whose draw runs `body` in the
+/// runtime: drawn only while the runtime runs and answers true.
+fn scripted_skin(
+    body: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<render::SkinBundle>,
+    crate::screens::ScriptSlot,
+) {
+    lua_skin_scripted(
+        "local calls = 0\n",
+        &format!(
+            "{{ id = \"dot\", draw = function() {body} end, \
+             dst = {{ {{ x = 0, y = 700, w = 8, h = 8 }} }} }},"
+        ),
+    )
 }
 
 /// A view payload `key` with EX score `ex`, its view lines `lines` and a
@@ -510,6 +565,7 @@ fn titled(
     Arc::new(ViewPayload {
         key,
         skin: skin.map(Arc::clone),
+        script: None,
         why: None,
         view,
         labels: ResultLabels {
@@ -1231,7 +1287,7 @@ fn a_new_lifetimes_page_base_has_its_settings_lines() {
     let dir = tempfile::tempdir().unwrap();
     crate::tests::on_rig_with(settings, link, |p, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let chart = ResultChart::default();
         let _ = p.result_skin.image_stage(chart, None, || false, || false);
@@ -1437,7 +1493,7 @@ fn a_panic_in_the_upload_fails_the_screen_before_its_teardown() {
     };
     crate::tests::on_rig_with(settings, link, |p, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let _ = p
             .result_skin
@@ -1496,9 +1552,15 @@ fn result_frame_alloc() {
     };
     let _warp = crate::warp_turn::take();
     // The widget quads' cap (16 384) admits 63 texts of 256 glyphs each
-    // beside the number and the image: the skin at its text capacity.
+    // beside the number and the images: the skin at its text capacity,
+    // with a dot its runtime draws (S7 C9: the runtime's step between the
+    // two counted spans).
     let texts = skin_model::MAX_TEXT_ELEMENTS - 1;
-    let (_dir, skin) = text_skin(texts);
+    let (_dir, skin, script) = text_skin_scripted(
+        texts,
+        "{ id = \"dot\", draw = function() calls = calls + 1 return calls > 0 end, \
+         dst = { { x = 0, y = 700, w = 8, h = 8 } } },",
+    );
     let r = render::Renderer::new(
         render::Target::Offscreen {
             width: 1_920,
@@ -1519,6 +1581,9 @@ fn result_frame_alloc() {
     );
     screen.commit(token(1, &screen)).unwrap();
     let shared = Shared::new();
+    let scripts = crate::screens::Scripts::new();
+    let g = scripts.offer_result(script, true);
+    assert!(g.is_some(), "the dot's draw runs in the runtime");
     let mut side = ResultSide::new(1);
     let lines: Vec<String> = (0..13).map(|i| format!("FACT {i}")).collect();
     let strip: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -1533,6 +1598,10 @@ fn result_frame_alloc() {
             &[],
             &title,
         );
+        let p = Arc::new(ViewPayload {
+            script: g,
+            ..(*p).clone()
+        });
         assert_eq!(
             screen.install(ScreenKind::Result, &skin, request).unwrap(),
             Preparation::Ready
@@ -1557,13 +1626,23 @@ fn result_frame_alloc() {
                 overlay: Overlay::default(),
                 state: Some(state),
                 page: None,
+                script: scripts.result_slot(g),
             },
             token: Some(token(request, &screen)),
         });
         side.overlay = Some((cycle + 1, overlay));
+        let now = TimeUs(1_000_000 + 16_000 * i64::try_from(cycle).unwrap());
         let before = crate::alloc_count::this_thread();
-        let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(1_000_000));
-        counts.push(crate::alloc_count::this_thread() - before);
+        let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+        let commit = crate::alloc_count::this_thread() - before;
+        Run::result_visit(Some(&mut side), now, fadeout);
+        assert!(
+            side.presented.as_ref().is_some_and(|h| h.script.runs()),
+            "the runtime ran between the spans"
+        );
+        let before = crate::alloc_count::this_thread();
+        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        counts.push(commit + crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         assert_eq!(screen.result_strip(), 13);
         let quads = screen
@@ -1572,7 +1651,10 @@ fn result_frame_alloc() {
             .iter()
             .filter(|q| q.layer != 0)
             .count();
-        assert!(quads >= texts + 5, "every text drawn: {quads} quads");
+        assert!(
+            quads >= texts + 6,
+            "every text and the dot drawn: {quads} quads"
+        );
         screen.submit_result().unwrap();
         side.dropped = [None, None];
         let _ = screen.drain_retired();
@@ -1580,7 +1662,8 @@ fn result_frame_alloc() {
     // A frame the skin refuses allocates nothing either.
     screen.refuse_next_result(false);
     let before = crate::alloc_count::this_thread();
-    let drawn = Run::result_frame(&mut screen, Some(&mut side), &shared, TimeUs(2_000_000));
+    let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+    let drawn = Run::result_build(&mut screen, Some(&mut side), TimeUs(2_000_000), fadeout);
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
     // The control: the count sees an allocation in the same window.
@@ -1613,7 +1696,7 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
         };
         crate::tests::on_rig_with(settings, link, |p, _| {
             p.result_skin = crate::result_skin::ResultSkin::new(Some(
-                crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+                crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
             ));
             let _ = p
                 .result_skin
@@ -1725,7 +1808,7 @@ fn on_shown_result(
     let dir = tempfile::tempdir().unwrap();
     crate::tests::on_rig_hooked(settings, link, clock, |p, _, _| {
         p.result_skin = crate::result_skin::ResultSkin::new(Some(
-            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin)),
+            crate::result_skin::ResultStart::Fixed(Arc::clone(&skin), None),
         ));
         let chart = ResultChart::default();
         let _ = p.result_skin.image_stage(chart, None, || false, || false);
@@ -2125,5 +2208,372 @@ fn a_built_in_view_is_pinned_over_a_prepared_skin() {
         "nothing of the skin draws"
     );
     assert_eq!(rig.link.result_status().shown, None);
+    rig.link.exit();
+}
+
+/// The fixture's runtime offered to the rig's cell, retained as the fixed
+/// skin's, with a flag its VM's destruction sets.
+fn offer(
+    rig: &Rig,
+    script: crate::screens::ScriptSlot,
+) -> (crate::screens::ScriptGen, Arc<AtomicBool>) {
+    let gone = Arc::new(AtomicBool::new(false));
+    script.on_vm_drop(&gone);
+    let g = rig.link.scripts().offer_result(script, true).unwrap();
+    (g, gone)
+}
+
+/// [`payload`] of the view `key` of generation `g`.
+fn scripted(
+    key: ViewKey,
+    skin: &Arc<render::SkinBundle>,
+    g: Option<crate::screens::ScriptGen>,
+    lines: &[&str],
+) -> Arc<ViewPayload> {
+    let ex = 1_000 * u32::try_from(key).unwrap();
+    let p = payload(key, Some(skin), ex, lines);
+    Arc::new(ViewPayload {
+        script: g,
+        ..(*p).clone()
+    })
+}
+
+/// C3 on result (s7-07-design §3.4): the presented view's runtime runs
+/// from its first frame, between the commit point and the build; a switch
+/// keeping the layout keeps the same VM, running, and a view of no
+/// generation draws the callback's constant.
+#[test]
+fn a_result_runtime_runs_from_the_first_frame_across_a_switch() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, None, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let Some(Drawn::Skin(without, _)) = rig.drawn().last().cloned() else {
+        panic!();
+    };
+    let dots = |q: &[Quad]| skin_quads(q).len();
+    rig.clear();
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &scripted(2, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(q, _)| dots(q) == dots(&without) + 1)));
+    // Every frame without the dot is view 1's (its own EX): view 2's
+    // first frame already drew the runtime's answer.
+    for d in rig.drawn() {
+        if let Some((q, _)) = skin_frame(&d)
+            && dots(q) == dots(&without)
+        {
+            assert_eq!(q, without.as_slice(), "view 2 drawn without its runtime");
+        }
+    }
+    rig.clear();
+    show(
+        &rig.link,
+        lifetime,
+        3,
+        &scripted(3, &skin, Some(g), &["B"]),
+        &Overlay::default(),
+    );
+    assert!(
+        rig.until(|d| skin_frame(d).is_some_and(|(q, n)| n == 1 && dots(q) == dots(&without) + 1))
+    );
+    for d in rig.drawn() {
+        if let Some((q, _)) = skin_frame(&d) {
+            assert_eq!(dots(q), dots(&without) + 1, "never a frame without it");
+        }
+    }
+    assert!(!gone.load(Ordering::Acquire), "the same VM");
+    assert!(rig.link.scripts().result_live(Some(g)));
+    rig.link.exit();
+}
+
+/// C8 and O4 on result (plan r2 MEDIUM): a runtime stopping with the strip
+/// full, no new presentation coming, puts its notice on the strip: the
+/// strip is prepared again, still 13 lines; the notice stays through an
+/// overlay update and a device loss's rebuild, the VM kept.
+#[test]
+fn a_stopped_runtime_leads_a_full_strip() {
+    let (_dir, skin, script) = scripted_skin("while true do end");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    let lines: Vec<String> = (0..13).map(|i| format!("FACT {i}")).collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let p = scripted(1, &skin, Some(g), &lines);
+    show(&rig.link, lifetime, 1, &p, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 13)));
+    let strip = || rig.faults.strip.lock().unwrap().clone();
+    let notice = crate::screens::ScriptStop::Budget.notice();
+    // Frames past the budget stop it; its notice leads, the last fact
+    // yields.
+    assert!(wait_until(
+        || strip().first().map(String::as_str) == Some(notice)
+    ));
+    let stopped = strip();
+    let facts: Vec<String> = lines.iter().take(12).map(|l| (*l).to_owned()).collect();
+    assert_eq!(stopped.get(1..), Some(facts.as_slice()));
+    show(&rig.link, lifetime, 2, &p, &Overlay::default());
+    assert!(wait_until(|| rig.link.result_status().revision == 2));
+    rig.clear();
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 13)));
+    assert_eq!(strip(), stopped, "an overlay update keeps it");
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.faults.strip.lock().unwrap().clear();
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 13)));
+    assert_eq!(strip(), stopped, "a rebuild keeps it");
+    assert!(!gone.load(Ordering::Acquire));
+    assert_eq!(
+        rig.link.scripts().result_state(g),
+        crate::screens::GenState::Live { stopped: true }
+    );
+    rig.link.exit();
+}
+
+/// The run's disable retires the presented runtime, after the frame, and
+/// the parking before a play parks it: nothing runs in the interval.
+#[test]
+fn a_disabled_result_retires_its_runtime() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(
+        !rig.link.scripts().result_parked(g),
+        "the presented view runs it"
+    );
+    assert!(rig.link.park_scripts());
+    assert!(
+        rig.link.scripts().result_parked(g),
+        "parked before the play"
+    );
+    let interval = rig.link.scripts().open_interval();
+    assert!(!gone.load(Ordering::Acquire));
+    let _closed = interval.close();
+    rig.faults.refuse.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    assert!(wait_until(|| gone.load(Ordering::Acquire)));
+    assert!(!rig.link.scripts().result_live(Some(g)));
+    rig.link.exit();
+}
+
+/// Waits until `rig` drew `n` more skin frames.
+fn frames(rig: &Rig, n: usize) -> Vec<Vec<Quad>> {
+    let seen = rig.drawn().len();
+    assert!(wait_until(|| rig.drawn().len() >= seen + n));
+    rig.drawn()
+        .into_iter()
+        .skip(seen)
+        .filter_map(|d| skin_frame(&d).map(|(q, _)| q.to_vec()))
+        .collect()
+}
+
+/// C5, C6, C11 on result (code r1 M3): views of one generation switching
+/// fast (the presented, prepared and replaced holders taken), the parking
+/// before a play parks the runtime; while the play's interval is open the
+/// screen draws on with the callback's constant and no call is made; after
+/// the close the runtime resumes, its calls going on; the close's token
+/// destroys it.
+#[test]
+fn a_result_runtime_rests_through_a_play_and_resumes() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    for key in 1..=4 {
+        show(
+            &rig.link,
+            lifetime,
+            key,
+            &scripted(key, &skin, Some(g), &[]),
+            &Overlay::default(),
+        );
+    }
+    let dots = |q: &[Quad]| skin_quads(q).len();
+    let running = frames(&rig, 3);
+    let with = running.last().map(|q| dots(q)).unwrap();
+    // As a retry leaves the result (the lifetime ends) before the play's
+    // preparation asks for the parking: no result frame takes it again.
+    rig.link.end_result();
+    assert!(rig.link.park_scripts());
+    let scripts = rig.link.scripts();
+    assert!(scripts.result_parked(g));
+    let calls = scripts.result_calls(g).unwrap();
+    assert!(calls >= 3, "{calls}");
+    let interval = scripts.open_interval();
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        5,
+        &scripted(5, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let during = frames(&rig, 4);
+    assert!(!during.is_empty(), "the view drew in the interval");
+    for q in during {
+        assert_eq!(
+            dots(&q),
+            with - 1,
+            "the constant while the interval is open"
+        );
+    }
+    assert_eq!(
+        scripts.result_calls(g),
+        Some(calls),
+        "no call in the interval"
+    );
+    let closed = interval.close();
+    assert!(wait_until(|| rig
+        .drawn()
+        .last()
+        .and_then(skin_frame)
+        .is_some_and(|(q, _)| dots(q) == with)));
+    assert!(rig.link.park_scripts());
+    assert!(scripts.result_calls(g).unwrap() > calls, "resumed");
+    assert!(!gone.load(Ordering::Acquire));
+    // The run's end, the interval closed: the token destroys it.
+    assert!(scripts.retire(crate::screens::Quiet::Closed(closed)));
+    assert!(gone.load(Ordering::Acquire));
+    rig.link.exit();
+}
+
+/// C13 on result: the render thread panicking while a play's interval is
+/// open (READY through Closing) destroys no result VM; the game thread's
+/// retirement with the close's token does.
+#[test]
+fn a_render_panic_in_a_play_leaves_the_result_runtime_to_the_game_thread() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let _ = frames(&rig, 3);
+    assert!(rig.link.park_scripts());
+    let scripts = rig.link.scripts().clone();
+    let interval = scripts.open_interval();
+    rig.link.send(crate::render_side::RenderMsg::Panic);
+    assert!(wait_until(|| scripts.orphaned()));
+    assert!(!gone.load(Ordering::Acquire));
+    assert!(scripts.inactive().is_none());
+    assert!(scripts.retire(crate::screens::Quiet::Closed(interval.close())));
+    assert!(gone.load(Ordering::Acquire));
+    assert_eq!(rig.link.exit(), crate::render_side::RenderEnd::Panicked);
+}
+
+/// C13 on result: a retirement while the view runs is terminal: the
+/// running slot gives its runtime back, which is destroyed; a recovery
+/// (a device lost, the screen built again) draws the callback's constant,
+/// and a new lifetime's view of the retired generation never commits:
+/// neither resumes it.
+#[test]
+fn a_retired_result_runtime_is_not_resumed() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let (g, gone) = offer(&rig, script);
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let dots = |q: &[Quad]| skin_quads(q).len();
+    let with = frames(&rig, 3).last().map(|q| dots(q)).unwrap();
+    let scripts = rig.link.scripts().clone();
+    assert!(scripts.retire(crate::screens::Quiet::Inactive(scripts.inactive().unwrap())));
+    assert!(
+        wait_until(|| gone.load(Ordering::Acquire)),
+        "given back and destroyed"
+    );
+    let after = frames(&rig, 3);
+    assert_eq!(after.last().map(|q| dots(q)), Some(with - 1));
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(q, _)| dots(q) == with - 1)));
+    let next = rig.link.begin_result();
+    show(
+        &rig.link,
+        next,
+        1,
+        &scripted(2, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    // Every frame drawn so far taken, the one after them drawn: no frame
+    // of the old lifetime arrives after the clear.
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    rig.clear();
+    // A view of the retired generation never commits: the new lifetime
+    // draws the built-in page, and no frame runs the runtime.
+    assert!(
+        rig.until(|d| matches!(d, Drawn::Page(_))),
+        "the new lifetime draws the built-in page"
+    );
+    assert!(rig.drawn().iter().filter_map(skin_frame).count() == 0);
+    assert!(!scripts.result_live(Some(g)));
+    rig.link.exit();
+}
+
+/// The render link's lifetimes reach the cell (code r3 LOW): a view
+/// presented in a lifetime protects its generation while that lifetime is
+/// current, `end_result` ends that before the next lifetime begins, and
+/// the next lifetime starts with nothing presented.
+#[test]
+fn the_links_lifetimes_scope_the_presented_protection() {
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    let rig = Rig::new();
+    let gone = Arc::new(AtomicBool::new(false));
+    script.on_vm_drop(&gone);
+    let scripts = rig.link.scripts().clone();
+    let g = scripts.offer_result(script, false).unwrap();
+    let lifetime = installed(&rig, &skin);
+    scripts.set_published(Some(g));
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| scripts.presented() == Some(g)));
+    scripts.set_published(None);
+    assert!(scripts.protected(g), "presented in the current lifetime");
+    rig.link.end_result();
+    assert_eq!(scripts.presented(), None, "no lifetime is current");
+    assert!(!scripts.protected(g));
+    let _next = rig.link.begin_result();
+    assert_eq!(scripts.presented(), None);
+    assert!(!scripts.protected(g));
     rig.link.exit();
 }
