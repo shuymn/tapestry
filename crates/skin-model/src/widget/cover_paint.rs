@@ -136,12 +136,12 @@ pub enum SliderRate {
 }
 
 /// The largest slider displacement, in reference pixels, a value slider is
-/// drawn at: past it the element is not drawn that frame. It is beyond
-/// any native extent the importer can keep (cells are `i32`-sized, below
-/// 2^31 texels), so at the source's own resolution such a paint lies off
-/// the window whatever its size; within it the placement's scales (unit
-/// for imported elements, at least ½ for an adaptive region, about ¼ for
-/// the lane-width map) keep every edge finite in `f32`.
+/// drawn at: past it the element is not drawn that frame (docs/stage3.md
+/// D24), where the source draws it, off the window unless the paint's own
+/// geometry is of that order (a stretch-8 native size under a ±10⁶
+/// destination scale). Within it the placement's scales (unit for imported
+/// elements, at least ½ for an adaptive region, about ¼ for the
+/// lane-width map) keep every edge finite in `f32`.
 pub const MAX_SLIDE: f64 = 1_099_511_627_776.0;
 
 /// Why a cover paint definition was refused.

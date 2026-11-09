@@ -443,6 +443,11 @@ fn a_critical_read_promotes_the_whole_slider() {
         &i.imported.report,
         NoteKind::Deviation(DeviationId::D20)
     ));
+    // Drawn at its final pose from the start, long before 500 ms.
+    let mut p = Drawn::new(i.imported.skin.clone(), 0);
+    let q = p.frame(100, &[]);
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert!(near(q[0].rect[1], TOP), "{q:?}");
     // Not compiled, it refuses; so does an unresolvable callee.
     for body in [
         "return ms.number(71) + ms.event_index(55)",
@@ -487,4 +492,42 @@ fn a_value_slider_s_keys_are_charged_once() {
     );
     assert_eq!(value, 1);
     assert_eq!(value, progress);
+}
+
+/// D24: past the bound a value slider is not drawn, even where its own
+/// geometry would still span the window, as a mirrored stretch-8 paint of
+/// a compacted tall cut under a −10⁶ destination scale does in the source.
+#[test]
+fn past_the_bound_a_mirrored_stretch_eight_paint_is_not_drawn_d24() {
+    for (angle, cut, dst) in [
+        (
+            2,
+            "x = 0, y = 1, w = 1, h = 2147483646",
+            "x = 1000000, y = 500, w = -1000000, h = 64",
+        ),
+        (
+            1,
+            "x = 1, y = 0, w = 2147483646, h = 1",
+            "x = 100, y = 1000000, w = 64, h = -1000000",
+        ),
+    ] {
+        let lua = skin(
+            angle,
+            "return ms.number(14) * 1e8",
+            "",
+            "stretch = 8,",
+            false,
+        )
+        .replace(
+            "src = \"a\", x = 0, y = 0, w = 64, h = 64",
+            &format!("src = \"t\", {cut}"),
+        )
+        .replace("x = 100, y = 500, w = 64, h = 64", dst);
+        let i = load(&lua).unwrap();
+        assert!(compiled(&i), "{angle}");
+        // Retained and drawn while the value is 0.
+        assert!(drawn(&i, 0, None).is_some(), "{angle}");
+        // 2e10 × 100: past the bound, not drawn (D24).
+        assert_eq!(drawn(&i, 200, None), None, "{angle}");
+    }
 }
