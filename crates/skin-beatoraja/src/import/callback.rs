@@ -2072,11 +2072,20 @@ impl Cx<'_> {
 
     /// The slot cells of timer root `inst`, which writes: each captured
     /// declaration written at frame time, with its slot, initial value and
-    /// that value's domain. A cell another instance captures too, or whose
-    /// initial value is neither an integer nor the off value by
-    /// provenance, refuses the root.
+    /// that value's domain. An open candidate, a cell another instance
+    /// captures too, or an initial value neither an integer nor the off
+    /// value by provenance, refuses the root.
     fn slot_cells(&self, an: &Analysis, inst: u32) -> R<Vec<(u32, Slot)>> {
         use skin_model::present::{Domain, MAX_SLOTS, OFF, Val as P};
+        // The closedness witness: an open candidate may run code the
+        // analysis never saw (an unknown call, a captured metatable, a
+        // closure reached by a numeric key or published at run time), so
+        // the captors and references below may be incomplete.
+        if an.open.get().is_some() {
+            return Err(Stop::Unsupported(Unsupported::Construct(
+                "a slot in a candidate that is not closed",
+            )));
+        }
         let none = || Stop::Unsupported(Unsupported::Capture("an untagged closure"));
         let i = *an.instance(inst).ok_or_else(none)?;
         let ast = an.ast(i.file).ok_or_else(none)?;
