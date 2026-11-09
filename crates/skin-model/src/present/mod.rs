@@ -322,6 +322,8 @@ pub struct PresentDef {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Present {
     def: PresentDef,
+    /// Per callback, whether it loads or stores a slot.
+    slotted: Box<[bool]>,
 }
 
 impl Present {

@@ -593,6 +593,7 @@ impl Play {
                 bank: &mut self.bank,
                 outs,
                 timers,
+                slots: self.slots_run,
             });
         }
         Ok(())

@@ -85,7 +85,20 @@ impl Present {
             cost = cost.saturating_add(callback_cost(&def, cb, code));
         }
         ops.charge_ops(cost).map_err(|_| PresentError::Cost)?;
-        Ok(Self { def })
+        let slotted = def
+            .callbacks
+            .iter()
+            .map(|cb| {
+                let span = usize::try_from(cb.start)
+                    .ok()
+                    .and_then(|s| def.code.get(s..s.saturating_add(usize::from(cb.len))));
+                span.is_some_and(|c| {
+                    c.iter()
+                        .any(|i| matches!(i, Insn::LoadSlot { .. } | Insn::StoreSlot { .. }))
+                })
+            })
+            .collect();
+        Ok(Self { def, slotted })
     }
 }
 

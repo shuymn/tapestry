@@ -428,6 +428,11 @@ pub struct Play {
     /// The presentation program's slots: fresh at each prepare, kept by
     /// a rearm.
     bank: crate::present::Bank,
+    /// Whether the program's callbacks with slots run: a whole-chart
+    /// attempt's, not a section's (a practice round, a mid-chart start),
+    /// where the source reads the point an earlier round left cached
+    /// (`ScoreDataProperty`, not reset at `BMSPlayer.java:582` at `0.8.9`).
+    slots_run: bool,
     /// The attempt's exact playhead, which notes, bar lines and the beat
     /// sample; a rearm keeps it.
     playhead: ExactPlayhead,
@@ -602,6 +607,7 @@ impl Play {
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: vec![0; field::COUNT.saturating_add(outputs)].into_boxed_slice(),
             bank,
+            slots_run: matches!(ctx.attempt, Attempt::Full { .. }),
             playhead,
             display: Position(0),
             beat: None,

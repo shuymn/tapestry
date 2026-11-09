@@ -76,6 +76,11 @@ pub struct Io<'a, 'b> {
     pub outs: &'a mut [i32],
     /// The timer callbacks' starts, in order, `None` while off.
     pub timers: &'a mut [Option<TimeUs>],
+    /// Whether callbacks with slots run: not in a section attempt, where
+    /// the source reads score state cached from an earlier practice round
+    /// that tapestry does not carry; there they are skipped, their timers
+    /// off.
+    pub slots: bool,
 }
 
 impl Present {
@@ -98,7 +103,8 @@ impl Present {
     pub fn run(&self, io: &mut Io<'_, '_>) {
         let mut timer = 0_usize;
         for (k, cb) in self.def.callbacks.iter().enumerate() {
-            let go = self.gated(cb, io.state, io.outs);
+            let slotted = self.slotted.get(k).copied().unwrap_or(true);
+            let go = (io.slots || !slotted) && self.gated(cb, io.state, io.outs);
             let (value, ok) = if cb.conv == Conv::Timer {
                 let start = if go { self.timer(cb, io) } else { None };
                 if let Some(t) = io.timers.get_mut(timer) {
