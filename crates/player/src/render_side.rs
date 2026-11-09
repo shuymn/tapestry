@@ -971,6 +971,7 @@ pub trait FrameSink: Send {
 
     /// Called at a play's end, before it is answered: what the sink still
     /// does for the frames drawn so far is done when this returns.
+    #[cfg(feature = "dev-tools")]
     fn finish(&mut self) {}
 }
 
@@ -3524,6 +3525,7 @@ impl Run {
                     }
                     // The frames drawn before the end are written when it
                     // is answered.
+                    #[cfg(feature = "dev-tools")]
                     self.frames.finish();
                     let _ = reply.send(self.measure.finish(end));
                 }
