@@ -1,0 +1,1115 @@
+//! A chosen chart's load through its jobs (design.md "Load Pipeline",
+//! "Play Lifecycle"): the Bank and Measure jobs on the real
+//! [`PlayerRig::load_chart`](crate::play::PlayerRig) of a headless rig,
+//! each event met at the job's own thread or the game thread's wait through
+//! the load's test hook ([`Decodes`]), never by timing. A watchdog
+//! (`TAPESTRY_TEST_WATCHDOG`, seconds) panics a wait that never ends.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use audio::{BankError, Cap, Found, Gain};
+use bms_model::{Speed, TimeUs};
+use game::coord::{Class, Coordinator, Failure, JobKind, JobPanic, Lease, LoadFailure, Spawner};
+use game::{AppRig as _, Chain, DataRoot, Loaded, Loading};
+
+use super::{ChartLoadError, Decodes, Hook, Probe, Selection};
+use crate::background::tests::{Mode, Said, Stepper};
+use crate::controls::Controls;
+use crate::loudness::fixture::{square, wav};
+use crate::play::PlayerRig;
+use crate::render_side::tests::Installers;
+use crate::select::{MenuQueue, SelectScreen};
+use crate::shelf::tests::{coordinator, job, stepped_shelf, worker};
+
+/// The output's rate, which the rig's engine runs at.
+const RATE: u32 = 48_000;
+
+fn watchdog() -> Duration {
+    let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+    Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
+}
+
+/// Waits until `done`, looking in parked slices; panics past the watchdog,
+/// which only catches what never happens.
+fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let began = Instant::now();
+    while !done() {
+        assert!(began.elapsed() < watchdog(), "{what} never happened");
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+}
+
+/// Writes `dir/song/key.wav`, half a second of a square wave of
+/// `amplitude`.
+fn write_sound(dir: &Path, amplitude: i16) {
+    std::fs::write(
+        dir.join("song").join("key.wav"),
+        wav(&square(0.5, amplitude)),
+    )
+    .unwrap();
+}
+
+/// A chart `dir/song/a.bms` playing `key.wav` as BGM and on a note, with
+/// `extra` header lines.
+fn song(dir: &Path, extra: &str) -> PathBuf {
+    let songs = dir.join("song");
+    std::fs::create_dir_all(&songs).unwrap();
+    write_sound(dir, 3_000);
+    let path = songs.join("a.bms");
+    let text =
+        format!("#PLAYER 1\n#TITLE A\n#BPM 120\n{extra}#WAV01 key.wav\n#00101:01\n#00111:01\n");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+fn settings() -> game::Settings {
+    game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    }
+}
+
+/// The chart at `path` loaded at `speed`.
+fn loaded(dir: &Path, path: &Path, speed: Speed) -> Loaded {
+    let settings = settings();
+    let mut config = crate::session_config(replay::ReceiveMethod::Scripted, None);
+    config.speed = speed;
+    let parts = game::Parts::unsaved(&settings.player);
+    Loaded::load(
+        DataRoot::new(dir.join("app")),
+        settings,
+        path,
+        config,
+        parts,
+    )
+    .unwrap()
+}
+
+/// A selection on a shelf without roots whose background measurement is
+/// stepped by the test, on one coordinator with the load.
+struct Bench {
+    sel: Option<Selection>,
+    coord: Coordinator,
+    stepper: Stepper,
+    mode: Arc<Mode>,
+    decodes: Arc<Decodes>,
+}
+
+fn bench(dir: &Path, decodes: Decodes, spawner: Spawner) -> Bench {
+    bench_on(coordinator(), dir, decodes, spawner)
+}
+
+/// [`bench`] on `coord`.
+fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) -> Bench {
+    let mode = Arc::new(Mode::default());
+    let (shelf, stepper) = stepped_shelf(dir, &coord, &mode);
+    let decodes = Arc::new(decodes);
+    let sel = Selection {
+        shelf,
+        screen: SelectScreen::new(Vec::new()),
+        menu: Arc::new(MenuQueue::default()),
+        dropped: 0,
+        feed: crate::selection_skin::SkinFeed::default(),
+        preset_refusal: false,
+        ime: None,
+        rate: RATE,
+        chosen_at: TimeUs(0),
+        loading: None,
+        practicing: false,
+        entered_at: TimeUs(0),
+        dirty: false,
+        search_pending: false,
+        preset_steps: std::collections::VecDeque::new(),
+        script: None,
+        coord: coord.clone(),
+        spawner,
+        decodes: Some(Arc::clone(&decodes)),
+        after_bank: None,
+    };
+    Bench {
+        sel: Some(sel),
+        coord,
+        stepper,
+        mode,
+        decodes,
+    }
+}
+
+/// `f` on a headless rig with `sel` as its selection (no adjustments).
+fn on_rig<R>(
+    sel: Selection,
+    installers: &Installers,
+    autoplay: bool,
+    f: impl FnOnce(&mut PlayerRig<'_>) -> R,
+) -> R {
+    let (out, _) = crate::tests::on_rig_with(settings(), installers.spawn_bare(), |rig, _| {
+        rig.adjust = None;
+        rig.autoplay = autoplay;
+        rig.selection = Some(sel);
+        f(rig)
+    });
+    out
+}
+
+/// The load's outcome; a refusal panics with its reason.
+fn outcome(got: Result<Loading, ChartLoadError>) -> Loading {
+    got.unwrap_or_else(|e| panic!("refused: {}", Chain(&e)))
+}
+
+/// Whether the engine took this load's bank and schedule.
+fn installed(rig: &PlayerRig<'_>, loaded: &Loaded) -> bool {
+    rig.audio
+        .control
+        .seek_source()
+        .matches(&loaded.audio_schedule())
+}
+
+fn sel<'r>(rig: &'r mut PlayerRig<'_>) -> &'r mut Selection {
+    rig.selection.as_mut().unwrap()
+}
+
+fn hook(f: impl Fn(Probe, &Controls, &dyn Fn() -> bool) + Send + Sync + 'static) -> Option<Hook> {
+    Some(Hook(Arc::new(f)))
+}
+
+fn decodes_with(hook: Option<Hook>) -> Decodes {
+    Decodes {
+        hook,
+        ..Decodes::default()
+    }
+}
+
+fn decoded(d: &Decodes) -> Vec<(Speed, usize, usize)> {
+    d.decodes.lock().unwrap().clone()
+}
+
+fn analysis(d: &Decodes) -> Option<usize> {
+    *d.analysis.lock().unwrap()
+}
+
+/// The quit key or a window close.
+#[derive(Clone, Copy, Debug)]
+enum Leave {
+    Quit,
+    Close,
+}
+
+impl Leave {
+    fn press(self, controls: &Controls) {
+        match self {
+            Self::Quit => controls.command(game::Command::Quit),
+            Self::Close => controls.close(),
+        }
+    }
+}
+
+/// At `at` on a job's thread: `how` pressed, then held until the game
+/// thread's wait has asked the job to stop; the flag is set once it has.
+fn leave_at(at: Probe, how: Leave) -> (Option<Hook>, Arc<AtomicBool>) {
+    let seen = Arc::new(AtomicBool::new(false));
+    let set = Arc::clone(&seen);
+    let hook = hook(move |p, controls, stop| {
+        if p == at {
+            how.press(controls);
+            until("the job's stop", stop);
+            set.store(true, Ordering::SeqCst);
+        }
+    });
+    (hook, seen)
+}
+
+/// The key of the chart at `path` at 1×, by its sounds as they are now.
+fn key_now(loaded: &Loaded) -> (bms_model::Chart, Arc<audio::SoundBank>) {
+    let bank = audio::load_bank_at(
+        loaded.chart(),
+        RATE,
+        Speed::NORMAL,
+        &audio::BankLimits::default(),
+    )
+    .unwrap();
+    (loaded.chart().clone(), Arc::new(bank))
+}
+
+/// Whether the shelf has no measurement of the chart's sounds as they are
+/// now, in memory or stored.
+fn unmeasured(rig: &mut PlayerRig<'_>, loaded: &Loaded) -> bool {
+    let (chart, bank) = key_now(loaded);
+    sel(rig)
+        .shelf
+        .look_up(&chart, &bank, "a.bms", loaded.path())
+        .is_some()
+}
+
+/// The background measurement ends its job and gives every permit back.
+fn background_ends(b: &Bench, rig: &mut PlayerRig<'_>) {
+    b.stepper.finish();
+    assert!(worker(&sel(rig).shelf).wait_results(1, watchdog()));
+    let coord = b.coord.clone();
+    let shelf = &sel(rig).shelf;
+    until("the background's end", || {
+        worker(shelf).busy() == (false, true) && coord.held(Class::Speculative) == 0
+    });
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// After a quit inside the Measure job, the chart is left to the
+/// background, which measures it once selection releases it; after a
+/// close, nothing is left to it.
+fn left_to_background(b: &Bench, rig: &mut PlayerRig<'_>, how: Leave) {
+    match how {
+        Leave::Quit => {
+            sel(rig).shelf.release();
+            assert_eq!(b.stepper.said(), Said::Block(0));
+            assert_eq!(b.coord.held(Class::Speculative), 1);
+            background_ends(b, rig);
+        }
+        Leave::Close => assert_eq!(worker(&sel(rig).shelf).busy(), (false, true)),
+    }
+}
+
+// --- Failures (F2, F3, F5, F7; F14p) ---
+
+/// F2: the Bank job's thread cannot start: the load fails naming it,
+/// nothing is decoded or installed, and no permit is held.
+#[test]
+fn a_bank_thread_that_cannot_start_fails_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(
+        dir.path(),
+        Decodes::default(),
+        Spawner::refusing(&[JobKind::Bank]),
+    );
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(
+        got,
+        Loading::Failed(LoadFailure {
+            job: JobKind::Bank,
+            cause: Failure::ThreadStart("refused (test)".to_owned()),
+        })
+    );
+    assert!(!installed);
+    assert!(decoded(&b.decodes).is_empty());
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F3: the Measure job's thread cannot start: the load fails naming it,
+/// after the bank was made and installed; nothing is measured.
+#[test]
+fn a_measure_thread_that_cannot_start_fails_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(
+        dir.path(),
+        Decodes::default(),
+        Spawner::refusing(&[JobKind::Measure]),
+    );
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(
+        got,
+        Loading::Failed(LoadFailure {
+            job: JobKind::Measure,
+            cause: Failure::ThreadStart("refused (test)".to_owned()),
+        })
+    );
+    assert!(installed);
+    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(analysis(&b.decodes), None);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F5: a panic in the Bank job's work, outside the per-sound decoder's
+/// own catch, fails the load with its message; nothing is installed.
+#[test]
+fn a_bank_panic_fails_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let decodes = decodes_with(hook(|p, _, _| {
+        assert!(
+            !matches!(p, Probe::Decode(_)),
+            "injected decode panic (test)"
+        );
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(
+        got,
+        Loading::Failed(LoadFailure {
+            job: JobKind::Bank,
+            cause: Failure::Panicked(JobPanic("injected decode panic (test)".to_owned())),
+        })
+    );
+    assert!(!installed);
+    assert_eq!(analysis(&b.decodes), None);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F7: a panic in the Measure job's 1× decode (a load at 1.5×) is not the
+/// analysis's: it fails the load, naming the measurement.
+#[test]
+fn a_1x_decode_panic_fails_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
+    let decodes = decodes_with(hook(|p, _, _| {
+        assert_ne!(
+            p,
+            Probe::Decode(Speed::NORMAL),
+            "injected 1x decode panic (test)"
+        );
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    let Loading::Failed(LoadFailure {
+        job: JobKind::Measure,
+        cause: Failure::Panicked(JobPanic(why)),
+    }) = &got
+    else {
+        panic!("{got:?}");
+    };
+    assert!(why.contains("injected 1x decode panic (test)"), "{why}");
+    assert!(installed);
+    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
+    assert_eq!(analysis(&b.decodes), None);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F14p: a panic in the Bank job after the quit asked it to stop still
+/// fails the load.
+#[test]
+fn a_panic_after_a_quit_during_the_decode_still_fails_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let decodes = decodes_with(hook(|p, controls, stop| {
+        if matches!(p, Probe::Decode(_)) {
+            Leave::Quit.press(controls);
+            until("the job's stop", stop);
+            panic!("injected panic after the quit (test)");
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(
+        got,
+        Loading::Failed(LoadFailure {
+            job: JobKind::Bank,
+            cause: Failure::Panicked(JobPanic("injected panic after the quit (test)".to_owned())),
+        })
+    );
+    assert!(!installed);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+// --- Refusals before and in the Bank job (F9, F10) ---
+
+/// F9: a sound declaring one frame past the length cap is refused by the
+/// Bank job's decode: the load is refused with the bank's reason.
+#[test]
+fn a_bank_too_large_is_refused_through_its_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    // 600 s + 1 frame declared at 8 kHz: 4 800 001 frames, 28 800 006 at
+    // 48 kHz (by hand), past the 28 800 000-frame cap.
+    let mut bytes = wav(&square(0.01, 1_000));
+    let data: u32 = 4_800_001 * 2;
+    bytes[4..8].copy_from_slice(&(36 + data).to_le_bytes());
+    bytes[40..44].copy_from_slice(&data.to_le_bytes());
+    std::fs::write(dir.path().join("song").join("key.wav"), bytes).unwrap();
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (rig.load_chart(&loaded), installed(rig, &loaded)),
+    );
+    assert!(
+        matches!(
+            got,
+            Err(ChartLoadError::Sounds(BankError::OverCap {
+                cap: Cap::SoundLength,
+                found: Found::Declared,
+                ..
+            }))
+        ),
+        "{got:?}"
+    );
+    assert!(!installed);
+    assert_eq!(decoded(&b.decodes).len(), 1, "not through the Bank job");
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F10: a chart autoplay cannot play (a rank the evaluator refuses) is
+/// refused before its Bank job begins: a refused Bank thread would have
+/// failed the load instead.
+#[test]
+fn an_unplayable_autoplay_chart_begins_no_bank_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "#DEFEXRANK 3000000\n");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(
+        dir.path(),
+        Decodes::default(),
+        Spawner::refusing(&[JobKind::Bank]),
+    );
+    let (got, installed) = on_rig(b.sel.take().unwrap(), &Installers::default(), true, |rig| {
+        (rig.load_chart(&loaded), installed(rig, &loaded))
+    });
+    assert!(matches!(got, Err(ChartLoadError::Autoplay(_))), "{got:?}");
+    assert!(!installed);
+    assert!(decoded(&b.decodes).is_empty());
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+// --- Quit and close (F11, F13a, F13b, F15, F16a, F16b, F17, F18, F19) ---
+
+/// F11 (Bank): every foreground permit held elsewhere, `how` at the game
+/// thread's first wait slice for the Bank job: the job, never admitted,
+/// gives up and decodes nothing; the load is cancelled and installs
+/// nothing; the permits held elsewhere are all that is held.
+fn leave_while_the_bank_waits_for_a_permit(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let pressed = AtomicBool::new(false);
+    let decodes = decodes_with(hook(move |p, controls, _| {
+        if p == Probe::Wait(JobKind::Bank) && !pressed.swap(true, Ordering::SeqCst) {
+            how.press(controls);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let held: Vec<Lease> = (0..game::coord::FOREGROUND_PERMITS)
+        .map(|_| b.coord.try_lease(Class::Foreground).unwrap())
+        .collect();
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(got, Loading::Cancelled);
+    assert!(!installed);
+    assert!(decoded(&b.decodes).is_empty(), "the decode ran");
+    assert_eq!(
+        b.coord.held(Class::Foreground),
+        game::coord::FOREGROUND_PERMITS
+    );
+    drop(held);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+#[test]
+fn a_quit_while_the_bank_waits_for_a_permit_leaves() {
+    leave_while_the_bank_waits_for_a_permit(Leave::Quit);
+}
+
+#[test]
+fn closing_while_the_bank_waits_for_a_permit_ends_the_run() {
+    leave_while_the_bank_waits_for_a_permit(Leave::Close);
+}
+
+/// F11 (Measure): the bank installed, every foreground permit then taken
+/// elsewhere, `how` at the game thread's first wait slice for the Measure
+/// job: the job is never admitted and measures nothing; the load is
+/// cancelled. A quit leaves the chart to the background; a close leaves
+/// nothing.
+fn leave_while_the_measurement_waits_for_a_permit(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let coord = coordinator();
+    let held: Arc<Mutex<Vec<Lease>>> = Arc::default();
+    let pressed = AtomicBool::new(false);
+    let (taker, leases) = (coord.clone(), Arc::clone(&held));
+    let decodes = decodes_with(hook(move |p, controls, _| match p {
+        Probe::BeforeMeasure => {
+            let mut leases = leases.lock().unwrap();
+            while let Some(l) = taker.try_lease(Class::Foreground) {
+                leases.push(l);
+            }
+        }
+        Probe::Wait(JobKind::Measure) if !pressed.swap(true, Ordering::SeqCst) => {
+            how.press(controls);
+        }
+        _ => {}
+    }));
+    let mut b = bench_on(coord, dir.path(), decodes, Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        let got = outcome(rig.load_chart(&loaded));
+        assert_eq!(got, Loading::Cancelled);
+        assert!(installed(rig, &loaded));
+        assert_eq!(analysis(&b.decodes), None, "the analysis ran");
+        assert_eq!(held.lock().unwrap().len(), game::coord::FOREGROUND_PERMITS);
+        assert_eq!(
+            b.coord.held(Class::Foreground),
+            game::coord::FOREGROUND_PERMITS
+        );
+        held.lock().unwrap().clear();
+        assert_eq!(b.coord.held(Class::Foreground), 0);
+        match how {
+            Leave::Quit => {
+                sel(rig).shelf.release();
+                assert_eq!(b.stepper.said(), Said::Block(0));
+                b.stepper.finish();
+                assert!(worker(&sel(rig).shelf).wait_results(1, watchdog()));
+            }
+            Leave::Close => assert_eq!(worker(&sel(rig).shelf).busy(), (false, true)),
+        }
+    });
+}
+
+#[test]
+fn a_quit_while_the_measurement_waits_for_a_permit_leaves() {
+    leave_while_the_measurement_waits_for_a_permit(Leave::Quit);
+}
+
+#[test]
+fn closing_while_the_measurement_waits_for_a_permit_ends_the_run() {
+    leave_while_the_measurement_waits_for_a_permit(Leave::Close);
+}
+
+/// F13a: the chart's background measurement holds a job the load waits
+/// for; once the wait has promoted it (the worker left background mode),
+/// `how` cancels the wait: no Bank job begins, nothing is installed, and
+/// the measurement, demoted, goes on to its result (a Bank job begun would
+/// fail the load: its thread is refused). The load's own
+/// permits are back at once; the background's foreground permit returns
+/// at its next check.
+fn leave_while_the_load_waits_for_the_background(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(
+        dir.path(),
+        Decodes::default(),
+        Spawner::refusing(&[JobKind::Bank]),
+    );
+    let s = b.sel.take().unwrap();
+    worker(&s.shelf).queue(job(&path));
+    assert_eq!(b.stepper.said(), Said::Block(0));
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        let controls = rig.controls;
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Steps the measurement until its check finds it promoted.
+                while b.mode.leaves.load(Ordering::SeqCst) == 0 {
+                    b.stepper.step();
+                    assert!(matches!(b.stepper.said(), Said::Block(_)));
+                }
+                how.press(controls);
+            });
+            outcome(rig.load_chart(&loaded))
+        });
+        assert_eq!(got, Loading::Cancelled);
+        assert!(!installed(rig, &loaded));
+        assert!(decoded(&b.decodes).is_empty());
+        // The background's promoted permit, until its next check.
+        assert_eq!(
+            (
+                b.coord.held(Class::Speculative),
+                b.coord.held(Class::Foreground)
+            ),
+            (0, 1)
+        );
+        assert!(worker(&sel(rig).shelf).holds(&path));
+        b.stepper.step();
+        assert!(matches!(b.stepper.said(), Said::Block(_)));
+        assert_eq!(
+            (
+                b.coord.held(Class::Speculative),
+                b.coord.held(Class::Foreground)
+            ),
+            (1, 0)
+        );
+        background_ends(&b, rig);
+    });
+}
+
+#[test]
+fn a_quit_while_the_load_waits_for_the_background_leaves() {
+    leave_while_the_load_waits_for_the_background(Leave::Quit);
+}
+
+#[test]
+fn closing_while_the_load_waits_for_the_background_ends_the_run() {
+    leave_while_the_load_waits_for_the_background(Leave::Close);
+}
+
+/// F13b / F18: `how` from inside the running Bank job, its permits taken,
+/// held until the game thread's wait asked it to stop: the decode stops,
+/// the load is cancelled, nothing is installed or measured.
+fn leave_while_the_bank_decodes(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let (hook, stopped) = leave_at(Probe::Decode(Speed::NORMAL), how);
+    let decodes = decodes_with(hook);
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let (got, installed) = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+    );
+    assert_eq!(got, Loading::Cancelled);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the wait never stopped the job"
+    );
+    assert!(!installed);
+    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(analysis(&b.decodes), None);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+#[test]
+fn a_quit_while_the_bank_decodes_leaves() {
+    leave_while_the_bank_decodes(Leave::Quit);
+}
+
+#[test]
+fn closing_while_the_bank_decodes_ends_the_run() {
+    leave_while_the_bank_decodes(Leave::Close);
+}
+
+/// F15: the quit after the Bank job joined with its bank, before the
+/// load's look: the bank is never installed, nothing is measured.
+#[test]
+fn a_quit_after_the_bank_is_made_installs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let mut s = b.sel.take().unwrap();
+    let (joined_tx, joined) = mpsc::channel::<()>();
+    let (pressed_tx, pressed) = mpsc::channel::<()>();
+    let pressed = Mutex::new(pressed);
+    s.after_bank = Some(Arc::new(move || {
+        joined_tx.send(()).unwrap();
+        pressed
+            .lock()
+            .unwrap()
+            .recv_timeout(watchdog())
+            .expect("the quit is pressed");
+    }));
+    let (got, installed) = on_rig(s, &Installers::default(), false, |rig| {
+        let controls = rig.controls;
+        let got = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                joined.recv_timeout(watchdog()).expect("the bank is made");
+                Leave::Quit.press(controls);
+                pressed_tx.send(()).unwrap();
+            });
+            outcome(rig.load_chart(&loaded))
+        });
+        (got, installed(rig, &loaded))
+    });
+    assert_eq!(got, Loading::Cancelled);
+    assert!(!installed, "the bank was installed");
+    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(analysis(&b.decodes), None);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F16a / F17: `how` from inside the running analysis (the Measure job
+/// admitted, at the analysis's first check), held until the game thread's
+/// wait asked the job to stop: the load is cancelled after its bank was
+/// installed. A quit leaves the chart to the background; a close leaves
+/// nothing.
+fn leave_inside_the_running_analysis(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let (hook, stopped) = leave_at(Probe::Analysis, how);
+    let decodes = decodes_with(hook);
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the wait never stopped the job"
+        );
+        assert!(installed(rig, &loaded));
+        assert_eq!(analysis(&b.decodes), Some(1));
+        assert_eq!(b.coord.held(Class::Foreground), 0);
+        // Looked up only now: a look-up takes a job waiting in the
+        // background as the load's own.
+        left_to_background(&b, rig, how);
+        assert!(unmeasured(rig, &loaded));
+    });
+}
+
+#[test]
+fn a_quit_inside_the_running_analysis_leaves_it_to_the_background() {
+    leave_inside_the_running_analysis(Leave::Quit);
+}
+
+#[test]
+fn closing_inside_the_running_analysis_ends_the_run() {
+    leave_inside_the_running_analysis(Leave::Close);
+}
+
+/// F16b: a load at 1.5×; `how` from inside the Measure job's 1× decode,
+/// held until the wait asked the job to stop: the load is cancelled. A
+/// quit leaves the chart to the background; a close leaves nothing.
+fn leave_during_the_1x_decode(how: Leave) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
+    let (hook, stopped) = leave_at(Probe::Decode(Speed::NORMAL), how);
+    let decodes = decodes_with(hook);
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the wait never stopped the job"
+        );
+        assert!(installed(rig, &loaded));
+        let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+        assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
+        assert_eq!(b.coord.held(Class::Foreground), 0);
+        // Looked up only now: a look-up takes a job waiting in the
+        // background as the load's own.
+        left_to_background(&b, rig, how);
+        assert!(unmeasured(rig, &loaded));
+    });
+}
+
+#[test]
+fn a_quit_during_the_1x_decode_leaves_the_measurement_to_the_background() {
+    leave_during_the_1x_decode(Leave::Quit);
+}
+
+#[test]
+fn closing_during_the_1x_decode_ends_the_run() {
+    leave_during_the_1x_decode(Leave::Close);
+}
+
+/// F19: the screen's load of the chart held on the render thread, the
+/// quit pressed from the game thread's wait for it: the wait does not
+/// look at the quit, the load is ready, and the quit is left for the flow
+/// to take.
+#[test]
+fn a_quit_during_the_screen_wait_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let installers = Installers::default();
+    installers.hold_load.store(true, Ordering::Release);
+    let screen = installers.clone();
+    let decodes = decodes_with(hook(move |p, controls, _| {
+        if p == Probe::Screen && screen.load_held.load(Ordering::Acquire) {
+            Leave::Quit.press(controls);
+            screen.hold_load.store(false, Ordering::Release);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let (got, installed, leaving) = on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
+        let got = outcome(rig.load_chart(&loaded));
+        (got, installed(rig, &loaded), rig.controls.leaving())
+    });
+    assert_eq!(got, Loading::Ready);
+    assert!(installers.load_held.load(Ordering::Acquire));
+    assert!(installed);
+    assert!(leaving, "the quit was taken");
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+// --- Permits (F21, F22, F23) ---
+
+/// F21: the chart's background measurement, promoted by the load's wait,
+/// ends; the wait returns with its foreground permit given back, so the
+/// Bank decode is granted every foreground permit.
+#[test]
+fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    worker(&s.shelf).queue(job(&path));
+    assert_eq!(b.stepper.said(), Said::Block(0));
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while b.mode.leaves.load(Ordering::SeqCst) == 0 {
+                    b.stepper.step();
+                    assert!(matches!(b.stepper.said(), Said::Block(_)));
+                }
+                b.stepper.finish();
+            });
+            outcome(rig.load_chart(&loaded))
+        });
+        assert_eq!(got, Loading::Ready);
+        let all = game::coord::FOREGROUND_PERMITS;
+        assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, all, all)]);
+        assert_eq!(b.coord.held(Class::Foreground), 0);
+    });
+}
+
+/// A load at `speed` with `k` foreground permits held elsewhere: what its
+/// decodes and analysis recorded. The permits held elsewhere are all that
+/// is held once it returns.
+fn load_beside(k: usize, speed: Speed) -> Arc<Decodes> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, speed);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let held: Vec<Lease> = (0..k)
+        .map(|_| b.coord.try_lease(Class::Foreground).unwrap())
+        .collect();
+    let got = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| outcome(rig.load_chart(&loaded)),
+    );
+    assert_eq!(got, Loading::Ready, "k = {k}");
+    assert_eq!(b.coord.held(Class::Foreground), k, "k = {k}");
+    drop(held);
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+    b.decodes
+}
+
+/// F22: with `k` foreground permits held elsewhere, the Bank decode is
+/// granted its job's permit and every free one: a limit of 4 − k, at
+/// least its own, the foreground then full.
+#[test]
+fn the_decode_limit_is_the_free_foreground_permits() {
+    let all = game::coord::FOREGROUND_PERMITS;
+    for k in 0..all {
+        let d = load_beside(k, Speed::NORMAL);
+        assert_eq!(decoded(&d), [(Speed::NORMAL, all - k, all)], "k = {k}");
+        assert_eq!(analysis(&d), Some(k + 1), "k = {k}");
+    }
+}
+
+/// F23: a load at 1.5× with `k` foreground permits held elsewhere: the
+/// Measure job's 1× decode draws the free permits as the Bank decode does.
+#[test]
+fn a_measurement_decode_draws_free_foreground_permits() {
+    let all = game::coord::FOREGROUND_PERMITS;
+    for k in 0..all {
+        let d = load_beside(k, Speed::FASTEST);
+        assert_eq!(
+            decoded(&d),
+            [
+                (Speed::FASTEST, all - k, all),
+                (Speed::NORMAL, all - k, all)
+            ],
+            "k = {k}"
+        );
+    }
+}
+
+/// F23: the 1× decode's extra permits are given back before the analysis,
+/// which runs on its job's one: k + 1 held.
+#[test]
+fn a_measurement_holds_one_permit_during_its_analysis() {
+    for k in 0..game::coord::FOREGROUND_PERMITS {
+        let d = load_beside(k, Speed::FASTEST);
+        assert_eq!(analysis(&d), Some(k + 1), "k = {k}");
+    }
+}
+
+// --- The measurement's own outcomes (F6, F27-F31) ---
+
+/// A load whose measurement plays at the headroom: ready and installed,
+/// the gain the headroom, nothing kept.
+fn at_the_headroom(decodes: Decodes, speed: Speed, spawner: Spawner) -> Arc<Decodes> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, speed);
+    let mut b = bench(dir.path(), decodes, spawner);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert!(installed(rig, &loaded));
+            assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
+            assert!(unmeasured(rig, &loaded), "a measurement was kept");
+        },
+    );
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+    b.decodes
+}
+
+/// F6: a panic in the analysis on the Measure job's thread is the
+/// analysis's failure: the chart plays at the headroom.
+#[test]
+fn an_analysis_panic_in_the_measure_job_plays_at_the_headroom() {
+    let decodes = decodes_with(hook(|p, _, _| {
+        assert_ne!(p, Probe::Analysis, "injected analysis panic (test)");
+    }));
+    let d = at_the_headroom(decodes, Speed::NORMAL, Spawner::SYSTEM);
+    assert_eq!(analysis(&d), Some(1));
+}
+
+/// F29: an analysis its meter refuses (an error, no panic) plays at the
+/// headroom; it never reached its first check.
+#[test]
+fn a_failed_analysis_plays_at_the_headroom() {
+    let decodes = Decodes::default();
+    decodes.refuse_meter.store(true, Ordering::SeqCst);
+    let d = at_the_headroom(decodes, Speed::NORMAL, Spawner::SYSTEM);
+    assert_eq!(analysis(&d), None);
+}
+
+/// F28: a bank without a sound digest is never measured: no Measure job
+/// begins (its thread would be refused), and it plays at the headroom.
+#[test]
+fn a_bank_without_a_digest_begins_no_measure_job() {
+    let decodes = Decodes::default();
+    decodes.no_digest.store(true, Ordering::SeqCst);
+    let d = at_the_headroom(
+        decodes,
+        Speed::NORMAL,
+        Spawner::refusing(&[JobKind::Measure]),
+    );
+    assert_eq!(analysis(&d), None);
+}
+
+/// F27: a chart measured once is measured no more: its next load begins
+/// no Measure job (its thread would be refused) and plays at the gain
+/// measured.
+#[test]
+fn a_cached_gain_begins_no_measure_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert_eq!(analysis(&b.decodes), Some(1));
+            let measured = sel(rig).shelf.gain();
+            assert_ne!(measured, Gain::HEADROOM);
+            let again = Arc::new(Decodes::default());
+            sel(rig).decodes = Some(Arc::clone(&again));
+            sel(rig).spawner = Spawner::refusing(&[JobKind::Measure]);
+            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert_eq!(sel(rig).shelf.gain(), measured);
+            assert_eq!(decoded(&again).len(), 1);
+            assert_eq!(analysis(&again), None);
+        },
+    );
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F30: a load at 1.5× whose chart file is gone before the Measure job
+/// reads it again at 1×: no 1× decode, and it plays at the headroom.
+#[test]
+fn an_unreadable_1x_chart_plays_at_the_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
+    let gone = path.clone();
+    let decodes = decodes_with(hook(move |p, _, _| {
+        if p == Probe::BeforeMeasure {
+            std::fs::remove_file(&gone).unwrap();
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert!(installed(rig, &loaded));
+            assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
+            assert!(unmeasured(rig, &loaded));
+        },
+    );
+    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    assert_eq!(speeds, [Speed::FASTEST], "the 1× bank was decoded");
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// F31: a load at 1.5× whose sound file is replaced between its bank and
+/// the Measure job's 1× reread: the 1× bank's key is another, so nothing
+/// is analyzed or kept under either key, and it plays at the headroom.
+#[test]
+fn a_sound_changed_between_the_speed_bank_and_its_1x_reread_plays_at_the_headroom() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
+    let before = key_now(&loaded);
+    let songs = dir.path().to_owned();
+    let decodes = decodes_with(hook(move |p, _, _| {
+        if p == Probe::BeforeMeasure {
+            write_sound(&songs, 300);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert!(installed(rig, &loaded));
+            assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
+            // Neither the old sounds' key nor the new ones' was kept.
+            let (chart, bank) = &before;
+            assert!(
+                sel(rig)
+                    .shelf
+                    .look_up(chart, bank, "a.bms", loaded.path())
+                    .is_some()
+            );
+            assert!(unmeasured(rig, &loaded));
+        },
+    );
+    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
+    assert_eq!(analysis(&b.decodes), None, "analyzed under another key");
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}

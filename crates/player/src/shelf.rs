@@ -1098,6 +1098,10 @@ pub(crate) mod tests {
         let coord = Coordinator::new(Caps::from_setting(Some(false), 16, Some(64 << 30)));
         let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60), None, &coord);
         assert!(shelf.background.is_none(), "no speculative work");
+        assert!(
+            shelf.options.on_pass.is_some(),
+            "each pass holds a maintenance permit"
+        );
         assert!(shelf.has_scan());
         pass_ends(&mut shelf);
         assert!(holds(&shelf, "a.bms"));
@@ -1364,7 +1368,11 @@ pub(crate) mod tests {
 
     /// A shelf whose background measures with a stepped measurement, on
     /// `coord`, with `mode`.
-    fn stepped_shelf(dir: &Path, coord: &Coordinator, mode: &Arc<Mode>) -> (Shelf, Stepper) {
+    pub(crate) fn stepped_shelf(
+        dir: &Path,
+        coord: &Coordinator,
+        mode: &Arc<Mode>,
+    ) -> (Shelf, Stepper) {
         let (library, _) = open_library(dir);
         let (stepper, measure) = Stepper::new();
         let mode: Arc<dyn ThreadMode> = Arc::clone(mode) as _;
@@ -1478,7 +1486,7 @@ pub(crate) mod tests {
     }
 
     /// The background job of the chart at `path`.
-    fn job(path: &Path) -> Job {
+    pub(crate) fn job(path: &Path) -> Job {
         Job {
             source: game::ChartSource::new(path.to_owned(), 0, [0; 32]),
             rate: sound::RATE,
@@ -1591,7 +1599,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn worker(shelf: &Shelf) -> &Worker {
+    pub(crate) fn worker(shelf: &Shelf) -> &Worker {
         shelf.background.as_ref().unwrap()
     }
 

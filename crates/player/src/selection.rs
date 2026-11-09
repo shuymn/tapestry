@@ -73,6 +73,63 @@ pub struct Decodes {
     pub decodes: Mutex<Vec<(bms_model::Speed, usize, usize)>>,
     /// Foreground permits held at the analysis's first check.
     pub analysis: Mutex<Option<usize>>,
+    /// Called at each [`Probe`] of the load.
+    pub hook: Option<Hook>,
+    /// The measurement's analysis is given a bank whose rate its meter
+    /// refuses, so it fails without a panic.
+    pub refuse_meter: std::sync::atomic::AtomicBool,
+    /// The decode returns a bank without a sound digest.
+    pub no_digest: std::sync::atomic::AtomicBool,
+}
+
+/// Where a load calls its test hook (tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// On a job's thread as a decode begins, its permits taken: the Bank
+    /// job's at the load's speed, the Measure job's at 1×.
+    Decode(bms_model::Speed),
+    /// On the game thread at each slice of its wait for a job, before it
+    /// looks for a cancel.
+    Wait(game::coord::JobKind),
+    /// On the game thread, the bank installed, before the Measure job
+    /// begins.
+    BeforeMeasure,
+    /// On the Measure job's thread, at the analysis's first check.
+    Analysis,
+    /// On the game thread at each slice of its wait for the screen's
+    /// chart.
+    Screen,
+}
+
+/// A load's test hook: the probe, the run's controls and whether the job
+/// calling it was asked to stop (`false` on the game thread).
+#[cfg(test)]
+#[derive(Clone)]
+pub struct Hook(pub Arc<HookFn>);
+
+/// What a [`Hook`] calls (tests).
+#[cfg(test)]
+pub type HookFn = dyn Fn(Probe, &crate::controls::Controls, &dyn Fn() -> bool) + Send + Sync;
+
+#[cfg(test)]
+impl std::fmt::Debug for Hook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Hook")
+    }
+}
+
+/// Calls `decodes`' hook, if any, at `at`.
+#[cfg(test)]
+fn probe(
+    decodes: Option<&Decodes>,
+    at: Probe,
+    controls: &crate::controls::Controls,
+    stop: &dyn Fn() -> bool,
+) {
+    if let Some(Hook(hook)) = decodes.and_then(|d| d.hook.as_ref()) {
+        hook(at, controls, stop);
+    }
 }
 
 /// Decodes `chart`'s bank at `speed` on the calling job's foreground permit
@@ -85,7 +142,7 @@ fn decode_on_permits(
     (chart, rate, speed): (&bms_model::Chart, u32, bms_model::Speed),
     progress: &(dyn Fn(usize, usize) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
-    #[cfg(test)] decodes: Option<&Decodes>,
+    #[cfg(test)] probed: Option<(&Decodes, &crate::controls::Controls, &game::coord::Ctx<'_>)>,
 ) -> Result<audio::SoundBank, audio::BankError> {
     let base = audio::BankLimits::default();
     let extra: Vec<game::coord::Lease> = (1..base.max_decode_threads)
@@ -96,7 +153,7 @@ fn decode_on_permits(
         ..base
     };
     #[cfg(test)]
-    if let Some(d) = decodes {
+    if let Some((d, controls, ctx)) = probed {
         d.decodes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -105,6 +162,10 @@ fn decode_on_permits(
                 limits.max_decode_threads,
                 coord.held(game::coord::Class::Foreground),
             ));
+        probe(Some(d), Probe::Decode(speed), controls, &|| ctx.cancelled());
+        if d.no_digest.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(audio::SoundBank::from_sounds(rate, Vec::new()));
+        }
     }
     let bank = audio::load_bank_reporting(chart, rate, speed, &limits, progress, cancel);
     drop(extra);
@@ -136,7 +197,7 @@ impl crate::loudness::Host for JobHost<'_, '_> {
             &|_, _| {},
             &|| ctx.cancelled() || cancelled(controls),
             #[cfg(test)]
-            self.decodes,
+            self.decodes.map(|d| (d, controls, ctx)),
         )?;
         Ok((chart, Arc::new(bank)))
     }
@@ -149,6 +210,9 @@ impl crate::loudness::Host for JobHost<'_, '_> {
             let mut first = d.analysis.lock().unwrap_or_else(PoisonError::into_inner);
             if first.is_none() {
                 *first = Some(self.coord.held(game::coord::Class::Foreground));
+                drop(first);
+                let ctx = self.ctx;
+                probe(Some(d), Probe::Analysis, self.controls, &|| ctx.cancelled());
             }
         }
         #[cfg(feature = "dev-tools")]
@@ -1995,12 +2059,19 @@ impl AppRig for PlayerRig<'_> {
                     },
                     &|| ctx.cancelled() || cancelled(controls),
                     #[cfg(test)]
-                    decodes.as_deref(),
+                    decodes.as_deref().map(|d| (d, controls, ctx)),
                 )
             };
             match coord.run_scoped(s, spawner, job, decode) {
                 Err(failure) => Joined::Failed(failure),
                 Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                    #[cfg(test)]
+                    probe(
+                        decodes.as_deref(),
+                        Probe::Wait(game::coord::JobKind::Bank),
+                        controls,
+                        &|| false,
+                    );
                     #[cfg(feature = "dev-tools")]
                     crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
                     crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
@@ -2068,6 +2139,23 @@ impl AppRig for PlayerRig<'_> {
             .is_some_and(|s| std::mem::take(&mut s.quit_measuring));
         if let Some(key) = sel.shelf.look_up(chart, &bank, &name, loaded.path()) {
             show_stage(&self.render, page.as_ref(), Stage::Loudness);
+            #[cfg(test)]
+            probe(
+                decodes.as_deref(),
+                Probe::BeforeMeasure,
+                self.controls,
+                &|| false,
+            );
+            // A bank whose rate the meter refuses (tests).
+            #[cfg(test)]
+            let bank = if decodes
+                .as_deref()
+                .is_some_and(|d| d.refuse_meter.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                Arc::new(audio::SoundBank::from_sounds(1, Vec::new()))
+            } else {
+                bank
+            };
             let reader = loaded.reader();
             let job = (
                 game::coord::JobKind::Measure,
@@ -2101,6 +2189,13 @@ impl AppRig for PlayerRig<'_> {
                 match coord.run_scoped(s, spawner, job, measure) {
                     Err(failure) => Joined::Failed(failure),
                     Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                        #[cfg(test)]
+                        probe(
+                            decodes.as_deref(),
+                            Probe::Wait(game::coord::JobKind::Measure),
+                            controls,
+                            &|| false,
+                        );
                         crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
                         cancelled(controls)
                     }),
@@ -2143,6 +2238,8 @@ impl AppRig for PlayerRig<'_> {
             self.adjust.as_mut(),
             &self.input,
             self.controls,
+            #[cfg(test)]
+            &|| probe(decodes.as_deref(), Probe::Screen, controls, &|| false),
         )
         .map_err(ChartLoadError::Screen)?;
         #[cfg(feature = "dev-tools")]
@@ -2386,13 +2483,19 @@ fn wait_chart_load(
     mut adjust: Option<&mut game::AdjustDriver>,
     input: &crate::input_side::InputLink,
     controls: &crate::controls::Controls,
+    #[cfg(test)] on_serve: &dyn Fn(),
 ) -> Result<(), ScreenError> {
     screen.wait_serving(render, || {
+        #[cfg(test)]
+        on_serve();
         #[cfg(feature = "dev-tools")]
         crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
         crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
     })
 }
+
+#[cfg(all(test, feature = "dev-tools"))]
+mod job_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2508,7 +2611,8 @@ pub(crate) mod tests {
             answer.send(Ok(())).unwrap();
             published
         });
-        super::wait_chart_load(load, &render, Some(&mut driver), &input, &controls).unwrap();
+        super::wait_chart_load(load, &render, Some(&mut driver), &input, &controls, &|| {})
+            .unwrap();
         assert!(side.join().unwrap(), "not published while the load waited");
         assert_eq!(
             driver.snapshot().options.hispeed().classic_hispeed_x100,
