@@ -74,6 +74,17 @@ struct Faults {
     time_out: AtomicBool,
     /// The next strip prepared for a view prepared fails as a lost device.
     fail_strip: AtomicBool,
+    /// The next view prepared takes this long, ms (the whole frames'
+    /// preparation before a wait).
+    slow_prepare: std::sync::atomic::AtomicU64,
+    /// The slow preparation then arms `lose`: the frame committing that
+    /// view fails as a lost device.
+    lose_after_prepare: AtomicBool,
+    /// Skin frames submitted.
+    submits: std::sync::atomic::AtomicU64,
+    /// At each status publication, after a frame's cleanup: the frames
+    /// submitted and the presents the render thread had timed.
+    cleanups: Mutex<Vec<(u64, u64)>>,
     /// The next chart load fails as a lost device.
     fail_load: AtomicBool,
     /// The next play selection releases the result's installation, then
@@ -206,6 +217,10 @@ impl Screen for Recorded {
         self.menu.installed_pages(kind)
     }
     fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+        self.faults.cleanups.lock().unwrap().push((
+            self.faults.submits.load(Ordering::Acquire),
+            crate::dev::presents_marked(),
+        ));
         self.menu.retained_atlases(kind)
     }
     fn prepare_result(
@@ -217,6 +232,13 @@ impl Screen for Recorded {
     ) -> Result<Result<(), String>, render::RenderError> {
         if self.faults.refuse_text.swap(false, Ordering::AcqRel) {
             self.menu.refuse_next_result(true);
+        }
+        let slow = self.faults.slow_prepare.swap(0, Ordering::AcqRel);
+        if slow > 0 {
+            std::thread::sleep(Duration::from_millis(slow));
+            if self.faults.lose_after_prepare.swap(false, Ordering::AcqRel) {
+                self.faults.lose.store(true, Ordering::Release);
+            }
         }
         self.menu.prepare_result(skin, state, view, labels)
     }
@@ -260,6 +282,7 @@ impl Screen for Recorded {
             return Err(render::RenderError::SurfaceLost);
         }
         let t = self.menu.submit_result()?;
+        self.faults.submits.fetch_add(1, Ordering::AcqRel);
         let quads = self.menu.result_quads().unwrap_or_default();
         let strip = self.menu.result_strip();
         self.drawn.lock().unwrap().push(Drawn::Skin(quads, strip));
@@ -2651,4 +2674,144 @@ fn the_build_mark_precedes_the_result_build() {
         side.dropped = [None, None];
         let _ = screen.drain_retired();
     }
+}
+
+/// The whole frames (dev-tools, the S7-07d gate): a view whose 80 ms
+/// preparation is followed by a lost device on its commit leaves none of
+/// that preparation to the frames after the recovery.
+#[test]
+fn a_lost_attempts_preparation_is_not_charged_after_recovery() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.faults.slow_prepare.store(80, Ordering::Release);
+    rig.faults.lose_after_prepare.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&skin), 2_222, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let probe = rig.link.frames_probe();
+    assert_eq!(probe.result.0, Some(lifetime));
+    assert!(
+        probe.result.1.iter().all(|s| s.preparation < 80_000_000)
+            && probe.before_wait < Duration::from_millis(80),
+        "{probe:?}"
+    );
+    rig.link.exit();
+}
+
+/// The whole frames (dev-tools, the S7-07d gate): a view whose 80 ms
+/// preparation fails on its strip as a lost device leaves none of that
+/// preparation to the frames after the recovery.
+#[test]
+fn a_failed_preparation_is_not_charged_after_recovery() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.faults.slow_prepare.store(80, Ordering::Release);
+    rig.faults.fail_strip.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &payload(2, Some(&skin), 2_222, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.failed()));
+    rig.clear();
+    rig.link.prepare().unwrap();
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let probe = rig.link.frames_probe();
+    assert_eq!(probe.result.0, Some(lifetime));
+    assert!(
+        probe.result.1.iter().all(|s| s.preparation < 80_000_000)
+            && probe.before_wait < Duration::from_millis(80),
+        "{probe:?}"
+    );
+    rig.link.exit();
+}
+
+/// The whole frames (dev-tools, the S7-07d gate): a result frame's present
+/// is timed before its cleanup, so the cleanup, which publishes the
+/// status, sees every frame submitted already timed.
+#[test]
+fn a_result_present_is_timed_before_its_cleanup() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(wait_until(|| rig.faults.submits.load(Ordering::Acquire) > 5));
+    let cleanups = rig.faults.cleanups.lock().unwrap().clone();
+    assert!(cleanups.iter().any(|&(s, _)| s > 0), "{cleanups:?}");
+    assert!(
+        cleanups.iter().all(|&(submits, timed)| timed >= submits),
+        "a cleanup ran before its frame's present was timed: {cleanups:?}"
+    );
+    rig.link.exit();
+}
+
+/// The whole frames (dev-tools, the S7-07d gate): when the render thread
+/// ends on a displayed result, that result lifetime's frames are still
+/// reported to `tapestry measure select`.
+#[test]
+fn a_results_frames_are_reported_when_the_render_thread_ends() {
+    // The skin's import takes the serial lock itself: imported first.
+    let (_dir, skin) = fixed_skin();
+    let _serial = crate::imports::tests::serial();
+    crate::dev::measure_screens();
+    let rig = Rig::new();
+    // A lifetime other tests' rigs rarely reach, so the record found is
+    // this one's.
+    for _ in 0..6 {
+        rig.link.begin_result();
+        rig.link.end_result();
+    }
+    let lifetime = installed(&rig, &skin);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    rig.link.exit();
+    let kept = crate::dev::measured_screens();
+    assert!(
+        kept.screens
+            .iter()
+            .any(|c| c.screen == "result" && c.lifetime == lifetime),
+        "lifetime {lifetime}: {:?}",
+        kept.screens
+    );
 }

@@ -844,6 +844,9 @@ pub enum RenderMsg {
     /// Makes the render thread panic (tests: its failure in a play).
     #[cfg(all(test, feature = "dev-tools"))]
     Panic,
+    /// Answers what the whole-frame records hold (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    FramesProbe(mpsc::SyncSender<crate::dev::FramesProbe>),
     /// Draw the select screen from the newest update in the slot
     /// ([`RenderLink::show_selection`]), if it is newer than the one held
     /// and its lifetime current.
@@ -1426,6 +1429,14 @@ impl RenderLink {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::ParkScripts(tx));
         rx.recv_timeout(self.answer_timeout).is_ok()
+    }
+
+    /// What the render thread's whole-frame records hold (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn frames_probe(&self) -> crate::dev::FramesProbe {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::FramesProbe(tx));
+        rx.recv_timeout(self.answer_timeout).unwrap_or_default()
     }
 
     /// Sends a message; a thread that already ended ignores it.
@@ -3560,6 +3571,16 @@ impl Run {
                 }
                 #[cfg(all(test, feature = "dev-tools"))]
                 Ok(RenderMsg::Panic) => panic!("the render thread fails (a test)"),
+                #[cfg(all(test, feature = "dev-tools"))]
+                Ok(RenderMsg::FramesProbe(reply)) => {
+                    let (sl, sf, _) = self.select_frames.probe();
+                    let (rl, rf, before_wait) = self.result_frames.probe();
+                    let _ = reply.send(crate::dev::FramesProbe {
+                        select: (sl, sf.len()),
+                        result: (rl, rf),
+                        before_wait,
+                    });
+                }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
             }
@@ -3583,8 +3604,12 @@ impl Run {
                 #[cfg(feature = "dev-tools")]
                 let prepared = Instant::now();
                 self.prepare_result();
+                // Charged to the next frame only while the screen it was
+                // done on lives (dev-tools: the whole frames).
                 #[cfg(feature = "dev-tools")]
-                self.result_frames.before_wait(prepared.elapsed());
+                if self.screen.is_some() {
+                    self.result_frames.before_wait(prepared.elapsed());
+                }
                 if self.screen.is_none() {
                     mode = Mode::Idle;
                     continue;
@@ -3962,6 +3987,7 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     {
                         presented_at = Some(self.clock.now());
+                        crate::dev::mark_presented();
                     }
                     if let Ok(SelectionDrawn {
                         refused: Some(why), ..
@@ -4071,6 +4097,7 @@ impl Run {
                             #[cfg(feature = "dev-tools")]
                             {
                                 presented_at = Some(self.clock.now());
+                                crate::dev::mark_presented();
                             }
                             submitted.map(|t| (t, None))
                         }
@@ -5123,6 +5150,10 @@ impl Run {
     fn drop_screen(&mut self) {
         self.reconcile_result();
         self.screen = None;
+        // The attempt is abandoned: its preparation before a wait is no
+        // recovered frame's (dev-tools: the whole frames).
+        #[cfg(feature = "dev-tools")]
+        let _ = self.result_frames.take_before_wait();
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i

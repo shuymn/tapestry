@@ -1879,6 +1879,49 @@ pub fn view_switched<K: PartialEq + Copy>(last: &mut Option<K>, now: Option<K>) 
 }
 
 thread_local! {
+    /// The select and result skin frames' presents this thread has timed
+    /// so far ([`mark_presented`]).
+    static PRESENTS_MARKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A select or result skin frame's present was timed now, right after it
+/// returned: counted, so a test sees it was before the frame's cleanup.
+pub fn mark_presented() {
+    PRESENTS_MARKED.with(|m| m.set(m.get() + 1));
+}
+
+/// The presents [`mark_presented`] counted on this thread (tests).
+#[cfg(test)]
+#[must_use]
+pub fn presents_marked() -> u64 {
+    PRESENTS_MARKED.with(std::cell::Cell::get)
+}
+
+/// What a test sees of the render thread's whole-frame records (tests).
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub struct FramesProbe {
+    /// The select screen's lifetime held, and its frames.
+    pub select: (Option<u64>, usize),
+    /// The result screen's lifetime held, and its frames' spans.
+    pub result: (Option<u64>, Vec<Spans>),
+    /// The result's preparation before a wait not yet charged.
+    pub before_wait: Duration,
+}
+
+impl ScreenFrames {
+    /// What a test sees of it (tests).
+    #[cfg(test)]
+    pub fn probe(&self) -> (Option<u64>, Vec<Spans>, Duration) {
+        (
+            self.lifetime,
+            self.frames.iter().map(|f| f.spans).collect(),
+            self.before_wait,
+        )
+    }
+}
+
+thread_local! {
     /// When this thread last called a select or result skin's build,
     /// until taken.
     static BUILD_MARK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
@@ -2913,6 +2956,8 @@ mod tests {
         assert_eq!((frames.lifetime(), frames.frames().len()), (Some(5), 4));
         assert!(!frames.frame(6, Spans::default(), s, false, at(400)));
         assert_eq!(frames.frames().len(), 4);
+        // Other tests that measure hold the lock too.
+        let _serial = crate::imports::tests::serial();
         super::measure_screens();
         frames.report("select", 10_000_000);
         // Other tests' render threads may report while it measures: this
