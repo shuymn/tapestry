@@ -83,6 +83,7 @@ use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
 use crate::bests::{BestKey, BestLookup};
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
+use crate::opening::{LoadingOpener, LoadingRig};
 use crate::policy::SessionEvent;
 use crate::practice::{FADE, RING_OUT};
 use crate::prep::{PrepHandle, PrepKey, PrepPoll, Readiness};
@@ -727,7 +728,10 @@ pub(crate) fn threads_over<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenErr
 /// (its preparation, its restore, its logic step) gives way to the input
 /// thread's or the audio output's failure when one came meanwhile, so it
 /// never hides the run's end; any other error is the run's end already.
-fn refused<R: Rig>(rig: &R, error: LiveError<R::ScreenError>) -> LiveError<R::ScreenError> {
+pub(crate) fn refused<R: Rig>(
+    rig: &R,
+    error: LiveError<R::ScreenError>,
+) -> LiveError<R::ScreenError> {
     match error {
         LiveError::Preparation(_) | LiveError::Restore(_) | LiveError::Logic(_) => {
             threads_over(rig).err().unwrap_or(error)
@@ -740,7 +744,7 @@ fn refused<R: Rig>(rig: &R, error: LiveError<R::ScreenError>) -> LiveError<R::Sc
 /// failed ([`threads_over`]), and the screen prepared for the attempt is
 /// still there. A screen that failed now has no prepared attempt, so the
 /// run ends rather than opening a play nothing draws.
-fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
+pub(crate) fn preflight<R: Rig>(rig: &R) -> Result<(), LiveError<R::ScreenError>> {
     threads_over(rig)?;
     if rig.screen_failed() {
         return Err(LiveError::ScreenLost);
@@ -945,7 +949,7 @@ pub fn run_chart<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
-    run_chart_with(loaded, rig, FirstOpening::Standard)
+    run_from(loaded, rig, play_standard)
 }
 
 /// [`run_chart`], with the chart's first attempt opened as `first` says;
@@ -954,15 +958,28 @@ pub fn run_chart<R: Rig>(
 /// # Errors
 ///
 /// As [`run_chart`].
-pub fn run_chart_with<R: Rig>(
+pub fn run_chart_with<R: LoadingRig>(
     loaded: &mut Loaded,
     rig: &mut R,
-    first: FirstOpening,
+    first: FirstOpening<'_>,
+) -> Result<Leave, LiveError<R::ScreenError>> {
+    run_from(loaded, rig, |loaded, rig| match first {
+        FirstOpening::Standard => play_standard(loaded, rig),
+        FirstOpening::Loading(opener) => crate::opening::play_loading(loaded, rig, opener),
+    })
+}
+
+/// [`run_chart`], with the chart's first attempt played by `first`.
+fn run_from<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+    first: impl FnOnce(&mut Loaded, &mut R) -> Result<Option<Played>, LiveError<R::ScreenError>>,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
     let mut first = Some(first);
     loop {
-        let played = match first.take().unwrap_or(FirstOpening::Standard) {
-            FirstOpening::Standard => play_standard(loaded, rig)?,
+        let played = match first.take() {
+            Some(first) => first(loaded, rig)?,
+            None => play_standard(loaded, rig)?,
         };
         let Some(Played {
             report,
@@ -1321,7 +1338,7 @@ fn ready_to_commit<R: Rig>(
 
 /// How long one poll of the attempt's preparation lasts at most before
 /// the flow polls it again.
-const PREP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+pub(crate) const PREP_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The attempt's preparation, begun and polled to its end, then its final
 /// readiness for attempt `number` (design.md "Play Lifecycle", preparing
@@ -1381,7 +1398,7 @@ fn prepare_attempt<R: Rig>(
 }
 
 /// A play's report, and what follows it.
-struct Played {
+pub(crate) struct Played {
     report: PlayReport,
     /// The run's next step: the command that arrived as recording closed
     /// after an abort, or a retry still pending once a completed play was
@@ -1397,27 +1414,48 @@ struct Played {
 
 /// How a chart's first attempt opens ([`run_chart_with`]); every later
 /// attempt (a retry, a practice round) opens [`Standard`](Self::Standard).
-/// The opener that waits in the loading state is a later variant.
 #[non_exhaustive]
 #[derive(Debug)]
-pub enum FirstOpening {
+pub enum FirstOpening<'o> {
     /// Prepared and opened at once ([`ready_standard`]), as every retry.
     Standard,
+    /// Opened out of the loading state ([`crate::opening`]): its wait, its
+    /// opening steps and its deferral policy.
+    Loading(&'o mut LoadingOpener),
 }
 
 /// How [`open_and_play`] asks for recording to open, once the attempt is
-/// ready to open. The policy of the opener that waits in the loading state
-/// is a later variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OpenPolicy {
+/// ready to open.
+pub(crate) enum OpenPolicy<'o, R: Rig> {
     /// Opened at once, or, on a gated rig, through [`open_gated`]'s
     /// deferral.
     Standard,
+    /// Opened by the loading state's opener, with its deferral policy
+    /// ([`crate::opening`]).
+    Loading(&'o mut dyn LoadingGate<R>),
+}
+
+/// The loading state's opening of recording, for [`OpenPolicy::Loading`]:
+/// candidate `generation` opens, deferred as the opener's policy says.
+/// `None` when the player left before it opened.
+pub(crate) trait LoadingGate<R: Rig> {
+    /// Opens recording with chart time 0 `lead_in` after it.
+    ///
+    /// # Errors
+    ///
+    /// The threads' failures and the screen's, which end the run.
+    fn open(
+        &mut self,
+        loaded: &mut Loaded,
+        rig: &mut R,
+        lead_in: TimeUs,
+        generation: u32,
+    ) -> Result<Option<Opening<R::Reader>>, LiveError<R::ScreenError>>;
 }
 
 /// One attempt prepared and opened the standard way: [`ready_standard`],
 /// then [`open_and_play`].
-fn play_standard<R: Rig>(
+pub(crate) fn play_standard<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Option<Played>, LiveError<R::ScreenError>> {
@@ -1494,13 +1532,12 @@ fn ready_standard<R: Rig>(
 ///
 /// What [`play`] reports from the opening on; recording is closed again.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn open_and_play<R: Rig>(
+pub(crate) fn open_and_play<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
     start: PlayStart,
-    policy: OpenPolicy,
+    policy: OpenPolicy<'_, R>,
 ) -> Result<Option<Played>, LiveError<R::ScreenError>> {
-    let OpenPolicy::Standard = policy;
     // A full play's recording opens its READY state before chart time 0, a
     // practice round's `RESTORE_AHEAD` before its lead-in, whose start its
     // audio is restored at (design.md "Mid-Chart Start and Section
@@ -1517,10 +1554,10 @@ fn open_and_play<R: Rig>(
     // A quit during the wait is latched and taken by the first step. A
     // failed opening opened nothing: its number goes back, and so does an
     // attempt left while its opening was deferred.
-    let opened = if gated {
-        open_gated(rig, lead_in, generation)
-    } else {
-        rig.open(lead_in).map(Some).map_err(LiveError::Input)
+    let opened = match policy {
+        OpenPolicy::Loading(gate) => gate.open(loaded, rig, lead_in, generation),
+        OpenPolicy::Standard if gated => open_gated(rig, lead_in, generation),
+        OpenPolicy::Standard => rig.open(lead_in).map(Some).map_err(LiveError::Input),
     };
     let opening = match opened {
         Ok(Some(opening)) => opening,

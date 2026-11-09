@@ -249,6 +249,8 @@ pub const IN_PLAY: &[Site] = &[
             "cancel_reason",
         ],
     ),
+    // The loading opener's deferral, as `open_gated`'s.
+    Site::Fns("crates/game/src/opening.rs", &["open_loading"]),
     Site::Fns(
         "crates/game/src/session.rs",
         &[
