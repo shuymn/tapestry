@@ -195,6 +195,7 @@ fn main() {
                 context: &ctx,
                 text: &labels,
                 target: r.target(),
+                continuation: skin_model::Continuation::Fresh,
             };
             let t = Instant::now();
             let token = r.stage(&b, &a, request).unwrap();

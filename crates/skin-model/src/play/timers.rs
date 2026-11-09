@@ -91,6 +91,14 @@ fn point(t: &Tally, targets: u32) -> i32 {
     low(sum / n).wrapping_add(low(50_000 * i64::from(int(t.max_combo)) / n))
 }
 
+/// The play state's cached point after an attempt whose final tally is
+/// `t` over `targets`: the source's 7-key point ([`point`]), `None` for
+/// the zero tally, which no judgment changed, so the cache stays.
+#[must_use]
+pub fn settled_point(t: &Tally, targets: u32) -> Option<i32> {
+    (*t != Tally::default()).then(|| point(t, targets))
+}
+
 /// The score rate of `ex` over `targets`, in basis points:
 /// `⌊10 000 · ex / (2 · targets)⌋`, 10 000 with no target. Not capped at
 /// 100 %: a custom EX weighting may pass it; only the field's `i32` range
@@ -547,6 +555,7 @@ impl Play {
         whens: &[Program],
         present: Option<&Present>,
     ) -> Result<(), BuildError> {
+        self.terminal = false;
         self.check()?;
         let Some(judged) = judged_targets(frame.tally, self.empty_poor_counted) else {
             return self.refuse(BuildError::InconsistentTally);
@@ -595,8 +604,25 @@ impl Play {
                 timers,
                 slots: self.slots_run,
             });
+            self.terminal = self.slots_run && frame.complete;
         }
         Ok(())
+    }
+
+    /// The point field: the play state's cached point until the attempt's
+    /// first judgment (the first frame whose tally is not the zero tally:
+    /// every judgment, the empty POOR included, adds a count), then the
+    /// attempt's own (`ScoreDataProperty.java:62-91`, updated only at a
+    /// judgment, `BMSPlayer.java:1038` at `0.8.9`).
+    fn point_field(&mut self, t: &Tally) -> i32 {
+        if !self.judged && *t != Tally::default() {
+            self.judged = true;
+        }
+        if self.judged {
+            point(t, self.reducer.targets())
+        } else {
+            self.cached_point
+        }
     }
 
     /// The fields, in slot order (`field::*`): the snapshot's, `judged`
@@ -606,6 +632,7 @@ impl Play {
     fn fill_fields(&mut self, frame: &SkinFrame<'_>, judged: u64, readouts: &Readouts) {
         let r = readouts;
         let t = frame.tally;
+        let point_now = self.point_field(t);
         let gauge = frame.gauges.get(frame.gauge).map_or(0, |g| {
             let permille = (g.value.0 / GAUGE_UNIT).clamp(0, i64::from(GAUGE_PERMILLE));
             i32::try_from(permille).unwrap_or(0)
@@ -706,7 +733,7 @@ impl Play {
             )
             .chain([r.progress_ppm])
             .chain(self.chart_fields)
-            .chain([point(t, self.reducer.targets())]);
+            .chain([point_now]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
