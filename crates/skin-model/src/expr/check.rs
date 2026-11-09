@@ -137,8 +137,11 @@ impl Checker<'_, '_> {
                     };
                     self.int(id, T::Read(op), Iv::new(i32::MIN, i32::MAX))
                 }
+                // A timer output is read only as an element's timer.
+                Some((_, OutTy::Timer, _)) | None => {
+                    Err(self.err(id, ErrorKind::UnknownName { name: name.into() }))
+                }
                 Some((slot, ty, ok)) => Ok(Self::boolean(T::Read(Op::Output { slot, ty, ok }))),
-                None => Err(self.err(id, ErrorKind::UnknownName { name: name.into() })),
             };
         };
         if output.is_some() {

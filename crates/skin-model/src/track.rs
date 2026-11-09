@@ -99,6 +99,21 @@ pub enum End {
     Loop { from: TimeUs },
 }
 
+impl End {
+    /// Whether a track ending so, its last key at `last` µs, shows past
+    /// [`MAX_KEY_US`] what it shows there: held, or hidden before it, never
+    /// a loop. A program timer's elapsed time is capped there, so only such
+    /// a track draws on one as on the true elapsed time.
+    #[must_use]
+    pub fn settles_by_cap(self, last: i64) -> bool {
+        match self {
+            Self::Hold => true,
+            Self::Hide => last < MAX_KEY_US,
+            Self::Loop { .. } => false,
+        }
+    }
+}
+
 /// A validated track: key times non-decreasing from `k0 ≥ 0`, values
 /// densified (every key holds all nine props). Of keys sharing a time, the
 /// last draws at it and the track before it moves toward the first
@@ -211,6 +226,13 @@ impl Track {
     #[must_use]
     pub fn key_count(&self) -> usize {
         self.at.len()
+    }
+
+    /// Whether it draws the same past [`MAX_KEY_US`] as there
+    /// ([`End::settles_by_cap`]).
+    pub(crate) fn settles_by_cap(&self) -> bool {
+        self.end
+            .settles_by_cap(self.at.last().copied().unwrap_or(0))
     }
 
     /// Whether `other` has the same key times, ease and end, so both are
