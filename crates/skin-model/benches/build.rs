@@ -277,6 +277,8 @@ fn program_skin(
             reads: Vec::new(),
             callbacks: vec![cb; n],
             signature: vec![OutTy::Int; n],
+            slots: Vec::new(),
+            domains: Vec::new(),
         }),
     })
     .expect("a program at the cap loads");

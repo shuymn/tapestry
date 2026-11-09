@@ -62,8 +62,19 @@ fn root() -> &'static Path {
                 panic!("{path:?}: {e}");
             }
         }
-        // A font file the sheet admits by its header alone.
-        std::fs::write(dir.join("o.ttf"), [0, 1, 0, 0]).unwrap();
+        // A font file the sheet admits by its header alone, replaced whole like
+        // the images: another test process may be reading it.
+        let tmp = tempfile::Builder::new()
+            .suffix(".ttf")
+            .tempfile_in(&dir)
+            .unwrap();
+        std::fs::write(tmp.path(), [0, 1, 0, 0]).unwrap();
+        let path = dir.join("o.ttf");
+        if let Err(e) = tmp.persist(&path)
+            && !path.is_file()
+        {
+            panic!("{path:?}: {e}");
+        }
         dir
     })
 }

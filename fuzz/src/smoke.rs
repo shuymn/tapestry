@@ -1415,6 +1415,38 @@ fn present_seeds_verify_or_fail_as_built() {
     }
 }
 
+/// The program decoder's newer bytes: a conversion byte's high bit a
+/// timer callback, op bytes from 240 the clock and a slot's load and
+/// store, wrapping every three.
+#[test]
+fn present_decodes_timers_the_clock_and_slots() {
+    use skin_model::present::{Conv, Insn};
+    let data = [
+        1, // one callback
+        0, 4, 2, 0x80, 0, 255, 255, // start 0, length 4, a timer
+        240, 0, 0, 0, // the clock into r0
+        241, 1, 5, 0, // r1 <- slot 1
+        242, 1, 6, 7, // slot 2 <- r1, domain 3
+        243, 0, 0, 0, // the clock again
+    ];
+    let def = crate::present_def(&data);
+    assert_eq!(def.callbacks.len(), 1);
+    assert_eq!(def.callbacks[0].conv, Conv::Timer);
+    assert_eq!(
+        def.code,
+        [
+            Insn::StateUs { dst: 0 },
+            Insn::LoadSlot { dst: 1, slot: 1 },
+            Insn::StoreSlot {
+                slot: 2,
+                src: 1,
+                domain: 3
+            },
+            Insn::StateUs { dst: 0 },
+        ]
+    );
+}
+
 #[test]
 fn skin_fnt_seeds_parse_or_fail_as_built() {
     use skin_model::FntErrorKind as K;
