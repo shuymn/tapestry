@@ -2596,7 +2596,13 @@ pub(crate) mod tests {
     /// order, A under the cursor.
     fn selection(dir: &std::path::Path) -> Selection {
         let mut sel = unlisted(dir, |library, charts| {
-            Shelf::new(library, charts, Duration::from_secs(60), None)
+            Shelf::new(
+                library,
+                charts,
+                Duration::from_secs(60),
+                None,
+                &crate::shelf::tests::coordinator(),
+            )
         });
         // The scan pass runs in background mode, which a loaded machine
         // starves for seconds: the bound only catches a pass that never
@@ -4445,7 +4451,13 @@ pub(crate) mod tests {
         roots: Vec<std::path::PathBuf>,
     ) -> (Selection, Vec<std::path::PathBuf>) {
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
-        let shelf = Shelf::new(library, roots.clone(), Duration::ZERO, None);
+        let shelf = Shelf::new(
+            library,
+            roots.clone(),
+            Duration::ZERO,
+            None,
+            &crate::shelf::tests::coordinator(),
+        );
         let mut sel = Selection {
             shelf,
             screen: SelectScreen::new(roots.clone()),
