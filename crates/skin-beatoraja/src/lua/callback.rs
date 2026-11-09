@@ -296,6 +296,11 @@ pub(crate) enum Unused {
     Dropped,
     /// A condition before it folded false.
     FoldedFalse,
+    /// Its object is one the source removes at installation.
+    Removed,
+    /// A keyless judge's or the notes' `op`, `draw` or `timer`, which the
+    /// source installs only with an authored key.
+    Inert,
 }
 
 /// A callback where the import consumed it, for the report.

@@ -21,6 +21,7 @@ pub(crate) mod ledger;
 mod object;
 pub(crate) mod ops;
 mod policy;
+mod prepare;
 mod property;
 mod report;
 pub(crate) mod result;
@@ -404,6 +405,9 @@ struct Common {
     /// On a result skin, whether its visibility tests the clear status,
     /// an essential part ([`result`]).
     tests_status: bool,
+    /// Its conditions' sources, in the source's order, as `visible` joins
+    /// them: what a value read after them is gated by.
+    conds: Vec<String>,
 }
 
 /// The import's running state.
@@ -452,6 +456,17 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
+    /// Per callable instance, the `timer`s of play destinations whose
+    /// object the source removes, or whose timer is inert: no site, and
+    /// no reference ([`Cx::close_slots`]).
+    removed_refs: HashMap<u32, usize>,
+    /// The play destination being read's installation ([`prepare`]).
+    install: prepare::Install,
+    /// What its kind's `prepare` checks before its conditions.
+    prepare: prepare::Prepare,
+    /// Whether a read of it so far is one the source sees as a
+    /// pre-judgment sentinel ([`property::Value::pre_judgment`]).
+    sentinel_read: bool,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -578,6 +593,10 @@ impl<'d> Cx<'d> {
             present: skin_model::present::PresentDef::default(),
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
+            removed_refs: HashMap::new(),
+            install: prepare::Install::default(),
+            prepare: prepare::Prepare::Open,
+            sentinel_read: false,
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],
@@ -992,7 +1011,7 @@ impl<'d> Cx<'d> {
         self.budget.element().map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
-        let (id, dst) = self.read_dst(index, rec)?;
+        let (id, mut dst) = self.read_dst(index, rec)?;
         #[cfg(feature = "dev-tools")]
         {
             self.element = Some(crate::lua::survey::Element {
@@ -1014,8 +1033,10 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
-            self.count_timer_site(&dst.timer);
-            return self.system(dst, n);
+            self.install(&mut dst, None, false)?;
+            self.system(dst, n)?;
+            self.installed();
+            return Ok(());
         }
         let role = Role::Decorative.or_failure(dst.failure);
         let Some((object, orec)) = self
@@ -1025,7 +1046,6 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
-        self.count_timer_site(&dst.timer);
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
@@ -1068,6 +1088,10 @@ impl<'d> Cx<'d> {
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
+        // An id another table names too: the source may make the other
+        // object when this one's source is missing, so that is uncertain.
+        let shared = self.objects.shared(self.def, &self.tables, &id)?;
+        self.install(&mut dst, Some((object, orec)), !shared)?;
         // The source makes no object of these when `src` names no source,
         // and skips the destination (`JSONSkinLoader.java:326-338,
         // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
@@ -1105,6 +1129,7 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }
         }
+        self.installed();
         Ok(())
     }
 
@@ -1557,6 +1582,7 @@ impl<'d> Cx<'d> {
             track,
             display_deviation: deviates,
             tests_status,
+            conds,
         }))
     }
 

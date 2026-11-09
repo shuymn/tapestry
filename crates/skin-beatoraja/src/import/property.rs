@@ -490,6 +490,24 @@ impl Value {
         }
     }
 
+    /// Whether the source reads it as `Integer.MIN_VALUE` before the
+    /// first judgment, where the play reads a value: the EX score and the
+    /// score rates, whose score data is null until a judgment
+    /// (`MainState.java:38`, `play/BMSPlayer.java:1038`;
+    /// `IntegerPropertyFactory.java:176-181`, `:606-616`, `:690-700` at
+    /// `0.8.9`). An object choosing or showing by it skips its conditions
+    /// and timer there; the program's gates cannot.
+    pub(crate) fn pre_judgment(self) -> bool {
+        matches!(
+            self,
+            Self::ExScore
+                | Self::CurrentRatePercent
+                | Self::CurrentRateFraction
+                | Self::WholeRatePercent
+                | Self::WholeRateFraction
+        )
+    }
+
     /// Whether the value differs from the source in an owner-decided way.
     pub(crate) fn deviates(self) -> bool {
         !matches!(

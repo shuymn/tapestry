@@ -308,8 +308,8 @@ pub struct CallbackDef {
     /// skips it.
     pub gate: Option<u16>,
     /// An earlier callback this one follows: a number's value (`Int`),
-    /// when it gave one; a `draw` (`Truthy`), when it gave true; a timer,
-    /// when it was on.
+    /// when it gave one; a `draw` (`Truthy`), when it gave true (a timer's
+    /// or a slider value's); a timer, when it was on (a timer's).
     pub after: Option<u16>,
 }
 

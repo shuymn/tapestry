@@ -1587,10 +1587,13 @@ fn a_slot_is_taken_only_when_proven() {
             latch("local n = 0", "n = n + 1 return 0") + &dst("latch", ""),
             construct("a slot in a candidate that is not closed"),
         ),
-        // A destination whose timer it is, dropped before its timer: the
-        // latch would not run on every frame the source runs it.
+        // A destination whose timer it is, dropped before its timer for
+        // what only the import refuses (the source draws it): the latch
+        // would not run on every frame the source runs it.
         (
-            latch(STATE, LATCH_BODY) + &dst("latch", "") + &dst("latch", "op = { 906 },"),
+            latch(STATE, LATCH_BODY)
+                + &dst("latch", "")
+                + &dst("latch", "mouseRect = { x = 0, y = 0, w = 1, h = 1 },"),
             construct("a slot writer a dropped destination calls"),
         ),
         // A consumer with a condition.

@@ -502,6 +502,11 @@ impl Cx<'_> {
                 return self.drop_el(role, at, why);
             };
             let selector = (src, index.deviates());
+            // Its callbacks run only while it selects a run
+            // (`SkinImage.java:127-132`).
+            self.gate_by_value(src, None, Conv::Index);
+            self.prepare =
+                super::prepare::Prepare::Selector((!index.non_negative()).then(|| src.to_owned()));
             return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
         // A plain image lowered as a paint left above.
@@ -688,6 +693,19 @@ impl Cx<'_> {
                 _ => role,
             };
         }
+        // A value property the source reads as a pre-judgment sentinel; a
+        // selector by `ref` alone that is never negative needs no gate.
+        let non_negative = match property::value_prop(self.kind, &value) {
+            property::IntProp::Shown(v) => {
+                self.read_sentinel(v.pre_judgment());
+                false
+            }
+            property::IntProp::Null => {
+                !matches!(value, Prop::Callable(_))
+                    && property::index_in(self.kind, r).non_negative()
+            }
+            _ => false,
+        };
         let (src, deviates) = if let Prop::Callable(id) = value {
             // A function's value selects, its element's role joined by the
             // part its reads show; it never falls back to `ref`.
@@ -710,6 +728,7 @@ impl Cx<'_> {
             }
         };
         self.gate_by_value(&src, None, Conv::Index);
+        self.prepare = super::prepare::Prepare::Selector((!non_negative).then(|| src.clone()));
         self.actions(at, act)?;
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));

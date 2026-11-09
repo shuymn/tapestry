@@ -272,7 +272,7 @@ const AUTOPLAY_OFF: i32 = 32;
 const AUTOPLAY_ON: i32 = 33;
 /// `mode_course` (`BooleanPropertyFactory.java:523-524`): a scene
 /// constant, false, as there are no courses.
-const COURSE_MODE: i32 = 290;
+pub(crate) const COURSE_MODE: i32 = 290;
 /// `judge_great_exist` to `judge_poor_exist`
 /// (`BooleanPropertyFactory.java:554-561`): whether the count is above 0,
 /// the POOR's the scored POORs', without empty POORs.
@@ -559,13 +559,7 @@ pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
     if kind == ScreenKind::Play {
         return named(name);
     }
-    let mut negative = false;
-    let mut rest = name;
-    while let Some(r) = rest.strip_prefix('!') {
-        negative = !negative;
-        rest = r;
-    }
-    let id = named_id(rest)?;
+    let (id, negative) = resolve_name(name)?;
     Some(profile_cond(kind, id, negative))
 }
 
@@ -583,17 +577,24 @@ fn named_id(name: &str) -> Option<i32> {
     (1..=PRACTICE_ITEMS).contains(&n).then(|| first + n - 1)
 }
 
-/// A boolean property named `name` (`getBooleanProperty(String)`,
-/// `BooleanPropertyFactory.java:69-85`): each leading `!` negates; a name
-/// the factory does not know is a script, `None`.
-pub(crate) fn named(name: &str) -> Option<Cond> {
+/// The property boolean `name` wraps and whether it negates it: each
+/// leading `!` negates (`BooleanPropertyFactory.java:69-99`); `None` for a
+/// name the factory does not know.
+pub(crate) fn resolve_name(name: &str) -> Option<(i32, bool)> {
     let mut negative = false;
     let mut rest = name;
     while let Some(r) = rest.strip_prefix('!') {
         negative = !negative;
         rest = r;
     }
-    let id = named_id(rest)?;
+    Some((named_id(rest)?, negative))
+}
+
+/// A boolean property named `name` (`getBooleanProperty(String)`,
+/// `BooleanPropertyFactory.java:69-85`): each leading `!` negates; a name
+/// the factory does not know is a script, `None`.
+pub(crate) fn named(name: &str) -> Option<Cond> {
+    let (id, negative) = resolve_name(name)?;
     Some(built_in_cond(id, negative))
 }
 

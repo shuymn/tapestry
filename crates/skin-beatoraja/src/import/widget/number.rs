@@ -112,7 +112,10 @@ impl Cx<'_> {
                     self.drop_el(base, at, why)?;
                     return Ok(());
                 }
-                IntProp::Shown(v) => NumberValue::of(v),
+                IntProp::Shown(v) => {
+                    self.read_sentinel(v.pre_judgment());
+                    NumberValue::of(v)
+                }
             }
         };
         self.gate_by_value(&shown.expr, shown.guard.as_deref(), Conv::Int);
