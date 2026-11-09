@@ -838,6 +838,40 @@ fn a_float_modulo_shows_what_the_source_shows() {
     }
 }
 
+/// The import charges each program callback's per-frame cost as the
+/// skin counts it (V5): its instructions, its reads at each use and its
+/// gate. Nothing is dropped, so the operations charged are the ones kept.
+#[test]
+fn a_program_callback_is_charged_as_the_skin_counts_it() {
+    let d = folder(&skin(
+        "skin.value = {\n\
+           { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return 5 end },\n\
+           { id = \"w\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return (ms.number(110) + ms.number(110)) % 3 end } }\n\
+         table.insert(skin.destination, { id = \"v\", draw = function() return ms.number(110) / 2 >= 0 end,\n\
+           dst = { { x = 0, y = 100, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"w\", dst = { { x = 0, y = 200, w = 6, h = 6 } } })",
+    ));
+    let i = import(&d, 905).unwrap();
+    let mut got = i.callbacks.clone();
+    got.sort_by_key(|d| format!("{d:?}"));
+    // The draw is gated by the expression value's sentinel.
+    assert_eq!(
+        got,
+        [
+            Disposition::Compiled,
+            Disposition::Compiled,
+            Disposition::Lowered
+        ]
+    );
+    assert_eq!(i.imported.skin.program_callbacks(), 2);
+    assert_eq!(
+        i.imported.report.usage.ops as usize,
+        i.imported.skin.ops().total()
+    );
+}
+
 /// A read whose value is discarded still keeps its availability: with
 /// the play level unavailable the number draws nothing, as the source's
 /// `number(96)` would have no value.

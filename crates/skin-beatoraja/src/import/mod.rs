@@ -1611,15 +1611,12 @@ impl<'d> Cx<'d> {
         Ok(p)
     }
 
-    /// `src` compiled against the play schema and charged as
-    /// [`Self::compile`] does, or `None` when it does not compile: a
-    /// program read or gate past an expression's limits.
-    fn trial(&mut self, src: &str, want: Ty, at: Span) -> Result<Option<Program>, ImportError> {
-        let Ok(p) = compile(src, &Scope::new(self.schema()), want) else {
-            return Ok(None);
-        };
-        self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
-        Ok(Some(p))
+    /// `src` compiled against the play schema, or `None` when it does not
+    /// compile: a program read or gate past an expression's limits. It is
+    /// not charged: its callback charges it at each use
+    /// ([`skin_model::present::callback_cost`]).
+    fn trial(&self, src: &str, want: Ty) -> Option<Program> {
+        compile(src, &Scope::new(self.schema()), want).ok()
     }
 
     /// The model reference of a mapped timer, adding a rank's `when`

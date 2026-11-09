@@ -68,7 +68,7 @@ impl Present {
             let code = v2(&def, cb, k)?;
             v3(&def, cb, code, k)?;
             v4_gating(&def, cb, k)?;
-            cost = cost.saturating_add(callback_cost(&def, cb, code));
+            cost = cost.saturating_add(cost_of(&def, cb, code));
         }
         ops.charge_ops(cost).map_err(|_| PresentError::Cost)?;
         Ok(Self { def })
@@ -220,15 +220,25 @@ fn read_cost(r: Option<&ReadDef>) -> usize {
     })
 }
 
-/// The most work one invocation of `cb` does, both arms of every branch
-/// counted: its instructions, each `Read`'s operations, and its gate's.
-fn callback_cost(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
-    let reads = code.iter().fold(0_usize, |n, insn| match *insn {
-        Insn::Read { read, .. } => n.saturating_add(read_cost(def.reads.get(usize::from(read)))),
+/// The most work one invocation of `cb` does, as [`callback_cost`].
+fn cost_of(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
+    let gate = cb.gate.and_then(|g| def.reads.get(usize::from(g)));
+    callback_cost(code, &def.reads, gate)
+}
+
+/// The most work one invocation of a callback does, both arms of every
+/// branch counted: its instructions `code`, each `Read`'s operations (the
+/// read it names in `reads`, its value's and its guard's) and its `gate`
+/// read's. V5 charges this; an importer charges the same before it keeps
+/// the callback, so its count of the skin's operations covers the
+/// program's.
+#[must_use]
+pub fn callback_cost(code: &[Insn], reads: &[ReadDef], gate: Option<&ReadDef>) -> usize {
+    let at_reads = code.iter().fold(0_usize, |n, insn| match *insn {
+        Insn::Read { read, .. } => n.saturating_add(read_cost(reads.get(usize::from(read)))),
         _ => n,
     });
-    let gate = cb
-        .gate
-        .map_or(0, |g| read_cost(def.reads.get(usize::from(g))));
-    code.len().saturating_add(reads).saturating_add(gate)
+    code.len()
+        .saturating_add(at_reads)
+        .saturating_add(read_cost(gate))
 }

@@ -169,6 +169,15 @@ impl Budget {
         Ok(())
     }
 
+    /// A presentation program callback's per-frame cost
+    /// ([`skin_model::present::callback_cost`]), before it is stored: the
+    /// skin's operation total counts it with the expressions'.
+    pub(crate) fn callback_ops(&mut self, cost: usize) -> Result<(), ImportLimit> {
+        self.ops.charge_ops(cost).map_err(|_| ImportLimit::Ops)?;
+        self.usage.ops = u32::try_from(self.ops.total()).unwrap_or(u32::MAX);
+        Ok(())
+    }
+
     /// The song list's `n` placements, the row text table's slots, before
     /// any placement is read.
     pub(crate) fn placements(&mut self, n: usize) -> Result<(), ImportLimit> {
