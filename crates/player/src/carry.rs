@@ -156,23 +156,22 @@ impl Carries {
     /// What an attempt of `key` drawing with `installed` takes over: fresh
     /// for a play state with no record; else the cached point, with the
     /// slots when they are valid and belong to `installed`. A record whose
-    /// attempt started and was never settled has invalid slots.
-    pub fn offer(&mut self, key: Option<CarryKey>, installed: &Installed) -> Offer {
+    /// attempt started and was never settled offers no slots, and the
+    /// attempt's commit records none ([`Event::Committed`]). It changes
+    /// nothing: every change goes through [`on`](Self::on).
+    pub fn offer(&self, key: Option<CarryKey>, installed: &Installed) -> Offer {
         let Some(key) = key else {
             return Offer::Fresh;
         };
         let Some(r) = self
             .record
-            .as_mut()
+            .as_ref()
             .filter(|r| r.key.play_state == key.play_state)
         else {
             return Offer::Fresh;
         };
-        if r.phase == Phase::Started {
-            r.bank = None;
-            r.phase = Phase::Settled;
-        }
-        let valid = r.key.chart == key.chart && r.installed.same(installed);
+        let valid =
+            r.phase != Phase::Started && r.key.chart == key.chart && r.installed.same(installed);
         Offer::Carried {
             point: r.point,
             bank: r.bank.clone().filter(|_| valid),
@@ -307,5 +306,45 @@ mod tests {
                 bank: None
             }
         );
+    }
+
+    /// A round that started and was never settled offers the next attempt
+    /// no slots and its point, and the offer changes nothing: the next
+    /// attempt's commit records no slots, and an offer before it is the
+    /// same.
+    #[test]
+    fn an_unsettled_round_offers_no_slots() {
+        use skin_model::present::{Bank, Val};
+        let mut c = Carries::default();
+        let bank = Bank::of(vec![Val::Int(7)]);
+        c.on(Event::Committed {
+            key: Some(KEY),
+            offer: &Offer::Fresh,
+            installed: Installed::Simple,
+            targets: 4,
+            bank: Some(&bank),
+        });
+        assert_eq!(
+            c.offer(Some(KEY), &Installed::Simple),
+            Offer::Carried {
+                point: 0,
+                bank: Some(bank.clone())
+            }
+        );
+        c.on(Event::Started);
+        let unsettled = Offer::Carried {
+            point: 0,
+            bank: None,
+        };
+        assert_eq!(c.offer(Some(KEY), &Installed::Simple), unsettled);
+        assert_eq!(c.offer(Some(KEY), &Installed::Simple), unsettled);
+        c.on(Event::Committed {
+            key: Some(KEY),
+            offer: &unsettled,
+            installed: Installed::Simple,
+            targets: 4,
+            bank: Some(&bank),
+        });
+        assert_eq!(c.offer(Some(KEY), &Installed::Simple), unsettled);
     }
 }
