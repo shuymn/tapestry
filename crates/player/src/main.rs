@@ -2254,6 +2254,7 @@ mod tests {
     /// the interval's token. Without, the runtime is still parked after the
     /// play, and the run's end destroys it (design.md "beatoraja Lua
     /// Skins", Quiescence acknowledged).
+    // Covers: T09
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_play_leaves_the_screens_runtimes_at_rest_until_its_end() {

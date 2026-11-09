@@ -242,6 +242,7 @@ fn a_false_gate_skips_the_call() {
 /// C8: a callback past the frame's budget gives its constant; after three
 /// such frames the runtime stops, every slot its constant from then on,
 /// and frames keep running.
+// Covers: T09
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_budget_stops_the_runtime_after_three_frames() {
@@ -307,6 +308,7 @@ fn over(body: &str, time: std::time::Duration) -> (Vec<CallStatus>, u64, u64) {
 /// later calls given their constants: the instructions with time to
 /// spare, the host calls within the instructions and time, the time with
 /// instructions to spare.
+// Covers: T09
 #[cfg(feature = "dev-tools")]
 #[test]
 fn each_frame_cap_stops_a_call_alone() {
@@ -366,6 +368,7 @@ fn a_poisoned_context_is_read_through() {
 }
 
 /// C8: the kept VM's memory cap stops the runtime at once.
+// Covers: T09
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_memory_cap_stops_the_runtime() {
@@ -385,6 +388,7 @@ fn the_memory_cap_stops_the_runtime() {
 /// C8, §4: a configured pass that leaves more than the runtime's memory
 /// cap reachable from a routed callback is refused at the import, its VM
 /// not kept; one whose large heap nothing reaches keeps its VM.
+// Covers: T09
 #[test]
 fn a_kept_heap_over_the_cap_refuses_the_import() {
     // 64 distinct strings of 512 KiB: 32 MiB, under the import's cap.
@@ -606,6 +610,7 @@ fn the_runtime_is_send() {
 /// local, an upvalue of a helper, a table field, and `require` of a module
 /// it already loaded, a host module or a file module the pass cached,
 /// refused before the cached return.
+// Covers: T09
 #[cfg(feature = "dev-tools")]
 #[test]
 fn loaders_raise_at_runtime_however_reached() {
@@ -936,6 +941,7 @@ fn a_runtime_holds_one_permit() {
 
 /// C8: a panic in a host function stops the runtime, even under a `pcall`;
 /// every slot is its constant from then on and frames keep running.
+// Covers: T09
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_host_panic_stops_the_runtime() {
