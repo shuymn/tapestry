@@ -805,8 +805,11 @@ fn focus_lost_and_back_during_the_commit_reply_waits_a_quiet_second() {
 /// specialization commits before the 3 s are up, and the end of loading
 /// waits for them from the same first frame, acceptance reopened and
 /// closed again on a fresh copy: the flow decided the end of loading at
-/// its own clock reading 3 s or more after the acknowledgement, on the
-/// one close after the commit, and committed once.
+/// its own clock reading 3 s or more after the acknowledgement, and
+/// committed once. The commit's time is the real clock's: one that came
+/// within the 3 s waited the rest with one close after it, a later one
+/// had nothing left to wait and closed nothing more (each branch's exact
+/// timing is the headless tests').
 #[test]
 fn a_committed_specializations_minimum_holds_the_end_of_loading() {
     let (_p, skin) = pending_play("local lv = ms.number(96)\nskin.loadend = 3000");
@@ -817,18 +820,22 @@ fn a_committed_specializations_minimum_holds_the_end_of_loading() {
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
         let (_, at) = rig.render.loading_ack().unwrap();
         assert_eq!(rig.render.loading_loadend(), Some(TimeUs(3_000_000)));
-        // The commit came within the 3 s: the remaining minimum was waited
-        // with acceptance open, then closed once.
-        let (closed_at, copy) = one_close(side);
-        assert!(copy.quiet_at(closed_at));
-        assert!(closed_at.0 >= at.0 + 3_000_000, "{closed_at:?} {at:?}");
         let [end] = ends(side)[..] else {
             panic!("{:?}", ends(side));
         };
-        assert!(
-            end >= closed_at && copy.quiet_at(end),
-            "decided after the close"
-        );
+        assert!(end.0 >= at.0 + 3_000_000, "{end:?} {at:?}");
+        let closes = side.gates.closes.lock().unwrap().clone();
+        if !closes.is_empty() {
+            // The commit came within the 3 s: the remaining minimum was
+            // waited with acceptance open, then closed once.
+            let (closed_at, copy) = one_close(side);
+            assert!(copy.quiet_at(closed_at));
+            assert!(closed_at.0 >= at.0 + 3_000_000, "{closed_at:?} {at:?}");
+            assert!(
+                end >= closed_at && copy.quiet_at(end),
+                "decided after the close"
+            );
+        }
         assert_eq!(side.gates.revalidate.passed(), 1);
         let commits = side
             .screens
