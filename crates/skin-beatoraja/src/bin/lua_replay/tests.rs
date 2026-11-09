@@ -390,21 +390,46 @@ fn a_write_free_entry_passes() {
     assert!(r.passes(), "{}", r.text(0, true));
 }
 
-/// R22: the source's installation removes an object under a disabled
-/// option, an absent option and without a keyframe: the reference
-/// invokes none of its consumers.
+/// R22 and s7-06e-design.md §7.3: the source's installation removes a
+/// number under a disabled option, an absent option and without a
+/// keyframe, so it never reads their values; production compiles each
+/// value and runs it every frame, found as invocations with no source
+/// point until the production fix. A number under the selected option is
+/// installed, and its value agrees on every frame.
 #[test]
 fn pruning_invokes_nothing() {
     let v = "value = function() return ms.number(100) / 2 end";
     let body = format!(
-        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, {v} }} }}\n\
-         table.insert(skin.destination, {{ id = \"m\", op = {{ 906 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
-         table.insert(skin.destination, {{ id = \"m\", op = {{ -950 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
-         table.insert(skin.destination, {{ id = \"m\", dst = {{}} }})\n"
+        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, {v} }} }}
+         table.insert(skin.destination, {{ id = \"m\", op = {{ 906 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
+         table.insert(skin.destination, {{ id = \"m\", op = {{ -950 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
+         table.insert(skin.destination, {{ id = \"m\", dst = {{}} }})
+"
     );
     let r = run(&body);
     assert_eq!(r.removed.len(), 3, "{}", r.text(0, true));
     assert_eq!(r.points, 0, "{}", r.text(0, true));
+    let extra = r
+        .findings
+        .iter()
+        .filter(|f| f.what.contains("with no source point"))
+        .count();
+    assert_eq!(extra, 3 * r.frames, "{}", r.text(0, true));
+    let selected = format!(
+        "{body}table.insert(skin.destination, {{ id = \"m\", op = {{ 905 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})
+"
+    );
+    let r = run(&selected);
+    assert_eq!(r.removed.len(), 3, "{}", r.text(0, true));
+    assert_eq!(r.matched, r.frames, "{}", r.text(0, true));
+    assert_eq!(r.agreed, r.frames, "{}", r.text(0, true));
+    assert!(
+        r.findings
+            .iter()
+            .all(|f| f.what.contains("with no source point")),
+        "{}",
+        r.text(0, true)
+    );
 }
 
 /// R23: a plain image ignores `ref` and `value`; an image set's numeric
