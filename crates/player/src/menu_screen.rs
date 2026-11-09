@@ -1674,6 +1674,7 @@ mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_splash_fade_lays_nothing_out_again_alloc() {
+        let _warp = crate::warp_turn::take();
         let mut screen = MenuScreen::new(warp(), Some(Fonts::runtime().unwrap()));
         screen.fade_splash(255).unwrap();
         screen.fade_splash(254).unwrap();

@@ -84,6 +84,48 @@ fn one() -> Builder {
     b
 }
 
+/// V5's cost written out by hand (design.md "beatoraja Lua Skins", V5):
+/// every instruction, each read's value and guard at every `Read` of it,
+/// and the gate's. One callback reads one guarded entry twice, under a
+/// gate, and the program is the skin's only work.
+#[test]
+fn the_program_cost_counts_each_read_at_every_use() {
+    let combo = read("combo", Ty::Int, Some("combo > 0"));
+    let gate = read("combo > 1", Ty::Bool, None);
+    // `combo` is one load; each comparison a load, a constant and the
+    // comparison.
+    assert_eq!(combo.value.op_count(), 1);
+    assert_eq!(
+        combo.guard.as_ref().map(skin_model::Program::op_count),
+        Some(3)
+    );
+    assert_eq!(gate.value.op_count(), 3);
+    let code = vec![
+        Insn::Read { dst: 0, read: 0 },
+        Insn::Read { dst: 1, read: 0 },
+        Insn::Arith {
+            op: Arith::Add,
+            dst: 0,
+            a: 0,
+            b: 1,
+        },
+        Insn::Ret { src: 0 },
+    ];
+    let mut b = Builder::default();
+    b.push(Cb::code(code, vec![], vec![combo], Conv::Int).gate(gate));
+    // 4 instructions, 2 × (1 + 3) at the two reads, 3 for the gate.
+    let want = 4 + 2 * (1 + 3) + 3;
+    let d = &b.0;
+    let cb = d.callbacks[0];
+    let span = &d.code[cb.start as usize..][..usize::from(cb.len)];
+    let gate = cb.gate.map(|g| &d.reads[usize::from(g)]);
+    assert_eq!(
+        skin_model::present::callback_cost(span, &d.reads, cb.conv, gate),
+        want
+    );
+    assert_eq!(plain_raw(b.0).unwrap().ops().total(), want);
+}
+
 #[test]
 fn a_minimal_program_is_accepted() {
     assert_eq!(outputs(plain(one()).unwrap(), 1, 0), [[1, 1]]);

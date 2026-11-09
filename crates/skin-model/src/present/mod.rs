@@ -39,7 +39,7 @@ pub use crate::output::OutTy;
 #[cfg(feature = "dev-tools")]
 pub use exec::invocations;
 pub use exec::{Io, elapsed_ms};
-pub use verify::PresentError;
+pub use verify::{PresentError, callback_cost};
 
 /// The most instructions in one callback ([`crate::MAX_OPS`]).
 pub const MAX_CALLBACK_OPS: usize = crate::expr::MAX_OPS;

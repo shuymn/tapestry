@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use game::coord::Caps;
+
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
     THREAD_PRIORITY,
@@ -96,6 +98,62 @@ fn set_current(priority: THREAD_PRIORITY) -> windows::core::Result<()> {
     unsafe { SetThreadPriority(GetCurrentThread(), priority) }
 }
 
+/// What the speculation setting is weighed against: the machine's cores
+/// and physical memory.
+pub trait Machine {
+    /// The cores available to the process.
+    fn cores(&self) -> usize;
+
+    /// The physical memory in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be read.
+    fn memory(&self) -> Result<u64, String>;
+}
+
+/// This machine.
+#[derive(Clone, Copy, Debug)]
+pub struct System;
+
+impl Machine for System {
+    fn cores(&self) -> usize {
+        std::thread::available_parallelism().map_or(1, usize::from)
+    }
+
+    fn memory(&self) -> Result<u64, String> {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(size_of::<MEMORYSTATUSEX>()).unwrap_or(u32::MAX),
+            ..MEMORYSTATUSEX::default()
+        };
+        // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set.
+        unsafe { GlobalMemoryStatusEx(&raw mut status) }.map_err(|e| e.to_string())?;
+        Ok(status.ullTotalPhys)
+    }
+}
+
+/// The run's permit caps from `device.toml`'s `speculation` on `machine`
+/// (design.md "Load Pipeline", the setting), and the line to say when the
+/// memory the setting leaves to the machine cannot be read.
+pub fn run_caps(device: &game::DeviceSettings, machine: &dyn Machine) -> (Caps, Option<String>) {
+    let cores = machine.cores();
+    let (memory, note) = if device.speculation.is_some() {
+        (None, None)
+    } else {
+        match machine.memory() {
+            Ok(m) => (Some(m), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "speculation: the memory size cannot be read ({e}); speculation is off"
+                )),
+            ),
+        }
+    };
+    (Caps::from_setting(device.speculation, cores, memory), note)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -105,6 +163,7 @@ mod tests {
 
     use game::ChartSource;
     use game::coord::{Caps, Class, Coordinator};
+    use game::{DataRoot, DeviceSettings, Settings};
     use windows::Win32::Foundation::E_ACCESSDENIED;
     use windows::Win32::System::Threading::{THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY};
 
@@ -140,6 +199,73 @@ mod tests {
             rate: 8_000,
             name: name.to_owned(),
         }
+    }
+
+    /// A machine of `cores` cores whose memory reads as `memory`, counting
+    /// the reads.
+    struct Fake {
+        cores: usize,
+        memory: Option<u64>,
+        reads: AtomicUsize,
+    }
+
+    impl super::Machine for Fake {
+        fn cores(&self) -> usize {
+            self.cores
+        }
+
+        fn memory(&self) -> Result<u64, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.memory.ok_or_else(|| "refused (test)".to_owned())
+        }
+    }
+
+    /// The run's caps come from `device.toml` as loaded: `false` turns
+    /// speculation off on a large machine, `true` turns it on on three
+    /// cores whose memory cannot be read, and the key left out leaves it to
+    /// the machine, with one line when its memory cannot be read.
+    #[test]
+    fn the_run_builds_its_caps_from_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        let fake = |cores, memory| Fake {
+            cores,
+            memory,
+            reads: AtomicUsize::new(0),
+        };
+        let caps = |speculation: Option<bool>, machine: &Fake| {
+            let device = DeviceSettings {
+                speculation,
+                ..DeviceSettings::default()
+            };
+            game::save_settings(&root.device_settings(), &device).unwrap();
+            let loaded = Settings::load(&root).unwrap();
+            assert_eq!(loaded.device.speculation, speculation);
+            super::run_caps(&loaded.device, machine)
+        };
+        let big = fake(16, Some(64 << 30));
+        assert_eq!(caps(Some(false), &big), (Caps::for_machine(0, 16), None));
+        let small = fake(3, None);
+        assert_eq!(caps(Some(true), &small), (Caps::for_machine(1, 3), None));
+        assert_eq!(small.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(caps(None, &big), (Caps::for_machine(1, 16), None));
+        let unknown = fake(16, None);
+        let (got, note) = caps(None, &unknown);
+        assert_eq!(got.speculative, 0);
+        assert_eq!(unknown.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "speculation: the memory size cannot be read (refused (test)); speculation is off"
+            )
+        );
+    }
+
+    /// The system's memory size reads, and is at least 1 GiB on any machine
+    /// that runs the tests.
+    #[test]
+    fn this_machines_memory_reads() {
+        assert!(super::Machine::memory(&super::System).unwrap() >= 1 << 30);
     }
 
     /// A worker whose entry into background mode is refused (through the

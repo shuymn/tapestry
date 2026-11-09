@@ -1284,6 +1284,7 @@ mod tests {
 
         use crate::menu_screen::{MenuScreen, WindowSink};
 
+        let _warp = crate::warp_turn::take();
         let mut event_loop = EventLoop::<super::Ask>::with_user_event()
             .with_any_thread(true)
             .build()

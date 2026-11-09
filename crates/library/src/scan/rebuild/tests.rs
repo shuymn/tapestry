@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use common::{CHART, Fixture, played, score_of, sql};
 
-use crate::scan::tests::{Fault, Hooks, Step};
+use crate::scan::tests::{Fault, Hold, Hooks, Step, Told, Watch};
 use crate::{BEST_BATCH, Library, ScanOptions};
 
 const LONG: Duration = Duration::from_secs(60);
@@ -124,10 +124,11 @@ fn rebuild_acknowledges_between_load_and_evaluation() {
     let lib = fx.open();
     let (held, at_load) = gate(is_load);
     let (evaluated, count) = counter(is_evaluate);
-    let options = hooked(&fx, move |s| {
+    let mut options = hooked(&fx, move |s| {
         at_load(s);
         count(s);
     });
+    let watch = Watch::on(&mut options, Hold::default());
     let scan = scan(&fx, &lib, options);
     held.held.recv_timeout(LONG).unwrap();
     // The load is in hand: no acknowledgment until it is done.
@@ -135,6 +136,11 @@ fn rebuild_acknowledges_between_load_and_evaluation() {
     assert!(!scan.wait_paused(SHORT));
     held.go.send(()).unwrap();
     assert!(scan.wait_paused(LONG));
+    assert_eq!(
+        watch.seen(),
+        [Told::Start, Told::Paused],
+        "told in the bests phase"
+    );
     assert_eq!(
         evaluated.load(Ordering::SeqCst),
         0,
@@ -149,6 +155,7 @@ fn rebuild_acknowledges_between_load_and_evaluation() {
     scan.release();
     assert_eq!(scan.finish().unwrap().bests.counted, 1);
     assert_eq!(evaluated.load(Ordering::SeqCst), 1);
+    assert_eq!(watch.seen(), [Told::Resumed, Told::Dropped]);
 }
 
 /// Each record folder is looked at behind a checkpoint, an empty one too: a
