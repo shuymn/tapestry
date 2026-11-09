@@ -9,7 +9,7 @@
 
 use skin_model::{Filter, LaneParts, LaneStyle, LanesDef, NoteOrder, Side, Source, SourceLanes};
 
-use super::super::asset::{Crop, FALLBACK_SIZE};
+use super::super::asset::{Axis, Crop, FALLBACK_SIZE};
 use super::super::geom::{HEIGHT, Offset, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
 use super::super::report::{
@@ -33,35 +33,21 @@ pub(crate) struct LaneState {
 }
 
 /// The texels of a frame of `[iw, ih]` that stretch 5 keeps for
-/// destination `r`, exactly. The source fits the frame to the
-/// destination's width and trims its rows when the destination is lower
-/// than the fitted frame, `r.h < r.w · ih / iw`, keeping `r.h · iw / r.w`
-/// of them (`skin/StretchType.java:65-68, 140-150`); the test is made as
-/// `r.h · iw < r.w · ih`, so a negative or zero width takes the source's
-/// branch. A zero width trims only a negative height, which the source
-/// cuts by a zero scale: its kept texels are `r.h`, negative, a crop of
-/// no rows. `Some(None)` when nothing is trimmed; `None` on overflow.
+/// destination `r`, exactly ([`track::kept`] on its rows, its scale the
+/// width's). `Some(None)` when nothing is trimmed; `None` on overflow.
 fn trimmed(r: Rect, [iw, ih]: [u32; 2]) -> Option<Option<Q>> {
-    let (iw, ih) = (Q::int(iw), Q::int(ih));
-    if r.h.mul(iw)? >= r.w.mul(ih)? {
-        return Some(None);
-    }
-    if r.w == Q::ZERO {
-        return Some(Some(r.h));
-    }
-    Some(Some(r.h.mul(iw)?.div(r.w)?))
+    track::kept(r.h, r.w, [ih, iw])
 }
 
 /// The rows a frame at row `y`, `h` high, keeps when it keeps `kept`
-/// texels about its middle, its edges rounded half up as D1 rounds;
-/// `None` when no row is left or on overflow.
+/// texels about its middle ([`track::crop_middle`]).
 fn crop_rows(y: u32, h: u32, kept: Q) -> Option<Crop> {
-    let top = Q::int(y).add(Q::int(h).sub(kept)?.half()?)?;
-    let (first, end) = (top.round()?, top.add(kept)?.round()?);
-    let rows = u32::try_from(end.checked_sub(first)?)
-        .ok()
-        .filter(|&n| n > 0)?;
-    Some([u32::try_from(first).ok()?, rows])
+    let [at, len] = track::crop_middle(y, h, kept)?;
+    Some(Crop {
+        axis: Axis::Rows,
+        at,
+        len,
+    })
 }
 
 /// The lanes' span as read ahead of the walk, for the offset-4 rule.
@@ -738,8 +724,10 @@ mod tests {
     }
 
     /// The crop of a `[iw, ih]` frame at row `y` under `w`×`h`.
-    fn crop(w: Q, h: Q, y: u32, [iw, ih]: [u32; 2]) -> Option<Crop> {
-        crop_rows(y, ih, trimmed(rect(w, h), [iw, ih]).unwrap()?)
+    fn crop(w: Q, h: Q, y: u32, [iw, ih]: [u32; 2]) -> Option<[u32; 2]> {
+        let c = crop_rows(y, ih, trimmed(rect(w, h), [iw, ih]).unwrap()?)?;
+        assert_eq!(c.axis, Axis::Rows);
+        Some([c.at, c.len])
     }
 
     #[test]
