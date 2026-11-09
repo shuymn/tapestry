@@ -1149,7 +1149,18 @@ impl Shared {
         self.loading_acked.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// What [`presented_loading`](Self::presented_loading) left.
+    /// A specialization committed in the current loading lifetime declares
+    /// the loading time `loadend`: the declaration from now on, before any
+    /// frame draws with it. Allocates nothing.
+    fn committed_loading(&self, loadend: Option<TimeUs>) {
+        self.loading_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .loadend = loadend;
+    }
+
+    /// What [`presented_loading`](Self::presented_loading) and
+    /// [`committed_loading`](Self::committed_loading) left.
     fn loading_ack(&self) -> LoadingAck {
         *self
             .loading_ack
@@ -1268,9 +1279,10 @@ impl TestGate {
 /// The render thread's acknowledgement of the loading state's frames: the
 /// latest lifetime whose first frame was presented, with when, and the
 /// play skin's declared loading time ([`skin_model::Skin::loadend`]) as
-/// the last presented loading frame drew with it: the installed skin's, or
-/// none while a pending skin has no specialization committed in the
-/// lifetime.
+/// the last presented loading frame drew with it, or as a specialization
+/// committed since in the current lifetime declares it: the installed
+/// skin's, or none while a pending skin has no specialization committed
+/// in the lifetime.
 #[derive(Clone, Copy, Debug, Default)]
 struct LoadingAck {
     first: Option<(u64, TimeUs)>,
@@ -4722,12 +4734,22 @@ impl Run {
             screen.discard();
             return Err(e);
         }
+        // A pending skin's specialization committed in the current loading
+        // lifetime declares that lifetime's loading time from now on.
+        let mut declared = None;
         if p.declarative && self.committed.pending(ScreenKind::Play) {
             // A pending skin's specialization: kept pending, drawn by the
             // loading frames of the lifetime it was committed in.
             self.committed
                 .pend(ScreenKind::Play, screen.installation(ScreenKind::Play));
             self.specialized_in = lifetime;
+            if lifetime.is_some() {
+                declared = Some(
+                    self.committed
+                        .get(ScreenKind::Play)
+                        .and_then(|i| i.bundle().skin().loadend()),
+                );
+            }
         } else if p.declarative {
             self.committed
                 .set(ScreenKind::Play, screen.installation(ScreenKind::Play));
@@ -4759,6 +4781,12 @@ impl Run {
         }
         commits.committed = request;
         commits.receipt = Receipt { request, close };
+        drop(commits);
+        // Before the answer, outside the commits' lock: the opener reads
+        // the minimum again once the commit is answered.
+        if let Some(loadend) = declared {
+            self.shared.committed_loading(loadend);
+        }
         Ok(close)
     }
 
@@ -11906,6 +11934,8 @@ pub(crate) mod tests {
         );
         assert_eq!(link.loading_loadend(), None, "staged, not committed");
         link.commit_attempt().unwrap();
+        // Declared with the commit's answer, before a frame draws with it.
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
         // A frame acknowledged after the commit's answer drew after it.
         let committed = link.loading_acked();
         assert!(wait_until(|| link.loading_acked() > committed));
