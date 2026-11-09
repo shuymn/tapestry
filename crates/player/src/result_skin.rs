@@ -227,6 +227,10 @@ pub struct ResultSkin {
     /// The cells of an image entry whose pages a deferred build dropped
     /// (D13), a union base until a build packs them.
     cells: Option<Sheet>,
+    /// The thread a layout job wakes once its outcome is in (the game
+    /// thread, [`crate::controls::Controls::game_thread`]): a switch's
+    /// layout lands then, not at the end of the game thread's idle wait.
+    wake: Option<std::thread::Thread>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -969,11 +973,17 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
-        match imports::spawn_job(move |cancel: &Cancel| LayoutOut {
-            request,
-            view,
-            laid: layout(&pending, view, class, &theirs, base, others, cancel),
-        }) {
+        match imports::spawn_job_with(
+            move |cancel: &Cancel| LayoutOut {
+                request,
+                view,
+                laid: layout(&pending, view, class, &theirs, base, others, cancel),
+            },
+            // The game thread, woken once the outcome is in.
+            self.wake
+                .clone()
+                .map(|t| -> Box<dyn FnOnce() + Send> { Box::new(move || t.unpark()) }),
+        ) {
             Ok(job) => self.job = Some((job, request, slot)),
             Err(why) => {
                 log::info!("skin: result: its layout cannot start: {why}");
@@ -1178,6 +1188,18 @@ impl ResultSkin {
     /// Whether a layout job runs.
     pub fn has_job(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Has each layout job wake `thread` once its outcome is in.
+    pub fn set_wake(&mut self, thread: Option<std::thread::Thread>) {
+        self.wake = thread;
+    }
+
+    /// Whether the layout job's outcome is in and its thread is still
+    /// ending: [`poll`](Self::poll) takes it once the thread has ended,
+    /// which a look soon after sees.
+    pub fn landing(&mut self) -> bool {
+        self.job.as_mut().is_some_and(|(job, _, _)| job.received())
     }
 
     /// The result skin of the next attempt is decided again by its image

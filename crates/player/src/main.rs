@@ -1189,6 +1189,7 @@ fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Res
         Ok(started) => {
             rig.pending = started.pending;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result);
+            rig.result_skin.set_wake(rig.controls.game_thread());
             // The direct play is the run's one play state until a retry.
             game::live::Rig::play_state_began(rig);
             game::live::run_chart(loaded, rig)
@@ -1575,6 +1576,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             // A pending play skin admits charts, each built for.
             rig.pending = started.pending;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result);
+            rig.result_skin.set_wake(rig.controls.game_thread());
             if let Some(sel) = &mut rig.selection {
                 sel.started(started.notice, started.selection);
             }

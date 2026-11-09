@@ -130,12 +130,14 @@ pub(super) fn exit_gate() {
     g.1 -= 1;
 }
 
-fn hold_exit(on: bool) {
+/// A job thread past its send, held at [`exit_gate`] while `on`.
+pub(crate) fn hold_exit(on: bool) {
     EXIT.lock().unwrap_or_else(PoisonError::into_inner).0 = on;
     EXIT_OPENED.notify_all();
 }
 
-fn exit_waiting() -> usize {
+/// The job threads waiting at [`exit_gate`].
+pub(crate) fn exit_waiting() -> usize {
     EXIT.lock().unwrap_or_else(PoisonError::into_inner).1
 }
 
@@ -1191,6 +1193,37 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
         "returned before the thread ended: {early:?}"
     );
     cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
+}
+
+/// A job's `sent` callback runs once on its thread, after its send and
+/// before the thread ends: the outcome is received from then on, and
+/// taken by `poll` only once the thread has ended.
+#[test]
+fn a_jobs_sent_callback_runs_once_before_its_thread_ends() {
+    let _s = serial();
+    hold_exit(true);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut job = super::spawn_job_with(
+        |_: &Cancel| 7_u32,
+        Some(Box::new(move || tx.send(()).unwrap())),
+    )
+    .unwrap();
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("the callback ran");
+    assert!(wait_until(|| exit_waiting() == 1), "held after its send");
+    assert!(job.received(), "the outcome is in");
+    assert!(job.poll().is_none(), "not taken before the thread ends");
+    hold_exit(false);
+    let end = Instant::now() + Duration::from_secs(20);
+    let ran = loop {
+        if let Some(ran) = job.poll() {
+            break ran;
+        }
+        assert!(Instant::now() < end, "the job never ended");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(matches!(ran, Ran::Done(7)), "{ran:?}");
+    assert!(rx.try_recv().is_err(), "the callback ran once");
 }
 
 /// How late past [`STOP_WAIT`] a runner that gives up at the bound may

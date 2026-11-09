@@ -51,6 +51,20 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 /// ([`game::InputPump::park`]).
 pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
 
+/// How long the result's idle wait parks between looks while a layout
+/// job's outcome is in and its thread still ends: the job wakes the game
+/// thread right after its send, but its outcome can be taken only once the
+/// thread has ended ([`crate::imports::Job::poll`]), which takes
+/// microseconds, so a short slice lands it at once instead of at the next
+/// deadline (up to `IDLE_WAIT`, 250 ms).
+const LAYOUT_RELOOK: Duration = Duration::from_millis(1);
+
+/// Tests: the result's looks for a landed layout ([`PlayerRig::land_result`])
+/// so far, on any rig.
+#[cfg(test)]
+pub(crate) static RESULT_LOOKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// How long an operation waits for the input thread's markers in all, in
 /// awake time, before the input thread counts as failed (design.md "Input
 /// thread failure": 2 s of awake time, a suspend not counted).
@@ -555,6 +569,8 @@ impl PlayerRig<'_> {
     /// the render thread reported applies (D7). Returns whether the latest
     /// request is published.
     fn land_result(&mut self) -> bool {
+        #[cfg(test)]
+        RESULT_LOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let status = self.render.result_status();
         self.result_skin.set_retained(&status.retained);
         let ready = self.result_skin.poll();
@@ -1362,9 +1378,17 @@ impl Rig for PlayerRig<'_> {
         if left > 0 {
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
-        // A switch's layout lands when its job is done; a close leaves its
-        // wait within the stop bound.
-        self.land_result();
+        // A switch's layout lands when its job is done: the job wakes this
+        // thread once its outcome is in, and while its thread still ends
+        // the look is repeated every LAYOUT_RELOOK, within the deadline.
+        // A close leaves its wait within the stop bound.
+        while !self.land_result() && self.result_skin.landing() {
+            let left = deadline.0 - self.clock.now().0;
+            if left <= 0 {
+                break;
+            }
+            thread::park_timeout(Duration::from_micros(left.unsigned_abs()).min(LAYOUT_RELOOK));
+        }
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
@@ -2613,6 +2637,74 @@ mod tests {
             assert!(ran, "the first preparation runs the specialization");
             assert!(reused, "the second reuses it");
             assert_eq!(imports::jobs_counted().0 - before.0, 1);
+        }
+
+        /// A layout job wakes the result's idle wait once its outcome is
+        /// in; the wait looks again every `LAYOUT_RELOOK` while the job's
+        /// thread still ends and lands it once the thread is released,
+        /// with no other wake; a thread that does not end is given up at
+        /// the wait's deadline, the job kept.
+        #[test]
+        fn the_idle_wait_lands_a_layout_whose_thread_still_ends() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let d = result::skin(
+                "",
+                "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+            );
+            let p = result::pending(d.path(), result::LIMITS);
+            let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+            result::staged_at(&mut rs, 12, JudgeClass::Normal);
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            // Waits for `done`, at most 20 s (a hang guard).
+            let until = |done: &dyn Fn() -> bool| {
+                let end = Instant::now() + Duration::from_secs(20);
+                while !done() {
+                    assert!(Instant::now() < end, "never came");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            let ((landed, kept), _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    rig.result_skin = rs;
+                    rig.result_skin.set_wake(Some(std::thread::current()));
+                    // Held between its send and its end; released only once
+                    // the wait has looked with the thread held.
+                    imports::hold_exit(true);
+                    rig.result_skin.request(result::view(5));
+                    let release = std::thread::spawn(move || {
+                        until(&|| imports::exit_waiting() == 1);
+                        let seen = super::super::RESULT_LOOKS.load(Ordering::SeqCst);
+                        until(&|| super::super::RESULT_LOOKS.load(Ordering::SeqCst) > seen);
+                        imports::hold_exit(false);
+                    });
+                    let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
+                    // Waits until the outcome is in (a wake before it is
+                    // another wait's); the wait that sees it lands it.
+                    while rig.result_skin.has_job() && !rig.result_skin.landing() {
+                        // A hang guard: a wait that saw no outcome by the far
+                        // deadline fails the test, releasing the held thread.
+                        assert!(rig.now().0 < far.0, "the outcome never came in");
+                        rig.idle_wait(far);
+                    }
+                    release.join().unwrap();
+                    // Woken by the job, not by the wait's far deadline.
+                    let landed = !rig.result_skin.has_job() && rig.now().0 < far.0;
+                    // A thread that never ends: given up at the deadline.
+                    imports::hold_exit(true);
+                    rig.result_skin.request(result::view(7));
+                    until(&|| imports::exit_waiting() == 1);
+                    rig.idle_wait(bms_model::TimeUs(rig.now().0 + 50_000));
+                    let kept = rig.result_skin.has_job() && rig.result_skin.landing();
+                    imports::hold_exit(false);
+                    rig.result_skin.settle(|| false);
+                    (landed, kept)
+                });
+            assert!(
+                landed,
+                "landed after its thread's release, woken by the job"
+            );
+            assert!(kept, "given up at the deadline, the job kept");
         }
 
         /// A preparation discarded while the result skin's image stage
