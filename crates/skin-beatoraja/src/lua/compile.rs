@@ -34,13 +34,15 @@
 //! - **One way**: no write is off, and each is reached only under the
 //!   slot's own off test, so once set no guard holds again.
 //! - **Frozen guard**: every condition selecting a write reads only
-//!   constants, the slot itself and fields a tally fixes (the counts, the
-//!   combos, the EX score, the point), which do not change outside play
-//!   frames; a guard reading another slot, the clock or any other field
-//!   is refused. So a guard false on the last play frame stays false.
+//!   constants, the slot itself and the fields of an allowlist
+//!   ([`GUARD_FIELDS`]: the point), each its source read's, fixed by the
+//!   tally and so unchanged outside play frames; a guard reading another
+//!   slot, the clock or any other field is refused. So a guard false on
+//!   the last play frame stays false.
 //! - **Loading**: every condition selecting a write is false before the
 //!   first play frame, evaluated with the slot at its initial value and
-//!   every tally field 0, so the program, which runs in play frames only,
+//!   each allowed field at the value the source reads then (established by
+//!   running the source), so the program, which runs in play frames only,
 //!   omits no write the source makes while loading.
 //!
 //! No operation it keeps can raise: the residual keeps arithmetic, `math`
@@ -103,19 +105,34 @@ pub(crate) struct Slot {
     pub(crate) domain: Domain,
 }
 
-/// The fields a zero tally holds at 0: the counts, the combos, the EX
-/// score and the point.
-fn zero_at_start(src: &str) -> bool {
+/// The fields a slot write's guard may read, each with the value the
+/// source reads before the first play frame (an allowlist: any other read
+/// in a guard refuses the slot). Each entry is established by running the
+/// source's read at `0.8.9`, not modelled:
+///
+/// - `point`, `main_state.number(100)` (`IntegerPropertyFactory.java:174`:
+///   `ScoreDataProperty.getNowScore()`): 0 before the first judgment, the
+///   play state not yet having called `ScoreDataProperty.update`
+///   (`BMSPlayer.java:1038`), so the field's default
+///   (`ScoreDataProperty.java:13`); always available; the tally's alone, so
+///   unchanged outside play frames.
+///
+/// Left out: the EX score (`number(71)`), `Integer.MIN_VALUE` before the
+/// first judgment (`IntegerPropertyFactory.java:607-615`: no score data
+/// yet), where tapestry's field reads 0; every other field, unverified.
+const GUARD_FIELDS: [(&str, i64); 1] = [("point", 0)];
+
+/// The value guard field `src` (a mapped read's source) has before the
+/// first play frame, when it is one of [`GUARD_FIELDS`].
+fn guard_field(src: &str) -> Option<i64> {
     let name = src
         .strip_prefix('(')
         .and_then(|s| s.strip_suffix(')'))
         .unwrap_or(src);
-    let field = name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
-    field
-        && (matches!(name, "combo" | "max_combo" | "ex_score" | "point")
-            || name.starts_with("count."))
+    GUARD_FIELDS
+        .iter()
+        .find(|&&(f, _)| f == name)
+        .map(|&(_, v)| v)
 }
 
 /// The largest value of the state clock: 2^53 µs.
@@ -182,8 +199,8 @@ enum At0 {
 }
 
 /// Node `v` as it is before the first play frame, as far as that is known:
-/// slot `k` at its initial value `init`, every field [`zero_at_start`]
-/// names 0.
+/// slot `k` at its initial value `init`, every field of [`GUARD_FIELDS`]
+/// at the source's value then.
 fn at_start<L: Leaves>(
     an: &Analysis,
     leaves: &mut L,
@@ -202,7 +219,7 @@ fn at_start<L: Leaves>(
         Node::Known(Val::Int(n)) => Some(At0::Int(n)),
         Node::Known(Val::Bool(b)) => Some(At0::Bool(b)),
         Node::Read { .. } => match leaves.leaf(res, v)? {
-            Some(l) if l.ty == Ty::Int && zero_at_start(&l.src) => Some(At0::Int(0)),
+            Some(l) if l.ty == Ty::Int => guard_field(&l.src).map(At0::Int),
             _ => None,
         },
         Node::Not(x) => match at_start(an, leaves, res, x, (k, init))? {
@@ -237,9 +254,9 @@ fn at_start<L: Leaves>(
 }
 
 /// Refuses a condition `c` selecting slot `k`'s write that reads anything
-/// but constants, slot `k` and the fields a tally fixes: another slot,
-/// whose change can enable it after the last play frame; the clock; any
-/// other field.
+/// but constants, slot `k` and the fields of [`GUARD_FIELDS`]: another
+/// slot, whose change can enable it after the last play frame; the clock;
+/// any other field.
 fn frozen<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, c: u32, k: u16) -> R<()> {
     charge(an, "compile:slot", 1)?;
     match res.node(c) {
@@ -247,8 +264,8 @@ fn frozen<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, c: u32, k: u
         Node::Slot(j) if j == k => Ok(()),
         Node::Slot(_) => refusal("a slot write guarded by another slot"),
         Node::Read { .. } => match leaves.leaf(res, c)? {
-            Some(l) if zero_at_start(&l.src) => Ok(()),
-            _ => refusal("a slot write guarded by state that changes outside play"),
+            Some(l) if l.ty == Ty::Int && guard_field(&l.src).is_some() => Ok(()),
+            _ => refusal("a slot write guarded by a read off its allowlist"),
         },
         Node::StateUs => refusal("a slot write guarded by state that changes outside play"),
         Node::Not(x) | Node::Neg(x) => frozen(an, leaves, res, x, k),
