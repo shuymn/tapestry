@@ -348,6 +348,10 @@ struct Opts<'a> {
     /// it and stays unrotated, as the source draws text
     /// (`skin/SkinTextImage.java:122`).
     turntable: bool,
+    /// Blend 4 maps to [`Blend::Multiply`]: an image, an image choice or
+    /// a player-drawn image drawn as an element of its own. Elsewhere it
+    /// drops as an unsupported blend.
+    multiply: bool,
     /// A relative element (a judge's combo): offsets 3 and 4 are taken
     /// and move nothing, as the source skips a relative element's own
     /// translation and attaches it to its grade (`skin/SkinObject.java:
@@ -1476,7 +1480,7 @@ impl<'d> Cx<'d> {
             }
         }
 
-        // Blend (`Skin.java:654-665`). A neutral outer destination draws
+        // Blend (`Skin.java:655-665`). A neutral outer destination draws
         // nothing of its own: its parts keep their blend, so its own is
         // ignored.
         let blend = match dst.blend {
@@ -1493,6 +1497,7 @@ impl<'d> Cx<'d> {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
                 Blend::Alpha
             }
+            4 if o.multiply => Blend::Multiply,
             4 | 9 => {
                 self.drop_el(role, at, NoteKind::Blend(dst.blend))?;
                 return Ok(None);
@@ -1642,15 +1647,12 @@ impl<'d> Cx<'d> {
         Ok(p)
     }
 
-    /// `src` compiled against the play schema and charged as
-    /// [`Self::compile`] does, or `None` when it does not compile: a
-    /// program read or gate past an expression's limits.
-    fn trial(&mut self, src: &str, want: Ty, at: Span) -> Result<Option<Program>, ImportError> {
-        let Ok(p) = compile(src, &Scope::new(self.schema()), want) else {
-            return Ok(None);
-        };
-        self.budget.ops(&p).map_err(|l| self.limit(at, l))?;
-        Ok(Some(p))
+    /// `src` compiled against the play schema, or `None` when it does not
+    /// compile: a program read or gate past an expression's limits. It is
+    /// not charged: its callback charges it at each use
+    /// ([`skin_model::present::callback_cost`]).
+    fn trial(&self, src: &str, want: Ty) -> Option<Program> {
+        compile(src, &Scope::new(self.schema()), want).ok()
     }
 
     /// The model reference of a mapped timer, adding a rank's `when`

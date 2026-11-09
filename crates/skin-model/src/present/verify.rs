@@ -82,7 +82,7 @@ impl Present {
             v3(&def, cb, code, k)?;
             v4_gating(&def, cb, k)?;
             v7_stores(&def, code, k)?;
-            cost = cost.saturating_add(callback_cost(&def, cb, code));
+            cost = cost.saturating_add(cost_of(&def, cb, code));
         }
         ops.charge_ops(cost).map_err(|_| PresentError::Cost)?;
         let slotted = def
@@ -301,13 +301,28 @@ fn read_cost(r: Option<&ReadDef>) -> usize {
     })
 }
 
-/// The most work a frame's run of `cb` does, both arms of every branch
-/// counted: per invocation its instructions, each `Read`'s operations and
-/// each slot it loads or stores; a timer callback invoked twice; and its
-/// gate's.
-fn callback_cost(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
-    let reads = code.iter().fold(0_usize, |n, insn| match *insn {
-        Insn::Read { read, .. } => n.saturating_add(read_cost(def.reads.get(usize::from(read)))),
+/// The most work a frame's run of `cb` does, as [`callback_cost`].
+fn cost_of(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
+    let gate = cb.gate.and_then(|g| def.reads.get(usize::from(g)));
+    callback_cost(code, &def.reads, cb.conv, gate)
+}
+
+/// The most work a frame's run of a callback does, both arms of every
+/// branch counted: per invocation its instructions `code`, each `Read`'s
+/// operations (the read it names in `reads`, its value's and its
+/// guard's) and each slot it loads or stores; a callback of conversion
+/// `conv` [`Conv::Timer`] invoked twice; and its `gate` read's. V5
+/// charges this; an importer charges the same before it keeps the
+/// callback, so its count of the skin's operations covers the program's.
+#[must_use]
+pub fn callback_cost(
+    code: &[Insn],
+    reads: &[ReadDef],
+    conv: Conv,
+    gate: Option<&ReadDef>,
+) -> usize {
+    let at_reads = code.iter().fold(0_usize, |n, insn| match *insn {
+        Insn::Read { read, .. } => n.saturating_add(read_cost(reads.get(usize::from(read)))),
         _ => n,
     });
     let touched = code
@@ -321,10 +336,7 @@ fn callback_cost(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
             _ => false,
         })
         .count();
-    let once = code.len().saturating_add(reads).saturating_add(touched);
-    let runs = if cb.conv == Conv::Timer { 2 } else { 1 };
-    let gate = cb
-        .gate
-        .map_or(0, |g| read_cost(def.reads.get(usize::from(g))));
-    once.saturating_mul(runs).saturating_add(gate)
+    let once = code.len().saturating_add(at_reads).saturating_add(touched);
+    let runs = if conv == Conv::Timer { 2 } else { 1 };
+    once.saturating_mul(runs).saturating_add(read_cost(gate))
 }

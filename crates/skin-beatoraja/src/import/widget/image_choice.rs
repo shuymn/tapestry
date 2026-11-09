@@ -271,7 +271,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.turning_image_common(&dst, charged, role)? else {
+        let Some(c) = self.turning_image_common(&dst, charged, (lowered, role))? else {
             return Ok(());
         };
         let (src, deviates) = selector;
@@ -334,7 +334,7 @@ impl Cx<'_> {
         self.budget.choice_refs(n).map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Refs);
-        let Some(c) = self.turning_image_common(&dst, charged, role)? else {
+        let Some(c) = self.turning_image_common(&dst, charged, (lowered, role))? else {
             return Ok(());
         };
         let value = self.selector(src, at)?;

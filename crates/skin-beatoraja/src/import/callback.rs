@@ -2305,8 +2305,10 @@ impl Cx<'_> {
     }
 
     /// Callback `prog` appended to the program with its `gate` source and
-    /// `after`: its reads and gate compiled and charged; its index, or a
-    /// refusal past the program's or an expression's limits.
+    /// `after`: its reads and gate compiled, and its per-frame cost (V5's,
+    /// [`skin_model::present::callback_cost`]) charged before it is kept;
+    /// its index, or a refusal past the program's or an expression's
+    /// limits.
     fn program(
         &mut self,
         prog: Compiled,
@@ -2315,7 +2317,9 @@ impl Cx<'_> {
         at: Span,
     ) -> Result<Result<u16, Unsupported>, ImportError> {
         use skin_model::MAX_SKIN_OPS;
-        use skin_model::present::{CallbackDef, Insn, MAX_CALLBACKS, OutTy, ReadDef};
+        use skin_model::present::{
+            CallbackDef, Insn, MAX_CALLBACKS, OutTy, ReadDef, callback_cost,
+        };
         let limits = Ok(Err(LIMITS));
         let p = &self.present;
         if p.callbacks.len() >= MAX_CALLBACKS
@@ -2325,13 +2329,13 @@ impl Cx<'_> {
         }
         let mut reads = Vec::with_capacity(prog.reads.len().saturating_add(1));
         for leaf in &prog.reads {
-            let Some(value) = self.trial(&leaf.src, leaf.ty, at)? else {
+            let Some(value) = self.trial(&leaf.src, leaf.ty) else {
                 return limits;
             };
             let guard = if leaf.guards.is_empty() {
                 None
             } else {
-                let Some(g) = self.trial(&leaf.guards.join(" && "), Ty::Bool, at)? else {
+                let Some(g) = self.trial(&leaf.guards.join(" && "), Ty::Bool) else {
                     return limits;
                 };
                 Some(g)
@@ -2341,13 +2345,25 @@ impl Cx<'_> {
         let gate = match gate {
             None => None,
             Some(src) => {
-                let Some(value) = self.trial(&src, Ty::Bool, at)? else {
+                let Some(value) = self.trial(&src, Ty::Bool) else {
                     return limits;
                 };
                 reads.push(ReadDef { value, guard: None });
                 Some(reads.len() - 1)
             }
         };
+        // Charged as V5 counts it: the instructions, each read at every
+        // `Read` of it and each slot touched, twice for a timer, and the
+        // gate.
+        let cost = callback_cost(
+            &prog.code,
+            &reads,
+            prog.conv,
+            gate.and_then(|g| reads.get(g)),
+        );
+        self.budget
+            .callback_ops(cost)
+            .map_err(|l| self.limit(at, l))?;
         let p = &mut self.present;
         let (k_off, r_off, d_off) = (p.consts.len(), p.reads.len(), p.domains.len());
         let (Ok(start), Ok(len), Ok(k)) = (

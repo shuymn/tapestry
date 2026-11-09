@@ -29,6 +29,7 @@ use bms_model::TimeUs;
 use bms_model::Speed;
 
 use crate::attempt::PreparationRefusal;
+use crate::coord::{Caps, Coordinator, JobKind, Joined, LoadFailure, Spawner};
 use crate::error::Chain;
 use crate::live::{Leave, LiveError, Rig, run_chart, run_over, threads_over};
 use crate::logic::LogicError;
@@ -37,12 +38,18 @@ use crate::practice::PracticeError;
 use crate::practice_screen::{PracticeActed, PracticeInput, PracticeScreen};
 use crate::presets::{PollDeadline, PresetStep, Shelf, ShelfError, UnknownPreset};
 use crate::session::Command;
-use crate::session::{Loaded, Parts, SessionConfig, SessionError, Settings};
+use crate::session::{
+    Loaded, Parts, PendingLoad, SessionConfig, SessionError, Settings, read_for_load,
+};
 use crate::settings::{DataRoot, PlayerSettings};
 
 /// The longest idle wait on the select screen and a result, on the rig's
 /// clock: the flow looks again at least this often.
 pub const IDLE_WAIT: TimeUs = TimeUs(250_000);
+
+/// How often a game thread waiting for a load's job asks whether to stop
+/// it.
+pub const LOAD_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The world the scene flow runs in.
 pub trait AppRig: Rig {
@@ -60,6 +67,13 @@ pub trait AppRig: Rig {
     ///
     /// Why the bank cannot be built: the chart is refused.
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
+    /// Whether a load in progress is to stop: the window closing, or a
+    /// quit key press waiting to be taken. Asked while the game thread waits
+    /// for a load's job, never taking the press; by default the latched
+    /// [`quitting`](Rig::quitting).
+    fn load_cancelled(&self) -> bool {
+        self.quitting()
+    }
     /// A chart's load for play began: the play screen shows in its loading
     /// state from here, before anything of `chart` is read, until the
     /// play's READY state or a return to where the chart was chosen
@@ -140,7 +154,7 @@ pub enum Pick {
 }
 
 /// How a chart's load ([`AppRig::load_chart`]) ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Loading {
     /// The chart is ready to play.
     Ready,
@@ -148,6 +162,10 @@ pub enum Loading {
     /// the quit key left the chart. Nothing further is prepared, and the
     /// chart is left.
     Cancelled,
+    /// A job of the load could not start its thread or panicked: the run
+    /// ends with it, never as a refusal (design.md "Play Lifecycle", who
+    /// loads).
+    Failed(LoadFailure),
 }
 
 /// Why a chosen chart was refused.
@@ -201,6 +219,11 @@ pub struct App {
     /// When a shelf that cannot open is tried again; an opened shelf keeps
     /// its own deadline.
     reopen: PollDeadline,
+    /// The run's coordinator, whose foreground permits a chart's read
+    /// takes.
+    coord: Coordinator,
+    /// Starts the load's job threads.
+    spawner: Spawner,
 }
 
 impl fmt::Debug for App {
@@ -236,7 +259,26 @@ impl App {
             events: SharedEvents::new(events),
             shelf,
             reopen: PollDeadline::default(),
+            coord: Coordinator::new(Caps::for_machine(0, 0)),
+            spawner: Spawner::SYSTEM,
         }
+    }
+
+    /// The flow on the run's coordinator `coord`, in place of one of its
+    /// own with no speculation.
+    #[must_use]
+    pub fn with_coordinator(mut self, coord: Coordinator) -> Self {
+        self.coord = coord;
+        self
+    }
+
+    /// The flow starting the load's threads through `spawner` (tests stand
+    /// in a refusal).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_spawner(mut self, spawner: Spawner) -> Self {
+        self.spawner = spawner;
+        self
     }
 
     /// The run's shelf, or why it cannot open.
@@ -460,15 +502,45 @@ impl App {
             rig.entered_loading(chart);
         }
         // Every chart reports to the run's one sink, never the parts' own.
-        let mut loaded = match Loaded::load_reporting_to(
+        let pending = match PendingLoad::new(
             self.root.clone(),
             self.settings.clone(),
-            chart,
             config,
             parts,
             self.events.clone(),
             shelf,
         ) {
+            Ok(pending) => pending,
+            Err(refused) => {
+                let (e, shelf) = *refused;
+                return (shelf, Ok(Chosen::Refused(Refused::Chart(e))));
+            }
+        };
+        // Read on its own thread while this one looks for a quit or a
+        // close (design.md "Play Lifecycle", who loads).
+        let read = {
+            let (ingest, transform) = pending.reader();
+            let config = pending.config();
+            let job = (JobKind::Ingest, chart.to_owned(), config.speed);
+            std::thread::scope(|s| {
+                match self.coord.run_scoped(s, self.spawner, job, |_| {
+                    read_for_load(chart, config, ingest, transform)
+                }) {
+                    Err(failure) => Joined::Failed(failure),
+                    Ok(job) => job.wait(LOAD_SLICE, || rig.load_cancelled()),
+                }
+            })
+        };
+        let read = match read {
+            Joined::Done(read) => read,
+            Joined::Cancelled(_) => {
+                return (pending.into_shelf(), cancelled(rig).map(Chosen::Left));
+            }
+            Joined::Failed(failure) => {
+                return (pending.into_shelf(), Err(LiveError::Load(failure)));
+            }
+        };
+        let mut loaded = match pending.finish(chart, read) {
             Ok(loaded) => loaded,
             Err(refused) => {
                 let (e, shelf) = *refused;
@@ -476,11 +548,12 @@ impl App {
             }
         };
         let chosen = if practice {
-            practice_chart(&mut loaded, rig).map(Chosen::Left)
+            practice_chart(&mut loaded, rig, &self.coord, self.spawner).map(Chosen::Left)
         } else {
             match rig.load_chart(&loaded) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
                 Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
                 Ok(Loading::Ready) => match run_chart(&mut loaded, rig) {
                     Ok(leave) => Ok(Chosen::Left(leave)),
                     Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
@@ -508,6 +581,8 @@ impl App {
 fn practice_chart<R: AppRig>(
     loaded: &mut Loaded,
     rig: &mut R,
+    coord: &Coordinator,
+    spawner: Spawner,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
     let mut screen = PracticeScreen::new(
         loaded.chart(),
@@ -559,7 +634,7 @@ fn practice_chart<R: AppRig>(
             // shows what the last fit gave, so what it shows is what the
             // next round plays.
             let mut set_up = false;
-            let ran = start_rounds(loaded, &screen, rig, &mut set_up);
+            let ran = start_rounds(loaded, &screen, rig, &mut set_up, (coord, spawner));
             // Back on the page: a turntable paused by a round's result
             // resumes.
             rig.turntable_resumed();
@@ -596,29 +671,47 @@ enum Stopped<S> {
     Run(LiveError<S>),
 }
 
-/// One Start of the practice screen: the chart read again at the chosen
-/// speed, the practice set up, the bank and the screen's chart loaded
-/// (every time, so no bank of another chart or speed is reused), and the
-/// rounds played until they are left. `set_up` turns true once the
-/// screen's practice was fitted to the refreshed play preset
-/// ([`Loaded::start_practice`]).
+/// One Start of the practice screen: the chart read again when the chosen
+/// speed is another (on a job's thread, as a choice's read), the practice
+/// set up, the bank and the screen's chart loaded (every time, so no bank
+/// of another chart or speed is reused), and the rounds played until they
+/// are left. `set_up` turns true once the screen's practice was fitted to
+/// the refreshed play preset ([`Loaded::start_practice`]).
 fn start_rounds<R: AppRig>(
     loaded: &mut Loaded,
     screen: &PracticeScreen,
     rig: &mut R,
     set_up: &mut bool,
+    (coord, spawner): (&Coordinator, Spawner),
 ) -> Result<Leave, Stopped<R::ScreenError>> {
     let notice = |e: &(dyn std::error::Error + 'static)| Stopped::Notice(Chain(e).to_string());
     rig.entered_loading(loaded.path());
-    if loaded.config().speed != screen.speed() {
-        loaded.set_speed(screen.speed()).map_err(|e| notice(&e))?;
+    let speed = screen.speed();
+    if loaded.config().speed != speed {
+        let read = {
+            let reader = loaded.reader();
+            let job = (JobKind::Ingest, loaded.path().to_owned(), speed);
+            std::thread::scope(|s| {
+                match coord.run_scoped(s, spawner, job, |_| reader.read_with(speed)) {
+                    Err(failure) => Joined::Failed(failure),
+                    Ok(job) => job.wait(LOAD_SLICE, || rig.load_cancelled()),
+                }
+            })
+        };
+        match read {
+            Joined::Done(read) => loaded.apply_speed(speed, read).map_err(|e| notice(&e))?,
+            Joined::Cancelled(_) => return cancelled(rig).map_err(Stopped::Run),
+            Joined::Failed(failure) => return Err(Stopped::Run(LiveError::Load(failure))),
+        }
     }
     let practice = screen.practice(loaded);
     let started = loaded.start_practice(practice);
     *set_up = true;
     started.map_err(|e| Stopped::Notice(e.to_string()))?;
-    if rig.load_chart(loaded).map_err(|e| notice(&e))? == Loading::Cancelled {
-        return cancelled(rig).map_err(Stopped::Run);
+    match rig.load_chart(loaded).map_err(|e| notice(&e))? {
+        Loading::Ready => {}
+        Loading::Cancelled => return cancelled(rig).map_err(Stopped::Run),
+        Loading::Failed(failure) => return Err(Stopped::Run(LiveError::Load(failure))),
     }
     match run_chart(loaded, rig) {
         Ok(leave) => Ok(leave),
