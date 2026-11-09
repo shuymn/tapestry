@@ -1511,6 +1511,7 @@ impl RenderLink {
     pub fn begin_result(&self) -> u64 {
         let lifetime = self.result_lifetimes.fetch_add(1, Ordering::Relaxed) + 1;
         self.shared.result_slot().enter(lifetime);
+        self.scripts.enter_result(lifetime);
         *self.shared.barrier() = ResultBarrier {
             lifetime,
             ..ResultBarrier::default()
@@ -1522,6 +1523,7 @@ impl RenderLink {
     /// presentation of it is drawn, one the render thread took included.
     pub fn end_result(&self) {
         self.shared.result_slot().enter(0);
+        self.scripts.leave_result();
     }
 
     /// The next request of the renderer's sequence, for a presentation's
@@ -5287,16 +5289,18 @@ impl Run {
             } else {
                 let mut committed = None;
                 if let Some(v) = side.prepared.take() {
-                    let commit = scripts.commit_view(v.held.payload.script, || match v.token {
-                        Some(token) => match screen.commit(token) {
-                            Ok(()) => {
-                                screen.install_result_text();
-                                true
-                            }
-                            Err(_) => false,
-                        },
-                        None => true,
-                    });
+                    let lifetime = side.lifetime;
+                    let commit =
+                        scripts.commit_view(v.held.payload.script, lifetime, || match v.token {
+                            Some(token) => match screen.commit(token) {
+                                Ok(()) => {
+                                    screen.install_result_text();
+                                    true
+                                }
+                                Err(_) => false,
+                            },
+                            None => true,
+                        });
                     match commit {
                         ViewCommit::Committed => {
                             if v.token.is_some() {

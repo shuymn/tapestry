@@ -104,9 +104,12 @@ pub(in crate::screens) struct ScriptHost {
     /// running one retired stays as `Retired` until its slot gives the
     /// runtime back.
     pub(in crate::screens) results: Vec<ResultEntry>,
-    /// The generation of the view presented last, protected from eviction
-    /// even while parked.
-    pub(in crate::screens) presented: Option<u64>,
+    /// The generation of the view presented last and the result lifetime
+    /// it presented in: protected from eviction, even while parked, only
+    /// while that lifetime is the current one ([`ScriptHost::presented_now`]).
+    pub(in crate::screens) presented: Option<(u64, u64)>,
+    /// The current result lifetime, 0 between lifetimes.
+    pub(in crate::screens) result_lifetime: u64,
     /// The last generation given: one counter for the cell.
     pub(in crate::screens) generations: u64,
     /// The run's result kind is disabled: no runtime is offered again.
@@ -129,6 +132,15 @@ impl ScriptHost {
             drop(rt);
             self.doomed.clear();
         }
+    }
+
+    /// The generation presented in the current result lifetime, if any:
+    /// decided where it is used, so a mark of an ended lifetime protects
+    /// nothing.
+    pub(in crate::screens) fn presented_now(&self) -> Option<u64> {
+        self.presented
+            .filter(|&(_, l)| l != 0 && l == self.result_lifetime)
+            .map(|(g, _)| g)
     }
 
     /// The entry of result generation `generation`, if it has one.
@@ -502,7 +514,7 @@ impl Scripts {
     pub(crate) fn result_permit(&self, keep: &[Option<ScriptGen>]) -> Option<ScriptPermit> {
         {
             let mut host = self.0.host();
-            let presented = host.presented;
+            let presented = host.presented_now();
             let id = self.0.id;
             host.retire_results(|e| {
                 matches!(e.held, Held::Parked(_))
@@ -517,13 +529,26 @@ impl Scripts {
         self.0.pool.take().map(ScriptPermit)
     }
 
-    /// The generation the view presented last runs, if any.
+    /// The generation the view presented in the current result lifetime
+    /// runs, if any.
     #[must_use]
     pub(crate) fn presented(&self) -> Option<ScriptGen> {
-        self.0.host().presented.map(|generation| ScriptGen {
+        self.0.host().presented_now().map(|generation| ScriptGen {
             cell: self.0.id,
             generation,
         })
+    }
+
+    /// Result lifetime `lifetime` begins (on the game thread, as the
+    /// render link begins it): the presentations of earlier ones protect
+    /// nothing from now on.
+    pub(crate) fn enter_result(&self, lifetime: u64) {
+        self.0.host().result_lifetime = lifetime;
+    }
+
+    /// The result lifetime ended: no presentation is current.
+    pub(crate) fn leave_result(&self) {
+        self.0.host().result_lifetime = 0;
     }
 
     /// The permits free now (tests).
@@ -567,13 +592,14 @@ impl Scripts {
     }
 
     /// Commits a view of result generation `next` (none for a view with no
-    /// runtime) under one hold of the host's lock: its generation checked
+    /// runtime) of result lifetime `lifetime` under one hold of the host's lock: its generation checked
     /// live, then `commit` (the GPU commit, which must neither park nor
     /// drop a slot), then the generation marked presented. A generation
     /// gone is not committed, so an evicted view never presents.
     pub(crate) fn commit_view(
         &self,
         next: Option<ScriptGen>,
+        lifetime: u64,
         commit: impl FnOnce() -> bool,
     ) -> ViewCommit {
         let mut host = self.0.host();
@@ -589,7 +615,7 @@ impl Scripts {
         if !commit() {
             return ViewCommit::Refused;
         }
-        host.presented = next.map(|g| g.generation);
+        host.presented = next.map(|g| (g.generation, lifetime));
         ViewCommit::Committed
     }
 

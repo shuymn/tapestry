@@ -2413,12 +2413,16 @@ fn a_result_runtime_rests_through_a_play_and_resumes() {
     let dots = |q: &[Quad]| skin_quads(q).len();
     let running = frames(&rig, 3);
     let with = running.last().map(|q| dots(q)).unwrap();
+    // As a retry leaves the result (the lifetime ends) before the play's
+    // preparation asks for the parking: no result frame takes it again.
+    rig.link.end_result();
     assert!(rig.link.park_scripts());
     let scripts = rig.link.scripts();
     assert!(scripts.result_parked(g));
     let calls = scripts.result_calls(g).unwrap();
     assert!(calls >= 3, "{calls}");
     let interval = scripts.open_interval();
+    let lifetime = rig.link.begin_result();
     show(
         &rig.link,
         lifetime,
@@ -2426,7 +2430,9 @@ fn a_result_runtime_rests_through_a_play_and_resumes() {
         &scripted(5, &skin, Some(g), &[]),
         &Overlay::default(),
     );
-    for q in frames(&rig, 4) {
+    let during = frames(&rig, 4);
+    assert!(!during.is_empty(), "the view drew in the interval");
+    for q in during {
         assert_eq!(
             dots(&q),
             with - 1,
@@ -2484,8 +2490,9 @@ fn a_render_panic_in_a_play_leaves_the_result_runtime_to_the_game_thread() {
 
 /// C13 on result: a retirement while the view runs is terminal: the
 /// running slot gives its runtime back, which is destroyed; a recovery
-/// (a device lost, the screen built again) and a new lifetime draw the
-/// callback's constant, never resuming it.
+/// (a device lost, the screen built again) draws the callback's constant,
+/// and a new lifetime's view of the retired generation never commits:
+/// neither resumes it.
 #[test]
 fn a_retired_result_runtime_is_not_resumed() {
     let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
@@ -2522,9 +2529,14 @@ fn a_retired_result_runtime_is_not_resumed() {
         &scripted(2, &skin, Some(g), &[]),
         &Overlay::default(),
     );
-    for q in frames(&rig, 3) {
-        assert_eq!(dots(&q), with - 1);
-    }
+    rig.clear();
+    // A view of the retired generation never commits: the new lifetime
+    // draws the built-in page, and no frame runs the runtime.
+    assert!(
+        rig.until(|d| matches!(d, Drawn::Page(_))),
+        "the new lifetime draws the built-in page"
+    );
+    assert!(rig.drawn().iter().filter_map(skin_frame).count() == 0);
     assert!(!scripts.result_live(Some(g)));
     rig.link.exit();
 }

@@ -242,9 +242,13 @@ pub struct ResultSkin {
     /// tried again at each poll.
     permit_wait: Option<(u64, ViewFacts)>,
     /// The specialization a newer one replaced in `layout` while its
-    /// generation was the presented one: a request for its view reuses it,
-    /// its runtime running on (s7-07-design §3.7.1 M8).
+    /// generation was protected: a request for its view reuses it, its
+    /// runtime running on (s7-07-design §3.7.1 M8).
     presented: Option<Specialized>,
+    /// The attempts begun so far, and the one the publication was made in:
+    /// a publication protects its runtime only in its own attempt.
+    attempts: u64,
+    published_in: u64,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -774,6 +778,7 @@ impl ResultSkin {
             }
         );
         self.published = Some(p);
+        self.published_in = self.attempts;
         self.generation += 1;
     }
 
@@ -1076,11 +1081,7 @@ impl ResultSkin {
         // permit, without which the request waits for one. The cached
         // layout holds no later view here (else it was reused), so it is
         // not spared: kept, it could hold a permit no view releases.
-        let published = match &self.published {
-            Some(Published::Skin(_, _, g)) => *g,
-            _ => None,
-        };
-        let Some(permit) = self.scripts.result_permit(&[published]) else {
+        let Some(permit) = self.scripts.result_permit(&[self.published_now()]) else {
             self.permit_wait = Some((request, view));
             return;
         };
@@ -1165,16 +1166,11 @@ impl ResultSkin {
     /// it reads no fact of the viewed result and its reads hold the
     /// attempt's.
     fn reuse_for_view(&self, view: ViewFacts) -> Option<Published> {
-        // The cached one, else the one presented, while it still is.
-        let presented = self.scripts.presented();
+        // The cached one, else the one kept, while it is protected.
         let l = self
             .layout
             .iter()
-            .chain(
-                self.presented
-                    .iter()
-                    .filter(|l| l.script.is_some() && l.script == presented),
-            )
+            .chain(self.presented.iter().filter(|l| self.protected(l.script)))
             .filter(|l| self.scripts.result_live(l.script))
             .find(|l| match view.0 {
                 Some(fields) => l.facts.holds(&result_facts(fields, self.class)),
@@ -1190,26 +1186,23 @@ impl ResultSkin {
         ))
     }
 
-    /// Drops the specialization kept as the presented one once another
-    /// generation presents: its atlas counts no more.
+    /// Drops the specialization kept for reuse once its generation is no
+    /// longer protected ([`Self::protected`]): its atlas counts no more.
     fn forget_unpresented(&mut self) {
-        let presented = self.scripts.presented();
         if self
             .presented
             .as_ref()
-            .is_some_and(|p| p.script != presented)
+            .is_some_and(|p| !self.protected(p.script))
         {
             self.presented = None;
         }
     }
 
-    /// Caches `spec` as the layout; the one it replaces is kept as the
-    /// presented one while its generation is the presented generation.
+    /// Caches `spec` as the layout; the one it replaces is kept for reuse
+    /// while its generation is protected.
     fn cache(&mut self, spec: Specialized) {
-        let presented = self.scripts.presented();
         if let Some(old) = self.layout.replace(spec)
-            && old.script.is_some()
-            && old.script == presented
+            && self.protected(old.script)
         {
             self.presented = Some(old);
         } else {
@@ -1415,6 +1408,23 @@ impl ResultSkin {
     pub fn next_attempt(&mut self) {
         self.attempt = None;
         self.latest = None;
+        self.attempts += 1;
+    }
+
+    /// The generation the publication of this attempt runs, if any.
+    fn published_now(&self) -> Option<ScriptGen> {
+        match &self.published {
+            Some(Published::Skin(_, _, g)) if self.published_in == self.attempts => *g,
+            _ => None,
+        }
+    }
+
+    /// Whether runtime generation `g` is protected now, as the eviction
+    /// and the reuse ask it each time: presented in the current result
+    /// lifetime, or published in this attempt (the fixed skin's is
+    /// retained by the cell).
+    fn protected(&self, g: Option<ScriptGen>) -> bool {
+        g.is_some() && (g == self.scripts.presented() || g == self.published_now())
     }
 }
 

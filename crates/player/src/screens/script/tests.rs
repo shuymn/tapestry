@@ -387,10 +387,11 @@ fn two_result_generations_hold_the_permits() {
 fn the_eviction_spares_the_presented_retained_and_kept() {
     let _serial = crate::imports::tests::serial();
     let scripts = Scripts::new();
+    scripts.enter_result(1);
     let (_a, presented, va) = offered(&scripts, false);
     let (_b, other, vb) = offered(&scripts, false);
     assert_eq!(
-        scripts.commit_view(Some(presented), || true),
+        scripts.commit_view(Some(presented), 1, || true),
         super::ViewCommit::Committed
     );
     let permit = scripts.result_permit(&[]).expect("the evicted permit");
@@ -398,7 +399,7 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
     assert!(live(&scripts, presented) && !live(&scripts, other));
     let mut ran = false;
     assert_eq!(
-        scripts.commit_view(Some(other), || {
+        scripts.commit_view(Some(other), 1, || {
             ran = true;
             true
         }),
@@ -410,7 +411,7 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
     // so the formerly presented one is evicted after.
     let (_c, kept, vc) = offered(&scripts, false);
     assert_eq!(
-        scripts.commit_view(None, || true),
+        scripts.commit_view(None, 1, || true),
         super::ViewCommit::Committed
     );
     let again = scripts.result_permit(&[Some(kept)]);
