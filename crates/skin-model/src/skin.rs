@@ -32,7 +32,7 @@ use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
 use crate::result::view::{ResultLabels, ResultView};
-use crate::result::{ResultError, ResultFrame, ResultScreen};
+use crate::result::{ResultError, ResultFrame, ResultScreen, ResultTimers};
 use crate::schema::Ty;
 use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
@@ -3477,9 +3477,36 @@ impl Skin {
         res.bitmap = self.bitmap_lines(&res.strings.chart());
     }
 
+    /// Prepares the timers of `res`'s frame at `now` from `timers`, as
+    /// [`prepare_selection_frame`](Self::prepare_selection_frame) does a
+    /// selection's: the build of the same frame (the same `now`) then takes
+    /// them as they are, so the screen's runtime between the two reads the
+    /// state the build draws (docs/stage3.md S7-07). Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a result skin.
+    pub fn prepare_result_frame(
+        &self,
+        res: &mut ResultScreen,
+        now: TimeUs,
+        timers: &ResultTimers,
+    ) -> Result<(), BuildError> {
+        if self.kind != ScreenKind::Result {
+            return Err(BuildError::Kind);
+        }
+        if self.owns_result(res) {
+            res.fill(now, timers, &self.whens);
+            res.prepared = Some(now);
+        }
+        Ok(())
+    }
+
     /// Builds one result frame of `res`, which must come from this skin's
     /// [`prepare_result`](Self::prepare_result): starts the built-in timers
     /// from the frame's starts and the `when` timers over the fields,
+    /// unless [`prepare_result_frame`](Self::prepare_result_frame) prepared
+    /// them for this frame's time,
     /// places the regions, then appends each drawn element's quads to `out`
     /// in draw order (the caller clears `out`): images, image choices,
     /// numbers, text, judge graphs, gauge graphs and timing
@@ -3503,7 +3530,9 @@ impl Skin {
         if !self.screen_draws(ScreenKind::Result, self.owns_result(res), uvs)? {
             return Ok(());
         }
-        res.fill(frame.now, &frame.timers, &self.whens);
+        if res.prepared.take() != Some(frame.now) {
+            res.fill(frame.now, &frame.timers, &self.whens);
+        }
         let res = &*res;
         let rt = Runtime {
             starts: res.starts(),

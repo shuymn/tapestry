@@ -97,7 +97,7 @@ use crate::menu_screen::{MenuPage, SPLASH};
 use crate::result_present::{
     Overlay, ResultBarrier, ResultPresentation, ResultReport, ResultSlot, ViewKey, ViewPayload,
 };
-use crate::screens::{Quiet, ScriptSlot, Scripts};
+use crate::screens::{Quiet, ScriptNotes, ScriptSlot, ScriptStop, Scripts, ViewCommit};
 use crate::selection_skin::{SelectionDrawn, SelectionLogic, SelectionSlot, SelectionUpdate};
 use crate::tuning::LiveTuning;
 use crate::ui_text::{Label, Message};
@@ -1520,6 +1520,7 @@ impl RenderLink {
     pub fn begin_result(&self) -> u64 {
         let lifetime = self.result_lifetimes.fetch_add(1, Ordering::Relaxed) + 1;
         self.shared.result_slot().enter(lifetime);
+        self.scripts.enter_result(lifetime);
         *self.shared.barrier() = ResultBarrier {
             lifetime,
             ..ResultBarrier::default()
@@ -1531,6 +1532,7 @@ impl RenderLink {
     /// presentation of it is drawn, one the render thread took included.
     pub fn end_result(&self) {
         self.shared.result_slot().enter(0);
+        self.scripts.leave_result();
     }
 
     /// The next request of the renderer's sequence, for a presentation's
@@ -3319,6 +3321,9 @@ impl Run {
                     if let Some(logic) = self.selection.as_mut().and_then(|s| s.logic.as_mut()) {
                         logic.script.park();
                     }
+                    if let Some(side) = &mut self.result {
+                        side.park_scripts();
+                    }
                     let _ = reply.send(());
                     continue;
                 }
@@ -3981,12 +3986,19 @@ impl Run {
                     drawn.map(|d| (d.timing, None))
                 }
                 Mode::Result => {
-                    let built = Self::result_frame(
+                    let now = self.clock.now();
+                    if let Some(side) = &mut self.result {
+                        side.drain();
+                    }
+                    let fadeout = Self::result_commit(
                         screen.as_mut(),
                         self.result.as_mut(),
                         &self.shared,
-                        self.clock.now(),
+                        &self.scripts,
                     );
+                    Self::result_visit(self.result.as_mut(), now, fadeout);
+                    let built =
+                        Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
                     // A frame under the barrier refused (dev-tools: the
                     // fallback during an outro).
                     #[cfg(feature = "dev-tools")]
@@ -4756,6 +4768,9 @@ struct HeldView {
     /// Its built-in page, composed outside the commit point while the
     /// built-in result draws it.
     page: Option<EndPage>,
+    /// Its runtime's slot, for its payload's generation: only the
+    /// presented view's takes the runtime (s7-07-design §3.7.1 M4).
+    script: ScriptSlot,
 }
 
 /// A view payload prepared and not yet presented: its staging's token.
@@ -4779,6 +4794,16 @@ struct ResultSide {
     /// What the commit point replaced or discarded, dropped after the
     /// frame: at most a view prepared and a view presented.
     dropped: [Option<HeldView>; 2],
+    /// A third one, when a failed frame left both places taken: dropped
+    /// with them, never inside the commit point.
+    overflow: Option<HeldView>,
+    /// The lifetime's notes, shared by every runtime it runs.
+    notes: ScriptNotes,
+    /// The presented runtime stopped: its notice leads the strip until
+    /// the lifetime ends.
+    stop: Option<ScriptStop>,
+    /// The stop came this frame: the strip is prepared again after it.
+    restrip: bool,
     /// A staging the commit point discarded, dropped after the frame.
     discard: bool,
     /// A commit happened: what it replaced is drained after the frame.
@@ -4806,6 +4831,10 @@ impl ResultSide {
             presented: None,
             overlay: None,
             dropped: [None, None],
+            overflow: None,
+            notes: ScriptNotes::default(),
+            stop: None,
+            restrip: false,
             discard: false,
             drain: false,
             reconcile: false,
@@ -4817,12 +4846,40 @@ impl ResultSide {
     }
 
     /// Keeps `held` to drop after the frame; with both places taken (a
-    /// frame that failed), the older one is dropped now.
+    /// frame that failed), the older one moves to the overflow, which the
+    /// caller drains outside the commit point. Drops nothing here.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn drop_later(&mut self, held: HeldView) {
         match &mut self.dropped {
             [slot @ None, _] | [_, slot @ None] => *slot = Some(held),
-            [first, _] => *first = Some(held),
+            [first, _] => {
+                // Unreached while every result frame drains first
+                // ([`Self::drain`]): a commit point adds two at most.
+                let older = first.replace(held);
+                if self.overflow.is_none() {
+                    self.overflow = older;
+                }
+            }
+        }
+    }
+
+    /// Drops what earlier commit points replaced or discarded: after a
+    /// frame, and before the next commit point, outside it.
+    fn drain(&mut self) {
+        self.dropped = [None, None];
+        self.overflow = None;
+    }
+
+    /// Parks every runtime its views hold: before a play's interval opens.
+    fn park_scripts(&mut self) {
+        for h in self
+            .presented
+            .iter_mut()
+            .chain(self.prepared.iter_mut().map(|v| &mut v.held))
+            .chain(self.dropped.iter_mut().flatten())
+            .chain(self.overflow.iter_mut())
+        {
+            h.script.park();
         }
     }
 
@@ -4832,14 +4889,24 @@ impl ResultSide {
     }
 }
 
-/// The strip's lines of a view payload's and an overlay's, in order.
-fn strip_lines<'a>(payload: &'a ViewPayload, overlay: &'a Overlay) -> Vec<&'a str> {
-    payload
-        .lines
-        .iter()
-        .chain(&overlay.lines)
+/// The strip's lines of a view payload's and an overlay's, in order,
+/// after a stopped runtime's notice, which leads so it always shows: the
+/// last native line yields to it (s7-07-design §3.7.1 M7).
+fn strip_lines<'a>(
+    payload: &'a ViewPayload,
+    overlay: &'a Overlay,
+    stop: Option<ScriptStop>,
+) -> Vec<&'a str> {
+    stop.map(ScriptStop::notice)
+        .into_iter()
+        .chain(
+            payload
+                .lines
+                .iter()
+                .chain(&overlay.lines)
+                .map(String::as_str),
+        )
         .take(crate::result_present::STRIP_LINES)
-        .map(String::as_str)
         .collect()
 }
 
@@ -4991,8 +5058,14 @@ impl Run {
                 v.token = None;
             }
         }
-        // No skin draws: commands take effect at once (D6).
+        // No skin draws: commands take effect at once (D6). No result
+        // runtime runs again this run: every generation retires, the
+        // running one given back here, after the frame's commit point.
         self.shared.barrier().timing = None;
+        self.scripts.disable_result();
+        if let Some(side) = &mut self.result {
+            side.park_scripts();
+        }
         self.reconcile_result();
     }
 
@@ -5035,7 +5108,7 @@ impl Run {
                     Err(e) => failed = Some(e),
                 }
             }
-            let lines = strip_lines(&h.payload, &h.overlay);
+            let lines = strip_lines(&h.payload, &h.overlay, side.stop);
             if let Err(e) = screen
                 .prepare_result_strip(STRIP_PRESENTED, &lines)
                 .map(|()| screen.use_result_strip(STRIP_PRESENTED))
@@ -5071,6 +5144,7 @@ impl Run {
                     overlay: p.overlay.clone(),
                     state: None,
                     page: None,
+                    script: self.scripts.result_slot(p.payload.script),
                 };
                 let mut token = None;
                 let mut ok = true;
@@ -5179,13 +5253,13 @@ impl Run {
         // newest overlay.
         if let Some((_, overlay)) = &side.overlay {
             if let Some(v) = &side.prepared {
-                let lines = strip_lines(&v.held.payload, overlay);
+                let lines = strip_lines(&v.held.payload, overlay, side.stop);
                 if let Err(e) = screen.prepare_result_strip(STRIP_PREPARED, &lines) {
                     failed = Some(e);
                 }
             }
             if let Some(h) = &side.presented {
-                let lines = strip_lines(&h.payload, overlay);
+                let lines = strip_lines(&h.payload, overlay, side.stop);
                 if let Err(e) = screen.prepare_result_strip(STRIP_PRESENTED, &lines) {
                     failed = Some(e);
                 }
@@ -5229,24 +5303,25 @@ impl Run {
         self.publish_result_status();
     }
 
-    /// One result frame's app work (the S10-09i design's D1 and D3): the
-    /// commit point, under the barrier's lock, then the build of what is
-    /// presented. At the commit point a barrier set for the lifetime
+    /// The commit point of a result frame (the S10-09i design's D1 and
+    /// D3), its first step; the presented view's runtime
+    /// ([`Self::result_visit`]) and the build ([`Self::result_build`])
+    /// follow. Under the barrier's lock: a barrier set for the lifetime
     /// discards the view prepared and merges only the overlay; otherwise
-    /// the view prepared is committed with its lines and its strip and
-    /// becomes the one presented, and then the overlay merges. The skin's
-    /// frame is built with the strip, or the built-in page is left to
-    /// draw. Allocates nothing.
+    /// the view prepared is committed with its lines and its strip, under
+    /// one hold of the result runtimes' lock with its generation checked
+    /// live first ([`Scripts::commit_view`]), and becomes the one
+    /// presented, the running runtime moving to it when it keeps the
+    /// presented generation; then the overlay merges. Nothing is
+    /// destroyed. Returns the fade-out's start. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn result_frame(
+    fn result_commit(
         screen: &mut dyn Screen,
         side: Option<&mut ResultSide>,
         shared: &Shared,
-        now: TimeUs,
-    ) -> ResultDrawn {
-        let Some(side) = side else {
-            return ResultDrawn::BuiltIn;
-        };
+        scripts: &Scripts,
+    ) -> Option<TimeUs> {
+        let side = side?;
         let fadeout;
         {
             let mut b = shared.barrier();
@@ -5271,22 +5346,33 @@ impl Run {
             } else {
                 let mut committed = None;
                 if let Some(v) = side.prepared.take() {
-                    let ok = match v.token {
-                        Some(token) => match screen.commit(token) {
-                            Ok(()) => {
-                                screen.install_result_text();
+                    let lifetime = side.lifetime;
+                    let commit =
+                        scripts.commit_view(v.held.payload.script, lifetime, || match v.token {
+                            Some(token) => match screen.commit(token) {
+                                Ok(()) => {
+                                    screen.install_result_text();
+                                    true
+                                }
+                                Err(_) => false,
+                            },
+                            None => true,
+                        });
+                    match commit {
+                        ViewCommit::Committed => {
+                            if v.token.is_some() {
                                 side.drain = true;
                                 side.reconcile = true;
-                                true
                             }
-                            Err(_) => false,
-                        },
-                        None => true,
-                    };
-                    if ok {
-                        committed = Some(v.held);
-                    } else {
-                        side.drop_later(v.held);
+                            committed = Some(v.held);
+                        }
+                        // Its generation was evicted: it never commits,
+                        // its staging discarded after the frame.
+                        ViewCommit::Gone => {
+                            side.discard |= v.token.is_some();
+                            side.drop_later(v.held);
+                        }
+                        ViewCommit::Refused => side.drop_later(v.held),
                     }
                 }
                 if let Some(mut h) = committed {
@@ -5295,6 +5381,11 @@ impl Run {
                         h.overlay = overlay;
                     }
                     screen.use_result_strip(STRIP_PREPARED);
+                    if let Some(old) = side.presented.as_mut() {
+                        // A switch that keeps the layout keeps its running
+                        // runtime.
+                        h.script.transfer_from(&mut old.script);
+                    }
                     if let Some(old) = side.presented.replace(h) {
                         side.drop_later(old);
                     }
@@ -5317,7 +5408,51 @@ impl Run {
                 .fadeout
                 .or_else(|| side.presented.as_ref().and_then(|h| h.overlay.fadeout));
         }
+        fadeout
+    }
+
+    /// The presented view's runtime step of a result frame, between its
+    /// commit point and its build, outside both counted spans
+    /// ([`crate::screens::result_visit`]); a stop's notice is latched for
+    /// the lifetime and its strip prepared again after the frame.
+    fn result_visit(side: Option<&mut ResultSide>, now: TimeUs, fadeout: Option<TimeUs>) {
+        let Some(side) = side else {
+            return;
+        };
         let Some(h) = side.presented.as_mut() else {
+            return;
+        };
+        let (Some(bundle), Some(state)) = (&h.payload.skin, h.state.as_mut()) else {
+            return;
+        };
+        let timers = skin_model::ResultTimers {
+            screen: Some(h.overlay.screen),
+            fadeout,
+        };
+        if let Ok(Some(stop)) = crate::screens::result_visit(
+            &mut h.script,
+            &side.notes,
+            bundle.skin(),
+            state,
+            now,
+            &timers,
+        ) && side.stop.is_none()
+        {
+            side.stop = Some(stop);
+            side.restrip = true;
+        }
+    }
+
+    /// The build of a result frame: the skin's frame with the strip, or
+    /// the built-in page left to draw. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_build(
+        screen: &mut dyn Screen,
+        side: Option<&mut ResultSide>,
+        now: TimeUs,
+        fadeout: Option<TimeUs>,
+    ) -> ResultDrawn {
+        let Some(h) = side.and_then(|s| s.presented.as_mut()) else {
             return ResultDrawn::BuiltIn;
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
@@ -5368,7 +5503,18 @@ impl Run {
         let Some(side) = &mut self.result else {
             return;
         };
-        side.dropped = [None, None];
+        // What the commit point replaced: its slots park, outside it.
+        side.drain();
+        // A runtime stopped this frame: the presented strip is prepared
+        // again with its notice, drawn from the next frame on.
+        if std::mem::take(&mut side.restrip)
+            && let (Some(h), Some(screen)) = (&side.presented, &mut self.screen)
+        {
+            let lines = strip_lines(&h.payload, &h.overlay, side.stop);
+            if screen.prepare_result_strip(STRIP_PRESENTED, &lines).is_ok() {
+                screen.use_result_strip(STRIP_PRESENTED);
+            }
+        }
         if let Some(screen) = &mut self.screen {
             if std::mem::take(&mut side.discard) {
                 screen.discard();

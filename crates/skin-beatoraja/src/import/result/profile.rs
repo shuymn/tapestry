@@ -56,6 +56,18 @@ const fn count(expr: &'static str) -> ResValue {
 }
 
 const VALID: &str = "result.valid";
+
+/// A count's share of the chart's notes in whole percent, as the source's
+/// `getJudgeCount(i) * 100 / getNotes()` (`IntegerPropertyFactory.java:
+/// 503-509`): hidden with no notes.
+/// `expr` bounds the count so the product stays an `i32`.
+const fn rate_of(expr: &'static str) -> ResValue {
+    v(
+        expr,
+        "result.valid && chart.notes_valid && chart.notes > 0",
+        (0, M),
+    )
+}
 const BEST: &str = "best.known";
 
 /// The mean timing deviation in whole ms and its hundredths, each
@@ -90,27 +102,48 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             .map(|e| count(e))
     };
     Some(Bridge(match id {
-        71 | 171 => ResValue {
+        // The ids after the first of an arm are the same property, or give
+        // the same value on the result (`IntegerPropertyFactory.java` at
+        // `0.8.9`: `:136-148`, `:175-189`, `:231-237`, `:499-503`,
+        // `:606-656`, `:690-694`).
+        71 | 101 | 171 => ResValue {
             part: Some(EssentialPart::ResultScore),
             ..count("ex_score")
         },
+        // The EX score less the target's, which is 0 with no target
+        // (`:186`, `:192`, `:198`, `:707-710`; `result/MusicResult.java:
+        // 343-344`, `ScoreDataProperty.java:129`).
+        108 | 128 | 153 => count("ex_score"),
         // The chart's, shown without a result too
         // (`IntegerPropertyFactory.java:562-576`).
-        74 => v("chart.notes", "chart.notes_valid", (0, M)),
-        75 => count("max_combo"),
-        76 => count("result.bp"),
+        74 | 106 => v("chart.notes", "chart.notes_valid", (0, M)),
+        75 | 105 | 174 => count("max_combo"),
+        // Twice the notes, with a score (`:127-129`).
+        72 => v(
+            "clamp(chart.notes, 0, 1073741823) * 2",
+            "result.valid && chart.notes_valid",
+            (0, M),
+        ),
+        // Each grade's share of the notes in whole percent, hidden with no
+        // notes (`:503-509`).
+        85 => rate_of("clamp(count.perfect, 0, 21474836) * 100 / chart.notes"),
+        86 => rate_of("clamp(count.great, 0, 21474836) * 100 / chart.notes"),
+        87 => rate_of("clamp(count.good, 0, 21474836) * 100 / chart.notes"),
+        88 => rate_of("clamp(count.bad, 0, 21474836) * 100 / chart.notes"),
+        89 => rate_of("clamp(count.poor, 0, 21474836) * 100 / chart.notes"),
+        76 | 177 => count("result.bp"),
         90 => v("chart.bpm_max_x100 / 100", "chart.bpm_valid", (0, M / 100)),
         91 => v("chart.bpm_min_x100 / 100", "chart.bpm_valid", (0, M / 100)),
-        96 => v("chart.level", "chart.level_valid", (-M, M)),
-        102 => v("rate.current_bp / 100", "result.rate_valid", (0, M / 100)),
-        103 => v("rate.current_bp % 100", "result.rate_valid", (0, 99)),
+        45..=49 | 96 => v("chart.level", "chart.level_valid", (-M, M)),
+        102 | 115 | 155 => v("rate.current_bp / 100", "result.rate_valid", (0, M / 100)),
+        103 | 116 | 156 => v("rate.current_bp % 100", "result.rate_valid", (0, 99)),
         107 => v("gauge / 10", VALID, (0, 100)),
         407 => v("gauge % 10", VALID, (0, 9)),
-        110 => count("count.perfect"),
-        111 => count("count.great"),
-        112 => count("count.good"),
-        113 => count("count.bad"),
-        114 => count("count.poor"),
+        80 | 110 => count("count.perfect"),
+        81 | 111 => count("count.great"),
+        82 | 112 => count("count.good"),
+        83 | 113 => count("count.bad"),
+        84 | 114 => count("count.poor"),
         150 | 170 => v("best.ex", BEST, (0, M)),
         154 => count("result.next_rank"),
         // One function in the source (`IntegerPropertyFactory.java:197`,
@@ -135,6 +168,10 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         373 => v("duration_10us % 100", "duration.valid", (0, 99)),
         374 => v(MEAN_WHOLE, "timing.valid", (-M / 100, M / 100)),
         375 => v(MEAN_HUNDREDTHS, "timing.valid", (-99, 99)),
+        // The standard deviation in whole ms and its hundredths
+        // (`:434-440`); it is never negative.
+        376 => v("timing.sd_x100 / 100", "timing.valid", (0, M / 100)),
+        377 => v("timing.sd_x100 % 100", "timing.valid", (0, 99)),
         410..=419 => early_late(id)?,
         420 => count("count.empty_poor"),
         421 => count("count.early.empty_poor"),
@@ -148,6 +185,18 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             VALID,
             (0, M),
         ),
+        // POOR and MISS, and BAD, POOR and MISS (`:463-467`), each count
+        // bounded as 425's.
+        426 => v(
+            "clamp(count.poor, 0, 1073741823) + clamp(count.empty_poor, 0, 1073741823)",
+            VALID,
+            (0, M),
+        ),
+        427 => v(
+            "clamp(count.bad, 0, 715827882) + clamp(count.poor, 0, 715827882)              + clamp(count.empty_poor, 0, 715827882)",
+            VALID,
+            (0, M),
+        ),
         1163 => v(
             "chart.length_ms / 60000 % 60",
             "chart.length_valid",
@@ -157,7 +206,7 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // The clock is no result fact; no score target; no IR. The best's
         // max combo (173, and 175 the difference from it) is not kept with
         // a best until stage3.md's row S10-14.
-        21..=25 | 151 | 153 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
+        21..=25 | 151 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
         _ => return None,

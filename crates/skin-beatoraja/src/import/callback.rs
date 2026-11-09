@@ -1853,9 +1853,20 @@ impl Cx<'_> {
         };
         let k = self.outputs.len();
         self.outputs.push(ty);
+        // Its constructor in its file's tree: the same in every import of
+        // one skin, apart for two callbacks on one line.
+        let func = self
+            .def
+            .arena
+            .lua
+            .as_deref()
+            .and_then(|l| l.callables.get(c as usize))
+            .and_then(|x| self.analysis()?.instance(x.instance))
+            .map_or(u32::MAX, |i| i.func);
         if let Some(an) = self.analysis() {
             an.runtime.borrow_mut().push(crate::lua::runtime::Site {
                 callable: c,
+                func,
                 ty,
                 gate,
             });
