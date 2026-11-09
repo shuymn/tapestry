@@ -968,6 +968,10 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(60);
 pub trait FrameSink: Send {
     /// Called after each frame.
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>);
+
+    /// Called at a play's end, before it is answered: what the sink still
+    /// does for the frames drawn so far is done when this returns.
+    fn finish(&mut self) {}
 }
 
 /// No frame sink.
@@ -3513,6 +3517,9 @@ impl Run {
                         self.measure.never_drawn(&effects);
                         effects.clear();
                     }
+                    // The frames drawn before the end are written when it
+                    // is answered.
+                    self.frames.finish();
                     let _ = reply.send(self.measure.finish(end));
                 }
                 Ok(RenderMsg::Follow(extent)) => {

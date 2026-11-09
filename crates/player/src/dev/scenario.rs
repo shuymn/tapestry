@@ -68,6 +68,7 @@ use std::io::Write as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -1281,7 +1282,11 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The render thread's frame sink of a scenario: each presented play frame
 /// writes the captures it is due for, taking them out of the list first
 /// and putting the outcome back after, so the list is never held while the
-/// frame is read back, encoded or written.
+/// frame is read back, encoded or written. The render thread only reads
+/// the frame back (and its display list); a thread of the frame's own
+/// encodes and writes it, so the encoding, which takes seconds on a loaded
+/// machine, delays no later frame and no capture due on one. The play's
+/// end waits for those threads ([`FrameSink::finish`]).
 pub struct ScenarioFrames {
     captures: Captures,
     /// How long each capture's read-back stalls first: a test's stand-in
@@ -1289,6 +1294,8 @@ pub struct ScenarioFrames {
     stall: Option<Duration>,
     /// The presented frames so far: captures of one number are one frame.
     frame: u64,
+    /// The threads writing a captured frame, one per frame.
+    writers: Vec<JoinHandle<()>>,
 }
 
 /// The environment variable that stalls each capture's read-back by its
@@ -1313,6 +1320,7 @@ impl ScenarioFrames {
             captures,
             stall: None,
             frame: 0,
+            writers: Vec::new(),
         }
     }
 
@@ -1326,6 +1334,65 @@ impl ScenarioFrames {
             captures,
             stall,
             frame: 0,
+            writers: Vec::new(),
+        }
+    }
+
+    /// Waits for every captured frame's writer.
+    fn join_writers(&mut self) {
+        for w in self.writers.drain(..) {
+            // A writer that panicked leaves its captures saving, which the
+            // play's settlement fails.
+            let _ = w.join();
+        }
+    }
+}
+
+impl Drop for ScenarioFrames {
+    fn drop(&mut self) {
+        self.join_writers();
+    }
+}
+
+/// Tests: a writer waits while this is write-locked.
+#[cfg(test)]
+static HOLD_WRITES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Encodes a captured frame and writes it as each of `due` (its index in
+/// the list, file, sidecar and generation), with the frame's display list
+/// beside a play frame, putting each outcome in `captures` unless the
+/// capture has ended meanwhile.
+fn write_frame(
+    captures: &Captures,
+    pixels: Option<(u32, u32, Vec<u8>)>,
+    list: Option<Result<String, String>>,
+    due: Vec<(usize, PathBuf, String, u64)>,
+) {
+    // Tests: held while a test holds the writers.
+    #[cfg(test)]
+    let _held = HOLD_WRITES.read();
+    // Encoded once, for every capture due.
+    let image = pixels.map(|(w, h, pixels)| super::png(w, h, &pixels));
+    for (i, path, side, generation) in due {
+        let outcome = match &image {
+            None => Err("nothing to read back".to_owned()),
+            Some(png) => write_new(&path, png)
+                .and_then(|()| write_new(&path.with_extension("json"), side.as_bytes()))
+                .map_err(|e| e.to_string())
+                .and_then(|()| match &list {
+                    None => Ok(()),
+                    Some(Err(why)) => Err(why.clone()),
+                    Some(Ok(lines)) => write_new(&path.with_extension("jsonl"), lines.as_bytes())
+                        .map_err(|e| e.to_string()),
+                }),
+        };
+        if let Some(c) = captures.lock().get_mut(i)
+            && c.state == CaptureState::Saving(generation)
+        {
+            c.state = match outcome {
+                Ok(()) => CaptureState::Succeeded,
+                Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
+            };
         }
     }
 }
@@ -1358,45 +1425,49 @@ impl FrameSink for ScenarioFrames {
         if let Some(stall) = self.stall {
             std::thread::sleep(stall);
         }
-        // Read back and encoded once, for every capture due.
-        let image = screen
-            .read_back()
-            .map(|(w, h, pixels)| super::png(w, h, &pixels));
+        // Read back once, for every capture due, and what the frame was.
+        let pixels = screen.read_back();
         // Its list too, outside the play's measured region; loading frames
         // are smoke only and have none.
         let list = drawn
             .play
             .and_then(|_| screen.display_list())
             .map(|l| display_list_lines(&l, drawn));
-        for (i, path, axis, generation) in due {
-            let outcome = match &image {
-                None => Err("nothing to read back".to_owned()),
-                Some(png) => write_new(&path, png)
-                    .and_then(|()| {
-                        write_new(
-                            &path.with_extension("json"),
-                            sidecar(axis, self.frame, drawn).as_bytes(),
-                        )
-                    })
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| match &list {
-                        None => Ok(()),
-                        Some(Err(why)) => Err(why.clone()),
-                        Some(Ok(lines)) => {
-                            write_new(&path.with_extension("jsonl"), lines.as_bytes())
-                                .map_err(|e| e.to_string())
-                        }
-                    }),
-            };
-            if let Some(c) = self.captures.lock().get_mut(i)
-                && c.state == CaptureState::Saving(generation)
-            {
-                c.state = match outcome {
-                    Ok(()) => CaptureState::Succeeded,
-                    Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
-                };
+        let due: Vec<_> = due
+            .into_iter()
+            .map(|(i, path, axis, generation)| {
+                let side = sidecar(axis, self.frame, drawn);
+                (i, path, side, generation)
+            })
+            .collect();
+        // The writers done so far are let go.
+        self.writers.retain(|w| !w.is_finished());
+        let captures = self.captures.clone();
+        // What fails if the writer cannot start.
+        let unwritten: Vec<_> = due.iter().map(|(i, p, _, g)| (*i, p.clone(), *g)).collect();
+        match std::thread::Builder::new()
+            .name("capture writer".to_owned())
+            .spawn(move || write_frame(&captures, pixels, list, due))
+        {
+            Ok(w) => self.writers.push(w),
+            Err(e) => {
+                let mut list = self.captures.lock();
+                for (i, path, generation) in unwritten {
+                    if let Some(c) = list.get_mut(i)
+                        && c.state == CaptureState::Saving(generation)
+                    {
+                        c.state = CaptureState::Failed(format!(
+                            "{}: its writer did not start: {e}",
+                            path.display()
+                        ));
+                    }
+                }
             }
         }
+    }
+
+    fn finish(&mut self) {
+        self.join_writers();
     }
 }
 
@@ -2711,6 +2782,7 @@ mod tests {
         };
         sink.frame(&screen, &drawn(1, -5));
         sink.frame(&screen, &drawn(1, 2));
+        sink.finish();
         assert_eq!(
             fs::read_to_string(path("a.json"))
                 .unwrap()
@@ -2728,6 +2800,52 @@ mod tests {
         // Its READY state ended first.
         assert!(matches!(c.states()[2], CaptureState::Failed(_)));
         assert!(!path("c.png").exists() && !path("c.json").exists());
+    }
+
+    /// A captured frame is encoded and written off the render thread: while
+    /// its writer is held, the sink returns and a later frame takes the
+    /// next capture; the play's end waits for both writers.
+    #[test]
+    fn a_held_write_delays_no_later_capture() {
+        use super::{FrameSink as _, ScenarioFrames};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let c = Captures::of(vec![
+            (TimeUs(0), path("a.png")),
+            (TimeUs(2_000), path("b.png")),
+        ]);
+        c.arm(0);
+        c.arm(1);
+        c.bind(1);
+        let mut sink = ScenarioFrames::new(c.clone());
+        let (entered, _seen) = std::sync::mpsc::channel();
+        let (_, held) = std::sync::mpsc::channel::<()>();
+        let screen = Stalling {
+            entered,
+            held: std::sync::Mutex::new(held),
+        };
+        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.frame(&screen, &drawn(1, 0));
+        assert_eq!(
+            c.states(),
+            [CaptureState::Saving(1), CaptureState::Bound(1)]
+        );
+        sink.frame(&screen, &drawn(1, 2));
+        assert_eq!(
+            c.states(),
+            [CaptureState::Saving(1), CaptureState::Saving(1)]
+        );
+        assert!(!path("a.png").exists());
+        drop(hold);
+        sink.finish();
+        assert_eq!(
+            c.states(),
+            [CaptureState::Succeeded, CaptureState::Succeeded]
+        );
+        let side = fs::read_to_string(path("b.json")).unwrap();
+        assert!(side.contains("\"frame\":2,"), "{side}");
+        assert!(fs::read(path("a.png")).unwrap().starts_with(b"\x89PNG"));
     }
 
     /// Captures arm, bind to the next play only, and settle when it ends:
