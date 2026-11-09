@@ -134,6 +134,9 @@ pub struct Drawn {
     /// The state clock each frame gives (`SkinFrame::state_us`): by
     /// default 0.
     pub state_us: i64,
+    /// Whether evaluation is complete, for every frame
+    /// ([`SkinFrame::complete`]): by default not.
+    pub complete: bool,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -205,7 +208,7 @@ pub fn context() -> PlayContext<'static> {
 
 /// [`context`] with the chart's BPM range `bpm_range` and BPM-change fact
 /// `bpm_whole_change`.
-fn context_with(
+pub fn context_with(
     bpm_range: Option<BpmRange>,
     bpm_whole_change: Option<bool>,
 ) -> PlayContext<'static> {
@@ -363,12 +366,40 @@ impl Drawn {
 
     /// `skin` played over `chart` with the context `ctx`.
     fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
+        Self::carried_over(skin, chart, ctx, skin_model::Continuation::Fresh)
+    }
+
+    /// [`over_section`](Self::over_section), taking over `carry` from the
+    /// earlier attempts of the play state.
+    pub fn over_carried(
+        skin: Skin,
+        notes: u32,
+        section: &eval::Section,
+        carry: skin_model::Continuation<'_>,
+    ) -> Self {
+        Self::carried_over(
+            skin,
+            &chart(notes),
+            &PlayContext {
+                attempt: Attempt::Section(section),
+                ..context_with(None, None)
+            },
+            carry,
+        )
+    }
+
+    fn carried_over(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        ctx: &PlayContext<'_>,
+        carry: skin_model::Continuation<'_>,
+    ) -> Self {
         let uvs = skin
             .atlas(Variant::Lo, LIMITS, &|| false)
             .unwrap()
             .into_parts()
             .1;
-        let play = skin.prepare(chart, ctx).unwrap();
+        let play = skin.prepare_carried(chart, ctx, carry).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
             skin,
@@ -395,6 +426,7 @@ impl Drawn {
             input: eval::InputFacts::NONE,
             turntable: 0,
             state_us: 0,
+            complete: false,
         }
     }
 
@@ -455,7 +487,7 @@ impl Drawn {
             effects,
             notes: &self.notes,
             input: &self.input,
-            complete: false,
+            complete: self.complete,
             target: self.target,
             layout: &Layout::AUTHOR,
             turntable: self.turntable,

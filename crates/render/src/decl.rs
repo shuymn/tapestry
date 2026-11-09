@@ -782,9 +782,11 @@ impl PlaySkin for DeclSkin {
     fn prepare(&mut self, _gpu: &Gpu, a: &AttemptInput<'_>) -> Result<(), SkinError> {
         self.play = None;
         let skin = &self.bundle.skin;
-        let mut play = skin.prepare(a.chart, a.context).map_err(|e| SkinError {
-            reason: e.to_string(),
-        })?;
+        let mut play = skin
+            .prepare_carried(a.chart, a.context, a.continuation)
+            .map_err(|e| SkinError {
+                reason: e.to_string(),
+            })?;
         skin.attach_bitmap_text(&mut play, a.text);
         self.play = Some(play);
         #[cfg(feature = "dev-tools")]
@@ -830,6 +832,11 @@ impl PlaySkin for DeclSkin {
         if let Some(play) = &mut self.play {
             play.rearm();
         }
+    }
+
+    /// The attempt's `Play`'s ([`Play::carry`]); none without one.
+    fn carry(&self) -> Option<skin_model::Carry<'_>> {
+        self.play.as_ref().map(Play::carry)
     }
 
     /// The model's build of the attempt's `Play` into the batch; nothing

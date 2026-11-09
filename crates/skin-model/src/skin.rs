@@ -27,7 +27,7 @@ use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
-use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
+use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
 use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
@@ -2809,20 +2809,38 @@ impl Skin {
             .map_or(0, |p| crate::output::slots(p.len()))
     }
 
-    /// A fresh [`Play`] for one attempt of `chart`; a retry or the next
-    /// practice round calls this again and starts clean.
+    /// A fresh [`Play`] for the first attempt of a play state of `chart`:
+    /// [`prepare_carried`](Self::prepare_carried) with
+    /// [`Continuation::Fresh`].
     ///
     /// # Errors
     ///
-    /// A negative lead-in, a READY state start outside the time range, or a
-    /// section whose initial gauges do not match the context's gauges.
+    /// As [`prepare_carried`](Self::prepare_carried).
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
+        self.prepare_carried(chart, ctx, Continuation::Fresh)
+    }
+
+    /// A [`Play`] for one attempt of `chart`, taking over `carry` from the
+    /// earlier attempts of its play state: everything else starts clean.
+    ///
+    /// # Errors
+    ///
+    /// A negative lead-in, a READY state start outside the time range, a
+    /// section whose initial gauges do not match the context's gauges, or
+    /// a carried bank that does not fit the program.
+    pub fn prepare_carried(
+        &self,
+        chart: &Chart,
+        ctx: &PlayContext<'_>,
+        carry: Continuation<'_>,
+    ) -> Result<Play, PrepareError> {
         if self.kind != ScreenKind::Play {
             return Err(PrepareError::Kind);
         }
         Play::new(
             chart,
             ctx,
+            carry,
             self.present.as_ref(),
             self.whens.len(),
             self.lanes.is_some(),

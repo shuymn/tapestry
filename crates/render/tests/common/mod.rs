@@ -103,6 +103,7 @@ pub fn attempt<'a>(r: &Renderer, chart: &'a Chart, ctx: &'a PlayContext<'a>) -> 
         context: ctx,
         text: &TEXT,
         target: r.target(),
+        continuation: skin_model::Continuation::Fresh,
     }
 }
 

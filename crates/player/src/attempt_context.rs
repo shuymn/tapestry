@@ -51,6 +51,9 @@ pub struct AttemptContext {
     /// The scratch lane's notes autoplay's turntable presses, built before
     /// READY; none for a play by hand.
     scratch_notes: Vec<game::ScratchNote>,
+    /// The play state and chart the attempt belongs to, which its carry
+    /// is keyed by; `None` carries nothing (tests).
+    carry_key: Option<crate::carry::CarryKey>,
 }
 
 impl AttemptContext {
@@ -78,7 +81,20 @@ impl AttemptContext {
             epoch,
             autoplay,
             scratch_notes: Vec::new(),
+            carry_key: None,
         }
+    }
+
+    /// The attempt as one of play state `play_state` of chart `chart`.
+    #[must_use]
+    pub const fn with_carry_key(mut self, key: Option<crate::carry::CarryKey>) -> Self {
+        self.carry_key = key;
+        self
+    }
+
+    /// The play state and chart the attempt belongs to.
+    pub const fn carry_key(&self) -> Option<crate::carry::CarryKey> {
+        self.carry_key
     }
 
     /// The attempt's tempo provider and references, which every play frame
