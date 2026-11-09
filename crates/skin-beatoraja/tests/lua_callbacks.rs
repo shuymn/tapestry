@@ -1769,51 +1769,286 @@ fn a_return_old_latch_lights_its_second_destination_first() {
     assert_eq!(p.frame(1_016, &[]).len(), 2);
 }
 
-/// A section attempt (a practice round) runs no slot program: the source
-/// reads the point an earlier round left cached there, which tapestry does
-/// not carry, so the timers with slots are off in every round, their slots
-/// at their initial values, where a whole-chart attempt runs them.
-#[test]
-fn a_practice_round_runs_no_slot_program() {
-    use skin_model::present::{OFF, Val};
-    let off = "ms.timer_off_value";
-    let section = eval::Section {
+/// A practice round's section, 60 s from the chart's start.
+fn round() -> eval::Section {
+    eval::Section {
         start: bms_model::TimeUs(0),
         end: bms_model::TimeUs(60_000_000),
         lead_in: bms_model::TimeUs(0),
         initial_gauges: vec![common::play::GAUGES[0].start],
-    };
-    // The latch, and Codex's integer slot shown only while the point is
-    // positive.
-    for (locals, body, init) in [
-        (STATE, LATCH_BODY.to_owned(), OFF),
-        (
-            "local state = 5000",
-            format!(
-                "if state == {off} then state = ms.time() end\n\
-                 if ms.number(100) > 0 then return state end\n\
-                 return {off}"
-            ),
-            Val::Int(5_000),
-        ),
-    ] {
-        let d = timer_skin(locals, &body, 1);
-        let i = import(&d, 905).unwrap();
-        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
-        // Two rounds, each prepared afresh, the first ending at a full score.
-        for round in 0..2 {
-            let mut p = Drawn::over_section(i.imported.skin.clone(), 4, &section);
-            if round == 0 {
-                full_score(&mut p, 4);
-            }
-            p.state_us = 2_000_000;
-            assert!(p.frame(1_000, &[]).is_empty(), "{body}: round {round}");
-            assert_eq!(bank(&p), [init], "{body}: round {round}");
-        }
-        // A whole-chart attempt at a full score runs it.
-        let mut p = Drawn::new(i.imported.skin, 4);
-        full_score(&mut p, 4);
-        p.state_us = 2_000_000;
-        assert_eq!(p.frame(1_000, &[]).len(), 1, "{body}");
     }
+}
+
+/// The program timer's start as of the last build, the last timer slot.
+fn program_start(p: &Drawn) -> Option<bms_model::TimeUs> {
+    let last = p.play.state().timers.len() - 1;
+    p.play.timer(u16::try_from(last).unwrap())
+}
+
+/// Codex's integer slot, shown only while the point is positive.
+fn positive_point_body() -> String {
+    let off = "ms.timer_off_value";
+    format!(
+        "if state == {off} then state = ms.time() end\n\
+         if ms.number(100) > 0 then return state end\n\
+         return {off}"
+    )
+}
+
+/// A fresh section attempt (a play state's first round) runs its slot
+/// program from the initial slots, the point 0 before its first judgment:
+/// the latch lights at a full score.
+#[test]
+fn a_fresh_section_attempt_runs_its_slots() {
+    use skin_model::present::{OFF, Val};
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::over_section(i.imported.skin.clone(), 4, &round());
+    p.state_us = 2_000_000;
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [OFF]);
+    full_score(&mut p, 4);
+    assert_eq!(p.frame(1_016, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+}
+
+/// A carried round with valid slots runs its slot program on them from
+/// its first frame: the latch round 1 set at 7 s keeps that start (2 s of
+/// elapsed at 9 s), where a fresh round is dark until a full score.
+#[test]
+fn a_carried_round_keeps_its_latch() {
+    use skin_model::Continuation;
+    use skin_model::present::Val;
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let mut r1 = Drawn::over_section(skin.clone(), 4, &round());
+    full_score(&mut r1, 4);
+    r1.state_us = 7_000_000;
+    r1.complete = true;
+    assert_eq!(r1.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&r1), [Val::Int(7_000_000)]);
+    let carry = r1.play.carry();
+    assert!(carry.slots_run && carry.terminal);
+    let mut r2 = Drawn::over_carried(
+        skin.clone(),
+        4,
+        &round(),
+        Continuation::Carried {
+            point: 200_000,
+            bank: Some(carry.bank),
+        },
+    );
+    r2.state_us = 9_000_000;
+    assert_eq!(r2.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&r2), [Val::Int(7_000_000)]);
+    assert_eq!(program_start(&r2), Some(bms_model::TimeUs(-1_000_000)));
+    // The control: a fresh round at the same point in time is dark.
+    let mut fresh = Drawn::over_section(skin, 4, &round());
+    fresh.state_us = 9_000_000;
+    assert!(fresh.frame(1_000, &[]).is_empty());
+}
+
+/// Before a carried round's first judgment the point reads the play
+/// state's cached point; from its first judgment, a POOR or an empty
+/// POOR, its own. A cache of 0 reads 0.
+#[test]
+fn the_point_is_cached_until_the_first_judgment() {
+    use skin_model::Continuation;
+    use skin_model::present::Bank;
+    use skin_model::present::Val;
+    let d = timer_skin("local state = 5000", &positive_point_body(), 1);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let skin = i.imported.skin;
+    let init = Bank::of(vec![Val::Int(5_000)]);
+    let carried = |point| Continuation::Carried {
+        point,
+        bank: Some(&init),
+    };
+    for first in ["poor", "empty poor"] {
+        let mut p = Drawn::over_carried(skin.clone(), 4, &round(), carried(200_000));
+        p.state_us = 6_000_000;
+        assert_eq!(p.frame(1_000, &[]).len(), 1, "{first}: before");
+        match first {
+            "poor" => p.tally.counts.poor = 1,
+            _ => p.tally.empty_poor = 1,
+        }
+        assert!(p.frame(1_016, &[]).is_empty(), "{first}: after");
+        assert_eq!(bank(&p), [Val::Int(5_000)]);
+    }
+    let mut zero = Drawn::over_carried(skin, 4, &round(), carried(0));
+    zero.state_us = 6_000_000;
+    assert!(zero.frame(1_000, &[]).is_empty());
+}
+
+/// A slotted callback reading anything but the point, constants, its slots
+/// and the clock is not carry-safe: on a carried state its slot program
+/// does not run (its slot stays as carried, its timer off), where a fresh
+/// attempt runs it.
+#[test]
+fn a_program_reading_other_fields_does_not_carry() {
+    use skin_model::Continuation;
+    use skin_model::present::{Bank, OFF, Val};
+    let off = "ms.timer_off_value";
+    for read in ["ms.number(71) > 0", &format!("ms.timer(48) ~= {off}")] {
+        let body = format!(
+            "if state == {off} and ms.number(100) == 200000 then state = ms.time() end\n\
+             if {read} then return state end\n\
+             return {off}"
+        );
+        let d = timer_skin(STATE, &body, 1);
+        let i = import(&d, 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{read}");
+        let skin = i.imported.skin;
+        let mut fresh = Drawn::over_section(skin.clone(), 4, &round());
+        full_score(&mut fresh, 4);
+        fresh.state_us = 3_000_000;
+        let _ = fresh.frame(1_000, &[]);
+        assert_eq!(bank(&fresh), [Val::Int(3_000_000)], "{read}: fresh");
+        let init = Bank::of(vec![OFF]);
+        let mut carried = Drawn::over_carried(
+            skin,
+            4,
+            &round(),
+            Continuation::Carried {
+                point: 200_000,
+                bank: Some(&init),
+            },
+        );
+        full_score(&mut carried, 4);
+        carried.state_us = 3_000_000;
+        assert!(carried.frame(1_000, &[]).is_empty(), "{read}: carried");
+        assert_eq!(bank(&carried), [OFF], "{read}: carried");
+        assert!(!carried.play.carry().slots_run, "{read}");
+    }
+}
+
+/// The clock is carry-safe: a return condition on `time()` crossing its
+/// threshold between rounds shows the start round 1 stored.
+#[test]
+fn a_clock_read_carries() {
+    use skin_model::Continuation;
+    use skin_model::present::Val;
+    let off = "ms.timer_off_value";
+    let body = format!(
+        "if state == {off} and ms.number(100) == 200000 then state = ms.time() end\n\
+         if ms.time() > 5000000 then return state end\n\
+         return {off}"
+    );
+    let d = timer_skin(STATE, &body, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let mut r1 = Drawn::over_section(skin.clone(), 4, &round());
+    full_score(&mut r1, 4);
+    r1.state_us = 1_000_000;
+    r1.complete = true;
+    assert!(r1.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&r1), [Val::Int(1_000_000)]);
+    let carry = r1.play.carry();
+    assert!(carry.terminal);
+    let mut r2 = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            point: 200_000,
+            bank: Some(carry.bank),
+        },
+    );
+    r2.state_us = 6_000_000;
+    assert_eq!(r2.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&r2), [Val::Int(1_000_000)]);
+    // 5 s of elapsed at 1 s of chart time.
+    assert_eq!(program_start(&r2), Some(bms_model::TimeUs(-4_000_000)));
+}
+
+/// An unwitnessed carry (no valid slots) runs no slot program: the latch
+/// stays dark at a full score, its slot at its initial value.
+#[test]
+fn an_unwitnessed_round_runs_no_slot_program() {
+    use skin_model::Continuation;
+    use skin_model::present::OFF;
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let mut p = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            point: 200_000,
+            bank: None,
+        },
+    );
+    full_score(&mut p, 4);
+    p.state_us = 2_000_000;
+    p.complete = true;
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [OFF]);
+    let carry = p.play.carry();
+    assert!(!carry.slots_run && !carry.terminal);
+}
+
+/// A rearm keeps the slots and the cached point and clears the first
+/// judgment's latch: after a judgment and a rearm the point reads the
+/// cache again.
+#[test]
+fn a_rearm_keeps_the_cache() {
+    use skin_model::Continuation;
+    use skin_model::present::{Bank, Val};
+    let d = timer_skin("local state = 5000", &positive_point_body(), 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let init = Bank::of(vec![Val::Int(5_000)]);
+    let mut p = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            point: 200_000,
+            bank: Some(&init),
+        },
+    );
+    p.state_us = 6_000_000;
+    assert_eq!(p.frame(1_000, &[]).len(), 1);
+    p.tally.counts.poor = 1;
+    assert!(p.frame(1_016, &[]).is_empty());
+    p.play.rearm();
+    p.tally = common::play::tally(0, 0);
+    assert_eq!(p.frame(1_032, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(5_000)]);
+}
+
+/// A carried bank is checked against the program before use: another
+/// length, or a value of the right length outside its slot's domain,
+/// refuses the attempt.
+#[test]
+fn a_continuation_of_another_shape_is_refused() {
+    use skin_model::present::{Bank, OFF, Val};
+    use skin_model::{Continuation, PrepareError};
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let chart = common::play::chart(4);
+    let section = round();
+    let ctx = skin_model::PlayContext {
+        attempt: skin_model::Attempt::Section(&section),
+        ..common::play::context_with(None, None)
+    };
+    for vals in [vec![], vec![OFF, OFF], vec![Val::Int(-5)]] {
+        let b = Bank::of(vals.clone());
+        let carry = Continuation::Carried {
+            point: 0,
+            bank: Some(&b),
+        };
+        assert_eq!(
+            skin.prepare_carried(&chart, &ctx, carry).err(),
+            Some(PrepareError::Continuation),
+            "{vals:?}"
+        );
+    }
+    // The control: a value in the domain is taken.
+    let b = Bank::of(vec![Val::Int(5)]);
+    let carry = Continuation::Carried {
+        point: 0,
+        bank: Some(&b),
+    };
+    assert!(skin.prepare_carried(&chart, &ctx, carry).is_ok());
 }

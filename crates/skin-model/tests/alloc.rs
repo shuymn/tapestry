@@ -4388,6 +4388,40 @@ fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     TRACK.with(|t| t.set(false));
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "slots: allocations");
     assert_eq!(seen, [true, true], "the timer off and on");
+    // A later attempt of the play state, prepared outside play with the
+    // slots and the point carried: the cached point until a judgment, the
+    // first judgment's latch, the terminal witness on complete views and
+    // a rearm allocate nothing either.
+    let bank = play.bank().clone();
+    let mut carried = skin
+        .prepare_carried(
+            chart,
+            ctx,
+            skin_model::Continuation::Carried {
+                point: 200_000,
+                bank: Some(&bank),
+            },
+        )
+        .unwrap();
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..1_000 * MS).step_by(16 * MS as usize).enumerate() {
+        if i == 30 {
+            carried.rearm();
+        }
+        batch.clear();
+        let f = SkinFrame {
+            complete: i % 2 == 0,
+            ..frame(now, &tallies[i / 7 % 10])
+        };
+        skin.build(&mut carried, &f, &uvs, &mut batch)
+            .expect("the frame builds");
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "carried slots: allocations"
+    );
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

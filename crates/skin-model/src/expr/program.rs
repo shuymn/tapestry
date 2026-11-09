@@ -151,6 +151,18 @@ impl Program {
         self.loads().map(|(slot, _)| slot)
     }
 
+    /// Whether every read the program performs is a load of field `slot`:
+    /// any other field, any output and any timer operand gives false. A
+    /// positive witness over every operation, so an operation added later
+    /// must be classified here.
+    pub(crate) fn reads_only(&self, slot: u16) -> bool {
+        self.ops.iter().all(|op| match *op {
+            Op::Load { slot: s, .. } => s == slot,
+            Op::Output { .. } | Op::Elapsed(_) | Op::On(_) => false,
+            Op::Const(_) | Op::Un(_) | Op::Bin(_) | Op::Select => true,
+        })
+    }
+
     /// The slot reads: each field read's slot with `None`, each output
     /// read's with its resolved type and whether it is the `ok` flag.
     pub(crate) fn loads(&self) -> impl Iterator<Item = (u16, Option<(OutTy, bool)>)> + '_ {

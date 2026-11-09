@@ -97,9 +97,44 @@ impl Present {
                         .any(|i| matches!(i, Insn::LoadSlot { .. } | Insn::StoreSlot { .. }))
                 })
             })
-            .collect();
-        Ok(Self { def, slotted })
+            .collect::<Box<[bool]>>();
+        let carry_safe = carry_safe(&def, &slotted);
+        Ok(Self {
+            def,
+            slotted,
+            carry_safe,
+        })
     }
+}
+
+/// Whether every slotted callback of `def` may run on a carried state:
+/// no gate, no `after`, and every read in its span loading only the point,
+/// value and guard alike ([`Present::carry_safe`]). A span or read index
+/// that does not resolve refuses it.
+fn carry_safe(def: &PresentDef, slotted: &[bool]) -> bool {
+    let point = crate::field::POINT;
+    let read_ok = |r: u16| {
+        def.reads.get(usize::from(r)).is_some_and(|d| {
+            d.value.reads_only(point) && d.guard.as_ref().is_none_or(|g| g.reads_only(point))
+        })
+    };
+    def.callbacks
+        .iter()
+        .zip(slotted)
+        .filter(|&(_, &s)| s)
+        .all(|(cb, _)| {
+            let span = usize::try_from(cb.start)
+                .ok()
+                .and_then(|s| def.code.get(s..s.saturating_add(usize::from(cb.len))));
+            cb.gate.is_none()
+                && cb.after.is_none()
+                && span.is_some_and(|c| {
+                    c.iter().all(|i| match *i {
+                        Insn::Read { read, .. } => read_ok(read),
+                        _ => true,
+                    })
+                })
+        })
 }
 
 fn v1(def: &PresentDef) -> Result<(), PresentError> {

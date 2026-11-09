@@ -176,11 +176,11 @@ pub use play::schema::{
     JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX,
     field, lane_timer, timer,
 };
-pub use play::timers::native_values;
+pub use play::timers::{native_values, settled_point};
 pub use play::{
-    Attempt, BpmRange, BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts,
-    GaugeDesc, LoadState, NativeReadouts, NativeValues, Play, PlayContext, PrepareError,
-    RoundedDuration, SkinFrame,
+    Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
+    DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, Play,
+    PlayContext, PrepareError, RoundedDuration, SkinFrame,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{
