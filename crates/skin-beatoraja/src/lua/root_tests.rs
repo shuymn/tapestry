@@ -397,16 +397,10 @@ fn a_string_or_choice_value_function_has_no_consumer_and_no_fallback() {
 
 #[test]
 fn a_function_no_consumer_reads_is_classified_only() {
-    // A slider's value drops the slider before it is consumed; an
-    // action, an event writer and a custom event's condition are never
+    // An action, an event writer and a custom event's condition are never
     // consumed.
     let dst = "{ id = \"sl\", dst = { { w = 8, h = 8 } } },";
     for entry in [
-        skin(
-            "skin.slider = { { id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, type = 4, angle = 2,\n\
-               value = function() return 1 end } }",
-            dst,
-        ),
         with_image(
             "{ id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, act = function() return 1 end }",
             dst,
@@ -433,6 +427,14 @@ fn a_function_no_consumer_reads_is_classified_only() {
             i.callbacks
         );
     }
+    // A play slider's value is consumed: compiled into the program.
+    let entry = skin(
+        "skin.slider = { { id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, type = 4, angle = 2,\n\
+           value = function() return 1 end } }",
+        dst,
+    );
+    let i = import(&entry).unwrap_or_else(|e| panic!("{entry}: {e:?}"));
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
 }
 
 #[test]

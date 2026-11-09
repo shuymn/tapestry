@@ -3,8 +3,10 @@
 //!
 //! - Every operation the source's interpreter has (`+ - * / %`, the
 //!   comparisons, unary minus, `math.floor`, `ceil`, `abs`, `max`, `min`)
-//!   and the consumer's `toint()` of a number's value
-//!   is checked against `luaj_numerics.txt`, the source's results over a
+//!   and the consumers' `toint()` of a number's value and `tofloat()` of a
+//!   slider's (numbers as the value the source builds from them, a numeric
+//!   −0 its integer 0; strings folded at import as luaj's `scannumber`)
+//!   are checked against `luaj_numerics.txt`, the source's results over a
 //!   grid of integers and floats (zeros of both signs, infinities, NaN,
 //!   values near 2^31 and 2^53), generated from the source's pinned
 //!   interpreter by `xtask/luaj/luaj_table.sh`.
@@ -17,7 +19,8 @@
 //! reports an overflow where `i64` would wrap, and is not compared.
 
 use mlua::{Function, Lua, Value};
-use skin_model::present::num::{arith, compare, extreme, math, neg, to_int};
+use skin_beatoraja::lua::num_scan::todouble;
+use skin_model::present::num::{arith, compare, extreme, math, neg, to_float, to_int};
 use skin_model::present::{Arith, Cmp, Fail, MathFn, Val};
 
 const TWO_53: i64 = 1 << 53;
@@ -84,8 +87,13 @@ fn every_operation_matches_the_source_interpreter() {
     let mut checked = 0;
     for line in table.lines() {
         let (lhs, rhs) = line.split_once(" = ").unwrap();
-        let theirs = parse(rhs);
         let words: Vec<&str> = lhs.split(' ').collect();
+        if words[0].starts_with("tofloat") {
+            check_tofloat(&words, rhs);
+            checked += 1;
+            continue;
+        }
+        let theirs = parse(rhs);
         let ours: Result<Val, Fail> = match words[..] {
             [op, a, b] => {
                 let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
@@ -128,6 +136,48 @@ fn every_operation_matches_the_source_interpreter() {
         checked += 1;
     }
     assert!(checked > 9_000, "{checked}");
+}
+
+/// A slider value's `tofloat()` line: `tofloat <operand> as <value the
+/// source built> = g:<f32 bits>`, converted from that value (a numeric
+/// −0 is the source's integer 0, as the importer normalizes it), or
+/// `tofloats x<hex bytes> = g:<bits>` (or `caught`, the consumer's `0f`),
+/// a string folded at import and then converted.
+fn check_tofloat(words: &[&str], rhs: &str) {
+    let ours = match words {
+        ["tofloat", _, "as", built] => to_float(parse(built).unwrap()),
+        ["tofloats", hex] => {
+            let hex = hex.strip_prefix('x').unwrap();
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            to_float(Val::Float(todouble(&bytes)))
+        }
+        _ => panic!("{words:?}"),
+    };
+    let theirs = match rhs {
+        "caught" => 0.0_f32,
+        g => f32::from_bits(u32::from_str_radix(g.strip_prefix("g:").unwrap(), 16).unwrap()),
+    };
+    assert!(
+        (ours.is_nan() && theirs.is_nan()) || ours.to_bits() == theirs.to_bits(),
+        "{words:?}: {ours:?} vs the source's {theirs:?}"
+    );
+}
+
+#[test]
+fn a_numeric_negative_zero_is_built_as_integer_zero() {
+    let table = include_str!("luaj_numerics.txt");
+    assert!(table.contains(
+        "tofloat f:8000000000000000 as i:0 = g:0
+"
+    ));
+    // A string's keeps its sign.
+    assert!(table.contains(
+        "tofloats x2d302e30 = g:80000000
+"
+    ));
 }
 
 fn grid() -> Vec<Val> {

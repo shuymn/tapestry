@@ -8,14 +8,17 @@
 //! same slots by the same names, its callbacks' types its signature.
 
 /// A callback output's type: a `draw` gives a boolean, a number's `value`
-/// an integer, and a play program's timer callback a timer, which only
-/// an element's timer reads ([`crate::TimerRef::Output`]): no expression
-/// reads it, as a field or otherwise.
+/// an integer, a play program's timer callback a timer, which only an
+/// element's timer reads ([`crate::TimerRef::Output`]): no expression
+/// reads it, as a field or otherwise; and a play slider's `value` a float,
+/// its `f32` bits, which only its slider reads
+/// ([`crate::SliderRate::Program`]): an expression reads only its `ok`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutTy {
     Bool,
     Int,
     Timer,
+    Float,
 }
 
 /// The slot, type and whether it is the `ok` flag of output `name` after
