@@ -2193,12 +2193,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     /// The state clock starts with the play state's turntable, at the
-    /// same instant, except within a practice session, which keeps its
-    /// first origin.
+    /// same instant.
     fn play_state_began(&mut self) {
         let state = self.play_states.begin(self.clock.now());
-        let practicing = self.selection.as_ref().is_some_and(|s| s.practicing);
-        self.state_clock.began(state.origin, practicing);
+        self.state_clock.began(state.origin);
         self.render.play_state(state);
     }
 
