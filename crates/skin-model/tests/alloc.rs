@@ -1083,10 +1083,12 @@ fn skin() -> Loaded {
             track: track(i, eases[usize::from(i % 4)], end),
             timer,
             visible: (i % 7 == 0).then(|| visible[usize::from(i % 3)].clone()),
-            blend: if (i / 3) % 2 == 0 {
-                Blend::Alpha
-            } else {
-                Blend::Add
+            // Every third group multiplies; its tracks start at alpha 0,
+            // which a multiply quad skips.
+            blend: match (i / 3) % 3 {
+                0 => Blend::Alpha,
+                1 => Blend::Add,
+                _ => Blend::Multiply,
             },
             clip: (i % 11 == 0).then_some(ClipId(i % 4)),
             place: Place {

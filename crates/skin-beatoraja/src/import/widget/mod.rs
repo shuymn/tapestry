@@ -429,7 +429,8 @@ impl Cx<'_> {
 
     /// [`image_common`](Self::image_common) of an image or image choice
     /// drawn as an element of its own, which turns with the turntable
-    /// (offset 1); a cover's paint does not.
+    /// (offset 1) and may multiply (blend 4); a cover's paint does
+    /// neither.
     pub(super) fn turning_image_common(
         &mut self,
         dst: &Dst,
@@ -439,6 +440,7 @@ impl Cx<'_> {
         let o = Opts {
             follow: true,
             turntable: true,
+            multiply: true,
             charged,
             ..Opts::default()
         };

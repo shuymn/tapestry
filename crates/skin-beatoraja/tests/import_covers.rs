@@ -660,8 +660,8 @@ fn stretch_five_takes_the_sources_branch_for_any_sign() {
 fn the_lanes_blend_ignores_the_outer_blend() {
     // The notes and SUDDEN+'s paint draw in alpha-blended runs, LIFT's in
     // its own under its clip: an additive note destination would leave a
-    // black cover see-through.
-    for blend in [2, 3] {
+    // black cover see-through. Blend 4 is ignored there too.
+    for blend in [2, 3, 4] {
         let notes = format!(
             r#"{{"id": "notes", "blend": {blend}, "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}"#
         );
