@@ -975,11 +975,28 @@ impl ResultSkin {
     }
 
     /// An image stage's `job` no attempt waits for any more (its
-    /// preparation superseded or discarded): cancelled and waited for as
-    /// the run's end waits, at most [`imports::STOP_WAIT`], and finished,
-    /// so its images are handed back.
-    pub fn settle_image_stage(&mut self, job: &mut ImageJob) {
-        let _ = self.poll_image_stage(job, None, || false, || true);
+    /// preparation superseded or discarded), settled as the attempt's quit
+    /// settles it: cancelled and waited for to its thread's end without a
+    /// bound, while `end_run` (a close, a thread's failure) is still asked;
+    /// once it turns true, the job is given up within
+    /// [`imports::STOP_WAIT`] of it. A job that ended is finished, so its
+    /// images are handed back; an abandoned one keeps them.
+    pub fn settle_image_stage(
+        &mut self,
+        job: &mut ImageJob,
+        end_run: impl FnMut() -> bool,
+    ) -> imports::Settled {
+        // Without a deadline the wait returns only with the job's end.
+        let Some(ran) = job.job.wait_until(None, || true, end_run) else {
+            return imports::Settled::Ended;
+        };
+        let settled = if matches!(ran, Ran::Abandoned) {
+            imports::Settled::Abandoned
+        } else {
+            imports::Settled::Ended
+        };
+        let _ = self.finish_image_stage(&job.slot, ran);
+        settled
     }
 
     /// The attempt's result skin from its image stage's outcome `ran`, the

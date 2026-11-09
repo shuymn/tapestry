@@ -445,7 +445,7 @@ impl InputLink {
     /// [`fail_for_script`](Self::fail_for_script) from another thread
     /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn failer(&self) -> impl Fn() + Send + Sync + 'static {
+    pub fn failer(&self) -> impl Fn() + Send + Sync + use<> {
         let state = Arc::clone(&self.state);
         move || state.gone.store(true, Ordering::Release)
     }

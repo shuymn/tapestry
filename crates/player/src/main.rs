@@ -885,6 +885,8 @@ fn rig<'a>(
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
+        #[cfg(test)]
+        audio_lost: std::sync::Arc::default(),
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;

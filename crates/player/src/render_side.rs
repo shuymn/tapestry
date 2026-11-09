@@ -10616,8 +10616,28 @@ pub(crate) mod tests {
         }
 
         /// The play bundle the screen built last has installed.
-        fn play(&self) -> Option<Arc<render::SkinBundle>> {
+        pub(crate) fn play(&self) -> Option<Arc<render::SkinBundle>> {
             self.play.lock().unwrap().clone()
+        }
+
+        /// The skin staged and neither committed nor discarded.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn staging(&self) -> Option<Arc<render::SkinBundle>> {
+            self.staging.lock().unwrap().clone()
+        }
+
+        /// The next request `link` sends stages, then does not answer
+        /// until [`release_staged`](Self::release_staged).
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_next_staging(&self, link: &super::RenderLink) {
+            let next = link.requests.load(Ordering::Relaxed) + 1;
+            self.hold_staged.store(next, Ordering::Release);
+        }
+
+        /// A held staging answers again.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn release_staged(&self) {
+            self.hold_staged.store(0, Ordering::Release);
         }
     }
 

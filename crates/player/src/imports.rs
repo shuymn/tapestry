@@ -311,14 +311,37 @@ impl PendingSkin {
     }
 
     /// A specialization `job` no attempt waits for any more (its
-    /// preparation superseded or discarded): cancelled and waited for as
-    /// the run's end waits, at most [`STOP_WAIT`], and its outcome kept as
-    /// [`finish`](Self::finish) keeps it.
-    pub fn settle(&mut self, job: &mut Specializing) {
-        if let Some(ran) = job.wait_until(None, || false, || true) {
-            let _ = self.finish(job, ran);
-        }
+    /// preparation superseded or discarded), settled as the attempt's quit
+    /// settles it: cancelled and waited for to its thread's end without a
+    /// bound, while `end_run` (a close, a thread's failure) is still asked;
+    /// once it turns true, the job is given up within [`STOP_WAIT`] of it.
+    /// Its outcome is kept as [`finish`](Self::finish) keeps it: a
+    /// specialization only from a successful run.
+    pub fn settle(&mut self, job: &mut Specializing, end_run: impl FnMut() -> bool) -> Settled {
+        // Without a deadline the wait returns only with the job's end; a
+        // job that never started has nothing to wait for.
+        let Some(ran) = job.wait_until(None, || true, end_run) else {
+            return Settled::Ended;
+        };
+        let settled = if matches!(ran, Ran::Abandoned) {
+            Settled::Abandoned
+        } else {
+            Settled::Ended
+        };
+        let _ = self.finish(job, ran);
+        settled
     }
+}
+
+/// How a job no attempt waits for any more was settled
+/// ([`PendingSkin::settle`], [`crate::result_skin::ResultSkin::settle_image_stage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// Its thread ended and was joined. The run may still be ending.
+    Ended,
+    /// The run's end came during the wait, and the thread had not ended
+    /// within [`STOP_WAIT`] of it: it is left to the process's exit.
+    Abandoned,
 }
 
 /// How [`PendingSkin::begin`] began.
@@ -830,7 +853,11 @@ pub fn spawn_job_with<T: Send + 'static>(
     let body = move || {
         #[cfg(test)]
         let _worker = tests::WorkerEnd;
-        let sent = match panic::catch_unwind(AssertUnwindSafe(|| job(&theirs))) {
+        let sent = match panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            tests::panic_if_armed();
+            job(&theirs)
+        })) {
             Ok(outcome) => Ok(outcome),
             Err(payload) => {
                 // Dropped before the send: a payload whose drop panics

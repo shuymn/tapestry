@@ -155,6 +155,31 @@ pub(crate) fn refuse_spawn() {
     REFUSE_SPAWN.store(true, Ordering::SeqCst);
 }
 
+/// Whether the next job panics in its body, before its work, as a job
+/// whose work panicked would.
+static PANIC_JOB: AtomicBool = AtomicBool::new(false);
+
+/// The next job started panics in its body, once.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn panic_next_job() {
+    PANIC_JOB.store(true, Ordering::SeqCst);
+}
+
+/// Panics once per [`panic_next_job`], on the job's thread.
+pub(super) fn panic_if_armed() {
+    assert!(
+        !PANIC_JOB.swap(false, Ordering::SeqCst),
+        "the job panics for the test"
+    );
+}
+
+/// The job threads started and not yet at their body's end, an abandoned
+/// one included.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn workers() -> usize {
+    WORKERS.load(Ordering::SeqCst)
+}
+
 /// The tests that run jobs, or hold the process-wide barriers, one at a
 /// time; each barrier is released when the test ends, failed or not, and
 /// the test's job threads, an abandoned one included, are waited for
@@ -177,6 +202,7 @@ impl Drop for Serial {
     fn drop(&mut self) {
         hold_exit(false);
         REFUSE_SPAWN.store(false, Ordering::SeqCst);
+        PANIC_JOB.store(false, Ordering::SeqCst);
         #[cfg(feature = "dev-tools")]
         skin_beatoraja::vm_hooks::release();
         wait_until(|| WORKERS.load(Ordering::SeqCst) == 0);
@@ -1133,7 +1159,7 @@ impl std::fmt::Debug for Witness {
 /// strings takes.
 #[cfg(feature = "dev-tools")]
 #[track_caller]
-pub(super) fn executing(base: usize) {
+pub(crate) fn executing(base: usize) {
     use skin_beatoraja::vm_hooks;
     assert!(wait_until(|| vm_hooks::live() > base));
     let from = vm_hooks::steps();
