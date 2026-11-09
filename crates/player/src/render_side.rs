@@ -2539,7 +2539,6 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 probe_view: None,
                 carries: crate::carry::Carries::default(),
-                play_commit: None,
             };
             r.run(&rx);
         })
@@ -2994,6 +2993,8 @@ struct Preparing {
     skin: Option<Arc<SkinBundle>>,
     /// What it takes over from the earlier attempts of its play state.
     offer: crate::carry::Offer,
+    /// The installation it draws with.
+    installed: crate::carry::Installed,
     reply: mpsc::SyncSender<Result<Answered, RenderError>>,
 }
 
@@ -3028,12 +3029,14 @@ struct Prepared {
     presentation: (game::AttemptTempo, u64),
     /// Autoplay's scratch notes, the turntable's once committed.
     scratch_notes: Vec<game::ScratchNote>,
-    /// Its play state and chart, what it was offered and the declarative
-    /// skin it was prepared with, for the carry's record at its commit.
+    /// Its play state and chart, what it was offered, the installation
+    /// it draws with and its target count, for the carry's record at its
+    /// commit.
     carry: (
         Option<crate::carry::CarryKey>,
         crate::carry::Offer,
-        Option<Arc<SkinBundle>>,
+        crate::carry::Installed,
+        u32,
     ),
     /// The attempt's READY on the chart's axis (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -3143,12 +3146,8 @@ struct Run {
     #[cfg(feature = "dev-tools")]
     probe_view: Option<crate::result_present::ViewKey>,
     /// The play state's carry across its attempts, kept apart from the
-    /// screen.
+    /// screen; every change goes through [`crate::carry::Carries::on`].
     carries: crate::carry::Carries,
-    /// The request of the committed play attempt whose `Play` the screen
-    /// holds: set by its commit, kept across other kinds' commits, cleared
-    /// when a chart's load or a dropped screen takes the `Play`.
-    play_commit: Option<u64>,
 }
 
 impl Run {
@@ -3292,8 +3291,6 @@ impl Run {
                     }
                     self.chart = Some(chart);
                     self.section = section;
-                    // The load drops the committed attempt's `Play`.
-                    self.play_commit = None;
                     let ready = self.prepare();
                     // A chart the screen cannot draw is refused, and the
                     // screen it dropped is built again without it, for the
@@ -3457,8 +3454,11 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Settled(tally)) => {
-                    let carry = self.screen.as_ref().and_then(|s| s.carry());
-                    self.carries.settled(&tally, self.play_commit, carry);
+                    let held = self.screen.as_ref().and_then(|s| s.carry());
+                    self.carries.on(crate::carry::Event::Settled {
+                        tally: &tally,
+                        held,
+                    });
                     continue;
                 }
                 Ok(RenderMsg::Turntable { number, pause }) => {
@@ -3516,11 +3516,10 @@ impl Run {
                     state_origin,
                 }) => {
                     let origin = measure.origin;
-                    // The committed attempt starts: its play state's carry
-                    // waits for its settlement.
-                    if let Some(request) = self.play_commit {
-                        self.carries.started(request);
-                    }
+                    // The committed attempt starts, whether or not the
+                    // screen still holds its `Play`: its play state's
+                    // carry waits for its settlement.
+                    self.carries.on(crate::carry::Event::Started);
                     self.turntable.play_starts();
                     self.measure.start(*measure);
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
@@ -4273,12 +4272,21 @@ impl Run {
             }
             AttemptSkin::InUse => self.selected.clone(),
         };
-        let offer = self.carries.offer(attempt.carry_key(), skin.as_ref());
+        // The installation the attempt draws with: the bundle it stages,
+        // or the one installed, which an attempt with none staged uses in
+        // place.
+        let installed = crate::carry::Installed::of(skin.as_ref().or_else(|| {
+            self.committed
+                .get(ScreenKind::Play)
+                .map(render::Installation::bundle)
+        }));
+        let offer = self.carries.offer(attempt.carry_key(), &installed);
         let p = Preparing {
             request,
             attempt,
             skin,
             offer,
+            installed,
             reply,
         };
         if let Err(e) = self.recover() {
@@ -4322,6 +4330,8 @@ impl Run {
             None => base,
         };
         let text = p.attempt.text();
+        // The attempt's target count, which its point is over.
+        let targets = skin_model::attempt_targets(chart, &context.attempt);
         let a = AttemptInput {
             chart,
             context: &context,
@@ -4331,6 +4341,11 @@ impl Run {
         };
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
+        // With nothing staged the skin in use is prepared in place: the
+        // committed attempt's `Play` goes now.
+        if p.skin.is_none() {
+            self.carries.on(crate::carry::Event::PlayGone);
+        }
         let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
             return;
         };
@@ -4349,7 +4364,12 @@ impl Run {
                 declarative: p.skin.is_some(),
                 presentation: (p.attempt.tempo().clone(), p.attempt.epoch()),
                 scratch_notes: p.attempt.take_scratch_notes(),
-                carry: (p.attempt.carry_key(), p.offer.clone(), p.skin.clone()),
+                carry: (
+                    p.attempt.carry_key(),
+                    p.offer.clone(),
+                    p.installed.clone(),
+                    targets,
+                ),
                 #[cfg(feature = "dev-tools")]
                 ready: p.attempt.ready(),
                 #[cfg(feature = "dev-tools")]
@@ -4474,10 +4494,14 @@ impl Run {
             .and_then(|i| i.bundle().skin().close());
         // The committed attempt's `Play` is the screen's now, whatever
         // other kinds commit until the next load, failure or commit.
-        self.play_commit = Some(request);
-        let (key, offer, bundle) = &p.carry;
-        self.carries
-            .committed(*key, offer, bundle.as_ref(), screen.carry());
+        let (key, offer, installed, targets) = &p.carry;
+        self.carries.on(crate::carry::Event::Committed {
+            key: *key,
+            offer,
+            installed: installed.clone(),
+            targets: *targets,
+            bank: screen.carry().map(|c| c.bank),
+        });
         self.current = Some(p.presentation);
         self.turntable.attempt(p.scratch_notes);
         #[cfg(feature = "dev-tools")]
@@ -4577,7 +4601,10 @@ impl Run {
                 self.scripts
                     .commit(kind, Arc::as_ptr(&bundle).addr(), script);
                 if kind == ScreenKind::Play {
-                    self.carries.installed(Some(&bundle));
+                    self.carries
+                        .on(crate::carry::Event::Installed(crate::carry::Installed::of(
+                            Some(&bundle),
+                        )));
                     self.selected = Some(bundle);
                     self.play_selection = request;
                 }
@@ -4639,6 +4666,9 @@ impl Run {
             return Ok(Preparation::Cancelled);
         }
         self.committed.pend(kind, None);
+        self.carries.on(crate::carry::Event::Installed(
+            crate::carry::Installed::Pending,
+        ));
         self.selected = None;
         self.play_selection = request;
         self.specialized_in = None;
@@ -4701,6 +4731,9 @@ impl Run {
     /// Prepares the chart loaded last and resets the screen's play state,
     /// building it again after a failure.
     fn prepare(&mut self) -> Result<(), RenderError> {
+        // A chart's load, or a screen built again, holds no attempt's
+        // `Play`.
+        self.carries.on(crate::carry::Event::PlayGone);
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
         let mut refused = None;
@@ -5017,7 +5050,7 @@ impl Run {
     fn drop_screen(&mut self) {
         self.reconcile_result();
         self.screen = None;
-        self.play_commit = None;
+        self.carries.on(crate::carry::Event::PlayGone);
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i
@@ -10737,6 +10770,137 @@ pub(crate) mod tests {
         }
     }
 
+    /// A chart of 4 taps, the carry tests' targets.
+    fn four_taps() -> Arc<Chart> {
+        let lane = Lane::new(1).unwrap();
+        Arc::new(
+            ChartBuilder::new(120_000)
+                .tap(lane, TimeUs(10_000_000))
+                .tap(lane, TimeUs(11_000_000))
+                .tap(lane, TimeUs(12_000_000))
+                .tap(lane, TimeUs(13_000_000))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Prepares an attempt of play state `key` with `skin` staged and
+    /// commits it; the request's offer.
+    fn staged_attempt(
+        screens: &Installers,
+        link: &super::RenderLink,
+        chart: &Chart,
+        key: crate::carry::CarryKey,
+        skin: &Arc<render::SkinBundle>,
+    ) -> CarryOffered {
+        let ready = link.prepare_attempt_with(
+            titled(chart).with_carry_key(Some(key)),
+            super::AttemptSkin::Specialized(Arc::clone(skin)),
+            || false,
+        );
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        screens.offers.lock().unwrap().last().unwrap().1.clone()
+    }
+
+    /// A witnessed round at a full score on a fresh link over 4 taps: the
+    /// installers, the link, the chart and the skin.
+    fn witnessed_round() -> (
+        Installers,
+        super::RenderLink,
+        Arc<Chart>,
+        Arc<render::SkinBundle>,
+    ) {
+        let chart = four_taps();
+        let (screens, link, skin) = carry_link(&chart);
+        *screens.round.lock().unwrap() = Some(latched());
+        screens.witness.store(true, Ordering::Release);
+        assert_eq!(
+            carried_attempt(&screens, &link, &chart, CARRY_KEY, true),
+            None
+        );
+        play_round(&link, &chart, full_tally());
+        *screens.round.lock().unwrap() = None;
+        (screens, link, chart, skin)
+    }
+
+    /// The screen lost after a commit and before its play, built again by
+    /// the result's upload (code review r1, HIGH): the play still starts
+    /// and its settlement takes the final point and leaves no valid slots.
+    #[test]
+    fn a_screen_lost_before_the_play_settles_the_point() {
+        let (screens, link, chart, _) = witnessed_round();
+        // Round 2 committed with the latch carried.
+        assert_eq!(
+            carried_attempt(&screens, &link, &chart, CARRY_KEY, true),
+            Some((200_000, Some(latched())))
+        );
+        // A result upload fails as a lost device: the screen is dropped.
+        screens.fail.store(true, Ordering::Release);
+        let lost = link.upload_result(crate::result_skin::Upload::Bundle(bundle()));
+        assert!(lost.wait().is_err());
+        screens.fail.store(false, Ordering::Release);
+        // The next upload builds the screen again, holding no `Play`.
+        let again = link.upload_result(crate::result_skin::Upload::Bundle(bundle()));
+        assert_eq!(again.wait().unwrap(), Preparation::Ready);
+        play_round(&link, &chart, poor_tally());
+        assert_eq!(
+            carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
+            Some((0, None))
+        );
+        link.exit();
+    }
+
+    /// The pending marker committed in the play state invalidates the
+    /// slots, and a specialization of the very bundle before does not
+    /// bring them back (A, pending, A); a withdrawn marker keeps them.
+    #[test]
+    fn a_pending_marker_invalidates_the_slots() {
+        for withdrawn in [false, true] {
+            let (screens, link, chart, skin) = witnessed_round();
+            if withdrawn {
+                stall_render(&link, &screens);
+                let mut pending = link.pend(ScreenKind::Play);
+                let (_, apart) = std::sync::mpsc::sync_channel(1);
+                let rx = std::mem::replace(&mut pending.rx, apart);
+                drop(pending);
+                screens.stall.store(false, Ordering::Release);
+                let answer = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+                assert_eq!(answer, Preparation::Cancelled);
+                link.end_loading().unwrap();
+            } else {
+                assert_eq!(
+                    link.pend(ScreenKind::Play).wait().unwrap(),
+                    Preparation::Ready
+                );
+            }
+            let slots = withdrawn.then(latched);
+            assert_eq!(
+                staged_attempt(&screens, &link, &chart, CARRY_KEY, &skin),
+                Some((200_000, slots)),
+                "withdrawn: {withdrawn}"
+            );
+            link.exit();
+        }
+    }
+
+    /// An attempt prepared in place on the installed skin, its selection
+    /// cleared (`select(Play, None)`), draws with the same installation:
+    /// it is offered the witnessed slots and the cached point.
+    #[test]
+    fn an_in_place_prepare_keeps_the_record() {
+        let (screens, link, chart, _) = witnessed_round();
+        assert_eq!(
+            link.select(ScreenKind::Play, None).wait().unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(
+            carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
+            Some((200_000, Some(latched())))
+        );
+        link.exit();
+    }
+
     /// The play state and chart of the carry tests' attempts.
     const CARRY_KEY: crate::carry::CarryKey = crate::carry::CarryKey {
         play_state: 1,
@@ -10835,7 +10999,7 @@ pub(crate) mod tests {
     /// 200 000, not 0).
     #[test]
     fn a_committed_attempt_cancelled_before_start_keeps_the_cache() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         screens.witness.store(true, Ordering::Release);
@@ -10864,7 +11028,7 @@ pub(crate) mod tests {
     /// point from the final tally and leaves no valid slots.
     #[test]
     fn a_judgment_after_the_last_frame_settles_the_point() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         let _ = carried_attempt(&screens, &link, &chart, CARRY_KEY, true);
@@ -10884,7 +11048,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unwitnessed_round_invalidates_the_play_state() {
         for witnessed_first in [false, true] {
-            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let chart = four_taps();
             let (screens, link, _) = carry_link(&chart);
             *screens.round.lock().unwrap() = Some(latched());
             screens.witness.store(witnessed_first, Ordering::Release);
@@ -10909,7 +11073,7 @@ pub(crate) mod tests {
     /// attempt is offered what the witnessed round left.
     #[test]
     fn a_discarded_stage_changes_nothing() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         screens.witness.store(true, Ordering::Release);
@@ -10929,7 +11093,7 @@ pub(crate) mod tests {
     /// starts, then the play and its settlement keep the witnessed slots.
     #[test]
     fn a_result_upload_keeps_the_committed_attempt() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         screens.witness.store(true, Ordering::Release);
@@ -10951,7 +11115,7 @@ pub(crate) mod tests {
     #[test]
     fn another_installation_invalidates_the_slots() {
         for refused in [false, true] {
-            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let chart = four_taps();
             let (screens, link, a) = carry_link(&chart);
             *screens.round.lock().unwrap() = Some(latched());
             screens.witness.store(true, Ordering::Release);
@@ -10984,7 +11148,7 @@ pub(crate) mod tests {
     /// outside practice) starts fresh.
     #[test]
     fn the_carry_follows_its_play_state() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         screens.witness.store(true, Ordering::Release);
@@ -11008,7 +11172,7 @@ pub(crate) mod tests {
     /// tally's.
     #[test]
     fn a_device_lost_in_a_round_invalidates_the_slots() {
-        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let chart = four_taps();
         let (screens, link, _) = carry_link(&chart);
         *screens.round.lock().unwrap() = Some(latched());
         screens.witness.store(true, Ordering::Release);
