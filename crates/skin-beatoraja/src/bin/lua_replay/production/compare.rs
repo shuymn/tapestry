@@ -14,7 +14,7 @@ use skin_model::present::{Fail, Val};
 
 use super::{ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
-use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw};
+use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw, RefFrame, TimerOut};
 use crate::report::{Finding, Report, Stopped};
 
 /// LuaJ's `toint()` of a value (`SkinLuaAccessor.java:640-651`): the
@@ -208,19 +208,50 @@ type TimerTrace = (bool, Option<i64>, Option<i64>, Option<bms_model::TimeUs>);
 /// One invocation's raw result and its conversion.
 type Invocation = (Result<Val, Fail>, Converted);
 
-/// One frame's production events, by callback, every one kept.
+/// A program callback's call-1 event.
+#[derive(Clone, Copy)]
+enum First {
+    Ran(Invocation),
+    Skipped(Skip),
+}
+
+/// One frame's production events after [`shapes`]: one of each.
 #[derive(Default)]
-struct ByK {
-    ran: BTreeMap<(u16, u8), Vec<Invocation>>,
-    /// Every invocation in order.
+struct Prod {
+    first: BTreeMap<u16, First>,
+    second: BTreeMap<u16, Invocation>,
+    timer: BTreeMap<u16, TimerTrace>,
+    /// Every invocation, in order.
     order: Vec<(u16, u8)>,
-    timer: BTreeMap<u16, Vec<TimerTrace>>,
-    skipped: BTreeMap<u16, Vec<Skip>>,
     sampled: BTreeMap<usize, Vec<i64>>,
 }
 
-fn by_k(events: &[Event]) -> ByK {
-    let mut b = ByK::default();
+/// One frame's reference points after [`shapes`]: each occurrence's
+/// call-1 point and call-2 outcome, and each invoked timer's summary.
+#[derive(Default)]
+struct Refs {
+    first: BTreeMap<Join, Point>,
+    second: BTreeMap<Join, Outcome>,
+    timers: BTreeMap<Join, TimerOut>,
+}
+
+/// A shape finding: production's callback or the source's occurrence it
+/// concerns, and what is wrong.
+type Misshapen = (Option<u16>, Option<Key>, String);
+
+/// The frame's events on both sides, checked for shape before anything is
+/// compared (s7-06e-1-r1-tables.md, A2): every finding of a shape that
+/// is not exactly once, an orphan or a reuse, and the events kept once.
+#[expect(clippy::too_many_lines, reason = "one rule per shape, both sides")]
+fn shapes(
+    events: &[Event],
+    rf: &RefFrame,
+    is_timer: &dyn Fn(u16) -> bool,
+    timer_slots: &BTreeMap<u16, usize>,
+) -> (Prod, Refs, Vec<Misshapen>) {
+    let mut p = Prod::default();
+    let mut bad: Vec<Misshapen> = Vec::new();
+    let mut kbad = |k: u16, what: String| bad.push((Some(k), None, what));
     for e in events {
         match *e {
             Event::Ran {
@@ -229,8 +260,21 @@ fn by_k(events: &[Event]) -> ByK {
                 result,
                 conv,
             } => {
-                b.order.push((k, call));
-                b.ran.entry((k, call)).or_default().push((result, conv));
+                p.order.push((k, call));
+                if call == 1 {
+                    if p.first.insert(k, First::Ran((result, conv))).is_some() {
+                        kbad(k, format!("callback {k}: a second call-1 event"));
+                    }
+                } else if !is_timer(k) || call != 2 {
+                    kbad(k, format!("callback {k}: call {call} of a non-timer"));
+                } else if p.second.insert(k, (result, conv)).is_some() {
+                    kbad(k, format!("callback {k}: a second call-2 event"));
+                }
+            }
+            Event::Skipped { k, why } => {
+                if p.first.insert(k, First::Skipped(why)).is_some() {
+                    kbad(k, format!("callback {k}: skipped and another call-1 event"));
+                }
             }
             Event::Timer {
                 k,
@@ -238,31 +282,94 @@ fn by_k(events: &[Event]) -> ByK {
                 start,
                 elapsed_ms,
                 installed,
-            } => b
-                .timer
-                .entry(k)
-                .or_default()
-                .push((on, start, elapsed_ms, installed)),
-            Event::Skipped { k, why } => b.skipped.entry(k).or_default().push(why),
-            Event::Sampled { slot, age_us } => b.sampled.entry(slot).or_default().push(age_us),
+            } => {
+                if !is_timer(k) {
+                    kbad(k, format!("callback {k}: a timer event of a non-timer"));
+                } else if p
+                    .timer
+                    .insert(k, (on, start, elapsed_ms, installed))
+                    .is_some()
+                {
+                    kbad(k, format!("timer {k}: a second timer event"));
+                }
+            }
+            Event::Sampled { slot, age_us } => p.sampled.entry(slot).or_default().push(age_us),
         }
     }
-    b
-}
-
-/// The skip causes production may give for a source's `NotReached` of
-/// `why`, stopped by `by` (s7-06e-1-r1-tables.md, A): through a compiled
-/// callback, the callback it follows (`After`); through an expression or
-/// a property, its gate. A negative selector has no production gate
-/// (§7.1): any skip is accepted, a production invocation there is the
-/// finding. `None` for a cause no skip may answer.
-fn allowed(why: Cause, by_compiled: Option<bool>) -> Option<&'static [Skip]> {
-    match (why, by_compiled) {
-        (Cause::Inconclusive, _) => None,
-        (Cause::Selector, _) => Some(&[Skip::Gate, Skip::After]),
-        (_, Some(true)) => Some(&[Skip::After]),
-        (_, _) => Some(&[Skip::Gate]),
+    // Production's orphans: a second call without an on first, a timer
+    // event without an invocation, an invoked timer without its event, a
+    // program slot sampled without an installed start.
+    for (&k, f) in &p.first {
+        let on = matches!(f, First::Ran((_, Converted::Long(Some(v)))) if *v != i64::MIN);
+        if p.second.contains_key(&k) && !on {
+            kbad(k, format!("timer {k}: a second call after no on first"));
+        }
+        let ran = matches!(f, First::Ran(_));
+        if is_timer(k) && ran != p.timer.contains_key(&k) {
+            kbad(
+                k,
+                format!(
+                    "timer {k}: invoked {ran}, timer event {}",
+                    p.timer.contains_key(&k)
+                ),
+            );
+        }
     }
+    for &k in p.timer.keys() {
+        if !p.first.contains_key(&k) {
+            kbad(k, format!("timer {k}: a timer event with no invocation"));
+        }
+    }
+    for (&k, &slot) in timer_slots {
+        let installed = p.timer.get(&k).is_some_and(|t| t.3.is_some());
+        if p.sampled.contains_key(&slot) && !installed {
+            kbad(k, format!("timer {k}: sampled with no installed start"));
+        }
+    }
+    // The reference's.
+    let mut r = Refs::default();
+    let mut ran1: BTreeSet<Join> = BTreeSet::new();
+    for pt in &rf.points {
+        match *pt {
+            Point::Ran { key, call: 1, .. } | Point::NotReached { key, .. } => {
+                if r.first.insert(join(&key), *pt).is_some() {
+                    bad.push((
+                        None,
+                        Some(key),
+                        "the source's occurrence twice in one frame".into(),
+                    ));
+                }
+                if matches!(pt, Point::Ran { .. }) {
+                    ran1.insert(join(&key));
+                }
+            }
+            Point::Ran { key, outcome, .. } => {
+                if key.field != "timer" || !ran1.contains(&join(&key)) {
+                    bad.push((None, Some(key), "a second call with no first".into()));
+                } else if r.second.insert(join(&key), outcome).is_some() {
+                    bad.push((None, Some(key), "the source's second call twice".into()));
+                }
+            }
+        }
+    }
+    for t in &rf.timers {
+        if !ran1.contains(&join(&t.key)) || r.timers.insert(join(&t.key), *t).is_some() {
+            bad.push((
+                None,
+                Some(t.key),
+                "a timer summary not once per invoked timer".into(),
+            ));
+        }
+    }
+    for j in &ran1 {
+        if j.1 == "timer" && !r.timers.contains_key(j) {
+            let key = r.first.get(j).map(|p| match p {
+                Point::Ran { key, .. } | Point::NotReached { key, .. } => *key,
+            });
+            bad.push((None, key, "an invoked timer with no summary".into()));
+        }
+    }
+    (p, r, bad)
 }
 
 /// What a consumer's output cells hold after the source's invocation:
@@ -272,6 +379,32 @@ fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
         Some(Converted::Bool(b)) => (i32::from(b), i32::from(o != Outcome::Unavailable)),
         Some(Converted::Int(n, ok)) => (n, i32::from(ok)),
         _ => (0, 0),
+    }
+}
+
+/// Whether a compiled consumer's outcome lets the one after it run
+/// (`Present::run`'s `after`): a value given and no sentinel, a draw or
+/// an `op` true.
+fn allows(field: &str, o: Outcome) -> bool {
+    match converted(field, o) {
+        Some(Converted::Int(_, ok)) => ok,
+        Some(Converted::Bool(b)) => b && o != Outcome::Unavailable,
+        _ => false,
+    }
+}
+
+/// The skips production may give for a source's `NotReached` of `why`
+/// whose object's last compiled consumer before it did not allow it
+/// (`blocked`): its `after` is checked before its gate, so `After`; else
+/// its gate. A negative selector has no production gate (§7.1): either is
+/// accepted, a production invocation there being the finding. `None` for
+/// a cause no skip may answer (s7-06e-1-r1-tables.md, A3).
+fn allowed(why: Cause, blocked: bool) -> Option<&'static [Skip]> {
+    match (why, blocked) {
+        (Cause::Inconclusive, _) => None,
+        (Cause::Selector, _) => Some(&[Skip::Gate, Skip::After]),
+        (_, true) => Some(&[Skip::After]),
+        (_, false) => Some(&[Skip::Gate]),
     }
 }
 
@@ -297,6 +430,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 field: o.field,
                 index: o.index,
                 callable: o.callable,
+                path: "",
             };
             by_key.insert(join(&key), o);
             if let (Some(k), "compiled") = (o.program, o.disposition) {
@@ -314,8 +448,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         field: "?",
         index: 0,
         callable: u32::MAX,
+        path: "",
     };
     let key_k = |k: u16| key_of.get(&k).copied().unwrap_or(unknown);
+    let is_timer = |k: u16| key_of.get(&k).is_some_and(|key| key.field == "timer");
     let mut findings: Vec<Finding> = Vec::new();
     let mut find = |key: Key, frame: usize, what: String| {
         findings.push(Finding {
@@ -337,7 +473,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         );
     }
     // A compiled callback on an object the reference does not run: one
-    // finding for the run, its frames not reported again.
+    // located finding for the run, its frames not reported again; a
+    // lowered one is counted until e-3.
     let mut listed_k: BTreeSet<u16> = BTreeSet::new();
     for (label, list) in [
         ("unmodelled", &obs.unmodelled),
@@ -369,123 +506,124 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
     let mut stopped: BTreeMap<u32, (&'static str, usize, Key)> = BTreeMap::new();
     let callbacks = u16::try_from(run.callbacks).unwrap_or(u16::MAX);
     for (i, (pf, rf)) in run.frames.iter().zip(&obs.frames).enumerate() {
-        let p = by_k(&pf.events);
+        let (p, r, bad) = shapes(&pf.events, rf, &is_timer, &run.timer_slots);
+        for (k, key, what) in bad {
+            find(key.unwrap_or_else(|| k.map_or(unknown, key_k)), i, what);
+        }
         rep.production_runs += p.order.len();
-        // Cardinality: one of each (k, call), one skip, one timer at most.
-        for (&(k, call), v) in &p.ran {
-            if v.len() > 1 {
-                find(
-                    key_k(k),
-                    i,
-                    format!("duplicate invocation {k} call {call} ({}x)", v.len()),
-                );
-            }
-        }
-        for (&k, v) in &p.skipped {
-            if v.len() > 1 || p.ran.contains_key(&(k, 1)) {
-                find(
-                    key_k(k),
-                    i,
-                    format!("callback {k} skipped {}x and ran", v.len()),
-                );
-            }
-        }
-        for (&k, v) in &p.timer {
-            if v.len() > 1 {
-                find(key_k(k), i, format!("timer {k} traced {}x", v.len()));
-            }
-        }
         let mut used: BTreeSet<(u16, u8)> = BTreeSet::new();
         let mut seen: BTreeSet<u16> = BTreeSet::new();
         let mut order: Vec<(u16, u8)> = Vec::new();
         let mut outs: BTreeMap<u16, (i32, i32)> = BTreeMap::new();
-        for pt in &rf.points {
-            rep.points += 1;
-            match *pt {
-                Point::Ran { key, call, outcome } => {
-                    let k = cx.compiled(&key);
-                    let api = match outcome {
-                        Outcome::Unanswered(a) => Some(a),
-                        Outcome::Budget => Some("budget"),
-                        _ => None,
-                    };
-                    if let Some(api) = api
-                        && k.is_none()
-                    {
-                        stopped.entry(key.callable).or_insert((api, 0, key)).1 += 1;
-                    }
-                    let Some(k) = k else {
-                        match cx.attribute(&key) {
-                            Some(b) => *rep.buckets.entry(b).or_default() += 1,
-                            None => find(key, i, "no production record of this occurrence".into()),
+        // Per object, in schedule order: whether the last compiled
+        // consumer before a point did not allow what follows.
+        for range in &rf.objects {
+            let mut blocked = false;
+            for pt in rf.points.get(range.clone()).unwrap_or_default() {
+                rep.points += 1;
+                match *pt {
+                    Point::Ran { key, call, outcome } => {
+                        let k = cx.compiled(&key);
+                        let api = match outcome {
+                            Outcome::Unanswered(a) => Some(a),
+                            Outcome::Budget => Some("budget"),
+                            _ => None,
+                        };
+                        if let Some(api) = api
+                            && k.is_none()
+                        {
+                            stopped.entry(key.callable).or_insert((api, 0, key)).1 += 1;
                         }
-                        continue;
-                    };
-                    seen.insert(k);
-                    order.push((k, call));
-                    rep.matched += 1;
-                    if let Some(api) = api {
-                        find(key, i, format!("reference could not complete ({api})"));
+                        let Some(k) = k else {
+                            match cx.attribute(&key) {
+                                Some(b) => *rep.buckets.entry(b).or_default() += 1,
+                                None => {
+                                    find(key, i, "no production record of this occurrence".into());
+                                }
+                            }
+                            continue;
+                        };
+                        seen.insert(k);
+                        order.push((k, call));
+                        rep.matched += 1;
+                        if call == 1 && key.field != "timer" {
+                            blocked = !allows(key.field, outcome);
+                            outs.insert(k, expected_out(key.field, outcome));
+                        }
+                        if let Some(api) = api {
+                            find(key, i, format!("reference could not complete ({api})"));
+                            used.insert((k, call));
+                            continue;
+                        }
+                        let prod = if call == 1 {
+                            match p.first.get(&k) {
+                                Some(First::Ran(inv)) => Some(*inv),
+                                Some(First::Skipped(s)) => {
+                                    find(
+                                        key,
+                                        i,
+                                        format!("ran in the source, skipped in production ({s:?})"),
+                                    );
+                                    continue;
+                                }
+                                None => None,
+                            }
+                        } else {
+                            p.second.get(&k).copied()
+                        };
+                        let Some(prod) = prod else {
+                            find(
+                                key,
+                                i,
+                                format!("ran in the source, call {call} not traced in production"),
+                            );
+                            continue;
+                        };
                         used.insert((k, call));
-                        continue;
-                    }
-                    if call == 1 && key.field != "timer" {
-                        outs.insert(k, expected_out(key.field, outcome));
-                    }
-                    let Some(prod) = p.ran.get(&(k, call)).and_then(|v| v.first()).copied() else {
-                        let why = p
-                            .skipped
-                            .get(&k)
-                            .and_then(|v| v.first())
-                            .map_or("not traced".into(), |s| format!("{s:?}"));
-                        find(
-                            key,
-                            i,
-                            format!("ran in the source, not in production ({why})"),
-                        );
-                        continue;
-                    };
-                    used.insert((k, call));
-                    match differ(key.field, prod, outcome) {
-                        None => rep.agreed += 1,
-                        Some(d) => {
-                            let hint = luaj_hint(obs, key.callable);
-                            find(key, i, format!("{d}{hint}"));
+                        match differ(key.field, prod, outcome) {
+                            None => rep.agreed += 1,
+                            Some(d) => {
+                                let hint = luaj_hint(obs, key.callable);
+                                find(key, i, format!("{d}{hint}"));
+                            }
                         }
                     }
-                }
-                Point::NotReached { key, why, by } => {
-                    let Some(k) = cx.compiled(&key) else {
-                        continue;
-                    };
-                    seen.insert(k);
-                    rep.matched += 1;
-                    outs.insert(k, (0, 0));
-                    if p.ran.contains_key(&(k, 1)) {
-                        used.insert((k, 1));
-                        used.insert((k, 2));
-                        find(
-                            key,
-                            i,
-                            format!("invoked in production, not in the source ({why:?})"),
-                        );
-                        continue;
-                    }
-                    let skip = p.skipped.get(&k).and_then(|v| v.first()).copied();
-                    let by_compiled = by.map(|b| cx.compiled(&b).is_some());
-                    match (skip, allowed(why, by_compiled)) {
-                        (None, _) => find(key, i, format!("no skip traced ({why:?})")),
-                        (Some(_), None) => {
-                            find(key, i, format!("reference could not decide ({why:?})"))
+                    Point::NotReached { key, why } => {
+                        let Some(k) = cx.compiled(&key) else {
+                            continue;
+                        };
+                        let was_blocked = blocked;
+                        if key.field != "timer" {
+                            blocked = true;
                         }
-                        (Some(s), Some(ok)) if ok.contains(&s) => rep.agreed += 1,
-                        (Some(s), Some(ok)) => find(
-                            key,
-                            i,
-                            format!(
-                                "skip cause: production {s:?}, source {why:?} (expects {ok:?})"
+                        seen.insert(k);
+                        rep.matched += 1;
+                        outs.insert(k, (0, 0));
+                        match (p.first.get(&k), allowed(why, was_blocked)) {
+                            (Some(First::Ran(_)), _) => {
+                                used.insert((k, 1));
+                                used.insert((k, 2));
+                                find(
+                                    key,
+                                    i,
+                                    format!("invoked in production, not in the source ({why:?})"),
+                                );
+                            }
+                            (None, _) => find(key, i, format!("no skip traced ({why:?})")),
+                            (Some(First::Skipped(_)), None) => {
+                                find(key, i, format!("reference could not decide ({why:?})"));
+                            }
+                            (Some(First::Skipped(s)), Some(ok)) if ok.contains(s) => {
+                                rep.agreed += 1
+                            }
+                            (Some(First::Skipped(s)), Some(ok)) => find(
+                                key,
+                                i,
+                                format!(
+                                    "skip cause: production {s:?}, source {why:?} (expects {ok:?})"
+                                ),
                             ),
-                        ),
+                        }
                     }
                 }
             }
@@ -516,8 +654,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 format!("order: production {prod_order:?}, source {order:?}"),
             );
         }
-        // Production invocations and skips with no source point.
-        for &(k, call) in p.ran.keys() {
+        // Production invocations with no source point.
+        for &(k, call) in &p.order {
             if !used.contains(&(k, call)) && !listed_k.contains(&k) {
                 find(
                     key_k(k),
@@ -526,17 +664,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 );
             }
         }
-        for &k in p.skipped.keys() {
-            if !seen.contains(&k) && !listed_k.contains(&k) {
-                find(
-                    key_k(k),
-                    i,
-                    format!("production skip of {k} with no source point"),
-                );
-            }
-        }
         // Timers: start, elapsed, installed start, sampled age.
-        for t in &rf.timers {
+        for t in r.timers.values() {
             let Some(k) = cx.compiled(&t.key) else {
                 continue;
             };
@@ -555,7 +684,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 elapsed.filter(|_| t.on),
                 installed,
             );
-            match p.timer.get(&k).and_then(|v| v.first()) {
+            match p.timer.get(&k) {
                 None => find(t.key, i, "timer not traced in production".into()),
                 Some(&got) if got != want => {
                     find(
@@ -572,8 +701,15 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 .and_then(|s| p.sampled.get(s))
                 .cloned()
                 .unwrap_or_default();
-            match elapsed.filter(|_| installed_ok && t.shown) {
-                Some(e) => {
+            match (elapsed.filter(|_| installed_ok), t.shown) {
+                (Some(_), None) => {
+                    find(
+                        t.key,
+                        i,
+                        "the selected source's fact is unknown: sampling undecided".into(),
+                    );
+                }
+                (Some(e), Some(true)) => {
                     let age = e.min(cap).saturating_mul(1_000);
                     if ages.is_empty() {
                         find(t.key, i, "no sampled age where the source draws".into());
@@ -581,14 +717,14 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         find(t.key, i, format!("sampled ages {ages:?}, source {age}"));
                     }
                 }
-                None if !ages.is_empty() => {
+                _ if !ages.is_empty() => {
                     find(
                         t.key,
                         i,
                         format!("sampled {ages:?} where the source draws nothing"),
                     );
                 }
-                None => {}
+                _ => {}
             }
         }
         // The output cells expressions read.
@@ -871,6 +1007,48 @@ mod tests {
         found("frame missing", &|run, _| {
             run.frames.pop();
         });
+        found("timer summaries cleared", &|_, obs| {
+            for f in &mut obs.frames {
+                f.timers.clear();
+            }
+        });
+        found("a timer event for a skipped draw", &|run, _| {
+            for f in &mut run.frames {
+                let skipped = f.events.iter().find_map(|e| match e {
+                    Event::Skipped { k, .. } => Some(*k),
+                    _ => None,
+                });
+                if let Some(k) = skipped {
+                    f.events.push(Event::Timer {
+                        k,
+                        on: false,
+                        start: None,
+                        elapsed_ms: None,
+                        installed: None,
+                    });
+                }
+            }
+        });
+        found("a program slot sampled while off", &|run, _| {
+            let slot = run.timer_slots.values().next().copied().unwrap_or(0);
+            if let Some(f) = run.frames.first_mut() {
+                f.events.push(Event::Sampled { slot, age_us: 0 });
+            }
+        });
+        found("a source point twice", &|_, obs| {
+            if let Some(f) = obs.frames.first_mut()
+                && let Some(pt) = f
+                    .points
+                    .iter()
+                    .find(|p| matches!(p, crate::observed::Point::NotReached { .. }))
+                    .copied()
+            {
+                f.points.push(pt);
+                if let Some(r) = f.objects.last_mut() {
+                    r.end = f.points.len();
+                }
+            }
+        });
         found("source point missing", &|_, obs| {
             if let Some(f) = obs.frames.first_mut() {
                 f.points
@@ -889,8 +1067,31 @@ mod tests {
             o.program = Some(99);
         }
         assert!(!run.same_import(&other, &run.structure));
-        // The same records with another program structure.
-        let records = run.recorded.clone();
-        assert!(!run.same_import(&records, &format!("{} ", run.structure)));
+        // Programs differing in a constant, a read, a gate or a slot, with
+        // the same occurrence records, differ in structure.
+        let base = |c: &str, read: &str, op: &str, init: &str| {
+            format!(
+                "local latch = (function()\n\
+                   local state = {init}\n\
+                   return function()\n\
+                     if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
+                     return state\n\
+                   end\n\
+                 end)()\n\
+                 table.insert(skin.destination, {{ id = \"i\", timer = latch, loop = -1, dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n\
+                 table.insert(skin.destination, {{ id = \"i\", op = {{ {op} }}, draw = function() return ms.number({read}) / {c} >= 0 end, dst = {{ {{ x = 100, y = 0, w = 64, h = 64 }} }} }})\n"
+            )
+        };
+        let (a, _) = pieces(&base("2", "100", "32", "ms.timer_off_value"));
+        for (what, body) in [
+            ("constant", base("3", "100", "32", "ms.timer_off_value")),
+            ("read", base("2", "101", "32", "ms.timer_off_value")),
+            ("gate", base("2", "100", "42", "ms.timer_off_value")),
+            ("slot", base("2", "100", "32", "-1")),
+        ] {
+            let (b, _) = pieces(&body);
+            assert_eq!(a.recorded.occurrences, b.recorded.occurrences, "{what}");
+            assert!(!a.same_import(&b.recorded, &b.structure), "{what}");
+        }
     }
 }

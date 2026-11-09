@@ -633,6 +633,147 @@ fn isolation_entries_parse() {
     assert!(!isolation::same_file("@C:/x/play/xplay.lua", "play.lua"));
 }
 
+/// A3: a property skips a compiled condition (`Gate`), and the timer
+/// after it follows that condition, which did not run (`After`).
+#[test]
+fn a_skipped_condition_skips_the_timer_after_it() {
+    let body = dst(
+        "\"i\"",
+        0,
+        &format!(
+            "op = {{ 33, {HALF_POINT} }}, timer = function() return ms.time() end, loop = -1,"
+        ),
+    );
+    let r = run(&body);
+    agrees(&r, 2);
+    assert_eq!(r.matched, r.frames * 2, "{}", r.text(0, true, true));
+}
+
+/// B2: a numeric `draw` the boolean-property factory does not know (950,
+/// and the configured option 905) adds no condition in the source: the
+/// timer after it runs every frame on both sides.
+#[test]
+fn a_numeric_draw_the_factory_does_not_know_adds_no_condition() {
+    let t = "timer = function() return ms.time() end, loop = -1,";
+    let body = format!(
+        "{}{}",
+        dst("\"i\"", 0, &format!("draw = 950, {t}")),
+        dst("\"i\"", 100, &format!("draw = 905, {t}"))
+    );
+    let r = run(&body);
+    agrees(&r, 2);
+    assert_eq!(r.matched, r.frames * 4, "{}", r.text(0, true, true));
+}
+
+/// B2: a grouped image with fewer cells than groups (`divx = divy = 1`,
+/// `len = 2`) builds empty arrays, fails validation and is removed: the
+/// reference invokes none of its callbacks.
+#[test]
+fn a_group_with_empty_arrays_is_removed() {
+    let body = format!(
+        "table.insert(skin.image, {{ id = \"g\", src = \"a\", x = 0, y = 0, w = 8, h = 8, len = 2, ref = 0 }})\n{}",
+        dst("\"g\"", 0, &format!("draw = {HALF_POINT},"))
+    );
+    let r = run(&body);
+    assert!(
+        r.removed.iter().any(|l| l.what == "invalid"),
+        "{}",
+        r.text(0, true, true)
+    );
+    assert_eq!(r.points, 0, "{}", r.text(0, true, true));
+    // Production keeps no callback of it either.
+    assert!(r.passes(), "{}", r.text(0, true, true));
+}
+
+/// B2: an image set whose selected entry's source fact is unknown (a
+/// glob) is never taken as a hole: sampling is undecided, a finding.
+#[test]
+fn an_unknown_entry_is_inconclusive() {
+    let body = format!(
+        "{LATCH}table.insert(skin.source, {{ id = \"glob\", path = \"x/*.png\" }})\n\
+         table.insert(skin.image, {{ id = \"u\", src = \"glob\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         skin.imageset = {{ {{ id = \"h\", images = {{ \"i\", \"u\" }}, value = function() return ms.number(100) * 0 + 1 end }} }}\n{}",
+        dst("\"h\"", 0, "timer = latch, loop = -1,")
+    );
+    let r = run(&body);
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.what.contains("fact is unknown")),
+        "{}",
+        r.text(0, true, true)
+    );
+}
+
+/// A4: a listed object's callables keep their consumer: an unmodelled
+/// slider's lowered `value` is attributed to production's record of it,
+/// and a compiled one is one located finding for the run.
+#[test]
+fn listed_consumers_join_their_records() {
+    let slider = |value: &str| {
+        format!(
+            "skin.slider = {{ {{ id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 100,\n\
+               value = function() {value} end }} }}\n{}",
+            dst("\"sl\"", 0, "")
+        )
+    };
+    let lowered = run(&slider("return ms.number(100) / 2000"));
+    let compiled = run(&slider("return ms.number(100) / 3 + 0.5"));
+    for r in [&lowered, &compiled] {
+        let listed = r.unmodelled.iter().find(|l| l.what == "slider");
+        assert!(
+            listed.is_some_and(|l| l
+                .callables
+                .iter()
+                .all(|k| k.field == "value" && k.path == "def")),
+            "{}",
+            r.text(0, true, true)
+        );
+        let attributed = r
+            .buckets
+            .keys()
+            .any(|b| b.starts_with("lowered on a unmodelled object"));
+        let found = r
+            .findings
+            .iter()
+            .filter(|f| f.what.starts_with("compiled on a unmodelled object"))
+            .count();
+        // Each listed value is either lowered and counted, or compiled and
+        // one finding, never per frame.
+        assert!(attributed || found == 1, "{}", r.text(0, true, true));
+        assert!(found <= 1, "{}", r.text(0, true, true));
+        assert!(
+            r.findings.iter().all(|f| f.what.starts_with("compiled on")),
+            "{}",
+            r.text(0, true, true)
+        );
+    }
+}
+
+/// A4: an isolation reader on a listed object is found by its consumer:
+/// a slider's `value` reading what a stopped value writes.
+#[test]
+fn a_listed_reader_carries_its_evidence() {
+    let body = "local n\n\
+         skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+           value = function() if ms.float_number(113) ~= 0 then n = 1 else n = 2 end return n end } }\n\
+         skin.slider = { { id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 100,\n\
+           value = function() return n or 0 end } }\n\
+         table.insert(skin.destination, { id = \"sl\", dst = { { x = 0, y = 0, w = 8, h = 8 } } })\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
+    let bare = run(body);
+    let line = site_of(&bare);
+    assert!(line > 0, "{}", bare.text(0, true, true));
+    let ok = with_isolation(
+        body,
+        &format!(
+            "root s.luaskin {line} writes n\nreader n s.luaskin {} value replaced Interference\n",
+            line + 2
+        ),
+    );
+    assert!(ok.passes(), "{}", ok.text(0, true, true));
+}
+
 /// A fixture's production run and what the reference observed, apart, for
 /// the comparator's own tests.
 pub fn pieces(body: &str) -> (crate::production::ProductionRun, crate::observed::Observed) {

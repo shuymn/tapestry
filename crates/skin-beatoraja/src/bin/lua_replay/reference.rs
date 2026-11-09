@@ -66,8 +66,8 @@ struct Obj {
     dest: usize,
     kind: Kind,
     sel: Sel,
-    /// An image set's entries, each whether its source loads.
-    entries: Vec<bool>,
+    /// An image set's entries, each its source's fact.
+    entries: Vec<Validity>,
     conds: Vec<Cond>,
     timer: Option<(Function, Key)>,
     options: Vec<i32>,
@@ -193,6 +193,17 @@ impl<'a> Reference<'a> {
     }
 
     fn key(&mut self, f: &Function, dest: usize, field: &'static str, index: u32) -> Key {
+        self.key_at(f, dest, (field, index), "")
+    }
+
+    /// [`Self::key`] of a listed object's part at object path `path`.
+    fn key_at(
+        &mut self,
+        f: &Function,
+        dest: usize,
+        (field, index): (&'static str, u32),
+        path: &'static str,
+    ) -> Key {
         let callable = self.vm.callable(f).unwrap_or(u32::MAX);
         if let std::collections::btree_map::Entry::Vacant(e) = self.observed.sites.entry(callable) {
             let info = f.info();
@@ -210,50 +221,76 @@ impl<'a> Reference<'a> {
             field,
             index,
             callable,
+            path,
         }
     }
 
-    /// Every function under `t` (to a few levels, each table once): the
-    /// callables of an object the reference does not run, its nested
-    /// parts' included.
+    /// Every function under `t` (to a few levels, each table once), keyed
+    /// by the consumer that holds it: `value`, `draw`, `timer`, an `op`
+    /// entry with its index, or `other`, at the object path `path` of
+    /// table keys: the callables of an object the reference does not run,
+    /// its nested parts' included.
     fn nested(
         &mut self,
         t: &Table,
         dest: usize,
+        (path, parent): (&str, &str),
         out: &mut Vec<Key>,
         seen: &mut BTreeSet<usize>,
-        depth: u32,
     ) {
-        if depth > 6 || !seen.insert(t.to_pointer().addr()) {
+        if path.matches('.').count() > 6 || !seen.insert(t.to_pointer().addr()) {
             return;
         }
-        let mut found: Vec<Value> = Vec::new();
-        let _ = t.for_each(|_: Value, v: Value| {
-            found.push(v);
+        let mut found: Vec<(String, Value)> = Vec::new();
+        let _ = t.for_each(|k: Value, v: Value| {
+            found.push((id_string(&k).unwrap_or_default(), v));
             Ok(())
         });
-        for v in found {
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, v) in found {
             match v {
                 Value::Function(f) => {
-                    let n = u32::try_from(out.len()).unwrap_or(u32::MAX);
-                    let k = self.key(&f, dest, "nested", n);
-                    if !out.iter().any(|o| o.callable == k.callable) {
+                    let consumer = if parent == "op" {
+                        ("op", name.parse::<u32>().map_or(0, |i| i.saturating_sub(1)))
+                    } else {
+                        (
+                            match name.as_str() {
+                                "value" => "value",
+                                "draw" => "draw",
+                                "timer" => "timer",
+                                _ => "other",
+                            },
+                            0,
+                        )
+                    };
+                    let k = self.key_at(&f, dest, consumer, intern(path));
+                    if !out.iter().any(|o| {
+                        o.callable == k.callable && o.field == k.field && o.index == k.index
+                    }) {
                         out.push(k);
                     }
                 }
-                Value::Table(t) => self.nested(&t, dest, out, seen, depth + 1),
+                Value::Table(t) => {
+                    let sub = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}.{name}")
+                    };
+                    self.nested(&t, dest, (&sub, &name), out, seen);
+                }
                 _ => {}
             }
         }
     }
 
-    /// Every callable of destination `d` and its definition `def`.
+    /// Every callable of destination `d` (path empty) and of its
+    /// definition `def` (path `def`).
     fn all_callables(&mut self, d: usize, dest: &Table, def: Option<&Table>) -> Vec<Key> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
-        self.nested(dest, d, &mut out, &mut seen, 0);
+        self.nested(dest, d, ("", ""), &mut out, &mut seen);
         if let Some(def) = def {
-            self.nested(def, d, &mut out, &mut seen, 0);
+            self.nested(def, d, ("def", "def"), &mut out, &mut seen);
         }
         out
     }
@@ -347,7 +384,15 @@ impl<'a> Reference<'a> {
             (Kind::Image, Sel::Zero, Validity::Valid)
         } else if let Some(img) = find(skin, "image", &id) {
             let len = int(&raw(&img, "len")).unwrap_or(0);
-            let validity = self.source(skin, &raw(&img, "src"));
+            let mut validity = self.source(skin, &raw(&img, "src"));
+            // A group splits its `divx·divy` cells into `len` arrays
+            // (`JsonSkinObjectLoader.java:50-59`): fewer cells than groups
+            // leave every array empty, so no source validates.
+            let cells = int(&raw(&img, "divx")).filter(|&d| d > 0).unwrap_or(1)
+                * int(&raw(&img, "divy")).filter(|&d| d > 0).unwrap_or(1);
+            if len > 1 && cells / len == 0 {
+                validity = Validity::Invalid;
+            }
             // A plain image ignores `ref` and `value`; a group reads its
             // image-index `ref` (`JsonSkinObjectLoader.java:49-64`).
             let sel = if len > 1 {
@@ -364,7 +409,7 @@ impl<'a> Reference<'a> {
                     .map_or(Validity::Invalid, |img| {
                         self.source(skin, &raw(&img, "src"))
                     });
-                entries.push(v == Validity::Valid);
+                entries.push(v);
                 validity = match (validity, v) {
                     (Validity::Movie, _) | (_, Validity::Movie) => Validity::Movie,
                     (Validity::Valid, _) | (_, Validity::Valid) => Validity::Valid,
@@ -432,8 +477,11 @@ impl<'a> Reference<'a> {
                 conds.push(Cond::Func(f, k));
             }
             v @ Value::String(_) => conds.push(Cond::Named(string(&v).unwrap_or_default())),
+            // An id the boolean-property factory does not know gives null,
+            // and the source adds no condition (`JSONSkinLoader.java:
+            // 458-462`): `draw` holds no configured option.
             v => {
-                if let Some(n) = int32(&v).filter(|&n| n != 0) {
+                if let Some(n) = int32(&v).filter(|&n| n != 0 && ReferenceVm::is_property(n)) {
                     conds.push(Cond::Prop(n));
                 }
             }
@@ -541,7 +589,9 @@ impl<'a> Reference<'a> {
             }
             let mut out = RefFrame::default();
             for o in &self.objects {
+                let from = out.points.len();
                 prepare(self.vm, self.items, o, &mut out);
+                out.objects.push(from..out.points.len());
             }
             self.observed.frames.push(out);
         }
@@ -600,16 +650,34 @@ pub fn to_long(v: &Value) -> i64 {
 }
 
 /// Every remaining occurrence of `o` from condition `from` on, and its
-/// timer, not reached for `why`, stopped by `by`.
-fn not_reached(o: &Obj, from: usize, why: Cause, by: Option<Key>, out: &mut RefFrame) {
+/// timer, not reached for `why`.
+fn not_reached(o: &Obj, from: usize, why: Cause, out: &mut RefFrame) {
     for c in o.conds.iter().skip(from) {
         if let Cond::Func(_, k) = c {
-            out.points.push(Point::NotReached { key: *k, why, by });
+            out.points.push(Point::NotReached { key: *k, why });
         }
     }
     if let Some((_, k)) = &o.timer {
-        out.points.push(Point::NotReached { key: *k, why, by });
+        out.points.push(Point::NotReached { key: *k, why });
     }
+}
+
+/// `s` with a static lifetime, each distinct one leaked once (an object
+/// path, for a key).
+fn intern(s: &str) -> &'static str {
+    thread_local! {
+        static SEEN: std::cell::RefCell<BTreeSet<&'static str>> =
+            const { std::cell::RefCell::new(BTreeSet::new()) };
+    }
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if let Some(&p) = seen.get(s) {
+            return p;
+        }
+        let p: &'static str = Box::leak(s.to_owned().into_boxed_str());
+        seen.insert(p);
+        p
+    })
 }
 
 /// An integer property's value as the source's prepare reads it: a null
@@ -634,11 +702,9 @@ fn prop(vm: &ReferenceVm, p: &PropRef, kind: &Kind) -> Result<i32, Cause> {
 /// `o`'s prepare path on the frame the VM holds.
 fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
     // 1. The selector or value.
-    let mut by = None;
     let sel: Result<i32, Cause> = match &o.sel {
         Sel::Zero => Ok(0),
         Sel::Callable(f, k) => {
-            by = Some(*k);
             let c = vm.call(f);
             out.points.push(Point::Ran {
                 key: *k,
@@ -658,21 +724,21 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
     };
     let sel = match sel {
         Ok(v) => v,
-        Err(why) => return not_reached(o, 0, why, by, out),
+        Err(why) => return not_reached(o, 0, why, out),
     };
     // 2. The kind's own gate before the conditions.
     match o.kind {
-        Kind::Image if sel < 0 => return not_reached(o, 0, Cause::Selector, None, out),
+        Kind::Image if sel < 0 => return not_reached(o, 0, Cause::Selector, out),
         Kind::Number if sel == i32::MIN || sel == i32::MAX => {
-            return not_reached(o, 0, Cause::Sentinel, by, out);
+            return not_reached(o, 0, Cause::Sentinel, out);
         }
         _ => {}
     }
     // 3. The conditions, the first false stopping.
     for (i, c) in o.conds.iter().enumerate() {
-        let (holds, by) = match c {
-            Cond::Prop(n) => (vm.condition(*n, items).ok_or(Cause::Inconclusive), None),
-            Cond::Named(name) => (vm.named_condition(name).ok_or(Cause::Inconclusive), None),
+        let holds = match c {
+            Cond::Prop(n) => vm.condition(*n, items).ok_or(Cause::Inconclusive),
+            Cond::Named(name) => vm.named_condition(name).ok_or(Cause::Inconclusive),
             Cond::Func(f, k) => {
                 let r = vm.call(f);
                 out.points.push(Point::Ran {
@@ -680,19 +746,18 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
                     call: 1,
                     outcome: outcome(&r),
                 });
-                let h = match &r {
+                match &r {
                     Called::Value(v) => Ok(to_bool(v)),
                     Called::Error => Ok(false),
                     Called::Unavailable => Err(Cause::Unavailable),
                     Called::Unanswered(_) | Called::Budget => Err(Cause::Inconclusive),
-                };
-                (h, Some(*k))
+                }
             }
         };
         match holds {
             Ok(true) => {}
-            Ok(false) => return not_reached(o, i + 1, Cause::Condition, by, out),
-            Err(why) => return not_reached(o, i + 1, why, by, out),
+            Ok(false) => return not_reached(o, i + 1, Cause::Condition, out),
+            Err(why) => return not_reached(o, i + 1, why, out),
         }
     }
     // 4. The timer: once, and again unless off (`TimerProperty.java:8-22`).
@@ -727,13 +792,17 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
         // 5. The chosen source (`SkinImage.java:133-139`): past the end
         // selects 0; a hole hides the object after all this.
         let shown = if o.entries.is_empty() {
-            true
+            Some(true)
         } else {
             let i = usize::try_from(sel)
                 .ok()
                 .filter(|&i| i < o.entries.len())
                 .unwrap_or(0);
-            o.entries.get(i).copied().unwrap_or(false)
+            match o.entries.get(i) {
+                Some(Validity::Valid) => Some(true),
+                Some(Validity::Unknown | Validity::Movie) => None,
+                _ => Some(false),
+            }
         };
         out.timers.push(TimerOut {
             key: *k,

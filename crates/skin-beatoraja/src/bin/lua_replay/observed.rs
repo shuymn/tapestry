@@ -1,16 +1,18 @@
 //! What the reference observed, as plain data the comparator reads.
 
 /// A consumer occurrence: its destination, its consumer (`value`, `op`,
-/// `draw`, `timer`; `nested` for a part of an unmodelled object), its
-/// index (an `op` entry's position in the list; a nested part's ordinal;
-/// 0 otherwise) and its callable. Top-level objects have an empty object
-/// path; nested parts are only listed in e-1.
+/// `draw`, `timer`, or the key a listed object holds it under), its index
+/// (an `op` entry's position in the list, 0 otherwise), its callable, and
+/// its object path (empty for a top-level object; a listed object's
+/// nested part's table keys). Production's records carry no path, so the
+/// comparator joins on the other four (s7-06e-1-r1-tables.md, A4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub dest: usize,
     pub field: &'static str,
     pub index: u32,
     pub callable: u32,
+    pub path: &'static str,
 }
 
 /// A returned value as the comparator reads it.
@@ -58,14 +60,8 @@ pub enum Point {
         call: u8,
         outcome: Outcome,
     },
-    /// Not invoked for `why`; `by` is the invocation whose result stopped
-    /// it (a function's value or condition), `None` for a property, a
-    /// static selector or a constant.
-    NotReached {
-        key: Key,
-        why: Cause,
-        by: Option<Key>,
-    },
+    /// Not invoked for `why`.
+    NotReached { key: Key, why: Cause },
 }
 
 /// A timer callback's invocations, as the source uses them.
@@ -77,8 +73,9 @@ pub struct TimerOut {
     /// The second invocation's `tolong()`.
     pub start: Option<i64>,
     /// Whether the object's selected source is available, so it draws
-    /// once its region does (`SkinImage.java:133-139`).
-    pub shown: bool,
+    /// once its region does (`SkinImage.java:133-139`); `None` when the
+    /// facts leave that entry unknown.
+    pub shown: Option<bool>,
 }
 
 /// One frame.
@@ -86,6 +83,9 @@ pub struct TimerOut {
 pub struct RefFrame {
     pub points: Vec<Point>,
     pub timers: Vec<TimerOut>,
+    /// Each installed object's points, in schedule order: the range of
+    /// `points` its prepare path gave.
+    pub objects: Vec<std::ops::Range<usize>>,
 }
 
 /// An object the reference did not run, with the callables it holds.

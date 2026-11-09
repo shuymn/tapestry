@@ -2080,7 +2080,7 @@ impl Cx<'_> {
     ) -> Result<Option<u16>, ImportError> {
         match self.program(v.prog, None, None, at)? {
             Ok(k) => {
-                self.outcome(v.at, "value", v.role, (Disposition::Compiled, None));
+                self.compiled(v.at, "value", v.role, k);
                 Ok(Some(k))
             }
             Err(why) => {

@@ -74,7 +74,7 @@ impl Report {
                 o,
                 "compiled {k}: destination {} {} {}",
                 key.dest,
-                key.field,
+                consumer(key, local),
                 site(s)
             );
         }
@@ -126,7 +126,7 @@ impl Report {
                 o,
                 "finding destination {} {} {} frame {}: {}",
                 f.key.dest,
-                f.key.field,
+                consumer(&f.key, local),
                 site(&f.site),
                 f.frame,
                 f.what
@@ -150,6 +150,23 @@ impl Report {
 
 /// The findings a report prints without `--all`.
 pub const SHOWN: usize = 200;
+
+/// An occurrence's consumer as a report prints it: the field, an `op`
+/// entry's index, and a listed part's object path (the skin's own keys,
+/// so only under `local`).
+fn consumer(k: &Key, local: bool) -> String {
+    let mut s = k.field.to_owned();
+    if k.field == "op" {
+        s.push_str(&format!("[{}]", k.index));
+    }
+    if !k.path.is_empty() {
+        s.push_str(if local { " at " } else { " at a nested part" });
+        if local {
+            s.push_str(k.path);
+        }
+    }
+    s
+}
 
 /// A chunk name without its directories.
 fn short(s: &str) -> &str {
