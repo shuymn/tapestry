@@ -87,6 +87,8 @@ impl std::fmt::Debug for Kept {
 #[derive(Debug)]
 pub(crate) struct Site {
     pub(crate) callable: u32,
+    /// Its constructor's node in its file's tree ([`SiteAt::func`]).
+    pub(crate) func: u32,
     pub(crate) ty: OutTy,
     /// The conditions before it in its element's `dstdraw`, which the
     /// source evaluates first, stopping at the first false.
@@ -138,12 +140,14 @@ pub enum RuntimeNote {
     Stopped(Stopped),
 }
 
-/// Where a callback is defined: its chunk and the line its definition
-/// starts at, the same in every import of one skin.
+/// Where a callback is defined: its chunk, the line its definition starts
+/// at, and its constructor's node in the chunk's tree, which tells apart
+/// two callbacks on one line; the same in every import of one skin.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SiteAt {
     pub chunk: Arc<str>,
     pub line: usize,
+    pub func: u32,
 }
 
 /// Notes shared by the runtimes of one screen lifetime: one cap and one
@@ -737,11 +741,12 @@ impl ScreenRuntime {
         let status = vec![CallStatus::Skipped; sites.len()];
         let at = sites
             .iter()
-            .map(|(_, f)| {
+            .map(|(s, f)| {
                 let info = f.info();
                 SiteAt {
                     chunk: info.source.unwrap_or_default().into(),
                     line: info.line_defined.unwrap_or(0),
+                    func: s.func,
                 }
             })
             .collect();

@@ -1002,3 +1002,25 @@ fn a_budget_spent_part_way_gives_the_rest_their_constant() {
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(outputs(&f), [3, 4, 5]);
 }
+
+/// O6: two callbacks defined on one line are two sites: each one's error
+/// is kept.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn two_callbacks_on_one_line_are_two_sites() {
+    untimed();
+    let mut i = import(&entry(
+        "local k = 0\nlocal e1, e2 = function() k = k + 1 error(\"a\") end, function() k = k + 1 error(\"b\") end",
+        &["e1", "e2"],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 2);
+    runtime(&mut i).frame(&mut fields(n, &[]), &[]);
+    let (notes, _) = runtime(&mut i).notes();
+    let errors = notes
+        .iter()
+        .filter(|n| matches!(n, RuntimeNote::CallbackError { .. }))
+        .count();
+    assert_eq!(errors, 2, "{notes:?}");
+}
