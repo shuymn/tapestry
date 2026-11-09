@@ -229,6 +229,66 @@ fn a_clipped_push_respects_both_capacities() {
     assert_runs_tile(&batch);
 }
 
+const MULTIPLY: RunKey = RunKey {
+    blend: Blend::Multiply,
+    clip: None,
+};
+
+/// [`quad`] at alpha `a`.
+fn tinted(x: f32, a: f32) -> Quad {
+    Quad {
+        color: [1.0, 1.0, 1.0, a],
+        ..quad(x)
+    }
+}
+
+/// A multiply quad of alpha 0 is accepted and not held, plain or
+/// clipped, even past both capacities; it neither splits a run nor
+/// counts as dropped (`skin/SkinObject.java:623-625` at `0.8.9`). A
+/// negative or NaN alpha is skipped too; any alpha above 0 is held, and
+/// alpha 0 under the other blends is held as before.
+#[test]
+fn a_multiply_quad_of_alpha_zero_is_not_held() {
+    let mut batch = QuadBatch::with_capacity(2, 1);
+    for a in [0.0, -0.0, -1.0, f32::NAN] {
+        assert!(batch.push(MULTIPLY, tinted(0.0, a)), "{a}");
+        assert!(
+            batch.push_clipped(MULTIPLY, tinted(0.0, a), rect(0.0)),
+            "{a}"
+        );
+    }
+    assert_eq!((batch.quads().len(), batch.runs().len()), (0, 0));
+    assert!(batch.push(ALPHA, tinted(1.0, 0.0)));
+    assert!(batch.push(MULTIPLY, tinted(2.0, 0.0)));
+    assert!(batch.push(ALPHA, tinted(3.0, 0.0)));
+    assert_eq!(batch.runs(), [run(ALPHA, 0, 2)]);
+    // Full: a zero-alpha multiply push still succeeds, a visible one drops.
+    assert!(batch.is_full());
+    assert!(batch.push(MULTIPLY, tinted(4.0, 0.0)));
+    assert!(batch.push_clipped(MULTIPLY, tinted(4.0, 0.0), rect(0.0)));
+    assert_eq!(batch.dropped(), 0);
+    assert!(!batch.push(MULTIPLY, tinted(5.0, 1.0 / 255.0)));
+    assert_eq!(batch.dropped(), 1);
+    assert_runs_tile(&batch);
+}
+
+/// Multiply splits runs like any other blend, in push order.
+#[test]
+fn a_multiply_quad_splits_runs_in_order() {
+    let mut batch = QuadBatch::with_capacity(8, 8);
+    assert!(batch.push(ALPHA, tinted(0.0, 1.0)));
+    assert!(batch.push(MULTIPLY, tinted(1.0, 1.0 / 255.0)));
+    assert!(batch.push(MULTIPLY, tinted(2.0, 1.0)));
+    assert!(batch.push(ALPHA, tinted(3.0, 1.0)));
+    assert_eq!(
+        batch.runs(),
+        [run(ALPHA, 0, 1), run(MULTIPLY, 1, 3), run(ALPHA, 3, 4)]
+    );
+    let xs: Vec<f32> = batch.quads().iter().map(|q| q.rect[0]).collect();
+    assert_eq!(xs, [0.0, 1.0, 2.0, 3.0]);
+    assert_runs_tile(&batch);
+}
+
 /// A skin that fills its own quads and runs leaves the reserve whole: the
 /// owner opens it and pushes after the skin, in a run of its own, into
 /// the buffers allocated up front, and a clear closes it again.

@@ -1592,6 +1592,7 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
             match q.blend {
                 Blend::Alpha => "alpha",
                 Blend::Add => "add",
+                Blend::Multiply => "multiply",
             },
             opt(q.clip.map(i64::from)),
             q.clip_geometry

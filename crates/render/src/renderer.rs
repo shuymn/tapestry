@@ -184,8 +184,7 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // samples are always taken, so they stay in uniform control flow; the
 // base read has an explicit level, which needs no derivatives, so only a
 // sprite with the base bit takes it. One result is chosen.
-@fragment
-fn fs(v: VOut) -> @location(0) vec4f {
+fn tinted(v: VOut) -> vec4f {
     let layer = i32(v.flags & 0xFFFFu);
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
     let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
@@ -196,6 +195,21 @@ fn fs(v: VOut) -> @location(0) vec4f {
         page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
     }
     return select(page, builtin, layer == 0) * v.color;
+}
+
+@fragment
+fn fs(v: VOut) -> @location(0) vec4f {
+    return tinted(v);
+}
+
+// The multiply blend takes the straight colour, texel times tint: the
+// premultiplied product divided by its alpha, black where that is 0 (a
+// transparent texel's colour is gone; the batch holds no quad of tint
+// alpha 0).
+@fragment
+fn fs_multiply(v: VOut) -> @location(0) vec4f {
+    let c = tinted(v);
+    return vec4f(select(vec3f(0.0), c.rgb / c.a, c.a > 0.0), c.a);
 }
 ";
 
@@ -848,6 +862,7 @@ pub struct Renderer {
     format: wgpu::TextureFormat,
     alpha: wgpu::RenderPipeline,
     additive: wgpu::RenderPipeline,
+    multiply: wgpu::RenderPipeline,
     bindings: Bindings,
     atlas: AtlasTexture,
     atlas_bind: wgpu::BindGroup,
@@ -1018,7 +1033,7 @@ impl Renderer {
                 (Output::Offscreen { texture, view }, format)
             }
         };
-        let (alpha, additive, bindings) = pipelines(&gpu, format);
+        let (alpha, additive, multiply, bindings) = pipelines(&gpu, format);
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
@@ -1036,6 +1051,7 @@ impl Renderer {
             format,
             alpha,
             additive,
+            multiply,
             bindings,
             atlas,
             atlas_bind,
@@ -3648,6 +3664,7 @@ impl Renderer {
                 pass.set_pipeline(match run.key.blend {
                     Blend::Alpha => &self.alpha,
                     Blend::Add => &self.additive,
+                    Blend::Multiply => &self.multiply,
                 });
                 pass.draw(0..4, run.start..end);
             }
@@ -3897,14 +3914,21 @@ const fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     }
 }
 
-/// The alpha and additive sprite pipelines and their bindings. Both take
-/// premultiplied colour (design.md "Rendering and Skins"): alpha blending
-/// is RGB source 1, destination 1 − source alpha; additive is RGB source
-/// 1, destination 1; in both the alpha channel composites over.
+/// The alpha, additive and multiply sprite pipelines and their bindings.
+/// All take premultiplied colour (design.md "Rendering and Skins"): alpha
+/// blending is RGB source 1, destination 1 − source alpha; additive is RGB
+/// source 1, destination 1; in both the alpha channel composites over.
+/// Multiply's fragment unpremultiplies its colour, and blending is RGB
+/// source 0, destination source colour, the alpha channel kept.
 fn pipelines(
     gpu: &Gpu,
     format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, Bindings) {
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    Bindings,
+) {
     let device = gpu.device();
     let smooth = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("smooth"),
@@ -3966,7 +3990,7 @@ fn pipelines(
         bind_group_layouts: &[Some(&layout)],
         immediate_size: 0,
     });
-    let pipeline = |blend| {
+    let pipeline = |blend, fragment| {
         // `Instance`: rect, uv and color, pivot and angle together, then
         // the flags.
         let attrs = wgpu::vertex_attr_array![
@@ -3991,7 +4015,7 @@ fn pipelines(
             },
             fragment: Some(wgpu::FragmentState {
                 module: &module,
-                entry_point: Some("fs"),
+                entry_point: Some(fragment),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -4010,13 +4034,33 @@ fn pipelines(
         })
     };
     // Both components over (source 1, destination 1 − source alpha).
-    let alpha = pipeline(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+    let alpha = pipeline(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, "fs");
     // Colour source 1, destination 1; the alpha channel still over, not
     // `ADDITIVE`'s 1, 1.
-    let additive = pipeline(wgpu::BlendState {
-        alpha: wgpu::BlendComponent::OVER,
-        ..wgpu::BlendState::ADDITIVE
-    });
+    let additive = pipeline(
+        wgpu::BlendState {
+            alpha: wgpu::BlendComponent::OVER,
+            ..wgpu::BlendState::ADDITIVE
+        },
+        "fs",
+    );
+    // Colour source 0, destination the source's straight colour
+    // (`skin/Skin.java:663` at `0.8.9`); the destination's alpha kept.
+    let multiply = pipeline(
+        wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::Src,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        },
+        "fs_multiply",
+    );
     let bindings = Bindings {
         layout,
         smooth,
@@ -4024,7 +4068,7 @@ fn pipelines(
         projection,
         uploaded: None,
     };
-    (alpha, additive, bindings)
+    (alpha, additive, multiply, bindings)
 }
 
 /// The projection's uniform: half the canvas's size, padded to 16 bytes.
@@ -4174,6 +4218,99 @@ mod tests {
         let alpha = |x: usize| pixels[(100 * 960 + x) * 4 + 3];
         assert!(alpha(50).abs_diff(159) <= 2, "alpha blend: {}", alpha(50));
         assert!(alpha(150).abs_diff(159) <= 2, "additive: {}", alpha(150));
+    }
+
+    /// Multiply takes the destination's RGB times the sprite's straight
+    /// colour and keeps the destination's alpha (`skin/Skin.java:663` at
+    /// `0.8.9`; O1 A, Q2). On a transparent target an alpha sprite lays
+    /// RGB 0.8, 0.6, 0.4 at alpha 0.5 (stored 102, 77, 51 at 128) under
+    /// four multiply sprites, at layout x 100, 300, 500 and 700 (target
+    /// x 50, 150, 250 and 350 at half scale):
+    /// - grey 0.5 at alpha 1 halves the RGB: 51, 38, 26;
+    /// - grey 0.5 at alpha 0.25 halves it too, the tint unpremultiplied
+    ///   (an eighth without it);
+    /// - an uploaded texel of straight grey 0.5 at alpha 128 (stored 64 at
+    ///   128) halves it: unpremultiplied by the product's alpha, not the
+    ///   tint's alone (a quarter);
+    /// - a transparent texel of the built-in atlas gives 0.
+    ///
+    /// The alpha stays 128 under all four: not 255 as over, nor scaled
+    /// as `GL_SRC_COLOR` scales it. Colour factors 1, 0 would give the
+    /// grey.
+    #[test]
+    fn multiply_takes_the_straight_colour_and_keeps_the_alpha() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 960,
+                height: 540,
+            },
+            AdapterChoice::Warp,
+        )
+        .expect("WARP renderer");
+        r.clear = wgpu::Color::TRANSPARENT;
+        let levels: Vec<Vec<u8>> = [128_usize, 64, 32, 16]
+            .iter()
+            .map(|s| [64, 64, 64, 128].repeat(s * s))
+            .collect();
+        let page: crate::PageLevels<'_> = [&levels[0], &levels[1], &levels[2], &levels[3]];
+        let pages = AtlasPages {
+            side: 128,
+            pages: &[page],
+            text_layer: false,
+        };
+        r.install_atlas(&pages, ClipTable::default()).unwrap();
+        let sprite = |x, color| Sprite {
+            rect: [x, 0.0, 200.0, 400.0],
+            uv: solid_uv(),
+            color,
+            ..Sprite::default()
+        };
+        // Texel (4, 4) of layer 0: inside the space's empty cell.
+        let empty = 4.5 / 128.0;
+        let text = MenuText::new(&r);
+        let timing = r
+            .menu_frame(
+                |b| {
+                    let mut under = sprite(0.0, [0.8, 0.6, 0.4, 0.5]);
+                    under.rect = [0.0, 0.0, 800.0, 400.0];
+                    b.push(Blend::Alpha, under);
+                    b.push(Blend::Multiply, sprite(0.0, [0.5, 0.5, 0.5, 1.0]));
+                    b.push(Blend::Multiply, sprite(200.0, [0.5, 0.5, 0.5, 0.25]));
+                    b.push(
+                        Blend::Multiply,
+                        Sprite {
+                            uv: [0.5; 4],
+                            layer: 1,
+                            ..sprite(400.0, [1.0; 4])
+                        },
+                    );
+                    b.push(
+                        Blend::Multiply,
+                        Sprite {
+                            uv: [empty; 4],
+                            ..sprite(600.0, [1.0; 4])
+                        },
+                    );
+                },
+                &text,
+            )
+            .unwrap();
+        assert!(timing.presented);
+        let pixels = r.read_back();
+        let at = |x: usize| -> [u8; 4] {
+            let i = (100 * 960 + x) * 4;
+            pixels[i..i + 4].try_into().unwrap()
+        };
+        let near = |got: [u8; 4], want: [u8; 4], what: &str| {
+            assert!(
+                got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2),
+                "{what}: {got:?}, expected {want:?}"
+            );
+        };
+        near(at(50), [51, 38, 26, 128], "opaque tint");
+        near(at(150), [51, 38, 26, 128], "translucent tint");
+        near(at(250), [51, 38, 26, 128], "translucent texel");
+        near(at(350), [0, 0, 0, 128], "transparent texel");
     }
 
     /// A staging whose instance buffer the device refuses, past its atlas's

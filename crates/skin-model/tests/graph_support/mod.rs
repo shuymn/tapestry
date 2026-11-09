@@ -147,7 +147,23 @@ pub fn load_with(
     elements: Vec<ElementDef>,
     widgets: ResultDefs,
 ) -> Result<Skin, skin_model::LoadError> {
+    load_sheet(elements, widgets, |_| {})
+}
+
+/// A result skin of `elements` whose sheet has `more` images added after
+/// the generated ones, from index [`GRID_NO_GAPS`] + 1.
+pub fn skin_more(elements: Vec<ElementDef>, more: impl FnOnce(&mut SheetBuilder)) -> Skin {
+    load_sheet(elements, ResultDefs::default(), more).unwrap()
+}
+
+fn load_sheet(
+    elements: Vec<ElementDef>,
+    widgets: ResultDefs,
+    more: impl FnOnce(&mut SheetBuilder),
+) -> Result<Skin, skin_model::LoadError> {
     let dir = tempfile::tempdir().unwrap();
+    let mut sheet = sheet_builder(dir.path());
+    more(&mut sheet);
     let def = SkinDef {
         fit: skin_model::Fit::Fixed,
         regions: [skin_model::RegionDef {
@@ -155,7 +171,7 @@ pub fn load_with(
             optional: false,
         }; skin_model::Region::COUNT],
         whens: Vec::new(),
-        sheet: sheet_builder(dir.path()).finish(),
+        sheet: sheet.finish(),
         lanes: None,
         elements,
         widgets: skin_model::WidgetDefs::default(),
@@ -336,28 +352,62 @@ pub fn composite(
     let mut dst = [BACKDROP / 255.0; 3];
     let mut covered = 0;
     for q in quads {
-        // The point turned back about the quad's pivot.
-        let [cx, cy] = q.pivot;
-        let (s, k) = q.angle.sin_cos();
-        let (dx, dy) = (x - cx, y - cy);
-        let (x, y) = (cx + dx * k + dy * s, cy - dx * s + dy * k);
-        let [qx, qy, qw, qh] = q.rect;
-        if !(x >= qx && x < qx + qw && y >= qy && y < qy + qh) {
-            continue;
-        }
-        covered += 1;
-        let [l, t, r, b] = q.uv;
-        let uv = [l + (r - l) * (x - qx) / qw, t + (b - t) * (y - qy) / qh];
-        let k = level(q, atlas.side(), force.unwrap_or(q.filter));
-        let texel = sample(atlas, q.layer, k, uv);
-        let [cr, cg, cb, ca] = q.color;
-        let tint = [cr * ca, cg * ca, cb * ca, ca];
-        let src: [f32; 4] = std::array::from_fn(|c| texel[c] * tint[c]);
-        for (d, s) in dst.iter_mut().zip(src) {
-            *d = s + *d * (1.0 - src[3]);
+        covered += u32::from(draw(&mut dst, q, Blend::Alpha, atlas, [x, y], force));
+    }
+    (dst.map(|c| c * 255.0), covered)
+}
+
+/// [`composite`] of a batch, each run's quads blended by its run's blend:
+/// over, added, or multiplied by the straight colour (the premultiplied
+/// product divided by its alpha, black at alpha 0; design.md "Rendering
+/// and Skins").
+pub fn composite_runs(batch: &QuadBatch, atlas: &Atlas, [x, y]: [f32; 2]) -> ([f32; 3], u32) {
+    let mut dst = [BACKDROP / 255.0; 3];
+    let mut covered = 0;
+    for run in batch.runs() {
+        for q in &batch.quads()[run.start as usize..run.end as usize] {
+            covered += u32::from(draw(&mut dst, q, run.key.blend, atlas, [x, y], None));
         }
     }
     (dst.map(|c| c * 255.0), covered)
+}
+
+/// Draws quad `q` with `blend` into `dst` (0 to 1) at canvas point
+/// `[x, y]`, as [`composite`] says; whether it covers the point.
+fn draw(
+    dst: &mut [f32; 3],
+    q: &Quad,
+    blend: Blend,
+    atlas: &Atlas,
+    [x, y]: [f32; 2],
+    force: Option<Filter>,
+) -> bool {
+    // The point turned back about the quad's pivot.
+    let [cx, cy] = q.pivot;
+    let (s, k) = q.angle.sin_cos();
+    let (dx, dy) = (x - cx, y - cy);
+    let (x, y) = (cx + dx * k + dy * s, cy - dx * s + dy * k);
+    let [qx, qy, qw, qh] = q.rect;
+    if !(x >= qx && x < qx + qw && y >= qy && y < qy + qh) {
+        return false;
+    }
+    let [l, t, r, b] = q.uv;
+    let uv = [l + (r - l) * (x - qx) / qw, t + (b - t) * (y - qy) / qh];
+    let k = level(q, atlas.side(), force.unwrap_or(q.filter));
+    let texel = sample(atlas, q.layer, k, uv);
+    let [cr, cg, cb, ca] = q.color;
+    let tint = [cr * ca, cg * ca, cb * ca, ca];
+    let src: [f32; 4] = std::array::from_fn(|c| texel[c] * tint[c]);
+    let [.., a] = src;
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = match blend {
+            Blend::Alpha => s + *d * (1.0 - a),
+            Blend::Add => s + *d,
+            Blend::Multiply if a > 0.0 => *d * s / a,
+            Blend::Multiply => 0.0,
+        };
+    }
+    true
 }
 
 /// `got` is `want` within `tolerance` (8-bit units) per channel.
