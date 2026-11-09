@@ -308,24 +308,19 @@ fn an_op_function_is_a_condition_by_its_element_s_role() {
 }
 
 #[test]
-fn a_timer_function_has_no_consumer() {
+fn a_timer_function_is_consumed_only_at_a_destination() {
     let consumer = Unsupported::Consumer("timer");
     let timed = |id: &str| {
         format!(
             "{{ id = \"{id}\", timer = function() return 0 end, dst = {{ {{ w = 64, h = 10 }} }} }},"
         )
     };
-    // A destination's: dropped when decorative, refused when critical.
-    let i = import(&skin("", &timed("i"))).unwrap();
-    assert_eq!(i.callbacks, [Disposition::Replaced(consumer)]);
-    assert!(noted(
-        &i,
-        NoteKind::Callback {
-            field: "timer",
-            why: consumer
-        }
-    ));
-    critical(import(&skin("", &timed("g"))), "timer", consumer);
+    // A destination's: the program's timer callback, decorative or
+    // critical.
+    for id in ["i", "g"] {
+        let i = import(&skin("", &timed(id))).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{id}");
+    }
     // A source image's cycle timer, by its element's role: failure
     // presentation (timer 3) is critical.
     let cycled = |timer: &str| {

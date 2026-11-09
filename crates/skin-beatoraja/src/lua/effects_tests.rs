@@ -584,14 +584,20 @@ fn a_protected_writer_writes() {
 }
 
 #[test]
-fn a_writer_no_consumer_takes_is_replaced_as_a_writer() {
-    // A decorative destination's `timer` that writes: its reason is the
-    // write, not the missing consumer.
+fn a_counting_timer_is_no_slot() {
+    // A decorative destination's `timer` that counts a chunk local: the
+    // walk reads the written cell as unknown, so its arithmetic opens the
+    // candidate, and no slot is granted in an open one.
     let entry = skin(
         "local n = 0",
         "{ id = \"i\", timer = function() n = n + 1 return 0 end, dst = { { w = 64, h = 10 } } },",
     );
     let (r, callbacks) = outcome(&entry, &[]);
     r.unwrap();
-    assert_eq!(callbacks, [Disposition::Replaced(Unsupported::Writes)]);
+    assert_eq!(
+        callbacks,
+        [Disposition::Replaced(Unsupported::Construct(
+            "a slot in a candidate that is not closed"
+        ))]
+    );
 }

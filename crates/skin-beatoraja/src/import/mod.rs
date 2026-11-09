@@ -443,6 +443,11 @@ pub(crate) struct Cx<'d> {
     /// The play presentation program, its callbacks in the order the
     /// import consumes them.
     present: skin_model::present::PresentDef,
+    /// The program's slot roots, by instance: their slots and the timer
+    /// callbacks compiled for them.
+    slot_roots: HashMap<u32, callback::SlotRoot>,
+    /// Per callable instance, the play destinations whose `timer` it is.
+    timer_sites: HashMap<u32, u32>,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -567,6 +572,8 @@ impl<'d> Cx<'d> {
             value_gate: None,
             when_spans: Vec::new(),
             present: skin_model::present::PresentDef::default(),
+            slot_roots: HashMap::new(),
+            timer_sites: HashMap::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],
@@ -1003,6 +1010,7 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
+            self.count_timer_site(&dst.timer);
             return self.system(dst, n);
         }
         let role = Role::Decorative.or_failure(dst.failure);
@@ -1013,6 +1021,7 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
+        self.count_timer_site(&dst.timer);
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
@@ -1311,6 +1320,16 @@ impl<'d> Cx<'d> {
             Prop::Name(_) => {
                 self.drop_el(role, at, NoteKind::Timer(TimerWhy::Script))?;
                 return Ok(None);
+            }
+            Prop::Callable(id) if self.kind == ScreenKind::Play => {
+                let last = track.keys.iter().map(|k| k.at).max().unwrap_or(0);
+                match self.timer_callback(role, at, (id, track.end, last), &conds)? {
+                    Ok(t) => (t, false),
+                    Err(why) => {
+                        self.drop_el(role, at, why)?;
+                        return Ok(None);
+                    }
+                }
             }
             Prop::Callable(id) => {
                 let why = self.unconsumed(role, id, "timer", "timer")?;
@@ -1991,8 +2010,10 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
-            present: (!self.present.callbacks.is_empty())
-                .then(|| std::mem::take(&mut self.present)),
+            present: {
+                self.close_slots()?;
+                (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))
+            },
         };
         let loaded = if selection {
             let widgets = SelectionDefs {
