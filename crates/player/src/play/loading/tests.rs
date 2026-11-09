@@ -13,6 +13,8 @@ use game::{Adjust, LoadingRig as _, Revalidated, Rig as _};
 use crate::play::PlayerRig;
 use crate::tuning::{HoldClass, KeyEvent};
 
+mod flow;
+
 /// SELECT and START on the keyboard as installed.
 const SELECT: u32 = 0x11;
 const START: u32 = 0x12;
@@ -63,11 +65,9 @@ impl Keyboard {
     }
 }
 
-/// `f` on a player's rig whose input thread serves its link, a keyboard
-/// connected to it, with LIFT and HIDDEN on.
-fn on_input_rig<R>(f: impl FnOnce(&mut PlayerRig<'_>, &Keyboard) -> R) -> R {
-    use input::{DeviceId, DeviceKind, SourceConfig, SourceSet};
-    let settings = game::Settings {
+/// Settings with LIFT and HIDDEN on.
+fn covers() -> game::Settings {
+    game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings {
             covers: game::CoverSettings {
@@ -77,8 +77,23 @@ fn on_input_rig<R>(f: impl FnOnce(&mut PlayerRig<'_>, &Keyboard) -> R) -> R {
             },
             ..game::PlayerSettings::default()
         },
-    };
+    }
+}
+
+/// `f` on a player's rig whose input thread serves its link, a keyboard
+/// connected to it, with LIFT and HIDDEN on.
+fn on_input_rig<R>(f: impl FnOnce(&mut PlayerRig<'_>, &Keyboard) -> R) -> R {
     let render = crate::render_side::tests::Installers::default().spawn_bare();
+    on_input_rig_with(covers(), render, f)
+}
+
+/// [`on_input_rig`] with `settings` and the render thread `render`.
+fn on_input_rig_with<R>(
+    settings: game::Settings,
+    render: crate::render_side::RenderLink,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Keyboard) -> R,
+) -> R {
+    use input::{DeviceId, DeviceKind, SourceConfig, SourceSet};
     crate::tests::on_rig_hooked(settings, render, input::QpcClock::start(), |rig, _, end| {
         let crate::tests::InputEnd {
             mut hook,
@@ -96,6 +111,8 @@ fn on_input_rig<R>(f: impl FnOnce(&mut PlayerRig<'_>, &Keyboard) -> R) -> R {
         sources.begin_batch(TimeUs(0));
         sources.connect(DeviceId(1), DeviceKind::Keyboard);
         sources.end_batch(TimeUs(0));
+        // The window's focus latches the source set's gate, as at startup.
+        rig.controls.set_latch(sources.gate().handle());
         let (jobs, rx) = std::sync::mpsc::channel::<Job>();
         let thread = input::ClockedThread::spawn(clock, sources, &waker, move |s, now| {
             while let Ok(job) = rx.try_recv() {

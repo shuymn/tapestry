@@ -1012,6 +1012,14 @@ struct Shared {
     /// Presented loading frames acknowledged so far (tests).
     #[cfg(test)]
     loading_acked: AtomicU64,
+    /// The end or pause of a loading lifetime waits here before its
+    /// answer (tests).
+    #[cfg(test)]
+    loading_end_gate: Arc<TestGate>,
+    /// The presentation epochs of the attempt staged last, as prepared,
+    /// and of the attempt committed last (tests).
+    #[cfg(test)]
+    epochs: [AtomicU64; 2],
     /// The current loading lifetime's state, from its beginning
     /// ([`RenderLink::begin_loading`]); `None` before. Locked before the
     /// slot when both are.
@@ -1070,6 +1078,10 @@ impl Shared {
             loading_ack_pass: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             loading_acked: AtomicU64::new(0),
+            #[cfg(test)]
+            loading_end_gate: Arc::default(),
+            #[cfg(test)]
+            epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
             #[cfg(test)]
@@ -1175,6 +1187,72 @@ impl Shared {
     /// Whether `lifetime` is selection's current one.
     fn selection_current(&self, lifetime: u64) -> bool {
         self.selection_slot().current(lifetime)
+    }
+}
+
+/// The loading acknowledgement's test hold, from any thread (tests):
+/// [`RenderLink::hold_loading_ack`] and its kin.
+#[cfg(all(test, feature = "dev-tools"))]
+pub struct AckHold(Arc<Shared>);
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl AckHold {
+    /// Holds every presented loading frame's acknowledgement while `on`.
+    pub fn hold(&self, on: bool) {
+        self.0.loading_ack_hold[0].store(on, Ordering::SeqCst);
+    }
+
+    /// Whether an acknowledgement is held.
+    pub fn held(&self) -> bool {
+        self.0.loading_ack_hold[1].load(Ordering::SeqCst)
+    }
+
+    /// Lets one held acknowledgement through.
+    pub fn pass(&self) {
+        self.0.loading_ack_pass.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A point a thread waits at while a test holds it (tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TestGate {
+    held: AtomicBool,
+    waiting: AtomicBool,
+    passed: AtomicU64,
+}
+
+#[cfg(test)]
+impl TestGate {
+    /// Holds every thread reaching the gate from now on while `on`, or
+    /// lets them go.
+    #[cfg(feature = "dev-tools")]
+    pub fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether a thread waits at the gate.
+    #[cfg(feature = "dev-tools")]
+    pub fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    /// How often a thread went past the gate.
+    #[cfg(feature = "dev-tools")]
+    pub fn passed(&self) -> u64 {
+        self.passed.load(Ordering::SeqCst)
+    }
+
+    /// Waits while held, then counts the passage.
+    pub fn pass(&self) {
+        if self.held.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while self.held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+        self.passed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -2022,6 +2100,32 @@ impl RenderLink {
     /// loading frame drew with it ([`LoadingAck`]).
     pub fn loading_loadend(&self) -> Option<TimeUs> {
         self.shared.loading_ack().loadend
+    }
+
+    /// A handle on the loading acknowledgement's test hold, for another
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn ack_hold(&self) -> AckHold {
+        AckHold(Arc::clone(&self.shared))
+    }
+
+    /// Where the end or pause of a loading lifetime waits before its
+    /// answer while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn loading_end_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.loading_end_gate)
+    }
+
+    /// The presentation epoch of the attempt staged last as it was
+    /// prepared, and of the attempt committed last as it committed (its
+    /// final readiness's stamp); 0 before either (tests).
+    #[cfg(test)]
+    pub fn epochs(&self) -> (u64, u64) {
+        let [staged, committed] = &self.shared.epochs;
+        (
+            staged.load(Ordering::SeqCst),
+            committed.load(Ordering::SeqCst),
+        )
     }
 
     /// Holds every presented loading frame's acknowledgement from now on
@@ -3487,6 +3591,8 @@ impl Run {
                     ) {
                         self.paused = Some(std::mem::replace(&mut mode, Mode::Idle));
                     }
+                    #[cfg(test)]
+                    self.shared.loading_end_gate.pass();
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -3518,6 +3624,8 @@ impl Run {
                         mode = Mode::Idle;
                     }
                     self.paused = None;
+                    #[cfg(test)]
+                    self.shared.loading_end_gate.pass();
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -4428,6 +4536,8 @@ impl Run {
             return;
         };
         if matches!(answer, Ok(Preparation::Ready)) {
+            #[cfg(test)]
+            self.shared.epochs[0].store(p.attempt.epoch(), Ordering::SeqCst);
             self.prepared = Some(Prepared {
                 token: PreparedToken {
                     request: p.request,
@@ -4564,6 +4674,8 @@ impl Run {
             .committed
             .get(ScreenKind::Play)
             .and_then(|i| i.bundle().skin().close());
+        #[cfg(test)]
+        self.shared.epochs[1].store(p.presentation.1, Ordering::SeqCst);
         self.current = Some(p.presentation);
         self.turntable.attempt(p.scratch_notes);
         #[cfg(feature = "dev-tools")]
@@ -10909,6 +11021,21 @@ pub(crate) mod tests {
         pub(crate) fn hold_preparations(&self, on: bool) {
             self.hold.store(on, Ordering::Release);
         }
+
+        /// Holds every commit in the screen while `on`, or lets it go.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_commits(&self, on: bool) {
+            if !on {
+                self.commit_held.store(false, Ordering::Release);
+            }
+            self.hold_commit.store(on, Ordering::Release);
+        }
+
+        /// Whether a commit waited on [`hold_commits`](Self::hold_commits).
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn commit_held(&self) -> bool {
+            self.commit_held.load(Ordering::Acquire)
+        }
     }
 
     /// Loads a chart on `link` and prepares an attempt with the skin in
@@ -11632,6 +11759,34 @@ pub(crate) mod tests {
     fn ready_attempt(link: &super::RenderLink, chart: &Chart) {
         let ready = link.prepare_attempt(titled(chart), || false);
         assert_eq!(ready.unwrap(), Preparation::Ready);
+    }
+
+    /// E2: a final readiness found stale (the screen built again since the
+    /// staging, on another device) stamps nothing: the commit is refused
+    /// and the epoch committed before stays the one committed.
+    #[test]
+    fn a_stale_readiness_stamps_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle());
+        ready_attempt(&link, &chart);
+        let first = link.requests.load(Ordering::Relaxed);
+        assert_eq!(
+            link.ready_attempt(first, 7).unwrap(),
+            super::ReadyAnswer::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert_eq!(link.epochs().1, 7);
+        ready_attempt(&link, &chart);
+        let second = link.requests.load(Ordering::Relaxed);
+        rebuild_screen(&link, &screens);
+        assert!(matches!(
+            link.ready_attempt(second, 9).unwrap(),
+            super::ReadyAnswer::Stale(_)
+        ));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert_eq!(link.epochs().1, 7, "nothing stamped or committed");
+        link.exit();
     }
 
     /// Fails `link`'s screen and builds it again.

@@ -348,6 +348,13 @@ pub struct PlayerRig<'a> {
     /// Tests: the audio output reads as lost while set, from any thread.
     #[cfg(test)]
     pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: where the loading opener's steps wait while a test holds
+    /// them.
+    #[cfg(test)]
+    pub opening_gates: std::sync::Arc<loading::OpeningGates>,
+    /// Tests: each ended play's end and record, in order.
+    #[cfg(test)]
+    pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -2283,6 +2290,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        #[cfg(test)]
+        self.ended_plays.push((report.end, report.record.clone()));
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();

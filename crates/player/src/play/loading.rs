@@ -112,11 +112,37 @@ impl LoadingRig for PlayerRig<'_> {
     /// The reducer closes at a fence; then, under the tuning's step lock,
     /// the window side closes too if nothing moved since `at_o1`.
     /// Otherwise the reducer's close is reversed at the same instant.
+    /// The presentation names a new epoch for the attempt without entering
+    /// it ([`game::AdjustDriver::refresh_presentation`]): holds, the
+    /// selected cover and the window's scene stay. The loading script
+    /// starts here as at [`Rig::begin_presentation`](game::Rig::begin_presentation).
+    fn refresh_presentation(
+        &mut self,
+        loaded: &game::Loaded,
+    ) -> Result<Option<game::PreparationRefusal>, InputWaitError> {
+        #[cfg(feature = "dev-tools")]
+        if std::mem::take(&mut self.loading_script) {
+            self.input.loading_script(self.clock.now());
+        }
+        if let Some(e) = self.adjustments_failure() {
+            return Err(e);
+        }
+        let refreshed = match self.adjustments() {
+            Some((driver, mut pump)) => driver.refresh_presentation(loaded, &mut pump),
+            None => Ok(None),
+        };
+        #[cfg(test)]
+        self.opening_gates.refresh.pass();
+        refreshed
+    }
+
     fn revalidate_and_close(
         &mut self,
         at_o1: &TuningSnapshot,
         generation: u32,
     ) -> Result<Revalidated, InputWaitError> {
+        #[cfg(test)]
+        self.opening_gates.revalidate.pass();
         let reducer = self.close_reducer()?;
         let at = self.accepted_at_o1.unwrap_or(at_o1.revision.reducer);
         let unchanged = reducer.is_none_or(|n| n == at)
@@ -159,6 +185,16 @@ impl PlayerRig<'_> {
         self.controls.tuning().enter_loading(self.clock.now());
         self.accepted_at_o1 = None;
     }
+}
+
+/// Where the loading opener's steps on the player's rig wait while a test
+/// holds them (tests): after the epoch's refresh (O5) acted, and before
+/// the revalidation (O11) acts.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct OpeningGates {
+    pub refresh: crate::render_side::TestGate,
+    pub revalidate: crate::render_side::TestGate,
 }
 
 #[cfg(test)]

@@ -888,6 +888,10 @@ fn rig<'a>(
         relooked: std::sync::Arc::default(),
         #[cfg(test)]
         audio_lost: std::sync::Arc::default(),
+        #[cfg(test)]
+        opening_gates: std::sync::Arc::default(),
+        #[cfg(test)]
+        ended_plays: Vec::new(),
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
