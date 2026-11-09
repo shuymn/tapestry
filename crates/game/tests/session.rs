@@ -1635,7 +1635,7 @@ fn reevaluation_refuses_a_record_of_another_evaluator_version() {
 struct Capped {
     chart: Chart,
     max: usize,
-    seen: Rc<RefCell<Option<usize>>>,
+    seen: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 impl ChartIngest for Capped {
@@ -1654,7 +1654,7 @@ impl ChartIngest for Capped {
         _seed: u64,
         _speed: bms_model::Speed,
     ) -> Result<Ingested, IngestError> {
-        *self.seen.borrow_mut() = Some(bytes.len());
+        *self.seen.lock().unwrap() = Some(bytes.len());
         Ok(Ingested {
             labels: game::ChartLabels::default(),
             chart: self.chart.clone(),
@@ -1670,18 +1670,18 @@ fn chart_is_read_one_byte_past_the_adapter_limit_at_most() {
     let path = chart_file(&root);
     fs::write(&path, vec![b'x'; 1_000]).unwrap();
     for (max, expected) in [(10, 11), (999, 1_000), (1_000, 1_000)] {
-        let seen = Rc::new(RefCell::new(None));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let parts = Parts {
             ingest: Box::new(Capped {
                 chart: chart.clone(),
                 max,
-                seen: Rc::clone(&seen),
+                seen: std::sync::Arc::clone(&seen),
             }),
             ..parts(&root, &chart, &Events::default())
         };
         let settings = tapestry_settings(&root);
         Loaded::load(root.clone(), settings, &path, config(), parts).unwrap();
-        assert_eq!(*seen.borrow(), Some(expected), "limit {max}");
+        assert_eq!(*seen.lock().unwrap(), Some(expected), "limit {max}");
     }
     // The BMS adapter refuses the cut file as too large.
     let big = root.path().join("big.bms");

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource, TimeUs};
+use game::coord::Joined;
 use game::{
     AppRig, Chain, LoadRefusal, Loaded, Loading, Pick, PracticeInput, PracticeScreen, Refused,
     ResultScreen, SessionError,
@@ -62,83 +63,97 @@ const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 #[cfg(feature = "dev-tools")]
 const QUERY_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 
-/// What a chart's load lends its loudness measurement: the 1× chart and
-/// bank of a practice at another speed, the load's stage on the play
-/// screen, and the
-/// window's close or the quit key as its cancel.
-struct LoadHost<'a> {
-    loaded: &'a Loaded,
-    rate: u32,
-    controls: &'a crate::controls::Controls,
-    render: &'a RenderLink,
-    /// The load's lines, which say the chart is being measured.
-    page: Option<&'a LoadingText>,
-    /// The adjustments' driver, served at every check of the measurement
-    /// and through the 1× decode.
-    adjust: Option<&'a mut game::AdjustDriver>,
-    input: &'a crate::input_side::InputLink,
-    /// The measurement closes the window (a script's `close-measuring`,
-    /// dev-tools).
-    #[cfg(feature = "dev-tools")]
-    close: bool,
-    /// The measurement presses the quit key (a script's `quit-measuring`,
-    /// dev-tools).
-    #[cfg(feature = "dev-tools")]
-    quit: bool,
+/// What a load's job threads report of their decodes (tests): each
+/// decode's speed, its granted thread limit and the foreground permits
+/// held as it began, and the permits held at a measurement's first check.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct Decodes {
+    /// `(speed, max_decode_threads, held)` per decode.
+    pub decodes: Mutex<Vec<(bms_model::Speed, usize, usize)>>,
+    /// Foreground permits held at the analysis's first check.
+    pub analysis: Mutex<Option<usize>>,
 }
 
-impl crate::loudness::Host for LoadHost<'_> {
+/// Decodes `chart`'s bank at `speed` on the calling job's foreground permit
+/// and every foreground permit free now, at most [`audio::BankLimits`]'
+/// default thread count (design.md "Load Pipeline": the decode pool draws
+/// the foreground permits); the extra permits are given back as the decode
+/// returns. The pool's threads are fewer still on fewer cores or files.
+fn decode_on_permits(
+    coord: &game::coord::Coordinator,
+    (chart, rate, speed): (&bms_model::Chart, u32, bms_model::Speed),
+    progress: &(dyn Fn(usize, usize) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+    #[cfg(test)] decodes: Option<&Decodes>,
+) -> Result<audio::SoundBank, audio::BankError> {
+    let base = audio::BankLimits::default();
+    let extra: Vec<game::coord::Lease> = (1..base.max_decode_threads)
+        .map_while(|_| coord.try_lease(game::coord::Class::Foreground))
+        .collect();
+    let limits = audio::BankLimits {
+        max_decode_threads: 1 + extra.len(),
+        ..base
+    };
+    #[cfg(test)]
+    if let Some(d) = decodes {
+        d.decodes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((
+                speed,
+                limits.max_decode_threads,
+                coord.held(game::coord::Class::Foreground),
+            ));
+    }
+    let bank = audio::load_bank_reporting(chart, rate, speed, &limits, progress, cancel);
+    drop(extra);
+    bank
+}
+
+/// What a chart's measurement job lends its measurement, on the job's
+/// thread: the 1× chart read again through the load's reader with its bank
+/// decoded on the job's permits (a practice at another speed), and the
+/// load's cancel. The stage line was shown before the job began.
+struct JobHost<'a, 'c> {
+    reader: game::ChartReader<'a>,
+    rate: u32,
+    controls: &'a crate::controls::Controls,
+    coord: &'a game::coord::Coordinator,
+    ctx: &'a game::coord::Ctx<'c>,
+    #[cfg(test)]
+    decodes: Option<&'a Decodes>,
+}
+
+impl crate::loudness::Host for JobHost<'_, '_> {
     fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
-        let chart = self.loaded.chart_at(bms_model::Speed::NORMAL)?;
-        let controls = self.controls;
-        let rate = self.rate;
-        let decode = || {
-            audio::load_bank_reporting(
-                &chart,
-                rate,
-                bms_model::Speed::NORMAL,
-                &audio::BankLimits::default(),
-                &|_, _| {},
-                &|| controls.quitting() || controls.leaving(),
-            )
-        };
-        // Decoded on its own thread while this one serves the adjustments.
-        let (adjust, input) = (&mut self.adjust, self.input);
-        let bank = std::thread::scope(|s| {
-            let worker = s.spawn(decode);
-            while !worker.is_finished() {
-                crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
-                std::thread::park_timeout(crate::play::MARKER_PARK);
-            }
-            worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        })?;
+        let normal = bms_model::Speed::NORMAL;
+        let chart = self.reader.read(normal)?;
+        let (ctx, controls) = (self.ctx, self.controls);
+        let bank = decode_on_permits(
+            self.coord,
+            (&chart, self.rate, normal),
+            &|_, _| {},
+            &|| ctx.cancelled() || cancelled(controls),
+            #[cfg(test)]
+            self.decodes,
+        )?;
         Ok((chart, Arc::new(bank)))
     }
 
-    fn measuring(&mut self, _name: &str) {
-        show_stage(self.render, self.page, Stage::Loudness);
-        #[cfg(feature = "dev-tools")]
-        if self.close {
-            self.controls.close();
-        }
-        #[cfg(feature = "dev-tools")]
-        if self.quit {
-            self.controls.command(game::Command::Quit);
-        }
-    }
+    fn measuring(&mut self, _name: &str) {}
 
     fn cancelled(&mut self) -> bool {
-        // Every block of the measurement serves the adjustments.
+        #[cfg(test)]
+        if let Some(d) = self.decodes {
+            let mut first = d.analysis.lock().unwrap_or_else(PoisonError::into_inner);
+            if first.is_none() {
+                *first = Some(self.coord.held(game::coord::Class::Foreground));
+            }
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::press_due(self.controls, crate::dev::LoadPhase::Measuring);
-        crate::play::serve_adjustments(
-            self.adjust.as_deref_mut(),
-            self.input,
-            self.controls.tuning(),
-        );
-        self.controls.quitting() || self.controls.leaving()
+        self.ctx.cancelled() || cancelled(self.controls)
     }
 }
 
@@ -183,6 +198,18 @@ pub struct Selection {
     /// The scripted input (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub script: Option<crate::dev::SelectScript>,
+    /// The run's coordinator, whose foreground permits a chart's bank and
+    /// measurement take.
+    pub coord: game::coord::Coordinator,
+    /// Starts the load's job threads (tests stand in a refusal).
+    pub spawner: game::coord::Spawner,
+    /// What the load's decodes report (tests).
+    #[cfg(test)]
+    pub decodes: Option<Arc<Decodes>>,
+    /// Called after the Bank job made its bank and before the load's look
+    /// for a cancel (tests).
+    #[cfg(test)]
+    pub after_bank: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Selection {
@@ -1829,6 +1856,10 @@ impl AppRig for PlayerRig<'_> {
         sel.loading = Some(page);
     }
 
+    fn load_cancelled(&self) -> bool {
+        cancelled(self.controls)
+    }
+
     fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
         // The chart, speed and section are final: the presentation solves
         // for them once, so what the player adjusts while loading applies
@@ -1937,58 +1968,72 @@ impl AppRig for PlayerRig<'_> {
             .as_mut()
             .and_then(|s| s.script.as_mut())
             .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
-        // The quit key or a close stops the decode at the next file or
-        // packet, and no bank is made.
-        // The sounds decode on their own thread while this one serves the
-        // adjustments, so one made during a long decode is published before
-        // loading ends (design.md "Play Adjustments").
-        let decode = || {
-            audio::load_bank_reporting(
-                chart,
-                rate,
-                speed,
-                &audio::BankLimits::default(),
-                &|done, files| {
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::hold_decoding();
-                    progress.decoded(done, files);
-                    #[cfg(feature = "dev-tools")]
-                    if quit_decoding && done == 1 {
-                        controls.command(game::Command::Quit);
-                    }
-                },
-                &|| controls.quitting() || controls.leaving(),
-            )
-        };
+        let sel = self.selection.as_ref().ok_or(ChartLoadError::NoSelection)?;
+        let (coord, spawner) = (sel.coord.clone(), sel.spawner);
+        #[cfg(test)]
+        let decodes = sel.decodes.clone();
+        // The sounds decode on the Bank job's thread while this one serves
+        // the adjustments, so one made during a long decode is published
+        // before loading ends (design.md "Play Adjustments"). The quit key
+        // or a close stops the decode at the next file or packet, and no
+        // bank is made.
         let (adjust, input) = (&mut self.adjust, &self.input);
-        let decoded_bank = std::thread::scope(|s| {
-            let worker = s.spawn(decode);
-            while !worker.is_finished() {
-                #[cfg(feature = "dev-tools")]
-                crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
-                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                std::thread::park_timeout(crate::play::MARKER_PARK);
+        let job = (game::coord::JobKind::Bank, loaded.path().to_owned(), speed);
+        let decoded = std::thread::scope(|s| {
+            let decode = |ctx: &game::coord::Ctx<'_>| {
+                decode_on_permits(
+                    &coord,
+                    (chart, rate, speed),
+                    &|done, files| {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::hold_decoding();
+                        progress.decoded(done, files);
+                        #[cfg(feature = "dev-tools")]
+                        if quit_decoding && done == 1 {
+                            controls.command(game::Command::Quit);
+                        }
+                    },
+                    &|| ctx.cancelled() || cancelled(controls),
+                    #[cfg(test)]
+                    decodes.as_deref(),
+                )
+            };
+            match coord.run_scoped(s, spawner, job, decode) {
+                Err(failure) => Joined::Failed(failure),
+                Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
+                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                    cancelled(controls)
+                }),
             }
-            worker
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         });
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("decoding", self.adjust.as_ref());
-        let bank = match decoded_bank {
-            Ok(bank) => {
+        let bank = match decoded {
+            Joined::Done(Ok(bank)) => {
                 progress.completed();
                 Arc::new(bank)
             }
-            Err(audio::BankError::Cancelled) => {
+            Joined::Done(Err(audio::BankError::Cancelled))
+            | Joined::Cancelled(Some(Err(audio::BankError::Cancelled))) => {
                 println!("load: cancelled while loading the sounds");
                 println!("load: cancelled");
                 return Ok(Loading::Cancelled);
             }
-            Err(e) => return Err(ChartLoadError::Sounds(e)),
+            Joined::Cancelled(_) => {
+                println!("load: cancelled");
+                return Ok(Loading::Cancelled);
+            }
+            Joined::Done(Err(e)) => return Err(ChartLoadError::Sounds(e)),
+            Joined::Failed(failure) => return Ok(Loading::Failed(failure)),
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
+        #[cfg(test)]
+        if let Some(gate) = self.selection.as_ref().and_then(|s| s.after_bank.as_ref()) {
+            gate();
+        }
         // A quit or a close since the decode's last check: the bank is not
         // installed.
         if cancelled(self.controls) {
@@ -2004,7 +2049,8 @@ impl AppRig for PlayerRig<'_> {
         // The rounds restore against the engine this load answered with.
         self.restorer = rounds.map(|s| game::Restorer::new(self.audio.control.seek_source(), s));
         let engine = self.clock.now();
-        // Its gain, from the cache, or measured now, before its first play.
+        // Its gain, from the cache, or measured now on the Measure job's
+        // thread, before its first play.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let name = sel
             .screen
@@ -2020,37 +2066,66 @@ impl AppRig for PlayerRig<'_> {
             .script
             .as_mut()
             .is_some_and(|s| std::mem::take(&mut s.quit_measuring));
-        let mut host = LoadHost {
-            loaded,
-            rate,
-            controls: self.controls,
-            render: &self.render,
-            page: page.as_ref(),
-            adjust: self.adjust.as_mut(),
-            input: &self.input,
-            #[cfg(feature = "dev-tools")]
-            close,
-            #[cfg(feature = "dev-tools")]
-            quit,
-        };
-        if sel
-            .shelf
-            .loaded(chart, &bank, &name, loaded.path(), &mut host)
-            == Loading::Cancelled
-        {
-            // The quit key leaves the chart's measurement to the
-            // background; a close ends the run.
-            if !self.controls.quitting() {
-                sel.shelf.leave_to_background(crate::background::Job {
-                    source: loaded.source(),
-                    rate,
-                    name,
-                });
+        if let Some(key) = sel.shelf.look_up(chart, &bank, &name, loaded.path()) {
+            show_stage(&self.render, page.as_ref(), Stage::Loudness);
+            let reader = loaded.reader();
+            let job = (
+                game::coord::JobKind::Measure,
+                loaded.path().to_owned(),
+                bms_model::Speed::NORMAL,
+            );
+            let (adjust, input) = (&mut self.adjust, &self.input);
+            let measured = std::thread::scope(|s| {
+                let measure = |ctx: &game::coord::Ctx<'_>| {
+                    // A script's `close-measuring` or `quit-measuring` acts
+                    // once the measurement holds its permit (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if close {
+                        controls.close();
+                    }
+                    #[cfg(feature = "dev-tools")]
+                    if quit {
+                        controls.command(game::Command::Quit);
+                    }
+                    let mut host = JobHost {
+                        reader,
+                        rate,
+                        controls,
+                        coord: &coord,
+                        ctx,
+                        #[cfg(test)]
+                        decodes: decodes.as_deref(),
+                    };
+                    crate::loudness::measure(chart, &bank, Some(&key), &name, &mut host)
+                };
+                match coord.run_scoped(s, spawner, job, measure) {
+                    Err(failure) => Joined::Failed(failure),
+                    Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                        cancelled(controls)
+                    }),
+                }
+            });
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            match measured {
+                Joined::Done(Ok(m)) => sel.shelf.keep_measured(key, m),
+                Joined::Done(Err(crate::loudness::Cancelled)) | Joined::Cancelled(_) => {
+                    // The quit key leaves the chart's measurement to the
+                    // background; a close ends the run.
+                    if !self.controls.quitting() {
+                        sel.shelf.leave_to_background(crate::background::Job {
+                            source: loaded.source(),
+                            rate,
+                            name,
+                        });
+                    }
+                    // Closing or the quit key: nothing more is prepared, and
+                    // the flow leaves the chart.
+                    println!("load: cancelled");
+                    return Ok(Loading::Cancelled);
+                }
+                Joined::Failed(failure) => return Ok(Loading::Failed(failure)),
             }
-            // Closing or the quit key: nothing more is prepared, and the
-            // flow leaves the chart.
-            println!("load: cancelled");
-            return Ok(Loading::Cancelled);
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("measuring", self.adjust.as_ref());
@@ -2654,6 +2729,10 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             #[cfg(feature = "dev-tools")]
             script: None,
+            coord: crate::shelf::tests::coordinator(),
+            spawner: game::coord::Spawner::SYSTEM,
+            decodes: None,
+            after_bank: None,
         }
     }
 
@@ -4475,6 +4554,10 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             #[cfg(feature = "dev-tools")]
             script: None,
+            coord: crate::shelf::tests::coordinator(),
+            spawner: game::coord::Spawner::SYSTEM,
+            decodes: None,
+            after_bank: None,
         };
         let listed: usize = roots.iter().map(|r| walk_count(r)).sum();
         settle(&mut sel);

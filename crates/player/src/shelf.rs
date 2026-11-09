@@ -42,7 +42,7 @@ use library::{
 use game::coord::{Class, Coordinator, Lease};
 
 use crate::background::{Job, Queued, Worker};
-use crate::loudness::{Host, Loudness};
+use crate::loudness::Loudness;
 #[cfg(test)]
 use crate::priority::Unchanged;
 use crate::priority::{Checked, ThreadMode};
@@ -556,22 +556,54 @@ impl Shelf {
     /// chart (its file `path`) waiting in the background is this load's
     /// own now. [`game::Loading::Cancelled`] when the load was cancelled
     /// during the measurement, which the quit key then leaves to the
-    /// background ([`leave_to_background`](Self::leave_to_background)).
+    /// background ([`leave_to_background`](Self::leave_to_background)). A
+    /// load runs the two halves itself ([`look_up`](Self::look_up),
+    /// [`keep_measured`](Self::keep_measured)); the tests drive them
+    /// together here.
+    #[cfg(test)]
     pub fn loaded(
         &mut self,
         chart: &Chart,
         bank: &Arc<SoundBank>,
         name: &str,
         path: &Path,
-        host: &mut dyn Host,
+        host: &mut dyn crate::loudness::Host,
     ) -> game::Loading {
+        let Some(key) = self.look_up(chart, bank, name, path) else {
+            return game::Loading::Ready;
+        };
+        match crate::loudness::measure(chart, bank, Some(&key), name, host) {
+            Ok(m) => {
+                self.keep_measured(key, m);
+                game::Loading::Ready
+            }
+            Err(crate::loudness::Cancelled) => game::Loading::Cancelled,
+        }
+    }
+
+    /// The first half of [`loaded`](Self::loaded): the gain looked up, a
+    /// job of the chart (its file `path`) waiting in the background taken
+    /// as this load's own; the key to measure on a miss.
+    pub fn look_up(
+        &mut self,
+        chart: &Chart,
+        bank: &SoundBank,
+        name: &str,
+        path: &Path,
+    ) -> Option<library::LoudnessKey> {
         self.adopt();
         if let Some(worker) = &self.background
             && worker.take_waiting(path)
         {
             println!("loudness: {name} is no longer waiting in the background");
         }
-        self.loudness.load(&self.library, chart, bank, name, host)
+        self.loudness.look_up(&self.library, chart, bank, name)
+    }
+
+    /// The second half of [`loaded`](Self::loaded): the measurement `m` of
+    /// `key` kept, and its gain the plays'.
+    pub fn keep_measured(&mut self, key: library::LoudnessKey, m: Option<audio::Measurement>) {
+        self.loudness.keep(key, m);
     }
 
     /// A load the quit key cancelled during its measurement: `job` is

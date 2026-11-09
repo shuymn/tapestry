@@ -101,8 +101,11 @@ pub struct ScopedJob<'scope, R> {
 pub enum Joined<R> {
     /// Its result.
     Done(R),
-    /// It stopped, or the waiter stopped it: no result.
-    Cancelled,
+    /// It stopped, or the waiter stopped it: no result. What its work
+    /// returned anyway, if it returned, says only how it stopped (a
+    /// decode's own cancel, a result made after the stop); it is never
+    /// installed.
+    Cancelled(Option<R>),
     /// It ends the run.
     Failed(LoadFailure),
 }
@@ -178,7 +181,7 @@ impl<R> ScopedJob<'_, R> {
             Err(_) => fail(JobPanic("its thread ended unexpectedly".to_owned())),
             Ok((Outcome::Panicked(p), _)) => fail(p),
             Ok((Outcome::Done(()), Some(r))) if !settling => Joined::Done(r),
-            Ok(_) => Joined::Cancelled,
+            Ok((_, r)) => Joined::Cancelled(r),
         }
     }
 
@@ -311,7 +314,11 @@ mod tests {
                 true
             })
         });
-        assert_eq!(joined, Joined::Cancelled);
+        assert_eq!(
+            joined,
+            Joined::Cancelled(Some("parsed")),
+            "made, then dropped"
+        );
         assert_eq!(
             stops.load(Ordering::SeqCst),
             1,
@@ -369,7 +376,11 @@ mod tests {
                 .unwrap();
             job.wait(SLICE, || started.try_recv().is_ok())
         });
-        assert_eq!(joined, Joined::Cancelled);
+        assert_eq!(
+            joined,
+            Joined::Cancelled(Some("measured")),
+            "returned after the stop"
+        );
         assert_eq!(coord.held(Class::Foreground), 0);
     }
 
@@ -390,7 +401,7 @@ mod tests {
                 .unwrap()
                 .wait(SLICE, || true)
         });
-        assert_eq!(joined, Joined::Cancelled);
+        assert_eq!(joined, Joined::Cancelled(None));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
         drop(held);
         assert_eq!(coord.held(Class::Foreground), 0);

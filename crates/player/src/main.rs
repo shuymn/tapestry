@@ -1553,6 +1553,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         dirty: true,
         #[cfg(feature = "dev-tools")]
         script: s.dev.script,
+        coord: coord.clone(),
+        spawner: game::coord::Spawner::SYSTEM,
+        #[cfg(test)]
+        decodes: None,
+        #[cfg(test)]
+        after_bank: None,
     });
     // Each chart of a scenario has its input chosen as it loads
     // (`AppRig::configure`), from autoplay's session.
@@ -1612,7 +1618,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         session_config(receive, auto),
         parts,
         Box::new(game::NoSessionEvents),
-    );
+    )
+    .with_coordinator(coord);
     let ran = if begin { app.run(&mut rig) } else { Ok(()) };
     #[cfg(feature = "dev-tools")]
     println!(
