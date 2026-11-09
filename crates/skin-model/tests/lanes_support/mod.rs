@@ -152,7 +152,7 @@ pub fn bar_group(y: i32, h: i32) -> BarGroupDef {
         place: Place {
             region: Region::Playfield,
             bind: Bind::Lanes,
-            follow: Follow::Lift,
+            follow: Follow::LIFT,
             ..Place::SCREEN
         },
     }

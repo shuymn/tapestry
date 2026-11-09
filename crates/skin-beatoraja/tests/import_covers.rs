@@ -778,11 +778,20 @@ fn every_lift_destination_paints() {
         },
     );
     assert_eq!(lifted(&l), [[20, 750, 430, 130]]);
-    // Offset 5 is HIDDEN+'s alone.
-    assert_eq!(
-        critical(with(&lift_object(""), &[&lift(r#""offset": 5"#)])),
-        (CriticalPart::Lift, NoteKind::RuntimeOffset(5))
-    );
+    // Offset 5 makes it follow HIDDEN+ too: 200 ‰ of the 480 px LIFT
+    // leaves raises it 96 more, and it is not drawn while HIDDEN+ is off.
+    let l = with(&unlined, &[&lift(r#""offset": 5"#)]);
+    let at = |on: bool| {
+        let chart = ChartBuilder::new(150_000).build().unwrap();
+        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        (d.view.lift, d.view.hidden) = (200, if on { 200 } else { 0 });
+        let mut readouts = common::play::readouts_for(d.view);
+        readouts.covers.hidden_enabled = on;
+        d.readouts = Some(readouts);
+        d.shown(5_000)
+    };
+    assert_eq!(at(true), [[20, 664, 430, 200]]);
+    assert!(at(false).is_empty());
 }
 
 /// The lanes over a 64×256 `a.png` with image records `extra` and `dsts`

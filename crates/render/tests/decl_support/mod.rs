@@ -511,7 +511,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                     blend: Blend::Alpha,
                     place: Place {
                         bind: Bind::Lanes,
-                        follow: Follow::Lift,
+                        follow: Follow::LIFT,
                         ..Place::SCREEN
                     },
                 }]
@@ -533,9 +533,9 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                 paint(Part::Hidden, CoverMotion::Hidden, CoverTrim::Lift(880)),
             ];
             for (index, rect, follow) in [
-                (0, [160, -720, 512, 800], Follow::Cover),
-                (1, [160, 880, 512, 200], Follow::None),
-                (2, [160, 80, 512, 800], Follow::None),
+                (0, [160, -720, 512, 800], Follow::COVER),
+                (1, [160, 880, 512, 200], Follow::NONE),
+                (2, [160, 80, 512, 800], Follow::NONE),
             ] {
                 elements.push(ElementDef {
                     source: Source::CoverPaint(index),
