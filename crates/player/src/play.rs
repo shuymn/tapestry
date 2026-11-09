@@ -687,8 +687,12 @@ impl PlayerRig<'_> {
         self.presenter.lines(&mut self.render, lines);
     }
 
-    /// The result's lifetime ends: nothing of it is drawn any more.
+    /// The result's lifetime ends: nothing of it is drawn any more, and
+    /// the input offset keys stop working (design.md "Play Lifecycle",
+    /// tuning while loading) whether selection, the practice page or a
+    /// retry's preparation comes next.
     pub(crate) fn leave_result(&mut self) {
+        let _ = self.controls.tuning().close_end_screen();
         #[cfg(feature = "dev-tools")]
         if self.presenter.current() {
             crate::dev::print_result_work("left");

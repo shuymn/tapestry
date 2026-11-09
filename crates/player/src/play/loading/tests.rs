@@ -329,3 +329,47 @@ fn the_opening_snapshot_allocates_nothing_alloc() {
         assert_eq!(key, loaded.prep_key());
     });
 }
+
+/// O-21: the result shown, the input offset keys work; once it is left
+/// (to selection, the practice page, or a retry's preparation) they are
+/// refused: no value change and no activity, nothing held.
+#[test]
+fn the_offset_keys_are_revoked_on_leaving_the_result() {
+    use game::AppRig as _;
+    for exit in ["selection", "page", "retry"] {
+        on_input_rig(|rig, _| {
+            let dir = tempfile::tempdir().unwrap();
+            let report = crate::end_screen::tests::report(rules::tapestry());
+            let screen = crate::end_screen::tests::screen(dir.path(), &report);
+            let tuning = std::sync::Arc::clone(rig.controls.tuning());
+            rig.show_end(&report, &screen);
+            let shown = tuning.get().input_offset_us;
+            rig.controls
+                .settings_key(Adjust::InputOffsetUp, KeyEvent::Press);
+            rig.controls
+                .settings_key(Adjust::InputOffsetUp, KeyEvent::Release);
+            assert_eq!(tuning.get().input_offset_us, shown + 1_000, "{exit}");
+            match exit {
+                "selection" => rig.entered_selection(),
+                "page" => {
+                    let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+                    rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+                }
+                _ => {
+                    rig.serve_leaving(game::MenuCommand::Retry);
+                    rig.prepare_screen().unwrap();
+                }
+            }
+            assert!(!tuning.end_screen_shown(), "{exit}");
+            let before = tuning.snapshot();
+            for a in [Adjust::InputOffsetDown, Adjust::InputOffsetUp] {
+                for e in [KeyEvent::Press, KeyEvent::Repeat, KeyEvent::Release] {
+                    rig.controls.settings_key(a, e);
+                    assert!(tuning.held().is_empty(), "{exit} {a:?} {e:?}");
+                    assert_eq!(tuning.snapshot(), before, "{exit} {a:?} {e:?}");
+                }
+            }
+            assert_eq!(tuning.get().input_offset_us, shown + 1_000, "{exit}");
+        });
+    }
+}
