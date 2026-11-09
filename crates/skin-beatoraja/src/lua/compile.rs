@@ -25,16 +25,29 @@
 //! unavailable one gives no value, as a lowered expression's joined guards
 //! do. Each refusal is [`Unsupported`] and follows the callback's role.
 //!
-//! A timer root's slots ([`slots`]) are checked before it compiles: each
-//! slot's every write is a constant, a mapped integer read, the state clock
-//! or the off value, so its domain is their join with its initial value;
-//! no write is off, and each is reached only under the slot's own off test
-//! and under a guard false at a zero tally (every slot off, every count,
-//! combo, score and point 0), so no write happens before the first play
-//! frame and none after the slot is set; and no operation of the callback
-//! can raise, so its stores are kept whatever it returns. Its stores are
-//! emitted together after its result: every value into its own register,
-//! then each [`Insn::StoreSlot`] with its domain.
+//! A timer root's slots ([`slots`]) are checked before it compiles,
+//! design.md "beatoraja Lua Skins", the program's state:
+//!
+//! - **Domain**: each slot's every write is a constant, a mapped integer
+//!   read, the state clock or the off value, never a value computed from
+//!   state, so its domain is their join with its initial value.
+//! - **One way**: no write is off, and each is reached only under the
+//!   slot's own off test, so once set no guard holds again.
+//! - **Frozen guard**: every condition selecting a write reads only
+//!   constants, the slot itself and fields a tally fixes (the counts, the
+//!   combos, the EX score, the point), which do not change outside play
+//!   frames; a guard reading another slot, the clock or any other field
+//!   is refused. So a guard false on the last play frame stays false.
+//! - **Loading**: every condition selecting a write is false before the
+//!   first play frame, evaluated with the slot at its initial value and
+//!   every tally field 0, so the program, which runs in play frames only,
+//!   omits no write the source makes while loading.
+//!
+//! No operation it keeps can raise: the residual keeps arithmetic, `math`
+//! and order only of numbers, and the intervals refuse an integer `//` by
+//! a possible 0, so its stores are kept whatever it returns. Its stores
+//! are emitted together after its result: every value into its own
+//! register, then each [`Insn::StoreSlot`] with its domain.
 
 use skin_model::Ty;
 use skin_model::present::{self, Cmp, Domain, Insn, MAX_CALLBACK_OPS, MAX_REGISTERS, MathFn};
@@ -42,7 +55,7 @@ use skin_model::present::{self, Cmp, Domain, Insn, MAX_CALLBACK_OPS, MAX_REGISTE
 use super::Unsupported;
 use super::callback::Analysis;
 use super::residual::{
-    self, Conv, FLT, INT, LIMITS, MathOp, NUM, Node, R, Residual, Stop, Val, charge, did,
+    self, Conv, FLT, INT, LIMITS, MathOp, Node, R, Residual, Stop, Val, charge, did,
 };
 use super::syntax::{Bin, EXACT};
 
@@ -169,23 +182,38 @@ enum At0 {
 }
 
 /// Node `v` as it is before the first play frame, as far as that is known:
-/// every slot off, every field [`zero_at_start`] names 0.
-fn at_start<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, v: u32) -> R<Option<At0>> {
+/// slot `k` at its initial value `init`, every field [`zero_at_start`]
+/// names 0.
+fn at_start<L: Leaves>(
+    an: &Analysis,
+    leaves: &mut L,
+    res: &Residual,
+    v: u32,
+    (k, init): (u16, present::Val),
+) -> R<Option<At0>> {
     charge(an, "compile:slot", 1)?;
     Ok(match res.node(v) {
-        Node::Slot(_) | Node::Known(Val::OffValue) => Some(At0::Off),
+        Node::Slot(j) if j == k => match init {
+            present::Val::Int(n) => Some(At0::Int(n)),
+            v if v == present::OFF => Some(At0::Off),
+            _ => None,
+        },
+        Node::Known(Val::OffValue) => Some(At0::Off),
         Node::Known(Val::Int(n)) => Some(At0::Int(n)),
         Node::Known(Val::Bool(b)) => Some(At0::Bool(b)),
         Node::Read { .. } => match leaves.leaf(res, v)? {
             Some(l) if l.ty == Ty::Int && zero_at_start(&l.src) => Some(At0::Int(0)),
             _ => None,
         },
-        Node::Not(x) => match at_start(an, leaves, res, x)? {
+        Node::Not(x) => match at_start(an, leaves, res, x, (k, init))? {
             Some(At0::Bool(b)) => Some(At0::Bool(!b)),
             _ => None,
         },
         Node::Cmp(op, a, b) => {
-            let (x, y) = (at_start(an, leaves, res, a)?, at_start(an, leaves, res, b)?);
+            let (x, y) = (
+                at_start(an, leaves, res, a, (k, init))?,
+                at_start(an, leaves, res, b, (k, init))?,
+            );
             match (op, x, y) {
                 (Bin::Eq | Bin::Ne, Some(x), Some(y)) => {
                     Some(At0::Bool((x == y) == (op == Bin::Eq)))
@@ -199,13 +227,41 @@ fn at_start<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, v: u32) ->
                 _ => None,
             }
         }
-        Node::Select { cond, then, other } => match at_start(an, leaves, res, cond)? {
-            Some(At0::Bool(true)) => at_start(an, leaves, res, then)?,
-            Some(At0::Bool(false)) => at_start(an, leaves, res, other)?,
+        Node::Select { cond, then, other } => match at_start(an, leaves, res, cond, (k, init))? {
+            Some(At0::Bool(true)) => at_start(an, leaves, res, then, (k, init))?,
+            Some(At0::Bool(false)) => at_start(an, leaves, res, other, (k, init))?,
             _ => None,
         },
         _ => None,
     })
+}
+
+/// Refuses a condition `c` selecting slot `k`'s write that reads anything
+/// but constants, slot `k` and the fields a tally fixes: another slot,
+/// whose change can enable it after the last play frame; the clock; any
+/// other field.
+fn frozen<L: Leaves>(an: &Analysis, leaves: &mut L, res: &Residual, c: u32, k: u16) -> R<()> {
+    charge(an, "compile:slot", 1)?;
+    match res.node(c) {
+        Node::Known(_) | Node::Unreachable => Ok(()),
+        Node::Slot(j) if j == k => Ok(()),
+        Node::Slot(_) => refusal("a slot write guarded by another slot"),
+        Node::Read { .. } => match leaves.leaf(res, c)? {
+            Some(l) if zero_at_start(&l.src) => Ok(()),
+            _ => refusal("a slot write guarded by state that changes outside play"),
+        },
+        Node::StateUs => refusal("a slot write guarded by state that changes outside play"),
+        Node::Not(x) | Node::Neg(x) => frozen(an, leaves, res, x, k),
+        Node::Arith(_, a, b) | Node::Math(_, a, b) | Node::Cmp(_, a, b) => {
+            frozen(an, leaves, res, a, k)?;
+            frozen(an, leaves, res, b, k)
+        }
+        Node::Select { cond, then, other } => {
+            frozen(an, leaves, res, cond, k)?;
+            frozen(an, leaves, res, then, k)?;
+            frozen(an, leaves, res, other, k)
+        }
+    }
 }
 
 /// Whether `c` having truthiness `pol` implies slot `k` is off.
@@ -243,7 +299,7 @@ fn check_writes<L: Leaves>(
     leaves: &mut L,
     res: &Residual,
     v: u32,
-    k: u16,
+    (k, init): (u16, present::Val),
     path: &mut Vec<(u32, bool)>,
 ) -> R<()> {
     charge(an, "compile:slot", 1)?;
@@ -252,11 +308,11 @@ fn check_writes<L: Leaves>(
         Node::Unreachable => Ok(()),
         Node::Select { cond, then, other } => {
             path.push((cond, true));
-            let r = check_writes(an, leaves, res, then, k, path);
+            let r = check_writes(an, leaves, res, then, (k, init), path);
             path.pop();
             r?;
             path.push((cond, false));
-            let r = check_writes(an, leaves, res, other, k, path);
+            let r = check_writes(an, leaves, res, other, (k, init), path);
             path.pop();
             r
         }
@@ -267,9 +323,10 @@ fn check_writes<L: Leaves>(
             let mut guarded = false;
             let mut before = false;
             for &(c, pol) in path.iter() {
+                frozen(an, leaves, res, c, k)?;
                 guarded = guarded || implies_off(an, res, c, pol, k)?;
                 before = before
-                    || match at_start(an, leaves, res, c)? {
+                    || match at_start(an, leaves, res, c, (k, init))? {
                         Some(At0::Bool(b)) => b != pol,
                         _ => false,
                     };
@@ -287,34 +344,20 @@ fn check_writes<L: Leaves>(
 
 /// The root's slots `slots`, at their initial values and domains so far,
 /// proven for `res` ([`Residual::stores`]): each slot's domain joined with
-/// its writes', checked against the rules above. Every node the residual
-/// holds is checked to raise nothing.
+/// its writes', each write checked against the rules above.
 pub(crate) fn slots<L: Leaves>(
     an: &Analysis,
     leaves: &mut L,
     res: &Residual,
     slots: &mut [Slot],
 ) -> R<()> {
-    for r in 0..res.len() {
-        charge(an, "compile:slot", 1)?;
-        let num = |x: u32| res.kind(x) & !NUM == 0;
-        let raises = match res.node(r) {
-            Node::Arith(_, a, b) | Node::Math(_, a, b) => !num(a) || !num(b),
-            Node::Neg(a) => !num(a),
-            Node::Cmp(Bin::Eq | Bin::Ne, ..) => false,
-            Node::Cmp(_, a, b) => !num(a) || !num(b),
-            _ => false,
-        };
-        if raises {
-            return refusal("a slot writer that may raise");
-        }
-    }
     for &(k, v) in &res.stores {
         let Some(s) = slots.iter_mut().find(|s| s.slot == k) else {
             return refusal("a slot it does not own");
         };
         s.domain = value_domain(an, leaves, res, v, k, s.domain)?;
-        check_writes(an, leaves, res, v, k, &mut Vec::new())?;
+        let init = s.init;
+        check_writes(an, leaves, res, v, (k, init), &mut Vec::new())?;
     }
     Ok(())
 }
@@ -443,13 +486,10 @@ struct C<'a, L> {
     leaves: &'a mut L,
     out: Compiled,
     top: u8,
-    /// Whether the off value is a value here: a timer's result or a
-    /// slot's.
-    off: bool,
 }
 
-/// `res`, converted by `conv` (a `draw` or a number's value), compiled into
-/// one callback.
+/// `res`, converted by `conv` (a `draw`, a number's value or a timer),
+/// compiled into one callback, its slots `slots` proven ([`slots`]).
 ///
 /// `root` is the root's integer bounds from [`intervals`], run before the
 /// backend was chosen; each node is charged again here, as the walk it
@@ -489,7 +529,6 @@ pub(crate) fn compile<L: Leaves>(
             slots: slots.to_vec(),
         },
         top: 0,
-        off: conv == present::Conv::Timer || !res.stores.is_empty(),
     };
     // Every read's availability first, its value aside.
     for guards in guards {
@@ -591,7 +630,9 @@ impl<L: Leaves> C<'_, L> {
         }
         let ty = || Err(Stop::Unsupported(Unsupported::Type));
         match res.node(r) {
-            Node::Known(Val::OffValue) if self.off => {
+            // The off value is a value only for a timer, its result or
+            // its slots'.
+            Node::Known(Val::OffValue) if self.out.conv == present::Conv::Timer => {
                 let k = self.constant(present::OFF)?;
                 self.push(Insn::Const { dst, k })?;
             }

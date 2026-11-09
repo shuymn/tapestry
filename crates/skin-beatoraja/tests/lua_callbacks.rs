@@ -1388,35 +1388,33 @@ fn the_latch_starts_once_and_keeps_its_start() {
     assert!(p.frame(1_000, &[]).is_empty());
 }
 
-/// Every slot's value is computed before any is stored: the second
-/// slot's guard reads the first's value as the run began, so it is set
-/// one run after the first; and a store on a returning path, or in a
-/// callback whose result is the off value or false, is kept.
+/// Every slot's value is computed before any is stored: a run returning
+/// the value its slot had as it began gives off on the run that sets it,
+/// so the timer is on from the next frame; and a store on a returning
+/// path, or in a callback whose result is the off value or false, is
+/// kept.
 #[test]
 fn stores_are_parallel_and_kept_on_every_path() {
-    use skin_model::present::{OFF, Val};
+    use skin_model::present::Val;
     let off = "ms.timer_off_value";
     let full = "ms.number(100) == 200000";
-    // `b` is set only when `a` was set as the run began.
-    let locals = format!("local a = {off}\nlocal b = {off}");
     let body = format!(
-        "local was = a\n\
-         if a == {off} and {full} then a = ms.time() end\n\
-         if b == {off} and was ~= {off} and {full} then b = ms.time() end\n\
-         return b"
+        "local was = state\n\
+         if state == {off} and {full} then state = ms.time() end\n\
+         return was"
     );
-    let d = timer_skin(&locals, &body, 1);
+    let d = timer_skin(STATE, &body, 1);
     let i = import(&d, 905).unwrap();
     assert_eq!(i.callbacks, [Disposition::Compiled]);
     let mut p = Drawn::new(i.imported.skin, 4);
     full_score(&mut p, 4);
     p.state_us = 7_000;
-    // The first run sets `a`, and gives `b`, still off: no second run.
+    // The run that sets the slot gives what it held, off: not drawn.
     assert!(p.frame(1_000, &[]).is_empty());
-    assert_eq!(bank(&p), [Val::Int(7_000), OFF]);
+    assert_eq!(bank(&p), [Val::Int(7_000)]);
     p.state_us = 9_000;
     assert_eq!(p.frame(1_016, &[]).len(), 1);
-    assert_eq!(bank(&p), [Val::Int(7_000), Val::Int(9_000)]);
+    assert_eq!(bank(&p), [Val::Int(7_000)]);
 
     for (body, drawn) in [
         // A store on the arm that returns.
@@ -1454,7 +1452,8 @@ fn stores_are_parallel_and_kept_on_every_path() {
 /// that can happen before play (no tally guard), a write repeated once
 /// set or of the off value, a cell only a helper captures, one a helper
 /// shared by two roots writes (each helper reading a written cell:
-/// `Interference`), and one a root reads through a helper.
+/// `Interference`), a guard reading another slot or the clock, a writer
+/// that raises, and one a root reads through a helper.
 #[test]
 fn a_slot_is_taken_only_when_proven() {
     let off = "ms.timer_off_value";
@@ -1555,6 +1554,60 @@ fn a_slot_is_taken_only_when_proven() {
                 dst("r1", ""),
                 dst("r2", "")
             ),
+            Disposition::Replaced(Unsupported::Interference),
+        ),
+        // A guard reading another slot: set by the source while loading
+        // (`b` starts set) where the program sets it at the first play
+        // frame, or enabled the run after the other slot changes, after
+        // the last play frame.
+        (
+            latch(
+                &format!("local a = {off}\nlocal b = 1"),
+                &format!(
+                    "if a == {off} and b ~= {off} then a = ms.time() end\n\
+                     if b == {off} and {full} then b = ms.time() end\n\
+                     return a"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by another slot"),
+        ),
+        (
+            latch(
+                &format!("local a = {off}\nlocal b = {off}"),
+                &format!(
+                    "local was = a\n\
+                     if a == {off} and {full} then a = ms.time() end\n\
+                     if b == {off} and was ~= {off} and {full} then b = ms.time() end\n\
+                     return b"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by another slot"),
+        ),
+        // A guard reading the clock, which runs on outside play (the
+        // practice page).
+        (
+            latch(
+                STATE,
+                &format!(
+                    "if state == {off} and {full} and ms.time() > 10000000 then state = ms.time() end\n\
+                     return state"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by state that changes outside play"),
+        ),
+        // A writer with a definite Lua error on a reached path: outside
+        // the admission walk's subset, it opens the candidate (and the
+        // residual refuses it as a Lua error), so no slot writer the
+        // program keeps raises.
+        (
+            latch(
+                STATE,
+                &format!(
+                    "local x = nil\n\
+                     if state == {off} and {full} then state = ms.time() end\n\
+                     return x + 1"
+                ),
+            ) + &dst("latch", ""),
             Disposition::Replaced(Unsupported::Interference),
         ),
         // The root reads its cell through a helper.
