@@ -2498,6 +2498,12 @@ enum Reads {
     /// The view's next-rank difference (number 154): each view laid out on
     /// the pages uploaded after the attempt's commit.
     View,
+    /// The view's best-relative values (numbers 150, 152, 170, 172, 176,
+    /// 178 and 371, options 330 and 332), raising an error unless each is
+    /// the source's empty score's for a view that scored: EX 0, the
+    /// difference the view's EX score (number 71), BP and its difference
+    /// `i32::MIN`, no lamp, both beaten.
+    EmptyBest,
 }
 
 /// A self-made Lua result skin under `fx`, chosen in `player.toml`: its EX
@@ -2520,6 +2526,18 @@ fn result_skin_with(fx: &Fixture, reads: Reads, header: &str) {
         Reads::Nothing => "",
         Reads::Chart => "local ms = require(\"main_state\")\nlocal lv = ms.number(96)\n",
         Reads::View => "local ms = require(\"main_state\")\nlocal nr = ms.number(154)\n",
+        Reads::EmptyBest => {
+            "local ms = require(\"main_state\")\n\
+             local ex = ms.number(71)\n\
+             local min = -2147483648\n\
+             if ex <= 0 or ms.number(150) ~= 0 or ms.number(170) ~= 0\n\
+               or ms.number(152) ~= ex or ms.number(172) ~= ex\n\
+               or ms.number(176) ~= min or ms.number(178) ~= min\n\
+               or ms.number(371) ~= 0\n\
+               or not ms.option(330) or not ms.option(332) then\n\
+               error(\"not the empty score\")\n\
+             end\n"
+        }
     };
     fs::write(
         skin.join("result.luaskin"),
@@ -2803,6 +2821,32 @@ fn left_after_outro(stdout: &str) -> Vec<i64> {
                 .unwrap()
         })
         .collect()
+}
+
+/// An autoplay's result, which has no best lookup (`Parts::unsaved`),
+/// through the real flow: a result skin reading its best-relative values
+/// while it loads reads the source's empty score for the own view and the
+/// next preset's, and draws (design.md "Personal Bests", skin
+/// projections).
+#[test]
+fn an_autoplay_result_skin_reads_the_empty_best() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::EmptyBest);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"next-preset\"",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let shown = lines(&stdout, "dev: result shown: ");
+    assert!(shown.len() >= 2, "{stdout}");
+    assert!(
+        shown.iter().all(|l| *l == "dev: result shown: skin"),
+        "{stdout}"
+    );
 }
 
 /// C14 through the real flow (P4): a skin's declared `fadeout` delays back
