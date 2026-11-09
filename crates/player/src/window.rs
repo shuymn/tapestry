@@ -1432,7 +1432,7 @@ mod tests {
             press(c, keys, Adjust::VolumeDown, false);
             release(c, keys, Adjust::VolumeDown);
             c.tuning().reopen();
-            let _ = c.tuning().close_unchanged(&s, 2);
+            let _ = c.tuning().close_unchanged(&s, 2, bms_model::TimeUs(0));
             c.tuning().reopen();
         };
         // Warmed up once: the routing's first call.

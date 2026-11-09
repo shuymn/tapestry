@@ -9,8 +9,13 @@
 //! current: when the opening takes its starting settings
 //! ([`apply_snapshot`](game::LoadingRig::apply_snapshot), which keeps it
 //! as [`PlayerRig::accepted_at_o1`]) and at the revalidation. Every other
-//! copy reads the count the driver last drained, and the input side's
-//! atomics as the input thread published them.
+//! copy reads the count the driver last drained. Every copy reads the
+//! activity record as one snapshot, the input thread's part written at
+//! each event before the tap queues it, so before any fence's answer
+//! after it. The revalidation's close is provisional on the reducer's
+//! side until the comparison decides, and a close accepts the window's
+//! focus-loss generation, which the opening asked for then carries
+//! ([`PlayerRig::accepted_focus`]).
 
 use bms_model::{TimeSource as _, TimeUs};
 use game::{InputWaitError, LoadingRig, Revalidated, Rig as _, Settings, TuningSnapshot};
@@ -25,21 +30,39 @@ impl PlayerRig<'_> {
     }
 
     /// Closes the reducer's acceptance at a fence: its count, then
-    /// current; `None` without the adjustments.
+    /// current; `None` without the adjustments. With `provisionally`, what
+    /// was observed after the fence waits until
+    /// [`decide_reducer`](Self::decide_reducer).
     ///
     /// # Errors
     ///
     /// Why the input thread did not answer the fence.
-    fn close_reducer(&mut self) -> Result<Option<u64>, InputWaitError> {
+    fn close_reducer(&mut self, provisionally: bool) -> Result<Option<u64>, InputWaitError> {
         if let Some(e) = self.adjustments_failure() {
             return Err(e);
         }
         match self.adjustments() {
             Some((driver, mut pump)) => {
-                driver.close_acceptance(&mut pump)?;
+                if provisionally {
+                    driver.close_provisionally(&mut pump)?;
+                } else {
+                    driver.close_acceptance(&mut pump)?;
+                }
                 Ok(Some(driver.accepted()))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Keeps the reducer's provisional close (`keep`) or reverses it at its
+    /// fence: what was observed since is then taken closed, or open.
+    fn decide_reducer(&mut self, keep: bool) {
+        if let Some((driver, mut pump)) = self.adjustments() {
+            if keep {
+                driver.commit_close(&mut pump);
+            } else {
+                driver.reverse_close(&mut pump);
+            }
         }
     }
 
@@ -136,6 +159,13 @@ impl LoadingRig for PlayerRig<'_> {
         refreshed
     }
 
+    /// The reducer closes at a fence, provisionally: what the input thread
+    /// observed after it waits. Then, under the tuning's step lock, the
+    /// window side closes too if nothing moved since `at_o1` and the
+    /// tuning is quiet now, accepting `at_o1`'s focus-loss generation for
+    /// the opening; the reducer's close is kept and what waited is taken
+    /// closed. Otherwise the reducer's close is reversed at its fence and
+    /// what waited is taken open.
     fn revalidate_and_close(
         &mut self,
         at_o1: &TuningSnapshot,
@@ -143,29 +173,40 @@ impl LoadingRig for PlayerRig<'_> {
     ) -> Result<Revalidated, InputWaitError> {
         #[cfg(test)]
         self.opening_gates.revalidate.pass();
-        let reducer = self.close_reducer()?;
+        let reducer = self.close_reducer(true)?;
         let at = self.accepted_at_o1.unwrap_or(at_o1.revision.reducer);
+        let now = self.clock.now();
         let unchanged = reducer.is_none_or(|n| n == at)
-            && self.controls.tuning().close_unchanged(at_o1, generation);
+            && self
+                .controls
+                .tuning()
+                .close_unchanged(at_o1, generation, now);
+        self.decide_reducer(unchanged);
         if unchanged {
+            self.accepted_focus = Some(at_o1.focus_losses);
             return Ok(Revalidated::Closed);
-        }
-        if reducer.is_some() {
-            self.reopen_reducer()?;
         }
         Ok(Revalidated::Changed)
     }
 
     fn close_acceptance(&mut self, generation: u32) -> Result<TuningSnapshot, InputWaitError> {
-        let reducer = self.close_reducer()?;
+        let reducer = self.close_reducer(false)?;
         let mut snapshot = self.controls.tuning().close(generation);
         snapshot.revision.reducer = reducer.unwrap_or(0);
+        self.accepted_focus = Some(snapshot.focus_losses);
+        #[cfg(test)]
+        self.opening_gates
+            .closes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((self.clock.now(), snapshot));
         Ok(snapshot)
     }
 
     fn reopen_acceptance(&mut self) -> Result<(), InputWaitError> {
         self.reopen_reducer()?;
         self.controls.tuning().reopen();
+        self.accepted_focus = None;
         Ok(())
     }
 
@@ -189,12 +230,16 @@ impl PlayerRig<'_> {
 
 /// Where the loading opener's steps on the player's rig wait while a test
 /// holds them (tests): after the epoch's refresh (O5) acted, and before
-/// the revalidation (O11) acts.
+/// the revalidation (O11) acts; and where a deferred opening passes.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct OpeningGates {
     pub refresh: crate::render_side::TestGate,
     pub revalidate: crate::render_side::TestGate,
+    /// Passed at each opening the input thread answered `Deferred`.
+    pub deferred: crate::render_side::TestGate,
+    /// Each close after a deferral: the clock's time and the copy.
+    pub closes: std::sync::Mutex<Vec<(TimeUs, TuningSnapshot)>>,
 }
 
 #[cfg(test)]

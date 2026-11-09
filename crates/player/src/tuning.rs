@@ -9,23 +9,25 @@
 //! kept under the step lock beside the values: the window side's revision,
 //! its last activity, the settings keys that are down with how each came
 //! to be ([`HoldClass`]), an overflow of that set, whether the window has
-//! focus, and whether acceptance is open or closed until a candidate
-//! generation's recording opens. The input side's START and SELECT holds
-//! come from the input thread's atomics ([`InputActivity`]). A copy of it
-//! all ([`LiveTuning::snapshot`]) is what the loading state and the
+//! focus with its focus losses, and whether acceptance is open or closed
+//! until a candidate generation's recording opens. Every change of them is
+//! written, under the lock, into the window side's section of the activity
+//! record ([`input::ActivityRecord`]); the input thread's adjustment tap
+//! writes the tuning controls it sees (START, SELECT, F1, F2) into the
+//! input side's. A copy of the values with the record read as one
+//! snapshot ([`LiveTuning::snapshot`]) is what the loading state and the
 //! opening read.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bms_model::TimeUs;
 use game::{
     AcceptanceRevision, Adjust, Chain, DataRoot, Settings, Tuning, TuningSnapshot, save_settings,
 };
-
-use crate::input_side::InputActivity;
+use input::{ActivityRecord, SectionValue};
 
 /// The settings keys the window side holds at most: one entry per bound
 /// settings key.
@@ -100,6 +102,8 @@ struct Window {
     /// [`HoldClass::PreLoading`].
     epoch_start: TimeUs,
     focused: bool,
+    /// Focus losses so far: the generation an opening accepts.
+    focus_losses: u64,
     /// Focus was lost since acceptance last reopened.
     lost_since_reopen: bool,
 }
@@ -115,7 +119,20 @@ impl Window {
             acceptance: Acceptance::Open,
             epoch_start: TimeUs(i64::MIN),
             focused: true,
+            focus_losses: 0,
             lost_since_reopen: false,
+        }
+    }
+
+    /// What the window side's section of the activity record holds.
+    fn section(&self) -> SectionValue {
+        SectionValue {
+            revision: self.revision,
+            last: self.last,
+            held: self.blocking(),
+            overflow: self.overflow,
+            unfocused: !self.focused,
+            focus_losses: self.focus_losses,
         }
     }
 
@@ -200,9 +217,10 @@ pub struct LiveTuning {
     /// refused, never lost between the two. The render thread reads the
     /// values without it.
     step: Mutex<Window>,
-    /// The input thread's START and SELECT, and the generation whose
-    /// recording it opened last: written without the lock.
-    input: InputActivity,
+    /// The activity record: the window side's section written under the
+    /// lock, the input side's by the input thread's tap without it, with
+    /// the generation whose recording the input thread opened last.
+    record: Arc<ActivityRecord>,
 }
 
 impl LiveTuning {
@@ -217,7 +235,7 @@ impl LiveTuning {
             version: AtomicU64::new(0),
             end_screen: AtomicBool::new(false),
             step: Mutex::new(Window::new()),
-            input: InputActivity::default(),
+            record: Arc::default(),
         }
     }
 
@@ -234,9 +252,21 @@ impl LiveTuning {
         self.step.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// What the input thread publishes of START and SELECT.
-    pub const fn input_activity(&self) -> &InputActivity {
-        &self.input
+    /// The activity record, for the input thread's tap to write its
+    /// section of and to read the focus losses at an opening.
+    pub const fn activity(&self) -> &Arc<ActivityRecord> {
+        &self.record
+    }
+
+    /// The window's focus losses as last written: what an opening compares
+    /// with the generation it accepted.
+    pub fn focus_losses(&self) -> u64 {
+        self.record.window.focus_losses()
+    }
+
+    /// Writes the window side's section from `w`, the step lock held.
+    fn publish(&self, w: &Window) {
+        self.record.window.publish(w.section());
     }
 
     /// The master volume to play: as loaded until a volume key moves it.
@@ -283,6 +313,7 @@ impl LiveTuning {
         let changed = self.step_value(a);
         if changed {
             w.bump(None);
+            self.publish(&w);
         }
         changed
     }
@@ -330,7 +361,15 @@ impl LiveTuning {
     /// key is nothing at all. Returns whether a value changed.
     pub fn key(&self, a: Adjust, event: KeyEvent, at: TimeUs) -> bool {
         let mut w = self.window();
-        w.normalize(self.input.opened());
+        let changed = self.key_locked(&mut w, a, event, at);
+        // Written before the lock is let go.
+        self.publish(&w);
+        changed
+    }
+
+    /// [`key`](Self::key), the step lock held.
+    fn key_locked(&self, w: &mut Window, a: Adjust, event: KeyEvent, at: TimeUs) -> bool {
+        w.normalize(self.record.opened());
         let refused = self.refused(a);
         match event {
             KeyEvent::Press => {
@@ -382,21 +421,25 @@ impl LiveTuning {
     /// revision; the same focus again changes nothing.
     pub fn focus(&self, focused: bool, at: TimeUs) {
         let mut w = self.window();
-        w.normalize(self.input.opened());
+        w.normalize(self.record.opened());
         if w.focused == focused {
             return;
         }
         w.focused = focused;
         if focused {
             w.bump(Some(at));
-            return;
+        } else {
+            for (_, class) in w.held.iter_mut().flatten() {
+                *class = HoldClass::FocusDisarmed;
+            }
+            w.overflow = false;
+            w.lost_since_reopen = true;
+            w.focus_losses = w.focus_losses.wrapping_add(1);
+            w.bump(None);
         }
-        for (_, class) in w.held.iter_mut().flatten() {
-            *class = HoldClass::FocusDisarmed;
-        }
-        w.overflow = false;
-        w.lost_since_reopen = true;
-        w.bump(None);
+        // Written before the window's other focus state, which the input
+        // thread samples: an opening it is asked for sees the loss here.
+        self.publish(&w);
     }
 
     /// A loading state begins at `at` (a chart chosen to play, a practice
@@ -412,34 +455,57 @@ impl LiveTuning {
         }
         w.acceptance = Acceptance::Open;
         w.lost_since_reopen = false;
+        self.publish(&w);
     }
 
-    /// A copy of the tuning, the step lock held: the values, the window
-    /// side's revision and holds, overflow, focus and last activity, and
-    /// the input side's atomics. The reducer's count is 0: its owner adds
-    /// it. Copies only: nothing allocates or calls back.
+    /// A copy of the tuning, the step lock held: the values, and the
+    /// activity record read as one snapshot (both sides' revisions, holds
+    /// and last activity, overflow, focus and its losses). The reducer's
+    /// count is 0: its owner adds it. Copies only: nothing allocates,
+    /// waits or calls back.
     pub fn snapshot(&self) -> TuningSnapshot {
         let w = self.window();
         self.copy(&w)
     }
 
-    /// [`snapshot`](Self::snapshot) of `w`, the step lock held.
+    /// [`snapshot`](Self::snapshot), the step lock held. A read of the
+    /// record that stays unstable gives an unstable copy: never quiet,
+    /// never unchanged.
     fn copy(&self, w: &Window) -> TuningSnapshot {
-        let input = self.input.read();
-        let last = match (w.last, input.last) {
+        let values = Some(self.get());
+        let Some(read) = self.record.read() else {
+            return TuningSnapshot {
+                stable: false,
+                values,
+                revision: AcceptanceRevision {
+                    window: w.revision,
+                    input: u64::MAX,
+                    reducer: 0,
+                },
+                held: true,
+                overflow: w.overflow,
+                focused: w.focused,
+                focus_losses: w.focus_losses,
+                last_activity: w.last,
+            };
+        };
+        let (window, input) = (read.window, read.input);
+        let last = match (window.last, input.last) {
             (Some(a), Some(b)) => Some(TimeUs(a.0.max(b.0))),
             (a, b) => a.or(b),
         };
         TuningSnapshot {
-            values: Some(self.get()),
+            stable: true,
+            values,
             revision: AcceptanceRevision {
-                window: w.revision,
+                window: window.revision,
                 input: input.revision,
                 reducer: 0,
             },
-            held: w.blocking() || input.held,
-            overflow: w.overflow,
-            focused: w.focused,
+            held: window.held || input.held,
+            overflow: window.overflow,
+            focused: !window.unfocused,
+            focus_losses: window.focus_losses,
             last_activity: last,
         }
     }
@@ -454,18 +520,16 @@ impl LiveTuning {
         self.copy(&w)
     }
 
-    /// The opening's revalidation, the step lock held: when the window's
-    /// and the input side's revisions are `at_o1`'s, focus is in and
-    /// nothing holds, acceptance closes until candidate `generation`'s
-    /// recording opens. Whether it closed.
-    pub fn close_unchanged(&self, at_o1: &TuningSnapshot, generation: u32) -> bool {
+    /// The opening's revalidation, the step lock held: when the copy now
+    /// is unchanged since `at_o1` at `now` (both sides' revisions,
+    /// [`TuningSnapshot::unchanged_since`]; the reducer's is its owner's),
+    /// acceptance closes until candidate `generation`'s recording opens.
+    /// Whether it closed.
+    pub fn close_unchanged(&self, at_o1: &TuningSnapshot, generation: u32, now: TimeUs) -> bool {
         let mut w = self.window();
-        let now = self.copy(&w);
-        let unchanged = now.revision.window == at_o1.revision.window
-            && now.revision.input == at_o1.revision.input
-            && now.focused
-            && !now.held
-            && !now.overflow;
+        let mut copy = self.copy(&w);
+        copy.revision.reducer = at_o1.revision.reducer;
+        let unchanged = copy.unchanged_since(at_o1, now);
         if unchanged {
             w.acceptance = Acceptance::Closed {
                 reopen_at: generation,
@@ -497,7 +561,7 @@ impl LiveTuning {
     #[cfg(test)]
     pub fn acceptance(&self) -> Acceptance {
         let mut w = self.window();
-        w.normalize(self.input.opened());
+        w.normalize(self.record.opened());
         w.acceptance
     }
 
@@ -518,12 +582,22 @@ impl LiveTuning {
         self.end_screen.store(true, Ordering::Release);
     }
 
-    /// A play is about to start: the input offset keys stop working, and
-    /// the values the play starts with are returned, in one step with
-    /// respect to [`adjust`](Self::adjust).
+    /// The result screen is left (a play is about to start): the input
+    /// offset keys stop working, and the values the play starts with are
+    /// returned, in one step with respect to [`adjust`](Self::adjust) and
+    /// [`key`](Self::key). An input offset key down now is dropped from the
+    /// held set in the same step: its value stays, and its repeats and
+    /// release, refused from here, count nothing (design.md "Play
+    /// Lifecycle", tuning while loading).
     pub fn close_end_screen(&self) -> Tuning {
-        let _step = self.window();
+        let mut w = self.window();
         self.end_screen.store(false, Ordering::Release);
+        for entry in &mut w.held {
+            if entry.is_some_and(|(k, _)| k.is_input_offset()) {
+                *entry = None;
+            }
+        }
+        self.publish(&w);
         self.get()
     }
 }
@@ -708,12 +782,15 @@ mod tests {
             at_o1.values.map(|v| v.display_offset_us + 1_000)
         );
         assert!(now.quiet_at(TimeUs(6 * S + 1)), "quiet by the time stamps");
-        assert!(!now.unchanged_since(&at_o1));
-        assert!(!t.close_unchanged(&at_o1, 3), "a local retry");
+        assert!(!now.unchanged_since(&at_o1, TimeUs(6 * S + 1)));
+        assert!(
+            !t.close_unchanged(&at_o1, 3, TimeUs(6 * S + 1)),
+            "a local retry"
+        );
         assert_eq!(t.acceptance(), Acceptance::Open);
         // The next opening's snapshot closes.
         let again = t.snapshot();
-        assert!(t.close_unchanged(&again, 3));
+        assert!(t.close_unchanged(&again, 3, TimeUs(6 * S + 1)));
         assert_eq!(t.acceptance(), Acceptance::Closed { reopen_at: 3 });
     }
 
@@ -743,13 +820,13 @@ mod tests {
         assert!(t.held().is_empty());
         assert!(released.overflow && !released.held);
         assert!(!released.quiet_at(TimeUs(100 * S)));
-        assert!(!t.close_unchanged(&released, 1));
+        assert!(!t.close_unchanged(&released, 1, TimeUs(100 * S)));
         t.focus(false, TimeUs(4 * S));
         assert!(!t.snapshot().overflow, "focus loss clears it");
         t.focus(true, TimeUs(5 * S));
         let back = t.snapshot();
         assert!(!back.quiet_at(TimeUs(6 * S - 1)) && back.quiet_at(TimeUs(6 * S)));
-        assert!(t.close_unchanged(&back, 1));
+        assert!(t.close_unchanged(&back, 1, TimeUs(6 * S)));
     }
 
     /// A4, a press routed after the loading state began but stamped
@@ -776,6 +853,32 @@ mod tests {
         assert!(!released.held);
         assert_eq!(released.values, began.values);
         assert_eq!(released.revision.window, began.revision.window + 1);
+    }
+
+    /// §2.10 R7 (finding 7): an input offset key held when the result is
+    /// left is dropped from the held set as the keys are revoked, its value
+    /// kept, no activity; the loading state that follows is not held, and
+    /// the key's repeat and release change nothing.
+    #[test]
+    fn a_held_offset_key_is_dropped_at_the_revocation() {
+        let t = LiveTuning::new(start());
+        t.open_end_screen();
+        assert!(t.key(Adjust::InputOffsetUp, KeyEvent::Press, TimeUs(S)));
+        assert_eq!(t.held(), [(Adjust::InputOffsetUp, HoldClass::Fresh)]);
+        let held = t.snapshot();
+        assert!(held.held);
+        assert_eq!(t.close_end_screen().input_offset_us, 3_000);
+        assert!(t.held().is_empty());
+        let revoked = t.snapshot();
+        assert!(!revoked.held);
+        assert_eq!(revoked.revision, held.revision, "no activity");
+        t.enter_loading(TimeUs(2 * S));
+        let loading = t.snapshot();
+        assert!(loading.quiet_at(TimeUs(2 * S)));
+        assert!(!t.key(Adjust::InputOffsetUp, KeyEvent::Repeat, TimeUs(3 * S)));
+        assert!(!t.key(Adjust::InputOffsetUp, KeyEvent::Release, TimeUs(4 * S)));
+        assert_eq!(t.snapshot(), loading);
+        assert_eq!(t.get().input_offset_us, 3_000);
     }
 
     /// A9: an input offset key while the end screen does not show is

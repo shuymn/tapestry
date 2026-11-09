@@ -153,6 +153,7 @@ struct Model {
     gap_lost: bool,
     /// Focus was lost since acceptance last reopened.
     lost_since_reopen: bool,
+    focus_losses: u64,
     last: Option<i64>,
     accepting: bool,
     /// Presses that acted, and presses discarded while closed.
@@ -172,6 +173,7 @@ impl Model {
             focused: true,
             gap_lost: false,
             lost_since_reopen: false,
+            focus_losses: 0,
             last: None,
             accepting: true,
             acted: 0,
@@ -217,6 +219,7 @@ impl Model {
                 self.overflow = false;
                 self.focused = false;
                 self.lost_since_reopen = true;
+                self.focus_losses += 1;
                 self.gap_lost |= !self.accepting;
                 self.window += 1;
             }
@@ -245,6 +248,7 @@ impl Model {
 
     fn snapshot(&self) -> TuningSnapshot {
         TuningSnapshot {
+            stable: true,
             values: Some(self.values),
             revision: game::AcceptanceRevision {
                 window: self.window,
@@ -254,6 +258,7 @@ impl Model {
             held: !self.held.is_empty(),
             overflow: self.overflow,
             focused: self.focused,
+            focus_losses: self.focus_losses,
             last_activity: self.last.map(TimeUs),
         }
     }
@@ -339,6 +344,9 @@ struct Loader {
     opens: usize,
     /// The gauge [`Shown`] shows.
     shown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Taken right after the first snapshot at or after its time that is
+    /// quiet: an event between a quiet look and the copy that follows it.
+    after_quiet: Option<(i64, Ev)>,
 }
 
 impl Loader {
@@ -396,6 +404,7 @@ impl Loader {
             lost_staging: false,
             opens: 0,
             shown: std::sync::Arc::default(),
+            after_quiet: None,
         }
     }
 
@@ -781,7 +790,16 @@ impl LoadingRig for Loader {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        Ok(self.model.snapshot())
+        let snapshot = self.model.snapshot();
+        let now = self.clock.now();
+        if let Some((from, ev)) = self.after_quiet
+            && now.0 >= from
+            && snapshot.quiet_at(now)
+        {
+            self.after_quiet = None;
+            self.model.take(ev, now.0);
+        }
+        Ok(snapshot)
     }
 
     fn apply_snapshot(&mut self, snapshot: &TuningSnapshot, settings: &mut Settings) {
@@ -815,7 +833,11 @@ impl LoadingRig for Loader {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if !self.model.snapshot().unchanged_since(at_o1) {
+        if !self
+            .model
+            .snapshot()
+            .unchanged_since(at_o1, self.clock.now())
+        {
             return Ok(Revalidated::Changed);
         }
         self.model.accepting = false;
@@ -1989,6 +2011,49 @@ fn focus_lost_while_deferred_waits_a_quiet_second_after_return() {
     assert_eq!(rig.times("close"), [T0 + 2_200_000]);
     assert_eq!(rig.opened_at(), T0 + 2_200_000);
     assert_eq!(rig.closes, [("revalidate", 1), ("close", 1)]);
+}
+
+/// §2.10 R26: deferred for focus, a tap right after the wait's quiet look
+/// lands in the copy the close takes: that copy is not quiet, so
+/// acceptance reopens and the wait goes on, a quiet second from the tap;
+/// the copy then closed has the tap.
+#[test]
+fn a_tap_between_the_deferrals_quiet_look_and_its_close_waits_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_waits = 100;
+    rig.at(T0 + 1_050_000, Happen::Ev(Ev::FocusLost));
+    rig.at(T0 + 1_200_000, Happen::Ev(Ev::FocusBack));
+    rig.after_quiet = Some((T0 + 2_000_000, Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.times("deferred"), [T0 + 1_100_000]);
+    assert_eq!(rig.times("close"), [T0 + 2_200_000, T0 + 3_200_000]);
+    assert_eq!(rig.times("reopen"), [T0 + 1_100_000, T0 + 2_200_000]);
+    assert_eq!(applied_at(&rig), [T0 + SECOND, T0 + 3_200_000]);
+    assert_eq!(display_of(&rig, 1), DISPLAY + 1_000);
+    assert_eq!(rig.opened_at(), T0 + 3_200_000);
+    assert_eq!(rig.closes, [("revalidate", 1), ("close", 1), ("close", 1)]);
+}
+
+/// §2.10 R24 (finding 6): the wait's last look is quiet, and a tap comes
+/// right after it, before the opening's own copy. That copy is not quiet
+/// at its time, so it is not applied: the wait goes on and the opening
+/// takes its copy a quiet second after the tap, with the tap in it.
+#[test]
+fn an_event_between_the_wait_and_o1_goes_back_to_the_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.after_quiet = Some((T0 + SECOND, Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    // The minimum ends at T0 + 1 s, where the wait's look is quiet; the
+    // tap at that instant holds the opening another second.
+    assert_eq!(applied_at(&rig), [T0 + 2 * SECOND]);
+    assert_eq!(display_of(&rig, 0), DISPLAY + 1_000);
+    assert_eq!(rig.applied[0].last_activity, Some(TimeUs(T0 + SECOND)));
+    assert_eq!(opening_steps(&rig), OPENING);
+    assert_eq!(rig.opened_at(), T0 + 2 * SECOND);
 }
 
 /// A20: the release takes a fresh snapshot as acceptance closes again and

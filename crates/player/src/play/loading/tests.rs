@@ -41,8 +41,18 @@ impl Keyboard {
     /// next wake.
     fn key(&self, code: u32, value: i32) {
         let clock = self.clock;
+        self.batch(code, value, move || clock.now());
+    }
+
+    /// [`key`](Self::key) in a batch stamped `at`: the time the activity
+    /// record takes for it.
+    fn key_at(&self, code: u32, value: i32, at: TimeUs) {
+        self.batch(code, value, move || at);
+    }
+
+    fn batch(&self, code: u32, value: i32, at: impl FnOnce() -> TimeUs + Send + 'static) {
         let _ = self.jobs.send(Box::new(move |s: &mut input::SourceSet| {
-            let at = clock.now();
+            let at = at();
             s.begin_batch(at);
             s.packet(&input::Packet {
                 device: input::DeviceId(1),
@@ -53,6 +63,23 @@ impl Keyboard {
             s.end_batch(at);
         }));
         self.waker.wake();
+    }
+
+    /// A batch with no packet, which samples the window's focus, and what
+    /// the adjustment tap sampled there: focus, and the losses counted.
+    fn sample_focus(&self) -> (bool, u64) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clock = self.clock;
+        let _ = self.jobs.send(Box::new(move |s: &mut input::SourceSet| {
+            let at = clock.now();
+            s.begin_batch(at);
+            s.end_batch(at);
+            let tap = s.adjustment().expect("the tap");
+            let _ = tx.send((tap.focused(), tap.focus_losses()));
+        }));
+        self.waker.wake();
+        rx.recv_timeout(watchdog())
+            .expect("the input thread sampled")
     }
 
     /// SELECT held, then START with it, then both released: the selected
@@ -155,11 +182,11 @@ fn a_press_in_the_closed_gap_is_discarded_and_rearms_through_the_input_thread() 
         let closed = rig.close_acceptance(1).unwrap();
         assert!(!accepting(rig));
         assert_eq!(closed.revision.reducer, base + 1);
-        let input_before = rig.controls.tuning().input_activity().read().revision;
+        let input_before = rig.controls.tuning().snapshot().revision.input;
         keys.both();
         assert_eq!(fenced(rig), base + 1, "closed: discarded");
         assert!(
-            rig.controls.tuning().input_activity().read().revision > input_before,
+            rig.controls.tuning().snapshot().revision.input > input_before,
             "the input side recorded the holds"
         );
         rig.reopen_acceptance().unwrap();
@@ -310,6 +337,121 @@ fn the_opening_snapshot_takes_no_nested_lock() {
     });
 }
 
+/// F1 and F2 on the keyboard: hi-speed slower and faster, the tuning
+/// controls the reducer takes without START or SELECT.
+const SLOWER: u32 = game::SPEED_KEYS[0];
+const FASTER: u32 = game::SPEED_KEYS[1];
+
+/// §2.10 R9-R11 and I7 (finding 1): F2 tapped, then F1 held, repeated
+/// and released, each in a batch at a time the test sets, through the
+/// input thread's tap: the opening's copy (read after a fence) holds while
+/// F1 is held, and is quiet exactly [`game::QUIET`] after the last of
+/// them, F1's repeat restarting the second. The reducer took each step.
+#[test]
+fn speed_keys_restart_the_quiet_wait_at_exact_deadlines() {
+    let q = game::QUIET.0;
+    on_input_rig(|rig, keys| {
+        let base = fenced(rig);
+        // Past any batch the input thread makes on its own.
+        let t = rig.clock.now().0 + 100_000_000;
+        let quiet = |rig: &mut PlayerRig<'_>, last: i64| {
+            fenced(rig);
+            let s = rig.tuning_snapshot().unwrap();
+            assert!(s.stable);
+            assert_eq!(s.last_activity, Some(TimeUs(last)));
+            assert!(!s.quiet_at(TimeUs(last + q - 1)), "{last}");
+            assert!(s.quiet_at(TimeUs(last + q)), "{last}");
+            s
+        };
+        keys.key_at(FASTER, 1, TimeUs(t));
+        keys.key_at(FASTER, 0, TimeUs(t + 10_000));
+        let tapped = quiet(rig, t + 10_000);
+        keys.key_at(SLOWER, 1, TimeUs(t + 2_000_000));
+        fenced(rig);
+        let held = rig.tuning_snapshot().unwrap();
+        assert!(held.held, "F1 holds");
+        assert!(!held.quiet_at(TimeUs(i64::MAX)));
+        assert_eq!(held.last_activity, Some(TimeUs(t + 2_000_000)));
+        keys.key_at(SLOWER, 1, TimeUs(t + 2_500_000));
+        fenced(rig);
+        let repeated = rig.tuning_snapshot().unwrap();
+        assert!(repeated.held);
+        assert_eq!(repeated.last_activity, Some(TimeUs(t + 2_500_000)));
+        assert_eq!(repeated.revision.input, held.revision.input + 1);
+        keys.key_at(SLOWER, 0, TimeUs(t + 3_000_000));
+        let released = quiet(rig, t + 3_000_000);
+        assert_eq!(released.revision.input, tapped.revision.input + 3);
+        assert_eq!(fenced(rig), base + 3, "F2, F1 and F1's repeat stepped");
+    });
+}
+
+/// §2.10 R15 (finding 3): a START tap ends just before a fence, and the
+/// input thread is held right after it answered the fence. The game
+/// thread, let go by the answer, already reads the tap in the activity
+/// record: its revision moved twice, its last activity is the tap's
+/// batch, nothing held.
+#[test]
+fn the_fence_answers_after_the_activity_is_published() {
+    on_input_rig(|rig, _| {
+        fenced(rig);
+        let before = rig.tuning_snapshot().unwrap();
+        let at = TimeUs(rig.clock.now().0 + 100_000_000);
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        rig.input.fence_gate(crate::input_side::FenceGate {
+            before: Box::new(move |s: &mut input::SourceSet| {
+                for value in [1, 0] {
+                    s.begin_batch(at);
+                    s.packet(&input::Packet {
+                        device: input::DeviceId(1),
+                        control: eval::ControlId(START),
+                        value,
+                        background: false,
+                    });
+                    s.end_batch(at);
+                }
+            }),
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        fenced(rig);
+        reached
+            .recv_timeout(watchdog())
+            .expect("the fence answered");
+        // The input thread waits right after the answer.
+        let after = rig.tuning_snapshot().unwrap();
+        assert!(after.stable);
+        assert_eq!(after.revision.input, before.revision.input + 2);
+        assert_eq!(after.last_activity, Some(at));
+        assert!(!after.held);
+        resume.send(()).unwrap();
+    });
+}
+
+/// §2.10 R22: a write of the activity record held in progress (its
+/// sequence odd) makes every copy unstable: never quiet, never unchanged
+/// since the opening's, so the revalidation does not close. Ended, the
+/// same copy closes. (No input thread serves this rig, so the input
+/// side's section has no other writer.)
+#[test]
+fn a_torn_snapshot_is_never_quiet_or_unchanged() {
+    let ((), _) = crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+        let tuning = std::sync::Arc::clone(rig.controls.tuning());
+        let at_o1 = rig.tuning_snapshot().unwrap();
+        assert!(at_o1.stable && at_o1.quiet_at(TimeUs(i64::MAX)));
+        let writing = tuning.activity().input.begin();
+        let torn = rig.tuning_snapshot().unwrap();
+        assert!(!torn.stable);
+        assert!(!torn.quiet_at(TimeUs(i64::MAX)));
+        assert!(!torn.unchanged_since(&at_o1, TimeUs(i64::MAX)));
+        assert!(!at_o1.unchanged_since(&torn, TimeUs(i64::MAX)));
+        assert!(!tuning.close_unchanged(&at_o1, 1, TimeUs(i64::MAX)));
+        assert_eq!(tuning.acceptance(), crate::tuning::Acceptance::Open);
+        drop(writing);
+        assert!(tuning.close_unchanged(&at_o1, 1, TimeUs(i64::MAX)));
+    });
+}
+
 /// The opening's copy on the practice path (a round's section kept by
 /// the chart): the tuning's copy under its step lock, the revalidation's
 /// close and the release's close allocate nothing; the preparation's key,
@@ -331,11 +473,11 @@ fn the_opening_snapshot_allocates_nothing_alloc() {
         let key = loaded.prep_key();
         let tuning = std::sync::Arc::clone(rig.controls.tuning());
         let warm = rig.tuning_snapshot().unwrap();
-        let _ = tuning.close_unchanged(&warm, 1);
+        let _ = tuning.close_unchanged(&warm, 1, TimeUs(i64::MAX));
         tuning.reopen();
         let before = crate::alloc_count::this_thread();
         let at_o1 = rig.tuning_snapshot().unwrap();
-        let closed = tuning.close_unchanged(&at_o1, 1);
+        let closed = tuning.close_unchanged(&at_o1, 1, TimeUs(i64::MAX));
         tuning.reopen();
         let released = tuning.close(2);
         tuning.reopen();
@@ -347,9 +489,12 @@ fn the_opening_snapshot_allocates_nothing_alloc() {
     });
 }
 
-/// O-21: the result shown, the input offset keys work; once it is left
-/// (to selection, the practice page, or a retry's preparation) they are
-/// refused: no value change and no activity, nothing held.
+/// O-21 and §2.10 R7: the result shown, the input offset keys work; one is
+/// pressed and still held when the result is left (to selection, the
+/// practice page, or a retry's preparation). Leaving revokes them and
+/// drops the held key in the same step: its value stays, the loading state
+/// that follows is not held by it, and its repeat and release, like every
+/// offset key from then on, change no value and are no activity.
 #[test]
 fn the_offset_keys_are_revoked_on_leaving_the_result() {
     use game::AppRig as _;
@@ -363,9 +508,12 @@ fn the_offset_keys_are_revoked_on_leaving_the_result() {
             let shown = tuning.get().input_offset_us;
             rig.controls
                 .settings_key(Adjust::InputOffsetUp, KeyEvent::Press);
-            rig.controls
-                .settings_key(Adjust::InputOffsetUp, KeyEvent::Release);
             assert_eq!(tuning.get().input_offset_us, shown + 1_000, "{exit}");
+            assert_eq!(
+                tuning.held(),
+                [(Adjust::InputOffsetUp, HoldClass::Fresh)],
+                "{exit}"
+            );
             match exit {
                 "selection" => rig.entered_selection(),
                 "page" => {
@@ -378,7 +526,20 @@ fn the_offset_keys_are_revoked_on_leaving_the_result() {
                 }
             }
             assert!(!tuning.end_screen_shown(), "{exit}");
+            assert!(
+                tuning.held().is_empty(),
+                "{exit}: dropped at the revocation"
+            );
+            // The loading state that follows is not held by it.
+            rig.begin_loading_epoch();
             let before = tuning.snapshot();
+            assert!(before.stable && !before.held, "{exit}");
+            assert!(before.quiet_at(TimeUs(i64::MAX)), "{exit}");
+            // Its own repeat and release, still to come, count nothing.
+            for e in [KeyEvent::Repeat, KeyEvent::Release] {
+                rig.controls.settings_key(Adjust::InputOffsetUp, e);
+                assert_eq!(tuning.snapshot(), before, "{exit} {e:?}");
+            }
             for a in [Adjust::InputOffsetDown, Adjust::InputOffsetUp] {
                 for e in [KeyEvent::Press, KeyEvent::Repeat, KeyEvent::Release] {
                     rig.controls.settings_key(a, e);

@@ -516,6 +516,54 @@ fn focus_lost_during_the_commit_reply_waits_a_quiet_second_after_return() {
     });
 }
 
+/// §2.10 R16, I3 and I4 (finding 5): the end of loading's answer (O13)
+/// held after the revalidation closed acceptance; focus lost and back
+/// meanwhile, and the input thread samples the return at a batch, so its
+/// own focus check would pass. Let go, the opening is still deferred: the
+/// window's focus-loss generation moved since the close. It is asked
+/// again only once the tuning is quiet a second from the return, on a
+/// close whose copy has that return as its last activity.
+#[test]
+fn focus_lost_and_back_while_the_end_of_loading_is_held_defers_then_waits_a_quiet_second() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        side.loading_end.hold(true);
+        let mut returned = None;
+        let ended = open_with(loaded, rig, side, || {
+            until("the end of loading held", || side.loading_end.waiting());
+            assert_eq!(
+                side.tuning.acceptance(),
+                Acceptance::Closed { reopen_at: 1 }
+            );
+            side.controls.focus(false);
+            side.controls.focus(true);
+            returned = side.tuning.snapshot().last_activity;
+            let losses = side.tuning.focus_losses();
+            assert_eq!(side.keys.sample_focus(), (true, losses), "sampled");
+            side.loading_end.hold(false);
+            until("the deferral", || side.gates.deferred.passed() == 1);
+            side.loading_end.hold(true);
+            until("the second end held", || side.loading_end.waiting());
+            side.quit_at_the_end_of_loading();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        let returned = returned.expect("the return's stamp");
+        assert_eq!(side.gates.deferred.passed(), 1);
+        assert_eq!(side.loading_end.passed(), 2);
+        let closes = side.gates.closes.lock().unwrap().clone();
+        let [(closed_at, copy)] = *closes.as_slice() else {
+            panic!("{closes:?}");
+        };
+        assert_eq!(copy.last_activity, Some(returned));
+        assert_eq!(copy.focus_losses, 1);
+        assert!(copy.quiet_at(closed_at));
+        assert!(
+            closed_at.0 >= returned.0 + game::QUIET.0,
+            "{closed_at:?} {returned:?}"
+        );
+    });
+}
+
 /// The display offset the one ended play recorded.
 #[track_caller]
 fn recorded_offset(rig: &PlayerRig<'_>) -> TimeUs {
@@ -612,14 +660,16 @@ fn focus_lost_after_a_loading_opening_aborts_the_play() {
 }
 
 /// F2 on the keyboard: hi-speed faster through the play adjustments, a
-/// role that is not latched (no START or SELECT), so it moves neither the
-/// window's revision nor the input side's.
+/// tuning control that is not latched (no START or SELECT): its press and
+/// release move the input side's revision in the activity record and the
+/// reducer's count, not the window's revision.
 const FASTER: u32 = game::SPEED_KEYS[1];
 
-/// A11 through the reducer alone: F2 pressed after the opening's copy and
-/// before the revalidation is a change only the reducer's count shows (no
-/// settings key, no START or SELECT, nothing held at O11). The opening
-/// retries locally and opens with the faster hi-speed at a new epoch.
+/// A11 and §2.10 R9/R18: F2 pressed and released after the opening's copy
+/// and before the revalidation (no settings key, no START or SELECT,
+/// nothing held at O11). The revalidation finds the input side's
+/// revision and the reducer's count moved; the opening retries locally
+/// and opens with the faster hi-speed at a new epoch.
 #[test]
 fn a_reducer_change_before_the_revalidation_retries() {
     let (_dir, mut loaded) = plain();
@@ -638,11 +688,8 @@ fn a_reducer_change_before_the_revalidation_retries() {
         });
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
         let now = rig.controls.tuning().snapshot().revision;
-        assert_eq!(
-            (now.window, now.input),
-            (window.window, window.input),
-            "only the reducer saw it"
-        );
+        assert_eq!(now.window, window.window, "no settings key");
+        assert_eq!(now.input, window.input + 2, "F2's press and release");
         assert_eq!(fenced(rig), accepted + 1);
         assert_ne!(rig.adjust.as_ref().unwrap().snapshot().hispeed, hispeed);
         assert_eq!(side.gates.revalidate.passed(), 2, "one local retry");

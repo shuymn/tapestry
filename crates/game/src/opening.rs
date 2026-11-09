@@ -11,8 +11,9 @@
 //!   acknowledgement of another lifetime is ignored, and the first one of
 //!   this lifetime is kept;
 //! - **the tuning controls** quiet for [`QUIET`] since the last activity,
-//!   nothing held and no overflow ([`TuningSnapshot::quiet_at`]);
-//! - **focus**.
+//!   nothing held and no overflow, and **focus**: one decision on one
+//!   snapshot of the tuning ([`TuningSnapshot::quiet_at`]), which decides
+//!   again on the opening's own snapshot and at its revalidation.
 //!
 //! Each slice of the wait polls the preparation while it is pending (an
 //! answer is latched once and the answered handle never polled again),
@@ -21,8 +22,9 @@
 //! opening runs in the order of design.md "Play Lifecycle", opening after
 //! the loading state:
 //!
-//! 1. a copy of the tuning ([`LoadingRig::tuning_snapshot`]) becomes the
-//!    attempt's starting settings ([`LoadingRig::apply_snapshot`]);
+//! 1. a copy of the tuning ([`LoadingRig::tuning_snapshot`]), quiet at the
+//!    time it is taken (else the wait goes on), becomes the attempt's
+//!    starting settings ([`LoadingRig::apply_snapshot`]);
 //! 2. the screen, the play's number and preset, a round's refit, the
 //!    presentation's new epoch ([`LoadingRig::refresh_presentation`]) and
 //!    audio;
@@ -33,8 +35,9 @@
 //!    key ends the run;
 //! 4. a round's restore check and the look at a quit or a failure;
 //! 5. the revalidation ([`LoadingRig::revalidate_and_close`]): tuning
-//!    activity since step 1 gives the number back and waits again, the
-//!    preparation kept (a local retry); otherwise tuning acceptance closes;
+//!    activity since step 1, or tuning no longer quiet, gives the number
+//!    back and waits again, the preparation kept (a local retry); otherwise
+//!    tuning acceptance closes;
 //! 6. the commit, the end of loading and the last look; then recording
 //!    opens through the common play loop, once.
 //!
@@ -42,8 +45,9 @@
 //! START or SELECT is asked again at the release; one deferred for focus
 //! once focus is back, START and SELECT released and the tuning controls
 //! quiet for [`QUIET`] from the return. Either closes acceptance again on
-//! a fresh snapshot, applied to the starting settings, and asks again with
-//! the same candidate generation. Every exit before the commit except the
+//! a fresh snapshot (one deferred for focus only when that snapshot is
+//! quiet too), applied to the starting settings, and asks again with the
+//! same candidate generation. Every exit before the commit except the
 //! local retry discards the preparation; every exit that does not end the
 //! run reopens tuning acceptance.
 
@@ -97,10 +101,15 @@ pub struct AcceptanceRevision {
 }
 
 /// A copy of the tuning taken under the tuning step lock: what the
-/// loading state's conditions and the opening's revalidation read. Taking
-/// it allocates nothing and calls nothing back.
+/// loading state's conditions and the opening's revalidation read, as one
+/// coherent observation of the window side, the input side and the
+/// reducer. Taking it allocates nothing and calls nothing back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TuningSnapshot {
+    /// The observation is coherent. An unstable one (a write in progress
+    /// through every attempt to read it) is never quiet and never
+    /// unchanged since another.
+    pub stable: bool,
     /// The settings keys' values; `None` for a rig without them.
     pub values: Option<Tuning>,
     /// The acceptance revision.
@@ -111,6 +120,9 @@ pub struct TuningSnapshot {
     pub overflow: bool,
     /// The window has focus.
     pub focused: bool,
+    /// The window's focus losses so far: the generation an opening out of
+    /// this snapshot's close accepts.
+    pub focus_losses: u64,
     /// The last activity on the rig's clock; `None` before any.
     pub last_activity: Option<TimeUs>,
 }
@@ -119,6 +131,7 @@ impl TuningSnapshot {
     /// Nothing held, focused and no activity: a rig without tuning in its
     /// loading state.
     pub const IDLE: Self = Self {
+        stable: true,
         values: None,
         revision: AcceptanceRevision {
             window: 0,
@@ -128,26 +141,29 @@ impl TuningSnapshot {
         held: false,
         overflow: false,
         focused: true,
+        focus_losses: 0,
         last_activity: None,
     };
 
-    /// Whether the tuning lets the loading state end at `now`: focused,
-    /// nothing held, no overflow, and [`QUIET`] since the last activity.
+    /// Whether the tuning lets the loading state end at `now`: a stable
+    /// observation, focused, nothing held, no overflow, and [`QUIET`]
+    /// since the last activity. The one decision of the wait, the
+    /// opening's snapshot and its revalidation.
     #[must_use]
     pub const fn quiet_at(&self, now: TimeUs) -> bool {
         let quiet = match self.last_activity {
             Some(last) => now.0 >= last.0.saturating_add(QUIET.0),
             None => true,
         };
-        quiet && self.focused && !self.held && !self.overflow
+        quiet && self.stable && self.focused && !self.held && !self.overflow
     }
 
-    /// Whether nothing changed since `earlier` was taken (the same
-    /// acceptance revision) and the tuning still lets the opening go on:
-    /// focused, nothing held, no overflow.
+    /// Whether nothing changed since `earlier` was taken (both stable, the
+    /// same acceptance revision) and the tuning is still quiet at `now`
+    /// ([`quiet_at`](Self::quiet_at)).
     #[must_use]
-    pub fn unchanged_since(&self, earlier: &Self) -> bool {
-        self.revision == earlier.revision && self.focused && !self.held && !self.overflow
+    pub fn unchanged_since(&self, earlier: &Self, now: TimeUs) -> bool {
+        earlier.stable && self.revision == earlier.revision && self.quiet_at(now)
     }
 }
 
@@ -219,9 +235,10 @@ pub trait LoadingRig: Rig {
     }
     /// Fences the input thread and closes tuning acceptance at the fence,
     /// then compares the tuning with `at_o1`, the opening's snapshot
-    /// ([`TuningSnapshot::unchanged_since`]): unchanged, the window side
-    /// closes too until candidate `generation`'s recording opens
-    /// ([`Revalidated::Closed`]); changed, the close is reversed
+    /// ([`TuningSnapshot::unchanged_since`] at the rig's time): unchanged,
+    /// the window side closes too until candidate `generation`'s recording
+    /// opens ([`Revalidated::Closed`]); changed, the close is reversed at
+    /// the fence, so nothing observed since is discarded
     /// ([`Revalidated::Changed`]). Closed by default.
     ///
     /// # Errors
@@ -462,11 +479,17 @@ fn before_commit<R: LoadingRig>(
     opener: &mut LoadingOpener,
     start: &mut Option<PlayStart>,
 ) -> Result<Before, LiveError<R::ScreenError>> {
-    if !wait_loading(rig, opener)? {
-        return Ok(Before::Left);
-    }
-    // The starting settings: a copy under the lock, applied outside it.
-    let at_o1 = rig.tuning_snapshot().map_err(LiveError::Input)?;
+    // The starting settings: a copy under the lock, decided quiet at its
+    // own time (the wait's look may be stale by now), applied outside it.
+    let at_o1 = loop {
+        if !wait_loading(rig, opener)? {
+            return Ok(Before::Left);
+        }
+        let at_o1 = rig.tuning_snapshot().map_err(LiveError::Input)?;
+        if at_o1.quiet_at(rig.now()) {
+            break at_o1;
+        }
+    };
     rig.apply_snapshot(&at_o1, loaded.settings_mut());
     rig.prepare_screen().map_err(LiveError::Screen)?;
     let begun = loaded.begin_play();
@@ -531,7 +554,7 @@ fn before_commit<R: LoadingRig>(
                 // The tuning moved meanwhile: wait again before the new
                 // preparation.
                 let tuning = rig.tuning_snapshot().map_err(LiveError::Input)?;
-                if !tuning.unchanged_since(&at_o1) {
+                if !tuning.unchanged_since(&at_o1, rig.now()) {
                     return Ok(Before::Retry);
                 }
             }
@@ -679,7 +702,7 @@ fn open_loading<R: LoadingRig>(
         rig.defer();
         rig.reopen_acceptance().map_err(LiveError::Input)?;
         opener.closed = false;
-        loop {
+        let snapshot = loop {
             rig.wait();
             preflight(rig)?;
             if quit_look(rig) {
@@ -689,16 +712,22 @@ fn open_loading<R: LoadingRig>(
             if rig.holding() {
                 continue;
             }
-            if !for_focus {
-                break;
+            if for_focus {
+                let tuning = rig.tuning_snapshot().map_err(LiveError::Input)?;
+                if !tuning.quiet_at(rig.now()) {
+                    continue;
+                }
             }
-            let tuning = rig.tuning_snapshot().map_err(LiveError::Input)?;
-            if tuning.quiet_at(rig.now()) {
-                break;
+            let snapshot = rig.close_acceptance(generation).map_err(LiveError::Input)?;
+            opener.closed = true;
+            // Deferred for focus, the closed copy is decided quiet itself:
+            // an event since the look sends it back to waiting.
+            if !for_focus || snapshot.quiet_at(rig.now()) {
+                break snapshot;
             }
-        }
-        let snapshot = rig.close_acceptance(generation).map_err(LiveError::Input)?;
-        opener.closed = true;
+            rig.reopen_acceptance().map_err(LiveError::Input)?;
+            opener.closed = false;
+        };
         rig.apply_snapshot(&snapshot, loaded.settings_mut());
         rig.end_loading().map_err(LiveError::Screen)?;
         // The last look before recording opens again.

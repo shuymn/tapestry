@@ -311,6 +311,11 @@ pub struct PlayerRig<'a> {
     /// ([`game::LoadingRig::apply_snapshot`]): what the revalidation
     /// compares.
     pub accepted_at_o1: Option<u64>,
+    /// The window's focus-loss generation the loading state's tuning
+    /// acceptance closed with, while it is closed: the opening asked for
+    /// carries it, and the input thread defers it when focus was lost
+    /// since.
+    pub accepted_focus: Option<u64>,
     /// The preparations begun so far: each one's ticket.
     pub preps: u64,
     /// The result's presentation (the S10-09i design's D1): its lifetime,
@@ -1863,6 +1868,7 @@ impl Rig for PlayerRig<'_> {
             logic: thread::current(),
             recorded: self.recorded.clone(),
             gate: None,
+            focus: None,
         });
         #[cfg(feature = "dev-tools")]
         if opened.is_ok() {
@@ -1929,7 +1935,16 @@ impl Rig for PlayerRig<'_> {
             logic: thread::current(),
             recorded: self.recorded.clone(),
             gate: Some(generation),
+            focus: self.accepted_focus,
         })?;
+        #[cfg(test)]
+        if opened.is_none() {
+            self.opening_gates.deferred.pass();
+        }
+        if opened.is_some() {
+            // Recording opened: acceptance with it.
+            self.accepted_focus = None;
+        }
         #[cfg(feature = "dev-tools")]
         if opened.is_some() {
             Self::print_lua("open");
