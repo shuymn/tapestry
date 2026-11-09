@@ -45,9 +45,12 @@ pub struct Occurrence {
     pub destination: Option<usize>,
     /// The field holding it (`value`, `draw`, `op`, `timer`, …).
     pub field: &'static str,
-    /// Its position in the destination's `op` list for an `op` entry, 0
-    /// otherwise.
+    /// Its position in its `op` list for an `op` entry, 0 otherwise.
     pub index: u32,
+    /// The nested part it belongs to, by object path under the
+    /// destination's definition (`def.images.2`); empty for the
+    /// destination itself.
+    pub path: String,
     /// The callable conversion gave the function.
     pub callable: u32,
     /// `lowered`, `compiled`, `replaced`, `runtime`, `refused`.
@@ -116,18 +119,6 @@ pub(crate) fn record_source(src: &str, fact: SourceFact) {
     }
 }
 
-/// Node `node`'s position in destination `dest`'s `op` list under the
-/// converted table's root `top`.
-fn op_index(arena: &Arena, top: u32, dest: usize, node: u32) -> Option<u32> {
-    let list = arena.last_member(top, "destination")?;
-    let d = arena.children(list).nth(dest)?;
-    let ops = arena.last_member(d, "op")?;
-    arena
-        .children(ops)
-        .position(|n| n == node)
-        .and_then(|i| u32::try_from(i).ok())
-}
-
 thread_local! {
     /// The next import keeps its VM for the reference.
     static WANT: Cell<bool> = const { Cell::new(false) };
@@ -147,9 +138,8 @@ pub(super) fn stash(kept: Kept) {
     KEPT.with(|k| *k.borrow_mut() = Some(kept));
 }
 
-/// Records the occurrences of `an` over `arena`, whose root is `top`,
-/// when recording.
-pub(super) fn record(arena: &Arena, top: u32, an: &Analysis) {
+/// Records the occurrences of `an` over `arena`, when recording.
+pub(super) fn record(arena: &Arena, an: &Analysis) {
     if !RECORDING.with(Cell::get) {
         return;
     }
@@ -160,16 +150,12 @@ pub(super) fn record(arena: &Arena, top: u32, an: &Analysis) {
         .iter()
         .map(|c| {
             let at = arena.loc(c.node);
-            let destination = c.element.as_ref().map(|e| e.index);
-            let index = match (c.field, destination) {
-                ("op", Some(d)) => op_index(arena, top, d, c.node).unwrap_or(u32::MAX),
-                _ => 0,
-            };
             Occurrence {
                 node: c.node,
-                destination,
+                destination: c.element.as_ref().map(|e| e.index),
                 field: c.field,
-                index,
+                index: c.index,
+                path: c.path.clone(),
                 callable: callable.get(&c.node).copied().unwrap_or(u32::MAX),
                 disposition: label(&c.disposition),
                 reason: c.why.as_ref().map(super::survey::unsupported),

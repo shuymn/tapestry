@@ -499,6 +499,15 @@ pub(crate) struct Cx<'d> {
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
+    /// The nested part being read, by its object path under the
+    /// destination's definition (`def.images.2`; empty for the
+    /// destination itself), for the replay's occurrence records.
+    #[cfg(feature = "dev-tools")]
+    part_path: String,
+    /// Each `op` entry node's position in its list, for the replay's
+    /// occurrence records.
+    #[cfg(feature = "dev-tools")]
+    op_positions: HashMap<u32, u32>,
     /// A condition of the destination being read folded false, for the
     /// conversion report's ledger.
     #[cfg(feature = "dev-tools")]
@@ -601,6 +610,10 @@ impl<'d> Cx<'d> {
             ignored_ops: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
+            #[cfg(feature = "dev-tools")]
+            part_path: String::new(),
+            #[cfg(feature = "dev-tools")]
+            op_positions: HashMap::new(),
             #[cfg(feature = "dev-tools")]
             folded: false,
             #[cfg(feature = "dev-tools")]
@@ -925,6 +938,11 @@ impl<'d> Cx<'d> {
                 return Ok(ops);
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
+            #[cfg(feature = "dev-tools")]
+            for (i, &item) in items.iter().enumerate() {
+                self.op_positions
+                    .insert(item, u32::try_from(i).unwrap_or(u32::MAX));
+            }
             for item in items {
                 match self.callback_prop(Some(item), "op")? {
                     Prop::Id(n) => ops.push(Op::Id(n)),

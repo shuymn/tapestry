@@ -1229,7 +1229,7 @@ impl LuaHeader {
                 callbacks = an.outcomes.borrow().clone();
                 #[cfg(feature = "dev-tools")]
                 {
-                    replay::record(&def.arena, def.top(), an);
+                    replay::record(&def.arena, an);
                     records = survey::records(&def.arena, an, r.is_ok());
                 }
             }

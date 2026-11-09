@@ -141,7 +141,14 @@ impl Cx<'_> {
                 continue;
             };
             if let Some(slot) = grades.get_mut(k) {
-                *slot = self.grade(&gdst, img)?;
+                #[cfg(feature = "dev-tools")]
+                {
+                    self.part_path = format!("def.images.{}", k + 1);
+                }
+                let g = self.grade(&gdst, img);
+                #[cfg(feature = "dev-tools")]
+                self.part_path.clear();
+                *slot = g?;
             }
         }
         if grades.iter().all(Option::is_none) {
@@ -167,7 +174,14 @@ impl Cx<'_> {
             let Some(value) = self.value_rec(&id)? else {
                 continue;
             };
-            if let Some(combo) = self.combo(&ndst, value)? {
+            #[cfg(feature = "dev-tools")]
+            {
+                self.part_path = format!("def.numbers.{}", k + 1);
+            }
+            let combo = self.combo(&ndst, value);
+            #[cfg(feature = "dev-tools")]
+            self.part_path.clear();
+            if let Some(combo) = combo? {
                 combos[k] = Some(combo);
             }
         }

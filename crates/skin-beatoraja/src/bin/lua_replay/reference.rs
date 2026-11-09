@@ -9,14 +9,16 @@
 //! and numbers. Every other kind is listed with every callable it holds,
 //! its nested parts' included.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use mlua::{Function, Table, Value};
 use skin_beatoraja::lua::replay::{Called, PropValue, ReferenceVm, SourceFact};
 use skin_beatoraja::lua::runtime::{to_bool, to_int};
 
 use crate::inputs::FrameInputs;
-use crate::observed::{Cause, Key, Listed, Observed, Outcome, Point, Raw, RefFrame, TimerOut};
+use crate::observed::{
+    Cause, Key, Listed, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern,
+};
 
 /// How an image or a number chooses what it shows.
 enum Sel {
@@ -87,27 +89,55 @@ fn list(v: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// A value as the JSON reader's string `id` reads it.
+/// A value as the source serializer's `tojstring()` gives a string field
+/// (`LuaSkinLoader.java:107`): an integral number without a fraction.
 fn id_string(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => s.to_str().ok().map(|s| s.to_owned()),
         Value::Integer(n) => Some(n.to_string()),
         Value::Number(f) if f.fract() == 0.0 => Some(format!("{f:.0}")),
+        Value::Number(f) => Some(format!("{f}")),
         _ => None,
     }
 }
 
-fn int(v: &Value) -> Option<i64> {
+/// LuaJ's `isnumber()` and its value: a number, or a string that reads as
+/// one.
+fn lua_number(v: &Value) -> Option<f64> {
     match v {
-        Value::Integer(n) => Some(*n),
-        #[expect(clippy::cast_possible_truncation, reason = "integral, checked")]
-        Value::Number(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Some(*f as i64),
+        #[expect(clippy::cast_precision_loss, reason = "LuaJ holds a double")]
+        Value::Integer(n) => Some(*n as f64),
+        Value::Number(f) => Some(*f),
+        Value::String(s) => s.to_str().ok()?.trim().parse::<f64>().ok(),
         _ => None,
     }
 }
 
-fn int32(v: &Value) -> Option<i32> {
-    int(v).and_then(|n| i32::try_from(n).ok())
+/// Java's `(int)` of a double: truncated toward zero, saturated, NaN 0.
+fn d2i(f: f64) -> i32 {
+    if f.is_nan() {
+        0
+    } else {
+        #[expect(clippy::cast_possible_truncation, reason = "Java's saturating d2i")]
+        let n = f.trunc().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+        n
+    }
+}
+
+/// The source serializer's `toint()` of an `int` field (`LuaSkinLoader.
+/// java:103-104`, `:144-146`): a number or a numeric string truncated as
+/// Java's `(int)`, anything else 0; `None` for an absent field, which the
+/// definition's default then gives.
+fn toint(v: &Value) -> Option<i32> {
+    match v {
+        Value::Nil => None,
+        Value::Integer(n) => Some(i32::try_from(*n).unwrap_or_else(|_| {
+            #[expect(clippy::cast_precision_loss, reason = "LuaJ holds a double")]
+            let f = *n as f64;
+            d2i(f)
+        })),
+        other => Some(lua_number(other).map_or(0, d2i)),
+    }
 }
 
 fn string(v: &Value) -> Option<String> {
@@ -236,11 +266,15 @@ impl<'a> Reference<'a> {
         dest: usize,
         (path, parent): (&str, &str),
         out: &mut Vec<Key>,
-        seen: &mut BTreeSet<usize>,
+        stack: &mut Vec<usize>,
     ) {
-        if path.matches('.').count() > 6 || !seen.insert(t.to_pointer().addr()) {
+        // A table on the way down is a cycle; one met again elsewhere is
+        // another occurrence, with its own path.
+        let at = t.to_pointer().addr();
+        if path.matches('.').count() > 6 || stack.contains(&at) {
             return;
         }
+        stack.push(at);
         let mut found: Vec<(String, Value)> = Vec::new();
         let _ = t.for_each(|k: Value, v: Value| {
             found.push((id_string(&k).unwrap_or_default(), v));
@@ -264,33 +298,36 @@ impl<'a> Reference<'a> {
                         )
                     };
                     let k = self.key_at(&f, dest, consumer, intern(path));
-                    if !out.iter().any(|o| {
-                        o.callable == k.callable && o.field == k.field && o.index == k.index
-                    }) {
+                    if !out.contains(&k) {
                         out.push(k);
                     }
                 }
                 Value::Table(t) => {
-                    let sub = if path.is_empty() {
+                    // An `op` list is a consumer of the object holding
+                    // it, its entries at that object's path.
+                    let sub = if name == "op" {
+                        path.to_owned()
+                    } else if path.is_empty() {
                         name.clone()
                     } else {
                         format!("{path}.{name}")
                     };
-                    self.nested(&t, dest, (&sub, &name), out, seen);
+                    self.nested(&t, dest, (&sub, &name), out, stack);
                 }
                 _ => {}
             }
         }
+        stack.pop();
     }
 
     /// Every callable of destination `d` (path empty) and of its
     /// definition `def` (path `def`).
     fn all_callables(&mut self, d: usize, dest: &Table, def: Option<&Table>) -> Vec<Key> {
         let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
-        self.nested(dest, d, ("", ""), &mut out, &mut seen);
+        let mut stack = Vec::new();
+        self.nested(dest, d, ("", ""), &mut out, &mut stack);
         if let Some(def) = def {
-            self.nested(def, d, ("def", "def"), &mut out, &mut seen);
+            self.nested(def, d, ("def", "def"), &mut out, &mut stack);
         }
         out
     }
@@ -342,8 +379,17 @@ impl<'a> Reference<'a> {
     /// `:119-124`).
     fn value_sel(&mut self, v: &Value, index: usize, fallback: Sel) -> Sel {
         match v {
-            Value::Function(f) => Sel::Callable(f.clone(), self.key(f, index, "value", 0)),
-            Value::Nil => fallback,
+            Value::Function(f) => {
+                Sel::Callable(f.clone(), self.key_at(f, index, ("value", 0), "def"))
+            }
+            // A number, or a string that reads as one, is an id by its
+            // `toint()`; another string a name; anything else null.
+            v if lua_number(v).is_some() => match toint(v) {
+                Some(id) if self.vm.number_property(id) != PropValue::Null => {
+                    Sel::Int(PropRef::Id(id))
+                }
+                _ => fallback,
+            },
             Value::String(_) => {
                 let name = string(v).unwrap_or_default();
                 match self.vm.named_number_property(&name) {
@@ -352,12 +398,7 @@ impl<'a> Reference<'a> {
                     Some(_) => Sel::Int(PropRef::Name(name)),
                 }
             }
-            other => match int32(other) {
-                Some(id) if self.vm.number_property(id) != PropValue::Null => {
-                    Sel::Int(PropRef::Id(id))
-                }
-                _ => fallback,
-            },
+            _ => fallback,
         }
     }
 
@@ -383,20 +424,22 @@ impl<'a> Reference<'a> {
         let (kind, sel, validity) = if system {
             (Kind::Image, Sel::Zero, Validity::Valid)
         } else if let Some(img) = find(skin, "image", &id) {
-            let len = int(&raw(&img, "len")).unwrap_or(0);
+            let len = i64::from(toint(&raw(&img, "len")).unwrap_or(0));
             let mut validity = self.source(skin, &raw(&img, "src"));
-            // A group splits its `divx·divy` cells into `len` arrays
-            // (`JsonSkinObjectLoader.java:50-59`): fewer cells than groups
-            // leave every array empty, so no source validates.
-            let cells = int(&raw(&img, "divx")).filter(|&d| d > 0).unwrap_or(1)
-                * int(&raw(&img, "divy")).filter(|&d| d > 0).unwrap_or(1);
-            if len > 1 && cells / len == 0 {
+            // A movie source is the movie constructor, before `len` or the
+            // grid (`JsonSkinObjectLoader.java:46-49`). A texture group
+            // splits its `divx·divy` cells into `len` arrays (`:50-59`):
+            // fewer cells than groups leave every array empty, so no source
+            // validates.
+            let cells = i64::from(toint(&raw(&img, "divx")).filter(|&d| d > 0).unwrap_or(1))
+                * i64::from(toint(&raw(&img, "divy")).filter(|&d| d > 0).unwrap_or(1));
+            if validity != Validity::Movie && len > 1 && cells / len == 0 {
                 validity = Validity::Invalid;
             }
             // A plain image ignores `ref` and `value`; a group reads its
             // image-index `ref` (`JsonSkinObjectLoader.java:49-64`).
-            let sel = if len > 1 {
-                Sel::Index(int32(&raw(&img, "ref")).unwrap_or(0))
+            let sel = if len > 1 && validity != Validity::Movie {
+                Sel::Index(toint(&raw(&img, "ref")).unwrap_or(0))
             } else {
                 Sel::Zero
             };
@@ -417,11 +460,11 @@ impl<'a> Reference<'a> {
                     _ => Validity::Invalid,
                 };
             }
-            let by_ref = Sel::Index(int32(&raw(&set, "ref")).unwrap_or(0));
+            let by_ref = Sel::Index(toint(&raw(&set, "ref")).unwrap_or(0));
             let sel = self.value_sel(&raw(&set, "value"), index, by_ref);
             (Kind::Image, sel, validity)
         } else if let Some(num) = find(skin, "value", &id) {
-            let by_ref = Sel::Int(PropRef::Id(int32(&raw(&num, "ref")).unwrap_or(0)));
+            let by_ref = Sel::Int(PropRef::Id(toint(&raw(&num, "ref")).unwrap_or(0)));
             let sel = self.value_sel(&raw(&num, "value"), index, by_ref);
             (Kind::Number, sel, Validity::Valid)
         } else {
@@ -449,14 +492,17 @@ impl<'a> Reference<'a> {
         let mut ids = Vec::new();
         let mut rest = Vec::new();
         let mut options = Vec::new();
+        // Each `op` entry by its serializer (`LuaSkinLoader.java:144-150`):
+        // a number, or a string that reads as one, is an id by its
+        // `toint()`; a function or another string a property; anything
+        // else a null property, no condition.
         for (i, v) in list(&raw(dest, "op")).into_iter().enumerate() {
             match &v {
                 Value::Function(f) => {
                     let k = self.key(f, index, "op", u32::try_from(i).unwrap_or(u32::MAX));
                     rest.push(Cond::Func(f.clone(), k));
                 }
-                Value::String(_) => rest.push(Cond::Named(string(&v).unwrap_or_default())),
-                _ => match int32(&v) {
+                v if lua_number(v).is_some() => match toint(v) {
                     Some(0) | None => {}
                     Some(n) if ReferenceVm::is_property(n) => {
                         if !ids.contains(&n) {
@@ -465,6 +511,8 @@ impl<'a> Reference<'a> {
                     }
                     Some(n) => options.push(n),
                 },
+                Value::String(_) => rest.push(Cond::Named(string(&v).unwrap_or_default())),
+                _ => {}
             }
         }
         let mut conds: Vec<Cond> = ids.into_iter().map(Cond::Prop).collect();
@@ -476,15 +524,17 @@ impl<'a> Reference<'a> {
                 let k = self.key(&f, index, "draw", 0);
                 conds.push(Cond::Func(f, k));
             }
-            v @ Value::String(_) => conds.push(Cond::Named(string(&v).unwrap_or_default())),
-            // An id the boolean-property factory does not know gives null,
-            // and the source adds no condition (`JSONSkinLoader.java:
-            // 458-462`): `draw` holds no configured option.
-            v => {
-                if let Some(n) = int32(&v).filter(|&n| n != 0 && ReferenceVm::is_property(n)) {
+            // An id (a number, or a string that reads as one) the
+            // boolean-property factory does not know gives null, and the
+            // source adds no condition (`JSONSkinLoader.java:458-462`):
+            // `draw` holds no configured option.
+            v if lua_number(&v).is_some() => {
+                if let Some(n) = toint(&v).filter(|&n| n != 0 && ReferenceVm::is_property(n)) {
                     conds.push(Cond::Prop(n));
                 }
             }
+            v @ Value::String(_) => conds.push(Cond::Named(string(&v).unwrap_or_default())),
+            _ => {}
         }
         let timer = match raw(dest, "timer") {
             Value::Function(f) => {
@@ -562,7 +612,10 @@ impl<'a> Reference<'a> {
                 removed = removed.or(Some("option"));
             }
             match removed.or(unknown) {
-                None => self.objects.push(obj),
+                None => {
+                    self.observed.installed.push(obj_keys(&obj));
+                    self.objects.push(obj);
+                }
                 Some(why) => {
                     let callables = obj_keys(&obj);
                     let l = Listed {
@@ -660,24 +713,6 @@ fn not_reached(o: &Obj, from: usize, why: Cause, out: &mut RefFrame) {
     if let Some((_, k)) = &o.timer {
         out.points.push(Point::NotReached { key: *k, why });
     }
-}
-
-/// `s` with a static lifetime, each distinct one leaked once (an object
-/// path, for a key).
-fn intern(s: &str) -> &'static str {
-    thread_local! {
-        static SEEN: std::cell::RefCell<BTreeSet<&'static str>> =
-            const { std::cell::RefCell::new(BTreeSet::new()) };
-    }
-    SEEN.with(|seen| {
-        let mut seen = seen.borrow_mut();
-        if let Some(&p) = seen.get(s) {
-            return p;
-        }
-        let p: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        seen.insert(p);
-        p
-    })
 }
 
 /// An integer property's value as the source's prepare reads it: a null

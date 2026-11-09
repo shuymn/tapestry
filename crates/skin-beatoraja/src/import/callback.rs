@@ -1413,6 +1413,18 @@ impl Cx<'_> {
                 disposition: d,
                 why,
                 element: self.element.clone(),
+                // A value belongs to the definition (`def`), the other
+                // consumers to the destination; a nested part has its own
+                // path.
+                path: match (self.part_path.as_str(), field) {
+                    ("", "value") => "def".to_owned(),
+                    (p, _) => p.to_owned(),
+                },
+                index: if field == "op" {
+                    self.op_positions.get(&id).copied().unwrap_or(u32::MAX)
+                } else {
+                    0
+                },
                 lowered: lowered.map(|l| crate::lua::survey::Lowered {
                     src: l.src.clone(),
                     guards: l.guards.clone(),

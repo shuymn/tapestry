@@ -117,4 +117,26 @@ pub struct Observed {
     pub custom: usize,
     /// The skin folder, which chunk names are relative to.
     pub root: std::path::PathBuf,
+    /// Each installed object's consumers, in schedule order: the
+    /// occurrences each frame must give exactly one first point each.
+    pub installed: Vec<Vec<Key>>,
+}
+
+/// `s` with a static lifetime, each distinct one leaked once (an object
+/// path, for a key).
+pub fn intern(s: &str) -> &'static str {
+    use std::collections::BTreeSet;
+    thread_local! {
+        static SEEN: std::cell::RefCell<BTreeSet<&'static str>> =
+            const { std::cell::RefCell::new(BTreeSet::new()) };
+    }
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if let Some(&p) = seen.get(s) {
+            return p;
+        }
+        let p: &'static str = Box::leak(s.to_owned().into_boxed_str());
+        seen.insert(p);
+        p
+    })
 }

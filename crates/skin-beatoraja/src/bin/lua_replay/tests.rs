@@ -774,6 +774,154 @@ fn a_listed_reader_carries_its_evidence() {
     assert!(ok.passes(), "{}", ok.text(0, true, true));
 }
 
+/// B (r3): every integer field the source interprets goes through its
+/// serializer's `toint()` (LuaSkinLoader.java:103-104, 144-146): an `op`
+/// entry `906.5` is option 906, disabled, so the number is removed
+/// (R22); a group of `len = 2` with `divx = 2.5` has 2 cells and is kept,
+/// with `divx = 1.5` 1 cell and is removed (truncation, not rounding); a
+/// movie is classified before the grid rule (JsonSkinObjectLoader.java:46-49),
+/// so a movie with `len = 2` is an unmodelled movie, not removed.
+#[test]
+fn integer_fields_truncate_and_movies_come_first() {
+    let v = "value = function() return ms.number(100) / 2 end";
+    let disabled = run(&format!(
+        "skin.value = {{ {{ id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, {v} }} }}\n\
+         table.insert(skin.destination, {{ id = \"m\", op = {{ 906.5 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n"
+    ));
+    assert!(
+        disabled.removed.iter().any(|l| l.what == "option"),
+        "{}",
+        disabled.text(0, true, true)
+    );
+    assert_eq!(disabled.points, 0, "{}", disabled.text(0, true, true));
+    let group = |divx: &str| {
+        run(&format!(
+            "table.insert(skin.image, {{ id = \"g\", src = \"a\", x = 0, y = 0, w = 8, h = 8, divx = {divx}, divy = 1, len = 2, ref = 0 }})\n{}",
+            dst("\"g\"", 0, &format!("draw = {HALF_POINT},"))
+        ))
+    };
+    let kept = group("2.5");
+    agrees(&kept, 1);
+    assert_eq!(kept.matched, kept.frames, "{}", kept.text(0, true, true));
+    let removed = group("1.5");
+    assert!(
+        removed.removed.iter().any(|l| l.what == "invalid"),
+        "{}",
+        removed.text(0, true, true)
+    );
+    assert_eq!(removed.points, 0, "{}", removed.text(0, true, true));
+    let movie = run(&format!(
+        "table.insert(skin.source, {{ id = \"mov\", path = \"m.mp4\" }})\n\
+         table.insert(skin.image, {{ id = \"mv\", src = \"mov\", x = 0, y = 0, w = 8, h = 8, len = 2 }})\n{}",
+        dst("\"mv\"", 0, &format!("draw = {HALF_POINT},"))
+    ));
+    assert!(
+        movie.unmodelled.iter().any(|l| l.what == "movie") && movie.removed.is_empty(),
+        "{}",
+        movie.text(0, true, true)
+    );
+}
+
+/// A judge object of parts `images` (after `pre`), with `f` a draw only
+/// the program runs.
+fn judge(pre: &str, images: &str) -> String {
+    format!(
+        "local f = {HALF_POINT}\n{pre}\n\
+         skin.judge = {{ {{ id = \"jd\", index = 0, images = {{ {images} }}, numbers = {{}} }} }}\n\
+         table.insert(skin.destination, {{ id = \"jd\", draw = function() return true end, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n"
+    )
+}
+
+const PART: &str = "{ id = \"i\", draw = f, dst = { { x = 0, y = 0, w = 6, h = 6 } } }";
+
+/// The keys a listed judge holds, and the compiled findings on it.
+fn judge_keys(r: &Report) -> (Vec<crate::observed::Key>, usize) {
+    let judge = r
+        .unmodelled
+        .iter()
+        .find(|l| l.what == "judge")
+        .unwrap_or_else(|| panic!("{}", r.text(0, true, true)));
+    let found = r
+        .findings
+        .iter()
+        .filter(|f| {
+            f.what
+                .starts_with("compiled on a unmodelled object (judge)")
+        })
+        .count();
+    // Every compiled callback joins a listed key: no finding but the one
+    // per compiled callable.
+    assert!(
+        r.findings
+            .iter()
+            .all(|f| f.what.starts_with("compiled on a unmodelled object")),
+        "{}",
+        r.text(0, true, true)
+    );
+    for (_, key, _) in &r.compiled {
+        assert!(
+            judge.callables.contains(key),
+            "{key:?}: {}",
+            r.text(0, true, true)
+        );
+    }
+    (judge.callables.clone(), found)
+}
+
+/// A4 (r3): two judge parts sharing one draw closure are two occurrences,
+/// told apart by their object paths on both sides; production's compiled
+/// callbacks join them one each.
+#[test]
+fn judge_parts_sharing_a_draw_are_two_occurrences() {
+    let r = run(&judge("", &format!("{PART}, {PART}")));
+    let (keys, found) = judge_keys(&r);
+    let paths: Vec<&str> = keys
+        .iter()
+        .filter(|k| k.field == "draw")
+        .map(|k| k.path)
+        .collect();
+    assert_eq!(
+        paths,
+        ["", "def.images.1", "def.images.2"],
+        "{}",
+        r.text(0, true, true)
+    );
+    assert_eq!(found, 2, "{}", r.text(0, true, true));
+}
+
+/// A4 (r3): one part table met twice is two occurrences (a table is
+/// skipped only on the way down, as a cycle).
+#[test]
+fn a_shared_part_table_is_two_occurrences() {
+    let r = run(&judge(&format!("local part = {PART}"), "part, part"));
+    let (keys, found) = judge_keys(&r);
+    let paths: Vec<&str> = keys.iter().map(|k| k.path).collect();
+    assert_eq!(
+        paths,
+        ["", "def.images.1", "def.images.2"],
+        "{}",
+        r.text(0, true, true)
+    );
+    assert_eq!(found, 2, "{}", r.text(0, true, true));
+}
+
+/// A4 (r3): an `op` entry of a nested part keeps its position in its own
+/// list and its part's path on both sides.
+#[test]
+fn a_nested_op_keeps_its_index_and_path() {
+    let r = run(&judge(
+        "",
+        "{ id = \"i\", op = { 32, f }, dst = { { x = 0, y = 0, w = 6, h = 6 } } }",
+    ));
+    let (keys, found) = judge_keys(&r);
+    assert!(
+        keys.iter()
+            .any(|k| k.field == "op" && k.index == 1 && k.path == "def.images.1"),
+        "{keys:?}"
+    );
+    assert_eq!(found, 1, "{}", r.text(0, true, true));
+}
+
 /// A fixture's production run and what the reference observed, apart, for
 /// the comparator's own tests.
 pub fn pieces(body: &str) -> (crate::production::ProductionRun, crate::observed::Observed) {
