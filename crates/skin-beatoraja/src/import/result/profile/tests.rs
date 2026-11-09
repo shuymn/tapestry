@@ -34,36 +34,37 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
         .collect()
 }
 
-/// §A's numeric ids and the source's bundled skin's five more (S10-09i):
-/// 51 N, 34 D.
+/// §A's numeric ids, the source's bundled skin's five more (S10-09i) and
+/// the ids equal to or derived from bridged ones (S7-07c).
 const NUMERIC: &[(i32, i32, C)] = &[
     (21, 25, C::D),
-    (71, 71, C::N),
+    (45, 49, C::N),
+    (71, 72, C::N),
     (74, 76, C::N),
+    (80, 89, C::N),
     (90, 91, C::N),
     (96, 96, C::N),
-    (102, 103, C::N),
-    (107, 107, C::N),
-    (110, 114, C::N),
+    (101, 103, C::N),
+    (105, 108, C::N),
+    (110, 116, C::N),
+    (128, 128, C::N),
     (150, 150, C::N),
     (151, 151, C::D),
-    (152, 152, C::N),
-    (153, 153, C::D),
-    (154, 154, C::N),
+    (152, 156, C::N),
     (157, 158, C::D),
     (170, 172, C::N),
     (173, 173, C::D),
+    (174, 174, C::N),
     (175, 175, C::D),
-    (176, 176, C::N),
-    (178, 178, C::N),
+    (176, 178, C::N),
     (179, 180, C::D),
     (182, 182, C::D),
     (183, 184, C::N),
     (368, 368, C::N),
-    (370, 375, C::N),
+    (370, 377, C::N),
     (380, 399, C::D),
     (407, 407, C::N),
-    (410, 425, C::N),
+    (410, 427, C::N),
     (1163, 1164, C::N),
 ];
 
@@ -139,7 +140,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (51, 34));
+    assert_eq!((count(C::N), count(C::D)), (83, 33));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
@@ -182,7 +183,7 @@ fn every_profile_id_has_its_class() {
     };
     for id in 0..=3_000 {
         let want = match id {
-            71 | 171 => Some(EssentialPart::ResultScore),
+            71 | 101 | 171 => Some(EssentialPart::ResultScore),
             370 => Some(EssentialPart::ResultStatus),
             _ => None,
         };
@@ -242,4 +243,47 @@ fn the_mean_truncates_toward_zero() {
         panic!()
     };
     assert_eq!(read_number(&v, &none), Read::Unavailable);
+}
+
+/// 72 is twice the notes; 85 to 89 each grade's whole percent of the
+/// notes, hidden with no notes; 376 and 377 the standard deviation's whole
+/// ms and hundredths (`IntegerPropertyFactory.java:127-129`, `:434-440`,
+/// `:503-509`).
+#[test]
+fn derived_result_numbers_read_as_the_source() {
+    use skin_model::result_field as f;
+    let mut a = [0; f::COUNT];
+    for (field, v) in [
+        (f::RESULT_VALID, 1),
+        (f::CHART_NOTES_VALID, 1),
+        (f::CHART_NOTES, 900),
+        (f::COUNT_PERFECT, 600),
+        (f::COUNT_GREAT, 299),
+        (f::COUNT_POOR, 1),
+        (f::TIMING_VALID, 1),
+        (f::TIMING_SD_X100, 1_234),
+    ] {
+        a[usize::from(field)] = v;
+    }
+    let get = |f: &[i32; f::COUNT], id| match number(id) {
+        Some(Class::Bridge(v)) => read_number(&v, &ResultFields(*f)),
+        _ => Read::Unavailable,
+    };
+    for (id, want) in [
+        (72, 1_800),
+        (85, 66),
+        (86, 33),
+        (87, 0),
+        (89, 0),
+        (376, 12),
+        (377, 34),
+    ] {
+        assert_eq!(get(&a, id), Read::Value(want), "{id}");
+    }
+    a[usize::from(f::CHART_NOTES)] = 0;
+    for id in 85..=89 {
+        assert_eq!(get(&a, id), Read::Unavailable, "{id}");
+    }
+    a[usize::from(f::RESULT_VALID)] = 0;
+    assert_eq!(get(&a, 72), Read::Unavailable);
 }
