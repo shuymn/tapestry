@@ -42,7 +42,7 @@ use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
-    SlideStop, SliderRate, TrimOutcome,
+    SliderRate, TrimOutcome,
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
@@ -3918,8 +3918,12 @@ impl Skin {
                             Err(_why) => {
                                 #[cfg(feature = "dev-tools")]
                                 out.observed(match _why {
-                                    SlideStop::NoValue => crate::observation::Outcome::NoValue,
-                                    SlideStop::Beyond => crate::observation::Outcome::SlideBeyond,
+                                    crate::widget::cover_paint::SlideStop::NoValue => {
+                                        crate::observation::Outcome::NoValue
+                                    }
+                                    crate::widget::cover_paint::SlideStop::Beyond => {
+                                        crate::observation::Outcome::SlideBeyond
+                                    }
                                 });
                                 continue;
                             }

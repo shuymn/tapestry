@@ -40,6 +40,10 @@ public class Probe {
         return LuaValue.valueOf(Double.longBitsToDouble(Long.parseUnsignedLong(s.substring(2), 16)));
     }
 
+    static String fbits(float f) {
+        return Integer.toHexString(Float.floatToRawIntBits(f));
+    }
+
     interface Op { LuaValue apply(LuaValue a, LuaValue b); }
 
     public static void main(String[] args) {
@@ -75,6 +79,42 @@ public class Probe {
         System.out.println("toint nil = i:" + LuaValue.NIL.toint());
         System.out.println("toint true = i:" + LuaValue.TRUE.toint());
         System.out.println("toint false = i:" + LuaValue.FALSE.toint());
+        // A slider value's conversion (`SkinLuaAccessor.java:665-673`):
+        // each number as the value the source builds from it (a float
+        // that is integral becomes an integer, so -0.0 is integer 0), and
+        // strings by their bytes, through `todouble` and `d2f`.
+        for (String a : vals) {
+            LuaValue x = num(a);
+            System.out.println("tofloat " + a + " as " + show(x) + " = g:" + fbits(x.tofloat()));
+        }
+        System.out.println("tofloat nil as nil = g:" + fbits(LuaValue.NIL.tofloat()));
+        System.out.println("tofloat true as true = g:" + fbits(LuaValue.TRUE.tofloat()));
+        System.out.println("tofloat false as false = g:" + fbits(LuaValue.FALSE.tofloat()));
+        StringBuilder longDigits = new StringBuilder();
+        for (int i = 0; i < 70; i++) longDigits.append((char) ('1' + i % 9));
+        StringBuilder cut = new StringBuilder("1.");
+        for (int i = 0; i < 62; i++) cut.append('0');
+        cut.append('x');
+        String[] strs = {
+            "", " ", "  12  ", "	1", "0x10", "0X1f", "0x", "0x-1", "-0x1", "-", "0x[",
+            "1.5", "-0.4", "0.0", "-0.0", "-0", "1e3", "1E-3", ".5", "5.", ".", "+1", "1e", "abc",
+            "9223372036854775808", "18446744073709551616", cut.toString(), longDigits.toString(),
+            "1e400", "3.4028236e38", "-1e-300", "NaN", "Infinity", "0.25", " 0x10 ",
+        };
+        for (String s : strs) {
+            byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            StringBuilder hex = new StringBuilder("x");
+            for (byte by : bytes) hex.append(String.format("%02x", by & 0xff));
+            // `0x` alone reads past its bytes and throws, which the
+            // consumer catches as 0f.
+            String r;
+            try {
+                r = "g:" + fbits(LuaValue.valueOf(bytes).tofloat());
+            } catch (RuntimeException e) {
+                r = "caught";
+            }
+            System.out.println("tofloats " + hex + " = " + r);
+        }
         String[] un = {"neg", "floor", "ceil", "abs"};
         for (String a : vals) {
             for (String u : un) {
