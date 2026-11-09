@@ -158,6 +158,8 @@ fn main() -> ExitCode {
         #[cfg(feature = "dev-tools")]
         Command::Measure { chart, perfect } => report(measure_play(&chart, perfect, clock)),
         #[cfg(feature = "dev-tools")]
+        Command::MeasureSelect => report(measure_select(clock)),
+        #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
     }
 }
@@ -173,7 +175,7 @@ fn logged(command: &Command) -> Option<&'static str> {
         Command::Play(_) => Some("play"),
         Command::Select(_) => Some("select"),
         #[cfg(feature = "dev-tools")]
-        Command::Measure { .. } => Some("measure"),
+        Command::Measure { .. } | Command::MeasureSelect => Some("measure"),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(_) => Some("scenario"),
     }
@@ -227,6 +229,81 @@ fn launch<T>(
     } else {
         interactive(chart, input, start, clock, false, tune)
     }
+}
+
+/// `tapestry measure select` (dev-tools; the S7-07d gate): song
+/// selection with the devices under a PresentMon capture, until it is
+/// left; then each select and result screen lifetime's span is counted
+/// against the capture by the rules a measured play's is
+/// ([`presentmon::count_capture`]) and printed, a lifetime without the
+/// evidence or the conditions as N/A.
+#[cfg(feature = "dev-tools")]
+fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
+    let exe = presentmon::locate(std::env::var_os(presentmon::ENV), std::env::var_os("PATH"))?;
+    let process = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .context("the game's own executable name is unknown")?;
+    let dir = data_root()?.path().join("measure");
+    std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let csv = dir.join(format!("{stamp}.select.presentmon.csv"));
+    let log = dir.join(format!("{stamp}.select.presentmon.log"));
+    println!(
+        "measure: PresentMon {} into {}",
+        exe.display(),
+        csv.display()
+    );
+    let capture = presentmon::Capture::start(&exe, &process, &csv, &log)?;
+    dev::measure_screens();
+    let ran = select(
+        args::Select {
+            input: PlayInput::Devices,
+            dev: dev::SelectOptions::default(),
+        },
+        clock,
+    );
+    let measured = dev::measured_screens();
+    let stopped = capture.stop();
+    ran?;
+    stopped?;
+    let text = std::fs::read_to_string(&csv).with_context(|| csv.display().to_string())?;
+    let (frames, error) = presentmon::parse(&text, &process, |t| clock.from_qpc(t).0);
+    if let Some(e) = error {
+        return Err(anyhow::Error::new(e).context(csv.display().to_string()));
+    }
+    // Every present the run issued, the screens' predecessors and
+    // successors included; none (N/A) once the log overflowed.
+    let presents = (measured.presents_past == 0).then_some(measured.presents.as_slice());
+    println!(
+        "measure: {} presents logged, {} past the log",
+        measured.presents.len(),
+        measured.presents_past
+    );
+    // The game's side of the pairing, beside the capture.
+    let log = dir.join(format!("{stamp}.select.presents.txt"));
+    let text: String = measured.presents.iter().map(|t| format!("{t}\n")).collect();
+    std::fs::write(&log, text).with_context(|| log.display().to_string())?;
+    // The capture on the game's clock: present, displayed (or -1).
+    let pm = dir.join(format!("{stamp}.select.capture.txt"));
+    let text: String = frames
+        .iter()
+        .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
+        .collect();
+    std::fs::write(&pm, text).with_context(|| pm.display().to_string())?;
+    for s in &measured.screens {
+        let span = dev::screen_span(s.presents, &measured.presents);
+        let counted = s.period_ns.map(|period| {
+            presentmon::count_capture(&frames, span, presents, s.presentation, period)
+        });
+        println!(
+            "measure: {} lifetime {}: span {}..{} us, presentation {:?}, period {:?} ns, frames past storage {}: {:?}",
+            s.screen, s.lifetime, span.0, span.1, s.presentation, s.period_ns, s.past, counted
+        );
+    }
+    Ok(())
 }
 
 /// `tapestry measure play [--perfect] <chart>` (dev-tools): one play
@@ -2204,6 +2281,7 @@ mod tests {
     /// the interval's token. Without, the runtime is still parked after the
     /// play, and the run's end destroys it (design.md "beatoraja Lua
     /// Skins", Quiescence acknowledged).
+    // Covers: T09
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_play_leaves_the_screens_runtimes_at_rest_until_its_end() {

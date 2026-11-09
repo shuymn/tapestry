@@ -29,9 +29,27 @@ pub(crate) fn selection_visit(
     timers: &SelectionTimers,
 ) -> Result<Option<ScriptStop>, BuildError> {
     skin.prepare_selection_frame(sel, now, timers)?;
+    // The switches' `off` (dev-tools): no runtime taken.
+    #[cfg(feature = "dev-tools")]
+    if super::probe::off() {
+        sel.outputs_mut().fill(0);
+        return Ok(None);
+    }
+    // The frame probe's generation, read once the runtime is taken
+    // (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    let generation = {
+        let _ = slot.running();
+        slot.generation().unwrap_or(0)
+    };
     match slot.running() {
         Some(rt) if rt.outputs() == skin.outputs() => {
             let (fields, timers) = sel.runtime_parts();
+            #[cfg(feature = "dev-tools")]
+            super::probe::run(rt, skin_model::ScreenKind::Selection, generation, |rt| {
+                rt.frame(fields, timers);
+            });
+            #[cfg(not(feature = "dev-tools"))]
             rt.frame(fields, timers);
         }
         _ => sel.outputs_mut().fill(0),

@@ -966,6 +966,21 @@ impl ScriptSlot {
         running.as_mut().map(|(rt, _)| &mut **rt)
     }
 
+    /// The generation it runs or would run: a selection slot's once it
+    /// holds its runtime, a result slot's always (dev-tools: the frame
+    /// probe's samples).
+    #[cfg(feature = "dev-tools")]
+    pub(in crate::screens) const fn generation(&self) -> Option<u64> {
+        match &self.0 {
+            Slot::Bound {
+                running: Some((_, g)),
+                ..
+            } => Some(*g),
+            Slot::Result { generation, .. } => Some(*generation),
+            _ => None,
+        }
+    }
+
     /// Why the runtime it holds stopped, the first time it is asked after
     /// the stop; `None` before, after, and without one.
     pub(in crate::screens) fn stop(&mut self) -> Option<ScriptStop> {

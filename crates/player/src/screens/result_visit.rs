@@ -30,9 +30,23 @@ pub(crate) fn result_visit(
     timers: &ResultTimers,
 ) -> Result<Option<ScriptStop>, BuildError> {
     skin.prepare_result_frame(res, now, timers)?;
+    // The switches' `off` (dev-tools): no runtime taken.
+    #[cfg(feature = "dev-tools")]
+    if super::probe::off() {
+        res.outputs_mut().fill(0);
+        return Ok(None);
+    }
+    // The frame probe's generation: the slot's (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    let generation = slot.generation().unwrap_or(0);
     match slot.result_running(notes) {
         Some(rt) if rt.outputs() == skin.outputs() => {
             let (fields, timers) = res.runtime_parts();
+            #[cfg(feature = "dev-tools")]
+            super::probe::run(rt, skin_model::ScreenKind::Result, generation, |rt| {
+                rt.frame(fields, timers);
+            });
+            #[cfg(not(feature = "dev-tools"))]
             rt.frame(fields, timers);
         }
         _ => res.outputs_mut().fill(0),

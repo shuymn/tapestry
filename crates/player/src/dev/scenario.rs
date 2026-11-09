@@ -67,7 +67,8 @@ use std::fs;
 use std::io::Write as _;
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -1281,7 +1282,14 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The render thread's frame sink of a scenario: each presented play frame
 /// writes the captures it is due for, taking them out of the list first
 /// and putting the outcome back after, so the list is never held while the
-/// frame is read back, encoded or written.
+/// frame is read back, encoded or written. The render thread only reads
+/// the frame back (and its display list); the sink's writer thread encodes
+/// and writes it, so the encoding, which takes seconds on a loaded
+/// machine, delays no later frame and no capture due on one. At most
+/// [`WRITE_FRAMES`] frames and [`WRITE_BYTES`] bytes wait for or are in the
+/// writer: a frame past either fails its captures at once, so the render
+/// thread never waits for the writer. The play's end waits for the
+/// writer's backlog ([`FrameSink::finish`]).
 pub struct ScenarioFrames {
     captures: Captures,
     /// How long each capture's read-back stalls first: a test's stand-in
@@ -1289,6 +1297,76 @@ pub struct ScenarioFrames {
     stall: Option<Duration>,
     /// The presented frames so far: captures of one number are one frame.
     frame: u64,
+    /// The writer, started with the first captured frame.
+    writer: Option<Writer>,
+    /// What waits for or is in the writer.
+    backlog: Arc<(Mutex<Backlog>, Condvar)>,
+    /// The bytes the backlog may hold: [`WRITE_BYTES`], less in tests.
+    write_bytes: usize,
+}
+
+/// The captured frames that may wait for or be in the writer at once.
+const WRITE_FRAMES: usize = 4;
+
+/// The bytes of captured frames (their pixels and display lists) that may
+/// wait for or be in the writer at once: one frame of the largest target.
+/// One frame is taken whatever its size when nothing waits.
+const WRITE_BYTES: usize = super::MAX_SIZE_SIDE as usize * super::MAX_SIZE_SIDE as usize * 4;
+
+/// What waits for or is in the writer.
+#[derive(Debug, Default)]
+struct Backlog {
+    frames: usize,
+    bytes: usize,
+}
+
+/// A captured frame for the writer: its pixels, display list, and each
+/// capture due on it (its index in the list, file, sidecar, generation).
+struct Job {
+    pixels: Option<(u32, u32, Vec<u8>)>,
+    list: Option<Result<String, String>>,
+    due: Vec<(usize, PathBuf, String, u64)>,
+    /// Its reservation in the backlog, released when the job is dropped:
+    /// written, discarded by a writer that ended, or never sent.
+    bytes: usize,
+    backlog: Arc<(Mutex<Backlog>, Condvar)>,
+    captures: Captures,
+}
+
+impl Job {
+    /// Each of its captures still saving fails, saying `why`.
+    fn fail(&self, why: &str) {
+        let mut list = self.captures.lock();
+        for (i, path, _, generation) in &self.due {
+            if let Some(c) = list.get_mut(*i)
+                && c.state == CaptureState::Saving(*generation)
+            {
+                c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
+            }
+        }
+    }
+}
+
+impl Drop for Job {
+    /// A job dropped before its captures were written (its writer ended,
+    /// by a panic, with it current or queued) fails them; any job leaves
+    /// the backlog, and a waiting end is woken.
+    fn drop(&mut self) {
+        self.fail("its writer ended before writing it");
+        let (lock, done) = &*self.backlog;
+        let mut b = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.frames -= 1;
+        b.bytes -= self.bytes;
+        done.notify_all();
+    }
+}
+
+/// The sink's writer thread and its queue.
+struct Writer {
+    jobs: mpsc::Sender<Job>,
+    thread: JoinHandle<()>,
 }
 
 /// The environment variable that stalls each capture's read-back by its
@@ -1308,12 +1386,8 @@ impl Captures {
 impl ScenarioFrames {
     /// The sink of `captures` (tests).
     #[cfg(test)]
-    pub const fn new(captures: Captures) -> Self {
-        Self {
-            captures,
-            stall: None,
-            frame: 0,
-        }
+    pub fn new(captures: Captures) -> Self {
+        Self::stalled(captures, None)
     }
 
     /// The sink of `captures`, stalled as [`STALL_ENV`] says.
@@ -1322,10 +1396,125 @@ impl ScenarioFrames {
             .ok()
             .and_then(|ms| ms.parse().ok())
             .map(Duration::from_millis);
+        Self::stalled(captures, stall)
+    }
+
+    fn stalled(captures: Captures, stall: Option<Duration>) -> Self {
         Self {
             captures,
             stall,
             frame: 0,
+            writer: None,
+            backlog: Arc::default(),
+            write_bytes: WRITE_BYTES,
+        }
+    }
+
+    /// Reserves `bytes` of a frame in the backlog; why not when it is full.
+    fn admit(&self, bytes: usize) -> Result<(), String> {
+        let mut b = self
+            .backlog
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if b.frames >= WRITE_FRAMES || (b.frames > 0 && b.bytes + bytes > self.write_bytes) {
+            return Err(format!(
+                "the capture writer is behind ({} frames, {} bytes waiting; at most {WRITE_FRAMES} frames, {} bytes)",
+                b.frames, b.bytes, self.write_bytes
+            ));
+        }
+        b.frames += 1;
+        b.bytes += bytes;
+        Ok(())
+    }
+
+    /// Hands `job`, admitted, to the writer, started if it is not. A job
+    /// the writer cannot take fails its captures, saying why, and leaves
+    /// the backlog as it drops.
+    fn send(&mut self, job: Job) {
+        if self.writer.is_none() {
+            match self.start() {
+                Ok(w) => self.writer = Some(w),
+                Err(why) => return job.fail(&why),
+            }
+        }
+        if let Some(w) = &self.writer
+            && let Err(mpsc::SendError(job)) = w.jobs.send(job)
+        {
+            job.fail("its writer ended");
+        }
+    }
+
+    /// Starts the writer.
+    fn start(&self) -> Result<Writer, String> {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let thread = std::thread::Builder::new()
+            .name("capture writer".to_owned())
+            // A job leaves the backlog as it drops: written, or discarded
+            // with the queue when a panic ends the thread.
+            .spawn(move || {
+                for mut job in queue {
+                    write_frame(&mut job);
+                }
+            })
+            .map_err(|e| format!("its writer did not start: {e}"))?;
+        Ok(Writer { jobs, thread })
+    }
+}
+
+impl Drop for ScenarioFrames {
+    /// The writer writes what it was given, then ends. A write stuck in
+    /// the file system holds it, and with it this thread: the render
+    /// link's bounds leave both to the process's exit.
+    fn drop(&mut self) {
+        if let Some(Writer { jobs, thread }) = self.writer.take() {
+            drop(jobs);
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Tests: a writer waits while this is write-locked.
+#[cfg(test)]
+static HOLD_WRITES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Encodes a captured frame and writes it as each capture due on it, with
+/// the frame's display list beside a play frame, putting each outcome in
+/// the list unless the capture has ended meanwhile.
+fn write_frame(job: &mut Job) {
+    // Tests: held while a test holds the writers.
+    #[cfg(test)]
+    let _held = HOLD_WRITES.read();
+    // Tests: a capture named so makes its writer panic.
+    #[cfg(test)]
+    if job.due.iter().any(|(_, p, ..)| p.ends_with("panic.png")) {
+        panic!("the capture writer fails (a test)");
+    }
+    // Encoded once, for every capture due.
+    let image = job
+        .pixels
+        .take()
+        .map(|(w, h, pixels)| super::png(w, h, &pixels));
+    for (i, path, side, generation) in &job.due {
+        let outcome = match &image {
+            None => Err("nothing to read back".to_owned()),
+            Some(png) => write_new(path, png)
+                .and_then(|()| write_new(&path.with_extension("json"), side.as_bytes()))
+                .map_err(|e| e.to_string())
+                .and_then(|()| match &job.list {
+                    None => Ok(()),
+                    Some(Err(why)) => Err(why.clone()),
+                    Some(Ok(lines)) => write_new(&path.with_extension("jsonl"), lines.as_bytes())
+                        .map_err(|e| e.to_string()),
+                }),
+        };
+        if let Some(c) = job.captures.lock().get_mut(*i)
+            && c.state == CaptureState::Saving(*generation)
+        {
+            c.state = match outcome {
+                Ok(()) => CaptureState::Succeeded,
+                Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
+            };
         }
     }
 }
@@ -1358,44 +1547,55 @@ impl FrameSink for ScenarioFrames {
         if let Some(stall) = self.stall {
             std::thread::sleep(stall);
         }
-        // Read back and encoded once, for every capture due.
-        let image = screen
-            .read_back()
-            .map(|(w, h, pixels)| super::png(w, h, &pixels));
+        // Read back once, for every capture due, and what the frame was.
+        let pixels = screen.read_back();
         // Its list too, outside the play's measured region; loading frames
         // are smoke only and have none.
         let list = drawn
             .play
             .and_then(|_| screen.display_list())
             .map(|l| display_list_lines(&l, drawn));
-        for (i, path, axis, generation) in due {
-            let outcome = match &image {
-                None => Err("nothing to read back".to_owned()),
-                Some(png) => write_new(&path, png)
-                    .and_then(|()| {
-                        write_new(
-                            &path.with_extension("json"),
-                            sidecar(axis, self.frame, drawn).as_bytes(),
-                        )
-                    })
-                    .map_err(|e| e.to_string())
-                    .and_then(|()| match &list {
-                        None => Ok(()),
-                        Some(Err(why)) => Err(why.clone()),
-                        Some(Ok(lines)) => {
-                            write_new(&path.with_extension("jsonl"), lines.as_bytes())
-                                .map_err(|e| e.to_string())
-                        }
-                    }),
-            };
-            if let Some(c) = self.captures.lock().get_mut(i)
-                && c.state == CaptureState::Saving(generation)
-            {
-                c.state = match outcome {
-                    Ok(()) => CaptureState::Succeeded,
-                    Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
-                };
+        let bytes = pixels.as_ref().map_or(0, |p| p.2.len())
+            + list
+                .as_ref()
+                .map_or(0, |l| l.as_ref().map_or_else(String::len, String::len));
+        if let Err(why) = self.admit(bytes) {
+            let mut list = self.captures.lock();
+            for (i, path, _, generation) in due {
+                if let Some(c) = list.get_mut(i)
+                    && c.state == CaptureState::Saving(generation)
+                {
+                    c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
+                }
             }
+            return;
+        }
+        let due = due
+            .into_iter()
+            .map(|(i, path, axis, generation)| {
+                let side = sidecar(axis, self.frame, drawn);
+                (i, path, side, generation)
+            })
+            .collect();
+        self.send(Job {
+            pixels,
+            list,
+            due,
+            bytes,
+            backlog: Arc::clone(&self.backlog),
+            captures: self.captures.clone(),
+        });
+    }
+
+    fn finish(&mut self) {
+        let (lock, done) = &*self.backlog;
+        let mut b = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while b.frames > 0 {
+            b = done
+                .wait(b)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 }
@@ -2712,6 +2912,7 @@ mod tests {
         };
         sink.frame(&screen, &drawn(1, -5));
         sink.frame(&screen, &drawn(1, 2));
+        sink.finish();
         assert_eq!(
             fs::read_to_string(path("a.json"))
                 .unwrap()
@@ -2729,6 +2930,185 @@ mod tests {
         // Its READY state ended first.
         assert!(matches!(c.states()[2], CaptureState::Failed(_)));
         assert!(!path("c.png").exists() && !path("c.json").exists());
+    }
+
+    /// `n` captures, one per ms from 0, armed and bound to play 1, a sink
+    /// of them, and a screen whose read-back answers at once.
+    fn released_sink(n: usize) -> (tempfile::TempDir, Captures, super::ScenarioFrames, Stalling) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Captures::of(
+            (0..n)
+                .map(|k| {
+                    (
+                        TimeUs(k as i64 * 1_000),
+                        dir.path().join(format!("{k}.png")),
+                    )
+                })
+                .collect(),
+        );
+        for k in 0..n {
+            c.arm(u16::try_from(k).unwrap());
+        }
+        c.bind(1);
+        let sink = super::ScenarioFrames::new(c.clone());
+        // Released from the start: its read-back answers at once.
+        let (entered, seen) = std::sync::mpsc::channel();
+        // Its notices go nowhere.
+        std::mem::forget(seen);
+        let (_, held) = std::sync::mpsc::channel::<()>();
+        let screen = Stalling {
+            entered,
+            held: std::sync::Mutex::new(held),
+        };
+        (dir, c, sink, screen)
+    }
+
+    /// A captured frame is encoded and written off the render thread: while
+    /// the writer is held, the sink returns and a later frame takes the
+    /// next capture; the play's end waits for the writer, and returns once
+    /// both frames are written.
+    #[test]
+    fn a_held_write_delays_no_later_capture() {
+        use super::FrameSink as _;
+
+        let (dir, c, mut sink, screen) = released_sink(2);
+        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.frame(&screen, &drawn(1, 0));
+        assert_eq!(
+            c.states(),
+            [CaptureState::Saving(1), CaptureState::Bound(1)]
+        );
+        sink.frame(&screen, &drawn(1, 1));
+        assert_eq!(
+            c.states(),
+            [CaptureState::Saving(1), CaptureState::Saving(1)]
+        );
+        std::thread::scope(|s| {
+            let (ended, finished) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                sink.finish();
+                ended.send(()).unwrap();
+            });
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the end waits for the held writer"
+            );
+            assert!(!dir.path().join("0.png").exists());
+            drop(hold);
+            finished
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the end returns once written");
+        });
+        assert_eq!(
+            c.states(),
+            [CaptureState::Succeeded, CaptureState::Succeeded]
+        );
+        let side = fs::read_to_string(dir.path().join("1.json")).unwrap();
+        assert!(side.contains("\"frame\":2,"), "{side}");
+        assert!(
+            fs::read(dir.path().join("0.png"))
+                .unwrap()
+                .starts_with(b"\x89PNG")
+        );
+    }
+
+    /// A frame past the writer's backlog fails its captures at once, saying
+    /// so, and the render thread does not wait: by frames, and by bytes.
+    #[test]
+    fn a_frame_past_the_writers_backlog_fails_its_captures() {
+        use super::FrameSink as _;
+
+        let behind = |s: &CaptureState| matches!(s, CaptureState::Failed(why) if why.contains("the capture writer is behind"));
+        // By frames: one more than the backlog holds.
+        let n = super::WRITE_FRAMES + 1;
+        let (dir, c, mut sink, screen) = released_sink(n);
+        let hold = super::HOLD_WRITES.write().unwrap();
+        for k in 0..n {
+            sink.frame(&screen, &drawn(1, k as i64));
+        }
+        let states = c.states();
+        assert!(
+            states[..n - 1]
+                .iter()
+                .all(|s| *s == CaptureState::Saving(1)),
+            "{states:?}"
+        );
+        assert!(behind(&states[n - 1]), "{states:?}");
+        drop(hold);
+        sink.finish();
+        let states = c.states();
+        assert!(
+            states[..n - 1]
+                .iter()
+                .all(|s| *s == CaptureState::Succeeded),
+            "{states:?}"
+        );
+        assert!(!dir.path().join(format!("{}.png", n - 1)).exists());
+        // By bytes: each frame's pixels are 4 bytes, and the backlog holds 4.
+        let (dir, c, mut sink, screen) = released_sink(2);
+        sink.write_bytes = 4;
+        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.frame(&screen, &drawn(1, 0));
+        sink.frame(&screen, &drawn(1, 1));
+        let states = c.states();
+        assert_eq!(states[0], CaptureState::Saving(1));
+        assert!(behind(&states[1]), "{states:?}");
+        drop(hold);
+        sink.finish();
+        assert_eq!(c.states()[0], CaptureState::Succeeded);
+        assert!(!dir.path().join("1.png").exists());
+    }
+
+    /// A writer that panics fails the captures of its current job and of
+    /// those queued behind it, and releases their place in the backlog:
+    /// the play's end returns, and a later frame fails because the writer
+    /// ended, not because it is behind.
+    #[test]
+    fn a_panicking_writer_releases_its_backlog() {
+        use super::FrameSink as _;
+
+        let (dir, _, mut sink, screen) = released_sink(0);
+        let c = Captures::of(
+            ["panic.png", "1.png", "2.png", "3.png"]
+                .iter()
+                .enumerate()
+                .map(|(k, name)| (TimeUs(k as i64 * 1_000), dir.path().join(name)))
+                .collect(),
+        );
+        for k in 0..4 {
+            c.arm(k);
+        }
+        c.bind(1);
+        sink.captures = c.clone();
+        let hold = super::HOLD_WRITES.write().unwrap();
+        for k in 0..3 {
+            sink.frame(&screen, &drawn(1, k));
+        }
+        assert_eq!(c.states()[..3], vec![CaptureState::Saving(1); 3]);
+        drop(hold);
+        std::thread::scope(|s| {
+            let (ended, finished) = std::sync::mpsc::channel();
+            let sink = &mut sink;
+            s.spawn(move || {
+                sink.finish();
+                ended.send(()).unwrap();
+            });
+            finished
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the end returns once the writer ended");
+        });
+        let ended = |s: &CaptureState| matches!(s, CaptureState::Failed(why) if why.contains("its writer ended"));
+        let states = c.states();
+        assert!(states[..3].iter().all(ended), "{states:?}");
+        {
+            let b = sink.backlog.0.lock().unwrap();
+            assert_eq!((b.frames, b.bytes), (0, 0));
+        }
+        sink.frame(&screen, &drawn(1, 3));
+        let states = c.states();
+        assert!(ended(&states[3]), "{states:?}");
     }
 
     /// Captures arm, bind to the next play only, and settle when it ends:
