@@ -311,9 +311,14 @@ impl ReferenceVm {
         }
     }
 
-    /// Calls `f` with no arguments under a fresh budget.
+    /// Calls `f` with no arguments under a fresh budget: the runtime's
+    /// instruction and host-call caps per call, and
+    /// [`REFERENCE_CALL_TIME`] of wall time, so a loaded machine's clock
+    /// cannot stop it.
     pub fn call(&self, f: &Function) -> Called {
+        super::vm_hooks::set_frame_time(Some(REFERENCE_CALL_TIME));
         self.pass.ledger.begin_frame();
+        super::vm_hooks::set_frame_time(None);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.call::<Value>(())));
         let out = match r {
             Ok(Ok(v)) => Called::Value(v),
@@ -411,6 +416,9 @@ impl ReferenceVm {
         i32::try_from(op.unsigned_abs()).is_ok_and(|id| STATIC_IN_PLAY.binary_search(&id).is_ok())
     }
 }
+
+/// The wall time one reference invocation may take.
+const REFERENCE_CALL_TIME: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The boolean properties static in a play state (`isStatic` true):
 /// `TYPE_STATIC_ALL`, `TYPE_STATIC_WITHOUT_MUSICSELECT`, the song-data,

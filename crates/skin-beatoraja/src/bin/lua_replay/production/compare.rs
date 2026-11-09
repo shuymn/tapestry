@@ -178,9 +178,11 @@ impl<'a> Cx<'a> {
         self.by_key.get(&(k.dest, k.field, k.callable)).copied()
     }
 
-    /// Why production did not run an occurrence the source ran: its
-    /// record, its destination's, or its callable's; `None` when it is
-    /// compiled or nothing explains it.
+    /// Why production did not run an occurrence the source ran: its own
+    /// record, or its destination's (dropped, folded, ignored); `None`
+    /// when it is compiled or nothing explains it. A callable's
+    /// classified-only reason explains no occurrence by itself
+    /// (s7-06e-design.md §3.7).
     fn attribute(&self, key: &Key) -> Option<String> {
         match self.rec(key) {
             Some(o) if o.disposition == "compiled" => None,
@@ -198,12 +200,7 @@ impl<'a> Cx<'a> {
                 Some(Became::Dropped) => Some("dropped".into()),
                 Some(Became::Folded) => Some("folded".into()),
                 Some(Became::Ignored) => Some("ignored".into()),
-                _ => self
-                    .run
-                    .recorded
-                    .unused
-                    .get(&key.callable)
-                    .map(|u| format!("unused {u}")),
+                _ => None,
             },
         }
     }
@@ -557,7 +554,7 @@ fn cover(s: &(String, u32), iso: &[Entry], obs: &Observed, cx: &Cx<'_>) -> Resul
             let got = attribute(&k).unwrap_or_default();
             let ok = match r.evidence.as_str() {
                 "replaced" => got.starts_with("replaced"),
-                "dropped" => got == "dropped" || got == "unused dropped",
+                "dropped" => got == "dropped",
                 _ => false,
             };
             if !ok {
@@ -566,4 +563,134 @@ fn cover(s: &(String, u32), iso: &[Entry], obs: &Observed, cx: &Cx<'_>) -> Resul
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use skin_model::present::trace::{Converted, Event};
+
+    use super::compare;
+    use crate::tests::{TAMPERED, pieces};
+
+    /// The untouched run agrees; each alteration of production's side is
+    /// found.
+    #[test]
+    fn altered_traces_are_found() {
+        let (run, obs) = pieces(TAMPERED);
+        assert!(compare(&run, &obs, &[]).passes());
+        let found = |f: &dyn Fn(&mut super::ProductionRun)| {
+            let (mut run, obs) = pieces(TAMPERED);
+            f(&mut run);
+            let r = compare(&run, &obs, &[]);
+            assert!(!r.findings.is_empty(), "{}", r.text(0, true));
+        };
+        // A changed conversion of an agreeing raw value.
+        found(&|run| {
+            for f in &mut run.frames {
+                for e in &mut f.events {
+                    if let Event::Ran { conv, .. } = e {
+                        *conv = Converted::Long(Some(7));
+                    }
+                }
+            }
+        });
+        // A changed installed start.
+        found(&|run| {
+            for f in &mut run.frames {
+                for e in &mut f.events {
+                    if let Event::Timer {
+                        installed: Some(t), ..
+                    } = e
+                    {
+                        t.0 += 1;
+                    }
+                }
+            }
+        });
+        // A changed sampled age, and a missing one.
+        found(&|run| {
+            for f in &mut run.frames {
+                for e in &mut f.events {
+                    if let Event::Sampled { age_us, .. } = e {
+                        *age_us += 1;
+                    }
+                }
+            }
+        });
+        found(&|run| {
+            for f in &mut run.frames {
+                f.events.retain(|e| !matches!(e, Event::Sampled { .. }));
+            }
+        });
+        // An extra invocation, and a missing one.
+        found(&|run| {
+            if let Some(f) = run.frames.first_mut()
+                && let Some(e) = f
+                    .events
+                    .iter()
+                    .find(|e| matches!(e, Event::Ran { .. }))
+                    .copied()
+            {
+                if let Event::Ran {
+                    k, result, conv, ..
+                } = e
+                {
+                    f.events.push(Event::Ran {
+                        k,
+                        call: 2,
+                        result,
+                        conv,
+                    });
+                }
+            }
+        });
+        found(&|run| {
+            for f in &mut run.frames {
+                f.events.retain(|e| !matches!(e, Event::Ran { .. }));
+            }
+        });
+    }
+
+    /// R15: an occurrence with no production record is a finding; R17: a
+    /// compiled callable on an object the reference does not run is one.
+    #[test]
+    fn unrecorded_and_unmodelled_occurrences_are_found() {
+        let (mut run, obs) = pieces(TAMPERED);
+        run.recorded
+            .occurrences
+            .retain(|o| o.disposition != "lowered");
+        let r = compare(&run, &obs, &[]);
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.what.contains("no production record")),
+            "{}",
+            r.text(0, true)
+        );
+        let (run, mut obs) = pieces(TAMPERED);
+        let key = obs.frames[0].timers[0].key;
+        obs.unmodelled.push(crate::observed::Listed {
+            dest: key.dest,
+            what: "text".into(),
+            callables: vec![key],
+        });
+        let r = compare(&run, &obs, &[]);
+        assert!(
+            r.findings.iter().any(|f| f.what.contains("unmodelled")),
+            "{}",
+            r.text(0, true)
+        );
+    }
+
+    /// R19: the reference import must equal production's.
+    #[test]
+    fn a_different_import_is_refused() {
+        let (run, _) = pieces(TAMPERED);
+        let mut other = run.recorded.clone();
+        assert!(run.same_import(&other));
+        if let Some(o) = other.occurrences.first_mut() {
+            o.program = Some(99);
+        }
+        assert!(!run.same_import(&other));
+    }
 }

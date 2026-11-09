@@ -438,3 +438,35 @@ fn isolation_entries_parse() {
     assert!(isolation::same_file("@C:/x/play/play.lua", "play/play.lua"));
     assert!(!isolation::same_file("@C:/x/play/xplay.lua", "play.lua"));
 }
+
+/// A fixture's production run and what the reference observed, apart, for
+/// the comparator's own tests.
+pub fn pieces(body: &str) -> (crate::production::ProductionRun, crate::observed::Observed) {
+    let d = folder(body);
+    let o = options(Script::full());
+    let cancel = skin_beatoraja::Cancel::new();
+    let h = skin_beatoraja::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let config = skin_beatoraja::Config::named(h.header(), [], []).unwrap();
+    let (out, rec) = h.import_recorded(&config, &o.facts, &cancel);
+    let skin_beatoraja::LuaOutcome::Imported(i) = out.unwrap() else {
+        panic!("pending");
+    };
+    let (run, inputs) =
+        crate::production::record(&i.imported.skin, rec, &o.script, Some(12)).unwrap();
+    let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+    let vm = vm.unwrap();
+    let mut obs = crate::reference::Reference::new(&vm, &rec.items).run(&inputs);
+    obs.root = d.path().to_path_buf();
+    (run, obs)
+}
+
+/// The latch on one destination, and a lowered draw on another.
+pub const TAMPERED: &str = "local latch = (function()\n\
+       local state = ms.timer_off_value\n\
+       return function()\n\
+         if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
+         return state\n\
+       end\n\
+     end)()\n\
+     table.insert(skin.destination, { id = \"i\", timer = latch, loop = -1, dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
+     table.insert(skin.destination, { id = \"i\", draw = function() return ms.number(100) >= 0 end, dst = { { x = 100, y = 0, w = 64, h = 64 } } })\n";
