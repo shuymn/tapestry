@@ -27,18 +27,24 @@
 //!   [`attach`](AdjustDriver::attach) gives it the attempt's tempo where
 //!   the chart, speed and section are final, solves once and names a new
 //!   presentation epoch, pending until the attempt's preparation makes it
-//!   active.
+//!   active. [`refresh_presentation`](AdjustDriver::refresh_presentation)
+//!   names a new epoch for the same attempt without entering it again.
+//! - **Acceptance**: [`close_acceptance`](AdjustDriver::close_acceptance)
+//!   and [`reopen_acceptance`](AdjustDriver::reopen_acceptance) fence the
+//!   input thread and put [`Event::Acceptance`] in the stream where the
+//!   fence's answer is, so everything observed before the request is taken
+//!   under the old acceptance and everything after under the new.
 //!
 //! Draining allocates nothing.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::TimeUs;
+use bms_model::{Speed, TimeUs};
 use input::{AdjustmentReceiver, AdjustmentTap, TapError, TapEvent, adjustment_queue};
 
 use crate::adjust_keys::AdjustmentPlan;
 use crate::adjustment::{
-    Adjustment, AttachError, Augmented, Diagnostics, Event, Head, NoTempo, Observation,
+    Acceptance, Adjustment, AttachError, Augmented, Diagnostics, Event, Head, NoTempo, Observation,
     PresentationReader, PresentationSnapshot, PresentationWriter, presentation_link,
 };
 use crate::attempt::PreparationRefusal;
@@ -85,6 +91,12 @@ pub struct AdjustDriver {
     /// The last fence asked for, and the last answered.
     fence_asked: u64,
     fence_answered: u64,
+    /// The acceptance to put in the stream at fence `n`'s answer.
+    at_fence: Option<(u64, Acceptance)>,
+    /// The speed and opening of the last attachment, while it stands and
+    /// succeeded: set by a successful attachment, cleared by any other
+    /// and by [`enter_attempt`](Self::enter_attempt).
+    attached: Option<(Speed, TimeUs)>,
     /// An opening or a rearm was asked for and its marker not yet taken.
     opening: bool,
     /// The generation of the last cancellation taken.
@@ -132,6 +144,8 @@ impl AdjustDriver {
                 offset: display_offset_us,
                 fence_asked: 0,
                 fence_answered: 0,
+                at_fence: None,
+                attached: None,
                 opening: false,
                 cancelled: None,
                 next_epoch: 1,
@@ -160,6 +174,7 @@ impl AdjustDriver {
             opens_at,
             offset,
             fence_answered,
+            at_fence,
             opening,
             cancelled,
             ..
@@ -197,7 +212,12 @@ impl AdjustDriver {
                 }
                 TapEvent::Fence(n) => {
                     *fence_answered = n;
-                    None
+                    let (_, acceptance) = at_fence.take_if(|(m, _)| *m == n)?;
+                    Some(Augmented::Obs(Observation {
+                        time: o.at,
+                        seq: o.seq,
+                        event: Event::Acceptance(acceptance),
+                    }))
                 }
                 _ => plan.observation(&o).map(Augmented::Obs),
             }
@@ -255,13 +275,66 @@ impl AdjustDriver {
     ///
     /// Why the input thread did not answer: the run ends with it.
     pub fn fence(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
+        self.fence_with(None, input)
+    }
+
+    /// [`fence`](Self::fence), with `acceptance` put in the stream where
+    /// the fence's answer is.
+    fn fence_with(
+        &mut self,
+        acceptance: Option<Acceptance>,
+        input: &mut impl InputPump,
+    ) -> Result<(), InputWaitError> {
         if let Some(e) = self.failed {
             return Err(e);
         }
         let n = self.fence_asked.wrapping_add(1);
         self.fence_asked = n;
+        self.at_fence = acceptance.map(|a| (n, a));
         input.request_fence(n);
-        self.wait_until(input, |d| d.fence_answered == n)
+        let waited = self.wait_until(input, |d| d.fence_answered == n);
+        self.at_fence = None;
+        waited
+    }
+
+    /// Closes the play adjustments' acceptance where the fence's answer
+    /// is: everything observed before it acts as before, and from it until
+    /// a reopening a press of a tuning control acts on nothing and its
+    /// hold stays suppressed, so the control acts again only on a fresh
+    /// press after the reopening ([`Acceptance::Closed`]). Publishes the
+    /// result.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence: the run ends with it.
+    pub fn close_acceptance(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
+        self.fence_with(Some(Acceptance::Closed), input)
+    }
+
+    /// Reopens the play adjustments' acceptance where the fence's answer
+    /// is. Closing and reopening at once drops nothing: the fence took
+    /// everything observed before either. An opening's phase reopens it
+    /// too. Publishes the result.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence: the run ends with it.
+    pub fn reopen_acceptance(&mut self, input: &mut impl InputPump) -> Result<(), InputWaitError> {
+        self.fence_with(Some(Acceptance::Open), input)
+    }
+
+    /// Whether the play adjustments take presses.
+    #[must_use]
+    pub const fn accepting(&self) -> bool {
+        self.reducer.accepting()
+    }
+
+    /// How many adjustments the reducer applied so far
+    /// ([`Adjustment::accepted`]): read after a fence, it moves with every
+    /// change accepted before it.
+    #[must_use]
+    pub const fn accepted(&self) -> u64 {
+        self.reducer.accepted()
     }
 
     /// Before asking for an opening or a rearm: the previous one's marker
@@ -316,6 +389,7 @@ impl AdjustDriver {
             None => self.reducer.enter_attempt(opens_at, &NoTempo),
         }
         self.tempo = None;
+        self.attached = None;
         if let Some(opens_at) = opens_at {
             self.opens_at = opens_at;
         }
@@ -342,10 +416,24 @@ impl AdjustDriver {
         input: &mut impl InputPump,
     ) -> Result<u64, Result<AttachError, InputWaitError>> {
         self.fence(input).map_err(Err)?;
-        self.opens_at = opens_at;
         let speed = tempo.speed();
         let references = tempo.references().ok();
         let attached = self.reducer.attach(opens_at, references, speed, &tempo);
+        self.attached_as(attached, tempo, opens_at, input)
+    }
+
+    /// After the reducer attached `tempo` for `opens_at` with the result
+    /// `attached`: keeps them, names a new epoch, publishes, and makes the
+    /// epoch pending when the attachment succeeded.
+    fn attached_as(
+        &mut self,
+        attached: Result<(), AttachError>,
+        tempo: AttemptTempo,
+        opens_at: TimeUs,
+        input: &mut impl InputPump,
+    ) -> Result<u64, Result<AttachError, InputWaitError>> {
+        self.opens_at = opens_at;
+        self.attached = attached.is_ok().then(|| (tempo.speed(), opens_at));
         self.tempo = Some(tempo);
         let epoch = self.next_epoch;
         self.next_epoch = epoch.wrapping_add(1);
@@ -488,18 +576,66 @@ impl AdjustDriver {
         loaded: &Loaded,
         input: &mut impl InputPump,
     ) -> Result<Option<PreparationRefusal>, InputWaitError> {
-        match self.attach(loaded.attempt_tempo(), loaded.opens_at(), input) {
-            Ok(_) => Ok(None),
-            // Located at the chart's path: the reason is the chart's
-            // tempo.
-            Err(Ok(why)) => Ok(Some(PreparationRefusal {
-                location: Some(loaded.path().display().to_string()),
-                reason: format!(
-                    "Floating hi-speed cannot be solved for this chart ({why}); \
-                     play it in Classic (player.toml [hispeed] mode = \"classic\")"
-                ),
-            })),
-            Err(Err(e)) => Err(e),
+        refusal(
+            loaded,
+            self.attach(loaded.attempt_tempo(), loaded.opens_at(), input),
+        )
+    }
+
+    /// The presentation takes the attempt `loaded` describes again, as it
+    /// stands now (its speed and opening possibly refitted), without
+    /// entering it: the holds, their repeat deadlines, the axes'
+    /// remainders, the selected cover and the double-press history stay,
+    /// and nothing ends the dispatch context.
+    ///
+    /// While an epoch is pending this does nothing. Otherwise it names a
+    /// new pending epoch: on the standing attachment when the last one
+    /// succeeded for the same speed and opening, else by solving again
+    /// ([`Adjustment::resolve`]). `Ok(Some(_))` refuses the attempt as
+    /// [`attach_loaded`](Self::attach_loaded) does, so a load-time
+    /// attachment that failed is refused here.
+    ///
+    /// # Errors
+    ///
+    /// Why the input thread did not answer the fence.
+    pub fn refresh_presentation(
+        &mut self,
+        loaded: &Loaded,
+        input: &mut impl InputPump,
+    ) -> Result<Option<PreparationRefusal>, InputWaitError> {
+        if self.has_pending() {
+            return Ok(None);
         }
+        self.fence(input)?;
+        let tempo = loaded.attempt_tempo();
+        let opens_at = loaded.opens_at();
+        let speed = tempo.speed();
+        let attached = if self.attached == Some((speed, opens_at)) {
+            Ok(())
+        } else {
+            let references = tempo.references().ok();
+            self.reducer.resolve(opens_at, references, speed, &tempo)
+        };
+        refusal(loaded, self.attached_as(attached, tempo, opens_at, input))
+    }
+}
+
+/// What an attachment of the attempt `loaded` describes gave: `Ok(Some(_))`
+/// refuses it, located at the chart, when Floating cannot solve for it.
+fn refusal(
+    loaded: &Loaded,
+    attached: Result<u64, Result<AttachError, InputWaitError>>,
+) -> Result<Option<PreparationRefusal>, InputWaitError> {
+    match attached {
+        Ok(_) => Ok(None),
+        // Located at the chart's path: the reason is the chart's tempo.
+        Err(Ok(why)) => Ok(Some(PreparationRefusal {
+            location: Some(loaded.path().display().to_string()),
+            reason: format!(
+                "Floating hi-speed cannot be solved for this chart ({why}); \
+                 play it in Classic (player.toml [hispeed] mode = \"classic\")"
+            ),
+        })),
+        Err(Err(e)) => Err(e),
     }
 }
