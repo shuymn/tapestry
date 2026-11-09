@@ -20,7 +20,7 @@
 //! too: the source lists offset 3 on LIFT and offsets 3 and 5 on HIDDEN+
 //! (`skin/json/JsonPlaySkinObjectLoader.java:182-210`), consumed however
 //! they are listed; offset 4 besides makes either follow SUDDEN+, and
-//! offset 5 anywhere else is unsupported. A `disapearLine` at or above 0
+//! offset 5 besides makes LIFT's follow HIDDEN+. A `disapearLine` at or above 0
 //! trims the paint (`play/SkinHidden.java:60-90`): nothing while its
 //! unstretched destination's upper edge is at or below the line, that
 //! destination's part above the line while the line crosses it, the
@@ -268,7 +268,7 @@ impl Cx<'_> {
         }
         // The paint's own motion is the covers', noted once with any
         // following.
-        if c.follow == Follow::None {
+        if c.follow == Follow::NONE {
             self.lane_approx(at, part, LaneApprox::CoverMotion)?;
         }
         let def = CoverPaintDef {

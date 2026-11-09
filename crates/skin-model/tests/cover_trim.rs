@@ -75,8 +75,8 @@ fn lift_and_hidden_paint_move_by_their_covers() {
     // K = 210, so LIFT's paint rises 180 and HIDDEN+'s 390; LIFT's linked
     // trim base 800 is 620 and cuts its paint, at 520, 100 down.
     let elements = vec![
-        paint(0, [160, 700, 544, 200], Follow::None),
-        paint(1, [160, 280, 544, 600], Follow::None),
+        paint(0, [160, 700, 544, 200], Follow::NONE),
+        paint(1, [160, 280, 544, 600], Follow::NONE),
     ];
     let defs = vec![
         lift_def(CoverTrim::Lift(800), None),
@@ -108,7 +108,7 @@ fn following_the_cover_adds_its_motion_once() {
     // Lift 300 ‰ (L = 180) and the cover 500 ‰ of the 420 left (C = 210):
     // LIFT's paint following the cover moves −180 + 210, its gate alike,
     // and its fixed line stays put.
-    let elements = vec![paint(0, [160, 700, 544, 200], Follow::Cover)];
+    let elements = vec![paint(0, [160, 700, 544, 200], Follow::COVER)];
     let defs = vec![lift_def(CoverTrim::Fixed(800), None)];
     let h = shown(skin(elements, defs), [500, 300, 0]);
     assert_eq!(
@@ -123,7 +123,7 @@ fn following_the_cover_adds_its_motion_once() {
 /// LIFT's paint fitted over `[160, 55, 544, 100]`, gated by the raw
 /// `[160, 100, 544, 10]` and trimmed at `trim`, without lanes.
 fn fitted(trim: i32) -> Harness {
-    let elements = vec![paint(0, [160, 55, 544, 100], Follow::None)];
+    let elements = vec![paint(0, [160, 55, 544, 100], Follow::NONE)];
     let defs = vec![lift_def(CoverTrim::Fixed(trim), Some([160, 100, 544, 10]))];
     let skin = def(None, elements, defs).unwrap();
     let mut h = Harness::new(skin, &tap_chart(), &full(0));
@@ -156,7 +156,7 @@ fn the_raw_rect_gates_the_fitted_paint() {
 /// A 32×32 paint drawn at its native size over the empty `[0, 100, 0,
 /// 10]`, trimmed at `trim`.
 fn native_on_empty(trim: i32) -> Harness {
-    let mut e = paint(0, [0, 100, 0, 10], Follow::None);
+    let mut e = paint(0, [0, 100, 0, 10], Follow::NONE);
     e.place.native = Some(Native::Exact([32, 32]));
     let defs = vec![lift_def(CoverTrim::Fixed(trim), None)];
     let skin = def(None, vec![e], defs).unwrap();
@@ -227,12 +227,12 @@ fn a_turned_or_native_paint_keeps_its_quad_under_an_upright_clip() {
                             pivot,
                             native,
                             bind,
-                            ..paint(0, [0; 4], Follow::None).place
+                            ..paint(0, [0; 4], Follow::NONE).place
                         };
                         let at = |index: u32| ElementDef {
                             track: turned([160, 300, 100, 200], 30),
                             place,
-                            ..paint(index, [0; 4], Follow::None)
+                            ..paint(index, [0; 4], Follow::NONE)
                         };
                         let plain = Place {
                             pivot: Anchor::TopLeft,
@@ -274,7 +274,7 @@ fn every_clip_keeps_the_draw_order() {
     // clip, an image between, or another blend each start one.
     let at = |index, y, blend| ElementDef {
         blend,
-        ..paint(index, [160, y, 544, 200], Follow::None)
+        ..paint(index, [160, y, 544, 200], Follow::NONE)
     };
     let elements = vec![
         at(0, 700, Blend::Alpha),
@@ -318,7 +318,7 @@ fn every_clip_keeps_the_draw_order() {
 fn notes(view: [u16; 3], with_paint: bool) -> Vec<[f32; 4]> {
     let mut elements = Vec::new();
     if with_paint {
-        let mut clear = paint(1, [160, 280, 544, 600], Follow::None);
+        let mut clear = paint(1, [160, 280, 544, 600], Follow::NONE);
         clear.track = still([
             Some(160),
             Some(280),
@@ -332,13 +332,13 @@ fn notes(view: [u16; 3], with_paint: bool) -> Vec<[f32; 4]> {
         ]);
         let off = ElementDef {
             timer: skin_model::TimerRef::Builtin(skin_model::timer::FULL_COMBO),
-            ..paint(0, [160, 880, 544, 200], Follow::None)
+            ..paint(0, [160, 880, 544, 200], Follow::NONE)
         };
         elements = vec![
-            paint(0, [160, 880, 544, 200], Follow::Cover),
+            paint(0, [160, 880, 544, 200], Follow::COVER),
             clear,
             off,
-            paint(0, [160, 2_000, 544, 10], Follow::None),
+            paint(0, [160, 2_000, 544, 10], Follow::NONE),
         ];
     }
     let defs = vec![
@@ -381,7 +381,7 @@ fn fading(ease: Ease, ms: i64, enabled: bool, amount: u16) -> Vec<[f32; 4]> {
     };
     let e = ElementDef {
         track: Track::new(&[key(0, 255), key(1_000, 0)], ease, End::Hold).unwrap(),
-        ..paint(0, [0; 4], Follow::None)
+        ..paint(0, [0; 4], Follow::NONE)
     };
     let defs = vec![moving(HIDDEN, CoverMotion::Hidden, CoverTrim::None)];
     let mut h = Harness::new(skin(vec![e], defs), &tap_chart(), &full(0));
@@ -449,7 +449,7 @@ fn a_hidden_gate_track_draws_nothing() {
         gate_track: Some(late),
         ..lift_def(CoverTrim::Fixed(105), None)
     }];
-    let elements = vec![paint(0, [160, 55, 544, 100], Follow::None)];
+    let elements = vec![paint(0, [160, 55, 544, 100], Follow::NONE)];
     let h = shown(skin(elements, defs), [0, 0, 0]);
     assert!(rects(&h, LIFT).is_empty());
 }
@@ -463,7 +463,7 @@ fn neither_gates_nor_trims_change_the_layout() {
             Some(source()),
             vec![
                 lanes_element(),
-                paint(0, [160, 700, 544, 200], Follow::None),
+                paint(0, [160, 700, 544, 200], Follow::NONE),
             ],
             defs,
         )
@@ -493,7 +493,7 @@ fn dbg(e: LoadError) -> String {
 fn paint_err(def_: CoverPaintDef) -> String {
     def(
         None,
-        vec![paint(0, [0, 0, 10, 10], Follow::None)],
+        vec![paint(0, [0, 0, 10, 10], Follow::NONE)],
         vec![def_],
     )
     .map(drop)
@@ -536,7 +536,7 @@ fn paints_are_checked_at_load() {
     assert!(
         def(
             None,
-            vec![paint(0, [0, 0, 10, 10], Follow::None)],
+            vec![paint(0, [0, 0, 10, 10], Follow::NONE)],
             vec![lift_def(CoverTrim::Fixed(0), Some([0, MAX_COORD, 0, 0]))],
         )
         .is_ok()
@@ -562,7 +562,7 @@ fn paints_are_checked_at_load() {
         assert!(
             def(
                 None,
-                vec![paint(0, [0, 0, 10, 10], Follow::None)],
+                vec![paint(0, [0, 0, 10, 10], Follow::NONE)],
                 vec![moving(LIFT, CoverMotion::Lift, trim)],
             )
             .is_ok()
@@ -577,7 +577,7 @@ fn trimmed_paint_elements_are_checked_at_load() {
     };
     // Gated by its own track, a trimmed paint has no negative size.
     for r in [[0, 0, -1, 10], [0, 0, 10, -1]] {
-        let e = paint(0, r, Follow::None);
+        let e = paint(0, r, Follow::NONE);
         assert_eq!(
             load(e.clone(), lift_def(CoverTrim::Fixed(0), None)).unwrap_err(),
             dbg(LoadError::CoverGate { element: 1 }),
@@ -586,31 +586,49 @@ fn trimmed_paint_elements_are_checked_at_load() {
         // Its own gate track lifts that.
         assert!(load(e, lift_def(CoverTrim::Fixed(0), Some([0, 0, 1, 1]))).is_ok());
     }
-    // A moving paint follows SUDDEN+ alone.
-    for follow in [Follow::Lift, Follow::LiftAndCover] {
+    // A moving paint never follows the lift, which it already rises by,
+    // and HIDDEN+'s never HIDDEN+.
+    let both = Follow {
+        cover: true,
+        ..Follow::HIDDEN
+    };
+    for (follow, motion) in [
+        (Follow::LIFT, CoverMotion::Lift),
+        (Follow::LIFT_AND_COVER, CoverMotion::Lift),
+        (Follow::LIFT, CoverMotion::Hidden),
+        (Follow::HIDDEN, CoverMotion::Hidden),
+        (both, CoverMotion::Hidden),
+    ] {
         assert_eq!(
             load(
                 paint(0, [0, 0, 10, 10], follow),
-                moving(LIFT, CoverMotion::Lift, CoverTrim::None)
+                moving(LIFT, motion, CoverTrim::None)
             )
             .unwrap_err(),
             dbg(LoadError::UnsupportedFollow { element: 1 }),
-            "{follow:?}"
+            "{follow:?} {motion:?}"
         );
     }
-    assert!(
-        load(
-            paint(0, [0, 0, 10, 10], Follow::Cover),
-            moving(LIFT, CoverMotion::Hidden, CoverTrim::None)
-        )
-        .is_ok()
-    );
+    for (follow, motion) in [
+        (Follow::COVER, CoverMotion::Hidden),
+        (Follow::HIDDEN, CoverMotion::Lift),
+        (both, CoverMotion::Lift),
+    ] {
+        assert!(
+            load(
+                paint(0, [0, 0, 10, 10], follow),
+                moving(LIFT, motion, CoverTrim::None)
+            )
+            .is_ok(),
+            "{follow:?} {motion:?}"
+        );
+    }
     // Moved the lanes' length, a moving paint's keys, its gate's and its
     // linked line stay within ±MAX_COORD.
     let low = MAX_COORD - 600 + 1;
     assert_eq!(
         load(
-            paint(0, [0, -low, 10, 10], Follow::None),
+            paint(0, [0, -low, 10, 10], Follow::NONE),
             moving(LIFT, CoverMotion::Lift, CoverTrim::None)
         )
         .unwrap_err(),
@@ -618,7 +636,7 @@ fn trimmed_paint_elements_are_checked_at_load() {
     );
     assert_eq!(
         load(
-            paint(0, [0, 0, 10, 10], Follow::None),
+            paint(0, [0, 0, 10, 10], Follow::NONE),
             lift_def(CoverTrim::Fixed(0), Some([0, -low, 10, 10]))
         )
         .unwrap_err(),
@@ -626,7 +644,7 @@ fn trimmed_paint_elements_are_checked_at_load() {
     );
     assert_eq!(
         load(
-            paint(0, [0, 0, 10, 10], Follow::None),
+            paint(0, [0, 0, 10, 10], Follow::NONE),
             moving(LIFT, CoverMotion::Lift, CoverTrim::Lift(-low))
         )
         .unwrap_err(),
@@ -634,7 +652,7 @@ fn trimmed_paint_elements_are_checked_at_load() {
     );
     assert!(
         load(
-            paint(0, [0, 0, 10, 10], Follow::None),
+            paint(0, [0, 0, 10, 10], Follow::NONE),
             moving(LIFT, CoverMotion::Lift, CoverTrim::Lift(1 - low))
         )
         .is_ok()

@@ -602,7 +602,7 @@ fn offsets_are_target_pixels_at_any_resolution() {
         },
         Place {
             region: Region::Playfield,
-            follow: Follow::Cover,
+            follow: Follow::COVER,
             ..Place::SCREEN
         },
     ];

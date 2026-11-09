@@ -89,11 +89,25 @@ const NOTES: i64 = 2_000;
 /// The most effects one frame drains; the rest wait for the next frame.
 const DRAIN: usize = 64;
 /// Every way an element or a grade follows the covers, cycled through.
-const FOLLOWS: [Follow; 4] = [
-    Follow::None,
-    Follow::Lift,
-    Follow::Cover,
-    Follow::LiftAndCover,
+const FOLLOWS: [Follow; 8] = [
+    Follow::NONE,
+    Follow::LIFT,
+    Follow::COVER,
+    Follow::LIFT_AND_COVER,
+    Follow::HIDDEN,
+    Follow {
+        lift: true,
+        ..Follow::HIDDEN
+    },
+    Follow {
+        cover: true,
+        ..Follow::HIDDEN
+    },
+    Follow {
+        lift: true,
+        cover: true,
+        hidden: true,
+    },
 ];
 
 fn lane(n: i64) -> Lane {
@@ -623,7 +637,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             pivot: Anchor::Center,
             fill: Fill::None,
             native: Some(Native::NoLarger([4, 4])),
-            follow: Follow::None,
+            follow: Follow::NONE,
             angle: skin_model::AngleFollow::None,
         },
         Place {
@@ -650,7 +664,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             track(300 + 7 * i, Ease::Linear, End::Hold),
             TimerRef::Builtin(timer::READY),
             Place {
-                follow: FOLLOWS[usize::from(i) % 4],
+                follow: FOLLOWS[usize::from(i) % FOLLOWS.len()],
                 angle: skin_model::AngleFollow::None,
                 ..place
             },
@@ -679,7 +693,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
             Place {
                 region,
                 pivot: Anchor::ALL[usize::from(i)],
-                follow: FOLLOWS[usize::from(i) % 4],
+                follow: FOLLOWS[usize::from(i) % FOLLOWS.len()],
                 ..Place::SCREEN
             },
         ));
@@ -738,7 +752,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
                 blend: if k % 2 == 0 { Blend::Alpha } else { Blend::Add },
                 visible: (k == 3).then(|| bool_program("bp < 100000")),
                 native: (k % 2 == 1).then_some(Native::Exact([2, 3])),
-                follow: FOLLOWS[usize::from(k) % 4],
+                follow: FOLLOWS[usize::from(k) % FOLLOWS.len()],
                 // Slots 0, 3 and 6 attach their combos to a wider rect
                 // timed as the paint, slot 3's native.
                 attachment: (k % 3 == 0).then(|| {
@@ -800,7 +814,7 @@ fn widgets(elements: &mut Vec<ElementDef>) -> skin_model::WidgetDefs {
     elements.push(widget(Source::Text(0), squeeze, ready, Place::SCREEN));
     let top = Place {
         region: Region::Top,
-        follow: Follow::Cover,
+        follow: Follow::COVER,
         ..Place::SCREEN
     };
     let fixed = lanes_support::rect([900, 20, 300, TEXT_H]);
@@ -998,7 +1012,7 @@ fn image_choices(
             track(980 + 5 * i, Ease::Linear, End::Hold),
             TimerRef::Builtin(timer::READY),
             Place {
-                follow: FOLLOWS[usize::from(i) % 4],
+                follow: FOLLOWS[usize::from(i) % FOLLOWS.len()],
                 angle: skin_model::AngleFollow::None,
                 ..place
             },
@@ -1099,7 +1113,7 @@ fn skin() -> Loaded {
                     3 => Some(Native::Exact([2, 2])),
                     _ => None,
                 },
-                follow: FOLLOWS[usize::from(i / 4) % 4],
+                follow: FOLLOWS[usize::from(i / 4) % FOLLOWS.len()],
                 angle: skin_model::AngleFollow::None,
             },
         });
@@ -1128,11 +1142,11 @@ fn skin() -> Loaded {
     // trimmed at the lanes' bottom by its own gate track.
     elements.push(ElementDef {
         visible: Some(bool_program("hidden.permille > 0")),
-        ..lanes_support::paint(3, [160, 880, 544, 800], Follow::Cover)
+        ..lanes_support::paint(3, [160, 880, 544, 800], Follow::COVER)
     });
     elements.push(ElementDef {
         timer: TimerRef::Builtin(timer::JUDGE),
-        ..lanes_support::paint(0, [160, -720, 544, 800], Follow::Cover)
+        ..lanes_support::paint(0, [160, -720, 544, 800], Follow::COVER)
     });
     elements.push(ElementDef {
         blend: Blend::Add,
@@ -1140,15 +1154,15 @@ fn skin() -> Loaded {
     });
     elements.push(ElementDef {
         visible: Some(bool_program("combo % 3 != 1")),
-        ..lanes_support::paint(1, [160, 0, 544, 80], Follow::None)
+        ..lanes_support::paint(1, [160, 0, 544, 80], Follow::NONE)
     });
     elements.push(lanes_support::paint(
         2,
         [160, -400, 544, 480],
-        Follow::LiftAndCover,
+        Follow::LIFT_AND_COVER,
     ));
-    elements.push(lanes_support::paint(4, [160, 940, 544, 120], Follow::None));
-    elements.push(lanes_support::paint(5, [160, 1_040, 24, 24], Follow::None));
+    elements.push(lanes_support::paint(4, [160, 940, 544, 120], Follow::NONE));
+    elements.push(lanes_support::paint(5, [160, 1_040, 24, 24], Follow::NONE));
     let beam = lanes_support::bound(Bind::Lane(Lane::SCRATCH));
     elements.push(ElementDef {
         blend: Blend::Add,
@@ -1298,18 +1312,18 @@ fn loading_skin() -> Loaded {
                 track(400 + 11 * i, Ease::Out, End::Hold),
                 Place {
                     pivot: Anchor::ALL[usize::from(i)],
-                    follow: FOLLOWS[usize::from(i) % 4],
+                    follow: FOLLOWS[usize::from(i) % FOLLOWS.len()],
                     ..Place::SCREEN
                 },
             )
         });
     }
     for (paint, r, follow) in [
-        (0, [160, -720, 544, 800], Follow::Cover),
-        (1, [160, 0, 544, 80], Follow::None),
-        (2, [160, -400, 544, 480], Follow::LiftAndCover),
-        (3, [160, 880, 544, 800], Follow::Cover),
-        (4, [160, 940, 544, 120], Follow::None),
+        (0, [160, -720, 544, 800], Follow::COVER),
+        (1, [160, 0, 544, 80], Follow::NONE),
+        (2, [160, -400, 544, 480], Follow::LIFT_AND_COVER),
+        (3, [160, 880, 544, 800], Follow::COVER),
+        (4, [160, 940, 544, 120], Follow::NONE),
     ] {
         elements.push(ElementDef {
             visible: (paint == 3).then(|| bool_program("hidden.permille > 0")),
@@ -2523,7 +2537,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         Some(lanes_support::source()),
         vec![
             lanes_support::lanes_element(),
-            lanes_support::paint(0, [160, 280, 544, 600], Follow::None),
+            lanes_support::paint(0, [160, 280, 544, 600], Follow::NONE),
         ],
         skin_model::WidgetDefs {
             cover_paints: vec![lanes_support::moving(
@@ -3113,14 +3127,14 @@ fn trim_skin() -> Skin {
             lanes_support::lanes_element(),
             ElementDef {
                 track: turning,
-                ..paint(0, [0; 4], Follow::Cover)
+                ..paint(0, [0; 4], Follow::COVER)
             },
             ElementDef {
                 place: native,
-                ..paint(1, [160, 900, 544, 0], Follow::None)
+                ..paint(1, [160, 900, 544, 0], Follow::NONE)
             },
-            paint(2, [160, 700, 544, 300], Follow::None),
-            paint(3, [160, 900, 544, 60], Follow::None),
+            paint(2, [160, 700, 544, 300], Follow::NONE),
+            paint(3, [160, 900, 544, 60], Follow::NONE),
         ],
         skin_model::WidgetDefs {
             image_choices: vec![choice],
@@ -3511,7 +3525,7 @@ fn attached_judges() -> (Vec<JudgeDef>, [Track; 2], Track) {
         blend: Blend::Alpha,
         visible: None,
         native: None,
-        follow: Follow::None,
+        follow: Follow::NONE,
         attachment,
     };
     let combo = |attach: Attach| ComboPart {
@@ -3741,7 +3755,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
     let mut loading_quads = [0_usize; 2];
     for (k, def) in defs.into_iter().enumerate() {
         let place = Place {
-            follow: Follow::LiftAndCover,
+            follow: Follow::LIFT_AND_COVER,
             ..Place::SCREEN
         };
         let elements = vec![
@@ -3834,7 +3848,8 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
 /// The readouts a stretch's frame `frame_no` gives with `view`: nothing
 /// known, then tempo, hi-speed and an exact duration, then a duration
 /// without a hi-speed, changing every 7 frames; a cover the view draws at
-/// 0 is off with a stored amount, and the adjustment mode toggles.
+/// 0 is off with a stored amount, the adjustment mode toggles, and
+/// HIDDEN+ at 0 switches on and off.
 fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
     let base = readouts_for(view);
     let off = |shown: u16, stored: u16| if shown == 0 { stored } else { shown };
@@ -3844,6 +3859,7 @@ fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
         cover_enabled: view.cover != 0,
         lift_enabled: view.lift != 0,
         adjusting: frame_no % 11 < 3,
+        hidden_enabled: view.hidden != 0 || frame_no % 13 < 7,
         ..base.covers
     };
     let k = u32::try_from(frame_no % 1_000).unwrap_or(0);

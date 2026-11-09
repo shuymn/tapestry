@@ -305,3 +305,144 @@ fn a_negative_size_rounding_to_zero_is_still_refused() {
         }
     }
 }
+
+/// What shows at 1,000 ms with the covers at `[cover, lift, hidden]` ‰,
+/// HIDDEN+ `enabled` and the adjustment control `held` (op 270).
+fn shown_held(l: &Loaded, view: [u16; 3], enabled: bool, held: bool) -> Vec<[i32; 4]> {
+    let [cover, lift, hidden] = view;
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+    (d.view.cover, d.view.lift, d.view.hidden) = (cover, lift, if enabled { hidden } else { 0 });
+    let mut readouts = readouts_for(d.view);
+    (readouts.covers.hidden, readouts.covers.hidden_enabled) = (hidden, enabled);
+    readouts.covers.adjusting = held;
+    d.readouts = Some(readouts);
+    d.shown(1_000)
+}
+
+/// A one-digit number off the lanes listing `offsets`, under `op`.
+fn amount(offsets: &str, op: &str) -> Loaded {
+    let number = r#""value": [{"id": "num", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 1, "ref": 71}]"#;
+    let objects = format!("{}, {number}", note(""));
+    let num = format!(
+        r#"{{"id": "num", "offsets": [{offsets}], "op": [{op}], "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}"#
+    );
+    import_body(&body("", &objects, &[NOTES, &num]))
+}
+
+/// `rects` moved down by `dy`.
+fn moved(rects: &[[i32; 4]], dy: i32) -> Vec<[i32; 4]> {
+    rects
+        .iter()
+        .map(|&[x, y, w, h]| [x, y + dy, w, h])
+        .collect()
+}
+
+#[test]
+fn a_number_listing_offset_five_follows_hidden_plus() {
+    // The HIDDEN+ amount, shown while the adjustment control is held and
+    // HIDDEN+ is on: HIDDEN+ at 300 ‰ of the 600 px lane raises it 180,
+    // the source's `hidden × lane height` (`play/LaneRenderer.java:
+    // 335-346`).
+    let l = amount("5", "270, 273");
+    assert!(!has(l.report(), NoteKind::RuntimeOffset(5)));
+    assert!(has(l.report(), d9(LaneApprox::CoverMotion)));
+    let rest = shown_held(&l, [0, 0, 0], true, true);
+    assert_eq!(rest.len(), 1);
+    assert_eq!(shown_held(&l, [0, 0, 300], true, true), moved(&rest, -180));
+    // Not held, it does not show.
+    assert!(shown_held(&l, [0, 0, 300], true, false).is_empty());
+}
+
+#[test]
+fn a_follower_of_hidden_plus_does_not_draw_while_it_is_off() {
+    // Without its switch in the condition, the follower alone hides it,
+    // as the source's alpha offset of −255 does.
+    let l = amount("5", "");
+    let on = shown_held(&l, [0, 0, 0], true, false);
+    assert_eq!(on.len(), 1);
+    assert!(shown_held(&l, [0, 0, 300], false, false).is_empty());
+    assert!(shown_held(&l, [0, 0, 0], false, false).is_empty());
+    // An element that does not follow HIDDEN+ still draws.
+    let l = amount("4", "");
+    assert_eq!(shown_held(&l, [0, 0, 300], false, false).len(), 1);
+}
+
+#[test]
+fn offsets_three_four_and_five_add() {
+    // LIFT 100 ‰ of 600 is 60 up; SUDDEN+ 500 ‰ of the 540 left is 270
+    // down; HIDDEN+ 300 ‰ of the 540 is 162 up: 48 down together, and
+    // each subset its own sum.
+    let rest = shown_held(&amount("3, 4, 5", ""), [0, 0, 0], true, false);
+    assert_eq!(rest.len(), 1);
+    for (offsets, dy) in [
+        ("3, 4, 5", 48),
+        ("3", -60),
+        ("4", 270),
+        ("5", -162),
+        ("3, 4", 210),
+        ("3, 5", -222),
+        ("4, 5", 108),
+    ] {
+        let l = amount(offsets, "");
+        assert_eq!(
+            shown_held(&l, [500, 100, 300], true, false),
+            moved(&rest, dy),
+            "{offsets}"
+        );
+    }
+}
+
+#[test]
+fn a_follower_of_hidden_plus_needs_a_fixed_colour_and_no_raised_alpha() {
+    // The source skips every alpha offset at an interpolated colour, so a
+    // fading follower would show while HIDDEN+ is off
+    // (`skin/SkinObject.java:489-504`): refused, as any alpha offset on
+    // animated colour is.
+    let number = r#""value": [{"id": "num", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 1, "ref": 71}]"#;
+    let objects = format!(
+        r#""offset": [{{"name": "a", "id": 42, "a": true}}], {}, {number}"#,
+        note("")
+    );
+    let num = |fields: &str, keys: &str| {
+        format!(r#"{{"id": "num", "offsets": [{fields}], "dst": [{keys}]}}"#)
+    };
+    let fading =
+        r#"{"time": 0, "x": 0, "y": 0, "w": 10, "h": 10, "a": 255}, {"time": 1000, "a": 0}"#;
+    let still = r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#;
+    let load = |d: &str, a: i32| {
+        common::import_config(
+            [1_920, 1_080],
+            &body("", &objects, &[NOTES, d]),
+            &[],
+            |c: &mut Config| {
+                c.offsets.insert(
+                    42,
+                    OffsetValue {
+                        a,
+                        ..OffsetValue::default()
+                    },
+                );
+            },
+        )
+    };
+    // The number shows the EX score, a critical part: refused.
+    let why = |l: Loaded| match l.err() {
+        ImportError::Critical { why, .. } => why,
+        e => panic!("{e:?}"),
+    };
+    assert_eq!(why(load(&num("5", fading), 0)), NoteKind::OffsetAlpha);
+    // Without offset 5 the fade imports.
+    assert!(!has(
+        load(&num("4", fading), 0).report(),
+        NoteKind::OffsetAlpha
+    ));
+    // A raised alpha after offset 5 clamps it back up in the source,
+    // 255 → 0 → 128 while HIDDEN+ is off: refused.
+    assert_eq!(why(load(&num("5, 42", still), 128)), NoteKind::OffsetAlpha);
+    // A lowered one keeps one sign: admitted and folded.
+    let l = load(&num("5, 42", still), -128);
+    assert!(!has(l.report(), NoteKind::OffsetAlpha));
+    assert_eq!(shown_held(&l, [0, 0, 0], true, false).len(), 1);
+    assert!(shown_held(&l, [0, 0, 0], false, false).is_empty());
+}

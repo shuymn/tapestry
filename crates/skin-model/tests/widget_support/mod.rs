@@ -225,7 +225,7 @@ pub fn grade(image: u32, r: [i32; 4]) -> GradePart {
         blend: Blend::Alpha,
         visible: None,
         native: None,
-        follow: Follow::None,
+        follow: Follow::NONE,
         attachment: None,
     }
 }
