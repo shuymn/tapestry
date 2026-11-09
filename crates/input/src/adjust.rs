@@ -731,6 +731,13 @@ impl AdjustmentTap {
         &self.gate
     }
 
+    /// Presses of a latched control so far, wrapping, as the latch counts
+    /// them ([`Hold::presses`]).
+    #[must_use]
+    pub const fn presses(&self) -> u64 {
+        self.presses
+    }
+
     /// Whether START or SELECT is held, or may be: what defers an opening.
     #[must_use]
     pub fn holding(&self) -> bool {
