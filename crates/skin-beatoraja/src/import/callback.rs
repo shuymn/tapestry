@@ -1348,12 +1348,29 @@ impl Cx<'_> {
         role: Role,
         d: (Disposition, Option<Unsupported>),
     ) {
-        self.record(at, field, role, d, None);
+        self.record(at, field, role, d, (None, None));
+    }
+
+    /// [`Self::outcome`] of a callback compiled as program callback `k`.
+    fn compiled(&self, at: (u32, u32), field: &'static str, role: Role, k: u16) {
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Compiled, None),
+            (None, Some(k)),
+        );
     }
 
     /// [`Self::outcome`] of callable `c` at node `id`, lowered to `l`.
     fn lowered_outcome(&self, at: (u32, u32), field: &'static str, role: Role, l: &Lowered) {
-        self.record(at, field, role, (Disposition::Lowered, None), Some(l));
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Lowered, None),
+            (Some(l), None),
+        );
     }
 
     /// [`Self::outcome`]'s work, with what the callback lowered to, if it
@@ -1364,7 +1381,7 @@ impl Cx<'_> {
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
-        lowered: Option<&Lowered>,
+        (lowered, program): (Option<&Lowered>, Option<u16>),
     ) {
         let Some(an) = self.analysis() else {
             return;
@@ -1388,9 +1405,10 @@ impl Cx<'_> {
                     guards: l.guards.clone(),
                     constant: l.constant,
                 }),
+                program,
             });
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, why, lowered);
+        let _ = (id, field, role, why, lowered, program);
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -1629,16 +1647,19 @@ impl Cx<'_> {
                     "value",
                     role,
                     (Disposition::Lowered, None),
-                    Some(&Lowered {
-                        src: format!("{fold:?}"),
-                        guards: Vec::new(),
-                        part: None,
-                        essential: None,
-                        deviates: false,
-                        known: None,
-                        #[cfg(feature = "dev-tools")]
-                        constant: matches!(fold, TextFold::Literal(_)),
-                    }),
+                    (
+                        Some(&Lowered {
+                            src: format!("{fold:?}"),
+                            guards: Vec::new(),
+                            part: None,
+                            essential: None,
+                            deviates: false,
+                            known: None,
+                            #[cfg(feature = "dev-tools")]
+                            constant: matches!(fold, TextFold::Literal(_)),
+                        }),
+                        None,
+                    ),
                 );
                 Ok(Ok(fold))
             }
@@ -1778,7 +1799,7 @@ impl Cx<'_> {
             }
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
-                    self.outcome((c, id), field, role, (Disposition::Compiled, None));
+                    self.compiled((c, id), field, role, k);
                     *deviates |= l.deviates;
                     conds.push(format!("lua.{k}"));
                     return Ok(true);
@@ -1944,7 +1965,7 @@ impl Cx<'_> {
                     .unwrap_or(base);
                 match self.program(prog, None, None, at)? {
                     Ok(k) => {
-                        self.outcome((c, id), "value", role, (Disposition::Compiled, None));
+                        self.compiled((c, id), "value", role, k);
                         return Ok(Some(NumberValue {
                             expr: format!("lua.{k}"),
                             guard: Some(format!("lua.{k}.ok")),
@@ -2205,7 +2226,7 @@ impl Cx<'_> {
                                     r.slots = ids;
                                     r.consumers.push((k, role, (c, id), at));
                                 }
-                                self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
+                                self.compiled((c, id), "timer", role, k);
                                 return Ok(Ok(TimerRef::Output(k)));
                             }
                             Err(why) => why,

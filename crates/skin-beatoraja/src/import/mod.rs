@@ -22,10 +22,12 @@ mod object;
 pub(crate) mod ops;
 mod policy;
 mod property;
+#[cfg(feature = "dev-tools")]
+pub(crate) use property::{IndexProp, IntProp, index_in, int_in, judge_count};
 mod report;
 pub(crate) mod result;
 pub(crate) mod selection;
-mod timer;
+pub(crate) mod timer;
 mod track;
 mod widget;
 
@@ -549,6 +551,8 @@ impl<'d> Cx<'d> {
                 items.insert(item.op, Some(item.op) == selected);
             }
         }
+        #[cfg(feature = "dev-tools")]
+        crate::lua::replay::record_items(&items);
         let mut cx = Self {
             def,
             header,
