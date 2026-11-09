@@ -9,7 +9,9 @@ mod common;
 use common::play::Drawn;
 use rules::GaugeValue;
 use skin_beatoraja::lua::{Disposition, Unsupported};
-use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
+use skin_beatoraja::{
+    Cancel, Config, ImportError, ImportLimit, LuaImported, LuaWhy, NoteKind, read_lua_header,
+};
 use skin_model::{ChartText, GaugeLook, Layout, MAX_TEXT_BYTES};
 use tempfile::TempDir;
 
@@ -838,6 +840,78 @@ fn a_float_modulo_shows_what_the_source_shows() {
     }
 }
 
+/// The import charges each program callback's per-frame cost as the
+/// skin counts it (V5): its instructions, its reads at each use and its
+/// gate. Nothing is dropped, so the operations charged are the ones kept.
+#[test]
+fn a_program_callback_is_charged_as_the_skin_counts_it() {
+    let d = folder(&skin(
+        "skin.value = {\n\
+           { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return 5 end },\n\
+           { id = \"w\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return (ms.number(110) + ms.number(110)) % 3 end } }\n\
+         table.insert(skin.destination, { id = \"v\", draw = function() return ms.number(110) / 2 >= 0 end,\n\
+           dst = { { x = 0, y = 100, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"w\", dst = { { x = 0, y = 200, w = 6, h = 6 } } })",
+    ));
+    let i = import(&d, 905).unwrap();
+    let mut got = i.callbacks.clone();
+    got.sort_by_key(|d| format!("{d:?}"));
+    // The draw is gated by the expression value's sentinel.
+    assert_eq!(
+        got,
+        [
+            Disposition::Compiled,
+            Disposition::Compiled,
+            Disposition::Lowered
+        ]
+    );
+    assert_eq!(i.imported.skin.program_callbacks(), 2);
+    assert_eq!(
+        i.imported.report.usage.ops as usize,
+        i.imported.skin.ops().total()
+    );
+}
+
+/// The program's per-frame cost counts against the skin's operation cap
+/// at import: as many program draws as fit import, every operation kept
+/// charged, and one more is refused there as the operation limit.
+#[test]
+fn a_program_past_the_operation_cap_is_refused_at_import() {
+    let body = |n: usize| {
+        skin(&format!(
+            "for k = 1, {n} do\n\
+               table.insert(skin.destination, {{ id = \"i\", draw = function()\n\
+                 return ms.number(110) % 7 + ms.number(111) % 5 > 3\n\
+               end, dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n\
+             end"
+        ))
+    };
+    let ops = |n: usize| {
+        let i = import(&folder(&body(n)), 905).unwrap();
+        assert_eq!(i.callbacks, vec![Disposition::Compiled; n]);
+        let charged = i.imported.report.usage.ops as usize;
+        assert_eq!(charged, i.imported.skin.ops().total(), "{n}");
+        charged
+    };
+    let (one, two) = (ops(1), ops(2));
+    let per = two - one;
+    let fit = 1 + (skin_model::MAX_SKIN_OPS - one) / per;
+    assert_eq!(ops(fit), one + (fit - 1) * per);
+    let e = import(&folder(&body(fit + 1)), 905).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            ImportError::Limit {
+                limit: ImportLimit::Ops,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
 /// A read whose value is discarded still keeps its availability: with
 /// the play level unavailable the number draws nothing, as the source's
 /// `number(96)` would have no value.
@@ -906,7 +980,20 @@ fn a_second_program_draw_follows_its_role() {
             Disposition::Compiled,
             Disposition::Replaced(Unsupported::Construct("a draw after a program draw"))
         ]
+    ); // The image is dropped after its `op` callback was compiled and
+    // charged: the callback stays in the program, and every operation
+    // the skin keeps was charged.
+    assert!(
+        i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| n.severity == skin_beatoraja::Severity::Dropped)
     );
+    assert_eq!(i.imported.skin.program_callbacks(), 1);
+    let kept = i.imported.skin.ops().total();
+    assert!(kept > 0);
+    assert_eq!(i.imported.report.usage.ops as usize, kept);
 }
 
 /// A latch: a closure whose frame-time body writes its own upvalue
@@ -1653,6 +1740,20 @@ fn a_slot_is_taken_only_when_proven() {
             i.callbacks
         );
     }
+}
+
+/// A slot-owning timer callback is charged as the skin counts it (V5:
+/// both runs and the slot it touches): nothing is dropped, so the
+/// operations charged are the ones kept.
+#[test]
+fn a_timer_callback_is_charged_as_the_skin_counts_it() {
+    let i = import(&timer_skin(STATE, LATCH_BODY, 1), 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    assert_eq!(i.imported.skin.program_callbacks(), 1);
+    assert_eq!(
+        i.imported.report.usage.ops as usize,
+        i.imported.skin.ops().total()
+    );
 }
 
 /// The loading proof reads a slot at its initial value: an integer start

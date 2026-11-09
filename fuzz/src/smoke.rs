@@ -1209,6 +1209,8 @@ fn skin_lua_seeds_import_or_fail_as_built() {
             "modules",
             "isolation",
             "callback_lowered",
+            "callback_program",
+            "callback_dropped",
             "facts",
             "result_facts",
             "callback_replaced",
@@ -1264,12 +1266,21 @@ fn skin_lua_seeds_import_or_fail_as_built() {
                     );
                 }
             }
-            "callback_lowered" | "callback_replaced" | "callback_effect" => {
+            "callback_lowered" | "callback_program" | "callback_dropped" | "callback_replaced"
+            | "callback_effect" => {
                 use skin_beatoraja::lua::{Disposition, Unsupported};
                 let (_, imported) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
                 let i = imported_lua(imported).unwrap_or_else(|e| panic!("{name}: {e:?}"));
                 let want: &[Disposition] = match name {
                     "callback_lowered" => &[Disposition::Lowered; 4],
+                    "callback_program" => &[Disposition::Compiled],
+                    // By callable: the draw's closure, then the `op`'s.
+                    "callback_dropped" => &[
+                        Disposition::Replaced(Unsupported::Construct(
+                            "a draw after a program draw",
+                        )),
+                        Disposition::Compiled,
+                    ],
                     // A decorative writer never lowers.
                     "callback_effect" => &[Disposition::Replaced(Unsupported::Writes)],
                     _ => &[Disposition::Replaced(Unsupported::Unmapped {

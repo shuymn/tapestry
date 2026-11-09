@@ -123,6 +123,28 @@ fn count(h: &play_support::Harness) -> Val {
     h.play.bank().values()[0]
 }
 
+/// V5's cost for a slot-owning timer callback, written out by hand
+/// (design.md "beatoraja Lua Skins", V5): per invocation its 11
+/// instructions and the one slot it loads and stores (counted once), and
+/// a timer callback invoked twice; it is the skin's only work.
+#[test]
+fn a_timer_callback_is_charged_for_both_runs_and_its_slot() {
+    let mut b = Builder::default();
+    counter(&mut b);
+    let k = b.push(counted(0, Cmp::Lt, 0, OFF));
+    let want = 2 * (11 + 1);
+    let d = &b.0;
+    let cb = d.callbacks[usize::from(k)];
+    let span = &d.code[cb.start as usize..][..usize::from(cb.len)];
+    assert_eq!(span.len(), 11);
+    assert_eq!(
+        skin_model::present::callback_cost(span, &d.reads, cb.conv, None),
+        want
+    );
+    let skin = timed(b, &[k], held).unwrap();
+    assert_eq!(skin.ops().total(), want);
+}
+
 /// A timer callback off at its first run runs once and is off; on at its
 /// first and off at its second, it runs twice, both runs' stores kept,
 /// and its start is the off value's, whose elapsed time is capped; two
