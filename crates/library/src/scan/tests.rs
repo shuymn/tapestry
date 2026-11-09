@@ -224,6 +224,8 @@ pub struct Hold {
     pub resumed: bool,
     pub panic_paused: bool,
     pub panic_resumed: bool,
+    /// The guard's drop waits for a go after saying so.
+    pub dropped: bool,
 }
 
 /// A pass guard saying each call from inside it.
@@ -256,6 +258,9 @@ impl PassGuard for Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         let _ = self.told.send(Told::Dropped);
+        if self.hold.dropped {
+            let _ = self.go.lock().unwrap().recv_timeout(LONG);
+        }
     }
 }
 
@@ -370,6 +375,35 @@ fn the_pass_guard_spans_the_pass() {
     let scan = lib.scan(&[root], options).unwrap();
     assert!(scan.wait_finished(LONG));
     assert_eq!(watch.seen(), [Told::Start, Told::Dropped]);
+    assert_eq!(scan.finish().unwrap().read, 3);
+}
+
+/// The pass's end is published only once its guard's drop has returned
+/// (the maintenance permit given back): held inside the drop, the scan is
+/// not finished; let go, it is.
+#[test]
+fn the_end_is_published_after_the_guard_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let mut options = ScanOptions::default();
+    let watch = Watch::on(
+        &mut options,
+        Hold {
+            dropped: true,
+            ..Hold::default()
+        },
+    );
+    let scan = lib.scan(&[root], options).unwrap();
+    assert_eq!(watch.next(), Told::Start);
+    assert_eq!(watch.next(), Told::Dropped);
+    assert!(
+        !scan.wait_finished(Duration::ZERO),
+        "published while the guard is still being dropped"
+    );
+    watch.open();
+    assert!(scan.wait_finished(LONG));
     assert_eq!(scan.finish().unwrap().read, 3);
 }
 

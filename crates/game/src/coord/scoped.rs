@@ -303,6 +303,11 @@ mod tests {
                 .unwrap();
             s.spawn(move || {
                 asked.recv_timeout(watchdog()).expect("the waiter stops it");
+                // The work is held for a hundred of the waiter's slices
+                // after the stop: a waiter that asked again while settling
+                // would be seen asking. The stretch only gives a repeated
+                // ask room to happen; nothing is timed.
+                thread::sleep(SLICE * 100);
                 go.send(()).unwrap();
             });
             job.wait(SLICE, || {
