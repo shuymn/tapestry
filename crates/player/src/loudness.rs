@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use audio::{Analysis, AnalysisError, Gain, Measurement, SoundBank, Speed, Step};
 use bms_model::Chart;
-use game::{Chain, Loading};
+use game::Chain;
+#[cfg(test)]
+use game::Loading;
 use library::{Library, LoudnessKey, LoudnessRow};
 
 /// What a load lends its loudness measurement.
@@ -266,7 +268,11 @@ impl Loudness {
     /// now ([`measure`]) and kept in memory, or plays at the headroom when
     /// it cannot be. A bank without a digest is never cached and plays at
     /// the headroom. [`Loading::Cancelled`] when the load was cancelled
-    /// during the measurement: the load stops there.
+    /// during the measurement: the load stops there. A load runs the two
+    /// halves itself, the measurement on its job's thread
+    /// ([`look_up`](Self::look_up), [`keep`](Self::keep)); the tests drive
+    /// them together here.
+    #[cfg(test)]
     pub fn load(
         &mut self,
         library: &Library,
@@ -275,30 +281,54 @@ impl Loudness {
         name: &str,
         host: &mut dyn Host,
     ) -> Loading {
-        self.gain = Gain::HEADROOM;
-        let Some(key) = key(chart, bank) else {
+        let Some(key) = self.look_up(library, chart, bank, name) else {
             return Loading::Ready;
         };
-        if let Some(row) = self.lookup(library, &key) {
-            self.gain = gain(&row);
-            log_line(
-                &format!(
-                    "loudness: {name}: gain {:.2} dB, measured before",
-                    20.0 * f64::from(self.gain.get()).log10()
-                ),
-                false,
-            );
-            return Loading::Ready;
-        }
         match measure(chart, bank, Some(&key), name, host) {
-            Ok(Some(m)) => {
-                let row = row(&m);
-                self.measured.insert(key, row);
-                self.gain = gain(&row);
+            Ok(m) => {
+                self.keep(key, m);
                 Loading::Ready
             }
-            Ok(None) => Loading::Ready,
             Err(Cancelled) => Loading::Cancelled,
+        }
+    }
+
+    /// The chart `name` was loaded with `bank`: its gain from a
+    /// measurement of its key in memory, else in `library`. On a miss the
+    /// key to measure ([`measure`], then [`keep`](Self::keep)), the gain at
+    /// the headroom until then; none for a bank without a digest, which is
+    /// never cached and plays at the headroom.
+    pub fn look_up(
+        &mut self,
+        library: &Library,
+        chart: &Chart,
+        bank: &SoundBank,
+        name: &str,
+    ) -> Option<LoudnessKey> {
+        self.gain = Gain::HEADROOM;
+        let key = key(chart, bank)?;
+        let Some(row) = self.lookup(library, &key) else {
+            return Some(key);
+        };
+        self.gain = gain(&row);
+        log_line(
+            &format!(
+                "loudness: {name}: gain {:.2} dB, measured before",
+                20.0 * f64::from(self.gain.get()).log10()
+            ),
+            false,
+        );
+        None
+    }
+
+    /// The measurement `m` of `key` a load made: kept in memory, and its
+    /// gain the plays'; none (it could not be measured) leaves the
+    /// headroom.
+    pub fn keep(&mut self, key: LoudnessKey, m: Option<Measurement>) {
+        if let Some(m) = m {
+            let row = row(&m);
+            self.measured.insert(key, row);
+            self.gain = gain(&row);
         }
     }
 

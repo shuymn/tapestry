@@ -453,7 +453,7 @@ static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 /// What one read of a chart's file gave: the chart, its record, its labels
 /// and what the loader skipped or assumed, all from one ingestion.
-struct ReadChart {
+pub(crate) struct ReadChart {
     chart: Chart,
     record: ChartRecord,
     labels: ChartLabels,
@@ -498,12 +498,179 @@ impl ChartSource {
 
     /// [`read`](Self::read), with the chart's record and warnings.
     fn read_with(&self, parts: &Parts, speed: Speed) -> Result<ReadChart, SessionError> {
-        let read = Loaded::read_chart(&self.path, self.seed, speed, parts)?;
+        self.read_by(&*parts.ingest, &*parts.transform, speed)
+    }
+
+    /// [`read_with`](Self::read_with) through `ingest` and `transform`.
+    fn read_by(
+        &self,
+        ingest: &dyn ChartIngest,
+        transform: &dyn ChartTransform,
+        speed: Speed,
+    ) -> Result<ReadChart, SessionError> {
+        let read = Loaded::read_chart(&self.path, self.seed, speed, ingest, transform)?;
         if read.record.identity.sha256 != self.sha256 {
             return Err(SessionError::ChartChanged(self.path.clone()));
         }
         Ok(read)
     }
+}
+
+/// What reads a loaded chart again away from the game thread: its source
+/// with the session's configured ingestion and transform, both `Sync`
+/// ([`Loaded::reader`]). A load's worker reads through it, the session's
+/// other parts staying on the game thread.
+#[derive(Clone)]
+pub struct ChartReader<'a> {
+    source: ChartSource,
+    ingest: &'a dyn ChartIngest,
+    transform: &'a dyn ChartTransform,
+}
+
+impl fmt::Debug for ChartReader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChartReader")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChartReader<'_> {
+    /// The chart read again at `speed`, as [`ChartSource::read`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::ChartChanged`] when the file's SHA-256 is not the
+    /// one loaded, and what reading it refuses.
+    pub fn read(&self, speed: Speed) -> Result<Chart, SessionError> {
+        self.read_with(speed).map(|read| read.chart)
+    }
+
+    /// [`read`](Self::read), with the chart's record and warnings.
+    pub(crate) fn read_with(&self, speed: Speed) -> Result<ReadChart, SessionError> {
+        self.source.read_by(self.ingest, self.transform, speed)
+    }
+}
+
+/// A chart's load before its read: the session's settings and parts and
+/// the lent shelf, checked, waiting for the chart that a worker reads
+/// through [`reader`](Self::reader) ([`read_for_load`]).
+pub(crate) struct PendingLoad {
+    root: DataRoot,
+    settings: Settings,
+    config: SessionConfig,
+    parts: Parts,
+    events: SharedEvents,
+    shelf: Shelf,
+}
+
+impl PendingLoad {
+    /// Checks what a load needs before its read: a positive step, and the
+    /// shelf. A refusal hands the shelf back with its reason.
+    pub(crate) fn new(
+        root: DataRoot,
+        settings: Settings,
+        config: SessionConfig,
+        parts: Parts,
+        events: SharedEvents,
+        mut shelf: Shelf,
+    ) -> Result<Self, Box<(SessionError, Shelf)>> {
+        if config.step.0 <= 0 {
+            return Err(Box::new((SessionError::InvalidStep(config.step), shelf)));
+        }
+        shelf.check();
+        Ok(Self {
+            root,
+            settings,
+            config,
+            parts,
+            events,
+            shelf,
+        })
+    }
+
+    /// The session's configuration.
+    pub(crate) const fn config(&self) -> &SessionConfig {
+        &self.config
+    }
+
+    /// The configured ingestion and transform, for the read's worker.
+    pub(crate) fn reader(&self) -> (&dyn ChartIngest, &dyn ChartTransform) {
+        (&*self.parts.ingest, &*self.parts.transform)
+    }
+
+    /// The shelf back, the load given up.
+    pub(crate) fn into_shelf(self) -> Shelf {
+        self.shelf
+    }
+
+    /// The session of `chart_path`, from what its read gave; a refusal
+    /// hands the shelf back with its reason.
+    pub(crate) fn finish(
+        self,
+        chart_path: &Path,
+        read: Result<ReadChart, SessionError>,
+    ) -> Result<Loaded, Box<(SessionError, Shelf)>> {
+        let Self {
+            root,
+            settings,
+            config,
+            parts,
+            events,
+            shelf,
+        } = self;
+        match read {
+            Ok(ReadChart {
+                chart,
+                record: chart_record,
+                labels,
+                warnings,
+            }) => {
+                events.on_event(&SessionEvent::Load);
+                let preset = shelf.chosen().clone();
+                let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
+                Ok(Loaded {
+                    root,
+                    settings,
+                    config,
+                    parts,
+                    path: chart_path.to_owned(),
+                    chart,
+                    chart_record,
+                    labels,
+                    warnings,
+                    preset,
+                    displayed,
+                    first_error: shelf.chosen_error().cloned(),
+                    shelf,
+                    attempt: 0,
+                    events,
+                    practice: None,
+                    practiced: None,
+                    fitted: None,
+                    lost: Vec::new(),
+                    generation: GENERATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .wrapping_add(1),
+                    settings_version: 0,
+                })
+            }
+            Err(e) => Err(Box::new((e, shelf))),
+        }
+    }
+}
+
+/// Reads `chart_path` with `config`'s seed and speed through `ingest` and
+/// `transform`, and admits it at that speed: a load's read, which a worker
+/// runs away from the game thread.
+pub(crate) fn read_for_load(
+    chart_path: &Path,
+    config: &SessionConfig,
+    ingest: &dyn ChartIngest,
+    transform: &dyn ChartTransform,
+) -> Result<ReadChart, SessionError> {
+    Loaded::read_chart(chart_path, config.seed, config.speed, ingest, transform)
+        .and_then(|read| admit(&read.chart, config.speed).map(|()| read))
 }
 
 /// The start of one play: its number, and whether the preset file it
@@ -636,52 +803,12 @@ impl Loaded {
         config: SessionConfig,
         parts: Parts,
         events: SharedEvents,
-        mut shelf: Shelf,
+        shelf: Shelf,
     ) -> Result<Self, Box<(SessionError, Shelf)>> {
-        if config.step.0 <= 0 {
-            return Err(Box::new((SessionError::InvalidStep(config.step), shelf)));
-        }
-        shelf.check();
-        let read = Self::read_chart(chart_path, config.seed, config.speed, &parts)
-            .and_then(|read| admit(&read.chart, config.speed).map(|()| read));
-        match read {
-            Ok(ReadChart {
-                chart,
-                record: chart_record,
-                labels,
-                warnings,
-            }) => {
-                events.on_event(&SessionEvent::Load);
-                let preset = shelf.chosen().clone();
-                let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
-                Ok(Self {
-                    root,
-                    settings,
-                    config,
-                    parts,
-                    path: chart_path.to_owned(),
-                    chart,
-                    chart_record,
-                    labels,
-                    warnings,
-                    preset,
-                    displayed,
-                    first_error: shelf.chosen_error().cloned(),
-                    shelf,
-                    attempt: 0,
-                    events,
-                    practice: None,
-                    practiced: None,
-                    fitted: None,
-                    lost: Vec::new(),
-                    generation: GENERATIONS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        .wrapping_add(1),
-                    settings_version: 0,
-                })
-            }
-            Err(e) => Err(Box::new((e, shelf))),
-        }
+        let pending = PendingLoad::new(root, settings, config, parts, events, shelf)?;
+        let (ingest, transform) = pending.reader();
+        let read = read_for_load(chart_path, pending.config(), ingest, transform);
+        pending.finish(chart_path, read)
     }
 
     /// Reads, ingests and transforms the chart at `chart_path`: the chart,
@@ -693,26 +820,26 @@ impl Loaded {
         chart_path: &Path,
         seed: u64,
         speed: Speed,
-        parts: &Parts,
+        ingest: &dyn ChartIngest,
+        transform: &dyn ChartTransform,
     ) -> Result<ReadChart, SessionError> {
-        if !parts.ingest.accepts(chart_path) {
+        if !ingest.accepts(chart_path) {
             return Err(SessionError::UnsupportedChart(chart_path.to_owned()));
         }
         // The file is untrusted: read one byte past the adapter's limit at
         // most, so a larger file is refused by the adapter without being
         // read whole.
-        let limit = u64::try_from(parts.ingest.max_bytes()).unwrap_or(u64::MAX);
+        let limit = u64::try_from(ingest.max_bytes()).unwrap_or(u64::MAX);
         let mut bytes = Vec::new();
         fs::File::open(chart_path)
             .and_then(|f| f.take(limit.saturating_add(1)).read_to_end(&mut bytes))
             .map_err(io_error(chart_path))?;
         let dir = chart_path.parent().unwrap_or_else(|| Path::new("."));
-        let ingested = parts
-            .ingest
+        let ingested = ingest
             .ingest(&bytes, dir, seed, speed)
             .map_err(SessionError::Ingest)?;
         let identity = ingested.chart.identity.clone();
-        let chart = parts.transform.apply(ingested.chart, seed);
+        let chart = transform.apply(ingested.chart, seed);
         // Rendering culls by position and evaluation walks lanes in time
         // order: a transform must keep both orders (design.md "Chart
         // Model").
@@ -723,7 +850,7 @@ impl Loaded {
         let chart_record = ChartRecord {
             identity,
             random_seed: seed,
-            transform: parts.transform.id().record(),
+            transform: transform.id().record(),
         };
         Ok(ReadChart {
             chart,
@@ -757,9 +884,33 @@ impl Loaded {
     /// [`SessionError::Presentation`] for a chart that cannot be presented
     /// at `speed`; nothing changes then.
     pub fn set_speed(&mut self, speed: Speed) -> Result<(), SessionError> {
-        let (config, read) = self.read_at(speed)?;
+        let read = self.reader().read_with(speed);
+        self.apply_speed(speed, read)
+    }
+
+    /// What reads this chart again away from the game thread.
+    #[must_use]
+    pub fn reader(&self) -> ChartReader<'_> {
+        ChartReader {
+            source: self.source(),
+            ingest: &*self.parts.ingest,
+            transform: &*self.parts.transform,
+        }
+    }
+
+    /// [`set_speed`](Self::set_speed) with the chart `read` again at
+    /// `speed` ([`ChartReader`]), on a worker or here.
+    pub(crate) fn apply_speed(
+        &mut self,
+        speed: Speed,
+        read: Result<ReadChart, SessionError>,
+    ) -> Result<(), SessionError> {
+        let read = read?;
         admit(&read.chart, speed)?;
-        self.config = config;
+        self.config = SessionConfig {
+            speed,
+            ..self.config.clone()
+        };
         self.chart = read.chart;
         self.chart_record = read.record;
         self.labels = read.labels;
@@ -1894,6 +2045,9 @@ impl<O: AudioOutput + Wakes> Session<O> {
             }
             Err(LiveError::Input(_)) => {
                 unreachable!("a session has no input thread to fail")
+            }
+            Err(LiveError::Load(_)) => {
+                unreachable!("a session's play loads nothing")
             }
         }
     }

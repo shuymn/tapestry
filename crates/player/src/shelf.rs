@@ -39,10 +39,10 @@ use library::{
     ScanOptions, ScanReport, Score, Search, Sort,
 };
 
-use game::coord::Coordinator;
+use game::coord::{Class, Coordinator, Lease};
 
 use crate::background::{Job, Queued, Worker};
-use crate::loudness::{Host, Loudness};
+use crate::loudness::Loudness;
 #[cfg(test)]
 use crate::priority::Unchanged;
 use crate::priority::{Checked, ThreadMode};
@@ -216,6 +216,7 @@ impl Shelf {
     ) -> Self {
         let options = ScanOptions {
             on_thread_start: Some(Arc::new(background_mode)),
+            on_pass: Some(maintenance(coord)),
             records,
             ..ScanOptions::default()
         };
@@ -555,22 +556,54 @@ impl Shelf {
     /// chart (its file `path`) waiting in the background is this load's
     /// own now. [`game::Loading::Cancelled`] when the load was cancelled
     /// during the measurement, which the quit key then leaves to the
-    /// background ([`leave_to_background`](Self::leave_to_background)).
+    /// background ([`leave_to_background`](Self::leave_to_background)). A
+    /// load runs the two halves itself ([`look_up`](Self::look_up),
+    /// [`keep_measured`](Self::keep_measured)); the tests drive them
+    /// together here.
+    #[cfg(test)]
     pub fn loaded(
         &mut self,
         chart: &Chart,
         bank: &Arc<SoundBank>,
         name: &str,
         path: &Path,
-        host: &mut dyn Host,
+        host: &mut dyn crate::loudness::Host,
     ) -> game::Loading {
+        let Some(key) = self.look_up(chart, bank, name, path) else {
+            return game::Loading::Ready;
+        };
+        match crate::loudness::measure(chart, bank, Some(&key), name, host) {
+            Ok(m) => {
+                self.keep_measured(key, m);
+                game::Loading::Ready
+            }
+            Err(crate::loudness::Cancelled) => game::Loading::Cancelled,
+        }
+    }
+
+    /// The first half of [`loaded`](Self::loaded): the gain looked up, a
+    /// job of the chart (its file `path`) waiting in the background taken
+    /// as this load's own; the key to measure on a miss.
+    pub fn look_up(
+        &mut self,
+        chart: &Chart,
+        bank: &SoundBank,
+        name: &str,
+        path: &Path,
+    ) -> Option<library::LoudnessKey> {
         self.adopt();
         if let Some(worker) = &self.background
             && worker.take_waiting(path)
         {
             println!("loudness: {name} is no longer waiting in the background");
         }
-        self.loudness.load(&self.library, chart, bank, name, host)
+        self.loudness.look_up(&self.library, chart, bank, name)
+    }
+
+    /// The second half of [`loaded`](Self::loaded): the measurement `m` of
+    /// `key` kept, and its gain the plays'.
+    pub fn keep_measured(&mut self, key: library::LoudnessKey, m: Option<audio::Measurement>) {
+        self.loudness.keep(key, m);
     }
 
     /// A load the quit key cancelled during its measurement: `job` is
@@ -793,6 +826,36 @@ fn stop_together<W>(
     (quiet, stopped)
 }
 
+/// Each scan pass's maintenance permit on `coord` (design.md "Load
+/// Pipeline", coordinator): taken when the pass starts, given back while
+/// the scan is paused and taken again when it goes on, and given back when
+/// the pass ends. Maintenance is counted, never refused.
+pub fn maintenance(coord: &Coordinator) -> library::PassStart {
+    let coord = coord.clone();
+    Arc::new(move || {
+        Box::new(Maintenance {
+            lease: coord.try_lease(Class::Maintenance),
+            coord: coord.clone(),
+        })
+    })
+}
+
+/// A pass's maintenance permit, held while the pass works.
+struct Maintenance {
+    coord: Coordinator,
+    lease: Option<Lease>,
+}
+
+impl library::PassGuard for Maintenance {
+    fn paused(&mut self) {
+        self.lease = None;
+    }
+
+    fn resumed(&mut self) {
+        self.lease = self.coord.try_lease(Class::Maintenance);
+    }
+}
+
 /// The scan thread's start hook: background mode, which lowers its CPU,
 /// I/O and memory priority (design.md "Coexisting with Other Software").
 /// When the system refuses it, the thread falls back to the lowest CPU
@@ -839,7 +902,7 @@ pub(crate) mod tests {
     use game::coord::{Caps, Coordinator};
     use library::{Search, Sort};
 
-    use super::{OpenError, PAUSE_SLICE, Paused, Shelf, open};
+    use super::{OpenError, PAUSE_SLICE, Paused, Shelf, maintenance, open};
     use crate::priority::{PriorityError, ThreadMode, Unchanged};
 
     /// A coordinator with one speculative permit, whatever the machine.
@@ -1021,6 +1084,28 @@ pub(crate) mod tests {
         // A second wait, as a retry's, is acknowledged again.
         assert_ne!(wait(&mut shelf), Paused::Cancelled);
         shelf.release();
+    }
+
+    /// With speculation off the library is still scanned and listed, the
+    /// pass on its maintenance permit, which it gives back at its end.
+    #[test]
+    fn a_library_is_scanned_and_listed_with_speculation_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().join("data"));
+        let charts = dir.path().join("charts");
+        chart(&charts, "a.bms");
+        let (library, _) = open(&root).unwrap();
+        let coord = Coordinator::new(Caps::from_setting(Some(false), 16, Some(64 << 30)));
+        let mut shelf = Shelf::new(library, vec![charts], Duration::from_secs(60), None, &coord);
+        assert!(shelf.background.is_none(), "no speculative work");
+        assert!(
+            shelf.options.on_pass.is_some(),
+            "each pass holds a maintenance permit"
+        );
+        assert!(shelf.has_scan());
+        pass_ends(&mut shelf);
+        assert!(holds(&shelf, "a.bms"));
+        assert_eq!(coord.held(game::coord::Class::Maintenance), 0);
     }
 
     /// Each launch's opening requests a bests catch-up, which the first
@@ -1239,7 +1324,11 @@ pub(crate) mod tests {
     /// measured at its next choice, in the foreground.
     #[test]
     fn without_a_speculative_permit_a_cancelled_chart_is_measured_at_its_next_choice() {
-        for caps in [Caps::for_machine(1, 2), Caps::for_machine(0, 16)] {
+        for caps in [
+            Caps::for_machine(1, 2),
+            Caps::for_machine(0, 16),
+            Caps::from_setting(Some(false), 16, Some(64 << 30)),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (c, b, _, path) = song(dir.path());
             let (library, _) = open_library(dir.path());
@@ -1279,7 +1368,11 @@ pub(crate) mod tests {
 
     /// A shelf whose background measures with a stepped measurement, on
     /// `coord`, with `mode`.
-    fn stepped_shelf(dir: &Path, coord: &Coordinator, mode: &Arc<Mode>) -> (Shelf, Stepper) {
+    pub(crate) fn stepped_shelf(
+        dir: &Path,
+        coord: &Coordinator,
+        mode: &Arc<Mode>,
+    ) -> (Shelf, Stepper) {
         let (library, _) = open_library(dir);
         let (stepper, measure) = Stepper::new();
         let mode: Arc<dyn ThreadMode> = Arc::clone(mode) as _;
@@ -1393,7 +1486,7 @@ pub(crate) mod tests {
     }
 
     /// The background job of the chart at `path`.
-    fn job(path: &Path) -> Job {
+    pub(crate) fn job(path: &Path) -> Job {
         Job {
             source: game::ChartSource::new(path.to_owned(), 0, [0; 32]),
             rate: sound::RATE,
@@ -1506,7 +1599,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn worker(shelf: &Shelf) -> &Worker {
+    pub(crate) fn worker(shelf: &Shelf) -> &Worker {
         shelf.background.as_ref().unwrap()
     }
 
@@ -1838,6 +1931,130 @@ pub(crate) mod tests {
 
     fn open_library(dir: &Path) -> (library::Library, library::Opened) {
         open(&DataRoot::new(dir.join("data"))).unwrap()
+    }
+
+    /// The scan's real maintenance guard: one permit from its making, none
+    /// while paused, one again once resumed, none once dropped.
+    #[test]
+    fn the_maintenance_guard_holds_its_permit_until_dropped() {
+        let coord = coordinator();
+        let held = || coord.held(game::coord::Class::Maintenance);
+        let start = maintenance(&coord);
+        let mut guard = start();
+        assert_eq!(held(), 1);
+        guard.paused();
+        assert_eq!(held(), 0);
+        guard.resumed();
+        assert_eq!(held(), 1);
+        let second = start();
+        assert_eq!(held(), 2, "never refused");
+        drop(second);
+        drop(guard);
+        assert_eq!(held(), 0);
+    }
+
+    /// A pass made with the maintenance guard, held after the guard took its
+    /// permit; each guard's drop is said.
+    fn held_pass(
+        dir: &Path,
+        coord: &Coordinator,
+    ) -> (
+        library::Library,
+        library::Scan,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<&'static str>,
+    ) {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        struct Said(Box<dyn library::PassGuard>, mpsc::Sender<&'static str>);
+        impl library::PassGuard for Said {
+            fn paused(&mut self) {
+                self.0.paused();
+            }
+            fn resumed(&mut self) {
+                self.0.resumed();
+            }
+        }
+        impl Drop for Said {
+            fn drop(&mut self) {
+                drop(std::mem::replace(&mut self.0, Box::new(Nothing)));
+                let _ = self.1.send("dropped");
+            }
+        }
+        struct Nothing;
+        impl library::PassGuard for Nothing {
+            fn paused(&mut self) {}
+            fn resumed(&mut self) {}
+        }
+        let charts = dir.join("charts");
+        chart(&charts, "a.bms");
+        let (library, _) = open_library(dir);
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (said_tx, said) = mpsc::channel();
+        let (go_rx, said_tx) = (Mutex::new(go_rx), Mutex::new(said_tx));
+        let inner = maintenance(coord);
+        let options = library::ScanOptions {
+            on_pass: Some(Arc::new(move || {
+                let guard = inner();
+                let said = said_tx.lock().unwrap().clone();
+                let _ = said.send("started");
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(600));
+                Box::new(Said(guard, said))
+            })),
+            ..library::ScanOptions::default()
+        };
+        let scan = library.scan(&[charts], options).unwrap();
+        assert_eq!(
+            said.recv_timeout(Duration::from_secs(600)).unwrap(),
+            "started"
+        );
+        (library, scan, go, said)
+    }
+
+    /// A scan pass holds a maintenance permit while it works, gives it back
+    /// while paused, and gives it back by the time its end is published.
+    #[test]
+    fn a_scan_pass_holds_a_maintenance_permit() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = coordinator();
+        let held = || coord.held(game::coord::Class::Maintenance);
+        let (_library, scan, go, said) = held_pass(dir.path(), &coord);
+        assert_eq!(held(), 1);
+        scan.request_pause();
+        go.send(()).unwrap();
+        assert!(scan.wait_paused(Duration::from_secs(600)));
+        assert_eq!(held(), 0, "given back before the acknowledgment");
+        scan.release();
+        assert!(scan.wait_finished(Duration::from_secs(600)));
+        assert_eq!(said.try_recv(), Ok("dropped"));
+        assert_eq!(held(), 0);
+        assert_eq!(scan.finish().unwrap().read, 1);
+    }
+
+    /// A scan stopped while it works gives its permit back as it ends.
+    #[test]
+    fn a_stopped_scan_gives_its_permit_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = coordinator();
+        let (_library, scan, go, said) = held_pass(dir.path(), &coord);
+        go.send(()).unwrap();
+        drop(scan);
+        assert_eq!(said.try_recv(), Ok("dropped"));
+        assert_eq!(coord.held(game::coord::Class::Maintenance), 0);
+    }
+
+    /// A scan left by its stop's bound keeps its permit until its thread
+    /// ends, and gives it back then.
+    #[test]
+    fn a_detached_scan_keeps_its_permit_until_its_thread_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = coordinator();
+        let (_library, scan, go, said) = held_pass(dir.path(), &coord);
+        assert!(!scan.stop_within(Duration::from_millis(300)));
+        assert_eq!(coord.held(game::coord::Class::Maintenance), 1, "kept");
+        go.send(()).unwrap();
+        assert_eq!(said.recv_timeout(Duration::from_secs(600)), Ok("dropped"));
+        assert_eq!(coord.held(game::coord::Class::Maintenance), 0);
     }
 
     /// A shelf whose background could not start leaves a cancelled load's

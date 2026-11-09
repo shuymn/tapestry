@@ -44,6 +44,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
+use bms_model::Speed;
+
+mod scoped;
+
+pub use scoped::{Failure, Joined, LoadFailure, ScopedJob, Spawner};
+
 /// Foreground permits: the chosen chart's decode threads, from a choice to
 /// its READY state (design.md "Load Pipeline", system friendliness).
 pub const FOREGROUND_PERMITS: usize = 4;
@@ -53,6 +59,12 @@ pub const SPECULATIVE_MAX: usize = 2;
 pub const SPECULATIVE_DEFAULT: usize = 1;
 /// The cores speculation leaves to the rest of the machine.
 pub const RESERVED_CORES: usize = 2;
+/// The cores a machine needs for speculation to run when the setting
+/// leaves it to the machine.
+pub const AUTO_MIN_CORES: usize = 4;
+/// The physical memory a machine needs for speculation to run when the
+/// setting leaves it to the machine: 8 GiB.
+pub const AUTO_MIN_MEMORY: u64 = 8 << 30;
 
 /// How often a wait for a permit asks whether to give up: a release wakes
 /// it at once.
@@ -107,11 +119,18 @@ impl Caps {
         }
     }
 
-    /// The caps for this machine with the default setting.
+    /// The caps for `device.toml`'s `speculation` on a machine of `cores`
+    /// cores and `memory` bytes of physical memory (`None` when it cannot
+    /// be read): on or off as set, and when unset, on only with at least
+    /// [`AUTO_MIN_CORES`] cores and [`AUTO_MIN_MEMORY`] (design.md "Load
+    /// Pipeline", the setting). On gives [`SPECULATIVE_DEFAULT`] within
+    /// [`for_machine`](Self::for_machine)'s bounds.
     #[must_use]
-    pub fn this_machine() -> Self {
-        let cores = thread::available_parallelism().map_or(1, usize::from);
-        Self::for_machine(SPECULATIVE_DEFAULT, cores)
+    pub fn from_setting(speculation: Option<bool>, cores: usize, memory: Option<u64>) -> Self {
+        let on = speculation.unwrap_or_else(|| {
+            cores >= AUTO_MIN_CORES && memory.is_some_and(|m| m >= AUTO_MIN_MEMORY)
+        });
+        Self::for_machine(if on { SPECULATIVE_DEFAULT } else { 0 }, cores)
     }
 
     /// The cap of `class`; none for maintenance.
@@ -163,15 +182,25 @@ pub struct Subscriber {
 pub enum JobKind {
     /// A chart's loudness at 1×.
     Loudness,
+    /// The chosen chart read, hashed and parsed.
+    Ingest,
+    /// The chosen chart's sound bank decoded.
+    Bank,
+    /// The chosen chart's loudness measured, its cache missed.
+    Measure,
 }
 
-/// What tells jobs apart: two of one key are one job.
+/// What tells jobs apart: two of one key are one job. The speed is
+/// groundwork: no two foreground loads overlap yet, and reuse by key needs
+/// the other freshness inputs of design.md "Load Pipeline" first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JobKey {
     /// What the job computes.
     pub kind: JobKind,
     /// The chart's file.
     pub path: PathBuf,
+    /// The speed it is read or decoded at.
+    pub speed: Speed,
 }
 
 /// A panic caught at a job's boundary, with its message when it had one.

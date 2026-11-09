@@ -318,6 +318,7 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
 /// put into that work (the probe) is counted.
 #[test]
 fn selection_frame_alloc() {
+    let _warp = crate::warp_turn::take();
     let (_dir, mut screen, mut logic, _) = skinned();
     let mut feed = SkinFeed::default();
     feed.enter(TimeUs(0));
@@ -501,6 +502,7 @@ fn measure_on(adapter: render::AdapterChoice) {
 /// (docs/stage3.md S7-07; design.md "Scope of No Allocation").
 #[test]
 fn selection_runtime_frame_alloc() {
+    let _warp = crate::warp_turn::take();
     let _serial = crate::imports::tests::serial();
     let mut r = warp();
     let dir = crate::selection_skin::runtime_fixture();

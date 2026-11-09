@@ -671,6 +671,10 @@ pub struct DeviceSettings {
     pub queued_periods: u32,
     /// The song library, `[library]`.
     pub library: LibrarySettings,
+    /// Whether speculative work runs (design.md "Load Pipeline", the
+    /// setting): `None`, the key absent, lets the machine decide
+    /// ([`crate::coord::Caps::from_setting`]). Written back as read.
+    pub speculation: Option<bool>,
 }
 
 /// `[library]` of `device.toml`: where this PC keeps its charts.
@@ -719,6 +723,7 @@ impl Default for DeviceSettings {
             scratch: ScratchConfig::default(),
             queued_periods: DEFAULT_QUEUED_PERIODS,
             library: LibrarySettings::default(),
+            speculation: None,
         }
     }
 }

@@ -55,7 +55,11 @@ pub enum IngestError {
 
 /// The ingestion extension point: reads one chart format into the common
 /// chart model.
-pub trait ChartIngest {
+///
+/// A load reads its chart on a worker thread while the game thread holds
+/// the session's parts, so an adapter is `Sync` (design.md "Extension
+/// Boundaries").
+pub trait ChartIngest: Sync {
     /// Whether this adapter reads the file at `path`, by its name.
     fn accepts(&self, path: &Path) -> bool;
     /// The largest file the adapter accepts. The session reads at most one
@@ -143,7 +147,10 @@ impl ChartIngest for BmsIngest {
 /// [`Chart::validate_presentation_links`]) and refuses a chart that breaks
 /// an invariant; play then admits it only if it can be presented at its
 /// speed ([`Chart::validate_presentation`]).
-pub trait ChartTransform {
+///
+/// Called on a load's worker thread, as ingestion is, so a transform is
+/// `Sync`.
+pub trait ChartTransform: Sync {
     /// Which transform this is.
     fn id(&self) -> TransformId;
     /// The transformed chart.

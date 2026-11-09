@@ -39,6 +39,7 @@ const NOTHING: &(dyn Fn(Class) + Sync) = &|_| {};
 
 fn key(name: &str) -> JobKey {
     JobKey {
+        speed: bms_model::Speed::NORMAL,
         kind: JobKind::Loudness,
         path: PathBuf::from(name),
     }
@@ -118,7 +119,34 @@ fn the_caps_follow_the_machine() {
     assert_eq!(speculative(1, 16), 1);
     assert_eq!(speculative(usize::MAX, usize::MAX), 2);
     assert_eq!(Caps::for_machine(1, 0).foreground, FOREGROUND_PERMITS);
-    assert!(Caps::this_machine().speculative <= 2);
+}
+
+/// `device.toml`'s `speculation`: off gives none; on gives one on more
+/// than two cores whatever the memory, known or not; unset gives one only
+/// with at least four cores and 8 GiB, none when the memory is unknown.
+#[test]
+fn caps_follow_the_setting() {
+    const GIB: u64 = 1 << 30;
+    let speculative =
+        |setting, cores, memory| Caps::from_setting(setting, cores, memory).speculative;
+    for (cores, memory) in [(16, Some(64 * GIB)), (3, Some(GIB)), (4, None)] {
+        assert_eq!(speculative(Some(false), cores, memory), 0, "off on {cores}");
+    }
+    assert_eq!(speculative(Some(true), 3, Some(4 * GIB)), 1);
+    assert_eq!(speculative(Some(true), 3, None), 1);
+    assert_eq!(speculative(Some(true), 16, Some(64 * GIB)), 1);
+    assert_eq!(speculative(Some(true), 2, Some(64 * GIB)), 0);
+    assert_eq!(speculative(Some(true), 1, Some(64 * GIB)), 0);
+    assert_eq!(speculative(None, 4, Some(8 * GIB)), 1);
+    assert_eq!(speculative(None, 16, Some(64 * GIB)), 1);
+    assert_eq!(speculative(None, 4, Some(8 * GIB - 1)), 0);
+    assert_eq!(speculative(None, 3, Some(16 * GIB)), 0);
+    assert_eq!(speculative(None, 16, None), 0);
+    assert_eq!(speculative(None, 2, Some(64 * GIB)), 0);
+    assert_eq!(
+        Caps::from_setting(None, 1, None).foreground,
+        FOREGROUND_PERMITS
+    );
 }
 
 /// Each bounded class stops at its cap and frees a permit when a lease is

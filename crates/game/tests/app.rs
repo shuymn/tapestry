@@ -15,14 +15,20 @@ mod counting;
 #[global_allocator]
 static GLOBAL: counting::Counting = counting::Counting;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, SoundId, Speed, TimeSource, TimeUs, VirtualClock};
 use common::{MS, lane};
 use eval::{ControlId, JudgeEventKind};
+use game::coord::{
+    Caps, Class, Coordinator, FOREGROUND_PERMITS, Failure, JobKind, JobPanic, LoadFailure, Spawner,
+};
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading,
@@ -147,6 +153,104 @@ impl ChartIngest for Charts {
     }
 }
 
+/// How long a test waits for another thread before it fails instead of
+/// hanging: `TAPESTRY_TEST_WATCHDOG` seconds (shorter for mutation runs).
+fn watchdog() -> Duration {
+    let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+    Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
+}
+
+/// The panic the probed ingest injects.
+const INGEST_PANIC: &str = "injected ingest panic";
+
+/// What the probed ingest does, and what it saw: [`Charts`] behind a
+/// counter, with a gate and a panic at chosen calls (counted from 0).
+struct Probe {
+    /// The run's coordinator, whose foreground permits each call notes.
+    coord: Coordinator,
+    /// Each call: its thread's name and the foreground permits held then.
+    calls: Mutex<Vec<(Option<String>, usize)>>,
+    /// The call that says it started, then waits for the gate.
+    gate: Mutex<Option<Gate>>,
+    /// The call that panics (after its gate, if gated).
+    panic_at: Option<usize>,
+    /// The calls that returned.
+    ended: AtomicUsize,
+}
+
+/// A call of the probed ingest held until the test opens it.
+struct Gate {
+    at: usize,
+    started: mpsc::Sender<()>,
+    open: mpsc::Receiver<()>,
+}
+
+impl Probe {
+    fn new(coord: Coordinator) -> Self {
+        Self {
+            coord,
+            calls: Mutex::new(Vec::new()),
+            gate: Mutex::new(None),
+            panic_at: None,
+            ended: AtomicUsize::new(0),
+        }
+    }
+
+    /// Call `at` says it started on `started`, then waits for `open`.
+    fn gated(self, at: usize, started: mpsc::Sender<()>, open: mpsc::Receiver<()>) -> Self {
+        *self.gate.lock().unwrap() = Some(Gate { at, started, open });
+        self
+    }
+
+    fn calls(&self) -> Vec<(Option<String>, usize)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn ended(&self) -> usize {
+        self.ended.load(Ordering::SeqCst)
+    }
+}
+
+/// [`Charts`] through a [`Probe`].
+struct Probed(Arc<Probe>);
+
+impl ChartIngest for Probed {
+    fn max_bytes(&self) -> usize {
+        Charts.max_bytes()
+    }
+
+    fn accepts(&self, path: &Path) -> bool {
+        Charts.accepts(path)
+    }
+
+    fn ingest(
+        &self,
+        bytes: &[u8],
+        dir: &Path,
+        seed: u64,
+        speed: bms_model::Speed,
+    ) -> Result<Ingested, IngestError> {
+        let p = &*self.0;
+        let call = {
+            let mut calls = p.calls.lock().unwrap();
+            let name = std::thread::current().name().map(str::to_owned);
+            calls.push((name, p.coord.held(Class::Foreground)));
+            calls.len() - 1
+        };
+        let gate = p.gate.lock().unwrap().take_if(|g| g.at == call);
+        if let Some(g) = gate {
+            let _ = g.started.send(());
+            g.open.recv_timeout(watchdog()).expect("the gate opens");
+        }
+        if p.panic_at == Some(call) {
+            panic!("{INGEST_PANIC}");
+        }
+        let read = Charts.ingest(bytes, dir, seed, speed);
+        p.ended.fetch_add(1, Ordering::SeqCst);
+        read
+    }
+}
+
 /// Every session event, in order.
 #[derive(Clone, Default)]
 struct Events(Rc<RefCell<Vec<SessionEvent>>>);
@@ -237,8 +341,20 @@ enum InLoad {
     InputFails,
     /// The audio thread goes.
     AudioFails,
+    /// The audio output fails ([`Rig::audio_failure`]).
+    OutputFails,
     /// A frame fails: the screen must be built again.
     ScreenFails,
+}
+
+/// A load's job stopped from the flow's ask ([`AppRig::load_cancelled`]).
+struct JobStop {
+    /// Said by the job once it runs; with none, the first ask stops it.
+    started: Option<mpsc::Receiver<()>>,
+    /// The quit key or a close ([`InLoad::Quit`], [`InLoad::Close`]).
+    what: InLoad,
+    /// Told at the stop.
+    asked: Option<mpsc::Sender<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -398,6 +514,24 @@ struct Headless {
     /// Every practice Start's readiness asked, with the chart loads before
     /// it.
     start_asks: Vec<usize>,
+    /// The next chart load's failure ([`Loading::Failed`]).
+    fail_load: Option<LoadFailure>,
+    /// Stops the next load's job that starts, until selection or the
+    /// practice page is entered again.
+    job_stop: Option<JobStop>,
+    /// The stop was answered for the job waited for now.
+    job_stopped: Cell<bool>,
+    /// Asks after that answer, while the same job was waited for.
+    asks_after_stop: Cell<usize>,
+    /// The quit key pressed, or the window closed, by that stop.
+    job_quit: Cell<bool>,
+    job_close: Cell<bool>,
+    /// The probed ingest, and the calls of it returned at each entry into
+    /// selection.
+    probe: Option<Arc<Probe>>,
+    ended_at_selection: Vec<usize>,
+    /// Foreground permits held elsewhere until the stopped job is left.
+    leases: Arc<Mutex<Vec<game::coord::Lease>>>,
 }
 
 /// What selection was shown of the shelf.
@@ -537,6 +671,23 @@ impl Headless {
             attempts: Vec::new(),
             unready_starts: 0,
             start_asks: Vec::new(),
+            fail_load: None,
+            job_stop: None,
+            job_stopped: Cell::new(false),
+            asks_after_stop: Cell::new(0),
+            job_quit: Cell::new(false),
+            job_close: Cell::new(false),
+            probe: None,
+            ended_at_selection: Vec::new(),
+            leases: Arc::default(),
+        }
+    }
+
+    /// A load's job is waited for no more: the next one is asked anew.
+    fn job_left(&mut self) {
+        if self.job_stopped.take() {
+            self.job_stop = None;
+            self.leases.lock().unwrap().clear();
         }
     }
 
@@ -641,6 +792,7 @@ impl Headless {
                     .poll(TimeUs(now), &mut self.sources),
                     InLoad::InputFails => self.input_fails_at = now,
                     InLoad::AudioFails => self.audio_gone = true,
+                    InLoad::OutputFails => self.output_failed = true,
                     InLoad::ScreenFails => self.screen_fails_at = now,
                 }
             }
@@ -669,7 +821,7 @@ impl Rig for Headless {
     }
 
     fn take(&mut self) -> Option<Command> {
-        if std::mem::take(&mut self.quit_pressed) {
+        if std::mem::take(&mut self.quit_pressed) || self.job_quit.take() {
             return Some(Command::Quit);
         }
         let c = match self.due_act()? {
@@ -694,7 +846,7 @@ impl Rig for Headless {
     }
 
     fn quitting(&self) -> bool {
-        self.quitting
+        self.quitting || self.job_close.get()
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
@@ -1031,6 +1183,9 @@ impl AppRig for Headless {
             self.violations
                 .push(format!("chart {i} loaded without its loading state"));
         }
+        if let Some(failure) = self.fail_load.take() {
+            return Ok(Loading::Failed(failure));
+        }
         if self.close_in_load {
             self.quitting = true;
         }
@@ -1118,7 +1273,34 @@ impl AppRig for Headless {
         }
     }
 
+    fn load_cancelled(&self) -> bool {
+        if self.job_stopped.get() {
+            self.asks_after_stop.set(self.asks_after_stop.get() + 1);
+            return true;
+        }
+        let Some(stop) = &self.job_stop else {
+            return self.quitting();
+        };
+        if stop.started.as_ref().is_some_and(|s| s.try_recv().is_err()) {
+            return self.quitting();
+        }
+        self.job_stopped.set(true);
+        match stop.what {
+            InLoad::Quit => self.job_quit.set(true),
+            InLoad::Close => self.job_close.set(true),
+            other => panic!("{other:?} does not stop a load"),
+        }
+        if let Some(asked) = &stop.asked {
+            let _ = asked.send(());
+        }
+        true
+    }
+
     fn entered_selection(&mut self) {
+        self.job_left();
+        if let Some(p) = &self.probe {
+            self.ended_at_selection.push(p.ended());
+        }
         self.loading = None;
         self.in_selection = true;
         self.entries += 1;
@@ -1126,6 +1308,7 @@ impl AppRig for Headless {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.job_left();
         self.loading = None;
         self.seen
             .push(Seen::Practice(screen.notice().map(str::to_owned)));
@@ -1179,6 +1362,17 @@ fn app(dir: &Path, refusal: Refusal, events: &Events) -> App {
 
 /// [`app`] choosing the preset named `preset`.
 fn app_named(dir: &Path, refusal: Refusal, preset: &str, events: &Events) -> App {
+    app_reading(dir, refusal, preset, events, || Box::new(Charts))
+}
+
+/// [`app_named`] reading each chart through what `ingest` makes.
+fn app_reading(
+    dir: &Path,
+    refusal: Refusal,
+    preset: &str,
+    events: &Events,
+    ingest: impl Fn() -> Box<dyn ChartIngest> + 'static,
+) -> App {
     let root = DataRoot::new(dir.to_owned());
     let mut settings = Settings::load(&root).unwrap();
     settings.player.preset = preset.to_owned();
@@ -1207,7 +1401,7 @@ fn app_named(dir: &Path, refusal: Refusal, preset: &str, events: &Events) -> App
         settings,
         config,
         Box::new(move |s: &Settings| Parts {
-            ingest: Box::new(Charts),
+            ingest: ingest(),
             ..Parts::standard(&parts_root, &s.player)
         }),
         Box::new(events.clone()),
@@ -2139,6 +2333,7 @@ fn the_loading_page_through_each_event_of_a_load() {
                     );
                     assert_eq!(rig.starts, 0, "{at}");
                 }
+                Some(InLoad::OutputFails) => unreachable!("not in this table"),
             }
             if event == Some(InLoad::ScreenFails) {
                 assert!(!rig.prepared_for.is_empty(), "{at}");
@@ -3764,4 +3959,715 @@ fn a_long_load_solves_at_the_initial_tempo() {
     });
     ran.unwrap();
     assert_eq!(rig.solved, [Some(game::Ratio::new(64, 25).unwrap())]);
+}
+
+// The chosen chart's load on its jobs (design.md "Play Lifecycle", who
+// loads): its read on a scoped thread of its own, the failures that end
+// the run, and a quit or a close while a job runs. Threads meet at
+// channels said from inside the probed ingest and the flow's asks; a
+// watchdog only fails a wait that never ends.
+
+/// A run whose charts are read through a [`Probe`], on a coordinator of
+/// its own the test looks at.
+struct ProbedRun {
+    rig: Headless,
+    events: Events,
+    ran: Result<(), LiveError<SurfaceLost>>,
+    app: App,
+    coord: Coordinator,
+    probe: Arc<Probe>,
+    _dir: tempfile::TempDir,
+}
+
+impl ProbedRun {
+    /// The failure the run ended with.
+    fn failure(&self) -> &LoadFailure {
+        match &self.ran {
+            Err(LiveError::Load(f)) => f,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The shelf came back to the app and the load's permits to the
+    /// coordinator; nothing was refused or noticed.
+    fn assert_returned(&self) {
+        assert!(self.rig.violations.is_empty(), "{:?}", self.rig.violations);
+        assert!(self.app.shelf().is_ok(), "{:?}", self.app.shelf());
+        assert_eq!(self.coord.held(Class::Foreground), 0);
+        assert!(self.rig.refusals.is_empty(), "{:?}", self.rig.refusals);
+        assert!(
+            notices(&self.rig).iter().all(Option::is_none),
+            "{:?}",
+            self.rig.seen
+        );
+    }
+}
+
+/// The thread every chosen chart is read on.
+const READ_THREAD: &str = "load-read";
+
+fn run_probed(
+    refusal: Refusal,
+    acts: Vec<(i64, Act)>,
+    spawner: Spawner,
+    probe: impl FnOnce(Probe) -> Probe,
+    setup: impl FnOnce(&mut Headless, &Coordinator),
+) -> ProbedRun {
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let coord = Coordinator::new(Caps {
+        foreground: FOREGROUND_PERMITS,
+        speculative: 0,
+    });
+    let probe = Arc::new(probe(Probe::new(coord.clone())));
+    let p = Arc::clone(&probe);
+    let mut app = app_reading(dir.path(), refusal, "tapestry", &events, move || {
+        Box::new(Probed(Arc::clone(&p)))
+    })
+    .with_coordinator(coord.clone())
+    .with_spawner(spawner);
+    let mut rig = Headless::new(dir.path(), refusal, acts);
+    rig.probe = Some(Arc::clone(&probe));
+    setup(&mut rig, &coord);
+    let ran = app.run(&mut rig);
+    ProbedRun {
+        rig,
+        events,
+        ran,
+        app,
+        coord,
+        probe,
+        _dir: dir,
+    }
+}
+
+/// Each call of the probed ingest ran on the read's thread, holding one
+/// foreground permit.
+fn read_on_jobs(n: usize) -> Vec<(Option<String>, usize)> {
+    vec![(Some(READ_THREAD.to_owned()), 1); n]
+}
+
+/// The practice chart's page, Start at 1×, then the window closed.
+fn practice_start() -> Vec<(i64, Act)> {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([(10, Act::Page(PracticeInput::Confirm)), (4_000, Act::Close)]);
+    acts
+}
+
+/// A chart chosen to play or to practice whose read's thread cannot
+/// start ends the run with that cause, never as a refusal: nothing was
+/// read, the shelf is back and no permit is held.
+#[test]
+fn an_ingest_thread_that_cannot_start_ends_the_run() {
+    for pick in [Act::Choose(0), Act::Practice(P)] {
+        let acts = vec![(0, pick), (4_000, Act::Close)];
+        let refusing = Spawner::refusing(&[JobKind::Ingest]);
+        let run = run_probed(Refusal::Missing, acts, refusing, |p| p, |_, _| {});
+        let failure = run.failure();
+        assert_eq!(
+            *failure,
+            LoadFailure {
+                job: JobKind::Ingest,
+                cause: Failure::ThreadStart("refused (test)".to_owned()),
+            },
+            "{pick:?}"
+        );
+        assert_eq!(
+            failure.to_string(),
+            "the chart's read cannot start its thread: refused (test)"
+        );
+        run.assert_returned();
+        assert_eq!(run.probe.calls(), [], "{pick:?}");
+        assert_eq!(run.rig.seen, [Seen::Select], "{pick:?}");
+        assert_eq!(run.events.count(|e| *e == SessionEvent::Load), 0);
+    }
+}
+
+/// A panic in the read ends the run with its message.
+#[test]
+fn an_ingest_panic_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |mut p| {
+            p.panic_at = Some(0);
+            p
+        },
+        |_, _| {},
+    );
+    assert_eq!(
+        *run.failure(),
+        LoadFailure {
+            job: JobKind::Ingest,
+            cause: Failure::Panicked(JobPanic(INGEST_PANIC.to_owned())),
+        }
+    );
+    run.assert_returned();
+    assert_eq!(run.probe.calls(), read_on_jobs(1));
+    assert_eq!(run.rig.seen, [Seen::Select]);
+}
+
+/// A chart its read refuses on the read's thread returns to selection with
+/// the reason, the shelf back, where the next chart plays.
+#[test]
+fn a_chart_refused_by_its_read_job_returns_to_selection() {
+    let acts = vec![
+        (0, Act::Choose(2)),
+        (500, Act::Choose(0)),
+        (4_000, Act::Close),
+    ];
+    let run = run_probed(
+        Refusal::TooLongAtSpeed,
+        acts,
+        Spawner::SYSTEM,
+        |p| p,
+        |_, _| {},
+    );
+    run.ran.as_ref().unwrap();
+    assert!(run.rig.violations.is_empty(), "{:?}", run.rig.violations);
+    assert_eq!(run.rig.refusals, ["too long at speed"]);
+    assert_eq!(
+        run.rig.seen,
+        [
+            Seen::Select,
+            Seen::Select,
+            Seen::Refused(2),
+            Seen::Load(0),
+            Seen::Shown(1),
+        ]
+    );
+    assert_eq!(run.probe.calls(), read_on_jobs(2));
+    assert!(run.app.shelf().is_ok());
+    assert_eq!(run.coord.held(Class::Foreground), 0);
+}
+
+/// A quit, or a close, while the read waits for its foreground permit
+/// (every one held elsewhere) ends it before it reads: the quit returns to
+/// selection, where the next chart plays; the close ends the run.
+#[test]
+fn a_quit_while_the_ingest_waits_for_a_permit_leaves() {
+    for what in [InLoad::Quit, InLoad::Close] {
+        let acts = if what == InLoad::Quit {
+            vec![
+                (0, Act::Choose(0)),
+                (500, Act::Choose(1)),
+                (4_000, Act::Close),
+            ]
+        } else {
+            vec![(0, Act::Choose(0)), (4_000, Act::Close)]
+        };
+        // Gives the permits back if the flow never leaves the wait, which
+        // then fails below instead of hanging.
+        let (done, finished) = mpsc::channel::<()>();
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = None;
+        let run = run_probed(
+            Refusal::Missing,
+            acts,
+            Spawner::SYSTEM,
+            |p| p,
+            |rig, coord| {
+                let leases = Arc::clone(&rig.leases);
+                leases.lock().unwrap().extend(
+                    (0..FOREGROUND_PERMITS).map(|_| coord.try_lease(Class::Foreground).unwrap()),
+                );
+                let timed_out = Arc::clone(&timed_out);
+                guard = Some(std::thread::spawn(move || {
+                    if finished.recv_timeout(watchdog()).is_err() {
+                        timed_out.store(true, Ordering::SeqCst);
+                        leases.lock().unwrap().clear();
+                    }
+                }));
+                rig.job_stop = Some(JobStop {
+                    started: None,
+                    what,
+                    asked: None,
+                });
+            },
+        );
+        let _ = done.send(());
+        guard.unwrap().join().unwrap();
+        assert!(!timed_out.load(Ordering::SeqCst), "{what:?}: the wait hung");
+        // A close ends the run with the permits still held here.
+        run.rig.leases.lock().unwrap().clear();
+        run.ran.as_ref().unwrap();
+        run.assert_returned();
+        assert_eq!(run.rig.asks_after_stop.get(), 0, "{what:?}");
+        if what == InLoad::Quit {
+            // Only chart 1 was read.
+            assert_eq!(run.probe.calls(), read_on_jobs(1));
+            assert_eq!(
+                run.rig.seen,
+                [Seen::Select, Seen::Select, Seen::Load(1), Seen::Shown(1)]
+            );
+        } else {
+            assert_eq!(run.probe.calls(), []);
+            assert_eq!(run.rig.seen, [Seen::Select]);
+        }
+    }
+}
+
+/// The run with call `at` of the ingest gated, and `what` (the quit key or
+/// a close) pressed once that call started; the stop opens the gate from
+/// another thread. With `panics`, the call panics once the gate opens.
+fn run_stopped_read(acts: Vec<(i64, Act)>, at: usize, panics: bool, what: InLoad) -> ProbedRun {
+    let (started_tx, started) = mpsc::channel();
+    let (open_tx, open) = mpsc::channel();
+    let (asked, asks) = mpsc::channel::<()>();
+    let opener = std::thread::spawn(move || {
+        asks.recv_timeout(watchdog())
+            .expect("the flow stops the read");
+        let _ = open_tx.send(());
+    });
+    let probe = move |mut p: Probe| {
+        if panics {
+            p.panic_at = Some(at);
+        }
+        p.gated(at, started_tx, open)
+    };
+    let run = run_probed(Refusal::Missing, acts, Spawner::SYSTEM, probe, |rig, _| {
+        rig.job_stop = Some(JobStop {
+            started: Some(started),
+            what,
+            asked: Some(asked),
+        });
+    });
+    opener.join().unwrap();
+    run
+}
+
+/// The quit key while the read runs: the flow stops it once and settles,
+/// asking nothing more, until the read's thread ends, which is before the
+/// flow leaves the chart; the read it made is dropped (no load) and
+/// selection, where the next chart plays, follows.
+#[test]
+fn a_quit_during_the_ingest_settles_its_thread_then_leaves() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let run = run_stopped_read(acts, 0, false, InLoad::Quit);
+    run.ran.as_ref().unwrap();
+    run.assert_returned();
+    assert_eq!(run.rig.asks_after_stop.get(), 0, "settling asks nothing");
+    // The read had returned by the next entry into selection.
+    assert_eq!(run.rig.ended_at_selection[..2], [0, 1]);
+    assert_eq!(run.probe.calls(), read_on_jobs(2));
+    assert_eq!(
+        run.rig.seen,
+        [Seen::Select, Seen::Select, Seen::Load(1), Seen::Shown(1)]
+    );
+    // Only chart 1's read was used.
+    assert_eq!(run.events.count(|e| *e == SessionEvent::Load), 1);
+}
+
+/// A panic in the read after the quit still ends the run.
+#[test]
+fn a_panic_after_a_quit_during_the_ingest_still_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let run = run_stopped_read(acts, 0, true, InLoad::Quit);
+    assert_eq!(
+        *run.failure(),
+        LoadFailure {
+            job: JobKind::Ingest,
+            cause: Failure::Panicked(JobPanic(INGEST_PANIC.to_owned())),
+        }
+    );
+    run.assert_returned();
+    assert_eq!(run.rig.asks_after_stop.get(), 0);
+    assert_eq!(run.probe.calls(), read_on_jobs(1));
+    assert_eq!(run.probe.ended(), 0);
+    assert_eq!(run.rig.seen, [Seen::Select]);
+}
+
+/// The window closing while the read runs: settled as at a quit, then the
+/// run ends, the read's thread over.
+#[test]
+fn closing_during_the_ingest_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let run = run_stopped_read(acts, 0, false, InLoad::Close);
+    run.ran.as_ref().unwrap();
+    run.assert_returned();
+    assert_eq!(run.rig.asks_after_stop.get(), 0);
+    assert_eq!(run.probe.calls(), read_on_jobs(1));
+    assert_eq!(run.probe.ended(), 1);
+    assert_eq!(run.rig.seen, [Seen::Select]);
+    assert!(run.rig.loads.is_empty());
+    assert_eq!(run.events.count(|e| *e == SessionEvent::Load), 0);
+}
+
+/// Each failure a load's job can end with: a bank or measurement thread
+/// that cannot start, or one that panicked.
+fn load_failures() -> Vec<LoadFailure> {
+    let mut all = Vec::new();
+    for job in [JobKind::Bank, JobKind::Measure] {
+        all.push(LoadFailure {
+            job,
+            cause: Failure::ThreadStart("refused (test)".to_owned()),
+        });
+        all.push(LoadFailure {
+            job,
+            cause: Failure::Panicked(JobPanic("injected".to_owned())),
+        });
+    }
+    all
+}
+
+/// A chosen chart's load that fails ends the run with the failure, never
+/// as a refusal: nothing opens, the shelf is back.
+#[test]
+fn a_failed_load_ends_the_run() {
+    for failure in load_failures() {
+        let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+        let f = failure.clone();
+        let run = run_probed(
+            Refusal::Missing,
+            acts,
+            Spawner::SYSTEM,
+            |p| p,
+            |rig, _| rig.fail_load = Some(f),
+        );
+        assert_eq!(*run.failure(), failure);
+        run.assert_returned();
+        assert_eq!(run.rig.seen, [Seen::Select], "{failure:?}");
+        assert_eq!(run.rig.opens, 0);
+        assert!(run.rig.prepared_for.is_empty(), "{failure:?}");
+    }
+}
+
+/// A practice Start's load that fails ends the run with the failure, never
+/// as a notice on the page.
+#[test]
+fn a_failed_practice_load_ends_the_run_without_a_notice() {
+    for failure in load_failures() {
+        let f = failure.clone();
+        let run = run_probed(
+            Refusal::Missing,
+            practice_start(),
+            Spawner::SYSTEM,
+            |p| p,
+            |rig, _| rig.fail_load = Some(f),
+        );
+        assert_eq!(*run.failure(), failure);
+        run.assert_returned();
+        assert_eq!(
+            run.rig.seen,
+            [Seen::Select, Seen::Practice(None)],
+            "{failure:?}"
+        );
+        assert_eq!(run.rig.opens, 0);
+    }
+}
+
+/// Two practice Starts at the speed the chart was read at read nothing
+/// again: the chart is read once, at the choice, and a file changed
+/// between them is not refused there.
+#[test]
+fn a_practice_start_at_the_same_speed_reads_the_chart_once() {
+    use PracticeInput::{Back, Confirm};
+    let mut acts = vec![(0, Act::Practice(0))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (1_100, Act::Back),
+        (500, Act::Page(Confirm)),
+        (3_000, Act::Quit),
+        (1_100, Act::Back),
+        (500, Act::Page(Back)),
+        (500, Act::Close),
+    ]);
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |p| p,
+        |rig, _| {
+            let path = rig.paths[0].clone();
+            rig.edits.push((
+                CLOCK_START + 1_000 * MS,
+                Box::new(move || std::fs::write(path, b"b").unwrap()),
+            ));
+        },
+    );
+    run.ran.as_ref().unwrap();
+    run.assert_returned();
+    assert_eq!(run.probe.calls(), read_on_jobs(1));
+    assert_eq!(run.rig.speeds, [Speed::NORMAL; 2]);
+    let [(0, first), (0, second)] = &run.rig.loads[..] else {
+        panic!("{:?}", run.rig.seen);
+    };
+    assert!(!first.is_empty() && !second.is_empty());
+}
+
+/// A practice Start at another speed reads the chart again once, on the
+/// read's thread, and plays at that speed.
+#[test]
+fn a_practice_start_at_another_speed_reads_once_through_a_job() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (3_000, Act::Quit),
+        (1_100, Act::Back),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let run = run_probed(Refusal::Missing, acts, Spawner::SYSTEM, |p| p, |_, _| {});
+    run.ran.as_ref().unwrap();
+    run.assert_returned();
+    assert_eq!(run.probe.calls(), read_on_jobs(2));
+    assert_eq!(run.rig.speeds, [Speed::from_twentieths(15).unwrap()]);
+}
+
+/// A speed change whose chart file changed since it was read is refused on
+/// the page, read once more and loaded never; the page stays.
+#[test]
+fn a_changed_chart_refuses_a_speed_change_on_the_page() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |p| p,
+        |rig, _| {
+            let path = rig.paths[P].clone();
+            rig.edits.push((
+                CLOCK_START + 20 * MS,
+                Box::new(move || std::fs::write(path, format!("{PRACTICE}#00411:01\n")).unwrap()),
+            ));
+        },
+    );
+    run.ran.as_ref().unwrap();
+    assert!(run.rig.violations.is_empty(), "{:?}", run.rig.violations);
+    assert!(run.app.shelf().is_ok());
+    assert_eq!(run.coord.held(Class::Foreground), 0);
+    assert_eq!(run.probe.calls(), read_on_jobs(2));
+    assert_eq!(
+        notices(&run.rig),
+        [
+            None,
+            Some("the chart file changed since it was loaded; open it again".to_owned()),
+        ]
+    );
+    assert!(run.rig.speeds.is_empty());
+    assert_eq!(
+        run.rig.practice_entries[1].speed(),
+        Speed::from_twentieths(15).unwrap()
+    );
+    assert_eq!(run.rig.seen.last(), Some(&Seen::Select));
+}
+
+/// The quit key while a practice Start reads the chart again returns to
+/// the page, which stays usable; nothing was loaded.
+#[test]
+fn a_quit_during_a_practice_reread_returns_to_the_page() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (500, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ]);
+    let run = run_stopped_read(acts, 1, false, InLoad::Quit);
+    run.ran.as_ref().unwrap();
+    run.assert_returned();
+    assert_eq!(run.rig.asks_after_stop.get(), 0);
+    assert_eq!(run.probe.calls(), read_on_jobs(2));
+    assert!(run.rig.speeds.is_empty());
+    assert_eq!(
+        run.rig.seen,
+        [
+            Seen::Select,
+            Seen::Practice(None),
+            Seen::Practice(None),
+            Seen::Select,
+        ]
+    );
+}
+
+/// A panic in a practice Start's read ends the run, never as a notice.
+#[test]
+fn an_ingest_panic_at_a_practice_start_ends_the_run() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.extend([(10, Act::Page(PracticeInput::Confirm)), (4_000, Act::Close)]);
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |mut p| {
+            p.panic_at = Some(1);
+            p
+        },
+        |_, _| {},
+    );
+    assert_eq!(
+        *run.failure(),
+        LoadFailure {
+            job: JobKind::Ingest,
+            cause: Failure::Panicked(JobPanic(INGEST_PANIC.to_owned())),
+        }
+    );
+    run.assert_returned();
+    assert_eq!(run.rig.seen, [Seen::Select, Seen::Practice(None)]);
+    assert!(run.rig.speeds.is_empty());
+}
+
+/// A thread failure, `fail`, 500 ms into each 1 s load, then the first
+/// load cancelled (`cancel`) or chart 2's bank refused.
+fn failed_during_the_load(acts: Vec<(i64, Act)>, fail: InLoad, cancel: bool) -> ProbedRun {
+    let refusal = if cancel {
+        Refusal::Missing
+    } else {
+        Refusal::Bank
+    };
+    run_probed(
+        refusal,
+        acts,
+        Spawner::SYSTEM,
+        |p| p,
+        |rig, _| {
+            rig.load_ms = 1_000;
+            rig.in_load = Some((500, fail));
+            if cancel {
+                rig.cancel_loads = vec![0];
+            }
+        },
+    )
+}
+
+/// Chart 2 chosen to play, or Start on its practice page: its bank is
+/// refused.
+fn refused_bank_entries() -> [(bool, Vec<(i64, Act)>); 2] {
+    let mut practice = vec![(0, Act::Practice(2))];
+    practice.extend(to_start(0));
+    practice.extend([(10, Act::Page(PracticeInput::Confirm)), (4_000, Act::Close)]);
+    [
+        (false, vec![(0, Act::Choose(2)), (4_000, Act::Close)]),
+        (true, practice),
+    ]
+}
+
+/// The input thread failing during a load the bank then refuses ends the
+/// run with the failure: the refusal shows neither on selection nor on the
+/// practice page.
+#[test]
+fn an_input_failure_during_the_load_beats_its_refusal() {
+    for (practice, acts) in refused_bank_entries() {
+        let run = failed_during_the_load(acts, InLoad::InputFails, false);
+        assert!(
+            matches!(run.ran, Err(LiveError::Input(InputWaitError::Gone))),
+            "{practice}: {:?}",
+            run.ran
+        );
+        run.assert_returned();
+        let mut seen = vec![Seen::Select];
+        if practice {
+            seen.push(Seen::Practice(None));
+        }
+        assert_eq!(run.rig.seen, seen);
+    }
+}
+
+/// The audio output failing during a load the bank then refuses ends the
+/// run with the failure, looked at where the refusal would show.
+#[test]
+fn an_audio_failure_during_the_load_beats_its_refusal() {
+    for (practice, acts) in refused_bank_entries() {
+        let run = failed_during_the_load(acts, InLoad::OutputFails, false);
+        assert!(
+            matches!(
+                run.ran,
+                Err(LiveError::Output(audio::OutputError::DeviceLost))
+            ),
+            "{practice}: {:?}",
+            run.ran
+        );
+        run.assert_returned();
+        let mut seen = vec![Seen::Select];
+        if practice {
+            seen.push(Seen::Practice(None));
+        }
+        assert_eq!(run.rig.seen, seen);
+    }
+}
+
+/// The input thread failing during a load that is then cancelled ends the
+/// run at the cancel, before selection or the page is entered again.
+#[test]
+fn an_input_failure_during_the_load_beats_its_cancel() {
+    let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    for (practice, acts) in [(false, choose), (true, practice_start())] {
+        let run = failed_during_the_load(acts, InLoad::InputFails, true);
+        assert!(
+            matches!(run.ran, Err(LiveError::Input(InputWaitError::Gone))),
+            "{practice}: {:?}",
+            run.ran
+        );
+        run.assert_returned();
+        let seen = if practice {
+            vec![Seen::Select, Seen::Practice(None), Seen::Load(P)]
+        } else {
+            vec![Seen::Select, Seen::Load(0)]
+        };
+        assert_eq!(run.rig.seen, seen);
+        assert!(run.rig.prepared_for.is_empty());
+    }
+}
+
+/// The audio output failing during a load that is then cancelled is not
+/// looked at by the cancel, which looks at the input thread only: the flow
+/// returns to selection or the page, and the failure ends the run at the
+/// next look at both threads, before the next play's recording opens.
+#[test]
+fn an_audio_failure_during_a_cancelled_load_ends_the_run_at_the_next_look() {
+    // The second choice, or Start, after the 1 s load.
+    let choose = vec![
+        (0, Act::Choose(0)),
+        (1_500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let mut start_twice = vec![(0, Act::Practice(P))];
+    start_twice.extend(to_start(0));
+    start_twice.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (1_500, Act::Page(PracticeInput::Confirm)),
+        (4_000, Act::Close),
+    ]);
+    for (practice, acts) in [(false, choose), (true, start_twice)] {
+        let run = failed_during_the_load(acts, InLoad::OutputFails, true);
+        assert!(
+            matches!(
+                run.ran,
+                Err(LiveError::Output(audio::OutputError::DeviceLost))
+            ),
+            "{practice}: {:?}",
+            run.ran
+        );
+        run.assert_returned();
+        let seen = if practice {
+            vec![
+                Seen::Select,
+                Seen::Practice(None),
+                Seen::Load(P),
+                Seen::Practice(None),
+                Seen::Load(P),
+            ]
+        } else {
+            vec![Seen::Select, Seen::Load(0), Seen::Select, Seen::Load(1)]
+        };
+        assert_eq!(run.rig.seen, seen);
+        assert_eq!(run.rig.opens, 0);
+    }
 }

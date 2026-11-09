@@ -94,6 +94,7 @@ fn changed() -> Settings {
             library: LibrarySettings {
                 roots: vec![r"D:\BMS".to_owned(), "songs/new".to_owned()],
             },
+            speculation: Some(false),
         },
         player: PlayerSettings {
             preset: "wide".to_owned(),
@@ -1234,6 +1235,63 @@ fn a_player_toml_with_visible_time_ms_is_refused() {
         );
         assert_eq!(fs::read_to_string(root.player_settings()).unwrap(), text);
     }
+}
+
+/// `speculation` in a `version = 2` file: absent, `true` and `false` each
+/// read and write back as they were, an absent one staying absent; a value
+/// that is not a boolean is refused naming the key.
+#[test]
+fn device_settings_keep_speculation_as_read() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    for (line, want) in [
+        ("", None),
+        (
+            "speculation = true
+",
+            Some(true),
+        ),
+        (
+            "speculation = false
+",
+            Some(false),
+        ),
+    ] {
+        let text = format!(
+            "version = 2
+{line}"
+        );
+        fs::write(root.device_settings(), &text).unwrap();
+        let s = Settings::load(&root).unwrap();
+        assert_eq!(s.device.speculation, want);
+        s.save(&root).unwrap();
+        let written = fs::read_to_string(root.device_settings()).unwrap();
+        let kept: Vec<&str> = written
+            .lines()
+            .filter(|l| l.starts_with("speculation"))
+            .collect();
+        assert_eq!(kept, line.lines().collect::<Vec<_>>(), "{written}");
+        assert_eq!(Settings::load(&root).unwrap().device.speculation, want);
+    }
+}
+
+#[test]
+fn device_settings_refuse_a_speculation_that_is_not_a_boolean() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(
+        root.device_settings(),
+        "version = 2
+speculation = \"yes\"
+",
+    )
+    .unwrap();
+    let e = Settings::load(&root).unwrap_err();
+    assert!(
+        Chain(&e).to_string().contains("speculation"),
+        "{}",
+        Chain(&e)
+    );
 }
 
 /// A `device.toml` without `version = 2`, none or another, is refused with
