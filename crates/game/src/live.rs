@@ -702,6 +702,10 @@ pub enum LiveError<S> {
     /// start.
     #[error("the round's audio cannot be restored")]
     Restore(#[source] RestoreError),
+    /// A job of the chart's load could not start its thread or panicked
+    /// (design.md "Play Lifecycle", who loads).
+    #[error("the chart's load failed")]
+    Load(#[source] crate::coord::LoadFailure),
 }
 
 /// How the run ends when nothing else stopped it: with the input thread's

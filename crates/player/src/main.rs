@@ -1323,7 +1323,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(not(feature = "dev-tools"))]
     let rescan = shelf::RESCAN_AFTER;
-    let coord = game::coord::Coordinator::new(game::coord::Caps::this_machine());
+    let (caps, note) = priority::run_caps(&settings.device, &priority::System);
+    if let Some(note) = note {
+        eprintln!("{note}");
+        log::warn!("{note}");
+    }
+    let coord = game::coord::Coordinator::new(caps);
     #[cfg_attr(
         not(feature = "dev-tools"),
         expect(unused_mut, reason = "`--dev-stop-timeout` sets its bound")
@@ -1552,6 +1557,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         dirty: true,
         #[cfg(feature = "dev-tools")]
         script: s.dev.script,
+        coord: coord.clone(),
+        spawner: game::coord::Spawner::SYSTEM,
+        #[cfg(test)]
+        decodes: None,
+        #[cfg(test)]
+        after_bank: None,
     });
     // Each chart of a scenario has its input chosen as it loads
     // (`AppRig::configure`), from autoplay's session.
@@ -1613,7 +1624,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         session_config(receive, auto),
         parts,
         Box::new(game::NoSessionEvents),
-    );
+    )
+    .with_coordinator(coord);
     let ran = if begin { app.run(&mut rig) } else { Ok(()) };
     #[cfg(feature = "dev-tools")]
     println!(

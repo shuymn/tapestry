@@ -107,8 +107,8 @@ pub use bms_parser::{ChartMode, Header};
 pub use db::Tuple;
 pub use loudness::{LoudnessKey, LoudnessRow};
 pub use scan::{
-    BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, REBUILD_MEMORY, Refusal, Refusals, Scan,
-    ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
+    BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, PassGuard, PassStart, REBUILD_MEMORY,
+    Refusal, Refusals, Scan, ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
 };
 pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 
