@@ -277,6 +277,8 @@ pub(crate) fn sample(
         return None;
     }
     let t = elapsed_us(now, start);
+    #[cfg(feature = "dev-tools")]
+    crate::present::trace::record(|| crate::present::trace::Event::Sampled { slot, age_us: t });
     Some((t, track.sample(t)?))
 }
 
