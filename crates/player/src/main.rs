@@ -80,7 +80,7 @@ mod render_json;
 #[cfg(test)]
 #[path = "../../render/tests/outline_support/mod.rs"]
 mod render_outline;
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-tools"))]
 mod warp_turn;
 
 use std::path::{Path, PathBuf};
