@@ -3642,6 +3642,150 @@ fn the_attempt_is_prepared_after_the_preset_refresh_and_before_loading_ends() {
     );
 }
 
+/// The handshakes of one attempt opened the standard way, from the screen
+/// to the opening, each once.
+const STANDARD_ATTEMPT: [&str; 8] = [
+    "screen",
+    "before play",
+    "audio",
+    "attempt",
+    "ready",
+    "commit",
+    "end loading",
+    "open",
+];
+
+/// [`loaded`], saving through a [`NotingSink`] that notes into `order`.
+fn noting_loaded(
+    dir: &Path,
+    order: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+) -> Loaded {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = OFFSET;
+    let chart_path = dir.join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let parts = Parts {
+        ingest: Box::new(Built(chart())),
+        records: Some(Box::new(NotingSink(std::sync::Arc::clone(order)))),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    Loaded::load(root, settings, &chart_path, config, parts).unwrap()
+}
+
+/// A first play completes, shows its result, and the result's retry plays
+/// again: each attempt is prepared, opened and saved exactly once, the
+/// retry through the standard opening (plan §2.4.1, the path table).
+#[test]
+fn a_completed_first_play_then_result_retry_opens_once_each() {
+    let dir = tempfile::tempdir().unwrap();
+    let order = std::sync::Arc::default();
+    let mut loaded = noting_loaded(dir.path(), &order);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    // The retry is taken on play 1's result; the window closes on play 2's.
+    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], 15_000_000);
+    rig.order = std::sync::Arc::clone(&order);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    assert_eq!(rig.steps, [STANDARD_ATTEMPT, STANDARD_ATTEMPT].concat());
+    assert_eq!(rig.opens, 2);
+    assert_eq!(rig.begun.len(), 2);
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["play over", "saved", "ended", "play over", "saved", "ended"]
+    );
+    let [one, two] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!((one.end, two.end), (PlayEnd::Completed, PlayEnd::Completed));
+    // Both results were prepared; the first one's retry was the retry.
+    assert_eq!(rig.preps.len(), 2);
+    assert_eq!(rig.accepted, [game::MenuCommand::Retry]);
+    assert_eq!(
+        rig.served.iter().map(|&(c, _)| c).collect::<Vec<_>>(),
+        [game::MenuCommand::Retry]
+    );
+}
+
+/// A retry during the first play retries at once: the next attempt is
+/// prepared and opened the standard way, and each attempt is prepared,
+/// opened and saved exactly once, with no result between them.
+#[test]
+fn an_immediate_play_retry_uses_the_standard_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    let order = std::sync::Arc::default();
+    let mut loaded = noting_loaded(dir.path(), &order);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 15_000_000);
+    rig.order = std::sync::Arc::clone(&order);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Quit);
+    assert_eq!(rig.steps, [STANDARD_ATTEMPT, STANDARD_ATTEMPT].concat());
+    assert_eq!(rig.opens, 2);
+    assert_eq!(rig.begun.len(), 2);
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["play over", "saved", "ended", "play over", "saved", "ended"]
+    );
+    let [one, two] = &rig.reports[..] else {
+        panic!("{} plays", rig.reports.len());
+    };
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Retry));
+    assert_eq!(two.end, PlayEnd::Completed);
+    // Only the second play's result was prepared, after its opening.
+    let [prep] = rig.preps[..] else {
+        panic!("{:?}", rig.preps);
+    };
+    assert!(prep > rig.origins[1].0, "{prep} {:?}", rig.origins);
+    assert!(rig.accepted.is_empty(), "{:?}", rig.accepted);
+}
+
+/// `live::play`, which `Session::play` runs, is one attempt: prepared,
+/// opened and saved once, its report returned without a result, and a
+/// retry during it does not play again.
+#[test]
+fn live_play_keeps_its_one_attempt_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let order = std::sync::Arc::default();
+    let mut loaded = noting_loaded(dir.path(), &order);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], i64::MAX);
+    rig.order = std::sync::Arc::clone(&order);
+    let report = game::live::play(&mut loaded, &mut rig).unwrap().unwrap();
+    assert_eq!(report.end, PlayEnd::Aborted(AbortCause::Retry));
+    assert_eq!(report.attempt, 1);
+    assert_eq!(rig.steps, STANDARD_ATTEMPT);
+    assert_eq!(rig.opens, 1);
+    assert_eq!(rig.begun.len(), 1);
+    // Saved once; the rig's `ended` and the result are the run's, not the
+    // wrapper's.
+    assert_eq!(*order.lock().unwrap(), ["play over", "saved"]);
+    assert!(rig.reports.is_empty());
+    assert!(rig.preps.is_empty(), "{:?}", rig.preps);
+    assert_eq!(rig.shows, 0);
+    assert_eq!(loaded.attempt().number, 1);
+}
+
 /// The play preset is edited while the result views another preset: the
 /// retry's attempt is prepared, fresh, with the refreshed play preset, its
 /// gauges in their order, never with the viewed one.
@@ -3939,7 +4083,7 @@ fn a_screen_error_while_preparing_or_readying_ends_the_run() {
 
 /// A screen lost while a held START defers the opening ends the run as
 /// before any opening, without waiting for the release: recording never
-/// opens. Exercises `game::live::play_and_next` through `open_gated`.
+/// opens. Exercises `game::live::open_and_play` through `open_gated`.
 #[test]
 fn a_screen_lost_while_the_opening_is_deferred_opens_nothing() {
     const Q: ControlId = ControlId(0x10);
@@ -3972,7 +4116,7 @@ fn a_screen_lost_while_the_opening_is_deferred_opens_nothing() {
 /// resumes it (Preparing → Loading), one without waits in Preparing;
 /// either way the loading state is quiesced again and the opening asked
 /// again once the hold is released, and READY opens at that release.
-/// Exercises `game::live::play_and_next` through `open_gated`.
+/// Exercises `game::live::open_and_play` through `open_gated`.
 #[test]
 fn a_hold_at_the_opening_defers_it_with_or_without_a_loading_lifetime() {
     const Q: ControlId = ControlId(0x10);

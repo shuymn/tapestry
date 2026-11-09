@@ -225,7 +225,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns(
         "crates/game/src/live.rs",
         &[
-            "play_and_next",
+            "ready_standard",
+            "open_and_play",
             "run_tail",
             "TailStage::begin",
             "TailStage::over",

@@ -90,7 +90,7 @@ use crate::render::RenderSide;
 use crate::restore::RestoreError;
 use crate::result_screen::ResultScreen;
 use crate::session::{
-    ClosingReport, Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport,
+    ClosingReport, Command, Loaded, MenuCommand, PlayEnd, PlayOutcome, PlayReport, PlayStart,
     RECORDING_MEMORY, Settings,
 };
 use crate::sound::{AudioQueue, audio_link_at};
@@ -945,13 +945,31 @@ pub fn run_chart<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
+    run_chart_with(loaded, rig, FirstOpening::Standard)
+}
+
+/// [`run_chart`], with the chart's first attempt opened as `first` says;
+/// every later attempt (a retry, a practice round) opens the standard way.
+///
+/// # Errors
+///
+/// As [`run_chart`].
+pub fn run_chart_with<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+    first: FirstOpening,
+) -> Result<Leave, LiveError<R::ScreenError>> {
+    let mut first = Some(first);
     loop {
+        let played = match first.take().unwrap_or(FirstOpening::Standard) {
+            FirstOpening::Standard => play_standard(loaded, rig)?,
+        };
         let Some(Played {
             report,
             next,
             next_round,
             counted_down,
-        }) = play_and_next(loaded, rig)?
+        }) = played
         else {
             return leave(rig);
         };
@@ -1233,7 +1251,7 @@ pub fn play<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Option<PlayReport>, LiveError<R::ScreenError>> {
-    Ok(play_and_next(loaded, rig)?.map(|p| p.report))
+    Ok(play_standard(loaded, rig)?.map(|p| p.report))
 }
 
 /// The rest of a play's preparation, once its preset was refreshed
@@ -1377,13 +1395,53 @@ struct Played {
     counted_down: bool,
 }
 
-/// [`play`], with the command that arrived as recording closed after an
-/// abort: the run's next step (a completed play's tail takes it).
-#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn play_and_next<R: Rig>(
+/// How a chart's first attempt opens ([`run_chart_with`]); every later
+/// attempt (a retry, a practice round) opens [`Standard`](Self::Standard).
+/// The opener that waits in the loading state is a later variant.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum FirstOpening {
+    /// Prepared and opened at once ([`ready_standard`]), as every retry.
+    Standard,
+}
+
+/// How [`open_and_play`] asks for recording to open, once the attempt is
+/// ready to open. The policy of the opener that waits in the loading state
+/// is a later variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenPolicy {
+    /// Opened at once, or, on a gated rig, through [`open_gated`]'s
+    /// deferral.
+    Standard,
+}
+
+/// One attempt prepared and opened the standard way: [`ready_standard`],
+/// then [`open_and_play`].
+fn play_standard<R: Rig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Option<Played>, LiveError<R::ScreenError>> {
+    match ready_standard(loaded, rig)? {
+        Some(start) => open_and_play(loaded, rig, start, OpenPolicy::Standard),
+        None => Ok(None),
+    }
+}
+
+/// An attempt's standard preparation, up to the point where recording
+/// may open: the screen, the starting settings, the play's number and
+/// preset, a round's refit, the presentation and [`ready_to_open`]. The
+/// play's start once it is ready to open; `None` when the player quit or
+/// cancelled before, its number withdrawn.
+///
+/// # Errors
+///
+/// What [`play`] reports before recording opens; a number already given
+/// is withdrawn.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn ready_standard<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+) -> Result<Option<PlayStart>, LiveError<R::ScreenError>> {
     if rig.quitting() {
         return Ok(None);
     }
@@ -1412,18 +1470,37 @@ fn play_and_next<R: Rig>(
         })),
     };
     match ready {
-        Ok(true) => {}
+        Ok(true) => Ok(Some(start)),
         Ok(false) => {
             rig.end_presentation();
             loaded.withdraw(start);
-            return Ok(None);
+            Ok(None)
         }
         Err(e) => {
             rig.end_presentation();
             loaded.withdraw(start);
-            return Err(refused(rig, e));
+            Err(refused(rig, e))
         }
     }
+}
+
+/// An attempt that is ready to open (`start` from [`ready_standard`]):
+/// recording opens as `policy` asks, then the play runs, is saved and
+/// reported, with the command that arrived as recording closed after an
+/// abort: the run's next step (a completed play's tail takes it). `None`
+/// when the player left before recording opened, the number withdrawn.
+///
+/// # Errors
+///
+/// What [`play`] reports from the opening on; recording is closed again.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn open_and_play<R: Rig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+    start: PlayStart,
+    policy: OpenPolicy,
+) -> Result<Option<Played>, LiveError<R::ScreenError>> {
+    let OpenPolicy::Standard = policy;
     // A full play's recording opens its READY state before chart time 0, a
     // practice round's `RESTORE_AHEAD` before its lead-in, whose start its
     // audio is restored at (design.md "Mid-Chart Start and Section
