@@ -980,7 +980,20 @@ fn a_second_program_draw_follows_its_role() {
             Disposition::Compiled,
             Disposition::Replaced(Unsupported::Construct("a draw after a program draw"))
         ]
+    ); // The image is dropped after its `op` callback was compiled and
+    // charged: the callback stays in the program, and every operation
+    // the skin keeps was charged.
+    assert!(
+        i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| n.severity == skin_beatoraja::Severity::Dropped)
     );
+    assert_eq!(i.imported.skin.program_callbacks(), 1);
+    let kept = i.imported.skin.ops().total();
+    assert!(kept > 0);
+    assert_eq!(i.imported.report.usage.ops as usize, kept);
 }
 
 /// A latch: a closure whose frame-time body writes its own upvalue

@@ -981,7 +981,8 @@ return skin
 /// `skin_lua` seeds: skins that import (data only, local modules and
 /// selected parts, configuration and a pass-local write to it, pass
 /// isolation, callbacks converted, one of them into the presentation
-/// program, and a decorative one replaced, import facts read), then
+/// program, one kept in the program after its element is dropped, and a
+/// decorative one replaced, import facts read), then
 /// one refusal per boundary: a callback with an unknown effect, a write
 /// to a host module, the instruction and memory caps (also inside a
 /// protected call), a path out of the folder, a coroutine, malformed
@@ -1041,6 +1042,13 @@ skin.value = { { id = "v", src = "s", w = 100, h = 10, divx = 10, digit = 2, val
 end } }
 skin.destination[2] = { id = "v", dst = { { w = 10, h = 10 } } }"#,
     );
+    // An image dropped after its `op` callback went to the program: a
+    // second program draw on it follows its decorative role.
+    let dropped = lua_skin(
+        r#"local ms = require("main_state")
+skin.destination[2] = { id = "i", op = { function() return ms.number(110) / 2 >= 0 end },
+  draw = function() return ms.number(111) / 2 >= 0 end, dst = { { w = 10, h = 10 } } }"#,
+    );
     let replaced = lua_skin(
         r#"local ms = require("main_state")
 skin.destination[2] = { id = "i", draw = function() return ms.number(426) > 0 end, dst = { { w = 10, h = 10 } } }"#,
@@ -1080,6 +1088,7 @@ skin.destination[3] = { id = "i", op = { 90 }, dst = { { x = x, y = 0, w = 10, h
         ),
         ("callback_lowered", lua_input(&[&lowered])),
         ("callback_program", lua_input(&[&program])),
+        ("callback_dropped", lua_input(&[&dropped])),
         ("facts", {
             let mut input = lua_input(&[&facts]);
             input[0] = LUA_AUTOPLAY_OFF_LEVEL_9;
