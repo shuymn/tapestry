@@ -245,9 +245,32 @@ pub(crate) enum FntFailure {
 /// image set takes.
 pub(crate) type ImageKey = (u32, bool, [u32; 2], bool, [u32; 2]);
 
-/// The source rows an image keeps of its single frame: the first row and
-/// the count.
-pub(crate) type Crop = [u32; 2];
+/// An axis of a frame: its columns or its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Axis {
+    Cols,
+    Rows,
+}
+
+impl Axis {
+    /// The axis's index in an `[x, y]` pair, and its length's in an
+    /// `[x, y, w, h]` rect less 2.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Cols => 0,
+            Self::Rows => 1,
+        }
+    }
+}
+
+/// The source texels an image keeps of its sheet on one axis, along which
+/// the sheet is one cell: the first column or row and the count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Crop {
+    pub(crate) axis: Axis,
+    pub(crate) at: u32,
+    pub(crate) len: u32,
+}
 
 /// Why an image was not added to the sheet.
 #[derive(Debug)]
@@ -520,16 +543,18 @@ impl Assets {
         }
     }
 
-    /// Adds image `def` with cells of `cell` under `key`, its single
-    /// frame cut to the rows of `crop` when there is one; returns the
-    /// image and its cell. Checked as [`Self::check_image`] says.
+    /// Adds image `def` with cells of `cell` under `key`, its sheet cut
+    /// to the columns or rows of `crop` when there is one, a sheet of one
+    /// cell along that axis;
+    /// returns the image and its cell. Checked as [`Self::check_image`]
+    /// says.
     ///
-    /// A crop of a frame running past its file's bottom edge may start at
-    /// or past that edge, where the source's texture, clamped to its edge,
-    /// samples only the file's last row: that row is cut in its place, one
-    /// row high, and the cell keeps the crop's rows. A crop starting inside
-    /// the file is cut as it is, the sheet padding its rows past the edge
-    /// ([`skin_model::ImageDef::rect`]).
+    /// A crop of a frame running past its file's right or bottom edge may
+    /// start at or past that edge, where the source's texture, clamped to
+    /// its edge, samples only the file's last column or row: that line is
+    /// cut in its place, one texel long, and the cell keeps the crop's
+    /// length. A crop starting inside the file is cut as it is, the sheet
+    /// padding it past the edge ([`skin_model::ImageDef::rect`]).
     pub(crate) fn add_image(
         &mut self,
         key: ImageKey,
@@ -538,16 +563,25 @@ impl Assets {
         cell: [u32; 2],
     ) -> Result<(u32, [u32; 2]), NotAdded> {
         let (added, added_cell) = match (crop, def.rect) {
-            (Some([y, rows]), Some([x, _, w, _])) => (
-                ImageDef {
-                    rect: Some(match self.file_dims(def.file) {
-                        Some([_, fh]) if fh > 0 && y >= fh => [x, fh - 1, w, 1],
-                        _ => [x, y, w, rows],
-                    }),
-                    ..def
-                },
-                [cell[0], rows],
-            ),
+            (Some(Crop { axis, at, len }), Some(rect)) => {
+                let i = axis.index();
+                let extent = self.file_dims(def.file).map_or(0, |d| d[i]);
+                let mut cut = rect;
+                let mut added_cell = cell;
+                (cut[i], cut[i + 2]) = if extent > 0 && at >= extent {
+                    (extent - 1, 1)
+                } else {
+                    (at, len)
+                };
+                added_cell[i] = len;
+                (
+                    ImageDef {
+                        rect: Some(cut),
+                        ..def
+                    },
+                    added_cell,
+                )
+            }
             _ => (def, cell),
         };
         self.check_image(&added)?;
