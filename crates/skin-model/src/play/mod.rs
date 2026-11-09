@@ -856,6 +856,7 @@ mod tests {
             widgets: crate::WidgetDefs::default(),
             bomb_up_to: Some(crate::Grade::Bad),
             close: None,
+            loadend: None,
             present: None,
         })
         .unwrap();

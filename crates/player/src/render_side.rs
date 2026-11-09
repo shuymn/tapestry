@@ -10106,6 +10106,7 @@ pub(crate) mod tests {
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
             close,
+            loadend: None,
             present: None,
         })
         .unwrap();

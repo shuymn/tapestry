@@ -1897,6 +1897,16 @@ impl<'d> Cx<'d> {
         Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
     }
 
+    /// The loading presentation's declared least length, from the
+    /// top-level `loadend` in ms: in µs, a negative value 0, `None` when
+    /// absent. Read as every integer field is: a value the reader refuses
+    /// refuses the import.
+    fn loadend(&mut self) -> Result<Option<TimeUs>, ImportError> {
+        let [f] = self.def.fields(self.def.top(), ["loadend"]);
+        let ms = f.map(|f| self.def.int(f, "loadend")).transpose()?;
+        Ok(ms.map(|ms| TimeUs(i64::from(ms.max(0)) * 1_000)))
+    }
+
     /// A result skin's declared timing (design.md "State Model", Result),
     /// from the top-level `fadeout`, `input` and `scene` in ms
     /// (`JsonSkin.java:14-16`, each 0 when absent; a Lua skin's table
@@ -1987,10 +1997,10 @@ impl<'d> Cx<'d> {
         } else {
             DecisionTiming::default()
         };
-        let (bomb_up_to, close) = if selection || result || decision {
-            (None, None)
+        let (bomb_up_to, close, loadend) = if selection || result || decision {
+            (None, None, None)
         } else {
-            (self.bomb_up_to()?, self.close()?)
+            (self.bomb_up_to()?, self.close()?, self.loadend()?)
         };
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
@@ -2012,6 +2022,7 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
+            loadend,
             present: {
                 self.close_slots()?;
                 (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))

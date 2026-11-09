@@ -3521,6 +3521,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        loadend: None,
         present: Some(def),
     })
     .ok()?;
