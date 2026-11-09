@@ -175,6 +175,10 @@ impl<'a> Reference<'a> {
                 info.source.unwrap_or_default().to_string(),
                 u32::try_from(info.line_defined.unwrap_or(0)).unwrap_or(0),
             ));
+            self.observed.ends.insert(
+                callable,
+                u32::try_from(info.last_line_defined.unwrap_or(0)).unwrap_or(0),
+            );
         }
         Key {
             dest,

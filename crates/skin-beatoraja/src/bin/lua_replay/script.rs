@@ -17,6 +17,8 @@ pub struct Script {
     pub name: &'static str,
     pub presses: Vec<Option<i64>>,
     pub ghosts: Vec<i64>,
+    /// Further frame times (chart µs).
+    pub extra: Vec<i64>,
 }
 
 /// The first note's time and the gap between notes.
@@ -39,6 +41,7 @@ impl Script {
             name: "full",
             presses: vec![Some(0); 7],
             ghosts: Vec::new(),
+            extra: Vec::new(),
         }
     }
 
@@ -62,6 +65,7 @@ impl Script {
                 Some(-140_000),
             ],
             ghosts: vec![FIRST + GAP * 4 + GAP / 2, FIRST + GAP * 9 + GAP / 2],
+            extra: Vec::new(),
         }
     }
 
@@ -74,7 +78,7 @@ impl Script {
         }
     }
 
-    fn note_time(i: usize) -> i64 {
+    pub fn note_time(i: usize) -> i64 {
         FIRST + GAP * i64::try_from(i).unwrap_or(i64::MAX / GAP)
     }
 
@@ -121,6 +125,7 @@ impl Script {
             .take_while(|&t| t <= end)
             .collect();
         t.extend(self.inputs().iter().map(|e| e.received.0));
+        t.extend(self.extra.iter().copied());
         t.sort_unstable();
         t.dedup();
         t

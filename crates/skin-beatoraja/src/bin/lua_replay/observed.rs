@@ -98,6 +98,10 @@ pub struct Observed {
     pub unresolved: Vec<Listed>,
     /// Each callable's definition (file, line), where the VM knows it.
     pub sites: std::collections::BTreeMap<u32, (String, u32)>,
+    /// Each callable's last line, where the VM knows it.
+    pub ends: std::collections::BTreeMap<u32, u32>,
     /// Custom timers and events holding a function.
     pub custom: usize,
+    /// The skin folder, which chunk names are relative to.
+    pub root: std::path::PathBuf,
 }

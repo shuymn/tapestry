@@ -170,7 +170,8 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
     for &(id, d) in &o.perturb {
         vm.perturb(id, d);
     }
-    let observed = reference::Reference::new(&vm, &rec.items).run(&inputs);
+    let mut observed = reference::Reference::new(&vm, &rec.items).run(&inputs);
+    observed.root = root.to_path_buf();
     Ok(production::compare::compare(&prod, &observed, &o.isolation))
 }
 

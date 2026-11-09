@@ -125,6 +125,48 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
     }
 }
 
+/// A hint naming the operators of callable `c`'s source where Lua 5.4
+/// and LuaJ differ (`/`, `%`, `//`, a unary minus), folded ones included,
+/// read from its lines: a candidate cause, settled against the LuaJ table
+/// by the developer.
+fn luaj_hint(obs: &Observed, c: u32) -> String {
+    let Some((file, first)) = obs.sites.get(&c) else {
+        return String::new();
+    };
+    let last = obs.ends.get(&c).copied().unwrap_or(*first).max(*first);
+    let Ok(text) = std::fs::read_to_string(obs.root.join(file.trim_start_matches('@'))) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .skip(usize::try_from(first.saturating_sub(1)).unwrap_or(0))
+        .take(usize::try_from(last - first + 1).unwrap_or(0))
+        .map(|l| l.split("--").next().unwrap_or(""))
+        .collect();
+    let body = lines.join(
+        "
+",
+    );
+    let mut ops = Vec::new();
+    if body.contains("//") {
+        ops.push("//");
+    }
+    if body.replace("//", "").contains('/') {
+        ops.push("/");
+    }
+    if body.contains('%') {
+        ops.push("%");
+    }
+    if body.contains("(-") || body.contains("= -") || body.contains("return -") {
+        ops.push("unary -");
+    }
+    if ops.is_empty() {
+        String::new()
+    } else {
+        format!(" [luaj-operator: {} at line {first}]", ops.join(" "))
+    }
+}
+
 /// Production's records, by occurrence.
 struct Cx<'a> {
     by_key: BTreeMap<(usize, &'static str, u32), &'a Occurrence>,
@@ -314,7 +356,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     used.insert((k, call));
                     match differ(key.field, prod, outcome) {
                         None => rep.agreed += 1,
-                        Some(d) => find(key, i, d),
+                        Some(d) => {
+                            let hint = luaj_hint(obs, key.callable);
+                            find(key, i, format!("{d}{hint}"));
+                        }
                     }
                 }
                 Point::NotReached { key, why } => {
