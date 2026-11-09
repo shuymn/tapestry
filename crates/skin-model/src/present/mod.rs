@@ -343,26 +343,6 @@ impl Present {
         &self.def.signature
     }
 
-    /// The number of timer callbacks: the timer outputs it gives.
-    #[must_use]
-    pub fn timers(&self) -> usize {
-        self.def
-            .callbacks
-            .iter()
-            .filter(|c| c.conv == Conv::Timer)
-            .count()
-    }
-
-    /// The timer output of callback `k`, by its rank among the timer
-    /// callbacks; `None` when `k` is no timer callback.
-    #[must_use]
-    pub fn timer_output(&self, k: u16) -> Option<usize> {
-        let k = usize::from(k);
-        let cbs = &self.def.callbacks;
-        (cbs.get(k)?.conv == Conv::Timer)
-            .then(|| cbs.iter().take(k).filter(|c| c.conv == Conv::Timer).count())
-    }
-
     /// The slots at their initial values: a fresh attempt's.
     #[must_use]
     pub fn bank(&self) -> Bank {

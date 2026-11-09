@@ -927,7 +927,6 @@ impl<'a> Eval<'a> {
     ) -> R<Option<Vec<u32>>> {
         let (a, b) = match (a, b) {
             (None, None) => return Ok(None),
-            (Some(x), None) | (None, Some(x)) if self.cells.is_empty() => return Ok(Some(x)),
             (a, b) => (a, b),
         };
         let n = self.cells.len();

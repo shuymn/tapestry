@@ -79,6 +79,17 @@ pub struct Io<'a, 'b> {
 }
 
 impl Present {
+    /// The number of timer callbacks: the timer outputs it gives. Read each
+    /// frame, when the play's timers are checked against the skin's.
+    #[must_use]
+    pub fn timers(&self) -> usize {
+        self.def
+            .callbacks
+            .iter()
+            .filter(|c| c.conv == Conv::Timer)
+            .count()
+    }
+
     /// Runs every callback in order over `io`: its state, clock and slots,
     /// writing callback `k`'s converted result to `outs[2k]` and whether it
     /// gave one to `outs[2k + 1]`, and each timer callback's start to its

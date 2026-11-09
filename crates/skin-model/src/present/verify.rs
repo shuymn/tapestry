@@ -48,7 +48,9 @@ pub enum PresentError {
     ReadSet { read: usize },
     #[error("callback {callback}'s gate is not a boolean read")]
     Gate { callback: usize },
-    #[error("callback {callback} follows a callback that is not an earlier number value")]
+    #[error(
+        "callback {callback} follows a callback that is not an earlier number value, or for a timer an earlier draw or timer"
+    )]
     After { callback: usize },
     #[error("the program and the skin's expressions exceed {MAX_SKIN_OPS} operations a frame")]
     Cost,
@@ -61,7 +63,8 @@ pub enum PresentError {
 }
 
 impl Present {
-    /// `def` checked against V1 to V5, its per-frame cost charged to `ops`;
+    /// `def` checked against V1 to V5 and V7, its per-frame cost charged
+    /// to `ops`;
     /// `base` is the schema's field count, the first output slot.
     ///
     /// # Errors

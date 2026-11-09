@@ -505,6 +505,7 @@ impl Play {
             + size_of_val(&*self.fields)
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
+            + size_of_val(self.bank.values())
             + self.playhead.heap_bytes()
             + notes
             + size_of_val(&*self.gauges)
