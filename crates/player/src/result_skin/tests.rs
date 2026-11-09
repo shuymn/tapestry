@@ -1596,3 +1596,111 @@ fn the_presented_layout_is_reused_while_a_newer_one_waits() {
     );
     assert!(scripts.result_live(Some(b)));
 }
+
+/// The script generation `rs` publishes, `None` for a layout without a
+/// runtime.
+fn published_script(rs: &ResultSkin) -> Option<crate::screens::ScriptGen> {
+    match rs.published().0 {
+        Some(Published::Skin(_, _, g)) => *g,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// C10 with runtimes (code r1 M2), through a renderer that lags: each
+/// view's cells differ, view 3's layout keeps no runtime. A third atlas
+/// defers its build, its runtime dropped with the deferral and its permit
+/// back; the renderer moving on retries it, and the eviction then takes
+/// the permit of the runtime no view references. A generation withdrawn
+/// by the eviction neither commits nor runs; a job that panics returns
+/// its permit; the latest view presents each time.
+#[test]
+fn a_lagging_renderer_presents_the_latest_view_with_runtimes() {
+    use crate::screens::{ScriptNotes, ViewCommit};
+    let _s = serial();
+    let d = skin(
+        "local calls = 0 if nr ~= 3 then rt_draw = function() calls = calls + 1 return calls > 0 end end",
+        "{ { id = \"dot\", src = \"s\", x = 8 * nr, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    let scripts = rs.scripts().clone();
+    let notes = ScriptNotes::default();
+    let mut fake = FakeRenderer::default();
+    staged(&mut rs);
+    let step = |rs: &mut ResultSkin, nr: u32| {
+        rs.request(view(nr));
+        ran(rs);
+    };
+    // A presented, its runtime running.
+    step(&mut rs, 2);
+    let a = published_script(&rs).expect("A runs a runtime");
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    assert_eq!(scripts.commit_view(Some(a), || true), ViewCommit::Committed);
+    let mut slot_a = scripts.result_slot(Some(a));
+    assert!(slot_a.runs_result(&notes));
+    // B, with no runtime, published; the renderer stays on A.
+    step(&mut rs, 3);
+    assert_eq!(published_script(&rs), None);
+    // C: a third atlas; its runtime goes with the deferral.
+    step(&mut rs, 4);
+    assert!(rs.deferred());
+    assert_eq!(scripts.permits_free(), 1, "only A's runtime holds one");
+    // The renderer presents B: A parks, unreferenced; C builds, the
+    // eviction retiring A for its permit.
+    assert_eq!(scripts.commit_view(None, || true), ViewCommit::Committed);
+    drop(slot_a);
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    ran(&mut rs);
+    let c = published_script(&rs).expect("C runs a runtime");
+    assert!(!scripts.result_live(Some(a)), "A evicted");
+    // D before C presents: deferred again (B retained, C published).
+    step(&mut rs, 5);
+    assert!(rs.deferred());
+    assert_eq!(scripts.permits_free(), 1);
+    // C presents; D builds.
+    assert_eq!(scripts.commit_view(Some(c), || true), ViewCommit::Committed);
+    let mut slot_c = scripts.result_slot(Some(c));
+    assert!(slot_c.runs_result(&notes));
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    ran(&mut rs);
+    let dg = published_script(&rs).expect("D runs a runtime");
+    // C's view asked again: the presented layout is reused; D is now
+    // referenced by no view, so E's layout evicts it.
+    rs.request(view(4));
+    assert_eq!(published_script(&rs), Some(c));
+    let mut slot_d = scripts.result_slot(Some(dg));
+    step(&mut rs, 6);
+    let e = published_script(&rs).expect("E runs a runtime");
+    assert!(!scripts.result_live(Some(dg)));
+    // A renderer that had D prepared neither commits nor runs it.
+    let mut ran_commit = false;
+    assert_eq!(
+        scripts.commit_view(Some(dg), || {
+            ran_commit = true;
+            true
+        }),
+        ViewCommit::Gone
+    );
+    assert!(!ran_commit && !slot_d.runs_result(&notes));
+    // The latest, E, presents and runs.
+    assert_eq!(scripts.commit_view(Some(e), || true), ViewCommit::Committed);
+    drop(slot_c);
+    let mut slot_e = scripts.result_slot(Some(e));
+    assert!(slot_e.runs_result(&notes));
+    let b = shown(&rs);
+    fake.take(&mut rs, b);
+    // A job panicking returns its permit; the next view still lays out.
+    FAIL.store(3, std::sync::atomic::Ordering::SeqCst);
+    step(&mut rs, 2);
+    assert!(matches!(rs.published().0, Some(Published::BuiltIn)));
+    assert_eq!(
+        scripts.permits_free(),
+        2 - scripts.result_entries(),
+        "every permit not held by an entry is back, the panicked job's too"
+    );
+    step(&mut rs, 5);
+    assert!(published_script(&rs).is_some());
+}

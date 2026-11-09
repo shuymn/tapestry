@@ -702,6 +702,7 @@ impl ResultSkin {
     /// Q3).
     pub fn set_retained(&mut self, ids: &[AtlasId]) {
         self.retained = ids.to_vec();
+        self.forget_unpresented();
         if self.others().len() < 2 {
             self.retry_deferred();
         }
@@ -1070,15 +1071,16 @@ impl ResultSkin {
             return;
         };
         // Reuse was checked first (`layout_for`); then the eviction, which
-        // spares the published and cached layouts' runtimes (a view may
-        // still present them), and the permit, without which the request
-        // waits for one.
+        // spares the published layout's runtime (the renderer may still
+        // present it) besides the presented and the fixed ones, and the
+        // permit, without which the request waits for one. The cached
+        // layout holds no later view here (else it was reused), so it is
+        // not spared: kept, it could hold a permit no view releases.
         let published = match &self.published {
             Some(Published::Skin(_, _, g)) => *g,
             _ => None,
         };
-        let cached = self.layout.as_ref().and_then(|l| l.script);
-        let Some(permit) = self.scripts.result_permit(&[published, cached]) else {
+        let Some(permit) = self.scripts.result_permit(&[published]) else {
             self.permit_wait = Some((request, view));
             return;
         };
@@ -1188,6 +1190,19 @@ impl ResultSkin {
         ))
     }
 
+    /// Drops the specialization kept as the presented one once another
+    /// generation presents: its atlas counts no more.
+    fn forget_unpresented(&mut self) {
+        let presented = self.scripts.presented();
+        if self
+            .presented
+            .as_ref()
+            .is_some_and(|p| p.script != presented)
+        {
+            self.presented = None;
+        }
+    }
+
     /// Caches `spec` as the layout; the one it replaces is kept as the
     /// presented one while its generation is the presented generation.
     fn cache(&mut self, spec: Specialized) {
@@ -1197,12 +1212,8 @@ impl ResultSkin {
             && old.script == presented
         {
             self.presented = Some(old);
-        } else if self
-            .presented
-            .as_ref()
-            .is_some_and(|p| p.script != presented)
-        {
-            self.presented = None;
+        } else {
+            self.forget_unpresented();
         }
     }
 
@@ -1239,6 +1250,7 @@ impl ResultSkin {
     /// still the latest, and starts the waiting request. Returns whether
     /// the latest request is published.
     pub fn poll(&mut self) -> bool {
+        self.forget_unpresented();
         if let Some((job, _, _)) = &mut self.job
             && let Some(ran) = job.poll()
             && let Some((_, request, slot)) = self.job.take()
