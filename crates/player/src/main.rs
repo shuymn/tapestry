@@ -1319,7 +1319,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(not(feature = "dev-tools"))]
     let rescan = shelf::RESCAN_AFTER;
-    let coord = game::coord::Coordinator::new(game::coord::Caps::this_machine());
+    let (caps, note) = priority::run_caps(&settings.device, &priority::System);
+    if let Some(note) = note {
+        eprintln!("{note}");
+        log::warn!("{note}");
+    }
+    let coord = game::coord::Coordinator::new(caps);
     #[cfg_attr(
         not(feature = "dev-tools"),
         expect(unused_mut, reason = "`--dev-stop-timeout` sets its bound")

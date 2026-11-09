@@ -420,6 +420,25 @@ mod tests {
         (screen.asked, screen.reversing)
     }
 
+    /// A key config written by `tapestry keys` keeps `speculation` as
+    /// `device.toml` had it: absent, `true` or `false`.
+    #[test]
+    fn keys_keep_speculation_as_read() {
+        let keep = Ok(game::KEEP_KEY);
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        for speculation in [None, Some(true), Some(false)] {
+            let mut device = DeviceSettings {
+                speculation,
+                ..DeviceSettings::default()
+            };
+            configured(keep, keep, &mut device);
+            game::save_settings(&root.device_settings(), &device).unwrap();
+            let read = game::Settings::load(&root).unwrap().device;
+            assert_eq!(read.speculation, speculation);
+        }
+    }
+
     /// The axis turned toward lower values at the prompt writes the menu
     /// direction reversed, toward higher values not reversed, and F12
     /// keeps what `device.toml` had.

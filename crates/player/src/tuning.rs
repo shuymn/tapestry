@@ -421,6 +421,34 @@ mod tests {
         assert_eq!(files.player_error(), None);
     }
 
+    /// A write of changed values keeps `speculation` as `device.toml` was
+    /// loaded with it: absent, `true` or `false`.
+    #[test]
+    fn a_tuning_write_keeps_speculation_as_read() {
+        for speculation in [None, Some(true), Some(false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = game::DataRoot::new(dir.path().to_owned());
+            let loaded = game::Settings {
+                device: game::DeviceSettings {
+                    speculation,
+                    ..game::DeviceSettings::default()
+                },
+                player: game::PlayerSettings::default(),
+            };
+            let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+            let quieter = Tuning::of(&loaded).adjust(Adjust::VolumeDown);
+            assert_eq!(files.write(quieter, 3), ["device.toml"]);
+            let text = std::fs::read_to_string(root.device_settings()).unwrap();
+            assert_eq!(
+                text.lines().any(|l| l.starts_with("speculation")),
+                speculation.is_some(),
+                "{text}"
+            );
+            let s = game::Settings::load(&root).unwrap();
+            assert_eq!(s.device.speculation, speculation);
+        }
+    }
+
     /// The select screen's preset written to `player.toml` keeps the
     /// `[skins]` tables the file was loaded with, unchanged.
     #[test]

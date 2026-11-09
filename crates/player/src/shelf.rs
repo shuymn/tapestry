@@ -1239,7 +1239,11 @@ pub(crate) mod tests {
     /// measured at its next choice, in the foreground.
     #[test]
     fn without_a_speculative_permit_a_cancelled_chart_is_measured_at_its_next_choice() {
-        for caps in [Caps::for_machine(1, 2), Caps::for_machine(0, 16)] {
+        for caps in [
+            Caps::for_machine(1, 2),
+            Caps::for_machine(0, 16),
+            Caps::from_setting(Some(false), 16, Some(64 << 30)),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (c, b, _, path) = song(dir.path());
             let (library, _) = open_library(dir.path());
