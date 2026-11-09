@@ -100,7 +100,7 @@ fn chart() -> ResultChart {
 }
 
 /// A ready view whose next-rank difference (154) is `nr`.
-fn view(nr: u32) -> ViewFacts {
+pub(crate) fn view(nr: u32) -> ViewFacts {
     view_at(12, nr)
 }
 

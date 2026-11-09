@@ -805,6 +805,25 @@ pub struct Job<T> {
 pub fn spawn_job<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
 ) -> Result<Job<T>, String> {
+    spawn_job_with(job, || {})
+}
+
+/// [`spawn_job`] with `on_sent` called once on the job's thread right after
+/// its send, before the thread ends, so the job's owner can be woken to
+/// take the outcome ([`Job::received`] holds from then on while the
+/// outcome is unclaimed, and [`Job::poll`] gives it once the thread has
+/// ended). The call follows the send attempt whatever it did: past an
+/// abandonment the send fails and the outcome is dropped before the call.
+/// A panic payload whose drop panics ends the thread without a send and
+/// without the call.
+///
+/// # Errors
+///
+/// Why the thread could not start.
+pub fn spawn_job_with<T: Send + 'static>(
+    job: impl FnOnce(&Cancel) -> T + Send + 'static,
+    on_sent: impl FnOnce() + Send + 'static,
+) -> Result<Job<T>, String> {
     let cancel = Cancel::new();
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
     let theirs = cancel.clone();
@@ -823,6 +842,7 @@ pub fn spawn_job<T: Send + 'static>(
         // Past an abandonment nobody receives: the outcome is dropped
         // here, on this thread.
         let _ = tx.send(sent);
+        on_sent();
         #[cfg(test)]
         tests::exit_gate();
     };
@@ -845,6 +865,17 @@ impl<T> Job<T> {
     /// The outcome once it is in and the thread has ended and been
     /// joined; `None` meanwhile. It does not block.
     pub fn poll(&mut self) -> Option<Ran<T>> {
+        if !self.received() || self.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            return None;
+        }
+        self.join();
+        self.outcome.take()
+    }
+
+    /// Whether the outcome is in: sent, or the thread ended without one.
+    /// [`poll`](Self::poll) takes it once the thread has ended. It does
+    /// not block.
+    pub fn received(&mut self) -> bool {
         if self.outcome.is_none() {
             match self.rx.try_recv() {
                 Ok(Ok(done)) => self.outcome = Some(Ran::Done(done)),
@@ -852,14 +883,10 @@ impl<T> Job<T> {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.outcome = Some(Ran::Refused(ENDED.to_owned()));
                 }
-                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Empty) => return false,
             }
         }
-        if self.handle.as_ref().is_some_and(|h| !h.is_finished()) {
-            return None;
-        }
-        self.join();
-        self.outcome.take()
+        true
     }
 
     fn join(&mut self) {
