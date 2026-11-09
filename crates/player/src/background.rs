@@ -453,7 +453,17 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
         // Whether the measurement was told to stop: a stop it was told is
         // a pause's or the end's, whatever the state is when it returns.
         let told = AtomicBool::new(false);
+        // A mode call that has not returned: set before each and cleared
+        // after it, so one that unwound stays set, even when the unwinding
+        // is caught inside the measurement (a decoder's own catch). From
+        // then on the thread's mode is unknown: every later check says
+        // stop, no other mode call is made, and the job is failed whatever
+        // the measurement returns.
+        let in_call = AtomicBool::new(false);
         let stop = || {
+            if in_call.load(Ordering::Relaxed) {
+                return true;
+            }
             let s = shared.lock();
             let stop = s.shutdown || !s.may_run(&path);
             if stop {
@@ -462,15 +472,13 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
             stop
         };
         // Whether the thread is out of background mode (promoted), cleared
-        // only once an entry succeeded; whether an entry was refused; and
-        // whether a mode call unwound, leaving the thread's mode unknown.
-        let (left, refused, unwound) = (
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-        );
+        // only once an entry succeeded, and whether an entry was refused.
+        let (left, refused) = (AtomicBool::new(false), AtomicBool::new(false));
         let on_class = |class: Class| {
-            unwound.store(true, Ordering::Relaxed);
+            if in_call.load(Ordering::Relaxed) {
+                return;
+            }
+            in_call.store(true, Ordering::Relaxed);
             match class {
                 Class::Foreground => match mode.leave_background() {
                     Ok(()) => left.store(true, Ordering::Relaxed),
@@ -488,24 +496,28 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
                 }
                 _ => {}
             }
-            unwound.store(false, Ordering::Relaxed);
+            in_call.store(false, Ordering::Relaxed);
         };
-        let outcome = match task.run(&stop, &on_class, |ctx| measure(&job, &|| ctx.checkpoint())) {
-            coord::Outcome::Done(outcome) => outcome,
-            // The wait for its permit stopped: as a stop it was told.
-            coord::Outcome::Cancelled if told.load(Ordering::Relaxed) => Outcome::Stopped,
-            coord::Outcome::Cancelled => Outcome::Failed("no speculative permit".to_owned()),
-            coord::Outcome::Panicked(p) => Outcome::Failed(format!(
-                "the background measurement stopped unexpectedly: {p}"
-            )),
-        };
-        // A mode call that unwound is not the measurement's failure: the
-        // thread's mode is unknown, so it runs no further job.
-        let unknown = unwound.load(Ordering::Relaxed);
+        let mut outcome =
+            match task.run(&stop, &on_class, |ctx| measure(&job, &|| ctx.checkpoint())) {
+                coord::Outcome::Done(outcome) => outcome,
+                // The wait for its permit stopped: as a stop it was told.
+                coord::Outcome::Cancelled if told.load(Ordering::Relaxed) => Outcome::Stopped,
+                coord::Outcome::Cancelled => Outcome::Failed("no speculative permit".to_owned()),
+                coord::Outcome::Panicked(p) => Outcome::Failed(format!(
+                    "the background measurement stopped unexpectedly: {p}"
+                )),
+            };
+        // A mode call that unwound during the job is not the measurement's
+        // failure, but the measurement cannot be trusted: it is failed,
+        // and the thread, its mode unknown, runs no further job.
+        let unknown = in_call.load(Ordering::Relaxed);
         if unknown {
             warn(
                 "loudness: a background mode call failed unexpectedly; the background measurement is off for this run",
             );
+            outcome =
+                Outcome::Failed("a background mode call failed during the measurement".to_owned());
         }
         // Back in background mode before the next job, or no more jobs. An
         // entry that unwinds here counts as refused, after the job's result
@@ -775,6 +787,8 @@ pub(crate) mod tests {
         pub(crate) refuse_leave: AtomicBool,
         /// The next entry panics (once).
         pub(crate) panics: AtomicBool,
+        /// The next leave panics (once).
+        pub(crate) leave_panics: AtomicBool,
         calls: Mutex<Option<Sender<ModeCall>>>,
     }
 
@@ -810,6 +824,10 @@ pub(crate) mod tests {
         }
 
         fn leave_background(&self) -> Result<(), PriorityError> {
+            assert!(
+                !self.leave_panics.swap(false, Ordering::SeqCst),
+                "the leave failed (test)"
+            );
             self.leaves.fetch_add(1, Ordering::SeqCst);
             let refused = self.refuse_leave.load(Ordering::SeqCst);
             self.said(ModeCall::Leave(!refused));
@@ -1449,6 +1467,236 @@ pub(crate) mod tests {
         );
         assert!(worker.wait_ended(*WATCHDOG));
         assert_eq!(worker.queue(job("b")), Queued::Ended);
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// A leave that unwinds at a promotion leaves the thread's mode
+    /// unknown: the job is published failed, and the worker ends.
+    #[test]
+    fn an_unwinding_leave_at_the_promotion_ends_the_worker() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let (worker, stepper) = stepped(&coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.queue(job("a"));
+        assert_eq!(stepper.said(), Said::Block(0));
+        mode.leave_panics.store(true, Ordering::SeqCst);
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(
+            results(&worker, 1),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: None,
+            }]
+        );
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert_eq!(worker.queue(job("b")), Queued::Ended);
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// Through the production measurement: an entry that unwinds at a
+    /// demotion, at a check inside a sound's decoding, is caught by the
+    /// decoder's own boundary, which would take the sound for undecodable
+    /// and measure the rest. The fault is the job's: every later check
+    /// stops it, the job is published failed, and the worker ends.
+    #[test]
+    fn an_unwinding_entry_caught_inside_decoding_fails_the_job() {
+        use crate::loudness::fixture::{RATE, square, wav};
+        let (dir, loaded) = crate::imports::facts::tests::loaded_kept(
+            "#WAV01 a.wav\n#WAV02 b.wav\n#00101:02\n",
+            "beatoraja-style",
+        );
+        std::fs::write(dir.path().join("a.wav"), wav(&square(1.0, 3_000))).unwrap();
+        std::fs::write(dir.path().join("b.wav"), wav(&square(1.0, 6_000))).unwrap();
+        let job = Job {
+            source: loaded.source(),
+            rate: RATE,
+            name: "a.bms".to_owned(),
+        };
+        let path = job.path().to_owned();
+        // The measurement's third check is the first packet's, inside the
+        // first sound's decoding (the first is before the read, the second
+        // before the first file): held there until the test has demoted.
+        let (at_tx, at) = mpsc::channel::<()>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&checks);
+        let measure: Measure = Box::new(move |job, stop| {
+            let checks = &counted;
+            let gated = || {
+                if checks.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                    let _ = at_tx.send(());
+                    let _ = go_rx.lock().unwrap().recv();
+                }
+                stop()
+            };
+            super::measure(job, &gated)
+        });
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let worker = Worker::start(measure, coord.clone(), Arc::clone(&mode) as _).unwrap();
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.promote(&path);
+        worker.queue(job.clone());
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        at.recv_timeout(*WATCHDOG)
+            .expect("the check inside decoding");
+        mode.panics.store(true, Ordering::SeqCst);
+        worker.demote(&path);
+        go.send(()).unwrap();
+        assert_eq!(
+            results(&worker, 1),
+            vec![Finished {
+                path: path.clone(),
+                measured: None,
+            }]
+        );
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert_eq!(worker.queue(job), Queued::Ended);
+        // The next check (before the second sound) stops the measurement:
+        // nothing more is decoded or analyzed.
+        assert_eq!(checks.load(Ordering::SeqCst), 4);
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// A measurement that catches the unwinding of a mode call itself and
+    /// returns a result is still failed: the fault stays the job's through
+    /// later class changes (no mode call is made after it, so none can
+    /// clear it), its checks say stop, and the worker ends.
+    #[test]
+    fn a_fault_caught_by_the_measurement_itself_still_fails_the_job() {
+        // Four checks, each held until the test lets it go, each catching
+        // what unwinds from it; then a result, whatever the checks said.
+        let (at_tx, at) = mpsc::channel::<bool>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let measure: Measure = Box::new(move |job, stop| {
+            for _ in 0..4 {
+                let _ = go_rx.lock().unwrap().recv();
+                let said = game::coord::catch(stop).unwrap_or(true);
+                let _ = at_tx.send(said);
+            }
+            Outcome::Measured(key(job.path()), ROW)
+        });
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let worker = Worker::start(measure, coord.clone(), Arc::clone(&mode) as _).unwrap();
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        let path = Path::new("a");
+        worker.promote(path);
+        worker.queue(job("a"));
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        let check = |what: &str| {
+            go.send(()).unwrap();
+            at.recv_timeout(*WATCHDOG).expect(what)
+        };
+        assert!(!check("the first check"));
+        // The demotion's entry unwinds, caught by the measurement.
+        mode.panics.store(true, Ordering::SeqCst);
+        worker.demote(path);
+        assert!(check("the check that unwinds"));
+        // A promotion and a demotion after it: the permit moves, and the
+        // demotion makes no mode call.
+        worker.promote(path);
+        assert!(check("the check after the promotion"));
+        worker.demote(path);
+        assert!(check("the check after the demotion"));
+        assert_eq!(
+            results(&worker, 1),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: None,
+            }]
+        );
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert_eq!(worker.queue(job("b")), Queued::Ended);
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// A measurement whose last check is the one that unwinds, caught by
+    /// the measurement, returns a result with no check after it: the job is
+    /// still failed.
+    #[test]
+    fn a_fault_at_the_last_check_still_fails_the_job() {
+        let (at_tx, at) = mpsc::channel::<()>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let measure: Measure = Box::new(move |job, stop| {
+            let _ = at_tx.send(());
+            let _ = go_rx.lock().unwrap().recv();
+            let _ = game::coord::catch(stop);
+            Outcome::Measured(key(job.path()), ROW)
+        });
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        let calls = mode.calls();
+        let worker = Worker::start(measure, coord.clone(), Arc::clone(&mode) as _).unwrap();
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.promote(Path::new("a"));
+        worker.queue(job("a"));
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        at.recv_timeout(*WATCHDOG).expect("the measurement's start");
+        mode.panics.store(true, Ordering::SeqCst);
+        worker.demote(Path::new("a"));
+        go.send(()).unwrap();
+        assert_eq!(
+            results(&worker, 1),
+            vec![Finished {
+                path: PathBuf::from("a"),
+                measured: None,
+            }]
+        );
+        assert!(worker.wait_ended(*WATCHDOG));
+        assert!(calls.none());
+        assert_eq!(held(&coord), (0, 0));
+    }
+
+    /// After a refused entry at a demotion the measurement goes on, still
+    /// out of background mode: a later wait promotes it again (its leave
+    /// refused, the thread being out already) and that wait's end demotes
+    /// it, entering background mode again. The result is kept and the
+    /// worker ends after it.
+    #[test]
+    fn a_demotion_after_a_refused_entry_enters_again() {
+        let coord = Coordinator::new(CAPS);
+        let mode = Arc::new(Mode::default());
+        mode.refuse_entry_from.store(2, Ordering::SeqCst);
+        let calls = mode.calls();
+        let (worker, stepper) = stepped(&coord, &mode);
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        worker.queue(job("a"));
+        assert_eq!(stepper.said(), Said::Block(0));
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Leave(true));
+        assert_eq!(stepper.said(), Said::Block(1));
+        worker.demote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Enter(false));
+        assert_eq!(stepper.said(), Said::Block(2));
+        mode.refuse_entry_from.store(0, Ordering::SeqCst);
+        mode.refuse_leave.store(true, Ordering::SeqCst);
+        worker.promote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Leave(false));
+        assert_eq!(stepper.said(), Said::Block(3));
+        worker.demote(Path::new("a"));
+        stepper.step();
+        assert_eq!(calls.next(), ModeCall::Enter(true));
+        assert_eq!(stepper.said(), Said::Block(4));
+        assert_eq!(held(&coord), (1, 0));
+        stepper.finish();
+        assert_eq!(results(&worker, 1), vec![measured("a")]);
+        assert!(worker.wait_ended(*WATCHDOG));
         assert!(calls.none());
         assert_eq!(held(&coord), (0, 0));
     }
