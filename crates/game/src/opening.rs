@@ -494,7 +494,7 @@ fn commit<R: LoadingRig>(
         rig.reopen_acceptance().map_err(LiveError::Input)?;
         opener.closed = false;
         let snapshot = loop {
-            if !wait_loading(rig, opener)? {
+            if !wait_loading(rig, opener, true)? {
                 return Ok(false);
             }
             let snapshot = rig.close_acceptance(generation).map_err(LiveError::Input)?;
@@ -536,7 +536,7 @@ fn before_commit<R: LoadingRig>(
     // The starting settings: a copy under the lock, decided quiet at its
     // own time (the wait's look may be stale by now), applied outside it.
     let at_o1 = loop {
-        if !wait_loading(rig, opener)? {
+        if !wait_loading(rig, opener, false)? {
             return Ok(Before::Left);
         }
         let at_o1 = rig.tuning_snapshot().map_err(LiveError::Input)?;
@@ -653,16 +653,20 @@ fn moved(now: &PrepKey, was: &PrepKey) -> bool {
 
 /// The loading state's wait (design.md "Play Lifecycle", the loading state
 /// before a play): `false` when the player left (a quit, a close, or the
-/// preparation cancelled).
+/// preparation cancelled). `committed` is the wait after the commit, for a
+/// committed specialization's longer minimum: a screen lost there is not
+/// built again, since the replacement would hold no prepared attempt.
 ///
 /// # Errors
 ///
 /// A thread's failure, a refusal latched by the preparation, the screen's
-/// failure at a poll or a rebuild, and the input thread's at a snapshot.
+/// failure at a poll or a rebuild (after the commit, any loss of it), and
+/// the input thread's at a snapshot.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn wait_loading<R: LoadingRig>(
     rig: &mut R,
     opener: &mut LoadingOpener,
+    committed: bool,
 ) -> Result<bool, LiveError<R::ScreenError>> {
     loop {
         if opener.latch == PrepState::Pending {
@@ -685,8 +689,13 @@ fn wait_loading<R: LoadingRig>(
             return Ok(false);
         }
         // A screen built again keeps the loading lifetime: its first
-        // frame, if not presented yet, still starts the minimum.
+        // frame, if not presented yet, still starts the minimum. After the
+        // commit, a lost screen ends the run (design.md "Rendering and
+        // Skins": nothing would draw the play).
         if rig.screen_failed() {
+            if committed {
+                return Err(LiveError::ScreenLost);
+            }
             rig.prepare_screen().map_err(LiveError::Screen)?;
         }
         if opener.ack.is_none()
