@@ -18,7 +18,7 @@ pub enum Outcome {
     Sampled,
     /// Its region is hidden.
     RegionHidden,
-    /// A HIDDEN+ paint while HIDDEN+ is off.
+    /// A HIDDEN+ paint, or a follower of HIDDEN+, while HIDDEN+ is off.
     HiddenOff,
     /// Its image choice selected nothing.
     NoChoice,

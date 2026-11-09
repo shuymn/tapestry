@@ -177,9 +177,9 @@ fn an_observation_says_where_a_cover_paint_stopped() {
         Some(source()),
         vec![
             lanes_element(),
-            paint(0, [160, 280, 544, 600], Follow::None),
-            paint(1, [160, 55, 544, 100], Follow::None),
-            paint(2, [160, 55, 544, 100], Follow::None),
+            paint(0, [160, 280, 544, 600], Follow::NONE),
+            paint(1, [160, 55, 544, 100], Follow::NONE),
+            paint(2, [160, 55, 544, 100], Follow::NONE),
         ],
         WidgetDefs {
             cover_paints: defs,

@@ -460,12 +460,7 @@ fn judges_refuse_what_the_model_cannot_share() {
         critical(judge_two()).1,
         NoteKind::UnsupportedField { field: "judge" }
     );
-    // HIDDEN+'s offset on a grade or its combo.
-    let hidden = judge_rec(&[grade(0, r#", "offset": 5"#)], &[combo("ten", 10)], "");
-    assert_eq!(
-        critical(skin(VALUES, &hidden, &[DST])),
-        (CriticalPart::Judge, NoteKind::RuntimeOffset(5))
-    );
+    // HIDDEN+'s offset on a combo (a grade follows it).
     let hidden = combo("ten", 10).replace(r#""id": "ten""#, r#""id": "ten", "offsets": [3, 5]"#);
     let hidden = judge_rec(&grades(1), &[hidden], "");
     assert_eq!(
@@ -871,6 +866,47 @@ fn a_lifted_grade_carries_its_combo_once() {
         .map(|&[x, y, w, h]| [x, y - 180, w, h])
         .collect();
     assert_eq!(at(300), lifted);
+}
+
+#[test]
+fn a_grade_following_hidden_plus_hides_alone() {
+    use common::lanes::{NOTES, body, note};
+    use common::play::readouts_for;
+    // Over the default lanes (600 px), HIDDEN+ at 300 ‰ raises the grade
+    // listing offset 5 by 180, its combo with it; while HIDDEN+ is off
+    // the grade is transparent and its combo still draws where it
+    // attaches, as the source only clears the grade's alpha
+    // (`skin/SkinObject.java:474-481`, `play/SkinJudge.java:121-137`).
+    let judge = judge_rec(&[grade(0, r#", "offset": 5"#)], &[combo("ten", 10)], "");
+    let objects = format!(r#"{}, {VALUES}, "judge": [{judge}]"#, note(""));
+    let l = common::import_body(&body("", &objects, &[NOTES, DST]));
+    assert!(!common::kinds(l.report()).contains(&NoteKind::RuntimeOffset(5)));
+    let at = |hidden: u16, on: bool| {
+        let chart = bms_model::ChartBuilder::new(150_000)
+            .tap(Lane::new(1).unwrap(), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let mut d = Drawn::over(l.ok().skin.clone(), &chart);
+        d.tally = tally(0, 12);
+        d.view.hidden = if on { hidden } else { 0 };
+        let mut readouts = readouts_for(d.view);
+        readouts.covers.hidden_enabled = on;
+        d.readouts = Some(readouts);
+        d.frame(
+            1_000,
+            &[event(1_000, judged(1_000, Judgment::Perfect, 12).kind)],
+        );
+        d.rects(1_001)
+    };
+    let still = at(0, true);
+    assert_eq!(still.len(), 3);
+    let raised: Vec<_> = still
+        .iter()
+        .map(|&[x, y, w, h]| [x, y - 180, w, h])
+        .collect();
+    assert_eq!(at(300, true), raised);
+    // The combo's two cells, unmoved; no grade.
+    assert_eq!(at(300, false), still[..2]);
 }
 
 #[test]

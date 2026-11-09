@@ -27,8 +27,8 @@ pub(crate) type Groups = (Vec<BarGroupDef>, Vec<Span>);
 impl Cx<'_> {
     /// The groups of the lanes element at `at` from its `group` field, as
     /// resolved: the count charged before anything is read, each record's
-    /// keys charged before they are read, each group moving with LIFT and
-    /// SUDDEN+ by offsets 3 and 4 and noted as D9
+    /// keys charged before they are read, each group moving with LIFT,
+    /// SUDDEN+ and HIDDEN+ by offsets 3, 4 and 5 and noted as D9
     /// [`LaneApprox::BarLine`]. A group's own clip is ignored: the source
     /// draws the image itself, outside any clip (`skin/SkinImage.java:
     /// 169-174`).

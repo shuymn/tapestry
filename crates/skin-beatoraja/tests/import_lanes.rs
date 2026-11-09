@@ -743,6 +743,26 @@ fn a_group_following_the_lift_moves_with_it() {
 }
 
 #[test]
+fn a_group_following_hidden_plus_moves_with_it_and_hides_while_it_is_off() {
+    let follower = dst("bar", r#""offset": 5"#, ACROSS);
+    let still = dst("bar", "", ACROSS);
+    let l = grouped(&format!("{follower}, {still}"));
+    assert!(!drops(l.report(), NoteKind::RuntimeOffset(5)));
+    let at = |hidden: u16, on: bool| {
+        let mut d = drawn(&l, &barred(&[1_000]));
+        d.view.hidden = if on { hidden } else { 0 };
+        let mut readouts = common::play::readouts_for(d.view);
+        readouts.covers.hidden_enabled = on;
+        d.readouts = Some(readouts);
+        d.rects(1_000)
+    };
+    // HIDDEN+ raises the follower by its 150 px; the other stays.
+    assert_eq!(at(250, true), [[20, 728, 430, 2], [20, 878, 430, 2]]);
+    // Off, the follower is not drawn.
+    assert_eq!(at(250, false), [[20, 878, 430, 2]]);
+}
+
+#[test]
 fn groups_that_cannot_draw_drop_alone() {
     let gone = r#"{"id": "gone", "src": "zz", "x": 0, "y": 0, "w": 8, "h": 2},
                   {"id": "undef", "x": 0, "y": 0, "w": 8, "h": 2}"#;
