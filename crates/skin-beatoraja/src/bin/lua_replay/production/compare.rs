@@ -471,24 +471,30 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             }
         }
     }
-    // A compiled callable on an object the reference did not run.
+    // An object the reference did not run: a compiled callable on one of
+    // a kind it does not model, or whose id or installation it cannot
+    // resolve, cannot be compared, so it is a finding; a lowered one waits
+    // for e-3 and is counted. An object the source removes at
+    // installation invokes nothing, which the unmatched production
+    // invocations above already find.
     for (label, list) in [
         ("unmodelled", &obs.unmodelled),
-        ("removed", &obs.removed),
         ("unresolved", &obs.unresolved),
     ] {
         for l in list {
             for key in &l.callables {
-                if rec(key).is_some_and(|o| matches!(o.disposition, "compiled" | "lowered")) {
-                    find(
+                match rec(key).map(|o| o.disposition) {
+                    Some("compiled") => find(
                         *key,
                         0,
-                        format!(
-                            "{} on a {label} object ({})",
-                            rec(key).map_or("", |o| o.disposition),
-                            l.what
-                        ),
-                    );
+                        format!("compiled on a {label} object ({})", l.what),
+                    ),
+                    Some("lowered") => {
+                        *rep.buckets
+                            .entry(format!("lowered on a {label} object"))
+                            .or_default() += 1;
+                    }
+                    _ => {}
                 }
             }
         }
