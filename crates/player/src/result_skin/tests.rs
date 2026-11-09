@@ -1744,15 +1744,16 @@ fn a_lagging_renderer_presents_the_latest_view_with_runtimes() {
     assert!(published_script(&rs).is_some());
 }
 
-/// §4/C10 (code r2 HIGH): protection is decided where it is used. A
-/// presented and B landed but never committed when a retry ends the
-/// lifetime; the next attempt's image stage is reused (no job, no
-/// eviction there); a different result C then gets a permit: neither the
-/// old publication nor the ended lifetime's presentation protects a
-/// runtime, and C presents.
-#[test]
-fn a_retry_leaves_no_runtime_protected_by_the_ended_lifetime() {
-    let _s = serial();
+/// The retry of Codex's code r2 HIGH: A presented in lifetime 1 and B
+/// landed but never committed when the retry ends the lifetime; the next
+/// attempt's image stage is reused (no job, no eviction there), both
+/// runtimes parked, holding both permits; lifetime 2 begins.
+fn retried() -> (
+    tempfile::TempDir,
+    ResultSkin,
+    crate::screens::Scripts,
+    [crate::screens::ScriptGen; 2],
+) {
     let d = scripted_skin();
     let p = pending(d.path(), LIMITS);
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
@@ -1772,7 +1773,6 @@ fn a_retry_leaves_no_runtime_protected_by_the_ended_lifetime() {
     rs.request(view(6));
     settled(&mut rs);
     let b = shown_script(&rs);
-    // The retry: the lifetime ends, every view goes, both park.
     drop(slot);
     scripts.leave_result();
     rs.next_attempt();
@@ -1781,13 +1781,48 @@ fn a_retry_leaves_no_runtime_protected_by_the_ended_lifetime() {
     assert_eq!(jobs_started(), jobs, "the image stage reused");
     assert_eq!(scripts.permits_free(), 0, "A and B hold both");
     scripts.enter_result(2);
+    (d, rs, scripts, [a, b])
+}
+
+/// §4/C10 (code r2 HIGH), protection decided where it is used: the old
+/// attempt's publication protects nothing. Lifetime 2 presents A again
+/// first; a different result C then takes B's permit and presents.
+#[test]
+fn an_earlier_attempts_publication_protects_nothing() {
+    let _s = serial();
+    let (_d, mut rs, scripts, [a, b]) = retried();
+    assert_eq!(
+        scripts.commit_view(Some(a), 2, || true),
+        crate::screens::ViewCommit::Committed
+    );
     rs.request(view(7));
     settled(&mut rs);
     let c = shown_script(&rs);
     assert!(c != a && c != b);
+    assert!(!scripts.result_live(Some(b)) && scripts.result_live(Some(a)));
+}
+
+/// §4/C10 (code r2 HIGH): an ended lifetime's presentation protects
+/// nothing. A different result D lands in lifetime 2 and stays
+/// uncommitted (published, so protected); E then takes A's permit, A
+/// presented only in lifetime 1, and presents.
+#[test]
+fn an_ended_lifetimes_presentation_protects_nothing() {
+    let _s = serial();
+    let (_d, mut rs, scripts, [a, b]) = retried();
+    let notes = crate::screens::ScriptNotes::default();
+    rs.request(view(7));
+    settled(&mut rs);
+    let d = shown_script(&rs);
+    assert!(!scripts.result_live(Some(b)), "the old publication evicted");
+    rs.request(view(8));
+    settled(&mut rs);
+    let e = shown_script(&rs);
+    assert!(e != a && e != d);
+    assert!(!scripts.result_live(Some(a)));
     assert_eq!(
-        scripts.commit_view(Some(c), 2, || true),
+        scripts.commit_view(Some(e), 2, || true),
         crate::screens::ViewCommit::Committed
     );
-    assert!(scripts.result_slot(Some(c)).runs_result(&notes));
+    assert!(scripts.result_slot(Some(e)).runs_result(&notes));
 }
