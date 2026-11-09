@@ -581,6 +581,10 @@ impl MenuScreen {
             layout: &skin_model::Layout::AUTHOR,
             timers: u.events.timers(),
         };
+        // The frame's preparation ends here (dev-tools: the S7-07d
+        // gate's whole frames).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::mark_build();
         self.renderer
             .build_selection(&mut logic.sel, &frame, sprites.get(..n).unwrap_or_default())
     }

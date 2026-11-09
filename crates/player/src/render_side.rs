@@ -2460,6 +2460,8 @@ pub fn spawn(
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
             #[cfg(feature = "dev-tools")]
             crate::dev::read_result_faults();
+            #[cfg(feature = "dev-tools")]
+            crate::dev::read_script_switches();
             let screen = match build(
                 &mut make,
                 &mut Committed::default(),
@@ -2523,6 +2525,12 @@ pub fn spawn(
                 result_disabled: None,
                 #[cfg(feature = "dev-tools")]
                 probe_view: None,
+                #[cfg(feature = "dev-tools")]
+                select_frames: crate::dev::ScreenFrames::default(),
+                #[cfg(feature = "dev-tools")]
+                result_frames: crate::dev::ScreenFrames::default(),
+                #[cfg(feature = "dev-tools")]
+                frames_view: None,
             };
             r.run(&rx);
         })
@@ -3116,6 +3124,16 @@ struct Run {
     /// with its skin, for G5's end (the S10-09i design's §8.1).
     #[cfg(feature = "dev-tools")]
     probe_view: Option<crate::result_present::ViewKey>,
+    /// The select screen's whole frames (dev-tools; the S7-07d gate).
+    #[cfg(feature = "dev-tools")]
+    select_frames: crate::dev::ScreenFrames,
+    /// The result screen's whole frames (dev-tools; the S7-07d gate).
+    #[cfg(feature = "dev-tools")]
+    result_frames: crate::dev::ScreenFrames,
+    /// The view the last result frame presented, for the whole frames'
+    /// switches (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    frames_view: Option<crate::result_present::ViewKey>,
 }
 
 impl Run {
@@ -3216,6 +3234,8 @@ impl Run {
             #[cfg(feature = "dev-tools")]
             if msg.is_ok() && !matches!(msg, Ok(RenderMsg::Menu(_) | RenderMsg::PracticePage(_))) {
                 self.menu_stats.report("select");
+                self.select_frames
+                    .report("select", self.clock.frequency().hz());
             }
             #[cfg(feature = "dev-tools")]
             if msg.is_ok()
@@ -3542,7 +3562,11 @@ impl Run {
             // it comes and before the frame's wait (the S10-09i design's
             // D1, "Prepared").
             if matches!(mode, Mode::Result) {
+                #[cfg(feature = "dev-tools")]
+                let prepared = Instant::now();
                 self.prepare_result();
+                #[cfg(feature = "dev-tools")]
+                self.result_frames.before_wait(prepared.elapsed());
                 if self.screen.is_none() {
                     mode = Mode::Idle;
                     continue;
@@ -3655,6 +3679,12 @@ impl Run {
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
             let mut skin_built = false;
+            // A select or result frame's start, and whether it drew the
+            // skin (dev-tools: the whole frames, the S7-07d gate).
+            #[cfg(feature = "dev-tools")]
+            let mut frame_began: Option<Instant> = None;
+            #[cfg(feature = "dev-tools")]
+            let mut skin_frame = false;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -3879,6 +3909,12 @@ impl Run {
                     drawn
                 }
                 Mode::Selection => {
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_began = Some(Instant::now());
+                        let _ = crate::dev::take_build_mark();
+                        let _ = crate::screens::take_visit();
+                    }
                     let Some(shown) = self.selection.as_mut() else {
                         mode = Mode::Idle;
                         continue;
@@ -3928,6 +3964,7 @@ impl Run {
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
                         self.menu_stats.frame(d.timing.cpu, after - before, changed);
+                        skin_frame = shown.logic.is_some() && d.refused.is_none();
                         // What a refusal put on the screen, once drawn.
                         if changed
                             && let Some(notice) = shown.update.page.lines.iter().find(|l| {
@@ -3941,6 +3978,12 @@ impl Run {
                     drawn.map(|d| (d.timing, None))
                 }
                 Mode::Result => {
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_began = Some(Instant::now());
+                        let _ = crate::dev::take_build_mark();
+                        let _ = crate::screens::take_visit();
+                    }
                     let now = self.clock.now();
                     if let Some(side) = &mut self.result {
                         side.drain();
@@ -4051,6 +4094,10 @@ impl Run {
             if skin_built && drawn.as_ref().is_ok_and(|(t, _)| t.presented) {
                 self.probe_result_frame();
             }
+            #[cfg(feature = "dev-tools")]
+            if matches!(mode, Mode::Result) {
+                skin_frame = skin_built;
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -4086,6 +4133,39 @@ impl Run {
                         effects: if play.is_some() { &effects } else { &[] },
                         at: self.clock.now(),
                     };
+                    // A select or result skin frame's spans and present
+                    // (dev-tools: the whole frames, the S7-07d gate).
+                    #[cfg(feature = "dev-tools")]
+                    if let Some(began) = frame_began.filter(|_| skin_frame)
+                        && let Some(built) = crate::dev::take_build_mark()
+                    {
+                        let result = matches!(mode, Mode::Result);
+                        let switch = result
+                            && crate::dev::view_switched(
+                                &mut self.frames_view,
+                                self.result
+                                    .as_ref()
+                                    .and_then(|s| s.presented.as_ref())
+                                    .map(|h| h.payload.key),
+                            );
+                        let frames = if result {
+                            &mut self.result_frames
+                        } else {
+                            &mut self.select_frames
+                        };
+                        let visit = crate::screens::take_visit();
+                        let marks = crate::dev::FrameMarks {
+                            before_wait: frames.take_before_wait(),
+                            began,
+                            built,
+                        };
+                        let spans = crate::dev::Spans::of(
+                            marks,
+                            visit.span.saturating_add(visit.collect_span),
+                            timing.cpu,
+                        );
+                        frames.frame(spans, visit, switch, &d);
+                    }
                     // The app region's second interval: a play frame's
                     // measurement. The frame sink (the frame dump) stays
                     // outside it.
@@ -4880,6 +4960,12 @@ impl Run {
     /// The result's lifetime ended: its staging is discarded and nothing
     /// of it is kept.
     fn drop_result(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        {
+            self.result_frames
+                .report("result", self.clock.frequency().hz());
+            self.frames_view = None;
+        }
         if let Some(side) = self.result.take()
             && side.prepared.as_ref().is_some_and(|p| p.token.is_some())
             && let Some(screen) = &mut self.screen
@@ -5408,6 +5494,10 @@ impl Run {
                     fadeout,
                 },
             };
+            // The frame's preparation ends here (dev-tools: the S7-07d
+            // gate's whole frames).
+            #[cfg(feature = "dev-tools")]
+            crate::dev::mark_build();
             return match screen.build_result(state, &frame) {
                 Ok(()) => ResultDrawn::Built,
                 Err(e) => ResultDrawn::Refused(e),

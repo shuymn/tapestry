@@ -17,9 +17,14 @@
 //! other `player` file names `mlua` or `skin_beatoraja::lua` (design.md
 //! "beatoraja Lua Skins", Unreachable from play).
 
+#[cfg(feature = "dev-tools")]
+mod probe;
 mod result_visit;
 mod script;
 mod selection_visit;
+
+#[cfg(feature = "dev-tools")]
+pub(crate) use probe::{VisitSample, collections, runtime_frames, take_visit};
 
 pub(crate) use result_visit::result_visit;
 #[cfg(all(test, feature = "dev-tools"))]

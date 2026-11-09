@@ -543,3 +543,43 @@ fn selection_runtime_frame_alloc() {
         "the runtime ran each frame"
     );
 }
+
+/// The whole frames' build mark (dev-tools, the S7-07d gate) is set
+/// before the selection skin's build: the build and the submission,
+/// which the frame's `cpu` counts, lie after it, so the preparation span
+/// never holds the build.
+#[test]
+fn the_build_mark_precedes_the_selection_build() {
+    let _serial = crate::imports::tests::serial();
+    let mut r = warp();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (b, script) =
+        crate::selection_skin::fixture_scripted(r.atlas_limits(), dir.path(), "rt.luaskin");
+    let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
+    r.commit(token).unwrap();
+    let key = std::sync::Arc::as_ptr(&b).addr();
+    let scripts = crate::screens::Scripts::new();
+    scripts.commit(ScreenKind::Selection, key, script);
+    let mut screen = MenuScreen::new(r, Some(Fonts::runtime().unwrap()));
+    let mut logic =
+        SelectionLogic::new(&b, 1).with_script(scripts.slot(ScreenKind::Selection, key));
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let u = update(&mut feed, &searching("", ""), 0);
+    screen
+        .prepare_selection(&u, &mut logic, true)
+        .unwrap()
+        .unwrap();
+    for k in 0..5 {
+        let now = TimeUs(k * 16_667);
+        let _ = crate::dev::take_build_mark();
+        screen.build_selection_frame(&u, &mut logic, now).unwrap();
+        let t = screen.renderer.submit_selection(&[]).unwrap();
+        let end = std::time::Instant::now();
+        let mark = crate::dev::take_build_mark().expect("the build marked");
+        assert!(
+            end.duration_since(mark) >= t.cpu,
+            "frame {k}: the build began before its mark"
+        );
+    }
+}

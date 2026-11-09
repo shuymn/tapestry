@@ -247,7 +247,7 @@ const PERIOD_SPAN: u32 = 60;
 
 /// One refresh in ns from two syncs `(QPC ticks, refresh count)` at
 /// `freq` ticks a second, once they lie [`PERIOD_SPAN`] refreshes apart.
-fn measured_period_ns(first: (i64, u32), last: (i64, u32), freq: i64) -> Option<i64> {
+pub(crate) fn measured_period_ns(first: (i64, u32), last: (i64, u32), freq: i64) -> Option<i64> {
     let refreshes = last.1.wrapping_sub(first.1);
     if !(PERIOD_SPAN..=u32::MAX / 2).contains(&refreshes) || freq <= 0 {
         return None;

@@ -519,6 +519,12 @@ pub fn measure_args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     const MEASURE_USAGE: &str = "usage: tapestry measure play [--perfect] <chart.bms>";
     match p.next()? {
         Some(lexopt::Arg::Value(v)) if v == "play" => {}
+        Some(lexopt::Arg::Value(v)) if v == "select" => {
+            return match p.next()? {
+                None => Ok(Command::MeasureSelect),
+                Some(other) => Err(other.unexpected().into()),
+            };
+        }
         Some(other) => return Err(other.unexpected().into()),
         None => return Err(UsageError::Usage(MEASURE_USAGE.to_owned())),
     }
@@ -1409,6 +1415,354 @@ impl MenuStats {
     }
 }
 
+/// The frames a [`ScreenFrames`] keeps per lifetime: 4.5 minutes at 240 Hz.
+pub const SCREEN_FRAMES: usize = 65_536;
+
+/// Where a select or result frame's work began and where its build was
+/// called (dev-tools; the S7-07d gate's whole-frame measurements).
+#[derive(Clone, Copy, Debug)]
+pub struct FrameMarks {
+    /// The screen's preparation before the frame wait since the last
+    /// recorded frame (the result's prepared views; zero on selection).
+    pub before_wait: Duration,
+    /// The frame's start, after the wait.
+    pub began: Instant,
+    /// The build's call ([`mark_build`]).
+    pub built: Instant,
+}
+
+/// One skin frame's work in spans that do not overlap, ns: their sum is
+/// the whole, and the frame wait and the swap chain's acquire count in
+/// none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Spans {
+    /// The screen's work before the build, the runtime's excluded: the
+    /// result's preparation before the wait, then the frame's from its
+    /// start to the build's call.
+    pub preparation: u64,
+    /// The runtime's frame, a forced collection included.
+    pub runtime: u64,
+    /// The build and the submission, acquire and present waits excluded
+    /// ([`render::FrameTiming::cpu`]).
+    pub build_submit: u64,
+    /// Their sum.
+    pub whole: u64,
+}
+
+impl Spans {
+    /// The spans of a frame marked `m` whose runtime took `runtime`
+    /// between its start and its build's call, and whose build and
+    /// submission took `build_submit`.
+    #[must_use]
+    pub fn of(m: FrameMarks, runtime: Duration, build_submit: Duration) -> Self {
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let window = m.built.saturating_duration_since(m.began);
+        let runtime = runtime.min(window);
+        let preparation = m.before_wait.saturating_add(window.saturating_sub(runtime));
+        let (preparation, runtime, build_submit) = (ns(preparation), ns(runtime), ns(build_submit));
+        Self {
+            preparation,
+            runtime,
+            build_submit,
+            whole: preparation
+                .saturating_add(runtime)
+                .saturating_add(build_submit),
+        }
+    }
+}
+
+/// One select or result skin frame (dev-tools).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScreenFrame {
+    /// Its spans.
+    pub spans: Spans,
+    /// The runtime's frame ([`crate::screens::VisitSample`]); `ran` false
+    /// without one.
+    pub visit: crate::screens::VisitSample,
+    /// Whether it presented another view than the frame before (result).
+    pub switch: bool,
+}
+
+/// A select or result screen's lifetime as `tapestry measure select`
+/// counts it against the capture (dev-tools).
+#[derive(Clone, Debug)]
+pub struct ScreenCapture {
+    /// "select" or "result".
+    pub screen: &'static str,
+    /// The span, µs on the game's clock: the first present to the last.
+    pub span: (i64, i64),
+    /// Every present the lifetime's frames issued, µs, in order.
+    pub present_times: Vec<i64>,
+    /// How the swap chain presented, when it said.
+    pub presentation: Option<render::measure::Presentation>,
+    /// One refresh, ns, measured from the lifetime's frame statistics.
+    pub period_ns: Option<i64>,
+    /// Frames past the storage, whose presents are not listed: the span
+    /// is then N/A.
+    pub past: u64,
+}
+
+/// The lifetimes `tapestry measure select` counts, while it runs.
+static MEASURED_SCREENS: Mutex<Option<Vec<ScreenCapture>>> = Mutex::new(None);
+
+/// Starts keeping each select and result lifetime for the count.
+pub fn measure_screens() {
+    *MEASURED_SCREENS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+}
+
+/// The lifetimes kept since [`measure_screens`], and stops keeping them.
+pub fn measured_screens() -> Vec<ScreenCapture> {
+    MEASURED_SCREENS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
+}
+
+/// A select or result screen's skin frames for one lifetime (dev-tools):
+/// storage made once, with the render thread, and cleared for each
+/// lifetime, so a frame's record allocates nothing; frames past its
+/// capacity are counted, not kept. Printed when the lifetime ends.
+#[derive(Debug)]
+pub struct ScreenFrames {
+    frames: Vec<ScreenFrame>,
+    presents: Vec<i64>,
+    past: u64,
+    filter: render::measure::StatsFilter,
+    first_sync: Option<(i64, u32)>,
+    last_sync: Option<(i64, u32)>,
+    presentation: Option<render::measure::Presentation>,
+    before_wait: Duration,
+}
+
+impl Default for ScreenFrames {
+    fn default() -> Self {
+        Self::with_capacity(SCREEN_FRAMES)
+    }
+}
+
+impl ScreenFrames {
+    /// Storage for `n` frames.
+    #[must_use]
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            frames: Vec::with_capacity(n),
+            presents: Vec::with_capacity(n),
+            past: 0,
+            filter: render::measure::StatsFilter::default(),
+            first_sync: None,
+            last_sync: None,
+            presentation: None,
+            before_wait: Duration::ZERO,
+        }
+    }
+
+    /// Preparation done before a frame wait, charged to the next
+    /// recorded frame.
+    pub fn before_wait(&mut self, d: Duration) {
+        self.before_wait = self.before_wait.saturating_add(d);
+    }
+
+    /// The preparation before the wait not yet charged, taken.
+    pub fn take_before_wait(&mut self) -> Duration {
+        std::mem::take(&mut self.before_wait)
+    }
+
+    /// One skin frame: its spans, its runtime's sample, whether it
+    /// switched views, and what its present gave (`d`).
+    pub fn frame(
+        &mut self,
+        spans: Spans,
+        visit: crate::screens::VisitSample,
+        switch: bool,
+        d: &crate::measure::Drawn<'_>,
+    ) {
+        let f = ScreenFrame {
+            spans,
+            visit,
+            switch,
+        };
+        if self.frames.len() < self.frames.capacity() {
+            self.frames.push(f);
+            if d.timing.presented && self.presents.len() < self.presents.capacity() {
+                self.presents.push(d.at.0);
+            }
+        } else {
+            self.past += 1;
+        }
+        if d.presentation.is_some() {
+            self.presentation = d.presentation;
+        }
+        if let Some(s) = self.filter.accept(d.statistics) {
+            let sync = (s.sync_qpc_time, s.sync_refresh_count);
+            self.first_sync.get_or_insert(sync);
+            self.last_sync = Some(sync);
+        }
+    }
+
+    /// The frames kept (tests).
+    #[cfg(test)]
+    pub fn frames(&self) -> &[ScreenFrame] {
+        &self.frames
+    }
+
+    /// Prints the lifetime's frames, if any, as `screen`'s, hands the
+    /// lifetime to `tapestry measure select` when it runs (its period from
+    /// the frame statistics at `freq` QPC ticks a second), and clears
+    /// them, keeping the storage.
+    pub fn report(&mut self, screen: &'static str, freq: i64) {
+        if !self.frames.is_empty() {
+            self.print(screen);
+            if let Some(kept) = MEASURED_SCREENS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                && let (Some(&a), Some(&b)) = (self.presents.first(), self.presents.last())
+            {
+                kept.push(ScreenCapture {
+                    screen,
+                    span: (a, b),
+                    present_times: self.presents.clone(),
+                    presentation: self.presentation,
+                    period_ns: self
+                        .first_sync
+                        .zip(self.last_sync)
+                        .and_then(|(f, l)| crate::measure::measured_period_ns(f, l, freq)),
+                    past: self.past,
+                });
+            }
+        }
+        self.frames.clear();
+        self.presents.clear();
+        self.past = 0;
+        self.filter = render::measure::StatsFilter::default();
+        self.first_sync = None;
+        self.last_sync = None;
+        self.presentation = None;
+        self.before_wait = Duration::ZERO;
+    }
+
+    fn print(&self, screen: &str) {
+        let q = |mut v: Vec<u64>| {
+            v.sort_unstable();
+            let at = |p: usize| {
+                v.get(v.len().saturating_sub(1) * p / 100)
+                    .copied()
+                    .unwrap_or(0)
+                    / 1_000
+            };
+            (at(50), at(99), at(100))
+        };
+        let f = &self.frames;
+        let pick = |g: fn(&ScreenFrame) -> u64| q(f.iter().map(g).collect());
+        let (w, p, r, b) = (
+            pick(|f| f.spans.whole),
+            pick(|f| f.spans.preparation),
+            pick(|f| f.spans.runtime),
+            pick(|f| f.spans.build_submit),
+        );
+        println!(
+            "dev: {screen} frames {} (past capacity {}), us p50/p99/max: whole {}/{}/{}, \
+             preparation {}/{}/{}, runtime {}/{}/{}, build and submission {}/{}/{}",
+            f.len(),
+            self.past,
+            w.0,
+            w.1,
+            w.2,
+            p.0,
+            p.1,
+            p.2,
+            r.0,
+            r.1,
+            r.2,
+            b.0,
+            b.1,
+            b.2,
+        );
+        let ran: Vec<&ScreenFrame> = f.iter().filter(|f| f.visit.ran).collect();
+        let max = |it: &mut dyn Iterator<Item = u64>| it.max().unwrap_or(0);
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let c = q(ran
+            .iter()
+            .filter(|f| f.visit.collected)
+            .map(|f| ns(f.visit.collect_span))
+            .collect());
+        println!(
+            "dev: {screen} runtime frames {}: instructions max {}, host calls max {}; \
+             first use frames {} (whole max {} us, runtime max {} us); switch frames {} \
+             (whole max {} us); forced collections {} (span p50/p99/max {}/{}/{} us)",
+            ran.len(),
+            max(&mut ran.iter().map(|f| f.visit.instructions)),
+            max(&mut ran.iter().map(|f| f.visit.host_calls)),
+            ran.iter().filter(|f| f.visit.bridges > 0).count(),
+            max(&mut ran
+                .iter()
+                .filter(|f| f.visit.bridges > 0)
+                .map(|f| f.spans.whole / 1_000)),
+            max(&mut ran
+                .iter()
+                .filter(|f| f.visit.bridges > 0)
+                .map(|f| f.spans.runtime / 1_000)),
+            f.iter().filter(|f| f.switch).count(),
+            max(&mut f.iter().filter(|f| f.switch).map(|f| f.spans.whole / 1_000)),
+            ran.iter().filter(|f| f.visit.collected).count(),
+            c.0,
+            c.1,
+            c.2,
+        );
+        // Per VM generation: the end-of-frame heap's maximum, the sampled
+        // high-water, and the frames whose end-of-frame heap fell (a
+        // diagnostic: not evidence of a collection).
+        let mut generations: Vec<u64> = ran.iter().map(|f| f.visit.generation).collect();
+        generations.sort_unstable();
+        generations.dedup();
+        for g in generations {
+            let of: Vec<&&ScreenFrame> = ran.iter().filter(|f| f.visit.generation == g).collect();
+            let fell = of
+                .windows(2)
+                .filter(|w| w[1].visit.heap < w[0].visit.heap && !w[1].visit.collected)
+                .count();
+            println!(
+                "dev: {screen} vm {g}: frames {}, heap at frame end max {} bytes, sampled \
+                 high-water {} bytes, frames whose heap fell {fell}",
+                of.len(),
+                max(&mut of
+                    .iter()
+                    .map(|f| u64::try_from(f.visit.heap).unwrap_or(u64::MAX))),
+                max(&mut of.iter().map(|f| f.visit.peak_heap)),
+            );
+        }
+    }
+}
+
+/// Whether a frame presenting `now` switched views from the frame
+/// before, which presented `*last` (none before the lifetime's first);
+/// `*last` becomes `now`.
+pub fn view_switched<K: PartialEq + Copy>(last: &mut Option<K>, now: Option<K>) -> bool {
+    let switched = last.is_some() && now != *last;
+    *last = now;
+    switched
+}
+
+thread_local! {
+    /// When this thread last called a select or result skin's build,
+    /// until taken.
+    static BUILD_MARK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A select or result skin's build is called now: the end of the
+/// frame's preparation ([`Spans`]).
+pub fn mark_build() {
+    BUILD_MARK.with(|m| m.set(Some(Instant::now())));
+}
+
+/// The build call [`mark_build`] noted on this thread, taken.
+pub fn take_build_mark() -> Option<Instant> {
+    BUILD_MARK.with(std::cell::Cell::take)
+}
+
 /// The scripted play's input: the log's events as a script, one device per
 /// source, and each speed key of `speed` pressed on the first keyboard at
 /// its time on the script's timeline and released 50 ms later, as packets
@@ -2089,6 +2443,109 @@ pub fn print_result_work(at: &str) {
     );
 }
 
+/// The environment variable of the screens' runtime switches (the S7-07d
+/// gate's real-app checks and measurements): a comma list of
+/// `budget-select` and `budget-result`, that kind's runtime frames run
+/// with no time budget, so a runtime stops after its budget frames;
+/// `collect`, a full collection after each runtime frame; and `off`, the
+/// visits take no runtime and draw every callback's constant.
+pub const SCRIPTS_ENV: &str = "TAPESTRY_DEV_SCRIPTS";
+
+/// [`SCRIPTS_ENV`] as read when the render thread started.
+static SCRIPT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+const BUDGET_SELECT: u64 = 1;
+const BUDGET_RESULT: u64 = 2;
+const COLLECT: u64 = 4;
+const OFF: u64 = 8;
+
+/// The screens' runtime switches ([`SCRIPTS_ENV`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent switches, read as a set"
+)]
+pub struct ScriptSwitches {
+    /// The selection runtime's frames run with no time budget.
+    pub budget_select: bool,
+    /// The result runtimes' frames run with no time budget.
+    pub budget_result: bool,
+    /// A full collection follows each runtime frame.
+    pub collect: bool,
+    /// The visits run no runtime.
+    pub off: bool,
+}
+
+impl ScriptSwitches {
+    /// The switches a [`SCRIPTS_ENV`] value names; unknown names are
+    /// ignored.
+    #[must_use]
+    pub fn parse(list: &str) -> Self {
+        let has = |name: &str| list.split(',').any(|f| f.trim() == name);
+        Self {
+            budget_select: has("budget-select"),
+            budget_result: has("budget-result"),
+            collect: has("collect"),
+            off: has("off"),
+        }
+    }
+
+    const fn bits(self) -> u64 {
+        (if self.budget_select { BUDGET_SELECT } else { 0 })
+            | (if self.budget_result { BUDGET_RESULT } else { 0 })
+            | (if self.collect { COLLECT } else { 0 })
+            | (if self.off { OFF } else { 0 })
+    }
+
+    const fn of(bits: u64) -> Self {
+        Self {
+            budget_select: bits & BUDGET_SELECT != 0,
+            budget_result: bits & BUDGET_RESULT != 0,
+            collect: bits & COLLECT != 0,
+            off: bits & OFF != 0,
+        }
+    }
+}
+
+/// Reads [`SCRIPTS_ENV`], when it is set, before any frame, so a frame
+/// reads only an atomic. Unset, the switches stay as they are: none, or
+/// what a test set.
+pub fn read_script_switches() {
+    if let Ok(list) = std::env::var(SCRIPTS_ENV) {
+        set_script_switches(ScriptSwitches::parse(&list));
+    }
+}
+
+/// Sets the switches for the process.
+pub fn set_script_switches(s: ScriptSwitches) {
+    SCRIPT_SWITCHES.store(s.bits(), Ordering::SeqCst);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's switches in place of the process's (tests: the
+    /// visits a test runs on its own thread, apart from other tests').
+    static TEST_SWITCHES: std::cell::Cell<Option<ScriptSwitches>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Sets this thread's switches in place of the process's (`None`: the
+/// process's again).
+#[cfg(test)]
+pub fn set_thread_script_switches(s: Option<ScriptSwitches>) {
+    TEST_SWITCHES.with(|t| t.set(s));
+}
+
+/// The switches now.
+#[must_use]
+pub fn script_switches() -> ScriptSwitches {
+    #[cfg(test)]
+    if let Some(s) = TEST_SWITCHES.with(std::cell::Cell::get) {
+        return s;
+    }
+    ScriptSwitches::of(SCRIPT_SWITCHES.load(Ordering::Relaxed))
+}
+
 /// The environment variable of the result's injected refusals (tests of
 /// the real flow): a comma list of `select<N>`, the N-th selection or
 /// upload of the result kind refused, `stage<N>`, the N-th view staging
@@ -2249,6 +2706,126 @@ pub fn refuse_result_staging() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{adler32, crc32, png, read_bounded, read_limited};
+
+    /// A frame's spans count each part once: the preparation before the
+    /// wait and the window up to the build less the runtime, the runtime,
+    /// and the build with the submission; the wait, before the frame's
+    /// start, in none. A runtime longer than its window is clamped to it.
+    #[test]
+    fn a_frames_spans_count_each_part_once() {
+        use super::{FrameMarks, Spans};
+        use std::time::{Duration, Instant};
+        let ms = |n: u64| Duration::from_millis(n);
+        let began = Instant::now();
+        let marks = FrameMarks {
+            before_wait: ms(2),
+            began,
+            built: began + ms(10),
+        };
+        let s = Spans::of(marks, ms(3), ms(5));
+        let ns = |n: u64| n * 1_000_000;
+        assert_eq!(
+            s,
+            Spans {
+                preparation: ns(2 + 7),
+                runtime: ns(3),
+                build_submit: ns(5),
+                whole: ns(17),
+            }
+        );
+        let s = Spans::of(marks, ms(12), ms(5));
+        assert_eq!((s.preparation, s.runtime, s.whole), (ns(2), ns(10), ns(17)));
+        // The parts add up to the whole, whatever they are.
+        for (w, r, b) in [(0, 0, 0), (4, 1, 9), (1, 1, 1)] {
+            let m = FrameMarks {
+                before_wait: ms(w),
+                began,
+                built: began + ms(w + r),
+            };
+            let s = Spans::of(m, ms(r), ms(b));
+            assert_eq!(s.preparation + s.runtime + s.build_submit, s.whole);
+        }
+    }
+
+    /// A switch is a presented view other than the frame before's; the
+    /// lifetime's first view is none.
+    #[test]
+    fn a_switch_is_a_change_of_the_presented_view() {
+        let mut last = None;
+        let seen: Vec<bool> = [Some(1), Some(1), Some(2), Some(2), None, Some(3)]
+            .into_iter()
+            .map(|v| super::view_switched(&mut last, v))
+            .collect();
+        assert_eq!(seen, [false, false, true, false, true, false]);
+    }
+
+    /// A frame drawn with nothing but its timing, as a select or result
+    /// skin frame gives it.
+    #[cfg(feature = "dev-tools")]
+    fn drawn(at: i64) -> crate::measure::Drawn<'static> {
+        crate::measure::Drawn {
+            play: None,
+            view: None,
+            loading_stamp: None,
+            menu: true,
+            loading: false,
+            skin_loading: None,
+            generation: None,
+            timing: render::FrameTiming {
+                cpu: std::time::Duration::from_micros(500),
+                sprites: 0,
+                dropped: 0,
+                presented: true,
+                present_count: Some(1),
+            },
+            statistics: None,
+            presentation: None,
+            effects: &[],
+            at: bms_model::TimeUs(at),
+        }
+    }
+
+    /// Recording a select or result frame allocates nothing: the first
+    /// write, the steady ones, those past the storage, and those after a
+    /// lifetime's report, which keeps the storage. A growing vector made
+    /// inside the count is counted (the control). Unoptimized builds
+    /// count the standard library's own allocations: CI runs it in
+    /// release.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn screen_frames_record_alloc() {
+        use super::{ScreenFrames, Spans};
+        use crate::alloc_count::this_thread;
+        let mut frames = ScreenFrames::with_capacity(4);
+        let sample = crate::screens::VisitSample {
+            ran: true,
+            generation: 7,
+            ..Default::default()
+        };
+        let d = drawn(1_000);
+        let before = this_thread();
+        frames.frame(Spans::default(), sample, false, &d);
+        let first = this_thread() - before;
+        let before = this_thread();
+        for _ in 0..8 {
+            frames.frame(Spans::default(), sample, true, &d);
+        }
+        let steady_and_past = this_thread() - before;
+        assert_eq!(frames.frames().len(), 4);
+        frames.report("select", 10_000_000);
+        let before = this_thread();
+        frames.frame(Spans::default(), sample, false, &d);
+        let after_report = this_thread() - before;
+        let before = this_thread();
+        let mut grown: Vec<u64> = Vec::new();
+        for i in 0..64 {
+            grown.push(std::hint::black_box(i));
+        }
+        let control = this_thread() - before;
+        assert_eq!((first, steady_and_past, after_report), (0, 0, 0));
+        assert!(control > 0, "the counter counts this thread");
+        assert_eq!(frames.frames().len(), 1);
+    }
 
     /// A 1 MB source that counts the bytes taken from it.
     struct Counted<'a>(&'a std::cell::Cell<u64>);

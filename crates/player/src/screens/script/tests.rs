@@ -537,3 +537,187 @@ fn a_taken_runtime_writes_to_the_lifetimes_notes() {
         "{kept:?}"
     );
 }
+
+/// Sets this thread's script switches until dropped (dev-tools: the
+/// visits this test runs on its own thread).
+struct Switches;
+
+impl Switches {
+    fn set(s: crate::dev::ScriptSwitches) -> Self {
+        crate::dev::set_thread_script_switches(Some(s));
+        Self
+    }
+}
+
+impl Drop for Switches {
+    fn drop(&mut self) {
+        crate::dev::set_thread_script_switches(None);
+    }
+}
+
+/// `entry`'s selection runtime committed in a fresh cell, with its
+/// bundle.
+fn selection_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scripts) {
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), entry);
+    assert!(slot.holds(), "{entry}'s callback runs in the runtime");
+    let scripts = Scripts::new();
+    scripts.commit(ScreenKind::Selection, 1, slot);
+    (dir, bundle, scripts)
+}
+
+/// `n` selection visits of `scripts`' runtime from `visit`, the stops
+/// they reported.
+fn visits(
+    visit: &mut ScriptSlot,
+    bundle: &render::SkinBundle,
+    n: i64,
+) -> Vec<Option<super::ScriptStop>> {
+    let skin = bundle.skin();
+    let mut sel = skin.prepare_selection();
+    let timers = skin_model::SelectionTimers::default();
+    (0..n)
+        .map(|f| {
+            super::super::selection_visit(
+                visit,
+                skin,
+                &mut sel,
+                bms_model::TimeUs(f * 16_000),
+                &timers,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// D2's budget switch for a kind stops that kind's runtime after its
+/// budget frames, reported once; the other kind's switch leaves it
+/// running (the S7-07d gate, P4).
+#[test]
+fn a_budget_switch_stops_its_kinds_runtime_alone() {
+    let _serial = crate::imports::tests::serial();
+    let (_dir, bundle, scripts) = selection_of("host.luaskin");
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    {
+        let _s = Switches::set(crate::dev::ScriptSwitches {
+            budget_result: true,
+            ..Default::default()
+        });
+        let stops = visits(&mut visit, &bundle, 6);
+        assert!(stops.iter().all(Option::is_none), "{stops:?}");
+    }
+    let _s = Switches::set(crate::dev::ScriptSwitches {
+        budget_select: true,
+        ..Default::default()
+    });
+    let stops = visits(&mut visit, &bundle, 6);
+    let reported: Vec<_> = stops.iter().flatten().collect();
+    assert_eq!(reported, [&super::ScriptStop::Budget], "{stops:?}");
+}
+
+/// D2's `off` takes no runtime: it stays parked with no call, and the
+/// outputs are their constants (P5's baseline).
+#[test]
+fn the_off_switch_takes_no_runtime() {
+    let _serial = crate::imports::tests::serial();
+    let (_dir, bundle, scripts) = selection_of("rt.luaskin");
+    let _s = Switches::set(crate::dev::ScriptSwitches {
+        off: true,
+        ..Default::default()
+    });
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    let skin = bundle.skin();
+    let mut sel = skin.prepare_selection();
+    let timers = skin_model::SelectionTimers::default();
+    for f in 0..3 {
+        let at = bms_model::TimeUs(f * 16_000);
+        assert_eq!(
+            super::super::selection_visit(&mut visit, skin, &mut sel, at, &timers).unwrap(),
+            None
+        );
+        assert!(sel.outputs_mut().iter().all(|&v| v == 0));
+    }
+    assert_eq!(scripts.parked(ScreenKind::Selection), Some((0, false)));
+    assert!(!super::super::take_visit().ran);
+}
+
+/// D2's `collect` runs exactly one full collection after each runtime
+/// frame, which the frame's sample notes with the runtime's generation,
+/// and none while a play's interval is open, when no visit takes the
+/// runtime.
+#[test]
+fn the_collect_switch_collects_once_after_each_frame() {
+    let _serial = crate::imports::tests::serial();
+    let (_dir, bundle, scripts) = selection_of("rt.luaskin");
+    let _s = Switches::set(crate::dev::ScriptSwitches {
+        collect: true,
+        ..Default::default()
+    });
+    let collections = super::super::collections;
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    let before = collections();
+    for n in 1..=4_u64 {
+        let _ = visits(&mut visit, &bundle, 1);
+        let s = super::super::take_visit();
+        assert!(s.ran && s.collected, "{s:?}");
+        assert_eq!(collections() - before, n);
+    }
+    let generation = visit.generation();
+    assert!(generation.is_some());
+    // A play's interval: the visit parks, and none takes it while open.
+    visit.park();
+    let interval = scripts.open_interval();
+    let at_open = collections();
+    let mut during = scripts.slot(ScreenKind::Selection, 1);
+    let _ = visits(&mut during, &bundle, 3);
+    assert!(!super::super::take_visit().ran);
+    assert_eq!(
+        collections(),
+        at_open,
+        "no collection while the interval is open"
+    );
+    let _closed = interval.close();
+    let _ = visits(&mut during, &bundle, 1);
+    let s = super::super::take_visit();
+    assert!(s.ran && s.collected);
+    assert_eq!(Some(s.generation), generation);
+    assert_eq!(collections(), at_open + 1);
+}
+
+/// The frame probe takes no script cell lock: a runtime frame with its
+/// sample completes while another thread holds the cell's lock.
+#[test]
+fn the_probe_runs_while_another_thread_holds_the_cell() {
+    let _serial = crate::imports::tests::serial();
+    let (_dir, bundle, scripts) = selection_of("rt.luaskin");
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    assert!(visit.running().is_some(), "taken before the lock is held");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let cell = Arc::clone(&scripts.0);
+    let holder = std::thread::spawn(move || {
+        let _guard = cell.host();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let prober = std::thread::spawn(move || {
+        let mut sel = bundle.skin().prepare_selection();
+        if let Some(rt) = visit.running() {
+            let (fields, timers) = sel.runtime_parts();
+            super::super::probe::run(rt, ScreenKind::Selection, 1, |rt| {
+                rt.frame(fields, timers);
+            });
+        }
+        let s = super::super::take_visit();
+        done_tx.send(s.ran).unwrap();
+        visit
+    });
+    let ran = done_rx.recv_timeout(Duration::from_secs(20));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let visit = prober.join().unwrap();
+    assert_eq!(ran, Ok(true), "the probe waited on the cell's lock");
+    drop(visit);
+}

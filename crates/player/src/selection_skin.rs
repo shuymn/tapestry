@@ -626,6 +626,11 @@ pub(crate) fn runtime_fixture() -> tempfile::TempDir {
     for (name, body) in [
         ("rt.luaskin", "calls = calls + 1; return calls > 0"),
         ("stop.luaskin", "while true do end"),
+        // A host read in each call: the time budget is checked at it.
+        (
+            "host.luaskin",
+            "calls = calls + 1; return ms.number(77) >= 0",
+        ),
     ] {
         let tail = format!(
             r#"local calls = 0

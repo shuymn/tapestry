@@ -2576,3 +2576,82 @@ fn the_links_lifetimes_scope_the_presented_protection() {
     assert!(!scripts.protected(g));
     rig.link.exit();
 }
+
+/// The whole frames' build mark (dev-tools, the S7-07d gate) is set
+/// before the result skin's build: the build and the submission, which
+/// the frame's `cpu` counts, lie after it, so the preparation span never
+/// holds the build.
+#[test]
+fn the_build_mark_precedes_the_result_build() {
+    use super::super::{HeldView, PreparedView, ResultDrawn, ResultSide, Run, Shared};
+    let (_dir, skin, script) = text_skin_scripted(
+        1,
+        "{ id = \"dot\", draw = function() calls = calls + 1 return calls > 0 end, \
+         dst = { { x = 0, y = 700, w = 8, h = 8 } } },",
+    );
+    let r = render::Renderer::new(
+        render::Target::Offscreen {
+            width: 1_920,
+            height: 1_080,
+        },
+        render::AdapterChoice::Warp,
+    )
+    .unwrap();
+    let mut screen = MenuScreen::new(r, Some(render::text::Fonts::runtime().unwrap()));
+    let token = |request, screen: &MenuScreen| render::PreparedToken {
+        request,
+        device: screen.device(),
+        kind: ScreenKind::Result,
+    };
+    assert_eq!(
+        screen.install(ScreenKind::Result, &skin, 1).unwrap(),
+        Preparation::Ready
+    );
+    screen.commit(token(1, &screen)).unwrap();
+    let shared = Shared::new();
+    let scripts = crate::screens::Scripts::new();
+    let g = scripts.offer_result(script, true);
+    let mut side = ResultSide::new(1);
+    let p = titled(0, Some(&skin), 1_000, &[], "A");
+    let p = Arc::new(ViewPayload {
+        script: g,
+        ..(*p).clone()
+    });
+    assert_eq!(
+        screen.install(ScreenKind::Result, &skin, 2).unwrap(),
+        Preparation::Ready
+    );
+    let mut state = skin.skin().prepare_result();
+    screen
+        .prepare_result(&skin, &mut state, &p.view, &p.labels)
+        .unwrap()
+        .unwrap();
+    side.prepared = Some(PreparedView {
+        held: HeldView {
+            revision: 1,
+            payload: Arc::clone(&p),
+            overlay: Overlay::default(),
+            state: Some(state),
+            page: None,
+            script: scripts.result_slot(g),
+        },
+        token: Some(token(2, &screen)),
+    });
+    for k in 0..5_i64 {
+        let now = TimeUs(1_000_000 + 16_000 * k);
+        let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+        Run::result_visit(Some(&mut side), now, fadeout);
+        let _ = crate::dev::take_build_mark();
+        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        assert_eq!(drawn, ResultDrawn::Built);
+        let t = screen.submit_result().unwrap();
+        let end = Instant::now();
+        let mark = crate::dev::take_build_mark().expect("the build marked");
+        assert!(
+            end.duration_since(mark) >= t.cpu,
+            "frame {k}: the build began before its mark"
+        );
+        side.dropped = [None, None];
+        let _ = screen.drain_retired();
+    }
+}
