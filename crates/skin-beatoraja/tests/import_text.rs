@@ -256,6 +256,9 @@ fn text_ignores_the_angle_and_blend_it_does_not_consume() {
         let mut d = l.drawn();
         d.attach_lines(1.0, 1.0);
         assert_eq!(d.frame(0, &[]).len(), 1, "{blend}");
+        // D5: alpha-blended, never multiplied.
+        let blends: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
+        assert_eq!(blends, [skin_model::Blend::Alpha], "{blend}");
     }
     // Equal-time keys that differ only in angle are one key for text.
     let l = text(
