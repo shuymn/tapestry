@@ -277,6 +277,42 @@ fn a_choice_entrys_track_on_a_program_timer_ignores_the_cap() {
     assert!(with_entry(key_track(&[0, max - 1_000], End::Hide)).is_ok());
 }
 
+/// A cover paint's gate track is sampled on the element's timer, so on a
+/// program timer it is held to the same rule: a loop, or a hidden end at
+/// 4 h, is refused; a held one is accepted.
+#[test]
+fn a_cover_gate_on_a_program_timer_ignores_the_cap() {
+    use skin_model::{CoverImage, CoverMotion, CoverPaintDef, CoverTrim};
+    let max = MAX_KEY_US;
+    let with_gate = |gate: Track| {
+        let mut b = Builder::default();
+        let k = b.push(Cb::ret(Val::Int(0), Conv::Timer));
+        let mut e = on_output(k, held());
+        e.source = Source::CoverPaint(0);
+        let widgets = WidgetDefs {
+            cover_paints: vec![CoverPaintDef {
+                image: CoverImage::Image(0),
+                slider: None,
+                motion: CoverMotion::None,
+                trim: CoverTrim::Fixed(960),
+                gate_track: Some(gate),
+            }],
+            ..WidgetDefs::default()
+        };
+        load(Some(b.0), Vec::new(), vec![e], widgets)
+    };
+    for end in [End::Loop { from: TimeUs(0) }, End::Hide] {
+        let r = with_gate(key_track(&[0, max], end));
+        assert!(
+            matches!(r, Err(LoadError::ProgramTimerTrack { element: 0 })),
+            "{end:?}: {:?}",
+            r.map(|_| ())
+        );
+    }
+    let r = with_gate(key_track(&[0, max], End::Hold));
+    assert!(r.is_ok(), "{:?}", r.map(|_| ()));
+}
+
 /// A timer gated by a program draw runs only while the draw is true.
 #[test]
 fn a_timer_after_a_false_draw_does_not_run() {

@@ -1595,6 +1595,27 @@ fn a_slot_is_taken_only_when_proven() {
             ) + &dst("latch", ""),
             construct("a slot write guarded by state that changes outside play"),
         ),
+        // A guard reading the EX score, which the source reads as
+        // `Integer.MIN_VALUE` before the first judgment (so this latch is
+        // set while loading there): off the guard allowlist.
+        (
+            latch(
+                STATE,
+                &format!(
+                    "if state == {off} and ms.number(71) < 0 then state = ms.time() end
+                     return state"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by a read off its allowlist"),
+        ),
+        // The latch also a custom timer, which the source runs before
+        // every object: a consumer the program does not run.
+        (
+            latch(STATE, LATCH_BODY)
+                + "skin.customTimers = { { id = 3001, timer = latch } }
+" + &dst("latch", ""),
+            construct("a slot writer referenced beside its destinations' timers"),
+        ),
         // A writer with a definite Lua error on a reached path: outside
         // the admission walk's subset, it opens the candidate (and the
         // residual refuses it as a Lua error), so no slot writer the
@@ -1630,4 +1651,27 @@ fn a_slot_is_taken_only_when_proven() {
             i.callbacks
         );
     }
+}
+
+/// The loading proof reads a slot at its initial value: an integer start
+/// fails the latch's own off test before play, so a guard of that test
+/// alone is no write while loading, and the timer shows the start.
+#[test]
+fn an_integer_initialized_slot_is_judged_at_its_initial_value() {
+    use skin_model::present::Val;
+    let off = "ms.timer_off_value";
+    let d = timer_skin(
+        "local state = 5000",
+        &format!(
+            "if state == {off} then state = ms.time() end
+return state"
+        ),
+        1,
+    );
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    p.state_us = 9_000;
+    assert_eq!(p.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(5_000)]);
 }
