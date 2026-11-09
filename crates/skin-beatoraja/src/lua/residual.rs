@@ -249,6 +249,10 @@ pub(crate) enum Conv {
     /// A destination's `timer`: left as it is, a number, nil, a boolean or
     /// the off value, for the program's `tolong()`.
     Timer,
+    /// A slider's `value`: numbers kept, nil and booleans 0, a string known
+    /// here folded to the double the source's `tofloat()` rounds
+    /// ([`super::num_scan::todouble`]), for the program's `tofloat()`.
+    Float,
 }
 
 /// Why evaluation stopped.
@@ -453,6 +457,7 @@ pub(crate) fn evaluate(
     let root = match conv {
         Conv::Truthy => ev.truthy(v)?,
         Conv::Int | Conv::Index => ev.integer(v)?,
+        Conv::Float => ev.float(v)?,
         Conv::Text => v,
         Conv::Timer => {
             if ev.kind(v) & !(NIL | BOOL | NUM | OFF) != 0 {
@@ -1053,6 +1058,9 @@ impl<'a> Eval<'a> {
             Captured::Int(n) if n.unsigned_abs() <= EXACT => Val::Int(n),
             Captured::Int(i64::MIN) if self.off_provenance(decl) => Val::OffValue,
             Captured::Int(_) => return refuse(Unsupported::Range),
+            // The source builds a numeric -0.0 as integer zero
+            // (`LuaValue.valueOf(double)`): its sign is not kept.
+            Captured::Float(bits) if f64::from_bits(bits) == 0.0 => Val::Float(0.0_f64.to_bits()),
             Captured::Float(bits) => Val::Float(bits),
             Captured::Str(id) => Val::Str(S::Name(id)),
             Captured::Host(api) => Val::Host(api),
@@ -1274,6 +1282,57 @@ impl<'a> Eval<'a> {
         if let Some((c, a, b)) = self.mixed(v) {
             let a = self.integer(a)?;
             let b = self.integer(b)?;
+            return self.select(c, a, b);
+        }
+        if k == OFF {
+            return refuse(Unsupported::Range);
+        }
+        refuse(Unsupported::Type)
+    }
+
+    /// Node `v` as a slider's value: numbers kept, nil and booleans 0, a
+    /// known string as the double `tofloat()` rounds (a −0 kept, as the
+    /// source's string gives one); the off value out of range, anything
+    /// else (a table, a function) refused, as for a number's value.
+    fn float(&mut self, v: u32) -> R<u32> {
+        self.visit()?;
+        let k = self.kind(v);
+        if k & !NUM == 0 {
+            return Ok(v);
+        }
+        if k & !(NIL | BOOL) == 0 {
+            return self.known(Val::Int(0));
+        }
+        if let Some(Val::Str(s)) = self.val(v) {
+            let d = match s {
+                S::Empty => super::num_scan::todouble(b""),
+                S::Lit { file, id } => {
+                    let b = self.bytes(file, id);
+                    charge(self.an, "str", units(b.len()))?;
+                    did("str");
+                    super::num_scan::todouble(b)
+                }
+                S::Name(n) => {
+                    charge(self.an, "str", units(self.an.names.len()))?;
+                    did("str");
+                    let b = self
+                        .an
+                        .names
+                        .iter()
+                        .find(|&(_, &m)| m == n)
+                        .map(|(b, _)| &**b);
+                    let Some(b) = b else {
+                        return refuse(Unsupported::Type);
+                    };
+                    charge(self.an, "str", units(b.len()))?;
+                    super::num_scan::todouble(b)
+                }
+            };
+            return self.known(Val::Float(d.to_bits()));
+        }
+        if let Some((c, a, b)) = self.mixed(v) {
+            let a = self.float(a)?;
+            let b = self.float(b)?;
             return self.select(c, a, b);
         }
         if k == OFF {

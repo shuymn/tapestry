@@ -217,7 +217,8 @@ pub use track::{
 };
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
 pub use widget::cover_paint::{
-    CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, Slider, SliderRate,
+    CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, MAX_SLIDE, Slider,
+    SliderRate,
 };
 pub use widget::digits::{
     Align, DigitOffset, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, MAX_DIGIT_OFFSETS, NumberDef,

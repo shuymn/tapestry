@@ -523,6 +523,7 @@ pub(crate) fn compile<L: Leaves>(
         Conv::Truthy => present::Conv::Truthy,
         Conv::Int => present::Conv::Int,
         Conv::Timer => present::Conv::Timer,
+        Conv::Float => present::Conv::Float,
         Conv::Text | Conv::Index => return Err(Stop::Unsupported(Unsupported::Type)),
     };
     for _ in 0..res.len() {

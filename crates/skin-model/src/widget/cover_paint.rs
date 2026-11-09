@@ -125,7 +125,24 @@ pub enum SliderRate {
     /// The attempt's progress, `time.progress_ppm / 10⁶`
     /// (`skin/property/FloatPropertyFactory.java:128-136`).
     Progress,
+    /// Program callback `k`'s float output, `lua.<k>`: the skin's own
+    /// `value`, the source's `tofloat()` of it
+    /// (`skin/lua/SkinLuaAccessor.java:665-673`), unclamped; a non-finite
+    /// value moves it by 0 (the source draws it at an infinity or NaN).
+    /// Only a slider reads such an output, one slider each (V9); while its
+    /// `ok` is not 1 (an unavailable read, or a frame the program did not
+    /// run, such as a loading one) the element is not drawn.
+    Program(u16),
 }
+
+/// The largest slider displacement, in reference pixels, a value slider is
+/// drawn at: past it the element is not drawn that frame (docs/stage3.md
+/// D24), where the source draws it, off the window unless the paint's own
+/// geometry is of that order (a stretch-8 native size under a ±10⁶
+/// destination scale). Within it the placement's scales (unit for imported
+/// elements, at least ½ for an adaptive region, about ¼ for the
+/// lane-width map) keep every edge finite in `f32`.
+pub const MAX_SLIDE: f64 = 1_099_511_627_776.0;
 
 /// Why a cover paint definition was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -146,6 +163,15 @@ pub enum CoverPaintError {
     GateSize,
     #[error("its trim line is beyond ±{}", crate::MAX_COORD)]
     TrimRange,
+}
+
+/// Why a slider's paint is not drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlideStop {
+    /// Its program value gave none.
+    NoValue,
+    /// Its displacement is past [`MAX_SLIDE`].
+    Beyond,
 }
 
 /// What a loaded paint shows.
@@ -185,29 +211,58 @@ impl CoverPaint {
     /// 1 000 ‰ (`skin/property/FloatPropertyFactory.java:139-151`); the
     /// progress's `p / 10⁶` of `progress`, `time.progress_ppm` clamped to
     /// 0..=10⁶. Each numerator is exact in `u64` and `f64` (below 2^41);
-    /// only the division rounds.
-    pub(crate) fn slider_offset(&self, view: LaneView, progress: i32) -> [f64; 2] {
+    /// only the division rounds. A program rate reads its output from
+    /// `fields` (`base` the slot of output 0): not drawn without a value
+    /// (its `ok` not 1), else its `f32` bits, a non-finite value as 0,
+    /// `R · value` exact in `f64`, and not drawn past [`MAX_SLIDE`].
+    pub(crate) fn slider_offset(
+        &self,
+        view: LaneView,
+        progress: i32,
+        fields: &[i32],
+        base: usize,
+    ) -> Result<[f64; 2], SlideStop> {
         let Some(s) = self.slider else {
-            return [0.0, 0.0];
+            return Ok([0.0, 0.0]);
         };
-        let rate = match s.rate {
-            SliderRate::Sudden => {
-                let c = u64::from(view.cover.min(1_000));
-                let l = u64::from(view.lift.min(1_000));
-                c * (1_000 - l)
+        let d = match s.rate {
+            SliderRate::Sudden | SliderRate::Progress => {
+                let rate = if s.rate == SliderRate::Sudden {
+                    let c = u64::from(view.cover.min(1_000));
+                    let l = u64::from(view.lift.min(1_000));
+                    c * (1_000 - l)
+                } else {
+                    u64::from(progress.clamp(0, PROGRESS_FULL).unsigned_abs())
+                };
+                let n = u64::from(s.range) * rate;
+                #[expect(clippy::cast_precision_loss, reason = "below 2^41, exact in f64")]
+                let n = n as f64;
+                n / 1_000_000.0
             }
-            SliderRate::Progress => u64::from(progress.clamp(0, PROGRESS_FULL).unsigned_abs()),
+            SliderRate::Program(k) => {
+                let at = base.saturating_add(usize::from(k).saturating_mul(2));
+                if fields.get(at.saturating_add(1)) != Some(&1) {
+                    return Err(SlideStop::NoValue);
+                }
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "the slot holds the f32's bits (`present::exec`)"
+                )]
+                let v = f32::from_bits(fields.get(at).copied().unwrap_or(0) as u32);
+                let v = if v.is_finite() { f64::from(v) } else { 0.0 };
+                let d = v * f64::from(s.range);
+                if d.abs() > MAX_SLIDE {
+                    return Err(SlideStop::Beyond);
+                }
+                d
+            }
         };
-        let n = u64::from(s.range) * rate;
-        #[expect(clippy::cast_precision_loss, reason = "below 2^41, exact in f64")]
-        let n = n as f64;
-        let d = n / 1_000_000.0;
-        match s.direction {
+        Ok(match s.direction {
             SliderDirection::Up => [0.0, -d],
             SliderDirection::Right => [d, 0.0],
             SliderDirection::Down => [0.0, d],
             SliderDirection::Left => [-d, 0.0],
-        }
+        })
     }
 
     /// The motion's displacement this frame, y down: 0, `−L` or `−L − K`

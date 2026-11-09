@@ -960,8 +960,8 @@ impl ScreenRuntime {
                         let out = match site.ty {
                             OutTy::Bool => i32::from(to_bool(&v)),
                             OutTy::Int => to_int(&v),
-                            // Only a play program gives a timer.
-                            OutTy::Timer => 0,
+                            // Only a play program gives a timer or a float.
+                            OutTy::Timer | OutTy::Float => 0,
                         };
                         write(fields, base, k, out);
                         CallStatus::Ok

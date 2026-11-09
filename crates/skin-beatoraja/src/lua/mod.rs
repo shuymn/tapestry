@@ -62,6 +62,8 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+#[doc(hidden)]
+pub mod num_scan;
 pub(crate) mod residual;
 #[cfg(test)]
 mod residual_tests;
