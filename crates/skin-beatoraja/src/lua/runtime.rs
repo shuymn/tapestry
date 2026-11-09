@@ -28,15 +28,17 @@
 //! - **Failures.** A callback that raises an ordinary error gives the
 //!   source's value (0, false), as the source's accessor does, and is
 //!   called again the next frame.
-//! - **Notes.** At most [`crate::limits::MAX_NOTES`] notes are kept;
-//!   further occurrences are counted.
+//! - **Notes.** At most [`crate::limits::MAX_NOTES`] notes are kept,
+//!   each once, a callback's keyed by its source site (chunk and line);
+//!   further occurrences are counted. They go to the runtime's
+//!   [`NoteBook`], its own unless a screen shares one between the
+//!   runtimes of one screen lifetime ([`ScreenRuntime::use_notes`]).
 //! - **Permits.** A screen that bounds its kept VMs gives each runtime a
 //!   [`Permit`] from its [`Pool`]; the runtime returns it when dropped,
 //!   after its VM is destroyed, on whichever thread drops it.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use mlua::{Function, Lua, Value};
@@ -84,6 +86,8 @@ impl std::fmt::Debug for Kept {
 #[derive(Debug)]
 pub(crate) struct Site {
     pub(crate) callable: u32,
+    /// Its constructor's node in its file's tree ([`SiteAt::func`]).
+    pub(crate) func: u32,
     pub(crate) ty: OutTy,
     /// The conditions before it in its element's `dstdraw`, which the
     /// source evaluates first, stopping at the first false.
@@ -120,8 +124,8 @@ pub enum Stopped {
 /// read, or the stop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeNote {
-    /// Callback `site` raised an ordinary error.
-    CallbackError { site: usize },
+    /// The callback defined `at` raised an ordinary error.
+    CallbackError { at: SiteAt },
     /// A host read of an id the profile omits: `api` (`number` or
     /// `option`) and the id, answered with `value`.
     Absent {
@@ -133,6 +137,46 @@ pub enum RuntimeNote {
     ImportOnly,
     /// The runtime stopped.
     Stopped(Stopped),
+}
+
+/// Where a callback is defined: its chunk, the line its definition starts
+/// at, and its constructor's node in the chunk's tree, which tells apart
+/// two callbacks on one line; the same in every import of one skin.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SiteAt {
+    pub chunk: Arc<str>,
+    pub line: usize,
+    pub func: u32,
+}
+
+/// Notes shared by the runtimes of one screen lifetime: one cap and one
+/// set of notes already kept, whichever runtime adds them. Clones share
+/// the book.
+#[derive(Clone, Debug, Default)]
+pub struct NoteBook(Arc<Mutex<Notes>>);
+
+impl NoteBook {
+    /// An empty book.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The notes kept, and how many more were dropped past the cap.
+    #[must_use]
+    pub fn notes(&self) -> (Vec<RuntimeNote>, u64) {
+        let n = self.lock();
+        (n.list.clone(), n.dropped)
+    }
+
+    pub(crate) fn add(&self, note: RuntimeNote) {
+        self.lock().add(note);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Notes> {
+        // Each update completes before anything can panic.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The runtime's notes: at most [`crate::limits::MAX_NOTES`], each once;
@@ -162,7 +206,7 @@ impl std::hash::Hash for RuntimeNote {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::CallbackError { site } => site.hash(state),
+            Self::CallbackError { at } => at.hash(state),
             Self::Absent { api, id, .. } => (api, id).hash(state),
             Self::ImportOnly => {}
             Self::Stopped(s) => (*s as u8).hash(state),
@@ -504,8 +548,6 @@ pub struct Pool {
 #[derive(Debug)]
 struct PoolInner {
     state: Mutex<PoolState>,
-    /// The returns so far: a waiting request retries when it changes.
-    released: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -527,7 +569,6 @@ impl Pool {
                     next: 0,
                     out: Vec::with_capacity(n),
                 }),
-                released: AtomicU64::new(0),
             }),
         }
     }
@@ -555,11 +596,12 @@ impl Pool {
         self.inner.lock().free
     }
 
-    /// How many permits have been returned: a request waiting for one
-    /// retries when this changes.
+    /// How many permits have been returned: those handed out less those
+    /// still out, each valid return removing one.
     #[must_use]
     pub fn releases(&self) -> u64 {
-        self.inner.released.load(Ordering::Acquire)
+        let st = self.inner.lock();
+        st.next.wrapping_sub(st.out.len() as u64)
     }
 }
 
@@ -579,9 +621,6 @@ impl PoolInner {
         };
         st.out.swap_remove(at);
         st.free += 1;
-        // Under the same lock as the take and the removal: a waiter that
-        // sees the release also sees the permit free.
-        self.released.fetch_add(1, Ordering::AcqRel);
         true
     }
 }
@@ -606,6 +645,8 @@ impl Drop for Permit {
 /// its permit, so a permit returns only once the VM is destroyed.
 pub struct ScreenRuntime {
     sites: Vec<(Site, Function)>,
+    /// Each site's definition, its notes' key.
+    at: Vec<SiteAt>,
     /// The VM, held so its functions stay callable.
     _lua: Lua,
     pass: Arc<Pass>,
@@ -692,8 +733,20 @@ impl ScreenRuntime {
             })
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
+        let at = sites
+            .iter()
+            .map(|(s, f)| {
+                let info = f.info();
+                SiteAt {
+                    chunk: info.source.unwrap_or_default().into(),
+                    line: info.line_defined.unwrap_or(0),
+                    func: s.func,
+                }
+            })
+            .collect();
         Ok(Some(Self {
             sites,
+            at,
             _lua: lua,
             pass,
             status,
@@ -719,6 +772,12 @@ impl ScreenRuntime {
         }
         self.permit = Some(permit);
         Ok(())
+    }
+
+    /// Whether it holds a permit.
+    #[must_use]
+    pub fn holds_permit(&self) -> bool {
+        self.permit.is_some()
     }
 
     /// Calls `f` when the VM is destroyed, from the VM's own teardown
@@ -754,11 +813,17 @@ impl ScreenRuntime {
         &self.status
     }
 
-    /// The notes so far, and how many more were dropped past the cap.
+    /// The notes so far in its book, and how many more were dropped past
+    /// the cap.
     #[must_use]
     pub fn notes(&self) -> (Vec<RuntimeNote>, u64) {
-        let n = self.pass.runtime_notes.borrow();
-        (n.list.clone(), n.dropped)
+        self.pass.runtime_notes.borrow().notes()
+    }
+
+    /// Writes its notes to `book` from now on: the book of the screen
+    /// lifetime it runs in, shared with the lifetime's other runtimes.
+    pub fn use_notes(&self, book: &NoteBook) {
+        *self.pass.runtime_notes.borrow_mut() = book.clone();
     }
 
     /// The calls, instruction steps and host calls so far.
@@ -846,11 +911,11 @@ impl ScreenRuntime {
                         }
                         Why::ImportOnly => {
                             self.note(RuntimeNote::ImportOnly);
-                            self.note(RuntimeNote::CallbackError { site: k });
+                            self.note_error(k);
                             CallStatus::Error
                         }
                         Why::Error => {
-                            self.note(RuntimeNote::CallbackError { site: k });
+                            self.note_error(k);
                             CallStatus::Error
                         }
                     },
@@ -889,7 +954,13 @@ impl ScreenRuntime {
     }
 
     fn note(&self, note: RuntimeNote) {
-        self.pass.runtime_notes.borrow_mut().add(note);
+        self.pass.runtime_notes.borrow().add(note);
+    }
+
+    fn note_error(&self, k: usize) {
+        if let Some(at) = self.at.get(k) {
+            self.note(RuntimeNote::CallbackError { at: at.clone() });
+        }
     }
 
     fn stop(&mut self, why: Stopped) {
@@ -959,6 +1030,62 @@ mod tests {
         s.fields[usize::from(f::SELECTED_EX)] = 1_234;
         for id in [71, 101, 171, 108, 128, 152, 153, 172] {
             assert_eq!(s.number(id), Some(1_234), "{id}");
+        }
+    }
+
+    /// Ids the result profile bridges to an equal id read the same state
+    /// as it, and 426 and 427 sum their counts: with no result every one
+    /// is hidden; with one, each gives its bridged id's value.
+    #[test]
+    fn equal_result_ids_read_as_their_bridged_id() {
+        use skin_model::result_field as f;
+        let mut s = Screen::new(Result);
+        s.fields = vec![0; skin_model::RESULT.fields.len()];
+        let ids = [
+            45, 80, 84, 101, 105, 106, 108, 115, 116, 128, 153, 155, 156, 174, 177, 426, 427,
+        ];
+        for id in ids {
+            assert_eq!(s.number(id), Some(HIDDEN), "{id}");
+        }
+        for (field, v) in [
+            (f::RESULT_VALID, 1),
+            (f::RESULT_RATE_VALID, 1),
+            (f::CHART_NOTES_VALID, 1),
+            (f::CHART_LEVEL_VALID, 1),
+            (f::CHART_LEVEL, 12),
+            (f::EX_SCORE, 1_234),
+            (f::MAX_COMBO, 56),
+            (f::RESULT_BP, 7),
+            (f::CHART_NOTES, 900),
+            (f::COUNT_PERFECT, 500),
+            (f::COUNT_BAD, 3),
+            (f::COUNT_POOR, 4),
+            (f::COUNT_EMPTY_POOR, 5),
+            (f::RATE_CURRENT_BP, 6_855),
+        ] {
+            s.fields[usize::from(field)] = v;
+        }
+        for (id, want) in [
+            (45, 12),
+            (49, 12),
+            (80, 500),
+            (84, 4),
+            (101, 1_234),
+            (108, 1_234),
+            (128, 1_234),
+            (153, 1_234),
+            (105, 56),
+            (174, 56),
+            (106, 900),
+            (177, 7),
+            (115, 68),
+            (155, 68),
+            (116, 55),
+            (156, 55),
+            (426, 9),
+            (427, 12),
+        ] {
+            assert_eq!(s.number(id), Some(want), "{id}");
         }
     }
 
