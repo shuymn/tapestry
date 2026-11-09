@@ -998,6 +998,20 @@ struct Shared {
     loading_drawn: AtomicU64,
     /// The loading state's slot.
     loading: Mutex<LoadingSlot>,
+    /// The latest loading lifetime's first presented frame, and the play
+    /// skin's declared loading time as the last loading frame was drawn
+    /// with it ([`LoadingAck`]).
+    loading_ack: Mutex<LoadingAck>,
+    /// A presented loading frame's acknowledgement holds while set, and
+    /// whether one holds (tests).
+    #[cfg(test)]
+    loading_ack_hold: [AtomicBool; 2],
+    /// Held acknowledgements still let through, one each (tests).
+    #[cfg(test)]
+    loading_ack_pass: std::sync::atomic::AtomicU32,
+    /// Presented loading frames acknowledged so far (tests).
+    #[cfg(test)]
+    loading_acked: AtomicU64,
     /// The current loading lifetime's state, from its beginning
     /// ([`RenderLink::begin_loading`]); `None` before. Locked before the
     /// slot when both are.
@@ -1049,6 +1063,13 @@ impl Shared {
             #[cfg(feature = "dev-tools")]
             loading_drawn: AtomicU64::new(0),
             loading: Mutex::new(LoadingSlot::default()),
+            loading_ack: Mutex::new(LoadingAck::default()),
+            #[cfg(test)]
+            loading_ack_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            loading_ack_pass: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            loading_acked: AtomicU64::new(0),
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
             #[cfg(test)]
@@ -1064,6 +1085,55 @@ impl Shared {
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
         }
+    }
+
+    /// A loading frame of lifetime `lifetime` was presented, drawn with a
+    /// play skin declaring the loading time `loadend`: the first of its
+    /// lifetime is acknowledged at the clock's `now()`, tagged with the
+    /// lifetime it was drawn for; a later one of the same lifetime changes
+    /// only the declared time. Allocates nothing.
+    fn presented_loading(
+        &self,
+        lifetime: u64,
+        loadend: Option<TimeUs>,
+        now: impl FnOnce() -> TimeUs,
+    ) {
+        #[cfg(test)]
+        {
+            let [held, waiting] = &self.loading_ack_hold;
+            if held.load(Ordering::SeqCst) {
+                waiting.store(true, Ordering::SeqCst);
+                while held.load(Ordering::SeqCst)
+                    && self
+                        .loading_ack_pass
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_err()
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                waiting.store(false, Ordering::SeqCst);
+            }
+        }
+        {
+            let mut ack = self
+                .loading_ack
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ack.loadend = loadend;
+            if ack.first.is_none_or(|(l, _)| l != lifetime) {
+                ack.first = Some((lifetime, now()));
+            }
+        }
+        #[cfg(test)]
+        self.loading_acked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// What [`presented_loading`](Self::presented_loading) left.
+    fn loading_ack(&self) -> LoadingAck {
+        *self
+            .loading_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Holds a result frame while a test says so.
@@ -1106,6 +1176,18 @@ impl Shared {
     fn selection_current(&self, lifetime: u64) -> bool {
         self.selection_slot().current(lifetime)
     }
+}
+
+/// The render thread's acknowledgement of the loading state's frames: the
+/// latest lifetime whose first frame was presented, with when, and the
+/// play skin's declared loading time ([`skin_model::Skin::loadend`]) as
+/// the last presented loading frame drew with it: the installed skin's, or
+/// none while a pending skin has no specialization committed in the
+/// lifetime.
+#[derive(Clone, Copy, Debug, Default)]
+struct LoadingAck {
+    first: Option<(u64, TimeUs)>,
+    loadend: Option<TimeUs>,
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -1922,6 +2004,49 @@ impl RenderLink {
     #[cfg(feature = "dev-tools")]
     pub fn loading_drawn(&self) -> u64 {
         self.shared.loading_drawn.load(Ordering::Relaxed)
+    }
+
+    /// The current loading lifetime: after [`begin_loading`](Self::begin_loading),
+    /// the one it began.
+    pub fn loading_lifetime(&self) -> u64 {
+        self.shared.loading_slot().lifetime
+    }
+
+    /// The latest loading lifetime whose first frame the render thread
+    /// presented, and when on the clock; `None` before any.
+    pub fn loading_ack(&self) -> Option<(u64, TimeUs)> {
+        self.shared.loading_ack().first
+    }
+
+    /// The loading time the play skin declares, as the last presented
+    /// loading frame drew with it ([`LoadingAck`]).
+    pub fn loading_loadend(&self) -> Option<TimeUs> {
+        self.shared.loading_ack().loadend
+    }
+
+    /// Holds every presented loading frame's acknowledgement from now on
+    /// while `held`, or lets it go (tests).
+    #[cfg(test)]
+    pub fn hold_loading_ack(&self, held: bool) {
+        self.shared.loading_ack_hold[0].store(held, Ordering::SeqCst);
+    }
+
+    /// Whether a presented loading frame's acknowledgement is held (tests).
+    #[cfg(test)]
+    pub fn loading_ack_held(&self) -> bool {
+        self.shared.loading_ack_hold[1].load(Ordering::SeqCst)
+    }
+
+    /// Lets one held acknowledgement through (tests).
+    #[cfg(test)]
+    pub fn pass_loading_ack(&self) {
+        self.shared.loading_ack_pass.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Presented loading frames acknowledged so far (tests).
+    #[cfg(test)]
+    pub fn loading_acked(&self) -> u64 {
+        self.shared.loading_acked.load(Ordering::SeqCst)
     }
 
     /// Where the current loading lifetime's lines and state are shown
@@ -3853,6 +3978,22 @@ impl Run {
                         screen.menu(page, *changed)
                     }
                     .map(|t| (t, None));
+                    // The lifetime's first presented frame starts the
+                    // loading state's minimum (design.md "Play Lifecycle").
+                    if let (Some(lifetime), Ok((t, _))) = (loading_frame, &drawn)
+                        && t.presented
+                    {
+                        let loadend = if pending {
+                            None
+                        } else {
+                            self.committed
+                                .get(ScreenKind::Play)
+                                .and_then(|i| i.bundle().skin().loadend())
+                        };
+                        let clock = self.clock;
+                        self.shared
+                            .presented_loading(lifetime, loadend, || clock.now());
+                    }
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
@@ -7723,6 +7864,114 @@ pub(crate) mod tests {
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
             None
         }
+    }
+
+    /// A render thread drawing its loading frames on [`TypedLoading`],
+    /// every presented frame's acknowledgement held from the start.
+    fn held_loading() -> (super::RenderLink, Typed) {
+        let seen: Typed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(TypedLoading {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.hold_loading_ack(true);
+        (link, seen)
+    }
+
+    /// L1, the render side: a loading lifetime's first presented frame is
+    /// acknowledged when its presentation is let through, tagged with its
+    /// lifetime, so the minimum ends exactly a second (no skin declaring
+    /// more) after it; a later frame of the same lifetime changes nothing.
+    #[test]
+    fn the_minimum_counts_from_this_lifetimes_first_presented_frame() {
+        let (link, _seen) = held_loading();
+        link.begin_loading(&chosen("One"), None);
+        let lifetime = link.loading_lifetime();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        assert_eq!(link.loading_ack(), None, "held: not acknowledged");
+        let let_through = link.clock.now();
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        let (acked, at) = link.loading_ack().unwrap();
+        assert_eq!(acked, lifetime);
+        assert!(at >= let_through, "{at:?} {let_through:?}");
+        assert_eq!(link.loading_loadend(), None);
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 1_000_000)
+        );
+        // A later frame of the same lifetime.
+        link.loading()
+            .report(LoadInput::Stage(Stage::Loudness), Some(one_line("B")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 2));
+        assert_eq!(link.loading_ack(), Some((lifetime, at)));
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// L2, the render side: a frame of the lifetime before, held across
+    /// the next lifetime's beginning, is acknowledged for the lifetime it
+    /// was drawn for, which a look for the new lifetime ignores; the new
+    /// lifetime's own first frame then starts its minimum.
+    #[test]
+    fn an_older_lifetimes_frame_does_not_start_the_minimum() {
+        let (link, _seen) = held_loading();
+        link.begin_loading(&chosen("One"), None);
+        let old = link.loading_lifetime();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        // The next lifetime begins while the old frame is held.
+        link.begin_loading(&chosen("Two"), None);
+        let new = link.loading_lifetime();
+        assert_ne!(old, new);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("C")));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        let (acked, old_at) = link.loading_ack().unwrap();
+        assert_eq!(acked, old, "tagged with the lifetime it was drawn for");
+        assert_eq!(
+            link.loading_ack().filter(|&(l, _)| l == new),
+            None,
+            "nothing of the new lifetime"
+        );
+        assert!(wait_until(|| link.loading_ack_held()));
+        let let_through = link.clock.now();
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 2));
+        let (acked, at) = link.loading_ack().unwrap();
+        assert_eq!(acked, new);
+        assert!(at >= let_through && at >= old_at, "{at:?}");
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The render thread's acknowledgement of a presented loading frame,
+    /// the first of a lifetime and a later one, allocates nothing, nor
+    /// does the game thread's read of it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_loading_ack_presents_without_allocating_alloc() {
+        let shared = super::Shared::new();
+        let clock = QpcClock::start();
+        shared.presented_loading(1, None, || clock.now());
+        let before = crate::alloc_count::this_thread();
+        for lifetime in 2..10 {
+            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            let read = shared.loading_ack();
+            assert_eq!(read.first.map(|(l, _)| l), Some(lifetime));
+            assert_eq!(read.loadend, Some(TimeUs(1_500_000)));
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
     }
 
     /// The loading text of chart `title`.
