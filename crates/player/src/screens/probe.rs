@@ -25,8 +25,8 @@ pub(crate) struct VisitSample {
     pub(crate) collect_span: Duration,
     /// Whether a forced collection ran after the frame.
     pub(crate) collected: bool,
-    /// The runtime's calls when its collections were counted, after the
-    /// frame: where the collection ran.
+    /// The runtime's calls when its last collection ran: where it ran
+    /// against the frame.
     pub(crate) collected_at_calls: u64,
     /// Instructions run in the frame.
     pub(crate) instructions: u64,
@@ -36,8 +36,10 @@ pub(crate) struct VisitSample {
     pub(crate) bridges: usize,
     /// The VM's Lua heap after the frame (and the collection), bytes.
     pub(crate) heap: usize,
-    /// The VM's sampled heap high-water so far, bytes.
-    pub(crate) peak_heap: u64,
+    /// The VM's sampled high-water while it ran as the runtime, bytes;
+    /// `None` while no sample rose above its import's (header pass
+    /// included), so not this VM's known peak.
+    pub(crate) runtime_peak: Option<u64>,
 }
 
 thread_local! {
@@ -54,7 +56,7 @@ thread_local! {
             host_calls: 0,
             bridges: 0,
             heap: 0,
-            peak_heap: 0,
+            runtime_peak: None,
         })
     };
 }
@@ -132,12 +134,12 @@ pub(in crate::screens) fn run(
         span,
         collect_span,
         collected,
-        collected_at_calls: rt.counters().calls,
+        collected_at_calls: rt.collected_at_calls(),
         instructions: after.instructions.saturating_sub(before.instructions),
         host_calls: after.host_calls.saturating_sub(before.host_calls),
         bridges: after.bridges.saturating_sub(before.bridges),
         heap: rt.heap(),
-        peak_heap: rt.peak_heap(),
+        runtime_peak: rt.runtime_peak(),
     };
     LAST.with(|l| l.set(sample));
 }

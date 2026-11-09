@@ -367,6 +367,43 @@ fn a_poisoned_context_is_read_through() {
     drop(i);
 }
 
+/// The runtime's sampled high-water is the kept VM's own (dev-tools,
+/// the S7-07d gate): a large heap the import's passes left and freed is
+/// not reported as the runtime's, and a runtime frame holding more than
+/// the import's high-water is.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_runtime_high_water_is_the_kept_vms_own() {
+    untimed();
+    let mut i = import(&entry(
+        "local calls = 0 local big = {} for k = 1, 100000 do big[k] = k end big = nil",
+        &["function() calls = calls + 1 return 1 end"],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(
+        runtime(&mut i).runtime_peak(),
+        None,
+        "the import's peak is not the VM's"
+    );
+    let mut i = import(&entry(
+        "",
+        &[
+            "function() local s = \"x\" for _ = 1, 21 do s = s .. s end \
+           for _ = 1, 300 do end return #s > 0 and 1 or 0 end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).stopped(), None);
+    let peak = runtime(&mut i).runtime_peak();
+    assert!(peak.is_some_and(|p| p >= 2 << 20), "{peak:?}");
+}
+
 /// C8: the kept VM's memory cap stops the runtime at once.
 // Covers: T09
 #[cfg(feature = "dev-tools")]
