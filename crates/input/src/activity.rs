@@ -155,6 +155,13 @@ impl ActivityRecord {
     /// Both sections as one snapshot: `None` when a write was in progress
     /// or completed during each of [`READ_TRIES`] attempts.
     pub fn read(&self) -> Option<ActivityRead> {
+        self.read_racing(|| {})
+    }
+
+    /// [`read`](Self::read), with `between` run in each attempt after the
+    /// fields are read and before the sequences are read again: a test
+    /// completes a write there.
+    fn read_racing(&self, mut between: impl FnMut()) -> Option<ActivityRead> {
         for _ in 0..READ_TRIES {
             let w = self.window.seq.load(Ordering::Acquire);
             let i = self.input.seq.load(Ordering::Acquire);
@@ -163,6 +170,7 @@ impl ActivityRecord {
                     window: self.window.fields(),
                     input: self.input.fields(),
                 };
+                between();
                 fence(Ordering::Acquire);
                 if self.window.seq.load(Ordering::Relaxed) == w
                     && self.input.seq.load(Ordering::Relaxed) == i
@@ -191,7 +199,7 @@ impl ActivityRecord {
 mod tests {
     use bms_model::TimeUs;
 
-    use super::{ActivityRecord, SectionValue};
+    use super::{ActivityRecord, READ_TRIES, SectionValue};
 
     /// R22: a write in progress on either section (its sequence odd) makes
     /// every attempt of a read fail: the read gives up rather than return
@@ -222,5 +230,48 @@ mod tests {
         let read = record.read().unwrap();
         assert!(read.window.unfocused);
         assert_eq!(record.window.focus_losses(), 1);
+    }
+
+    /// R22: a write that begins and completes while a read takes the
+    /// fields leaves both sequences even, and only their second reading
+    /// shows it moved: a read with such a write in every attempt gives up
+    /// on each section, and one with it in the first attempt only returns
+    /// the written value whole from the next.
+    #[test]
+    fn a_write_completed_during_a_read_is_rejected() {
+        for section in ["input", "window"] {
+            let record = ActivityRecord::default();
+            let written = |n: u64| SectionValue {
+                revision: n,
+                last: Some(TimeUs(i64::try_from(n).unwrap())),
+                held: true,
+                ..SectionValue::default()
+            };
+            let publish = |n| match section {
+                "input" => record.input.publish(written(n)),
+                _ => record.window.publish(written(n)),
+            };
+            let mut n = 0;
+            let read = record.read_racing(|| {
+                n += 1;
+                publish(n);
+            });
+            assert_eq!(read, None, "{section}: written in every attempt");
+            assert_eq!(n, u64::from(READ_TRIES), "{section}");
+            let mut once = false;
+            let read = record
+                .read_racing(|| {
+                    if !once {
+                        once = true;
+                        publish(100);
+                    }
+                })
+                .unwrap();
+            let got = match section {
+                "input" => read.input,
+                _ => read.window,
+            };
+            assert_eq!(got, written(100), "{section}: read whole after it");
+        }
     }
 }
