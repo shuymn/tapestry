@@ -374,6 +374,36 @@ fn widgets_listing_offset_four_follow_sudden_plus() {
     assert_eq!(rects(&l, 5_000, 500, 0), moved);
 }
 
+/// Blend 4 on a selecting image listing offset 4: over the lanes it is
+/// SUDDEN+'s paint showing its table, and a cover paint never multiplies,
+/// so the skin is refused as before; off them it is an image choice of its
+/// own and multiplies.
+#[test]
+fn a_selecting_paint_does_not_multiply() {
+    let group = r#"{"id": "group", "src": "a", "w": 16, "h": 16, "divx": 2, "len": 2, "ref": 40}"#;
+    let objects = format!(
+        r#"{}, "imageset": [{{"id": "set", "images": ["cover"], "value": 40, "ref": 40}}]"#,
+        note("")
+    );
+    for id in ["group", "set"] {
+        let over = cover(r#""blend": 4"#).replace(r#""id": "cover""#, &format!(r#""id": "{id}""#));
+        let l = import_body(&body(group, &objects, &[NOTES, &over]));
+        assert_eq!(
+            critical(l),
+            (CriticalPart::Cover, NoteKind::Blend(4)),
+            "{id}"
+        );
+        let off = deco(r#", "blend": 4"#, r#"{"x": 0, "y": 0, "w": 10, "h": 10}"#)
+            .replace(r#""id": "deco""#, &format!(r#""id": "{id}""#));
+        let l = import_body(&body(group, &objects, &[NOTES, &off]));
+        assert!(!has(l.report(), NoteKind::Blend(4)), "{id}");
+        let mut d = l.drawn();
+        d.frame(5_000, &[]);
+        let blends: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
+        assert!(blends.contains(&Blend::Multiply), "{id}: {blends:?}");
+    }
+}
+
 #[test]
 fn selecting_images_listing_offset_four_follow_sudden_plus() {
     // Off the lanes, a group choosing by the gauge's type and a set

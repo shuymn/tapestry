@@ -427,20 +427,20 @@ impl Cx<'_> {
         self.common_with(role, dst, o)
     }
 
-    /// [`image_common`](Self::image_common) of an image or image choice
-    /// drawn as an element of its own, which turns with the turntable
-    /// (offset 1) and may multiply (blend 4); a cover's paint does
-    /// neither.
+    /// [`image_common`](Self::image_common) of an image or image choice,
+    /// which turns with the turntable (offset 1); lowered as an element of
+    /// its own, it may multiply (blend 4), and as SUDDEN+'s paint showing
+    /// a table it may not, as no cover paint does.
     pub(super) fn turning_image_common(
         &mut self,
         dst: &Dst,
         charged: bool,
-        role: Role,
+        (lowered, role): (Lowered, Role),
     ) -> Result<Option<Common>, ImportError> {
         let o = Opts {
             follow: true,
             turntable: true,
-            multiply: true,
+            multiply: lowered == Lowered::Image,
             charged,
             ..Opts::default()
         };
@@ -504,7 +504,8 @@ impl Cx<'_> {
             let selector = (src, index.deviates());
             return self.image_group(dst, rec, &s, len, selector, charged, (lowered, role));
         }
-        let Some(c) = self.turning_image_common(&dst, charged, role)? else {
+        // A plain image lowered as a paint left above.
+        let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
             return Ok(());
         };
         let Some((image, t, native)) = self.src_image_track(&c, rec, &s)? else {
