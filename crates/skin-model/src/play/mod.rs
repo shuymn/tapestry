@@ -81,6 +81,17 @@ pub enum Continuation<'a> {
     },
 }
 
+/// The target count of `attempt` over `chart`: what its point is over,
+/// whatever the skin (the reducer's rule).
+#[must_use]
+pub fn attempt_targets(chart: &Chart, attempt: &Attempt<'_>) -> u32 {
+    let section = match attempt {
+        Attempt::Full { .. } => None,
+        Attempt::Section(s) => Some((s.start, s.end)),
+    };
+    reducer::count_targets(chart, section)
+}
+
 /// What a play's committed attempt gives the next attempt of its play
 /// state: its slots, whether its callbacks with slots ran, whether its last
 /// build ran them on a complete view, and its target count.
@@ -405,10 +416,6 @@ pub enum PrepareError {
     /// A timeline row lies past the scroll map's domain (`±DOMAIN` µs),
     /// where the playhead cannot follow it: a chart built in code with
     /// such a time; the loader refuses one.
-    /// A carried bank that does not fit the program's slots: another
-    /// length, or a value outside its slot's domain.
-    #[error("the carried slots do not fit the skin's program")]
-    Continuation,
     #[error("timeline row {} at {} µs is outside the playhead's range", .row.0, .at.0)]
     TimeOutOfDomain {
         /// The first row past the domain.
@@ -416,6 +423,10 @@ pub enum PrepareError {
         /// Its time.
         at: TimeUs,
     },
+    /// A carried bank that does not fit the program's slots: another
+    /// length, or a value outside its slot's domain.
+    #[error("the carried slots do not fit the skin's program")]
+    Continuation,
 }
 
 /// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's

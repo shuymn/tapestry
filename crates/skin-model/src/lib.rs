@@ -180,7 +180,7 @@ pub use play::timers::{native_values, settled_point};
 pub use play::{
     Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
     DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, Play,
-    PlayContext, PrepareError, RoundedDuration, SkinFrame,
+    PlayContext, PrepareError, RoundedDuration, SkinFrame, attempt_targets,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{
