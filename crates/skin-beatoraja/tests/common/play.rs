@@ -348,6 +348,19 @@ impl Drawn {
         Self::over_context(skin, chart, &context_with(bpm_range, bpm_whole_change))
     }
 
+    /// `skin` played over a chart of `notes` notes as a section attempt
+    /// (a practice round) over `section`.
+    pub fn over_section(skin: Skin, notes: u32, section: &eval::Section) -> Self {
+        Self::over_context(
+            skin,
+            &chart(notes),
+            &PlayContext {
+                attempt: Attempt::Section(section),
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over `chart` with the context `ctx`.
     fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
         let uvs = skin

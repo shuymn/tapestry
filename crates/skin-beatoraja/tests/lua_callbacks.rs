@@ -1493,10 +1493,12 @@ fn a_slot_is_taken_only_when_proven() {
         i.callbacks
     );
     for (body, why) in [
-        // A counter: arithmetic on a slot.
+        // A counter: the walk reads the written cell as unknown, so its
+        // arithmetic opens the candidate (and the residual refuses
+        // arithmetic on a slot as `Range`).
         (
             latch("local n = 0", "n = n + 1 return 0") + &dst("latch", ""),
-            Disposition::Replaced(Unsupported::Range),
+            construct("a slot in a candidate that is not closed"),
         ),
         // A destination whose timer it is, dropped before its timer: the
         // latch would not run on every frame the source runs it.
@@ -1617,9 +1619,9 @@ fn a_slot_is_taken_only_when_proven() {
             construct("a slot writer referenced beside its destinations' timers"),
         ),
         // A writer with a definite Lua error on a reached path: outside
-        // the admission walk's subset, it opens the candidate (and the
-        // residual refuses it as a Lua error), so no slot writer the
-        // program keeps raises.
+        // the admission walk's subset, it opens the candidate, which
+        // grants no slot (and the residual refuses it as a Lua error), so
+        // no slot writer the program keeps raises.
         (
             latch(
                 STATE,
@@ -1629,7 +1631,7 @@ fn a_slot_is_taken_only_when_proven() {
                      return x + 1"
                 ),
             ) + &dst("latch", ""),
-            Disposition::Replaced(Unsupported::Interference),
+            construct("a slot in a candidate that is not closed"),
         ),
         // The root reads its cell through a helper.
         (
@@ -1674,4 +1676,144 @@ return state"
     p.state_us = 9_000;
     assert_eq!(p.frame(1_000, &[]).len(), 1);
     assert_eq!(bank(&p), [Val::Int(5_000)]);
+}
+
+/// Slots are granted only in a closed candidate: a closure the analysis
+/// never captures (one held under a numeric key, one a metatable's
+/// `__index` gives, one published at run time into a table or a global)
+/// can write the slot or call the root, so each opens the candidate and
+/// the root follows its role.
+#[test]
+fn a_slot_needs_a_closed_candidate() {
+    let root = "local state = 5000000\n\
+                local function timer() state = state return state end\n";
+    let dst = "table.insert(skin.destination, { id = \"i\", timer = timer,\n\
+                 dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
+    let custom = |call: &str| {
+        format!("skin.customTimers = {{ {{ id = 3001, timer = function() {call} end }} }}\n")
+    };
+    let writer = "function() state = 7000000 return timer() end";
+    for (name, escape) in [
+        (
+            "numeric key",
+            format!(
+                "local hidden = {{ {writer} }}\n{}",
+                custom("return hidden[1]()")
+            ),
+        ),
+        (
+            "metatable",
+            format!(
+                "local holder = setmetatable({{}}, {{ __index = function() state = 7000000 return timer end }})\n{}",
+                custom("return holder.f()")
+            ),
+        ),
+        (
+            "table publication",
+            format!(
+                "local pub = {{}}\nlocal function publish() pub.f = {writer} end\n{}",
+                custom("publish() return pub.f()")
+            ),
+        ),
+        (
+            "global publication",
+            format!(
+                "local function publish() published = {writer} end\n{}",
+                custom("publish() return published()")
+            ),
+        ),
+    ] {
+        let d = folder(&skin(&format!("{root}{escape}{dst}")));
+        let i = import(&d, 905).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(
+            i.callbacks
+                .contains(&Disposition::Replaced(Unsupported::Construct(
+                    "a slot in a candidate that is not closed"
+                ))),
+            "{name}: {:?}",
+            i.callbacks
+        );
+        assert!(
+            !i.callbacks.contains(&Disposition::Compiled),
+            "{name}: {:?}",
+            i.callbacks
+        );
+    }
+    // The control: the same root alone compiles.
+    let d = folder(&skin(&format!("{root}{dst}")));
+    assert_eq!(import(&d, 905).unwrap().callbacks, [Disposition::Compiled]);
+}
+
+/// Two destinations of one latch returning the value its slot had as the
+/// run began: on the setting frame the first is off (it set the slot) and
+/// the second on (it saw it set); both on after.
+#[test]
+fn a_return_old_latch_lights_its_second_destination_first() {
+    let off = "ms.timer_off_value";
+    let body = format!(
+        "local was = state\n\
+         if state == {off} and ms.number(100) == 200000 then state = ms.time() end\n\
+         return was"
+    );
+    let d = timer_skin(STATE, &body, 2);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    full_score(&mut p, 4);
+    p.state_us = 7_000;
+    let q = p.frame(1_000, &[]);
+    // Only the second destination, at x 100 of 1920 (the canvas's left
+    // edge is 0): the first is off.
+    assert_eq!(q.len(), 1);
+    assert!(q[0].rect[0] > 50.0, "{:?}", q[0].rect);
+    assert_eq!(p.frame(1_016, &[]).len(), 2);
+}
+
+/// A section attempt (a practice round) runs no slot program: the source
+/// reads the point an earlier round left cached there, which tapestry does
+/// not carry, so the timers with slots are off in every round, their slots
+/// at their initial values, where a whole-chart attempt runs them.
+#[test]
+fn a_practice_round_runs_no_slot_program() {
+    use skin_model::present::{OFF, Val};
+    let off = "ms.timer_off_value";
+    let section = eval::Section {
+        start: bms_model::TimeUs(0),
+        end: bms_model::TimeUs(60_000_000),
+        lead_in: bms_model::TimeUs(0),
+        initial_gauges: vec![common::play::GAUGES[0].start],
+    };
+    // The latch, and Codex's integer slot shown only while the point is
+    // positive.
+    for (locals, body, init) in [
+        (STATE, LATCH_BODY.to_owned(), OFF),
+        (
+            "local state = 5000",
+            format!(
+                "if state == {off} then state = ms.time() end\n\
+                 if ms.number(100) > 0 then return state end\n\
+                 return {off}"
+            ),
+            Val::Int(5_000),
+        ),
+    ] {
+        let d = timer_skin(locals, &body, 1);
+        let i = import(&d, 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
+        // Two rounds, each prepared afresh, the first ending at a full score.
+        for round in 0..2 {
+            let mut p = Drawn::over_section(i.imported.skin.clone(), 4, &section);
+            if round == 0 {
+                full_score(&mut p, 4);
+            }
+            p.state_us = 2_000_000;
+            assert!(p.frame(1_000, &[]).is_empty(), "{body}: round {round}");
+            assert_eq!(bank(&p), [init], "{body}: round {round}");
+        }
+        // A whole-chart attempt at a full score runs it.
+        let mut p = Drawn::new(i.imported.skin, 4);
+        full_score(&mut p, 4);
+        p.state_us = 2_000_000;
+        assert_eq!(p.frame(1_000, &[]).len(), 1, "{body}");
+    }
 }
