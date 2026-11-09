@@ -327,6 +327,7 @@ pub const IN_PLAY: &[Site] = &[
             "Controls::wake_game",
             "Controls::command",
             "Controls::set_command",
+            "Controls::settings_key",
         ],
     ),
     Site::File("crates/player/src/tuning.rs"),

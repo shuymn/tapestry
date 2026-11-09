@@ -49,6 +49,7 @@ use crate::controls::Controls;
 use crate::menu_screen::WindowSink;
 use crate::render_side::Extent;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
+use crate::tuning::KeyEvent;
 
 /// What the game and render threads ask of the window thread.
 enum Ask {
@@ -332,6 +333,9 @@ impl ApplicationHandler<Ask> for App {
                     self.controls.window_key(key, e, is_synthetic);
                 }
                 if !pressed {
+                    if !is_synthetic {
+                        key_released(&self.controls, event.physical_key, &self.keys);
+                    }
                     return;
                 }
                 if !is_synthetic {
@@ -739,10 +743,11 @@ impl Keys {
     }
 }
 
-/// A key pressed in the window. A settings key steps again while held
-/// (key repeat), only while the scene its press was taken in is current
-/// (the held-input guard), and wakes the game thread to show it; the
-/// overlay key, retry and quit act on the first press only.
+/// A key pressed in the window. A settings key goes to tuning, which takes
+/// it by its hold class ([`crate::tuning::LiveTuning::key`]); its repeats
+/// go only while the scene its press was taken in is current (the
+/// held-input guard). The overlay key, retry and quit act on the first
+/// press only.
 fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut Keys) {
     if let Some(i) = keys.settings.iter().position(|(k, _)| *k == key) {
         let scene = controls.scene();
@@ -762,8 +767,12 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut K
         if pressed_in != scene {
             return;
         }
-        controls.tuning().adjust(a);
-        controls.wake_game();
+        let event = if repeat {
+            KeyEvent::Repeat
+        } else {
+            KeyEvent::Press
+        };
+        controls.settings_key(a, event);
     } else if repeat {
         // The others take the first press only.
     } else if key == keys.overlay {
@@ -772,6 +781,13 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut K
         controls.command(Command::Retry);
     } else if Some(key) == keys.quit {
         controls.command(Command::Quit);
+    }
+}
+
+/// A key released in the window: a settings key's release goes to tuning.
+fn key_released(controls: &Controls, key: PhysicalKey, keys: &Keys) {
+    if let Some(&(_, a)) = keys.settings.iter().find(|(k, _)| *k == key) {
+        controls.settings_key(a, KeyEvent::Release);
     }
 }
 
@@ -1019,6 +1035,8 @@ mod tests {
 
     use super::{Keys, key_pressed, window_key};
     use crate::controls::Controls;
+    use crate::tuning::HoldClass::{FocusDisarmed, Fresh, GapDiscarded, PreLoading};
+    use crate::tuning::KeyEvent;
 
     /// Raw Input's controls for Pause and NumLock (`input::raw::key_control`).
     const PAUSE: u32 = 0xE11D;
@@ -1160,6 +1178,268 @@ mod tests {
         assert_eq!(offset(&c), 2_000, "held across the scene change");
         key_pressed(&c, f6, false, &mut keys);
         assert_eq!(offset(&c), 3_000, "pressed afresh");
+    }
+
+    /// Controls on the clock, the settings keys starting from 100 %
+    /// volume and no offsets, with the loading state begun now.
+    fn loading_controls() -> Controls {
+        use bms_model::TimeSource as _;
+        let clock = QpcClock::start();
+        let tuning = crate::tuning::LiveTuning::new(game::Tuning {
+            volume_percent: 100,
+            display_offset_us: 0,
+            input_offset_us: 0,
+        });
+        let c = Controls::with_tuning(clock, std::sync::Arc::new(tuning));
+        c.tuning().enter_loading(clock.now());
+        c
+    }
+
+    /// Settings key `a` pressed (or repeated) in the window.
+    fn press(c: &Controls, keys: &mut Keys, a: Adjust, repeat: bool) {
+        key_pressed(c, window_key(a.key()), repeat, keys);
+    }
+
+    /// Settings key `a` released in the window.
+    fn release(c: &Controls, keys: &Keys, a: Adjust) {
+        super::key_released(c, window_key(a.key()), keys);
+    }
+
+    /// The window side's last activity, µs.
+    fn last(c: &Controls) -> i64 {
+        c.tuning().snapshot().last_activity.unwrap().0
+    }
+
+    /// A1: a settings key pressed in the window while loading, focused and
+    /// open, is a fresh hold: it steps its value, holds the loading state,
+    /// and moves the revision and the last activity.
+    #[test]
+    fn an_accepted_press_holds_counts_and_adjusts() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        let before = c.tuning().snapshot();
+        assert!(before.quiet_at(bms_model::TimeUs(0)));
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        let after = c.tuning().snapshot();
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, Fresh)]);
+        assert!(after.held && !after.overflow && after.focused);
+        assert_eq!(after.revision.window, before.revision.window + 1);
+        assert_eq!(after.values.unwrap().display_offset_us, 1_000);
+        assert!(after.last_activity.is_some());
+        assert!(!after.quiet_at(bms_model::TimeUs(i64::MAX)), "held");
+    }
+
+    /// A2: a fresh hold's repeats at the value's limit step nothing but
+    /// count, each moving the last activity, so the quiet wait restarts
+    /// from the latest; it runs from the release once released.
+    #[test]
+    fn held_at_the_limit_and_repeat_restart_the_quiet_wait() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        press(&c, &mut keys, Adjust::VolumeUp, false);
+        let pressed = c.tuning().snapshot();
+        assert_eq!(pressed.values.unwrap().volume_percent, 100, "at the limit");
+        assert_eq!(c.tuning().held(), [(Adjust::VolumeUp, Fresh)]);
+        let first = last(&c);
+        press(&c, &mut keys, Adjust::VolumeUp, true);
+        let repeated = c.tuning().snapshot();
+        assert_eq!(repeated.revision.window, pressed.revision.window + 1);
+        assert_eq!(repeated.values, pressed.values);
+        let second = last(&c);
+        assert!(second >= first);
+        assert_eq!(c.tuning().held(), [(Adjust::VolumeUp, Fresh)]);
+        assert!(
+            !repeated.quiet_at(bms_model::TimeUs(second + game::QUIET.0)),
+            "held"
+        );
+        release(&c, &keys, Adjust::VolumeUp);
+        let released = c.tuning().snapshot();
+        let third = last(&c);
+        assert!(third >= second);
+        assert_eq!(released.revision.window, repeated.revision.window + 1);
+        assert!(c.tuning().held().is_empty());
+        assert!(!released.quiet_at(bms_model::TimeUs(third + game::QUIET.0 - 1)));
+        assert!(released.quiet_at(bms_model::TimeUs(third + game::QUIET.0)));
+    }
+
+    /// A3: the loading state's tuning is quiet one second after the last
+    /// release, not a microsecond earlier.
+    #[test]
+    fn ready_one_second_after_the_last_release() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        press(&c, &mut keys, Adjust::VolumeDown, false);
+        assert_eq!(c.tuning().held(), [(Adjust::VolumeDown, Fresh)]);
+        release(&c, &keys, Adjust::VolumeDown);
+        assert!(c.tuning().held().is_empty());
+        let s = c.tuning().snapshot();
+        let at = last(&c);
+        assert!(!s.held);
+        assert_eq!(s.values.unwrap().volume_percent, 95);
+        assert!(!s.quiet_at(bms_model::TimeUs(at + game::QUIET.0 - 1)));
+        assert!(s.quiet_at(bms_model::TimeUs(at + game::QUIET.0)));
+    }
+
+    /// A4: a settings key down when the loading state begins holds it
+    /// until released and steps nothing meanwhile, its repeats
+    /// neither; its release counts, and the next press is fresh.
+    #[test]
+    fn a_key_held_from_before_loading_blocks_until_released_and_never_adjusts() {
+        use bms_model::TimeSource as _;
+        let clock = QpcClock::start();
+        let c = Controls::with_tuning(
+            clock,
+            std::sync::Arc::new(crate::tuning::LiveTuning::new(game::Tuning {
+                volume_percent: 100,
+                display_offset_us: 0,
+                input_offset_us: 0,
+            })),
+        );
+        let mut keys = Keys::new(None, None);
+        // Pressed on the select screen: it steps there.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().get().display_offset_us, 1_000);
+        // The loading state begins, as `entered_loading` begins it.
+        c.next_scene();
+        c.tuning().enter_loading(clock.now());
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, PreLoading)]);
+        let began = c.tuning().snapshot();
+        assert!(began.held);
+        // Its repeats, past the held-input guard or not, step nothing and
+        // count nothing.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, true);
+        c.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Repeat);
+        assert_eq!(c.tuning().snapshot(), began);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, PreLoading)]);
+        // Its release counts, the quiet wait running from it.
+        release(&c, &keys, Adjust::DisplayOffsetUp);
+        let released = c.tuning().snapshot();
+        assert!(c.tuning().held().is_empty());
+        assert!(!released.held);
+        assert_eq!(released.revision.window, began.revision.window + 1);
+        assert_eq!(released.values, began.values);
+        let at = last(&c);
+        assert!(at >= began.last_activity.unwrap().0);
+        assert!(!released.quiet_at(bms_model::TimeUs(at + game::QUIET.0 - 1)));
+        // The next press is fresh.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, Fresh)]);
+        assert_eq!(c.tuning().get().display_offset_us, 2_000);
+    }
+
+    /// A5, through the window's routing: focus lost while a fresh key is
+    /// down empties the held set, the key disarmed, and counts; focus back
+    /// counts and the quiet wait runs from it; the key's stale repeat does
+    /// nothing; a fresh press of it steps and holds again.
+    #[test]
+    fn focus_loss_then_return_follows_the_disarmed_rule() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, Fresh)]);
+        let held = c.tuning().snapshot();
+        c.focus(false);
+        assert_eq!(
+            c.tuning().held(),
+            [(Adjust::DisplayOffsetUp, FocusDisarmed)]
+        );
+        let lost = c.tuning().snapshot();
+        assert!(!lost.held && !lost.focused);
+        assert_eq!(lost.revision.window, held.revision.window + 1);
+        assert!(c.tuning().focus_lost_since_reopen());
+        c.focus(true);
+        assert_eq!(
+            c.tuning().held(),
+            [(Adjust::DisplayOffsetUp, FocusDisarmed)]
+        );
+        let back = c.tuning().snapshot();
+        assert!(back.focused && !back.held);
+        assert_eq!(back.revision.window, lost.revision.window + 1);
+        let at = last(&c);
+        assert!(at >= held.last_activity.unwrap().0);
+        assert!(!back.quiet_at(bms_model::TimeUs(at + game::QUIET.0 - 1)));
+        assert!(back.quiet_at(bms_model::TimeUs(at + game::QUIET.0)));
+        // The stale repeat: nothing, past the guard or not.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, true);
+        c.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Repeat);
+        assert_eq!(c.tuning().snapshot(), back);
+        assert_eq!(
+            c.tuning().held(),
+            [(Adjust::DisplayOffsetUp, FocusDisarmed)]
+        );
+        // A fresh press: A1.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, Fresh)]);
+        let fresh = c.tuning().snapshot();
+        assert!(fresh.held);
+        assert_eq!(fresh.revision.window, back.revision.window + 1);
+        assert_eq!(fresh.values.unwrap().display_offset_us, 2_000);
+    }
+
+    /// A13, the window's half: while acceptance is closed a settings key's
+    /// press is discarded (stepping, holding and counting nothing), and so
+    /// are its repeats and release; once reopened, its next press steps.
+    #[test]
+    fn a_press_in_the_closed_gap_is_discarded_and_rearms() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        let open = c.tuning().snapshot();
+        let closed = c.tuning().close(4);
+        assert_eq!(closed, open);
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, GapDiscarded)]);
+        assert_eq!(c.tuning().snapshot(), open);
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, true);
+        assert_eq!(c.tuning().snapshot(), open);
+        release(&c, &keys, Adjust::DisplayOffsetUp);
+        assert!(c.tuning().held().is_empty());
+        assert_eq!(c.tuning().snapshot(), open);
+        // Down across the reopening: still discarded.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        c.tuning().reopen();
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, true);
+        assert_eq!(c.tuning().snapshot(), open);
+        release(&c, &keys, Adjust::DisplayOffsetUp);
+        // Rearmed: the next press steps.
+        press(&c, &mut keys, Adjust::DisplayOffsetUp, false);
+        assert_eq!(c.tuning().held(), [(Adjust::DisplayOffsetUp, Fresh)]);
+        assert_eq!(c.tuning().get().display_offset_us, 1_000);
+        assert_eq!(
+            c.tuning().snapshot().revision.window,
+            open.revision.window + 1
+        );
+    }
+
+    /// The window's routing of the settings keys into tuning, presses,
+    /// repeats, releases and focus changes, allocates nothing.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_held_set_routes_without_allocating_alloc() {
+        let c = loading_controls();
+        let mut keys = Keys::new(None, None);
+        let round = |c: &Controls, keys: &mut Keys| {
+            for a in Adjust::ALL {
+                press(c, keys, a, false);
+                press(c, keys, a, true);
+            }
+            c.focus(false);
+            c.focus(true);
+            for a in Adjust::ALL {
+                press(c, keys, a, false);
+                release(c, keys, a);
+            }
+            let s = c.tuning().close(1);
+            press(c, keys, Adjust::VolumeDown, false);
+            release(c, keys, Adjust::VolumeDown);
+            c.tuning().reopen();
+            let _ = c.tuning().close_unchanged(&s, 2);
+            c.tuning().reopen();
+        };
+        // Warmed up once: the routing's first call.
+        round(&c, &mut keys);
+        let before = crate::alloc_count::this_thread();
+        round(&c, &mut keys);
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
     }
 
     /// A volume key stores only the volume; an offset key only its offset.

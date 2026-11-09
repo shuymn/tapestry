@@ -41,7 +41,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::Thread;
 use std::time::Duration;
@@ -148,6 +148,10 @@ pub enum Request {
     /// tests). Not answered.
     #[cfg(all(test, feature = "dev-tools"))]
     FenceGate(Box<FenceGate>),
+    /// Stops the thread at its next gated opening ([`OpenGate`]; tests).
+    /// Not answered.
+    #[cfg(test)]
+    OpenGate(Box<OpenGate>),
 }
 
 /// An interleaving with the game thread at the input thread's next fence
@@ -302,6 +306,120 @@ pub struct InputState {
     wakes: std::sync::atomic::AtomicU64,
 }
 
+/// What the input thread publishes of tuning acceptance (design.md "Play
+/// Lifecycle", tuning while loading), without the tuning's step lock: START
+/// and SELECT held, as the adjustment tap counts the devices that reach it
+/// (a removed device's holds leave with it, another device's stay), a
+/// revision that moves whenever that changes or a latched control is
+/// pressed, the latest time it moved, and the candidate generation whose
+/// recording it opened last.
+#[derive(Debug)]
+pub struct InputActivity {
+    /// START (bit 0), SELECT (bit 1), a latched control held or possibly
+    /// held (bit 2).
+    held: AtomicU8,
+    /// The latched controls' presses as last published.
+    presses: AtomicU64,
+    revision: AtomicU64,
+    /// On the clock; `i64::MIN` before any.
+    last: AtomicI64,
+    /// The candidate generation opened last; 0 before any.
+    opened: AtomicU32,
+}
+
+impl Default for InputActivity {
+    fn default() -> Self {
+        Self {
+            held: AtomicU8::new(0),
+            presses: AtomicU64::new(0),
+            revision: AtomicU64::new(0),
+            last: AtomicI64::new(i64::MIN),
+            opened: AtomicU32::new(0),
+        }
+    }
+}
+
+/// What [`InputActivity::read`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputRead {
+    /// START or SELECT is held, or may be.
+    pub held: bool,
+    /// The input side's acceptance revision.
+    pub revision: u64,
+    /// When it last moved, on the clock.
+    pub last: Option<TimeUs>,
+}
+
+impl InputActivity {
+    /// What the input thread published last.
+    pub fn read(&self) -> InputRead {
+        let last = self.last.load(Ordering::Acquire);
+        InputRead {
+            held: self.held.load(Ordering::Acquire) != 0,
+            revision: self.revision.load(Ordering::Acquire),
+            last: (last != i64::MIN).then_some(TimeUs(last)),
+        }
+    }
+
+    /// The candidate generation whose recording the input thread opened
+    /// last.
+    pub fn opened(&self) -> u32 {
+        self.opened.load(Ordering::Acquire)
+    }
+
+    /// The input thread's publication at a boundary at `now`: `held` and
+    /// `presses` as the tap has them; a change moves the revision and the
+    /// last time. Only the input thread writes.
+    fn publish(&self, held: u8, presses: u64, now: TimeUs) {
+        let was = self.held.swap(held, Ordering::AcqRel);
+        let pressed = self.presses.swap(presses, Ordering::AcqRel);
+        if was != held || pressed != presses {
+            self.last.fetch_max(now.0, Ordering::AcqRel);
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Candidate `generation`'s recording opened: tuning acceptance closed
+    /// until it opened is open from here.
+    fn open(&self, generation: u32) {
+        self.opened.store(generation, Ordering::Release);
+    }
+}
+
+/// The input thread's publication of `sources`' START and SELECT at a
+/// boundary at `now` ([`InputActivity`]).
+fn publish_activity(controls: &Controls, sources: &SourceSet, now: TimeUs) {
+    let (held, presses) = sources.adjustment().map_or((0, 0), |tap| {
+        let panels = tap.held_panels();
+        let held = u8::from(panels.start)
+            | (u8::from(panels.select) << 1)
+            | (u8::from(tap.holding()) << 2);
+        (held, tap.presses())
+    });
+    controls
+        .tuning()
+        .input_activity()
+        .publish(held, presses, now);
+}
+
+/// Candidate `generation`'s recording opened at this boundary: published
+/// as soon as the source set opened it, before the hook builds the opening
+/// and replies (design.md "Play Lifecycle", tuning while loading).
+fn published_opening(controls: &Controls, generation: u32) {
+    controls.tuning().input_activity().open(generation);
+}
+
+/// Stops the input thread once a gated opening's generation is published,
+/// before the hook builds the opening (tests): it sends `reached` and waits
+/// for `resume`, at most 60 s.
+#[cfg(test)]
+pub struct OpenGate {
+    /// Sent once the generation is published.
+    pub reached: mpsc::Sender<()>,
+    /// Waited for after `reached`.
+    pub resume: mpsc::Receiver<()>,
+}
+
 /// The game thread's end of the input side.
 pub struct InputLink {
     requests: Sender<Request>,
@@ -429,6 +547,21 @@ impl InputLink {
             && self
                 .requests
                 .send(Request::FenceGate(Box::new(gate)))
+                .is_ok()
+        {
+            self.waker.wake();
+        }
+    }
+
+    /// Stops the input thread at its next gated opening, once its
+    /// generation is published ([`OpenGate`]; tests). A failed link sends
+    /// nothing.
+    #[cfg(test)]
+    pub fn open_gate(&self, gate: OpenGate) {
+        if self.failed.is_none()
+            && self
+                .requests
+                .send(Request::OpenGate(Box::new(gate)))
                 .is_ok()
         {
             self.waker.wake();
@@ -749,6 +882,9 @@ pub struct Hook {
     /// The gate at the next fence (dev-tools tests).
     #[cfg(all(test, feature = "dev-tools"))]
     fence_gate: Option<Box<FenceGate>>,
+    /// The gate at the next gated opening (tests).
+    #[cfg(test)]
+    open_gate: Option<Box<OpenGate>>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -786,6 +922,8 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             loading: None,
             #[cfg(all(test, feature = "dev-tools"))]
             fence_gate: None,
+            #[cfg(test)]
+            open_gate: None,
         },
         InputLink {
             requests: req_tx,
@@ -910,6 +1048,11 @@ impl Hook {
                     self.fence_gate = Some(gate);
                     continue;
                 }
+                #[cfg(test)]
+                Request::OpenGate(gate) => {
+                    self.open_gate = Some(gate);
+                    continue;
+                }
                 Request::Close => {
                     let (closing, lines) = self.close(sources);
                     self.phase = Phase::Tail;
@@ -947,7 +1090,7 @@ impl Hook {
             };
             // Published before the reply, so the game thread never reads
             // the previous play's state after it.
-            self.publish(sources);
+            self.publish(sources, now);
             // The game thread waits for the reply; if it is gone, so is
             // the play.
             let _ = self.replies.send(reply);
@@ -977,7 +1120,7 @@ impl Hook {
         if let Some((loading, at)) = &self.loading {
             sources.set_wake_at(loading.next_at().map(|t| TimeUs(t.0.saturating_add(at.0))));
         }
-        self.publish(sources);
+        self.publish(sources, now);
         if self.origin.is_some()
             && let Some(logic) = &self.logic
         {
@@ -1019,7 +1162,8 @@ impl Hook {
             .is_some_and(|tap| tap.publish_panels(active, losses))
     }
 
-    fn publish(&self, sources: &SourceSet) {
+    fn publish(&self, sources: &SourceSet, now: TimeUs) {
+        publish_activity(&self.controls, sources, now);
         self.state
             .tripped
             .store(sources.gate().is_tripped(), Ordering::Release);
@@ -1051,7 +1195,11 @@ impl Hook {
                 reset_gate(sources, &self.controls);
                 let start = match gate {
                     None => sources.open_play(now, origin),
-                    Some(generation) => candidate(sources.open_candidate(now, origin, generation))?,
+                    Some(generation) => {
+                        let start = candidate(sources.open_candidate(now, origin, generation))?;
+                        published_opening(&self.controls, generation);
+                        start
+                    }
                 };
                 // Devices the source limit left out: keyboards, when any
                 // is (controllers come first), possibly one with lanes.
@@ -1081,11 +1229,15 @@ impl Hook {
                 sources.set_presentation_offset(origin);
                 match gate {
                     None => sources.open_recording(TimeUs(-lead_in.0)),
-                    Some(generation) => candidate(sources.open_candidate(
-                        TimeUs(-lead_in.0),
-                        TimeUs(0),
-                        generation,
-                    ))?,
+                    Some(generation) => {
+                        let start = candidate(sources.open_candidate(
+                            TimeUs(-lead_in.0),
+                            TimeUs(0),
+                            generation,
+                        ))?;
+                        published_opening(&self.controls, generation);
+                        start
+                    }
                 }
             }
             #[cfg(feature = "dev-tools")]
@@ -1130,6 +1282,7 @@ impl Hook {
                     Some(generation) => {
                         let chart0 = TimeUs(open_at.0 + lead_in.0);
                         let start = candidate(sources.open_candidate(open_at, chart0, generation))?;
+                        published_opening(&self.controls, generation);
                         // The first successful opening ends the loading
                         // script; a deferred one keeps feeding it, so the
                         // release it waits for arrives.
@@ -1140,6 +1293,13 @@ impl Hook {
                 }
             }
         };
+        #[cfg(test)]
+        if gate.is_some()
+            && let Some(g) = self.open_gate.take()
+        {
+            let _ = g.reached.send(());
+            let _ = g.resume.recv_timeout(Duration::from_secs(60));
+        }
         self.origin = Some(origin);
         self.logic = Some(logic);
         self.handoff = Some(Handoff::reserved(
@@ -1226,6 +1386,7 @@ impl Hook {
         let opened = sources.reopen_candidate(batch, chart0, rearm.generation);
         rearm.outcome = match opened {
             Ok(start) => {
+                published_opening(&self.controls, rearm.generation);
                 self.script_origin = script_origin;
                 rearm.start.opened_at = start.opened_at;
                 rearm.start.held.clear();
@@ -2827,6 +2988,152 @@ mod gate_tests {
             Reply::Deferred => None,
             Reply::Closed(..) => panic!("an open is answered by an opening"),
         }
+    }
+
+    /// [`rig`]'s two keyboards and hook, its START published as START's
+    /// panel role, with the controls the hook publishes tuning into.
+    fn tuning_rig() -> (SourceSet, Hook, InputLink, Arc<Controls>) {
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(1));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (hook, link) = link(Arc::clone(&controls), Mode::Clock, Waker::new().unwrap());
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        tap.set_panel_roles(1, 0);
+        link.tap(tap);
+        (sources, hook, link, controls)
+    }
+
+    /// A7, the input side's half: START held by two keyboards is one
+    /// hold. The first one's removal leaves it held, moving nothing; the
+    /// second's releases it, moving the revision and the last activity to
+    /// that boundary. Each press and release that changes what is held
+    /// counts too.
+    #[test]
+    fn a_removed_source_leaves_only_its_own_holds() {
+        let (mut sources, mut hook, _link, controls) = tuning_rig();
+        let read = || controls.tuning().input_activity().read();
+        batch(&mut hook, &mut sources, 0, &[]);
+        let idle = read();
+        assert!(!idle.held);
+        batch(&mut hook, &mut sources, 10, &[packet(1, Q, 1)]);
+        let one = read();
+        assert!(one.held);
+        assert_eq!(one.revision, idle.revision + 1);
+        assert_eq!(one.last, Some(TimeUs(10 * MS + 1)));
+        assert!(controls.tuning().snapshot().held, "the snapshot holds");
+        // The second keyboard holds it too: one hold.
+        batch(&mut hook, &mut sources, 20, &[packet(2, Q, 1)]);
+        assert_eq!(read(), one);
+        // The first keyboard removed while it holds: the other's stays.
+        sources.begin_batch(TimeUs(30 * MS));
+        sources.disconnect(DeviceId(1));
+        sources.end_batch(TimeUs(30 * MS + 1));
+        hook.wake(&mut sources, TimeUs(30 * MS + 1));
+        assert_eq!(read(), one);
+        assert!(controls.tuning().snapshot().held);
+        // The second removed: released at that boundary.
+        sources.begin_batch(TimeUs(40 * MS));
+        sources.disconnect(DeviceId(2));
+        sources.end_batch(TimeUs(40 * MS + 1));
+        hook.wake(&mut sources, TimeUs(40 * MS + 1));
+        let none = read();
+        assert!(!none.held);
+        assert_eq!(none.revision, one.revision + 1);
+        assert_eq!(none.last, Some(TimeUs(40 * MS + 1)));
+        let s = controls.tuning().snapshot();
+        assert!(!s.held);
+        assert_eq!(s.revision.input, none.revision);
+        assert_eq!(s.last_activity, Some(TimeUs(40 * MS + 1)));
+    }
+
+    /// A16: the input thread publishes candidate generation 1 as opened as
+    /// soon as the source set opened it, before it builds the opening and
+    /// replies. Stopped there, tuning acceptance closed until generation
+    /// 1 reads open, and a settings key pressed in the window then steps
+    /// the in-play values and holds, while the starting tuning the close
+    /// returned keeps the value before it.
+    #[test]
+    fn a_press_after_recording_opens_before_the_hook_returns_is_in_play() {
+        use std::time::Duration;
+
+        use game::Adjust;
+
+        use crate::tuning::{Acceptance, HoldClass, KeyEvent};
+
+        let watchdog = Duration::from_secs(
+            std::env::var("TAPESTRY_TEST_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+        );
+        let (mut sources, mut hook, link, controls) = tuning_rig();
+        batch(&mut hook, &mut sources, 0, &[]);
+        let starting = controls.tuning().close(1);
+        assert_eq!(
+            controls.tuning().acceptance(),
+            Acceptance::Closed { reopen_at: 1 }
+        );
+        // Closed: a press is discarded.
+        controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Press);
+        controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Release);
+        assert_eq!(controls.tuning().get(), starting.values.unwrap());
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        link.open_gate(super::OpenGate {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        link.requests
+            .send(Request::Open {
+                lead_in: LEAD_IN,
+                logic: std::thread::current(),
+                recorded: recorded(),
+                gate: Some(1),
+            })
+            .unwrap();
+        std::thread::scope(|s| {
+            let opener = s.spawn(|| batch(&mut hook, &mut sources, 40, &[]));
+            reached
+                .recv_timeout(watchdog)
+                .expect("the opening reached its gate");
+            // Opened, published, not yet answered.
+            assert_eq!(controls.tuning().input_activity().opened(), 1);
+            assert!(link.replies.try_recv().is_err(), "no reply yet");
+            controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Press);
+            assert_eq!(controls.tuning().acceptance(), Acceptance::Open);
+            assert_eq!(
+                controls.tuning().held(),
+                [(Adjust::DisplayOffsetUp, HoldClass::Fresh)]
+            );
+            assert_eq!(
+                controls.tuning().get().display_offset_us,
+                starting.values.unwrap().display_offset_us + 1_000
+            );
+            resume.send(()).unwrap();
+            opener.join().unwrap();
+        });
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Opened(..))));
+        assert_eq!(
+            starting.values.unwrap().display_offset_us + 1_000,
+            controls.tuning().get().display_offset_us,
+            "the starting tuning kept the value before the press"
+        );
     }
 
     fn rearm_buffers(readers: Vec<input::SourceReader>, snapshot: usize) -> Box<Rearm> {
