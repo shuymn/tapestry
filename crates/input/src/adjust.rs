@@ -642,6 +642,12 @@ pub struct AdjustmentTap {
     /// each, whose holds and events the activity record's input section
     /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
     tuning: u128,
+    /// The tuning controls held at a focus loss, a bit each: disarmed
+    /// until their last holder releases them, they are not held in the
+    /// record and their repeats and release count nothing (design.md
+    /// "Play Lifecycle", the window has focus). The start gate's holds
+    /// do not follow it.
+    disarmed: u128,
     /// The record the tap writes its section of, if any.
     activity: Option<Arc<ActivityRecord>>,
     /// The input section as last written.
@@ -715,6 +721,7 @@ pub fn adjustment_queue(
             panels: Arc::new(AtomicU64::new(0)),
             panel_losses: 0,
             tuning: 0,
+            disarmed: 0,
             activity: None,
             written: SectionValue::default(),
             seen_at: TimeUs(i64::MIN),
@@ -785,16 +792,29 @@ impl AdjustmentTap {
         self.written = SectionValue::default();
         self.activity = Some(record);
         if let Some(record) = &self.activity {
-            self.written.held = self.unverified || self.held_set() & self.tuning != 0;
+            self.written.held = self.activity_held();
             record.input.publish(self.written);
         }
     }
 
+    /// Whether the record's input section is held: a tuning control held
+    /// and not disarmed, or the held state unverified.
+    fn activity_held(&self) -> bool {
+        self.unverified || self.held_set() & self.tuning & !self.disarmed != 0
+    }
+
+    /// Whether number `n` is a disarmed tuning control.
+    const fn disarmed(&self, n: u8) -> bool {
+        self.disarmed & (1_u128 << (n & 127)) != 0
+    }
+
     /// Writes the input section: the revision moves when `counted` (an
     /// event of a tuning control) or when whether one is held changed,
-    /// the last activity then taking `at`, else the latest time seen.
+    /// the last activity then taking `at`, else the latest time seen. A
+    /// disarmed control no longer held is armed again first.
     fn publish_activity(&mut self, at: Option<TimeUs>, counted: bool) {
-        let held = self.unverified || self.held_set() & self.tuning != 0;
+        self.disarmed &= self.held_set();
+        let held = self.activity_held();
         if !counted && held == self.written.held {
             return;
         }
@@ -885,6 +905,12 @@ impl AdjustmentTap {
         let back = focused && !self.focused;
         self.losses = losses;
         self.focused = focused;
+        if lost {
+            // The tuning controls held now are disarmed, and the record
+            // drops them at the loss.
+            self.disarmed |= self.held_set() & self.tuning;
+            self.publish_activity(None, false);
+        }
         if lost || back {
             // What was derived from the focus before is resolved now: the
             // recovery's Lost or Resync closes the reducer's open group, so
@@ -964,6 +990,7 @@ impl AdjustmentTap {
     /// followed by [`TapEvent::Cancelled`].
     pub(crate) fn button(&mut self, n: u8, was: bool, now: bool, at: TimeUs, foreground: bool) {
         let latched = self.latched & (1_u128 << (n & 127)) != 0;
+        let disarmed = self.disarmed(n);
         let Some(h) = self.holders.get_mut(usize::from(n)) else {
             return;
         };
@@ -991,8 +1018,9 @@ impl AdjustmentTap {
             self.cancelled = Some(generation);
         }
         self.seen_at = self.seen_at.max(at);
-        // Written before the event is queued, so before any marker after it.
-        let tuning = self.tuning & (1_u128 << (n & 127)) != 0;
+        // Written before the event is queued, so before any marker after
+        // it; a disarmed control's repeat or release counts nothing.
+        let tuning = self.tuning & (1_u128 << (n & 127)) != 0 && !disarmed;
         self.publish_activity(Some(at), tuning && event.is_some());
         if let Some(event) = event {
             self.observe(at, event, foreground);
@@ -1163,6 +1191,7 @@ impl AdjustmentTap {
                 continue;
             };
             let bit = 1_u8 << key;
+            let disarmed = self.disarmed(n);
             let tap = match event {
                 WindowKeyEvent::Press if self.window_held & bit == 0 => {
                     self.window_held |= bit;
@@ -1175,7 +1204,7 @@ impl AdjustmentTap {
                 WindowKeyEvent::Repeat if self.window_held & bit != 0 => TapEvent::Repeat(n),
                 _ => continue,
             };
-            let tuning = self.tuning & (1_u128 << (n & 127)) != 0;
+            let tuning = self.tuning & (1_u128 << (n & 127)) != 0 && !disarmed;
             self.publish_activity(Some(at), tuning);
             self.observe(at, tap, true);
         }

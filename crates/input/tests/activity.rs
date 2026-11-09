@@ -9,8 +9,9 @@ use std::sync::Arc;
 use bms_model::TimeUs;
 use eval::ControlId;
 use input::{
-    ActivityRecord, AdjustmentBindings, DeviceId, DeviceKind, Packet, SectionValue, SourceConfig,
-    SourceSet, TapControl, WindowKeyEvent, WindowKeys, adjustment_queue, window_keys,
+    ActivityRecord, AdjustmentBindings, DeviceId, DeviceKind, Packet, PresentationFocus,
+    SectionValue, SourceConfig, SourceSet, TapControl, WindowKeyEvent, WindowKeys,
+    adjustment_queue, window_keys,
 };
 
 /// F2 on the keyboard: a tuning control, number 0.
@@ -143,4 +144,72 @@ fn an_unverified_hold_holds_the_record() {
     assert!(!removed.held);
     assert_eq!(removed.revision, lost.revision + 1);
     assert_eq!(removed.last, Some(TimeUs(30 * MS)));
+}
+
+/// The window's presentation focus lost at `lost` and back at `back`,
+/// each sampled at the input thread's wake then.
+fn lose_focus(set: &mut SourceSet, focus: &PresentationFocus, lost: i64, back: i64) {
+    focus.set(false);
+    set.tick_presentation(TimeUs(lost));
+    focus.set(true);
+    set.tick_presentation(TimeUs(back));
+}
+
+/// The focus loss disarms the tuning controls held then (design.md "Play
+/// Lifecycle", the window has focus): F2 held across a loss and its
+/// return, and the window's F1 the same, leave the record held at the
+/// loss; their repeats and release move nothing; a fresh press counts.
+#[test]
+fn a_tuning_control_held_across_a_focus_loss_is_disarmed() {
+    let (mut set, record, mut window) = rig(8);
+    let focus = PresentationFocus::new();
+    set.set_presentation_focus(focus.clone());
+    // F2 from a device.
+    key(&mut set, 10 * MS, F2, 1);
+    let pressed = input(&record);
+    assert!(pressed.held);
+    lose_focus(&mut set, &focus, 20 * MS, 30 * MS);
+    let lost = input(&record);
+    assert!(!lost.held, "dropped at the loss");
+    assert_eq!(lost.revision, pressed.revision + 1);
+    key(&mut set, 40 * MS, F2, 1);
+    assert_eq!(input(&record), lost, "a disarmed repeat");
+    key(&mut set, 50 * MS, F2, 0);
+    assert_eq!(input(&record), lost, "a disarmed release");
+    key(&mut set, 60 * MS, F2, 1);
+    let fresh = input(&record);
+    assert_eq!(
+        fresh,
+        SectionValue {
+            revision: lost.revision + 1,
+            last: Some(TimeUs(60 * MS)),
+            held: true,
+            ..SectionValue::default()
+        }
+    );
+    key(&mut set, 70 * MS, F2, 0);
+    let released = input(&record);
+    assert!(!released.held);
+    assert_eq!(released.revision, fresh.revision + 1);
+    // The window's F1.
+    window.key(0, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(80 * MS));
+    let window_pressed = input(&record);
+    assert!(window_pressed.held);
+    lose_focus(&mut set, &focus, 90 * MS, 100 * MS);
+    let window_lost = input(&record);
+    assert!(!window_lost.held, "dropped at the loss");
+    assert_eq!(window_lost.revision, window_pressed.revision + 1);
+    window.key(0, WindowKeyEvent::Repeat, false);
+    set.tick_presentation(TimeUs(110 * MS));
+    assert_eq!(input(&record), window_lost, "a disarmed repeat");
+    window.key(0, WindowKeyEvent::Release, false);
+    set.tick_presentation(TimeUs(120 * MS));
+    assert_eq!(input(&record), window_lost, "a disarmed release");
+    window.key(0, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(130 * MS));
+    let window_fresh = input(&record);
+    assert!(window_fresh.held);
+    assert_eq!(window_fresh.revision, window_lost.revision + 1);
+    assert_eq!(window_fresh.last, Some(TimeUs(130 * MS)));
 }
