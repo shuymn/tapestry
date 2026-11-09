@@ -8,8 +8,9 @@
 //! instruction steps once, so an invocation ends within its length. A
 //! `Ret`, or the end of the span with nil, gives the result, which is
 //! converted as its consumer converts it ([`super::num::to_bool`],
-//! [`super::num::to_int`]): a Lua error gives the source's caught value
-//! (false, 0) with `ok` 1; an unavailable read or an overflow gives `ok` 0;
+//! [`super::num::to_int`], [`super::num::to_float`], a float stored as
+//! its bits): a Lua error gives the source's caught value (false, 0, `0f`)
+//! with `ok` 1; an unavailable read or an overflow gives `ok` 0;
 //! an integer result of `i32::MIN` or `i32::MAX` gives `ok` 0, as the
 //! source's number draws nothing for those (`SkinNumber.java:139-143` at
 //! `0.8.9`). No heap, no recursion, no indexing.
@@ -159,7 +160,8 @@ impl Present {
             let allows = match self.def.callbacks.get(usize::from(a)).map(|c| c.conv) {
                 Some(Conv::Int) => ok,
                 Some(Conv::Truthy | Conv::Timer) => ok && value,
-                None => false,
+                // Never an `after` target (V4).
+                Some(Conv::Float) | None => false,
             };
             if !allows {
                 return false;
@@ -273,7 +275,17 @@ fn start_of(r: Result<Val, Fail>) -> Option<i64> {
     }
 }
 
-/// Result `r` as conversion `conv` gives it, and whether it gave a value.
+/// The bits of `f`, as an output slot holds a float.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "the slot holds the bits, read back by `f32::from_bits`"
+)]
+fn f32_bits(f: f32) -> i32 {
+    f.to_bits() as i32
+}
+
+/// Result `r` as conversion `conv` gives it, and whether it gave a value:
+/// a float as its bits, a Lua error the source's caught `0f` (+0's bits).
 fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
     match (conv, r) {
         (_, Err(Fail::Unavailable | Fail::Overflow)) => (0, false),
@@ -283,6 +295,7 @@ fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
             let n = num::to_int(v);
             (n, n != i32::MIN && n != i32::MAX)
         }
+        (Conv::Float, Ok(v)) => (f32_bits(num::to_float(v)), true),
         // Run through [`Present::timer`] instead.
         (Conv::Timer, Ok(_)) => (0, false),
     }

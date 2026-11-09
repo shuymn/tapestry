@@ -42,7 +42,7 @@ use crate::track::{MAX_KEY_US, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
-    TrimOutcome,
+    SlideStop, SliderRate, TrimOutcome,
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
@@ -287,6 +287,10 @@ pub enum LoadError {
         "an expression reads a presentation output the program lacks, at another type, or in a          `when` timer"
     )]
     OutputRead,
+    #[error(
+        "cover paint {paint}'s slider reads a presentation output that is no float, or one another slider reads"
+    )]
+    SliderOutput { paint: usize },
     #[error("judge element {element} is outside `judge` (`screen` in a fixed-canvas skin)")]
     JudgeRegion { element: usize },
     #[error("element {element}'s number")]
@@ -1930,6 +1934,7 @@ impl Skin {
                 check_outputs(program, base, signature, i < whens.len())?;
             }
         }
+        check_slider_outputs(&def.widgets.cover_paints, signature)?;
         // V1 to V5, its per-frame cost charged with the expressions'.
         let present = present
             .map(|p| Present::verify(p, base, &mut ops))
@@ -3906,7 +3911,19 @@ impl Skin {
                         .get(usize::from(field::TIME_PROGRESS_PPM))
                         .copied()
                         .unwrap_or(0);
-                    let [dx, slide] = p.slider_offset(scene.lanes, progress);
+                    // A value slider's output sits after the play fields.
+                    let [dx, slide] =
+                        match p.slider_offset(scene.lanes, progress, state.fields, field::COUNT) {
+                            Ok(d) => d,
+                            Err(_why) => {
+                                #[cfg(feature = "dev-tools")]
+                                out.observed(match _why {
+                                    SlideStop::NoValue => crate::observation::Outcome::NoValue,
+                                    SlideStop::Beyond => crate::observation::Outcome::SlideBeyond,
+                                });
+                                continue;
+                            }
+                        };
                     let dy = e.follow.dy(g) + p.motion_dy(g) + slide;
                     let gate = match &p.gate {
                         Some(gate) => match gate.sample(t) {
@@ -4148,6 +4165,32 @@ fn screen_elapsed(starts: Starts<'_>, now: TimeUs) -> Option<i64> {
         .map(|at| elapsed_us(now, at))
 }
 
+/// V9: each cover paint whose slider is [`SliderRate::Program`] names a
+/// float output of `signature`, and no float output is named by two
+/// sliders. A float output no slider names is accepted, as an unread
+/// number is.
+fn check_slider_outputs(paints: &[CoverPaintDef], signature: &[OutTy]) -> Result<(), LoadError> {
+    let mut taken = vec![false; signature.len()];
+    for (paint, p) in paints.iter().enumerate() {
+        let Some(crate::Slider {
+            rate: SliderRate::Program(k),
+            ..
+        }) = p.slider
+        else {
+            continue;
+        };
+        let k = usize::from(k);
+        let fresh = signature.get(k) == Some(&OutTy::Float)
+            && taken
+                .get_mut(k)
+                .is_some_and(|t| !std::mem::replace(t, true));
+        if !fresh {
+            return Err(LoadError::SliderOutput { paint });
+        }
+    }
+    Ok(())
+}
+
 /// V6 for `program`: each read past the schema's `base` fields is an output
 /// read, resolved by name, of the output of `signature` at that slot, at
 /// its type (`lua.<k>` the signature's, `lua.<k>.ok` a boolean); a field
@@ -4167,6 +4210,8 @@ fn check_outputs(
         // V8: a timer output is read only as an element's timer.
         let matches = match out {
             _ if *want == OutTy::Timer => false,
+            // A float output's value is read only by its slider (V9).
+            _ if *want == OutTy::Float && !ok => false,
             Some((ty, o)) => o == ok && (ok || ty == *want),
             None => false,
         };

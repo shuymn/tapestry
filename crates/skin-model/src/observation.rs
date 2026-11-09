@@ -29,6 +29,11 @@ pub enum Outcome {
     GateNotSampled,
     /// A cover paint's trim hid it.
     TrimSuppressed,
+    /// A value slider's program value gave none.
+    NoValue,
+    /// A value slider's displacement is past
+    /// [`MAX_SLIDE`](crate::MAX_SLIDE): off the window, not drawn.
+    SlideBeyond,
 }
 
 /// One element's observation in one frame.

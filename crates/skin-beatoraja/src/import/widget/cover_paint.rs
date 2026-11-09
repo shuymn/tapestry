@@ -31,13 +31,13 @@
 //! leave off, is dropped with a note unless it is failure presentation.
 
 use skin_model::{
-    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, Slider,
-    SliderDirection, SliderRate, Source, Track,
+    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, ScreenKind,
+    Slider, SliderDirection, SliderRate, Source, Track,
 };
 
 use super::super::geom::{HEIGHT, Q, Rect};
 use super::super::policy::{CriticalPart, Role};
-use super::super::report::{LaneApprox, NoteKind, Object};
+use super::super::report::{LaneApprox, NoteKind, Object, Span};
 use super::super::track::Stretch;
 use super::super::{Common, Cx, Dst, OFFSET_HIDDEN, OFFSET_LIFT, Opts, Prop};
 use super::{Painted, SrcImage};
@@ -51,6 +51,15 @@ const RATE_LANECOVER: i32 = 4;
 const RATE_MUSIC_PROGRESS: i32 = 6;
 /// The slider direction that moves down (`skin/SkinSlider.java:116-120`).
 const DOWN: i32 = 2;
+
+/// The fields a slider with a `value` has that the source does not read
+/// there (`skin/json/JsonSkinObjectLoader.java:398-402`): each present one
+/// is noted ignored.
+struct Unread {
+    ty: bool,
+    ref_num: bool,
+    event: bool,
+}
 
 impl Cx<'_> {
     /// Adds the cover paint `def` and the element `c` drawing it on
@@ -324,6 +333,7 @@ impl Cx<'_> {
                 "event",
             ],
         );
+        let typed = ty.is_some();
         let ty = self.int_or(ty, "type", 0)?;
         let angle = self.int_or(angle, "angle", 0)?;
         let range = self.int_or(range, "range", 0)?;
@@ -334,6 +344,16 @@ impl Cx<'_> {
         };
         if let Some(f) = changeable {
             self.def.bool(f, "changeable")?;
+        }
+        if let Prop::Callable(id) = value
+            && self.kind == ScreenKind::Play
+        {
+            let unread = Unread {
+                ty: typed,
+                ref_num,
+                event: event.is_some(),
+            };
+            return self.value_slider(dst, rec, id, (angle, range), unread);
         }
         let field = |field| NoteKind::UnsupportedField { field };
         let rate = match ty {
@@ -367,14 +387,7 @@ impl Cx<'_> {
             Ok(v) => v,
             Err(why) => return self.drop_el(Role::Decorative.or_failure(dst.failure), at, why),
         };
-        // `⌊1080 · range / height⌋`, at most `MAX_COORD`. Every size the
-        // importer takes is 16:9, so the source's width scale for a
-        // horizontal slider is the same ratio.
-        let r = (HEIGHT * i128::from(range))
-            .checked_div(i128::from(self.height))
-            .and_then(|r| u32::try_from(r).ok())
-            .filter(|&r| i128::from(r) <= i128::from(MAX_COORD))
-            .ok_or_else(|| self.range(at, "range"))?;
+        let r = self.slider_range(at, range)?;
         if event.is_some() {
             self.ignored(at, NoteKind::Ignored { field: "event" });
         }
@@ -393,6 +406,98 @@ impl Cx<'_> {
             Role::Critical(CriticalPart::Cover)
         };
         self.cover_paint_image(dst, rec, &s, role, Some(r))
+    }
+
+    /// A slider's range `range` (0 or more) in reference pixels:
+    /// `⌊1080 · range / height⌋`, at most `MAX_COORD`. Every size the
+    /// importer takes is 16:9, so the source's width scale for a
+    /// horizontal slider is the same ratio.
+    fn slider_range(&self, at: Span, range: i32) -> Result<u32, ImportError> {
+        (HEIGHT * i128::from(range))
+            .checked_div(i128::from(self.height))
+            .and_then(|r| u32::try_from(r).ok())
+            .filter(|&r| i128::from(r) <= i128::from(MAX_COORD))
+            .ok_or_else(|| self.range(at, "range"))
+    }
+
+    /// A play slider of record `rec` moved by its callable `value` at node
+    /// `id` (`skin/json/JsonSkinObjectLoader.java:398-402`,
+    /// `skin/lua/SkinLuaAccessor.java:665-673`): a paint moved by `R` times
+    /// the program's `tofloat()` of the value in the direction of `angle`
+    /// (0 to 3), `range` scaled as any slider's; `type`, `isRefNum` and
+    /// `event` are unread by the source with a value and noted ignored.
+    ///
+    /// Its base role is decorative, or failure presentation, never
+    /// SUDDEN+'s paint, whatever it reaches or its type says: its travel is
+    /// the skin's own value, and what it covers is none of tapestry's
+    /// covers. A read showing a critical part raises the whole element to
+    /// that part, which then follows the critical dependency rules. The
+    /// value is compiled first, for that role, and kept in the program only
+    /// once the element is retained, so a slider dropped for another field
+    /// leaves no callback; its keys are charged once, as a progress
+    /// slider's.
+    fn value_slider(
+        &mut self,
+        dst: Dst,
+        rec: u32,
+        id: u32,
+        (angle, range): (i32, i32),
+        unread: Unread,
+    ) -> Result<(), ImportError> {
+        let at = dst.span;
+        let base = Role::Decorative.or_failure(dst.failure);
+        let Some(v) = self.slider_value(at, id, base)? else {
+            return Ok(());
+        };
+        let role = v.role;
+        let field = |field| NoteKind::UnsupportedField { field };
+        let direction = match angle {
+            0 => SliderDirection::Up,
+            1 => SliderDirection::Right,
+            DOWN => SliderDirection::Down,
+            3 => SliderDirection::Left,
+            _ => return self.drop_el(role, at, field("angle")),
+        };
+        if range < 0 {
+            return self.drop_el(role, at, field("range"));
+        }
+        let r = self.slider_range(at, range)?;
+        for (unread, field) in [
+            (unread.ty, "type"),
+            (unread.ref_num, "isRefNum"),
+            (unread.event, "event"),
+        ] {
+            if unread {
+                self.ignored(at, NoteKind::Ignored { field });
+            }
+        }
+        let s = self.src_image(rec)?;
+        self.budget
+            .keys(dst.keys.len())
+            .map_err(|l| self.limit(at, l))?;
+        let Some(mut c) = self.image_common(&dst, true, role)? else {
+            return Ok(());
+        };
+        c.display_deviation |= v.deviates;
+        let Some((image, rects, native)) = self.paint_image(&c, rec, &s)? else {
+            return Ok(());
+        };
+        let t = self.model_track(&c, &rects)?;
+        let Some(k) = self.keep_slider_value(v, at)? else {
+            return Ok(());
+        };
+        let def = CoverPaintDef {
+            image: CoverImage::Image(image),
+            slider: Some(Slider {
+                range: r,
+                rate: SliderRate::Program(k),
+                direction,
+            }),
+            motion: CoverMotion::None,
+            trim: CoverTrim::None,
+            gate_track: None,
+        };
+        self.push_paint_def(c, def, t, native)
     }
 
     /// A progress slider's paint from image record `rec` (`s`):
