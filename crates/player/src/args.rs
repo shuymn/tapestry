@@ -29,6 +29,10 @@ pub enum Command {
     /// `measure play [--perfect] <chart>`.
     #[cfg(feature = "dev-tools")]
     Measure { chart: PathBuf, perfect: bool },
+    /// `measure select`: song selection under a PresentMon capture, each
+    /// select and result screen lifetime counted (the S7-07d gate).
+    #[cfg(feature = "dev-tools")]
+    MeasureSelect,
     /// `--dev-scenario <file.toml> [--dev-render-timeout <s>]`.
     #[cfg(feature = "dev-tools")]
     Scenario(crate::dev::scenario::ScenarioArgs),

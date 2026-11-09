@@ -747,6 +747,21 @@ impl MemoryWitness {
     }
 }
 
+#[cfg(feature = "dev-tools")]
+thread_local! {
+    /// When this thread's last selection or result build began: the start
+    /// its frame's `cpu` counts from (dev-tools).
+    static BUILD_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// When this thread's last [`Renderer::build_selection`] or
+/// [`Renderer::build_result`] began, taken (dev-tools: the order of a
+/// frame's spans).
+#[cfg(feature = "dev-tools")]
+pub fn take_build_start() -> Option<Instant> {
+    BUILD_START.with(std::cell::Cell::take)
+}
+
 /// What one frame cost and drew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameTiming {
@@ -3154,6 +3169,8 @@ impl Renderer {
     ) -> Result<(), BuildError> {
         self.started = None;
         let start = Instant::now();
+        #[cfg(feature = "dev-tools")]
+        BUILD_START.with(|b| b.set(Some(start)));
         let target = self.target();
         #[cfg(feature = "dev-tools")]
         if std::mem::take(&mut self.selection_faults.0) {
@@ -3418,6 +3435,8 @@ impl Renderer {
     ) -> Result<(), BuildError> {
         self.started = None;
         let start = Instant::now();
+        #[cfg(feature = "dev-tools")]
+        BUILD_START.with(|b| b.set(Some(start)));
         let target = self.target();
         #[cfg(any(test, feature = "dev-tools"))]
         if std::mem::take(&mut self.result_faults.0) {

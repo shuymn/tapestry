@@ -317,7 +317,28 @@ pub struct PlayCapture {
 /// the capture's `SyncInterval` and `AllowsTearing` and the game's own
 /// swap chain configuration both confirm. Otherwise the span is N/A.
 pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapture {
-    let (a, b) = (fig.span.0.0, fig.span.1.0);
+    count_capture(
+        frames,
+        (fig.span.0.0, fig.span.1.0),
+        fig.present_times.as_deref(),
+        fig.presentation,
+        period_ns,
+    )
+}
+
+/// Counts the span `[a, b)` (µs on the game's clock) over `frames` at one
+/// refresh of `period_ns` and k = 1, as [`count_play`] counts a play's,
+/// with `present_times` every present the game issued (none: N/A) and
+/// `presentation` how its swap chain presented: a play's span, or a
+/// select or result screen's lifetime (dev-tools, `tapestry measure
+/// select`).
+pub fn count_capture(
+    frames: &[PmFrame],
+    (a, b): (i64, i64),
+    present_times: Option<&[i64]>,
+    presentation: Option<render::measure::Presentation>,
+    period_ns: i64,
+) -> PlayCapture {
     let na = PlayCapture {
         count: None,
         presents: None,
@@ -348,7 +369,7 @@ pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapt
         .iter()
         .find(|f| f.present_us > to)
         .map(|f| f.present_us);
-    let covered = fig.present_times.as_ref().is_some_and(|times| {
+    let covered = present_times.is_some_and(|times| {
         let issued: Vec<i64> = times
             .iter()
             .copied()
@@ -373,9 +394,7 @@ pub fn count_play(frames: &[PmFrame], fig: &Figures, period_ns: i64) -> PlayCapt
             .filter(|f| (a..b).contains(&f.present_us) && f.display_us.is_none())
             .count() as u64,
     );
-    let applicable = fig
-        .presentation
-        .is_some_and(render::measure::Presentation::countable)
+    let applicable = presentation.is_some_and(render::measure::Presentation::countable)
         && window
             .iter()
             .all(|f| f.sync_interval == Some(1) && f.tearing == Some(false));
@@ -626,6 +645,36 @@ mod tests {
         close.insert(2, frame(11_000, None));
         fig.present_times = Some(vec![300, 4_300, 11_300, 12_100, 16_300]);
         assert_eq!(count_play(&close, &fig, T).count, None);
+    }
+
+    /// A select or result screen's lifetime is counted with the run's
+    /// present log: its span reaches the next screen's first present, and
+    /// its predecessor, the previous screen's last present, is matched. With
+    /// the lifetime's own presents only, that predecessor is missing and
+    /// the span is N/A (the S7-07d gate's P5).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_screens_lifetime_counts_against_the_runs_presents() {
+        let frames: Vec<PmFrame> = [0, 4, 8, 12, 16]
+            .map(|p| frame(p * 1_000, Some(p * 1_000 + 1_000)))
+            .to_vec();
+        let log = [300, 4_300, 8_300, 12_300, 16_300];
+        let span = crate::dev::screen_span((4_300, 12_300), &log);
+        assert_eq!(span, (4_300, 16_300));
+        let shown = Some(render::measure::Presentation {
+            sync_interval: 1,
+            tearing: false,
+        });
+        let c = super::count_capture(&frames, span, Some(&log), shown, T);
+        assert_eq!(c.count.map(|s| s.lost), Some(0));
+        let own = [4_300, 8_300, 12_300];
+        let c = super::count_capture(&frames, span, Some(&own), shown, T);
+        assert_eq!(c.count, None);
+        // The last lifetime of a run: its span ends just after its last.
+        assert_eq!(
+            crate::dev::screen_span((4_300, 16_300), &log),
+            (4_300, 16_301)
+        );
     }
 
     /// An empty capture, or a game without present times, has no figure.
