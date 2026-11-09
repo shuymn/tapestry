@@ -6,11 +6,14 @@
 //! [`Coordinator::take`], so it needs neither `Clone` nor a shared slot;
 //! the coordinator keeps only the outcome's kind. Waiting
 //! ([`ScopedJob::wait`]) asks the waiter each slice whether to stop. At the
-//! first yes it asks the job to stop (its owner's stop, and the choice
-//! advanced, so the job is cancelled) and then **settles**: it waits for
-//! the thread's end in parked slices, asking nothing more, joins it and
-//! decides from what the join returned. A panic stays fatal after a stop,
-//! and a result the job made after the stop is dropped.
+//! first yes it stops the job through its owner's stop, which its admission
+//! and every checkpoint read (a seen stop is terminal: the job ends
+//! cancelled), and then **settles**: it waits for the thread's end in
+//! parked slices, asking nothing more, joins it and decides from what the
+//! join returned. A panic stays fatal after a stop, and a result the job
+//! made after the stop is dropped. The choice's scope is not advanced: that
+//! would cancel the other subscribers of the choice too, the stop is this
+//! job's own.
 
 use std::io;
 use std::path::PathBuf;
@@ -88,7 +91,6 @@ impl Spawner {
 /// A foreground job running on its own scoped thread.
 #[derive(Debug)]
 pub struct ScopedJob<'scope, R> {
-    coord: Coordinator,
     kind: JobKind,
     /// Kept until the join: dropping the last handle would cancel it.
     handle: Handle<()>,
@@ -146,7 +148,6 @@ impl Coordinator {
             })
             .map_err(|e| failed(e.to_string()))?;
         Ok(ScopedJob {
-            coord: self.clone(),
             kind,
             handle,
             stop,
@@ -164,7 +165,6 @@ impl<R> ScopedJob<'_, R> {
             if !settling && stop() {
                 settling = true;
                 self.stop.store(true, Ordering::Release);
-                self.coord.advance(Scope::Choice);
                 continue;
             }
             thread::park_timeout(slice);
@@ -368,7 +368,9 @@ mod tests {
             let job = coord
                 .run_scoped(s, Spawner::SYSTEM, job(JobKind::Measure), move |ctx| {
                     let _ = started_tx.send(());
+                    let began = std::time::Instant::now();
                     while !ctx.checkpoint() {
+                        assert!(began.elapsed() < watchdog(), "the stop is never seen");
                         thread::yield_now();
                     }
                     "measured"
@@ -393,17 +395,31 @@ mod tests {
             .map(|_| coord.try_lease(Class::Foreground).unwrap())
             .collect();
         let ran = AtomicUsize::new(0);
+        let expired = std::sync::atomic::AtomicBool::new(false);
+        let (done, waited) = mpsc::channel::<()>();
         let joined = thread::scope(|s| {
-            coord
+            // A hang guard: a stop never seen would wait for a permit
+            // forever, so the permits are given back at the watchdog and
+            // the test fails.
+            let expired = &expired;
+            s.spawn(move || {
+                if waited.recv_timeout(watchdog()).is_err() {
+                    expired.store(true, Ordering::SeqCst);
+                }
+                drop(held);
+            });
+            let joined = coord
                 .run_scoped(s, Spawner::SYSTEM, job(JobKind::Bank), |_| {
                     ran.fetch_add(1, Ordering::SeqCst);
                 })
                 .unwrap()
-                .wait(SLICE, || true)
+                .wait(SLICE, || true);
+            let _ = done.send(());
+            joined
         });
+        assert!(!expired.load(Ordering::SeqCst), "the stop was never seen");
         assert_eq!(joined, Joined::Cancelled(None));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
-        drop(held);
         assert_eq!(coord.held(Class::Foreground), 0);
     }
 }
