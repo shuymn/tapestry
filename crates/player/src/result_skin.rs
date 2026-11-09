@@ -245,6 +245,10 @@ pub struct ResultSkin {
     /// generation was protected: a request for its view reuses it, its
     /// runtime running on (s7-07-design §3.7.1 M8).
     presented: Option<Specialized>,
+    /// The thread a layout job wakes once its outcome is in (the game
+    /// thread, [`crate::controls::Controls::game_thread`]): a switch's
+    /// layout lands then, not at the end of the game thread's idle wait.
+    wake: Option<std::thread::Thread>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -1093,24 +1097,33 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
-        match imports::spawn_job(move |cancel: &Cancel| {
-            let (laid, script) = layout(
-                &pending,
-                view,
-                class,
-                &theirs,
-                base,
-                others,
-                cancel,
-                Some(permit),
-            );
-            LayoutOut {
-                request,
-                view,
-                laid,
-                script,
-            }
-        }) {
+        // The game thread, woken once the outcome is in.
+        let wake = self.wake.clone();
+        match imports::spawn_job_with(
+            move |cancel: &Cancel| {
+                let (laid, script) = layout(
+                    &pending,
+                    view,
+                    class,
+                    &theirs,
+                    base,
+                    others,
+                    cancel,
+                    Some(permit),
+                );
+                LayoutOut {
+                    request,
+                    view,
+                    laid,
+                    script,
+                }
+            },
+            move || {
+                if let Some(t) = wake {
+                    t.unpark();
+                }
+            },
+        ) {
             Ok(job) => self.job = Some((job, request, slot)),
             Err(why) => {
                 log::info!("skin: result: its layout cannot start: {why}");
@@ -1402,6 +1415,18 @@ impl ResultSkin {
     /// Whether a layout job runs.
     pub fn has_job(&self) -> bool {
         self.job.is_some()
+    }
+
+    /// Has each layout job wake `thread` once its outcome is in.
+    pub fn set_wake(&mut self, thread: Option<std::thread::Thread>) {
+        self.wake = thread;
+    }
+
+    /// Whether the layout job's outcome was received and not yet taken: its
+    /// thread may still be ending, and [`poll`](Self::poll) takes it once
+    /// the thread has ended.
+    pub fn landing(&mut self) -> bool {
+        self.job.as_mut().is_some_and(|(job, _, _)| job.received())
     }
 
     /// The result skin of the next attempt is decided again by its image

@@ -136,6 +136,12 @@ impl Controls {
         let _ = self.game.set(game);
     }
 
+    /// The game thread, once named: what a job wakes when its outcome is
+    /// in, as [`wake_game`](Self::wake_game) does.
+    pub fn game_thread(&self) -> Option<Thread> {
+        self.game.get().cloned()
+    }
+
     /// Unparks the game thread, so it acts on what changed without
     /// waiting out its idle wait. The input thread calls it for menu
     /// events.
