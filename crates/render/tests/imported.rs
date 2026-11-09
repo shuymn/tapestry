@@ -57,6 +57,7 @@ fn attempt_frame(
         context: &ctx,
         text,
         target: r.target(),
+        continuation: skin_model::Continuation::Fresh,
     };
     let token = r.stage(b, &a, request).unwrap();
     r.commit(token).unwrap();

@@ -240,6 +240,25 @@ impl Bank {
     pub fn values(&self) -> &[Val] {
         &self.vals
     }
+
+    /// A bank holding `vals`, which a program takes only when it
+    /// [`fits`](Present::fits).
+    #[must_use]
+    pub fn of(vals: Vec<Val>) -> Self {
+        Self {
+            vals: vals.into_boxed_slice(),
+        }
+    }
+
+    /// Takes `other`'s values, reusing this bank's storage when the
+    /// lengths match.
+    pub fn copy_from(&mut self, other: &Self) {
+        if self.vals.len() == other.vals.len() {
+            self.vals.copy_from_slice(&other.vals);
+        } else {
+            self.vals.clone_from(&other.vals);
+        }
+    }
 }
 
 /// What a frame gives the program beside the fields and timers: the state
@@ -328,6 +347,10 @@ pub struct Present {
     def: PresentDef,
     /// Per callback, whether it loads or stores a slot.
     slotted: Box<[bool]>,
+    /// Whether its slotted callbacks may run on a carried state: each has
+    /// no gate and no `after`, and every read it makes (value and guard)
+    /// loads only the point ([`Present::carry_safe`]).
+    carry_safe: bool,
 }
 
 impl Present {
@@ -347,6 +370,30 @@ impl Present {
     #[must_use]
     pub fn signature(&self) -> &[OutTy] {
         &self.def.signature
+    }
+
+    /// Whether its slotted callbacks may run on a state carried from an
+    /// earlier attempt of the play state: each has no gate and no `after`,
+    /// and every read it makes, value and availability guard, loads only
+    /// the point (`field::POINT`), the one field whose cached value the
+    /// carry reproduces. The clock (`Insn::StateUs`) is no read. Any other
+    /// field, an output or a timer refuses it.
+    #[must_use]
+    pub fn carry_safe(&self) -> bool {
+        self.carry_safe
+    }
+
+    /// Whether `bank` fits the program's slots: one value a slot, each in
+    /// its slot's domain (V7's rule for initial values).
+    #[must_use]
+    pub fn fits(&self, bank: &Bank) -> bool {
+        bank.vals.len() == self.def.slots.len()
+            && self
+                .def
+                .slots
+                .iter()
+                .zip(&bank.vals)
+                .all(|(s, &v)| s.domain.holds(v))
     }
 
     /// The slots at their initial values: a fresh attempt's.
