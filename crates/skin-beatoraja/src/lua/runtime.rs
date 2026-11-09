@@ -654,6 +654,9 @@ pub struct ScreenRuntime {
     stopped: Option<Stopped>,
     over_budget: u32,
     calls: u64,
+    /// The full collections [`collect`](Self::collect) ran (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    collections: u64,
     #[cfg(feature = "dev-tools")]
     _open: Option<super::vm_hooks::Open>,
     permit: Option<Permit>,
@@ -754,6 +757,8 @@ impl ScreenRuntime {
             over_budget: 0,
             calls: 0,
             #[cfg(feature = "dev-tools")]
+            collections: 0,
+            #[cfg(feature = "dev-tools")]
             _open: open,
             permit: None,
         }))
@@ -848,7 +853,18 @@ impl ScreenRuntime {
     /// Returns whether it ran: a stopped runtime's VM is left as it is.
     #[cfg(feature = "dev-tools")]
     pub fn collect(&mut self) -> bool {
-        self.stopped.is_none() && self._lua.gc_collect().is_ok()
+        let ran = self.stopped.is_none() && self._lua.gc_collect().is_ok();
+        if ran {
+            self.collections += 1;
+        }
+        ran
+    }
+
+    /// The full collections [`collect`](Self::collect) ran (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn collections(&self) -> u64 {
+        self.collections
     }
 
     /// The calls, instruction steps and host calls so far.

@@ -25,6 +25,9 @@ pub(crate) struct VisitSample {
     pub(crate) collect_span: Duration,
     /// Whether a forced collection ran after the frame.
     pub(crate) collected: bool,
+    /// The runtime's calls when its collections were counted, after the
+    /// frame: where the collection ran.
+    pub(crate) collected_at_calls: u64,
     /// Instructions run in the frame.
     pub(crate) instructions: u64,
     /// Host calls made in the frame.
@@ -46,6 +49,7 @@ thread_local! {
             span: Duration::ZERO,
             collect_span: Duration::ZERO,
             collected: false,
+            collected_at_calls: 0,
             instructions: 0,
             host_calls: 0,
             bridges: 0,
@@ -109,22 +113,26 @@ pub(in crate::screens) fn run(
     FRAMES.fetch_add(1, Ordering::SeqCst);
     let span = started.elapsed();
     let after = rt.counters();
-    let (collected, collect_span) = if s.collect {
+    let collections = rt.collections();
+    let collect_span = if s.collect {
         let at = Instant::now();
-        let ran = rt.collect();
-        if ran {
-            COLLECTIONS.fetch_add(1, Ordering::SeqCst);
-        }
-        (ran, at.elapsed())
+        rt.collect();
+        at.elapsed()
     } else {
-        (false, Duration::ZERO)
+        Duration::ZERO
     };
+    // The collections the runtime itself counts, so a second one or one
+    // run elsewhere shows.
+    let ran = rt.collections().saturating_sub(collections);
+    COLLECTIONS.fetch_add(ran, Ordering::SeqCst);
+    let collected = ran > 0;
     let sample = VisitSample {
         ran: true,
         generation,
         span,
         collect_span,
         collected,
+        collected_at_calls: rt.counters().calls,
         instructions: after.instructions.saturating_sub(before.instructions),
         host_calls: after.host_calls.saturating_sub(before.host_calls),
         bridges: after.bridges.saturating_sub(before.bridges),

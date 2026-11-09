@@ -660,7 +660,14 @@ fn the_collect_switch_collects_once_after_each_frame() {
         let _ = visits(&mut visit, &bundle, 1);
         let s = super::super::take_visit();
         assert!(s.ran && s.collected, "{s:?}");
-        assert_eq!(collections() - before, n);
+        assert_eq!(collections() - before, n, "one collection a frame");
+        let rt = visit.running().unwrap();
+        assert_eq!(rt.collections(), n);
+        assert_eq!(
+            s.collected_at_calls,
+            rt.counters().calls,
+            "after the frame's calls"
+        );
     }
     let generation = visit.generation();
     assert!(generation.is_some());
@@ -684,8 +691,9 @@ fn the_collect_switch_collects_once_after_each_frame() {
     assert_eq!(collections(), at_open + 1);
 }
 
-/// The frame probe takes no script cell lock: a runtime frame with its
-/// sample completes while another thread holds the cell's lock.
+/// A visit holding its runtime takes no script cell lock for its
+/// instruments: its frame, with the switches' work and its sample,
+/// completes while another thread holds the cell's lock.
 #[test]
 fn the_probe_runs_while_another_thread_holds_the_cell() {
     let _serial = crate::imports::tests::serial();
@@ -703,13 +711,11 @@ fn the_probe_runs_while_another_thread_holds_the_cell() {
     held_rx.recv().unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let prober = std::thread::spawn(move || {
-        let mut sel = bundle.skin().prepare_selection();
-        if let Some(rt) = visit.running() {
-            let (fields, timers) = sel.runtime_parts();
-            super::super::probe::run(rt, ScreenKind::Selection, 1, |rt| {
-                rt.frame(fields, timers);
-            });
-        }
+        let _s = Switches::set(crate::dev::ScriptSwitches {
+            collect: true,
+            ..Default::default()
+        });
+        let _ = visits(&mut visit, &bundle, 1);
         let s = super::super::take_visit();
         done_tx.send(s.ran).unwrap();
         visit
