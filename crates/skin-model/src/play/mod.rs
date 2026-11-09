@@ -417,13 +417,22 @@ pub struct Play {
     empty_poor_counted: bool,
     /// The error of a refused build, which every later build returns.
     poisoned: Option<BuildError>,
-    /// Per timer slot (built-in, then `when`): its start, `None` while off.
+    /// Per timer slot (built-in, then `when`, then the program's timer
+    /// callbacks): its start, `None` while off.
     starts: Box<[Option<TimeUs>]>,
     /// Per timer slot: elapsed ms, or [`TIMER_OFF`].
     ms: Box<[i32]>,
     /// The fields, then the presentation program's outputs, two a
     /// callback.
     fields: Box<[i32]>,
+    /// The presentation program's slots: fresh at each prepare, kept by
+    /// a rearm.
+    bank: crate::present::Bank,
+    /// Whether the program's callbacks with slots run: a whole-chart
+    /// attempt's, not a section's (a practice round, a mid-chart start),
+    /// where the source reads the point an earlier round left cached
+    /// (`ScoreDataProperty`, not reset at `BMSPlayer.java:582` at `0.8.9`).
+    slots_run: bool,
     /// The attempt's exact playhead, which notes, bar lines and the beat
     /// sample; a rearm keeps it.
     playhead: ExactPlayhead,
@@ -501,6 +510,7 @@ impl Play {
             + size_of_val(&*self.fields)
             + size_of_val(&*self.starts)
             + size_of_val(&*self.ms)
+            + size_of_val(self.bank.values())
             + self.playhead.heap_bytes()
             + notes
             + size_of_val(&*self.gauges)
@@ -510,19 +520,24 @@ impl Play {
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
-    /// A fresh attempt with `outputs` program output slots and `whens`
-    /// `when` timers, keeping the chart's
+    /// A fresh attempt with the program `present` (its output slots, its
+    /// timers and its slots at their initial values) and `whens` `when`
+    /// timers, keeping the chart's
     /// notes and the work of `bar_groups` checked groups when the skin has
     /// `lanes`; grades up to `bomb_up_to` give a bomb.
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
-        outputs: usize,
+        present: Option<&crate::present::Present>,
         whens: usize,
         lanes: bool,
         bar_groups: usize,
         bomb_up_to: Option<schema::Grade>,
     ) -> Result<Self, PrepareError> {
+        let outputs = present.map_or(0, |p| crate::output::slots(p.len()));
+        let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
+        let bank =
+            present.map_or_else(crate::present::Bank::default, crate::present::Present::bank);
         let (play_at, lead_in, section) = match ctx.attempt {
             Attempt::Full { lead_in } => (TimeUs(0), lead_in, None),
             Attempt::Section(s) => (s.start, s.lead_in, Some(s)),
@@ -565,7 +580,7 @@ impl Play {
             ctx.empty_poor_breaks_combo,
             bomb_up_to,
         );
-        let slots = usize::from(timer::BUILTIN).saturating_add(whens);
+        let slots = usize::from(timer::BUILTIN).saturating_add(timers);
         let notes = lanes.then(|| {
             let range = std::array::from_fn(|l| {
                 chart.lanes.get(l).map_or((0, 0), |notes| match bounds {
@@ -591,6 +606,8 @@ impl Play {
             starts: vec![None; slots].into_boxed_slice(),
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: vec![0; field::COUNT.saturating_add(outputs)].into_boxed_slice(),
+            bank,
+            slots_run: matches!(ctx.attempt, Attempt::Full { .. }),
             playhead,
             display: Position(0),
             beat: None,
@@ -622,8 +639,8 @@ impl Play {
     /// candidate (design.md "Play Lifecycle", the start gate), in place:
     /// the reducer, the holds, every timer and the beat, as a fresh attempt
     /// has them. The chart's notes, the prepared playhead, the gauges, the
-    /// attached and bitmap text and a refused build stay, and nothing is
-    /// allocated.
+    /// attached and bitmap text, the program's slots and a refused build
+    /// stay, and nothing is allocated.
     pub fn rearm(&mut self) {
         self.reducer.rearm();
         self.holds = [None; LANE_COUNT];
@@ -652,7 +669,13 @@ impl Play {
         self.fields.len()
     }
 
-    /// The number of timer slots, built-in and `when`.
+    /// The program's slots as of the last build.
+    #[must_use]
+    pub fn bank(&self) -> &crate::present::Bank {
+        &self.bank
+    }
+
+    /// The number of timer slots: built-in, `when` and the program's.
     pub(crate) fn slots(&self) -> usize {
         self.ms.len()
     }

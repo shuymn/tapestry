@@ -2172,6 +2172,7 @@ fn build_does_not_allocate() {
     grade_attachments_do_not_allocate(&full);
     large_gauges_do_not_allocate(&full, &views, &descs);
     programs_do_not_allocate(&chart, &full);
+    slots_do_not_allocate(&chart, &full);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -4268,6 +4269,127 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     );
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
+/// A latch on a slot, the timer of two objects of one closure, built
+/// frame after frame as its condition comes and goes, through a rearm:
+/// slots, timer callbacks' two runs and their timers allocate nothing;
+/// with a positive control.
+fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    use present_support::{Builder, Cb, read};
+    use skin_model::present::{Cmp, Conv, Domain, Insn, OFF, SlotDef};
+    let domain = Domain {
+        off: true,
+        ints: Some((0, 1 << 53)),
+    };
+    let mut b = Builder::default();
+    b.0.slots.push(SlotDef { init: OFF, domain });
+    b.0.domains.push(domain);
+    let k = b.push(Cb::code(
+        vec![
+            Insn::LoadSlot { dst: 0, slot: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Cmp {
+                op: Cmp::Eq,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            Insn::Test {
+                cond: 2,
+                when: false,
+                to: 7,
+            },
+            Insn::Read { dst: 2, read: 0 },
+            Insn::Test {
+                cond: 2,
+                when: false,
+                to: 7,
+            },
+            Insn::StateUs { dst: 0 },
+            Insn::StoreSlot {
+                slot: 0,
+                src: 0,
+                domain: 0,
+            },
+            Insn::Ret { src: 0 },
+        ],
+        vec![OFF],
+        vec![read("combo >= 5", skin_model::Ty::Bool, None)],
+        Conv::Timer,
+    ));
+    let j = b.share(k);
+    let elements = [k, j]
+        .into_iter()
+        .map(|k| {
+            widget(
+                Source::Image(0),
+                track(0, Ease::Linear, End::Hold),
+                TimerRef::Output(k),
+                Place::SCREEN,
+            )
+        })
+        .collect();
+    let skin = present_support::load(
+        Some(b.0),
+        Vec::new(),
+        elements,
+        skin_model::WidgetDefs::default(),
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let notes = NoteFacts::default();
+    let layout = SkinLayout::AUTHOR;
+    let frame = |now: i64, t: &'static Tally| SkinFrame {
+        state_us: now + 500_000,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &layout,
+        turntable: 0,
+        lanes: play_support::VIEW,
+        readouts: readouts_for(play_support::VIEW),
+        playing: true,
+        closing: None,
+    };
+    let tallies: &'static [Tally] =
+        Box::leak((0..10).map(tally).collect::<Vec<_>>().into_boxed_slice());
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    // The timer seen off and on.
+    let mut seen = [false; 2];
+    TRACK.with(|t| t.set(true));
+    for (i, now) in (0..3_000 * MS).step_by(16 * MS as usize).enumerate() {
+        if i == 100 {
+            play.rearm();
+        }
+        batch.clear();
+        skin.build(
+            &mut play,
+            &frame(now, &tallies[i / 7 % 10]),
+            &uvs,
+            &mut batch,
+        )
+        .expect("the frame builds");
+        seen[usize::from(play.timer(timer::BUILTIN).is_some())] = true;
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "slots: allocations");
+    assert_eq!(seen, [true, true], "the timer off and on");
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

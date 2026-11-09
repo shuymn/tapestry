@@ -131,6 +131,9 @@ pub struct Drawn {
     pub input: eval::InputFacts,
     /// The turntable angle each frame gives: by default 0.
     pub turntable: i32,
+    /// The state clock each frame gives (`SkinFrame::state_us`): by
+    /// default 0.
+    pub state_us: i64,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -345,6 +348,19 @@ impl Drawn {
         Self::over_context(skin, chart, &context_with(bpm_range, bpm_whole_change))
     }
 
+    /// `skin` played over a chart of `notes` notes as a section attempt
+    /// (a practice round) over `section`.
+    pub fn over_section(skin: Skin, notes: u32, section: &eval::Section) -> Self {
+        Self::over_context(
+            skin,
+            &chart(notes),
+            &PlayContext {
+                attempt: Attempt::Section(section),
+                ..context_with(None, None)
+            },
+        )
+    }
+
     /// `skin` played over `chart` with the context `ctx`.
     fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
         let uvs = skin
@@ -378,6 +394,7 @@ impl Drawn {
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
             turntable: 0,
+            state_us: 0,
         }
     }
 
@@ -429,7 +446,7 @@ impl Drawn {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
-            state_us: 0,
+            state_us: self.state_us,
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
             tally: &self.tally,

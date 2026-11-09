@@ -6,7 +6,7 @@
 //! gauge's look under the view's preset. `skin_model` holds no `game` type and `game` no library type,
 //! so the conversion is the player's.
 
-use game::{BestCompare, BestLamp, Rate, ResultBasis, ResultGraphs, ViewSummary};
+use game::{BestCompare, BestLamp, BestLookup, Rate, ResultBasis, ResultGraphs, ViewSummary};
 use rules::RulePreset;
 use skin_model::{
     BestFigures, BestRate, BestView, DEVIATION_SLOTS, GaugeColumn, GaugeDesc, GaugeHistory,
@@ -32,7 +32,10 @@ pub struct ResultParts {
 
 /// The parts of `summary`, a view under `preset`, of the result whose
 /// views share `basis` ([`game::ResultScreen::basis`]). A best not yet
-/// read is unavailable.
+/// read is unavailable; a best that is not known (no library, a failed
+/// read, an autoplay or a practice round) is the source's empty score, as
+/// a known-empty best gives it (design.md "Personal Bests", skin
+/// projections), so a result skin reads its values and never refuses.
 pub fn result_parts(
     summary: &ViewSummary,
     preset: &RulePreset,
@@ -40,6 +43,15 @@ pub fn result_parts(
 ) -> ResultParts {
     let f = &summary.figures;
     let t = &summary.graphs.timelines;
+    let best = match summary.best {
+        Some(BestCompare::Unavailable) => Some(BestCompare::of(
+            &BestLookup::KnownEmpty,
+            &summary.tally,
+            f,
+            basis.random,
+        )),
+        other => other,
+    };
     ResultParts {
         score: ResultScore {
             tally: summary.tally,
@@ -51,7 +63,7 @@ pub fn result_parts(
             duration_us: f.duration_us,
         },
         notes: f.notes,
-        best: match summary.best {
+        best: match best {
             None | Some(BestCompare::Unavailable) => BestView::Unavailable,
             Some(BestCompare::Known(b)) => BestView::Known(BestFigures {
                 ex: b.ex,
@@ -233,8 +245,8 @@ mod tests {
     }
 
     /// The figures, best, timing and timelines convert value for value;
-    /// an empty best's BP and difference are hidden, an unread or
-    /// unavailable best is unavailable, and a difference past `i32` stays
+    /// an empty best's BP and difference are hidden, an unread best is
+    /// unavailable, and a difference past `i32` stays
     /// at its bound.
     #[test]
     fn a_views_parts_convert_value_for_value() {
@@ -303,12 +315,62 @@ mod tests {
         assert_eq!(lines.bins()[1][4], 2);
         assert_eq!(lines.notes(), &[5, 6, 7]);
         assert_eq!(lines.uncovered_from(), Some(2));
-        for best in [None, Some(BestCompare::Unavailable)] {
-            assert_eq!(
-                result_parts(&summary(best), &p, &basis()).best,
-                BestView::Unavailable
-            );
-        }
+        assert_eq!(
+            result_parts(&summary(None), &p, &basis()).best,
+            BestView::Unavailable
+        );
+    }
+
+    /// A best that is not known projects as the source's empty score
+    /// (`ScoreData`'s defaults: EX 0, no BP, no lamp), exactly as a
+    /// known-empty one: EX 0, the difference the view's EX score, BP and
+    /// its difference hidden, no lamp, EX beaten when the view scored, BP
+    /// beaten, and the rate 0 over the view's largest EX score; a view of
+    /// EX 0 beats neither its EX nor its rate.
+    #[test]
+    fn an_unknown_best_projects_as_the_empty_score() {
+        let p = rules::tapestry();
+        let mut view = summary(Some(BestCompare::Unavailable));
+        view.tally.ex_score = 900;
+        view.tally.bp = 5;
+        let unknown = result_parts(&view, &p, &basis()).best;
+        let BestView::Known(b) = unknown else {
+            panic!("{unknown:?}");
+        };
+        assert_eq!((b.ex, b.ex_diff), (0, 900));
+        assert_eq!(
+            (b.bp, b.bp_diff),
+            (ResultNumber::Hidden, ResultNumber::Hidden)
+        );
+        assert_eq!(b.clear, LampKey::NoPlay);
+        assert!(b.ex_updated && b.bp_updated);
+        let r = b.rate.unwrap();
+        assert_eq!((r.rate_bp, r.grade, r.updated), (0, 0, true));
+        view.best = Some(BestCompare::of(
+            &game::BestLookup::KnownEmpty,
+            &view.tally,
+            &view.figures,
+            false,
+        ));
+        assert_eq!(result_parts(&view, &p, &basis()).best, unknown);
+        // A chart that declares `#RANDOM` has no best rate, as a
+        // known-empty best of it.
+        let mut random = basis();
+        random.random = true;
+        view.best = Some(BestCompare::Unavailable);
+        let BestView::Known(b) = result_parts(&view, &p, &random).best else {
+            panic!("unavailable");
+        };
+        assert_eq!(b.rate, None);
+        // A view of EX 0 does not beat the empty score's EX or rate; its
+        // BP still beats the empty score's.
+        view.tally.ex_score = 0;
+        let BestView::Known(b) = result_parts(&view, &p, &basis()).best else {
+            panic!("unavailable");
+        };
+        assert_eq!((b.ex, b.ex_diff), (0, 0));
+        assert!(!b.ex_updated && b.bp_updated);
+        assert!(!b.rate.unwrap().updated);
     }
 
     /// A preset of seven gauges whose emphasized one, the seventh, is

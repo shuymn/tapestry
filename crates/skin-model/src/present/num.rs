@@ -281,3 +281,18 @@ pub fn to_int(a: Val) -> i32 {
         Val::Nil | Val::Bool(_) => 0,
     }
 }
+
+/// The source's `tolong()` (LuaJ): an integer as it is, a float
+/// saturated to 64 bits with NaN 0 (Java's `(long)`), nil and booleans 0.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Java's `(long)` of a double: saturating, NaN 0, as Rust's `as`"
+)]
+pub fn to_long(a: Val) -> i64 {
+    match a {
+        Val::Int(n) => n,
+        Val::Float(f) => f as i64,
+        Val::Nil | Val::Bool(_) => 0,
+    }
+}
