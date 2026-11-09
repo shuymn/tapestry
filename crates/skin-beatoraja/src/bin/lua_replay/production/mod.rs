@@ -21,21 +21,23 @@ use skin_model::{
 use crate::inputs::FrameInputs;
 use crate::script::{STATE_AT_ZERO, Script};
 
-/// One frame's trace.
-struct FrameTrace {
-    events: Vec<Event>,
-    now: TimeUs,
-    state_us: i64,
+/// One frame's trace. Its fields, and [`ProductionRun`]'s, are
+/// `pub(in crate::production)`: readable here and in [`compare`] only, as
+/// `cargo xtask check-arch`'s privacy harness checks.
+pub(in crate::production) struct FrameTrace {
+    pub(in crate::production) events: Vec<Event>,
+    pub(in crate::production) now: TimeUs,
+    pub(in crate::production) state_us: i64,
 }
 
 /// What production did, owned and unreadable outside this module.
 pub struct ProductionRun {
-    recorded: Recorded,
-    frames: Vec<FrameTrace>,
+    pub(in crate::production) recorded: Recorded,
+    pub(in crate::production) frames: Vec<FrameTrace>,
     /// Each timer callback's timer slot.
-    timer_slots: BTreeMap<u16, usize>,
+    pub(in crate::production) timer_slots: BTreeMap<u16, usize>,
     /// The program's callbacks.
-    callbacks: usize,
+    pub(in crate::production) callbacks: usize,
 }
 
 const LIMITS: AtlasLimits = AtlasLimits {
