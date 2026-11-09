@@ -10184,6 +10184,12 @@ pub(crate) mod tests {
             _chart: &Chart,
             _section: Option<&eval::Section>,
         ) -> Result<(), RenderError> {
+            if self.shared.hold_load.load(Ordering::Acquire) {
+                self.shared.load_held.store(true, Ordering::Release);
+                while self.shared.hold_load.load(Ordering::Acquire) {
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+            }
             Ok(())
         }
         fn prepare_attempt(
@@ -10490,6 +10496,10 @@ pub(crate) mod tests {
         pub(crate) refuse_install: Arc<AtomicBool>,
         /// Loading frames are refused while set.
         refuse_loading: Arc<AtomicBool>,
+        /// A chart's load waits, once noted, while set.
+        pub(crate) hold_load: Arc<AtomicBool>,
+        /// Set once a chart's load waits on `hold_load`.
+        pub(crate) load_held: Arc<AtomicBool>,
         /// Commits wait, once noted, while set.
         hold_commit: Arc<AtomicBool>,
         /// Set once a commit waits on `hold_commit`.
