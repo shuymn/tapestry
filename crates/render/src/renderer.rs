@@ -2563,6 +2563,13 @@ impl Renderer {
         self.skin.rearm();
     }
 
+    /// What the play skin in use's attempt gives the next attempt of its
+    /// play state ([`PlaySkin::carry`]).
+    #[must_use]
+    pub fn carry(&self) -> Option<skin_model::Carry<'_>> {
+        self.skin.carry()
+    }
+
     /// The app's share of a frame ([`Staging::build`]): the skin builds
     /// `f`, the overlay follows, and the batch is staged, with no call into
     /// wgpu. The frame's CPU time starts here; [`submit`](Self::submit)
@@ -4505,6 +4512,7 @@ mod tests {
             context: &ctx,
             text,
             target: r.target(),
+            continuation: skin_model::Continuation::Fresh,
         };
         r.stage(b, &a, request)
     }
