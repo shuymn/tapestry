@@ -3030,6 +3030,81 @@ mod gate_tests {
         assert_eq!(controls.tuning().activity().opened(), 1);
     }
 
+    /// A16 and A18p: the opening linearizes at the input thread's
+    /// focus-generation check. A focus loss after that check, while the
+    /// hook builds the opening (stopped at its gate), also lost and back
+    /// again, opens recording all the same, and the focus gate, reset
+    /// before the check, trips at the next batch: the play is aborted for
+    /// focus (`focus_lost`) and nothing after the loss is recorded. With
+    /// focus kept, the same press is recorded.
+    #[test]
+    fn a_focus_loss_after_the_generation_check_aborts_the_play() {
+        use std::time::Duration;
+
+        let watchdog = Duration::from_secs(
+            std::env::var("TAPESTRY_TEST_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+        );
+        for (case, lose, back) in [
+            ("kept", false, false),
+            ("lost", true, false),
+            ("lost and back", true, true),
+        ] {
+            let (mut sources, mut hook, link, controls) = tuning_rig();
+            batch(&mut hook, &mut sources, 0, &[]);
+            let closed = controls.tuning().close(1);
+            let (reached_tx, reached) = std::sync::mpsc::channel();
+            let (resume, resume_rx) = std::sync::mpsc::channel();
+            link.open_gate(super::OpenGate {
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+            link.requests
+                .send(Request::Open {
+                    lead_in: LEAD_IN,
+                    logic: std::thread::current(),
+                    recorded: recorded(),
+                    gate: Some(1),
+                    focus: Some(closed.focus_losses),
+                })
+                .unwrap();
+            std::thread::scope(|s| {
+                let opener = s.spawn(|| batch(&mut hook, &mut sources, 40, &[]));
+                reached
+                    .recv_timeout(watchdog)
+                    .expect("the opening reached its gate");
+                if lose {
+                    controls.focus(false);
+                }
+                if back {
+                    controls.focus(true);
+                }
+                resume.send(()).unwrap();
+                opener.join().unwrap();
+            });
+            let Ok(Reply::Opened(mut opening, _)) = link.replies.try_recv() else {
+                panic!("{case}: the opening is answered opened");
+            };
+            batch(&mut hook, &mut sources, 50, &[packet(1, Z, 1)]);
+            assert_eq!(link.tripped(), lose, "{case}");
+            let mut recorded = Vec::new();
+            for reader in &mut opening.readers {
+                while let Some(e) = reader.pop() {
+                    recorded.push(e.received);
+                }
+            }
+            // The press, on the play's clock from the opening's origin.
+            let expected: &[TimeUs] = if lose {
+                &[]
+            } else {
+                &[TimeUs(50 * MS - (40 * MS + 1 + LEAD_IN.0))]
+            };
+            assert_eq!(recorded, expected, "{case}");
+        }
+    }
+
     /// A16: the input thread publishes candidate generation 1 as opened as
     /// soon as the source set opened it, before it builds the opening and
     /// replies. Stopped there, tuning acceptance closed until generation
