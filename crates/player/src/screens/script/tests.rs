@@ -393,7 +393,7 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
         scripts.commit_view(Some(presented), || true),
         super::ViewCommit::Committed
     );
-    let permit = scripts.result_permit(None).expect("the evicted permit");
+    let permit = scripts.result_permit(&[]).expect("the evicted permit");
     assert!(gone(&vb) && !gone(&va));
     assert!(live(&scripts, presented) && !live(&scripts, other));
     let mut ran = false;
@@ -413,12 +413,12 @@ fn the_eviction_spares_the_presented_retained_and_kept() {
         scripts.commit_view(None, || true),
         super::ViewCommit::Committed
     );
-    let again = scripts.result_permit(Some(kept));
+    let again = scripts.result_permit(&[Some(kept)]);
     assert!(again.is_some());
     assert!(gone(&va) && !gone(&vc));
     let scripts = Scripts::new();
     let (_d, fixed, vd) = offered(&scripts, true);
-    assert!(scripts.result_permit(None).is_some());
+    assert!(scripts.result_permit(&[]).is_some());
     assert!(!gone(&vd) && live(&scripts, fixed));
 }
 

@@ -241,6 +241,10 @@ pub struct ResultSkin {
     /// A request whose job waits for a permit (s7-07-design §4 rule 4):
     /// tried again at each poll.
     permit_wait: Option<(u64, ViewFacts)>,
+    /// The specialization a newer one replaced in `layout` while its
+    /// generation was the presented one: a request for its view reuses it,
+    /// its runtime running on (s7-07-design §3.7.1 M8).
+    presented: Option<Specialized>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -682,7 +686,7 @@ impl ResultSkin {
         if let Some(Published::Skin(b, _, _)) = &self.published {
             v.push(b.atlas_pages().id());
         }
-        if let Some(l) = &self.layout {
+        for l in self.layout.iter().chain(&self.presented) {
             v.push(l.bundle.atlas_pages().id());
         }
         v.sort_unstable();
@@ -841,7 +845,7 @@ impl ResultSkin {
         // A bundle for every view keeps its runtime: the probe's import
         // keeps one under a permit, taken after the eviction; laid out per
         // view, it goes on the job's thread.
-        let permit = self.scripts.result_permit(None);
+        let permit = self.scripts.result_permit(&[]);
         let slot = self.slot_for_job();
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
@@ -979,7 +983,7 @@ impl ResultSkin {
                     Some(Ok(Some(bundle))) => {
                         let script = self.scripts.offer_result(script, false);
                         self.attempt = Some(ForAttempt::Every(Arc::clone(&bundle), None, script));
-                        self.layout = Some(Specialized {
+                        self.cache(Specialized {
                             bundle,
                             facts: deps,
                             entry: None,
@@ -1065,9 +1069,16 @@ impl ResultSkin {
         let Some(pending) = self.pending().map(Arc::clone) else {
             return;
         };
-        // Reuse was checked first (`layout_for`); then the eviction and the
-        // permit, without which the request waits for one.
-        let Some(permit) = self.scripts.result_permit(None) else {
+        // Reuse was checked first (`layout_for`); then the eviction, which
+        // spares the published and cached layouts' runtimes (a view may
+        // still present them), and the permit, without which the request
+        // waits for one.
+        let published = match &self.published {
+            Some(Published::Skin(_, _, g)) => *g,
+            _ => None,
+        };
+        let cached = self.layout.as_ref().and_then(|l| l.script);
+        let Some(permit) = self.scripts.result_permit(&[published, cached]) else {
             self.permit_wait = Some((request, view));
             return;
         };
@@ -1152,17 +1163,47 @@ impl ResultSkin {
     /// it reads no fact of the viewed result and its reads hold the
     /// attempt's.
     fn reuse_for_view(&self, view: ViewFacts) -> Option<Published> {
+        // The cached one, else the one presented, while it still is.
+        let presented = self.scripts.presented();
         let l = self
             .layout
+            .iter()
+            .chain(
+                self.presented
+                    .iter()
+                    .filter(|l| l.script.is_some() && l.script == presented),
+            )
+            .filter(|l| self.scripts.result_live(l.script))
+            .find(|l| match view.0 {
+                Some(fields) => l.facts.holds(&result_facts(fields, self.class)),
+                None => {
+                    !reads_result(&l.facts)
+                        && self.attempt_facts().is_some_and(|f| l.facts.holds(&f))
+                }
+            })?;
+        Some(Published::Skin(
+            Arc::clone(&l.bundle),
+            l.entry.clone(),
+            l.script,
+        ))
+    }
+
+    /// Caches `spec` as the layout; the one it replaces is kept as the
+    /// presented one while its generation is the presented generation.
+    fn cache(&mut self, spec: Specialized) {
+        let presented = self.scripts.presented();
+        if let Some(old) = self.layout.replace(spec)
+            && old.script.is_some()
+            && old.script == presented
+        {
+            self.presented = Some(old);
+        } else if self
+            .presented
             .as_ref()
-            .filter(|l| self.scripts.result_live(l.script))?;
-        let holds = match view.0 {
-            Some(fields) => l.facts.holds(&result_facts(fields, self.class)),
-            None => {
-                !reads_result(&l.facts) && self.attempt_facts().is_some_and(|f| l.facts.holds(&f))
-            }
-        };
-        holds.then(|| Published::Skin(Arc::clone(&l.bundle), l.entry.clone(), l.script))
+            .is_some_and(|p| p.script != presented)
+        {
+            self.presented = None;
+        }
     }
 
     /// The image side a job may release, in its slot: the image entry, the
@@ -1271,7 +1312,7 @@ impl ResultSkin {
                         .collect::<String>()
                 );
                 let p = Published::Skin(Arc::clone(&spec.bundle), spec.entry.clone(), spec.script);
-                self.layout = Some(spec);
+                self.cache(spec);
                 self.publish(p);
             }
             Ok(spec) => {
@@ -1279,7 +1320,7 @@ impl ResultSkin {
                 if let Some((_, view)) = self.latest
                     && view == out.view
                 {
-                    self.layout = Some(spec);
+                    self.cache(spec);
                 }
             }
             Err(Unbuilt::Deferred) if latest == Some(out.request) => {

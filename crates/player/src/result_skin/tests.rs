@@ -1470,8 +1470,8 @@ fn a_permit_wait_takes_a_permit_returned_after_the_failed_take() {
     let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
     staged(&mut rs);
     let held = [
-        rs.scripts().result_permit(None).unwrap(),
-        rs.scripts().result_permit(None).unwrap(),
+        rs.scripts().result_permit(&[]).unwrap(),
+        rs.scripts().result_permit(&[]).unwrap(),
     ];
     rs.request(view(5));
     assert!(rs.permit_waiting() && !rs.has_job());
@@ -1498,7 +1498,7 @@ fn a_layout_is_reused_only_while_its_runtime_lives() {
     rs.request(view(5));
     assert!(!rs.busy(), "reused");
     // Nothing presented it: the eviction before a take retires it.
-    drop(rs.scripts().result_permit(None));
+    drop(rs.scripts().result_permit(&[]));
     assert!(!rs.scripts().result_live(Some(g)));
     rs.request(view(5));
     assert!(rs.busy(), "laid out again");
@@ -1522,7 +1522,7 @@ fn the_fixed_generation_serves_every_attempt() {
     rs.request(view(5));
     assert_eq!(Some(shown_script(&rs)), g);
     drop(scripts.result_slot(g));
-    drop(scripts.result_permit(None));
+    drop(scripts.result_permit(&[]));
     rs.next_attempt();
     staged(&mut rs);
     rs.request(view(6));
@@ -1550,7 +1550,7 @@ fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
     staged_at(&mut rs, 8, JudgeClass::Normal);
     rs.request(view_at(8, 6));
     assert_eq!(shown_script(&rs), g, "reused while it lives");
-    drop(rs.scripts().result_permit(None));
+    drop(rs.scripts().result_permit(&[]));
     assert!(!rs.scripts().result_live(Some(g)));
     rs.next_attempt();
     staged_at(&mut rs, 8, JudgeClass::Normal);
@@ -1558,4 +1558,41 @@ fn an_every_view_bundle_is_reused_only_while_its_runtime_lives() {
     let again = shown_script(&rs);
     assert_ne!(again, g);
     assert!(rs.scripts().result_live(Some(again)));
+}
+
+/// §3.7.1 M8 (code r1 M1): A presented and running, B landed but not
+/// committed, then A's view asked again: A's layout is reused with its
+/// generation, no import starts, and its runtime runs on in its slot.
+#[test]
+fn the_presented_layout_is_reused_while_a_newer_one_waits() {
+    let _s = serial();
+    let d = scripted_skin();
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    staged(&mut rs);
+    rs.request(view(5));
+    settled(&mut rs);
+    let a = shown_script(&rs);
+    let scripts = rs.scripts().clone();
+    assert_eq!(
+        scripts.commit_view(Some(a), || true),
+        crate::screens::ViewCommit::Committed
+    );
+    let notes = crate::screens::ScriptNotes::default();
+    let mut slot = scripts.result_slot(Some(a));
+    assert!(slot.runs_result(&notes));
+    rs.request(view(6));
+    settled(&mut rs);
+    let b = shown_script(&rs);
+    assert_ne!(a, b);
+    let jobs = jobs_started();
+    rs.request(view(5));
+    assert!(!rs.busy(), "no job: reused");
+    assert_eq!(jobs_started(), jobs);
+    assert_eq!(shown_script(&rs), a);
+    assert!(
+        slot.runs_result(&notes),
+        "its runtime runs on, uninterrupted"
+    );
+    assert!(scripts.result_live(Some(b)));
 }

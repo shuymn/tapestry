@@ -490,21 +490,35 @@ impl Scripts {
 
     /// A permit for a job that may keep a result runtime, after the
     /// eviction (s7-07-design §4 rule 2): every parked result generation
-    /// but the presented one, the fixed skin's and `keep` is retired
-    /// first. `None` when both permits stay held. On the game thread.
-    pub(crate) fn result_permit(&self, keep: Option<ScriptGen>) -> Option<ScriptPermit> {
+    /// but the presented one, the fixed skin's and those in `keep` (the
+    /// published and the cached layouts', which a view may still present)
+    /// is retired first. `None` when both permits stay held. On the game
+    /// thread.
+    pub(crate) fn result_permit(&self, keep: &[Option<ScriptGen>]) -> Option<ScriptPermit> {
         {
             let mut host = self.0.host();
             let presented = host.presented;
-            let kept = keep.filter(|k| k.cell == self.0.id).map(|k| k.generation);
+            let id = self.0.id;
             host.retire_results(|e| {
                 matches!(e.held, Held::Parked(_))
                     && !e.retained
                     && Some(e.generation) != presented
-                    && Some(e.generation) != kept
+                    && !keep
+                        .iter()
+                        .flatten()
+                        .any(|k| k.cell == id && k.generation == e.generation)
             });
         }
         self.0.pool.take().map(ScriptPermit)
+    }
+
+    /// The generation the view presented last runs, if any.
+    #[must_use]
+    pub(crate) fn presented(&self) -> Option<ScriptGen> {
+        self.0.host().presented.map(|generation| ScriptGen {
+            cell: self.0.id,
+            generation,
+        })
     }
 
     /// The permits free now (tests).
@@ -968,3 +982,12 @@ impl Drop for ScriptSlot {
 
 #[cfg(all(test, feature = "dev-tools"))]
 pub(in crate::screens) mod tests;
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl ScriptSlot {
+    /// Whether this result slot runs its runtime this frame, a frame run
+    /// on it (tests outside `screens`).
+    pub(crate) fn runs_result(&mut self, notes: &ScriptNotes) -> bool {
+        self.result_running(notes).is_some()
+    }
+}
