@@ -10,7 +10,8 @@
 //!   adjustment's quantum filters it. Priority is the frame's
 //!   ([`ScratchInput`]).
 //! - **Play states** ([`PlayStates`]): created by a chart chosen to play,
-//!   P, or a retry, each numbered and stamped with its origin on the
+//!   P, or a retry outside practice (a practice session's retries keep
+//!   its play state), each numbered and stamped with its origin on the
 //!   shared clock.
 //! - **Autoplay notes** ([`scratch_notes`]): the scratch lane's taps and
 //!   long notes as events, built before READY.
@@ -194,8 +195,9 @@ pub struct PlayState {
 }
 
 /// The run's play states (docs/design.md "Play Lifecycle"): one per chart
-/// chosen to play, P, and retry; a practice Start, a round, an automatic
-/// round and a practice result keep it.
+/// chosen to play, P, and retry outside practice; a practice Start, a
+/// round, an automatic round, a practice result and a retry within
+/// practice keep it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayStates {
     current: Option<PlayState>,
