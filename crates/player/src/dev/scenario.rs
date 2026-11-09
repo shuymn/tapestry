@@ -1326,7 +1326,41 @@ struct Job {
     pixels: Option<(u32, u32, Vec<u8>)>,
     list: Option<Result<String, String>>,
     due: Vec<(usize, PathBuf, String, u64)>,
+    /// Its reservation in the backlog, released when the job is dropped:
+    /// written, discarded by a writer that ended, or never sent.
     bytes: usize,
+    backlog: Arc<(Mutex<Backlog>, Condvar)>,
+    captures: Captures,
+}
+
+impl Job {
+    /// Each of its captures still saving fails, saying `why`.
+    fn fail(&self, why: &str) {
+        let mut list = self.captures.lock();
+        for (i, path, _, generation) in &self.due {
+            if let Some(c) = list.get_mut(*i)
+                && c.state == CaptureState::Saving(*generation)
+            {
+                c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
+            }
+        }
+    }
+}
+
+impl Drop for Job {
+    /// A job dropped before its captures were written (its writer ended,
+    /// by a panic, with it current or queued) fails them; any job leaves
+    /// the backlog, and a waiting end is woken.
+    fn drop(&mut self) {
+        self.fail("its writer ended before writing it");
+        let (lock, done) = &*self.backlog;
+        let mut b = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.frames -= 1;
+        b.bytes -= self.bytes;
+        done.notify_all();
+    }
 }
 
 /// The sink's writer thread and its queue.
@@ -1376,75 +1410,55 @@ impl ScenarioFrames {
         }
     }
 
-    /// The backlog, whether or not a holder panicked.
-    fn backlog(&self) -> MutexGuard<'_, Backlog> {
-        self.backlog
+    /// Reserves `bytes` of a frame in the backlog; why not when it is full.
+    fn admit(&self, bytes: usize) -> Result<(), String> {
+        let mut b = self
+            .backlog
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if b.frames >= WRITE_FRAMES || (b.frames > 0 && b.bytes + bytes > self.write_bytes) {
+            return Err(format!(
+                "the capture writer is behind ({} frames, {} bytes waiting; at most {WRITE_FRAMES} frames, {} bytes)",
+                b.frames, b.bytes, self.write_bytes
+            ));
+        }
+        b.frames += 1;
+        b.bytes += bytes;
+        Ok(())
     }
 
-    /// Hands `job` to the writer, started if it is not; why not when the
-    /// backlog is full or the writer cannot take it.
-    fn send(&mut self, job: Job) -> Result<(), String> {
-        let bytes = job.bytes;
-        {
-            let mut b = self.backlog();
-            if b.frames >= WRITE_FRAMES || (b.frames > 0 && b.bytes + bytes > self.write_bytes) {
-                return Err(format!(
-                    "the capture writer is behind ({} frames, {} bytes waiting; at most {WRITE_FRAMES} frames, {} bytes)",
-                    b.frames, b.bytes, self.write_bytes
-                ));
+    /// Hands `job`, admitted, to the writer, started if it is not. A job
+    /// the writer cannot take fails its captures, saying why, and leaves
+    /// the backlog as it drops.
+    fn send(&mut self, job: Job) {
+        if self.writer.is_none() {
+            match self.start() {
+                Ok(w) => self.writer = Some(w),
+                Err(why) => return job.fail(&why),
             }
-            b.frames += 1;
-            b.bytes += bytes;
         }
-        let sent = match &self.writer {
-            Some(w) => w.jobs.send(job).map_err(|_| "its writer ended".to_owned()),
-            None => self.start(job),
-        };
-        if sent.is_err() {
-            let mut b = self.backlog();
-            b.frames -= 1;
-            b.bytes -= bytes;
+        if let Some(w) = &self.writer
+            && let Err(mpsc::SendError(job)) = w.jobs.send(job)
+        {
+            job.fail("its writer ended");
         }
-        sent
     }
 
-    /// Starts the writer with `job`.
-    fn start(&mut self, job: Job) -> Result<(), String> {
+    /// Starts the writer.
+    fn start(&self) -> Result<Writer, String> {
         let (jobs, queue) = mpsc::channel::<Job>();
-        let captures = self.captures.clone();
-        let backlog = Arc::clone(&self.backlog);
         let thread = std::thread::Builder::new()
             .name("capture writer".to_owned())
+            // A job leaves the backlog as it drops: written, or discarded
+            // with the queue when a panic ends the thread.
             .spawn(move || {
-                for job in queue {
-                    // Out of the backlog once done, even by a panic.
-                    let _done = Done(&backlog, job.bytes);
-                    write_frame(&captures, job.pixels, job.list, job.due);
+                for mut job in queue {
+                    write_frame(&mut job);
                 }
             })
             .map_err(|e| format!("its writer did not start: {e}"))?;
-        // The receiver lives as long as the thread, which only began.
-        let _ = jobs.send(job);
-        self.writer = Some(Writer { jobs, thread });
-        Ok(())
-    }
-}
-
-/// A finished job, taken out of the backlog when dropped.
-struct Done<'a>(&'a (Mutex<Backlog>, Condvar), usize);
-
-impl Drop for Done<'_> {
-    fn drop(&mut self) {
-        let (lock, done) = self.0;
-        let mut b = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        b.frames -= 1;
-        b.bytes -= self.1;
-        done.notify_all();
+        Ok(Writer { jobs, thread })
     }
 }
 
@@ -1464,36 +1478,38 @@ impl Drop for ScenarioFrames {
 #[cfg(test)]
 static HOLD_WRITES: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-/// Encodes a captured frame and writes it as each of `due` (its index in
-/// the list, file, sidecar and generation), with the frame's display list
-/// beside a play frame, putting each outcome in `captures` unless the
-/// capture has ended meanwhile.
-fn write_frame(
-    captures: &Captures,
-    pixels: Option<(u32, u32, Vec<u8>)>,
-    list: Option<Result<String, String>>,
-    due: Vec<(usize, PathBuf, String, u64)>,
-) {
+/// Encodes a captured frame and writes it as each capture due on it, with
+/// the frame's display list beside a play frame, putting each outcome in
+/// the list unless the capture has ended meanwhile.
+fn write_frame(job: &mut Job) {
     // Tests: held while a test holds the writers.
     #[cfg(test)]
     let _held = HOLD_WRITES.read();
+    // Tests: a capture named so makes its writer panic.
+    #[cfg(test)]
+    if job.due.iter().any(|(_, p, ..)| p.ends_with("panic.png")) {
+        panic!("the capture writer fails (a test)");
+    }
     // Encoded once, for every capture due.
-    let image = pixels.map(|(w, h, pixels)| super::png(w, h, &pixels));
-    for (i, path, side, generation) in due {
+    let image = job
+        .pixels
+        .take()
+        .map(|(w, h, pixels)| super::png(w, h, &pixels));
+    for (i, path, side, generation) in &job.due {
         let outcome = match &image {
             None => Err("nothing to read back".to_owned()),
-            Some(png) => write_new(&path, png)
+            Some(png) => write_new(path, png)
                 .and_then(|()| write_new(&path.with_extension("json"), side.as_bytes()))
                 .map_err(|e| e.to_string())
-                .and_then(|()| match &list {
+                .and_then(|()| match &job.list {
                     None => Ok(()),
                     Some(Err(why)) => Err(why.clone()),
                     Some(Ok(lines)) => write_new(&path.with_extension("jsonl"), lines.as_bytes())
                         .map_err(|e| e.to_string()),
                 }),
         };
-        if let Some(c) = captures.lock().get_mut(i)
-            && c.state == CaptureState::Saving(generation)
+        if let Some(c) = job.captures.lock().get_mut(*i)
+            && c.state == CaptureState::Saving(*generation)
         {
             c.state = match outcome {
                 Ok(()) => CaptureState::Succeeded,
@@ -1543,8 +1559,17 @@ impl FrameSink for ScenarioFrames {
             + list
                 .as_ref()
                 .map_or(0, |l| l.as_ref().map_or_else(String::len, String::len));
-        // What fails if the writer does not take the frame.
-        let unwritten: Vec<_> = due.iter().map(|(i, p, _, g)| (*i, p.clone(), *g)).collect();
+        if let Err(why) = self.admit(bytes) {
+            let mut list = self.captures.lock();
+            for (i, path, _, generation) in due {
+                if let Some(c) = list.get_mut(i)
+                    && c.state == CaptureState::Saving(generation)
+                {
+                    c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
+                }
+            }
+            return;
+        }
         let due = due
             .into_iter()
             .map(|(i, path, axis, generation)| {
@@ -1552,22 +1577,14 @@ impl FrameSink for ScenarioFrames {
                 (i, path, side, generation)
             })
             .collect();
-        let job = Job {
+        self.send(Job {
             pixels,
             list,
             due,
             bytes,
-        };
-        if let Err(why) = self.send(job) {
-            let mut list = self.captures.lock();
-            for (i, path, generation) in unwritten {
-                if let Some(c) = list.get_mut(i)
-                    && c.state == CaptureState::Saving(generation)
-                {
-                    c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
-                }
-            }
-        }
+            backlog: Arc::clone(&self.backlog),
+            captures: self.captures.clone(),
+        });
     }
 
     fn finish(&mut self) {
@@ -3041,6 +3058,56 @@ mod tests {
         sink.finish();
         assert_eq!(c.states()[0], CaptureState::Succeeded);
         assert!(!dir.path().join("1.png").exists());
+    }
+
+    /// A writer that panics fails the captures of its current job and of
+    /// those queued behind it, and releases their place in the backlog:
+    /// the play's end returns, and a later frame fails because the writer
+    /// ended, not because it is behind.
+    #[test]
+    fn a_panicking_writer_releases_its_backlog() {
+        use super::FrameSink as _;
+
+        let (dir, _, mut sink, screen) = released_sink(0);
+        let c = Captures::of(
+            ["panic.png", "1.png", "2.png", "3.png"]
+                .iter()
+                .enumerate()
+                .map(|(k, name)| (TimeUs(k as i64 * 1_000), dir.path().join(name)))
+                .collect(),
+        );
+        for k in 0..4 {
+            c.arm(k);
+        }
+        c.bind(1);
+        sink.captures = c.clone();
+        let hold = super::HOLD_WRITES.write().unwrap();
+        for k in 0..3 {
+            sink.frame(&screen, &drawn(1, k));
+        }
+        assert_eq!(c.states()[..3], vec![CaptureState::Saving(1); 3]);
+        drop(hold);
+        std::thread::scope(|s| {
+            let (ended, finished) = std::sync::mpsc::channel();
+            let sink = &mut sink;
+            s.spawn(move || {
+                sink.finish();
+                ended.send(()).unwrap();
+            });
+            finished
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the end returns once the writer ended");
+        });
+        let ended = |s: &CaptureState| matches!(s, CaptureState::Failed(why) if why.contains("its writer ended"));
+        let states = c.states();
+        assert!(states[..3].iter().all(ended), "{states:?}");
+        {
+            let b = sink.backlog.0.lock().unwrap();
+            assert_eq!((b.frames, b.bytes), (0, 0));
+        }
+        sink.frame(&screen, &drawn(1, 3));
+        let states = c.states();
+        assert!(ended(&states[3]), "{states:?}");
     }
 
     /// Captures arm, bind to the next play only, and settle when it ends:
