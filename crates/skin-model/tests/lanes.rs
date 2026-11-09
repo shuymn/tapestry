@@ -1078,9 +1078,9 @@ fn budget_skin() -> Skin {
         vec![
             image(WHITE, [0, 0, 10, 10], screen),
             lanes_element(),
-            paint(0, [160, -720, 544, 800], Follow::Cover),
-            paint(1, [160, 880, 544, 800], Follow::None),
-            paint(2, [160, 960, 544, 80], Follow::None),
+            paint(0, [160, -720, 544, 800], Follow::COVER),
+            paint(1, [160, 880, 544, 800], Follow::NONE),
+            paint(2, [160, 960, 544, 80], Follow::NONE),
             image(WHITE, [20, 0, 10, 10], screen),
         ],
         skin_model::WidgetDefs {
@@ -1457,11 +1457,11 @@ fn followers_move_by_this_frames_cover_geometry() {
     };
     let elements = |lanes: skin_model::ElementDef| {
         vec![
-            follower(600, Follow::None),
-            follower(620, Follow::Lift),
+            follower(600, Follow::NONE),
+            follower(620, Follow::LIFT),
             lanes,
-            follower(640, Follow::Cover),
-            follower(660, Follow::LiftAndCover),
+            follower(640, Follow::COVER),
+            follower(660, Follow::LIFT_AND_COVER),
         ]
     };
     let chart = long_note();
@@ -1501,9 +1501,9 @@ fn cover_amounts_cap_at_a_whole_lane() {
     // 1 000. Every follower stays finite, with no scroll left.
     let elements = vec![
         lanes_element(),
-        follower(600, Follow::Lift),
-        follower(620, Follow::Cover),
-        follower(640, Follow::LiftAndCover),
+        follower(600, Follow::LIFT),
+        follower(620, Follow::COVER),
+        follower(640, Follow::LIFT_AND_COVER),
     ];
     let skin = skin_with(REGIONS, Some(simple()), elements).unwrap();
     let chart = long_note();
@@ -1528,7 +1528,7 @@ fn cover_amounts_cap_at_a_whole_lane() {
 fn only_drawing_widgets_follow_within_the_coordinate_range() {
     let lanes_following = skin_model::ElementDef {
         place: Place {
-            follow: Follow::Cover,
+            follow: Follow::COVER,
             angle: skin_model::AngleFollow::None,
             ..in_region(Region::Playfield)
         },
@@ -1542,7 +1542,7 @@ fn only_drawing_widgets_follow_within_the_coordinate_range() {
     // ±MAX_COORD: one more pixel refuses; without lanes nothing moves.
     let at = |y: i32| {
         let place = Place {
-            follow: Follow::Lift,
+            follow: Follow::LIFT,
             angle: skin_model::AngleFollow::None,
             ..in_region(Region::Playfield)
         };

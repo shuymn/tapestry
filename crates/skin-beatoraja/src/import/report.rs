@@ -224,7 +224,7 @@ pub enum LaneApprox {
     /// while the colour interpolates (`play/LaneRenderer.java:335-345`,
     /// `skin/SkinObject.java:480-519`).
     HiddenDisable,
-    /// p: what follows LIFT or SUDDEN+ (offsets 3 and 4), and LIFT's and
+    /// p: what follows LIFT, SUDDEN+ or HIDDEN+ (offsets 3, 4 and 5), and LIFT's and
     /// HIDDEN+'s paint, move by this frame's lane geometry, from the first
     /// frame and while the lanes are hidden or off, and not at all in a
     /// skin without lanes. The
@@ -273,7 +273,8 @@ pub enum NoteKind {
     Stretch(i32),
     /// An offset the play sets at run time.
     RuntimeOffset(i32),
-    /// An alpha offset on animated colour, or of mixed sign.
+    /// An alpha offset on animated colour, or of mixed sign; HIDDEN+'s
+    /// offset 5 is one (−255 while HIDDEN+ is off).
     OffsetAlpha,
     Track(TrackWhy),
     Timer(TimerWhy),
@@ -367,7 +368,7 @@ impl fmt::Display for NoteKind {
             Self::Blend(b) => write!(f, "an unsupported blend {b}"),
             Self::Stretch(s) => write!(f, "an unsupported stretch {s}"),
             Self::RuntimeOffset(id) => write!(f, "a run-time offset {id}"),
-            Self::OffsetAlpha => f.write_str("an alpha offset on animated colour or of mixed sign"),
+            Self::OffsetAlpha => f.write_str("an alpha offset (HIDDEN+'s offset 5 among them) on animated colour or of mixed sign"),
             Self::Track(why) => write!(f, "an unsupported track ({why:?})"),
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
