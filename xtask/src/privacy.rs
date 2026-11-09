@@ -47,7 +47,14 @@ const REPLAY: &str = "crates/skin-beatoraja/src/bin/lua_replay";
 const PRODUCTION: &str = "crates/skin-beatoraja/src/bin/lua_replay/production";
 const PRODUCTION_RESTRICTED: &str = "pub(in crate::production)";
 /// The modules of `lua_replay` the production tree names, beside it.
-const REPLAY_MODULES: [&str; 5] = ["inputs", "isolation", "observed", "report", "script"];
+const REPLAY_MODULES: [&str; 6] = [
+    "hints",
+    "inputs",
+    "isolation",
+    "observed",
+    "report",
+    "script",
+];
 
 /// One case: its name, the sibling's code, and the error code it must
 /// fail with (`None`: it compiles).
@@ -62,7 +69,7 @@ const REPLAY_CASES: &[Case] = &[
             run: &crate::production::ProductionRun,
             other: &skin_beatoraja::lua::replay::Recorded,
         ) -> bool {
-            run.same_import(other)
+            run.same_import(other, \"\")
         }",
         None,
     ),
