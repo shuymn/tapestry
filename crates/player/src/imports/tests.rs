@@ -75,6 +75,8 @@ pub(crate) struct Decision {
     /// The time each look of a wait read, the last one; and how many.
     pub(crate) looked: Option<Instant>,
     pub(crate) looks: u64,
+    /// When a wait gave the job up at its stop bound.
+    pub(crate) gave_up: Option<Instant>,
 }
 
 impl Tally {
@@ -103,6 +105,11 @@ impl Tally {
         if let Some(by) = stop_by {
             d.stopped.get_or_insert((now, by));
         }
+    }
+
+    /// A wait gave the job up at `now`.
+    pub(super) fn gave_up(&self, now: Instant) {
+        self.decision().gave_up.get_or_insert(now);
     }
 
     /// A wait looked at `now`.
@@ -169,6 +176,19 @@ impl StopClock {
         assert!(
             wait_until(|| self.seen().looked.is_some_and(|l| l >= now)),
             "no look at the decision's time"
+        );
+    }
+
+    /// Waits until a look of a wait read the decision's time as it is
+    /// now, or later, and a later look followed it: that look decided to
+    /// go on waiting.
+    #[track_caller]
+    pub(crate) fn continued_now(&self) {
+        self.looked_now();
+        let looks = self.seen().looks;
+        assert!(
+            wait_until(|| self.seen().looks > looks),
+            "no look after the decision's time"
         );
     }
 }

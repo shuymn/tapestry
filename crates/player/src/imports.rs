@@ -982,6 +982,8 @@ impl<T> Job<T> {
             #[cfg(test)]
             self.tally.looked(now);
             if self.stop_by.is_some_and(|d| now >= d) {
+                #[cfg(test)]
+                self.tally.gave_up(now);
                 // Detached: the handle and the receiver go, so a late
                 // outcome is dropped on its own thread.
                 self.handle = None;

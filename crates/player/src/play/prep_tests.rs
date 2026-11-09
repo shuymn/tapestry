@@ -244,13 +244,13 @@ fn held_past<R>(release: impl FnOnce() + Send, settle: impl FnOnce() -> R) -> (R
 /// A wait bounded by the run's end, on this thread's jobs' frozen stop
 /// clock: another thread gives the run's end with `give` (which waits for
 /// its moment first), and waits until the job's wait saw it and set its
-/// deadline. The clock is then moved to just before the
-/// deadline, where the wait looks and goes on waiting, then to it. What
-/// `settle` returned; the deadline is checked to be [`STOP_WAIT`] after
-/// the decision saw the signal. A terminating watchdog guards the scope.
+/// deadline. The clock is then moved to just before the deadline, where
+/// the wait looks and decides to go on waiting, then to it, where it gives
+/// the job up, the clock still frozen. What `settle` returned; the
+/// deadline is checked to be [`STOP_WAIT`] after the decision saw the
+/// signal. A terminating watchdog guards the scope.
 fn bounded<R>(give: impl FnOnce() + Send, settle: impl FnOnce() -> R) -> R {
     let clock = imports::stop_clock();
-    let returned = std::sync::atomic::AtomicBool::new(false);
     let _watchdog = crate::tests::Watchdog::arm("a bounded settle");
     std::thread::scope(|s| {
         let helper = s.spawn(|| {
@@ -259,18 +259,27 @@ fn bounded<R>(give: impl FnOnce() + Send, settle: impl FnOnce() -> R) -> R {
             let (seen, by) = clock.seen().stopped.expect("seen");
             assert_eq!(by - seen, STOP_WAIT, "bounded from the signal");
             clock.advance_to(by - Duration::from_micros(1));
-            clock.looked_now();
-            assert!(
-                !returned.load(std::sync::atomic::Ordering::SeqCst),
-                "given up before the bound"
-            );
+            clock.continued_now();
+            assert_eq!(clock.seen().gave_up, None, "given up before the bound");
             clock.advance_to(by);
-            // Given up at that look; later waits read real time.
+            // The look at the bound gives up, or a later look shows it
+            // went on waiting.
             clock.looked_now();
-            clock.thaw();
+            let looks = clock.seen().looks;
+            until("the decision at the bound", || {
+                let d = clock.seen();
+                d.gave_up.is_some() || d.looks > looks
+            });
+            let gave_up = clock.seen().gave_up;
+            if gave_up != Some(by) {
+                // A wait that went on past the bound never gives up on the
+                // frozen clock: real time ends it, so the failure is
+                // reported rather than held until the watchdog.
+                clock.thaw();
+                panic!("given up at the bound: {gave_up:?}, bound {by:?}");
+            }
         });
         let out = settle();
-        returned.store(true, std::sync::atomic::Ordering::SeqCst);
         helper.join().unwrap();
         out
     })
