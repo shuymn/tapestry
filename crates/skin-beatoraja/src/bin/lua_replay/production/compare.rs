@@ -1057,6 +1057,53 @@ mod tests {
         });
     }
 
+    /// A2: a sample of a program timer's slot whose callback was skipped
+    /// (no installed start) is an orphan; one with an installed start is
+    /// not.
+    #[test]
+    fn shapes_reject_an_orphan_sample() {
+        use super::shapes;
+        let slots: std::collections::BTreeMap<u16, usize> = [(0, 7)].into();
+        let is_timer = |k: u16| k == 0;
+        let rf = crate::observed::RefFrame::default();
+        let orphan = [
+            Event::Skipped {
+                k: 0,
+                why: Skip::Gate,
+            },
+            Event::Sampled { slot: 7, age_us: 0 },
+        ];
+        let (_, _, bad) = shapes(&orphan, &rf, &is_timer, &slots);
+        assert!(
+            bad.iter().any(|b| b.2.contains("no installed start")),
+            "{bad:?}"
+        );
+        let fine = [
+            Event::Ran {
+                k: 0,
+                call: 1,
+                result: Ok(skin_model::present::Val::Int(5)),
+                conv: Converted::Long(Some(5)),
+            },
+            Event::Ran {
+                k: 0,
+                call: 2,
+                result: Ok(skin_model::present::Val::Int(5)),
+                conv: Converted::Long(Some(5)),
+            },
+            Event::Timer {
+                k: 0,
+                on: true,
+                start: Some(5),
+                elapsed_ms: Some(0),
+                installed: Some(bms_model::TimeUs(0)),
+            },
+            Event::Sampled { slot: 7, age_us: 0 },
+        ];
+        let (_, _, bad) = shapes(&fine, &rf, &is_timer, &slots);
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
     /// R19: the reference import must equal production's.
     #[test]
     fn a_different_import_is_refused() {
