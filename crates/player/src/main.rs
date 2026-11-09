@@ -279,13 +279,24 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         measured.presents.len(),
         measured.presents_past
     );
+    // The game's side of the pairing, beside the capture.
+    let log = dir.join(format!("{stamp}.select.presents.txt"));
+    let text: String = measured.presents.iter().map(|t| format!("{t}\n")).collect();
+    std::fs::write(&log, text).with_context(|| log.display().to_string())?;
+    // The capture on the game's clock: present, displayed (or -1).
+    let pm = dir.join(format!("{stamp}.select.capture.txt"));
+    let text: String = frames
+        .iter()
+        .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
+        .collect();
+    std::fs::write(&pm, text).with_context(|| pm.display().to_string())?;
     for s in &measured.screens {
         let span = dev::screen_span(s.presents, &measured.presents);
         let counted = s.period_ns.map(|period| {
             presentmon::count_capture(&frames, span, presents, s.presentation, period)
         });
         println!(
-            "measure: {} lifetime {}: span {}..{} us, presentation {:?}, period {:?} ns,              frames past storage {}: {:?}",
+            "measure: {} lifetime {}: span {}..{} us, presentation {:?}, period {:?} ns, frames past storage {}: {:?}",
             s.screen, s.lifetime, span.0, span.1, s.presentation, s.period_ns, s.past, counted
         );
     }

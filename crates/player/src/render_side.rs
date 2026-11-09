@@ -4225,6 +4225,11 @@ impl Run {
                             );
                             frames.frame(lifetime, spans, visit, switch, presented);
                         }
+                    } else if matches!(mode, Mode::Result) {
+                        // A result frame not recorded (the built-in page,
+                        // a refusal) ends the preparation charged before
+                        // its wait: none of it is the next frame's.
+                        let _ = self.result_frames.take_before_wait();
                     }
                     // The app region's second interval: a play frame's
                     // measurement. The frame sink (the frame dump) stays
