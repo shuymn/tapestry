@@ -54,7 +54,7 @@ impl Place {
         bind: Bind::None,
         fill: Fill::None,
         native: None,
-        follow: Follow::None,
+        follow: Follow::NONE,
         angle: AngleFollow::None,
     };
 }
@@ -86,47 +86,87 @@ impl AngleFollow {
     }
 }
 
-/// The covers an element or a judge's grade moves with, vertically and
-/// in the frame's own geometry: up by the lift's raise, down by the lane
-/// cover's travel, or by both.
+/// The covers an element, a judge's grade or a bar group moves with,
+/// vertically and in the frame's own geometry: any set of up by the
+/// lift's raise, down by the lane cover's travel, and up by the hidden
+/// cover's own share, the displacements added as the source adds its
+/// offsets (`skin/SkinObject.java:401-410`). A hidden-cover follower is
+/// also not drawn while HIDDEN+ is off (`play/LaneRenderer.java:335-346`).
 ///
 /// The motion is a translation of the sampled rect, in reference pixels,
 /// after the track and before the lane binding and the region's
 /// transform, so it scales with the region and moves the pivot along;
 /// it changes no key, clock, clip or region placement. Without lanes it
-/// is zero.
+/// is zero and nothing is hidden.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Follow {
-    #[default]
-    None,
+pub struct Follow {
     /// Up by the lift's raise.
-    Lift,
+    pub lift: bool,
     /// Down by the lane cover's travel.
-    Cover,
-    /// By both: the cover's travel less the lift's raise.
-    LiftAndCover,
+    pub cover: bool,
+    /// Up by the hidden cover's own share, as drawn, and not drawn while
+    /// HIDDEN+ is off.
+    pub hidden: bool,
 }
 
 impl Follow {
+    /// No cover.
+    pub const NONE: Self = Self {
+        lift: false,
+        cover: false,
+        hidden: false,
+    };
+    /// The lift alone.
+    pub const LIFT: Self = Self {
+        lift: true,
+        ..Self::NONE
+    };
+    /// The lane cover alone.
+    pub const COVER: Self = Self {
+        cover: true,
+        ..Self::NONE
+    };
+    /// The lift and the lane cover: the cover's travel less the lift's
+    /// raise.
+    pub const LIFT_AND_COVER: Self = Self {
+        lift: true,
+        cover: true,
+        hidden: false,
+    };
+    /// The hidden cover alone.
+    pub const HIDDEN: Self = Self {
+        hidden: true,
+        ..Self::NONE
+    };
+
     /// The vertical displacement in reference pixels, y down, for the
-    /// frame's geometry `g`.
+    /// frame's geometry `g`: the lane cover's travel, less the lift's
+    /// raise, less the hidden cover's share, each when followed.
     pub(crate) fn dy(self, g: Option<&LaneFrameGeometry>) -> f64 {
         let Some(g) = g else {
             return 0.0;
         };
-        match self {
-            Self::None => 0.0,
-            Self::Lift => -g.lift_px,
-            Self::Cover => g.cover_px,
-            Self::LiftAndCover => g.cover_px - g.lift_px,
+        let mut dy = if self.cover { g.cover_px } else { 0.0 };
+        if self.lift {
+            dy -= g.lift_px;
         }
+        if self.hidden {
+            dy -= g.hidden_px;
+        }
+        dy
+    }
+
+    /// Whether the follower is not drawn this frame: it follows the
+    /// hidden cover and the frame's lanes have HIDDEN+ off. Without lanes
+    /// it is drawn.
+    pub(crate) fn hides(self, g: Option<&LaneFrameGeometry>) -> bool {
+        self.hidden && g.is_some_and(|g| !g.hidden_on)
     }
 
     /// `[x, y, w, h]` moved by [`dy`](Self::dy): x, w and h kept, y summed
     /// in `f64`.
     pub(crate) fn translate(self, rect: [f32; 4], g: Option<&LaneFrameGeometry>) -> [f32; 4] {
-        if self == Self::None {
+        if self == Self::NONE {
             return rect;
         }
         let [x, y, w, h] = rect;

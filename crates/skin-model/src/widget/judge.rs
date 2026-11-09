@@ -437,6 +437,13 @@ impl Judge {
                 shift = width / 2.0;
             }
         }
+        // A grade that follows HIDDEN+ is transparent while HIDDEN+ is off;
+        // its combo still draws, attached to it, as the source only clears
+        // the grade's alpha (`skin/SkinObject.java:474-481`,
+        // `play/SkinJudge.java:121-137`).
+        if g.follow.hides(d.lanes) {
+            return;
+        }
         let Some(f) = g.image.frame(d.at.starts, d.at.now, d.at.uvs) else {
             return;
         };

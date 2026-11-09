@@ -256,7 +256,7 @@ fn followed_widgets_move_once_by_the_covers() {
     };
     let mut j = judge_all([800, 500, 200, 80]);
     j.grades[JudgeSlot::Great.index()] = Some(GradePart {
-        follow: Follow::Lift,
+        follow: Follow::LIFT,
         ..grade(GRADE + 1, [800, 500, 200, 80])
     });
     j.combos[JudgeSlot::Great.index()] = Some(ComboPart {
@@ -272,14 +272,14 @@ fn followed_widgets_move_once_by_the_covers() {
         Some(lanes_support::simple()),
         vec![
             lanes,
-            element(Source::Number(0), [100, 50, 20, 30], at(Follow::Cover)),
+            element(Source::Number(0), [100, 50, 20, 30], at(Follow::COVER)),
             element(
                 Source::Gauge(0),
                 [0, 100, 500, 20],
-                at(Follow::LiftAndCover),
+                at(Follow::LIFT_AND_COVER),
             ),
             judge_element(0),
-            element(Source::Image(0), [0, 0, 10, 10], at(Follow::None)),
+            element(Source::Image(0), [0, 0, 10, 10], at(Follow::NONE)),
         ],
         WidgetDefs {
             numbers: vec![number(
@@ -394,9 +394,9 @@ fn followers_keep_the_transform_order() {
         (q, run)
     };
     for right in [false, true] {
-        let (still, still_run) = quads(Follow::None, 250, right);
-        let (moved, moved_run) = quads(Follow::Lift, 250, right);
-        let (unlifted, _) = quads(Follow::Lift, 0, right);
+        let (still, still_run) = quads(Follow::NONE, 250, right);
+        let (moved, moved_run) = quads(Follow::LIFT, 250, right);
+        let (unlifted, _) = quads(Follow::LIFT, 0, right);
         // L = 200 reference pixels, 400 on the canvas at 200 %.
         let [x, y, w, hh] = still.rect;
         assert_eq!(moved.rect, [x, y - 400.0, w, hh], "right {right}");
@@ -413,7 +413,7 @@ fn judges_follow_only_through_their_grades() {
     let following = ElementDef {
         place: Place {
             region: Region::Judge,
-            follow: Follow::Cover,
+            follow: Follow::COVER,
             ..Place::SCREEN
         },
         ..judge_element(0)
@@ -429,7 +429,7 @@ fn judges_follow_only_through_their_grades() {
     // A followed grade's keys moved the lanes' 800 stay within ±MAX_COORD.
     let mut j = judge_all([800, 500, 200, 80]);
     j.grades[2] = Some(GradePart {
-        follow: Follow::Cover,
+        follow: Follow::COVER,
         ..grade(GRADE + 2, [800, skin_model::MAX_COORD - 799, 200, 80])
     });
     let r = load_fit(
@@ -455,7 +455,7 @@ fn judges_follow_only_through_their_grades() {
     let followed = |y: i32| {
         let mut j = judge_all([800, 500, 200, 80]);
         j.grades[2] = Some(GradePart {
-            follow: Follow::Cover,
+            follow: Follow::COVER,
             attachment: Some(lanes_support::rect([800, y, 200, 80])),
             ..grade(GRADE + 2, [800, 500, 200, 80])
         });
@@ -495,7 +495,7 @@ fn a_followed_grade_carries_its_attachment_once() {
     };
     let mut j = judge_all([800, 500, 200, 80]);
     j.grades[JudgeSlot::Great.index()] = Some(GradePart {
-        follow: Follow::Lift,
+        follow: Follow::LIFT,
         attachment: Some(lanes_support::rect([780, 500, 240, 100])),
         ..grade(GRADE + 1, [800, 500, 200, 80])
     });
