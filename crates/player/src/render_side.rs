@@ -10335,6 +10335,15 @@ pub(crate) mod tests {
 
     /// [`bundle`] declaring Closing's duration `close`.
     pub(crate) fn bundle_closing(close: Option<TimeUs>) -> Arc<render::SkinBundle> {
+        bundle_declaring(close, None)
+    }
+
+    /// [`bundle`] declaring Closing's duration `close` and the loading
+    /// time `loadend`.
+    pub(crate) fn bundle_declaring(
+        close: Option<TimeUs>,
+        loadend: Option<TimeUs>,
+    ) -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -10355,7 +10364,7 @@ pub(crate) mod tests {
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
             close,
-            loadend: None,
+            loadend,
             present: None,
         })
         .unwrap();
@@ -11168,6 +11177,43 @@ pub(crate) mod tests {
         );
         link.commit_attempt().unwrap();
         assert!(wait_until(|| skin() >= s + 3));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// L5: a pending play skin's base import stops at the fact it reads,
+    /// inside the configured pass and before the skin's table exists, so
+    /// it declares no loading time: until a specialization commits in the
+    /// lifetime the minimum is the floor, a second from the first frame;
+    /// a specialization declaring 3 000 ms then moves it to 3 s from that
+    /// same frame.
+    #[test]
+    fn a_pending_skin_uses_the_floor_until_its_specialization_commits() {
+        let (chart, _screens, link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let (lifetime, at) = link.loading_ack().unwrap();
+        assert_eq!(link.loading_loadend(), None);
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 1_000_000)
+        );
+        let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            specialized(&link, &chart, &declared).unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(link.loading_loadend(), None, "staged, not committed");
+        link.commit_attempt().unwrap();
+        // A frame acknowledged after the commit's answer drew after it.
+        let committed = link.loading_acked();
+        assert!(wait_until(|| link.loading_acked() > committed));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        assert_eq!(link.loading_ack(), Some((lifetime, at)));
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 3_000_000)
+        );
         link.end_loading().unwrap();
         link.exit();
     }
