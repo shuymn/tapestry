@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bms_model::{TimeSource as _, TimeUs};
+use bms_model::TimeUs;
 use game::{Adjust, AppRig as _, Command, CoverKind, Leave, LiveError};
 
 use super::{Keyboard, accepting, covers, fenced, on_input_rig_with, watchdog};
@@ -83,7 +83,6 @@ struct Side<'a> {
     loading_end: Arc<crate::render_side::TestGate>,
     ack: crate::render_side::AckHold,
     gates: Arc<crate::play::loading::OpeningGates>,
-    clock: input::QpcClock,
     tuning: Arc<crate::tuning::LiveTuning>,
     /// Set once `load_and_open` returned.
     returned: std::sync::atomic::AtomicBool,
@@ -181,7 +180,6 @@ fn on_loading<R>(
             loading_end: rig.render.loading_end_gate(),
             ack: rig.render.ack_hold(),
             gates: Arc::clone(&rig.opening_gates),
-            clock: rig.clock,
             tuning: Arc::clone(rig.controls.tuning()),
             returned: std::sync::atomic::AtomicBool::new(false),
         };
@@ -193,13 +191,17 @@ fn on_loading<R>(
 
 /// `load_and_open` on the game thread while `helper` runs beside it. A
 /// helper that panics lets every hold go and closes the window, so the
-/// run ends and the panic is reported.
+/// run ends and the panic is reported; a run that never returns ends the
+/// process ([`crate::tests::Watchdog`]).
 fn open_with(
     loaded: &mut game::Loaded,
     rig: &mut PlayerRig<'_>,
     side: &Side<'_>,
     helper: impl FnOnce() + Send,
 ) -> Ended {
+    // A run that never returns ends the process: the scope would join
+    // its helper forever.
+    let _watchdog = crate::tests::Watchdog::arm("load_and_open");
     std::thread::scope(|s| {
         let helper = s.spawn(|| {
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(helper));
@@ -445,49 +447,69 @@ fn a_quit_at_the_last_look_reopens_tuning_on_the_page() {
     });
 }
 
+/// The times the flow decided to end the loading state at: the clock it
+/// last read before each end of loading it asked.
+fn ends(side: &Side<'_>) -> Vec<TimeUs> {
+    side.gates.ends.lock().unwrap().clone()
+}
+
 /// L1 and L3, the opener's side: the minimum counts from the render
 /// thread's acknowledgement of the lifetime's first presented frame, held
-/// here past the lifetime's beginning; the loading state ends no earlier
-/// than a second after it.
+/// here until the flow has looked at its wait without it; the loading
+/// state ends no earlier than a second after it, as the flow decided on
+/// its own clock reading.
 #[test]
 fn the_opener_counts_the_minimum_from_the_render_ack() {
     let (_dir, mut loaded) = plain();
     on_loading(&mut loaded, None, true, |rig, side, loaded| {
         let lifetime = rig.render.loading_lifetime();
         side.loading_end.hold(true);
-        let mut passed = TimeUs(0);
-        let mut ended_at = TimeUs(0);
+        let mut looked = TimeUs(0);
         let ended = open_with(loaded, rig, side, || {
             until("the first frame held", || side.ack.held());
-            // The frame stays unacknowledged a while.
-            std::thread::sleep(Duration::from_millis(300));
-            passed = side.clock.now();
+            // The flow looked at its wait (it read its clock) with the
+            // frame still unacknowledged.
+            until("the flow's look", || side.gates.clock_read().0 > 0);
+            looked = side.gates.clock_read();
             side.ack.hold(false);
             side.ack.pass();
-            until("the end held", || side.loading_end.waiting());
-            ended_at = side.clock.now();
             side.quit_at_the_end_of_loading();
         });
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
         let (acked, at) = rig.render.loading_ack().unwrap();
         assert_eq!(acked, lifetime);
-        assert!(at >= passed, "{at:?} {passed:?}");
-        assert!(ended_at.0 >= at.0 + 1_000_000, "{ended_at:?} {at:?}");
+        assert!(at >= looked, "{at:?} {looked:?}");
+        let [end] = ends(side)[..] else {
+            panic!("{:?}", ends(side));
+        };
+        assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
     });
+}
+
+/// The one close after a deferral or a commit: the time the flow decided
+/// at and the copy it closed on.
+#[track_caller]
+fn one_close(side: &Side<'_>) -> (TimeUs, game::TuningSnapshot) {
+    let closes = side.gates.closes.lock().unwrap().clone();
+    let [close] = *closes.as_slice() else {
+        panic!("{closes:?}");
+    };
+    close
 }
 
 /// A18f, on the player's rig: focus lost while the commit's reply is
 /// held. The opening defers for focus, reopening acceptance; it is asked
 /// again only once focus is back and the tuning quiet for a second from
-/// the return.
+/// the return: the close's copy has the return as its last activity, and
+/// the flow decided it quiet on its own clock reading, a second or more
+/// after it. (The exact deadline is the headless test's.)
 #[test]
 fn focus_lost_during_the_commit_reply_waits_a_quiet_second_after_return() {
     let (_dir, mut loaded) = plain();
     on_loading(&mut loaded, None, false, |rig, side, loaded| {
         side.screens.hold_commits(true);
         side.loading_end.hold(true);
-        let mut returned = TimeUs(0);
-        let mut asked = TimeUs(0);
+        let mut returned = None;
         let tuning = Arc::clone(rig.controls.tuning());
         let ended = open_with(loaded, rig, side, || {
             until("the commit held", || side.screens.commit_held());
@@ -500,18 +522,21 @@ fn focus_lost_during_the_commit_reply_waits_a_quiet_second_after_return() {
                 side.loading_end.passed() == 1 && tuning.acceptance() == Acceptance::Open
             });
             side.loading_end.hold(true);
-            returned = side.clock.now();
             side.controls.focus(true);
+            returned = tuning.snapshot().last_activity;
             until("the second end held", || side.loading_end.waiting());
-            asked = side.clock.now();
             side.quit_at_the_end_of_loading();
         });
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
-        let waited = asked.0 - returned.0;
+        let returned = returned.expect("the return's stamp");
+        let (closed_at, copy) = one_close(side);
+        assert_eq!(copy.last_activity, Some(returned));
+        assert!(copy.quiet_at(closed_at));
         assert!(
-            (1_000_000..2_500_000).contains(&waited),
-            "{waited} us from the return"
+            closed_at.0 >= returned.0 + game::QUIET.0,
+            "{closed_at:?} {returned:?}"
         );
+        assert!(ends(side)[1] >= closed_at, "decided after the close");
         assert_eq!(side.loading_end.passed(), 2);
     });
 }
@@ -604,8 +629,9 @@ fn a_display_offset_set_during_a_deferral_is_recorded() {
 
 /// O-20, the player's half: settings keys pressed after the epoch's
 /// refresh (O5) and before the revalidation (O11) each send the opening
-/// back to the wait; the copy it finally opens with has both, and so does
-/// the record. HIDDEN, selected before, stays selected.
+/// back to the wait; the copy it finally opens with has both, and so do
+/// the record and the settings files the ended play wrote. HIDDEN,
+/// selected before, stays selected.
 #[test]
 fn an_adjustment_at_each_opening_step_reaches_the_record() {
     let (_dir, mut loaded) = plain();
@@ -631,6 +657,10 @@ fn an_adjustment_at_each_opening_step_reaches_the_record() {
         assert_eq!(recorded_offset(rig), TimeUs(offset + 2_000));
         assert_eq!(loaded.settings().device.display_offset_us, offset + 2_000);
         assert_eq!(selected(rig), Some(CoverKind::Hidden));
+        // `device.toml`, which the ended play wrote, holds them.
+        let root = rig.files.root();
+        let device: game::DeviceSettings = game::load_settings(&root.device_settings()).unwrap();
+        assert_eq!(device.display_offset_us, offset + 2_000);
     });
 }
 
@@ -731,20 +761,21 @@ fn a_local_retry_reopens_the_reducer() {
 
 /// A18f by the latch alone: focus lost and back while the commit's reply
 /// is held, so it is back when the deferral is read. The opening defers
-/// for the loss, and asks again only a quiet second after the return.
+/// for the loss, and asks again only a quiet second after the return: the
+/// close's copy has the return as its last activity, decided quiet on the
+/// flow's clock reading a second or more after it.
 #[test]
 fn focus_lost_and_back_during_the_commit_reply_waits_a_quiet_second() {
     let (_dir, mut loaded) = plain();
     on_loading(&mut loaded, None, false, |rig, side, loaded| {
         side.screens.hold_commits(true);
         side.loading_end.hold(true);
-        let mut returned = TimeUs(0);
-        let mut asked = TimeUs(0);
+        let mut returned = None;
         let ended = open_with(loaded, rig, side, || {
             until("the commit held", || side.screens.commit_held());
             side.controls.focus(false);
-            returned = side.clock.now();
             side.controls.focus(true);
+            returned = side.tuning.snapshot().last_activity;
             side.screens.hold_commits(false);
             until("the end held", || side.loading_end.waiting());
             side.loading_end.hold(false);
@@ -753,15 +784,93 @@ fn focus_lost_and_back_during_the_commit_reply_waits_a_quiet_second() {
             });
             side.loading_end.hold(true);
             until("the second end held", || side.loading_end.waiting());
-            asked = side.clock.now();
             side.quit_at_the_end_of_loading();
         });
         assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
-        let waited = asked.0 - returned.0;
+        let returned = returned.expect("the return's stamp");
+        let (closed_at, copy) = one_close(side);
+        assert_eq!(copy.last_activity, Some(returned));
+        assert!(copy.quiet_at(closed_at));
         assert!(
-            (1_000_000..2_500_000).contains(&waited),
-            "{waited} us from the return"
+            closed_at.0 >= returned.0 + game::QUIET.0,
+            "{closed_at:?} {returned:?}"
         );
         assert_eq!(side.loading_end.passed(), 2);
+    });
+}
+
+/// L5b and O12a (finding 2), on the player's rig: a pending play skin
+/// whose base declares no loading time and whose specialization, quick to
+/// prepare, declares 3 s. The wait passes on the floor's second; the
+/// specialization commits before the 3 s are up, and the end of loading
+/// waits for them from the same first frame, acceptance reopened and
+/// closed again on a fresh copy: the flow decided the end of loading at
+/// its own clock reading 3 s or more after the acknowledgement, on the
+/// one close after the commit, and committed once.
+#[test]
+fn a_committed_specializations_minimum_holds_the_end_of_loading() {
+    let (_p, skin) = pending_play("local lv = ms.number(96)\nskin.loadend = 3000");
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, Some(skin), false, |rig, side, loaded| {
+        side.loading_end.hold(true);
+        let ended = open_with(loaded, rig, side, || side.quit_at_the_end_of_loading());
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        let (_, at) = rig.render.loading_ack().unwrap();
+        assert_eq!(rig.render.loading_loadend(), Some(TimeUs(3_000_000)));
+        // The commit came within the 3 s: the remaining minimum was waited
+        // with acceptance open, then closed once.
+        let (closed_at, copy) = one_close(side);
+        assert!(copy.quiet_at(closed_at));
+        assert!(closed_at.0 >= at.0 + 3_000_000, "{closed_at:?} {at:?}");
+        let [end] = ends(side)[..] else {
+            panic!("{:?}", ends(side));
+        };
+        assert!(
+            end >= closed_at && copy.quiet_at(end),
+            "decided after the close"
+        );
+        assert_eq!(side.gates.revalidate.passed(), 1);
+        let commits = side
+            .screens
+            .log()
+            .iter()
+            .filter(|l| l.contains(" commit "))
+            .count();
+        assert_eq!(commits, 1, "{:?}", side.screens.log());
+        assert_eq!(rig.controls.tuning().acceptance(), Acceptance::Open);
+    });
+}
+
+/// H4 and O-1 (finding 8), through `load_and_open`: the quit in the wait
+/// while the pending skin's specialization runs, its VM held; the discard
+/// settles the job, and the audio output fails during that join. The
+/// settle gives the job up at its bound on the stop clock, and the run
+/// ends with the audio's failure, not back on the page.
+#[test]
+fn an_audio_failure_during_the_quits_settle_ends_the_run() {
+    let (_p, skin) =
+        pending_play("local lv = ms.number(96)\nif lv == 12 then while true do end end");
+    let (_dir, mut loaded) = chart("#PLAYLEVEL 12\n#BPM 120\n#00111:01\n", covers());
+    on_loading(&mut loaded, Some(skin), false, |rig, side, loaded| {
+        let base = skin_beatoraja::vm_hooks::live();
+        skin_beatoraja::vm_hooks::hold();
+        let audio = Arc::clone(&rig.audio_lost);
+        let clock = imports::stop_clock();
+        let ended = open_with(loaded, rig, side, || {
+            imports::executing(base);
+            side.controls.command(Command::Quit);
+            until("the settle began", || clock.seen().settling.is_some());
+            audio.store(true, std::sync::atomic::Ordering::Release);
+            until("the failure seen", || clock.seen().stopped.is_some());
+            let (_, by) = clock.seen().stopped.expect("seen");
+            clock.advance_to(by);
+            clock.looked_now();
+            clock.thaw();
+        });
+        assert!(matches!(ended, Err(LiveError::Output(_))), "{ended:?}");
+        assert_eq!(side.gates.refresh.passed(), 0, "left in the wait");
+        skin_beatoraja::vm_hooks::release();
+        imports::hold_exit(false);
+        until("every job thread ended", || imports::workers() == 0);
     });
 }

@@ -4,8 +4,11 @@
 //! settle ([`settle`]), and each stage's adapter, event by event
 //! ([`adapter`]). Real jobs on self-made skins, held by the jobs' test
 //! gates (the exit gate, the VM hooks), on a render thread of
-//! [`Installers`]. A watchdog (`TAPESTRY_TEST_WATCHDOG`, seconds) panics a
-//! wait that never ends.
+//! [`Installers`]. The settles' bounds are decided on the jobs' stop
+//! clock, which the tests move ([`imports::stop_clock`]), and observed
+//! inside that decision. A watchdog (`TAPESTRY_TEST_WATCHDOG`, seconds)
+//! panics a wait that never ends, or ends the process where the wait is
+//! inside a thread scope.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,14 +45,10 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// How long a held thread is kept past the settle's or the signal's
-/// start: past the stop bound, so a wait bounded by it would have
-/// returned before the release.
+/// How far past the settlement's begin the stop decision's clock is moved
+/// while the settled thread is held: past the stop bound, so a wait
+/// bounded by it would give the thread up there.
 const PAST: Duration = Duration::from_millis(STOP_WAIT.as_millis() as u64 + 1_000);
-
-/// How late past [`STOP_WAIT`] a wait that gives up at the bound may
-/// return on a loaded machine.
-const LATE: Duration = Duration::from_millis(750);
 
 /// A play skin reading the play level: level 12 loops in metered Lua
 /// until cancelled; any other level builds at once.
@@ -212,24 +211,68 @@ impl Signal {
     }
 }
 
-/// Runs `settle`, a call that settles a held job, while another thread
-/// lets the job go with `release` [`PAST`] after `settle` began: what
-/// `settle` returned, and whether it returned only after the release.
+/// Runs `settle`, a call that settles a held job, on this thread's jobs'
+/// frozen stop clock ([`imports::stop_clock`]), while another thread waits
+/// until the settlement began inside the job's wait (its decision saw the
+/// attempt's quit), moves the clock [`PAST`] that begin, waits for a look
+/// of the wait at that time, and only then lets the job go with
+/// `release`. What `settle` returned, and whether it was still waiting
+/// when the wait looked past the bound: an unbounded settle was. A
+/// terminating watchdog guards the scope.
 fn held_past<R>(release: impl FnOnce() + Send, settle: impl FnOnce() -> R) -> (R, bool) {
+    let clock = imports::stop_clock();
+    let returned = std::sync::atomic::AtomicBool::new(false);
+    let _watchdog = crate::tests::Watchdog::arm("a held settle");
     std::thread::scope(|s| {
-        let (tx, rx) = std::sync::mpsc::channel::<Instant>();
-        let helper = s.spawn(move || {
-            let began = rx.recv().unwrap();
-            std::thread::sleep((began + PAST).saturating_duration_since(Instant::now()));
-            let at = Instant::now();
+        let helper = s.spawn(|| {
+            until("the settlement began", || clock.seen().settling.is_some());
+            let began = clock.seen().settling.expect("began");
+            clock.advance_to(began + PAST);
+            clock.looked_now();
+            let waiting = !returned.load(std::sync::atomic::Ordering::SeqCst);
+            clock.thaw();
             release();
-            at
+            waiting
         });
-        tx.send(Instant::now()).unwrap();
         let out = settle();
-        let returned = Instant::now();
-        let released = helper.join().unwrap();
-        (out, returned >= released)
+        returned.store(true, std::sync::atomic::Ordering::SeqCst);
+        let waited = helper.join().unwrap();
+        (out, waited)
+    })
+}
+
+/// A wait bounded by the run's end, on this thread's jobs' frozen stop
+/// clock: another thread gives the run's end with `give` (which waits for
+/// its moment first), and waits until the job's wait saw it and set its
+/// deadline. The clock is then moved to just before the
+/// deadline, where the wait looks and goes on waiting, then to it. What
+/// `settle` returned; the deadline is checked to be [`STOP_WAIT`] after
+/// the decision saw the signal. A terminating watchdog guards the scope.
+fn bounded<R>(give: impl FnOnce() + Send, settle: impl FnOnce() -> R) -> R {
+    let clock = imports::stop_clock();
+    let returned = std::sync::atomic::AtomicBool::new(false);
+    let _watchdog = crate::tests::Watchdog::arm("a bounded settle");
+    std::thread::scope(|s| {
+        let helper = s.spawn(|| {
+            give();
+            until("the run's end seen", || clock.seen().stopped.is_some());
+            let (seen, by) = clock.seen().stopped.expect("seen");
+            assert_eq!(by - seen, STOP_WAIT, "bounded from the signal");
+            clock.advance_to(by - Duration::from_micros(1));
+            clock.looked_now();
+            assert!(
+                !returned.load(std::sync::atomic::Ordering::SeqCst),
+                "given up before the bound"
+            );
+            clock.advance_to(by);
+            // Given up at that look; later waits read real time.
+            clock.looked_now();
+            clock.thaw();
+        });
+        let out = settle();
+        returned.store(true, std::sync::atomic::Ordering::SeqCst);
+        helper.join().unwrap();
+        out
     })
 }
 

@@ -1389,7 +1389,10 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
-        self.clock.now()
+        let now = self.clock.now();
+        #[cfg(test)]
+        self.opening_gates.read_clock(now);
+        now
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1641,6 +1644,8 @@ impl Rig for PlayerRig<'_> {
     /// the opening returns to the same loading state ([`defer`](Rig::defer));
     /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
+        #[cfg(test)]
+        self.opening_gates.ending();
         let loading = self
             .selection
             .as_mut()

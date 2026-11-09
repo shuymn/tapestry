@@ -91,8 +91,6 @@ fn run_flow(
 /// What a signalled flow cell gave.
 struct Signalled {
     ended: Ended,
-    /// From the signal to the flow's return.
-    took: Duration,
     /// The jobs started and joined, counted once every job thread ended.
     jobs: (u64, u64),
     log: Vec<String>,
@@ -116,7 +114,7 @@ fn signalled_in(stage: Stage, signal: Signal) -> Signalled {
     let mut l = at_level(level);
     let chart = l.chart().clone();
     let screens = Installers::default();
-    let (ended, took, jobs) = on_flow_rig(&chart, &screens, pending, |rig| {
+    let (ended, jobs) = on_flow_rig(&chart, &screens, pending, |rig| {
         if pending {
             rig.pending = Some(skin);
         }
@@ -129,43 +127,44 @@ fn signalled_in(stage: Stage, signal: Signal) -> Signalled {
             vm_hooks::hold();
         }
         let give = signal.giver(rig);
-        let (ended, took) = std::thread::scope(|s| {
-            let helper = s.spawn(|| {
-                if stage == Stage::Screen {
+        let ended = if stage == Stage::Screen {
+            let _watchdog = crate::tests::Watchdog::arm("a signalled flow");
+            std::thread::scope(|s| {
+                let helper = s.spawn(|| {
                     until("the attempt staged", || screens.staging().is_some());
-                } else {
+                    give();
+                });
+                let ended = game::live::run_chart(&mut l, rig);
+                helper.join().unwrap();
+                ended
+            })
+        } else {
+            // The job's wait sees the run's end and gives the job up at
+            // its bound on the stop clock.
+            bounded(
+                || {
                     imports::executing(base);
-                }
-                let at = Instant::now();
-                give();
-                at
-            });
-            let ended = game::live::run_chart(&mut l, rig);
-            let returned = Instant::now();
-            (ended, returned - helper.join().unwrap())
-        });
+                    give();
+                },
+                || game::live::run_chart(&mut l, rig),
+            )
+        };
         screens.release_staged();
         release_workers();
-        (ended, took, jobs_since(from))
+        (ended, jobs_since(from))
     });
     Signalled {
         ended,
-        took,
         jobs,
         log: screens.log(),
     }
 }
 
-/// A held job's cell: the flow gave the job up within the stop bound of
-/// the signal, and the job, counted once its thread ended after the
-/// test let it go, was started and never joined.
+/// A held job's cell: the flow gave the job up at the stop bound from the
+/// signal its wait saw ([`bounded`]), and the job, counted once its thread
+/// ended after the test let it go, was started and never joined.
 #[track_caller]
 fn abandoned(s: &Signalled) {
-    assert!(
-        s.took >= STOP_WAIT && s.took < STOP_WAIT + LATE,
-        "{:?}",
-        s.took
-    );
     assert_eq!(s.jobs, (1, 0), "abandoned, never joined");
 }
 

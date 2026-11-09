@@ -1807,6 +1807,36 @@ mod tests {
         sources,
     };
 
+    /// A hang guard that ends the test process (tests): armed, a detached
+    /// thread waits on a channel for the watchdog's time
+    /// (`TAPESTRY_TEST_WATCHDOG`, seconds); unless the guard is dropped
+    /// first, it prints what never ended and aborts. A panic inside a
+    /// thread scope would only unwind into the scope's join of threads
+    /// that never end.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) struct Watchdog(
+        #[expect(dead_code, reason = "dropped to disarm")] std::sync::mpsc::Sender<()>,
+    );
+
+    #[cfg(feature = "dev-tools")]
+    impl Watchdog {
+        /// Armed for `what`.
+        pub(crate) fn arm(what: &str) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let what = what.to_owned();
+            let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+            let after =
+                std::time::Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600));
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(after) {
+                    eprintln!("watchdog: {what} never ended; aborting");
+                    std::process::abort();
+                }
+            });
+            Self(tx)
+        }
+    }
+
     /// Both launch paths, `tapestry play <chart>` as song selection, make
     /// the quit key a command taken once by the play or result it arrives
     /// in, so a complete play's tail can skip to the result; only closing

@@ -190,6 +190,8 @@ impl LoadingRig for PlayerRig<'_> {
     }
 
     fn close_acceptance(&mut self, generation: u32) -> Result<TuningSnapshot, InputWaitError> {
+        #[cfg(test)]
+        self.opening_gates.closing.pass();
         let reducer = self.close_reducer(false)?;
         let mut snapshot = self.controls.tuning().close(generation);
         snapshot.revision.reducer = reducer.unwrap_or(0);
@@ -229,8 +231,9 @@ impl PlayerRig<'_> {
 }
 
 /// Where the loading opener's steps on the player's rig wait while a test
-/// holds them (tests): after the epoch's refresh (O5) acted, and before
-/// the revalidation (O11) acts; and where a deferred opening passes.
+/// holds them (tests): after the epoch's refresh (O5) acted, before the
+/// revalidation (O11) acts and before a close after a deferral or a
+/// commit; and where a deferred opening passes.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct OpeningGates {
@@ -238,8 +241,42 @@ pub struct OpeningGates {
     pub revalidate: crate::render_side::TestGate,
     /// Passed at each opening the input thread answered `Deferred`.
     pub deferred: crate::render_side::TestGate,
-    /// Each close after a deferral: the clock's time and the copy.
+    /// Passed before each close after a deferral or a commit, acceptance
+    /// still open.
+    pub closing: crate::render_side::TestGate,
+    /// Each close after a deferral or a commit: the clock's time and the
+    /// copy.
     pub closes: std::sync::Mutex<Vec<(TimeUs, TuningSnapshot)>>,
+    /// The time the flow last read from the rig's clock
+    /// ([`Rig::now`](game::Rig::now)).
+    clock_read: std::sync::atomic::AtomicI64,
+    /// Each end of loading asked: the time the flow last read before it,
+    /// the one its decision to end the loading state was taken at.
+    pub ends: std::sync::Mutex<Vec<TimeUs>>,
+}
+
+#[cfg(test)]
+impl OpeningGates {
+    /// The flow read `now` from the rig's clock.
+    pub fn read_clock(&self, now: TimeUs) {
+        self.clock_read
+            .store(now.0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The time the flow last read from the rig's clock; 0 before any.
+    #[cfg(feature = "dev-tools")]
+    pub fn clock_read(&self) -> TimeUs {
+        TimeUs(self.clock_read.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// The flow asks the end of loading.
+    pub fn ending(&self) {
+        let at = TimeUs(self.clock_read.load(std::sync::atomic::Ordering::SeqCst));
+        self.ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(at);
+    }
 }
 
 #[cfg(test)]

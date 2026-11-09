@@ -9,8 +9,9 @@ use game::Preparation;
 use super::*;
 
 /// H1: a replacement while the specialization's thread is held after its
-/// successful outcome waits for that thread past the stop bound (today's
-/// bounded settle would have given it up), joins it, and reuses the kept
+/// successful outcome waits for that thread past the stop bound on the
+/// stop clock (a bounded settle would have given it up), joins it, and
+/// reuses the kept
 /// specialization: no new job, the replacement ready.
 #[test]
 fn replacing_a_pending_specialization_waits_for_its_thread() {
@@ -258,7 +259,8 @@ fn with_running(
 
 /// H5a: a close, an input failure or an audio failure during a
 /// replacement's settle, the old job's VM held: the settle gives the job
-/// up within the stop bound of the signal, no new handle begins (the
+/// up exactly at the stop bound from the signal its wait saw, on the
+/// stop clock (not before), no new handle begins (the
 /// replacement is cancelled, no job started), and the rig shows the cause.
 /// The abandoned thread is counted once the test let it go: started,
 /// never joined. One case per signal and per stage.
@@ -274,20 +276,12 @@ fn a_close_during_a_replacement_settle_ends_the_run_without_opening() {
                 let _a = begin(rig, looping);
                 imports::executing(base);
                 let give = signal.giver(rig);
-                let (mut b, took) = std::thread::scope(|s| {
-                    let helper = s.spawn(|| {
+                let mut b = bounded(
+                    || {
                         until("the settle cancelled the job", || vm_hooks::waiting() == 1);
-                        let at = Instant::now();
                         give();
-                        at
-                    });
-                    let b = begin(rig, next);
-                    let returned = Instant::now();
-                    (b, returned - helper.join().unwrap())
-                });
-                assert!(
-                    took >= STOP_WAIT && took < STOP_WAIT + LATE,
-                    "{case}: {took:?}"
+                    },
+                    || begin(rig, next),
                 );
                 assert_eq!(stage(rig), "ended", "{case}");
                 assert_eq!(

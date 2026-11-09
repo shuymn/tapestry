@@ -2,10 +2,11 @@
 //! driver: acceptance closing and reopening on both sides (design.md "Play
 //! Lifecycle", tuning while loading), and the opening's copy taken
 //! without a nested lock or an allocation. A watchdog
-//! (`TAPESTRY_TEST_WATCHDOG`, seconds) panics a wait that never ends.
+//! (`TAPESTRY_TEST_WATCHDOG`, seconds) panics a wait that never ends, or
+//! ends the process where the wait is inside a thread scope.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bms_model::{TimeSource as _, TimeUs};
 use game::{Adjust, LoadingRig as _, Revalidated, Rig as _};
@@ -265,11 +266,13 @@ fn a_press_during_the_second_acknowledgement_is_discarded() {
 /// reopening through the rig, repeated while the window thread routes
 /// settings keys and focus changes and the input thread publishes START
 /// and SELECT: none waits on a lock it already holds or on the other
-/// threads. The rig's work runs on its own thread; the watchdog panics if
-/// it never ends.
+/// threads. The rig's work runs on its own thread; the watchdog ends the
+/// process if it never ends.
 #[test]
 fn the_opening_snapshot_takes_no_nested_lock() {
     on_input_rig(|rig, keys| {
+        // A deadlock ends the process: the scope's threads never end.
+        let _watchdog = crate::tests::Watchdog::arm("the rig's work");
         let done = AtomicBool::new(false);
         let controls = rig.controls;
         let worker = &mut *rig;
@@ -320,13 +323,9 @@ fn the_opening_snapshot_takes_no_nested_lock() {
                 }
                 outcomes
             });
-            let began = Instant::now();
-            while !game.is_finished() {
-                assert!(began.elapsed() < watchdog(), "the rig's work never ended");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let outcomes = game.join();
             done.store(true, Ordering::Release);
-            let outcomes = game.join().unwrap();
+            let outcomes = outcomes.unwrap();
             assert_eq!(outcomes.iter().sum::<u32>(), 200, "{outcomes:?}");
             window.join().unwrap();
             input.join().unwrap();

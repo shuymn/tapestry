@@ -50,16 +50,133 @@ pub(super) fn spawn_failed() {
 /// carries the tally of the thread that started it, so a test counts its
 /// own jobs only, whatever jobs other tests run meanwhile: the
 /// process-wide counters ([`super::jobs_started`]) move with every test's.
+///
+/// With it, the clock the jobs' stop decision reads ([`stop_clock`]) and
+/// what that decision saw.
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     started: AtomicU64,
     joined: AtomicU64,
+    decision: Mutex<Decision>,
+}
+
+/// What a job's stop decision ([`super::Job::wait_until`]) read and saw,
+/// on the clock a test controls.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Decision {
+    /// The clock: frozen at the instant and the advance a test set, or
+    /// real time when `None`.
+    frozen: Option<(Instant, Duration)>,
+    /// When a wait first saw the attempt's quit or the run's end: the
+    /// settlement began.
+    pub(crate) settling: Option<Instant>,
+    /// When a wait first saw the run's end, and the deadline it set.
+    pub(crate) stopped: Option<(Instant, Instant)>,
+    /// The time each look of a wait read, the last one; and how many.
+    pub(crate) looked: Option<Instant>,
+    pub(crate) looks: u64,
 }
 
 impl Tally {
     /// Its job's thread was joined.
     pub(super) fn joined(&self) {
         self.joined.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn decision(&self) -> MutexGuard<'_, Decision> {
+        self.decision.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The time a job's stop decision reads.
+    pub(super) fn now(&self) -> Instant {
+        match self.decision().frozen {
+            Some((at, by)) => at + by,
+            None => Instant::now(),
+        }
+    }
+
+    /// A wait saw the attempt's quit or, with its deadline `stop_by`, the
+    /// run's end at `now`.
+    pub(super) fn settling(&self, now: Instant, stop_by: Option<Instant>) {
+        let mut d = self.decision();
+        d.settling.get_or_insert(now);
+        if let Some(by) = stop_by {
+            d.stopped.get_or_insert((now, by));
+        }
+    }
+
+    /// A wait looked at `now`.
+    pub(super) fn looked(&self, now: Instant) {
+        let mut d = self.decision();
+        d.looked = Some(now);
+        d.looks += 1;
+    }
+}
+
+/// The clock the stop decision of this thread's jobs reads, frozen from
+/// now on until dropped, and what the decision saw since (tests): a
+/// settlement's begin and its bound observed inside the decision, the
+/// time moved only by [`advance`](Self::advance).
+#[cfg(feature = "dev-tools")]
+#[derive(Debug)]
+pub(crate) struct StopClock(Arc<Tally>);
+
+/// Freezes this thread's jobs' stop decision clock ([`StopClock`]).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn stop_clock() -> StopClock {
+    let t = tally();
+    *t.decision() = Decision {
+        frozen: Some((Instant::now(), Duration::ZERO)),
+        ..Decision::default()
+    };
+    StopClock(t)
+}
+
+#[cfg(feature = "dev-tools")]
+impl StopClock {
+    /// The decision's time now.
+    pub(crate) fn now(&self) -> Instant {
+        self.0.now()
+    }
+
+    /// Moves the decision's time on by `by`.
+    pub(crate) fn advance(&self, by: Duration) {
+        if let Some((_, moved)) = &mut self.0.decision().frozen {
+            *moved += by;
+        }
+    }
+
+    /// Moves the decision's time on to `to` (never back).
+    pub(crate) fn advance_to(&self, to: Instant) {
+        self.advance(to.saturating_duration_since(self.now()));
+    }
+
+    /// Lets the decision read real time again, what it saw kept.
+    pub(crate) fn thaw(&self) {
+        self.0.decision().frozen = None;
+    }
+
+    /// What the decision saw so far.
+    pub(crate) fn seen(&self) -> Decision {
+        *self.0.decision()
+    }
+
+    /// Waits until a look of a wait read the decision's time as it is
+    /// now, or later: the decision looked at it.
+    #[track_caller]
+    pub(crate) fn looked_now(&self) {
+        let now = self.now();
+        assert!(
+            wait_until(|| self.seen().looked.is_some_and(|l| l >= now)),
+            "no look at the decision's time"
+        );
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+impl Drop for StopClock {
+    fn drop(&mut self) {
+        self.0.decision().frozen = None;
     }
 }
 

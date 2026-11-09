@@ -962,15 +962,26 @@ impl<T> Job<T> {
         mut end_run: impl FnMut() -> bool,
     ) -> Option<Ran<T>> {
         loop {
+            // The stop decision's time: a test's clock under test.
+            #[cfg(test)]
+            let now = self.tally.now();
+            #[cfg(not(test))]
+            let now = Instant::now();
             if self.stop_by.is_none() && end_run() {
                 self.cancel.cancel();
-                self.stop_by = Some(Instant::now() + STOP_WAIT);
+                self.stop_by = Some(now + STOP_WAIT);
+                #[cfg(test)]
+                self.tally.settling(now, self.stop_by);
             }
             if self.stop_by.is_none() && !self.attempt_cancelled && cancel_attempt() {
                 self.cancel.cancel();
                 self.attempt_cancelled = true;
+                #[cfg(test)]
+                self.tally.settling(now, None);
             }
-            if self.stop_by.is_some_and(|d| Instant::now() >= d) {
+            #[cfg(test)]
+            self.tally.looked(now);
+            if self.stop_by.is_some_and(|d| now >= d) {
                 // Detached: the handle and the receiver go, so a late
                 // outcome is dropped on its own thread.
                 self.handle = None;

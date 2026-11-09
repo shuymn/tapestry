@@ -662,6 +662,12 @@ impl SettingsFiles {
         self.options.or_else(|| self.written.player.options().ok())
     }
 
+    /// The data root the files are in (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn root(&self) -> &DataRoot {
+        &self.root
+    }
+
     /// The play preset `player.toml` is to hold.
     pub fn preset(&self) -> &str {
         &self.preset
