@@ -1406,7 +1406,7 @@ impl Cx<'_> {
     /// The report's record of the consumer at node `id` in `field`, for an
     /// element of `role` (dev-tools): its disposition `d`, `why` it did not
     /// lower, and what it lowered to.
-    fn consumed(
+    pub(super) fn consumed(
         &self,
         id: u32,
         field: &'static str,
@@ -1437,6 +1437,14 @@ impl Cx<'_> {
         }
         #[cfg(not(feature = "dev-tools"))]
         let _ = (id, field, role, d, why, lowered);
+    }
+
+    /// A program callback at node `id` in `field`, compiled for the play
+    /// destination being read ([`Self::installed`]).
+    fn compiled_at(&mut self, id: u32, field: &'static str) {
+        if self.kind == ScreenKind::Play {
+            self.install.compiled.push((id, field));
+        }
     }
 
     /// The record of callable `c` at node `id` in `field`, for an element
@@ -1860,6 +1868,7 @@ impl Cx<'_> {
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
                     self.outcome((c, id), field, role, (Disposition::Compiled, None));
+                    self.compiled_at(id, field);
                     *deviates |= l.deviates;
                     self.read_sentinel(l.sentinel);
                     conds.push(format!("lua.{k}"));
@@ -2041,6 +2050,7 @@ impl Cx<'_> {
                 match self.program(prog, gate, None, at)? {
                     Ok(k) => {
                         self.outcome((c, id), "value", role, (Disposition::Compiled, None));
+                        self.compiled_at(id, "value");
                         self.read_sentinel(l.sentinel);
                         return Ok(Some(NumberValue {
                             expr: format!("lua.{k}"),
@@ -2146,6 +2156,7 @@ impl Cx<'_> {
         match gated {
             Ok(k) => {
                 self.outcome(v.at, "value", v.role, (Disposition::Compiled, None));
+                self.compiled_at(v.at.1, "value");
                 Ok(Some(k))
             }
             Err(why) => {
@@ -2415,6 +2426,7 @@ impl Cx<'_> {
                                     self.install.consumers.push((inst, n));
                                 }
                                 self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
+                                self.compiled_at(id, "timer");
                                 self.read_sentinel(l.sentinel);
                                 return Ok(Ok(TimerRef::Output(k)));
                             }

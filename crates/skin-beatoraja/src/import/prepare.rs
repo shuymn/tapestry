@@ -23,11 +23,29 @@ use skin_model::{JudgeSlot, ScreenKind};
 
 use super::ops::{self, Cond};
 use super::property::IndexProp;
-use super::report::Object;
+
+use super::report::{NoteKind, Object, ScheduleWhy, Severity};
 use super::{Common, Cx, Dst, Op, Prop};
 use crate::error::ImportError;
-use crate::lua::Unsupported;
+use crate::lua::{Disposition, Unsupported};
 use crate::tree::NONE;
+
+/// The reason an inert authored callback is not compiled.
+const INERT: &str = "an authored `op`, `draw` or `timer` inert without an authored key";
+
+/// Where an image record's source leads, known without reading a file.
+enum Resolved {
+    /// No `source` record of its `src`, one without a `path`, or a file
+    /// choice of none: the source makes no texture.
+    Absent,
+    /// A movie, which the source makes before it reads `len`
+    /// (`JsonSkinObjectLoader.java:44-49`).
+    Movie,
+    /// A file choice the importer does not resolve.
+    Glob,
+    /// A file, its name resolved.
+    File(String),
+}
 
 /// Why the source removes a destination's object at installation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +77,11 @@ pub(super) struct Install {
     pub(super) elements: usize,
     /// The slot roots' consumers it compiled, by root and position.
     pub(super) consumers: Vec<(u32, usize)>,
+    /// Its program callbacks, by node and field.
+    pub(super) compiled: Vec<(u32, &'static str)>,
+    /// Whether its selector is gated by an availability the source does
+    /// not have ([`ScheduleWhy::Availability`]).
+    pub(super) availability: bool,
 }
 
 /// What a kind's own `prepare` checks before an element's conditions.
@@ -222,19 +245,30 @@ impl Cx<'_> {
         if removal.is_some() || self.inert(dst, object) {
             self.uncount_timer(&dst.timer);
             if removal.is_none() {
-                #[cfg(feature = "dev-tools")]
-                {
-                    let callables = dst.ops.iter().filter_map(|op| match op {
-                        Op::Callable(id) => Some(*id),
-                        Op::Id(_) | Op::Name(_) => None,
-                    });
-                    let props = [&dst.draw, &dst.timer].into_iter().filter_map(|p| match p {
-                        Prop::Callable(id) => Some(*id),
+                // Each inert use recorded on its own, its callable's other
+                // uses left alone.
+                let callables = dst.ops.iter().filter_map(|op| match op {
+                    Op::Callable(id) => Some((*id, "op")),
+                    Op::Id(_) | Op::Name(_) => None,
+                });
+                let props = [(&dst.draw, "draw"), (&dst.timer, "timer")]
+                    .into_iter()
+                    .filter_map(|(p, f)| match p {
+                        Prop::Callable(id) => Some((*id, f)),
                         _ => None,
                     });
-                    for id in callables.chain(props).collect::<Vec<_>>() {
-                        self.unused(id, crate::lua::callback::Unused::Inert);
-                    }
+                for (id, field) in callables.chain(props).collect::<Vec<_>>() {
+                    let why = Unsupported::Construct(INERT);
+                    let role = super::policy::Role::Decorative;
+                    self.consumed(
+                        id,
+                        field,
+                        role,
+                        (Disposition::Replaced(why), Some(why)),
+                        None,
+                    );
+                    #[cfg(feature = "dev-tools")]
+                    self.unused(id, crate::lua::callback::Unused::Inert);
                 }
                 dst.ops.clear();
                 dst.draw = Prop::Null;
@@ -352,17 +386,21 @@ impl Cx<'_> {
     fn no_source(&mut self, object: Object, rec: u32) -> Result<bool, ImportError> {
         match object {
             Object::Image => {
+                match self.resolve_source(rec)? {
+                    Resolved::Absent => return Ok(true),
+                    // A movie ignores `len`; a glob may name one.
+                    Resolved::Movie | Resolved::Glob => return Ok(false),
+                    Resolved::File(_) => {}
+                }
                 let [len, divx, divy] = self.def.fields(rec, ["len", "divx", "divy"]);
                 let len = self.int_or(len, "len", 0)?;
                 if len > 1 {
                     let div = |v: i32| u64::try_from(v).ok().filter(|&d| d > 0).unwrap_or(1);
                     let frames =
                         div(self.int_or(divx, "divx", 1)?) * div(self.int_or(divy, "divy", 1)?);
-                    if frames / u64::try_from(len).unwrap_or(1) == 0 {
-                        return Ok(true);
-                    }
+                    return Ok(frames / u64::try_from(len).unwrap_or(1) == 0);
                 }
-                self.unresolved(rec)
+                Ok(false)
             }
             Object::ImageSet => {
                 let [images] = self.def.fields(rec, ["images"]);
@@ -397,26 +435,88 @@ impl Cx<'_> {
     /// Whether image record `rec`'s source does not resolve without a file
     /// being read: no `source` record of its `src`, one without a `path`,
     /// or a file choice of none.
-    pub(super) fn unresolved(&mut self, rec: u32) -> Result<bool, ImportError> {
+    fn unresolved(&mut self, rec: u32) -> Result<bool, ImportError> {
+        Ok(matches!(self.resolve_source(rec)?, Resolved::Absent))
+    }
+
+    /// Where image record `rec`'s source leads, as the importer resolves
+    /// it before placing it ([`Self::src_rect`]).
+    fn resolve_source(&mut self, rec: u32) -> Result<Resolved, ImportError> {
+        use super::asset::{self, Path};
         let [src] = self.def.fields(rec, ["src"]);
         let src = self.opt_string(src, "src")?;
         let Some(source) = self.source_rec(src.as_deref())? else {
-            return Ok(true);
+            return Ok(Resolved::Absent);
         };
         let Some(path) = self.source_path(source)? else {
-            return Ok(true);
+            return Ok(Resolved::Absent);
         };
-        Ok(matches!(
-            self.choices.substitute(&path),
-            super::asset::Path::Missing
-        ))
+        if asset::is_movie(&path) {
+            return Ok(Resolved::Movie);
+        }
+        Ok(match self.choices.substitute(&path) {
+            Path::Missing => Resolved::Absent,
+            Path::Glob => Resolved::Glob,
+            Path::File(p) => Resolved::File(asset::resolve(&self.entry_dir, &p)),
+        })
     }
 
-    /// At a destination's end: a slot root's consumer on one whose import
-    /// retained no element counts as a dropped destination's, since the
-    /// source may have removed it ([`Self::close_slots`]).
+    /// Whether image record `rec`'s texture loads, as the source's
+    /// constructor needs it (`JsonPlaySkinObjectLoader.java:233-239`): its
+    /// file admitted now, as its own import would (cached for it); `None`
+    /// for a movie or a file choice the importer does not resolve, and a
+    /// file only the importer refuses, which the source may load.
+    pub(super) fn texture_loads(
+        &mut self,
+        rec: u32,
+        at: super::Span,
+    ) -> Result<Option<bool>, ImportError> {
+        let name = match self.resolve_source(rec)? {
+            Resolved::Absent => return Ok(Some(false)),
+            Resolved::Movie | Resolved::Glob => return Ok(None),
+            Resolved::File(name) => name,
+        };
+        let def = skin_model::FileDef {
+            path: name,
+            hi: None,
+        };
+        let admitted = self
+            .assets
+            .admit(&mut self.budget, def)
+            .map_err(|l| self.limit(at, l))?;
+        Ok(match admitted {
+            Ok(_) => Some(true),
+            Err(super::asset::Failed::File { refused: false }) => Some(false),
+            Err(_) => None,
+        })
+    }
+
+    /// At a destination's end: on one whose import retained no element,
+    /// which the source may have removed, a slot root's consumer counts as
+    /// a dropped destination's ([`Self::close_slots`]) and every program
+    /// callback compiled is noted as run where the source may not; on an
+    /// element whose selector waits for an availability the source does
+    /// not have, each is noted as skipped where the source runs it.
     pub(super) fn installed(&mut self) {
-        if self.elements.len() > self.install.elements {
+        let retained = self.elements.len() > self.install.elements;
+        let why = if !retained && self.install.removed.is_none() {
+            Some(ScheduleWhy::MayBeRemoved)
+        } else if self.install.availability {
+            Some(ScheduleWhy::Availability)
+        } else {
+            None
+        };
+        for (id, field) in std::mem::take(&mut self.install.compiled) {
+            if let Some(why) = why {
+                let at = self.arena_span(id);
+                self.note(
+                    Some(at),
+                    Severity::Deviation,
+                    NoteKind::Schedule { field, why },
+                );
+            }
+        }
+        if retained {
             return;
         }
         for (inst, at) in std::mem::take(&mut self.install.consumers) {
@@ -459,8 +559,8 @@ impl Cx<'_> {
         c: &Common,
         timer: &Prop,
     ) -> Result<(Option<String>, Option<u16>), Unsupported> {
-        let held =
-            c.track.end == skin_model::End::Hold && c.track.keys.first().is_some_and(|k| k.at == 0);
+        // The source's first key, before D20 settles a critical track.
+        let held = c.track.end == skin_model::End::Hold && c.first_at == 0;
         if !held {
             return Err(Unsupported::Construct(
                 "a slider value whose keys need the source's prepare clock",

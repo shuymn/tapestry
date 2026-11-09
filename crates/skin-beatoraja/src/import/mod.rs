@@ -45,7 +45,7 @@ pub use policy::{CriticalPart, EssentialPart};
 pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
     DeviationId, FileChoice, LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, PartWhy,
-    PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage,
+    PropertyKind, Report, Rule, ScheduleWhy, Severity, TimerWhy, TrackWhy, Usage,
 };
 
 use self::asset::{Assets, Choices};
@@ -408,6 +408,8 @@ struct Common {
     /// Its conditions' sources, in the source's order, as `visible` joins
     /// them: what a value read after them is gated by.
     conds: Vec<String>,
+    /// Its first key's time in ms as written, before D20 settles it.
+    first_at: i64,
 }
 
 /// The import's running state.
@@ -1469,6 +1471,7 @@ impl<'d> Cx<'d> {
         let mut track = track;
         // At rest the source's colour is the key's, so an alpha offset adds
         // to it even where the colour animates (`SkinObject.java:493-519`).
+        let first_at = track.keys.first().map_or(0, |k| k.at);
         let settled = untimed && matches!(role, Role::Critical(_)) && policy::settles(&track);
         if settled {
             track.keep_last_from_start();
@@ -1583,6 +1586,7 @@ impl<'d> Cx<'d> {
             display_deviation: deviates,
             tests_status,
             conds,
+            first_at,
         }))
     }
 

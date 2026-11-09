@@ -714,6 +714,9 @@ impl Cx<'_> {
                 return Ok(());
             };
             role = super::result::set_role(v.role, role);
+            // A selector gated by an availability the source does not have
+            // skips the set's callbacks where the source runs them.
+            self.install.availability |= v.guard.is_some();
             (
                 image_choice::guarded(&v.expr, v.guard.as_deref()),
                 v.deviates,

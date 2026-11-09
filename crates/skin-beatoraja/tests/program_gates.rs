@@ -679,3 +679,163 @@ fn a_dropped_kind_compiles_no_callback() {
         i.callbacks
     );
 }
+
+/// Slot 6's part exists when its texture loads, whatever the import makes
+/// of its track: a loaded part never drawn still takes a full gauge's
+/// PERFECT; an absent texture leaves it to slot 0.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn slot_six_exists_by_its_texture() {
+    let never = "loop = 50, dst = { { time = 100, x = 0, y = 0, w = 8, h = 8 } }";
+    for (src, want) in [("a", 0), ("m", 1)] {
+        let images: String = (0..6)
+            .map(|k| {
+                let f = if k == 0 { PROGRAM_DRAW } else { "" };
+                format!("{{ id = \"g{k}\", {f} dst = {{ {{ x = 0, y = 0, w = 8, h = 8 }} }} }},")
+            })
+            .collect();
+        let body = format!(
+            "table.insert(skin.source, {{ id = \"m\", path = \"missing.png\" }})\n\
+             table.insert(skin.image, {{ id = \"six\", src = \"{src}\", x = 0, y = 0, w = 8, h = 8 }})\n\
+             skin.judge = {{ {{ id = \"j\", index = 0, images = {{ {images} {{ id = \"six\", {never} }} }}, numbers = {{}} }} }}\n{}",
+            dst("j", "")
+        );
+        let mut p = played(&body);
+        full_gauge(&mut p);
+        assert_eq!(
+            invoked(&mut p, 1_000, &[at(1_000, Judgment::Perfect)]),
+            want,
+            "{src}"
+        );
+    }
+}
+
+/// The gauge full from 900 ms.
+#[cfg(feature = "dev-tools")]
+fn full_gauge(p: &mut Drawn) {
+    p.gauges[0].value = GaugeValue::FULL;
+    let max = eval::JudgeEvent {
+        seq: 0,
+        time: TimeUs(900_000),
+        origin: None,
+        kind: eval::JudgeEventKind::Gauge {
+            gauge: 0,
+            value: GaugeValue::FULL,
+            reference: GaugeValue::FULL,
+        },
+    };
+    p.frame(900, &[max]);
+}
+
+/// A movie ignores `len`, so an empty run proves nothing: the image is
+/// uncertain, its timer a site, and a latch it shares with a kept image
+/// is refused once the import drops the movie.
+#[test]
+fn a_movie_grouped_image_is_not_removed() {
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"v\", path = \"a.mp4\" }})\n\
+         table.insert(skin.image, {{ id = \"mv\", src = \"v\", x = 0, y = 0, w = 8, h = 8, len = 2 }})\n\
+         local l = latch(100000)\n{}{}",
+        dst("mv", "timer = l,"),
+        dst("i", "timer = l,")
+    );
+    let i = import(&body).unwrap();
+    assert!(
+        i.callbacks
+            .contains(&construct("a slot writer a dropped destination calls")),
+        "{:?}",
+        i.callbacks
+    );
+}
+
+/// A critical slider whose keys start at 1 s is settled to its last key
+/// (D20), but the source reads its value only from 1 s: it refuses.
+#[test]
+fn a_settled_late_start_slider_refuses() {
+    let body = "skin.slider = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 1, range = 100,\n\
+           value = function() return ms.number(75) / 100 end } }\n\
+         table.insert(skin.destination, { id = \"v\", loop = 2000,\n\
+           dst = { { time = 1000, x = 0, y = 0, w = 8, h = 8 }, { time = 2000, x = 100, y = 0, w = 8, h = 8 } } })\n";
+    assert!(refused(
+        &import(body),
+        "a slider value whose keys need the source's prepare clock"
+    ));
+}
+
+/// The accepted deviations are noted at their callbacks: a draw on an
+/// image whose declared file does not load (the source makes no object),
+/// and a set's timer behind a selector that waits for an availability.
+#[test]
+fn schedule_deviations_are_noted_at_their_callbacks() {
+    use skin_beatoraja::{NoteKind, ScheduleWhy, Severity};
+    let noted = |body: &str, field: &'static str, why: ScheduleWhy| {
+        let i = import(body).unwrap();
+        assert!(
+            i.imported
+                .report
+                .notes
+                .iter()
+                .any(|n| n.severity == Severity::Deviation
+                    && n.at.is_some()
+                    && n.kind == NoteKind::Schedule { field, why }),
+            "{body}: {:#?}",
+            i.imported.report.notes
+        );
+    };
+    noted(
+        &format!(
+            "table.insert(skin.source, {{ id = \"m\", path = \"missing.png\" }})\n\
+             table.insert(skin.image, {{ id = \"x\", src = \"m\", x = 0, y = 0, w = 8, h = 8 }})\n{}",
+            dst("x", "draw = function() return ms.time() >= 0 end,")
+        ),
+        "draw",
+        ScheduleWhy::MayBeRemoved,
+    );
+    noted(
+        &format!(
+            "skin.imageset = {{ {{ id = \"s\", images = {{ \"i\" }}, value = function() if ms.number(90) > 100 then return 0 end return 0 end }} }}\n{}",
+            dst("s", "timer = clock,")
+        ),
+        "timer",
+        ScheduleWhy::Availability,
+    );
+    // A kept element with a plain selector has no such note.
+    let i = import(&dst("i", "draw = function() return ms.time() >= 0 end,")).unwrap();
+    assert!(
+        !i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Schedule { .. }))
+    );
+}
+
+/// On READY (40) and PLAY (41): not before the attempt's start, and not
+/// on a rearmed frame before it again.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_value_slider_on_ready_and_play() {
+    for timer in ["timer = 40,", "timer = 41,"] {
+        let mut p = played(&slider(timer, KEY0));
+        assert_eq!(invoked(&mut p, -1, &[]), 0, "{timer}");
+        assert_eq!(invoked(&mut p, 0, &[]), 1, "{timer}");
+        p.play.rearm();
+        assert_eq!(invoked(&mut p, -1, &[]), 0, "{timer}");
+    }
+}
+
+/// A custom timer resolving to PLAY is no proven timer: the value follows
+/// its role.
+#[test]
+fn a_value_slider_on_a_custom_alias_is_dropped() {
+    let body = "skin.customTimers = { { id = 10000, timer = 41 } }\n".to_owned()
+        + &slider("timer = 10000,", KEY0);
+    let i = import(&body).unwrap();
+    assert!(
+        i.callbacks.contains(&construct(
+            "a slider value on a timer the program cannot gate"
+        )),
+        "{:?}",
+        i.callbacks
+    );
+}

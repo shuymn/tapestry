@@ -132,12 +132,13 @@ impl Cx<'_> {
 
         // Whether the source has a slot-6 part, which takes PERFECT at a
         // full gauge from slot 0 (`SkinJudge.java:107-109`,
-        // `JsonPlaySkinObjectLoader.java:230-239`): as far as it is known
-        // without reading the file.
+        // `JsonPlaySkinObjectLoader.java:230-239`): whether its texture
+        // loads, whatever the import makes of its track.
         let full_part = match images.get(JudgeSlot::PerfectAtMax.index()) {
             Some(&g) => match self.read_nested(g)?.0 {
                 Some(id) => match self.image_rec(&id)? {
-                    Some(img) => !self.unresolved(img)?,
+                    // A texture the import cannot prove absent stands.
+                    Some(img) => self.texture_loads(img, at)? != Some(false),
                     None => false,
                 },
                 None => false,
