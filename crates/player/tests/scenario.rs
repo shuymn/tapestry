@@ -2857,8 +2857,11 @@ fn the_skins_scene_time_leaves_the_result() {
 
 /// C17f, C23 joined: a screen lost under a 5 s outro's barrier whose
 /// result restore is refused falls back for the run, and the flow serves
-/// back (accepted by the scene time) at its next look, well before the
-/// outro's end (T16).
+/// back (accepted by the scene time) once, the result shown built-in. When
+/// it is served (the first look after the rebuild, before the outro's
+/// end, T16) is `game`'s fixed-clock test
+/// `a_screen_lost_mid_outro_serves_back_after_its_refused_rebuild`: the
+/// rebuild on WARP takes about 0.5 s idle and up to 5 s under load.
 #[test]
 fn a_screen_lost_mid_outro_with_its_restore_refused_serves_back() {
     let fx = Fixture::new();
@@ -2880,9 +2883,7 @@ fn a_screen_lost_mid_outro_with_its_restore_refused_serves_back() {
         stderr.contains("dev: the result's restore was refused"),
         "the screen was built again, its result restore refused: {stderr}"
     );
-    let left = left_after_outro(&stdout);
-    assert_eq!(left.len(), 1, "{stdout}");
-    assert!(left[0] < 3_000_000, "served at the fallback: {left:?}");
+    assert_eq!(left_after_outro(&stdout).len(), 1, "{stdout}");
     assert_eq!(
         lines(&stdout, "dev: result shown: built-in").len(),
         1,
@@ -2892,7 +2893,9 @@ fn a_screen_lost_mid_outro_with_its_restore_refused_serves_back() {
 
 /// C17f through the real flow (P5): a frame refused on a healthy device
 /// while back waits on a 5 s outro disables the skin for the run, and back
-/// is served at the next look, not at the outro's end.
+/// is served once, the result shown built-in. When it is served (the next
+/// look, not the outro's end) is `game`'s fixed-clock test
+/// `a_fallback_during_an_outro_serves_the_command`.
 #[test]
 fn a_fallback_during_the_outro_serves_back_at_once() {
     let fx = Fixture::new();
@@ -2908,9 +2911,7 @@ fn a_fallback_during_the_outro_serves_back_at_once() {
         "pinned3",
     );
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    let left = left_after_outro(&stdout);
-    assert_eq!(left.len(), 1, "{stdout}");
-    assert!(left[0] < 3_000_000, "served at the fallback: {left:?}");
+    assert_eq!(left_after_outro(&stdout).len(), 1, "{stdout}");
     assert_eq!(
         lines(&stdout, "dev: result shown: built-in").len(),
         1,

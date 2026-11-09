@@ -669,13 +669,14 @@ impl Installation {
 /// The model's frame of `f`: the tally, the gauges, the completion and the
 /// play phase from the one play view `f` borrows, the effects slice as
 /// drained, the target as the renderer applied it, the author's layout,
-/// and the lanes and readouts `f` carries.
+/// and the state clock, lanes and readouts `f` carries.
 #[must_use]
 pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
     let view = f.view;
     SkinFrame {
         now: f.now,
         display_offset: f.display_offset,
+        state_us: f.state_us,
         tally: &view.tally,
         gauges: &view.gauges,
         gauge: f.gauge,

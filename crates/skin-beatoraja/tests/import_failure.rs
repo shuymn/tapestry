@@ -300,7 +300,7 @@ fn an_unsupported_part_refuses_at_its_destination() {
     let r = images("", &[clip]);
     refused_as_failure(r, &at("i"), unsupported_field("clip"));
     for (fields, why) in [
-        (r#""stretch": 3"#, NoteKind::Stretch(3)),
+        (r#""stretch": 10"#, NoteKind::Stretch(10)),
         (MOUSE, unsupported_field("mouseRect")),
         (r#""blend": 9"#, NoteKind::Blend(9)),
         (r#""offset": 2"#, NoteKind::RuntimeOffset(2)),

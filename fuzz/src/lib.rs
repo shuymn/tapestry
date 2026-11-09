@@ -777,6 +777,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         let mut notes = eval::NoteFacts::new(&chart);
         notes.set_done(lane, 0);
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -829,6 +830,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         }
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -926,6 +928,7 @@ fn lane_order_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1013,6 +1016,7 @@ fn gauge_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -1132,6 +1136,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1250,6 +1255,7 @@ fn grade_anchor_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -1433,6 +1439,7 @@ fn digit_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now,
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1520,6 +1527,7 @@ fn long_note_probes(
                 notes.set_hold(lane, Some(hold));
             }
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(ms * 1_000),
                 display_offset: TimeUs(0),
                 tally,
@@ -1588,6 +1596,7 @@ fn bar_probes(
         };
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(offset * 1_000),
             tally,
@@ -1697,6 +1706,7 @@ fn choice_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1793,6 +1803,7 @@ fn rate_and_kind_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(2_000_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -2071,6 +2082,7 @@ fn readout_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                state_us: 0,
                 now: TimeUs(now_ms * 1_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -3508,6 +3520,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
             ..Default::default()
         };
         let frame = SkinFrame {
+            state_us: 0,
             now: TimeUs(i64::from(combo) * 16_000),
             display_offset: TimeUs(0),
             tally: &tally,
