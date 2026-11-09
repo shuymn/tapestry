@@ -21,6 +21,7 @@ use crate::render_side::tests::{Installers, bundle};
 use crate::result_skin::tests as result;
 use crate::result_skin::{ResultSkin, ResultStart};
 
+mod adapter;
 mod settle;
 
 /// How long a test waits for what must come; `TAPESTRY_TEST_WATCHDOG`

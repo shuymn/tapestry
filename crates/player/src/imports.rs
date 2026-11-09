@@ -916,6 +916,12 @@ impl<T> Job<T> {
         true
     }
 
+    /// Whether the attempt's quit or the run's end came during a wait
+    /// ([`wait_until`](Self::wait_until)): the job was cancelled.
+    pub const fn signaled(&self) -> bool {
+        self.attempt_cancelled || self.stop_by.is_some()
+    }
+
     fn join(&mut self) {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -1002,6 +1008,8 @@ impl<T> Job<T> {
 /// Starts `body` on a `skin-import` thread; a test can have the start
 /// refused.
 fn spawn(body: impl FnOnce() + Send + 'static) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    tests::spawning_hook();
     #[cfg(test)]
     if tests::spawn_refused() {
         return Err(std::io::Error::other("refused by the test"));

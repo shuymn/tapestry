@@ -155,6 +155,28 @@ pub(crate) fn refuse_spawn() {
     REFUSE_SPAWN.store(true, Ordering::SeqCst);
 }
 
+/// What runs on the starting thread as the next job's thread starts.
+type SpawnHook = Box<dyn FnOnce() + Send>;
+static SPAWN_HOOK: Mutex<Option<SpawnHook>> = Mutex::new(None);
+
+/// `hook` runs on the starting thread as the next job's thread starts,
+/// before a refusal of its start ([`refuse_spawn`]), once.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn on_next_spawn(hook: impl FnOnce() + Send + 'static) {
+    *SPAWN_HOOK.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+}
+
+/// Runs the hook [`on_next_spawn`] armed, if any.
+pub(super) fn spawning_hook() {
+    let hook = SPAWN_HOOK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Whether the next job panics in its body, before its work, as a job
 /// whose work panicked would.
 static PANIC_JOB: AtomicBool = AtomicBool::new(false);
@@ -203,6 +225,12 @@ impl Drop for Serial {
         hold_exit(false);
         REFUSE_SPAWN.store(false, Ordering::SeqCst);
         PANIC_JOB.store(false, Ordering::SeqCst);
+        drop(
+            SPAWN_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
         #[cfg(feature = "dev-tools")]
         skin_beatoraja::vm_hooks::release();
         wait_until(|| WORKERS.load(Ordering::SeqCst) == 0);

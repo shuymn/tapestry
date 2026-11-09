@@ -10202,6 +10202,10 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
+            assert!(
+                !self.shared.panic_prepare.swap(false, Ordering::AcqRel),
+                "the render thread panics for the test"
+            );
             // Read once: the request whose preparation stages and holds.
             let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
             // Staged already and held: asked again, still no answer.
@@ -10550,6 +10554,8 @@ pub(crate) mod tests {
         /// The request whose preparation stages, then does not answer; 0
         /// for none.
         hold_staged: Arc<std::sync::atomic::AtomicU64>,
+        /// The next attempt's preparation panics the render thread, once.
+        pub(crate) panic_prepare: Arc<AtomicBool>,
     }
 
     /// One selection frame as an [`Installer`] saw it.
@@ -10638,6 +10644,12 @@ pub(crate) mod tests {
         #[cfg(feature = "dev-tools")]
         pub(crate) fn release_staged(&self) {
             self.hold_staged.store(0, Ordering::Release);
+        }
+
+        /// Attempts' preparations are not answered while `on`.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_preparations(&self, on: bool) {
+            self.hold.store(on, Ordering::Release);
         }
     }
 
