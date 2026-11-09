@@ -14,7 +14,10 @@
 //! paint to the lanes or replaces it (`skin/SkinImage.java:136-149`,
 //! `skin/SkinSlider.java:109-120`), and the logical coverage never
 //! depends on it. A type-6 slider paints no cover: it takes the same path,
-//! moved by the play's progress instead.
+//! moved by the play's progress instead; and on play a slider with a Lua
+//! `value` paints none either, moved by the presentation program's
+//! `tofloat()` of its value, decorative unless a read or failure makes it
+//! critical ([`Cx::value_slider`]).
 //!
 //! LIFT's and HIDDEN+'s paint rise by the lift, HIDDEN+'s by its own share
 //! too: the source lists offset 3 on LIFT and offsets 3 and 5 on HIDDEN+
@@ -303,8 +306,9 @@ impl Cx<'_> {
             .ok_or_else(|| self.range(at, "disapearLine"))
     }
 
-    /// A `slider` (`skin/json/JsonSkinObjectLoader.java:393-417`), without
-    /// a value property or a numeric reference: one of type 4 moving down
+    /// A `slider` (`skin/json/JsonSkinObjectLoader.java:393-417`). On play,
+    /// one with a callable `value` is moved by it ([`Self::value_slider`]).
+    /// Otherwise, without a value property or a numeric reference: one of type 4 moving down
     /// is SUDDEN+'s paint, play-critical unless it is proven outside the
     /// lanes as an offset-4 image is; one of type 6 (`musicprogress`,
     /// `skin/property/FloatPropertyFactory.java:128-136`) in any of the
