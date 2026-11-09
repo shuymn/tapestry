@@ -1494,6 +1494,7 @@ fn result_frame_alloc() {
         HeldView, PreparedView, ResultDrawn, ResultSide, Run, STRIP_PREPARED, STRIP_PRESENTED,
         Shared,
     };
+    let _warp = crate::warp_turn::take();
     // The widget quads' cap (16 384) admits 63 texts of 256 glyphs each
     // beside the number and the image: the skin at its text capacity.
     let texts = skin_model::MAX_TEXT_ELEMENTS - 1;
