@@ -383,6 +383,20 @@ impl ReferenceVm {
         }
     }
 
+    /// Boolean property `name` (a `!` negating it) on the frame: `None`
+    /// when the model has no value for it.
+    #[must_use]
+    pub fn named_condition(&self, name: &str) -> Option<bool> {
+        match ops::named_in(ScreenKind::Play, name)? {
+            Cond::Fold(b) => Some(b),
+            Cond::Expr { src, .. } => {
+                let mut g = self.pass.replay.borrow_mut();
+                g.as_mut()?.eval(&src, Ty::Bool).map(|v| v != 0)
+            }
+            Cond::Unsupported(_) | Cond::Undefined(_) => None,
+        }
+    }
+
     /// Whether numeric op `op` (either sign) names a built-in boolean
     /// property: otherwise it is an option of the destination.
     #[must_use]

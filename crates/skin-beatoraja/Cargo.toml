@@ -11,10 +11,12 @@ publish.workspace = true
 # The Lua conversion report (src/bin/lua_report.rs), for the developer's
 # PC only (docs/stage3.md §3), and the sandbox's VM hooks for the player's
 # import tests (src/lua/vm_hooks.rs).
-dev-tools = ["skin-model/dev-tools"]
+dev-tools = ["skin-model/dev-tools", "dep:eval"]
 
 [dependencies]
 bms-model.workspace = true
+# The replay harness's frames (src/bin/lua_replay), dev-tools only.
+eval = { workspace = true, optional = true }
 image.workspace = true
 mlua.workspace = true
 rules.workspace = true
@@ -37,6 +39,10 @@ workspace = true
 
 [[bin]]
 name = "lua_report"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "lua_replay"
 required-features = ["dev-tools"]
 
 [[bench]]
