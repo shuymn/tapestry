@@ -7,15 +7,18 @@
 //! | V1 | at most [`MAX_CALLBACKS`] callbacks, one signature entry each matching its conversion; constants and reads fit `u16` indices; at most [`MAX_SKIN_OPS`] instructions |
 //! | V2 | each span inside the code, 1 to [`MAX_CALLBACK_OPS`] long, with at most [`MAX_REGISTERS`] registers |
 //! | V3 | every register below the callback's count, every constant and read index valid, every jump forward and within the span (`pc < to <= len`; the end returns nil) |
-//! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback |
-//! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, and each gate's) charged to the skin's [`SkinOps`] |
+//! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback, or, for a timer callback, an earlier `draw` or timer |
+//! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, each gate's, and every slot the callback loads or stores; a timer callback's twice, for its two invocations) charged to the skin's [`SkinOps`] |
+//! | V7 | at most [`MAX_SLOTS`] slots, each domain's bounds ordered and within ±2^53, each initial value within its slot's domain, every slot and domain index valid, and each store's domain within its slot's |
 //!
 //! V6, that each consumer reads an output inside the signature at its type,
-//! is [`crate::Skin::new`]'s, which holds the consumers.
+//! and V8, that an element's program timer names a timer callback and that
+//! no expression reads a timer output, are [`crate::Skin::new`]'s, which
+//! holds the consumers.
 
 use super::{
-    CallbackDef, Insn, MAX_CALLBACK_OPS, MAX_CALLBACKS, MAX_REGISTERS, OutTy, Present, PresentDef,
-    ReadDef,
+    CallbackDef, Conv, Domain, Insn, MAX_CALLBACK_OPS, MAX_CALLBACKS, MAX_REGISTERS, MAX_SLOTS,
+    OutTy, Present, PresentDef, ReadDef,
 };
 use crate::expr::{MAX_SKIN_OPS, Program, SkinOps};
 use crate::schema::Ty;
@@ -45,14 +48,23 @@ pub enum PresentError {
     ReadSet { read: usize },
     #[error("callback {callback}'s gate is not a boolean read")]
     Gate { callback: usize },
-    #[error("callback {callback} follows a callback that is not an earlier number value")]
+    #[error(
+        "callback {callback} follows a callback that is not an earlier number value, or for a timer an earlier draw or timer"
+    )]
     After { callback: usize },
     #[error("the program and the skin's expressions exceed {MAX_SKIN_OPS} operations a frame")]
     Cost,
+    #[error("the program has {n} slots, more than {MAX_SLOTS}")]
+    TooManySlots { n: usize },
+    #[error("slot {slot}'s domain or initial value is out of range")]
+    Slot { slot: usize },
+    #[error("callback {callback}'s instruction {pc} stores a value outside its slot's domain")]
+    Store { callback: usize, pc: usize },
 }
 
 impl Present {
-    /// `def` checked against V1 to V5, its per-frame cost charged to `ops`;
+    /// `def` checked against V1 to V5 and V7, its per-frame cost charged
+    /// to `ops`;
     /// `base` is the schema's field count, the first output slot.
     ///
     /// # Errors
@@ -60,6 +72,7 @@ impl Present {
     /// The first rule `def` breaks.
     pub fn verify(def: PresentDef, base: usize, ops: &mut SkinOps) -> Result<Self, PresentError> {
         v1(&def)?;
+        v7_slots(&def)?;
         for (i, r) in def.reads.iter().enumerate() {
             v4_read(r, i, base)?;
         }
@@ -68,10 +81,24 @@ impl Present {
             let code = v2(&def, cb, k)?;
             v3(&def, cb, code, k)?;
             v4_gating(&def, cb, k)?;
+            v7_stores(&def, code, k)?;
             cost = cost.saturating_add(cost_of(&def, cb, code));
         }
         ops.charge_ops(cost).map_err(|_| PresentError::Cost)?;
-        Ok(Self { def })
+        let slotted = def
+            .callbacks
+            .iter()
+            .map(|cb| {
+                let span = usize::try_from(cb.start)
+                    .ok()
+                    .and_then(|s| def.code.get(s..s.saturating_add(usize::from(cb.len))));
+                span.is_some_and(|c| {
+                    c.iter()
+                        .any(|i| matches!(i, Insn::LoadSlot { .. } | Insn::StoreSlot { .. }))
+                })
+            })
+            .collect();
+        Ok(Self { def, slotted })
     }
 }
 
@@ -90,7 +117,7 @@ fn v1(def: &PresentDef) -> Result<(), PresentError> {
         return Err(PresentError::Signature);
     }
     let fits = |n: usize| n <= usize::from(u16::MAX) + 1;
-    if !fits(def.consts.len()) || !fits(def.reads.len()) {
+    if !fits(def.consts.len()) || !fits(def.reads.len()) || !fits(def.domains.len()) {
         return Err(PresentError::TooManyEntries);
     }
     if def.code.len() > MAX_SKIN_OPS {
@@ -166,7 +193,61 @@ fn v3(def: &PresentDef, cb: &CallbackDef, code: &[Insn], k: usize) -> Result<(),
                 reg(cond)?;
                 target(to)?;
             }
-            Insn::Ret { src } => reg(src)?,
+            Insn::Ret { src } | Insn::StoreSlot { src, .. } => reg(src)?,
+            Insn::StateUs { dst } | Insn::LoadSlot { dst, .. } => reg(dst)?,
+        }
+        if let Insn::LoadSlot { slot, .. } | Insn::StoreSlot { slot, .. } = *insn
+            && usize::from(slot) >= def.slots.len()
+        {
+            return Err(operand);
+        }
+        if let Insn::StoreSlot { domain, .. } = *insn
+            && usize::from(domain) >= def.domains.len()
+        {
+            return Err(operand);
+        }
+    }
+    Ok(())
+}
+
+/// The largest integer the source's doubles hold exactly.
+const EXACT: i64 = 1 << 53;
+
+/// Whether domain `d`'s bounds are ordered and exact.
+fn well_formed(d: Domain) -> bool {
+    d.ints
+        .is_none_or(|(lo, hi)| lo <= hi && -EXACT <= lo && hi <= EXACT)
+}
+
+/// V7's slots: their count, domains and initial values, and every store
+/// domain's bounds.
+fn v7_slots(def: &PresentDef) -> Result<(), PresentError> {
+    let n = def.slots.len();
+    if n > MAX_SLOTS {
+        return Err(PresentError::TooManySlots { n });
+    }
+    for (slot, s) in def.slots.iter().enumerate() {
+        if !well_formed(s.domain) || !s.domain.holds(s.init) {
+            return Err(PresentError::Slot { slot });
+        }
+    }
+    Ok(())
+}
+
+/// V7's stores in `code`: each store's domain within its slot's.
+fn v7_stores(def: &PresentDef, code: &[Insn], k: usize) -> Result<(), PresentError> {
+    for (pc, insn) in code.iter().enumerate() {
+        if let Insn::StoreSlot { slot, domain, .. } = *insn {
+            let within = match (
+                def.slots.get(usize::from(slot)),
+                def.domains.get(usize::from(domain)),
+            ) {
+                (Some(s), Some(&d)) => well_formed(d) && s.domain.contains(d),
+                _ => false,
+            };
+            if !within {
+                return Err(PresentError::Store { callback: k, pc });
+            }
         }
     }
     Ok(())
@@ -200,10 +281,10 @@ fn v4_gating(def: &PresentDef, cb: &CallbackDef, k: usize) -> Result<(), Present
     }
     if let Some(a) = cb.after {
         let earlier = usize::from(a) < k
-            && def
-                .callbacks
-                .get(usize::from(a))
-                .is_some_and(|c| c.conv == super::Conv::Int);
+            && def.callbacks.get(usize::from(a)).is_some_and(|c| {
+                c.conv == Conv::Int
+                    || (cb.conv == Conv::Timer && matches!(c.conv, Conv::Truthy | Conv::Timer))
+            });
         if !earlier {
             return Err(PresentError::After { callback: k });
         }
@@ -220,25 +301,42 @@ fn read_cost(r: Option<&ReadDef>) -> usize {
     })
 }
 
-/// The most work one invocation of `cb` does, as [`callback_cost`].
+/// The most work a frame's run of `cb` does, as [`callback_cost`].
 fn cost_of(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
     let gate = cb.gate.and_then(|g| def.reads.get(usize::from(g)));
-    callback_cost(code, &def.reads, gate)
+    callback_cost(code, &def.reads, cb.conv, gate)
 }
 
-/// The most work one invocation of a callback does, both arms of every
-/// branch counted: its instructions `code`, each `Read`'s operations (the
-/// read it names in `reads`, its value's and its guard's) and its `gate`
-/// read's. V5 charges this; an importer charges the same before it keeps
-/// the callback, so its count of the skin's operations covers the
-/// program's.
+/// The most work a frame's run of a callback does, both arms of every
+/// branch counted: per invocation its instructions `code`, each `Read`'s
+/// operations (the read it names in `reads`, its value's and its
+/// guard's) and each slot it loads or stores; a callback of conversion
+/// `conv` [`Conv::Timer`] invoked twice; and its `gate` read's. V5
+/// charges this; an importer charges the same before it keeps the
+/// callback, so its count of the skin's operations covers the program's.
 #[must_use]
-pub fn callback_cost(code: &[Insn], reads: &[ReadDef], gate: Option<&ReadDef>) -> usize {
+pub fn callback_cost(
+    code: &[Insn],
+    reads: &[ReadDef],
+    conv: Conv,
+    gate: Option<&ReadDef>,
+) -> usize {
     let at_reads = code.iter().fold(0_usize, |n, insn| match *insn {
         Insn::Read { read, .. } => n.saturating_add(read_cost(reads.get(usize::from(read)))),
         _ => n,
     });
-    code.len()
-        .saturating_add(at_reads)
-        .saturating_add(read_cost(gate))
+    let touched = code
+        .iter()
+        .enumerate()
+        .filter(|&(i, insn)| match *insn {
+            Insn::LoadSlot { slot, .. } | Insn::StoreSlot { slot, .. } => !code
+                .iter()
+                .take(i)
+                .any(|e| matches!(*e, Insn::LoadSlot { slot: s, .. } | Insn::StoreSlot { slot: s, .. } if s == slot)),
+            _ => false,
+        })
+        .count();
+    let once = code.len().saturating_add(at_reads).saturating_add(touched);
+    let runs = if conv == Conv::Timer { 2 } else { 1 };
+    once.saturating_mul(runs).saturating_add(read_cost(gate))
 }

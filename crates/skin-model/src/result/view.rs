@@ -191,7 +191,9 @@ pub enum ResultNumber {
 /// The best before this play, as the view compares with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BestView {
-    /// Not known: every best value is unavailable.
+    /// Not read yet: every best value is unavailable. A best read as not
+    /// known is the source's empty score, [`Known`](Self::Known) (design.md
+    /// "Personal Bests", skin projections).
     Unavailable,
     /// Known, an empty best included; its values as the comparison gives
     /// them.

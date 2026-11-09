@@ -120,7 +120,7 @@ fn the_program_cost_counts_each_read_at_every_use() {
     let span = &d.code[cb.start as usize..][..usize::from(cb.len)];
     let gate = cb.gate.map(|g| &d.reads[usize::from(g)]);
     assert_eq!(
-        skin_model::present::callback_cost(span, &d.reads, gate),
+        skin_model::present::callback_cost(span, &d.reads, cb.conv, gate),
         want
     );
     assert_eq!(plain_raw(b.0).unwrap().ops().total(), want);

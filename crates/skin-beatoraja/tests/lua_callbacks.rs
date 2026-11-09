@@ -1398,3 +1398,509 @@ fn every_integer_source_is_bounded() {
         assert_eq!(i.callbacks, [want], "{source}: {value}");
     }
 }
+
+/// A timer closure made by a factory whose state is `locals`, running
+/// `body`, the timer of `n` images (`i` at x 0, 100, ...).
+fn timer_skin(locals: &str, body: &str, n: usize) -> TempDir {
+    let dsts: String = (0..n)
+        .map(|k| {
+            format!(
+                "table.insert(skin.destination, {{ id = \"i\", timer = latch,\n\
+                   dst = {{ {{ x = {}, y = 0, w = 64, h = 64 }} }} }})\n",
+                k * 100
+            )
+        })
+        .collect();
+    folder(&skin(&format!(
+        "local latch = (function()\n\
+           {locals}\n\
+           return function()\n\
+             {body}\n\
+           end\n\
+         end)()\n\
+         {dsts}"
+    )))
+}
+
+/// The latch's state.
+const STATE: &str = "local state = ms.timer_off_value";
+
+/// The latch's body: the state clock stored once the point reaches
+/// 200 000 (a full score), its start the timer.
+const LATCH_BODY: &str = "if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
+     return state";
+
+/// The slots' values.
+fn bank(p: &Drawn) -> Vec<skin_model::present::Val> {
+    p.play.bank().values().to_vec()
+}
+
+/// A full score over `notes` notes: every note a PERFECT, the max combo
+/// all of them.
+fn full_score(p: &mut Drawn, notes: u32) {
+    p.tally.counts.perfect = notes;
+    p.tally.max_combo = notes;
+    p.tally.combo = notes;
+}
+
+/// The latch shape, the MAX line's timer on two destinations: compiled
+/// into the program; dark until the point reaches 200 000, then lit from
+/// the state clock of that frame and kept, whatever the score after it,
+/// through a rearm; fresh at a retry.
+#[test]
+fn the_latch_starts_once_and_keeps_its_start() {
+    use skin_model::present::{OFF, Val};
+    let d = timer_skin(STATE, LATCH_BODY, 2);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    p.state_us = 1_000_000;
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [OFF]);
+    full_score(&mut p, 4);
+    p.state_us = 2_000_000;
+    assert_eq!(p.frame(1_016, &[]).len(), 2);
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    // The score drops (as no play's does): the start stays.
+    p.tally = common::play::tally(0, 0);
+    p.state_us = 3_500_000;
+    assert_eq!(p.frame(1_032, &[]).len(), 2);
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    p.play.rearm();
+    assert_eq!(bank(&p), [Val::Int(2_000_000)]);
+    assert_eq!(p.frame(0, &[]).len(), 2);
+    // A retry prepares the play again: dark until reached again.
+    p.retry(4);
+    assert_eq!(bank(&p), [OFF]);
+    assert!(p.frame(1_000, &[]).is_empty());
+}
+
+/// Every slot's value is computed before any is stored: a run returning
+/// the value its slot had as it began gives off on the run that sets it,
+/// so the timer is on from the next frame; and a store on a returning
+/// path, or in a callback whose result is the off value or false, is
+/// kept.
+#[test]
+fn stores_are_parallel_and_kept_on_every_path() {
+    use skin_model::present::Val;
+    let off = "ms.timer_off_value";
+    let full = "ms.number(100) == 200000";
+    let body = format!(
+        "local was = state\n\
+         if state == {off} and {full} then state = ms.time() end\n\
+         return was"
+    );
+    let d = timer_skin(STATE, &body, 1);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    full_score(&mut p, 4);
+    p.state_us = 7_000;
+    // The run that sets the slot gives what it held, off: not drawn.
+    assert!(p.frame(1_000, &[]).is_empty());
+    assert_eq!(bank(&p), [Val::Int(7_000)]);
+    p.state_us = 9_000;
+    assert_eq!(p.frame(1_016, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(7_000)]);
+
+    for (body, drawn) in [
+        // A store on the arm that returns.
+        (
+            format!(
+                "if state == {off} and {full} then state = ms.time() return 0 end\nreturn state"
+            ),
+            true,
+        ),
+        // A store in a run giving the off value, or false.
+        (
+            format!("if state == {off} and {full} then state = ms.time() end\nreturn {off}"),
+            false,
+        ),
+        (
+            format!("if state == {off} and {full} then state = ms.time() end\nreturn false"),
+            true,
+        ),
+    ] {
+        let d = timer_skin(STATE, &body, 1);
+        let i = import(&d, 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
+        let mut p = Drawn::new(i.imported.skin, 4);
+        full_score(&mut p, 4);
+        p.state_us = 5_000;
+        assert_eq!(!p.frame(1_000, &[]).is_empty(), drawn, "{body}");
+        assert_eq!(bank(&p), [Val::Int(5_000)], "{body}");
+    }
+}
+
+/// A slot is taken only for a proven cell, domain and writer; otherwise
+/// the timer follows its role (a decorative constant here): a cell two
+/// instances of a factory capture, a counter, a write a dropped
+/// destination's timer would make, a consumer with a condition, a write
+/// that can happen before play (no tally guard), a write repeated once
+/// set or of the off value, a cell only a helper captures, one a helper
+/// shared by two roots writes (each helper reading a written cell:
+/// `Interference`), a guard reading another slot or the clock, a writer
+/// that raises, and one a root reads through a helper.
+#[test]
+fn a_slot_is_taken_only_when_proven() {
+    let off = "ms.timer_off_value";
+    let full = "ms.number(100) == 200000";
+    let construct = |s| Disposition::Replaced(Unsupported::Construct(s));
+    let one = |body: &str| {
+        let d = folder(&skin(body));
+        import(&d, 905).unwrap_or_else(|e| panic!("{body}: {e:?}"))
+    };
+    let dst = |name: &str, extra: &str| {
+        format!(
+            "table.insert(skin.destination, {{ id = \"i\", timer = {name}, {extra}\n\
+               dst = {{ {{ x = 0, y = 0, w = 64, h = 64 }} }} }})\n"
+        )
+    };
+    let latch = |locals: &str, body: &str| {
+        format!("local latch = (function()\n{locals}\nreturn function()\n{body}\nend\nend)()\n")
+    };
+    // Two instances of one factory.
+    let two = format!(
+        "local function mk() local s = {off}\n\
+           return function() if s == {off} and {full} then s = ms.time() end return s end end\n\
+         local l1 = mk()\nlocal l2 = mk()\n{}{}",
+        dst("l1", ""),
+        dst("l2", "")
+    );
+    let i = one(&two);
+    assert!(
+        i.callbacks
+            .contains(&construct("a written cell more than one closure captures")),
+        "{:?}",
+        i.callbacks
+    );
+    assert!(
+        !i.callbacks.contains(&Disposition::Compiled),
+        "{:?}",
+        i.callbacks
+    );
+    for (body, why) in [
+        // A counter: the walk reads the written cell as unknown, so its
+        // arithmetic opens the candidate (and the residual refuses
+        // arithmetic on a slot as `Range`).
+        (
+            latch("local n = 0", "n = n + 1 return 0") + &dst("latch", ""),
+            construct("a slot in a candidate that is not closed"),
+        ),
+        // A destination whose timer it is, dropped before its timer: the
+        // latch would not run on every frame the source runs it.
+        (
+            latch(STATE, LATCH_BODY) + &dst("latch", "") + &dst("latch", "op = { 906 },"),
+            construct("a slot writer a dropped destination calls"),
+        ),
+        // A consumer with a condition.
+        (
+            latch(STATE, LATCH_BODY)
+                + &dst("latch", "draw = function() return ms.number(110) > 2 end,"),
+            construct("a slot writer the program does not run on every play frame"),
+        ),
+        // Written while loading: no tally in its guard.
+        (
+            latch(
+                STATE,
+                &format!("if state == {off} then state = ms.time() end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot write that can happen outside play frames"),
+        ),
+        // Set again once set: no off test.
+        (
+            latch(
+                STATE,
+                &format!("if {full} then state = ms.time() end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot written again once set"),
+        ),
+        (
+            latch(
+                STATE,
+                &format!("if state == {off} and {full} then state = {off} end return state"),
+            ) + &dst("latch", ""),
+            construct("a slot written the off value"),
+        ),
+        // A cell only a helper captures and writes: the helper reads it,
+        // a written cell, first.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function h() if s == {off} and {full} then s = ms.time() end return s end\n\
+                 local latch = function() h() return h() end\n{}",
+                dst("latch", "")
+            ),
+            Disposition::Replaced(Unsupported::Interference),
+        ),
+        // A helper two roots share writes it.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function h() if s == {off} and {full} then s = ms.time() end return s end\n\
+                 local r1 = function() return h() end\n\
+                 local r2 = function() return h() end\n{}{}",
+                dst("r1", ""),
+                dst("r2", "")
+            ),
+            Disposition::Replaced(Unsupported::Interference),
+        ),
+        // A guard reading another slot: set by the source while loading
+        // (`b` starts set) where the program sets it at the first play
+        // frame, or enabled the run after the other slot changes, after
+        // the last play frame.
+        (
+            latch(
+                &format!("local a = {off}\nlocal b = 1"),
+                &format!(
+                    "if a == {off} and b ~= {off} then a = ms.time() end\n\
+                     if b == {off} and {full} then b = ms.time() end\n\
+                     return a"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by another slot"),
+        ),
+        (
+            latch(
+                &format!("local a = {off}\nlocal b = {off}"),
+                &format!(
+                    "local was = a\n\
+                     if a == {off} and {full} then a = ms.time() end\n\
+                     if b == {off} and was ~= {off} and {full} then b = ms.time() end\n\
+                     return b"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by another slot"),
+        ),
+        // A guard reading the clock, which runs on outside play (the
+        // practice page).
+        (
+            latch(
+                STATE,
+                &format!(
+                    "if state == {off} and {full} and ms.time() > 10000000 then state = ms.time() end\n\
+                     return state"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by state that changes outside play"),
+        ),
+        // A guard reading the EX score, which the source reads as
+        // `Integer.MIN_VALUE` before the first judgment (so this latch is
+        // set while loading there): off the guard allowlist.
+        (
+            latch(
+                STATE,
+                &format!(
+                    "if state == {off} and ms.number(71) < 0 then state = ms.time() end
+                     return state"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot write guarded by a read off its allowlist"),
+        ),
+        // The latch also a custom timer, which the source runs before
+        // every object: a consumer the program does not run.
+        (
+            latch(STATE, LATCH_BODY)
+                + "skin.customTimers = { { id = 3001, timer = latch } }
+" + &dst("latch", ""),
+            construct("a slot writer referenced beside its destinations' timers"),
+        ),
+        // A writer with a definite Lua error on a reached path: outside
+        // the admission walk's subset, it opens the candidate, which
+        // grants no slot (and the residual refuses it as a Lua error), so
+        // no slot writer the program keeps raises.
+        (
+            latch(
+                STATE,
+                &format!(
+                    "local x = nil\n\
+                     if state == {off} and {full} then state = ms.time() end\n\
+                     return x + 1"
+                ),
+            ) + &dst("latch", ""),
+            construct("a slot in a candidate that is not closed"),
+        ),
+        // The root reads its cell through a helper.
+        (
+            format!(
+                "local s = {off}\n\
+                 local function peek() return s end\n\
+                 local latch = function()\n\
+                   if s == {off} and {full} then s = ms.time() end return peek() end\n{}",
+                dst("latch", "")
+            ),
+            construct("a written cell more than one closure captures"),
+        ),
+    ] {
+        let i = one(&body);
+        assert!(i.callbacks.contains(&why), "{body}: {:?}", i.callbacks);
+        assert!(
+            !i.callbacks.contains(&Disposition::Compiled),
+            "{body}: {:?}",
+            i.callbacks
+        );
+    }
+}
+
+/// The loading proof reads a slot at its initial value: an integer start
+/// fails the latch's own off test before play, so a guard of that test
+/// alone is no write while loading, and the timer shows the start.
+#[test]
+fn an_integer_initialized_slot_is_judged_at_its_initial_value() {
+    use skin_model::present::Val;
+    let off = "ms.timer_off_value";
+    let d = timer_skin(
+        "local state = 5000",
+        &format!(
+            "if state == {off} then state = ms.time() end
+return state"
+        ),
+        1,
+    );
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    p.state_us = 9_000;
+    assert_eq!(p.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&p), [Val::Int(5_000)]);
+}
+
+/// Slots are granted only in a closed candidate: a closure the analysis
+/// never captures (one held under a numeric key, one a metatable's
+/// `__index` gives, one published at run time into a table or a global)
+/// can write the slot or call the root, so each opens the candidate and
+/// the root follows its role.
+#[test]
+fn a_slot_needs_a_closed_candidate() {
+    let root = "local state = 5000000\n\
+                local function timer() state = state return state end\n";
+    let dst = "table.insert(skin.destination, { id = \"i\", timer = timer,\n\
+                 dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
+    let custom = |call: &str| {
+        format!("skin.customTimers = {{ {{ id = 3001, timer = function() {call} end }} }}\n")
+    };
+    let writer = "function() state = 7000000 return timer() end";
+    for (name, escape) in [
+        (
+            "numeric key",
+            format!(
+                "local hidden = {{ {writer} }}\n{}",
+                custom("return hidden[1]()")
+            ),
+        ),
+        (
+            "metatable",
+            format!(
+                "local holder = setmetatable({{}}, {{ __index = function() state = 7000000 return timer end }})\n{}",
+                custom("return holder.f()")
+            ),
+        ),
+        (
+            "table publication",
+            format!(
+                "local pub = {{}}\nlocal function publish() pub.f = {writer} end\n{}",
+                custom("publish() return pub.f()")
+            ),
+        ),
+        (
+            "global publication",
+            format!(
+                "local function publish() published = {writer} end\n{}",
+                custom("publish() return published()")
+            ),
+        ),
+    ] {
+        let d = folder(&skin(&format!("{root}{escape}{dst}")));
+        let i = import(&d, 905).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert!(
+            i.callbacks
+                .contains(&Disposition::Replaced(Unsupported::Construct(
+                    "a slot in a candidate that is not closed"
+                ))),
+            "{name}: {:?}",
+            i.callbacks
+        );
+        assert!(
+            !i.callbacks.contains(&Disposition::Compiled),
+            "{name}: {:?}",
+            i.callbacks
+        );
+    }
+    // The control: the same root alone compiles.
+    let d = folder(&skin(&format!("{root}{dst}")));
+    assert_eq!(import(&d, 905).unwrap().callbacks, [Disposition::Compiled]);
+}
+
+/// Two destinations of one latch returning the value its slot had as the
+/// run began: on the setting frame the first is off (it set the slot) and
+/// the second on (it saw it set); both on after.
+#[test]
+fn a_return_old_latch_lights_its_second_destination_first() {
+    let off = "ms.timer_off_value";
+    let body = format!(
+        "local was = state\n\
+         if state == {off} and ms.number(100) == 200000 then state = ms.time() end\n\
+         return was"
+    );
+    let d = timer_skin(STATE, &body, 2);
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled]);
+    let mut p = Drawn::new(i.imported.skin, 4);
+    full_score(&mut p, 4);
+    p.state_us = 7_000;
+    let q = p.frame(1_000, &[]);
+    // Only the second destination, at x 100 of 1920 (the canvas's left
+    // edge is 0): the first is off.
+    assert_eq!(q.len(), 1);
+    assert!(q[0].rect[0] > 50.0, "{:?}", q[0].rect);
+    assert_eq!(p.frame(1_016, &[]).len(), 2);
+}
+
+/// A section attempt (a practice round) runs no slot program: the source
+/// reads the point an earlier round left cached there, which tapestry does
+/// not carry, so the timers with slots are off in every round, their slots
+/// at their initial values, where a whole-chart attempt runs them.
+#[test]
+fn a_practice_round_runs_no_slot_program() {
+    use skin_model::present::{OFF, Val};
+    let off = "ms.timer_off_value";
+    let section = eval::Section {
+        start: bms_model::TimeUs(0),
+        end: bms_model::TimeUs(60_000_000),
+        lead_in: bms_model::TimeUs(0),
+        initial_gauges: vec![common::play::GAUGES[0].start],
+    };
+    // The latch, and Codex's integer slot shown only while the point is
+    // positive.
+    for (locals, body, init) in [
+        (STATE, LATCH_BODY.to_owned(), OFF),
+        (
+            "local state = 5000",
+            format!(
+                "if state == {off} then state = ms.time() end\n\
+                 if ms.number(100) > 0 then return state end\n\
+                 return {off}"
+            ),
+            Val::Int(5_000),
+        ),
+    ] {
+        let d = timer_skin(locals, &body, 1);
+        let i = import(&d, 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
+        // Two rounds, each prepared afresh, the first ending at a full score.
+        for round in 0..2 {
+            let mut p = Drawn::over_section(i.imported.skin.clone(), 4, &section);
+            if round == 0 {
+                full_score(&mut p, 4);
+            }
+            p.state_us = 2_000_000;
+            assert!(p.frame(1_000, &[]).is_empty(), "{body}: round {round}");
+            assert_eq!(bank(&p), [init], "{body}: round {round}");
+        }
+        // A whole-chart attempt at a full score runs it.
+        let mut p = Drawn::new(i.imported.skin, 4);
+        full_score(&mut p, 4);
+        p.state_us = 2_000_000;
+        assert_eq!(p.frame(1_000, &[]).len(), 1, "{body}");
+    }
+}
