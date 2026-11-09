@@ -1070,6 +1070,10 @@ impl Screen for MenuScreen {
         self.renderer.rearm();
     }
 
+    fn carry(&self) -> Option<skin_model::Carry<'_>> {
+        self.renderer.carry()
+    }
+
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
         self.renderer.build(f)

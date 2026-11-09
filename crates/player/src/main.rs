@@ -24,6 +24,7 @@ mod attempt_context;
 mod audio_side;
 mod background;
 mod bests;
+mod carry;
 mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;

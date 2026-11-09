@@ -150,6 +150,21 @@ pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: Ti
     section.is_none_or(|(start, until)| start <= time && time < until && end < until)
 }
 
+/// The targets of `chart` within `section` (every tap and long note of
+/// the whole chart without one): the attempt's target count, which its
+/// point is over.
+pub(crate) fn count_targets(chart: &Chart, section: Option<(TimeUs, TimeUs)>) -> u32 {
+    let mut targets: u32 = 0;
+    for note in chart.lanes.iter().flatten() {
+        if matches!(note.kind, NoteKind::Tap | NoteKind::Long { .. })
+            && is_target(section, note.time, note.end())
+        {
+            targets = targets.saturating_add(1);
+        }
+    }
+    targets
+}
+
 impl Reducer {
     /// The bytes its buffers hold: every lane's note times, and each
     /// gauge's maximum and when it reached it.
@@ -173,14 +188,7 @@ impl Reducer {
         empty_poor_breaks_combo: bool,
         bomb_up_to: Option<Grade>,
     ) -> Self {
-        let mut targets: u32 = 0;
-        for note in chart.lanes.iter().flatten() {
-            if matches!(note.kind, NoteKind::Tap | NoteKind::Long { .. })
-                && is_target(section.map(|s| (s.start, s.end)), note.time, note.end())
-            {
-                targets = targets.saturating_add(1);
-            }
-        }
+        let targets = count_targets(chart, section.map(|s| (s.start, s.end)));
         let notes = std::array::from_fn(|l| {
             chart.lanes.get(l).map_or_else(Box::default, |notes| {
                 notes
