@@ -4341,11 +4341,6 @@ impl Run {
         };
         #[cfg(feature = "dev-tools")]
         crate::dev::hold_preparing();
-        // With nothing staged the skin in use is prepared in place: the
-        // committed attempt's `Play` goes now.
-        if p.skin.is_none() {
-            self.carries.on(crate::carry::Event::PlayGone);
-        }
         let Some(answer) = screen.prepare_attempt(&a, p.skin.as_ref(), p.request) else {
             return;
         };
@@ -4731,9 +4726,6 @@ impl Run {
     /// Prepares the chart loaded last and resets the screen's play state,
     /// building it again after a failure.
     fn prepare(&mut self) -> Result<(), RenderError> {
-        // A chart's load, or a screen built again, holds no attempt's
-        // `Play`.
-        self.carries.on(crate::carry::Event::PlayGone);
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
         let mut refused = None;
@@ -5050,7 +5042,6 @@ impl Run {
     fn drop_screen(&mut self) {
         self.reconcile_result();
         self.screen = None;
-        self.carries.on(crate::carry::Event::PlayGone);
     }
 
     /// The result kind is disabled for the run, for `why` (the S10-09i

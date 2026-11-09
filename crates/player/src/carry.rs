@@ -12,8 +12,8 @@
 //! - the committed attempt: its target count, over which its final tally
 //!   gives the point whatever the skin, and whether it is committed,
 //!   started or settled;
-//! - whether the screen still holds that attempt's `Play`, the only place
-//!   its slots can be read from;
+//! - what the screen's `Play` gives at the settlement, the only place the
+//!   attempt's slots can be read from (none once the screen lost it);
 //! - the play installation the slots belong to.
 //!
 //! The slots are valid only through an unbroken chain of runs that ran the
@@ -109,14 +109,14 @@ pub enum Event<'a> {
     /// A play installation was committed: a selection's bundle, or the
     /// pending marker.
     Installed(Installed),
-    /// The screen no longer holds the committed attempt's `Play`: a
-    /// chart's load, an in-place preparation, the screen dropped.
-    PlayGone,
     /// The committed attempt started (`RenderMsg::Play`).
     Started,
     /// The started attempt ended with the final tally `tally`; `held` is
-    /// what the screen's committed attempt's `Play` gives, when the screen
-    /// holds it.
+    /// what the screen's `Play` gives, when it holds one. It can only be
+    /// the committed attempt's: the attempt's settlement comes before the
+    /// next preparation on the one channel from the game thread, and every
+    /// other change of the screen's `Play` (a chart's load, a screen built
+    /// again) leaves none.
     Settled {
         tally: &'a Tally,
         held: Option<Carry<'a>>,
@@ -144,8 +144,6 @@ struct Record {
     /// The committed attempt's target count, which its point is over.
     targets: u32,
     phase: Phase,
-    /// Whether the screen holds the committed attempt's `Play`.
-    held: bool,
 }
 
 /// The render thread's record of the play state's carry.
@@ -200,11 +198,6 @@ impl Carries {
                     r.installed = installed;
                 }
             }
-            Event::PlayGone => {
-                if let Some(r) = &mut self.record {
-                    r.held = false;
-                }
-            }
             Event::Started => {
                 if let Some(r) = &mut self.record
                     && r.phase == Phase::Idle
@@ -244,7 +237,6 @@ impl Carries {
             installed,
             targets,
             phase: Phase::Idle,
-            held: true,
         });
     }
 
@@ -262,7 +254,7 @@ impl Carries {
         if let Some(p) = skin_model::settled_point(tally, r.targets) {
             r.point = p;
         }
-        let witnessed = held.filter(|c| r.held && c.slots_run && c.terminal);
+        let witnessed = held.filter(|c| c.slots_run && c.terminal);
         match (&mut r.bank, witnessed) {
             (Some(b), Some(c)) => b.copy_from(c.bank),
             (b, _) => *b = None,
