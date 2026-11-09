@@ -2690,19 +2690,12 @@ fn practice_round(after: &[(i64, Act)]) -> Vec<(i64, Act)> {
     acts
 }
 
-/// How many play states the flow began.
-fn began(rig: &Headless) -> usize {
-    rig.turntable
-        .iter()
-        .filter(|t| matches!(t, Tt::Began(_)))
-        .count()
-}
-
 /// A retry within a practice session keeps its play state, as the
 /// source's practice stays in its play state across rounds
 /// (`BMSPlayer.java:740-741, 772-773` at `0.8.9`; docs/stage3.md, offset
 /// 1), on each of the flow's retry paths: no play state begins but P's,
-/// and a turntable a round's result paused resumes for the next round.
+/// and a turntable a round's result paused resumes once, for the next
+/// round.
 #[test]
 fn a_practice_retry_keeps_the_play_state() {
     use game::MenuCommand::Retry;
@@ -2717,10 +2710,22 @@ fn a_practice_retry_keeps_the_play_state() {
     let [(P, reports)] = &rig.loads[..] else {
         panic!("{:?}", rig.seen);
     };
-    assert_eq!(reports[0].end, PlayEnd::Aborted(AbortCause::Retry));
-    assert!(reports.len() >= 2, "{reports:?}");
-    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
-    assert_eq!(rig.turntable[..2], [Tt::Began(1), Tt::Resumed(3)]);
+    // Round 1 retried, round 2 closed with the window.
+    let ends: Vec<PlayEnd> = reports.iter().map(|r| r.end).collect();
+    assert_eq!(
+        ends,
+        [
+            PlayEnd::Aborted(AbortCause::Retry),
+            PlayEnd::Aborted(AbortCause::Quit)
+        ]
+    );
+    // P began the one play state; the retry resumed once (the clock ran
+    // on), and the rounds' return on the close resumed once more.
+    assert_eq!(
+        rig.turntable,
+        [Tt::Began(1), Tt::Resumed(3), Tt::Resumed(3)]
+    );
+    assert_eq!(rig.resumed_after, [1, 2]);
 
     // The quit during round 2 shows its result; the retry withdrawing that
     // result's preparation.
@@ -2732,19 +2737,21 @@ fn a_practice_retry_keeps_the_play_state() {
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     assert_eq!(rig.withdrawals, [Some(Retry)], "{:?}", rig.seen);
     assert!(!rig.seen.iter().any(|s| matches!(s, Seen::Shown(_))));
-    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
+    // Round 1 ran out into round 2 (rounds repeat), round 2's quit went on
+    // to its result, whose retry played round 3, closed with the window.
+    let ends = |rig: &Headless| -> Vec<PlayEnd> { rig.reports().map(|r| r.end).collect() };
+    let quit = PlayEnd::Aborted(AbortCause::Quit);
+    assert_eq!(ends(&rig), [PlayEnd::Completed, quit, quit]);
+    // P began the one play state; round 2's result paused it once; the
+    // retry resumed it once, before round 3 was prepared (2 plays prepared
+    // of 3); the rounds' return on the close resumed once more.
     assert_eq!(
-        rig.turntable[..3],
-        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(3)],
-        "{:?}",
-        rig.turntable
+        rig.turntable,
+        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(3), Tt::Resumed(3)]
     );
-    // Resumed for the next round, which is then prepared, not only at the
-    // return to the page.
-    assert!(
-        rig.resumed_after[0] < rig.prepares,
-        "{:?}",
-        rig.resumed_after
+    assert_eq!(
+        (rig.resumed_after.as_slice(), rig.prepares),
+        ([2, 3].as_slice(), 3)
     );
 
     // The retry the shown result serves.
@@ -2753,7 +2760,7 @@ fn a_practice_retry_keeps_the_play_state() {
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     assert!(rig.withdrawals.is_empty(), "{:?}", rig.withdrawals);
     assert_eq!(
-        rig.seen[..4],
+        rig.seen,
         [
             Seen::Select,
             Seen::Practice(None),
@@ -2761,19 +2768,15 @@ fn a_practice_retry_keeps_the_play_state() {
             Seen::Shown(2)
         ]
     );
-    assert_eq!(began(&rig), 1, "{:?}", rig.turntable);
+    assert_eq!(ends(&rig), [PlayEnd::Completed, quit, quit]);
+    // As above, the retry's resume after round 2's result showed.
     assert_eq!(
-        rig.turntable[..3],
-        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(4)],
-        "{:?}",
-        rig.turntable
+        rig.turntable,
+        [Tt::Began(1), Tt::Paused(3), Tt::Resumed(4), Tt::Resumed(4)]
     );
-    // Resumed for the next round, which is then prepared, not only at the
-    // return to the page.
-    assert!(
-        rig.resumed_after[0] < rig.prepares,
-        "{:?}",
-        rig.resumed_after
+    assert_eq!(
+        (rig.resumed_after.as_slice(), rig.prepares),
+        ([2, 3].as_slice(), 3)
     );
 }
 

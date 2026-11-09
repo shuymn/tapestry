@@ -36,9 +36,10 @@ pub(crate) struct Turntable {
     /// The committed attempt's scratch notes, for autoplay; none for a
     /// play by hand.
     notes: Vec<ScratchNote>,
-    /// A resume the game sent, applied when the practice page shows, so
-    /// no frame drawn before it (an old play frame after a withdrawn
-    /// result) takes the fresh baseline.
+    /// A resume the game sent, applied when the next presentation begins
+    /// (the practice page, or a practice retry's next round at its
+    /// attempt's preparation), so no frame drawn before it (an old play
+    /// frame after a withdrawn result) takes the fresh baseline.
     resume: Option<u64>,
 }
 
@@ -50,13 +51,19 @@ impl Turntable {
     }
 
     /// A presentation begins (the practice page, a loading lifetime, an
-    /// attempt's preparation): a play state created since is adopted.
+    /// attempt's preparation): a play state created since is adopted, and
+    /// a resume the game sent applies now, the presentation's first frame
+    /// its baseline (a resume of a play state replaced meanwhile is
+    /// ignored).
     pub(crate) fn begin_presentation(&mut self) {
         if let Some(s) = self.pending.take()
             && self.clock.number() != Some(s.number)
         {
             self.clock.adopt(s.number);
             self.origin = s.origin;
+        }
+        if let Some(n) = self.resume.take() {
+            self.clock.resume(n);
         }
     }
 
@@ -65,23 +72,19 @@ impl Turntable {
         self.clock.pause(number);
     }
 
-    /// Play state `number`'s resume, applied by the practice page
-    /// ([`practice_page`](Self::practice_page)); another number's is
-    /// ignored and leaves a queued one.
+    /// Play state `number`'s resume, applied when the next presentation
+    /// begins ([`begin_presentation`](Self::begin_presentation)); another
+    /// number's is ignored and leaves a queued one.
     pub(crate) fn resume(&mut self, number: u64) {
         if self.clock.number() == Some(number) {
             self.resume = Some(number);
         }
     }
 
-    /// The practice page shows: its play state's presentation begins, and
-    /// a resume the game sent applies now, the page's first frame its
-    /// baseline.
+    /// The practice page shows: its play state's presentation begins, a
+    /// resume the game sent applying with it.
     pub(crate) fn practice_page(&mut self) {
         self.begin_presentation();
-        if let Some(n) = self.resume.take() {
-            self.clock.resume(n);
-        }
     }
 
     /// The committed attempt's scratch notes: autoplay's presses start

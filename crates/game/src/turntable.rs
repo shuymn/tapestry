@@ -195,8 +195,9 @@ pub struct PlayState {
 }
 
 /// The run's play states (docs/design.md "Play Lifecycle"): one per chart
-/// chosen to play, P, and retry; a practice Start, a round, an automatic
-/// round and a practice result keep it.
+/// chosen to play, P, and retry outside practice; a practice Start, a
+/// round, an automatic round, a practice result and a retry within
+/// practice keep it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayStates {
     current: Option<PlayState>,
