@@ -880,6 +880,8 @@ fn rig<'a>(
         result_outro: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
+        #[cfg(test)]
+        relooked: std::sync::Arc::default(),
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;

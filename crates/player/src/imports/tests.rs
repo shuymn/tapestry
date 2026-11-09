@@ -1203,11 +1203,7 @@ fn a_jobs_sent_callback_runs_once_before_its_thread_ends() {
     let _s = serial();
     hold_exit(true);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut job = super::spawn_job_with(
-        |_: &Cancel| 7_u32,
-        Some(Box::new(move || tx.send(()).unwrap())),
-    )
-    .unwrap();
+    let mut job = super::spawn_job_with(|_: &Cancel| 7_u32, move || tx.send(()).unwrap()).unwrap();
     rx.recv_timeout(Duration::from_secs(20))
         .expect("the callback ran");
     assert!(wait_until(|| exit_waiting() == 1), "held after its send");

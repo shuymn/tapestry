@@ -973,16 +973,19 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
+        // The game thread, woken once the outcome is in.
+        let wake = self.wake.clone();
         match imports::spawn_job_with(
             move |cancel: &Cancel| LayoutOut {
                 request,
                 view,
                 laid: layout(&pending, view, class, &theirs, base, others, cancel),
             },
-            // The game thread, woken once the outcome is in.
-            self.wake
-                .clone()
-                .map(|t| -> Box<dyn FnOnce() + Send> { Box::new(move || t.unpark()) }),
+            move || {
+                if let Some(t) = wake {
+                    t.unpark();
+                }
+            },
         ) {
             Ok(job) => self.job = Some((job, request, slot)),
             Err(why) => {
@@ -1195,9 +1198,9 @@ impl ResultSkin {
         self.wake = thread;
     }
 
-    /// Whether the layout job's outcome is in and its thread is still
-    /// ending: [`poll`](Self::poll) takes it once the thread has ended,
-    /// which a look soon after sees.
+    /// Whether the layout job's outcome was received and not yet taken: its
+    /// thread may still be ending, and [`poll`](Self::poll) takes it once
+    /// the thread has ended.
     pub fn landing(&mut self) -> bool {
         self.job.as_mut().is_some_and(|(job, _, _)| job.received())
     }

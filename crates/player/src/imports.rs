@@ -805,20 +805,24 @@ pub struct Job<T> {
 pub fn spawn_job<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
 ) -> Result<Job<T>, String> {
-    spawn_job_with(job, None)
+    spawn_job_with(job, || {})
 }
 
-/// [`spawn_job`] with `on_sent` called on the job's thread once its outcome
-/// (or its panic) is sent, before the thread ends: the job's owner can be
-/// woken to take it ([`Job::received`] holds from then on, and
-/// [`Job::poll`] once the thread has ended).
+/// [`spawn_job`] with `on_sent` called once on the job's thread right after
+/// its send, before the thread ends, so the job's owner can be woken to
+/// take the outcome ([`Job::received`] holds from then on while the
+/// outcome is unclaimed, and [`Job::poll`] gives it once the thread has
+/// ended). The call follows the send attempt whatever it did: past an
+/// abandonment the send fails and the outcome is dropped before the call.
+/// A panic payload whose drop panics ends the thread without a send and
+/// without the call.
 ///
 /// # Errors
 ///
 /// Why the thread could not start.
 pub fn spawn_job_with<T: Send + 'static>(
     job: impl FnOnce(&Cancel) -> T + Send + 'static,
-    on_sent: Option<Box<dyn FnOnce() + Send>>,
+    on_sent: impl FnOnce() + Send + 'static,
 ) -> Result<Job<T>, String> {
     let cancel = Cancel::new();
     let (tx, rx) = mpsc::sync_channel::<Result<T, &'static str>>(1);
@@ -838,9 +842,7 @@ pub fn spawn_job_with<T: Send + 'static>(
         // Past an abandonment nobody receives: the outcome is dropped
         // here, on this thread.
         let _ = tx.send(sent);
-        if let Some(wake) = on_sent {
-            wake();
-        }
+        on_sent();
         #[cfg(test)]
         tests::exit_gate();
     };

@@ -52,18 +52,12 @@ const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs
 pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
 
 /// How long the result's idle wait parks between looks while a layout
-/// job's outcome is in and its thread still ends: the job wakes the game
-/// thread right after its send, but its outcome can be taken only once the
-/// thread has ended ([`crate::imports::Job::poll`]), which takes
-/// microseconds, so a short slice lands it at once instead of at the next
-/// deadline (up to `IDLE_WAIT`, 250 ms).
+/// job's outcome was received and is not yet taken: the job wakes the game
+/// thread right after its send, but its outcome can be taken only once its
+/// thread has ended ([`crate::imports::Job::poll`]), so the look is
+/// repeated in short slices instead of waiting for the next deadline (up
+/// to `IDLE_WAIT`, 250 ms).
 const LAYOUT_RELOOK: Duration = Duration::from_millis(1);
-
-/// Tests: the result's looks for a landed layout ([`PlayerRig::land_result`])
-/// so far, on any rig.
-#[cfg(test)]
-pub(crate) static RESULT_LOOKS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 /// How long an operation waits for the input thread's markers in all, in
 /// awake time, before the input thread counts as failed (design.md "Input
@@ -341,6 +335,11 @@ pub struct PlayerRig<'a> {
     /// did, until the opening prints it.
     #[cfg(feature = "dev-tools")]
     pub probe_ready: Option<(std::time::Instant, &'static str)>,
+    /// Tests: set when the result's idle wait found a layout's outcome
+    /// received and not yet taken (its thread still ending), before it
+    /// looks again.
+    #[cfg(test)]
+    pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -569,8 +568,6 @@ impl PlayerRig<'_> {
     /// the render thread reported applies (D7). Returns whether the latest
     /// request is published.
     fn land_result(&mut self) -> bool {
-        #[cfg(test)]
-        RESULT_LOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let status = self.render.result_status();
         self.result_skin.set_retained(&status.retained);
         let ready = self.result_skin.poll();
@@ -1380,9 +1377,14 @@ impl Rig for PlayerRig<'_> {
         }
         // A switch's layout lands when its job is done: the job wakes this
         // thread once its outcome is in, and while its thread still ends
-        // the look is repeated every LAYOUT_RELOOK, within the deadline.
-        // A close leaves its wait within the stop bound.
-        while !self.land_result() && self.result_skin.landing() {
+        // the look is repeated every LAYOUT_RELOOK, within the deadline. A
+        // close leaves the looks at once, and the wait within the stop
+        // bound.
+        while !self.land_result() && self.result_skin.landing() && !self.controls.quitting() {
+            // Tests: a look found the outcome received, not yet taken.
+            #[cfg(test)]
+            self.relooked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let left = deadline.0 - self.clock.now().0;
             if left <= 0 {
                 break;
@@ -2639,15 +2641,30 @@ mod tests {
             assert_eq!(imports::jobs_counted().0 - before.0, 1);
         }
 
-        /// A layout job wakes the result's idle wait once its outcome is
-        /// in; the wait looks again every `LAYOUT_RELOOK` while the job's
-        /// thread still ends and lands it once the thread is released,
-        /// with no other wake; a thread that does not end is given up at
-        /// the wait's deadline, the job kept.
-        #[test]
-        fn the_idle_wait_lands_a_layout_whose_thread_still_ends() {
-            use std::sync::atomic::Ordering;
-            let _serial = imports::serial();
+        /// Polls `done` every 1 ms until it holds, at most 20 s (a hang
+        /// guard).
+        fn until(done: impl Fn() -> bool) {
+            let end = Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(Instant::now() < end, "never came");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Lets every held job thread and settle go when dropped: made
+        /// first inside a rig's closure, so a failing test lets them go
+        /// before its rig drops and joins the job.
+        struct LetGo;
+
+        impl Drop for LetGo {
+            fn drop(&mut self) {
+                imports::hold_exit(false);
+                crate::dev::hold_result_settles(false);
+            }
+        }
+
+        /// A pending result skin whose images are staged, and a chart.
+        fn staged_skin() -> (tempfile::TempDir, ResultSkin, game::Loaded) {
             let d = result::skin(
                 "",
                 "{ { id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
@@ -2655,45 +2672,53 @@ mod tests {
             let p = result::pending(d.path(), result::LIMITS);
             let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
             result::staged_at(&mut rs, 12, JudgeClass::Normal);
-            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
-            // Waits for `done`, at most 20 s (a hang guard).
-            let until = |done: &dyn Fn() -> bool| {
-                let end = Instant::now() + Duration::from_secs(20);
-                while !done() {
-                    assert!(Instant::now() < end, "never came");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            };
+            (d, rs, loaded("#PLAYLEVEL 12\n", "tapestry"))
+        }
+
+        /// A layout job wakes the result's idle wait once its outcome is
+        /// in; the wait looks again every `LAYOUT_RELOOK` while the job's
+        /// thread still ends, and lands it once the thread is released,
+        /// with no other wake. The thread is released only after this
+        /// rig's wait found the outcome received and not yet taken. A
+        /// thread that does not end is given up at the wait's deadline,
+        /// the job kept. The 60 s deadline is a liveness guard only: the
+        /// wait must be woken by the job, never reach it.
+        #[test]
+        fn the_idle_wait_lands_a_layout_whose_thread_still_ends() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let (_d, rs, loaded) = staged_skin();
             let ((landed, kept), _) =
                 super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let _let_go = LetGo;
                     rig.result_skin = rs;
-                    rig.result_skin.set_wake(Some(std::thread::current()));
-                    // Held between its send and its end; released only once
-                    // the wait has looked with the thread held.
+                    rig.result_skin.set_wake(rig.controls.game_thread());
+                    let relooked = Arc::clone(&rig.relooked);
                     imports::hold_exit(true);
                     rig.result_skin.request(result::view(5));
-                    let release = std::thread::spawn(move || {
-                        until(&|| imports::exit_waiting() == 1);
-                        let seen = super::super::RESULT_LOOKS.load(Ordering::SeqCst);
-                        until(&|| super::super::RESULT_LOOKS.load(Ordering::SeqCst) > seen);
-                        imports::hold_exit(false);
-                    });
                     let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
-                    // Waits until the outcome is in (a wake before it is
-                    // another wait's); the wait that sees it lands it.
-                    while rig.result_skin.has_job() && !rig.result_skin.landing() {
-                        // A hang guard: a wait that saw no outcome by the far
-                        // deadline fails the test, releasing the held thread.
-                        assert!(rig.now().0 < far.0, "the outcome never came in");
-                        rig.idle_wait(far);
-                    }
-                    release.join().unwrap();
-                    // Woken by the job, not by the wait's far deadline.
-                    let landed = !rig.result_skin.has_job() && rig.now().0 < far.0;
+                    let landed = std::thread::scope(|s| {
+                        s.spawn(|| {
+                            let _let_go = LetGo;
+                            until(|| relooked.load(Ordering::SeqCst));
+                            imports::hold_exit(false);
+                        });
+                        // One wait at least, the outcome perhaps in already;
+                        // another only while it is not in (a wake came
+                        // first).
+                        loop {
+                            assert!(rig.now().0 < far.0, "the outcome never came in");
+                            rig.idle_wait(far);
+                            if !rig.result_skin.has_job() || rig.result_skin.landing() {
+                                break;
+                            }
+                        }
+                        !rig.result_skin.has_job() && rig.now().0 < far.0
+                    });
                     // A thread that never ends: given up at the deadline.
                     imports::hold_exit(true);
                     rig.result_skin.request(result::view(7));
-                    until(&|| imports::exit_waiting() == 1);
+                    until(|| imports::exit_waiting() == 1);
                     rig.idle_wait(bms_model::TimeUs(rig.now().0 + 50_000));
                     let kept = rig.result_skin.has_job() && rig.result_skin.landing();
                     imports::hold_exit(false);
@@ -2705,6 +2730,47 @@ mod tests {
                 "landed after its thread's release, woken by the job"
             );
             assert!(kept, "given up at the deadline, the job kept");
+        }
+
+        /// A close while the idle wait looks again for a received layout
+        /// (its thread held after its send) leaves the looks at once: the
+        /// result skin's settlement begins while the thread is still
+        /// held, not once it ended or the wait's deadline passed.
+        #[test]
+        fn a_close_during_the_relooks_settles_at_once() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let (_d, rs, loaded) = staged_skin();
+            let (held, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let _let_go = LetGo;
+                    rig.result_skin = rs;
+                    rig.result_skin.set_wake(rig.controls.game_thread());
+                    let relooked = Arc::clone(&rig.relooked);
+                    let controls = rig.controls;
+                    imports::hold_exit(true);
+                    crate::dev::hold_result_settles(true);
+                    rig.result_skin.request(result::view(5));
+                    let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
+                    std::thread::scope(|s| {
+                        let closer = s.spawn(|| {
+                            let _let_go = LetGo;
+                            until(|| relooked.load(Ordering::SeqCst));
+                            controls.close();
+                            until(crate::dev::result_settle_holding);
+                            let held = imports::exit_waiting() == 1;
+                            crate::dev::hold_result_settles(false);
+                            imports::hold_exit(false);
+                            held
+                        });
+                        while !rig.controls.quitting() {
+                            assert!(rig.now().0 < far.0, "the close never came");
+                            rig.idle_wait(far);
+                        }
+                        closer.join().unwrap()
+                    })
+                });
+            assert!(held, "the settlement began while the thread was still held");
         }
 
         /// A preparation discarded while the result skin's image stage
