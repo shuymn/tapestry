@@ -10,7 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use super::{
-    BATCH, HEADER_FIELD_BYTES, Scan, ScanError, ScanOptions, ThreadStart, cap, read_chart,
+    BATCH, HEADER_FIELD_BYTES, PassGuard, Scan, ScanError, ScanOptions, ThreadStart, cap,
+    read_chart,
 };
 use crate::{Library, LibraryError};
 
@@ -60,6 +61,8 @@ pub struct Hooks {
     pub(crate) before_commit: Option<CommitHook>,
     /// The bests phase is at this step.
     pub(crate) bests: Option<BestsHook>,
+    /// The scan's thread is refused, as a system out of threads would.
+    pub(crate) refuse_spawn: bool,
 }
 
 impl Hooks {
@@ -200,6 +203,104 @@ impl Gate {
     }
 }
 
+/// What a pass's guard was told, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Told {
+    /// The guard was made.
+    Start,
+    /// The pass stopped for a pause.
+    Paused,
+    /// The pass goes on.
+    Resumed,
+    /// The guard was dropped: the pass ended.
+    Dropped,
+}
+
+/// Which of a guard's calls wait for a go after saying so, and which
+/// panic.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hold {
+    pub paused: bool,
+    pub resumed: bool,
+    pub panic_paused: bool,
+    pub panic_resumed: bool,
+}
+
+/// A pass guard saying each call from inside it.
+struct Recorder {
+    told: Sender<Told>,
+    go: Arc<Mutex<Receiver<()>>>,
+    hold: Hold,
+}
+
+impl Recorder {
+    fn say(&self, told: Told, hold: bool, panic: bool) {
+        let _ = self.told.send(told);
+        if hold {
+            let _ = self.go.lock().unwrap().recv_timeout(LONG);
+        }
+        assert!(!panic, "injected guard panic at {told:?}");
+    }
+}
+
+impl PassGuard for Recorder {
+    fn paused(&mut self) {
+        self.say(Told::Paused, self.hold.paused, self.hold.panic_paused);
+    }
+
+    fn resumed(&mut self) {
+        self.say(Told::Resumed, self.hold.resumed, self.hold.panic_resumed);
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.told.send(Told::Dropped);
+    }
+}
+
+/// The guards of `options`' passes, as they are told.
+pub struct Watch {
+    told: Receiver<Told>,
+    go: Sender<()>,
+}
+
+impl Watch {
+    /// Gives `options` a guard that says every call, holding or panicking
+    /// at the calls `hold` names.
+    pub fn on(options: &mut ScanOptions, hold: Hold) -> Self {
+        let (told_tx, told) = mpsc::channel();
+        let (go, go_rx) = mpsc::channel();
+        let go_rx = Arc::new(Mutex::new(go_rx));
+        let told_tx = Mutex::new(told_tx);
+        options.on_pass = Some(Arc::new(move || {
+            let told = told_tx.lock().unwrap().clone();
+            let _ = told.send(Told::Start);
+            Box::new(Recorder {
+                told,
+                go: Arc::clone(&go_rx),
+                hold,
+            })
+        }));
+        Self { told, go }
+    }
+
+    /// The next call, waiting for it.
+    pub fn next(&self) -> Told {
+        self.told.recv_timeout(LONG).unwrap()
+    }
+
+    /// The calls said so far, waiting for none.
+    pub fn seen(&self) -> Vec<Told> {
+        self.told.try_iter().collect()
+    }
+
+    /// Lets a held call return.
+    pub fn open(&self) {
+        self.go.send(()).unwrap();
+    }
+}
+
 /// Lets every held file go until the scan ends.
 fn drain(scan: &Scan, gate: &Gate) {
     while !scan.wait_finished(Duration::from_millis(10)) {
@@ -215,15 +316,12 @@ fn pause_is_acknowledged_after_in_flight_work() {
     write_charts(&root, 4);
     let lib = library(dir.path());
     let (gate, hook) = Gate::new();
-    let scan = lib
-        .scan(
-            &[root],
-            with(Hooks {
-                in_hand: Some(hook),
-                ..Hooks::default()
-            }),
-        )
-        .unwrap();
+    let mut options = with(Hooks {
+        in_hand: Some(hook),
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
 
     // A is read and waits in the batch; B is in hand.
     let a = gate.next();
@@ -234,8 +332,15 @@ fn pause_is_acknowledged_after_in_flight_work() {
         !scan.wait_paused(SHORT),
         "no acknowledgment while a file is in hand"
     );
+    assert_eq!(
+        watch.seen(),
+        [Told::Start],
+        "the guard is told at the pause"
+    );
     gate.open(1);
     assert!(scan.wait_paused(LONG));
+    // The guard was told before the acknowledgment was published.
+    assert_eq!(watch.seen(), [Told::Paused]);
 
     // Everything read is committed, and nothing else is read.
     let mut expected = vec![a, b];
@@ -249,6 +354,254 @@ fn pause_is_acknowledged_after_in_flight_work() {
     drain(&scan, &gate);
     assert_eq!(scan.finish().unwrap().read, 4);
     assert_eq!(indexed(&lib).len(), 4);
+    assert_eq!(watch.seen(), [Told::Resumed, Told::Dropped]);
+}
+
+/// A pass's guard is made before the pass prepares and dropped before its
+/// end is published, with nothing told between when no pause comes.
+#[test]
+fn the_pass_guard_spans_the_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let mut options = ScanOptions::default();
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
+    assert!(scan.wait_finished(LONG));
+    assert_eq!(watch.seen(), [Told::Start, Told::Dropped]);
+    assert_eq!(scan.finish().unwrap().read, 3);
+}
+
+/// A pause requested and withdrawn while the scan commits for it is never
+/// waited for: the guard is told nothing, and the pass goes on.
+#[test]
+fn a_withdrawn_pause_never_tells_the_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let (gate, in_hand) = Gate::new();
+    let (commits, before_commit) = Gate::new();
+    let mut options = with(Hooks {
+        in_hand: Some(in_hand),
+        before_commit: Some(Arc::new(move |_| before_commit(Path::new("")))),
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
+    gate.next();
+    scan.request_pause();
+    gate.open(1);
+    commits.next();
+    scan.release();
+    commits.open(1);
+    gate.next();
+    assert_eq!(
+        watch.seen(),
+        [Told::Start],
+        "the pause was never waited for"
+    );
+    gate.open(1);
+    while !scan.wait_finished(Duration::from_millis(10)) {
+        while gate.held.try_recv().is_ok() {
+            gate.open(1);
+        }
+        while commits.held.try_recv().is_ok() {
+            commits.open(1);
+        }
+    }
+    assert_eq!(watch.seen(), [Told::Dropped]);
+    assert_eq!(scan.finish().unwrap().read, 3);
+}
+
+/// The scan held at a pause with its guard still being told (a file in
+/// hand, then the guard's `paused` held), and its state changed meanwhile.
+fn held_in_the_guards_pause(hold: Hold) -> (tempfile::TempDir, Library, Scan, Gate, Watch) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let (gate, hook) = Gate::new();
+    let mut options = with(Hooks {
+        in_hand: Some(hook),
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, hold);
+    let scan = lib.scan(&[root], options).unwrap();
+    assert_eq!(watch.next(), Told::Start);
+    gate.next();
+    scan.request_pause();
+    gate.open(1);
+    (dir, lib, scan, gate, watch)
+}
+
+/// A release while the guard is being told of the pause: the scan tells
+/// it the pause is over before it takes the next file, and never
+/// acknowledges the withdrawn request.
+#[test]
+fn a_release_during_the_guards_pause_resumes_before_working() {
+    let (_dir, _lib, scan, gate, watch) = held_in_the_guards_pause(Hold {
+        paused: true,
+        ..Hold::default()
+    });
+    assert_eq!(watch.next(), Told::Paused);
+    assert!(
+        !scan.wait_paused(SHORT),
+        "no acknowledgment before the guard returns"
+    );
+    scan.release();
+    watch.open();
+    gate.next();
+    assert_eq!(watch.seen(), [Told::Resumed], "told before the next file");
+    gate.open(1);
+    drain(&scan, &gate);
+    assert_eq!(scan.finish().unwrap().read, 3);
+    assert_eq!(watch.seen(), [Told::Dropped]);
+}
+
+/// Another pause requested while the guard is being told of the first:
+/// acknowledged only once the guard has returned, and the guard is told
+/// once.
+#[test]
+fn a_second_pause_during_the_guards_pause_is_acknowledged_once_released() {
+    let (_dir, _lib, scan, gate, watch) = held_in_the_guards_pause(Hold {
+        paused: true,
+        ..Hold::default()
+    });
+    assert_eq!(watch.next(), Told::Paused);
+    scan.shared.update(|state| {
+        state.release();
+        state.request_pause();
+    });
+    assert!(
+        !scan.wait_paused(SHORT),
+        "no acknowledgment before the guard returns"
+    );
+    watch.open();
+    assert!(scan.wait_paused(LONG));
+    assert!(gate.quiet(), "nothing is read during the pause");
+    assert_eq!(watch.seen(), [], "told once");
+    scan.release();
+    drain(&scan, &gate);
+    assert_eq!(scan.finish().unwrap().read, 3);
+    assert_eq!(watch.seen(), [Told::Resumed, Told::Dropped]);
+}
+
+/// A shutdown while the guard is being told of the pause ends the pass
+/// without telling it the pause is over.
+#[test]
+fn a_shutdown_during_the_guards_pause_ends_without_resuming() {
+    let (_dir, _lib, scan, gate, watch) = held_in_the_guards_pause(Hold {
+        paused: true,
+        ..Hold::default()
+    });
+    assert_eq!(watch.next(), Told::Paused);
+    scan.shared.update(|state| state.shutdown = true);
+    watch.open();
+    assert!(scan.wait_finished(LONG));
+    assert_eq!(watch.seen(), [Told::Dropped]);
+    assert!(gate.quiet(), "nothing more is read");
+}
+
+/// A shutdown while the guard is being told the pause is over ends the
+/// pass before any further work.
+#[test]
+fn a_shutdown_during_the_guards_resume_ends_the_pass() {
+    let (_dir, _lib, scan, gate, watch) = held_in_the_guards_pause(Hold {
+        resumed: true,
+        ..Hold::default()
+    });
+    assert!(scan.wait_paused(LONG));
+    assert_eq!(watch.seen(), [Told::Paused]);
+    scan.release();
+    assert_eq!(watch.next(), Told::Resumed);
+    scan.shared.update(|state| state.shutdown = true);
+    watch.open();
+    assert!(scan.wait_finished(LONG));
+    assert_eq!(watch.seen(), [Told::Dropped]);
+    assert!(gate.quiet(), "nothing more is read");
+}
+
+/// A guard that panics when told the pause is over ends the scan, its end
+/// published and the guard dropped.
+#[test]
+fn a_panic_in_the_guards_resume_ends_the_scan() {
+    let (_dir, _lib, scan, gate, watch) = held_in_the_guards_pause(Hold {
+        panic_resumed: true,
+        ..Hold::default()
+    });
+    assert!(scan.wait_paused(LONG));
+    scan.release();
+    assert!(scan.wait_finished(LONG), "the end is published");
+    assert_eq!(watch.seen(), [Told::Paused, Told::Resumed, Told::Dropped]);
+    assert!(gate.quiet(), "nothing more is read");
+    let result = bounded(move || scan.finish());
+    assert!(matches!(result, Err(ScanError::Panicked)), "{result:?}");
+}
+
+/// A guard that panics when told of the pause ends the scan, its end
+/// published and the guard dropped.
+#[test]
+fn a_panic_in_the_guards_pause_ends_the_scan() {
+    let (_dir, _lib, scan, _gate, watch) = held_in_the_guards_pause(Hold {
+        panic_paused: true,
+        ..Hold::default()
+    });
+    assert!(scan.wait_finished(LONG), "the end is published");
+    assert_eq!(watch.seen(), [Told::Paused, Told::Dropped]);
+    let result = bounded(move || scan.finish());
+    assert!(matches!(result, Err(ScanError::Panicked)), "{result:?}");
+}
+
+/// A scan detached by [`Scan::stop_within`] while its thread is in a step
+/// keeps its pass's guard until that thread ends, and drops it then.
+#[test]
+fn a_detached_scan_drops_its_pass_guard_when_its_thread_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 3);
+    let lib = library(dir.path());
+    let (gate, hook) = Gate::new();
+    let mut options = with(Hooks {
+        in_hand: Some(hook),
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
+    gate.next();
+    assert!(!scan.stop_within(SHORT), "the step is still in hand");
+    assert_eq!(watch.seen(), [Told::Start], "the guard is kept");
+    gate.open(1);
+    assert_eq!(watch.next(), Told::Dropped);
+}
+
+/// A scan whose thread cannot start returns the error, and its pass's
+/// guard is never made.
+#[test]
+fn a_scan_that_cannot_start_never_calls_its_pass_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("songs");
+    write_charts(&root, 1);
+    let lib = library(dir.path());
+    let mut options = with(Hooks {
+        refuse_spawn: true,
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    assert!(lib.scan(std::slice::from_ref(&root), options).is_err());
+    assert_eq!(watch.seen(), []);
+    // Its lease was released with the call.
+    drop(lib.scan(&[root], ScanOptions::default()).unwrap());
+}
+
+/// A pass guard's maker that panics ends the scan.
+#[test]
+fn a_panic_in_the_pass_hook_ends_the_scan() {
+    panicking_scan(ScanOptions {
+        on_pass: Some(Arc::new(|| panic!("injected pass hook panic"))),
+        ..ScanOptions::default()
+    });
 }
 
 #[test]
@@ -302,15 +655,12 @@ fn a_pause_requested_again_right_after_a_release_is_acknowledged() {
     write_charts(&root, 3);
     let lib = library(dir.path());
     let (gate, hook) = Gate::new();
-    let scan = lib
-        .scan(
-            &[root],
-            with(Hooks {
-                in_hand: Some(hook),
-                ..Hooks::default()
-            }),
-        )
-        .unwrap();
+    let mut options = with(Hooks {
+        in_hand: Some(hook),
+        ..Hooks::default()
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
     gate.next();
     scan.request_pause();
     gate.open(1);
@@ -322,10 +672,16 @@ fn a_pause_requested_again_right_after_a_release_is_acknowledged() {
     });
     assert!(scan.wait_paused(LONG), "the new request is acknowledged");
     assert!(gate.quiet(), "nothing is read between");
+    assert_eq!(
+        watch.seen(),
+        [Told::Start, Told::Paused],
+        "the guard is told once, still paused"
+    );
     // Released, and the scan takes the next file in hand before the new
     // request: the request is acknowledged once that file is done.
     scan.release();
     gate.next();
+    assert_eq!(watch.seen(), [Told::Resumed], "told before the next file");
     scan.request_pause();
     assert!(
         !scan.wait_paused(SHORT),
@@ -334,9 +690,11 @@ fn a_pause_requested_again_right_after_a_release_is_acknowledged() {
     gate.open(1);
     assert!(scan.wait_paused(LONG));
     assert!(gate.quiet(), "nothing is read during the pause");
+    assert_eq!(watch.seen(), [Told::Paused]);
     scan.release();
     drain(&scan, &gate);
     assert_eq!(scan.finish().unwrap().read, 3);
+    assert_eq!(watch.seen(), [Told::Resumed, Told::Dropped]);
 }
 
 #[test]
@@ -351,10 +709,11 @@ fn a_failed_commit_ends_the_scan() {
              BEGIN SELECT RAISE(ABORT, 'refused'); END;",
         )
         .unwrap();
-    let scan = lib
-        .scan(std::slice::from_ref(&root), ScanOptions::default())
-        .unwrap();
+    let mut options = ScanOptions::default();
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(std::slice::from_ref(&root), options).unwrap();
     assert!(scan.wait_finished(LONG));
+    assert_eq!(watch.seen(), [Told::Start, Told::Dropped]);
     scan.request_pause();
     assert!(scan.wait_paused(Duration::ZERO), "an ended scan holds");
     let result = bounded(move || scan.finish());
@@ -428,10 +787,13 @@ fn a_panic_in_the_start_hook_ends_the_scan() {
 
 #[test]
 fn a_panic_mid_file_ends_the_scan() {
-    panicking_scan(with(Hooks {
+    let mut options = with(Hooks {
         in_hand: Some(Arc::new(|_: &Path| panic!("injected panic mid-file"))),
         ..Hooks::default()
-    }));
+    });
+    let watch = Watch::on(&mut options, Hold::default());
+    panicking_scan(options);
+    assert_eq!(watch.seen(), [Told::Start, Told::Dropped]);
 }
 
 #[test]
@@ -485,12 +847,20 @@ fn dropping_a_paused_scan_joins_its_thread() {
     let root = dir.path().join("songs");
     write_charts(&root, 300);
     let lib = library(dir.path());
-    let (options, started, hook) = counted();
+    let (mut options, started, hook) = counted();
+    let watch = Watch::on(&mut options, Hold::default());
     let scan = lib.scan(&[root], options).unwrap();
     scan.request_pause();
     assert!(scan.wait_paused(LONG));
     let committed = indexed(&lib).len();
+    // Released and stopped at once, before the thread can see the release:
+    // it ends without being told the pause is over.
+    scan.shared.update(|state| {
+        state.release();
+        state.shutdown = true;
+    });
     bounded(move || drop(scan));
+    assert_eq!(watch.seen(), [Told::Start, Told::Paused, Told::Dropped]);
     assert_eq!(started.load(Ordering::SeqCst), 1);
     assert_eq!(Arc::strong_count(&hook), 1, "the thread has ended");
     assert_eq!(indexed(&lib).len(), committed, "the drop commits nothing");
@@ -879,11 +1249,14 @@ fn gated_commits(gate_hook: PathHook) -> ScanOptions {
 fn a_pause_during_removals_holds_the_later_batches() {
     let (_dir, root, lib) = all_gone();
     let (commits, hook) = Gate::new();
-    let scan = lib.scan(&[root], gated_commits(hook)).unwrap();
+    let mut options = gated_commits(hook);
+    let watch = Watch::on(&mut options, Hold::default());
+    let scan = lib.scan(&[root], options).unwrap();
     commits.next();
     scan.request_pause();
     commits.open(1);
     assert!(scan.wait_paused(LONG));
+    assert_eq!(watch.seen(), [Told::Start, Told::Paused]);
     assert!(
         commits.quiet(),
         "no later batch is committed during the pause"

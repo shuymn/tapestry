@@ -7,6 +7,14 @@
 //! and each removal of a gone file's row. On one it commits its batch, acknowledges the latest request and
 //! waits until the release or the drop. A file in hand is finished first.
 //!
+//! **The pass guard.** [`ScanOptions::on_pass`] makes a [`PassGuard`] on
+//! the scan thread before the pass prepares; the guard is told when the
+//! scan stops for a pause and when it goes on, and is dropped when the
+//! pass ends, however it ends, before the end is published. The scan
+//! acknowledges a pause only after telling the guard, and works again only
+//! after telling it the pause is over, each call made without the scan's
+//! lock and the state looked at again after it.
+//!
 //! **Endings.** Whatever ends the thread, an error, a panic in the start
 //! hook or anywhere after it, or the drop, a guard publishes the end and
 //! wakes every waiter; [`Scan::finish`] or the drop joins the thread.
@@ -42,6 +50,21 @@ pub const HEADER_FIELD_BYTES: usize = 1024;
 /// Called first on the scan thread, before it does any work.
 pub type ThreadStart = Arc<dyn Fn() + Send + Sync>;
 
+/// Called on the scan thread at a pass's start, after its
+/// [`ThreadStart`]: the guard the pass holds until it ends.
+pub type PassStart = Arc<dyn Fn() -> Box<dyn PassGuard> + Send + Sync>;
+
+/// What a pass holds while it runs (the player's maintenance permit), told
+/// on the scan thread when the pass stops for a pause and when it goes on,
+/// and dropped when the pass ends, before the end is published.
+pub trait PassGuard {
+    /// The pass stops for a pause; called before the pause is
+    /// acknowledged.
+    fn paused(&mut self);
+    /// The pass goes on after a pause; called before any further work.
+    fn resumed(&mut self);
+}
+
 /// How a scan runs.
 #[derive(Clone, Default)]
 pub struct ScanOptions {
@@ -49,6 +72,9 @@ pub struct ScanOptions {
     /// mode. This crate holds no platform code, so the caller sets the
     /// priority.
     pub on_thread_start: Option<ThreadStart>,
+    /// Makes the pass's guard on the scan thread ([`PassGuard`]); none
+    /// when absent.
+    pub on_pass: Option<PassStart>,
     /// The records folder (the data root's `records`), whose records the
     /// bests phase counts after the charts; `None` runs no bests phase.
     pub records: Option<PathBuf>,
@@ -64,6 +90,7 @@ impl fmt::Debug for ScanOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScanOptions")
             .field("on_thread_start", &self.on_thread_start.is_some())
+            .field("on_pass", &self.on_pass.is_some())
             .field("records", &self.records)
             .field("rebuild_memory", &self.rebuild_memory)
             .finish_non_exhaustive()
@@ -199,15 +226,21 @@ pub fn start(
         shared: Arc::clone(&shared),
         lease: Some(lease),
     };
+    #[cfg(test)]
+    if options.test.refuse_spawn {
+        return Err(io::Error::other("the scan thread cannot start (test)"));
+    }
     let thread = thread::Builder::new()
         .name("library-scan".to_owned())
         .spawn(move || {
-            // `ending` drops last, after the connection, and sees any panic.
+            // `ending` drops last, after the connection, and sees any panic;
+            // the scanner, and with it the pass guard, drops before it.
             let (ending, conn, roots, options) = (ending, conn, roots, options);
             if let Some(hook) = &options.on_thread_start {
                 hook();
             }
-            let result = Scanner::new(&ending.shared, conn, options, owner).run(&roots);
+            let guard = options.on_pass.as_ref().map(|start| start());
+            let result = Scanner::new(&ending.shared, conn, options, owner, guard).run(&roots);
             if let Err(e) = result {
                 ending
                     .shared
@@ -498,10 +531,20 @@ struct Scanner<'a> {
     read: HashSet<[u8; 32]>,
     /// The bests phase's batch.
     items: Vec<rebuild::Item>,
+    /// The pass's guard, dropped with the scanner.
+    guard: Option<Box<dyn PassGuard>>,
+    /// The guard was told of a pause and not yet that it is over.
+    released: bool,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(shared: &'a Shared, conn: Connection, options: ScanOptions, owner: Arc<Owner>) -> Self {
+    fn new(
+        shared: &'a Shared,
+        conn: Connection,
+        options: ScanOptions,
+        owner: Arc<Owner>,
+        guard: Option<Box<dyn PassGuard>>,
+    ) -> Self {
         Self {
             shared,
             conn,
@@ -515,6 +558,8 @@ impl<'a> Scanner<'a> {
             owner,
             read: HashSet::new(),
             items: Vec::new(),
+            guard,
+            released: false,
         }
     }
 
@@ -555,9 +600,13 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    /// Between two folders or files: on a pause, commits, acknowledges every
-    /// request made of it and waits for the release. `false` when the scan
-    /// is being dropped.
+    /// Between two folders or files: on a pause, commits, tells the guard,
+    /// acknowledges every request made of it and waits for the release,
+    /// then tells the guard before going on. Each call to the guard is made
+    /// without the lock, and the state is looked at again after it: work
+    /// goes on only with the guard told the pause is over, and a request
+    /// is acknowledged only with the guard told of the pause. `false` when
+    /// the scan is being dropped.
     fn checkpoint(&mut self) -> rusqlite::Result<bool> {
         {
             let state = self.shared.lock();
@@ -575,9 +624,27 @@ impl<'a> Scanner<'a> {
                 return Ok(false);
             }
             if !state.pause {
-                return Ok(true);
+                if !self.released {
+                    return Ok(true);
+                }
+                drop(state);
+                if let Some(guard) = &mut self.guard {
+                    guard.resumed();
+                }
+                self.released = false;
+                state = self.shared.lock();
+                continue;
             }
             if state.acked_gen != state.pause_gen {
+                if !self.released {
+                    drop(state);
+                    if let Some(guard) = &mut self.guard {
+                        guard.paused();
+                    }
+                    self.released = true;
+                    state = self.shared.lock();
+                    continue;
+                }
                 state.acked_gen = state.pause_gen;
                 self.shared.changed.notify_all();
             }
