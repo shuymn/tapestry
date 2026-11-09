@@ -325,7 +325,8 @@ mod tests {
     /// (`ScoreData`'s defaults: EX 0, no BP, no lamp), exactly as a
     /// known-empty one: EX 0, the difference the view's EX score, BP and
     /// its difference hidden, no lamp, EX beaten when the view scored, BP
-    /// beaten, and the rate 0 over the view's largest EX score.
+    /// beaten, and the rate 0 over the view's largest EX score; a view of
+    /// EX 0 beats neither its EX nor its rate.
     #[test]
     fn an_unknown_best_projects_as_the_empty_score() {
         let p = rules::tapestry();
@@ -361,6 +362,15 @@ mod tests {
             panic!("unavailable");
         };
         assert_eq!(b.rate, None);
+        // A view of EX 0 does not beat the empty score's EX or rate; its
+        // BP still beats the empty score's.
+        view.tally.ex_score = 0;
+        let BestView::Known(b) = result_parts(&view, &p, &basis()).best else {
+            panic!("unavailable");
+        };
+        assert_eq!((b.ex, b.ex_diff), (0, 0));
+        assert!(!b.ex_updated && b.bp_updated);
+        assert!(!b.rate.unwrap().updated);
     }
 
     /// A preset of seven gauges whose emphasized one, the seventh, is
