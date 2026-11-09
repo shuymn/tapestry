@@ -44,6 +44,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
+use bms_model::Speed;
+
+mod scoped;
+
+pub use scoped::{Failure, Joined, LoadFailure, ScopedJob, Spawner};
+
 /// Foreground permits: the chosen chart's decode threads, from a choice to
 /// its READY state (design.md "Load Pipeline", system friendliness).
 pub const FOREGROUND_PERMITS: usize = 4;
@@ -176,15 +182,25 @@ pub struct Subscriber {
 pub enum JobKind {
     /// A chart's loudness at 1×.
     Loudness,
+    /// The chosen chart read, hashed and parsed.
+    Ingest,
+    /// The chosen chart's sound bank decoded.
+    Bank,
+    /// The chosen chart's loudness measured, its cache missed.
+    Measure,
 }
 
-/// What tells jobs apart: two of one key are one job.
+/// What tells jobs apart: two of one key are one job. The speed is
+/// groundwork: no two foreground loads overlap yet, and reuse by key needs
+/// the other freshness inputs of design.md "Load Pipeline" first.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JobKey {
     /// What the job computes.
     pub kind: JobKind,
     /// The chart's file.
     pub path: PathBuf,
+    /// The speed it is read or decoded at.
+    pub speed: Speed,
 }
 
 /// A panic caught at a job's boundary, with its message when it had one.

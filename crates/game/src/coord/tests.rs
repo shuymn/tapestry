@@ -39,6 +39,7 @@ const NOTHING: &(dyn Fn(Class) + Sync) = &|_| {};
 
 fn key(name: &str) -> JobKey {
     JobKey {
+        speed: bms_model::Speed::NORMAL,
         kind: JobKind::Loudness,
         path: PathBuf::from(name),
     }
