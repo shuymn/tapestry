@@ -449,6 +449,8 @@ fn the_image_stage_falls_back_when_its_thread_cannot_start() {
 /// Screen × quit: cancelled, its request discarded, nothing committed.
 #[test]
 fn the_screen_stage_on_a_quit_cancels_and_discards_its_request() {
+    // Its rig lets the process-wide VM holds go when dropped.
+    let _serial = imports::serial();
     let l = at_level(14);
     let screens = Installers::default();
     on_rig(l.chart(), &screens, false, |rig| {
@@ -503,6 +505,8 @@ fn the_screen_stage_ends_the_run_on_an_audio_failure() {
 /// is fatal: `ScreenError::Ended`, and no screen is built again.
 #[test]
 fn the_screen_stage_fails_when_the_render_thread_panics() {
+    // Its rig lets the process-wide VM holds go when dropped.
+    let _serial = imports::serial();
     let l = at_level(14);
     let screens = Installers::default();
     on_rig(l.chart(), &screens, false, |rig| {
