@@ -30,7 +30,8 @@ fn folder(entry: &str) -> TempDir {
 fn skin(body: &str) -> String {
     format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080,\n\
-           property = {{ {{ name = \"fc\", item = {{ {{ name = \"off\", op = 905 }}, {{ name = \"on\", op = 906 }} }} }} }} }}\n\
+           property = {{ {{ name = \"fc\", item = {{ {{ name = \"off\", op = 905 }}, {{ name = \"on\", op = 906 }} }} }} }},\n\
+           filepath = {{ {{ name = \"mv\", path = \"mv/*\", def = \"clip.mp4\" }} }} }}\n\
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
          skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
@@ -58,7 +59,16 @@ thread_local! {
 
 /// Imports `body`'s skin with the option `fc` at 905.
 fn import(body: &str) -> Result<LuaImported, ImportError> {
+    import_files(body, &[])
+}
+
+/// [`import`], the skin's folder holding `files` too, each a name and its
+/// bytes.
+fn import_files(body: &str, files: &[(&str, &[u8])]) -> Result<LuaImported, ImportError> {
     let d = folder(&skin(body));
+    for (name, bytes) in files {
+        common::write(d.path(), name, bytes);
+    }
     let cancel = Cancel::new();
     let h = read_lua_header(d.path(), "s.luaskin", &cancel)?;
     FOLDERS.with(|f| f.borrow_mut().push(d));
@@ -837,5 +847,171 @@ fn a_value_slider_on_a_custom_alias_is_dropped() {
         )),
         "{:?}",
         i.callbacks
+    );
+}
+
+/// A 64x64 PNG whose header is whole and whose pixel data is corrupt.
+#[cfg(feature = "dev-tools")]
+fn corrupt_png() -> Vec<u8> {
+    let d = tempfile::tempdir().unwrap();
+    common::png(d.path(), "p.png", 64, 64);
+    let mut bytes = std::fs::read(d.path().join("p.png")).unwrap();
+    let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap();
+    for b in bytes.iter_mut().skip(idat + 4).take(16) {
+        *b ^= 0x5a;
+    }
+    bytes
+}
+
+/// A judge whose slot 6 is image `six`, of source `src`, never drawn, and
+/// whose slot 0 has a program draw.
+#[cfg(feature = "dev-tools")]
+fn six_judge(src: &str) -> String {
+    let images: String = (0..6)
+        .map(|k| {
+            let f = if k == 0 {
+                "draw = function() return ms.time() >= 0 end,"
+            } else {
+                ""
+            };
+            format!("{{ id = \"g{k}\", {f} dst = {{ {{ x = 0, y = 0, w = 8, h = 8 }} }} }},")
+        })
+        .collect();
+    format!(
+        "table.insert(skin.source, {{ id = \"x\", path = \"{src}\" }})\n\
+         table.insert(skin.image, {{ id = \"six\", src = \"x\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         skin.judge = {{ {{ id = \"j\", index = 0, images = {{ {images} {{ id = \"six\", loop = 50, dst = {{ {{ time = 100, x = 0, y = 0, w = 8, h = 8 }} }} }} }}, numbers = {{}} }} }}\n{}",
+        dst("j", "")
+    )
+}
+
+/// Slot 6's texture decides PERFECT's part at a full gauge whatever the
+/// import makes of its track: one that decodes takes it from slot 0; a
+/// missing file, a movie (there or not), an unmatched pattern, a file
+/// whose pixels do not decode, a file choice naming a movie leave it to
+/// slot 0; a pattern some file matches is a random pick the import cannot
+/// tell, and PERFECT's program callbacks follow their role.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn slot_six_follows_its_texture() {
+    let corrupt = corrupt_png();
+    let mp4: &[u8] = b"not a video";
+    for (src, files, want) in [
+        ("a.png", vec![], 0),
+        ("missing.png", vec![], 1),
+        ("clip.mp4", vec![("clip.mp4", mp4)], 1),
+        ("gone.mp4", vec![], 1),
+        ("pics/*.png", vec![], 1),
+        ("bad.png", vec![("bad.png", corrupt.as_slice())], 1),
+        ("mv/*", vec![("mv/clip.mp4", mp4)], 1),
+    ] {
+        let i = import_files(&six_judge(src), &files).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        let mut p = Drawn::new(i.imported.skin, 4);
+        full_gauge(&mut p);
+        assert_eq!(
+            invoked(&mut p, 1_000, &[at(1_000, Judgment::Perfect)]),
+            want,
+            "{src}"
+        );
+    }
+    let png = std::fs::read(FOLDERS.with(|f| f.borrow()[0].path().join("a.png"))).unwrap();
+    assert!(refused(
+        &import_files(
+            &six_judge("pics/*.png"),
+            &[("pics/one.png", png.as_slice())]
+        ),
+        "a judge whose slot-6 texture the import cannot prove"
+    ));
+}
+
+/// A grouped image whose file choice names a movie is a movie: `len` does
+/// not remove it, its timer stays a site, and the latch it shares with a
+/// kept image is refused once the import drops the movie.
+#[test]
+fn a_movie_chosen_by_a_file_choice_is_not_removed() {
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"v\", path = \"mv/*\" }})\n\
+         table.insert(skin.image, {{ id = \"mv\", src = \"v\", x = 0, y = 0, w = 8, h = 8, len = 2 }})\n\
+         local l = latch(100000)\n{}{}",
+        dst("mv", "timer = l,"),
+        dst("i", "timer = l,")
+    );
+    let i = import_files(&body, &[("mv/clip.mp4", b"not a video")]).unwrap();
+    assert!(
+        i.callbacks
+            .contains(&construct("a slot writer a dropped destination calls")),
+        "{:?}",
+        i.callbacks
+    );
+}
+
+/// A set choosing by a guarded property, given as an id, a name or a
+/// callable, notes its program callbacks as skipped while unavailable.
+#[test]
+fn a_guarded_selector_is_noted_whatever_backs_it() {
+    use skin_beatoraja::{NoteKind, ScheduleWhy};
+    for value in [
+        "90",
+        "\"maxbpm\"",
+        "function() if ms.number(90) > 100 then return 0 end return 0 end",
+    ] {
+        let i = import(&format!(
+            "skin.imageset = {{ {{ id = \"s\", images = {{ \"i\" }}, value = {value} }} }}\n{}",
+            dst("s", "timer = clock,")
+        ))
+        .unwrap();
+        assert!(
+            i.imported.report.notes.iter().any(|n| n.kind
+                == NoteKind::Schedule {
+                    field: "timer",
+                    why: ScheduleWhy::Availability
+                }),
+            "{value}"
+        );
+    }
+}
+
+/// A judge is installed whatever its grades: one whose grades the import
+/// never draws has no element, but its outer callbacks run where the
+/// source runs them, unnoted.
+#[test]
+fn a_judge_without_drawn_grades_is_not_noted() {
+    use skin_beatoraja::NoteKind;
+    let i = import(&format!(
+        "skin.judge = {{ {{ id = \"j\", index = 0, images = {{ {{ id = \"g0\", loop = 50, dst = {{ {{ time = 100, x = 0, y = 0, w = 8, h = 8 }} }} }} }}, numbers = {{}} }} }}\n{}",
+        dst("j", "draw = function() return ms.time() >= 0 end,")
+    ))
+    .unwrap();
+    assert!(
+        !i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Schedule { .. })),
+        "{:#?}",
+        i.imported.report.notes
+    );
+}
+
+/// A refused slot root's consumers never run: no schedule note for them.
+#[test]
+fn a_refused_root_is_not_noted() {
+    use skin_beatoraja::NoteKind;
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"m\", path = \"missing.png\" }})\n\
+         table.insert(skin.image, {{ id = \"x\", src = \"m\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         local l = latch(100000)\n{}{}",
+        dst("x", "timer = l,"),
+        dst("i", "timer = l,")
+    );
+    let i = import(&body).unwrap();
+    assert!(
+        !i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Schedule { .. })),
+        "{:#?}",
+        i.imported.report.notes
     );
 }

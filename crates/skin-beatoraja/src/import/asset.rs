@@ -496,6 +496,13 @@ impl Assets {
         Ok(result)
     }
 
+    /// Whether admitted file `file` decodes completely
+    /// ([`SheetBuilder::validate_file`]): `Err(refused)`, `refused` when
+    /// only this importer refuses it (a cap), not the file itself.
+    pub(crate) fn validate(&self, file: u32) -> Result<(), bool> {
+        self.builder.validate_file(file).map_err(|e| refused(&e))
+    }
+
     /// The error a failed file was cached with, taken: a critical user
     /// refuses the import with it.
     pub(crate) fn take_error(&mut self, path: &str) -> Option<ImageError> {

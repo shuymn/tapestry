@@ -327,6 +327,42 @@ impl SheetBuilder {
         Ok(index)
     }
 
+    /// Whether admitted file `file`'s 1x version decodes completely, as a
+    /// texture of it loads (the admission read only its header): read
+    /// and decoded, keeping no pixels, the verdict cached with the file
+    /// source's other contents ([`super::source::FileSource`]).
+    ///
+    /// # Errors
+    ///
+    /// Why it does not decode, its name or path refused, or an unknown
+    /// file.
+    pub fn validate_file(&self, file: u32) -> Result<(), ImageError> {
+        let index = usize::try_from(file).unwrap_or(usize::MAX);
+        let at = FileAt {
+            file: index,
+            hi: false,
+        };
+        let Some(f) = self.files.get(index) else {
+            return Err(ImageError::TooManyFiles { n: index });
+        };
+        let (canonical, _) = self
+            .source
+            .resolve(&self.root, &f.lo.name)
+            .map_err(|e| ImageError::path(at, e))?;
+        match self.source.validate_page(
+            &canonical,
+            at,
+            (f.lo.dims, f.lo.mode),
+            MAX_FILE_BYTES,
+            &|| false,
+        ) {
+            Ok(()) => Ok(()),
+            Err(super::Stop::Image(e)) => Err(e),
+            // `cancel` is never asked to stop.
+            Err(super::Stop::Cancelled) => Ok(()),
+        }
+    }
+
     /// An admitted file's 1x width and height.
     #[must_use]
     pub fn file_dims(&self, file: u32) -> Option<[u32; 2]> {

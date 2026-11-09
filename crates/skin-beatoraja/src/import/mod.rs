@@ -469,6 +469,9 @@ pub(crate) struct Cx<'d> {
     /// Whether a read of it so far is one the source sees as a
     /// pre-judgment sentinel ([`property::Value::pre_judgment`]).
     sentinel_read: bool,
+    /// The schedule notes, by callback, held until the slot roots close
+    /// ([`Cx::schedule_notes`]).
+    schedule: Vec<(u16, Span, NoteKind)>,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -599,6 +602,7 @@ impl<'d> Cx<'d> {
             install: prepare::Install::default(),
             prepare: prepare::Prepare::Open,
             sentinel_read: false,
+            schedule: Vec::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],

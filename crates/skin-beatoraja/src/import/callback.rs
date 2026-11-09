@@ -1441,9 +1441,9 @@ impl Cx<'_> {
 
     /// A program callback at node `id` in `field`, compiled for the play
     /// destination being read ([`Self::installed`]).
-    fn compiled_at(&mut self, id: u32, field: &'static str) {
+    fn compiled_at(&mut self, id: u32, field: &'static str, k: u16) {
         if self.kind == ScreenKind::Play {
-            self.install.compiled.push((id, field));
+            self.install.compiled.push((id, field, k));
         }
     }
 
@@ -1868,7 +1868,7 @@ impl Cx<'_> {
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
                     self.outcome((c, id), field, role, (Disposition::Compiled, None));
-                    self.compiled_at(id, field);
+                    self.compiled_at(id, field, k);
                     *deviates |= l.deviates;
                     self.read_sentinel(l.sentinel);
                     conds.push(format!("lua.{k}"));
@@ -2050,7 +2050,7 @@ impl Cx<'_> {
                 match self.program(prog, gate, None, at)? {
                     Ok(k) => {
                         self.outcome((c, id), "value", role, (Disposition::Compiled, None));
-                        self.compiled_at(id, "value");
+                        self.compiled_at(id, "value", k);
                         self.read_sentinel(l.sentinel);
                         return Ok(Some(NumberValue {
                             expr: format!("lua.{k}"),
@@ -2156,7 +2156,7 @@ impl Cx<'_> {
         match gated {
             Ok(k) => {
                 self.outcome(v.at, "value", v.role, (Disposition::Compiled, None));
-                self.compiled_at(v.at.1, "value");
+                self.compiled_at(v.at.1, "value", k);
                 Ok(Some(k))
             }
             Err(why) => {
@@ -2426,7 +2426,7 @@ impl Cx<'_> {
                                     self.install.consumers.push((inst, n));
                                 }
                                 self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
-                                self.compiled_at(id, "timer");
+                                self.compiled_at(id, "timer", k);
                                 self.read_sentinel(l.sentinel);
                                 return Ok(Ok(TimerRef::Output(k)));
                             }
@@ -2492,6 +2492,7 @@ impl Cx<'_> {
     /// holding it) its consumers are made never to run (their gate false)
     /// and follow their role, a critical one refusing the candidate.
     pub(super) fn close_slots(&mut self) -> Result<(), ImportError> {
+        let mut never = std::collections::HashSet::new();
         let roots = std::mem::take(&mut self.slot_roots);
         let mut roots: Vec<(u32, SlotRoot)> = roots.into_iter().collect();
         roots.sort_by_key(|&(inst, _)| inst);
@@ -2514,6 +2515,7 @@ impl Cx<'_> {
                 k, role, at, span, ..
             } in root.consumers
             {
+                never.insert(k);
                 let never = self.compile("false", Ty::Bool, span)?;
                 let read = self.present.reads.len();
                 self.present.reads.push(skin_model::present::ReadDef {
@@ -2531,6 +2533,7 @@ impl Cx<'_> {
                 self.note(Some(span), super::report::Severity::Fallback, note);
             }
         }
+        self.schedule_notes(&never);
         Ok(())
     }
 

@@ -26,7 +26,7 @@ use super::super::track::{self, Stretch};
 use super::super::{Common, Cx, Dst, Opts};
 use super::number;
 use crate::error::ImportError;
-use crate::import::prepare::Prepare;
+use crate::import::prepare::{Load, Prepare};
 
 #[cfg(test)]
 thread_local! {
@@ -137,13 +137,18 @@ impl Cx<'_> {
         let full_part = match images.get(JudgeSlot::PerfectAtMax.index()) {
             Some(&g) => match self.read_nested(g)?.0 {
                 Some(id) => match self.image_rec(&id)? {
-                    // A texture the import cannot prove absent stands.
-                    Some(img) => self.texture_loads(img, at)? != Some(false),
-                    None => false,
+                    Some(img) => match self.texture(img, true, at)? {
+                        Load::Loads => Some(true),
+                        Load::Absent => Some(false),
+                        // Neither is assumed: PERFECT's parts follow their
+                        // role ([`Prepare::before`]).
+                        Load::Unknown => None,
+                    },
+                    None => Some(false),
                 },
-                None => false,
+                None => Some(false),
             },
-            None => false,
+            None => Some(false),
         };
         let mut grades: [Option<PendingGrade>; JudgeSlot::COUNT] = Default::default();
         if images.len() > JudgeSlot::COUNT {

@@ -33,18 +33,36 @@ use crate::tree::NONE;
 /// The reason an inert authored callback is not compiled.
 const INERT: &str = "an authored `op`, `draw` or `timer` inert without an authored key";
 
-/// Where an image record's source leads, known without reading a file.
-enum Resolved {
-    /// No `source` record of its `src`, one without a `path`, or a file
-    /// choice of none: the source makes no texture.
+/// Where an image record's source leads, as the source resolves its path
+/// (`JSONSkinLoader.java:497-501`, `SkinLoader.java:95-130`): the file
+/// choice substituted first, then the resulting name classified.
+pub(super) enum Resolved {
+    /// No `source` record of its `src`, one without a `path`, a file
+    /// choice of none, or a pattern no file matches (the source keeps the
+    /// raw `*` path, which does not exist).
     Absent,
-    /// A movie, which the source makes before it reads `len`
-    /// (`JsonSkinObjectLoader.java:44-49`).
+    /// A movie by its resolved name, or a pattern whose matches all are
+    /// movies: the source makes a movie object, before it reads `len`
+    /// (`JsonSkinObjectLoader.java:44-49`), never a texture.
     Movie,
-    /// A file choice the importer does not resolve.
-    Glob,
+    /// A pattern some file matches: the source picks one at random.
+    Matched,
     /// A file, its name resolved.
     File(String),
+}
+
+/// Whether an image record's texture loads, as the source needs one
+/// (`JsonSkinObjectLoader.java:561-582`, `SkinLoader.java:136-178`: a
+/// whole decode, `null` on any failure, and none for a movie).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Load {
+    /// It decodes.
+    Loads,
+    /// It does not: no file, a movie, or a file that does not decode.
+    Absent,
+    /// The import cannot tell: a random pick among matches, a file only
+    /// the importer refuses, or a file not decoded here.
+    Unknown,
 }
 
 /// Why the source removes a destination's object at installation.
@@ -77,8 +95,12 @@ pub(super) struct Install {
     pub(super) elements: usize,
     /// The slot roots' consumers it compiled, by root and position.
     pub(super) consumers: Vec<(u32, usize)>,
-    /// Its program callbacks, by node and field.
-    pub(super) compiled: Vec<(u32, &'static str)>,
+    /// Its program callbacks: node, field and callback.
+    pub(super) compiled: Vec<(u32, &'static str, u16)>,
+    /// Whether the source installs its object whatever its assets: a
+    /// system image, a judge or the notes, which validate by their keys
+    /// alone, with no condition the import cannot decide.
+    pub(super) certain: bool,
     /// Whether its selector is gated by an availability the source does
     /// not have ([`ScheduleWhy::Availability`]).
     pub(super) availability: bool,
@@ -96,8 +118,12 @@ pub(super) enum Prepare {
     Selector(Option<String>),
     /// The judge's outer object.
     JudgeOuter,
-    /// A judge's grade part, and whether the source has a part at slot 6.
-    JudgeGrade { slot: JudgeSlot, full_part: bool },
+    /// A judge's grade part, and whether the source has a part at slot 6
+    /// (`None`: the import cannot tell).
+    JudgeGrade {
+        slot: JudgeSlot,
+        full_part: Option<bool>,
+    },
     /// A judge's combo part.
     JudgeCombo,
 }
@@ -110,7 +136,16 @@ impl Prepare {
             Self::Open | Self::Selector(None) => None,
             Self::Selector(Some(src)) => Some(format!("({src}) >= 0")),
             Self::JudgeOuter => Some("on(judge)".to_owned()),
-            Self::JudgeGrade { slot, full_part } => Some(selected(*slot, *full_part).to_owned()),
+            Self::JudgeGrade { slot, full_part } => match (slot, full_part) {
+                (_, Some(full)) => Some(selected(*slot, *full).to_owned()),
+                // Which part a full gauge's PERFECT selects is unknown.
+                (JudgeSlot::Perfect | JudgeSlot::PerfectAtMax, None) => {
+                    return Err(Unsupported::Construct(
+                        "a judge whose slot-6 texture the import cannot prove",
+                    ));
+                }
+                (_, None) => Some(selected(*slot, false).to_owned()),
+            },
             Self::JudgeCombo => {
                 return Err(Unsupported::Construct(
                     "a judge combo's callback the program cannot gate",
@@ -242,6 +277,9 @@ impl Cx<'_> {
             return Ok(());
         }
         let removal = self.removal(dst, object, sources)?;
+        self.install.certain = removal.is_none()
+            && matches!(object, None | Some((Object::Judge | Object::Note, _)))
+            && !self.undecided(dst);
         if removal.is_some() || self.inert(dst, object) {
             self.uncount_timer(&dst.timer);
             if removal.is_none() {
@@ -288,6 +326,31 @@ impl Cx<'_> {
     /// (`play/SkinJudge.java:55`, `play/SkinNote.java:32`).
     fn inert(&self, dst: &Dst, object: Option<(Object, u32)>) -> bool {
         dst.keys.is_empty() && matches!(object, Some((Object::Judge | Object::Note, _)))
+    }
+
+    /// Whether one of `dst`'s conditions is static on play but unmapped:
+    /// the source may remove the object by it.
+    fn undecided(&self, dst: &Dst) -> bool {
+        let numeric = dst.ops.iter().filter_map(|op| match op {
+            Op::Id(n) => Some(*n),
+            Op::Name(_) | Op::Callable(_) => None,
+        });
+        let named = dst
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Name(s) => ops::resolve_name(s).map(|(id, _)| id),
+                Op::Id(_) | Op::Callable(_) => None,
+            })
+            .chain(match &dst.draw {
+                Prop::Name(s) => ops::resolve_name(s).map(|(id, _)| id),
+                Prop::Id(n) => Some(*n),
+                Prop::Null | Prop::Callable(_) => None,
+            });
+        numeric
+            .chain(named)
+            .filter_map(|n| i32::try_from(n.unsigned_abs()).ok())
+            .any(|id| ops::is_builtin(id) && matches!(static_class(id), Static::Unmapped))
     }
 
     /// A timer callable that is no slot root's site: its reference does
@@ -364,7 +427,7 @@ impl Cx<'_> {
             return Ok(Some(Removal::Static));
         }
         if let Some((object, rec)) = object.filter(|_| sources)
-            && self.no_source(object, rec)?
+            && self.no_source(object, rec, dst.span)?
         {
             return Ok(Some(Removal::NoSource));
         }
@@ -383,13 +446,19 @@ impl Cx<'_> {
     /// frames (every run empty), an image set every entry of which is a
     /// hole. Whether a resolved file loads, a movie and every other kind
     /// stay uncertain.
-    fn no_source(&mut self, object: Object, rec: u32) -> Result<bool, ImportError> {
+    fn no_source(
+        &mut self,
+        object: Object,
+        rec: u32,
+        at: super::Span,
+    ) -> Result<bool, ImportError> {
         match object {
             Object::Image => {
                 match self.resolve_source(rec)? {
                     Resolved::Absent => return Ok(true),
-                    // A movie ignores `len`; a glob may name one.
-                    Resolved::Movie | Resolved::Glob => return Ok(false),
+                    // A movie is an object whatever its `len`; a random pick
+                    // may be one.
+                    Resolved::Movie | Resolved::Matched => return Ok(false),
                     Resolved::File(_) => {}
                 }
                 let [len, divx, divy] = self.def.fields(rec, ["len", "divx", "divy"]);
@@ -398,9 +467,11 @@ impl Cx<'_> {
                     let div = |v: i32| u64::try_from(v).ok().filter(|&d| d > 0).unwrap_or(1);
                     let frames =
                         div(self.int_or(divx, "divx", 1)?) * div(self.int_or(divy, "divy", 1)?);
-                    return Ok(frames / u64::try_from(len).unwrap_or(1) == 0);
+                    if frames / u64::try_from(len).unwrap_or(1) == 0 {
+                        return Ok(true);
+                    }
                 }
-                Ok(false)
+                Ok(self.texture(rec, false, at)? == Load::Absent)
             }
             Object::ImageSet => {
                 let [images] = self.def.fields(rec, ["images"]);
@@ -422,7 +493,9 @@ impl Cx<'_> {
                     let Some(img) = self.image_rec(&name)? else {
                         continue;
                     };
-                    if !self.unresolved(img)? {
+                    // An entry is a hole when its texture is absent, a movie
+                    // included (`JsonSkinObjectLoader.java:80-85`).
+                    if self.texture(img, false, at)? != Load::Absent {
                         return Ok(false);
                     }
                 }
@@ -435,14 +508,8 @@ impl Cx<'_> {
     /// Whether image record `rec`'s source does not resolve without a file
     /// being read: no `source` record of its `src`, one without a `path`,
     /// or a file choice of none.
-    fn unresolved(&mut self, rec: u32) -> Result<bool, ImportError> {
-        Ok(matches!(self.resolve_source(rec)?, Resolved::Absent))
-    }
-
-    /// Where image record `rec`'s source leads, as the importer resolves
-    /// it before placing it ([`Self::src_rect`]).
+    /// Where image record `rec`'s source leads.
     fn resolve_source(&mut self, rec: u32) -> Result<Resolved, ImportError> {
-        use super::asset::{self, Path};
         let [src] = self.def.fields(rec, ["src"]);
         let src = self.opt_string(src, "src")?;
         let Some(source) = self.source_rec(src.as_deref())? else {
@@ -451,29 +518,75 @@ impl Cx<'_> {
         let Some(path) = self.source_path(source)? else {
             return Ok(Resolved::Absent);
         };
-        if asset::is_movie(&path) {
-            return Ok(Resolved::Movie);
-        }
-        Ok(match self.choices.substitute(&path) {
-            Path::Missing => Resolved::Absent,
-            Path::Glob => Resolved::Glob,
-            Path::File(p) => Resolved::File(asset::resolve(&self.entry_dir, &p)),
-        })
+        Ok(self.resolve_path(&path))
     }
 
-    /// Whether image record `rec`'s texture loads, as the source's
-    /// constructor needs it (`JsonPlaySkinObjectLoader.java:233-239`): its
-    /// file admitted now, as its own import would (cached for it); `None`
-    /// for a movie or a file choice the importer does not resolve, and a
-    /// file only the importer refuses, which the source may load.
-    pub(super) fn texture_loads(
+    /// Where source path `path` leads, the file choice substituted before
+    /// the name is classified; the one resolution the installation pass
+    /// and the placement read ([`Self::src_rect`]).
+    pub(super) fn resolve_path(&self, path: &str) -> Resolved {
+        use super::asset::{self, Path};
+        match self.choices.substitute(path) {
+            Path::Missing => Resolved::Absent,
+            Path::File(p) if asset::is_movie(&p) => Resolved::Movie,
+            Path::File(p) => Resolved::File(asset::resolve(&self.entry_dir, &p)),
+            // Every match ends with the pattern's tail.
+            Path::Glob if asset::is_movie(path) => Resolved::Movie,
+            Path::Glob => match self.glob_matches(path) {
+                Some(false) => Resolved::Absent,
+                Some(true) | None => Resolved::Matched,
+            },
+        }
+    }
+
+    /// Whether some file matches pattern `path` as the source picks one
+    /// (`SkinLoader.java:107-127`): a name in its folder ending, lowercased,
+    /// with the tail after its last `*` (its `|` part dropped); `None`
+    /// when the folder cannot be listed within the entry bound.
+    fn glob_matches(&self, path: &str) -> Option<bool> {
+        let star = path.rfind('*')?;
+        let mut tail = path.get(star + 1..)?.to_owned();
+        if let Some(bar) = path.find('|') {
+            let head = path.get(star + 1..bar).unwrap_or("");
+            let rest = path.get(path.rfind('|')? + 1..).unwrap_or("");
+            tail = format!("{head}{rest}");
+        }
+        let folder = path
+            .get(..path.get(..star)?.rfind('/').unwrap_or(0))
+            .unwrap_or("");
+        let dir = super::asset::resolve(&self.entry_dir, folder);
+        let remaining = crate::limits::MAX_LIST_ENTRIES.saturating_sub(self.def.run.entries);
+        match self.def.root().list(&dir, remaining) {
+            Ok(listing) => Some(
+                listing
+                    .entries
+                    .iter()
+                    .any(|e| e.name.to_lowercase().ends_with(&tail)),
+            ),
+            Err(skin_model::RootError::Missing | skin_model::RootError::NotAFolder) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Whether image record `rec`'s texture loads: the one decision the
+    /// installation pass and a judge's slot 6 read, from the source's
+    /// resolution ([`Self::resolve_path`]). A file is unknown unless
+    /// `decode`: the installation pass reads no file, since the import
+    /// charges an element before it admits a file and admits none for an
+    /// element it drops. With `decode` a file is admitted, as its own
+    /// import would (cached for it): missing, it is absent; refused only by
+    /// this importer, unknown; admitted, it loads once a whole decode
+    /// proves it (the verdict cached), else it is absent.
+    pub(super) fn texture(
         &mut self,
         rec: u32,
+        decode: bool,
         at: super::Span,
-    ) -> Result<Option<bool>, ImportError> {
+    ) -> Result<Load, ImportError> {
         let name = match self.resolve_source(rec)? {
-            Resolved::Absent => return Ok(Some(false)),
-            Resolved::Movie | Resolved::Glob => return Ok(None),
+            Resolved::Absent | Resolved::Movie => return Ok(Load::Absent),
+            Resolved::Matched => return Ok(Load::Unknown),
+            Resolved::File(_) if !decode => return Ok(Load::Unknown),
             Resolved::File(name) => name,
         };
         let def = skin_model::FileDef {
@@ -485,9 +598,13 @@ impl Cx<'_> {
             .admit(&mut self.budget, def)
             .map_err(|l| self.limit(at, l))?;
         Ok(match admitted {
-            Ok(_) => Some(true),
-            Err(super::asset::Failed::File { refused: false }) => Some(false),
-            Err(_) => None,
+            Err(super::asset::Failed::File { refused: false }) => Load::Absent,
+            Err(_) => Load::Unknown,
+            Ok(file) => match self.assets.validate(file) {
+                Ok(()) => Load::Loads,
+                Err(false) => Load::Absent,
+                Err(true) => Load::Unknown,
+            },
         })
     }
 
@@ -498,7 +615,7 @@ impl Cx<'_> {
     /// element whose selector waits for an availability the source does
     /// not have, each is noted as skipped where the source runs it.
     pub(super) fn installed(&mut self) {
-        let retained = self.elements.len() > self.install.elements;
+        let retained = self.elements.len() > self.install.elements || self.install.certain;
         let why = if !retained && self.install.removed.is_none() {
             Some(ScheduleWhy::MayBeRemoved)
         } else if self.install.availability {
@@ -506,14 +623,11 @@ impl Cx<'_> {
         } else {
             None
         };
-        for (id, field) in std::mem::take(&mut self.install.compiled) {
+        for (id, field, k) in std::mem::take(&mut self.install.compiled) {
             if let Some(why) = why {
                 let at = self.arena_span(id);
-                self.note(
-                    Some(at),
-                    Severity::Deviation,
-                    NoteKind::Schedule { field, why },
-                );
+                self.schedule
+                    .push((k, at, NoteKind::Schedule { field, why }));
             }
         }
         if retained {
@@ -585,6 +699,17 @@ impl Cx<'_> {
             }
         }
         self.gating(&conds, true)
+    }
+
+    /// The schedule notes, once the slot roots are closed: a callback
+    /// whose gate [`Self::close_slots`] made false never runs, so it has
+    /// none.
+    pub(super) fn schedule_notes(&mut self, never: &std::collections::HashSet<u16>) {
+        for (k, at, note) in std::mem::take(&mut self.schedule) {
+            if !never.contains(&k) {
+                self.note(Some(at), Severity::Deviation, note);
+            }
+        }
     }
 
     /// Marks a read of a value the source sees as a pre-judgment sentinel:

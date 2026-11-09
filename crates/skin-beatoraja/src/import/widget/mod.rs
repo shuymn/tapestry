@@ -17,10 +17,11 @@ pub(super) mod text;
 
 use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 
-use super::asset::{self, Axis, Crop, Failed, ImageKey, NotAdded, Path};
+use super::asset::{Axis, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
 use super::geom::Q;
 use super::policy::{self, Role};
+use super::prepare::Resolved;
 use super::property::{self, IndexProp};
 use super::report::{NoteKind, Object, Span};
 use super::track::{self, Stretch, Trim, TrimMode};
@@ -308,15 +309,19 @@ impl Cx<'_> {
         let Some(path) = self.source_path(source)? else {
             return missing(NoteKind::MissingAsset);
         };
-        if asset::is_movie(&path) {
-            return missing(NoteKind::Unsupported {
-                object: Object::Movie,
-            });
-        }
-        let name = match self.choices.substitute(&path) {
-            Path::File(p) => asset::resolve(&self.entry_dir, &p),
-            Path::Missing => return missing(NoteKind::MissingAsset),
-            Path::Glob => {
+        // The file choice substituted, then the name classified, as the
+        // installation pass reads it ([`Self::resolve_path`]).
+        let name = match self.resolve_path(&path) {
+            Resolved::File(name) => name,
+            Resolved::Movie => {
+                return missing(NoteKind::Unsupported {
+                    object: Object::Movie,
+                });
+            }
+            Resolved::Absent if !matches!(self.choices.substitute(&path), Path::Glob) => {
+                return missing(NoteKind::MissingAsset);
+            }
+            Resolved::Absent | Resolved::Matched => {
                 return refused(NoteKind::UnsupportedField {
                     field: "source glob",
                 });
@@ -706,7 +711,7 @@ impl Cx<'_> {
             }
             _ => false,
         };
-        let (src, deviates) = if let Prop::Callable(id) = value {
+        let (src, deviates, guard) = if let Prop::Callable(id) = value {
             // A function's value selects, its element's role joined by the
             // part its reads show; it never falls back to `ref`.
             role = self.callback_role(id, "value", role)?;
@@ -714,22 +719,29 @@ impl Cx<'_> {
                 return Ok(());
             };
             role = super::result::set_role(v.role, role);
-            // A selector gated by an availability the source does not have
-            // skips the set's callbacks where the source runs them.
-            self.install.availability |= v.guard.is_some();
+            let guarded = v.guard.is_some();
             (
                 image_choice::guarded(&v.expr, v.guard.as_deref()),
                 v.deviates,
+                guarded,
             )
         } else {
             match selector {
                 SetSelector::Unsupported { why, .. } => {
                     return self.drop_el(role, at, why);
                 }
-                SetSelector::Null => ("0".to_owned(), false),
-                SetSelector::Expr { src, deviates, .. } => (src, deviates),
+                SetSelector::Null => ("0".to_owned(), false, false),
+                SetSelector::Expr {
+                    src,
+                    deviates,
+                    guard,
+                } => (src, deviates, guard.is_some()),
             }
         };
+        // A selector gated by an availability the source does not have
+        // skips the set's callbacks where the source runs them, whatever
+        // backs it.
+        self.install.availability |= guard;
         self.gate_by_value(&src, None, Conv::Index);
         self.prepare = super::prepare::Prepare::Selector((!non_negative).then(|| src.clone()));
         self.actions(at, act)?;
