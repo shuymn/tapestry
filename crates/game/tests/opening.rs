@@ -303,6 +303,9 @@ struct Loader {
     acks: Vec<(i64, u64, i64)>,
     /// The declared loadend from a clock time on.
     loadends: Vec<(i64, Option<TimeUs>)>,
+    /// The loadend a specialization committed in the lifetime declares,
+    /// from the commit's answer on.
+    commit_loadend: Option<Option<TimeUs>>,
     begun: Vec<game::PrepKey>,
     /// Each preparation's answer and the clock time it comes; then ready
     /// at once.
@@ -374,6 +377,7 @@ impl Loader {
             lifetime: 7,
             acks: vec![(T0, 7, T0)],
             loadends: Vec::new(),
+            commit_loadend: None,
             begun: Vec::new(),
             answers: Vec::new(),
             polls: Vec::new(),
@@ -575,6 +579,9 @@ impl Rig for Loader {
         }
         if self.commit_fails {
             return Err(SurfaceLost);
+        }
+        if let Some(d) = self.commit_loadend.take() {
+            self.loadends.push((self.clock.now().0, d));
         }
         Ok(())
     }
@@ -1116,6 +1123,107 @@ fn a_pending_skin_uses_its_base_loadend_until_committed() {
     }
 }
 
+/// L5b, O12a: a pending skin's specialization committed at the opening
+/// declares 3 s, while the wait passed on the floor's second. The end of
+/// loading waits for the 3 s from the same first frame with tuning
+/// acceptance reopened, then closes it again on a fresh copy, applied as
+/// the starting settings; the commit is taken once.
+#[test]
+fn a_committed_specializations_minimum_holds_the_end_of_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+    assert_eq!(run(&mut loaded, &mut rig).unwrap(), Leave::Back);
+    assert_eq!(
+        opening_steps(&rig),
+        [
+            "apply",
+            "screen",
+            "refresh",
+            "audio",
+            "ready",
+            "revalidate",
+            "commit",
+            "reopen",
+            "close",
+            "apply",
+            "end loading",
+            "open"
+        ]
+    );
+    assert_eq!(rig.times("commit"), [T0 + SECOND]);
+    assert_eq!(rig.times("reopen"), [T0 + SECOND]);
+    assert_eq!(rig.times("close"), [T0 + 3 * SECOND]);
+    assert_eq!(applied_at(&rig), [T0 + SECOND, T0 + 3 * SECOND]);
+    assert_eq!(rig.times("end loading"), [T0 + 3 * SECOND]);
+    assert_eq!(rig.opened_at(), T0 + 3 * SECOND);
+    assert_eq!(rig.closes, [("revalidate", 1), ("close", 1)]);
+    assert_eq!(rig.reports[0].attempt, 1);
+}
+
+/// L5b, O12a: a tap while the committed minimum runs acts (acceptance is
+/// open), and the end of loading waits a quiet second from it; the copy
+/// closed then has the tap.
+#[test]
+fn a_tap_while_a_committed_minimum_runs_acts_and_restarts_the_quiet_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+    rig.at(T0 + 2_500_000, Happen::Ev(Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!((rig.model.acted, rig.model.discarded), (1, 0));
+    assert_eq!(rig.times("close"), [T0 + 3_500_000]);
+    assert_eq!(applied_at(&rig), [T0 + SECOND, T0 + 3_500_000]);
+    assert_eq!(display_of(&rig, 1), DISPLAY + 1_000);
+    assert_eq!(rig.opened_at(), T0 + 3_500_000);
+    assert_eq!(rig.count("commit"), 1);
+}
+
+/// L5b, O12a: a tap right after the committed minimum's quiet look lands
+/// in the copy the close takes: that copy is not quiet, so acceptance
+/// reopens and the wait goes on a quiet second from the tap.
+#[test]
+fn a_tap_between_the_committed_minimums_quiet_look_and_its_close_waits_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+    rig.after_quiet = Some((T0 + 3 * SECOND, Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.times("reopen"), [T0 + SECOND, T0 + 3 * SECOND]);
+    assert_eq!(rig.times("close"), [T0 + 3 * SECOND, T0 + 4 * SECOND]);
+    assert_eq!(applied_at(&rig), [T0 + SECOND, T0 + 4 * SECOND]);
+    assert_eq!(display_of(&rig, 1), DISPLAY + 1_000);
+    assert_eq!(rig.times("end loading"), [T0 + 4 * SECOND]);
+    assert_eq!(rig.opened_at(), T0 + 4 * SECOND);
+    assert_eq!(rig.count("commit"), 1);
+}
+
+/// L5b, O-17b: a quit while the committed minimum runs leaves with the
+/// installation committed (nothing discarded), the number given back, and
+/// acceptance open; loading is not ended and nothing opens.
+#[test]
+fn a_quit_while_a_committed_minimum_runs_keeps_the_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+    rig.at(T0 + 2 * SECOND, Happen::Quit);
+    assert_eq!(run(&mut loaded, &mut rig).unwrap(), Leave::Back);
+    assert_eq!(rig.clock.now().0, T0 + 2 * SECOND);
+    assert_eq!(
+        last_steps(&rig, 3),
+        ["commit", "reopen", "end presentation"]
+    );
+    assert_eq!(rig.count("discard"), 0);
+    assert_eq!(rig.count("end loading"), 0);
+    assert_eq!(rig.count("open"), 0);
+    assert_eq!(loaded.attempt().number, 0);
+    assert_tuning_open(&mut rig);
+}
+
 /// The waits of L10 to L12, each holding the wait from its first slice to
 /// past 500 ms: no
 /// acknowledgement (the preparation pending); the minimum only, the
@@ -1204,6 +1312,30 @@ fn a_thread_failure_ends_the_run_from_each_wait() {
             assert_eq!(rig.count("apply"), 0, "{name}");
         }
     }
+}
+
+/// O-1 and H4 (finding 8): a quit in the wait, then a failure or a close
+/// while the discard settles the preparation (a blocking cleanup): the
+/// run ends with that cause, not on the page.
+#[test]
+fn a_failure_during_the_abandonments_cleanup_ends_the_run() {
+    for input in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.at(T0 + 500_000, Happen::Quit);
+        rig.at_step.push(("discard", fails(input)));
+        let ran = run(&mut loaded, &mut rig);
+        assert_failed(&ran, input, "discard");
+        assert_eq!(rig.count("discard"), 1);
+        assert_eq!(rig.count("apply"), 0);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.at(T0 + 500_000, Happen::Quit);
+    rig.at_step.push(("discard", Happen::Close));
+    assert_eq!(run(&mut loaded, &mut rig).unwrap(), Leave::Quit);
 }
 
 /// L12b: a refusal latched in the slice a thread failed in gives way to

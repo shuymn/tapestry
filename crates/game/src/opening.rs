@@ -38,8 +38,12 @@
 //!    activity since step 1, or tuning no longer quiet, gives the number
 //!    back and waits again, the preparation kept (a local retry); otherwise
 //!    tuning acceptance closes;
-//! 6. the commit, the end of loading and the last look; then recording
-//!    opens through the common play loop, once.
+//! 6. the commit; a minimum the commit lengthened (a pending skin's
+//!    specialization declares its loading time only once committed) is
+//!    waited out with acceptance reopened, then closed again on a fresh,
+//!    quiet snapshot applied to the starting settings; the end of loading
+//!    and the last look; then recording opens through the common play
+//!    loop, once.
 //!
 //! A deferred opening reopens tuning acceptance. One deferred by a held
 //! START or SELECT is asked again at the release; one deferred for focus
@@ -319,6 +323,16 @@ pub struct LoadingOpener {
     closed: bool,
 }
 
+impl LoadingOpener {
+    /// Whether the minimum has passed at `now`: the lifetime's first frame
+    /// acknowledged, and the loading time the play skin declares now
+    /// counted from it.
+    fn minimum_passed<R: LoadingRig>(&self, rig: &R, now: TimeUs) -> bool {
+        self.ack
+            .is_some_and(|at| now.0 >= minimum_ends(at, rig.loadend()).0)
+    }
+}
+
 /// Plays a chart whose load is ready, its first attempt opened out of the
 /// loading state: the attempt's preparation begins now, the loading state
 /// waits and opens as [this module](self) describes, and from the
@@ -356,6 +370,9 @@ pub fn load_and_open<R: LoadingRig>(
     };
     if opener.closed && !ended {
         rig.reopen_acceptance().map_err(LiveError::Input)?;
+        // The reopening fences the input thread: a failure that came
+        // meanwhile ends the run.
+        threads_over(rig)?;
     }
     left
 }
@@ -414,6 +431,9 @@ fn ready_loading<R: LoadingRig>(
             }
             (Ok(Before::Ready | Before::Left), start) => {
                 dispose(loaded, rig, start);
+                // The discard can block on a running job's thread: a
+                // failure that came meanwhile ends the run.
+                threads_over(rig)?;
                 return Ok(None);
             }
             (Err(e), start) => {
@@ -422,12 +442,13 @@ fn ready_loading<R: LoadingRig>(
             }
         };
         // Committed from here on: the installation stays on every exit.
-        let after = commit(rig);
+        let after = commit(loaded, rig, opener);
         return match after {
             Ok(true) => Ok(Some(start)),
             Ok(false) => {
                 rig.end_presentation();
                 loaded.withdraw(start);
+                threads_over(rig)?;
                 Ok(None)
             }
             Err(e) => {
@@ -450,10 +471,43 @@ fn dispose<R: Rig>(loaded: &mut Loaded, rig: &mut R, start: Option<PlayStart>) {
 }
 
 /// The commit, the end of loading and the last look: `false` when the
-/// player quit or closed at the last look.
+/// player quit or closed before the end of loading or at the last look.
+///
+/// A pending play skin's specialization declares its loading time only
+/// once committed in the lifetime (design.md "Rendering and Skins", the
+/// pending presentation), so the minimum is looked at again after the
+/// commit. While it still runs, tuning acceptance reopens and the loading
+/// state waits as before the opening; then acceptance closes again on a
+/// fresh copy, which must be quiet and past the minimum at one time
+/// (else it reopens and waits on) and becomes the starting settings. The
+/// commit is not taken again, and the closed gap is the end of loading
+/// and the last look.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn commit<R: Rig>(rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+fn commit<R: LoadingRig>(
+    loaded: &mut Loaded,
+    rig: &mut R,
+    opener: &mut LoadingOpener,
+) -> Result<bool, LiveError<R::ScreenError>> {
     rig.commit_attempt().map_err(LiveError::Screen)?;
+    if !opener.minimum_passed(rig, rig.now()) {
+        let generation = next_generation(rig.candidate());
+        rig.reopen_acceptance().map_err(LiveError::Input)?;
+        opener.closed = false;
+        let snapshot = loop {
+            if !wait_loading(rig, opener)? {
+                return Ok(false);
+            }
+            let snapshot = rig.close_acceptance(generation).map_err(LiveError::Input)?;
+            opener.closed = true;
+            let now = rig.now();
+            if opener.minimum_passed(rig, now) && snapshot.quiet_at(now) {
+                break snapshot;
+            }
+            rig.reopen_acceptance().map_err(LiveError::Input)?;
+            opener.closed = false;
+        };
+        rig.apply_snapshot(&snapshot, loaded.settings_mut());
+    }
     rig.end_loading().map_err(LiveError::Screen)?;
     preflight(rig)?;
     Ok(!quit_look(rig))
@@ -643,10 +697,7 @@ fn wait_loading<R: LoadingRig>(
         }
         let now = rig.now();
         let tuning = rig.tuning_snapshot().map_err(LiveError::Input)?;
-        let minimum = opener
-            .ack
-            .is_some_and(|at| now.0 >= minimum_ends(at, rig.loadend()).0);
-        if minimum && tuning.quiet_at(now) {
+        if opener.minimum_passed(rig, now) && tuning.quiet_at(now) {
             return Ok(true);
         }
     }
