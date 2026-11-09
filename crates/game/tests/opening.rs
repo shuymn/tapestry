@@ -1250,7 +1250,7 @@ fn a_screen_rebuilt_while_waiting_keeps_its_lifetime_and_minimum() {
 /// (nothing held, quiet) are separate cases.
 #[test]
 fn each_condition_alone_holds_the_wait() {
-    let cases: [(&str, Set, i64); 4] = [
+    let cases: [(&str, Set, i64); 5] = [
         (
             "minimum",
             Box::new(|r| r.acks = vec![(T0 + 1_500_000, 7, T0 + 1_500_000)]),
@@ -1273,6 +1273,17 @@ fn each_condition_alone_holds_the_wait() {
             "focus",
             Box::new(|r| {
                 r.at(T0 + 100_000, Happen::Ev(Ev::FocusLost));
+                r.at(T0 + 1_300_000, Happen::Ev(Ev::FocusBack));
+            }),
+            T0 + 2_300_000,
+        ),
+        // An overflow alone, nothing held: it holds the wait until a focus
+        // loss clears it, past the quiet second its own press began.
+        (
+            "overflow",
+            Box::new(|r| {
+                r.at(T0 + 100_000, Happen::Ev(Ev::Overflow));
+                r.at(T0 + 1_200_000, Happen::Ev(Ev::FocusLost));
                 r.at(T0 + 1_300_000, Happen::Ev(Ev::FocusBack));
             }),
             T0 + 2_300_000,
