@@ -57,6 +57,11 @@ pub enum Blend {
     Alpha,
     /// Added on top.
     Add,
+    /// The destination's colour multiplied by the quad's straight colour,
+    /// texel times tint; the alpha takes no part and the destination's
+    /// stays (`skin/Skin.java:663` at `0.8.9`, `GL_ZERO, GL_SRC_COLOR`).
+    /// A quad of alpha 0 is not pushed.
+    Multiply,
 }
 
 /// An opaque clip: an index into the clip table of the skin that pushes it.
@@ -327,7 +332,10 @@ impl QuadBatch {
     /// Adds `quad` with `key` and no clip rect, extending the last run when
     /// its key is equal and it has no clip rect. Returns `false` and counts
     /// the quad as dropped when the quad list is full, or when it needs a
-    /// new run and the run list is full.
+    /// new run and the run list is full. A [`Blend::Multiply`] quad whose
+    /// alpha is not above 0 is accepted and not held, taking no capacity:
+    /// the source draws nothing of alpha 0 (`skin/SkinObject.java:623-625`
+    /// at `0.8.9`), and multiplying by its colour would.
     pub fn push(&mut self, key: RunKey, quad: Quad) -> bool {
         self.push_in(key, None, quad)
     }
@@ -340,6 +348,12 @@ impl QuadBatch {
     }
 
     fn push_in(&mut self, key: RunKey, clip_rect: Option<ClipRect>, quad: Quad) -> bool {
+        // The source skips exactly 0; a negative or NaN alpha, which no
+        // track gives, is skipped too.
+        let [.., alpha] = quad.color;
+        if key.blend == Blend::Multiply && (alpha.is_nan() || alpha <= 0.0) {
+            return true;
+        }
         let len = self.len();
         if len >= self.quad_cap {
             return self.drop_one();

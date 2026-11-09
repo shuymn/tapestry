@@ -162,7 +162,7 @@ fn a_system_image_is_charged_once_and_admits_nothing() {
 fn a_dropped_element_admits_nothing() {
     let json = skin(
         A,
-        r#"{"id": "i", "blend": 4, "dst": [{"w": 1, "h": 1}]},
+        r#"{"id": "i", "blend": 9, "dst": [{"w": 1, "h": 1}]},
            {"id": "i", "op": [7777], "dst": [{"w": 1, "h": 1}]},
            {"id": "i", "timer": 2, "dst": [{"w": 1, "h": 1}]},
            {"id": "i", "dst": [{"time": 0, "w": 1, "h": 1}, {"time": 0, "w": 2, "h": 1},
