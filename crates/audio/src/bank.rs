@@ -1142,7 +1142,8 @@ fn pool<T: Send>(
 ) -> (Option<Vec<T>>, usize) {
     let cap = cap.max(1);
     let next = AtomicUsize::new(0);
-    // Workers running, and those that took a file; worker 0 in both.
+    // Workers running, and those that took a file; worker 0 in both, even
+    // with no file to take, so an empty bank reports one worker.
     let running = AtomicUsize::new(1);
     let decoding = AtomicUsize::new(1);
     let most = AtomicUsize::new(1);
@@ -1833,6 +1834,9 @@ mod tests {
         files0: AtomicUsize,
         alive: AtomicUsize,
         panicked: AtomicBool,
+        /// Set by an extra about to wait for worker 0's panic; the panic
+        /// waits for it while an extra is alive.
+        held: AtomicBool,
         asks: Mutex<HashMap<usize, usize>>,
         arrived: (Mutex<usize>, std::sync::Condvar),
         calls: Mutex<Vec<(usize, thread::ThreadId)>>,
@@ -1850,6 +1854,7 @@ mod tests {
                 files0: AtomicUsize::new(0),
                 alive: AtomicUsize::new(0),
                 panicked: AtomicBool::new(false),
+                held: AtomicBool::new(false),
                 asks: Mutex::new(HashMap::new()),
                 arrived: (Mutex::new(0), std::sync::Condvar::new()),
                 calls: Mutex::new(Vec::new()),
@@ -1927,6 +1932,9 @@ mod tests {
                         false
                     }
                     Zero::Panic => {
+                        if self.alive.load(Ordering::SeqCst) > 0 {
+                            Self::wait("the extra's hold", || self.held.load(Ordering::SeqCst));
+                        }
                         self.panicked.store(true, Ordering::SeqCst);
                         panic!("worker 0 (test)")
                     }
@@ -2033,11 +2041,13 @@ mod tests {
     /// Z6: a width allowing more workers than the pool's cap gets the cap:
     /// no start is asked past it. Worker 0 and the first other worker are
     /// held after their first file, so any further worker would decode
-    /// beside them.
+    /// beside them. Three files leave one after the meeting, so no worker
+    /// retires while a file is still unclaimed and none is started in its
+    /// place.
     #[test]
     fn workers_never_pass_the_pools_cap() {
-        let (_dir, chart) = distinct(4);
-        let cap = cap(2, 4);
+        let (_dir, chart) = distinct(3);
+        let cap = cap(2, 3);
         let mut width = Probe::new(|_| 8);
         if cap > 1 {
             width.meet = vec![(0, 2), (1, 2)];
@@ -2165,10 +2175,11 @@ mod tests {
         extra.extra = |_, _| panic!("an extra (test)");
         let mut zero = Probe::new(|_| 2);
         zero.zero = Some((2, Zero::Panic));
-        // The other worker, after its first file, waits for the panic: it
-        // is alive across it.
+        // The other worker, after its first file, waits for the panic, and
+        // the panic waits for it to hold: it is alive across it.
         zero.extra = |p, _| {
             if p.calls().iter().filter(|c| c.0 > 0).count() > 1 {
+                p.held.store(true, Ordering::SeqCst);
                 Probe::wait("worker 0's panic", || p.panicked.load(Ordering::SeqCst));
             }
             true
