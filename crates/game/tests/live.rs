@@ -3409,12 +3409,15 @@ fn a_command_during_the_ready_poll_is_served_before_the_result() {
     }
 }
 
-/// A record sink whose save succeeds at once and whose best lookup tells
-/// its test it began, then blocks until the test releases it: a slow read
-/// of the own view's best, with the test acting while it waits.
+/// A record sink whose save succeeds at once and whose best lookup, after
+/// answering the first play's begin at once, tells its test it began, then
+/// blocks until the test releases it: a slow read of the own view's best,
+/// with the test acting while it waits.
 struct BlockedLookup {
     began: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
+    /// Whether the first play's begin has read.
+    begun: bool,
 }
 
 impl game::RecordSink for BlockedLookup {
@@ -3425,6 +3428,9 @@ impl game::RecordSink for BlockedLookup {
     }
 
     fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        if !std::mem::replace(&mut self.begun, true) {
+            return game::BestLookup::KnownEmpty;
+        }
         self.began.send(()).unwrap();
         self.release.recv().unwrap();
         game::BestLookup::KnownEmpty
@@ -3475,6 +3481,7 @@ fn a_fresh_command_during_the_best_read_withdraws_the_result() {
                     records: Some(Box::new(BlockedLookup {
                         began,
                         release: released,
+                        begun: false,
                     })),
                     ..p
                 },
@@ -5643,7 +5650,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
         })
     );
     // Back on each view, its best is the one read before: each key asked
-    // once, the own never.
+    // once, the own never. Each play's begin reads under the play preset:
+    // the first play's before any view, the retry's after them.
     assert_eq!(
         compared(shown(&rig, 11_250_000)),
         compared(shown(&rig, 11_050_000))
@@ -5663,11 +5671,15 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
     let asked = asked.lock().unwrap().clone();
     assert_eq!(
         asked,
-        [hash(&rules::beatoraja_style()), hash(&rules::lr2_style())].map(|preset_sha256| {
-            game::BestKey {
-                chart_sha256: chart_sha,
-                preset_sha256,
-            }
+        [
+            hash(&rules::tapestry()),
+            hash(&rules::beatoraja_style()),
+            hash(&rules::lr2_style()),
+            hash(&rules::tapestry()),
+        ]
+        .map(|preset_sha256| game::BestKey {
+            chart_sha256: chart_sha,
+            preset_sha256,
         })
     );
 }
@@ -5688,7 +5700,8 @@ fn an_uncounted_play_reads_its_own_best_and_a_random_chart_has_no_best_rate() {
     let mut rig = Fake::new(items(), &[(11_000_000, Command::Retry)], 12_000_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(compared(shown(&rig, 10_999_000)), BestCompare::Unavailable);
-    assert_eq!(asked.lock().unwrap()[0].preset_sha256, tapestry);
+    // The play's begin read first, then the own view's.
+    assert_eq!(asked.lock().unwrap()[1].preset_sha256, tapestry);
     // Known on a `#RANDOM` chart: the differences, no rate.
     let dir = tempfile::tempdir().unwrap();
     let mut random = chart();
@@ -6289,4 +6302,228 @@ fn the_turntable_signals_follow_the_outro() {
     let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
     assert!(paused_before_result(&rig), "{:?}", rig.turntable);
+}
+
+/// Reads [`chart`] as [`Built`] does, counting each ingestion.
+struct CountedIngest(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl game::ChartIngest for CountedIngest {
+    fn max_bytes(&self) -> usize {
+        1 << 20
+    }
+
+    fn accepts(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|e| e == "chart")
+    }
+
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &Path,
+        _seed: u64,
+        _speed: bms_model::Speed,
+    ) -> Result<game::Ingested, game::IngestError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let chart = chart();
+        Ok(game::Ingested {
+            labels: game::ChartLabels::default(),
+            profile: bms_model::ChartProfile::of(&chart, &[]),
+            chart,
+            warnings: Vec::new(),
+        })
+    }
+}
+
+/// A record sink that saves locally, answers each best read by its
+/// preset's hash (known empty for any other), noting each key it is asked,
+/// and counts each play as raising its preset's best to `raise`.
+struct Raising {
+    local: game::LocalRecords,
+    answers: Vec<([u8; 32], game::BestLookup)>,
+    raise: Option<u32>,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<game::BestKey>>>,
+}
+
+impl game::RecordSink for Raising {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.local.save(rec)
+    }
+
+    fn after_result(&mut self, play: &game::SavedPlay<'_>) -> Option<game::BestView> {
+        let ex = self.raise?;
+        let current = best(ex, 0, game::BestLamp::Failed);
+        self.answers.push((
+            play.record.preset.sha256,
+            game::BestLookup::Known(current.clone()),
+        ));
+        Some(game::BestView::Counted {
+            play: (0, 0),
+            previous: None,
+            current,
+            ineligible: None,
+        })
+    }
+
+    fn best_before(&mut self, key: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.asked.lock().unwrap().push(*key);
+        self.answers
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == key.preset_sha256)
+            .map_or(game::BestLookup::KnownEmpty, |(_, a)| a.clone())
+    }
+}
+
+/// [`chart`] loaded through a [`CountedIngest`] under the preset named
+/// `preset`, the player's target `"next"`, with a [`Raising`] sink; the
+/// ingestions and the keys asked.
+fn loaded_raising(
+    dir: &Path,
+    preset: &str,
+    answers: Vec<([u8; 32], game::BestLookup)>,
+    raise: Option<u32>,
+) -> (
+    Loaded,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<game::BestKey>>>,
+) {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.player.preset = preset.to_owned();
+    settings.player.target = game::ScoreTarget::Next;
+    settings.device.input_offset_us = OFFSET;
+    let chart_path = dir.join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let ingests = std::sync::Arc::default();
+    let asked = std::sync::Arc::default();
+    let parts = Parts {
+        ingest: Box::new(CountedIngest(std::sync::Arc::clone(&ingests))),
+        records: Some(Box::new(Raising {
+            local: game::LocalRecords::new(root.records()),
+            answers,
+            raise,
+            asked: std::sync::Arc::clone(&asked),
+        })),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let config = SessionConfig {
+        lead_in: TimeUs(1_000 * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 11,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: BuildProvenance::Development,
+        receive: ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    (
+        Loaded::load(root, settings, &chart_path, config, parts).unwrap(),
+        ingests,
+        asked,
+    )
+}
+
+/// C10 and C13 (stage 3, S10-10): a play reads its best once as it
+/// begins, however many times its attempt is prepared (two `Stale`
+/// readinesses here, so three preparations), and every preparation gets
+/// the same basis, the load's one profile and its MAIN tempo; the chart is
+/// ingested once. The play is counted as raising the best to 3 before the
+/// retry, whose begin reads it: two notes, a maximum of 4, `"next"` above 0
+/// rank 15 (3) and above 3 rank 21 (4).
+#[test]
+fn a_play_reads_its_best_once_however_often_it_is_prepared() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut loaded, ingests, asked) = loaded_raising(dir.path(), "tapestry", Vec::new(), Some(3));
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(13_000_000, Command::Retry)], 16_000_000);
+    rig.stale = changed_screens(2);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let numbers: Vec<_> = rig.attempts.iter().map(|a| a.number).collect();
+    assert_eq!(numbers, [1, 1, 1, 2]);
+    let scores: Vec<_> = rig.attempts.iter().map(|a| a.score).collect();
+    let first = game::ScoreBasis {
+        best: 0,
+        best_known: true,
+        target: 3,
+    };
+    let retry = game::ScoreBasis {
+        best: 3,
+        best_known: true,
+        target: 4,
+    };
+    assert_eq!(scores, [first, first, first, retry]);
+    // One read per play, under the play preset.
+    let tapestry = game::BestKey {
+        chart_sha256: rig.reports[0]
+            .record
+            .as_ref()
+            .unwrap()
+            .chart
+            .identity
+            .sha256,
+        preset_sha256: replay::preset_hash(&rules::tapestry()),
+    };
+    assert_eq!(*asked.lock().unwrap(), [tapestry, tapestry]);
+    // The load's one profile, shared, and its MAIN tempo, in every
+    // preparation; one ingestion.
+    let profile = rig.attempts[0].profile.clone().unwrap();
+    assert_eq!(*profile, bms_model::ChartProfile::of(&chart(), &[]));
+    for a in &rig.attempts {
+        assert!(std::sync::Arc::ptr_eq(
+            a.profile.as_ref().unwrap(),
+            &profile
+        ));
+        assert_eq!(a.main, Some(chart().timeline.meta().initial));
+    }
+    assert_eq!(ingests.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+/// C10: a play reads its best under the result's key, the preset it is
+/// played under: one changed in its file before a retry is read for the
+/// retry, the first play's under the preset before.
+#[test]
+fn a_play_reads_its_best_under_its_refreshed_preset() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let named = |mut p: rules::RulePreset| {
+        p.id = "mine".to_owned();
+        p
+    };
+    let (before, after) = (named(rules::tapestry()), named(flat_normal()));
+    let answers = vec![
+        (
+            replay::preset_hash(&before),
+            game::BestLookup::Known(best(1, 0, game::BestLamp::Failed)),
+        ),
+        (
+            replay::preset_hash(&after),
+            game::BestLookup::Known(best(2, 0, game::BestLamp::Failed)),
+        ),
+    ];
+    let (mut loaded, _, asked) = loaded_raising(dir.path(), "mine", answers, None);
+    assert_eq!(*loaded.preset(), before);
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 12_500_000);
+    let edited = flat_normal();
+    rig.at
+        .push((8_000_000, Box::new(move || rewrite_preset(&path, &edited))));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let bests: Vec<_> = rig
+        .attempts
+        .iter()
+        .map(|a| (a.number, a.score.best))
+        .collect();
+    assert_eq!(bests, [(1, 1), (2, 2)]);
+    let presets: Vec<_> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|k| k.preset_sha256)
+        .collect();
+    assert_eq!(
+        presets[..2],
+        [replay::preset_hash(&before), replay::preset_hash(&after)]
+    );
 }
