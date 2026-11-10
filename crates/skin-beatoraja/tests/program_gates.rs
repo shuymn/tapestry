@@ -328,6 +328,10 @@ fn static_folds_remove_the_object() {
         ("op = { -1008 },", 1),
         ("op = { \"!table_song\" },", 1),
         ("draw = 290,", 0),
+        // The course stages are static too (S10-13b), and false.
+        ("op = { 281 },", 0),
+        ("op = { \"course_stage_final\" },", 0),
+        ("op = { -289 },", 1),
     ] {
         let mut p = played(&format!("{number}{}", dst("m", fields)));
         assert_eq!(invoked(&mut p, 1_000, &[]), want, "{fields}");
