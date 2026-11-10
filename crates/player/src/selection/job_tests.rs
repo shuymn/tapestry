@@ -118,6 +118,7 @@ struct Bench {
     stepper: Stepper,
     mode: Arc<Mode>,
     decodes: Arc<Decodes>,
+    witness: Arc<crate::bank_witness::BankWitness>,
 }
 
 fn bench(dir: &Path, decodes: Decodes, spawner: Spawner) -> Bench {
@@ -129,6 +130,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
     let mode = Arc::new(Mode::default());
     let (shelf, stepper) = stepped_shelf(dir, &coord, &mode);
     let decodes = Arc::new(decodes);
+    let witness = crate::bank_witness::BankWitness::new();
     let sel = Selection {
         shelf,
         screen: SelectScreen::new(Vec::new()),
@@ -150,6 +152,8 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         spawner,
         decodes: Some(Arc::clone(&decodes)),
         after_bank: None,
+        unload_fault: None,
+        witness: Arc::clone(&witness),
     };
     Bench {
         sel: Some(sel),
@@ -157,6 +161,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         stepper,
         mode,
         decodes,
+        witness,
     }
 }
 
@@ -1273,4 +1278,320 @@ fn a_sound_changed_between_the_speed_bank_and_its_1x_reread_plays_at_the_headroo
     assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
     assert_eq!(analysis(&b.decodes), None, "analyzed under another key");
     assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+// --- The release barrier and its witness (C21) ---
+
+/// Where a hook finds the bench's witness once it exists.
+type WitnessSlot = Arc<Mutex<Option<Arc<crate::bank_witness::BankWitness>>>>;
+
+/// What a hook saw of the witness: decodes in flight and banks alive.
+type Seen = Arc<Mutex<Vec<(usize, usize)>>>;
+
+/// What the witness recorded: its checks and their violations.
+fn witnessed(b: &Bench) -> (usize, Vec<String>) {
+    b.witness.record()
+}
+
+/// `loaded` at `speed` with a practice section, as a Start loads it: its
+/// load keeps a restorer.
+fn practiced(dir: &Path, path: &Path, speed: Speed) -> Loaded {
+    let mut l = loaded(dir, path, speed);
+    let screen = game::PracticeScreen::new(l.chart(), &rules::tapestry(), 0);
+    let practice = screen.practice(&l);
+    l.start_practice(practice).unwrap();
+    l
+}
+
+/// A hook that records, at each release barrier before its unload, the
+/// decodes in flight and the banks alive the witness sees.
+fn at_each_barrier(witness: &WitnessSlot) -> (Option<Hook>, Seen) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (w, s) = (Arc::clone(witness), Arc::clone(&seen));
+    let hook = hook(move |p, _, _| {
+        if p == Probe::Barrier
+            && let Some(w) = w.lock().unwrap().as_ref()
+        {
+            s.lock().unwrap().push(w.now());
+        }
+    });
+    (hook, seen)
+}
+
+/// B1: a chart loaded, then another (Enter after a play): before the
+/// second's unload the first bank is still alive; once the barrier has run,
+/// no bank is alive and no decode is in flight, so its check finds nothing.
+#[test]
+fn entering_after_a_play_releases_every_owner_before_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let first = loaded(dir.path(), &path, Speed::NORMAL);
+    let second = loaded(dir.path(), &path, Speed::NORMAL);
+    let slot = Arc::new(Mutex::new(None));
+    let (hook, seen) = at_each_barrier(&slot);
+    let mut b = bench(dir.path(), decodes_with(hook), Spawner::SYSTEM);
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let s = b.sel.take().unwrap();
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&first)), Loading::Ready);
+        assert_eq!(b.witness.now(), (0, 1), "the installed bank");
+        assert_eq!(outcome(rig.load_chart(&second)), Loading::Ready);
+        assert!(installed(rig, &second));
+    });
+    assert_eq!(*seen.lock().unwrap(), [(0, 0), (0, 1)]);
+    assert_eq!(witnessed(&b), (2, Vec::new()));
+    slot.lock().unwrap().take();
+}
+
+/// B3a, B4, B5, B8: practice Starts in turn, each keeping a restorer: at
+/// 1×, at 1.5× (another speed after 1×), at 0.5× (a second speed), at 1×
+/// (a return to 1×) and at 1× again. Each barrier finds the previous
+/// Start's bank alive before its unload, and none once it has run: its
+/// restorer and the engine's bank are gone.
+#[test]
+fn every_start_releases_the_previous_starts_bank_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let speeds = [
+        Speed::NORMAL,
+        Speed::FASTEST,
+        Speed::SLOWEST,
+        Speed::NORMAL,
+        Speed::NORMAL,
+    ];
+    let slot = Arc::new(Mutex::new(None));
+    let (hook, seen) = at_each_barrier(&slot);
+    let mut b = bench(dir.path(), decodes_with(hook), Spawner::SYSTEM);
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let s = b.sel.take().unwrap();
+    on_rig(s, &Installers::default(), false, |rig| {
+        for speed in speeds {
+            let start = practiced(dir.path(), &path, speed);
+            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready, "{speed:?}");
+            assert!(rig.restorer.is_some(), "{speed:?}");
+        }
+    });
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), speeds.len());
+    assert_eq!(seen[0], (0, 0));
+    assert!(seen[1..].iter().all(|&s| s == (0, 1)), "{seen:?}");
+    assert_eq!(witnessed(&b), (speeds.len(), Vec::new()));
+    slot.lock().unwrap().take();
+}
+
+/// B9: a load at 1.5× whose gain is unknown measures on a 1× bank decoded
+/// beside the installed 1.5× bank: two banks alive then, within the
+/// registration's bound, and the barrier does not run before it.
+#[test]
+fn the_measurement_decode_beside_the_installed_bank_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
+    let slot: WitnessSlot = Arc::new(Mutex::new(None));
+    let at_analysis = Arc::new(Mutex::new(None));
+    let (w, a) = (Arc::clone(&slot), Arc::clone(&at_analysis));
+    let decodes = decodes_with(hook(move |p, _, _| {
+        if p == Probe::Analysis
+            && let Some(w) = w.lock().unwrap().as_ref()
+        {
+            *a.lock().unwrap() = Some(w.now());
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let s = b.sel.take().unwrap();
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+    });
+    assert_eq!(begun(&b.decodes), [Speed::FASTEST, Speed::NORMAL]);
+    assert_eq!(*at_analysis.lock().unwrap(), Some((0, 2)));
+    assert_eq!(witnessed(&b), (1, Vec::new()));
+    slot.lock().unwrap().take();
+}
+
+/// The witness's decode accounting begins before the Bank job is spawned:
+/// with every foreground permit held, the job waits for admission, its
+/// decode not entered, and the witness already counts it in flight.
+#[test]
+fn a_decode_is_accounted_from_its_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let slot: WitnessSlot = Arc::new(Mutex::new(None));
+    let seen = Arc::new(Mutex::new(None));
+    let (w, s) = (Arc::clone(&slot), Arc::clone(&seen));
+    let decodes = decodes_with(hook(move |p, controls, _| {
+        if p == Probe::Wait(JobKind::Bank) && s.lock().unwrap().is_none() {
+            *s.lock().unwrap() = w.lock().unwrap().as_ref().map(|w| w.now());
+            Leave::Quit.press(controls);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let held: Vec<Lease> = (0..game::coord::FOREGROUND_PERMITS)
+        .map(|_| b.coord.try_lease(Class::Foreground).unwrap())
+        .collect();
+    let got = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| outcome(rig.load_chart(&loaded)),
+    );
+    assert_eq!(got, Loading::Cancelled);
+    assert!(begun(&b.decodes).is_empty(), "the decode was entered");
+    assert_eq!(*seen.lock().unwrap(), Some((1, 0)));
+    assert_eq!(b.witness.now(), (0, 0));
+    drop(held);
+    slot.lock().unwrap().take();
+}
+
+/// The witness's decode accounting lasts until the bank is registered: the
+/// Bank job joined, its bank not yet wrapped, the decode is still in
+/// flight and the bank not yet alive in the registry; once registered and
+/// installed, no decode is in flight.
+#[test]
+fn a_decode_is_accounted_until_its_bank_is_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let slot: WitnessSlot = Arc::new(Mutex::new(None));
+    let seen = Arc::new(Mutex::new(None));
+    let (w, s) = (Arc::clone(&slot), Arc::clone(&seen));
+    let decodes = decodes_with(hook(move |p, _, _| {
+        if p == Probe::Joined {
+            *s.lock().unwrap() = w.lock().unwrap().as_ref().map(|w| w.now());
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let s = b.sel.take().unwrap();
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+        assert_eq!(b.witness.now(), (0, 1));
+    });
+    assert_eq!(*seen.lock().unwrap(), Some((1, 0)));
+    slot.lock().unwrap().take();
+}
+
+/// U6: a quit or a close pressed while the barrier unloads: the look after
+/// the unload cancels the load before its Bank job, even one whose thread
+/// would be refused (a load that spawned it would fail instead).
+#[test]
+fn a_close_or_quit_at_the_unload_cancels_before_the_decode() {
+    for how in [Leave::Quit, Leave::Close] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = song(dir.path(), "");
+        let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+        let decodes = decodes_with(hook(move |p, controls, _| {
+            if p == Probe::Barrier {
+                how.press(controls);
+            }
+        }));
+        let mut b = bench(dir.path(), decodes, Spawner::refusing(&[JobKind::Bank]));
+        let got = on_rig(
+            b.sel.take().unwrap(),
+            &Installers::default(),
+            false,
+            |rig| outcome(rig.load_chart(&loaded)),
+        );
+        assert_eq!(got, Loading::Cancelled, "{how:?}");
+        assert!(begun(&b.decodes).is_empty());
+        assert_eq!(witnessed(&b), (1, Vec::new()));
+    }
+}
+
+/// U2, U5, U8: an unload the audio thread does not take (timed out, a
+/// previous one still out, the thread gone) refuses the load before any
+/// decode, with that error, whether or not a quit or a close was pressed
+/// at the barrier; the barrier's check never runs.
+#[test]
+fn a_failed_unload_refuses_before_decoding() {
+    use game::{AudioLoadError, AudioWaitError};
+    for fault in [
+        AudioLoadError::Wait(AudioWaitError::Timeout),
+        AudioLoadError::Busy,
+        AudioLoadError::Wait(AudioWaitError::Gone),
+    ] {
+        for how in [None, Some(Leave::Quit), Some(Leave::Close)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = song(dir.path(), "");
+            let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+            let decodes = decodes_with(hook(move |p, controls, _| {
+                if p == Probe::Barrier
+                    && let Some(how) = how
+                {
+                    how.press(controls);
+                }
+            }));
+            let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+            let mut s = b.sel.take().unwrap();
+            s.unload_fault = Some(fault);
+            let got = on_rig(s, &Installers::default(), false, |rig| {
+                rig.load_chart(&loaded)
+            });
+            assert!(
+                matches!(got, Err(ChartLoadError::Audio(e)) if e == fault),
+                "{fault:?} {how:?}: {got:?}"
+            );
+            assert!(begun(&b.decodes).is_empty(), "{fault:?} {how:?}");
+            assert_eq!(witnessed(&b), (0, Vec::new()));
+        }
+    }
+}
+
+/// U7: a load cancelled after the barrier's unload and its decode, before
+/// its installation, leaves the engine empty; the next load's barrier
+/// unloads that empty engine and the load goes through.
+#[test]
+fn a_refused_load_after_the_unload_leaves_the_next_load_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    // The first load: the quit pressed once its Bank job is joined, so
+    // the look before the installation cancels it.
+    let pressed = AtomicBool::new(false);
+    let decodes = decodes_with(hook(move |p, controls, _| {
+        if p == Probe::Joined && !pressed.swap(true, Ordering::SeqCst) {
+            Leave::Quit.press(controls);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert!(!installed(rig, &loaded));
+        assert_eq!(b.witness.now(), (0, 0), "a bank is still held");
+        assert_eq!(rig.controls.take(), Some(game::Command::Quit));
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+        assert!(installed(rig, &loaded));
+    });
+    assert_eq!(witnessed(&b), (2, Vec::new()));
+}
+
+/// B10: a quit during the measurement, after the installation, leaves the
+/// new bank installed (as before); the next load's barrier releases it.
+#[test]
+fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let pressed = Arc::new(AtomicBool::new(false));
+    let p = Arc::clone(&pressed);
+    let decodes = decodes_with(hook(move |at, controls, _| {
+        if at == Probe::Analysis && !p.swap(true, Ordering::SeqCst) {
+            Leave::Quit.press(controls);
+        }
+    }));
+    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+    let s = b.sel.take().unwrap();
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert!(installed(rig, &loaded));
+        assert_eq!(b.witness.now(), (0, 1), "the installed bank");
+        assert_eq!(rig.controls.take(), Some(game::Command::Quit));
+        left_to_background(&b, rig, Leave::Quit);
+        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+    });
+    assert_eq!(witnessed(&b), (2, Vec::new()));
 }

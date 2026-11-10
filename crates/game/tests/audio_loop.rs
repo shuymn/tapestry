@@ -1144,3 +1144,171 @@ fn a_drop_acknowledgement_belongs_to_its_own_attempt() {
     worker.step(&mut out).unwrap();
     assert!(!control.counters().dropped(next));
 }
+
+/// An engine on `chart`'s bank, the bank's `Arc` kept by the caller, and
+/// its control and worker over a recorded simulated device.
+fn rig_holding(
+    chart: &Chart,
+) -> (
+    std::sync::Arc<audio::SoundBank>,
+    AudioControl,
+    AudioWorker,
+    RecordingOutput<SimDevice>,
+) {
+    let held = bank(chart);
+    let engine = AudioEngine::new(
+        std::sync::Arc::clone(&held),
+        &chart.bgm,
+        RATE,
+        PERIOD,
+        MAX_VOICES,
+        0,
+    )
+    .unwrap();
+    let (control, worker) = audio_control(engine);
+    let out = RecordingOutput::new(
+        SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+        RATE as usize * 4,
+    );
+    (held, control, worker, out)
+}
+
+/// Runs `call` on another thread while the worker is stepped here, until it
+/// returns: a load or an unload the audio thread answers.
+fn answered<T: Send>(
+    worker: &mut AudioWorker,
+    out: &mut RecordingOutput<SimDevice>,
+    call: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|s| {
+        let call = s.spawn(call);
+        while !call.is_finished() {
+            worker.step(out).unwrap();
+        }
+        call.join().unwrap()
+    })
+}
+
+/// U1: an unload swaps an empty bank in, and the installed bank, with the
+/// source the last load answered with, is freed by the unloading thread.
+#[test]
+fn an_unload_frees_the_installed_bank_on_the_game_thread() {
+    let chart = chart();
+    let (held, mut control, mut worker, mut out) = rig_holding(&chart);
+    let weak = std::sync::Arc::downgrade(&held);
+    drop(held);
+    assert!(
+        weak.upgrade().is_some(),
+        "the engine and the source hold it"
+    );
+    answered(&mut worker, &mut out, || control.unload()).unwrap();
+    assert_eq!(worker.engine().bank().stored_count(), 0);
+    assert!(weak.upgrade().is_none(), "the installed bank was kept");
+}
+
+/// U2, U4: an unload the stalled audio thread does not answer times out
+/// and stays outstanding: the next is refused (`Busy`) and sends nothing.
+#[test]
+fn an_unload_timeout_leaves_it_outstanding() {
+    let chart = chart();
+    let (_held, mut control, _worker, _out) = rig_holding(&chart);
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    assert_eq!(control.unload(), Err(game::AudioLoadError::Busy));
+}
+
+/// U3: the answer to an unload that timed out comes back late, holding the
+/// bank it replaced; the next unload frees it first, then goes through.
+#[test]
+fn a_late_unload_answer_is_freed_by_the_next_unload() {
+    let chart = chart();
+    let (held, mut control, mut worker, mut out) = rig_holding(&chart);
+    let weak = std::sync::Arc::downgrade(&held);
+    drop(held);
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    // The stalled thread recovers and answers, late.
+    worker.step(&mut out).unwrap();
+    assert!(weak.upgrade().is_some(), "the late answer holds it");
+    answered(&mut worker, &mut out, || control.unload()).unwrap();
+    assert!(weak.upgrade().is_none(), "the late answer was kept");
+}
+
+/// B11: an install that timed out takes effect late; the next unload frees
+/// that late answer, the bank it replaced and the source of the one it
+/// installed with it, then takes the installed one away too.
+#[test]
+fn an_install_timeout_is_freed_by_the_next_unload() {
+    let chart = chart();
+    let (held, mut control, mut worker, mut out) = rig_holding(&chart);
+    let old = std::sync::Arc::downgrade(&held);
+    drop(held);
+    let new = bank(&chart);
+    let installed = std::sync::Arc::downgrade(&new);
+    assert_eq!(
+        control.load(new, audio::BgmSchedule::new(chart.bgm.clone())),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    worker.step(&mut out).unwrap();
+    assert!(installed.upgrade().is_some(), "taken late");
+    answered(&mut worker, &mut out, || control.unload()).unwrap();
+    assert!(old.upgrade().is_none(), "the bank the install replaced");
+    assert!(installed.upgrade().is_none(), "the bank installed late");
+}
+
+/// U5: once the audio thread is gone, an unload is refused as gone.
+#[test]
+fn an_unload_after_the_worker_is_gone_is_gone() {
+    let chart = chart();
+    let (_held, mut control, worker, _out) = rig_holding(&chart);
+    drop(worker);
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Gone))
+    );
+}
+
+/// V1, through the control: the decision tone started before an unload
+/// sounds on in the step that takes it. The unload is sent while the
+/// worker is not stepped (it times out, still queued), so the tone has
+/// sounded one step when the unload lands, whatever the scheduling.
+#[test]
+fn the_decision_tone_survives_an_unload() {
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    control.play_tone();
+    worker.step(&mut out).unwrap();
+    assert!(worker.engine().tone_sounding());
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    let from = out.samples().len();
+    worker.step(&mut out).unwrap();
+    assert_eq!(worker.engine().bank().stored_count(), 0, "the unload taken");
+    assert!(worker.engine().tone_sounding());
+    assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
+}
+
+/// V5: with a load pending (sent, timed out, still in the control queue),
+/// the decision tone asked for starts in the very step that takes the load:
+/// it does not wait behind the queue.
+#[test]
+fn the_decision_tone_starts_with_a_load_pending() {
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    control.play_tone();
+    let from = out.samples().len();
+    worker.step(&mut out).unwrap();
+    assert_eq!(worker.engine().bank().stored_count(), 0, "the load taken");
+    assert!(worker.engine().tone_sounding());
+    assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
+}

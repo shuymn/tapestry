@@ -23,6 +23,8 @@ mod args;
 mod attempt_context;
 mod audio_side;
 mod background;
+#[cfg(feature = "dev-tools")]
+mod bank_witness;
 mod bests;
 mod carry;
 mod controls;
@@ -1652,6 +1654,10 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         decodes: None,
         #[cfg(test)]
         after_bank: None,
+        #[cfg(test)]
+        unload_fault: None,
+        #[cfg(feature = "dev-tools")]
+        witness: crate::bank_witness::BankWitness::new(),
     });
     // Each chart of a scenario has its input chosen as it loads
     // (`AppRig::configure`), from autoplay's session.

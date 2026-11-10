@@ -1576,6 +1576,7 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
            for _, m in ipairs({ \"main_state\", \"timer_util\", \"event_util\" }) do\n\
              assert(next(require(m)) == nil, m)\n\
            end\n\
+           assert(require(\"main_state\").offset == nil, \"offset\")\n\
            return { type = 0 }\n\
          end\n\
          local ms = require(\"main_state\")\n\
@@ -1586,8 +1587,12 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
     )]);
     let h = header(&d).unwrap();
     // Each pinned name is a function in its module, and calling it is
-    // refused as reading play state.
+    // refused as reading play state; `offset` answers from the
+    // configuration (`offset_answers_the_configuration`).
     for (index, &(module, api)) in HOST_APIS.iter().enumerate() {
+        if api == "offset" {
+            continue;
+        }
         let d = folder(&[(
             "s.luaskin",
             &format!(
@@ -2436,4 +2441,106 @@ fn a_mixed_note_part_array_is_refused() {
     assert_eq!(why(import(&mixed)), LuaWhy::Mixed);
     let mixed = lanes(&format!("{{ {deco} }}"), "{ \"x\", n = 1 }");
     assert_eq!(why(import(&mixed)), LuaWhy::Mixed);
+}
+
+/// A header declaring offsets 71 (`G`), 72 (`H`) and 73 (no name).
+const OFFSETS: &str = "offset = { { name = \"G\", id = 71, x = true, y = true, w = true, h = true, r = true, a = true },\n\
+    { name = \"H\", id = 72, w = true }, { id = 73, x = true } },";
+
+/// The configured pass's `main_state.offset(id)`, its six fields written
+/// out as `tostring` writes them (`3`, an integer; `3.0`, a float).
+const FIELDS: &str = "local ms = require(\"main_state\") \
+    local function f(id) local t = ms.offset(id) \
+    return tostring(t.x) .. \",\" .. tostring(t.y) .. \",\" .. tostring(t.w) .. \",\" \
+    .. tostring(t.h) .. \",\" .. tostring(t.r) .. \",\" .. tostring(t.a) end";
+
+/// [`Config::defaults`] of `h` with offsets 71 = (1..6), 73 = (7..12) and
+/// 74 = 9s; 74 is not declared.
+fn offsets_configured(h: &LuaHeader) -> Config {
+    let mut c = Config::defaults(h.header());
+    let v = |a: [i32; 6]| OffsetValue {
+        x: a[0],
+        y: a[1],
+        w: a[2],
+        h: a[3],
+        r: a[4],
+        a: a[5],
+    };
+    c.offsets.insert(71, v([1, 2, 3, 4, 5, 6]));
+    c.offsets.insert(73, v([7, 8, 9, 10, 11, 12]));
+    c.offsets.insert(74, v([9; 6]));
+    c
+}
+
+/// s7-06f-design.md F1, F2: the configured pass's `main_state.offset(n)`
+/// is the configured offset of a declared id, named or not, as integers;
+/// zeros for an unconfigured declared id and for any undeclared id in 0 to
+/// 199, a configured one included.
+#[test]
+fn offset_answers_the_configuration() {
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            OFFSETS,
+            &format!(
+                "{FIELDS}\n\
+                 assert(f(71) == \"1,2,3,4,5,6\", \"71 \" .. f(71))\n\
+                 assert(f(73) == \"7,8,9,10,11,12\", \"73 \" .. f(73))\n\
+                 for _, id in ipairs({{ 72, 0, 199, 74 }}) do\n\
+                   assert(f(id) == \"0,0,0,0,0,0\", id .. \" \" .. f(id))\n\
+                 end\n{DRAW_I}"
+            ),
+        ),
+    )]);
+    let h = header(&d).unwrap();
+    common::lua_play(&h, &offsets_configured(&h), &Cancel::new()).unwrap();
+}
+
+/// s7-06f-design.md F3: an id past the source's array, or an argument that
+/// is not a Lua integer, refuses the skin at its call, also inside
+/// `pcall`: the refusal is a recorded fault, not an error Lua recovers.
+#[test]
+fn offset_outside_its_range_or_not_an_integer_refuses_the_skin() {
+    for arg in ["-1", "200", "71.5", "71.0", "\"71\"", "nil", "true"] {
+        for call in [
+            format!("ms.offset({arg})"),
+            format!("local ok = pcall(ms.offset, {arg})"),
+        ] {
+            let d = folder(&[(
+                "s.luaskin",
+                &skin(
+                    OFFSETS,
+                    &format!("local ms = require(\"main_state\") {call}\n{DRAW_I}"),
+                ),
+            )]);
+            let h = header(&d).unwrap();
+            let r = common::lua_play(&h, &offsets_configured(&h), &Cancel::new());
+            assert_eq!(
+                located(r),
+                (LuaWhy::FactArgument, "s.luaskin".into(), 6),
+                "{call}"
+            );
+        }
+    }
+}
+
+/// s7-06f-design.md F4: each call builds a new table; writing to one
+/// changes neither the next answer nor `skin_config.offset`.
+#[test]
+fn offset_tables_are_fresh() {
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            OFFSETS,
+            &format!(
+                "local ms = require(\"main_state\")\n\
+                 local t = ms.offset(71)\n\
+                 t.w = 99\n\
+                 assert(ms.offset(71).w == 3, \"fresh\")\n\
+                 assert(skin_config.offset[\"G\"].w == 3, \"configuration\")\n{DRAW_I}"
+            ),
+        ),
+    )]);
+    let h = header(&d).unwrap();
+    common::lua_play(&h, &offsets_configured(&h), &Cancel::new()).unwrap();
 }

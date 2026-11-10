@@ -93,6 +93,9 @@ pub struct Survey {
     /// The screen's runtime run for one frame over a state whose fields
     /// are all 0, when the import routed a callback to it.
     pub runtime: Option<RuntimeFrame>,
+    /// An imported skin's gauge widgets: each one's segments and motion,
+    /// written out (dev-tools; empty without).
+    pub gauges: Vec<(u16, String)>,
 }
 
 /// One runtime frame of a surveyed skin (docs/stage3.md S7-07): a first
@@ -751,6 +754,15 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
         imported.skin.ops().total(),
         imported.skin.program_callbacks(),
     ));
+    #[cfg(feature = "dev-tools")]
+    {
+        s.gauges = imported
+            .skin
+            .gauge_shapes()
+            .into_iter()
+            .map(|(segments, motion)| (segments, format!("{motion:?}")))
+            .collect();
+    }
     for n in &imported.report.notes {
         *s.notes.entry(note(&n.kind)).or_default() += 1;
     }
