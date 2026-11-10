@@ -83,6 +83,8 @@ pub use overlay::{OVERLAY_RUNS, OVERLAY_SPRITES};
 pub use projection::{ClipError, ClipTable, MAX_CLIPS, Projection};
 #[cfg(any(test, feature = "dev-tools"))]
 pub use renderer::UploadTiming;
+#[cfg(feature = "dev-tools")]
+pub use renderer::take_build_start;
 pub use renderer::{
     Admission, CommitError, FrameTiming, LoadingTextError, LoadingTextKey, MAX_SPRITES,
     MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError, Renderer, SHARED_TEXELS,

@@ -31,6 +31,8 @@
 
 mod exec;
 pub mod num;
+#[cfg(feature = "dev-tools")]
+pub mod trace;
 mod verify;
 
 use crate::expr::Program;
@@ -290,6 +292,9 @@ pub enum Conv {
     /// A destination's `timer`: the source's `tolong()`, run once to see
     /// whether it is on and again for its start.
     Timer,
+    /// A slider's `value`: the source's `tofloat()` ([`num::to_float`]),
+    /// stored as the `f32`'s bits.
+    Float,
 }
 
 /// One callback.
@@ -318,6 +323,7 @@ impl OutTy {
             Conv::Truthy => Self::Bool,
             Conv::Int => Self::Int,
             Conv::Timer => Self::Timer,
+            Conv::Float => Self::Float,
         }
     }
 }

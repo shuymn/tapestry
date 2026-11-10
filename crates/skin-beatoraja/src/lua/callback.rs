@@ -314,6 +314,13 @@ pub(crate) struct Consumed {
     pub(crate) element: Option<super::survey::Element>,
     /// What it lowered to, when it lowered.
     pub(crate) lowered: Option<super::survey::Lowered>,
+    /// Its program callback, when compiled.
+    pub(crate) program: Option<u16>,
+    /// The nested part it belongs to, by object path; empty for the
+    /// destination itself.
+    pub(crate) path: String,
+    /// Its position in its `op` list for an `op` entry, 0 otherwise.
+    pub(crate) index: u32,
 }
 
 impl Analysis {

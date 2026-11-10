@@ -62,6 +62,10 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+#[doc(hidden)]
+pub mod num_scan;
+#[cfg(feature = "dev-tools")]
+pub mod replay;
 pub(crate) mod residual;
 #[cfg(test)]
 mod residual_tests;
@@ -384,6 +388,9 @@ pub(crate) struct Pass {
     pub(crate) screen: SyncRefCell<Option<runtime::Screen>>,
     /// The runtime's notes.
     pub(crate) runtime_notes: SyncRefCell<runtime::NoteBook>,
+    /// A reference's frame inputs (dev-tools, [`replay`]).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) replay: SyncRefCell<Option<replay::Frame>>,
 }
 
 /// What [`LuaHeader::timed`] gives: the stages' times of an import, or
@@ -447,6 +454,8 @@ impl Pass {
             runtime: SyncCell::new(false),
             screen: SyncRefCell::new(None),
             runtime_notes: SyncRefCell::new(runtime::NoteBook::default()),
+            #[cfg(feature = "dev-tools")]
+            replay: SyncRefCell::new(None),
         }
     }
 
@@ -716,6 +725,10 @@ fn run_pass(pass: &Arc<Pass>, entry: &str, keep: bool) -> Result<Converted, Stop
         let executed = std::time::Instant::now();
         let converted = run.map(|(values, id)| {
             let value = values.into_iter().next().unwrap_or(Value::Nil);
+            #[cfg(feature = "dev-tools")]
+            if replay::wanted() && pass.bridge.is_some() {
+                let _ = lua.set_named_registry_value(replay::SKIN_KEY, value.clone());
+            }
             let modules = pass.modules.borrow().clone();
             convert::convert(&lua, pass, value, &id, modules)
                 .map(|(arena, top, functions)| (arena, top, id, functions))
@@ -730,6 +743,9 @@ fn run_pass(pass: &Arc<Pass>, entry: &str, keep: bool) -> Result<Converted, Stop
             && pass
                 .facts
                 .is_some_and(|f| matches!(f.scene, ScreenKind::Selection | ScreenKind::Result));
+        // The reference keeps a play skin's configured pass too.
+        #[cfg(feature = "dev-tools")]
+        let keep = keep || (replay::wanted() && pass.bridge.is_some());
         let converted = match converted {
             Ok(Ok((arena, top, entry, functions))) if keep => Ok(Ok(Converted {
                 arena,
@@ -960,6 +976,46 @@ impl LuaHeader {
         crate::import::ledger::recording(|| self.import(config, facts, cancel))
     }
 
+    /// [`Self::import`] as production runs it, with what it decided for
+    /// each consumer occurrence and each destination ([`replay::Recorded`],
+    /// dev-tools).
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses.
+    #[cfg(feature = "dev-tools")]
+    pub fn import_recorded(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> (Result<LuaOutcome, ImportError>, replay::Recorded) {
+        replay::recording(|| self.import(config, facts, cancel))
+    }
+
+    /// [`Self::import_recorded`] with the configured pass's VM kept as the
+    /// reference's ([`replay::ReferenceVm`], dev-tools): a play skin only,
+    /// `None` otherwise or when the import did not complete.
+    ///
+    /// # Errors
+    ///
+    /// What [`Self::import`] refuses.
+    #[cfg(feature = "dev-tools")]
+    pub fn import_reference(
+        &self,
+        config: &Config,
+        facts: &ImportFacts,
+        cancel: &Cancel,
+    ) -> (
+        Result<LuaOutcome, ImportError>,
+        replay::Recorded,
+        Option<replay::ReferenceVm>,
+    ) {
+        let ((out, rec), kept) =
+            replay::keeping(|| replay::recording(|| self.import(config, facts, cancel)));
+        (out, rec, kept.map(replay::ReferenceVm::new))
+    }
+
     /// The header, which [`Config`]s are made against.
     #[must_use]
     pub fn header(&self) -> &Header {
@@ -1173,6 +1229,7 @@ impl LuaHeader {
                 callbacks = an.outcomes.borrow().clone();
                 #[cfg(feature = "dev-tools")]
                 {
+                    replay::record(&def.arena, an);
                     records = survey::records(&def.arena, an, r.is_ok());
                 }
             }
@@ -1186,13 +1243,23 @@ impl LuaHeader {
                 .map(|an| an.runtime.take())
                 .unwrap_or_default();
             if let Some(kept) = def.arena.lua.as_deref_mut().and_then(|l| l.kept.take()) {
-                if r.is_ok() {
-                    match runtime::ScreenRuntime::new(slot, kept, sites) {
+                #[cfg(feature = "dev-tools")]
+                let kept = if replay::wanted() && slot == ScreenKind::Play {
+                    replay::stash(kept);
+                    None
+                } else {
+                    Some(kept)
+                };
+                #[cfg(not(feature = "dev-tools"))]
+                let kept = Some(kept);
+                match kept {
+                    Some(kept) if r.is_ok() => match runtime::ScreenRuntime::new(slot, kept, sites)
+                    {
                         Ok(rt) => runtime = rt,
                         Err(e) => r = Err(e),
-                    }
-                } else {
-                    kept.close();
+                    },
+                    Some(kept) => kept.close(),
+                    None => {}
                 }
             }
             r.map_err(Stop::Fault)

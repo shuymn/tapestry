@@ -160,6 +160,16 @@ pub(crate) struct NumberValue {
     pub(crate) deviates: bool,
 }
 
+/// A play slider's compiled `value`, not yet kept in the program
+/// ([`Cx::slider_value`], [`Cx::keep_slider_value`]).
+pub(crate) struct SliderValue {
+    prog: Compiled,
+    /// The element's role: its base, raised by a critical read.
+    pub(crate) role: Role,
+    pub(crate) deviates: bool,
+    at: (u32, u32),
+}
+
 impl NumberValue {
     pub(crate) fn of(v: property::Value) -> Self {
         Self {
@@ -437,9 +447,12 @@ impl Lower<'_> {
         match name {
             // The gauge and the judgments are play's alone.
             "gauge_type" | "judge" if !play => Err(unmapped()),
+            // On play no image index is bridged yet (`event_index(55)`, the
+            // speed policy, is S10-13's): named with its id.
+            "event_index" if play => Err(unmapped()),
             // An image index the selection profile bridges, as an image's
             // or an image set's `ref` reads it: -1 (nothing) to 10.
-            "event_index" if !play => {
+            "event_index" => {
                 let id = id.ok_or_else(unmapped)?;
                 match property::index_in(self.kind, id) {
                     IndexProp::Selection(src) => {
@@ -1348,12 +1361,29 @@ impl Cx<'_> {
         role: Role,
         d: (Disposition, Option<Unsupported>),
     ) {
-        self.record(at, field, role, d, None);
+        self.record(at, field, role, d, (None, None));
+    }
+
+    /// [`Self::outcome`] of a callback compiled as program callback `k`.
+    fn compiled(&self, at: (u32, u32), field: &'static str, role: Role, k: u16) {
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Compiled, None),
+            (None, Some(k)),
+        );
     }
 
     /// [`Self::outcome`] of callable `c` at node `id`, lowered to `l`.
     fn lowered_outcome(&self, at: (u32, u32), field: &'static str, role: Role, l: &Lowered) {
-        self.record(at, field, role, (Disposition::Lowered, None), Some(l));
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Lowered, None),
+            (Some(l), None),
+        );
     }
 
     /// [`Self::outcome`]'s work, with what the callback lowered to, if it
@@ -1364,7 +1394,7 @@ impl Cx<'_> {
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
-        lowered: Option<&Lowered>,
+        (lowered, program): (Option<&Lowered>, Option<u16>),
     ) {
         let Some(an) = self.analysis() else {
             return;
@@ -1383,14 +1413,27 @@ impl Cx<'_> {
                 disposition: d,
                 why,
                 element: self.element.clone(),
+                // A value belongs to the definition (`def`), the other
+                // consumers to the destination; a nested part has its own
+                // path.
+                path: match (self.part_path.as_str(), field) {
+                    ("", "value") => "def".to_owned(),
+                    (p, _) => p.to_owned(),
+                },
+                index: if field == "op" {
+                    self.op_positions.get(&id).copied().unwrap_or(u32::MAX)
+                } else {
+                    0
+                },
                 lowered: lowered.map(|l| crate::lua::survey::Lowered {
                     src: l.src.clone(),
                     guards: l.guards.clone(),
                     constant: l.constant,
                 }),
+                program,
             });
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, why, lowered);
+        let _ = (id, field, role, why, lowered, program);
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -1516,6 +1559,11 @@ impl Cx<'_> {
                     compile::slots(an, &mut l, &res, &mut slots)?;
                     return compile::compile(an, &mut l, &res, conv, root, &slots).map(Err);
                 }
+                // A slider's value is a float, which no expression is: the
+                // program takes it (play only, [`Cx::value_slider`]).
+                if conv == Conv::Float {
+                    return compile::compile(an, &mut l, &res, conv, root, &[]).map(Err);
+                }
                 match l.emit_root(&res, conv) {
                     Ok(src) => Ok(Ok(src)),
                     Err(Stop::Unsupported(_)) if program => {
@@ -1629,16 +1677,19 @@ impl Cx<'_> {
                     "value",
                     role,
                     (Disposition::Lowered, None),
-                    Some(&Lowered {
-                        src: format!("{fold:?}"),
-                        guards: Vec::new(),
-                        part: None,
-                        essential: None,
-                        deviates: false,
-                        known: None,
-                        #[cfg(feature = "dev-tools")]
-                        constant: matches!(fold, TextFold::Literal(_)),
-                    }),
+                    (
+                        Some(&Lowered {
+                            src: format!("{fold:?}"),
+                            guards: Vec::new(),
+                            part: None,
+                            essential: None,
+                            deviates: false,
+                            known: None,
+                            #[cfg(feature = "dev-tools")]
+                            constant: matches!(fold, TextFold::Literal(_)),
+                        }),
+                        None,
+                    ),
                 );
                 Ok(Ok(fold))
             }
@@ -1778,7 +1829,7 @@ impl Cx<'_> {
             }
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
-                    self.outcome((c, id), field, role, (Disposition::Compiled, None));
+                    self.compiled((c, id), field, role, k);
                     *deviates |= l.deviates;
                     conds.push(format!("lua.{k}"));
                     return Ok(true);
@@ -1841,7 +1892,7 @@ impl Cx<'_> {
         // ([`Self::gate_by_value`]), then its own conditions.
         let gate: Vec<&str> = match ty {
             OutTy::Bool => self.value_gate.as_deref(),
-            OutTy::Int | OutTy::Timer => None,
+            OutTy::Int | OutTy::Timer | OutTy::Float => None,
         }
         .into_iter()
         .chain(gate.iter().map(String::as_str))
@@ -1944,7 +1995,7 @@ impl Cx<'_> {
                     .unwrap_or(base);
                 match self.program(prog, None, None, at)? {
                     Ok(k) => {
-                        self.outcome((c, id), "value", role, (Disposition::Compiled, None));
+                        self.compiled((c, id), "value", role, k);
                         return Ok(Some(NumberValue {
                             expr: format!("lua.{k}"),
                             guard: Some(format!("lua.{k}.ok")),
@@ -1976,8 +2027,95 @@ impl Cx<'_> {
                 deviates: false,
             }));
         }
-        if role != Role::Decorative || scan.unresolved.is_some() {
-            let why = match (role, scan.unresolved) {
+        self.drop_value((c, id), at, role, scan.unresolved, why)?;
+        Ok(None)
+    }
+
+    /// A play slider's `value` callback at node `id`, for the slider at
+    /// `at` in `base`: compiled to a float for the program but not kept,
+    /// with the element's role, `base` raised to a critical part a read
+    /// shows (the whole element then follows the critical dependency
+    /// rules); or `None` once the slider is dropped with its note, a
+    /// critical one, or one whose role scan resolves not every id or
+    /// callee, refusing instead, as a number's value does
+    /// ([`Self::value_callback`]). The caller keeps it
+    /// ([`Self::keep_slider_value`]) only once the element is retained, so
+    /// a slider dropped for another field leaves no callback.
+    pub(super) fn slider_value(
+        &mut self,
+        at: Span,
+        id: u32,
+        base: Role,
+    ) -> Result<Option<SliderValue>, ImportError> {
+        let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
+        let (why, scan) = match self.lower(id, Conv::Float) {
+            Ok(Lowering::Compiled(l, prog)) => {
+                let role = l.part.map_or(base, Role::Critical);
+                return Ok(Some(SliderValue {
+                    prog,
+                    role,
+                    deviates: l.deviates,
+                    at: (c, id),
+                }));
+            }
+            // A float has no expression: `lower` never lowers one.
+            Ok(Lowering::Lowered(l)) => (
+                Unsupported::Type,
+                Scan {
+                    part: l.part,
+                    unresolved: None,
+                },
+            ),
+            Ok(Lowering::Unsupported(why, scan)) => (why, scan),
+            Err(e) => {
+                self.outcome((c, id), "value", base, (Disposition::Refused, None));
+                return Err(e);
+            }
+        };
+        self.drop_value(
+            (c, id),
+            at,
+            self.scan_role(scan.part, base),
+            scan.unresolved,
+            why,
+        )?;
+        Ok(None)
+    }
+
+    /// Slider value `v` kept in the program, for the retained slider at
+    /// `at`: its callback's index, or `None` once the slider is dropped
+    /// past the program's limits (refused when critical).
+    pub(super) fn keep_slider_value(
+        &mut self,
+        v: SliderValue,
+        at: Span,
+    ) -> Result<Option<u16>, ImportError> {
+        match self.program(v.prog, None, None, at)? {
+            Ok(k) => {
+                self.compiled(v.at, "value", v.role, k);
+                Ok(Some(k))
+            }
+            Err(why) => {
+                self.drop_value(v.at, at, v.role, None, why)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// A `value` callback (`c`, node `id`) that gives no value, for the
+    /// element at `at` in `role`: refused when the role is not decorative
+    /// or `unresolved` names what the role scan could not resolve,
+    /// otherwise dropped with its note.
+    fn drop_value(
+        &mut self,
+        (c, id): (u32, u32),
+        at: Span,
+        role: Role,
+        unresolved: Option<&'static str>,
+        why: Unsupported,
+    ) -> Result<(), ImportError> {
+        if role != Role::Decorative || unresolved.is_some() {
+            let why = match (role, unresolved) {
                 (Role::Decorative, Some(what))
                     if !matches!(why, Unsupported::Interference | Unsupported::Writes) =>
                 {
@@ -1995,8 +2133,7 @@ impl Cx<'_> {
             (Disposition::Replaced(why), Some(why)),
         );
         let note = self.callback_note("value", why);
-        self.drop_el(Role::Decorative, at, note)?;
-        Ok(None)
+        self.drop_el(Role::Decorative, at, note)
     }
 
     /// Draw callback `prog`, after the element's conditions `conds`:
@@ -2205,7 +2342,7 @@ impl Cx<'_> {
                                     r.slots = ids;
                                     r.consumers.push((k, role, (c, id), at));
                                 }
-                                self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
+                                self.compiled((c, id), "timer", role, k);
                                 return Ok(Ok(TimerRef::Output(k)));
                             }
                             Err(why) => why,

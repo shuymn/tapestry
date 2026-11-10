@@ -971,17 +971,20 @@ impl PlayerRig<'_> {
     }
 
     /// The Lua sandbox's counters at `when` (dev-tools): its VMs open, the
-    /// jobs started, the passes and the instruction steps run, which stay
+    /// jobs started, the passes and the instruction steps run, and the
+    /// screens' runtime frames and forced collections, which all stay
     /// still from recording's open to the play's end.
     #[cfg(feature = "dev-tools")]
     fn print_lua(when: &str) {
         use skin_beatoraja::vm_hooks;
         println!(
-            "dev: lua at {when}: live {} jobs {} passes {} steps {}",
+            "dev: lua at {when}: live {} jobs {} passes {} steps {} frames {} collections {}",
             vm_hooks::live(),
             crate::imports::jobs_started(),
             vm_hooks::passes(),
-            vm_hooks::steps()
+            vm_hooks::steps(),
+            crate::screens::runtime_frames(),
+            crate::screens::collections()
         );
     }
 

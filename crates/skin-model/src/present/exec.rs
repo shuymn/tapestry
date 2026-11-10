@@ -8,8 +8,9 @@
 //! instruction steps once, so an invocation ends within its length. A
 //! `Ret`, or the end of the span with nil, gives the result, which is
 //! converted as its consumer converts it ([`super::num::to_bool`],
-//! [`super::num::to_int`]): a Lua error gives the source's caught value
-//! (false, 0) with `ok` 1; an unavailable read or an overflow gives `ok` 0;
+//! [`super::num::to_int`], [`super::num::to_float`], a float stored as
+//! its bits): a Lua error gives the source's caught value (false, 0, `0f`)
+//! with `ok` 1; an unavailable read or an overflow gives `ok` 0;
 //! an integer result of `i32::MIN` or `i32::MAX` gives `ok` 0, as the
 //! source's number draws nothing for those (`SkinNumber.java:139-143` at
 //! `0.8.9`). No heap, no recursion, no indexing.
@@ -76,9 +77,9 @@ pub struct Io<'a, 'b> {
     pub outs: &'a mut [i32],
     /// The timer callbacks' starts, in order, `None` while off.
     pub timers: &'a mut [Option<TimeUs>],
-    /// Whether callbacks with slots run: not in a section attempt, where
-    /// the source reads score state cached from an earlier practice round
-    /// that tapestry does not carry; there they are skipped, their timers
+    /// Whether callbacks with slots run: on a fresh attempt, and on a
+    /// carried one whose slots are valid and whose program is carry-safe
+    /// ([`crate::Continuation`]); otherwise they are skipped, their timers
     /// off.
     pub slots: bool,
 }
@@ -104,9 +105,32 @@ impl Present {
         let mut timer = 0_usize;
         for (k, cb) in self.def.callbacks.iter().enumerate() {
             let slotted = self.slotted.get(k).copied().unwrap_or(true);
-            let go = (io.slots || !slotted) && self.gated(cb, io.state, io.outs);
+            let held = if io.slots || !slotted {
+                self.held(cb, io.state, io.outs)
+            } else {
+                Some(Held::Slots)
+            };
+            let go = held.is_none();
+            #[cfg(feature = "dev-tools")]
+            let id = u16::try_from(k).unwrap_or(u16::MAX);
+            #[cfg(feature = "dev-tools")]
+            if let Some(h) = held {
+                super::trace::record(|| super::trace::Event::Skipped {
+                    k: id,
+                    why: h.skip(),
+                });
+            }
             let (value, ok) = if cb.conv == Conv::Timer {
-                let start = if go { self.timer(cb, io) } else { None };
+                let start = if go {
+                    self.timer(
+                        cb,
+                        io,
+                        #[cfg(feature = "dev-tools")]
+                        id,
+                    )
+                } else {
+                    None
+                };
                 if let Some(t) = io.timers.get_mut(timer) {
                     *t = start.and_then(|s| s);
                 }
@@ -114,7 +138,19 @@ impl Present {
                 (i32::from(start.is_some()), go)
             } else if go {
                 let r = self.invoke(cb, io.state, io.clock, io.bank);
-                convert(cb.conv, r)
+                let out = convert(cb.conv, r);
+                #[cfg(feature = "dev-tools")]
+                super::trace::record(|| super::trace::Event::Ran {
+                    k: id,
+                    call: 1,
+                    result: r,
+                    conv: if cb.conv == Conv::Truthy {
+                        super::trace::Converted::Bool(out.0 != 0)
+                    } else {
+                        super::trace::Converted::Int(out.0, out.1)
+                    },
+                });
+                out
             } else {
                 (0, false)
             };
@@ -132,26 +168,55 @@ impl Present {
     /// off or no value; otherwise `Some` of its start against the frame,
     /// `None` within when the second gave no value or the elapsed time is
     /// negative.
-    fn timer(&self, cb: &CallbackDef, io: &mut Io<'_, '_>) -> Option<Option<TimeUs>> {
-        let first = start_of(self.invoke(cb, io.state, io.clock, io.bank))?;
-        if first == i64::MIN {
-            return None;
-        }
-        let Some(start) = start_of(self.invoke(cb, io.state, io.clock, io.bank)) else {
-            return Some(None);
+    fn timer(
+        &self,
+        cb: &CallbackDef,
+        io: &mut Io<'_, '_>,
+        #[cfg(feature = "dev-tools")] k: u16,
+    ) -> Option<Option<TimeUs>> {
+        let call = |n: u8, io: &mut Io<'_, '_>| {
+            let r = self.invoke(cb, io.state, io.clock, io.bank);
+            let v = start_of(r);
+            #[cfg(feature = "dev-tools")]
+            super::trace::record(|| super::trace::Event::Ran {
+                k,
+                call: n,
+                result: r,
+                conv: super::trace::Converted::Long(v),
+            });
+            #[cfg(not(feature = "dev-tools"))]
+            let _ = n;
+            v
         };
-        let elapsed = elapsed_ms(io.clock.state_us, start);
-        if elapsed < 0 {
-            return Some(None);
-        }
-        let us = elapsed.min(i64::from(MAX_ELAPSED_MS)).saturating_mul(1_000);
-        Some(Some(TimeUs(io.clock.now.0.saturating_sub(us))))
+        let first = call(1, io);
+        let out = match first {
+            None => None,
+            Some(i64::MIN) => None,
+            Some(_) => match call(2, io) {
+                None => Some((None, None)),
+                Some(start) => Some((Some(start), Some(elapsed_ms(io.clock.state_us, start)))),
+            },
+        };
+        let installed = out.and_then(|(_, elapsed)| {
+            let elapsed = elapsed.filter(|&e| e >= 0)?;
+            let us = elapsed.min(i64::from(MAX_ELAPSED_MS)).saturating_mul(1_000);
+            Some(TimeUs(io.clock.now.0.saturating_sub(us)))
+        });
+        #[cfg(feature = "dev-tools")]
+        super::trace::record(|| super::trace::Event::Timer {
+            k,
+            on: out.is_some(),
+            start: out.and_then(|(s, _)| s),
+            elapsed_ms: out.and_then(|(_, e)| e),
+            installed,
+        });
+        out.map(|_| installed)
     }
 
-    /// Whether `cb` runs this frame: the callback it follows allows it
-    /// (a number's value given, a draw true, a timer on) and its gate
-    /// holds.
-    fn gated(&self, cb: &CallbackDef, state: &State<'_>, outs: &[i32]) -> bool {
+    /// Why `cb` does not run this frame, if it does not: the callback it
+    /// follows does not allow it (a number's value given, a draw true, a
+    /// timer on), or its gate does not hold.
+    fn held(&self, cb: &CallbackDef, state: &State<'_>, outs: &[i32]) -> Option<Held> {
         if let Some(a) = cb.after {
             let at = usize::from(a).saturating_mul(2);
             let ok = outs.get(at.saturating_add(1)) == Some(&1);
@@ -159,20 +224,22 @@ impl Present {
             let allows = match self.def.callbacks.get(usize::from(a)).map(|c| c.conv) {
                 Some(Conv::Int) => ok,
                 Some(Conv::Truthy | Conv::Timer) => ok && value,
-                None => false,
+                // Never an `after` target (V4).
+                Some(Conv::Float) | None => false,
             };
             if !allows {
-                return false;
+                return Some(Held::After);
             }
         }
-        match cb.gate {
+        let open = match cb.gate {
             None => true,
             Some(g) => self
                 .def
                 .reads
                 .get(usize::from(g))
                 .is_some_and(|r| read(r, state) == Ok(Val::Bool(true))),
-        }
+        };
+        (!open).then_some(Held::Gate)
     }
 
     /// One invocation of `cb`: its result or why it gave none.
@@ -253,6 +320,26 @@ impl Present {
     }
 }
 
+/// Why a callback does not run this frame.
+#[derive(Clone, Copy)]
+enum Held {
+    /// Its slots do not run on this attempt.
+    Slots,
+    After,
+    Gate,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Held {
+    const fn skip(self) -> super::trace::Skip {
+        match self {
+            Self::Slots => super::trace::Skip::SlotsOff,
+            Self::After => super::trace::Skip::After,
+            Self::Gate => super::trace::Skip::Gate,
+        }
+    }
+}
+
 /// A program timer's elapsed ms at the state clock `state_us` from its
 /// start `start` (µs): `state_us / 1000 - start / 1000`, the source's two
 /// `long` divisions, each truncating toward zero (`TimerProperty.java:8-10`,
@@ -273,7 +360,17 @@ fn start_of(r: Result<Val, Fail>) -> Option<i64> {
     }
 }
 
-/// Result `r` as conversion `conv` gives it, and whether it gave a value.
+/// The bits of `f`, as an output slot holds a float.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "the slot holds the bits, read back by `f32::from_bits`"
+)]
+fn f32_bits(f: f32) -> i32 {
+    f.to_bits() as i32
+}
+
+/// Result `r` as conversion `conv` gives it, and whether it gave a value:
+/// a float as its bits, a Lua error the source's caught `0f` (+0's bits).
 fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
     match (conv, r) {
         (_, Err(Fail::Unavailable | Fail::Overflow)) => (0, false),
@@ -283,6 +380,7 @@ fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
             let n = num::to_int(v);
             (n, n != i32::MIN && n != i32::MAX)
         }
+        (Conv::Float, Ok(v)) => (f32_bits(num::to_float(v)), true),
         // Run through [`Present::timer`] instead.
         (Conv::Timer, Ok(_)) => (0, false),
     }

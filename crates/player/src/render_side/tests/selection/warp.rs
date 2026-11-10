@@ -895,3 +895,33 @@ fn a_menu_page_before_selections_cleanup_leaves_the_runtime_to_the_acknowledgmen
     assert!(link.scripts().parked(ScreenKind::Selection).is_some());
     link.exit();
 }
+
+/// The whole frames (dev-tools, the S7-07d gate): a selection lifetime's
+/// frames stay together across its updates and are reported only when it
+/// ends, not at every message the render thread takes.
+#[test]
+fn a_selections_updates_keep_its_whole_frames() {
+    let _serial = crate::imports::tests::serial();
+    let (_dir, skin, script) = scripted("rt.luaskin");
+    let (link, frames) = warp_link(None);
+    link.select_with(ScreenKind::Selection, Some(skin), script)
+        .wait()
+        .unwrap();
+    link.enter_selection(1);
+    link.show_selection(update_of(1, 1, listed(SelectionPlace::All, "")));
+    let seen = frames.0.lock().unwrap().len();
+    assert!(quads_after(&frames, seen, 3).is_some());
+    let before = link.frames_probe().select;
+    assert_eq!(before.0, Some(1));
+    for revision in 2..5 {
+        link.show_selection(update_of(1, revision, listed(SelectionPlace::All, "")));
+        let seen = frames.0.lock().unwrap().len();
+        assert!(quads_after(&frames, seen, 2).is_some());
+    }
+    let after = link.frames_probe().select;
+    assert_eq!(after.0, Some(1), "kept across updates");
+    assert!(after.1 > before.1, "{before:?} then {after:?}");
+    link.leave_selection();
+    assert!(wait_until(|| link.frames_probe().select.0.is_none()));
+    link.exit();
+}

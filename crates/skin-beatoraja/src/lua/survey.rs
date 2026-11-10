@@ -463,7 +463,7 @@ fn api(a: u16) -> String {
 
 /// The label of why a callback does not convert: the importer's own
 /// constructs, host API names and numbers.
-fn unsupported(why: &Unsupported) -> String {
+pub(crate) fn unsupported(why: &Unsupported) -> String {
     match why {
         Unsupported::Construct(c) => format!("Construct {c}"),
         Unsupported::Binding(b) => format!("Binding {b}"),

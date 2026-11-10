@@ -654,6 +654,16 @@ pub struct ScreenRuntime {
     stopped: Option<Stopped>,
     over_budget: u32,
     calls: u64,
+    /// The full collections [`collect`](Self::collect) ran (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    collections: u64,
+    /// Its calls when [`collect`](Self::collect) last ran (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    collected_at: u64,
+    /// The candidate's sampled heap high-water when the VM was kept: its
+    /// header and configured passes' (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    import_peak: u64,
     #[cfg(feature = "dev-tools")]
     _open: Option<super::vm_hooks::Open>,
     permit: Option<Permit>,
@@ -744,6 +754,8 @@ impl ScreenRuntime {
                 }
             })
             .collect();
+        #[cfg(feature = "dev-tools")]
+        let import_peak = pass.ledger.counts().peak_memory;
         Ok(Some(Self {
             sites,
             at,
@@ -753,6 +765,12 @@ impl ScreenRuntime {
             stopped: None,
             over_budget: 0,
             calls: 0,
+            #[cfg(feature = "dev-tools")]
+            collections: 0,
+            #[cfg(feature = "dev-tools")]
+            collected_at: 0,
+            #[cfg(feature = "dev-tools")]
+            import_peak,
             #[cfg(feature = "dev-tools")]
             _open: open,
             permit: None,
@@ -826,6 +844,54 @@ impl ScreenRuntime {
         *self.pass.runtime_notes.borrow_mut() = book.clone();
     }
 
+    /// The VM's Lua heap now, in bytes (dev-tools: the screens' frame
+    /// probe).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn heap(&self) -> usize {
+        self._lua.used_memory()
+    }
+
+    /// The most Lua heap this VM held while it ran as the runtime, in
+    /// bytes, as sampled at each instruction step (dev-tools): `None` while
+    /// no sample rose above the import's high-water, which counts the
+    /// header pass's VM too, so the runtime's own peak is then not known.
+    /// A peak between two samples is not seen.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn runtime_peak(&self) -> Option<u64> {
+        let peak = self.pass.ledger.counts().peak_memory;
+        (peak > self.import_peak).then_some(peak)
+    }
+
+    /// Runs a full collection of the VM now (dev-tools: a stress
+    /// measurement). No skin Lua runs: the sandbox refuses finalizers.
+    /// Returns whether it ran: a stopped runtime's VM is left as it is.
+    #[cfg(feature = "dev-tools")]
+    pub fn collect(&mut self) -> bool {
+        let ran = self.stopped.is_none() && self._lua.gc_collect().is_ok();
+        if ran {
+            self.collections += 1;
+            self.collected_at = self.calls;
+        }
+        ran
+    }
+
+    /// Its calls when [`collect`](Self::collect) last ran (dev-tools): where
+    /// the collection ran against its frames.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn collected_at_calls(&self) -> u64 {
+        self.collected_at
+    }
+
+    /// The full collections [`collect`](Self::collect) ran (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn collections(&self) -> u64 {
+        self.collections
+    }
+
     /// The calls, instruction steps and host calls so far.
     #[must_use]
     pub fn counters(&self) -> Counters {
@@ -894,8 +960,8 @@ impl ScreenRuntime {
                         let out = match site.ty {
                             OutTy::Bool => i32::from(to_bool(&v)),
                             OutTy::Int => to_int(&v),
-                            // Only a play program gives a timer.
-                            OutTy::Timer => 0,
+                            // Only a play program gives a timer or a float.
+                            OutTy::Timer | OutTy::Float => 0,
                         };
                         write(fields, base, k, out);
                         CallStatus::Ok

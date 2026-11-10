@@ -282,6 +282,26 @@ pub fn to_int(a: Val) -> i32 {
     }
 }
 
+/// The source's `tofloat()` (LuaJ 3.0.2) as a slider's `value` reads it:
+/// an integer by `i2f`, a float by `d2f` (round to nearest, ties to even;
+/// past `f32` an infinity; NaN kept), nil and booleans 0. An integer here
+/// is within ±2^53, where `(n as f64) as f32` equals both `i2f` and `d2f`
+/// of its exact double. No sign is normalized: the program's values carry
+/// no −0 but the ones luaj's `d2f` gives too.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "Java's i2f and d2f round to nearest, as these casts do"
+)]
+pub fn to_float(a: Val) -> f32 {
+    match a {
+        Val::Int(n) => (n as f64) as f32,
+        Val::Float(f) => f as f32,
+        Val::Nil | Val::Bool(_) => 0.0,
+    }
+}
+
 /// The source's `tolong()` (LuaJ): an integer as it is, a float
 /// saturated to 64 bits with NaN 0 (Java's `(long)`), nil and booleans 0.
 #[must_use]

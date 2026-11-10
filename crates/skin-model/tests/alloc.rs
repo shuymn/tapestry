@@ -4167,9 +4167,92 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         vec![combo()],
         Conv::Int,
     ));
+    // Slider values (`Conv::Float`), each read by a paint's slider: the
+    // combo times 1e10, a finite value drawn and, from a combo of 2, past
+    // the bound; the combo over 0, non-finite (at 0) or NaN; a caught
+    // error; and one unavailable at a low combo.
+    let mul = |k: u16| Insn::Arith {
+        op: Arith::Mul,
+        dst: 0,
+        a: 0,
+        b: u8::try_from(k).unwrap(),
+    };
+    let floats = [
+        b.push(Cb::code(
+            vec![
+                Insn::Read { dst: 0, read: 0 },
+                Insn::Const { dst: 1, k: 0 },
+                mul(1),
+                Insn::Ret { src: 0 },
+            ],
+            vec![Val::Float(1e10)],
+            vec![combo()],
+            Conv::Float,
+        )),
+        b.push(Cb::code(
+            vec![
+                Insn::Read { dst: 0, read: 0 },
+                Insn::Const { dst: 1, k: 0 },
+                Insn::Arith {
+                    op: Arith::Div,
+                    dst: 0,
+                    a: 0,
+                    b: 1,
+                },
+                Insn::Ret { src: 0 },
+            ],
+            vec![Val::Int(0)],
+            vec![combo()],
+            Conv::Float,
+        )),
+        b.push(Cb::code(
+            vec![
+                Insn::Const { dst: 0, k: 0 },
+                Insn::Const { dst: 1, k: 1 },
+                Insn::Arith {
+                    op: Arith::Add,
+                    dst: 0,
+                    a: 0,
+                    b: 1,
+                },
+                Insn::Ret { src: 0 },
+            ],
+            vec![Val::Nil, Val::Int(1)],
+            vec![],
+            Conv::Float,
+        )),
+        b.push(Cb::code(
+            vec![Insn::Read { dst: 0, read: 0 }, Insn::Ret { src: 0 }],
+            vec![],
+            vec![read("combo", skin_model::Ty::Int, Some("combo > 5"))],
+            Conv::Float,
+        )),
+    ];
+    let sliders: Vec<CoverPaintDef> = floats
+        .iter()
+        .map(|&k| CoverPaintDef {
+            image: CoverImage::Image(0),
+            slider: Some(skin_model::Slider {
+                range: 100,
+                rate: skin_model::SliderRate::Program(k),
+                direction: skin_model::SliderDirection::Down,
+            }),
+            motion: CoverMotion::None,
+            trim: CoverTrim::None,
+            gate_track: None,
+        })
+        .collect();
     let sig = b.signature();
     let n = sig.len();
-    let elements = (0..n)
+    let paints = (0..sliders.len()).map(|p| {
+        widget(
+            Source::CoverPaint(u32::try_from(p).unwrap()),
+            track(0, Ease::Linear, End::Hold),
+            TimerRef::Builtin(timer::READY),
+            Place::SCREEN,
+        )
+    });
+    let elements = (0..n - sliders.len())
         .map(|k| {
             let mut e = widget(
                 Source::Image(0),
@@ -4184,12 +4267,16 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             ));
             e
         })
+        .chain(paints)
         .collect();
     let skin = present_support::load(
         Some(b.0),
         Vec::new(),
         elements,
-        skin_model::WidgetDefs::default(),
+        skin_model::WidgetDefs {
+            cover_paints: sliders,
+            ..skin_model::WidgetDefs::default()
+        },
     )
     .unwrap();
     let uvs = play_support::uvs(&skin);
@@ -4249,6 +4336,10 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             [true, true],
             [false, true],
             [false, true],
+            [false, true],
+            [false, true],
+            [false, true],
+            [true, true],
         ],
         "the paths each callback took"
     );

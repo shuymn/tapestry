@@ -22,10 +22,12 @@ mod object;
 pub(crate) mod ops;
 mod policy;
 mod property;
+#[cfg(feature = "dev-tools")]
+pub(crate) use property::{IndexProp, IntProp, index_in, int_in, int_named, judge_count};
 mod report;
 pub(crate) mod result;
 pub(crate) mod selection;
-mod timer;
+pub(crate) mod timer;
 mod track;
 mod widget;
 
@@ -270,6 +272,8 @@ pub fn import(
     }
     #[cfg(feature = "dev-tools")]
     ledger.publish(&mut cx);
+    #[cfg(feature = "dev-tools")]
+    cx.record_unreached_sources();
     cx.finish(files)
 }
 
@@ -495,6 +499,15 @@ pub(crate) struct Cx<'d> {
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
+    /// The nested part being read, by its object path under the
+    /// destination's definition (`def.images.2`; empty for the
+    /// destination itself), for the replay's occurrence records.
+    #[cfg(feature = "dev-tools")]
+    part_path: String,
+    /// Each `op` entry node's position in its list, for the replay's
+    /// occurrence records.
+    #[cfg(feature = "dev-tools")]
+    op_positions: HashMap<u32, u32>,
     /// A condition of the destination being read folded false, for the
     /// conversion report's ledger.
     #[cfg(feature = "dev-tools")]
@@ -549,6 +562,8 @@ impl<'d> Cx<'d> {
                 items.insert(item.op, Some(item.op) == selected);
             }
         }
+        #[cfg(feature = "dev-tools")]
+        crate::lua::replay::record_items(&items);
         let mut cx = Self {
             def,
             header,
@@ -595,6 +610,10 @@ impl<'d> Cx<'d> {
             ignored_ops: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
+            #[cfg(feature = "dev-tools")]
+            part_path: String::new(),
+            #[cfg(feature = "dev-tools")]
+            op_positions: HashMap::new(),
             #[cfg(feature = "dev-tools")]
             folded: false,
             #[cfg(feature = "dev-tools")]
@@ -919,6 +938,11 @@ impl<'d> Cx<'d> {
                 return Ok(ops);
             }
             let items: Vec<u32> = self.def.arena.children(op).collect();
+            #[cfg(feature = "dev-tools")]
+            for (i, &item) in items.iter().enumerate() {
+                self.op_positions
+                    .insert(item, u32::try_from(i).unwrap_or(u32::MAX));
+            }
             for item in items {
                 match self.callback_prop(Some(item), "op")? {
                     Prop::Id(n) => ops.push(Op::Id(n)),
@@ -1862,6 +1886,44 @@ impl<'d> Cx<'d> {
             self.sources = Some(object::index(self.def, &recs, true)?);
         }
         Ok(src.and_then(|s| self.sources.as_ref().and_then(|m| m.get(s)).copied()))
+    }
+
+    /// Records what the source's loader would find of each source no
+    /// element reached (dev-tools, the reference's facts): a movie by its
+    /// extension, else whether its file exists, read through the root as
+    /// admission reads it; a glob is unknown.
+    #[cfg(feature = "dev-tools")]
+    fn record_unreached_sources(&mut self) {
+        use crate::lua::replay::{SourceFact, has_source, is_recording, record_source};
+        if !is_recording() {
+            return;
+        }
+        for rec in object::records(&self.tables, "source").to_vec() {
+            let [id] = self.def.fields(rec, ["id"]);
+            let Ok(Some(id)) = self.opt_string(id, "id") else {
+                continue;
+            };
+            if has_source(&id) {
+                continue;
+            }
+            let fact = match self.source_path(rec) {
+                Ok(Some(path)) if asset::is_movie(&path) => SourceFact::Movie,
+                Ok(Some(path)) => match self.choices.substitute(&path) {
+                    asset::Path::File(p) => {
+                        let name = asset::resolve(&self.entry_dir, &p);
+                        if self.def.root().read(&name, u64::MAX).is_ok() {
+                            SourceFact::Loaded
+                        } else {
+                            SourceFact::Missing
+                        }
+                    }
+                    asset::Path::Missing => SourceFact::Missing,
+                    asset::Path::Glob => SourceFact::Unknown,
+                },
+                _ => SourceFact::Missing,
+            };
+            record_source(&id, fact);
+        }
     }
 
     /// Source record `rec`'s `path`.
