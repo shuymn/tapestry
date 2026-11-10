@@ -453,9 +453,14 @@ pub struct Loaded {
     /// from its original tempos, so a speed change keeps it; `None` when
     /// its histogram is refused.
     main: Option<bms_model::Tempo>,
-    /// The play's best and target, read when it began
-    /// ([`begin_play`](Self::begin_play)).
+    /// The play's best and target, read for it once
+    /// ([`read_score`](Self::read_score)).
     score: ScoreBasis,
+    /// The coming play's best as read, under the play preset's SHA-256:
+    /// kept until that play is finished, so a loading opening that begins
+    /// the same play again, or prepares it before it begins, reads no
+    /// more ([`finish_play`](Self::finish_play) forgets it).
+    coming: Option<([u8; 32], BestLookup)>,
 }
 
 /// The identity of the next chart loaded.
@@ -669,6 +674,7 @@ impl PendingLoad {
                     profile: Arc::new(profile),
                     main,
                     score: ScoreBasis::default(),
+                    coming: None,
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -1329,10 +1335,13 @@ impl Loaded {
     /// chosen file's error standing when the chart loaded unless its check
     /// found a newer one; a later play only an error its check found.
     ///
-    /// The play's best is read here, once, under its key with the
-    /// refreshed preset, and its target set ([`ScoreBasis`]): every
-    /// preparation and READY rearm of the attempt keeps them, and a retry
-    /// begins again, reading a play counted since.
+    /// The play's best and target are set here ([`ScoreBasis`]), the best
+    /// read under its key with the refreshed preset unless this play read
+    /// it already under that key ([`prepare_score`](Self::prepare_score),
+    /// or an earlier begin of the same play the loading state withdrew).
+    /// Every preparation and READY rearm of the attempt keeps them; a
+    /// retry after a finished play reads again, seeing a play counted
+    /// since.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
@@ -1354,7 +1363,8 @@ impl Loaded {
     /// sink, a failed read) 0, not known. The target is
     /// [`score_target`] of the player's setting over the chart's judged
     /// notes and that best, a chart that declares `#RANDOM` or
-    /// `#SETRANDOM` a random one.
+    /// `#SETRANDOM` a random one. The coming play reads at most once per
+    /// key: a best already read for it under the same key is taken again.
     fn read_score(&mut self) -> ScoreBasis {
         if self.practice.is_some() {
             return ScoreBasis::default();
@@ -1363,10 +1373,14 @@ impl Loaded {
             chart_sha256: self.chart_record.identity.sha256,
             preset_sha256: replay::preset_hash(&self.preset),
         };
-        let lookup = match self.parts.records.as_mut() {
-            Some(sink) => sink.best_before(&key, &self.preset),
-            None => BestLookup::Unavailable,
+        let lookup = match self.coming.take() {
+            Some((preset, lookup)) if preset == key.preset_sha256 => lookup,
+            _ => match self.parts.records.as_mut() {
+                Some(sink) => sink.best_before(&key, &self.preset),
+                None => BestLookup::Unavailable,
+            },
         };
+        self.coming = Some((key.preset_sha256, lookup.clone()));
         let (best, best_known) = match lookup {
             BestLookup::Known(score) => (score.ex.unwrap_or(0), true),
             BestLookup::KnownEmpty => (0, true),
@@ -1383,6 +1397,16 @@ impl Loaded {
             best_known,
             target: score_target(self.settings.player.target, basis.notes, best, play),
         }
+    }
+
+    /// The coming play's best and target, set before its attempt is first
+    /// prepared when that comes before the play begins: the loading state
+    /// prepares a chart's first attempt at load-ready
+    /// ([`crate::load_and_open`]), and its skin takes them from that
+    /// preparation. [`begin_play`](Self::begin_play) then reads no more
+    /// under the same key.
+    pub(crate) fn prepare_score(&mut self) {
+        self.score = self.read_score();
     }
 
     /// The play `start` stopped before recording opened (its preparation
@@ -1693,6 +1717,8 @@ impl Loaded {
     /// saves it, summarizes it through the result extension, and reports
     /// the session events.
     pub fn finish_play(&mut self, outcome: PlayOutcome) -> PlayReport {
+        // The play is over: the next one reads its best again.
+        self.coming = None;
         let PlayOutcome {
             start,
             end,

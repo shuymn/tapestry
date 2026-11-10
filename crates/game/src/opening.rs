@@ -349,6 +349,9 @@ pub fn load_and_open<R: LoadingRig>(
     loaded: &mut Loaded,
     rig: &mut R,
 ) -> Result<Leave, LiveError<R::ScreenError>> {
+    // The attempt is prepared before its play begins: its best and target
+    // are set first, and the begin reads no more under the same key.
+    loaded.prepare_score();
     let key = loaded.prep_key();
     let handle = rig.begin_preparation(loaded, key);
     let mut opener = LoadingOpener {
