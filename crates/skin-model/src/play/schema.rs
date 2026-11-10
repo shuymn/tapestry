@@ -37,6 +37,10 @@ pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
 /// down.
 pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
+/// The ranks' lower bounds in 27ths of the rate, from the top: the bands
+/// `rank.current.K` and the thresholds `rank.whole.K` read
+/// (`skin/property/BooleanPropertyFactory.java:280-288, 619-626`).
+pub const RANK_TWENTY_SEVENTHS: [u32; 8] = [24, 21, 18, 15, 12, 9, 6, 0];
 /// The largest `settings.fix_hispeed`: 4, Floating from the minimum
 /// tempo.
 pub const FIX_HISPEED_MAX: i32 = 4;
@@ -80,6 +84,18 @@ const fn count(name: &'static str, export: Export) -> Field {
             hi: MAX_COUNT,
         },
         export,
+    }
+}
+
+/// A difference of counts, either sign.
+const fn diff(name: &'static str) -> Field {
+    Field {
+        name,
+        ty: FieldTy::Int {
+            lo: -MAX_COUNT,
+            hi: MAX_COUNT,
+        },
+        export: E,
     }
 }
 
@@ -250,6 +266,32 @@ pub static PLAY: Schema = Schema {
         },
         flag("chart.stagefile", T),
         flag("chart.backbmp", T),
+        count("best.ex", E),
+        count("target.ex", E),
+        diff("best.diff"),
+        diff("target.diff"),
+        rate("best.rate_bp"),
+        rate("target.rate_bp"),
+        flag("best.valid", T),
+        int("best.rate_ppm", i32::MAX, T),
+        flag("best.reached", T),
+        flag("target.reached", T),
+        flag("rank.current.0", E),
+        flag("rank.current.1", E),
+        flag("rank.current.2", E),
+        flag("rank.current.3", E),
+        flag("rank.current.4", E),
+        flag("rank.current.5", E),
+        flag("rank.current.6", E),
+        flag("rank.current.7", E),
+        flag("rank.whole.0", E),
+        flag("rank.whole.1", E),
+        flag("rank.whole.2", E),
+        flag("rank.whole.3", E),
+        flag("rank.whole.4", E),
+        flag("rank.whole.5", E),
+        flag("rank.whole.6", E),
+        flag("rank.whole.7", E),
         Field {
             name: "display_offset.ms",
             ty: FieldTy::Int {
@@ -516,15 +558,70 @@ pub mod field {
     pub const CHART_STAGEFILE: u16 = 111;
     /// Whether the chart's back image is, as `chart.stagefile`.
     pub const CHART_BACKBMP: u16 = 112;
+    /// The play's best EX score B
+    /// ([`ScoreBasis::best`](crate::ScoreBasis::best)): 0 when known
+    /// empty, unavailable (no library, a failed read) or in a practice
+    /// round.
+    pub const BEST_EX: u16 = 113;
+    /// The play's target EX score T
+    /// ([`ScoreBasis::target`](crate::ScoreBasis::target)).
+    pub const TARGET_EX: u16 = 114;
+    /// The EX score less the best paced linearly to the judged targets,
+    /// `ex − ⌊B · p / n⌋` (`p` the judged targets, `n` the attempt's
+    /// targets; 0 at `n = 0`), clamped to ±[`MAX_COUNT`](super::MAX_COUNT).
+    /// Shown only while `best.valid`.
+    pub const BEST_DIFF: u16 = 115;
+    /// The EX score less the target paced alike, `ex − ⌊T · p / n⌋`.
+    pub const TARGET_DIFF: u16 = 116;
+    /// B's rate over the attempt's targets, `⌊10 000 · B / 2n⌋` basis
+    /// points, 0 at `n = 0`. Shown only while `best.valid`.
+    pub const BEST_RATE_BP: u16 = 117;
+    /// T's rate alike.
+    pub const TARGET_RATE_BP: u16 = 118;
+    /// Whether the values measured against the best are shown: false for a
+    /// chart that declares `#RANDOM` or `#SETRANDOM`, whose best may come
+    /// from another draw. Not whether the best was read: an unavailable
+    /// best is the empty score, shown.
+    pub const BEST_VALID: u16 = 119;
+    /// B's rate in parts per million, `⌊10⁶ · B / 2n⌋`: 0 at `n = 0` and
+    /// while `best.valid` is false. Nonzero for any best above 0 while
+    /// `2n ≤ 10⁶`, which the parser's object cap keeps.
+    pub const BEST_RATE_PPM: u16 = 120;
+    /// Whether the attempt has a judgment and its EX score is at least B.
+    pub const BEST_REACHED: u16 = 121;
+    /// Whether the attempt has a judgment and its EX score is at least T.
+    pub const TARGET_REACHED: u16 = 122;
+    /// The first of the eight current-rank flags, `rank.current.K` at
+    /// `123 + K`: the band of the rate over the judged targets, from
+    /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27 up to
+    /// the band above; see [`rank_current`].
+    pub const RANK_CURRENT: u16 = 123;
+    /// The first of the eight whole-rank flags, `rank.whole.K` at
+    /// `131 + K`: the rate over the attempt's targets at least
+    /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27; see
+    /// [`rank_whole`].
+    pub const RANK_WHOLE: u16 = 131;
     /// The display offset in whole ms, truncated toward zero as the
     /// selection screen shows it, from the frame's live presentation.
-    pub const DISPLAY_OFFSET_MS: u16 = 113;
+    pub const DISPLAY_OFFSET_MS: u16 = 139;
     /// The speed policy's hi-speed fix, as the selection screen's: 0
     /// Classic; Floating 1 from the start tempo, 2 the maximum, 3 the main
     /// and 4 the minimum.
-    pub const SETTINGS_FIX_HISPEED: u16 = 114;
+    pub const SETTINGS_FIX_HISPEED: u16 = 140;
     /// The number of fields.
-    pub const COUNT: usize = 115;
+    pub const COUNT: usize = 141;
+
+    /// The `rank.current.K` slot, `k` below 8.
+    #[must_use]
+    pub const fn rank_current(k: u16) -> u16 {
+        RANK_CURRENT + k
+    }
+
+    /// The `rank.whole.K` slot, `k` below 8.
+    #[must_use]
+    pub const fn rank_whole(k: u16) -> u16 {
+        RANK_WHOLE + k
+    }
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -882,6 +979,48 @@ mod tests {
             );
         }
         assert_eq!(field::CHART_STAGEFILE, field::POINT + 1);
+        let int = |lo, hi| FieldTy::Int { lo, hi };
+        let score = [
+            ("best.ex", field::BEST_EX, int(0, MAX_COUNT), E),
+            ("target.ex", field::TARGET_EX, int(0, MAX_COUNT), E),
+            ("best.diff", field::BEST_DIFF, int(-MAX_COUNT, MAX_COUNT), E),
+            (
+                "target.diff",
+                field::TARGET_DIFF,
+                int(-MAX_COUNT, MAX_COUNT),
+                E,
+            ),
+            ("best.rate_bp", field::BEST_RATE_BP, int(0, i32::MAX), E),
+            ("target.rate_bp", field::TARGET_RATE_BP, int(0, i32::MAX), E),
+            ("best.valid", field::BEST_VALID, FieldTy::Bool, T),
+            ("best.rate_ppm", field::BEST_RATE_PPM, int(0, i32::MAX), T),
+            ("best.reached", field::BEST_REACHED, FieldTy::Bool, T),
+            ("target.reached", field::TARGET_REACHED, FieldTy::Bool, T),
+        ];
+        for (i, (name, s, ty, export)) in score.into_iter().enumerate() {
+            assert_eq!(usize::from(s), 113 + i, "{name}");
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((ty, export)),
+                "{name}"
+            );
+        }
+        for k in 0..8_u16 {
+            for (kind, s, first) in [
+                ("current", field::rank_current(k), 123),
+                ("whole", field::rank_whole(k), 131),
+            ] {
+                let name = format!("rank.{kind}.{k}");
+                assert_eq!(s, first + k, "{name}");
+                assert_eq!(slot(&name), Some(s), "{name}");
+                assert_eq!(
+                    PLAY.field(&name).map(|(_, f)| (f.ty, f.export)),
+                    Some((FieldTy::Bool, E)),
+                    "{name}"
+                );
+            }
+        }
         assert_eq!(slot("display_offset.ms"), Some(field::DISPLAY_OFFSET_MS));
         assert_eq!(
             PLAY.field("display_offset.ms")
@@ -903,7 +1042,7 @@ mod tests {
                 .map(|(_, f)| (f.ty, f.export)),
             Some((FieldTy::Int { lo: 0, hi: 4 }, T))
         );
-        assert_eq!(field::COUNT, 115);
+        assert_eq!(field::COUNT, 141);
     }
 
     #[test]

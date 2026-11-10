@@ -586,8 +586,14 @@ fn decode_pool_is_capped() {
             .stats()
             .decode_threads
     };
-    assert_eq!(threads(4, &files), cores.min(4));
-    assert_eq!(threads(2, &files), cores.min(2));
+    // The workers that decode at once depend on the scheduling: never past
+    // the limit or the cores, never none. That the pool reaches its cap is
+    // the unit tests' (`decode_threads_counts_the_workers_that_ran`), whose
+    // workers are held until they all decode.
+    for max in [4, 2] {
+        let n = threads(max, &files);
+        assert!((1..=cores.min(max)).contains(&n), "{n} at {max}");
+    }
     assert_eq!(threads(4, &files[..1]), 1);
     assert_eq!(threads(0, &files), 1);
 }

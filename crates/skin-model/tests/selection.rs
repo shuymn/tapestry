@@ -13,10 +13,11 @@ use selection_support::{
 };
 use skin_model::{
     Attempt, BuildError, FrameUv, GaugeLook, ImagePartDef, LampKey, LoadError, LoadState,
-    LoadingFrame, NumberDef, OwnLamp, PlayContext, PrepareError, Ratio, RatioBarDef, RatioForm,
-    RatioSource, RowLabel, RowScore, ScreenKind, SelectionDefs, SelectionError, SelectionPlace,
-    SelectionText, Side, Skin, SliderCommand, SliderDirection, SongListError, Source, TextDef,
-    TextImage, TextTable, TextValue, TimerRef, WidgetDefs, selection_timer,
+    LoadingFrame, NumberDef, OwnLamp, PlayContext, PlayDefs, PrepareError, Ratio, RatioBarDef,
+    RatioForm, RatioSource, RowLabel, RowScore, ScoreRate, ScreenKind, SelectionDefs,
+    SelectionError, SelectionPlace, SelectionText, Side, Skin, SliderCommand, SliderDirection,
+    SongListError, Source, TextDef, TextImage, TextTable, TextValue, TimerRef, WidgetDefs,
+    selection_timer,
 };
 
 /// A view of rows `a`, `b` and `c` with the cursor on `cursor`.
@@ -1227,8 +1228,9 @@ fn plain_play_def(
     skin_def(elements, widgets)
 }
 
-/// A play skin draws no song list, ratio bar or selection text; a
-/// selection skin no lanes, gauge, judge or cover paint.
+/// A play skin draws no song list, selection text or ratio bar but one of
+/// a score rate; a selection skin no lanes, gauge, judge, cover paint or
+/// ratio bar of a score rate.
 #[test]
 fn each_kind_draws_its_own_widgets() {
     let kind = |r: Result<Skin, LoadError>, k| match r {
@@ -1248,6 +1250,34 @@ fn each_kind_draws_its_own_widgets() {
             ScreenKind::Play,
         );
     }
+    // A play skin's ratio bars show its score rates only, and only a play
+    // skin's do.
+    kind(
+        Skin::new_play(
+            plain_play_def(
+                vec![element(Source::RatioBar(0), [0, 0, 1, 1])],
+                WidgetDefs::default(),
+            ),
+            PlayDefs {
+                ratio_bars: sel().ratio_bars,
+            },
+        ),
+        ScreenKind::Play,
+    );
+    kind(
+        load(
+            vec![element(Source::RatioBar(0), [0, 0, 1, 1])],
+            WidgetDefs::default(),
+            SelectionDefs {
+                song_list: None,
+                ratio_bars: vec![bar(
+                    RatioForm::Bar { vertical: false },
+                    RatioSource::Score(ScoreRate::Best),
+                )],
+            },
+        ),
+        ScreenKind::Selection,
+    );
     let text = WidgetDefs {
         texts: vec![TextDef {
             value: TextValue::Selection(SelectionText::Query),

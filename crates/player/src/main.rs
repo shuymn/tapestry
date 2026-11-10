@@ -38,6 +38,7 @@ mod log_file;
 mod loudness;
 mod measure;
 mod menu_screen;
+mod page_jobs;
 mod play;
 mod power;
 mod practice_page;
