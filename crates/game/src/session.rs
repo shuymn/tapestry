@@ -422,6 +422,10 @@ pub struct Loaded {
     /// first play reports: the shelf plays its last good version.
     first_error: Option<PresetFileError>,
     attempt: u32,
+    /// The coming play is prepared before it begins (the loading state's
+    /// first attempt): until [`begin_play`](Self::begin_play) numbers it,
+    /// [`attempt`](Self::attempt) gives the number it will have.
+    ahead: bool,
     /// Where the session events go, out of the parts so a play can report
     /// its start while its logic step borrows the chart.
     events: SharedEvents,
@@ -663,6 +667,7 @@ impl PendingLoad {
                     first_error: shelf.chosen_error().cloned(),
                     shelf,
                     attempt: 0,
+                    ahead: false,
                     events,
                     practice: None,
                     practiced: None,
@@ -1344,6 +1349,7 @@ impl Loaded {
     /// since.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
+        self.ahead = false;
         let attempt = self.attempt;
         let checked = self.reload_preset();
         self.score = self.read_score();
@@ -1404,9 +1410,18 @@ impl Loaded {
     /// prepares a chart's first attempt at load-ready
     /// ([`crate::load_and_open`]), and its skin takes them from that
     /// preparation. [`begin_play`](Self::begin_play) then reads no more
-    /// under the same key.
+    /// under the same key. Until it begins, the attempt prepared carries
+    /// the number the play will have.
     pub(crate) fn prepare_score(&mut self) {
         self.score = self.read_score();
+        self.ahead = true;
+    }
+
+    /// The loading state's opening is over: a play it prepared ahead began
+    /// or was abandoned, and [`attempt`](Self::attempt) numbers the last
+    /// play begun again.
+    pub(crate) const fn end_ahead(&mut self) {
+        self.ahead = false;
     }
 
     /// The play `start` stopped before recording opened (its preparation
@@ -1423,7 +1438,9 @@ impl Loaded {
     }
 
     /// The attempt of the play [`begin_play`](Self::begin_play) numbered
-    /// last, under the play preset it refreshed: what the screen prepares
+    /// last, under the play preset it refreshed, or of the coming play when
+    /// the loading state prepares it before it begins
+    /// ([`prepare_score`](Self::prepare_score)): what the screen prepares
     /// it with, made afresh for each play.
     #[must_use]
     pub fn attempt(&self) -> Attempt {
@@ -1440,7 +1457,11 @@ impl Loaded {
             profile: Some(Arc::clone(&self.profile)),
             main: self.main,
             ..Attempt::new(
-                self.attempt,
+                if self.ahead {
+                    self.attempt + 1
+                } else {
+                    self.attempt
+                },
                 &self.preset,
                 self.config.lead_in,
                 self.section(),

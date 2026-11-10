@@ -363,6 +363,8 @@ pub fn load_and_open<R: LoadingRig>(
         closed: false,
     };
     let left = crate::live::run_chart_with(loaded, rig, FirstOpening::Loading(&mut opener));
+    // A play abandoned before it began took no number.
+    loaded.end_ahead();
     let ended = match &left {
         Ok(Leave::Back) => false,
         Ok(Leave::Quit) => true,
