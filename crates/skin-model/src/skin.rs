@@ -24,7 +24,7 @@ use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{
     AngleFollow, Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union,
 };
-use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need};
+use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need, loading_rate};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
@@ -124,8 +124,9 @@ pub enum Source {
     /// The selection skin's song list ([`SelectionDefs::song_list`]). Its
     /// track gives only color and alpha; its placements place themselves.
     SongList,
-    /// The ratio bar at this index of [`SelectionDefs::ratio_bars`]: its
-    /// image cut to, or moved by, its ratio from the element's rect.
+    /// The ratio bar at this index of [`SelectionDefs::ratio_bars`], or
+    /// of [`PlayDefs::ratio_bars`] in a play skin: its image cut to, or
+    /// moved by, its ratio from the element's rect.
     RatioBar(u32),
     /// The judge graph at this index of [`ResultDefs::judge_graphs`]: the
     /// view's timelines over the element's rect.
@@ -162,6 +163,14 @@ pub struct ResultDefs {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecisionDefs {
     pub timing: crate::decision::DecisionTiming,
+}
+
+/// The widgets only a play skin draws.
+#[derive(Clone, Debug, Default)]
+pub struct PlayDefs {
+    /// The ratio bars [`Source::RatioBar`] draws: each of a
+    /// [`RatioSource::Score`] source.
+    pub ratio_bars: Vec<RatioBarDef>,
 }
 
 /// The widgets only a selection skin draws.
@@ -1272,13 +1281,22 @@ fn selection_text(def: &SkinDef, source: Source) -> bool {
     }
 }
 
-/// The kind checks of [`Skin::new`], [`Skin::new_selection`],
+/// The kind checks of [`Skin::new_play`], [`Skin::new_selection`],
 /// [`Skin::new_result`] and [`Skin::new_decision`], first: a play skin
-/// draws no song list, ratio bar, graph or selection text; a selection
-/// skin no lanes, gauge, judge, cover paint or graph; a result skin none
-/// of these but its graphs; a decision skin only images, image choices
-/// whose selector is a constant, and chart text.
-fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
+/// draws no song list, graph, selection text or ratio bar but one of a
+/// score rate; a selection skin no lanes, gauge, judge, cover paint,
+/// graph or ratio bar of a score rate; a result skin none of these but
+/// its graphs; a decision skin only images, image choices whose selector
+/// is a constant, and chart text. The ratio bars are `sel`'s.
+fn check_kind(def: &SkinDef, kind: ScreenKind, sel: &SelectionDefs) -> Result<(), LoadError> {
+    // Whether a ratio bar element's source is a play's score rate, `None`
+    // for an unknown bar: a play skin refuses one here, a selection skin
+    // later.
+    let score = |i: u32| {
+        sel.ratio_bars
+            .get(index(i))
+            .map(|b| matches!(b.source, RatioSource::Score(_)))
+    };
     for (element, e) in def.elements.iter().enumerate() {
         let ok = match kind {
             ScreenKind::Decision => match e.source {
@@ -1301,17 +1319,20 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                 | Source::TimingGraph(_)
                 | Source::ChartImage { .. } => false,
             },
-            ScreenKind::Selection => !matches!(
-                e.source,
-                Source::Lanes
-                    | Source::ChartImage { .. }
-                    | Source::Gauge(_)
-                    | Source::Judge(_)
-                    | Source::CoverPaint(_)
-                    | Source::JudgeGraph(_)
-                    | Source::GaugeGraph(_)
-                    | Source::TimingGraph(_)
-            ),
+            ScreenKind::Selection => match e.source {
+                Source::RatioBar(i) => score(i) != Some(true),
+                _ => !matches!(
+                    e.source,
+                    Source::Lanes
+                        | Source::ChartImage { .. }
+                        | Source::Gauge(_)
+                        | Source::Judge(_)
+                        | Source::CoverPaint(_)
+                        | Source::JudgeGraph(_)
+                        | Source::GaugeGraph(_)
+                        | Source::TimingGraph(_)
+                ),
+            },
             ScreenKind::Result => {
                 !selection_text(def, e.source)
                     && !matches!(
@@ -1325,17 +1346,19 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                             | Source::ChartImage { .. }
                     )
             }
-            ScreenKind::Play => {
-                !selection_text(def, e.source)
-                    && !matches!(
-                        e.source,
-                        Source::SongList
-                            | Source::RatioBar(_)
-                            | Source::JudgeGraph(_)
-                            | Source::GaugeGraph(_)
-                            | Source::TimingGraph(_)
-                    )
-            }
+            ScreenKind::Play => match e.source {
+                Source::RatioBar(i) => score(i) == Some(true),
+                _ => {
+                    !selection_text(def, e.source)
+                        && !matches!(
+                            e.source,
+                            Source::SongList
+                                | Source::JudgeGraph(_)
+                                | Source::GaugeGraph(_)
+                                | Source::TimingGraph(_)
+                        )
+                }
+            },
         };
         if !ok {
             return Err(LoadError::SourceKind { element, kind });
@@ -1584,12 +1607,25 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new(def: SkinDef) -> Result<Self, LoadError> {
-        Self::load(
-            def,
-            ScreenKind::Play,
-            SelectionDefs::default(),
-            ResultDefs::default(),
-        )
+        Self::new_play(def, PlayDefs::default())
+    }
+
+    /// Loads a play skin with the widgets only a play skin draws in
+    /// `widgets`: the checks of [`new`](Self::new), and every ratio bar's
+    /// image exists, its source is a [`RatioSource::Score`] (an element
+    /// drawing one of another source is refused,
+    /// [`LoadError::SourceKind`]) and a slider's range is at most
+    /// [`MAX_COORD`]. A play records no slider press.
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails.
+    pub fn new_play(def: SkinDef, widgets: PlayDefs) -> Result<Self, LoadError> {
+        let sel = SelectionDefs {
+            song_list: None,
+            ratio_bars: widgets.ratio_bars,
+        };
+        Self::load(def, ScreenKind::Play, sel, ResultDefs::default())
     }
 
     /// Loads a selection skin: the checks of [`new`](Self::new) over the
@@ -1685,7 +1721,7 @@ impl Skin {
         {
             return Err(LoadError::SongList(SongListError::TooManyPlacements { n }));
         }
-        check_kind(&def, kind)?;
+        check_kind(&def, kind, &sel)?;
         if whens.len() > MAX_WHEN_TIMERS {
             return Err(LoadError::TooManyWhenTimers { n: whens.len() });
         }
@@ -2176,8 +2212,17 @@ impl Skin {
                         _ => None,
                     };
                     // A progress slider reads `time.progress_ppm`, which
-                    // loading knows (0) and nothing else needs.
-                    Need::of(e.visible.as_ref()).and(Need::of(value))
+                    // loading knows (0) and nothing else needs; a score
+                    // rate reads as its class.
+                    let rate = match e.source {
+                        Source::RatioBar(i) => match ratio_bars.get(index(i)).map(|b| b.def.source)
+                        {
+                            Some(RatioSource::Score(r)) => Need::of_class(Some(loading_rate(r)), 0),
+                            _ => Need::default(),
+                        },
+                        _ => Need::default(),
+                    };
+                    Need::of(e.visible.as_ref()).and(Need::of(value)).and(rate)
                 },
                 kind: match e.source {
                     Source::Image(i) => Kind::Image(image(i)),
@@ -4212,13 +4257,24 @@ impl Skin {
                     }
                 }
                 Kind::RatioBar(i, hit) => {
-                    if let (Some(b), Some(sel)) = (self.ratio_bars.get(i), sel) {
+                    if let Some(b) = self.ratio_bars.get(i) {
                         let image = b.image;
                         let b = &b.def;
-                        let value = match b.source {
-                            RatioSource::ListPosition => sel.position,
-                            RatioSource::ExRate => sel.ex_rate,
-                            RatioSource::MasterVolume => sel.master_volume,
+                        let value = match (b.source, scene.phase) {
+                            (RatioSource::ListPosition, Phase::Selection { sel }) => sel.position,
+                            (RatioSource::ExRate, Phase::Selection { sel }) => sel.ex_rate,
+                            (RatioSource::MasterVolume, Phase::Selection { sel }) => {
+                                sel.master_volume
+                            }
+                            (RatioSource::Score(r), Phase::Play { play, .. }) => {
+                                play.score_ratio(r)
+                            }
+                            // Only a rate loading knows reaches here
+                            // (`loading_rate`): 0, its READY value.
+                            (RatioSource::Score(_), Phase::Loading { .. }) => {
+                                crate::selection::Ratio::new(0, 1)
+                            }
+                            _ => None,
                         };
                         if let Some(v) = value {
                             draw_ratio(b, image, v, rect, &brush, &at, out);
@@ -4227,7 +4283,7 @@ impl Skin {
                                 RatioForm::Slider {
                                     direction, range, ..
                                 },
-                            ) = (hit.and_then(|h| sel.hits.get(h)), b.form)
+                            ) = (hit.and_then(|h| sel?.hits.get(h)), b.form)
                             {
                                 let [ox, oy] = canvas.origin();
                                 let sc = canvas.scale();
