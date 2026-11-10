@@ -2,10 +2,12 @@
 
 /// A consumer occurrence: its destination, its consumer (`value`, `op`,
 /// `draw`, `timer`, or the key a listed object holds it under), its index
-/// (an `op` entry's position in the list, 0 otherwise), its callable, and
-/// its object path (empty for a top-level object; a listed object's
-/// nested part's table keys). Production's records carry no path, so the
-/// comparator joins on the other four (s7-06e-1-r1-tables.md, A4).
+/// (an `op` entry's position in its own list, a nested one too, 0
+/// otherwise), its callable, and its object path (empty for the
+/// destination, `def` for its definition, `def.<keys>` for a nested part;
+/// an `op` list's entries at the path of the object holding it).
+/// Production's records carry the same five, and the comparator joins on
+/// all of them (s7-06e-1-r1-tables.md, A4 and A6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub dest: usize,
