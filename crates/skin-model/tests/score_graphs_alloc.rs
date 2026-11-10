@@ -161,7 +161,14 @@ fn skin() -> Skin {
         widgets,
         ..def(whens, sheet(), elements)
     };
-    Skin::new_play(d, PlayDefs { ratio_bars }).unwrap()
+    Skin::new_play(
+        d,
+        PlayDefs {
+            ratio_bars,
+            ..PlayDefs::default()
+        },
+    )
+    .unwrap()
 }
 
 /// Seven taps, 100 ms apart from 1 s.

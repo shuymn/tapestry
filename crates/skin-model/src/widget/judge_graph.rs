@@ -1,7 +1,10 @@
-//! The result's judge graph: a view's notes over chart time, one column
-//! a timeline bin, stacked in chips from the bottom, each note without a
-//! counted judgment grey and the others by their judgment (design.md
-//! "Rendering and Skins", result widgets).
+//! The judge graph: on the result, a view's notes over chart time, one
+//! column a timeline bin, stacked in chips from the bottom, each note
+//! without a counted judgment grey and the others by their judgment; on
+//! play, the notes graph, the chart's notes by kind over its 1× seconds
+//! (the source's type 0), with the play cursor and a practice round's
+//! section lines over it (design.md "Rendering and Skins", result widgets
+//! and play graphs).
 //!
 //! The source paints two textures and draws each once under the
 //! destination's colour: a background of stripes and lines, then the
@@ -28,6 +31,15 @@ use crate::place::Native;
 use crate::quad::QuadBatch;
 use crate::result::view::{MAX_TIMELINE_BINS, TIMELINE_CHANNELS, Timelines};
 
+/// The notes graph's categories ([`bms_model::NOTE_CATEGORIES`]).
+const NOTE_CHANNELS: usize = bms_model::NOTE_CATEGORIES;
+/// The pieces a notes graph's cursors draw at most: a practice round's
+/// start line cut by its end line and the play cursor (three), its end line
+/// cut by the play cursor (two), and the play cursor.
+const CURSOR_PIECES: usize = 6;
+#[expect(clippy::cast_possible_truncation, reason = "6")]
+const CURSOR_QUADS: u32 = CURSOR_PIECES as u32;
+
 /// The cells a generated chip grid holds down its height: a graph's
 /// largest scale.
 pub const CHIP_GRID_CELLS: u32 = 100;
@@ -52,6 +64,9 @@ pub enum JudgeGraphKind {
     /// The source's type 2: PERFECT, then each other grade early, then
     /// late.
     EarlyLate,
+    /// The source's type 0, a play skin's only kind: the chart's notes by
+    /// category ([`bms_model::ChartProfile::bins`]).
+    Notes,
 }
 
 /// How a result graph's texture fits its element's rect: the source's
@@ -110,7 +125,12 @@ impl JudgeGraphDef {
     #[must_use]
     pub fn quads(&self) -> u32 {
         let back = if self.back { BACK_QUADS } else { 0 };
-        back + BINS * channels(self.kind)
+        let cursors = if self.kind == JudgeGraphKind::Notes {
+            CURSOR_QUADS
+        } else {
+            0
+        };
+        back + BINS * channels(self.kind) + cursors
     }
 }
 
@@ -119,6 +139,7 @@ fn channels(kind: JudgeGraphKind) -> u32 {
     match kind {
         JudgeGraphKind::Judgment => 6,
         JudgeGraphKind::EarlyLate => 10,
+        JudgeGraphKind::Notes => 7,
     }
 }
 
@@ -143,6 +164,24 @@ const EARLY_LATE_COLORS: [Rgba8; 10] = [
     Rgba8::rgb(0x88_4400, 0xff),
     Rgba8::rgb(0x44_2200, 0xff),
 ];
+
+/// Each note category's colour (`skin/SkinNoteDistributionGraph.java:45-46`):
+/// scratch LN head, scratch LN body, scratch tap, key LN head, key LN
+/// body, key tap, mine.
+const NOTE_COLORS: [Rgba8; NOTE_CHANNELS] = [
+    Rgba8::rgb(0x44_ff44, 0xff),
+    Rgba8::rgb(0x22_8822, 0xff),
+    Rgba8::rgb(0xff_4444, 0xff),
+    Rgba8::rgb(0x44_44ff, 0xff),
+    Rgba8::rgb(0x22_2288, 0xff),
+    Rgba8::rgb(0xcc_cccc, 0xff),
+    Rgba8::rgb(0x88_0000, 0xff),
+];
+/// The play cursor, white, and a practice round's start (green) and end
+/// (red) lines (`skin/SkinNoteDistributionGraph.java:203-223`).
+const PLAY_CURSOR: Rgba8 = Rgba8::rgb(0xff_ffff, 0xff);
+const START_CURSOR: Rgba8 = Rgba8::rgb(0x80_ff80, 0xff);
+const END_CURSOR: Rgba8 = Rgba8::rgb(0xff_8080, 0xff);
 
 /// The background's base, below cell 10.
 const BASE: Rgba8 = Rgba8::rgb(0, 0xcc);
@@ -171,10 +210,90 @@ pub(crate) struct JudgeGraph {
 /// What one judge graph's frame reads besides its element's.
 pub(crate) struct GraphDraw<'a> {
     pub(crate) at: Frame<'a>,
-    /// The view's timelines; nothing draws without them.
-    pub(crate) timelines: Option<&'a Timelines>,
+    pub(crate) data: GraphData<'a>,
     /// The screen timer's elapsed µs, `None` while it is off.
     pub(crate) screen: Option<i64>,
+}
+
+/// What a judge graph draws.
+#[derive(Clone, Copy)]
+pub(crate) enum GraphData<'a> {
+    /// The result view's timelines; nothing draws without them.
+    Timelines(Option<&'a Timelines>),
+    /// The chart's notes by category, a bin a column, and the cursors.
+    Notes {
+        bins: &'a [[u16; NOTE_CHANNELS]],
+        cursors: Cursors,
+    },
+}
+
+/// A notes graph's cursors, in 1× µs over `seconds` seconds: the play
+/// cursor while the play runs, and a practice round's section.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cursors {
+    pub(crate) seconds: u32,
+    pub(crate) play: Option<i64>,
+    pub(crate) section: Option<[i64; 2]>,
+}
+
+impl Cursors {
+    /// Each cursor's left and right as fractions of the graph's width, and
+    /// its colour, in paint order, each cut where a later one covers it
+    /// (the source paints them into one pixmap): at most
+    /// [`CURSOR_QUADS`] pieces.
+    fn pieces(&self) -> [Option<([f64; 2], Rgba8)>; CURSOR_PIECES] {
+        let len = f64::from(self.seconds.max(1));
+        // `t·W/(len·1000)` ms, 3/5 of a second wide.
+        #[expect(clippy::cast_precision_loss, reason = "µs far below 2^53")]
+        let at = |us: i64| {
+            let left = us as f64 / (len * 1_000_000.0);
+            [left, left + 3.0 / (5.0 * len)]
+        };
+        let [start, end] = self.section.map_or([None; 2], |s| s.map(Some));
+        let marks = [
+            start.map(|t| (at(t), START_CURSOR)),
+            end.map(|t| (at(t), END_CURSOR)),
+            self.play.map(|t| (at(t), PLAY_CURSOR)),
+        ];
+        let mut out = [None; CURSOR_PIECES];
+        let mut n = 0;
+        for (k, mark) in marks.iter().enumerate() {
+            let Some((x, color)) = *mark else {
+                continue;
+            };
+            let mut parts = [Some(x), None, None];
+            for cut in marks.iter().skip(k + 1).flatten().map(|&(x, _)| x) {
+                let mut next = [None; 3];
+                let mut j = 0;
+                for q in parts
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|p| subtract(p, cut))
+                    .flatten()
+                {
+                    if let Some(slot) = next.get_mut(j) {
+                        *slot = Some(q);
+                        j += 1;
+                    }
+                }
+                parts = next;
+            }
+            for p in parts.into_iter().flatten() {
+                if let Some(slot) = out.get_mut(n) {
+                    *slot = Some((p, color));
+                    n += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// `[l, r]` less `[cl, cr]`: the parts left of and right of the cut.
+fn subtract([l, r]: [f64; 2], [cl, cr]: [f64; 2]) -> [Option<[f64; 2]>; 2] {
+    let left = (cl > l).then(|| [l, r.min(cl)]).filter(|[a, b]| b > a);
+    let right = (cr < r).then(|| [l.max(cr), r]).filter(|[a, b]| b > a);
+    [left, right]
 }
 
 /// One bin's counts by the graph's channels: first the notes without a
@@ -199,6 +318,7 @@ fn bin_counts(kind: JudgeGraphKind, b: &[u32; TIMELINE_CHANNELS], notes: u32) ->
             0,
         ],
         JudgeGraphKind::EarlyLate => [grey, pg, gr_e, gd_e, bd_e, pr_e, gr_l, gd_l, bd_l, pr_l],
+        JudgeGraphKind::Notes => [0; 10],
     }
 }
 
@@ -236,17 +356,25 @@ impl JudgeGraph {
         if !(w > 0.0 && h > 0.0) {
             return;
         }
-        let Some(tl) = d.timelines else {
-            return;
-        };
         let kind = self.def.kind;
-        let bins = tl.bins();
-        let notes = tl.notes();
-        // A bin's chips, grey included, are its notes: `Timelines::new`
-        // refuses more counted judgments than notes.
-        let largest = notes.iter().copied().max().unwrap_or(0);
+        let (n, largest) = match d.data {
+            GraphData::Timelines(None) => return,
+            GraphData::Timelines(Some(tl)) => {
+                // A bin's chips, grey included, are its notes:
+                // `Timelines::new` refuses more counted judgments than
+                // notes.
+                (
+                    tl.bins().len(),
+                    tl.notes().iter().copied().max().unwrap_or(0),
+                )
+            }
+            GraphData::Notes { bins, .. } => {
+                let sum = |b: &[u16; NOTE_CHANNELS]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
+                (bins.len(), bins.iter().map(sum).max().unwrap_or(0))
+            }
+        };
         let scale = scale(largest);
-        let n = u32::try_from(bins.len()).unwrap_or(BINS);
+        let n = u32::try_from(n).unwrap_or(BINS);
         let texels = [n.saturating_mul(5), scale.saturating_mul(5)];
         let (fitted, clip) = fitted_region(rect, brush, self.def.fit, texels);
         let g = Geometry::new(fitted, clip, brush.pivot, n, scale);
@@ -264,14 +392,33 @@ impl JudgeGraph {
         let colors: &[Rgba8] = match kind {
             JudgeGraphKind::Judgment => &JUDGMENT_COLORS,
             JudgeGraphKind::EarlyLate => &EARLY_LATE_COLORS,
+            JudgeGraphKind::Notes => &NOTE_COLORS,
         };
         let used = colors.len();
-        for (i, (b, &notes)) in (0_u32..).zip(bins.iter().zip(notes)) {
+        let count = |i: usize| -> Option<[u32; 10]> {
+            match d.data {
+                GraphData::Timelines(tl) => {
+                    let tl = tl?;
+                    Some(bin_counts(kind, tl.bins().get(i)?, *tl.notes().get(i)?))
+                }
+                GraphData::Notes { bins, .. } => {
+                    let b = bins.get(i)?;
+                    let mut c = [0; 10];
+                    for (c, &v) in c.iter_mut().zip(b) {
+                        *c = u32::from(v);
+                    }
+                    Some(c)
+                }
+            }
+        };
+        for i in 0..n {
             let column @ [left, right] = g.column(i);
             if left >= clip {
                 break;
             }
-            let counts = bin_counts(kind, b, notes);
+            let Some(counts) = usize::try_from(i).ok().and_then(count) else {
+                break;
+            };
             let mut cell = 0_u32;
             for c in 0..used {
                 let ch = if self.def.reverse { used - 1 - c } else { c };
@@ -299,6 +446,20 @@ impl JudgeGraph {
                 cell += k;
                 if cell >= scale {
                     break;
+                }
+            }
+        }
+        if let GraphData::Notes { cursors, .. } = d.data {
+            let filter = self.solid.filter;
+            let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs) else {
+                return;
+            };
+            for ([l, r], color) in cursors.pieces().into_iter().flatten() {
+                let x = f64::from(g.x);
+                let w = f64::from(g.w);
+                let rect = [x + w * l, f64::from(g.y), w * (r - l), f64::from(g.h)].map(f32_of);
+                if !g.push(brush, tint(brush.color, color.unit()), rect, f, filter, out) {
+                    return;
                 }
             }
         }
@@ -360,7 +521,7 @@ impl JudgeGraph {
 }
 
 /// The reference `rect` placed: through the brush's lane map and affine.
-fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
+pub(crate) fn placed(rect: [f32; 4], brush: &Brush) -> [f32; 4] {
     let [x, y, w, h] = rect;
     brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h])
 }

@@ -11,8 +11,8 @@ pub(crate) mod schema;
 pub(crate) mod timers;
 
 use bms_model::{
-    Chart, ChartProfile, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, Tempo,
-    TimeUs, TimelineId,
+    Chart, ChartProfile, LANE_COUNT, Lane, LnMode, NOTE_CATEGORIES, Note, Position,
+    PresentationError, Speed, Tempo, TimeUs, TimelineId,
 };
 use eval::{GaugeState, InputFacts, JudgeEvent, NoteFacts, NoteHold, Section, Tally};
 use rules::GaugeValue;
@@ -25,10 +25,14 @@ use crate::chart_image::{ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::selection::Ratio;
+use crate::skin::GraphPlan;
 use crate::widget::Starts;
 use crate::widget::bar::BarScratch;
+use crate::widget::bpm_graph::{BpmInput, BpmRaster};
+use crate::widget::compose::Run;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::glyphs::{self, GlyphLine};
+use crate::widget::hit_error::HitErrorState;
 use crate::widget::lanes::{LaneView, Side};
 use crate::widget::ratio_bar::ScoreRate;
 use crate::widget::text::TextTable;
@@ -136,6 +140,15 @@ pub struct PlayScore<'a> {
     /// The whole chart's MAIN tempo, not a practice section's; `None`
     /// when the caller has none.
     pub main: Option<Tempo>,
+    /// The preset's key judge areas for the chart's rank, in ms, early
+    /// positive: PERFECT, GREAT, GOOD and BAD as `[−late, early]`, the
+    /// empty POOR range as `[−behind, ahead]`, which the visualizers band
+    /// their offsets by; `None` when the caller has none, which draws every
+    /// band empty.
+    pub areas: Option<[[i16; 2]; 5]>,
+    /// The speed the chart is loaded at: its times are 1× times divided by
+    /// it, so a 1× time is a play time times it.
+    pub speed: Speed,
 }
 
 impl PlayScore<'static> {
@@ -148,7 +161,59 @@ impl PlayScore<'static> {
         },
         profile: None,
         main: None,
+        areas: None,
+        speed: Speed::NORMAL,
     };
+}
+
+/// How many judgment offsets a frame's ring holds.
+pub const OFFSET_SLOTS: usize = 100;
+
+/// The play view's newest judgment offsets as a frame gives them, in whole
+/// ms, early positive (note time minus press, truncated toward 0), one per
+/// judgment PERFECT to BAD: `slots` as the ring stands, the next one going
+/// to `count % OFFSET_SLOTS`, and `count` the offsets recorded since the
+/// attempt's start or its last rearm, the overwritten ones included.
+#[derive(Clone, Copy, Debug)]
+pub struct Offsets<'a> {
+    pub slots: &'a [i32; OFFSET_SLOTS],
+    pub count: u32,
+}
+
+/// [`OFFSET_SLOTS`] as a count.
+#[expect(clippy::cast_possible_truncation, reason = "100")]
+const SLOTS_U32: u32 = OFFSET_SLOTS as u32;
+
+impl Offsets<'static> {
+    /// Nothing recorded.
+    pub const NONE: Self = Self {
+        slots: &[0; OFFSET_SLOTS],
+        count: 0,
+    };
+}
+
+impl Offsets<'_> {
+    /// The offsets recorded after the first `seen` still in the ring,
+    /// oldest first: the last `min(count − seen, OFFSET_SLOTS)`.
+    pub(crate) fn since(self, seen: u32) -> impl Iterator<Item = i32> {
+        let new = self.count.wrapping_sub(seen).min(SLOTS_U32);
+        let first = self.count.wrapping_sub(new);
+        let slots = self.slots;
+        (0..new).filter_map(move |i| {
+            let at = first.wrapping_add(i) % SLOTS_U32;
+            slots.get(usize::try_from(at).ok()?).copied()
+        })
+    }
+
+    /// The offset recorded `age` judgments ago (0 the newest), if one is
+    /// still in the ring.
+    pub(crate) fn back(self, age: u32) -> Option<i32> {
+        if age >= self.count.min(SLOTS_U32) {
+            return None;
+        }
+        let at = self.count.wrapping_sub(1).wrapping_sub(age) % SLOTS_U32;
+        self.slots.get(usize::try_from(at).ok()?).copied()
+    }
 }
 
 /// What is fixed for one attempt.
@@ -396,6 +461,8 @@ pub struct SkinFrame<'a> {
     /// visual long-note hold, from which the lanes and the `hold` timers
     /// read, whatever effects were dropped.
     pub notes: &'a NoteFacts,
+    /// The play view's judgment offsets, which the visualizers draw.
+    pub offsets: Offsets<'a>,
     /// The play view's lane input: each lane held or not, with its latest
     /// press and release, from which the `press` and `release` timers
     /// read.
@@ -598,6 +665,109 @@ pub struct Play {
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
     bars: Option<BarScratch>,
+    /// The graphs' and visualizers' prepared data and state.
+    graphs: Graphs,
+}
+
+/// A play's graphs and visualizers: the notes graph's bins and cursor
+/// clock, each BPM graph element's pixmap, each timing visualizer
+/// element's band and each hit-error element's state, prepared with the
+/// attempt.
+#[derive(Clone, Debug, Default)]
+struct Graphs {
+    /// The chart's notes by category, a bin each; empty without a notes
+    /// graph or a profile.
+    bins: Box<[[u16; NOTE_CATEGORIES]]>,
+    /// The chart's 1× seconds the bins span.
+    seconds: u32,
+    /// The speed the chart is loaded at, as `(num, den)`: a 1× time is a
+    /// play time times `num / den`.
+    speed: (u32, u32),
+    /// A section attempt's start and end in 1× µs.
+    section: Option<[i64; 2]>,
+    bpm: Box<[BpmRaster]>,
+    bands: Box<[Box<[Run]>]>,
+    hits: Box<[HitErrorState]>,
+    /// The key judge areas the hit-error visualizers band by; all 0
+    /// without any.
+    areas: [[i16; 2]; 5],
+}
+
+impl Graphs {
+    /// The graphs of `plan` for `chart` under `ctx`.
+    fn new(plan: &GraphPlan, chart: &Chart, ctx: &PlayContext<'_>) -> Self {
+        let score = ctx.score;
+        let profile = score.profile;
+        let (bins, seconds) = match profile.filter(|_| plan.notes) {
+            Some(p) => (
+                p.bins().into(),
+                u32::try_from(p.seconds().len()).unwrap_or(u32::MAX),
+            ),
+            None => (Box::default(), 0),
+        };
+        let speed = score.speed.ratio();
+        let to_1x = |t: TimeUs| {
+            let (n, d) = speed;
+            let v = i128::from(t.0) * i128::from(n) / i128::from(d.max(1));
+            i64::try_from(v).unwrap_or(0)
+        };
+        let section = match ctx.attempt {
+            Attempt::Section(s) => Some([to_1x(s.start), to_1x(s.end)]),
+            Attempt::Full { .. } => None,
+        };
+        // A chart without a note draws no BPM graph, as the source has no
+        // MAIN for it (`skin/SkinBPMGraph.java:169`).
+        let any_note = chart
+            .lanes
+            .iter()
+            .flatten()
+            .any(|n| !matches!(n.kind, bms_model::NoteKind::Mine { .. }));
+        let bpm = plan
+            .bpm
+            .iter()
+            .map(|(def, [cols, rows])| match (profile, score.main) {
+                (Some(p), Some(main)) if any_note => {
+                    let input = BpmInput {
+                        rows: p.speeds(),
+                        main,
+                        length_ms: chart.meta.length.0 / 1_000,
+                    };
+                    def.prepare(&input, *cols, *rows)
+                }
+                _ => BpmRaster::default(),
+            })
+            .collect();
+        Self {
+            bins,
+            seconds,
+            speed,
+            section,
+            bpm,
+            bands: plan.timing.iter().map(|t| t.band(score.areas)).collect(),
+            hits: plan.hit.iter().map(|&h| HitErrorState::new(h)).collect(),
+            areas: score.areas.unwrap_or([[0; 2]; 5]),
+        }
+    }
+
+    /// The bytes its buffers hold.
+    fn heap_bytes(&self) -> usize {
+        size_of_val(&*self.bins)
+            + self
+                .bpm
+                .iter()
+                .map(|b| size_of::<BpmRaster>() + size_of_val(&*b.runs))
+                .sum::<usize>()
+            + self
+                .bands
+                .iter()
+                .map(|b| size_of::<Box<[Run]>>() + size_of_val(&**b))
+                .sum::<usize>()
+            + self
+                .hits
+                .iter()
+                .map(|h| size_of::<HitErrorState>() + h.heap_bytes())
+                .sum::<usize>()
+    }
 }
 
 /// The chart's notes and bar lines, kept for a skin with lanes.
@@ -642,7 +812,8 @@ impl Play {
             + size_of_val(&*self.gauges)
             + self.text.heap_bytes()
             + glyphs::lines_bytes(&self.bitmap)
-            + self.bars.as_ref().map_or(0, BarScratch::heap_bytes);
+            + self.bars.as_ref().map_or(0, BarScratch::heap_bytes)
+            + self.graphs.heap_bytes();
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
@@ -664,6 +835,7 @@ impl Play {
         lanes: bool,
         bar_groups: usize,
         bomb_up_to: Option<schema::Grade>,
+        plan: &GraphPlan,
     ) -> Result<Self, PrepareError> {
         let outputs = present.map_or(0, |p| crate::output::slots(p.len()));
         let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
@@ -788,6 +960,7 @@ impl Play {
             chart: ChartTable::ABSENT,
             chart_live: None,
             bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
+            graphs: Graphs::new(plan, chart, ctx),
         })
     }
 
@@ -806,6 +979,56 @@ impl Play {
         self.starts.fill(None);
         self.ms.fill(TIMER_OFF);
         self.beat = None;
+        self.graphs.hits.iter_mut().for_each(HitErrorState::reset);
+    }
+
+    /// Reads the frame's ring into each hit-error element's state.
+    pub(crate) fn read_offsets(&mut self, offsets: Offsets<'_>) {
+        let areas = self.graphs.areas;
+        for h in &mut self.graphs.hits {
+            h.update(offsets, areas);
+        }
+    }
+
+    /// The notes graph's bins and its cursors at `now`: the play cursor
+    /// while the play runs; `None` without bins.
+    pub(crate) fn notes_graph(
+        &self,
+        now: TimeUs,
+    ) -> Option<(
+        &[[u16; NOTE_CATEGORIES]],
+        crate::widget::judge_graph::Cursors,
+    )> {
+        let g = &self.graphs;
+        if g.bins.is_empty() {
+            return None;
+        }
+        let (n, d) = g.speed;
+        let play = (now >= self.play_at).then(|| {
+            let v = i128::from(now.0) * i128::from(n) / i128::from(d.max(1));
+            i64::try_from(v).unwrap_or(0)
+        });
+        let cursors = crate::widget::judge_graph::Cursors {
+            seconds: g.seconds,
+            play,
+            section: g.section,
+        };
+        Some((&g.bins, cursors))
+    }
+
+    /// BPM graph element `slot`'s prepared pixmap.
+    pub(crate) fn bpm_raster(&self, slot: usize) -> Option<&BpmRaster> {
+        self.graphs.bpm.get(slot)
+    }
+
+    /// Timing visualizer element `slot`'s band.
+    pub(crate) fn timing_band(&self, slot: usize) -> Option<&[Run]> {
+        self.graphs.bands.get(slot).map(|b| &**b)
+    }
+
+    /// Hit-error element `slot`'s state.
+    pub(crate) fn hit_error(&self, slot: usize) -> Option<&HitErrorState> {
+        self.graphs.hits.get(slot)
     }
 
     /// The play's best and target, as the context gave them: fixed for
@@ -1142,6 +1365,7 @@ mod tests {
                     effects,
                     input: &eval::InputFacts::NONE,
                     notes,
+                    offsets: crate::Offsets::NONE,
                     complete: false,
                     playing: true,
                     closing: None,
@@ -1227,6 +1451,7 @@ mod tests {
             gauge: 0,
             effects: &[ev(1_250, ended(2, 0))],
             notes: &notes,
+            offsets: crate::Offsets::NONE,
             input: &eval::InputFacts::NONE,
             complete: false,
             playing: true,
@@ -1286,6 +1511,7 @@ mod tests {
             false,
             0,
             None,
+            &crate::skin::GraphPlan::default(),
         )
         .unwrap();
         assert_eq!(play.score(), basis);

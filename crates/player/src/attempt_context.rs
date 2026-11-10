@@ -57,6 +57,10 @@ pub struct AttemptContext {
     profile: Option<Arc<ChartProfile>>,
     /// The whole chart's MAIN tempo.
     main: Option<Tempo>,
+    /// The preset's key judge areas for the chart's rank.
+    areas: [[i16; 2]; 5],
+    /// The speed the chart is loaded at.
+    speed: bms_model::Speed,
     /// The scratch lane's notes autoplay's turntable presses, built before
     /// READY; none for a play by hand.
     scratch_notes: Vec<game::ScratchNote>,
@@ -96,6 +100,8 @@ impl AttemptContext {
             },
             profile: attempt.profile,
             main: attempt.main,
+            areas: attempt.areas,
+            speed: attempt.speed,
             scratch_notes: Vec::new(),
             carry_key: None,
         }
@@ -191,6 +197,8 @@ impl AttemptContext {
                 basis: self.score,
                 profile: self.profile.as_deref(),
                 main: self.main,
+                areas: Some(self.areas),
+                speed: self.speed,
             },
         }
     }

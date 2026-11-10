@@ -460,6 +460,7 @@ impl Harness {
             gauge: self.gauge,
             effects,
             notes: &self.notes,
+            offsets: skin_model::Offsets::NONE,
             input: &self.input,
             complete: self.complete,
             target: self.target,

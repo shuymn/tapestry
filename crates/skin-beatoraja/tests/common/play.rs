@@ -487,6 +487,7 @@ impl Drawn {
             gauge: 0,
             effects,
             notes: &self.notes,
+            offsets: skin_model::Offsets::NONE,
             input: &self.input,
             complete: self.complete,
             target: self.target,

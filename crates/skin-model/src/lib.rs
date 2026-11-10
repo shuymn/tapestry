@@ -183,8 +183,9 @@ pub use play::timers::score_fields;
 pub use play::timers::{Settled, native_values, settled};
 pub use play::{
     Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
-    DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, Play,
-    PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame, attempt_targets,
+    DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, OFFSET_SLOTS,
+    Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame,
+    attempt_targets,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{
@@ -214,12 +215,15 @@ pub use selection::{
 pub use skin::{
     DecisionDefs, ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
     MAX_WIDGET_QUADS, PlayDefs, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef,
-    Source, TimerRef, WidgetDefs,
+    Source, TimerRef, VisualizerError, WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
 };
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
+pub use widget::bpm_graph::{
+    BpmColors, BpmGraphDef, MAX_BPM_COLUMNS, RUNS_PER_COLUMN, bpm_columns,
+};
 pub use widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, MAX_SLIDE, Slider,
     SliderRate,
@@ -233,6 +237,7 @@ pub use widget::gauge::{
 };
 pub use widget::gauge_graph::{GaugeGraphColors, GaugeGraphDef};
 pub use widget::glyphs::BitmapLines;
+pub use widget::hit_error::{EmaMode, HitErrorDef, MAX_HIT_ERROR_WIDTH, MAX_HIT_ERROR_WINDOW};
 pub use widget::image_choice::{
     ImageChoiceDef, ImageChoiceError, ImageChoicePart, ImageSpan, MAX_IMAGE_CHOICE_REFS, PastTable,
 };
@@ -257,3 +262,4 @@ pub use widget::text::{
     TextTableError, TextValue,
 };
 pub use widget::timing_graph::TimingGraphDef;
+pub use widget::timing_vis::{MAX_JUDGE_WIDTH, TimingVisualizerDef};
