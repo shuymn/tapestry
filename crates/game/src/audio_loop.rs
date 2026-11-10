@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
@@ -369,6 +369,9 @@ struct Shared {
     /// waiting. Only the newest counts, so volume keys never fill the
     /// control queue.
     volume: AtomicU64,
+    /// The decision tone asked to start: not a control message, so it
+    /// never waits behind one.
+    tone: AtomicBool,
     /// The latest report that the sealed play's audio has ended: its
     /// generation in the high 32 bits, the key-sound commands the audio
     /// thread had taken from its queue in the low 32.
@@ -925,6 +928,14 @@ impl AudioControl {
         Ok(())
     }
 
+    /// Starts the decision tone from the audio thread's next step on,
+    /// whatever the play's state and whatever waits in the control queue:
+    /// a UI sound outside every bank, which loading or unloading a bank does
+    /// not cut ([`AudioEngine::play_tone`]).
+    pub fn play_tone(&self) {
+        self.shared.tone.store(true, Ordering::Release);
+    }
+
     /// The current play's number: 0 before the first play, then one more
     /// for each [`play`](Self::play).
     #[must_use]
@@ -953,6 +964,9 @@ impl AudioWorker {
         if volume != 0 {
             // Checked by `set_volume`.
             let _ = self.engine.set_volume(f32::from_bits(volume as u32));
+        }
+        if self.shared.tone.swap(false, Ordering::Acquire) {
+            self.engine.play_tone();
         }
         if let Some(old) = self.unreturned_restore.take() {
             self.give_back(old);

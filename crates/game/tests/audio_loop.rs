@@ -1271,3 +1271,38 @@ fn an_unload_after_the_worker_is_gone_is_gone() {
         Err(game::AudioLoadError::Wait(game::AudioWaitError::Gone))
     );
 }
+
+/// V1, through the control: the decision tone started before an unload
+/// sounds on after it.
+#[test]
+fn the_decision_tone_survives_an_unload() {
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    control.play_tone();
+    worker.step(&mut out).unwrap();
+    assert!(worker.engine().tone_sounding());
+    answered(&mut worker, &mut out, || control.unload()).unwrap();
+    assert!(worker.engine().tone_sounding());
+    let from = out.samples().len();
+    worker.step(&mut out).unwrap();
+    assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
+}
+
+/// V5: with a load pending (sent, timed out, still in the control queue),
+/// the decision tone asked for starts in the very step that takes the load:
+/// it does not wait behind the queue.
+#[test]
+fn the_decision_tone_starts_with_a_load_pending() {
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
+    control.play_tone();
+    let from = out.samples().len();
+    worker.step(&mut out).unwrap();
+    assert_eq!(worker.engine().bank().stored_count(), 0, "the load taken");
+    assert!(worker.engine().tone_sounding());
+    assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
+}

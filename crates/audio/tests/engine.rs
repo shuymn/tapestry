@@ -670,3 +670,169 @@ fn a_seek_planned_before_a_bank_replacement_is_refused() {
     let fresh = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
     assert_eq!(e.seek(&fresh), Ok(()));
 }
+
+/// An engine with nothing to play.
+fn silent_engine() -> AudioEngine {
+    let empty = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
+    AudioEngine::new(empty, &[], RATE, PERIOD, 64, 64).unwrap()
+}
+
+/// Steps `e` past its priming wakes, starts the decision tone and steps it
+/// `steps` more times, calling `before(e, k, at)` before step `k` with the
+/// last timed wake: the samples from the tone's first block on.
+fn with_tone(
+    mut e: AudioEngine,
+    steps: usize,
+    mut before: impl FnMut(&mut AudioEngine, usize, TimeUs),
+) -> (AudioEngine, Vec<f32>) {
+    let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let mut out = RecordingOutput::new(dev, RATE as usize * 4);
+    let (_tx, mut rx) = queue();
+    let mut at = TimeUs(0);
+    for _ in 0..3 {
+        if let Some(t) = e.step(&mut out, &mut rx).unwrap().at {
+            at = t;
+        }
+    }
+    let from = out.samples().len();
+    e.play_tone();
+    for k in 0..steps {
+        before(&mut e, k, at);
+        if let Some(t) = e.step(&mut out, &mut rx).unwrap().at {
+            at = t;
+        }
+    }
+    let tail = out.samples()[from..].to_vec();
+    (e, tail)
+}
+
+/// The decision tone alone over silence: it sounds, then ends.
+fn tone_alone() -> Vec<f32> {
+    let (e, tone) = with_tone(silent_engine(), 70, |_, _, _| {});
+    assert!(!e.tone_sounding());
+    assert!(tone.iter().any(|&x| x != 0.0));
+    assert!(
+        tone[tone.len() - 2 * PERIOD as usize..]
+            .iter()
+            .all(|&x| x == 0.0)
+    );
+    tone
+}
+
+/// V1, V2: the decision tone goes on, sample for sample, through a bank's
+/// replacement and an unload (an empty bank), a stop, a restart and a
+/// seek's park: none of them touches it.
+#[test]
+fn the_decision_tone_survives_unload_load_stop_restart_and_seek() {
+    let alone = tone_alone();
+    let (_, through) = with_tone(silent_engine(), 70, |e, k, at| match k {
+        5 => {
+            e.replace(bank(), audio::BgmSchedule::new(Vec::new()))
+                .expect("same rate");
+        }
+        10 => e.stop(),
+        15 => e.restart(at),
+        20 => {
+            let plan =
+                audio::SeekPlan::new(&e.seek_source(), &[], e.frame_line(), TimeUs(10_000_000))
+                    .unwrap();
+            assert_eq!(e.seek(&plan), Ok(()));
+        }
+        25 => {
+            let empty = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
+            e.replace(empty, audio::BgmSchedule::new(Vec::new()))
+                .expect("same rate");
+        }
+        _ => {}
+    });
+    assert_eq!(through, alone);
+}
+
+/// V3: after a ring-out has ended (the mixer's output held at 0 until a
+/// restart), the decision tone still sounds whole.
+#[test]
+fn the_decision_tone_sounds_after_a_run_out_round() {
+    let alone = tone_alone();
+    let mut e = silent_engine();
+    let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+    let mut out = RecordingOutput::new(dev, RATE as usize * 4);
+    let (_tx, mut rx) = queue();
+    let mut at = TimeUs(0);
+    for _ in 0..3 {
+        if let Some(t) = e.step(&mut out, &mut rx).unwrap().at {
+            at = t;
+        }
+    }
+    e.restart(at);
+    e.ring_out(TimeUs(0), TimeUs(20_000));
+    for _ in 0..10 {
+        e.step(&mut out, &mut rx).unwrap();
+    }
+    assert!(e.mixer().rung_out());
+    let (e, after) = with_tone(e, 70, |_, _, _| {});
+    assert!(e.mixer().rung_out(), "still rung out");
+    assert_eq!(after, alone);
+}
+
+/// V4: the decision tone follows the master volume, never the play's gain.
+#[test]
+fn the_decision_tone_follows_the_volume_not_the_gain() {
+    let alone = tone_alone();
+    let mut gained = silent_engine();
+    gained.set_gain(audio::MAX_GAIN).unwrap();
+    let (_, with_gain) = with_tone(gained, 70, |_, _, _| {});
+    assert_eq!(with_gain, alone);
+    let mut quiet = silent_engine();
+    quiet.set_volume(0.5).unwrap();
+    let (_, half) = with_tone(quiet, 70, |_, _, _| {});
+    for (h, a) in half.iter().zip(&alone) {
+        assert!((h - a * 0.5).abs() < 1e-6, "{h} vs {a}");
+    }
+}
+
+/// V6: an engine whose tone has ended plays its chart exactly as one that
+/// never played it: the BGM click after a restart, sample for sample.
+#[test]
+fn no_tone_leaves_the_output_unchanged() {
+    let schedule = vec![BgmEvent {
+        time: TimeUs(100_000),
+        sound: CLICK,
+    }];
+    let play = |tone: bool| {
+        let mut e = engine(&schedule);
+        let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
+        let mut out = RecordingOutput::new(dev, RATE as usize * 4);
+        let (_tx, mut rx) = queue();
+        let mut at = TimeUs(0);
+        for _ in 0..3 {
+            if let Some(t) = e.step(&mut out, &mut rx).unwrap().at {
+                at = t;
+            }
+        }
+        if tone {
+            e.play_tone();
+        }
+        for _ in 0..70 {
+            if let Some(t) = e.step(&mut out, &mut rx).unwrap().at {
+                at = t;
+            }
+        }
+        assert!(!e.tone_sounding());
+        let from = out.samples().len();
+        e.restart(at);
+        for _ in 0..30 {
+            e.step(&mut out, &mut rx).unwrap();
+        }
+        let after = out.samples()[from..].to_vec();
+        assert!(after.iter().any(|&x| x != 0.0), "the click sounded");
+        after
+    };
+    let (with, without) = (play(true), play(false));
+    assert!(
+        with.iter()
+            .zip(&without)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the output changed after the tone"
+    );
+    assert_eq!(with.len(), without.len());
+}
