@@ -2302,8 +2302,9 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // The engine frees the chart before's bank here, so a measurement's
-        // 1× bank is never held beside both.
+        // The engine takes the new bank in place of the empty one the
+        // release barrier left: the previous chart's bank was freed before
+        // the decode.
         self.audio
             .control
             .load(Arc::clone(&bank), audio::BgmSchedule::new(schedule))
