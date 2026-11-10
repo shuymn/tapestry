@@ -1934,6 +1934,15 @@ fn stretch(
     }
 }
 
+/// A carried round's score data: distinct values per field, so a swapped
+/// field shows.
+const CARRIED_SCORE: skin_model::Settled = skin_model::Settled {
+    point: 200_000,
+    ex_score: 6,
+    rate_current_bp: 9_000,
+    rate_whole_bp: 4_285,
+};
+
 #[test]
 fn build_does_not_allocate() {
     let chart = chart();
@@ -4596,14 +4605,15 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             chart,
             ctx,
             skin_model::Continuation::Carried {
-                point: 200_000,
+                score: Some(CARRIED_SCORE),
                 bank: Some(&carried),
             },
         )
         .unwrap();
     assert!(play.carry().slots_run, "a carry-safe program runs");
-    // Each frame's timer start, kept without allocating.
+    // Each frame's timer start and score fields, kept without allocating.
     let mut starts = [None; 64];
+    let mut scores = [[0; 3]; 64];
     TRACK.with(|t| t.set(true));
     for (i, now) in (0..64 * 16 * MS).step_by(16 * MS as usize).enumerate() {
         if i == 32 {
@@ -4615,6 +4625,15 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             .expect("the frame builds");
         if let Some(s) = starts.get_mut(i) {
             *s = play.timer(timer::BUILTIN);
+        }
+        let fields = play.state().fields;
+        if let Some(s) = scores.get_mut(i) {
+            *s = [
+                field::EX_SCORE,
+                field::RATE_CURRENT_BP,
+                field::RATE_WHOLE_BP,
+            ]
+            .map(|f| fields.get(usize::from(f)).copied().unwrap_or(-1));
         }
     }
     let witness = play.carry().terminal;
@@ -4631,6 +4650,20 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         starts.iter().all(|s| *s == Some(TimeUs(-400_000))),
         "{starts:?}"
     );
+    // The carried score data before each first judgment, the rearm's
+    // included; the round's own from it.
+    let carried = [
+        CARRIED_SCORE.ex_score,
+        CARRIED_SCORE.rate_current_bp,
+        CARRIED_SCORE.rate_whole_bp,
+    ];
+    for (i, s) in scores.iter().enumerate() {
+        if i % 32 < 16 {
+            assert_eq!(*s, carried, "frame {i}");
+        } else {
+            assert_ne!(s[0], carried[0], "frame {i}");
+        }
+    }
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

@@ -82,13 +82,17 @@ fn an_imported_skin_draws_through_the_model() {
 
     // A judgment starts the cycled image; the A rank shows once the EX
     // score reaches 18/27 of the maximum (100 notes: 2 × 100 × 18/27 ≥
-    // 134, so 134 is the first).
+    // 134, so 134 is the first), from the judgments the EX score counts.
     drawn.tally = tally(133, 1);
+    drawn.tally.counts.perfect = 66;
+    drawn.tally.counts.great = 1;
     let below = drawn.frame(1_100, &[judged(1_100, Judgment::Perfect, 1)]);
-    assert_eq!(below.len(), 1 + 1 + 3 + 1 + 2, "{below:?}");
+    // The PERFECT count now reads two digits (66, then 67).
+    assert_eq!(below.len(), 1 + 1 + 3 + 2 + 2, "{below:?}");
     drawn.tally = tally(134, 2);
+    drawn.tally.counts.perfect = 67;
     let at = drawn.frame(1_200, &[]);
-    assert_eq!(at.len(), 1 + 1 + 3 + 1 + 2 + 1, "{at:?}");
+    assert_eq!(at.len(), 1 + 1 + 3 + 2 + 2 + 1, "{at:?}");
     let rank = at.iter().find(|q| round(q.rect)[0] == 300).unwrap();
     assert_eq!(round(rank.rect), [300, 1080 - 52, 64, 32]);
 }

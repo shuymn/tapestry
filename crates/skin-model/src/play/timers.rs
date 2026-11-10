@@ -92,29 +92,54 @@ fn point(t: &Tally, targets: u32) -> i32 {
     low(sum / n).wrapping_add(low(50_000 * i64::from(int(t.max_combo)) / n))
 }
 
-/// The play state's cached point after an attempt whose final tally is
-/// `t` over `targets`: the source's 7-key point ([`point`]), `None` for
-/// the zero tally, which no judgment changed, so the cache stays.
+/// The play state's score data (`ScoreDataProperty` at `0.8.9`) as a
+/// frame reads it: the point, the EX score and the two score rates, the
+/// fields `fill_fields` writes for one tally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Settled {
+    pub point: i32,
+    pub ex_score: i32,
+    pub rate_current_bp: i32,
+    pub rate_whole_bp: i32,
+}
+
+/// The score data a frame over `t` reads, the attempt having `targets`
+/// targets of which `t` judged `judged`: the field fill's own formulas.
+fn scores(t: &Tally, targets: u32, judged: u64) -> Settled {
+    Settled {
+        point: point(t, targets),
+        ex_score: count(t.ex_score),
+        rate_current_bp: rate_bp(t.ex_score, judged),
+        rate_whole_bp: rate_bp(t.ex_score, u64::from(targets)),
+    }
+}
+
+/// The play state's score data after an attempt whose final tally is `t`
+/// over `targets` (the source updates it at a judgment only,
+/// `BMSPlayer.java:1038` at `0.8.9`, so the last judgment's stays): what
+/// a frame over `t` reads. `None` for the zero tally, which no judgment
+/// changed, and for a tally [`Skin::build`](crate::Skin::build) refuses
+/// (more counted empty POORs than POORs), which no frame showed: the play
+/// state's earlier data stays, the point included.
 #[must_use]
-pub fn settled_point(t: &Tally, targets: u32) -> Option<i32> {
-    (*t != Tally::default()).then(|| point(t, targets))
+pub fn settled(t: &Tally, targets: u32, empty_poor_counted: bool) -> Option<Settled> {
+    if *t == Tally::default() {
+        return None;
+    }
+    Some(scores(t, targets, judged_targets(t, empty_poor_counted)?))
 }
 
 /// The three score fields a play frame over `t` gives, `[ex_score,
 /// rate.current_bp, rate.whole_bp]`, by `fill_fields`' own formulas, the
 /// attempt having `targets` targets (dev-tools: the replay harness's model
-/// of the source's score data, s7-06e-3-design.md §2a). `None` for a tally
-/// [`Skin::build`](crate::Skin::build) refuses (more counted empty POORs
-/// than POORs).
+/// of the source's score data, s7-06e-3-design.md §2a), the zero tally's
+/// included. `None` for a tally [`Skin::build`](crate::Skin::build)
+/// refuses (more counted empty POORs than POORs).
 #[cfg(feature = "dev-tools")]
 #[must_use]
 pub fn score_fields(t: &Tally, targets: u32, empty_poor_counted: bool) -> Option<[i32; 3]> {
-    let judged = judged_targets(t, empty_poor_counted)?;
-    Some([
-        count(t.ex_score),
-        rate_bp(t.ex_score, judged),
-        rate_bp(t.ex_score, u64::from(targets)),
-    ])
+    let s = scores(t, targets, judged_targets(t, empty_poor_counted)?);
+    Some([s.ex_score, s.rate_current_bp, s.rate_whole_bp])
 }
 
 /// The score rate of `ex` over `targets`, in basis points:
@@ -646,19 +671,20 @@ impl Play {
         Ok(())
     }
 
-    /// The point field: the play state's cached point until the attempt's
-    /// first judgment (the first frame whose tally is not the zero tally:
-    /// every judgment, the empty POOR included, adds a count), then the
-    /// attempt's own (`ScoreDataProperty.java:62-91`, updated only at a
-    /// judgment, `BMSPlayer.java:1038` at `0.8.9`).
-    fn point_field(&mut self, t: &Tally) -> i32 {
+    /// The score fields: the play state's cached score data until the
+    /// attempt's first judgment (the first frame whose tally is not the
+    /// zero tally: every judgment, the empty POOR included, adds a count),
+    /// then the attempt's own, `judged` its judged targets
+    /// (`ScoreDataProperty.java:64-99`, updated only at a judgment,
+    /// `BMSPlayer.java:1038` at `0.8.9`). With no cached data (a play
+    /// state with no judgment yet) it is the attempt's own throughout.
+    fn score_now(&mut self, t: &Tally, judged: u64) -> Settled {
         if !self.judged && *t != Tally::default() {
             self.judged = true;
         }
-        if self.judged {
-            point(t, self.reducer.targets())
-        } else {
-            self.cached_point
+        match self.cached {
+            Some(c) if !self.judged => c,
+            _ => scores(t, self.reducer.targets(), judged),
         }
     }
 
@@ -669,7 +695,7 @@ impl Play {
     fn fill_fields(&mut self, frame: &SkinFrame<'_>, judged: u64, readouts: &Readouts) {
         let r = readouts;
         let t = frame.tally;
-        let point_now = self.point_field(t);
+        let score = self.score_now(t, judged);
         let gauge = frame.gauges.get(frame.gauge).map_or(0, |g| {
             let permille = (g.value.0 / GAUGE_UNIT).clamp(0, i64::from(GAUGE_PERMILLE));
             i32::try_from(permille).unwrap_or(0)
@@ -681,7 +707,6 @@ impl Play {
             .get(frame.gauge)
             .and(self.gauge_desc(frame.gauge))
             .map(|d| d.look);
-        let targets = u64::from(self.reducer.targets());
         let n = &r.native;
         let [native_ms, native_green, native_valid] = duration_fields(n.duration);
         let native: [i32; (field::NATIVE_FLOATING + 1 - field::NATIVE_HISPEED_X100) as usize] = [
@@ -700,7 +725,7 @@ impl Play {
         let head: [i32; field::DURATION_VARIANTS as usize] = [
             count(t.combo),
             count(t.max_combo),
-            count(t.ex_score),
+            score.ex_score,
             count(t.bp),
             count(t.counts.perfect),
             count(t.counts.great),
@@ -712,8 +737,8 @@ impl Play {
             gauge,
             // Loaded: a play's frames never load (the loading runtime's do).
             100,
-            rate_bp(t.ex_score, judged),
-            rate_bp(t.ex_score, targets),
+            score.rate_current_bp,
+            score.rate_whole_bp,
             kind.unwrap_or(GaugeLook::Normal).schema_value(),
             i32::from(kind.is_some()),
             r.bpm_current,
@@ -770,7 +795,7 @@ impl Play {
             )
             .chain([r.progress_ppm])
             .chain(self.chart_fields)
-            .chain([point_now])
+            .chain([score.point])
             .chain([
                 i32::from(self.drawable_chart().present(ChartImage::Stage)),
                 i32::from(self.drawable_chart().present(ChartImage::Back)),

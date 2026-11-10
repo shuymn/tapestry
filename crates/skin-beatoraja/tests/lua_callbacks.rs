@@ -1939,7 +1939,7 @@ fn a_carried_round_keeps_its_latch() {
         4,
         &round(),
         Continuation::Carried {
-            point: 200_000,
+            score: Some(full(200_000)),
             bank: Some(carry.bank),
         },
     );
@@ -1967,7 +1967,7 @@ fn the_point_is_cached_until_the_first_judgment() {
     let skin = i.imported.skin;
     let init = Bank::of(vec![Val::Int(5_000)]);
     let carried = |point| Continuation::Carried {
-        point,
+        score: Some(full(point)),
         bank: Some(&init),
     };
     for first in ["poor", "empty poor"] {
@@ -2016,7 +2016,7 @@ fn a_program_reading_other_fields_does_not_carry() {
             4,
             &round(),
             Continuation::Carried {
-                point: 200_000,
+                score: Some(full(200_000)),
                 bank: Some(&init),
             },
         );
@@ -2055,7 +2055,7 @@ fn a_clock_read_carries() {
         4,
         &round(),
         Continuation::Carried {
-            point: 200_000,
+            score: Some(full(200_000)),
             bank: Some(carry.bank),
         },
     );
@@ -2079,7 +2079,7 @@ fn an_unwitnessed_round_runs_no_slot_program() {
         4,
         &round(),
         Continuation::Carried {
-            point: 200_000,
+            score: Some(full(200_000)),
             bank: None,
         },
     );
@@ -2092,9 +2092,9 @@ fn an_unwitnessed_round_runs_no_slot_program() {
     assert!(!carry.slots_run && !carry.terminal);
 }
 
-/// A rearm keeps the slots and the cached point and clears the first
-/// judgment's latch: after a judgment and a rearm the point reads the
-/// cache again.
+/// A rearm keeps the slots and the cached score data and clears the first
+/// judgment's latch: after a judgment and a rearm the point, the EX score
+/// and the score rates read the cache again.
 #[test]
 fn a_rearm_keeps_the_cache() {
     use skin_model::Continuation;
@@ -2102,23 +2102,198 @@ fn a_rearm_keeps_the_cache() {
     let d = timer_skin("local state = 5000", &positive_point_body(), 1);
     let skin = import(&d, 905).unwrap().imported.skin;
     let init = Bank::of(vec![Val::Int(5_000)]);
+    let cache = skin_model::Settled {
+        point: 200_000,
+        ..SCORE
+    };
     let mut p = Drawn::over_carried(
         skin,
         4,
         &round(),
         Continuation::Carried {
-            point: 200_000,
+            score: Some(cache),
             bank: Some(&init),
         },
     );
     p.state_us = 6_000_000;
     assert_eq!(p.frame(1_000, &[]).len(), 1);
+    assert_eq!(scores(&p), cache);
     p.tally.counts.poor = 1;
     assert!(p.frame(1_016, &[]).is_empty());
+    assert_eq!(scores(&p).ex_score, 0);
     p.play.rearm();
     p.tally = common::play::tally(0, 0);
     assert_eq!(p.frame(1_032, &[]).len(), 1);
+    assert_eq!(scores(&p), cache);
     assert_eq!(bank(&p), [Val::Int(5_000)]);
+}
+
+/// A carried round's score data, distinct per field (s7-06s-design.md S1).
+const SCORE: skin_model::Settled = skin_model::Settled {
+    point: 120_000,
+    ex_score: 6,
+    rate_current_bp: 9_000,
+    rate_whole_bp: 4_285,
+};
+
+/// Score data with the point `point` and the rest of a full score's over
+/// four targets.
+fn full(point: i32) -> skin_model::Settled {
+    skin_model::Settled {
+        point,
+        ex_score: 8,
+        rate_current_bp: 10_000,
+        rate_whole_bp: 10_000,
+    }
+}
+
+/// The frame's score data: the point, the EX score and the two score
+/// rates as the play fields hold them.
+fn scores(p: &Drawn) -> skin_model::Settled {
+    use skin_model::field;
+    let fields = p.play.state().fields;
+    let f = |slot: u16| fields[usize::from(slot)];
+    skin_model::Settled {
+        point: f(field::POINT),
+        ex_score: f(field::EX_SCORE),
+        rate_current_bp: f(field::RATE_CURRENT_BP),
+        rate_whole_bp: f(field::RATE_WHOLE_BP),
+    }
+}
+
+/// s7-06s S1: before a carried round's first judgment the EX score and the
+/// score rates read the play state's cached score data, with the point;
+/// from its first judgment (a GREAT: EX 1 of 2) the round's own.
+#[test]
+fn the_score_is_cached_until_the_first_judgment() {
+    use skin_model::Continuation;
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let mut p = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            score: Some(SCORE),
+            bank: None,
+        },
+    );
+    let _ = p.frame(1_000, &[]);
+    assert_eq!(scores(&p), SCORE);
+    p.tally.counts.great = 1;
+    p.tally.ex_score = 1;
+    p.tally.combo = 1;
+    p.tally.max_combo = 1;
+    let _ = p.frame(1_016, &[]);
+    let own = scores(&p);
+    assert_eq!(
+        (own.ex_score, own.rate_current_bp, own.rate_whole_bp),
+        (1, 5_000, 1_250)
+    );
+    assert_ne!(own.point, SCORE.point);
+}
+
+/// s7-06s S3: a play state's first round, and a later one of a play state
+/// with no judgment yet, read the round's own score data for no judgment:
+/// the current rate 100 %, the whole rate 0 over targets and 100 % over
+/// none (design.md "Score rate and gauge kind").
+#[test]
+fn a_fresh_round_reads_its_own_score() {
+    use skin_model::Continuation;
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    for (notes, whole) in [(4, 0), (0, 10_000)] {
+        let own = skin_model::Settled {
+            point: 0,
+            ex_score: 0,
+            rate_current_bp: 10_000,
+            rate_whole_bp: whole,
+        };
+        let mut fresh = Drawn::over_section(skin.clone(), notes, &round());
+        let _ = fresh.frame(1_000, &[]);
+        assert_eq!(scores(&fresh), own, "fresh over {notes}");
+        let mut none = Drawn::over_carried(
+            skin.clone(),
+            notes,
+            &round(),
+            Continuation::Carried {
+                score: None,
+                bank: None,
+            },
+        );
+        let _ = none.frame(1_000, &[]);
+        assert_eq!(scores(&none), own, "no score data over {notes}");
+    }
+}
+
+/// s7-06s S6: the score data carries whatever the slots: a program that is
+/// not carry-safe runs no slot program on a carried state, and still reads
+/// the carried EX score and rates.
+#[test]
+fn a_score_carries_without_carry_safety() {
+    use skin_model::Continuation;
+    use skin_model::present::{Bank, OFF};
+    let off = "ms.timer_off_value";
+    let body = format!(
+        "if state == {off} and ms.number(100) == 200000 then state = ms.time() end\n\
+         if ms.number(71) > 0 then return state end\n\
+         return {off}"
+    );
+    let d = timer_skin(STATE, &body, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let init = Bank::of(vec![OFF]);
+    let mut p = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            score: Some(SCORE),
+            bank: Some(&init),
+        },
+    );
+    let _ = p.frame(1_000, &[]);
+    assert!(!p.play.carry().slots_run);
+    assert_eq!(scores(&p), SCORE);
+}
+
+/// s7-06s S9: a rank timer (AAA, 350) waits for the round's own judgment:
+/// a carried EX score that qualifies over the round's one target does not
+/// light it at READY, before or after a rearm; its own PGREAT does, its
+/// start that frame. A fresh round gives the same timeline.
+#[test]
+fn a_rank_timer_waits_for_the_rounds_judgment() {
+    use skin_model::Continuation;
+    let d = folder(&skin(
+        "table.insert(skin.destination, { id = \"i\", timer = 350,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })",
+    ));
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let carried = skin_model::Settled {
+        point: 200_000,
+        ex_score: 14,
+        rate_current_bp: 10_000,
+        rate_whole_bp: 10_000,
+    };
+    for carry in [
+        Continuation::Fresh,
+        Continuation::Carried {
+            score: Some(carried),
+            bank: None,
+        },
+    ] {
+        let mut p = Drawn::over_carried(skin.clone(), 1, &round(), carry);
+        assert!(p.frame(500, &[]).is_empty(), "{carry:?}: READY");
+        p.play.rearm();
+        assert!(p.frame(516, &[]).is_empty(), "{carry:?}: rearmed");
+        assert!(p.frame(532, &[]).is_empty(), "{carry:?}: rearmed");
+        p.tally.counts.perfect = 1;
+        p.tally.ex_score = 2;
+        p.tally.combo = 1;
+        p.tally.max_combo = 1;
+        assert_eq!(p.frame(1_000, &[]).len(), 1, "{carry:?}: judged");
+        let rank = p.play.timer(skin_model::timer::BUILTIN);
+        assert_eq!(rank, Some(bms_model::TimeUs(1_000_000)), "{carry:?}");
+    }
 }
 
 /// A carried bank is checked against the program before use: another
@@ -2139,7 +2314,7 @@ fn a_continuation_of_another_shape_is_refused() {
     for vals in [vec![], vec![OFF, OFF], vec![Val::Int(-5)]] {
         let b = Bank::of(vals.clone());
         let carry = Continuation::Carried {
-            point: 0,
+            score: None,
             bank: Some(&b),
         };
         assert_eq!(
@@ -2151,7 +2326,7 @@ fn a_continuation_of_another_shape_is_refused() {
     // The control: a value in the domain is taken.
     let b = Bank::of(vec![Val::Int(5)]);
     let carry = Continuation::Carried {
-        point: 0,
+        score: None,
         bank: Some(&b),
     };
     assert!(skin.prepare_carried(&chart, &ctx, carry).is_ok());
