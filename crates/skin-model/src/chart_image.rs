@@ -475,7 +475,30 @@ fn read_resolved(
         return Err(Stop::Changed);
     };
     unchanged(&file)?;
-    let probe = decode::header(&mut file, len).map_err(absent_of)?;
+    // Every outcome of the handle's bytes but a cancellation, a failure as
+    // much as a success, is verified against the key on the handle once
+    // the bytes are taken: a file changed meanwhile is not the one
+    // resolved, so its failure is not that observation's either.
+    let snapshot = take(&mut file, len, cancel);
+    if !matches!(snapshot, Err(Stop::Absent(Absent::Cancelled))) {
+        unchanged(&file)?;
+    }
+    drop(file);
+    let (bytes, dims, header) = snapshot?;
+    decode::check_whole(&bytes, dims, header).map_err(absent_of)?;
+    let image = decode::decode(bytes, dims).map_err(absent_of)?;
+    checkpoint(cancel, Site::Decoded)?;
+    Ok(fit(image, slot, cancel)?)
+}
+
+/// What a read decodes: the whole bytes, the dimensions and a PNG's
+/// header fields.
+type Snapshot = (Vec<u8>, [u32; 2], Option<decode::PngHeader>);
+
+/// The header within the side and texel caps, and the whole bytes, of the
+/// open `file` of `len` bytes.
+fn take(file: &mut File, len: u64, cancel: &dyn Fn() -> bool) -> Result<Snapshot, Stop> {
+    let probe = decode::header(file, len).map_err(absent_of)?;
     let [w, h] = probe.dims;
     if w > MAX_SIDE || h > MAX_SIDE {
         return Err(Absent::OverCap(Cap::Side).into());
@@ -487,7 +510,7 @@ fn read_resolved(
         return Err(Absent::OverCap(Cap::Texels).into());
     };
     file.seek(SeekFrom::Start(0)).map_err(|_| Absent::Decode)?;
-    let (bytes, more) = match decode::read_capped(&mut file, len, MAX_FILE_BYTES, cancel) {
+    let (bytes, more) = match decode::read_capped(file, len, MAX_FILE_BYTES, cancel) {
         Ok(read) => read,
         Err(e) if decode::is_cancelled(&e) => return Err(Absent::Cancelled.into()),
         Err(_) => return Err(Absent::Decode.into()),
@@ -495,12 +518,7 @@ fn read_resolved(
     if more || u64::try_from(bytes.len()).ok() != Some(len) {
         return Err(Stop::Changed);
     }
-    unchanged(&file)?;
-    drop(file);
-    decode::check_whole(&bytes, probe.dims, header).map_err(absent_of)?;
-    let image = decode::decode(bytes, probe.dims).map_err(absent_of)?;
-    checkpoint(cancel, Site::Decoded)?;
-    Ok(fit(image, slot, cancel)?)
+    Ok((bytes, probe.dims, header))
 }
 
 /// The largest size within `max` that keeps the aspect of `native`,

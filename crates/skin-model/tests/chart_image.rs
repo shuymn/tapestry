@@ -271,6 +271,16 @@ fn files_over_the_byte_cap_are_refused_before_reading() {
     assert_eq!(absent(&r), Absent::Unresolved(Unresolved::TooLarge));
 }
 
+/// A side of exactly the cap is admitted and decoded.
+#[test]
+fn a_side_of_exactly_the_cap_is_decoded() {
+    let d = dir();
+    save(d.path(), "line.png", &solid(16_384, 1, [3, 6, 9, 255]));
+    let f = fitted(read_in(d.path(), "line.png", 64));
+    assert_eq!((f.native(), f.content()), ([16_384, 1], [48, 1]));
+    assert_eq!(texel(&f, 0, GUTTER, GUTTER), [3, 6, 9, 255]);
+}
+
 #[test]
 fn the_side_and_texel_caps_refuse_by_the_header() {
     let d = dir();
@@ -498,6 +508,74 @@ fn a_read_returns_the_observation_it_decoded() {
     assert!(!now.same_as(&r.binding));
     // And an unchanged file is the same observation.
     assert!(now.same_as(&resolve(&chart, "s.png", &[], &fixed)));
+}
+
+/// A file changed in place after the handle's first observation (here
+/// while its identity is asked, after its metadata was read) is not the
+/// file resolved, whatever its new bytes make of the read: a valid image,
+/// a header over a cap, or bytes that are no image. Each outcome carries
+/// the observation of the bytes it came from, so restoring the original
+/// bytes, time and identity is not taken for the file just read.
+#[test]
+fn an_outcome_carries_the_observation_of_its_own_bytes() {
+    let original = encoded(&solid(2, 2, [1, 1, 1, 255]), ImageFormat::Png);
+    // What each replacement is, its bytes, and the native size or absence
+    // a read of it gives.
+    type Case = (&'static str, Vec<u8>, Result<[u32; 2], Absent>);
+    let replacements: [Case; 3] = [
+        (
+            "valid",
+            encoded(&solid(3, 3, [2, 2, 2, 255]), ImageFormat::Png),
+            Ok([3, 3]),
+        ),
+        (
+            "over a cap",
+            png_header(2_191, 5_743),
+            Err(Absent::OverCap(Cap::Texels)),
+        ),
+        (
+            "no image",
+            b"not an image at all, longer".to_vec(),
+            Err(Absent::Format),
+        ),
+    ];
+    for (what, replacement, expected) in replacements {
+        let d = dir();
+        let file = d.path().join("s.png");
+        fs::write(&file, &original).unwrap();
+        let time = fs::metadata(&file).unwrap().modified().unwrap();
+        let chart = ChartDir::new(d.path()).unwrap();
+        // The second identity asked is the data handle's first
+        // observation, after resolution's.
+        let asked = Cell::new(0);
+        let change_in_place = |_: &File| {
+            asked.set(asked.get() + 1);
+            if asked.get() == 2 {
+                fs::write(&file, &replacement).unwrap();
+            }
+            Some(FileIdentity(1))
+        };
+        let r = read(&chart, "s.png", &[], slot(64), &never, &change_in_place);
+        let Binding::Resolved { key, .. } = &r.binding else {
+            panic!("{what}: {:?}", r.binding);
+        };
+        assert_eq!(key.len, replacement.len() as u64, "{what}");
+        assert_eq!(
+            r.image.as_ref().map(Fitted::native).map_err(Clone::clone),
+            expected,
+            "{what}"
+        );
+        // The original bytes, time and identity back.
+        fs::write(&file, &original).unwrap();
+        File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        let restored = resolve(&chart, "s.png", &[], &fixed);
+        assert!(!restored.same_as(&r.binding), "{what}");
+    }
 }
 
 #[test]
