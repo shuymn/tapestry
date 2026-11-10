@@ -150,6 +150,49 @@ pub fn autoplay_script(
     (events, script)
 }
 
+/// The release of `lane` at `received` from `source`.
+pub fn release(received: i64, source: u16, lane: Lane) -> PhysicalInputEvent {
+    PhysicalInputEvent {
+        kind: InputKind::Control {
+            control: control(lane),
+            value: 0,
+        },
+        ..press(received, source, lane)
+    }
+}
+
+/// The `i`th tap's offset in [`offset_taps`], in whole ms: from −20 to 20,
+/// cycling, every one of them inside the PERFECT window.
+pub fn tap_offset_ms(i: i64) -> i64 {
+    i % 41 - 20
+}
+
+/// `count` taps 100 ms apart from 1 s on, cycling over the seven keys, each
+/// pressed [`tap_offset_ms`] early (late when negative) and 400 µs more away
+/// from the note, so truncation toward 0 gives the whole ms, and released
+/// 50 ms after its press: the chart and its inputs from source 0, in time
+/// order. The `i`th tap's note lies at `tap_time(i)`.
+pub fn offset_taps(count: i64) -> (Chart, Vec<PhysicalInputEvent>) {
+    let mut b = ChartBuilder::new(150_000);
+    let mut events = Vec::new();
+    for i in 0..count {
+        let l = lane(u8::try_from(i % 7).unwrap() + 1);
+        let t = tap_time(i);
+        b = b.tap(l, TimeUs(t));
+        let ms = tap_offset_ms(i);
+        let at = t - (ms * MS + ms.signum() * 400);
+        events.push(press(at, 0, l));
+        events.push(release(at + 50 * MS, 0, l));
+    }
+    events.sort_by_key(|e| e.received);
+    (b.build().unwrap(), events)
+}
+
+/// The time of [`offset_taps`]'s `i`th note.
+pub fn tap_time(i: i64) -> i64 {
+    1_000 * MS + i * 100 * MS
+}
+
 pub fn press(received: i64, source: u16, lane: Lane) -> PhysicalInputEvent {
     PhysicalInputEvent {
         received: TimeUs(received),
