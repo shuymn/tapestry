@@ -198,8 +198,8 @@ pub struct Shelf {
     /// When the running pass started (dev-tools).
     #[cfg(feature = "dev-tools")]
     pass_started: Option<Instant>,
-    /// The end's wait in place of [`STOP_TIMEOUT`] (dev-tools).
-    #[cfg(feature = "dev-tools")]
+    /// The end's wait in place of [`STOP_TIMEOUT`] (dev-tools, tests).
+    #[cfg(any(test, feature = "dev-tools"))]
     stop_timeout: Option<Duration>,
 }
 
@@ -274,7 +274,7 @@ impl Shelf {
             passes: 0,
             #[cfg(feature = "dev-tools")]
             pass_started: None,
-            #[cfg(feature = "dev-tools")]
+            #[cfg(any(test, feature = "dev-tools"))]
             stop_timeout: None,
         };
         shelf.start_pass();
@@ -736,8 +736,8 @@ impl Shelf {
     }
 
     /// The end waits `bound` in place of [`STOP_TIMEOUT`] (dev-tools,
-    /// `--dev-stop-timeout`).
-    #[cfg(feature = "dev-tools")]
+    /// `--dev-stop-timeout`; tests).
+    #[cfg(any(test, feature = "dev-tools"))]
     pub fn set_stop_timeout(&mut self, bound: Duration) {
         self.stop_timeout = Some(bound);
     }
@@ -745,7 +745,7 @@ impl Shelf {
     /// How long the end waits for the pass and the background measurement
     /// to stop.
     fn stop_timeout(&self) -> Duration {
-        #[cfg(feature = "dev-tools")]
+        #[cfg(any(test, feature = "dev-tools"))]
         if let Some(bound) = self.stop_timeout {
             return bound;
         }
@@ -1907,24 +1907,34 @@ pub(crate) mod tests {
     }
 
     /// The end of a run while the background measures stops it at its
-    /// next block: the drop returns before its stop bound, long before the
-    /// measurement could end, and nothing of it is stored.
+    /// next block: the measurement, which never ends on its own, returns
+    /// stopped, and the drop returns once it did, not at its stop bound
+    /// (raised to the watchdog); nothing of it is stored.
     #[test]
     fn exit_while_measuring_in_the_background_stores_nothing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
-        let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let open = Arc::new(AtomicBool::new(false));
         let (c, b, key, path) = song(dir.path());
-        // 3 s of blocks.
-        let mut shelf = with_background(dir.path(), fake(key, 300, &open));
-        cancelled_load(&mut shelf, &c, &b, &path);
-        until("the background's start", || worker(&shelf).holds(&path));
-        let begun = Instant::now();
-        drop(shelf);
-        assert!(
-            begun.elapsed() < super::STOP_TIMEOUT,
-            "{:?}",
-            begun.elapsed()
+        let (began, stopped) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
+        let (begins, theirs) = (Arc::clone(&began), Arc::clone(&stopped));
+        let mut endless = fake(key, usize::MAX, &open);
+        let measure: crate::background::Measure = Box::new(move |job, stop| {
+            begins.store(true, Ordering::SeqCst);
+            let out = endless(job, stop);
+            let told = matches!(out, crate::background::Outcome::Stopped);
+            theirs.store(told, Ordering::SeqCst);
+            out
+        });
+        let mut shelf = with_background(dir.path(), measure);
+        shelf.set_stop_timeout(*WATCHDOG);
+        cancelled_load(&mut shelf, &c, &b, &path);
+        until("the measurement's start", || began.load(Ordering::SeqCst));
+        drop(shelf);
+        assert!(stopped.load(Ordering::SeqCst), "the drop did not stop it");
         let (library, _) = open_library(dir.path());
         assert_eq!(library.loudness(&key).unwrap(), None);
     }

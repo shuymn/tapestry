@@ -963,6 +963,20 @@ const ACQUIRE_RETRIES: u32 = 4;
 /// tried again, past [`ACQUIRE_RETRIES`] skips in a row.
 const ACQUIRE_WAIT: Duration = Duration::from_millis(1);
 
+#[cfg(test)]
+std::thread_local! {
+    /// The [`ACQUIRE_WAIT`] waits the render loop on this thread has taken
+    /// (tests).
+    static ACQUIRE_WAITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`ACQUIRE_WAIT`] waits the render loop on the calling thread has
+/// taken so far (tests).
+#[cfg(test)]
+pub(crate) fn acquire_waits() -> u64 {
+    ACQUIRE_WAITS.with(std::cell::Cell::get)
+}
+
 /// How long the end of the render thread is waited for: past it, the thread
 /// is left to the process's exit.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3576,6 +3590,8 @@ impl Run {
             } else if matches!(mode, Mode::Play { skipped, .. } if skipped >= ACQUIRE_RETRIES) {
                 // A play frame's acquisition keeps being skipped: wait a
                 // little, or for a message, before trying it again.
+                #[cfg(test)]
+                ACQUIRE_WAITS.with(|w| w.set(w.get().wrapping_add(1)));
                 rx.recv_timeout(ACQUIRE_WAIT).map_err(|e| match e {
                     mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
                     mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
@@ -6559,6 +6575,16 @@ pub(crate) mod tests {
         stall: Arc<AtomicBool>,
         stalled: Arc<AtomicBool>,
         seen: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        answer: Arc<std::sync::Mutex<Answer>>,
+    }
+
+    /// A preparation's answer as a menu screen sees it: the first menu
+    /// frame after the answer was sent takes it, noting how many frames
+    /// were drawn before it and whether it was `Ok`.
+    #[derive(Default)]
+    struct Answer {
+        pending: Option<std::sync::mpsc::Receiver<Result<(), RenderError>>>,
+        taken: Option<(usize, bool)>,
     }
 
     impl Screen for StalledMenus {
@@ -6593,7 +6619,15 @@ pub(crate) mod tests {
                 .lines
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
-            self.seen.lock().unwrap().push((line, changed));
+            let mut seen = self.seen.lock().unwrap();
+            let mut answer = self.answer.lock().unwrap();
+            if let Some(ready) = answer.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                answer.pending = None;
+                answer.taken = Some((seen.len(), ready.is_ok()));
+            }
+            drop(answer);
+            seen.push((line, changed));
+            drop(seen);
             while self.stall.load(Ordering::Acquire) {
                 self.stalled.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
@@ -6619,19 +6653,23 @@ pub(crate) mod tests {
 
     /// A render thread stalled in a loading frame falls behind on nothing:
     /// of 300 pages shown meanwhile, only the newest is drawn, one new page
-    /// once it resumes, and the play's preparation is answered at once
-    /// after it; a page shown before loading ended is never drawn after.
+    /// once it resumes, and the play's preparation is answered right after
+    /// that one frame; a page shown before loading ended is never drawn
+    /// after.
     #[test]
     fn a_stalled_render_thread_draws_only_the_newest_loading_lines() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
+        let answer = Arc::new(std::sync::Mutex::new(Answer::default()));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
+        let answered = Arc::clone(&answer);
         let make: MakeScreen = Box::new(move || {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::clone(&answered),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -6655,14 +6693,19 @@ pub(crate) mod tests {
         for n in 1..=300 {
             sink.show(one_line(&n.to_string()));
         }
+        // The preparation waits behind the pages; the frame after its
+        // answer notes how many were drawn before it.
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        answer.lock().unwrap().pending = Some(rx);
+        link.send(RenderMsg::Prepare(reply));
         stall.store(false, Ordering::Release);
-        let released = Instant::now();
-        link.prepare().unwrap();
-        // Unbacked by a slot, 300 pages a frame each would take seconds.
-        assert!(released.elapsed() < Duration::from_secs(1));
-        let after: Vec<_> = seen.lock().unwrap()[before..].to_vec();
-        let new: Vec<_> = after.iter().filter(|(_, changed)| *changed).collect();
-        assert_eq!(new, [&("300".to_owned(), true)], "{after:?}");
+        assert!(wait_until(|| answer.lock().unwrap().taken.is_some()));
+        let (drawn, ready) = answer.lock().unwrap().taken.unwrap();
+        assert!(ready);
+        // Unbacked by a slot and its one signal, every page would be a
+        // frame of its own before the answer.
+        let after: Vec<_> = seen.lock().unwrap()[before..drawn].to_vec();
+        assert_eq!(after, [("300".to_owned(), true)]);
 
         // Loading ends while the thread stalls with a page waiting: the
         // select page follows, and the waiting page is never drawn.
@@ -6946,6 +6989,7 @@ pub(crate) mod tests {
             origin: clock.now(),
         };
         link.play_state(state(1));
+        let shown = clock.now();
         link.loading().show(one_line("L"));
         assert!(wait_until(|| count() >= 1));
         assert_eq!(seen.lock().unwrap()[0].0, 0, "the first frame adds 0");
@@ -6953,18 +6997,33 @@ pub(crate) mod tests {
         let n = count();
         assert!(wait_until(|| count() > n + 1));
         // Idle: +1/6° per ms after negation, one unit a µs. A frame draws
-        // what the ticks before it left: the angle of the last frame is the
-        // time from the first to the one before it; the frames' times are
-        // sampled apart from the ticks, so a 5 ms tolerance.
-        let (angle, previous, first) = {
+        // what the ticks before it left: the second frame draws the first
+        // one's, which set the baseline, and the angle of the last frame is
+        // the time from the first frame's tick to the one before the last.
+        // A frame ticks at its start, which follows the unpaced loop's
+        // sleep of at least 16 ms and precedes the time the frame carries;
+        // the first frame's start also follows the page's show. So that
+        // time lies between bounds the frames' own times give, however long
+        // any thread is held, within one revolution.
+        // The sleep less 1 ms for the timers' rounding.
+        const SLEEP: i64 = 15_000;
+        let (second, angle, high, low) = {
             let s = seen.lock().unwrap();
-            (s[s.len() - 1].0, s[s.len() - 2].1, s[0].1)
+            let [.., before, previous, (angle, _)] = s[..] else {
+                unreachable!("three frames")
+            };
+            (
+                s[1].0,
+                angle,
+                previous.1.0 - SLEEP - shown.0,
+                before.1.0 + SLEEP - s[0].1.0,
+            )
         };
-        let off = i64::from(angle) - (previous.0 - first.0);
+        assert_eq!(second, 0, "the first frame's tick adds 0");
+        let turned = low + (i64::from(angle) - low).rem_euclid(2_160_000);
         assert!(
-            off.abs() < 5_000,
-            "{angle} after {} µs",
-            previous.0 - first.0
+            low <= high && turned <= high,
+            "{angle} for {low}..={high} µs"
         );
         // Another number's pause changes nothing; its own holds it: every
         // frame after both were taken draws one angle.
@@ -7446,6 +7505,7 @@ pub(crate) mod tests {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::default(),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -7490,6 +7550,7 @@ pub(crate) mod tests {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::default(),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -7658,7 +7719,8 @@ pub(crate) mod tests {
     }
 
     /// A page that comes after the launch screen's time replaces it at
-    /// once.
+    /// once: the frame after the page was taken draws it, and no splash
+    /// frame follows.
     #[test]
     fn a_page_after_the_splash_time_shows_at_once() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
@@ -7682,15 +7744,14 @@ pub(crate) mod tests {
         .unwrap();
         std::thread::sleep(crate::menu_screen::SPLASH + Duration::from_millis(100));
         assert_eq!(menus.load(Ordering::SeqCst), 0);
-        let sent = Instant::now();
         link.send(RenderMsg::Menu(Box::default()));
-        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 1));
-        assert!(
-            sent.elapsed() < Duration::from_millis(500),
-            "{:?}",
-            sent.elapsed()
-        );
+        assert!(link.fence(super::hook_bound()));
+        assert!(menus.load(Ordering::SeqCst) >= 1);
+        let drawn = splashes.load(Ordering::SeqCst);
+        let shown = menus.load(Ordering::SeqCst);
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= shown + 2));
         link.exit();
+        assert_eq!(splashes.load(Ordering::SeqCst), drawn);
     }
 
     /// A preparation (a play's, before it opens) leaves the splash drawn,
@@ -8217,8 +8278,12 @@ pub(crate) mod tests {
         link.exit();
     }
 
-    /// A screen whose chart preparation blocks while `hold` is set.
-    struct Held(Arc<AtomicBool>);
+    /// A screen whose chart preparation blocks while `hold` is set, with
+    /// `inside` set meanwhile.
+    struct Held {
+        hold: Arc<AtomicBool>,
+        inside: Arc<AtomicBool>,
+    }
 
     impl Screen for Held {
         fn load(
@@ -8226,9 +8291,11 @@ pub(crate) mod tests {
             _chart: &Chart,
             _section: Option<&eval::Section>,
         ) -> Result<(), RenderError> {
-            while self.0.load(Ordering::Acquire) {
+            while self.hold.load(Ordering::Acquire) {
+                self.inside.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            self.inside.store(false, Ordering::Release);
             Ok(())
         }
         fn wait(&self) -> bool {
@@ -8258,32 +8325,41 @@ pub(crate) mod tests {
     #[test]
     fn a_slow_attempt_stops_when_the_player_leaves_or_a_thread_fails() {
         let hold = Arc::new(AtomicBool::new(false));
-        let held = Arc::clone(&hold);
-        let make: MakeScreen =
-            Box::new(move || Ok(Box::new(Held(Arc::clone(&held))) as Box<dyn Screen>));
+        let inside = Arc::new(AtomicBool::new(false));
+        let (held, within) = (Arc::clone(&hold), Arc::clone(&inside));
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(Held {
+                hold: Arc::clone(&held),
+                inside: Arc::clone(&within),
+            }) as Box<dyn Screen>)
+        });
         let link = spawn_empty(make);
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         link.load(Arc::clone(&chart), None).unwrap();
         for cause in ["leave", "input", "audio"] {
             hold.store(true, Ordering::Release);
             let started = Instant::now();
-            let at = started + Duration::from_millis(100);
+            // The cause comes once the screen holds the preparation.
+            let mut stops = 0;
             let answer = link.prepare_attempt(attempt(&chart, None), || {
-                let now = Instant::now() >= at;
-                crate::play::preparation_stops(
+                let now = inside.load(Ordering::Acquire);
+                let stop = crate::play::preparation_stops(
                     false,
                     now && cause == "leave",
                     (now && cause == "input").then_some(game::InputWaitError::Gone),
                     (now && cause == "audio").then_some(audio::OutputError::DeviceLost),
-                )
+                );
+                stops += usize::from(stop);
+                stop
             });
             assert_eq!(answer.unwrap(), Preparation::Cancelled, "{cause}");
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "{cause}: {:?}",
-                started.elapsed()
-            );
+            // It stopped at the first look that saw the cause, with the
+            // screen still holding the preparation, and not at the bound.
+            assert_eq!(stops, 1, "{cause}");
+            assert!(inside.load(Ordering::Acquire), "{cause}");
+            assert!(started.elapsed() < super::LOAD_TIMEOUT, "{cause}");
             hold.store(false, Ordering::Release);
+            assert!(wait_until(|| !inside.load(Ordering::Acquire)));
         }
         link.exit();
     }

@@ -968,6 +968,8 @@ fn rig<'a>(
         #[cfg(test)]
         audio_lost: std::sync::Arc::default(),
         #[cfg(test)]
+        result_upload_looks: std::sync::Arc::default(),
+        #[cfg(test)]
         opening_gates: std::sync::Arc::default(),
         #[cfg(test)]
         ended_plays: Vec::new(),

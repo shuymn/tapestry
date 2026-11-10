@@ -56,6 +56,10 @@ pub struct PlayerGate {
     /// A cancellation the audio thread never acknowledged: its output
     /// counts as failed, so no candidate opens after it.
     unacknowledged: bool,
+    /// How many times [`wait_dropped`] looked for the acknowledgement
+    /// (tests).
+    #[cfg(test)]
+    drop_looks: u32,
 }
 
 impl PlayerGate {
@@ -75,6 +79,8 @@ impl PlayerGate {
             spare: None,
             loading: false,
             unacknowledged: false,
+            #[cfg(test)]
+            drop_looks: 0,
         }
     }
 
@@ -364,6 +370,10 @@ pub fn wait_dropped(control: &AudioControl, gate: &mut PlayerGate, generation: u
     let counters = control.counters();
     let begun = Instant::now();
     loop {
+        #[cfg(test)]
+        {
+            gate.drop_looks = gate.drop_looks.saturating_add(1);
+        }
         if counters.dropped(generation)
             || gate.state().phase == GatePhase::Committed
             || control.failure().is_some()
@@ -512,14 +522,12 @@ mod tests {
             Some(audio::OutputError::Stalled),
             "the next candidate may open without the acknowledgement"
         );
-        // The attempt's final settlement waits no more once latched.
-        let begun = std::time::Instant::now();
+        // The attempt's final settlement waits no more once latched: it
+        // does not look for the acknowledgement again.
+        let looks = gate.drop_looks;
+        assert!(looks > 0);
         wait_dropped(&control, &mut gate, 1);
-        assert!(
-            begun.elapsed() < std::time::Duration::from_millis(500),
-            "waited again: {:?}",
-            begun.elapsed()
-        );
+        assert_eq!(gate.drop_looks, looks, "waited again");
     }
 
     /// A cancelled READY candidate rearmed through the gate restarts the

@@ -173,17 +173,16 @@ fn a_kept_specialization_is_reused_after_its_files_change() {
 /// The attempt's quit during a looping specialization cancels the attempt
 /// once the job's thread has ended, its VM closed; with the VM's
 /// destruction held, the quit waits past the stop bound, and the run's
-/// end then gives the attempt up within the bound, the job abandoned and
-/// never joined.
+/// end then gives the attempt up at the bound, the job abandoned and
+/// never joined. The bounds are decided on the job's frozen stop clock.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
 
     use skin_beatoraja::vm_hooks;
 
-    use super::{LATE, STOP_WAIT, executing, lua_skin};
+    use super::{LATE, STOP_WAIT, executing, given_up_at_the_bound, lua_skin, stop_clock};
     let serial = serial();
     let r = crate::render_common::offscreen(1_920, 1_080);
     let t = target(&r);
@@ -199,7 +198,8 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
         }
         // The attempt's thread counts its job into this test's tally.
         let tally = super::tally();
-        let (got, took) = std::thread::scope(|scope| {
+        let clock = stop_clock();
+        let got = std::thread::scope(|scope| {
             let attempt = scope.spawn(|| {
                 super::adopt(tally);
                 let (got, _) = skin.attempt(
@@ -208,30 +208,28 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
                     || quit.load(Ordering::SeqCst),
                     || end.load(Ordering::SeqCst),
                 );
-                (got, Instant::now())
+                got
             });
             executing(base);
             quit.store(true, Ordering::SeqCst);
-            let ended = if held {
+            if held {
                 assert!(super::wait_until(|| vm_hooks::waiting() == 1));
-                std::thread::sleep(STOP_WAIT + Duration::from_millis(500));
+                // The quit's wait looks past the stop bound and goes on.
+                assert!(super::wait_until(|| clock.seen().settling.is_some()));
+                let quit = clock.seen().settling.expect("quit");
+                clock.advance_to(quit + STOP_WAIT + LATE);
+                clock.continued_now();
                 assert!(
                     !attempt.is_finished(),
                     "the quit returned before the job ended"
                 );
-                let ended = Instant::now();
-                end.store(true, Ordering::SeqCst);
-                ended
-            } else {
-                Instant::now()
-            };
-            let (got, at) = attempt.join().unwrap();
-            (got, at.duration_since(ended))
+                given_up_at_the_bound(&clock, || end.store(true, Ordering::SeqCst));
+            }
+            attempt.join().unwrap()
         });
         assert!(matches!(got, ForAttempt::Cancelled), "held {held}: {got:?}");
         let (s2, j2, live) = counters();
         if held {
-            assert!(took >= STOP_WAIT && took < STOP_WAIT + LATE, "{took:?}");
             assert_eq!((s2 - s, j2 - j), (1, 0));
             assert_eq!(live, base + 1);
             vm_hooks::release();
@@ -248,15 +246,18 @@ fn a_quit_waits_for_the_job_and_the_runs_end_bounds_it() {
 /// what a begun preparation's polls use) returns at each deadline while
 /// nothing came and the job runs; once the attempt's quit came it waits
 /// past the deadline for the job's thread, which the quit cancelled.
+/// Uncancelled, the job ends only past the watchdog, so a wait that
+/// returned nothing returned at its deadline, not at the job's end.
 #[test]
 fn a_job_wait_returns_at_its_deadline_until_a_quit() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::LATE;
+    use super::WATCHDOG;
     use crate::imports::{Ran, spawn_job};
     let mut job = spawn_job(|cancel: &crate::imports::Cancel| {
-        while !cancel.is_cancelled() {
+        let end = Instant::now() + WATCHDOG;
+        while !cancel.is_cancelled() && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(5));
         }
         // The thread outlives the cancel a while: the quit waits for it.
@@ -272,9 +273,10 @@ fn a_job_wait_returns_at_its_deadline_until_a_quit() {
             || quit.load(Ordering::SeqCst),
             || false,
         );
-        assert!(polled.is_none());
+        assert!(polled.is_none(), "{:?}", polled.map(|_| ()));
+        assert!(!job.received(), "the job ended uncancelled");
         let took = asked.elapsed();
-        assert!(took >= Duration::from_millis(50) && took < LATE, "{took:?}");
+        assert!(took >= Duration::from_millis(50), "{took:?}");
     }
     quit.store(true, Ordering::SeqCst);
     let asked = Instant::now();
@@ -289,8 +291,9 @@ fn a_job_wait_returns_at_its_deadline_until_a_quit() {
 
 /// A specialization whose preparation was superseded or discarded is
 /// settled, never detached (the S10 item 9 design's 9.2 ownership: the
-/// handle owns its subjobs): a job that would run forever is cancelled,
-/// its thread joined and its VMs closed within the stop bound.
+/// handle owns its subjobs): a job that would run forever is cancelled at
+/// the wait's first look, its thread joined and its VMs closed, and the
+/// run's end is never needed to bound it.
 #[test]
 fn a_settled_specialization_is_cancelled_and_joined() {
     let _serial = serial();
@@ -309,16 +312,12 @@ fn a_settled_specialization_is_cancelled_and_joined() {
     ) else {
         panic!("a job runs");
     };
-    let from = std::time::Instant::now();
+    let clock = super::stop_clock();
     assert_eq!(
         skin.settle(&mut job, || false),
         crate::imports::Settled::Ended
     );
-    assert!(
-        from.elapsed() < crate::imports::STOP_WAIT,
-        "{:?}",
-        from.elapsed()
-    );
+    super::cancelled_at_once(&clock);
     let (s2, j2, live2) = counters();
     let one = u64::from(cfg!(feature = "dev-tools"));
     assert_eq!((s2 - s, j2 - j), (one, one), "started and joined");

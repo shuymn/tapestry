@@ -2467,8 +2467,10 @@ mod wake_tests {
         }));
     }
 
-    /// An idle thread, which has no timer, serves an open at once: the
-    /// link wakes it after the request.
+    /// An idle thread, which has no timer, serves an open: the link wakes
+    /// it after the request. Only that wake can answer it, so the link
+    /// waits up to the watchdog (`TAPESTRY_TEST_WATCHDOG`, seconds), a
+    /// hang guard, before it gives up.
     #[test]
     fn request_wakes_the_idle_thread() {
         let sources = set();
@@ -2477,13 +2479,13 @@ mod wake_tests {
         let (thread, wakes) = spawn(hook, sources, &waker);
         link.idle();
         settles(&wakes);
-        let begun = Instant::now();
-        open(&mut link);
-        assert!(
-            begun.elapsed() < Duration::from_millis(500),
-            "{:?}",
-            begun.elapsed()
+        link.timeout = Duration::from_secs(
+            std::env::var("TAPESTRY_TEST_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
         );
+        open(&mut link);
         // Open again: the heartbeat runs.
         let from = wakes.load(Ordering::Acquire);
         assert!(until(|| wakes.load(Ordering::Acquire) >= from + 10));
@@ -2535,7 +2537,6 @@ mod wake_tests {
 #[cfg(test)]
 mod menu_tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use bms_model::TimeUs;
     use eval::ControlId;
@@ -2694,14 +2695,11 @@ mod menu_tests {
             std::iter::from_fn(|| self.menu.pop()).collect()
         }
 
-        /// Takes any unpark left, runs `reports`, and says whether the game
-        /// thread (this one) was unparked by them.
+        /// Runs `reports`, and says whether they woke the game thread.
         fn unparks(&mut self, reports: Reports<'_>) -> bool {
-            std::thread::park_timeout(Duration::ZERO);
+            let before = self.controls.game_wakes();
             self.batch(reports, false);
-            let begun = Instant::now();
-            std::thread::park_timeout(Duration::from_secs(5));
-            begun.elapsed() < Duration::from_secs(1)
+            self.controls.game_wakes() > before
         }
     }
 

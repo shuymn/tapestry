@@ -837,8 +837,9 @@ fn a_screen_built_again_draws_the_revision_presented() {
 /// the process's.
 static HOLDS: Mutex<()> = Mutex::new(());
 
-/// An upload held on the render thread is withdrawn at once when its
-/// pending selection is dropped, and once released installs nothing: the
+/// An upload held on the render thread is withdrawn when its pending
+/// selection is dropped, the drop returning while the render thread is
+/// still held, and once released installs nothing: the
 /// status names no installation and retains nothing of it (C10's render
 /// half).
 #[test]
@@ -855,13 +856,19 @@ fn a_withdrawn_upload_installs_nothing_when_released() {
             skin.atlas_pages(),
         )));
     assert!(wait_until(crate::dev::result_upload_holding));
-    let at = Instant::now();
-    drop(pending);
-    assert!(
-        at.elapsed() < Duration::from_millis(50),
-        "withdrawn at once"
-    );
-    crate::dev::hold_result_uploads(false);
+    // Dropped on another thread: the hold is released only after the drop
+    // returned, or once the watchdog gave up on it.
+    let dropped = AtomicBool::new(false);
+    let returned = std::thread::scope(|s| {
+        s.spawn(|| {
+            drop(pending);
+            dropped.store(true, Ordering::Release);
+        });
+        let returned = wait_until(|| dropped.load(Ordering::Acquire));
+        crate::dev::hold_result_uploads(false);
+        returned
+    });
+    assert!(returned, "the withdrawal waited for the held render thread");
     assert!(rig.link.fence(Duration::from_secs(10)));
     let status = rig.link.result_status();
     assert_eq!(status.installed, None);
@@ -1703,11 +1710,12 @@ fn result_frame_alloc() {
 }
 
 /// C10's flow half through the real `PlayerRig` and its WARP render
-/// thread: while the render thread holds the after-commit upload, a quit,
-/// a close or an input thread's failure ends the rig's wait within the
-/// slice bound, the attempt's upload withdrawn; the end of loading then
-/// does not wait on the render thread, still held; released, the late
-/// staging installs nothing and nothing of it is retained.
+/// thread: while the render thread holds the after-commit upload, the
+/// rig's wait looks again between slices, and a quit, a close or an input
+/// thread's failure ends it at the next look, the attempt's upload
+/// withdrawn; the end of loading then does not wait on the render thread,
+/// still held; released, the late staging installs nothing and nothing of
+/// it is retained.
 #[test]
 fn a_held_upload_is_withdrawn_by_the_flow() {
     use game::Rig as _;
@@ -1731,38 +1739,42 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
             crate::dev::hold_result_uploads(true);
             let controls = p.controls;
             let fail = p.input.failer();
-            let waited = std::thread::scope(|s| {
+            let looks = Arc::clone(&p.result_upload_looks);
+            let _watchdog = crate::tests::Watchdog::arm("a stopped result upload's wait");
+            let (relooked, stopped, returned) = std::thread::scope(|s| {
                 let stopper = s.spawn(|| {
                     assert!(wait_until(crate::dev::result_upload_holding));
-                    let at = Instant::now();
+                    let from = looks.load(Ordering::SeqCst);
+                    let relooked = wait_until(|| looks.load(Ordering::SeqCst) >= from + 2);
                     match stop {
                         "quit" => controls.command(game::Command::Quit),
                         "close" => controls.close(),
                         _ => fail(),
                     }
-                    at
+                    // A read-modify-write after the stop: a look counted
+                    // after it follows a check that sees the stop.
+                    (relooked, looks.fetch_add(0, Ordering::SeqCst))
                 });
                 p.upload_result();
-                let returned = Instant::now();
-                let at = stopper.join().unwrap();
-                returned.duration_since(at)
+                let returned = p.result_upload_looks.load(Ordering::SeqCst);
+                let (relooked, stopped) = stopper.join().unwrap();
+                (relooked, stopped, returned)
             });
-            // One slice, which a timed wait on Windows rounds up to the
-            // system timer's period (about 15.6 ms), and the scheduling of
-            // two threads on a loaded machine.
-            println!("{stop}: the wait ended {waited:?} after");
+            assert!(relooked, "{stop}: the wait looks again between slices");
+            // The look in flight when the stop came, if any; the next check
+            // saw the stop.
             assert!(
-                waited < crate::render_side::SELECT_SLICE + Duration::from_millis(50),
-                "{stop}: the wait ended {waited:?} after"
+                returned - stopped <= 1,
+                "{stop}: {} looks after the stop",
+                returned - stopped
             );
             assert!(p.result_withdrawn, "{stop}");
             assert!(crate::dev::result_upload_holding(), "{stop}: still held");
-            let ended = Instant::now();
+            // Answered while the render thread stays held, which cannot
+            // answer the end of loading.
             p.end_loading().unwrap();
-            assert!(
-                ended.elapsed() < Duration::from_millis(100),
-                "{stop}: the end of loading waited"
-            );
+            assert!(!p.result_withdrawn, "{stop}");
+            assert!(crate::dev::result_upload_holding(), "{stop}: still held");
             crate::dev::hold_result_uploads(false);
             assert!(p.render.fence(Duration::from_secs(10)));
             let status = p.render.result_status();

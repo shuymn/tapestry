@@ -51,6 +51,10 @@ pub struct Controls {
     /// The game thread, unparked by what the window and the system tell
     /// it, so it can wait idly between plays.
     game: OnceLock<Thread>,
+    /// How many times [`wake_game`](Self::wake_game) unparked the game
+    /// thread (tests).
+    #[cfg(test)]
+    game_wakes: std::sync::atomic::AtomicU64,
     tuning: Arc<LiveTuning>,
     /// Whether the measurement overlay shows (design.md "Latency Figures").
     overlay: Arc<AtomicBool>,
@@ -91,6 +95,8 @@ impl Controls {
             latch: OnceLock::new(),
             input: OnceLock::new(),
             game: OnceLock::new(),
+            #[cfg(test)]
+            game_wakes: std::sync::atomic::AtomicU64::new(0),
             tuning,
             overlay: Arc::new(AtomicBool::new(false)),
             scene: std::sync::atomic::AtomicU64::new(0),
@@ -157,8 +163,17 @@ impl Controls {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn wake_game(&self) {
         if let Some(g) = self.game.get() {
+            #[cfg(test)]
+            self.game_wakes.fetch_add(1, Ordering::AcqRel);
             g.unpark();
         }
+    }
+
+    /// How many times [`wake_game`](Self::wake_game) unparked the game
+    /// thread (tests).
+    #[cfg(test)]
+    pub fn game_wakes(&self) -> u64 {
+        self.game_wakes.load(Ordering::Acquire)
     }
 
     /// A system control or the system's suspend. Quit latches; a retry and
