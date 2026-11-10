@@ -403,6 +403,8 @@ mod tests {
             },
             profile: Some(std::sync::Arc::clone(&profile)),
             main: Some(main),
+            areas: [[-1, 2], [-3, 4], [-5, 6], [-7, 8], [-9, 10]],
+            speed: bms_model::Speed::from_twentieths(30).unwrap(),
             ..bare
         };
         let owned = AttemptContext::new(attempt, Side::Left, 0, false);
@@ -417,5 +419,18 @@ mod tests {
         );
         assert!(std::ptr::eq(ctx.score.profile.unwrap(), &*profile));
         assert_eq!(ctx.score.main, Some(main));
+        // The judge areas and the speed the visualizers and the notes
+        // graph's cursors read.
+        assert_eq!(
+            ctx.score.areas,
+            Some([[-1, 2], [-3, 4], [-5, 6], [-7, 8], [-9, 10]])
+        );
+        assert_eq!(ctx.score.speed.twentieths(), 30);
+        // A bare attempt has the preset's areas for the chart, at 1×.
+        assert_eq!(
+            none.context().score.areas,
+            Some(game::judge_areas(&chart, &preset))
+        );
+        assert_eq!(none.context().score.speed, bms_model::Speed::NORMAL);
     }
 }

@@ -321,6 +321,8 @@ fn the_cursors_follow_the_1x_chart_time() {
     fx.empty(99.0, y);
     fx.empty(161.0, y);
     fx.empty(90.0, y);
+    // A whole chart has no section lines.
+    fx.empty(30.0, y);
 
     // ×1.5: play time 1.0 s is 1× 1.5 s (x 150 to 210); the section from
     // 0.4 to 1.2 s of play time is 0.6 to 1.8 s at 1×: green 60 to 120,
