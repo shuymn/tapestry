@@ -177,6 +177,7 @@ fn load_sheet(
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        loadend: None,
         present: None,
     };
     Skin::new_result(def, widgets)

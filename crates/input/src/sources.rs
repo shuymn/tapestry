@@ -533,6 +533,12 @@ impl SourceSet {
         self.adjust.as_mut()
     }
 
+    /// The adjustment tap, to read what it holds.
+    #[must_use]
+    pub const fn adjustment(&self) -> Option<&AdjustmentTap> {
+        self.adjust.as_ref()
+    }
+
     /// Reads the window's presentation focus from `focus` from now on
     /// (focused until set).
     pub fn set_presentation_focus(&mut self, focus: PresentationFocus) {

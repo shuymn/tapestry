@@ -109,6 +109,15 @@ impl Controls {
         &self.tuning
     }
 
+    /// Settings key `a` had `event` in the window, now: tuning takes it by
+    /// its hold class ([`LiveTuning::key`]), and the game thread is woken
+    /// to show a change and look at the loading state again.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn settings_key(&self, a: game::Adjust, event: crate::tuning::KeyEvent) {
+        self.tuning.key(a, event, self.clock.now());
+        self.wake_game();
+    }
+
     /// Whether the measurement overlay shows, for the render thread.
     pub const fn overlay(&self) -> &Arc<AtomicBool> {
         &self.overlay
@@ -251,10 +260,12 @@ impl Controls {
     }
 
     /// The window gained or lost focus; a loss sets the input side's latch
-    /// (design.md "Input"). Then the input thread is woken, so an idle one
-    /// sees the change, and the game thread.
+    /// (design.md "Input"), and tuning takes the change
+    /// ([`LiveTuning::focus`]). Then the input thread is woken, so an idle
+    /// one sees the change, and the game thread.
     pub fn focus(&self, focused: bool) {
         self.next_scene();
+        self.tuning.focus(focused, self.clock.now());
         self.focused.store(focused, Ordering::Release);
         self.presentation.set(focused);
         if !focused && let Some(l) = self.latch.get() {

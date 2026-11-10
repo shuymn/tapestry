@@ -205,6 +205,7 @@ fn bench_bitmap_text(c: &mut Criterion) {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .expect("valid skin");
@@ -271,6 +272,7 @@ fn program_skin(
         widgets: WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        loadend: None,
         present: Some(PresentDef {
             code,
             consts,

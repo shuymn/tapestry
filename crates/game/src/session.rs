@@ -443,9 +443,6 @@ pub struct Loaded {
     /// The loaded chart's identity, which a preparation's key reads: each
     /// load is another ([`prep_key`](Self::prep_key)).
     generation: u64,
-    /// The settings' version: it moves whenever they are lent to be
-    /// changed ([`settings_mut`](Self::settings_mut)).
-    settings_version: u64,
 }
 
 /// The identity of the next chart loaded.
@@ -652,7 +649,6 @@ impl PendingLoad {
                     generation: GENERATIONS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .wrapping_add(1),
-                    settings_version: 0,
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -1241,7 +1237,6 @@ impl Loaded {
 
     /// The settings, to change between plays.
     pub(crate) const fn settings_mut(&mut self) -> &mut Settings {
-        self.settings_version = self.settings_version.wrapping_add(1);
         &mut self.settings
     }
 
@@ -1249,7 +1244,7 @@ impl Loaded {
     /// structural inputs aside (design.md "Play Lifecycle", preparing each
     /// attempt): the chart loaded and its speed, the whole chart's lead-in
     /// or the round's section and initial gauges, the play preset and the
-    /// settings' version.
+    /// displayed gauge it resolved ([`displayed`](Self::displayed)).
     #[must_use]
     pub fn prep_key(&self) -> crate::prep::PrepKey {
         use std::hash::Hasher as _;
@@ -1266,7 +1261,7 @@ impl Loaded {
             speed: self.config.speed,
             kind,
             preset: preset.finish(),
-            settings: self.settings_version,
+            displayed: self.displayed,
             screen: None,
         }
     }

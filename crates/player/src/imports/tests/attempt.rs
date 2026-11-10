@@ -310,7 +310,10 @@ fn a_settled_specialization_is_cancelled_and_joined() {
         panic!("a job runs");
     };
     let from = std::time::Instant::now();
-    skin.settle(&mut job);
+    assert_eq!(
+        skin.settle(&mut job, || false),
+        crate::imports::Settled::Ended
+    );
     assert!(
         from.elapsed() < crate::imports::STOP_WAIT,
         "{:?}",

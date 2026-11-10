@@ -7,7 +7,7 @@
 //! saves the capture cancelled before playback.
 //!
 //! Every test drives `Session::play_until`, the production lifecycle
-//! (`game::live::play_and_next`) through the scripted rig's input side
+//! (`game::live::open_and_play`) through the scripted rig's input side
 //! (the source set and its adjustment tap) and audio side (the commit
 //! before the engine pass reaching the commit point). Script times are on
 //! the first attempted opening's timeline: its READY opens at −1 s.
@@ -706,7 +706,7 @@ fn a_device_removed_and_reconnected_across_a_rearm_keeps_its_source_id() {
 /// commit won decides the capture, so a play whose transport started is
 /// never saved as cancelled before playback, and one saved so never
 /// started it. Quits around chart time 0, one per millisecond, go through
-/// `game::live::play_and_next` with the scripted audio side committing.
+/// `game::live::open_and_play` with the scripted audio side committing.
 #[test]
 fn an_ending_in_the_commits_step_is_settled_by_the_gate() {
     let (mut played, mut unplayed) = (0, 0);
@@ -734,7 +734,7 @@ fn an_ending_in_the_commits_step_is_settled_by_the_gate() {
 /// A cancelled opening whose arrivals run the history out seals the
 /// capture: no candidate follows, and the attempt ends cancelled before
 /// playback, incomplete (overflow), with what fit. Through
-/// `game::live::play_and_next` and the scripted rig's rearm.
+/// `game::live::open_and_play` and the scripted rig's rearm.
 #[test]
 fn a_history_run_out_while_waiting_ends_the_attempt() {
     let (_dir, root) = temp_root();
@@ -887,7 +887,7 @@ fn the_rigs_exchange_counts_in_the_recording_admission() {
 
 /// Through the lifecycle: a gated play whose window fits only without the
 /// gate's storage is refused right after recording opens, before it is
-/// admitted or handed to audio (`game::live::play_and_next` planning with
+/// admitted or handed to audio (`game::live::open_and_play` planning with
 /// the input side's snapshot storage).
 #[test]
 fn a_gated_play_over_the_reservation_is_refused_before_it_starts() {
@@ -990,7 +990,7 @@ impl game::Wakes for FailsAfterSounding {
 /// The audio pass after the step's look at the gate commits the transport,
 /// renders its block and then fails: the attempt was played, so it is
 /// saved ended midway, never as cancelled before playback. Every way out
-/// of `game::live::play_and_next` settles the gate before recording
+/// of `game::live::open_and_play` settles the gate before recording
 /// closes.
 #[test]
 fn a_failure_after_the_committing_block_leaves_a_played_attempt() {
@@ -1107,7 +1107,7 @@ fn pre_zero_bgm_waits_for_the_commit_in_a_gated_play() {
 /// restored, not at chart time 0; a hold just before that cancels the round
 /// and a release rearms it, its restore planned again; a hold after it is
 /// an ordinary adjustment while the round stays in READY until its section
-/// starts. Through `game::live::play_and_next` on a session with practice.
+/// starts. Through `game::live::open_and_play` on a session with practice.
 #[test]
 fn a_practice_round_commits_at_its_lead_in_start() {
     let chart = ChartBuilder::new(150_000)

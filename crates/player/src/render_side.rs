@@ -1015,6 +1015,28 @@ struct Shared {
     loading_drawn: AtomicU64,
     /// The loading state's slot.
     loading: Mutex<LoadingSlot>,
+    /// The latest loading lifetime's first presented frame, and the play
+    /// skin's declared loading time as the last loading frame was drawn
+    /// with it ([`LoadingAck`]).
+    loading_ack: Mutex<LoadingAck>,
+    /// A presented loading frame's acknowledgement holds while set, and
+    /// whether one holds (tests).
+    #[cfg(test)]
+    loading_ack_hold: [AtomicBool; 2],
+    /// Held acknowledgements still let through, one each (tests).
+    #[cfg(test)]
+    loading_ack_pass: std::sync::atomic::AtomicU32,
+    /// Presented loading frames acknowledged so far (tests).
+    #[cfg(test)]
+    loading_acked: AtomicU64,
+    /// The end or pause of a loading lifetime waits here before its
+    /// answer (tests).
+    #[cfg(test)]
+    loading_end_gate: Arc<TestGate>,
+    /// The presentation epochs of the attempt staged last, as prepared,
+    /// and of the attempt committed last (tests).
+    #[cfg(test)]
+    epochs: [AtomicU64; 2],
     /// The current loading lifetime's state, from its beginning
     /// ([`RenderLink::begin_loading`]); `None` before. Locked before the
     /// slot when both are.
@@ -1026,6 +1048,17 @@ struct Shared {
     /// before it takes the commits' lock (tests).
     #[cfg(test)]
     commit_timed_out: AtomicBool,
+    /// While set, a commit waits between its receipt and its loading
+    /// time's declaration, and says so in `declaration_held`, at most
+    /// [`hook_bound`] (tests).
+    #[cfg(test)]
+    hold_declaration: AtomicBool,
+    #[cfg(test)]
+    declaration_held: AtomicBool,
+    /// Set when a held declaration let go at [`hook_bound`] instead of
+    /// at the test's release (tests).
+    #[cfg(test)]
+    declaration_expired: AtomicBool,
     /// The atlas limits and the target size of the screen built last,
     /// written at each build: what a skin is packed for
     /// ([`RenderLink::atlas_limits`]).
@@ -1066,10 +1099,27 @@ impl Shared {
             #[cfg(feature = "dev-tools")]
             loading_drawn: AtomicU64::new(0),
             loading: Mutex::new(LoadingSlot::default()),
+            loading_ack: Mutex::new(LoadingAck::default()),
+            #[cfg(test)]
+            loading_ack_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            loading_ack_pass: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            loading_acked: AtomicU64::new(0),
+            #[cfg(test)]
+            loading_end_gate: Arc::default(),
+            #[cfg(test)]
+            epochs: [AtomicU64::new(0), AtomicU64::new(0)],
             producer: Mutex::new(None),
             commits: Mutex::new(Commits::default()),
             #[cfg(test)]
             commit_timed_out: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_declaration: AtomicBool::new(false),
+            #[cfg(test)]
+            declaration_held: AtomicBool::new(false),
+            #[cfg(test)]
+            declaration_expired: AtomicBool::new(false),
             packing: Mutex::new(None),
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
@@ -1081,6 +1131,66 @@ impl Shared {
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
         }
+    }
+
+    /// A loading frame of lifetime `lifetime` was presented, drawn with a
+    /// play skin declaring the loading time `loadend`: the first of its
+    /// lifetime is acknowledged at the clock's `now()`, tagged with the
+    /// lifetime it was drawn for; a later one of the same lifetime changes
+    /// only the declared time. Allocates nothing.
+    fn presented_loading(
+        &self,
+        lifetime: u64,
+        loadend: Option<TimeUs>,
+        now: impl FnOnce() -> TimeUs,
+    ) {
+        #[cfg(test)]
+        {
+            let [held, waiting] = &self.loading_ack_hold;
+            if held.load(Ordering::SeqCst) {
+                waiting.store(true, Ordering::SeqCst);
+                while held.load(Ordering::SeqCst)
+                    && self
+                        .loading_ack_pass
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_err()
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                waiting.store(false, Ordering::SeqCst);
+            }
+        }
+        {
+            let mut ack = self
+                .loading_ack
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ack.loadend = loadend;
+            if ack.first.is_none_or(|(l, _)| l != lifetime) {
+                ack.first = Some((lifetime, now()));
+            }
+        }
+        #[cfg(test)]
+        self.loading_acked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A specialization committed in the current loading lifetime declares
+    /// the loading time `loadend`: the declaration from now on, before any
+    /// frame draws with it. Allocates nothing.
+    fn committed_loading(&self, loadend: Option<TimeUs>) {
+        self.loading_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .loadend = loadend;
+    }
+
+    /// What [`presented_loading`](Self::presented_loading) and
+    /// [`committed_loading`](Self::committed_loading) left.
+    fn loading_ack(&self) -> LoadingAck {
+        *self
+            .loading_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Holds a result frame while a test says so.
@@ -1125,6 +1235,85 @@ impl Shared {
     }
 }
 
+/// The loading acknowledgement's test hold, from any thread (tests):
+/// [`RenderLink::hold_loading_ack`] and its kin.
+#[cfg(all(test, feature = "dev-tools"))]
+pub struct AckHold(Arc<Shared>);
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl AckHold {
+    /// Holds every presented loading frame's acknowledgement while `on`.
+    pub fn hold(&self, on: bool) {
+        self.0.loading_ack_hold[0].store(on, Ordering::SeqCst);
+    }
+
+    /// Whether an acknowledgement is held.
+    pub fn held(&self) -> bool {
+        self.0.loading_ack_hold[1].load(Ordering::SeqCst)
+    }
+
+    /// Lets one held acknowledgement through.
+    pub fn pass(&self) {
+        self.0.loading_ack_pass.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A point a thread waits at while a test holds it (tests).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TestGate {
+    held: AtomicBool,
+    waiting: AtomicBool,
+    passed: AtomicU64,
+}
+
+#[cfg(test)]
+impl TestGate {
+    /// Holds every thread reaching the gate from now on while `on`, or
+    /// lets them go.
+    #[cfg(feature = "dev-tools")]
+    pub fn hold(&self, on: bool) {
+        self.held.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether a thread waits at the gate.
+    #[cfg(feature = "dev-tools")]
+    pub fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    /// How often a thread went past the gate.
+    #[cfg(feature = "dev-tools")]
+    pub fn passed(&self) -> u64 {
+        self.passed.load(Ordering::SeqCst)
+    }
+
+    /// Waits while held, then counts the passage.
+    pub fn pass(&self) {
+        if self.held.load(Ordering::SeqCst) {
+            self.waiting.store(true, Ordering::SeqCst);
+            while self.held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.waiting.store(false, Ordering::SeqCst);
+        }
+        self.passed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The render thread's acknowledgement of the loading state's frames: the
+/// latest lifetime whose first frame was presented, with when, and the
+/// play skin's declared loading time ([`skin_model::Skin::loadend`]) as
+/// the last presented loading frame drew with it, or as a specialization
+/// committed since in the current lifetime declares it: the installed
+/// skin's, or none while a pending skin has no specialization committed
+/// in the lifetime.
+#[derive(Clone, Copy, Debug, Default)]
+struct LoadingAck {
+    first: Option<(u64, TimeUs)>,
+    loadend: Option<TimeUs>,
+}
+
 /// The last request committed and the last whose commit the game thread
 /// stopped waiting for: a commit is installed only while its request is
 /// not withdrawn, and a withdrawal finds a commit already installed, so
@@ -1141,11 +1330,14 @@ struct Commits {
 /// declared Closing duration ([`skin_model::Skin::close`]) of the
 /// declarative installation the committed attempt draws with, the one it
 /// staged or the one already in use; `None` for a skin that declares
-/// none and for the simple skin.
+/// none and for the simple skin. A pending skin's specialization committed
+/// in the current loading lifetime also gives its declared loading time
+/// (`loadend`), which a game thread that stopped waiting declares itself.
 #[derive(Clone, Copy, Debug, Default)]
 struct Receipt {
     request: u64,
     close: Option<TimeUs>,
+    loadend: Option<Option<TimeUs>>,
 }
 
 /// The loading state's lifetime, its newest page and its newest state
@@ -1400,6 +1592,18 @@ pub enum RenderEnd {
     Panicked,
     /// It did not end in time and was left to the process's exit.
     Stuck,
+}
+
+/// How long a test hook waits on its other side: `TAPESTRY_TEST_WATCHDOG`
+/// seconds, else 60 (tests).
+#[cfg(test)]
+fn hook_bound() -> Duration {
+    Duration::from_secs(
+        std::env::var("TAPESTRY_TEST_WATCHDOG")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    )
 }
 
 /// The game thread's end of the render thread.
@@ -1810,11 +2014,36 @@ impl RenderLink {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 #[cfg(test)]
-                self.shared.commit_timed_out.store(true, Ordering::Release);
+                {
+                    self.shared.commit_timed_out.store(true, Ordering::Release);
+                    // A test holding the render thread between the receipt
+                    // and the declaration reads the receipt only then; a
+                    // render thread that never gets there fails the test.
+                    let deadline = Instant::now() + hook_bound();
+                    while self.shared.hold_declaration.load(Ordering::Acquire)
+                        && !self.shared.declaration_held.load(Ordering::Acquire)
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the render thread never held its declaration"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 let mut commits = self.shared.commits();
                 if commits.committed >= request {
                     let r = commits.receipt;
-                    return Ok(if r.request == request { r.close } else { None });
+                    drop(commits);
+                    if r.request != request {
+                        return Ok(None);
+                    }
+                    // Declared before the opener reads the minimum again,
+                    // outside the commits' lock, whether or not the
+                    // render thread has declared it yet.
+                    if let Some(loadend) = r.loadend {
+                        self.shared.committed_loading(loadend);
+                    }
+                    return Ok(r.close);
                 }
                 commits.withdrawn = commits.withdrawn.max(request);
                 Err(ScreenError::NoAnswer)
@@ -1953,6 +2182,75 @@ impl RenderLink {
     #[cfg(feature = "dev-tools")]
     pub fn loading_drawn(&self) -> u64 {
         self.shared.loading_drawn.load(Ordering::Relaxed)
+    }
+
+    /// The current loading lifetime: after [`begin_loading`](Self::begin_loading),
+    /// the one it began.
+    pub fn loading_lifetime(&self) -> u64 {
+        self.shared.loading_slot().lifetime
+    }
+
+    /// The latest loading lifetime whose first frame the render thread
+    /// presented, and when on the clock; `None` before any.
+    pub fn loading_ack(&self) -> Option<(u64, TimeUs)> {
+        self.shared.loading_ack().first
+    }
+
+    /// The loading time the play skin declares, as the last presented
+    /// loading frame drew with it ([`LoadingAck`]).
+    pub fn loading_loadend(&self) -> Option<TimeUs> {
+        self.shared.loading_ack().loadend
+    }
+
+    /// A handle on the loading acknowledgement's test hold, for another
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn ack_hold(&self) -> AckHold {
+        AckHold(Arc::clone(&self.shared))
+    }
+
+    /// Where the end or pause of a loading lifetime waits before its
+    /// answer while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn loading_end_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.loading_end_gate)
+    }
+
+    /// The presentation epoch of the attempt staged last as it was
+    /// prepared, and of the attempt committed last as it committed (its
+    /// final readiness's stamp); 0 before either (tests).
+    #[cfg(test)]
+    pub fn epochs(&self) -> (u64, u64) {
+        let [staged, committed] = &self.shared.epochs;
+        (
+            staged.load(Ordering::SeqCst),
+            committed.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Holds every presented loading frame's acknowledgement from now on
+    /// while `held`, or lets it go (tests).
+    #[cfg(test)]
+    pub fn hold_loading_ack(&self, held: bool) {
+        self.shared.loading_ack_hold[0].store(held, Ordering::SeqCst);
+    }
+
+    /// Whether a presented loading frame's acknowledgement is held (tests).
+    #[cfg(test)]
+    pub fn loading_ack_held(&self) -> bool {
+        self.shared.loading_ack_hold[1].load(Ordering::SeqCst)
+    }
+
+    /// Lets one held acknowledgement through (tests).
+    #[cfg(test)]
+    pub fn pass_loading_ack(&self) {
+        self.shared.loading_ack_pass.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Presented loading frames acknowledged so far (tests).
+    #[cfg(test)]
+    pub fn loading_acked(&self) -> u64 {
+        self.shared.loading_acked.load(Ordering::SeqCst)
     }
 
     /// Where the current loading lifetime's lines and state are shown
@@ -3436,6 +3734,8 @@ impl Run {
                     ) {
                         self.paused = Some(std::mem::replace(&mut mode, Mode::Idle));
                     }
+                    #[cfg(test)]
+                    self.shared.loading_end_gate.pass();
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -3467,6 +3767,8 @@ impl Run {
                         mode = Mode::Idle;
                     }
                     self.paused = None;
+                    #[cfg(test)]
+                    self.shared.loading_end_gate.pass();
                     let _ = reply.send(self.loading_end(lifetime));
                     continue;
                 }
@@ -3983,6 +4285,22 @@ impl Run {
                         screen.menu(page, *changed)
                     }
                     .map(|t| (t, None));
+                    // The lifetime's first presented frame starts the
+                    // loading state's minimum (design.md "Play Lifecycle").
+                    if let (Some(lifetime), Ok((t, _))) = (loading_frame, &drawn)
+                        && t.presented
+                    {
+                        let loadend = if pending {
+                            None
+                        } else {
+                            self.committed
+                                .get(ScreenKind::Play)
+                                .and_then(|i| i.bundle().skin().loadend())
+                        };
+                        let clock = self.clock;
+                        self.shared
+                            .presented_loading(lifetime, loadend, || clock.now());
+                    }
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
@@ -4526,6 +4844,8 @@ impl Run {
             return;
         };
         if matches!(answer, Ok(Preparation::Ready)) {
+            #[cfg(test)]
+            self.shared.epochs[0].store(p.attempt.epoch(), Ordering::SeqCst);
             self.prepared = Some(Prepared {
                 token: PreparedToken {
                     request: p.request,
@@ -4652,12 +4972,22 @@ impl Run {
             screen.discard();
             return Err(e);
         }
+        // A pending skin's specialization committed in the current loading
+        // lifetime declares that lifetime's loading time from now on.
+        let mut declared = None;
         if p.declarative && self.committed.pending(ScreenKind::Play) {
             // A pending skin's specialization: kept pending, drawn by the
             // loading frames of the lifetime it was committed in.
             self.committed
                 .pend(ScreenKind::Play, screen.installation(ScreenKind::Play));
             self.specialized_in = lifetime;
+            if lifetime.is_some() {
+                declared = Some(
+                    self.committed
+                        .get(ScreenKind::Play)
+                        .and_then(|i| i.bundle().skin().loadend()),
+                );
+            }
         } else if p.declarative {
             self.committed
                 .set(ScreenKind::Play, screen.installation(ScreenKind::Play));
@@ -4668,6 +4998,8 @@ impl Run {
             .committed
             .get(ScreenKind::Play)
             .and_then(|i| i.bundle().skin().close());
+        #[cfg(test)]
+        self.shared.epochs[1].store(p.presentation.1, Ordering::SeqCst);
         // The committed attempt's `Play` is the screen's now, whatever
         // other kinds commit until the next load, failure or commit.
         let (key, offer, installed, targets) = &p.carry;
@@ -4686,7 +5018,34 @@ impl Run {
             self.gauge_looks = Some(p.gauge_looks);
         }
         commits.committed = request;
-        commits.receipt = Receipt { request, close };
+        commits.receipt = Receipt {
+            request,
+            close,
+            loadend: declared,
+        };
+        drop(commits);
+        #[cfg(test)]
+        {
+            // Held at most the hook's bound: a test that never lets go
+            // does not keep the render thread.
+            let deadline = Instant::now() + hook_bound();
+            while self.shared.hold_declaration.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    self.shared
+                        .declaration_expired
+                        .store(true, Ordering::Release);
+                    break;
+                }
+                self.shared.declaration_held.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        // Before the answer, outside the commits' lock: the opener reads
+        // the minimum again once the commit is answered (or, past the
+        // bound, once it read the receipt, which carries it too).
+        if let Some(loadend) = declared {
+            self.shared.committed_loading(loadend);
+        }
         Ok(close)
     }
 
@@ -8012,6 +8371,114 @@ pub(crate) mod tests {
         }
     }
 
+    /// A render thread drawing its loading frames on [`TypedLoading`],
+    /// every presented frame's acknowledgement held from the start.
+    fn held_loading() -> (super::RenderLink, Typed) {
+        let seen: Typed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&seen);
+        let make: MakeScreen = Box::new(move || {
+            Ok(Box::new(TypedLoading {
+                seen: Arc::clone(&noted),
+            }) as Box<dyn Screen>)
+        });
+        let link = spawn_empty(make);
+        link.hold_loading_ack(true);
+        (link, seen)
+    }
+
+    /// L1, the render side: a loading lifetime's first presented frame is
+    /// acknowledged when its presentation is let through, tagged with its
+    /// lifetime, so the minimum ends exactly a second (no skin declaring
+    /// more) after it; a later frame of the same lifetime changes nothing.
+    #[test]
+    fn the_minimum_counts_from_this_lifetimes_first_presented_frame() {
+        let (link, _seen) = held_loading();
+        link.begin_loading(&chosen("One"), None);
+        let lifetime = link.loading_lifetime();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        assert_eq!(link.loading_ack(), None, "held: not acknowledged");
+        let let_through = link.clock.now();
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        let (acked, at) = link.loading_ack().unwrap();
+        assert_eq!(acked, lifetime);
+        assert!(at >= let_through, "{at:?} {let_through:?}");
+        assert_eq!(link.loading_loadend(), None);
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 1_000_000)
+        );
+        // A later frame of the same lifetime.
+        link.loading()
+            .report(LoadInput::Stage(Stage::Loudness), Some(one_line("B")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 2));
+        assert_eq!(link.loading_ack(), Some((lifetime, at)));
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// L2, the render side: a frame of the lifetime before, held across
+    /// the next lifetime's beginning, is acknowledged for the lifetime it
+    /// was drawn for, which a look for the new lifetime ignores; the new
+    /// lifetime's own first frame then starts its minimum.
+    #[test]
+    fn an_older_lifetimes_frame_does_not_start_the_minimum() {
+        let (link, _seen) = held_loading();
+        link.begin_loading(&chosen("One"), None);
+        let old = link.loading_lifetime();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        assert!(wait_until(|| link.loading_ack_held()));
+        // The next lifetime begins while the old frame is held.
+        link.begin_loading(&chosen("Two"), None);
+        let new = link.loading_lifetime();
+        assert_ne!(old, new);
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("C")));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        let (acked, old_at) = link.loading_ack().unwrap();
+        assert_eq!(acked, old, "tagged with the lifetime it was drawn for");
+        assert_eq!(
+            link.loading_ack().filter(|&(l, _)| l == new),
+            None,
+            "nothing of the new lifetime"
+        );
+        assert!(wait_until(|| link.loading_ack_held()));
+        let let_through = link.clock.now();
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 2));
+        let (acked, at) = link.loading_ack().unwrap();
+        assert_eq!(acked, new);
+        assert!(at >= let_through && at >= old_at, "{at:?}");
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
+    /// The render thread's acknowledgement of a presented loading frame,
+    /// the first of a lifetime and a later one, allocates nothing, nor
+    /// does the game thread's read of it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_loading_ack_presents_without_allocating_alloc() {
+        let shared = super::Shared::new();
+        let clock = QpcClock::start();
+        shared.presented_loading(1, None, || clock.now());
+        let before = crate::alloc_count::this_thread();
+        for lifetime in 2..10 {
+            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            let read = shared.loading_ack();
+            assert_eq!(read.first.map(|(l, _)| l), Some(lifetime));
+            assert_eq!(read.loadend, Some(TimeUs(1_500_000)));
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    }
+
     /// The loading text of chart `title`.
     fn chosen(title: &str) -> LoadingText {
         LoadingText {
@@ -10373,6 +10840,15 @@ pub(crate) mod tests {
 
     /// [`bundle`] declaring Closing's duration `close`.
     pub(crate) fn bundle_closing(close: Option<TimeUs>) -> Arc<render::SkinBundle> {
+        bundle_declaring(close, None)
+    }
+
+    /// [`bundle`] declaring Closing's duration `close` and the loading
+    /// time `loadend`.
+    pub(crate) fn bundle_declaring(
+        close: Option<TimeUs>,
+        loadend: Option<TimeUs>,
+    ) -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -10393,6 +10869,7 @@ pub(crate) mod tests {
             widgets: skin_model::WidgetDefs::default(),
             bomb_up_to: None,
             close,
+            loadend,
             present: None,
         })
         .unwrap();
@@ -10501,6 +10978,10 @@ pub(crate) mod tests {
             if self.shared.hold.load(Ordering::Acquire) {
                 return None;
             }
+            assert!(
+                !self.shared.panic_prepare.swap(false, Ordering::AcqRel),
+                "the render thread panics for the test"
+            );
             // Read once: the request whose preparation stages and holds.
             let hold = self.shared.hold_staged.load(Ordering::Acquire) == request;
             // Staged already and held: asked again, still no answer.
@@ -10889,6 +11370,8 @@ pub(crate) mod tests {
         /// The request whose preparation stages, then does not answer; 0
         /// for none.
         hold_staged: Arc<std::sync::atomic::AtomicU64>,
+        /// The next attempt's preparation panics the render thread, once.
+        pub(crate) panic_prepare: Arc<AtomicBool>,
         /// Each attempt's preparation: its request and what it was offered,
         /// `None` for a fresh one, else the point and the slots.
         offers: Arc<std::sync::Mutex<Vec<(u64, CarryOffered)>>>,
@@ -10973,8 +11456,49 @@ pub(crate) mod tests {
         }
 
         /// The play bundle the screen built last has installed.
-        fn play(&self) -> Option<Arc<render::SkinBundle>> {
+        pub(crate) fn play(&self) -> Option<Arc<render::SkinBundle>> {
             self.play.lock().unwrap().clone()
+        }
+
+        /// The skin staged and neither committed nor discarded.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn staging(&self) -> Option<Arc<render::SkinBundle>> {
+            self.staging.lock().unwrap().clone()
+        }
+
+        /// The next request `link` sends stages, then does not answer
+        /// until [`release_staged`](Self::release_staged).
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_next_staging(&self, link: &super::RenderLink) {
+            let next = link.requests.load(Ordering::Relaxed) + 1;
+            self.hold_staged.store(next, Ordering::Release);
+        }
+
+        /// A held staging answers again.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn release_staged(&self) {
+            self.hold_staged.store(0, Ordering::Release);
+        }
+
+        /// Attempts' preparations are not answered while `on`.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_preparations(&self, on: bool) {
+            self.hold.store(on, Ordering::Release);
+        }
+
+        /// Holds every commit in the screen while `on`, or lets it go.
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn hold_commits(&self, on: bool) {
+            if !on {
+                self.commit_held.store(false, Ordering::Release);
+            }
+            self.hold_commit.store(on, Ordering::Release);
+        }
+
+        /// Whether a commit waited on [`hold_commits`](Self::hold_commits).
+        #[cfg(feature = "dev-tools")]
+        pub(crate) fn commit_held(&self) -> bool {
+            self.commit_held.load(Ordering::Acquire)
         }
     }
 
@@ -11670,6 +12194,88 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// L5: a pending play skin's base import stops at the fact it reads,
+    /// inside the configured pass and before the skin's table exists, so
+    /// it declares no loading time: until a specialization commits in the
+    /// lifetime the minimum is the floor, a second from the first frame;
+    /// a specialization declaring 3 000 ms then moves it to 3 s from that
+    /// same frame.
+    #[test]
+    fn a_pending_skin_uses_the_floor_until_its_specialization_commits() {
+        let (chart, _screens, link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let (lifetime, at) = link.loading_ack().unwrap();
+        assert_eq!(link.loading_loadend(), None);
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 1_000_000)
+        );
+        let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            specialized(&link, &chart, &declared).unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(link.loading_loadend(), None, "staged, not committed");
+        link.commit_attempt().unwrap();
+        // Declared with the commit's answer, before a frame draws with it.
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        // A frame acknowledged after the commit's answer drew after it.
+        let committed = link.loading_acked();
+        assert!(wait_until(|| link.loading_acked() > committed));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        assert_eq!(link.loading_ack(), Some((lifetime, at)));
+        assert_eq!(
+            game::minimum_ends(at, link.loading_loadend()),
+            TimeUs(at.0 + 3_000_000)
+        );
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// O12a: a commit whose answer the game thread stopped waiting for,
+    /// its receipt published but its loading time not yet declared by the
+    /// render thread: the receipt declares it, so the minimum read after
+    /// the commit is the specialization's.
+    #[test]
+    fn a_timed_out_commit_declares_its_loading_time_from_the_receipt() {
+        let (chart, _screens, mut link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            specialized(&link, &chart, &declared).unwrap(),
+            Preparation::Ready
+        );
+        /// Lets the render thread go when dropped, the test failing
+        /// included.
+        struct Hold(Arc<super::Shared>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.hold_declaration.store(false, Ordering::Release);
+            }
+        }
+        link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
+        link.shared.commit_timed_out.store(false, Ordering::Release);
+        link.shared.declaration_held.store(false, Ordering::Release);
+        link.shared.hold_declaration.store(true, Ordering::Release);
+        let hold = Hold(Arc::clone(&link.shared));
+        link.commit_attempt().unwrap();
+        // Read past the bound, with the render thread held between the
+        // receipt and its own declaration: only the receipt declared it.
+        assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
+        assert!(link.shared.declaration_held.load(Ordering::Acquire));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        // The render thread still held its declaration when the receipt
+        // was read: a stall past the hook's bound would let the render
+        // thread declare it itself and weaken this oracle.
+        assert!(!link.shared.declaration_expired.load(Ordering::Acquire));
+        drop(hold);
+        link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
     /// A loading frame's stamp says which presentation it drew: not settled
     /// on the pending placeholder, settled on the skin's after a commit in
     /// its lifetime.
@@ -12084,6 +12690,34 @@ pub(crate) mod tests {
     fn ready_attempt(link: &super::RenderLink, chart: &Chart) {
         let ready = link.prepare_attempt(titled(chart), || false);
         assert_eq!(ready.unwrap(), Preparation::Ready);
+    }
+
+    /// E2: a final readiness found stale (the screen built again since the
+    /// staging, on another device) stamps nothing: the commit is refused
+    /// and the epoch committed before stays the one committed.
+    #[test]
+    fn a_stale_readiness_stamps_nothing() {
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle());
+        ready_attempt(&link, &chart);
+        let first = link.requests.load(Ordering::Relaxed);
+        assert_eq!(
+            link.ready_attempt(first, 7).unwrap(),
+            super::ReadyAnswer::Ready
+        );
+        link.commit_attempt().unwrap();
+        assert_eq!(link.epochs().1, 7);
+        ready_attempt(&link, &chart);
+        let second = link.requests.load(Ordering::Relaxed);
+        rebuild_screen(&link, &screens);
+        assert!(matches!(
+            link.ready_attempt(second, 9).unwrap(),
+            super::ReadyAnswer::Stale(_)
+        ));
+        assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
+        assert_eq!(link.epochs().1, 7, "nothing stamped or committed");
+        link.exit();
     }
 
     /// Fails `link`'s screen and builds it again.

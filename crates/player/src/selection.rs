@@ -1888,6 +1888,9 @@ impl AppRig for PlayerRig<'_> {
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
         self.enter_attempt();
+        // Tuning's loading epoch: a settings key down now holds the
+        // loading state until released, and steps nothing.
+        self.begin_loading_epoch();
         // Selection is left: nothing of it is drawn again.
         self.render.leave_selection();
         let Some(sel) = &mut self.selection else {

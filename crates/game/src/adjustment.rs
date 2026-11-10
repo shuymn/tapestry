@@ -22,6 +22,13 @@
 //!   [`REPEAT_US`] on the producer's ticks ([`Event::Tick`]): a tick that
 //!   passed several deadlines acts once, so a stalled producer leaves no
 //!   backlog, and every tick produced is processed.
+//! - **Acceptance**: [`Event::Acceptance`] closes and reopens it, and an
+//!   opening's phase ([`Head::Clock`]) reopens it. While closed, a press
+//!   takes no action and its hold is suppressed, so the control acts again
+//!   only on a fresh press after the reopening; repeats, ticks and axis
+//!   movements act on nothing. A START or SELECT pressed while closed
+//!   still counts as held. Holds taken before the close keep their
+//!   context, so a close reversed at once changes nothing.
 //!
 //! Tempos come from the caller ([`TempoMap`]); the reducer applies the
 //! practice speed once. It allocates nothing: its state is fixed-size.
@@ -216,6 +223,8 @@ pub enum Event {
         /// The practice speed.
         speed: Speed,
     },
+    /// The play adjustments' acceptance closes or reopens.
+    Acceptance(Acceptance),
     /// Observations were lost, or focus was: nothing acts until
     /// [`Event::Resync`].
     Lost,
@@ -228,6 +237,16 @@ pub enum Event {
         /// Whether `held` is known to be complete.
         verified: bool,
     },
+}
+
+/// Whether the play adjustments take presses ([`Event::Acceptance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acceptance {
+    /// Presses act.
+    Open,
+    /// Presses act on nothing, and their holds stay suppressed until a
+    /// fresh press after the reopening.
+    Closed,
 }
 
 /// An observation: an event at a receive time, with its packet sequence.
@@ -447,6 +466,10 @@ pub struct Adjustment {
     opened: Option<PresentationSnapshot>,
     /// The scratch directions the driver last set ([`Self::set_scratch`]).
     scratch: crate::turntable::ScratchInput,
+    /// Whether presses act ([`Event::Acceptance`]).
+    accepting: bool,
+    /// Adjustments applied so far ([`Self::accepted`]).
+    accepted: u64,
 }
 
 impl Adjustment {
@@ -484,6 +507,8 @@ impl Adjustment {
             epoch: 0,
             opened: None,
             scratch: crate::turntable::ScratchInput::NONE,
+            accepting: true,
+            accepted: 0,
         };
         a.hispeed = match options.hispeed().mode {
             SpeedMode::Classic => Some(Ratio::from_hundredths(
@@ -560,6 +585,26 @@ impl Adjustment {
         self.prepare(references, speed, tempo)
     }
 
+    /// The attempt's chart is solved again for `opens_at` and `speed`, as
+    /// [`attach`](Self::attach) does, but within the dispatch context: the
+    /// open group closes, and the holds, their repeat deadlines, the axes'
+    /// remainders, the selected cover and the double-press history stay.
+    ///
+    /// # Errors
+    ///
+    /// As [`attach`](Self::attach).
+    pub fn resolve<T: TempoMap>(
+        &mut self,
+        opens_at: TimeUs,
+        references: Option<References>,
+        speed: Speed,
+        tempo: &T,
+    ) -> Result<(), AttachError> {
+        self.close(tempo);
+        self.head = Head::Frozen { opens_at };
+        self.solve_for(references, speed)
+    }
+
     /// The tempo becomes known at the practice `speed`: in Floating, one
     /// solve from `references` ([`Event::Prepare`]).
     fn prepare<T: TempoMap>(
@@ -569,6 +614,15 @@ impl Adjustment {
         tempo: &T,
     ) -> Result<(), AttachError> {
         self.end_context(tempo);
+        self.solve_for(references, speed)
+    }
+
+    /// The practice `speed`, and in Floating one solve from `references`.
+    fn solve_for(
+        &mut self,
+        references: Option<References>,
+        speed: Speed,
+    ) -> Result<(), AttachError> {
         self.speed = Some(speed);
         if self.options.hispeed().mode != SpeedMode::Floating {
             return Ok(());
@@ -595,6 +649,22 @@ impl Adjustment {
     #[must_use]
     pub const fn last(&self) -> Option<(TimeUs, u64)> {
         self.last
+    }
+
+    /// Whether presses act ([`Event::Acceptance`]).
+    #[must_use]
+    pub const fn accepting(&self) -> bool {
+        self.accepting
+    }
+
+    /// How many adjustments were applied so far: each transaction applied
+    /// with a request left in it (one clamped at a limit too), each
+    /// SUDDEN+ toggle and each switch of the LIFT/HIDDEN+ target. A
+    /// transaction refused, or whose requests cancelled out, does not
+    /// count.
+    #[must_use]
+    pub const fn accepted(&self) -> u64 {
+        self.accepted
     }
 
     /// Marks what is published from now on as of presentation epoch
@@ -760,9 +830,15 @@ impl Adjustment {
                 // An opening (the head on the clock): its starting tuning,
                 // with every adjustment ordered before it reduced and its
                 // open group closed by the new generation's context end.
+                // Recording opened: the play's adjustments are open.
                 if matches!(head, Head::Clock { .. }) {
                     self.opened = Some(self.snapshot());
+                    self.accepting = true;
                 }
+            }
+            Event::Acceptance(a) => {
+                self.close(tempo);
+                self.accepting = a == Acceptance::Open;
             }
             Event::Prepare { references, speed } => {
                 let _ = self.prepare(Some(references), speed, tempo);
@@ -829,13 +905,26 @@ impl Adjustment {
             // A press without a release, or one the loss left unverified.
             return;
         }
-        *hold = Hold::Held {
-            role,
-            context,
-            suppressed: false,
-            pressed: time,
-            next: TimeUs(time.0.saturating_add(REPEAT_US)),
-            pending: None,
+        let closed = !self.accepting;
+        *hold = if closed {
+            // Discarded: no action until released and pressed afresh.
+            Hold::Held {
+                role,
+                context: context.wrapping_sub(1),
+                suppressed: true,
+                pressed: time,
+                next: TimeUs(i64::MAX),
+                pending: None,
+            }
+        } else {
+            Hold::Held {
+                role,
+                context,
+                suppressed: false,
+                pressed: time,
+                next: TimeUs(time.0.saturating_add(REPEAT_US)),
+                pending: None,
+            }
         };
         match role {
             Role::Start | Role::Select => {
@@ -845,10 +934,16 @@ impl Adjustment {
                 } else {
                     self.selects += 1;
                 }
-                if !self.lost {
+                if closed {
+                    // A modifier change, without an activation.
+                    if self.mods() != before {
+                        self.end_context(tempo);
+                    }
+                } else if !self.lost {
                     self.modifiers_changed(before, time, tempo);
                 }
             }
+            _ if closed => {}
             Role::ScratchPositive | Role::ScratchNegative => {
                 let opposite = if role == Role::ScratchPositive {
                     Role::ScratchNegative
@@ -941,6 +1036,7 @@ impl Adjustment {
                         CoverKind::Lift => CoverKind::Hidden,
                         _ => CoverKind::Lift,
                     };
+                    self.accepted = self.accepted.wrapping_add(1);
                 }
             }
             _ => {}
@@ -974,12 +1070,13 @@ impl Adjustment {
         }
         self.options = options;
         self.hispeed = hispeed;
+        self.accepted = self.accepted.wrapping_add(1);
         // The target changed.
         self.context = self.context.wrapping_add(1);
     }
 
     fn repeat(&mut self, control: ControlId, time: TimeUs) {
-        if self.lost {
+        if self.lost || !self.accepting {
             return;
         }
         if let Some(&Hold::Held {
@@ -994,7 +1091,7 @@ impl Adjustment {
     }
 
     fn tick(&mut self, time: TimeUs) {
-        if self.lost {
+        if self.lost || !self.accepting {
             return;
         }
         let context = self.context;
@@ -1049,7 +1146,7 @@ impl Adjustment {
     }
 
     fn axis(&mut self, control: ControlId, delta: i64, quantum: AxisQuantum, time: TimeUs) {
-        if self.lost {
+        if self.lost || !self.accepting {
             return;
         }
         let context = self.context;
@@ -1203,6 +1300,9 @@ impl Adjustment {
             Ok(()) => {
                 self.options = options;
                 self.hispeed = hispeed;
+                if group.coarse != 0 || group.fine != 0 || group.green != 0 || group.cover != 0 {
+                    self.accepted = self.accepted.wrapping_add(1);
+                }
             }
             Err(Unrepresentable) => self.diagnostics.unrepresentable += 1,
         }

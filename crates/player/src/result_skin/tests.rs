@@ -1433,7 +1433,10 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
     };
     let joined = jobs_joined();
     let from = std::time::Instant::now();
-    rs.settle_image_stage(&mut job);
+    assert_eq!(
+        rs.settle_image_stage(&mut job, || false),
+        crate::imports::Settled::Ended
+    );
     assert!(
         from.elapsed() < crate::imports::STOP_WAIT,
         "{:?}",
