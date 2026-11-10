@@ -307,6 +307,7 @@ pub fn skin_with_widgets(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
 }

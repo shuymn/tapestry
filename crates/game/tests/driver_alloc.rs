@@ -2,7 +2,8 @@
 //! (design.md "Scope of No Allocation"): drains of a real tap's presses,
 //! releases, repeats and ticks with the attempt's tempo provider, an
 //! opening's and a cancellation's markers, a loss and its recovery, the
-//! window's speed keys, and a display offset cut into the stream. This
+//! window's speed keys, a provisional close with its decision either way,
+//! and a display offset cut into the stream. This
 //! file holds a single test, so the harness's other threads are not
 //! tracked.
 
@@ -137,6 +138,20 @@ fn the_driver_drains_without_allocating() {
             focus.set(true);
         }
         set.tick_presentation(TimeUs(at + 210_000));
+        // The revalidation's provisional close, F2 waiting behind its
+        // fence, then the decision: reversed, or kept and reopened.
+        driver
+            .close_provisionally(&mut Pump(&mut set, TimeUs(at + 220_000)))
+            .unwrap();
+        batch(&mut set, at + 230_000, &[(f2, 1), (f2, 0)]);
+        if round % 2 == 0 {
+            driver.reverse_close(&mut Pump(&mut set, TimeUs(at + 240_000)));
+        } else {
+            driver.commit_close(&mut Pump(&mut set, TimeUs(at + 240_000)));
+            driver
+                .reopen_acceptance(&mut Pump(&mut set, TimeUs(at + 250_000)))
+                .unwrap();
+        }
         let _ = driver.drain(round * 1_000);
         let _ = reader.read();
         at += 300_000;

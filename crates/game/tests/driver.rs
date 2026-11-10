@@ -996,3 +996,455 @@ fn the_snapshot_publishes_the_held_scratch_across_an_attempts_entry() {
     rig.keys(20 * MS, &[(SCRATCH, false)]);
     assert_eq!(rig.drain().scratch, game::ScratchInput::NONE);
 }
+
+// ---- The Loading opener's presentation epoch and acceptance ----
+
+const SCRATCH: u32 = 0x2a;
+
+/// Reads any `.chart` file as the chart it was built with.
+struct Built(bms_model::Chart);
+
+impl game::ChartIngest for Built {
+    fn max_bytes(&self) -> usize {
+        1 << 20
+    }
+
+    fn accepts(&self, path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|e| e == "chart")
+    }
+
+    fn ingest(
+        &self,
+        _bytes: &[u8],
+        _dir: &std::path::Path,
+        _seed: u64,
+        _speed: Speed,
+    ) -> Result<game::Ingested, game::IngestError> {
+        Ok(game::Ingested {
+            labels: game::ChartLabels::default(),
+            chart: self.0.clone(),
+            warnings: Vec::new(),
+        })
+    }
+}
+
+/// `chart` loaded with a lead-in of `lead_in_ms`, in a data root that lives
+/// as long as the directory returned with it.
+fn loaded(chart: &bms_model::Chart, lead_in_ms: i64) -> (tempfile::TempDir, game::Loaded) {
+    let dir = tempfile::Builder::new()
+        .prefix("driver")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = game::DataRoot::new(dir.path().to_owned());
+    std::fs::create_dir_all(root.path()).unwrap();
+    let path = root.path().join("play.chart");
+    std::fs::write(&path, b"built in code").unwrap();
+    let settings = game::Settings::load(&root).unwrap();
+    let parts = game::Parts {
+        ingest: Box::new(Built(chart.clone())),
+        ..game::Parts::standard(&root, &settings.player)
+    };
+    let config = game::SessionConfig {
+        lead_in: TimeUs(lead_in_ms * MS),
+        step: TimeUs(MS),
+        start: TimeUs(0),
+        effects: 4_096,
+        seed: 7,
+        speed: Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: replay::BuildProvenance::Development,
+        receive: replay::ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    let loaded = game::Loaded::load(root, settings, &path, config, parts).unwrap();
+    (dir, loaded)
+}
+
+fn chart_150() -> bms_model::Chart {
+    ChartBuilder::new(150_000).build().unwrap()
+}
+
+/// A chart at 150.000000000000000001 BPM: no exact ratio, so its
+/// references are unavailable and Floating cannot solve for it.
+fn no_references_chart() -> bms_model::Chart {
+    let mut chart = chart_150();
+    let fine = bms_model::Tempo::from_units(150 * bms_model::Tempo::UNITS_PER_BPM + 1).unwrap();
+    chart.timeline = bms_model::ChartTimeline::new(
+        vec![bms_model::TimelinePoint {
+            at: TimeUs(0),
+            pos: bms_model::Position(0),
+            tempo: fine,
+        }],
+        Vec::new(),
+        fine,
+        Speed::NORMAL,
+    )
+    .unwrap();
+    chart
+}
+
+fn lift_and_hidden() -> Covers {
+    Covers {
+        lift: Cover {
+            amount: 100,
+            on: true,
+        },
+        hidden: Cover {
+            amount: 300,
+            on: true,
+        },
+        ..Covers::default()
+    }
+}
+
+fn hidden_only() -> Covers {
+    Covers {
+        hidden: Cover {
+            amount: 300,
+            on: true,
+        },
+        ..Covers::default()
+    }
+}
+
+fn hidden(s: &PresentationSnapshot) -> u16 {
+    s.options.covers().hidden.amount
+}
+
+impl Rig {
+    fn attach_loaded(&mut self, loaded: &game::Loaded) -> Option<game::PreparationRefusal> {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.attach_loaded(loaded, &mut pump).unwrap()
+    }
+
+    fn refresh(&mut self, loaded: &game::Loaded) -> Option<game::PreparationRefusal> {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.refresh_presentation(loaded, &mut pump).unwrap()
+    }
+
+    fn close(&mut self) -> &mut Self {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.close_acceptance(&mut pump).unwrap();
+        self
+    }
+
+    fn reopen(&mut self) -> &mut Self {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.reopen_acceptance(&mut pump).unwrap();
+        self
+    }
+
+    fn close_provisionally(&mut self) -> &mut Self {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        self.driver.close_provisionally(&mut pump).unwrap();
+        self
+    }
+
+    /// Decides a provisional close: kept, or reversed.
+    fn decide(&mut self, keep: bool) -> PresentationSnapshot {
+        let mut pump = Pump {
+            set: &mut self.set,
+            now: TimeUs(self.now),
+            offset: self.offset,
+        };
+        if keep {
+            self.driver.commit_close(&mut pump);
+        } else {
+            self.driver.reverse_close(&mut pump);
+        }
+        *self.reader.read()
+    }
+}
+
+/// §2.10 R19 and R21 (A11's interleaving): the revalidation's close is
+/// provisional; F2 pressed after its fence's answer and before the
+/// decision waits undrained (a drain meanwhile takes nothing), and once
+/// the close is reversed at its fence it acts, open; held, its key
+/// repeat acts too, so nothing is left suppressed.
+#[test]
+fn a_press_after_the_closing_fence_acts_when_the_close_is_reversed() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let accepted = rig.driver.accepted();
+    rig.close_provisionally();
+    assert!(!rig.driver.accepting(), "closed at the fence");
+    rig.keys(10 * MS, &[(F2, true)]);
+    let waiting = rig.drain();
+    assert_eq!(waiting.hispeed, Some(r(320, 100)), "it waits");
+    assert_eq!(rig.driver.accepted(), accepted);
+    rig.decide(false);
+    assert!(rig.driver.accepting());
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)), "F2 acted, open");
+    // Still held: its repeat acts.
+    rig.keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(370, 100)));
+    assert_eq!(rig.driver.accepted(), accepted + 2);
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
+
+/// §2.10 R20: the same provisional close kept: the F2 press that waited
+/// is taken closed, discarded, and its repeat too; released and pressed
+/// afresh after a reopening, it acts.
+#[test]
+fn a_press_after_the_closing_fence_is_discarded_when_the_close_commits() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let accepted = rig.driver.accepted();
+    rig.close_provisionally();
+    rig.keys(10 * MS, &[(F2, true)]);
+    rig.decide(true);
+    assert!(!rig.driver.accepting());
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)), "discarded");
+    rig.keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)));
+    rig.reopen();
+    rig.keys(30 * MS, &[(F2, false)])
+        .keys(40 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)));
+    assert_eq!(rig.driver.accepted(), accepted + 1);
+}
+
+/// A10: the Loading opener's epoch refresh, with HIDDEN+ selected (LIFT
+/// and HIDDEN+ on, SUDDEN+ off), a Floating override and START with the
+/// scratch held and repeating: a new epoch on the standing attachment;
+/// the selection, the override and the repeating hold all stay.
+#[test]
+fn the_epoch_refresh_keeps_the_selected_cover_and_holds() {
+    let chart = chart_150();
+    let (_dir, loaded) = loaded(&chart, 1_000);
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, lift_and_hidden()));
+    rig.enter(loaded.opens_at().0);
+    assert_eq!(rig.attach_loaded(&loaded), None);
+    let first = rig.driver.prepared().unwrap();
+    let solved = rig.drain().hispeed.unwrap();
+    // F2 overrides H; START and SELECT together select HIDDEN+.
+    rig.tap(5 * MS, F2);
+    rig.keys(10 * MS, &[(E, true), (W, true)])
+        .keys(20 * MS, &[(E, false), (W, false)]);
+    let s = rig.snap();
+    let overridden = s.hispeed.unwrap();
+    assert_ne!(overridden, solved);
+    assert_eq!(s.target, Some(game::CoverKind::Hidden));
+    // START and the scratch held: HIDDEN+ steps on the press and at 650 ms.
+    rig.keys(600 * MS, &[(E, true), (SCRATCH, true)]);
+    rig.tick(650 * MS);
+    assert_eq!(hidden(&rig.snap()), 298);
+    let accepted = rig.driver.accepted();
+    assert_eq!(rig.refresh(&loaded), None);
+    assert!(rig.driver.has_pending());
+    let second = rig.driver.prepared().unwrap();
+    assert!(second > first);
+    let s = rig.drain();
+    assert_eq!(s.epoch, second);
+    assert_eq!(s.target, Some(game::CoverKind::Hidden), "still selected");
+    assert_eq!(s.hispeed, Some(overridden), "the attachment stands");
+    assert!(s.adjusting, "START still held");
+    assert_eq!(rig.driver.accepted(), accepted, "the refresh is no change");
+    // The hold keeps repeating at its deadline.
+    rig.tick(700 * MS);
+    assert_eq!(hidden(&rig.snap()), 297);
+    assert_eq!(rig.driver.diagnostics().out_of_order, 0);
+}
+
+/// A10b: a refresh whose opening moved (a refitted lead-in) solves again
+/// within the dispatch context: the held scratch's next repeat comes at
+/// its old deadline, not a fresh press's, and is not suppressed. The axis
+/// remainder's half is at the reducer
+/// (`resolve_keeps_repeat_deadlines_and_axis_remainders`).
+#[test]
+fn a_changed_refresh_keeps_repeat_deadlines_and_axis_remainders() {
+    let chart = chart_150();
+    let (_d1, before) = loaded(&chart, 1_000);
+    let (_d2, after) = loaded(&chart, 2_000);
+    assert_ne!(before.opens_at(), after.opens_at());
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, hidden_only()));
+    rig.enter(before.opens_at().0);
+    assert_eq!(rig.attach_loaded(&before), None);
+    let first = rig.driver.prepared().unwrap();
+    let solved = rig.drain().hispeed.unwrap();
+    rig.tap(5 * MS, F2);
+    assert_ne!(rig.snap().hispeed, Some(solved), "an override");
+    // START and the scratch at 600 ms: a step, the next due at 650 ms.
+    rig.keys(600 * MS, &[(E, true), (SCRATCH, true)]);
+    rig.tick(620 * MS);
+    assert_eq!(hidden(&rig.drain()), 299);
+    assert_eq!(rig.refresh(&after), None);
+    let second = rig.driver.prepared().unwrap();
+    assert!(second > first);
+    let s = rig.drain();
+    assert_eq!(s.epoch, second);
+    assert_eq!(
+        s.hispeed,
+        Some(solved),
+        "solved again: the override is gone"
+    );
+    // Before the old deadline nothing; at it, one step.
+    rig.tick(649 * MS);
+    assert_eq!(hidden(&rig.drain()), 299);
+    rig.tick(650 * MS);
+    assert_eq!(hidden(&rig.snap()), 298);
+    rig.tick(700 * MS);
+    assert_eq!(hidden(&rig.snap()), 297);
+    // The refresh's attachment stands: a second refresh at the same
+    // opening reuses it and keeps a new override.
+    rig.tap(800 * MS, F2);
+    let overridden = rig.snap().hispeed;
+    assert_ne!(overridden, Some(solved));
+    assert_eq!(rig.refresh(&after), None);
+    rig.driver.prepared().unwrap();
+    assert_eq!(rig.drain().hispeed, overridden);
+}
+
+/// A10c, the driver's half: the load-time attachment of a chart Floating
+/// cannot solve for (no references) is refused and ignored, as the player
+/// ignores it; the refresh attaches again and reports the same refusal,
+/// with no epoch pending.
+#[test]
+fn a_failed_load_attachment_is_refused_at_refresh() {
+    let chart = no_references_chart();
+    let (_dir, loaded) = loaded(&chart, 1_000);
+    let mut rig = Rig::new(PlayOptions::default());
+    rig.enter(loaded.opens_at().0);
+    let at_load = rig.attach_loaded(&loaded).expect("refused at load");
+    assert!(!rig.driver.has_pending());
+    let at_refresh = rig.refresh(&loaded).expect("refused at the refresh");
+    assert_eq!(at_refresh, at_load);
+    assert_eq!(
+        at_refresh.location,
+        Some(loaded.path().display().to_string())
+    );
+    assert!(
+        at_refresh
+            .reason
+            .contains(&AttachError::NoReferences.to_string()),
+        "{}",
+        at_refresh.reason
+    );
+    assert!(!rig.driver.has_pending());
+    assert_eq!(rig.driver.prepared(), None);
+    assert_eq!(rig.drain().hispeed, None);
+    // Every refresh refuses again: no failed attachment is reused.
+    assert_eq!(rig.refresh(&loaded), Some(at_load));
+}
+
+/// A11: a close reversed at once drops nothing. A press queued before the
+/// close (not yet drained) is taken by the close's fence and acts; the
+/// repeating hold, the selection and the acceptance are as before.
+#[test]
+fn a_provisional_close_reversed_drops_nothing() {
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, hidden_only()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.keys(600 * MS, &[(E, true), (SCRATCH, true)]);
+    rig.tick(650 * MS);
+    let s = rig.snap();
+    assert_eq!(hidden(&s), 298);
+    assert_eq!(s.hispeed, Some(r(16, 5)));
+    let accepted = rig.driver.accepted();
+    // F2 under START, queued and not drained when the close is asked.
+    rig.tap(660 * MS, F2);
+    rig.close();
+    assert!(!rig.driver.accepting());
+    rig.reopen();
+    assert!(rig.driver.accepting());
+    let after = rig.drain();
+    assert_eq!(after.hispeed, Some(r(37, 10)), "the queued F2 acted");
+    assert_eq!(rig.driver.accepted(), accepted + 1);
+    assert_eq!(after.target, s.target);
+    assert!(after.adjusting);
+    // The scratch held before the close repeats at its deadline.
+    rig.tick(700 * MS);
+    assert_eq!(hidden(&rig.snap()), 297);
+    assert_eq!(rig.driver.accepted(), accepted + 2);
+}
+
+/// A12 and A13 at the reducer: from the close, a press acts on nothing and
+/// its repeats neither, before or after the reopening; a START tapped in
+/// the gap is no double-press history; once released, a fresh press after
+/// the reopening acts.
+#[test]
+fn a_press_in_the_closed_gap_is_discarded_and_rearms() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let accepted = rig.driver.accepted();
+    rig.close();
+    // F2 pressed and repeating in the gap.
+    rig.keys(10 * MS, &[(F2, true)])
+        .keys(20 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)));
+    // START held in the gap is held, and acts on nothing.
+    rig.keys(30 * MS, &[(E, true)]);
+    assert!(rig.snap().adjusting);
+    rig.keys(40 * MS, &[(E, false)]);
+    rig.reopen();
+    // F2's repeat after the reopening: still nothing.
+    rig.keys(50 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)));
+    // One START after the reopening, 30 ms after the gap's: no double press.
+    rig.keys(60 * MS, &[(E, true)]).keys(70 * MS, &[(E, false)]);
+    assert!(!rig.snap().options.covers().sudden.on);
+    assert_eq!(rig.driver.accepted(), accepted);
+    // Released and pressed afresh, F2 steps, and repeats.
+    rig.keys(80 * MS, &[(F2, false)])
+        .keys(90 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)));
+    rig.keys(100 * MS, &[(F2, true)]);
+    let s = rig.snap();
+    assert_eq!(s.hispeed, Some(r(370, 100)));
+    assert_eq!(s.options.hispeed().classic_hispeed_x100, 370);
+    assert_eq!(rig.driver.accepted(), accepted + 2);
+}
+
+/// A16: the opening's phase (recording opened) reopens the acceptance,
+/// with no reopening asked: the starting tuning has none of the gap's
+/// presses, a press held from the gap stays discarded, and a fresh press
+/// acts in play.
+#[test]
+fn the_opened_phase_reopens_acceptance() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    rig.close();
+    rig.keys(10 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)));
+    assert!(!rig.driver.accepting());
+    rig.open(20 * MS, 1_020 * MS, 1);
+    rig.drain();
+    assert!(rig.driver.accepting());
+    assert_eq!(
+        rig.driver.opened(1).unwrap().hispeed,
+        Some(replay::HiSpeedRatio { num: 16, den: 5 })
+    );
+    rig.keys(30 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(320, 100)), "held from the gap");
+    rig.keys(40 * MS, &[(F2, false)])
+        .keys(50 * MS, &[(F2, true)]);
+    assert_eq!(rig.snap().hispeed, Some(r(345, 100)));
+}

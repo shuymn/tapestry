@@ -75,17 +75,9 @@ pub struct Source {
 /// Headers read and ignored without a warning: descriptive ones, and ones
 /// for what stage 1 does not show or use.
 const IGNORED_HEADERS: &[&str] = &[
-    "STAGEFILE",
-    "BANNER",
-    "BACKBMP",
-    "VOLWAV",
-    "COMMENT",
-    "PREVIEW",
+    "BANNER", "VOLWAV", "COMMENT", "PREVIEW",
     // Read by other players for things stage 1 does not show or use.
-    "BASEBPM",
-    "CHARFILE",
-    "EXTCHR",
-    "MAKER",
+    "BASEBPM", "CHARFILE", "EXTCHR", "MAKER",
 ];
 
 /// Prefixes of numbered definitions read and ignored without a warning: images,
@@ -400,6 +392,8 @@ fn parse_header(
         "ARTIST" => source.labels.artist = value.to_owned(),
         "SUBARTIST" => source.labels.subartist = value.to_owned(),
         "GENRE" => source.labels.genre = value.to_owned(),
+        "STAGEFILE" => source.labels.stagefile = value.to_owned(),
+        "BACKBMP" => source.labels.backbmp = value.to_owned(),
         "PLAYLEVEL" => source.labels.playlevel = value.to_owned(),
         "DIFFICULTY" if sets_difficulty(value) => source.labels.difficulty = value.to_owned(),
         "DIFFICULTY" => {}

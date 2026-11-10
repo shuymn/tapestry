@@ -93,7 +93,7 @@ use super::policy::{CriticalPart, EssentialPart, Role};
 use super::property::{self, IndexProp, IntProp};
 use super::report::{NoteKind, Span};
 use super::timer::{Custom, Timer};
-use super::{Cx, Prop};
+use super::{Common, Cx, Prop};
 use crate::error::ImportError;
 use crate::lua::callback::{
     Analysis, Callee, Captured, Disposition, Found, Site, fatal as sentinel, numeral,
@@ -113,7 +113,19 @@ use crate::tree::{Kind, LuaScalar, NONE};
 #[derive(Debug, Default)]
 pub(super) struct SlotRoot {
     slots: Vec<u16>,
-    consumers: Vec<(u16, Role, (u32, u32), Span)>,
+    pub(super) consumers: Vec<SlotConsumer>,
+}
+
+/// A timer callback compiled for a slot root.
+#[derive(Debug)]
+pub(super) struct SlotConsumer {
+    k: u16,
+    role: Role,
+    at: (u32, u32),
+    span: Span,
+    /// Whether its destination's element was retained: one that was not
+    /// may be an object the source removed ([`Cx::installed`]).
+    pub(super) kept: bool,
 }
 
 /// The gauge looks `gauge_type()` selects, by index.
@@ -130,6 +142,9 @@ pub(crate) struct Lowered {
     /// On a result skin, the essential part a read shows.
     pub(crate) essential: Option<EssentialPart>,
     pub(crate) deviates: bool,
+    /// Whether it reads a value the source sees as a sentinel before the
+    /// first judgment ([`property::Value::pre_judgment`]).
+    pub(crate) sentinel: bool,
     /// The value its expression folds to when it compiles to a constant,
     /// its guards aside: a visibility known false folds as a JSON
     /// condition does.
@@ -302,6 +317,7 @@ impl<'a> Lower<'a> {
                 part: None,
                 essential: None,
                 deviates: false,
+                sentinel: false,
                 known: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
@@ -485,6 +501,7 @@ impl Lower<'_> {
                     self.guard(g);
                 }
                 self.out.deviates |= v.deviates();
+                self.out.sentinel |= v.pre_judgment();
                 self.out.part = self.out.part.or(v.part());
                 self.out.essential = self.out.essential.or(v.essential());
                 let (lo, hi) = v.range();
@@ -1400,40 +1417,85 @@ impl Cx<'_> {
             return;
         };
         an.set_outcome(c, d);
+        self.consumed(id, field, role, (d, why), (lowered, program));
+    }
+
+    /// The report's record of the consumer at node `id` in `field`, for an
+    /// element of `role` (dev-tools): its disposition `d`, `why` it did not
+    /// lower, and what it lowered to.
+    pub(super) fn consumed(
+        &self,
+        id: u32,
+        field: &'static str,
+        role: Role,
+        (d, why): (Disposition, Option<Unsupported>),
+        (lowered, program): (Option<&Lowered>, Option<u16>),
+    ) {
         #[cfg(feature = "dev-tools")]
-        an.consumed
-            .borrow_mut()
-            .push(crate::lua::callback::Consumed {
-                node: id,
-                field,
-                part: match role {
-                    Role::Critical(p) => Some(p),
-                    Role::Essential(_) | Role::Decorative => None,
-                },
-                disposition: d,
-                why,
-                element: self.element.clone(),
-                // A value belongs to the definition (`def`), the other
-                // consumers to the destination; a nested part has its own
-                // path.
-                path: match (self.part_path.as_str(), field) {
-                    ("", "value") => "def".to_owned(),
-                    (p, _) => p.to_owned(),
-                },
-                index: if field == "op" {
-                    self.op_positions.get(&id).copied().unwrap_or(u32::MAX)
-                } else {
-                    0
-                },
-                lowered: lowered.map(|l| crate::lua::survey::Lowered {
-                    src: l.src.clone(),
-                    guards: l.guards.clone(),
-                    constant: l.constant,
-                }),
-                program,
-            });
+        if let Some(an) = self.analysis() {
+            an.consumed
+                .borrow_mut()
+                .push(crate::lua::callback::Consumed {
+                    node: id,
+                    field,
+                    part: match role {
+                        Role::Critical(p) => Some(p),
+                        Role::Essential(_) | Role::Decorative => None,
+                    },
+                    disposition: d,
+                    why,
+                    element: self.element.clone(),
+                    // A value belongs to the definition (`def`), the other
+                    // consumers to the destination; a nested part has its
+                    // own path.
+                    path: match (self.part_path.as_str(), field) {
+                        ("", "value") => "def".to_owned(),
+                        (p, _) => p.to_owned(),
+                    },
+                    index: if field == "op" {
+                        self.op_positions.get(&id).copied().unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    },
+                    lowered: lowered.map(|l| crate::lua::survey::Lowered {
+                        src: l.src.clone(),
+                        guards: l.guards.clone(),
+                        constant: l.constant,
+                    }),
+                    program,
+                });
+        }
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, why, lowered, program);
+        let _ = (id, field, role, d, why, lowered, program);
+    }
+
+    /// A program callback at node `id` in `field`, compiled for the play
+    /// destination being read ([`Self::installed`]).
+    fn compiled_at(&mut self, id: u32, field: &'static str, k: u16) {
+        if self.kind == ScreenKind::Play {
+            self.install.compiled.push((id, field, k));
+        }
+    }
+
+    /// The record of callable `c` at node `id` in `field`, for an element
+    /// of `role` whose object the source removes at installation: not
+    /// compiled, recorded for this occurrence only (the callable's
+    /// outcome, shared with its other uses, is left alone).
+    pub(super) fn removed_record(&self, (c, id): (u32, u32), field: &'static str, role: Role) {
+        let why = Unsupported::Construct("an object the source removes at installation");
+        self.consumed(
+            id,
+            field,
+            role,
+            (Disposition::Replaced(why), Some(why)),
+            (None, None),
+        );
+        #[cfg(feature = "dev-tools")]
+        if let Some(an) = self.analysis() {
+            an.unused(c, crate::lua::callback::Unused::Removed);
+        }
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = c;
     }
 
     /// Records why the callback at node `id`, read, was not consumed:
@@ -1684,6 +1746,7 @@ impl Cx<'_> {
                             part: None,
                             essential: None,
                             deviates: false,
+                            sentinel: false,
                             known: None,
                             #[cfg(feature = "dev-tools")]
                             constant: matches!(fold, TextFold::Literal(_)),
@@ -1815,6 +1878,7 @@ impl Cx<'_> {
                     }
                 }
                 *deviates |= l.deviates;
+                self.read_sentinel(l.sentinel);
                 // Off play a visibility known to be false folds as a JSON
                 // condition of the same id does: never drawn, so an
                 // essential part is missing rather than kept invisible.
@@ -1827,10 +1891,19 @@ impl Cx<'_> {
                 }
                 return Ok(true);
             }
+            // An object the source removes never calls it: compiled to
+            // nothing, it reads false.
+            Ok(Lowering::Compiled(..)) if self.install.removed.is_some() => {
+                self.removed_record((c, id), field, role);
+                conds.push("false".to_owned());
+                return Ok(true);
+            }
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
                     self.compiled((c, id), field, role, k);
+                    self.compiled_at(id, field, k);
                     *deviates |= l.deviates;
+                    self.read_sentinel(l.sentinel);
                     conds.push(format!("lua.{k}"));
                     return Ok(true);
                 }
@@ -1980,6 +2053,7 @@ impl Cx<'_> {
                 #[cfg(test)]
                 LOWERED_META.with(|w| w.borrow_mut().push((l.guards.clone(), l.part, l.deviates)));
                 let guard = (!l.guards.is_empty()).then(|| l.guards.join(" && "));
+                self.read_sentinel(l.sentinel);
                 return Ok(Some(NumberValue {
                     expr: l.src,
                     guard,
@@ -1993,9 +2067,24 @@ impl Cx<'_> {
                     .map(Role::Critical)
                     .or(l.essential.map(Role::Essential))
                     .unwrap_or(base);
-                match self.program(prog, None, None, at)? {
+                // An object the source removes never reads it: no value.
+                if self.install.removed.is_some() {
+                    self.removed_record((c, id), "value", role);
+                    return Ok(Some(NumberValue {
+                        expr: "0".to_owned(),
+                        guard: Some("false".to_owned()),
+                        role,
+                        deviates: l.deviates,
+                    }));
+                }
+                // The source prunes the object by the chart facts before it
+                // reads its value.
+                let gate = self.install.gate.clone();
+                match self.program(prog, gate, None, at)? {
                     Ok(k) => {
                         self.compiled((c, id), "value", role, k);
+                        self.compiled_at(id, "value", k);
+                        self.read_sentinel(l.sentinel);
                         return Ok(Some(NumberValue {
                             expr: format!("lua.{k}"),
                             guard: Some(format!("lua.{k}.ok")),
@@ -2088,11 +2177,19 @@ impl Cx<'_> {
     pub(super) fn keep_slider_value(
         &mut self,
         v: SliderValue,
+        (c, timer): (&Common, &Prop),
         at: Span,
     ) -> Result<Option<u16>, ImportError> {
-        match self.program(v.prog, None, None, at)? {
+        // The source reads it only when the slider draws
+        // ([`Self::slider_gate`]).
+        let gated = match self.slider_gate(c, timer) {
+            Ok((gate, after)) => self.program(v.prog, gate, after, at)?,
+            Err(why) => Err(why),
+        };
+        match gated {
             Ok(k) => {
                 self.compiled(v.at, "value", v.role, k);
+                self.compiled_at(v.at.1, "value", k);
                 Ok(Some(k))
             }
             Err(why) => {
@@ -2157,12 +2254,15 @@ impl Cx<'_> {
     /// `lua.<k>`) too; a second such output, or a program draw before a
     /// draw, is refused, as the program has no such gating. An expression
     /// value's sentinel joins the gate.
-    fn gating(
+    pub(super) fn gating(
         &self,
         conds: &[String],
         timer: bool,
     ) -> Result<(Option<String>, Option<u16>), Unsupported> {
         use skin_model::present::Conv as P;
+        // What the source checks before the conditions: its installation
+        // and its kind's prepare ([`super::prepare`]).
+        let before = self.prepare_gate()?;
         let mut gate = Vec::new();
         let mut after = None;
         for cond in conds {
@@ -2199,8 +2299,9 @@ impl Cx<'_> {
             )),
             _ => None,
         };
-        let gate = sentinel
+        let gate = before
             .into_iter()
+            .chain(sentinel)
             .chain(gate.iter().map(|g| (*g).to_owned()))
             .collect::<Vec<_>>();
         Ok(((!gate.is_empty()).then(|| gate.join(" && ")), after))
@@ -2324,7 +2425,14 @@ impl Cx<'_> {
         let capped = end.settles_by_cap(last.saturating_mul(1000));
         let why = if capped {
             match self.lower(id, Conv::Timer) {
-                Ok(Lowering::Compiled(_, prog)) => {
+                // An object the source removes never calls it: compiled to
+                // nothing, the element on the screen's timer, by which it
+                // is never drawn.
+                Ok(Lowering::Compiled(..)) if self.install.removed.is_some() => {
+                    self.removed_record((c, id), "timer", role);
+                    return Ok(Ok(self.screen()));
+                }
+                Ok(Lowering::Compiled(l, prog)) => {
                     let ids: Vec<u16> = prog.slots.iter().map(|s| s.slot).collect();
                     let slots = !ids.is_empty();
                     match self.gating(conds, true) {
@@ -2340,9 +2448,19 @@ impl Cx<'_> {
                                 if !ids.is_empty() {
                                     let r = self.slot_roots.entry(inst).or_default();
                                     r.slots = ids;
-                                    r.consumers.push((k, role, (c, id), at));
+                                    r.consumers.push(SlotConsumer {
+                                        k,
+                                        role,
+                                        at: (c, id),
+                                        span: at,
+                                        kept: true,
+                                    });
+                                    let n = r.consumers.len() - 1;
+                                    self.install.consumers.push((inst, n));
                                 }
                                 self.compiled((c, id), "timer", role, k);
+                                self.compiled_at(id, "timer", k);
+                                self.read_sentinel(l.sentinel);
                                 return Ok(Ok(TimerRef::Output(k)));
                             }
                             Err(why) => why,
@@ -2407,20 +2525,30 @@ impl Cx<'_> {
     /// holding it) its consumers are made never to run (their gate false)
     /// and follow their role, a critical one refusing the candidate.
     pub(super) fn close_slots(&mut self) -> Result<(), ImportError> {
+        let mut never = std::collections::HashSet::new();
         let roots = std::mem::take(&mut self.slot_roots);
         let mut roots: Vec<(u32, SlotRoot)> = roots.into_iter().collect();
         roots.sort_by_key(|&(inst, _)| inst);
         for (inst, root) in roots {
             let sites = usize::try_from(self.timer_sites.get(&inst).copied().unwrap_or(0))
                 .unwrap_or(usize::MAX);
-            let why = if root.consumers.len() < sites {
+            let kept = root.consumers.iter().filter(|c| c.kept).count();
+            let why = if kept < sites {
                 Unsupported::Construct("a slot writer a dropped destination calls")
-            } else if self.references(inst) != sites {
+            } else if self
+                .references(inst)
+                .saturating_sub(self.removed_refs.get(&inst).copied().unwrap_or(0))
+                != sites
+            {
                 Unsupported::Construct("a slot writer referenced beside its destinations' timers")
             } else {
                 continue;
             };
-            for (k, role, at, span) in root.consumers {
+            for SlotConsumer {
+                k, role, at, span, ..
+            } in root.consumers
+            {
+                never.insert(k);
                 let never = self.compile("false", Ty::Bool, span)?;
                 let read = self.present.reads.len();
                 self.present.reads.push(skin_model::present::ReadDef {
@@ -2438,6 +2566,7 @@ impl Cx<'_> {
                 self.note(Some(span), super::report::Severity::Fallback, note);
             }
         }
+        self.schedule_notes(&never);
         Ok(())
     }
 

@@ -13,7 +13,7 @@ use eval::{
 use input::SourceReader;
 use rules::RulePreset;
 
-use crate::render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
+use crate::render::{OffsetRing, PlayView, RenderSide, RenderSink, ViewWriter, render_link};
 
 /// Receives every judgment event the logic step emits, in order.
 pub trait EventSink {
@@ -222,6 +222,8 @@ pub struct Logic<'a, R = SourceReader> {
     render: RenderSink,
     sinks: Vec<Box<dyn EventSink + Send + 'a>>,
     view: ViewWriter,
+    /// The candidate's newest judgment offsets ([`PlayView::offsets`]).
+    offsets: OffsetRing,
     /// The READY candidate's rearms so far ([`PlayView::generation`]).
     generation: u64,
     /// The latest rearm's origin ([`PlayView::origin`]).
@@ -325,6 +327,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             playing: false,
             closing: None,
             events: 0,
+            offsets: OffsetRing::EMPTY,
         };
         let (render, view, side) = render_link(config.effects, &initial);
         let max_events = evaluator.max_events(budget);
@@ -347,6 +350,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             render,
             sinks,
             view,
+            offsets: OffsetRing::EMPTY,
             generation: 0,
             origin: None,
             playing: false,
@@ -482,6 +486,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.emitted += self.out.len() as u64;
         let mut oldest: Option<TimeUs> = None;
         for ev in &self.out {
+            self.offsets.record(ev);
             self.render.receive(ev);
             for sink in &mut self.sinks {
                 sink.receive(ev);
@@ -730,6 +735,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             playing: self.playing,
             closing: self.closing,
             events: self.emitted,
+            offsets: self.offsets,
         }
     }
 
@@ -811,6 +817,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.out.clear();
         self.record.clear();
         self.emitted = 0;
+        self.offsets.clear();
         self.playing = false;
         self.closing = None;
         self.finalized = None;
@@ -870,6 +877,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.playing = self.playing;
         v.closing = self.closing;
         v.events = self.emitted;
+        v.offsets = self.offsets;
         self.view.publish();
     }
 }

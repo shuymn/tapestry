@@ -1,7 +1,8 @@
 //! After construction, a whole play allocates nothing: scripted input,
 //! publication, the logic step, the audio step and draining the render side,
 //! including a play whose output is mostly input-driven and an overflow over
-//! several sources.
+//! several sources, and the judgment offsets ring through 130 judgments and
+//! a rearm.
 //!
 //! A counting global allocator counts allocations made on threads that opted
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -15,9 +16,11 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{ChartBuilder, SoundId, TimeUs};
-use common::{MS, count_judged, device, lane, press, window_capacity};
+use common::{
+    MS, count_judged, device, lane, offset_taps, press, tap_offset_ms, tap_time, window_capacity,
+};
 use eval::{InputKind, InputStart, JudgeEventKind, PhysicalInputEvent, SourceId};
-use game::{AbortCause, Logic, LogicConfig, RunOutcome, Runner};
+use game::{AbortCause, Logic, LogicConfig, OffsetRing, RunOutcome, Runner};
 use input::{
     AutoplayInput, DeviceKind, InputAdapter, ScriptedInput, SourceConfig, SourceSet, autoplay,
     autoplay_count, source_queue,
@@ -239,4 +242,51 @@ fn logic_does_not_allocate_during_play() {
     assert_eq!(fed, total);
     assert_eq!(feeder.fed(), 0);
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+
+    // The judgment offsets ring (design.md "Rendering and Skins"): 130
+    // judgments through the step and the publish, one step each, with the
+    // effect queue full from the first; the render side reads each view's
+    // ring, and a rearm clears it.
+    let (taps, inputs) = offset_taps(130);
+    let (mut writer, reader) = source_queue(inputs.len());
+    for ev in inputs {
+        writer.push(ev).unwrap();
+    }
+    let one = device(&[0]);
+    let (mut ringed, mut side) = Logic::new(
+        &taps,
+        &rule,
+        &one,
+        &InputStart::default(),
+        vec![reader],
+        LogicConfig {
+            inputs: 1_024,
+            effects: 1,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let mut counts = 0;
+    TRACK.with(|t| t.set(true));
+    counted();
+    for i in 0..130 {
+        let t = TimeUs(tap_time(i) + 50 * MS);
+        writer.publish(t);
+        ringed.advance_to(t);
+        counts += u64::from(side.view().offsets.count());
+    }
+    let full = side.view().offsets;
+    ringed.rearm(&InputStart::default(), TimeUs(20_000 * MS));
+    let cleared = side.view().offsets;
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
+    assert!(side.dropped() > 0);
+    // Each step's view counted its own judgment: 1 + 2 + … + 130.
+    assert_eq!(counts, 130 * 131 / 2);
+    assert_eq!(full.count(), 130);
+    let newest: Vec<i32> = (30..130)
+        .map(|i| i32::try_from(tap_offset_ms(i)).unwrap())
+        .collect();
+    assert_eq!(full.recorded().collect::<Vec<_>>(), newest);
+    assert_eq!(cleared, OffsetRing::EMPTY);
 }

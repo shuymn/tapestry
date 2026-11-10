@@ -21,6 +21,7 @@ pub(crate) mod ledger;
 mod object;
 pub(crate) mod ops;
 mod policy;
+mod prepare;
 mod property;
 #[cfg(feature = "dev-tools")]
 pub(crate) use property::{IndexProp, IntProp, index_in, int_in, int_named, judge_count};
@@ -46,7 +47,7 @@ pub use policy::{CriticalPart, EssentialPart};
 pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
     DeviationId, FileChoice, LaneApprox, Note, NoteFallback, NoteKind, NoteLoc, Object, PartWhy,
-    PropertyKind, Report, Rule, Severity, TimerWhy, TrackWhy, Usage,
+    PropertyKind, Report, Rule, ScheduleWhy, Severity, TimerWhy, TrackWhy, Usage,
 };
 
 use self::asset::{Assets, Choices};
@@ -408,6 +409,11 @@ struct Common {
     /// On a result skin, whether its visibility tests the clear status,
     /// an essential part ([`result`]).
     tests_status: bool,
+    /// Its conditions' sources, in the source's order, as `visible` joins
+    /// them: what a value read after them is gated by.
+    conds: Vec<String>,
+    /// Its first key's time in ms as written, before D20 settles it.
+    first_at: i64,
 }
 
 /// The import's running state.
@@ -456,6 +462,24 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
+    /// Per callable instance, the `timer`s of play destinations whose
+    /// object the source removes, or whose timer is inert: no site, and
+    /// no reference ([`Cx::close_slots`]).
+    removed_refs: HashMap<u32, usize>,
+    /// The play destination being read's installation ([`prepare`]).
+    install: prepare::Install,
+    /// What its kind's `prepare` checks before its conditions.
+    prepare: prepare::Prepare,
+    /// Whether a read of it so far is one the source sees as a
+    /// pre-judgment sentinel ([`property::Value::pre_judgment`]).
+    sentinel_read: bool,
+    /// The schedule notes, by callback, held until the slot roots close
+    /// ([`Cx::schedule_notes`]).
+    schedule: Vec<(u16, Span, NoteKind)>,
+    /// Each folder a source pattern lists, by name: its entries' names and
+    /// whether the listing skipped one, or `None` when it could not be
+    /// read; listed and charged once.
+    listings: HashMap<String, Option<(Vec<String>, bool)>>,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -593,6 +617,12 @@ impl<'d> Cx<'d> {
             present: skin_model::present::PresentDef::default(),
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
+            removed_refs: HashMap::new(),
+            install: prepare::Install::default(),
+            prepare: prepare::Prepare::Open,
+            sentinel_read: false,
+            schedule: Vec::new(),
+            listings: HashMap::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],
@@ -1016,7 +1046,7 @@ impl<'d> Cx<'d> {
         self.budget.element().map_err(|l| self.limit(at, l))?;
         #[cfg(test)]
         trace(Event::Charge);
-        let (id, dst) = self.read_dst(index, rec)?;
+        let (id, mut dst) = self.read_dst(index, rec)?;
         #[cfg(feature = "dev-tools")]
         {
             self.element = Some(crate::lua::survey::Element {
@@ -1038,8 +1068,10 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
-            self.count_timer_site(&dst.timer);
-            return self.system(dst, n);
+            self.install(&mut dst, None, false)?;
+            self.system(dst, n)?;
+            self.installed();
+            return Ok(());
         }
         let role = Role::Decorative.or_failure(dst.failure);
         let Some((object, orec)) = self
@@ -1049,7 +1081,6 @@ impl<'d> Cx<'d> {
             self.ignored(at, NoteKind::UndefinedObject);
             return Ok(());
         };
-        self.count_timer_site(&dst.timer);
         #[cfg(feature = "dev-tools")]
         if let Some(e) = &mut self.element {
             e.kind = Some(format!("{object:?}"));
@@ -1092,6 +1123,10 @@ impl<'d> Cx<'d> {
                 why: NoteKind::UnsupportedField { field: "id" },
             });
         }
+        // An id another table names too: the source may make the other
+        // object when this one's source is missing, so that is uncertain.
+        let shared = self.objects.shared(self.def, &self.tables, &id)?;
+        self.install(&mut dst, Some((object, orec)), !shared)?;
         // The source makes no object of these when `src` names no source,
         // and skips the destination (`JSONSkinLoader.java:326-338,
         // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
@@ -1129,6 +1164,7 @@ impl<'d> Cx<'d> {
                 self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }
         }
+        self.installed();
         Ok(())
     }
 
@@ -1468,6 +1504,7 @@ impl<'d> Cx<'d> {
         let mut track = track;
         // At rest the source's colour is the key's, so an alpha offset adds
         // to it even where the colour animates (`SkinObject.java:493-519`).
+        let first_at = track.keys.first().map_or(0, |k| k.at);
         let settled = untimed && matches!(role, Role::Critical(_)) && policy::settles(&track);
         if settled {
             track.keep_last_from_start();
@@ -1581,6 +1618,8 @@ impl<'d> Cx<'d> {
             track,
             display_deviation: deviates,
             tests_status,
+            conds,
+            first_at,
         }))
     }
 
@@ -1959,6 +1998,16 @@ impl<'d> Cx<'d> {
         Ok((ms > 0).then(|| TimeUs(i64::from(ms) * 1_000)))
     }
 
+    /// The loading presentation's declared least length, from the
+    /// top-level `loadend` in ms: in µs, a negative value 0, `None` when
+    /// absent. Read as every integer field is: a value the reader refuses
+    /// refuses the import.
+    fn loadend(&mut self) -> Result<Option<TimeUs>, ImportError> {
+        let [f] = self.def.fields(self.def.top(), ["loadend"]);
+        let ms = f.map(|f| self.def.int(f, "loadend")).transpose()?;
+        Ok(ms.map(|ms| TimeUs(i64::from(ms.max(0)) * 1_000)))
+    }
+
     /// A result skin's declared timing (design.md "State Model", Result),
     /// from the top-level `fadeout`, `input` and `scene` in ms
     /// (`JsonSkin.java:14-16`, each 0 when absent; a Lua skin's table
@@ -2049,10 +2098,10 @@ impl<'d> Cx<'d> {
         } else {
             DecisionTiming::default()
         };
-        let (bomb_up_to, close) = if selection || result || decision {
-            (None, None)
+        let (bomb_up_to, close, loadend) = if selection || result || decision {
+            (None, None, None)
         } else {
-            (self.bomb_up_to()?, self.close()?)
+            (self.bomb_up_to()?, self.close()?, self.loadend()?)
         };
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
@@ -2074,6 +2123,7 @@ impl<'d> Cx<'d> {
             widgets: std::mem::take(&mut self.widgets),
             bomb_up_to,
             close,
+            loadend,
             present: {
                 self.close_slots()?;
                 (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))

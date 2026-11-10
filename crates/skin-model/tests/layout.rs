@@ -485,6 +485,7 @@ fn hidden_regions_and_offered_controls() {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap();

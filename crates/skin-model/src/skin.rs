@@ -222,6 +222,10 @@ pub struct SkinDef {
     /// Closing), positive; `None` declares nothing, and the player's
     /// floor applies either way.
     pub close: Option<TimeUs>,
+    /// How long the play skin declares its loading presentation lasts at
+    /// least (design.md "Play Lifecycle", the loading state), 0 or more;
+    /// `None` declares nothing.
+    pub loadend: Option<TimeUs>,
     /// The play presentation program, whose outputs the expressions read
     /// as `lua.<k>` and `lua.<k>.ok`; `None` has none.
     pub present: Option<PresentDef>,
@@ -487,6 +491,7 @@ pub struct Skin {
     widget_quads: u32,
     bomb_up_to: Option<Grade>,
     close: Option<TimeUs>,
+    loadend: Option<TimeUs>,
     /// The screen the skin is made for.
     kind: ScreenKind,
     song_list: Option<SongList>,
@@ -2223,6 +2228,7 @@ impl Skin {
             widget_quads,
             bomb_up_to: def.bomb_up_to,
             close: def.close,
+            loadend: def.loadend,
             kind,
             song_list,
             ratio_bars,
@@ -2242,6 +2248,13 @@ impl Skin {
     #[must_use]
     pub fn close(&self) -> Option<TimeUs> {
         self.close
+    }
+
+    /// How long the skin declares its loading presentation lasts at least,
+    /// if it declares it ([`SkinDef::loadend`]).
+    #[must_use]
+    pub fn loadend(&self) -> Option<TimeUs> {
+        self.loadend
     }
 
     /// What a result skin declares for its screen's timing
@@ -2344,6 +2357,26 @@ impl Skin {
     #[must_use]
     pub fn program_structure(&self) -> String {
         format!("{:?}", self.present)
+    }
+
+    /// Whether the presentation program's slotted callbacks may run on a
+    /// carried state ([`Present::carry_safe`](crate::present::Present::carry_safe));
+    /// true without a program (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn program_carry_safe(&self) -> bool {
+        self.present
+            .as_ref()
+            .is_none_or(crate::present::Present::carry_safe)
+    }
+
+    /// Per program callback, whether it loads or stores a slot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn program_slotted(&self) -> Vec<bool> {
+        self.present
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.slotted().to_vec())
     }
 
     /// The lanes' bar groups: the groups a [`Play`] from
@@ -4325,6 +4358,7 @@ mod tests {
             },
             bomb_up_to: None,
             close: None,
+            loadend: None,
             present: None,
         })
         .unwrap();

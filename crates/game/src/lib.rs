@@ -28,6 +28,7 @@ mod hispeed;
 mod keys;
 pub mod live;
 mod logic;
+pub mod opening;
 mod policy;
 mod practice;
 mod practice_screen;
@@ -67,7 +68,7 @@ pub use audio_loop::{
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
-    SavedPlay,
+    SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
 pub use driver::{AdjustDriver, InputPump};
 pub use error::{Chain, IoFailure};
@@ -87,6 +88,10 @@ pub use live::{
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
+};
+pub use opening::{
+    AcceptanceRevision, LOADING_FLOOR, LoadingOpener, LoadingRig, QUIET, Revalidated,
+    TuningSnapshot, load_and_open, loading_minimum, minimum_ends,
 };
 pub use policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
@@ -110,7 +115,9 @@ pub use presets::{
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use ready_history::{HistoryFull, HistoryRecorder};
-pub use render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
+pub use render::{
+    OFFSET_SLOTS, OffsetRing, PlayView, RenderSide, RenderSink, ViewWriter, render_link,
+};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_figures::{
     MAX_TIMELINE_BINS, Rate, ResultBasis, ResultFigures, TIMELINE_BIN_US, TIMELINE_CHANNELS,

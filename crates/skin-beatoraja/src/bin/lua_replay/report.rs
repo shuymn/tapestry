@@ -13,12 +13,16 @@ pub struct Finding {
     /// The callable's definition (file, line).
     pub site: (String, u32),
     pub frame: usize,
+    /// The frame's round and stage, or its outside kind.
+    pub place: String,
     pub what: String,
 }
 
 /// A root whose reference invocation could not complete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stopped {
+    /// The kind of frame it stopped on: `play` or `outside`.
+    pub kind: &'static str,
     pub site: (String, u32),
     pub api: &'static str,
     pub count: usize,
@@ -47,6 +51,18 @@ pub struct Report {
     pub custom: usize,
     pub stopped: Vec<Stopped>,
     pub findings: Vec<Finding>,
+    /// Per frame kind (loading, page, ready, …): frames and agreed
+    /// invocations.
+    pub kinds: BTreeMap<&'static str, (usize, usize)>,
+    /// Each round's continuation and witness.
+    pub rounds: Vec<String>,
+    /// The agreed invocations of each round's first frame.
+    pub first_agreed: Vec<usize>,
+    /// Source invocations attributed to the carried-state limit, by round
+    /// (from 1) and reason.
+    pub slots_off: BTreeMap<(usize, &'static str), usize>,
+    /// Whether the program's slotted callbacks may run on a carried state.
+    pub carry_safe: bool,
 }
 
 impl Report {
@@ -85,6 +101,21 @@ impl Report {
         for (b, n) in &self.buckets {
             let _ = writeln!(o, "attributed {b}: {n}");
         }
+        for (k, (n, a)) in &self.kinds {
+            let _ = writeln!(o, "frames {k}: {n}, agreed {a}");
+        }
+        let _ = writeln!(o, "carry-safe {}", self.carry_safe);
+        for (r, a) in self.rounds.iter().zip(
+            self.first_agreed
+                .iter()
+                .map(Some)
+                .chain(std::iter::repeat(None)),
+        ) {
+            let _ = writeln!(o, "{r}; first frame agreed {}", a.map_or(0, |a| *a));
+        }
+        for ((r, why), n) in &self.slots_off {
+            let _ = writeln!(o, "round {r} carried-state limit {why}: {n}");
+        }
         let listed = |o: &mut String, label: &str, l: &[Listed]| {
             let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
             for e in l {
@@ -108,8 +139,9 @@ impl Report {
         for s in &self.stopped {
             let _ = writeln!(
                 o,
-                "stopped {} at {} x{} ({}): {}",
+                "stopped {} on {} frames at {} x{} ({}): {}",
                 site(&s.site),
+                s.kind,
                 s.api,
                 s.count,
                 s.disposition,
@@ -124,11 +156,12 @@ impl Report {
         for f in self.findings.iter().take(shown) {
             let _ = writeln!(
                 o,
-                "finding destination {} {} {} frame {}: {}",
+                "finding destination {} {} {} frame {} ({}): {}",
                 f.key.dest,
                 consumer(&f.key, local),
                 site(&f.site),
                 f.frame,
+                f.place,
                 f.what
             );
         }

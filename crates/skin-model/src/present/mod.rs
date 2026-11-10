@@ -310,8 +310,8 @@ pub struct CallbackDef {
     /// skips it.
     pub gate: Option<u16>,
     /// An earlier callback this one follows: a number's value (`Int`),
-    /// when it gave one; a `draw` (`Truthy`), when it gave true; a timer,
-    /// when it was on.
+    /// when it gave one; a `draw` (`Truthy`), when it gave true (a timer's
+    /// or a slider value's); a timer, when it was on (a timer's).
     pub after: Option<u16>,
 }
 
@@ -383,6 +383,13 @@ impl Present {
     #[must_use]
     pub fn carry_safe(&self) -> bool {
         self.carry_safe
+    }
+
+    /// Per callback, whether it loads or stores a slot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn slotted(&self) -> &[bool] {
+        &self.slotted
     }
 
     /// Whether `bank` fits the program's slots: one value a slot, each in

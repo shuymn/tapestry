@@ -1272,6 +1272,7 @@ mod tests {
             playing: true,
             closing: None,
             events: 0,
+            offsets: game::OffsetRing::EMPTY,
         }
     }
 

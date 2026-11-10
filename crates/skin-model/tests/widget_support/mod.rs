@@ -123,6 +123,7 @@ pub fn load_fit(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
 }

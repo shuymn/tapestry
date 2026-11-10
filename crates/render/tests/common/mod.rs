@@ -157,6 +157,7 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
         playing: true,
         closing: None,
         events: 31,
+        offsets: game::OffsetRing::EMPTY,
     }
 }
 

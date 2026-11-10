@@ -566,6 +566,7 @@ fn result_skin(dir: &std::path::Path, elements: &[(u32, i32)], texts: usize) -> 
         widgets: WidgetDefs::default(),
         bomb_up_to: None,
         close: None,
+        loadend: None,
         present: None,
     };
     let mut def = def;

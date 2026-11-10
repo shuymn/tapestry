@@ -95,6 +95,10 @@ pub enum Request {
         /// ([`input::SourceSet::open_candidate`]), else the opening is
         /// deferred ([`Reply::Deferred`]).
         gate: Option<u32>,
+        /// With a gate out of the loading state, the window's focus-loss
+        /// generation the tuning acceptance closed with: a loss since
+        /// defers the opening too.
+        focus: Option<u64>,
     },
     /// Close recording at the next boundary.
     Close,
@@ -148,6 +152,10 @@ pub enum Request {
     /// tests). Not answered.
     #[cfg(all(test, feature = "dev-tools"))]
     FenceGate(Box<FenceGate>),
+    /// Stops the thread at its next gated opening ([`OpenGate`]; tests).
+    /// Not answered.
+    #[cfg(test)]
+    OpenGate(Box<OpenGate>),
 }
 
 /// An interleaving with the game thread at the input thread's next fence
@@ -302,6 +310,33 @@ pub struct InputState {
     wakes: std::sync::atomic::AtomicU64,
 }
 
+/// Candidate `generation`'s recording opened at this boundary: published
+/// as soon as the source set opened it, before the hook builds the opening
+/// and replies (design.md "Play Lifecycle", tuning while loading).
+fn published_opening(controls: &Controls, generation: u32) {
+    controls.tuning().activity().set_opened(generation);
+}
+
+/// Whether an opening that accepted the window's focus-loss generation
+/// `accepted` finds focus lost since: the window wrote each loss into the
+/// activity record before the input thread could sample it, so a loss and
+/// return this boundary already sampled still shows here (design.md "Play
+/// Lifecycle", the loading state: focus).
+fn focus_moved(controls: &Controls, accepted: Option<u64>) -> bool {
+    accepted.is_some_and(|g| controls.tuning().focus_losses() != g)
+}
+
+/// Stops the input thread once a gated opening's generation is published,
+/// before the hook builds the opening (tests): it sends `reached` and waits
+/// for `resume`, at most 60 s.
+#[cfg(test)]
+pub struct OpenGate {
+    /// Sent once the generation is published.
+    pub reached: mpsc::Sender<()>,
+    /// Waited for after `reached`.
+    pub resume: mpsc::Receiver<()>,
+}
+
 /// The game thread's end of the input side.
 pub struct InputLink {
     requests: Sender<Request>,
@@ -435,6 +470,21 @@ impl InputLink {
         }
     }
 
+    /// Stops the input thread at its next gated opening, once its
+    /// generation is published ([`OpenGate`]; tests). A failed link sends
+    /// nothing.
+    #[cfg(test)]
+    pub fn open_gate(&self, gate: OpenGate) {
+        if self.failed.is_none()
+            && self
+                .requests
+                .send(Request::OpenGate(Box::new(gate)))
+                .is_ok()
+        {
+            self.waker.wake();
+        }
+    }
+
     /// Marks the input thread gone, as its hook's end does, so the game
     /// thread sees its failure (dev-tools: a script's input failure).
     #[cfg(feature = "dev-tools")]
@@ -445,7 +495,7 @@ impl InputLink {
     /// [`fail_for_script`](Self::fail_for_script) from another thread
     /// (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn failer(&self) -> impl Fn() + Send + Sync + 'static {
+    pub fn failer(&self) -> impl Fn() + Send + Sync + use<> {
         let state = Arc::clone(&self.state);
         move || state.gone.store(true, Ordering::Release)
     }
@@ -749,6 +799,9 @@ pub struct Hook {
     /// The gate at the next fence (dev-tools tests).
     #[cfg(all(test, feature = "dev-tools"))]
     fence_gate: Option<Box<FenceGate>>,
+    /// The gate at the next gated opening (tests).
+    #[cfg(test)]
+    open_gate: Option<Box<OpenGate>>,
 }
 
 /// A linked hook and link; the link wakes the input thread through
@@ -786,6 +839,8 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             loading: None,
             #[cfg(all(test, feature = "dev-tools"))]
             fence_gate: None,
+            #[cfg(test)]
+            open_gate: None,
         },
         InputLink {
             requests: req_tx,
@@ -851,15 +906,17 @@ impl Hook {
                     logic,
                     recorded,
                     gate,
-                } => match self.open(sources, now, lead_in, logic, &recorded, gate) {
+                    focus,
+                } => match self.open(sources, now, lead_in, logic, &recorded, (gate, focus)) {
                     Some((opening, lines)) => {
                         self.phase = Phase::Open;
                         Reply::Opened(opening, lines)
                     }
                     None => Reply::Deferred,
                 },
-                Request::Tap(tap) => {
+                Request::Tap(mut tap) => {
                     sources.set_presentation_focus(self.controls.presentation_focus().clone());
+                    tap.set_activity(Arc::clone(self.controls.tuning().activity()));
                     sources.set_adjustment(*tap);
                     continue;
                 }
@@ -908,6 +965,11 @@ impl Hook {
                 #[cfg(all(test, feature = "dev-tools"))]
                 Request::FenceGate(gate) => {
                     self.fence_gate = Some(gate);
+                    continue;
+                }
+                #[cfg(test)]
+                Request::OpenGate(gate) => {
+                    self.open_gate = Some(gate);
                     continue;
                 }
                 Request::Close => {
@@ -1037,7 +1099,7 @@ impl Hook {
         lead_in: TimeUs,
         logic: Thread,
         recorded: &Recorded,
-        gate: Option<u32>,
+        (gate, focus): (Option<u32>, Option<u64>),
     ) -> Option<(Opening<SourceReader>, Vec<String>)> {
         let origin = TimeUs(now.0 + lead_in.0);
         let mut lines = Vec::new();
@@ -1051,7 +1113,14 @@ impl Hook {
                 reset_gate(sources, &self.controls);
                 let start = match gate {
                     None => sources.open_play(now, origin),
-                    Some(generation) => candidate(sources.open_candidate(now, origin, generation))?,
+                    Some(generation) => {
+                        if focus_moved(&self.controls, focus) {
+                            return None;
+                        }
+                        let start = candidate(sources.open_candidate(now, origin, generation))?;
+                        published_opening(&self.controls, generation);
+                        start
+                    }
                 };
                 // Devices the source limit left out: keyboards, when any
                 // is (controllers come first), possibly one with lanes.
@@ -1081,11 +1150,18 @@ impl Hook {
                 sources.set_presentation_offset(origin);
                 match gate {
                     None => sources.open_recording(TimeUs(-lead_in.0)),
-                    Some(generation) => candidate(sources.open_candidate(
-                        TimeUs(-lead_in.0),
-                        TimeUs(0),
-                        generation,
-                    ))?,
+                    Some(generation) => {
+                        if focus_moved(&self.controls, focus) {
+                            return None;
+                        }
+                        let start = candidate(sources.open_candidate(
+                            TimeUs(-lead_in.0),
+                            TimeUs(0),
+                            generation,
+                        ))?;
+                        published_opening(&self.controls, generation);
+                        start
+                    }
                 }
             }
             #[cfg(feature = "dev-tools")]
@@ -1129,7 +1205,11 @@ impl Hook {
                     None => sources.open_recording(open_at),
                     Some(generation) => {
                         let chart0 = TimeUs(open_at.0 + lead_in.0);
+                        if focus_moved(&self.controls, focus) {
+                            return None;
+                        }
                         let start = candidate(sources.open_candidate(open_at, chart0, generation))?;
+                        published_opening(&self.controls, generation);
                         // The first successful opening ends the loading
                         // script; a deferred one keeps feeding it, so the
                         // release it waits for arrives.
@@ -1140,6 +1220,13 @@ impl Hook {
                 }
             }
         };
+        #[cfg(test)]
+        if gate.is_some()
+            && let Some(g) = self.open_gate.take()
+        {
+            let _ = g.reached.send(());
+            let _ = g.resume.recv_timeout(Duration::from_secs(60));
+        }
         self.origin = Some(origin);
         self.logic = Some(logic);
         self.handoff = Some(Handoff::reserved(
@@ -1226,6 +1313,7 @@ impl Hook {
         let opened = sources.reopen_candidate(batch, chart0, rearm.generation);
         rearm.outcome = match opened {
             Ok(start) => {
+                published_opening(&self.controls, rearm.generation);
                 self.script_origin = script_origin;
                 rearm.start.opened_at = start.opened_at;
                 rearm.start.held.clear();
@@ -1802,6 +1890,7 @@ mod autoplay_tests {
                 logic: std::thread::current(),
                 recorded: recorded(),
                 gate: None,
+                focus: None,
             })
             .unwrap();
         hook.wake(sources, TimeUs(at));
@@ -2107,6 +2196,7 @@ mod link_tests {
             logic: std::thread::current(),
             recorded: recorded(),
             gate: None,
+            focus: None,
         }
     }
 
@@ -2304,6 +2394,7 @@ mod link_tests {
                 logic: std::thread::current(),
                 recorded,
                 gate: None,
+                focus: None,
             })
             .unwrap();
         hook.wake(&mut sources, TimeUs(1_000));
@@ -2350,6 +2441,7 @@ mod wake_tests {
             logic: std::thread::current(),
             recorded: recorded(),
             gate: None,
+            focus: None,
         });
         assert!(opened.is_ok());
     }
@@ -2593,6 +2685,7 @@ mod menu_tests {
                 logic: std::thread::current(),
                 recorded,
                 gate: None,
+                focus: None,
             });
             assert!(matches!(reply, Some(Reply::Opened(..))));
         }
@@ -2819,6 +2912,7 @@ mod gate_tests {
                 logic: std::thread::current(),
                 recorded: recorded(),
                 gate: Some(1),
+                focus: None,
             })
             .unwrap();
         batch(hook, sources, at, &[]);
@@ -2827,6 +2921,263 @@ mod gate_tests {
             Reply::Deferred => None,
             Reply::Closed(..) => panic!("an open is answered by an opening"),
         }
+    }
+
+    /// [`rig`]'s two keyboards and hook, its START published as START's
+    /// panel role, with the controls the hook publishes tuning into.
+    fn tuning_rig() -> (SourceSet, Hook, InputLink, Arc<Controls>) {
+        let mut sources = SourceSet::new(SourceConfig {
+            max_devices: 4,
+            max_sources: 4,
+            max_held: 4,
+            queue_capacity: 16,
+            max_arrivals: 4,
+        })
+        .unwrap();
+        sources.begin_batch(TimeUs(0));
+        sources.connect(DeviceId(1), DeviceKind::Keyboard);
+        sources.connect(DeviceId(2), DeviceKind::Keyboard);
+        sources.end_batch(TimeUs(1));
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        controls.set_latch(sources.gate().handle());
+        let (hook, link) = link(Arc::clone(&controls), Mode::Clock, Waker::new().unwrap());
+        let (mut tap, _rx) = adjustment_queue(AdjustmentBindings {
+            controls: vec![(TapControl::Key(Q), 0)],
+            latched: 1,
+            ..AdjustmentBindings::default()
+        })
+        .unwrap();
+        tap.set_panel_roles(1, 0);
+        tap.set_tuning_controls(1);
+        link.tap(tap);
+        (sources, hook, link, controls)
+    }
+
+    /// A7 and §2.10 R13, the input side's half: START held by two
+    /// keyboards is one hold in the activity record's input section. The
+    /// first one's removal leaves it held, moving nothing; the second's
+    /// releases it, moving the revision and the last activity to that
+    /// batch. The press counts at its batch too.
+    #[test]
+    fn a_removed_source_leaves_only_its_own_holds() {
+        let (mut sources, mut hook, _link, controls) = tuning_rig();
+        let read = || controls.tuning().activity().read().unwrap().input;
+        batch(&mut hook, &mut sources, 0, &[]);
+        let idle = read();
+        assert!(!idle.held);
+        batch(&mut hook, &mut sources, 10, &[packet(1, Q, 1)]);
+        let one = read();
+        assert!(one.held);
+        assert_eq!(one.revision, idle.revision + 1);
+        assert_eq!(one.last, Some(TimeUs(10 * MS)));
+        assert!(controls.tuning().snapshot().held, "the snapshot holds");
+        // The second keyboard holds it too: one hold.
+        batch(&mut hook, &mut sources, 20, &[packet(2, Q, 1)]);
+        assert_eq!(read(), one);
+        // The first keyboard removed while it holds: the other's stays.
+        sources.begin_batch(TimeUs(30 * MS));
+        sources.disconnect(DeviceId(1));
+        sources.end_batch(TimeUs(30 * MS + 1));
+        hook.wake(&mut sources, TimeUs(30 * MS + 1));
+        assert_eq!(read(), one);
+        assert!(controls.tuning().snapshot().held);
+        // The second removed: released at that batch.
+        sources.begin_batch(TimeUs(40 * MS));
+        sources.disconnect(DeviceId(2));
+        sources.end_batch(TimeUs(40 * MS + 1));
+        hook.wake(&mut sources, TimeUs(40 * MS + 1));
+        let none = read();
+        assert!(!none.held);
+        assert_eq!(none.revision, one.revision + 1);
+        assert_eq!(none.last, Some(TimeUs(40 * MS)));
+        let s = controls.tuning().snapshot();
+        assert!(s.stable && !s.held);
+        assert_eq!(s.revision.input, none.revision);
+        assert_eq!(s.last_activity, Some(TimeUs(40 * MS)));
+    }
+
+    /// §2.10 R16 and I5: an opening out of the loading state carries the
+    /// window's focus-loss generation its tuning acceptance closed with.
+    /// Focus lost and back since, and the return sampled at a batch, so the
+    /// source set's own focus check passes: the hook defers it all the
+    /// same, before the source set opens anything. Asked again with the
+    /// generation now, it opens.
+    #[test]
+    fn an_opening_with_a_moved_focus_generation_is_deferred() {
+        let (mut sources, mut hook, link, controls) = tuning_rig();
+        batch(&mut hook, &mut sources, 0, &[]);
+        let closed = controls.tuning().close(1);
+        assert_eq!(closed.focus_losses, 0);
+        controls.focus(false);
+        controls.focus(true);
+        assert_eq!(controls.tuning().focus_losses(), 1);
+        // The input thread samples the return.
+        batch(&mut hook, &mut sources, 10, &[]);
+        let ask = |focus| Request::Open {
+            lead_in: LEAD_IN,
+            logic: std::thread::current(),
+            recorded: recorded(),
+            gate: Some(1),
+            focus: Some(focus),
+        };
+        link.requests.send(ask(closed.focus_losses)).unwrap();
+        batch(&mut hook, &mut sources, 20, &[]);
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Deferred)));
+        assert_eq!(controls.tuning().activity().opened(), 0, "nothing opened");
+        link.requests.send(ask(1)).unwrap();
+        batch(&mut hook, &mut sources, 30, &[]);
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Opened(..))));
+        assert_eq!(controls.tuning().activity().opened(), 1);
+    }
+
+    /// A16 and A18p: the opening linearizes at the input thread's
+    /// focus-generation check. A focus loss after that check, while the
+    /// hook builds the opening (stopped at its gate), also lost and back
+    /// again, opens recording all the same, and the focus gate, reset
+    /// before the check, trips at the next batch: the play is aborted for
+    /// focus (`focus_lost`) and nothing after the loss is recorded. With
+    /// focus kept, the same press is recorded.
+    #[test]
+    fn a_focus_loss_after_the_generation_check_aborts_the_play() {
+        use std::time::Duration;
+
+        let watchdog = Duration::from_secs(
+            std::env::var("TAPESTRY_TEST_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+        );
+        for (case, lose, back) in [
+            ("kept", false, false),
+            ("lost", true, false),
+            ("lost and back", true, true),
+        ] {
+            let (mut sources, mut hook, link, controls) = tuning_rig();
+            batch(&mut hook, &mut sources, 0, &[]);
+            let closed = controls.tuning().close(1);
+            let (reached_tx, reached) = std::sync::mpsc::channel();
+            let (resume, resume_rx) = std::sync::mpsc::channel();
+            link.open_gate(super::OpenGate {
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+            link.requests
+                .send(Request::Open {
+                    lead_in: LEAD_IN,
+                    logic: std::thread::current(),
+                    recorded: recorded(),
+                    gate: Some(1),
+                    focus: Some(closed.focus_losses),
+                })
+                .unwrap();
+            std::thread::scope(|s| {
+                let opener = s.spawn(|| batch(&mut hook, &mut sources, 40, &[]));
+                reached
+                    .recv_timeout(watchdog)
+                    .expect("the opening reached its gate");
+                if lose {
+                    controls.focus(false);
+                }
+                if back {
+                    controls.focus(true);
+                }
+                resume.send(()).unwrap();
+                opener.join().unwrap();
+            });
+            let Ok(Reply::Opened(mut opening, _)) = link.replies.try_recv() else {
+                panic!("{case}: the opening is answered opened");
+            };
+            batch(&mut hook, &mut sources, 50, &[packet(1, Z, 1)]);
+            assert_eq!(link.tripped(), lose, "{case}");
+            let mut recorded = Vec::new();
+            for reader in &mut opening.readers {
+                while let Some(e) = reader.pop() {
+                    recorded.push(e.received);
+                }
+            }
+            // The press, on the play's clock from the opening's origin.
+            let expected: &[TimeUs] = if lose {
+                &[]
+            } else {
+                &[TimeUs(50 * MS - (40 * MS + 1 + LEAD_IN.0))]
+            };
+            assert_eq!(recorded, expected, "{case}");
+        }
+    }
+
+    /// A16: the input thread publishes candidate generation 1 as opened as
+    /// soon as the source set opened it, before it builds the opening and
+    /// replies. Stopped there, tuning acceptance closed until generation
+    /// 1 reads open, and a settings key pressed in the window then steps
+    /// the in-play values and holds, while the starting tuning the close
+    /// returned keeps the value before it.
+    #[test]
+    fn a_press_after_recording_opens_before_the_hook_returns_is_in_play() {
+        use std::time::Duration;
+
+        use game::Adjust;
+
+        use crate::tuning::{Acceptance, HoldClass, KeyEvent};
+
+        let watchdog = Duration::from_secs(
+            std::env::var("TAPESTRY_TEST_WATCHDOG")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+        );
+        let (mut sources, mut hook, link, controls) = tuning_rig();
+        batch(&mut hook, &mut sources, 0, &[]);
+        let starting = controls.tuning().close(1);
+        assert_eq!(
+            controls.tuning().acceptance(),
+            Acceptance::Closed { reopen_at: 1 }
+        );
+        // Closed: a press is discarded.
+        controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Press);
+        controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Release);
+        assert_eq!(controls.tuning().get(), starting.values.unwrap());
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        link.open_gate(super::OpenGate {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+        link.requests
+            .send(Request::Open {
+                lead_in: LEAD_IN,
+                logic: std::thread::current(),
+                recorded: recorded(),
+                gate: Some(1),
+                focus: None,
+            })
+            .unwrap();
+        std::thread::scope(|s| {
+            let opener = s.spawn(|| batch(&mut hook, &mut sources, 40, &[]));
+            reached
+                .recv_timeout(watchdog)
+                .expect("the opening reached its gate");
+            // Opened, published, not yet answered.
+            assert_eq!(controls.tuning().activity().opened(), 1);
+            assert!(link.replies.try_recv().is_err(), "no reply yet");
+            controls.settings_key(Adjust::DisplayOffsetUp, KeyEvent::Press);
+            assert_eq!(controls.tuning().acceptance(), Acceptance::Open);
+            assert_eq!(
+                controls.tuning().held(),
+                [(Adjust::DisplayOffsetUp, HoldClass::Fresh)]
+            );
+            assert_eq!(
+                controls.tuning().get().display_offset_us,
+                starting.values.unwrap().display_offset_us + 1_000
+            );
+            resume.send(()).unwrap();
+            opener.join().unwrap();
+        });
+        assert!(matches!(link.replies.try_recv(), Ok(Reply::Opened(..))));
+        assert_eq!(
+            starting.values.unwrap().display_offset_us + 1_000,
+            controls.tuning().get().display_offset_us,
+            "the starting tuning kept the value before the press"
+        );
     }
 
     fn rearm_buffers(readers: Vec<input::SourceReader>, snapshot: usize) -> Box<Rearm> {
@@ -3184,6 +3535,7 @@ mod gate_tests {
                 logic: std::thread::current(),
                 recorded: recorded(),
                 gate: Some(1),
+                focus: None,
             })
             .unwrap();
         hook.wake(&mut sources, TimeUs(SCRIPT_OPENED));
@@ -3268,6 +3620,7 @@ mod gate_tests {
                     logic: std::thread::current(),
                     recorded: recorded(),
                     gate: Some(1),
+                    focus: None,
                 })
                 .unwrap();
             hook.wake(sources, TimeUs(LOADING + ms * MS));
@@ -4003,6 +4356,7 @@ mod panel_tests {
                     logic: std::thread::current(),
                     recorded: recorded(),
                     gate: None,
+                    focus: None,
                 })
                 .unwrap();
             self.wake();
