@@ -1055,6 +1055,10 @@ struct Shared {
     hold_declaration: AtomicBool,
     #[cfg(test)]
     declaration_held: AtomicBool,
+    /// Set when a held declaration let go at [`hook_bound`] instead of
+    /// at the test's release (tests).
+    #[cfg(test)]
+    declaration_expired: AtomicBool,
     /// The atlas limits and the target size of the screen built last,
     /// written at each build: what a skin is packed for
     /// ([`RenderLink::atlas_limits`]).
@@ -1114,6 +1118,8 @@ impl Shared {
             hold_declaration: AtomicBool::new(false),
             #[cfg(test)]
             declaration_held: AtomicBool::new(false),
+            #[cfg(test)]
+            declaration_expired: AtomicBool::new(false),
             packing: Mutex::new(None),
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
@@ -5023,8 +5029,13 @@ impl Run {
             // Held at most the hook's bound: a test that never lets go
             // does not keep the render thread.
             let deadline = Instant::now() + hook_bound();
-            while self.shared.hold_declaration.load(Ordering::Acquire) && Instant::now() < deadline
-            {
+            while self.shared.hold_declaration.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    self.shared
+                        .declaration_expired
+                        .store(true, Ordering::Release);
+                    break;
+                }
                 self.shared.declaration_held.store(true, Ordering::Release);
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -12255,6 +12266,10 @@ pub(crate) mod tests {
         assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
         assert!(link.shared.declaration_held.load(Ordering::Acquire));
         assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
+        // The render thread still held its declaration when the receipt
+        // was read: a stall past the hook's bound would let the render
+        // thread declare it itself and weaken this oracle.
+        assert!(!link.shared.declaration_expired.load(Ordering::Acquire));
         drop(hold);
         link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
         link.end_loading().unwrap();
