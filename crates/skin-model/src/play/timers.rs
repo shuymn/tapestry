@@ -10,8 +10,8 @@ use rules::GaugeValue;
 
 use super::schema::{
     COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT,
-    NATIVE_TARGET_MAX, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field,
-    lane_timer, timer,
+    NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS, RATE_BASIS_POINTS, READOUT_MAX,
+    READOUT_MAX_U32, field, lane_timer, timer,
 };
 use super::{
     BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
@@ -19,6 +19,7 @@ use super::{
 };
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::present::{Clock, Io, Present};
+use crate::selection::Ratio;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::lanes::LaneView;
 
@@ -128,6 +129,152 @@ fn rate_bp(ex: u32, targets: u64) -> i32 {
     };
     let rate = bp.saturating_mul(u64::from(ex)) / den;
     i32::try_from(rate).unwrap_or(i32::MAX)
+}
+
+/// 0 as a ratio.
+const RATIO_ZERO: Ratio = Ratio {
+    numerator: 0,
+    denominator: 1,
+};
+/// 1 as a ratio.
+const RATIO_ONE: Ratio = Ratio {
+    numerator: 1,
+    denominator: 1,
+};
+
+/// The number of score fields from `field::BEST_EX`.
+pub(crate) const SCORE_FIELDS: usize = field::COUNT - field::BEST_EX as usize;
+
+/// `x` paced linearly to `p` of `n` targets, `⌊x · p / n⌋`; 0 at `n = 0`.
+/// The product is taken in `u128`, so nothing overflows.
+fn paced(x: u32, p: u64, n: u64) -> u64 {
+    let Some(q) = (u128::from(x) * u128::from(p)).checked_div(u128::from(n)) else {
+        return 0;
+    };
+    u64::try_from(q).unwrap_or(u64::MAX)
+}
+
+/// `⌊scale · x / 2n⌋` as a field value, 0 at `n = 0`: an exact rate whose
+/// empty denominator gives 0, never [`rate_bp`]'s 100 %. At most
+/// `i32::MAX`.
+fn exact_rate(x: u64, n: u64, scale: u32) -> i32 {
+    let den = u128::from(n) * 2;
+    let q = (u128::from(scale) * u128::from(x))
+        .checked_div(den)
+        .unwrap_or(0);
+    i32::try_from(q).unwrap_or(i32::MAX)
+}
+
+/// `ex − paced` as a field value, clamped to ±[`MAX_COUNT`].
+fn difference(ex: u32, paced: u64) -> i32 {
+    let d = i128::from(ex) - i128::from(paced);
+    let max = i128::from(MAX_COUNT);
+    i32::try_from(d.clamp(-max, max)).unwrap_or(0)
+}
+
+/// `x / 2n` as an exact ratio; 0 at `n = 0`.
+fn over_chart(x: u64, n: u64) -> Ratio {
+    Ratio::new(x, n.saturating_mul(2)).unwrap_or(RATIO_ZERO)
+}
+
+/// Whether `27 · ex ≥ 2 · i · d`: a rate of `ex` over `2d` at least
+/// `i/27`, exactly.
+fn at_least(ex: u32, i: u32, d: u64) -> bool {
+    27 * u128::from(ex) >= 2 * u128::from(i) * u128::from(d)
+}
+
+/// What one frame's score figures read: the EX score, the judged targets
+/// `p`, the attempt's targets `n`, whether the attempt has been updated
+/// (its first judgment, the empty POOR included), the play's best and
+/// target, and whether its chart declares `#RANDOM`.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoreInputs {
+    pub(crate) ex: u32,
+    pub(crate) judged: u64,
+    pub(crate) targets: u64,
+    pub(crate) updated: bool,
+    pub(crate) best: u32,
+    pub(crate) target: u32,
+    pub(crate) random: bool,
+}
+
+/// The score fields from `field::BEST_EX`, in slot order.
+pub(crate) fn score_fields(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
+    let ScoreInputs {
+        ex,
+        judged: p,
+        targets: n,
+        updated,
+        best,
+        target,
+        random,
+    } = s;
+    let live = updated && n > 0;
+    // The rate over the judged targets, 1 while none is judged, in each
+    // band from its bound up to the one above (none above AAA).
+    let current_at = |r: u32| p == 0 || at_least(ex, r, p);
+    let above = std::iter::once(None).chain(RANK_TWENTY_SEVENTHS.map(Some));
+    let current = RANK_TWENTY_SEVENTHS
+        .into_iter()
+        .zip(above)
+        .map(|(lo, hi)| i32::from(live && current_at(lo) && !hi.is_some_and(current_at)));
+    let whole = RANK_TWENTY_SEVENTHS
+        .into_iter()
+        .map(|lo| i32::from(live && at_least(ex, lo, n)));
+    let bp = RATE_BASIS_POINTS.unsigned_abs();
+    let head = [
+        count(best),
+        count(target),
+        difference(ex, paced(best, p, n)),
+        difference(ex, paced(target, p, n)),
+        exact_rate(u64::from(best), n, bp),
+        exact_rate(u64::from(target), n, bp),
+        i32::from(!random),
+        if random {
+            0
+        } else {
+            exact_rate(u64::from(best), n, 1_000_000)
+        },
+        i32::from(updated && ex >= best),
+        i32::from(updated && ex >= target),
+    ];
+    let mut out = [0; SCORE_FIELDS];
+    for (slot, v) in out
+        .iter_mut()
+        .zip(head.into_iter().chain(current).chain(whole))
+    {
+        *slot = v;
+    }
+    out
+}
+
+/// The six score ratios the play's ratio bars draw, in
+/// [`ScoreRate::ALL`](crate::ScoreRate::ALL)'s order: each exact, 0 for an empty denominator,
+/// and none for the best's two on a `#RANDOM` chart.
+pub(crate) fn score_ratios(s: ScoreInputs) -> [Option<Ratio>; 6] {
+    let ScoreInputs {
+        ex,
+        judged: p,
+        targets: n,
+        updated,
+        best,
+        target,
+        random,
+    } = s;
+    let judged = match (updated, p) {
+        (false, _) => RATIO_ZERO,
+        (true, 0) => RATIO_ONE,
+        (true, p) => Ratio::new(u64::from(ex), p.saturating_mul(2)).unwrap_or(RATIO_ZERO),
+    };
+    let compared = |r: Ratio| (!random).then_some(r);
+    [
+        Some(over_chart(u64::from(ex), n)),
+        Some(judged),
+        compared(over_chart(paced(best, p, n), n)),
+        compared(over_chart(u64::from(best), n)),
+        Some(over_chart(paced(target, p, n), n)),
+        Some(over_chart(u64::from(target), n)),
+    ]
 }
 
 /// The readout fields of one frame, `field::BPM_CURRENT_X100` to
@@ -650,6 +797,18 @@ impl Play {
         let r = readouts;
         let t = frame.tally;
         let point_now = self.point_field(t);
+        // After `point_field`, whose latch is the update the score figures
+        // wait for.
+        let score = ScoreInputs {
+            ex: t.ex_score,
+            judged,
+            targets: u64::from(self.reducer.targets()),
+            updated: self.judged,
+            best: self.score.best,
+            target: self.score.target,
+            random: self.random,
+        };
+        self.ratios = score_ratios(score);
         let gauge = frame.gauges.get(frame.gauge).map_or(0, |g| {
             let permille = (g.value.0 / GAUGE_UNIT).clamp(0, i64::from(GAUGE_PERMILLE));
             i32::try_from(permille).unwrap_or(0)
@@ -750,7 +909,8 @@ impl Play {
             )
             .chain([r.progress_ppm])
             .chain(self.chart_fields)
-            .chain([point_now]);
+            .chain([point_now])
+            .chain(score_fields(score));
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

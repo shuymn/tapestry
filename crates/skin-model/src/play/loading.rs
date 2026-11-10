@@ -19,6 +19,7 @@ use crate::widget::Starts;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::lanes::{LaneView, Side};
+use crate::widget::ratio_bar::ScoreRate;
 use crate::widget::text::TextTable;
 
 /// A field's class while the play screen loads.
@@ -189,8 +190,55 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // chart.judge_class_valid
         // The point, 110: from the counts, unavailable as they are.
         Unavailable, // point
+        // The best and the target, 111 to 120: read at load-ready, but not
+        // shown while the play screen loads, so they do not appear partway
+        // through its loading lifetime; with them their rates, the flags
+        // that compare against them, and whether the chart declares
+        // `#RANDOM`, which only the parsed chart knows.
+        Unavailable, // best.ex
+        Unavailable, // target.ex
+        // The paced differences: 0 until the first judgment, as in READY.
+        Before,      // best.diff
+        Before,      // target.diff
+        Unavailable, // best.rate_bp
+        Unavailable, // target.rate_bp
+        Unavailable, // best.valid
+        Unavailable, // best.rate_ppm
+        Unavailable, // best.reached
+        Unavailable, // target.reached
+        // The ranks, 121 to 136: false until the first judgment.
+        Before, // rank.current.0
+        Before, // rank.current.1
+        Before, // rank.current.2
+        Before, // rank.current.3
+        Before, // rank.current.4
+        Before, // rank.current.5
+        Before, // rank.current.6
+        Before, // rank.current.7
+        Before, // rank.whole.0
+        Before, // rank.whole.1
+        Before, // rank.whole.2
+        Before, // rank.whole.3
+        Before, // rank.whole.4
+        Before, // rank.whole.5
+        Before, // rank.whole.6
+        Before, // rank.whole.7
     ]
 };
+
+/// Score rate `rate`'s class while loading, as a ratio bar reads it: the
+/// best's and the target's own rates are [`LoadingField::Unavailable`] as
+/// their fields are; the others are [`LoadingField::Before`] at 0, their
+/// READY value.
+#[must_use]
+pub const fn loading_rate(rate: ScoreRate) -> LoadingField {
+    match rate {
+        ScoreRate::Best | ScoreRate::Target => LoadingField::Unavailable,
+        ScoreRate::Current | ScoreRate::Judged | ScoreRate::PacedBest | ScoreRate::PacedTarget => {
+            LoadingField::Before
+        }
+    }
+}
 
 /// Field `slot`'s class while loading; `None` past the PLAY schema.
 #[must_use]
@@ -243,21 +291,31 @@ impl Need {
     pub(crate) fn of(p: Option<&Program>) -> Self {
         p.into_iter()
             .flat_map(Program::fields)
-            .fold(Self::default(), |need, slot| match loading_field(slot) {
-                Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => need,
-                Some(LoadingField::Descriptor) => Self {
-                    descriptor: true,
-                    ..need
-                },
-                Some(LoadingField::Chosen) => Self {
-                    chosen: need.chosen | chosen_bit(slot),
-                    ..need
-                },
-                Some(LoadingField::Unavailable) | None => Self {
-                    never: true,
-                    ..need
-                },
+            .fold(Self::default(), |need, slot| {
+                need.and(Self::of_class(loading_field(slot), chosen_bit(slot)))
             })
+    }
+
+    /// What reading a value of `class` needs, `chosen` the chosen chart's
+    /// datum a [`LoadingField::Chosen`] one reads; never met for no class.
+    pub(crate) const fn of_class(class: Option<LoadingField>, chosen: u8) -> Self {
+        let none = Self {
+            descriptor: false,
+            chosen: 0,
+            never: false,
+        };
+        match class {
+            Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => none,
+            Some(LoadingField::Descriptor) => Self {
+                descriptor: true,
+                ..none
+            },
+            Some(LoadingField::Chosen) => Self { chosen, ..none },
+            Some(LoadingField::Unavailable) | None => Self {
+                never: true,
+                ..none
+            },
+        }
     }
 
     /// What it and `other` need together.
@@ -605,6 +663,29 @@ mod tests {
             assert_eq!(class(name), Some(LoadingField::Setting), "{name}");
         }
         assert_eq!(class("time.progress_ppm"), Some(LoadingField::Before));
+        // The values that wait for the first judgment read their READY
+        // value; the best, the target, their rates and what compares
+        // against them are unavailable (stage 3, S10-10, G1).
+        let mut before = vec!["best.diff".to_owned(), "target.diff".to_owned()];
+        for k in 0..8 {
+            before.push(format!("rank.current.{k}"));
+            before.push(format!("rank.whole.{k}"));
+        }
+        for name in &before {
+            assert_eq!(class(name), Some(LoadingField::Before), "{name}");
+        }
+        for name in [
+            "best.ex",
+            "target.ex",
+            "best.rate_bp",
+            "target.rate_bp",
+            "best.valid",
+            "best.rate_ppm",
+            "best.reached",
+            "target.reached",
+        ] {
+            assert_eq!(class(name), Some(LoadingField::Unavailable), "{name}");
+        }
         for f in PLAY.fields {
             let named = [
                 "load.percent",
@@ -614,6 +695,7 @@ mod tests {
                 "time.progress_ppm",
             ]
             .contains(&f.name)
+                || before.iter().any(|b| b == f.name)
                 || chosen.contains(&f.name)
                 || settings.contains(&f.name);
             if !named {
@@ -644,5 +726,23 @@ mod tests {
             assert_eq!(loading_timer(slot), Some(want), "{}", t.name);
         }
         assert_eq!(loading_timer(timer::BUILTIN), None);
+    }
+
+    /// A ratio bar's score rate reads as its fields do while loading: the
+    /// best's and the target's own rates are unavailable, the others are
+    /// 0 until the first judgment.
+    #[test]
+    fn score_rates_have_their_fields_loading_classes() {
+        use crate::widget::ratio_bar::ScoreRate;
+        for (rate, want) in [
+            (ScoreRate::Current, LoadingField::Before),
+            (ScoreRate::Judged, LoadingField::Before),
+            (ScoreRate::PacedBest, LoadingField::Before),
+            (ScoreRate::Best, LoadingField::Unavailable),
+            (ScoreRate::PacedTarget, LoadingField::Before),
+            (ScoreRate::Target, LoadingField::Unavailable),
+        ] {
+            assert_eq!(super::loading_rate(rate), want, "{rate:?}");
+        }
     }
 }

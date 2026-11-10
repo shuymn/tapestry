@@ -37,6 +37,10 @@ pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
 /// down.
 pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
+/// The ranks' lower bounds in 27ths of the rate, from the top: the bands
+/// `rank.current.K` and the thresholds `rank.whole.K` read
+/// (`skin/property/BooleanPropertyFactory.java:280-288, 619-626`).
+pub const RANK_TWENTY_SEVENTHS: [u32; 8] = [24, 21, 18, 15, 12, 9, 6, 0];
 /// The largest `native.hispeed.x100`: the multiplier's maximum, 20.
 const NATIVE_HISPEED_MAX: i32 = 2_000;
 /// The largest `native.target.green`: the target green number's maximum.
@@ -77,6 +81,18 @@ const fn count(name: &'static str, export: Export) -> Field {
             hi: MAX_COUNT,
         },
         export,
+    }
+}
+
+/// A difference of counts, either sign.
+const fn diff(name: &'static str) -> Field {
+    Field {
+        name,
+        ty: FieldTy::Int {
+            lo: -MAX_COUNT,
+            hi: MAX_COUNT,
+        },
+        export: E,
     }
 }
 
@@ -245,6 +261,32 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        count("best.ex", E),
+        count("target.ex", E),
+        diff("best.diff"),
+        diff("target.diff"),
+        rate("best.rate_bp"),
+        rate("target.rate_bp"),
+        flag("best.valid", T),
+        int("best.rate_ppm", i32::MAX, T),
+        flag("best.reached", T),
+        flag("target.reached", T),
+        flag("rank.current.0", E),
+        flag("rank.current.1", E),
+        flag("rank.current.2", E),
+        flag("rank.current.3", E),
+        flag("rank.current.4", E),
+        flag("rank.current.5", E),
+        flag("rank.current.6", E),
+        flag("rank.current.7", E),
+        flag("rank.whole.0", E),
+        flag("rank.whole.1", E),
+        flag("rank.whole.2", E),
+        flag("rank.whole.3", E),
+        flag("rank.whole.4", E),
+        flag("rank.whole.5", E),
+        flag("rank.whole.6", E),
+        flag("rank.whole.7", E),
     ],
     timers: &[
         timer("ready", E),
@@ -495,8 +537,63 @@ pub mod field {
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
     /// The source's 7-key point, with its intermediate widths: any `i32`.
     pub const POINT: u16 = 110;
+    /// The play's best EX score B
+    /// ([`ScoreBasis::best`](crate::ScoreBasis::best)): 0 when known
+    /// empty, unavailable (no library, a failed read) or in a practice
+    /// round.
+    pub const BEST_EX: u16 = 111;
+    /// The play's target EX score T
+    /// ([`ScoreBasis::target`](crate::ScoreBasis::target)).
+    pub const TARGET_EX: u16 = 112;
+    /// The EX score less the best paced linearly to the judged targets,
+    /// `ex − ⌊B · p / n⌋` (`p` the judged targets, `n` the attempt's
+    /// targets; 0 at `n = 0`), clamped to ±[`MAX_COUNT`](super::MAX_COUNT).
+    /// Shown only while `best.valid`.
+    pub const BEST_DIFF: u16 = 113;
+    /// The EX score less the target paced alike, `ex − ⌊T · p / n⌋`.
+    pub const TARGET_DIFF: u16 = 114;
+    /// B's rate over the attempt's targets, `⌊10 000 · B / 2n⌋` basis
+    /// points, 0 at `n = 0`. Shown only while `best.valid`.
+    pub const BEST_RATE_BP: u16 = 115;
+    /// T's rate alike.
+    pub const TARGET_RATE_BP: u16 = 116;
+    /// Whether the values measured against the best are shown: false for a
+    /// chart that declares `#RANDOM` or `#SETRANDOM`, whose best may come
+    /// from another draw. Not whether the best was read: an unavailable
+    /// best is the empty score, shown.
+    pub const BEST_VALID: u16 = 117;
+    /// B's rate in parts per million, `⌊10⁶ · B / 2n⌋`: 0 at `n = 0` and
+    /// while `best.valid` is false. Nonzero for any best above 0 while
+    /// `2n ≤ 10⁶`, which the parser's object cap keeps.
+    pub const BEST_RATE_PPM: u16 = 118;
+    /// Whether the attempt has a judgment and its EX score is at least B.
+    pub const BEST_REACHED: u16 = 119;
+    /// Whether the attempt has a judgment and its EX score is at least T.
+    pub const TARGET_REACHED: u16 = 120;
+    /// The first of the eight current-rank flags, `rank.current.K` at
+    /// `121 + K`: the band of the rate over the judged targets, from
+    /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27 up to
+    /// the band above; see [`rank_current`].
+    pub const RANK_CURRENT: u16 = 121;
+    /// The first of the eight whole-rank flags, `rank.whole.K` at
+    /// `129 + K`: the rate over the attempt's targets at least
+    /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27; see
+    /// [`rank_whole`].
+    pub const RANK_WHOLE: u16 = 129;
     /// The number of fields.
-    pub const COUNT: usize = 111;
+    pub const COUNT: usize = 137;
+
+    /// The `rank.current.K` slot, `k` below 8.
+    #[must_use]
+    pub const fn rank_current(k: u16) -> u16 {
+        RANK_CURRENT + k
+    }
+
+    /// The `rank.whole.K` slot, `k` below 8.
+    #[must_use]
+    pub const fn rank_whole(k: u16) -> u16 {
+        RANK_WHOLE + k
+    }
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -841,7 +938,49 @@ mod tests {
                 E
             ))
         );
-        assert_eq!(field::COUNT, 111);
+        let int = |lo, hi| FieldTy::Int { lo, hi };
+        let score = [
+            ("best.ex", field::BEST_EX, int(0, MAX_COUNT), E),
+            ("target.ex", field::TARGET_EX, int(0, MAX_COUNT), E),
+            ("best.diff", field::BEST_DIFF, int(-MAX_COUNT, MAX_COUNT), E),
+            (
+                "target.diff",
+                field::TARGET_DIFF,
+                int(-MAX_COUNT, MAX_COUNT),
+                E,
+            ),
+            ("best.rate_bp", field::BEST_RATE_BP, int(0, i32::MAX), E),
+            ("target.rate_bp", field::TARGET_RATE_BP, int(0, i32::MAX), E),
+            ("best.valid", field::BEST_VALID, FieldTy::Bool, T),
+            ("best.rate_ppm", field::BEST_RATE_PPM, int(0, i32::MAX), T),
+            ("best.reached", field::BEST_REACHED, FieldTy::Bool, T),
+            ("target.reached", field::TARGET_REACHED, FieldTy::Bool, T),
+        ];
+        for (i, (name, s, ty, export)) in score.into_iter().enumerate() {
+            assert_eq!(usize::from(s), 111 + i, "{name}");
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((ty, export)),
+                "{name}"
+            );
+        }
+        for k in 0..8_u16 {
+            for (kind, s, first) in [
+                ("current", field::rank_current(k), 121),
+                ("whole", field::rank_whole(k), 129),
+            ] {
+                let name = format!("rank.{kind}.{k}");
+                assert_eq!(s, first + k, "{name}");
+                assert_eq!(slot(&name), Some(s), "{name}");
+                assert_eq!(
+                    PLAY.field(&name).map(|(_, f)| (f.ty, f.export)),
+                    Some((FieldTy::Bool, E)),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(field::COUNT, 137);
     }
 
     #[test]

@@ -22,11 +22,13 @@ use self::reducer::Reducer;
 use self::schema::{field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
+use crate::selection::Ratio;
 use crate::widget::Starts;
 use crate::widget::bar::BarScratch;
 use crate::widget::gauge::GaugeLook;
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::lanes::{LaneView, Side};
+use crate::widget::ratio_bar::ScoreRate;
 use crate::widget::text::TextTable;
 
 /// What the skin knows of one of the preset's gauges, in the preset's
@@ -564,6 +566,14 @@ pub struct Play {
     /// The context's play best and target ([`PlayScore::basis`]), which a
     /// rearm keeps.
     score: ScoreBasis,
+    /// Whether the chart declares `#RANDOM` or `#SETRANDOM`: the values
+    /// measured against the best are then not shown (design.md "Personal
+    /// Bests", skin projections).
+    random: bool,
+    /// The score ratios as of the last build, in
+    /// [`ScoreRate::ALL`]'s order; each fill computes them afresh, so a
+    /// fresh attempt and a rearm start from their "until updated" values.
+    ratios: [Option<Ratio>; 6],
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -751,6 +761,8 @@ impl Play {
             chart_fields: timers::chart_fields(ctx.meta),
             autoplay: ctx.autoplay,
             score: ctx.score.basis,
+            random: !chart.identity.random_results.is_empty(),
+            ratios: [None; 6],
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -788,6 +800,12 @@ impl Play {
     #[must_use]
     pub const fn score(&self) -> ScoreBasis {
         self.score
+    }
+
+    /// Score ratio `rate` as of the last build: `None` before the first
+    /// and for the best's two on a `#RANDOM` chart.
+    pub(crate) fn score_ratio(&self, rate: ScoreRate) -> Option<Ratio> {
+        self.ratios.get(rate.index()).copied().flatten()
     }
 
     /// The bar groups the play holds work for.

@@ -24,6 +24,49 @@ pub enum RatioSource {
     /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
     /// the settings.
     MasterVolume,
+    /// A play's score rate: a play skin's only source, and only a play
+    /// skin's.
+    Score(ScoreRate),
+}
+
+/// A play's score rate, exact, with `ex` the EX score, `p` the judged
+/// targets, `n` the attempt's targets, B and T the play's best and target
+/// ([`ScoreBasis`](crate::ScoreBasis)). An empty denominator gives 0;
+/// a rate past 1 draws at 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScoreRate {
+    /// `ex / 2n`.
+    Current,
+    /// `ex / 2p` once the attempt has a judgment (1 while `p` is 0), 0
+    /// before.
+    Judged,
+    /// The best paced linearly to the judged targets, `⌊B · p / n⌋ / 2n`;
+    /// none for a chart that declares `#RANDOM`.
+    PacedBest,
+    /// `B / 2n`; none for a chart that declares `#RANDOM`.
+    Best,
+    /// The target paced alike, `⌊T · p / n⌋ / 2n`.
+    PacedTarget,
+    /// `T / 2n`.
+    Target,
+}
+
+impl ScoreRate {
+    /// Every rate, in index order.
+    pub const ALL: [Self; 6] = [
+        Self::Current,
+        Self::Judged,
+        Self::PacedBest,
+        Self::Best,
+        Self::PacedTarget,
+        Self::Target,
+    ];
+
+    /// Its index in [`ALL`](Self::ALL).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// Which way a slider moves as its ratio grows, on the screen.
