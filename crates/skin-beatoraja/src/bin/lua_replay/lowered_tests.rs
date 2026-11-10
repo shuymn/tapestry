@@ -116,14 +116,16 @@ fn lowered(r: &Report, field: &str) -> usize {
         .sum()
 }
 
-/// L1: one callable consumed as a number's value (an integer) and as an
-/// `op` (a truthiness) is two occurrences, each with its own expression.
+/// L1: one callable consumed as an `op` (a truthiness, `true`) and as a
+/// number's value (an integer, the PGREAT count) is two occurrences, each with
+/// its own expression: the `op` comes first, so an expression looked up by
+/// callable would give the value the `op`'s 1 where the count is 0.
 #[test]
 fn a_lowered_record_carries_its_expression() {
     let body = format!(
-        "local f = function() return ms.number(100) end\n{VALUES}{}{}",
-        number("m", "f", 0),
-        dst("\"i\"", 100, "op = { f },")
+        "local f = function() return ms.number(110) end\n{VALUES}{}{}",
+        dst("\"i\"", 100, "op = { f },"),
+        number("m", "f", 0)
     );
     let r = run_with(&body, &options(Script::full()));
     assert!(r.passes(), "{}", r.text(0, true, true));
