@@ -1,12 +1,14 @@
 //! The sound bank: every sound a chart references, decoded before play into i16
 //! at the device rate (design.md "Audio").
 //!
-//! A pool of at most `min(available cores, BankLimits::max_decode_threads)`
-//! workers takes one distinct file at a time and finishes it before taking
-//! the next: read its bytes (at most [`BankLimits::max_file_bytes`]), hash
-//! them, and either drop them at once as a duplicate of contents already
-//! taken, or decode them and drop them. So at most one raw file per worker
-//! is held at any time.
+//! A pool of at most `min(available cores, BankLimits::max_decode_threads,
+//! files)` workers takes one distinct file at a time and finishes it before
+//! taking the next: read its bytes (at most [`BankLimits::max_file_bytes`]),
+//! hash them, and either drop them at once as a duplicate of contents
+//! already taken, or decode them and drop them. So at most one raw file per
+//! worker is held at any time. Worker 0 is the caller's own thread; a
+//! [`Width`] says, at each of its files, how many workers may run, and the
+//! others are started then ([`load_bank_width`]).
 //!
 //! A sound is checked against the caps before decoding, from the frame count
 //! its container declares, and while decoding, from a running count. While
@@ -345,8 +347,8 @@ pub enum BankError {
         /// The cap in the same unit.
         limit: u64,
     },
-    /// The load was cancelled ([`load_bank_reporting`]'s `cancel`): no
-    /// bank is made.
+    /// The load was cancelled ([`load_bank_reporting`]'s `cancel`, or the
+    /// caller's own worker told to stop by its [`Width`]): no bank is made.
     #[error("the load was cancelled")]
     Cancelled,
 }
@@ -366,7 +368,8 @@ pub enum BankWarning {
 /// How a bank was loaded (indicators, not checked).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
-    /// Threads in the decode pool.
+    /// The most decode workers running or started at once, the caller's
+    /// own included, counted at its file boundaries.
     pub decode_threads: usize,
     /// Distinct files read.
     pub files: usize,
@@ -1059,36 +1062,155 @@ fn resample(
     Ok(Some(out))
 }
 
-/// Runs `f(0..jobs)` on `threads` threads, results in job order; one
-/// thread is the caller's own, so a decode limited to one thread keeps the
-/// caller's priority (the background loudness measurement's).
-fn pool<T: Send>(threads: usize, jobs: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    if threads <= 1 {
-        return (0..jobs).map(f).collect();
+/// How many workers a decode may run, decided as it goes (design.md "Load
+/// Pipeline": the decode pool draws its caller's permits). Worker 0 is the
+/// caller's own thread; the others are started at worker 0's file
+/// boundaries, each on its own `start`, and each ends with one `retire`.
+pub trait Width: Sync {
+    /// Asked by worker `worker` on its own thread before each of its files:
+    /// whether it goes on. Worker 0's call may wait. A `false` ends that
+    /// worker; worker 0's ends the load cancelled
+    /// ([`BankError::Cancelled`]), and the other workers stop at their next
+    /// packet.
+    fn at_file(&self, worker: usize) -> bool;
+
+    /// Asked by worker 0 after an `at_file(0)` that went on, before it
+    /// starts worker `worker` (numbered from 1), while fewer than `cap`
+    /// workers run (the decode threads the limits, the cores and the files
+    /// allow) and files are left: whether it may. A `true` may reserve what
+    /// that worker will hold, and is followed by exactly one
+    /// `retire(worker)`.
+    fn start(&self, worker: usize, cap: usize) -> bool;
+
+    /// Worker `worker`, which `start` allowed, ended (unwinding included)
+    /// or its thread was refused: what it held goes back.
+    fn retire(&self, worker: usize);
+}
+
+/// Every worker the pool's cap allows, from the first file.
+struct Full;
+
+impl Width for Full {
+    fn at_file(&self, _: usize) -> bool {
+        true
     }
+
+    fn start(&self, _: usize, _: usize) -> bool {
+        true
+    }
+
+    fn retire(&self, _: usize) {}
+}
+
+/// An extra worker's end: retired, then no longer counted as running, on
+/// its return or its unwinding.
+struct Retire<'a> {
+    width: &'a dyn Width,
+    worker: usize,
+    running: &'a AtomicUsize,
+}
+
+impl Drop for Retire<'_> {
+    fn drop(&mut self) {
+        self.width.retire(self.worker);
+        self.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Runs `f(0..jobs)` on at most `cap` workers as `width` allows, results in
+/// job order, with the most workers running or started at once, counted at
+/// worker 0's file boundaries. Worker 0 is the caller's own thread, so a
+/// decode on one worker keeps the caller's priority (the background
+/// loudness measurement's) and a job's checkpoint there moves its permit.
+/// `halt` is called once worker 0 stops; the results are then `None` when a
+/// job was left untaken.
+fn pool<T: Send>(
+    cap: usize,
+    jobs: usize,
+    width: &dyn Width,
+    halt: &(dyn Fn() + Sync),
+    f: impl Fn(usize) -> T + Sync,
+) -> (Option<Vec<T>>, usize) {
+    let cap = cap.max(1);
     let next = AtomicUsize::new(0);
+    // Workers running, worker 0 included.
+    let running = AtomicUsize::new(1);
+    let mut most = 1;
+    let take = |out: &mut Vec<(usize, T)>| {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= jobs {
+            return false;
+        }
+        out.push((i, f(i)));
+        true
+    };
     let mut done: Vec<(usize, T)> = thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut out = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= jobs {
-                            break out;
-                        }
-                        out.push((i, f(i)));
+        let (take, running) = (&take, &running);
+        let mut extras = Vec::new();
+        let mut started = 0;
+        let mut out = Vec::new();
+        loop {
+            if !width.at_file(0) {
+                halt();
+                break;
+            }
+            // Workers for the files left, each on its own start.
+            if next.load(Ordering::Relaxed) < jobs {
+                let mut now = running.load(Ordering::SeqCst);
+                while now < cap {
+                    let k = started + 1;
+                    if !width.start(k, cap) {
+                        break;
                     }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
+                    started = k;
+                    running.fetch_add(1, Ordering::SeqCst);
+                    let retire = Retire {
+                        width,
+                        worker: k,
+                        running,
+                    };
+                    let worker = move || {
+                        let _retire = retire;
+                        let mut out = Vec::new();
+                        while width.at_file(k) && take(&mut out) {}
+                        out
+                    };
+                    #[cfg(test)]
+                    let spawned = if inject::spawn_refused() {
+                        // The refused closure drops here, retiring it.
+                        drop(worker);
+                        Err(std::io::Error::other("refused (test)"))
+                    } else {
+                        thread::Builder::new().spawn_scoped(s, worker)
+                    };
+                    #[cfg(not(test))]
+                    let spawned = thread::Builder::new().spawn_scoped(s, worker);
+                    match spawned {
+                        Ok(handle) => {
+                            extras.push(handle);
+                            now += 1;
+                        }
+                        // One worker fewer, until worker 0's next file; a
+                        // refused spawn drops its closure, which retires it.
+                        Err(_) => break,
+                    }
+                }
+                most = most.max(now);
+            }
+            if !take(&mut out) {
+                break;
+            }
+        }
+        for extra in extras {
+            out.extend(extra.join().unwrap_or_else(|e| panic::resume_unwind(e)));
+        }
+        out
     });
+    if done.len() < jobs {
+        return (None, most);
+    }
     done.sort_by_key(|(i, _)| *i);
-    done.into_iter().map(|(_, t)| t).collect()
+    (Some(done.into_iter().map(|(_, t)| t).collect()), most)
 }
 
 /// Every sound id the chart's notes and BGM reference, in id order.
@@ -1168,6 +1290,26 @@ pub fn load_bank_reporting(
     progress: &(dyn Fn(usize, usize) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<SoundBank, BankError> {
+    load_bank_width(chart, rate, speed, limits, progress, cancel, &Full)
+}
+
+/// [`load_bank_reporting`] on as many workers as `width` allows as it goes,
+/// within the same cap: worker 0, the calling thread, asks it before each
+/// of its files and starts the others there.
+///
+/// # Errors
+///
+/// As [`load_bank_reporting`]; [`BankError::Cancelled`] also once `width`
+/// stopped worker 0.
+pub fn load_bank_width(
+    chart: &Chart,
+    rate: u32,
+    speed: Speed,
+    limits: &BankLimits,
+    progress: &(dyn Fn(usize, usize) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+    width: &dyn Width,
+) -> Result<SoundBank, BankError> {
     if !(MIN_RATE..=MAX_RATE).contains(&rate) {
         return Err(BankError::RateOutOfRange { rate });
     }
@@ -1204,21 +1346,26 @@ pub fn load_bank_reporting(
         taken: Mutex::new(HashMap::new()),
     };
     let finished = AtomicUsize::new(0);
-    let (hashes, mut outcomes): (Vec<_>, Vec<_>) = pool(threads, paths.len(), |i| {
+    // Worker 0 told to stop cancels the load: every worker stops.
+    let halt = || {
+        shared.cancelled.store(true, Ordering::Relaxed);
+        shared.stop.store(true, Ordering::Relaxed);
+    };
+    let (results, workers) = pool(threads, paths.len(), width, &halt, |i| {
         let r = process(i, paths[i].0, paths[i].1[0], &shared);
         if matches!(r.1, Outcome::Stopped(Stop::Cap(_))) {
             shared.stop.store(true, Ordering::Relaxed);
         }
         progress(finished.fetch_add(1, Ordering::Relaxed) + 1, paths.len());
         r
-    })
-    .into_iter()
-    .unzip();
+    });
     // A cancelled load makes no bank, whatever it had decoded; asked once
     // more here, so a cancel after the last file's checks is seen too.
-    if shared.cancelled.load(Ordering::Relaxed) || (shared.cancel)() {
-        return Err(BankError::Cancelled);
-    }
+    let results = match results {
+        Some(results) if !shared.cancelled.load(Ordering::Relaxed) && !(shared.cancel)() => results,
+        _ => return Err(BankError::Cancelled),
+    };
+    let (hashes, mut outcomes): (Vec<_>, Vec<_>) = results.into_iter().unzip();
     // The first cap error in path order refuses the bank.
     for o in &mut outcomes {
         if let Outcome::Stopped(Stop::Cap(e)) = o {
@@ -1266,7 +1413,7 @@ pub fn load_bank_reporting(
         warnings,
         sound_digest,
         stats: LoadStats {
-            decode_threads: threads,
+            decode_threads: workers,
             files: paths.len(),
             peak_raw_bytes: shared.raw_peak.load(Ordering::Relaxed),
             elapsed: started.elapsed(),
@@ -1278,6 +1425,7 @@ pub fn load_bank_reporting(
 /// it has decoded some frames.
 #[cfg(test)]
 mod inject {
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -1290,6 +1438,26 @@ mod inject {
     }
 
     static FAULTS: Mutex<Vec<(PathBuf, Fault)>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        /// Worker spawns to refuse, asked on the pool's own thread (the
+        /// test's), so tests running beside it are untouched.
+        static REFUSE_SPAWNS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The next `n` worker spawns of pools run on this thread are refused.
+    pub fn refuse_spawns(n: usize) {
+        REFUSE_SPAWNS.with(|r| r.set(n));
+    }
+
+    /// Whether this spawn is refused; counts it.
+    pub fn spawn_refused() -> bool {
+        REFUSE_SPAWNS.with(|r| {
+            let left = r.get();
+            r.set(left.saturating_sub(1));
+            left > 0
+        })
+    }
 
     pub fn arm(path: &Path, fault: Fault) {
         FAULTS.lock().unwrap().push((path.to_owned(), fault));
@@ -1587,5 +1755,301 @@ mod tests {
             assert_eq!(frames(&bank), frames(&plain), "sound {i}");
         }
         assert_eq!(bank.warnings(), plain.warnings());
+    }
+
+    /// `n` distinct sounds of 400 frames in a fresh directory, and a chart
+    /// playing each once.
+    fn distinct(n: usize) -> (tempfile::TempDir, Chart) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("audio-unit-")
+            .tempdir_in(root)
+            .unwrap();
+        let mut builder = ChartBuilder::new(120_000);
+        for i in 0..n {
+            builder = builder
+                .sound(&format!("{i}.wav"))
+                .bgm(TimeUs(i as i64), SoundId(i as u16));
+        }
+        let mut chart = builder.build().unwrap();
+        for (i, sound) in chart.sounds.iter_mut().enumerate() {
+            let path = dir.path().join(format!("{i}.wav"));
+            std::fs::write(&path, wav(&[100 + i as i16; 400], true)).unwrap();
+            sound.path = Some(path);
+        }
+        (dir, chart)
+    }
+
+    /// The pool's cap for `files` files at `threads` decode threads.
+    fn cap(threads: usize, files: usize) -> usize {
+        let cores = thread::available_parallelism().map_or(1, usize::from);
+        threads.min(cores).min(files).max(1)
+    }
+
+    /// What worker 0 does at one of its files (from 1).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Zero {
+        Stop,
+        /// Waits until every other worker retired, then stops.
+        DrainThenStop,
+        Panic,
+    }
+
+    /// A width that lets `grant(n)` workers run at once from worker 0's
+    /// `n`th file (from 1), and worker `k ≥ 1` go on while `extra(k)`;
+    /// worker 0 acts at its file `zero.0` as `zero.1` says. Every call is
+    /// recorded with its thread.
+    struct Probe {
+        grant: fn(usize) -> usize,
+        extra: fn(usize) -> bool,
+        zero: Option<(usize, Zero)>,
+        files0: AtomicUsize,
+        alive: AtomicUsize,
+        calls: Mutex<Vec<(usize, thread::ThreadId)>>,
+        started: Mutex<Vec<usize>>,
+        retired: Mutex<Vec<usize>>,
+    }
+
+    impl Probe {
+        fn new(grant: fn(usize) -> usize) -> Self {
+            Self {
+                grant,
+                extra: |_| true,
+                zero: None,
+                files0: AtomicUsize::new(0),
+                alive: AtomicUsize::new(0),
+                calls: Mutex::new(Vec::new()),
+                started: Mutex::new(Vec::new()),
+                retired: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(usize, thread::ThreadId)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn sorted(list: &Mutex<Vec<usize>>) -> Vec<usize> {
+            let mut l = list.lock().unwrap().clone();
+            l.sort_unstable();
+            l
+        }
+
+        fn started(&self) -> Vec<usize> {
+            Self::sorted(&self.started)
+        }
+
+        fn retired(&self) -> Vec<usize> {
+            Self::sorted(&self.retired)
+        }
+    }
+
+    impl Width for Probe {
+        fn at_file(&self, worker: usize) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((worker, thread::current().id()));
+            if worker > 0 {
+                return (self.extra)(worker);
+            }
+            let n = self.files0.fetch_add(1, Ordering::SeqCst) + 1;
+            match self.zero {
+                Some((at, how)) if at == n => match how {
+                    Zero::Stop => false,
+                    Zero::DrainThenStop => {
+                        let began = Instant::now();
+                        while self.alive.load(Ordering::SeqCst) > 0 {
+                            assert!(began.elapsed() < Duration::from_secs(60), "never drained");
+                            thread::yield_now();
+                        }
+                        false
+                    }
+                    Zero::Panic => panic!("worker 0 (test)"),
+                },
+                _ => true,
+            }
+        }
+
+        fn start(&self, worker: usize, _cap: usize) -> bool {
+            let n = self.files0.load(Ordering::SeqCst);
+            if 1 + self.alive.load(Ordering::SeqCst) >= (self.grant)(n) {
+                return false;
+            }
+            self.alive.fetch_add(1, Ordering::SeqCst);
+            self.started.lock().unwrap().push(worker);
+            true
+        }
+
+        fn retire(&self, worker: usize) {
+            self.retired.lock().unwrap().push(worker);
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn load_on(chart: &Chart, threads: usize, width: &dyn Width) -> Result<SoundBank, BankError> {
+        let limits = BankLimits {
+            max_decode_threads: threads,
+            ..BankLimits::default()
+        };
+        load_bank_width(
+            chart,
+            8_000,
+            Speed::NORMAL,
+            &limits,
+            &|_, _| {},
+            &|| false,
+            width,
+        )
+    }
+
+    /// Z4: worker 0 asks before each of its files on the calling thread,
+    /// alone or beside another worker.
+    #[test]
+    fn pool_runs_worker_zero_on_the_callers_thread() {
+        let (_dir, chart) = distinct(3);
+        let me = thread::current().id();
+        for grant in [|_| 1, |_| 2] {
+            let width = Probe::new(grant);
+            let bank = load_on(&chart, 3, &width).unwrap();
+            assert_eq!(bank.sounds.len(), 3);
+            let calls = width.calls();
+            assert!(calls.iter().any(|&(w, _)| w == 0));
+            assert!(
+                calls.iter().all(|&(w, t)| (w == 0) == (t == me)),
+                "{calls:?}"
+            );
+            assert_eq!(bank.stats().decode_threads, grant(1).min(cap(3, 3)));
+        }
+    }
+
+    /// Z5: a width that allows a second worker from worker 0's second file
+    /// on starts it then, not before.
+    #[test]
+    fn a_width_widened_mid_decode_adds_a_worker() {
+        let (_dir, chart) = distinct(6);
+        if cap(2, 6) < 2 {
+            eprintln!("one core: no second worker to add");
+            return;
+        }
+        let width = Probe::new(|n| if n < 2 { 1 } else { 2 });
+        let bank = load_on(&chart, 2, &width).unwrap();
+        assert_eq!(bank.sounds.len(), 6);
+        assert_eq!(bank.stats().decode_threads, 2);
+        let calls = width.calls();
+        let first_extra = calls.iter().position(|&(w, _)| w > 0).unwrap();
+        let zeros_before = calls[..first_extra].iter().filter(|c| c.0 == 0).count();
+        assert!(zeros_before >= 2, "{calls:?}");
+        assert_eq!(width.retired(), width.started());
+    }
+
+    /// Z6: a width allowing more workers than the pool's cap gets the cap:
+    /// no start is asked past it.
+    #[test]
+    fn workers_never_pass_the_pools_cap() {
+        let (_dir, chart) = distinct(4);
+        let width = Probe::new(|_| 8);
+        let bank = load_on(&chart, 2, &width).unwrap();
+        let cap = cap(2, 4);
+        assert_eq!(bank.stats().decode_threads, cap);
+        assert!(width.started().len() < 4, "{:?}", width.started());
+        assert_eq!(width.retired(), width.started());
+    }
+
+    /// Z7: an extra worker told to stop retires once, before any file; the
+    /// caller's worker decodes the whole bank.
+    #[test]
+    fn a_worker_told_to_stop_retires_and_the_rest_decode() {
+        let (_dir, chart) = distinct(4);
+        let mut width = Probe::new(|_| 2);
+        width.extra = |_| false;
+        let bank = load_on(&chart, 2, &width).unwrap();
+        assert_eq!(bank.sounds.len(), 4);
+        let mut asked: Vec<usize> = width
+            .calls()
+            .iter()
+            .filter(|c| c.0 > 0)
+            .map(|c| c.0)
+            .collect();
+        asked.sort_unstable();
+        assert_eq!(width.started(), asked, "each asked once");
+        assert_eq!(width.retired(), asked, "each retired once");
+        if cap(2, 4) >= 2 {
+            assert!(!asked.is_empty());
+        }
+    }
+
+    /// Z8: worker 0 told to stop at its second file cancels the load: alone,
+    /// and when another worker has already decoded every other file.
+    #[test]
+    fn worker_zeros_stop_cancels_the_load() {
+        let (_dir, chart) = distinct(4);
+        let mut alone = Probe::new(|_| 1);
+        alone.zero = Some((2, Zero::Stop));
+        let got = load_on(&chart, 2, &alone);
+        assert!(matches!(got, Err(BankError::Cancelled)), "{got:?}");
+        if cap(2, 4) < 2 {
+            eprintln!("one core: no other worker");
+            return;
+        }
+        let mut beside = Probe::new(|_| 2);
+        beside.zero = Some((2, Zero::DrainThenStop));
+        let got = load_on(&chart, 2, &beside);
+        assert!(matches!(got, Err(BankError::Cancelled)), "{got:?}");
+        assert_eq!(beside.started(), [1]);
+    }
+
+    /// Z9: a worker whose thread is refused is retired at once, never asked
+    /// for a file; the load goes on.
+    #[test]
+    fn a_refused_worker_spawn_retires_its_share() {
+        let (_dir, chart) = distinct(4);
+        if cap(2, 4) < 2 {
+            eprintln!("one core: no worker to refuse");
+            return;
+        }
+        let width = Probe::new(|_| 2);
+        inject::refuse_spawns(1);
+        let bank = load_on(&chart, 2, &width).unwrap();
+        inject::refuse_spawns(0);
+        assert_eq!(bank.sounds.len(), 4);
+        assert!(width.retired().contains(&1), "{:?}", width.retired());
+        assert_eq!(width.retired(), width.started());
+        assert!(
+            width.calls().iter().all(|c| c.0 != 1),
+            "the refused worker ran"
+        );
+    }
+
+    /// Z10: the bank reports the most workers that ran, not the cap.
+    #[test]
+    fn decode_threads_counts_the_workers_that_ran() {
+        let (_dir, chart) = distinct(3);
+        let bank = load_on(&chart, 3, &Probe::new(|_| 1)).unwrap();
+        assert_eq!(bank.stats().decode_threads, 1);
+        let full = load_on(&chart, 3, &Full).unwrap();
+        assert_eq!(full.stats().decode_threads, cap(3, 3));
+    }
+
+    /// Z27: a worker's panic, an extra's or worker 0's, unwinds the load,
+    /// and every worker started is retired exactly once.
+    #[test]
+    fn a_panicking_worker_retires_every_worker_once() {
+        let (_dir, chart) = distinct(4);
+        let mut extra = Probe::new(|_| 2);
+        extra.extra = |_| panic!("an extra (test)");
+        let mut zero = Probe::new(|_| 2);
+        zero.zero = Some((2, Zero::Panic));
+        for (name, width) in [("extra", &extra), ("zero", &zero)] {
+            let got = panic::catch_unwind(AssertUnwindSafe(|| load_on(&chart, 2, width)));
+            let started = width.started();
+            if name == "zero" || !started.is_empty() {
+                assert!(got.is_err(), "{name}: no panic");
+            }
+            assert_eq!(width.retired(), started, "{name}");
+        }
+        if cap(2, 4) >= 2 {
+            assert!(!extra.started().is_empty());
+        }
     }
 }
