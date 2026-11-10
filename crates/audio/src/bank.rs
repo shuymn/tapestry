@@ -2044,7 +2044,9 @@ mod tests {
         }
         let bank = load_on(&chart, 2, &width).unwrap();
         assert_eq!(bank.stats().decode_threads, cap);
-        assert!(width.started().len() < 4, "{:?}", width.started());
+        // Only the first file's boundary starts a worker: later ones find the
+        // cap reached, then no file left.
+        assert_eq!(width.started(), (1..cap).collect::<Vec<_>>());
         assert_eq!(width.retired(), width.started());
     }
 
