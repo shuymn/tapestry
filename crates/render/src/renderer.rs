@@ -1371,7 +1371,7 @@ impl Renderer {
         self.atlas_bind = bind;
         self.staging.set_clips(clips);
         self.atlas = atlas;
-        self.resources += 1;
+        self.advance_resources();
         Ok(())
     }
 
@@ -2214,7 +2214,17 @@ impl Renderer {
         self.instances = r.instances;
         self.text_cache = r.text_cache;
         self.installed_loading = Holder::default();
+        self.advance_resources();
+    }
+
+    /// The one step every replacement of the play array passes: a new
+    /// resource generation, and any frame built against the old one
+    /// cancelled, so no staged quad, a chart image's included, is
+    /// submitted against an array it was not built for (S10-12 design
+    /// §5.3).
+    fn advance_resources(&mut self) {
         self.resources += 1;
+        self.started = None;
     }
 
     /// Drops the staged installation, if any: its resources go, and the
@@ -5161,6 +5171,40 @@ mod tests {
         assert_eq!(r.valid_chart(), None);
         let again = r.publish_chart_images([Some(&stage), None]).unwrap();
         assert!(again.drawable(r.chart_key()));
+    }
+
+    /// A play frame built against the published images, then the play
+    /// pages uploaded again (a new, zeroed chart layer), then submitted:
+    /// the built frame was cancelled with the old array, so nothing it
+    /// staged is drawn against the new one.
+    #[test]
+    fn a_frame_built_before_an_atlas_upload_is_never_submitted() {
+        use crate::test_common::{GAUGES, attempt, context, input, view};
+        use skin_model::chart_image::ChartImage;
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
+        r.publish_chart_images([Some(&stage), None]).unwrap();
+        let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+        let ctx = context(&GAUGES, false);
+        let bundle = std::sync::Arc::clone(r.installed.as_ref().unwrap().bundle());
+        let token = r.stage(&bundle, &attempt(&r, &chart, &ctx), 2).unwrap();
+        r.commit(token).unwrap();
+        let v = view(0, 0);
+        let f = input(&v, bms_model::TimeUs(0), bms_model::TimeUs(0), &[]);
+        r.build(&f).unwrap();
+        let levels = crate::decl::page_levels(bundle.atlas_pages());
+        let pages = AtlasPages {
+            side: bundle.side(),
+            pages: &levels,
+            text_layer: bundle.text_layer().is_some(),
+            chart_layer: true,
+        };
+        r.install_atlas(&pages, bundle.clips().clone()).unwrap();
+        let timing = r.submit().unwrap();
+        assert_eq!(timing.sprites, 0, "the frame built at the old generation");
+        // A frame built now is submitted, against the new array.
+        r.build(&f).unwrap();
+        assert!(r.submit().unwrap().sprites > 0);
     }
 
     /// Level `k` of atlas layer `z`, read back: RGBA8, `side >> k` texels

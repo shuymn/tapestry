@@ -513,8 +513,10 @@ fn placement_rounds_exactly() {
 
 /// An animated destination is stretched and rounded at each sample: at
 /// whole-pixel keys this is the importer's baked key; between keys the
-/// model's quad snaps to whole pixels where the importer's interpolated
-/// baked keys would sit on a fraction (design note D-chart-8). An `Inner`
+/// model's quad sits on whole pixels where the importer's interpolated
+/// baked keys sit on a fraction, and since a size animation changes the
+/// stretch's own centring, by up to the distance between the two baked
+/// keys' edges, not by half a pixel (design note D-chart-8). An `Inner`
 /// destination moving x from 0 to 1, sampled a quarter of the way: the
 /// model places it at 0, the baked keys at 0.25.
 #[test]
@@ -523,4 +525,21 @@ fn an_animated_destination_rounds_at_each_sample() {
     assert_eq!(at_key, [1.0, 1.0, 7.0, 7.0]);
     let quarter = ChartStretch::Inner.place([0.25, 0.0, 7.0, 8.0], [25, 25]).0;
     assert_eq!(quarter, [0.0, 1.0, 7.0, 7.0]);
+}
+
+/// A size animation: a 2 × 1 image, `Inner`, its destination growing from
+/// 2 × 2 at y = 0 to 3 × 2 (same top): at the keys the model places what
+/// the importer bakes (top 1 then 0.5 rounded to 1, so `[0, 1, 2, 1]` and
+/// `[0, 0, 3, 2]` after its own centring), and a quarter of the way it
+/// places the sampled `[0, 0, 2.25, 2]` with top 0, where the baked keys'
+/// interpolation would give 0.75. Today's behaviour, pinned (D-chart-8).
+#[test]
+fn a_size_animation_rounds_its_sample_not_its_keys() {
+    let native = [2, 1];
+    assert_eq!(
+        ChartStretch::Inner.place([0.0, 0.0, 2.0, 2.0], native).0,
+        [0.0, 1.0, 2.0, 1.0]
+    );
+    let quarter = ChartStretch::Inner.place([0.0, 0.0, 2.25, 2.0], native).0;
+    assert_eq!(quarter[1], 0.0, "the sample's top, rounded");
 }
