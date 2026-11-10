@@ -1095,3 +1095,26 @@ fn pattern_listings_share_the_entry_bound() {
         })
     ),);
 }
+
+/// A pattern's folder is listed and charged once, however many times the
+/// import resolves the pattern: one folder of most of the bound imports.
+#[test]
+fn a_pattern_folder_is_listed_once() {
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"p\", path = \"p/*.png\" }})\n\
+         table.insert(skin.image, {{ id = \"x\", src = \"p\", x = 0, y = 0, w = 8, h = 8 }})\n{}{}",
+        dst("x", ""),
+        dst("x", "")
+    );
+    let d = folder(&skin(&body));
+    for k in 0..2_100 {
+        common::write(d.path(), &format!("p/{k}.txt"), b"");
+    }
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let config = Config {
+        options: vec![Some(905)],
+        ..Config::default()
+    };
+    common::lua_play(&h, &config, &cancel).unwrap();
+}
