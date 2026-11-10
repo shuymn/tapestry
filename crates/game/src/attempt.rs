@@ -4,7 +4,9 @@
 //! ended. Everything here is ordinary game data: the player translates it
 //! into whatever a skin takes, so the game depends on no skin crate.
 
-use bms_model::{Chart, JudgmentHeader, NoteKind, Speed, TimeUs};
+use std::sync::Arc;
+
+use bms_model::{Chart, ChartProfile, JudgmentHeader, NoteKind, Speed, Tempo, TimeUs};
 use eval::Section;
 use rules::{GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
@@ -46,6 +48,24 @@ impl std::fmt::Display for PreparationRefusal {
         }
         f.write_str(&self.reason)
     }
+}
+
+/// A play's best and target EX scores, read once when the play begins
+/// ([`crate::Loaded::begin_play`]) and kept by every preparation and READY
+/// rearm of its attempt (stage 3, S10-10; design.md "Personal Bests",
+/// skin projections).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScoreBasis {
+    /// The best EX score under the play's key before this play: 0 for a
+    /// known-empty best, an unavailable one (no library or a failed read)
+    /// and a practice round.
+    pub best: u32,
+    /// Whether the best was read: `false` for an unavailable one and a
+    /// practice round, which reads none.
+    pub best_known: bool,
+    /// The target EX score ([`crate::score_target`]): 0 in a practice
+    /// round.
+    pub target: u32,
 }
 
 /// What an attempt plays.
@@ -102,6 +122,17 @@ pub struct Attempt {
     /// The tempo provider and reference tempos, from the chart as loaded
     /// at the attempt's speed over its section.
     pub tempo: AttemptTempo,
+    /// The play's best and target. [`Attempt::new`] gives none read (0,
+    /// unknown, target 0); [`crate::Loaded::attempt`] gives the play's.
+    pub score: ScoreBasis,
+    /// The chart's 1× profile as its ingestion built it, shared by every
+    /// attempt of the load; `None` from [`Attempt::new`], `Some` from
+    /// [`crate::Loaded::attempt`].
+    pub profile: Option<Arc<ChartProfile>>,
+    /// The whole chart's MAIN tempo, computed once per load, not the
+    /// section's that [`tempo`](Self::tempo) gives in practice; `None`
+    /// from [`Attempt::new`] and when its histogram is refused.
+    pub main: Option<Tempo>,
 }
 
 /// What an attempt's notes end at (design.md "Play Lifecycle"; the skin
@@ -172,6 +203,9 @@ impl Attempt {
             song_total: song_total(chart),
             judgment_headers: chart.meta.judgment_headers.clone(),
             tempo: AttemptTempo::prepare(chart, section),
+            score: ScoreBasis::default(),
+            profile: None,
+            main: None,
         }
     }
 }

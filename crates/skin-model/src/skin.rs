@@ -12,8 +12,9 @@ use eval::{GaugeState, NoteFacts};
 use rules::GaugeValue;
 
 use crate::atlas::uv::{Cycle, UvTable};
-use crate::atlas::{Atlas, AtlasError, AtlasLimits, Variant};
+use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
+use crate::chart_image::{ChartImage, ChartStretch, ChartTable};
 use crate::decision::schema::timer as decision_timer;
 use crate::decision::{DecisionError, DecisionFrame, DecisionScreen};
 use crate::expr::State;
@@ -38,7 +39,7 @@ use crate::screen::ScreenKind;
 use crate::select::schema::timer as selection_timer;
 use crate::select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
-use crate::track::{MAX_KEY_US, Track};
+use crate::track::{MAX_KEY_US, Sample, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
@@ -136,6 +137,15 @@ pub enum Source {
     /// [`ResultDefs::timing_graphs`]: the view's deviations over the
     /// element's rect.
     TimingGraph(u32),
+    /// The chart's own image `which` (play only, S10-12): its installed
+    /// uv and native size ([`ChartTable`]), on the element's track, met by
+    /// `stretch` at placement and sampled with `filter`. An absent image,
+    /// and any while its table is unavailable, draws nothing.
+    ChartImage {
+        which: ChartImage,
+        filter: Filter,
+        stretch: ChartStretch,
+    },
 }
 
 /// What only a result skin has: the widgets it draws and the timing it
@@ -384,6 +394,8 @@ enum Kind {
     GaugeGraph(usize),
     /// The timing distribution's index.
     TimingGraph(usize),
+    /// The chart's own image, its filter and stretch.
+    ChartImage(ChartImage, Filter, ChartStretch),
 }
 
 #[derive(Clone, Debug)]
@@ -414,6 +426,10 @@ struct Runtime<'a> {
     state: State<'a>,
     text: &'a TextTable,
     bitmap: &'a [Option<GlyphLine>],
+    /// The chart images the frame draws; `None` while unavailable (a
+    /// loading frame before they are published) and on screens that draw
+    /// none.
+    chart: Option<&'a ChartTable>,
 }
 
 /// What a frame's drawing reads of its frame.
@@ -731,7 +747,11 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
         if e.place.angle != AngleFollow::None
             && !matches!(
                 e.source,
-                Source::Image(_) | Source::ImageChoice(_) | Source::Number(_) | Source::Text(_)
+                Source::Image(_)
+                    | Source::ImageChoice(_)
+                    | Source::Number(_)
+                    | Source::Text(_)
+                    | Source::ChartImage { .. }
             )
         {
             return Err(LoadError::UnsupportedFollow { element });
@@ -877,7 +897,8 @@ fn check_widget_images(
         | Source::RatioBar(_)
         | Source::JudgeGraph(_)
         | Source::GaugeGraph(_)
-        | Source::TimingGraph(_) => {}
+        | Source::TimingGraph(_)
+        | Source::ChartImage { .. } => {}
     }
     Ok(())
 }
@@ -932,7 +953,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::RatioBar(_)
         | Source::JudgeGraph(_)
         | Source::GaugeGraph(_)
-        | Source::TimingGraph(_) => {}
+        | Source::TimingGraph(_)
+        | Source::ChartImage { .. } => {}
     }
     Ok(())
 }
@@ -950,7 +972,8 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) 
         | Source::Lanes
         | Source::ImageChoice(_)
         | Source::CoverPaint(_)
-        | Source::RatioBar(_) => 0,
+        | Source::RatioBar(_)
+        | Source::ChartImage { .. } => 0,
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1007,7 +1030,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::RatioBar(_)
             | Source::JudgeGraph(_)
             | Source::GaugeGraph(_)
-            | Source::TimingGraph(_) => {
+            | Source::TimingGraph(_)
+            | Source::ChartImage { .. } => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -1040,7 +1064,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::RatioBar(_)
                     | Source::JudgeGraph(_)
                     | Source::GaugeGraph(_)
-                    | Source::TimingGraph(_) => e.track.bounds(),
+                    | Source::TimingGraph(_)
+                    | Source::ChartImage { .. } => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1273,11 +1298,13 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                 | Source::RatioBar(_)
                 | Source::JudgeGraph(_)
                 | Source::GaugeGraph(_)
-                | Source::TimingGraph(_) => false,
+                | Source::TimingGraph(_)
+                | Source::ChartImage { .. } => false,
             },
             ScreenKind::Selection => !matches!(
                 e.source,
                 Source::Lanes
+                    | Source::ChartImage { .. }
                     | Source::Gauge(_)
                     | Source::Judge(_)
                     | Source::CoverPaint(_)
@@ -1295,6 +1322,7 @@ fn check_kind(def: &SkinDef, kind: ScreenKind) -> Result<(), LoadError> {
                             | Source::CoverPaint(_)
                             | Source::SongList
                             | Source::RatioBar(_)
+                            | Source::ChartImage { .. }
                     )
             }
             ScreenKind::Play => {
@@ -1771,7 +1799,8 @@ impl Skin {
                 | Source::RatioBar(_)
                 | Source::JudgeGraph(_)
                 | Source::GaugeGraph(_)
-                | Source::TimingGraph(_) => {}
+                | Source::TimingGraph(_)
+                | Source::ChartImage { .. } => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -1795,7 +1824,7 @@ impl Skin {
         let exists = |i: u32| usize::try_from(i).is_ok_and(|i| i < images.len());
         let frames = |i: u32| images.get(index(i)).map(|m| m.frames);
         if let Some(element) = elements.iter().position(|e| match e.source {
-            Source::Image(_) | Source::Lanes => false,
+            Source::Image(_) | Source::Lanes | Source::ChartImage { .. } => false,
             Source::CoverPaint(p) => w.cover_paints.get(index(p)).is_none(),
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
@@ -1823,7 +1852,8 @@ impl Skin {
             | Source::RatioBar(_)
             | Source::JudgeGraph(_)
             | Source::GaugeGraph(_)
-            | Source::TimingGraph(_) => false,
+            | Source::TimingGraph(_)
+            | Source::ChartImage { .. } => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -2175,6 +2205,11 @@ impl Skin {
                     Source::JudgeGraph(i) => Kind::JudgeGraph(index(i)),
                     Source::GaugeGraph(i) => Kind::GaugeGraph(index(i)),
                     Source::TimingGraph(i) => Kind::TimingGraph(index(i)),
+                    Source::ChartImage {
+                        which,
+                        filter,
+                        stretch,
+                    } => Kind::ChartImage(which, filter, stretch),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -2285,13 +2320,12 @@ impl Skin {
     }
 
     /// Builds the sheet's atlas for `variant`, asking `cancel` as it goes,
-    /// with a text layer when the skin has rasterized text
-    /// ([`has_outline_text`](Self::has_outline_text),
-    /// [`Sheet::atlas_reserving`]).
+    /// keeping the layers the skin needs after its pages
+    /// ([`kept_layers`](Self::kept_layers), [`Sheet::atlas_keeping`]).
     ///
     /// # Errors
     ///
-    /// As [`Sheet::atlas_reserving`].
+    /// As [`Sheet::atlas_keeping`].
     pub fn atlas(
         &self,
         variant: Variant,
@@ -2299,7 +2333,29 @@ impl Skin {
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
         self.sheet
-            .atlas_reserving(variant, limits, self.has_outline_text(), cancel)
+            .atlas_keeping(variant, limits, self.kept_layers(), cancel)
+    }
+
+    /// The layers its atlas keeps after its pages: a text layer when it has
+    /// rasterized text ([`has_outline_text`](Self::has_outline_text)), and
+    /// a chart layer when it draws a chart's own images
+    /// ([`has_chart_images`](Self::has_chart_images)).
+    #[must_use]
+    pub fn kept_layers(&self) -> KeptLayers {
+        KeptLayers {
+            text: self.has_outline_text(),
+            chart: self.has_chart_images(),
+        }
+    }
+
+    /// Whether some element draws one of the chart's own images
+    /// ([`Source::ChartImage`]): its installation then keeps a chart
+    /// layer.
+    #[must_use]
+    pub fn has_chart_images(&self) -> bool {
+        self.elements
+            .iter()
+            .any(|e| matches!(e.kind, Kind::ChartImage(..)))
     }
 
     /// Whether some text element or song list row style is rasterized: set
@@ -2444,6 +2500,7 @@ impl Skin {
                         | Kind::ImageChoice(_)
                         | Kind::CoverPaint(_)
                         | Kind::RatioBar(..)
+                        | Kind::ChartImage(..)
                 )
             })
             .count();
@@ -2952,6 +3009,7 @@ impl Skin {
             state: shown.state(),
             text: shown.text(),
             bitmap: shown.bitmap(),
+            chart: Some(shown.drawable_chart()),
         };
         let scene = Scene {
             turntable: frame.turntable,
@@ -3022,6 +3080,7 @@ impl Skin {
             state: loading.state(),
             text: loading.text(),
             bitmap: loading.bitmap(),
+            chart: loading.drawable_chart(),
         };
         let scene = Scene {
             turntable: frame.turntable,
@@ -3032,7 +3091,7 @@ impl Skin {
             hidden_enabled: frame.covers.hidden_enabled,
             phase: Phase::Loading {
                 gauge: frame.gauge,
-                chosen: frame.chosen(),
+                chosen: loading.chosen(frame),
             },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
@@ -3385,6 +3444,7 @@ impl Skin {
             state: sel.state(),
             text: &sel.text,
             bitmap: &sel.bitmap,
+            chart: None,
         };
         let scene = Scene {
             turntable: 0,
@@ -3586,6 +3646,7 @@ impl Skin {
             state: res.state(),
             text: &res.text,
             bitmap: &res.bitmap,
+            chart: None,
         };
         let at = (frame.now, frame.target, frame.layout);
         self.draw_screen(&rt, Phase::Result { res }, at, uvs, out);
@@ -3706,6 +3767,7 @@ impl Skin {
             state: dec.state(),
             text: &dec.text,
             bitmap: &dec.bitmap,
+            chart: None,
         };
         let at = (frame.now, frame.target, frame.layout);
         self.draw_screen(&rt, Phase::Decision, at, uvs, out);
@@ -3955,6 +4017,21 @@ impl Skin {
             };
             #[cfg(feature = "dev-tools")]
             out.observed_time(t);
+            // A chart image: its uv, and its stretch against its native
+            // size, applied to the sampled rect as an imported image's is
+            // baked into its keys; absent, or unavailable, it draws nothing.
+            let (s, chart) = match e.kind {
+                Kind::ChartImage(which, _, stretch) => {
+                    let Some(c) = rt.chart.and_then(|table| table.get(which)) else {
+                        #[cfg(feature = "dev-tools")]
+                        out.observed(crate::observation::Outcome::NoChartImage);
+                        continue;
+                    };
+                    let (rect, native) = stretch.place(s.rect, c.native);
+                    (Sample { rect, ..s }, Some((c.uv, native)))
+                }
+                _ => (s, None),
+            };
             let affine = placement.affine(e.region, e.fill);
             let map = placement.bind(e.bind);
             // The covers' motion, after the track and before the lane map
@@ -4029,7 +4106,10 @@ impl Skin {
                 pivot: e.pivot,
                 angle: radians(s.angle + turn),
                 color: s.color,
-                native: choice.map_or(e.native, |p| p.native),
+                native: match chart {
+                    Some((_, native)) => native,
+                    None => choice.map_or(e.native, |p| p.native),
+                },
                 scale: canvas.scale(),
             };
             let at = Frame {
@@ -4049,6 +4129,11 @@ impl Skin {
                         && let Some(f) = image.frame(rt.starts, now, uvs)
                     {
                         brush.push_clipped(out, rect, f, image.filter, trim);
+                    }
+                }
+                Kind::ChartImage(_, filter, _) => {
+                    if let Some((uv, _)) = chart {
+                        brush.push_clipped(out, rect, uv, filter, trim);
                     }
                 }
                 Kind::Number(i) => {
@@ -4376,6 +4461,7 @@ mod tests {
             bpm_range: None,
             bpm_whole_change: None,
             play_level: None,
+            score: crate::PlayScore::NONE,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());

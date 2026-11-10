@@ -133,6 +133,13 @@ pub struct Look {
     /// untimed `screen` timer; it draws [`lane_chart`] under
     /// [`FULL_LANES`] and [`full_readouts`].
     pub full_lanes: bool,
+    /// The chart's own images (S10-12), each filling its rect on the
+    /// untimed `screen` timer, so loading frames draw them too: the stage
+    /// file over [`CHART_STAGE`] and the back image over [`CHART_BACK`];
+    /// and the image unclipped over [`BACK_MARK`] while `chart.backbmp`
+    /// and over [`NO_BACK_MARK`] while `!chart.backbmp`. Its atlas keeps
+    /// a chart layer.
+    pub chart: bool,
 }
 
 /// The images of the full lane fixture's categories, each its own texel
@@ -278,6 +285,15 @@ pub const JUDGE_MARKER: [i32; 4] = [1_500, 100, 100, 100];
 pub const FINISH_MARKER: [i32; 4] = [1_700, 100, 100, 100];
 /// Where the miss marker draws.
 pub const MISS_MARKER: [i32; 4] = [1_700, 300, 100, 100];
+/// Where [`Look::chart`]'s stage file draws.
+pub const CHART_STAGE: [i32; 4] = [1_100, 800, 100, 100];
+/// Where its back image draws.
+pub const CHART_BACK: [i32; 4] = [1_300, 800, 100, 100];
+/// Where its mark draws while the back image is drawable (the source's
+/// option 195).
+pub const BACK_MARK: [i32; 4] = [1_500, 800, 100, 100];
+/// Where its mark draws while it is not, through a negation (194).
+pub const NO_BACK_MARK: [i32; 4] = [1_700, 800, 100, 100];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -298,6 +314,7 @@ impl Look {
             chart_text: false,
             progress: false,
             full_lanes: false,
+            chart: false,
         }
     }
 }
@@ -423,6 +440,36 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
             visible: Some(poor),
             ..image(MISS_MARKER, false)
         });
+    }
+    if look.chart {
+        use skin_model::chart_image::{ChartImage, ChartStretch};
+        let untimed = |e: ElementDef| ElementDef {
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..e
+        };
+        for (which, rect) in [
+            (ChartImage::Stage, CHART_STAGE),
+            (ChartImage::Back, CHART_BACK),
+        ] {
+            elements.push(untimed(ElementDef {
+                source: Source::ChartImage {
+                    which,
+                    filter: Filter::Nearest,
+                    stretch: ChartStretch::Fill,
+                },
+                ..image(rect, false)
+            }));
+        }
+        let scope = Scope::new(&PLAY);
+        for (src, rect) in [
+            ("chart.backbmp", BACK_MARK),
+            ("!chart.backbmp", NO_BACK_MARK),
+        ] {
+            elements.push(untimed(ElementDef {
+                visible: Some(compile(src, &scope, Ty::Bool).unwrap()),
+                ..image(rect, false)
+            }));
+        }
     }
     if look.finish {
         elements.push(ElementDef {

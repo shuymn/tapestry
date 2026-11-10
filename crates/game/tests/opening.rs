@@ -98,6 +98,72 @@ fn loaded(dir: &Path) -> Loaded {
     loaded_with(dir, None, None)
 }
 
+/// A record sink that saves nothing and answers every best read with
+/// `answer`, counting the reads.
+struct Lookups {
+    answer: game::BestLookup,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl game::RecordSink for Lookups {
+    fn save(&mut self, _: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Ok(game::RecordRef {
+            path: "saved.tprl".into(),
+        })
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answer.clone()
+    }
+}
+
+/// `chart` loaded under the tapestry preset with the player's `target`,
+/// its best reads answered with `answer` (no record sink for `None`); and
+/// the reads.
+fn scored(
+    dir: &Path,
+    chart: Chart,
+    answer: Option<game::BestLookup>,
+    target: game::ScoreTarget,
+) -> (Loaded, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let root = DataRoot::new(dir.to_owned());
+    let mut settings = tapestry_settings(&root);
+    settings.device.input_offset_us = OFFSET;
+    settings.device.display_offset_us = DISPLAY;
+    settings.player.target = target;
+    let chart_path = dir.join("play.chart");
+    std::fs::write(&chart_path, b"built in code").unwrap();
+    let reads = std::sync::Arc::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        records: answer.map(|answer| {
+            Box::new(Lookups {
+                answer,
+                reads: std::sync::Arc::clone(&reads),
+            }) as Box<dyn game::RecordSink>
+        }),
+        ..Parts::standard(&root, &settings.player)
+    };
+    let loaded = Loaded::load(root, settings, &chart_path, config(), parts).unwrap();
+    (loaded, reads)
+}
+
+/// A known best of `ex`.
+fn known(ex: u32) -> game::BestLookup {
+    game::BestLookup::Known(game::BestScore {
+        plays: 1,
+        ex: Some(ex),
+        bp: Some(0),
+        clear: None,
+    })
+}
+
+/// The reads a [`Lookups`] counted.
+fn reads(n: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    n.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// [`loaded`], practising the whole chart in repeated rounds.
 fn practising(dir: &Path) -> Loaded {
     let mut loaded = loaded(dir);
@@ -310,6 +376,9 @@ struct Loader {
     /// from the commit's answer on.
     commit_loadend: Option<Option<TimeUs>>,
     begun: Vec<game::PrepKey>,
+    /// The best and target of the attempt each preparation was begun
+    /// with: the last is the committed one's.
+    scores: Vec<game::ScoreBasis>,
     /// Each preparation's answer and the clock time it comes; then ready
     /// at once.
     answers: Vec<(i64, Preparation)>,
@@ -383,6 +452,7 @@ impl Loader {
             loadends: Vec::new(),
             commit_loadend: None,
             begun: Vec::new(),
+            scores: Vec::new(),
             answers: Vec::new(),
             polls: Vec::new(),
             poll_fails: false,
@@ -527,9 +597,10 @@ impl Rig for Loader {
         Ok(())
     }
 
-    fn begin_preparation(&mut self, _loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
+    fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
         self.step("begin");
         self.begun.push(key.clone());
+        self.scores.push(loaded.attempt().score);
         game::PrepHandle::new(key, self.begun.len() as u64)
     }
 
@@ -1578,10 +1649,22 @@ fn a_preparation_ready_before_the_minimum_ends_is_not_polled_again() {
 #[test]
 fn a_ready_preparation_survives_a_same_key_local_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let mut loaded = loaded(dir.path());
+    let (mut loaded, lookups) =
+        scored(dir.path(), chart(), Some(known(1)), game::ScoreTarget::Next);
     let mut rig = Loader::new(&loaded);
     rig.at_step.push(("audio", Happen::Ev(Ev::Tap(DISPLAY_UP))));
     run(&mut loaded, &mut rig).unwrap();
+    // The play's best is read once, before the preparation at load-ready,
+    // and the retried begin of the same play reads no more (stage 3,
+    // S10-10): two notes, `"next"` above 1 is rank 15, 3.
+    let basis = game::ScoreBasis {
+        best: 1,
+        best_known: true,
+        target: 3,
+    };
+    assert_eq!(reads(&lookups), 1);
+    assert_eq!(rig.scores, [basis]);
+    assert_eq!(loaded.attempt().score, basis);
     assert_eq!(rig.begun.len(), 1);
     assert_eq!(rig.polls, [(T0, 1)]);
     assert_eq!(rig.readied, [(1, 1), (1, 1)]);
@@ -1904,7 +1987,8 @@ fn a_stale_readiness_with_an_unchanged_key_ends_the_run_untried() {
 #[test]
 fn a_mixed_tuning_and_structural_stale_retries_through_the_wait() {
     let dir = tempfile::tempdir().unwrap();
-    let mut loaded = loaded(dir.path());
+    let (mut loaded, lookups) =
+        scored(dir.path(), chart(), Some(known(1)), game::ScoreTarget::Next);
     let mut rig = Loader::new(&loaded);
     rig.stale = vec![ScreenKey {
         device: 1,
@@ -1918,6 +2002,50 @@ fn a_mixed_tuning_and_structural_stale_retries_through_the_wait() {
     assert_eq!(rig.readied, [(1, 1), (1, 2)]);
     assert_eq!(rig.count("revalidate"), 1);
     assert_eq!(display_of(&rig, 1), DISPLAY + 1_000);
+    // One read for the play, the begin again after the wait and the
+    // preparation begun again included; both preparations carry it.
+    let basis = game::ScoreBasis {
+        best: 1,
+        best_known: true,
+        target: 3,
+    };
+    assert_eq!(reads(&lookups), 1);
+    assert_eq!(rig.scores, [basis, basis]);
+}
+
+/// The chart's first attempt is prepared at load-ready, before its play
+/// begins: the preparation the skin commits carries the play's best and
+/// target, read once, the preset and the screen unchanged so it is never
+/// begun again (stage 3, S10-10). 27 notes: a known best of 40 under
+/// `"next"` gives rank 21, 42; no library under `"max"` gives 54.
+#[test]
+fn the_preparation_at_load_ready_carries_the_plays_best_and_target() {
+    let notes = || {
+        let mut b = ChartBuilder::new(150_000);
+        for i in 0..27 {
+            b = b.tap(lane(1), TimeUs((1_000 + 100 * i) * MS));
+        }
+        b.build().unwrap()
+    };
+    let cases = [
+        (Some(known(40)), game::ScoreTarget::Next, (40, true, 42), 1),
+        (None, game::ScoreTarget::Max, (0, false, 54), 0),
+    ];
+    for (answer, target, (best, best_known, t), read) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut loaded, lookups) = scored(dir.path(), notes(), answer, target);
+        let mut rig = Loader::new(&loaded);
+        run(&mut loaded, &mut rig).unwrap();
+        let basis = game::ScoreBasis {
+            best,
+            best_known,
+            target: t,
+        };
+        assert_eq!(rig.begun.len(), 1, "{target:?}");
+        assert_eq!(rig.scores, [basis], "{target:?}");
+        assert_eq!(loaded.attempt().score, basis, "{target:?}");
+        assert_eq!(reads(&lookups), read, "{target:?}");
+    }
 }
 
 /// O-12: a round whose audio cannot be restored disposes of the

@@ -4,7 +4,9 @@
 //! [`crate::atlas`]) at its top left, which the shader reads by integer
 //! texel; a skin's pages follow it, each with its four supplied mip levels
 //! (docs/stage3.md R7), then the skin's text layer, if it has one, created
-//! zeroed and written by the text preparation. Without a skin's pages the
+//! zeroed and written by the text preparation, then its chart layer, if
+//! it has one, created zeroed and written by the chart images'
+//! publication (S10-12). Without a skin's pages the
 //! array is the built-in atlas alone, one 128-texel layer.
 //!
 //! Uploading is preparation work, never a frame's: the pages are checked
@@ -37,6 +39,8 @@ pub struct AtlasPages<'a> {
     pub pages: &'a [PageLevels<'a>],
     /// Whether a zeroed text layer follows the pages.
     pub text_layer: bool,
+    /// Whether a zeroed chart layer follows them and the text layer.
+    pub chart_layer: bool,
 }
 
 /// Why a skin's atlas was not uploaded. The atlas in use stays.
@@ -135,7 +139,8 @@ pub(crate) fn check_pages(
     let layers = u64::try_from(pages.pages.len())
         .unwrap_or(u64::MAX)
         .saturating_add(u64::from(RESERVED_LAYERS))
-        .saturating_add(u64::from(pages.text_layer));
+        .saturating_add(u64::from(pages.text_layer))
+        .saturating_add(u64::from(pages.chart_layer));
     // A sprite names its layer in 16 bits.
     let max_layers = limits.max_texture_array_layers.min(1 << 16);
     let Some(layer_count) = u32::try_from(layers).ok().filter(|&n| n <= max_layers) else {
@@ -175,6 +180,9 @@ pub(crate) struct AtlasTexture {
     levels: u32,
     /// The text layer, after the pages, if the array has one.
     text_layer: Option<u32>,
+    /// The chart layer, after the pages and the text layer, if the array
+    /// has one.
+    chart_layer: Option<u32>,
 }
 
 impl AtlasTexture {
@@ -202,16 +210,23 @@ impl AtlasTexture {
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
             }
         }
-        if pages.text_layer {
-            // One zero texel written to each level of the text layer: the
-            // device zeroes the rest of each level now, with the upload,
-            // and not at the first text written into it.
+        // The kept layers, after the pages: one zero texel written to each
+        // level of each, so the device zeroes the rest of each level now,
+        // with the upload, and not at the first text or image written into
+        // it.
+        let after = RESERVED_LAYERS.saturating_add(u32::try_from(pages.pages.len()).unwrap_or(0));
+        let text_layer = pages.text_layer.then_some(after);
+        let chart_layer = pages
+            .chart_layer
+            .then(|| after.saturating_add(u32::from(pages.text_layer)));
+        for layer in text_layer.into_iter().chain(chart_layer) {
             for level in 0..levels {
-                write(gpu.queue(), &texture, layers - 1, level, 1, &[0; 4]);
+                write(gpu.queue(), &texture, layer, level, 1, &[0; 4]);
             }
         }
         let mut atlas = Self::of(&texture, side, layers, levels);
-        atlas.text_layer = pages.text_layer.then(|| layers - 1);
+        atlas.text_layer = text_layer;
+        atlas.chart_layer = chart_layer;
         atlas
     }
 
@@ -228,6 +243,7 @@ impl AtlasTexture {
             layers,
             levels,
             text_layer: None,
+            chart_layer: None,
         }
     }
 
@@ -239,6 +255,16 @@ impl AtlasTexture {
     /// The text layer, if the array has one.
     pub(crate) const fn text_layer(&self) -> Option<u32> {
         self.text_layer
+    }
+
+    /// The chart layer, if the array has one.
+    pub(crate) const fn chart_layer(&self) -> Option<u32> {
+        self.chart_layer
+    }
+
+    /// The mip levels of every layer.
+    pub(crate) const fn levels(&self) -> u32 {
+        self.levels
     }
 
     /// The array's view, for the sprites' bind group.
@@ -279,7 +305,8 @@ impl AtlasTexture {
         let pages = self
             .layers
             .saturating_sub(RESERVED_LAYERS)
-            .saturating_sub(u32::from(self.text_layer.is_some()));
+            .saturating_sub(u32::from(self.text_layer.is_some()))
+            .saturating_sub(u32::from(self.chart_layer.is_some()));
         padded(ATLAS_SIZE) + u64::from(pages) * skin
     }
 }
@@ -348,6 +375,38 @@ fn write(
     );
 }
 
+/// Writes `size` texels of `bytes`, rows tightly packed, at `origin` of
+/// `layer`'s `level`: a chart image's level into its slot (S10-12). The
+/// write is queued, not yet submitted.
+pub(crate) fn write_region(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    (layer, level): (u32, u32),
+    [x, y]: [u32; 2],
+    [w, h]: [u32; 2],
+    bytes: &[u8],
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d { x, y, z: layer },
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use skin_model::MIP_LEVELS;
@@ -367,6 +426,7 @@ mod tests {
             side,
             pages: &all[..n],
             text_layer: false,
+            chart_layer: false,
         };
         // A side past a multiple of 128 is refused; 384 is not a power of
         // two but passes the side check, failing next on its bytes.
@@ -433,6 +493,7 @@ mod tests {
             side: 256,
             pages: &pages,
             text_layer: false,
+            chart_layer: false,
         };
         assert_eq!(check_pages(&ok, &limits()).unwrap(), 3);
         let bad_page: PageLevels<'_> = [&l0, &l1, &l2, &short];
@@ -441,6 +502,7 @@ mod tests {
             side: 256,
             pages: &pages,
             text_layer: false,
+            chart_layer: false,
         };
         assert!(matches!(
             check_pages(&bad, &limits()),
@@ -456,6 +518,7 @@ mod tests {
             side: 512,
             pages: &[],
             text_layer: false,
+            chart_layer: false,
         };
         assert_eq!(check_pages(&none, &limits()).unwrap(), 1);
     }

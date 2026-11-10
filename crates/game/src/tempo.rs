@@ -180,6 +180,13 @@ fn references(
     })
 }
 
+/// The whole chart's MAIN tempo, with the histogram bounded by `limit`
+/// bytes: what a loaded chart computes once for its play skins' tempo
+/// graphs, whatever section a practice round plays (stage 3, S10-10).
+pub(crate) fn whole_main(chart: &Chart, limit: usize) -> Result<Tempo, ReferenceError> {
+    main(chart, None, limit)
+}
+
 /// MAIN's tempo ([`AttemptTempo::prepare_within`]).
 fn main(chart: &Chart, section: Option<&Section>, limit: usize) -> Result<Tempo, ReferenceError> {
     let timeline = &chart.timeline;

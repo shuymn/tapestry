@@ -504,6 +504,77 @@ pub(crate) fn one_branch(shared: Branches) -> bool {
 mod tests {
     use super::*;
 
+    /// A chart image's stretch at placement (`skin_model::chart_image`)
+    /// meets a destination as an imported image's baked stretch does, for
+    /// every mode it keeps, wide and tall images, and boxes of every
+    /// aspect; 8 and 9 keep the same native size at placement.
+    #[test]
+    fn chart_image_stretches_agree_with_the_baked_ones() {
+        use skin_model::chart_image::ChartStretch;
+        let modes = [
+            (0, ChartStretch::Fill),
+            (1, ChartStretch::Inner),
+            (2, ChartStretch::Outer),
+            (4, ChartStretch::FitWidth),
+            (6, ChartStretch::FitHeight),
+        ];
+        // Model boxes, y down. A 2 × 1 or 1 × 2 image in the small boxes
+        // puts an edge on a half pixel, which both round half up.
+        let boxes = [
+            [100, 100, 400, 100],
+            [-30, 20, 100, 400],
+            [0, 0, 640, 480],
+            [5, 7, 333, 333],
+            [10, 10, 2, 2],
+            [11, 13, 3, 2],
+            // A square image in 7 × 8: the exact top is a half pixel that
+            // floating division misses.
+            [0, 0, 7, 8],
+        ];
+        let natives = [
+            [200, 100],
+            [100, 200],
+            [640, 480],
+            [1, 1],
+            [1_920, 1_080],
+            [2, 1],
+            [1, 2],
+            [25, 25],
+        ];
+        let height = i32::try_from(super::super::geom::HEIGHT).unwrap();
+        for (mode, chart) in modes {
+            for b in boxes {
+                for n in natives {
+                    // The importer bakes in the source's y up, then reflects
+                    // and rounds the edges into the model's integer rect.
+                    let [x, y, w, h] = b;
+                    let up = Rect {
+                        x: Q::int(x),
+                        y: Q::int(height - y - h),
+                        w: Q::int(w),
+                        h: Q::int(h),
+                    };
+                    let (baked, _) = stretch(Stretch::of(mode), up, n).unwrap();
+                    let baked = baked.model().unwrap().map(|v| v as f32);
+                    let (placed, native) = chart.place(b.map(|v| v as f32), n);
+                    assert_eq!(native, None);
+                    assert_eq!(placed, baked, "mode {mode} {b:?} {n:?}");
+                }
+            }
+        }
+        for n in natives {
+            let r = [0.0, 0.0, 10.0, 10.0];
+            assert_eq!(
+                ChartStretch::NoExpanding.place(r, n).1,
+                Stretch::of(8).native(n)
+            );
+            assert_eq!(
+                ChartStretch::NoResize.place(r, n).1,
+                Stretch::of(9).native(n)
+            );
+        }
+    }
+
     fn key(at: i64, x: i32) -> SrcKey {
         SrcKey {
             at,
