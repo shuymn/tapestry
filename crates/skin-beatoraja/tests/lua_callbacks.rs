@@ -426,7 +426,7 @@ fn other_text_shapes_follow_the_role() {
         "function() return ms.text(1) end",
         "function() local n = ms.number(110) return \"x\" end",
         "function() return ms.number(110) == 0 and \"a\" or \"b\" end",
-        "function() if ms.option(289) then return ms.text(10) else return ms.text(11) end end",
+        "function() if ms.option(271) then return ms.text(10) else return ms.text(11) end end",
         "function() local tx = ms.text(10)\n\
            if tx == \"\" then return tx else return \"x\" end end",
         "function() local a, b = ms.text(10), ms.text(11)\n\
