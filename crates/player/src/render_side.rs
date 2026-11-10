@@ -3929,11 +3929,11 @@ impl Run {
                 #[cfg(all(test, feature = "dev-tools"))]
                 Ok(RenderMsg::FramesProbe(reply)) => {
                     let (sl, sf, _) = self.select_frames.probe();
-                    let (rl, rf, before_wait) = self.result_frames.probe();
+                    let (rl, rf, charged) = self.result_frames.probe();
                     let _ = reply.send(crate::dev::FramesProbe {
                         select: (sl, sf.len()),
                         result: (rl, rf),
-                        before_wait,
+                        charged,
                     });
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
@@ -3963,7 +3963,7 @@ impl Run {
                 // done on lives (dev-tools: the whole frames).
                 #[cfg(feature = "dev-tools")]
                 if self.screen.is_some() {
-                    self.result_frames.before_wait(prepared.elapsed());
+                    self.result_frames.before_wait(prepared);
                 }
                 if self.screen.is_none() {
                     mode = Mode::Idle;

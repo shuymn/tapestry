@@ -1481,6 +1481,10 @@ pub struct ScreenFrame {
     pub visit: crate::screens::VisitSample,
     /// Whether it presented another view than the frame before (result).
     pub switch: bool,
+    /// When the earliest preparation before a wait charged to it began
+    /// and the latest ended (tests).
+    #[cfg(test)]
+    pub charged: Option<(Instant, Instant)>,
 }
 
 /// A select or result screen's lifetime as `tapestry measure select`
@@ -1632,6 +1636,13 @@ pub struct ScreenFrames {
     last_sync: Option<(i64, u32)>,
     presentation: Option<render::measure::Presentation>,
     before_wait: Duration,
+    /// When the earliest preparation before a wait not yet charged began
+    /// and the latest ended (tests).
+    #[cfg(test)]
+    pending: Option<(Instant, Instant)>,
+    /// What the last take of it held (tests).
+    #[cfg(test)]
+    taken: Option<(Instant, Instant)>,
 }
 
 impl Default for ScreenFrames {
@@ -1665,6 +1676,10 @@ impl ScreenFrames {
             last_sync: None,
             presentation: None,
             before_wait: Duration::ZERO,
+            #[cfg(test)]
+            pending: None,
+            #[cfg(test)]
+            taken: None,
         }
     }
 
@@ -1674,14 +1689,25 @@ impl ScreenFrames {
         self.lifetime
     }
 
-    /// Preparation done before a frame wait, charged to the next
-    /// recorded frame.
-    pub fn before_wait(&mut self, d: Duration) {
-        self.before_wait = self.before_wait.saturating_add(d);
+    /// Preparation done before a frame wait, from `since` to now, charged
+    /// to the next recorded frame.
+    pub fn before_wait(&mut self, since: Instant) {
+        let now = Instant::now();
+        self.before_wait = self
+            .before_wait
+            .saturating_add(now.saturating_duration_since(since));
+        #[cfg(test)]
+        {
+            self.pending = Some(self.pending.map_or((since, now), |(a, _)| (a, now)));
+        }
     }
 
     /// The preparation before the wait not yet charged, taken.
     pub fn take_before_wait(&mut self) -> Duration {
+        #[cfg(test)]
+        {
+            self.taken = self.pending.take();
+        }
         std::mem::take(&mut self.before_wait)
     }
 
@@ -1705,6 +1731,8 @@ impl ScreenFrames {
             spans,
             visit,
             switch,
+            #[cfg(test)]
+            charged: self.taken,
         };
         if self.frames.len() < self.frames.capacity() {
             self.frames.push(f);
@@ -1767,6 +1795,10 @@ impl ScreenFrames {
         self.last_sync = None;
         self.presentation = None;
         self.before_wait = Duration::ZERO;
+        #[cfg(test)]
+        {
+            self.pending = None;
+        }
     }
 
     fn print(&self, screen: &str, lifetime: u64) {
@@ -1905,18 +1937,20 @@ pub struct FramesProbe {
     pub select: (Option<u64>, usize),
     /// The result screen's lifetime held, and its frames' spans.
     pub result: (Option<u64>, Vec<Spans>),
-    /// The result's preparation before a wait not yet charged.
-    pub before_wait: Duration,
+    /// When the preparation before a wait charged to each of the result's
+    /// frames began and ended ([`ScreenFrame::charged`]).
+    pub charged: Vec<Option<(Instant, Instant)>>,
 }
 
 impl ScreenFrames {
-    /// What a test sees of it (tests).
+    /// What a test sees of it (tests): the lifetime held, and its frames'
+    /// spans and charges.
     #[cfg(test)]
-    pub fn probe(&self) -> (Option<u64>, Vec<Spans>, Duration) {
+    pub fn probe(&self) -> (Option<u64>, Vec<Spans>, Vec<Option<(Instant, Instant)>>) {
         (
             self.lifetime,
             self.frames.iter().map(|f| f.spans).collect(),
-            self.before_wait,
+            self.frames.iter().map(|f| f.charged).collect(),
         )
     }
 }

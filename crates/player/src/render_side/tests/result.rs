@@ -77,6 +77,8 @@ struct Faults {
     /// The next view prepared takes this long, ms (the whole frames'
     /// preparation before a wait).
     slow_prepare: std::sync::atomic::AtomicU64,
+    /// When the slow preparation's sleep began and ended.
+    slept: Mutex<Option<(Instant, Instant)>>,
     /// The slow preparation then arms `lose`: the frame committing that
     /// view fails as a lost device.
     lose_after_prepare: AtomicBool,
@@ -235,7 +237,9 @@ impl Screen for Recorded {
         }
         let slow = self.faults.slow_prepare.swap(0, Ordering::AcqRel);
         if slow > 0 {
+            let began = Instant::now();
             std::thread::sleep(Duration::from_millis(slow));
+            *self.faults.slept.lock().unwrap() = Some((began, Instant::now()));
             if self.faults.lose_after_prepare.swap(false, Ordering::AcqRel) {
                 self.faults.lose.store(true, Ordering::Release);
             }
@@ -2677,6 +2681,32 @@ fn the_build_mark_precedes_the_result_build() {
     }
 }
 
+/// What the whole frames of `lifetime` were charged with after the slow
+/// preparation was lost and the screen recovered: no frame's preparation
+/// before its wait overlaps the slow preparation's sleep, and a frame
+/// after the sleep (the recovery's) was charged. The charges are told
+/// apart by when they ran, not by how long they took.
+fn assert_slow_preparation_uncharged(rig: &Rig, lifetime: u64) {
+    let (began, ended) = rig
+        .faults
+        .slept
+        .lock()
+        .unwrap()
+        .expect("the slow preparation ran");
+    let probe = rig.link.frames_probe();
+    assert_eq!(probe.result.0, Some(lifetime));
+    assert_eq!(probe.charged.len(), probe.result.1.len());
+    let charged = || probe.charged.iter().flatten();
+    assert!(
+        charged().all(|&(from, to)| to < began || ended < from),
+        "a frame was charged with the lost preparation ({began:?}..{ended:?}): {probe:?}"
+    );
+    assert!(
+        charged().any(|&(from, _)| ended < from),
+        "no frame after the recovery was charged: {probe:?}"
+    );
+}
+
 /// The whole frames (dev-tools, the S7-07d gate): a view whose 80 ms
 /// preparation is followed by a lost device on its commit leaves none of
 /// that preparation to the frames after the recovery.
@@ -2706,13 +2736,7 @@ fn a_lost_attempts_preparation_is_not_charged_after_recovery() {
     rig.clear();
     rig.link.prepare().unwrap();
     assert!(rig.until(|d| skin_frame(d).is_some()));
-    let probe = rig.link.frames_probe();
-    assert_eq!(probe.result.0, Some(lifetime));
-    assert!(
-        probe.result.1.iter().all(|s| s.preparation < 80_000_000)
-            && probe.before_wait < Duration::from_millis(80),
-        "{probe:?}"
-    );
+    assert_slow_preparation_uncharged(&rig, lifetime);
     rig.link.exit();
 }
 
@@ -2745,13 +2769,7 @@ fn a_failed_preparation_is_not_charged_after_recovery() {
     rig.clear();
     rig.link.prepare().unwrap();
     assert!(rig.until(|d| skin_frame(d).is_some()));
-    let probe = rig.link.frames_probe();
-    assert_eq!(probe.result.0, Some(lifetime));
-    assert!(
-        probe.result.1.iter().all(|s| s.preparation < 80_000_000)
-            && probe.before_wait < Duration::from_millis(80),
-        "{probe:?}"
-    );
+    assert_slow_preparation_uncharged(&rig, lifetime);
     rig.link.exit();
 }
 
