@@ -9,14 +9,15 @@
 //!   final cancel and publishes in one critical section, so the
 //!   coordinator's lock never sees it as neither. Its thread may still run
 //!   after publication (unwinding).
-//! - **Ending is final.** Only a current subscriber withdraws a requested
-//!   cancel. An owned job's only subscriber is its owner's, whose
-//!   generation never becomes current again once stale, and no `begin`
-//!   joins an owned job (a same-key `begin` starts a job of its own and
-//!   takes the key), so no entry point (`begin`, `spawn_owned`,
-//!   `advance`, a promotion or demotion, a checkpoint, a wait or a read)
-//!   brings an ending owned job back. Keyed jobs keep their resubscription
-//!   (design.md "Load Pipeline", A→B→A).
+//! - **Ending is final, by construction.** The one place a requested
+//!   cancel is withdrawn, the cancel decision, never withdraws an owned
+//!   job's, whatever subscriber turns current (a later generation
+//!   included); a seen cancel is never withdrawn for any job. No `begin`
+//!   joins an owned job either (a same-key `begin` starts a job of its own
+//!   and takes the key), so its owner's stays its only subscriber. No entry
+//!   point (`begin`, `spawn_owned`, `advance`, a promotion or demotion, a
+//!   checkpoint, a wait or a read) brings an ending owned job back. Keyed
+//!   jobs keep their resubscription (design.md "Load Pipeline", A→B→A).
 //! - **Who answers for it.** The outcome is published with its owner then
 //!   ([`Owner`]) and whether a promotion of the live job made a waiter
 //!   responsible for it; nothing withdraws responsibility, a stopped wait

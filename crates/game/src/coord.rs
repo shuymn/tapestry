@@ -380,7 +380,9 @@ impl State {
             .any(|(_, s)| generations.get(s.scope.index()) == Some(&s.generation.0));
         job.cancel = match (job.cancel, current) {
             (Cancel::No, false) => Cancel::Requested,
-            (Cancel::Requested, true) => Cancel::No,
+            // An owned job's requested cancel is final: it ends cancelled
+            // whatever subscriber turns current afterwards.
+            (Cancel::Requested, true) if !job.owned => Cancel::No,
             (cancel, _) => cancel,
         };
     }
@@ -464,14 +466,15 @@ struct Shared {
     cuts: Mutex<Cuts>,
 }
 
-/// Where a test holds a job's end: between its computation and its
-/// finish, and inside the finish between the registry removal and the
-/// publication, the state lock held (tests).
+/// Where a test holds a job: as its admission begins, between its
+/// computation and its finish, and inside the finish between the registry
+/// removal and the publication, the state lock held (tests).
 #[cfg(test)]
 #[derive(Default)]
 struct Cuts {
     before_finish: Option<Arc<Gate>>,
     in_finish: Option<Arc<Gate>>,
+    admission: Option<Arc<Gate>>,
 }
 
 /// A point threads stop at until a test opens it (tests).
@@ -570,6 +573,19 @@ impl Coordinator {
                 cuts: Mutex::new(Cuts::default()),
             }),
         }
+    }
+
+    /// Holds each job from now on as its admission begins, before it reads
+    /// its cancel (tests).
+    #[cfg(test)]
+    pub(crate) fn cut_admission(&self) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        self.shared
+            .cuts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .admission = Some(Arc::clone(&gate));
+        gate
     }
 
     /// Holds each job's end from now on: before its finish, or inside it
@@ -1256,6 +1272,19 @@ impl Ctx<'_> {
     /// the class and takes the permit, so a job cancelled before it takes
     /// one never computes.
     fn admit(&self) -> bool {
+        #[cfg(test)]
+        {
+            let gate = self
+                .shared
+                .cuts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .admission
+                .clone();
+            if let Some(gate) = gate {
+                gate.pass();
+            }
+        }
         loop {
             if (self.stop)() {
                 self.shared.lock().terminate(self.id);

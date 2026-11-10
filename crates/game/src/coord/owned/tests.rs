@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::super::{
-    Caps, Class, Coordinator, Ctx, Failure, Gate, JobKey, JobKind, Observed, Outcome, Owner, Scope,
-    Spawner, Taken, catch,
+    Caps, Class, Coordinator, Ctx, Failure, Gate, Generation, JobKey, JobKind, Observed, Outcome,
+    Owner, Scope, Spawner, Subscriber, Taken, catch,
 };
 use super::{Handed, OwnedJob, Promotion, Settled, Waited, WorkerLeases};
 
@@ -1359,6 +1359,13 @@ fn a_payload_clone_may_query_the_coordinator() {
                 });
             }
         });
+        // The job's thread clones the published result on its way out:
+        // it holds no reference once it has ended.
+        let begun = Instant::now();
+        while !job.thread_finished() {
+            assert!(begun.elapsed() < *LONG, "the job's thread never ended");
+            thread::yield_now();
+        }
         let job = Arc::into_inner(job).expect("the probes hold no strong reference");
         let settled = job.settle(*LONG, &Instant::now, &mut || None::<()>);
         assert!(
@@ -1448,6 +1455,44 @@ fn an_ending_job_never_publishes_done() {
         handle.slot.record().map(|r| r.outcome.clone()),
         Some(Outcome::Cancelled)
     );
+}
+
+/// Y32: an owned job's requested cancel is never withdrawn, whatever
+/// subscriber turns current afterwards. Held before its admission reads
+/// the cancel: spawned for a generation ahead of the current one (so its
+/// cancel is requested at once), found `Ending`, then the scope advanced
+/// to that generation; let go, it ends `Cancelled`, its work never run.
+#[test]
+fn an_owned_jobs_requested_cancel_is_never_withdrawn() {
+    let _w = Watchdog::arm("an_owned_jobs_requested_cancel_is_never_withdrawn");
+    let coord = Coordinator::new(CAPS);
+    let cut = coord.cut_admission();
+    let ran = Arc::new(AtomicBool::new(false));
+    let r = Arc::clone(&ran);
+    let ahead = Subscriber {
+        scope: Scope::Choice,
+        generation: Generation(coord.current(Scope::Choice).0 + 1),
+    };
+    let job = coord
+        .spawn_owned(
+            Spawner::SYSTEM,
+            key("a"),
+            (Class::Foreground, false, Owner::Foreground),
+            ahead,
+            |_| {},
+            move |_| {
+                r.store(true, Ordering::SeqCst);
+                1_u32
+            },
+        )
+        .unwrap();
+    reach(&cut, "the admission");
+    assert_eq!(job.promote_unless_ended(), Promotion::Ending);
+    assert_eq!(coord.advance(Scope::Choice), ahead.generation);
+    assert_eq!(job.promote_unless_ended(), Promotion::Ending);
+    cut.open();
+    assert_eq!(outcome(&job).outcome, Outcome::Cancelled);
+    assert!(!ran.load(Ordering::SeqCst), "the work ran");
 }
 
 /// A result whose drop asks the coordinator: a drop run under its lock
