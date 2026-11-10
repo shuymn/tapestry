@@ -992,9 +992,12 @@ impl<T> Runner<T> {
     where
         T: Clone,
     {
-        let outcome = self.compute(stop, on_class, work);
-        self.finish(outcome.clone());
-        outcome
+        let computed = self.compute(stop, on_class, work);
+        // The published outcome, cloned after every lock is let go.
+        match self.finish(computed) {
+            Final::Kept(outcome) => outcome,
+            Final::Published(record) => record.outcome.clone(),
+        }
     }
 
     fn compute(
@@ -1002,7 +1005,7 @@ impl<T> Runner<T> {
         stop: &(dyn Fn() -> bool + Sync),
         on_class: &(dyn Fn(Class) + Sync),
         work: impl FnOnce(&Ctx<'_>) -> T,
-    ) -> Outcome<T> {
+    ) -> Computed<T> {
         let ctx = Ctx {
             shared: &self.coord.shared,
             id: self.id,
@@ -1023,21 +1026,21 @@ impl<T> Runner<T> {
             .take();
         // Its permit is given back before the outcome is published.
         drop(ctx);
-        let cancelled = self.coord.shared.lock().observe(self.id);
         match (computed, fault) {
-            // A panic comes before an observed cancel.
-            (Err(panic), _) | (Ok(_), Some(panic)) => Outcome::Panicked(panic),
-            (Ok(None), None) => Outcome::Cancelled,
-            (Ok(Some(_)), None) if cancelled => Outcome::Cancelled,
-            (Ok(Some(value)), None) => Outcome::Done(value),
+            // A panic comes before any cancel.
+            (Err(panic), _) | (Ok(_), Some(panic)) => Computed::Panicked(panic),
+            (Ok(None), None) => Computed::Stopped,
+            (Ok(Some(value)), None) => Computed::Value(value),
         }
     }
 
     /// Out of the registry and published in one critical section, so an
     /// observer under the lock finds the job live or published, never
-    /// neither; a later begin of the key starts anew. Only prepared values
-    /// move under the lock, and the removed entry drops after it.
-    fn finish(&mut self, outcome: Outcome<T>) {
+    /// neither; a later begin of the key starts anew. The final cancel is
+    /// read in the same section, so a job an observer found ending never
+    /// publishes a result. Only prepared values move under the lock; the
+    /// removed entry and a discarded result drop after it.
+    fn finish(&mut self, computed: Computed<T>) -> Final<T> {
         self.done = true;
         let id = self.id;
         #[cfg(test)]
@@ -1059,35 +1062,65 @@ impl<T> Runner<T> {
             gate.pass();
         }
         let mut state = self.coord.shared.lock();
+        let cancelled = state.observe(id);
         let removed = state.finish(id);
         let (owner, responsible) = removed
             .as_ref()
             .map_or((Owner::of(self.base), false), |j| (j.owner, j.responsible));
+        let (outcome, discarded) = match computed {
+            Computed::Panicked(panic) => (Outcome::Panicked(panic), None),
+            Computed::Stopped => (Outcome::Cancelled, None),
+            Computed::Value(value) if cancelled => (Outcome::Cancelled, Some(value)),
+            Computed::Value(value) => (Outcome::Done(value), None),
+        };
         #[cfg(test)]
         if let Some(gate) = cut(true) {
             gate.pass();
         }
-        if let Some(slot) = &self.slot {
-            let record = Arc::new(Observed {
-                outcome,
-                owner,
-                responsible,
-            });
-            *slot
-                .published
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(record);
-        }
+        let left = match &self.slot {
+            Some(slot) => {
+                let record = Arc::new(Observed {
+                    outcome,
+                    owner,
+                    responsible,
+                });
+                *slot
+                    .published
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&record));
+                Final::Published(record)
+            }
+            None => Final::Kept(outcome),
+        };
         drop(state);
         drop(removed);
+        drop(discarded);
         self.coord.shared.changed.notify_all();
+        left
     }
+}
+
+/// What a job's computation came to, before its final cancel is read.
+enum Computed<T> {
+    /// It, or its hook, panicked: before any cancel.
+    Panicked(JobPanic),
+    /// Its admission or a checkpoint stopped it.
+    Stopped,
+    /// Its work returned.
+    Value(T),
+}
+
+/// The outcome a finish settled on: published in the slot, or kept for
+/// a job without one.
+enum Final<T> {
+    Published(Arc<Observed<T>>),
+    Kept(Outcome<T>),
 }
 
 impl<T> Drop for Runner<T> {
     fn drop(&mut self) {
         if !self.done {
-            self.finish(Outcome::Cancelled);
+            let _ = self.finish(Computed::Stopped);
         }
     }
 }

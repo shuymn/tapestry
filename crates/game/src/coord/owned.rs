@@ -24,6 +24,16 @@
 //!   `Done` does not prove its thread ended cleanly.
 //! - **Dropping** an unsettled job never blocks: it stops it and detaches
 //!   the thread, a fallback that proves nothing about what the job held.
+//!
+//! **What the bound covers.** It is there so that work that hangs (a
+//! decoder stuck on a crafted file, design.md "Threat Model") cannot
+//! freeze the thread that settles it: the work and everything it calls
+//! are covered. The result type's `Clone` and `Drop`, and the job
+//! thread's own exit after its work (the hook's captures dropping, its
+//! thread-local destructors, which a join waits for even once the thread
+//! reports finished) are first-party code that does not block: a precondition
+//! of [`Coordinator::spawn_owned`], not something a settle can bound. An
+//! abandonment clones no result.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -107,8 +117,8 @@ pub enum Settled<T, C> {
     },
     /// The bound passed after a terminal cause: its thread is detached.
     Abandoned {
-        /// What it had published by then.
-        observed: Option<Observed<T>>,
+        /// What it had published by then, not cloned.
+        observed: Option<Arc<Observed<T>>>,
         /// The terminal cause.
         cause: C,
     },
@@ -127,6 +137,11 @@ impl Coordinator {
     /// `promoted`, answered for by `owner`, for `subscriber`. `on_class`
     /// is called on the job's thread at each change of the class it
     /// computes in; it drops after the job publishes.
+    ///
+    /// Precondition (module doc, what the bound covers): `T`'s `Clone` and
+    /// `Drop`, `on_class`'s captures' `Drop` and the thread-local
+    /// destructors the job's thread runs at its exit do not block. `work`
+    /// may.
     ///
     /// # Errors
     ///
@@ -340,12 +355,20 @@ impl<T: Clone> OwnedJob<T> {
             {
                 drop(self.thread.take());
                 return Settled::Abandoned {
-                    observed: self.poll(),
+                    observed: self.slot.record(),
                     cause,
                 };
             }
             thread::park_timeout(SETTLE_SLICE);
         }
+    }
+}
+
+impl<T> OwnedJob<T> {
+    /// Whether its thread has ended, as the settle would see it (tests).
+    #[cfg(test)]
+    pub(crate) fn thread_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 }
 

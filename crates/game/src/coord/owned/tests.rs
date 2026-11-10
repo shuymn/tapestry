@@ -453,6 +453,63 @@ fn promotion_and_demotion_move_at_the_owners_checkpoint() {
     );
 }
 
+/// YI4: while the hook runs on the job's thread for a promotion (held
+/// there, the coordinator's lock let go), the job is demoted and promoted
+/// again and then demoted: the hook's run neither blocks those requests
+/// nor is undone by them, and the next checkpoint follows the last one.
+#[test]
+fn a_hook_running_while_promoted_and_demoted_follows_the_last_request() {
+    let _w = Watchdog::arm("a_hook_running_while_promoted_and_demoted_follows_the_last_request");
+    let coord = Coordinator::new(CAPS);
+    let in_hook = gate();
+    let h = Arc::clone(&in_hook);
+    let (step_tx, step_rx) = mpsc::channel::<()>();
+    let (class_tx, class_rx) = mpsc::channel();
+    let job = coord
+        .spawn_owned(
+            Spawner::SYSTEM,
+            key("a"),
+            (Class::Speculative, false, Owner::Speculative),
+            coord.subscriber(Scope::Choice),
+            move |c| {
+                if c == Class::Foreground {
+                    h.pass();
+                }
+            },
+            move |ctx| {
+                class_tx.send(ctx.class()).unwrap();
+                while step_rx.recv().is_ok() {
+                    let _ = ctx.checkpoint();
+                    class_tx.send(ctx.class()).unwrap();
+                }
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        class_rx.recv_timeout(*LONG).unwrap(),
+        Some(Class::Speculative)
+    );
+    assert_eq!(job.promote_unless_ended(), Promotion::Live);
+    step_tx.send(()).unwrap();
+    reach(&in_hook, "the hook");
+    job.demote();
+    assert_eq!(job.promote_unless_ended(), Promotion::Live);
+    job.demote();
+    in_hook.open();
+    assert_eq!(
+        class_rx.recv_timeout(*LONG).unwrap(),
+        Some(Class::Foreground)
+    );
+    step_tx.send(()).unwrap();
+    assert_eq!(
+        class_rx.recv_timeout(*LONG).unwrap(),
+        Some(Class::Speculative)
+    );
+    drop(step_tx);
+    let o = outcome(&job);
+    assert_eq!((o.outcome, o.responsible), (Outcome::Done(()), true));
+}
+
 /// A speculative job that waits at `hold`, then passes a checkpoint and
 /// returns 7, or 0 when that checkpoint says stop.
 fn checked_after(coord: &Coordinator, name: &str, hold: &Arc<Gate>) -> OwnedJob<u32> {
@@ -921,7 +978,7 @@ fn a_terminal_while_the_thread_unwinds_abandons_at_the_bound() {
         panic!("not abandoned: {settled:?}");
     };
     assert_eq!(
-        (observed.map(|o| o.outcome), cause),
+        (observed.map(|o| o.outcome.clone()), cause),
         (Some(Outcome::Done(1)), "closed")
     );
     hold.open();
@@ -1216,54 +1273,131 @@ fn a_working_extra_keeps_its_permit_until_it_retires() {
     assert_eq!(outcome(&job).outcome, Outcome::Done((true, 2, 1)));
 }
 
-/// A result whose clone asks the coordinator, as a result type may.
-struct Asking(Coordinator);
+thread_local! {
+    /// The clone of an `Asking` running on this thread: a nested clone
+    /// asks nothing more.
+    static ASKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Reads the slot an `Asking` result was published in.
+type Probe = Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>;
+
+/// A result whose clone asks the coordinator and reads its own slot again,
+/// as a result type may: a clone run under the registry's or the slot's
+/// lock deadlocks.
+struct Asking(Coordinator, Probe);
 
 impl Clone for Asking {
     fn clone(&self) -> Self {
-        let _ = self.0.current(Scope::Choice);
-        let _ = self.0.held(Class::Foreground);
-        Self(self.0.clone())
+        if !ASKING.with(std::cell::Cell::get) {
+            ASKING.with(|a| a.set(true));
+            let _ = self.0.current(Scope::Choice);
+            let _ = self.0.held(Class::Foreground);
+            if let Some(probe) = self.1.get() {
+                probe();
+            }
+            ASKING.with(|a| a.set(false));
+        }
+        Self(self.0.clone(), Arc::clone(&self.1))
     }
 }
 
-/// Y29.
+/// Y29: run on its own thread, so a deadlock fails this test by name.
 #[test]
 fn a_payload_clone_may_query_the_coordinator() {
     let _w = Watchdog::arm("a_payload_clone_may_query_the_coordinator");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let coord = Coordinator::new(CAPS);
+        let (owned_probe, keyed_probe): (Probe, Probe) = Default::default();
+        let (c, p) = (coord.clone(), Arc::clone(&owned_probe));
+        let job = Arc::new(spawn(
+            &coord,
+            "a",
+            Class::Foreground,
+            false,
+            Owner::Foreground,
+            move |_| Asking(c, p),
+        ));
+        let again = Arc::clone(&job);
+        let _ = owned_probe.set(Box::new(move || {
+            let _ = again.poll();
+        }));
+        let _ = outcome(&job);
+        let (handle, runner) =
+            coord.begin::<Asking>(key("b"), Class::Foreground, coord.subscriber(Scope::Choice));
+        let handle = Arc::new(handle);
+        let (c, p) = (coord.clone(), Arc::clone(&keyed_probe));
+        let _ = runner
+            .unwrap()
+            .run(&|| false, &|_| {}, move |_| Asking(c, p));
+        let (c, h) = (coord.clone(), Arc::clone(&handle));
+        let _ = keyed_probe.set(Box::new(move || {
+            let _ = c.take(&h);
+        }));
+        thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..50 {
+                        assert!(job.poll().is_some());
+                        assert!(matches!(
+                            job.promote_unless_ended(),
+                            Promotion::Published(_)
+                        ));
+                        assert!(matches!(
+                            job.to_owner(Owner::Speculative),
+                            Handed::Published(_)
+                        ));
+                        assert!(matches!(coord.take(&handle), Taken::Ready(_)));
+                    }
+                });
+            }
+        });
+        let _ = tx.send(());
+    });
+    assert!(rx.recv_timeout(*LONG).is_ok(), "a payload clone deadlocked");
+}
+
+/// An `Ending` job's computed result is not published: the final cancel
+/// is read in the same critical section as the publication. A job whose
+/// work returned, held before its finish; the choice advances; it is
+/// found ending; let go, it publishes `Cancelled`. The same for a keyed
+/// job, whose `run` returns what was published.
+#[test]
+fn an_ending_job_never_publishes_done() {
+    let _w = Watchdog::arm("an_ending_job_never_publishes_done");
     let coord = Coordinator::new(CAPS);
-    let c = coord.clone();
+    let cut = coord.cut(false);
     let job = spawn(
         &coord,
         "a",
         Class::Foreground,
         false,
         Owner::Foreground,
-        move |_| Asking(c),
+        |_| 1_u32,
     );
-    let _ = outcome(&job);
+    reach(&cut, "the finish");
+    let _ = coord.advance(Scope::Choice);
+    assert_eq!(job.promote_unless_ended(), Promotion::Ending);
+    cut.open();
+    assert_eq!(outcome(&job).outcome, Outcome::Cancelled);
+
+    let coord = Coordinator::new(CAPS);
+    let cut = coord.cut(false);
     let (handle, runner) =
-        coord.begin::<Asking>(key("b"), Class::Foreground, coord.subscriber(Scope::Choice));
-    let c = coord.clone();
-    let _ = runner.unwrap().run(&|| false, &|_| {}, move |_| Asking(c));
-    thread::scope(|s| {
-        for _ in 0..2 {
-            s.spawn(|| {
-                for _ in 0..50 {
-                    assert!(job.poll().is_some());
-                    assert!(matches!(
-                        job.promote_unless_ended(),
-                        Promotion::Published(_)
-                    ));
-                    assert!(matches!(
-                        job.to_owner(Owner::Speculative),
-                        Handed::Published(_)
-                    ));
-                    assert!(matches!(coord.take(&handle), Taken::Ready(_)));
-                }
-            });
-        }
-    });
+        coord.begin::<u32>(key("b"), Class::Foreground, coord.subscriber(Scope::Choice));
+    let runner = runner.unwrap();
+    let ran = thread::spawn(move || runner.run(&|| false, &|_| {}, |_| 2));
+    reach(&cut, "the keyed finish");
+    let _ = coord.advance(Scope::Choice);
+    cut.open();
+    assert_eq!(ran.join().unwrap(), Outcome::Cancelled);
+    // The handle's generation is superseded: what was published is read
+    // through the slot directly.
+    assert_eq!(
+        handle.slot.record().map(|r| r.outcome.clone()),
+        Some(Outcome::Cancelled)
+    );
 }
 
 /// YI1.
@@ -1353,7 +1487,8 @@ fn a_stop_with_a_published_result_keeps_it() {
     assert_eq!(job.poll().map(|o| o.outcome), Some(Outcome::Done(1)));
 }
 
-/// YI8: the cause arrives as the thread is joined.
+/// YI8: the thread has ended before the settle begins, so the one look
+/// at the terminal is the one after the join, and its cause is kept.
 #[test]
 fn a_cause_arriving_at_the_join_is_kept() {
     let _w = Watchdog::arm("a_cause_arriving_at_the_join_is_kept");
@@ -1367,9 +1502,16 @@ fn a_cause_arriving_at_the_join_is_kept() {
         |_| 1_u32,
     );
     let _ = outcome(&job);
-    // The thread ends right after it published: within the bound, it is
-    // joined, and the cause given meanwhile or at the join is kept.
-    let settled = job.settle(*LONG, &Instant::now, &mut || Some("late"));
+    let begun = Instant::now();
+    while !job.thread_finished() {
+        assert!(begun.elapsed() < *LONG, "the job's thread never ended");
+        thread::yield_now();
+    }
+    let mut looks = 0;
+    let settled = job.settle(Duration::ZERO, &Instant::now, &mut || {
+        looks += 1;
+        Some("late")
+    });
     assert!(
         matches!(
             settled,
@@ -1380,6 +1522,7 @@ fn a_cause_arriving_at_the_join_is_kept() {
         ),
         "{settled:?}"
     );
+    assert_eq!(looks, 1, "the cause came from the look after the join");
 }
 
 /// YI9: a replacement begun while the old job settles in CO; the old
