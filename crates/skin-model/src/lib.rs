@@ -169,13 +169,14 @@ pub use place::{
     RegionPlacement, TURNTABLE_UNITS_PER_DEGREE,
 };
 pub use play::loading::{
-    Loading, LoadingField, LoadingFrame, LoadingGauge, LoadingTimer, loading_field, loading_timer,
+    Loading, LoadingField, LoadingFrame, LoadingGauge, LoadingTimer, loading_field, loading_rate,
+    loading_timer,
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
     COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade,
-    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX,
-    field, lane_timer, timer,
+    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
+    RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
 };
 #[cfg(feature = "dev-tools")]
 pub use play::timers::score_fields;
@@ -212,8 +213,8 @@ pub use selection::{
 };
 pub use skin::{
     DecisionDefs, ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
-    MAX_WIDGET_QUADS, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef, Source,
-    TimerRef, WidgetDefs,
+    MAX_WIDGET_QUADS, PlayDefs, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef,
+    Source, TimerRef, WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
@@ -242,7 +243,7 @@ pub use widget::lanes::{
     LanesError, NoteOrder, Side, SourceLanes,
 };
 pub use widget::ratio_bar::{
-    RatioBarDef, RatioBarError, RatioForm, RatioSource, SLIDER_STEPS, SliderCommand,
+    RatioBarDef, RatioBarError, RatioForm, RatioSource, SLIDER_STEPS, ScoreRate, SliderCommand,
     SliderDirection,
 };
 pub use widget::scroll::{Gain, Scale};
