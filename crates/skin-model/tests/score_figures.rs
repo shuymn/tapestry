@@ -388,6 +388,10 @@ fn an_unavailable_best_shows_as_the_empty_score() {
     for i in 0..6 {
         fx.bar(i, Some((0, 1)));
     }
+    // Nor does a chart without targets rank, even once updated.
+    fx.frame(900, tally(0, 0, 0, 1));
+    assert!(fx.figures().current.is_empty());
+    assert!(fx.figures().whole.is_empty());
 }
 
 /// 200-207 hold the one band of the rate over the judged targets once
