@@ -404,6 +404,10 @@ pub struct Harness {
     pub notes: NoteFacts,
     /// The lane input each frame gives.
     pub input: eval::InputFacts,
+    /// The judgment offsets each frame gives: the slots and the count
+    /// ([`Harness::record`]).
+    pub ring: [i32; skin_model::OFFSET_SLOTS],
+    pub ring_count: u32,
 }
 
 impl Harness {
@@ -431,7 +435,23 @@ impl Harness {
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
+            ring: [0; skin_model::OFFSET_SLOTS],
+            ring_count: 0,
         }
+    }
+
+    /// Records `ms` in the ring the frames give, as the play view's ring
+    /// records a judgment's offset.
+    pub fn record(&mut self, ms: i32) {
+        let slot = usize::try_from(self.ring_count).unwrap() % skin_model::OFFSET_SLOTS;
+        self.ring[slot] = ms;
+        self.ring_count += 1;
+    }
+
+    /// Clears the ring, as a rearm does.
+    pub fn clear_ring(&mut self) {
+        self.ring = [0; skin_model::OFFSET_SLOTS];
+        self.ring_count = 0;
     }
 
     /// An empty skin over `chart`.
@@ -460,7 +480,10 @@ impl Harness {
             gauge: self.gauge,
             effects,
             notes: &self.notes,
-            offsets: skin_model::Offsets::NONE,
+            offsets: skin_model::Offsets {
+                slots: &self.ring,
+                count: self.ring_count,
+            },
             input: &self.input,
             complete: self.complete,
             target: self.target,

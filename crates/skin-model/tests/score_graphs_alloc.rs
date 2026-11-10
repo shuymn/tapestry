@@ -4,7 +4,12 @@
 //! score bars in both orientations, every score number at the most cells
 //! a strip takes, the sixteen rank flags and both pass timers, over the
 //! frames before the first judgment, after an empty POOR, mid-play, at
-//! the end, after a rearm and in a second practice round.
+//! the end, after a rearm and in a second practice round. Then skins B to
+//! D and a one-hour chart's notes graph over the same frames: a BPM graph
+//! at 2 048 columns, every column at its four runs; a timing visualizer at
+//! jw 1 000 beside a hit-error visualizer 4 096 texels wide over a wrapped
+//! ring; and a notes graph, a BPM graph, both visualizers and the score
+//! bars together within the budget.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -19,13 +24,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bms_model::Tempo;
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use eval::{Section, Tally};
 use rules::PerJudgment;
 use skin_model::{
-    Align, Atlas, Attempt, Continuation, ElementDef, GlyphSet, MAX_CELLS, Pad, PlayContext,
-    PlayDefs, PlayScore, RatioBarDef, RatioForm, RatioSource, ScoreBasis, ScoreRate, Skin, Source,
-    TimerRef, Variant, WidgetDefs, timer,
+    Align, Atlas, Attempt, BpmColors, BpmGraphDef, Continuation, ElementDef, EmaMode, GlyphSet,
+    HitErrorDef, MAX_CELLS, Pad, PlayContext, PlayDefs, PlayScore, RatioBarDef, RatioForm,
+    RatioSource, Rgba8, ScoreBasis, ScoreRate, Skin, Source, TimerRef, TimingVisualizerDef,
+    Variant, WidgetDefs, timer,
 };
 
 use play_support::{GAUGES, Harness, MS, def, full, lane};
@@ -469,4 +476,365 @@ fn score_frames_do_not_allocate() {
         },
         "second round, mid-play",
     );
+    skin_b();
+    skin_c();
+    skin_d();
+    one_hour();
+}
+
+// ---------------------------------------------------------------------
+// Skins B to D and the one-hour notes graph: the play graphs and
+// visualizers, each at its cap.
+
+/// An element on `screen` drawing `source` over `r`.
+fn screen_el(source: Source, r: [i32; 4]) -> ElementDef {
+    graph_support::source_element(source, r, 255, timer::SCREEN)
+}
+
+/// A play skin over the widget sheet (image 0 white) of `elements` and
+/// `defs`.
+fn graph_skin(elements: Vec<ElementDef>, defs: PlayDefs) -> Skin {
+    Skin::new_play(def(Vec::new(), sheet(), elements), defs).unwrap()
+}
+
+fn tempo(bpm: u128) -> Tempo {
+    Tempo::from_units(bpm * Tempo::UNITS_PER_BPM).unwrap()
+}
+
+/// What a graph skin's frame shows, checked after every frame.
+type Check<'a> = &'a dyn Fn(&Harness, &Atlas, &str);
+
+/// Builds `skin`'s frames over `chart` with `score` at zero allocations,
+/// checking each with `check`: during READY, after an empty POOR, mid-play
+/// with three offsets recorded, at the end with 130 recorded (the ring
+/// wrapped), after a rearm, and in a second practice round's READY and its
+/// mid-play.
+fn graph_frames(name: &str, skin: Skin, chart: &Chart, score: PlayScore<'_>, check: Check<'_>) {
+    let atlas = skin
+        .sheet()
+        .atlas(Variant::Lo, graph_support::LIMITS, &|| false)
+        .unwrap();
+    let ctx = PlayContext {
+        score,
+        ..full(1_000)
+    };
+    let mut h = Harness::new(skin, chart, &ctx);
+    h.uvs = atlas.uvs().clone();
+    let label = |stage: &str| format!("{name}: {stage}");
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0, "{}", label("ready"));
+    check(&h, &atlas, &label("ready"));
+    assert_eq!(frame(&mut h, 100, tally(0, 0, 1)), 0);
+    check(&h, &atlas, &label("empty POOR"));
+    for v in [12, -30, 7] {
+        h.record(v);
+    }
+    assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
+    check(&h, &atlas, &label("mid-play"));
+    for k in 0..127 {
+        h.record((k * 17 % 300) - 150);
+    }
+    assert_eq!(frame(&mut h, 3_000, tally(7, 0, 0)), 0);
+    check(&h, &atlas, &label("end"));
+    h.play.rearm();
+    h.clear_ring();
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0);
+    check(&h, &atlas, &label("rearm"));
+    let section = Section {
+        start: TimeUs(900 * MS),
+        end: TimeUs(2_000 * MS),
+        lead_in: TimeUs(500 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score,
+        ..full(0)
+    };
+    let mut round = h.skin.prepare(chart, &practice).unwrap();
+    std::mem::swap(&mut h.play, &mut round);
+    assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
+    let carried = skin_model::settled(&tally(2, 1, 0), 7, false);
+    let mut next = h
+        .skin
+        .prepare_carried(
+            chart,
+            &practice,
+            Continuation::Carried {
+                score: carried,
+                bank: Some(h.play.bank()),
+            },
+        )
+        .unwrap();
+    std::mem::swap(&mut h.play, &mut next);
+    h.clear_ring();
+    assert_eq!(frame(&mut h, 400, tally(0, 0, 0)), 0);
+    check(&h, &atlas, &label("second round, READY"));
+    h.record(20);
+    assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
+    check(&h, &atlas, &label("second round, mid-play"));
+}
+
+/// The quads whose left edge is canvas `x`.
+fn at_x(h: &Harness, x: f32) -> usize {
+    h.batch.quads().iter().filter(|q| q.rect[0] == x).count()
+}
+
+/// Skin B: a BPM graph at 2 048 columns whose every column holds more
+/// than four runs, so draws exactly four. The tempo cycles through 75,
+/// 150, 300, 600 and 1 200 every 100 µs up to 2 s; the last note is at
+/// 1 s, so `last` is `1 000 + 1 000`: about a column a ms, each holding
+/// ten rows' strokes, every tempo among them, and the rows reach
+/// every column.
+fn skin_b() {
+    let cycle = [75_000, 150_000, 300_000, 600_000, 1_200_000];
+    let mut b = ChartBuilder::new(150_000);
+    for k in 1..20_000_i64 {
+        let bpm = cycle[usize::try_from(k).unwrap() % cycle.len()];
+        b = b.bpm(TimeUs(100 * k), bpm);
+    }
+    b = b
+        .tap(lane(1), TimeUs(100 * MS))
+        .tap(lane(1), TimeUs(1_000 * MS));
+    let mut chart = b.build().unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    let score = PlayScore {
+        profile: Some(&profile),
+        main: Some(tempo(150)),
+        ..PlayScore::NONE
+    };
+    let skin = graph_skin(
+        vec![screen_el(Source::BpmGraph(0), [0, 0, 2_048, 200])],
+        PlayDefs {
+            bpm_graphs: vec![BpmGraphDef {
+                delay: TimeUs(0),
+                line_width: 2,
+                colors: BpmColors::DEFAULT,
+                solid: 0,
+            }],
+            ..PlayDefs::default()
+        },
+    );
+    let check = |h: &Harness, _: &Atlas, at: &str| {
+        let low: Vec<i32> = (0..2_048)
+            .filter(|&c| at_x(h, c as f32) != 4)
+            .take(20)
+            .collect();
+        assert!(low.is_empty(), "{at}: {low:?}");
+        assert_eq!(h.batch.quads().len(), 4 * 2_048, "{at}");
+        for x in [0.0, 1_024.0, 2_047.0] {
+            assert_eq!(at_x(h, x), 4, "{at}: column {x}");
+        }
+    };
+    graph_frames("B", skin, &chart, score, &check);
+}
+
+/// Skin C: a timing visualizer at jw 1 000 and a hit-error visualizer
+/// 4 096 texels wide over a 100-line window with 4-texel lines and both
+/// average marks.
+fn skin_c() {
+    let chart = chart();
+    let areas = [[-20, 20], [-60, 60], [-100, 100], [-150, 150], [-200, 200]];
+    let score = PlayScore {
+        areas: Some(areas),
+        ..PlayScore::NONE
+    };
+    let white = Rgba8::rgb(0xff_ffff, 0xff);
+    let tv = TimingVisualizerDef {
+        judge_width: 1_000,
+        width: 2_001,
+        line_width: 1,
+        line: Rgba8::rgb(0x00_ffff, 0xff),
+        center: white,
+        bands: [white; 5],
+        decay: true,
+        solid: 0,
+    };
+    let he = HitErrorDef {
+        width: 4_096,
+        judge_width: 1_000,
+        line_width: 4,
+        window: 100,
+        lines: true,
+        band_colors: true,
+        ema_mode: EmaMode::Both,
+        alpha: 0.1,
+        line: white,
+        center: white,
+        ema: Rgba8::rgb(0x00_ff00, 0xff),
+        bands: [Rgba8::rgb(0xff_0000, 0xff); 5],
+        decay: true,
+        solid: 0,
+    };
+    assert!(tv.quads() + he.quads() <= skin_model::MAX_WIDGET_QUADS);
+    let skin = graph_skin(
+        vec![
+            screen_el(Source::TimingVisualizer(0), [0, 0, 2_001, 20]),
+            screen_el(Source::HitErrorVisualizer(0), [0, 100, 4_096, 200]),
+        ],
+        PlayDefs {
+            timing_visualizers: vec![tv],
+            hit_errors: vec![he],
+            ..PlayDefs::default()
+        },
+    );
+    let check = |h: &Harness, atlas: &Atlas, at: &str| {
+        let n = h.ring_count.min(100);
+        // The band of the timing visualizer: its first quad starts at 0.
+        assert!(at_x(h, 0.0) >= 1, "{at}");
+        // A line per offset in range (all are: within ±1 000 ms).
+        let lines = h
+            .batch
+            .quads()
+            .iter()
+            .filter(|q| {
+                q.rect[1] < 20.0 && q.rect[2] == 1.0 && q.color[2] == 1.0 && q.color[0] == 0.0
+            })
+            .count();
+        assert_eq!(lines, usize::try_from(n).unwrap(), "{at}");
+        // The hit-error centre line, white, at texel `(4 096 − 4)/2`.
+        let (rgb, covered) = graph_support::composite(h.batch.quads(), atlas, 2_046.5, 299.0, None);
+        assert!(covered > 0, "{at}");
+        let _ = rgb;
+    };
+    graph_frames("C", skin, &chart, score, &check);
+}
+
+/// Skin D: a notes graph, a 600-column BPM graph, both visualizers with a
+/// skin's usual fields and the six score bars, together within the
+/// budget.
+fn skin_d() {
+    let mut b = ChartBuilder::new(150_000).bpm(TimeUs(1_000 * MS), 300_000);
+    for k in 0..40_i64 {
+        b = b.tap(
+            lane(1 + u8::try_from(k % 7).unwrap()),
+            TimeUs((100 + 50 * k) * MS),
+        );
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    let areas = [[-20, 20], [-60, 60], [-100, 100], [-150, 150], [-200, 200]];
+    let score = PlayScore {
+        profile: Some(&profile),
+        main: Some(tempo(150)),
+        areas: Some(areas),
+        ..PlayScore::NONE
+    };
+    let white = Rgba8::rgb(0xff_ffff, 0xff);
+    let mut elements = vec![
+        screen_el(Source::JudgeGraph(0), [0, 0, 400, 100]),
+        screen_el(Source::BpmGraph(0), [0, 120, 600, 100]),
+        screen_el(Source::TimingVisualizer(0), [0, 240, 301, 20]),
+        screen_el(Source::HitErrorVisualizer(0), [0, 280, 300, 40]),
+    ];
+    let mut ratio_bars = Vec::new();
+    for (i, rate) in ScoreRate::ALL.into_iter().enumerate() {
+        ratio_bars.push(RatioBarDef {
+            image: 0,
+            form: RatioForm::Bar { vertical: false },
+            source: RatioSource::Score(rate),
+        });
+        let y = 400 + 30 * i32::try_from(i).unwrap();
+        elements.push(screen_el(
+            Source::RatioBar(u32::try_from(i).unwrap()),
+            [0, y, 168, 20],
+        ));
+    }
+    let skin = graph_skin(
+        elements,
+        PlayDefs {
+            ratio_bars,
+            judge_graphs: vec![skin_model::JudgeGraphDef {
+                kind: skin_model::JudgeGraphKind::Notes,
+                delay: TimeUs(500 * MS),
+                reverse: false,
+                back: true,
+                chips: 0,
+                solid: 0,
+                fit: skin_model::GraphFit::Stretch,
+            }],
+            bpm_graphs: vec![BpmGraphDef {
+                delay: TimeUs(0),
+                line_width: 2,
+                colors: BpmColors::DEFAULT,
+                solid: 0,
+            }],
+            timing_visualizers: vec![TimingVisualizerDef {
+                judge_width: 150,
+                width: 301,
+                line_width: 1,
+                line: Rgba8::rgb(0x00_ffff, 0xff),
+                center: white,
+                bands: [white; 5],
+                decay: false,
+                solid: 0,
+            }],
+            hit_errors: vec![HitErrorDef {
+                width: 300,
+                judge_width: 150,
+                line_width: 2,
+                window: 50,
+                lines: true,
+                band_colors: false,
+                ema_mode: EmaMode::Both,
+                alpha: 0.1,
+                line: white,
+                center: white,
+                ema: Rgba8::rgb(0x00_ff00, 0xff),
+                bands: [white; 5],
+                decay: false,
+                solid: 0,
+            }],
+        },
+    );
+    let check = |h: &Harness, atlas: &Atlas, at: &str| {
+        // The BPM graph's MAIN row, green, at the left of its rect: 150
+        // over 150 is row `⌊98/2⌋ = 49` of 100.
+        let (rgb, covered) =
+            graph_support::composite(h.batch.quads(), atlas, 0.5, 220.0 - 49.5, None);
+        assert!(covered > 0, "{at}");
+        graph_support::near(rgb, [0.0, 255.0, 0.0], 1.0);
+        // The ratio bar of the current rate is drawn.
+        assert!(at_x(h, 0.0) >= 6, "{at}");
+    };
+    graph_frames("D", skin, &chart, score, &check);
+}
+
+/// The one-hour case: 3 602 seconds take bins of 8 (`⌈3 602 / 512⌉`), 451
+/// of them, and the graph draws the last one: a note at 3 600 s is in bin
+/// 450, at 2 px a bin from x = 900.
+fn one_hour() {
+    let mut chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(100 * MS))
+        .tap(lane(1), TimeUs(3_600_000 * MS))
+        .build()
+        .unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    assert_eq!(profile.bins().len(), 451);
+    assert_eq!(profile.bin_seconds(), 8);
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let skin = graph_skin(
+        vec![screen_el(Source::JudgeGraph(0), [0, 0, 902, 100])],
+        PlayDefs {
+            judge_graphs: vec![skin_model::JudgeGraphDef {
+                kind: skin_model::JudgeGraphKind::Notes,
+                delay: TimeUs(0),
+                reverse: false,
+                back: false,
+                chips: 0,
+                solid: 0,
+                fit: skin_model::GraphFit::Stretch,
+            }],
+            ..PlayDefs::default()
+        },
+    );
+    let check = |h: &Harness, _: &Atlas, at: &str| {
+        assert_eq!(at_x(h, 900.0), 1, "{at}");
+    };
+    graph_frames("one hour", skin, &chart, score, &check);
 }
