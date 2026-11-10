@@ -312,3 +312,33 @@ fn lua_callbacks_read_the_offset_and_the_constants() {
         .collect();
     assert_eq!(widths(&p.rects(1_000)), want);
 }
+
+/// C4: the configured pass reads the constant options as false on play,
+/// as their callbacks do, so a skin choosing its parts by them imports.
+#[test]
+fn the_configured_pass_reads_the_constants_false() {
+    let d = tempfile::tempdir().unwrap();
+    let reads: Vec<String> = CONSTANTS
+        .iter()
+        .map(|(id, _)| format!("ms.option({id}) or not ms.option(-{id})"))
+        .collect();
+    let lua = format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}
+         if not skin_config then return skin end
+         local ms = require(\"main_state\")
+         skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 8, h = 8 }} }}
+         local w = 10
+         if {} then w = 20 end
+         skin.destination = {{ {{ id = \"i\", dst = {{ {{ w = w, h = 10 }} }} }} }}
+         return skin
+",
+        reads.join(" or ")
+    );
+    write(d.path(), "s.luaskin", lua.as_bytes());
+    common::png(d.path(), "a.png", 64, 64);
+    let h = read_lua_header(d.path(), "s.luaskin", &Cancel::new()).unwrap();
+    let i = lua_import(&h);
+    let mut p = Drawn::new(i.imported.skin, 10);
+    assert_eq!(widths(&p.rects(1_000)), [10]);
+}
