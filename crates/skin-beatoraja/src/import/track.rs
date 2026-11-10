@@ -518,27 +518,43 @@ mod tests {
             (4, ChartStretch::FitWidth),
             (6, ChartStretch::FitHeight),
         ];
+        // Model boxes, y down. A 2 × 1 or 1 × 2 image in the small boxes
+        // puts an edge on a half pixel, which both round half up.
         let boxes = [
             [100, 100, 400, 100],
             [-30, 20, 100, 400],
             [0, 0, 640, 480],
             [5, 7, 333, 333],
+            [10, 10, 2, 2],
+            [11, 13, 3, 2],
         ];
-        let natives = [[200, 100], [100, 200], [640, 480], [1, 1], [1_920, 1_080]];
+        let natives = [
+            [200, 100],
+            [100, 200],
+            [640, 480],
+            [1, 1],
+            [1_920, 1_080],
+            [2, 1],
+            [1, 2],
+        ];
+        let height = i32::try_from(super::super::geom::HEIGHT).unwrap();
         for (mode, chart) in modes {
             for b in boxes {
                 for n in natives {
-                    let [x, y, w, h] = b.map(Q::int);
-                    let (baked, _) = stretch(Stretch::of(mode), Rect { x, y, w, h }, n).unwrap();
-                    let baked = [baked.x, baked.y, baked.w, baked.h].map(Q::to_f32);
+                    // The importer bakes in the source's y up, then reflects
+                    // and rounds the edges into the model's integer rect.
+                    let [x, y, w, h] = b;
+                    let up = Rect {
+                        x: Q::int(x),
+                        y: Q::int(height - y - h),
+                        w: Q::int(w),
+                        h: Q::int(h),
+                    };
+                    let (baked, _) = stretch(Stretch::of(mode), up, n).unwrap();
+                    let baked = baked.model().unwrap().map(|v| v as f32);
                     let (placed, native) = chart.place(b.map(|v| v as f32), n);
                     assert_eq!(native, None);
-                    for (p, q) in placed.iter().zip(baked) {
-                        assert!(
-                            (p - q).abs() <= 1e-3,
-                            "mode {mode} {b:?} {n:?}: {placed:?} {baked:?}"
-                        );
-                    }
+                    assert_eq!(placed, baked, "mode {mode} {b:?} {n:?}");
                 }
             }
         }

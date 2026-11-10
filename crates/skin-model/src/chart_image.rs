@@ -792,8 +792,9 @@ impl ChartStretch {
     /// `native` texels, and the native size the quad keeps at placement
     /// for [`NoExpanding`](Self::NoExpanding) and
     /// [`NoResize`](Self::NoResize), as an imported image's stretch is
-    /// baked (the importer's `track::stretch`, in `f64`). An image without
-    /// area keeps the destination.
+    /// baked (the importer's `track::stretch`, in `f64`), its edges then
+    /// rounded half up as the importer rounds a baked key's (y down,
+    /// `Rect::model_from`). An image without area keeps the destination.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn place(self, [x, y, w, h]: [f32; 4], native: [u32; 2]) -> ([f32; 4], Option<Native>) {
@@ -804,8 +805,20 @@ impl ChartStretch {
         let (fx, fy, fw, fh) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
         let (iw, ih) = (f64::from(iw), f64::from(ih));
         let (sx, sy) = (fw / iw, fh / ih);
-        let fit_height = |nh: f64| [x, f32_of(fy + (fh - nh) / 2.0), w, f32_of(nh)];
-        let fit_width = |nw: f64| [f32_of(fx + (fw - nw) / 2.0), y, f32_of(nw), h];
+        // The edges left, top, right and bottom, rounded half up.
+        let edges = |l: f64, t: f64, r: f64, b: f64| {
+            let up = |v: f64| (v + 0.5).floor();
+            let (l, t) = (up(l), up(t));
+            [f32_of(l), f32_of(t), f32_of(up(r) - l), f32_of(up(b) - t)]
+        };
+        let fit_height = |nh: f64| {
+            let top = fy + (fh - nh) / 2.0;
+            edges(fx, top, fx + fw, top + nh)
+        };
+        let fit_width = |nw: f64| {
+            let left = fx + (fw - nw) / 2.0;
+            edges(left, fy, left + nw, fy + fh)
+        };
         let rect = match self {
             Self::Fill => [x, y, w, h],
             Self::Inner if sx <= sy => fit_height(ih * sx),

@@ -111,6 +111,11 @@ fn uv(native: [u32; 2]) -> ChartUv {
 
 #[test]
 fn chart_image_frames_do_not_allocate() {
+    // The positive control: the counter sees an allocation on this thread.
+    let n = counted(|| {
+        std::hint::black_box(Vec::<u8>::with_capacity(64));
+    });
+    assert!(n > 0, "the counter missed an allocation");
     let mut elements = Vec::new();
     for (i, s) in (0..).zip(STRETCHES) {
         elements.push(element(ChartImage::Stage, s, 10 * i));
