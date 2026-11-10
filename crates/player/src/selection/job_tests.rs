@@ -963,7 +963,7 @@ fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
     let dir = tempfile::tempdir().unwrap();
     let path = song_of(dir.path(), 3);
     let loaded = loaded(dir.path(), &path, Speed::NORMAL);
-    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
     let s = b.sel.take().unwrap();
     worker(&s.shelf).queue(job(&path));
     assert_eq!(b.stepper.said(), Said::Block(0));
@@ -987,15 +987,58 @@ fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
     });
 }
 
+/// A record whose decodes each hold their first `workers` workers after
+/// their first file until all of them are there, so they decode at once
+/// whatever the scheduling. A worker that never comes fails the test.
+fn meeting(workers: usize) -> Decodes {
+    #[derive(Default)]
+    struct Meet {
+        asks: std::collections::HashMap<usize, usize>,
+        arrived: usize,
+    }
+    let meet = Arc::new((Mutex::new(Meet::default()), std::sync::Condvar::new()));
+    let reset = Arc::clone(&meet);
+    let at = Arc::clone(&meet);
+    Decodes {
+        // Each decode meets on its own.
+        hook: hook(move |p, _, _| {
+            if matches!(p, Probe::Decode(_)) {
+                *reset.0.lock().unwrap() = Meet::default();
+            }
+        }),
+        at_file: Some(super::FileHook(Arc::new(move |worker| {
+            let (state, changed) = &*at;
+            let mut m = state.lock().unwrap();
+            let nth = {
+                let n = m.asks.entry(worker).or_default();
+                *n += 1;
+                *n
+            };
+            if nth != 2 || m.arrived >= workers {
+                return;
+            }
+            m.arrived += 1;
+            changed.notify_all();
+            let began = Instant::now();
+            while m.arrived < workers {
+                assert!(began.elapsed() < watchdog() / 2, "only {} met", m.arrived);
+                m = changed.wait_timeout(m, watchdog() / 2).unwrap().0;
+            }
+        }))),
+        ..Decodes::default()
+    }
+}
+
 /// A load at `speed` of a chart of `files` distinct sounds with `k`
-/// foreground permits held elsewhere: what its decodes and analysis
+/// foreground permits held elsewhere, its decodes' workers meeting as
+/// [`meeting`] says for [`granted`]'s count: what its decodes and analysis
 /// recorded. The permits held elsewhere are all that is held once it
 /// returns.
 fn load_beside(k: usize, files: usize, speed: Speed) -> Arc<Decodes> {
     let dir = tempfile::tempdir().unwrap();
     let path = song_of(dir.path(), files - 1);
     let loaded = loaded(dir.path(), &path, speed);
-    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let mut b = bench(dir.path(), meeting(granted(k, files)), Spawner::SYSTEM);
     let held: Vec<Lease> = (0..k)
         .map(|_| b.coord.try_lease(Class::Foreground).unwrap())
         .collect();

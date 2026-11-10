@@ -81,6 +81,9 @@ pub struct Decodes {
     pub analysis: Mutex<Option<usize>>,
     /// Called at each [`Probe`] of the load.
     pub hook: Option<Hook>,
+    /// Called by each decode worker, with its index, as it asks before a
+    /// file.
+    pub at_file: Option<FileHook>,
     /// The measurement's analysis is given a bank whose rate its meter
     /// refuses, so it fails without a panic.
     pub refuse_meter: std::sync::atomic::AtomicBool,
@@ -113,6 +116,18 @@ pub enum Probe {
 #[cfg(test)]
 #[derive(Clone)]
 pub struct Hook(pub Arc<HookFn>);
+
+/// A decode worker's test hook, called with its index (tests).
+#[cfg(test)]
+#[derive(Clone)]
+pub struct FileHook(pub Arc<dyn Fn(usize) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for FileHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileHook")
+    }
+}
 
 /// What a [`Hook`] calls (tests).
 #[cfg(test)]
@@ -291,7 +306,10 @@ impl crate::loudness::Host for JobHost<'_, '_> {
             #[cfg(test)]
             DecodeProbe {
                 load: self.decodes.map(|d| (d, controls)),
-                at_file: None,
+                at_file: self
+                    .decodes
+                    .and_then(|d| d.at_file.as_ref())
+                    .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
             },
         )?;
         Ok((chart, Arc::new(bank)))
@@ -2160,7 +2178,10 @@ impl AppRig for PlayerRig<'_> {
                     #[cfg(test)]
                     DecodeProbe {
                         load: decodes.as_deref().map(|d| (d, controls)),
-                        at_file: None,
+                        at_file: decodes
+                            .as_deref()
+                            .and_then(|d| d.at_file.as_ref())
+                            .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
                     },
                 )
             };
