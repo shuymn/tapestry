@@ -1,13 +1,28 @@
 //! What one production frame gave the program to read: the only thing
 //! the reference takes from production.
 
+/// The host a frame's reads are answered by (s7-06e-2-design.md §5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Host {
+    /// A play frame: every mapped read.
+    Play,
+    /// A frame production builds no play frame for: only reads loading
+    /// fields `allowed` accepts (by slot), and the clock; `page` is the
+    /// practice page's ordinal in the script, `None` while loading.
+    Outside {
+        allowed: Vec<bool>,
+        page: Option<usize>,
+    },
+}
+
 /// One frame's inputs: the play schema's fields, the timers' readings
-/// (ms, `TIMER_OFF` while off) and the state clock.
+/// (ms, `TIMER_OFF` while off), the state clock and the host.
 #[derive(Clone, Debug)]
 pub struct FrameInputs {
     fields: Vec<i32>,
     timers: Vec<i32>,
     state_us: i64,
+    host: Host,
 }
 
 impl FrameInputs {
@@ -16,6 +31,17 @@ impl FrameInputs {
             fields: fields.to_vec(),
             timers: timers.to_vec(),
             state_us,
+            host: Host::Play,
+        }
+    }
+
+    /// A frame of `host`, which reads `fields` and no timer.
+    pub fn outside(fields: &[i32], allowed: Vec<bool>, page: Option<usize>, state_us: i64) -> Self {
+        Self {
+            fields: fields.to_vec(),
+            timers: Vec::new(),
+            state_us,
+            host: Host::Outside { allowed, page },
         }
     }
 
@@ -29,5 +55,13 @@ impl FrameInputs {
 
     pub fn state_us(&self) -> i64 {
         self.state_us
+    }
+
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    pub fn is_play(&self) -> bool {
+        self.host == Host::Play
     }
 }
