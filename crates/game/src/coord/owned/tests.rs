@@ -24,8 +24,9 @@ static WATCHDOG: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
     Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
 });
 
-/// A long wait for something that must happen: a safety net only.
-const LONG: Duration = Duration::from_secs(600);
+/// A long wait for something that must happen: a safety net only, half
+/// the watchdog, so a missing event fails its own test by name.
+static LONG: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| *WATCHDOG / 2);
 
 /// Aborts the process when the test it was armed for has not ended in
 /// time: a hung join would never fail the test.
@@ -113,7 +114,7 @@ fn gate() -> Arc<Gate> {
 }
 
 fn reach(g: &Gate, what: &str) {
-    assert!(g.reached(LONG), "{what} never happened");
+    assert!(g.reached(*LONG), "{what} never happened");
 }
 
 /// A clock a test moves by hand, counting its reads.
@@ -149,7 +150,7 @@ impl TestClock {
     fn read_past(&self, since: usize, n: usize) {
         let begun = Instant::now();
         while self.reads() < since + n {
-            assert!(begun.elapsed() < LONG, "the clock was never read");
+            assert!(begun.elapsed() < *LONG, "the clock was never read");
             thread::yield_now();
         }
     }
@@ -236,7 +237,7 @@ impl Settling {
     fn asked(&self, n: usize) {
         let begun = Instant::now();
         while self.asked.load(Ordering::SeqCst) < n {
-            assert!(begun.elapsed() < LONG, "the settle never asked");
+            assert!(begun.elapsed() < *LONG, "the settle never asked");
             thread::yield_now();
         }
     }
@@ -258,7 +259,7 @@ impl Settling {
         self.clock.read_past(r, 2);
         assert!(rx.try_recv().is_err(), "abandoned before the bound");
         self.clock.set(1_000);
-        rx.recv_timeout(LONG).unwrap()
+        rx.recv_timeout(*LONG).unwrap()
     }
 }
 
@@ -430,10 +431,10 @@ fn promotion_and_demotion_move_at_the_owners_checkpoint() {
     let next = |f: &dyn Fn()| {
         f();
         step_tx.send(()).unwrap();
-        class_rx.recv_timeout(LONG).unwrap()
+        class_rx.recv_timeout(*LONG).unwrap()
     };
     assert_eq!(
-        class_rx.recv_timeout(LONG).unwrap(),
+        class_rx.recv_timeout(*LONG).unwrap(),
         Some(Class::Speculative)
     );
     let promote = || assert_eq!(job.promote_unless_ended(), Promotion::Live);
@@ -694,17 +695,28 @@ fn an_owned_panic_carries_its_owner_and_responsibility() {
     assert!(matches!(o.outcome, Outcome::Panicked(ref p) if p.0 == "in the work"));
     assert_eq!((o.owner, o.responsible), (Owner::Foreground, false));
 
+    // The job signals once admitted, so a promotion lands at a checkpoint
+    // of its work, not at its admission.
     let hooked = |name: &str, promoted: bool, work: fn(&Ctx<'_>) -> u32| {
-        coord
+        let admitted = gate();
+        let a = Arc::clone(&admitted);
+        let job = coord
             .spawn_owned(
                 Spawner::SYSTEM,
                 key(name),
                 (Class::Speculative, promoted, Owner::Speculative),
                 coord.subscriber(Scope::Choice),
                 in_the_hook,
-                work,
+                move |ctx| {
+                    a.arrive();
+                    work(ctx)
+                },
             )
-            .unwrap()
+            .unwrap();
+        if !promoted {
+            reach(&admitted, "the job's admission");
+        }
+        job
     };
     let at_admission = hooked("admission", true, |_| 1);
     let o = outcome(&at_admission);
@@ -883,7 +895,7 @@ fn settling_after_publication_waits_for_the_thread() {
     settling.asked(3);
     assert!(rx.try_recv().is_err(), "settled before the thread ended");
     hold.open();
-    let settled = rx.recv_timeout(LONG).unwrap();
+    let settled = rx.recv_timeout(*LONG).unwrap();
     assert!(
         matches!(
             settled,
@@ -982,10 +994,20 @@ fn dropping_an_unsettled_owned_job_detaches_it() {
         },
     );
     reach(&hold, "the job's start");
-    drop(job);
+    // Dropped on another thread: a drop that joins would wait on the held
+    // job forever, and fails here instead.
+    let (dropped_tx, dropped) = mpsc::channel();
+    thread::spawn(move || {
+        drop(job);
+        let _ = dropped_tx.send(());
+    });
+    assert!(
+        dropped.recv_timeout(*LONG).is_ok(),
+        "the drop blocked on the job's thread"
+    );
     assert_eq!(coord.unsettled_drops(), 1);
     hold.open();
-    assert_eq!(rx.recv_timeout(LONG), Ok(true), "the drop stopped it");
+    assert_eq!(rx.recv_timeout(*LONG), Ok(true), "the drop stopped it");
 }
 
 /// Y24b, two cases: the terminal unwinds; the clock unwinds.
@@ -1347,7 +1369,7 @@ fn a_cause_arriving_at_the_join_is_kept() {
     let _ = outcome(&job);
     // The thread ends right after it published: within the bound, it is
     // joined, and the cause given meanwhile or at the join is kept.
-    let settled = job.settle(LONG, &Instant::now, &mut || Some("late"));
+    let settled = job.settle(*LONG, &Instant::now, &mut || Some("late"));
     assert!(
         matches!(
             settled,
