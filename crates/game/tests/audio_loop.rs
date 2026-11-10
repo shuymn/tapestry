@@ -1273,7 +1273,9 @@ fn an_unload_after_the_worker_is_gone_is_gone() {
 }
 
 /// V1, through the control: the decision tone started before an unload
-/// sounds on after it.
+/// sounds on in the step that takes it. The unload is sent while the
+/// worker is not stepped (it times out, still queued), so the tone has
+/// sounded one step when the unload lands, whatever the scheduling.
 #[test]
 fn the_decision_tone_survives_an_unload() {
     let chart = chart();
@@ -1281,10 +1283,14 @@ fn the_decision_tone_survives_an_unload() {
     control.play_tone();
     worker.step(&mut out).unwrap();
     assert!(worker.engine().tone_sounding());
-    answered(&mut worker, &mut out, || control.unload()).unwrap();
-    assert!(worker.engine().tone_sounding());
+    assert_eq!(
+        control.unload(),
+        Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
+    );
     let from = out.samples().len();
     worker.step(&mut out).unwrap();
+    assert_eq!(worker.engine().bank().stored_count(), 0, "the unload taken");
+    assert!(worker.engine().tone_sounding());
     assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
 }
 
