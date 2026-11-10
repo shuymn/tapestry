@@ -689,3 +689,30 @@ fn builtin_timer(id: i32) -> Option<usize> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use skin_model::field;
+
+    use super::Frame;
+
+    /// Off play, a read's availability guard is checked as its value is:
+    /// an allowed value behind a guard on a field the host does not give
+    /// is unanswered, where a play frame answers it.
+    #[test]
+    fn an_outside_guard_is_checked_as_its_value() {
+        let mut f = Frame {
+            fields: vec![0; field::COUNT],
+            ..Frame::default()
+        };
+        f.fields[usize::from(field::POINT)] = 5;
+        f.fields[usize::from(field::CHART_LEVEL_VALID)] = 1;
+        let mut allowed = vec![false; field::COUNT];
+        allowed[usize::from(field::POINT)] = true;
+        f.allowed = Some(allowed);
+        assert_eq!(f.guarded(None, "point"), Some(Ok(5)));
+        assert_eq!(f.guarded(Some("chart.level_valid"), "point"), None);
+        f.allowed = None;
+        assert_eq!(f.guarded(Some("chart.level_valid"), "point"), Some(Ok(5)));
+    }
+}
