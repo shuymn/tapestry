@@ -314,10 +314,12 @@ impl Frame {
         src: &str,
         delta: i32,
     ) -> Option<Result<i32, ()>> {
-        if sentinel && self.no_score {
-            return Some(Ok(i32::MIN));
-        }
-        Some(self.guarded(guard, src)?.map(|n| n.saturating_add(delta)))
+        let read = if sentinel && self.no_score {
+            Ok(i32::MIN)
+        } else {
+            self.guarded(guard, src)?
+        };
+        Some(read.map(|n| n.saturating_add(delta)))
     }
 
     /// A guarded integer: `Err(())` when the guard is false.
@@ -805,6 +807,13 @@ mod tests {
         let got: Vec<Option<i32>> = ids.iter().map(|&id| read(&mut f, id)).collect();
         let want = [6, 6, 100, 0, 42, 85, 42, 85].map(Some);
         assert_eq!(got, want);
+        // A perturbation applies after the sentinel is chosen, as after a
+        // mapped value.
+        f.no_score = true;
+        assert_eq!(
+            f.property(true, None, "ex_score", 1),
+            Some(Ok(i32::MIN + 1))
+        );
     }
 
     /// Off play, a read's availability guard is checked as its value is:
