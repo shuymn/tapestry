@@ -22,6 +22,8 @@ pub enum Outcome {
     HiddenOff,
     /// Its image choice selected nothing.
     NoChoice,
+    /// Its chart image is absent, or unavailable while loading.
+    NoChartImage,
     /// Its timer is off, its track has not started or has ended, or its
     /// visibility is false.
     NotSampled,
