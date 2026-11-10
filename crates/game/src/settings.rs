@@ -20,6 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::adjust_keys::{AdjustKeyError, AdjustmentKeys};
+use crate::bests::ScoreTarget;
 use crate::error::IoFailure;
 use crate::hispeed::{Cover, Covers, HiSpeedSettings, PlayOptions, PlayOptionsError};
 use crate::policy::FailureAction;
@@ -830,6 +831,10 @@ pub struct PlayerSettings {
     /// (design.md "Settings Files"). Read once, at startup; declared
     /// before the tables, so it is written before them.
     pub language: Language,
+    /// The target score plays are paced against, `"max"` by default
+    /// (design.md "Settings Files"); declared before the tables, so it is
+    /// written before them.
+    pub target: ScoreTarget,
     /// The speed settings, `[hispeed]` (design.md "Play Adjustments").
     pub hispeed: HiSpeedSettings,
     /// The lane covers, `[covers]`.
@@ -848,6 +853,7 @@ impl Default for PlayerSettings {
             displayed_gauge: 0,
             on_failure: FailureAction::Close,
             language: Language::Ja,
+            target: ScoreTarget::Max,
             hispeed: HiSpeedSettings::default(),
             covers: CoverSettings::default(),
             skins: SkinChoices::default(),

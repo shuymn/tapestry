@@ -7,9 +7,9 @@ use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourcePro
 use game::{
     Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, FailureAction,
     HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language, LibrarySettings,
-    LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role, ScratchConfig, Settings,
-    SettingsError, SkinChoice, SkinChoices, SpeedMode, Tuning, load_settings, save_settings,
-    write_atomic,
+    LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role, ScoreTarget,
+    ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SpeedMode, Tuning,
+    load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -101,6 +101,7 @@ fn changed() -> Settings {
             displayed_gauge: 1,
             on_failure: FailureAction::PlayToEnd,
             language: Language::Ja,
+            target: ScoreTarget::AaaMinus,
             hispeed: HiSpeedSettings {
                 mode: SpeedMode::Classic,
                 reference: HiSpeedReference::Maximum,
@@ -315,6 +316,7 @@ fn device_and_player_settings_round_trip() {
     fs::write(
         root.player_settings(),
         "preset = \"wide\"\ndisplayed_gauge = 1\non_failure = \"play-to-end\"\n\
+         target = \"aaa-\"\n\
          [hispeed]\nmode = \"classic\"\nreference = \"max\"\nclassic_hispeed_x100 = 235\n\
          classic_step_x100 = 10\nfloating_step_x100 = 25\ngreen_target = 280\n\
          [covers]\nsudden = 120\nsudden_on = true\nlift = 80\nlift_on = true\n\
@@ -1693,4 +1695,58 @@ fn language_reads_ja_by_default_refuses_others_and_is_written() {
     let line = text.lines().position(|l| l == "language = \"ja\"");
     let table = text.lines().position(|l| l.starts_with('['));
     assert!(line.is_some() && line < table, "{text}");
+}
+
+/// `target` in `player.toml`: a missing key reads `"max"`; each of the
+/// twelve values reads as itself and is written back as read, ahead of the
+/// tables; a value naming no target refuses the file with an error naming
+/// the key and the value (design.md "Settings Files").
+#[test]
+fn target_reads_max_by_default_round_trips_and_refuses_others() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.player_settings().parent().unwrap()).unwrap();
+    fs::write(root.player_settings(), "preset = \"wide\"\n").unwrap();
+    assert_eq!(
+        Settings::load(&root).unwrap().player.target,
+        ScoreTarget::Max
+    );
+    let names = [
+        "a-", "a", "a+", "aa-", "aa", "aa+", "aaa-", "aaa", "aaa+", "max-", "max", "next",
+    ];
+    for (target, name) in ScoreTarget::ALL.into_iter().zip(names) {
+        fs::write(
+            root.player_settings(),
+            format!("preset = \"wide\"\ntarget = \"{name}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(&root).unwrap().player.target,
+            target,
+            "{name}"
+        );
+        let written = PlayerSettings {
+            target,
+            ..PlayerSettings::default()
+        };
+        save_settings(&root.player_settings(), &written).unwrap();
+        let text = fs::read_to_string(root.player_settings()).unwrap();
+        let line = text
+            .lines()
+            .position(|l| l == format!("target = \"{name}\""));
+        let table = text.lines().position(|l| l.starts_with('['));
+        assert!(line.is_some() && line < table, "{text}");
+        assert_eq!(Settings::load(&root).unwrap().player, written, "{name}");
+    }
+    fs::write(
+        root.player_settings(),
+        "preset = \"wide\"\ntarget = \"s\"\n",
+    )
+    .unwrap();
+    let e = Settings::load(&root).unwrap_err();
+    assert!(matches!(e, SettingsError::Parse(_)), "{e:?}");
+    let message = Chain(&e).to_string();
+    assert!(
+        message.contains("target") && message.contains("\"s\""),
+        "{message}"
+    );
 }
