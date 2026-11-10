@@ -3929,11 +3929,11 @@ impl Run {
                 #[cfg(all(test, feature = "dev-tools"))]
                 Ok(RenderMsg::FramesProbe(reply)) => {
                     let (sl, sf, _) = self.select_frames.probe();
-                    let (rl, rf, before_wait) = self.result_frames.probe();
+                    let (rl, rf, charged) = self.result_frames.probe();
                     let _ = reply.send(crate::dev::FramesProbe {
                         select: (sl, sf.len()),
                         result: (rl, rf),
-                        before_wait,
+                        charged,
                     });
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
@@ -3963,7 +3963,7 @@ impl Run {
                 // done on lives (dev-tools: the whole frames).
                 #[cfg(feature = "dev-tools")]
                 if self.screen.is_some() {
-                    self.result_frames.before_wait(prepared.elapsed());
+                    self.result_frames.before_wait(prepared);
                 }
                 if self.screen.is_none() {
                     mode = Mode::Idle;
@@ -6559,6 +6559,16 @@ pub(crate) mod tests {
         stall: Arc<AtomicBool>,
         stalled: Arc<AtomicBool>,
         seen: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        answer: Arc<std::sync::Mutex<Answer>>,
+    }
+
+    /// A preparation's answer as a menu screen sees it: the first menu
+    /// frame after the answer was sent takes it, noting how many frames
+    /// were drawn before it and whether it was `Ok`.
+    #[derive(Default)]
+    struct Answer {
+        pending: Option<std::sync::mpsc::Receiver<Result<(), RenderError>>>,
+        taken: Option<(usize, bool)>,
     }
 
     impl Screen for StalledMenus {
@@ -6593,7 +6603,15 @@ pub(crate) mod tests {
                 .lines
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
-            self.seen.lock().unwrap().push((line, changed));
+            let mut seen = self.seen.lock().unwrap();
+            let mut answer = self.answer.lock().unwrap();
+            if let Some(ready) = answer.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                answer.pending = None;
+                answer.taken = Some((seen.len(), ready.is_ok()));
+            }
+            drop(answer);
+            seen.push((line, changed));
+            drop(seen);
             while self.stall.load(Ordering::Acquire) {
                 self.stalled.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
@@ -6619,19 +6637,23 @@ pub(crate) mod tests {
 
     /// A render thread stalled in a loading frame falls behind on nothing:
     /// of 300 pages shown meanwhile, only the newest is drawn, one new page
-    /// once it resumes, and the play's preparation is answered at once
-    /// after it; a page shown before loading ended is never drawn after.
+    /// once it resumes, and the play's preparation is answered right after
+    /// that one frame; a page shown before loading ended is never drawn
+    /// after.
     #[test]
     fn a_stalled_render_thread_draws_only_the_newest_loading_lines() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stall = Arc::new(AtomicBool::new(false));
         let stalled = Arc::new(AtomicBool::new(false));
+        let answer = Arc::new(std::sync::Mutex::new(Answer::default()));
         let (noted, held, at) = (Arc::clone(&seen), Arc::clone(&stall), Arc::clone(&stalled));
+        let answered = Arc::clone(&answer);
         let make: MakeScreen = Box::new(move || {
             Ok(Box::new(StalledMenus {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::clone(&answered),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -6655,14 +6677,19 @@ pub(crate) mod tests {
         for n in 1..=300 {
             sink.show(one_line(&n.to_string()));
         }
+        // The preparation waits behind the pages; the frame after its
+        // answer notes how many were drawn before it.
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
+        answer.lock().unwrap().pending = Some(rx);
+        link.send(RenderMsg::Prepare(reply));
         stall.store(false, Ordering::Release);
-        let released = Instant::now();
-        link.prepare().unwrap();
-        // Unbacked by a slot, 300 pages a frame each would take seconds.
-        assert!(released.elapsed() < Duration::from_secs(1));
-        let after: Vec<_> = seen.lock().unwrap()[before..].to_vec();
-        let new: Vec<_> = after.iter().filter(|(_, changed)| *changed).collect();
-        assert_eq!(new, [&("300".to_owned(), true)], "{after:?}");
+        assert!(wait_until(|| answer.lock().unwrap().taken.is_some()));
+        let (drawn, ready) = answer.lock().unwrap().taken.unwrap();
+        assert!(ready);
+        // Unbacked by a slot and its one signal, every page would be a
+        // frame of its own before the answer.
+        let after: Vec<_> = seen.lock().unwrap()[before..drawn].to_vec();
+        assert_eq!(after, [("300".to_owned(), true)]);
 
         // Loading ends while the thread stalls with a page waiting: the
         // select page follows, and the waiting page is never drawn.
@@ -7446,6 +7473,7 @@ pub(crate) mod tests {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::default(),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -7490,6 +7518,7 @@ pub(crate) mod tests {
                 stall: Arc::clone(&held),
                 stalled: Arc::clone(&at),
                 seen: Arc::clone(&noted),
+                answer: Arc::default(),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
@@ -7658,7 +7687,8 @@ pub(crate) mod tests {
     }
 
     /// A page that comes after the launch screen's time replaces it at
-    /// once.
+    /// once: the frame after the page was taken draws it, and no splash
+    /// frame follows.
     #[test]
     fn a_page_after_the_splash_time_shows_at_once() {
         let (splashes, menus) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
@@ -7682,15 +7712,14 @@ pub(crate) mod tests {
         .unwrap();
         std::thread::sleep(crate::menu_screen::SPLASH + Duration::from_millis(100));
         assert_eq!(menus.load(Ordering::SeqCst), 0);
-        let sent = Instant::now();
         link.send(RenderMsg::Menu(Box::default()));
-        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= 1));
-        assert!(
-            sent.elapsed() < Duration::from_millis(500),
-            "{:?}",
-            sent.elapsed()
-        );
+        assert!(link.fence(super::hook_bound()));
+        assert!(menus.load(Ordering::SeqCst) >= 1);
+        let drawn = splashes.load(Ordering::SeqCst);
+        let shown = menus.load(Ordering::SeqCst);
+        assert!(wait_until(|| menus.load(Ordering::SeqCst) >= shown + 2));
         link.exit();
+        assert_eq!(splashes.load(Ordering::SeqCst), drawn);
     }
 
     /// A preparation (a play's, before it opens) leaves the splash drawn,
@@ -11084,6 +11113,7 @@ pub(crate) mod tests {
                 _ => format!("{kind:?} {request}"),
             };
             while self.shared.hold_install.load(Ordering::Acquire) {
+                self.shared.install_held.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
             if self.shared.fail.load(Ordering::Acquire) {
@@ -11313,6 +11343,8 @@ pub(crate) mod tests {
         stalled: Arc<AtomicBool>,
         /// Installations wait while set.
         pub(crate) hold_install: Arc<AtomicBool>,
+        /// Set once an installation waits on `hold_install`.
+        pub(crate) install_held: Arc<AtomicBool>,
         /// Installations are refused while set.
         pub(crate) refuse_install: Arc<AtomicBool>,
         /// Loading frames are refused while set.

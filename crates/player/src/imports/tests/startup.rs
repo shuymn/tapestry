@@ -476,8 +476,8 @@ fn a_close_during_startup_ends_it() {
     let stop = stop_flag();
     let r = std::thread::scope(|s| {
         s.spawn(|| {
-            assert!(wait_until(|| builds.started() == 1));
-            std::thread::sleep(Duration::from_millis(100));
+            // Play's selection reached the render thread and waits there.
+            assert!(wait_until(|| screens.install_held.load(Ordering::SeqCst)));
             stop.store(true, Ordering::SeqCst);
         });
         startup(&link, &choices, Launch::Selection, false, &build, || {
