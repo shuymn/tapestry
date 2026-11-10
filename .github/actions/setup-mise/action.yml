@@ -50,7 +50,7 @@ runs:
         restore-keys: ${{ steps.bin.outputs.prefix }}
     - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
       with:
-        version: 2026.11.4
+        version: 2026.11.5
         install: ${{ inputs.install }}
         install_args: ${{ inputs.install_args }}
         cache: ${{ inputs.cache }}
