@@ -67,6 +67,7 @@ impl ChartIngest for Built {
     ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
             labels: game::ChartLabels::default(),
+            profile: bms_model::ChartProfile::of(&self.0, &[]),
             chart: self.0.clone(),
             warnings: Vec::new(),
         })

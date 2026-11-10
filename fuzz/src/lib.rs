@@ -710,6 +710,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         bpm_whole_change: None,
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
+        score: skin_model::PlayScore::NONE,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1002,6 +1003,7 @@ fn gauge_probes(
             bpm_whole_change: None,
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
+            score: skin_model::PlayScore::NONE,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -1081,6 +1083,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         bpm_whole_change: None,
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
+        score: skin_model::PlayScore::NONE,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1674,6 +1677,7 @@ fn choice_probes(
         bpm_whole_change: None,
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
+        score: skin_model::PlayScore::NONE,
     };
     let mut play = skin
         .prepare(chart, &ctx)
@@ -1787,6 +1791,7 @@ fn rate_and_kind_probes(
             bpm_whole_change: None,
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
+            score: skin_model::PlayScore::NONE,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -2066,6 +2071,7 @@ fn readout_probes(
             bpm_whole_change: None,
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
+            score: skin_model::PlayScore::NONE,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -3559,6 +3565,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
         bpm_whole_change: None,
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
+        score: skin_model::PlayScore::NONE,
     };
     let mut play = skin.prepare(&chart, &ctx).expect("the skin prepares");
     let states = [GaugeState {

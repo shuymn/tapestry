@@ -60,7 +60,9 @@ pub use adjust_keys::{
     AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, AdjustmentPlan,
 };
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
-pub use attempt::{Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, song_total};
+pub use attempt::{
+    Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, ScoreBasis, song_total,
+};
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
     Probed, SWITCH_TIMEOUT, TransportGate, audio_control,

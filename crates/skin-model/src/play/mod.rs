@@ -11,7 +11,8 @@ pub(crate) mod schema;
 pub(crate) mod timers;
 
 use bms_model::{
-    Chart, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, TimeUs, TimelineId,
+    Chart, ChartProfile, LANE_COUNT, Lane, LnMode, Note, Position, PresentationError, Tempo,
+    TimeUs, TimelineId,
 };
 use eval::{GaugeState, InputFacts, JudgeEvent, NoteFacts, NoteHold, Section, Tally};
 use rules::GaugeValue;
@@ -103,6 +104,47 @@ pub struct Carry<'a> {
     pub targets: u32,
 }
 
+/// A play's best and target EX scores, read once when the play began and
+/// kept by each READY rearm of its attempt (stage 3, S10-10).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScoreBasis {
+    /// The best EX score before this play: 0 when known empty, unavailable
+    /// (no library, a failed read) or in a practice round.
+    pub best: u32,
+    /// Whether the best was read: `false` when unavailable and in a
+    /// practice round.
+    pub best_known: bool,
+    /// The target EX score: 0 in a practice round.
+    pub target: u32,
+}
+
+/// What an attempt's score figures and graphs read: the play's best and
+/// target, the chart's 1× profile and its whole MAIN tempo.
+#[derive(Clone, Copy, Debug)]
+pub struct PlayScore<'a> {
+    /// The play's best and target.
+    pub basis: ScoreBasis,
+    /// The chart's notes by second and tempo rows over its 1× times;
+    /// `None` when the caller has no chart profile.
+    pub profile: Option<&'a ChartProfile>,
+    /// The whole chart's MAIN tempo, not a practice section's; `None`
+    /// when the caller has none.
+    pub main: Option<Tempo>,
+}
+
+impl PlayScore<'static> {
+    /// No best read, no target, no profile and no MAIN tempo.
+    pub const NONE: Self = Self {
+        basis: ScoreBasis {
+            best: 0,
+            best_known: false,
+            target: 0,
+        },
+        profile: None,
+        main: None,
+    };
+}
+
 /// What is fixed for one attempt.
 #[derive(Clone, Copy, Debug)]
 pub struct PlayContext<'a> {
@@ -144,6 +186,8 @@ pub struct PlayContext<'a> {
     pub autoplay: bool,
     /// The chart's metadata the `chart.*` fields read.
     pub meta: ChartMetadata,
+    /// The play's best and target, the chart's profile and its MAIN tempo.
+    pub score: PlayScore<'a>,
 }
 
 /// A chart's metadata as the `chart.*` fields read it, each `None` when
@@ -517,6 +561,9 @@ pub struct Play {
     chart_fields: [i32; timers::CHART_FIELDS],
     /// The context's [`PlayContext::autoplay`].
     pub(crate) autoplay: bool,
+    /// The context's play best and target ([`PlayScore::basis`]), which a
+    /// rearm keeps.
+    score: ScoreBasis,
     scratch: Side,
     /// Whether a long note's release is judged on its own (CN and HCN).
     separate_end_judgment: bool,
@@ -703,6 +750,7 @@ impl Play {
             play_level: ctx.play_level,
             chart_fields: timers::chart_fields(ctx.meta),
             autoplay: ctx.autoplay,
+            score: ctx.score.basis,
             scratch: ctx.scratch,
             // As eval decides the chart's mode (evaluator.rs, `ln_mode`):
             // a new preset mode must be placed here.
@@ -733,6 +781,13 @@ impl Play {
         self.starts.fill(None);
         self.ms.fill(TIMER_OFF);
         self.beat = None;
+    }
+
+    /// The play's best and target, as the context gave them: fixed for
+    /// the attempt, a rearm included.
+    #[must_use]
+    pub const fn score(&self) -> ScoreBasis {
+        self.score
     }
 
     /// The bar groups the play holds work for.
@@ -985,6 +1040,7 @@ mod tests {
             bpm_range: None,
             bpm_whole_change: None,
             play_level: None,
+            score: crate::PlayScore::NONE,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -1123,5 +1179,53 @@ mod tests {
         );
         assert_eq!(play.hold_note(lane(2)), Some(0));
         assert_eq!(play.poisoned, Some(super::BuildError::InconsistentTally));
+    }
+
+    /// C12 (stage 3, S10-10): the play's best and target, as the context
+    /// gave them, stay through a READY rearm, which starts the rest of the
+    /// attempt's runtime state over.
+    #[test]
+    fn a_rearm_keeps_the_score_basis() {
+        let chart = ChartBuilder::new(150_000)
+            .tap(lane(1), TimeUs(1_000 * MS))
+            .build()
+            .unwrap();
+        let basis = super::ScoreBasis {
+            best: 7,
+            best_known: true,
+            target: 9,
+        };
+        let ctx = PlayContext {
+            meta: crate::ChartMetadata::UNKNOWN,
+            autoplay: false,
+            gauges: &[],
+            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            empty_poor_breaks_combo: false,
+            empty_poor_counted: false,
+            scratch: Side::Left,
+            ln_default: rules::LnMode::Ln,
+            last_note_end: TimeUs(1_000 * MS),
+            bpm_range: None,
+            bpm_whole_change: None,
+            play_level: None,
+            score: super::PlayScore {
+                basis,
+                ..crate::PlayScore::NONE
+            },
+        };
+        let mut play = super::Play::new(
+            &chart,
+            &ctx,
+            super::Continuation::Fresh,
+            None,
+            0,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(play.score(), basis);
+        play.rearm();
+        assert_eq!(play.score(), basis);
     }
 }

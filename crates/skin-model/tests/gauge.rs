@@ -47,6 +47,7 @@ fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     };
     Harness::new(skin_of(g).unwrap(), &chart(), &ctx)
 }
@@ -453,6 +454,7 @@ fn narrow_and_degenerate_gauges_keep_their_cells() {
             bpm_range: None,
             bpm_whole_change: None,
             play_level: None,
+            score: skin_model::PlayScore::NONE,
         };
         let mut h = Harness::new(skin, &chart(), &ctx);
         h.gauges.truncate(1);
