@@ -337,6 +337,21 @@ pub enum RenderError {
     /// A skin's atlas was not uploaded; the atlas in use stays.
     #[error("atlas")]
     Atlas(#[source] UploadError),
+    /// No committed play installation keeps a chart layer: no chart image
+    /// was published.
+    #[error("chart images: no play installation keeps a chart layer")]
+    NoChartLayer,
+    /// A chart image does not fit its slot of the chart layer, or lacks a
+    /// mip level: the images are absent for the installation.
+    #[error("chart images: the {which:?} image does not fit its slot")]
+    ChartImage {
+        /// The image.
+        which: skin_model::chart_image::ChartImage,
+    },
+    /// The play installation, its pages or the device changed while the
+    /// chart images were written: they stay unavailable.
+    #[error("chart images: the installation changed during the write")]
+    ChartChanged,
     /// A skin's sprites do not fit the device's largest buffer; the skin
     /// in use stays.
     #[error("capacity: {sprites} sprites, past the device's {max} bytes")]
@@ -411,7 +426,8 @@ impl RenderError {
             | Self::Superseded { .. }
             | Self::Admission { .. }
             | Self::ResultDisabled
-            | Self::PagesKind { .. } => true,
+            | Self::PagesKind { .. }
+            | Self::ChartImage { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
                 wgpu::Error::OutOfMemory { .. } | wgpu::Error::Validation { .. }
@@ -962,6 +978,15 @@ pub struct Renderer {
     /// group exist: a unit test makes the device refuse something there.
     #[cfg(test)]
     atlas_fault: Option<fn(&Gpu)>,
+    /// Run by the next [`publish_chart_images`](Self::publish_chart_images)
+    /// inside its error scopes, after its writes are queued: a unit test
+    /// makes the device refuse something there.
+    #[cfg(test)]
+    chart_fault: Option<fn(&Gpu)>,
+    /// The installation's chart images as the last publication's writes
+    /// were queued: a unit test checks they were unavailable then.
+    #[cfg(test)]
+    chart_during_write: Option<Option<skin_model::chart_image::ChartTable>>,
     /// A staging's instance buffer is made invalid (both map modes, which
     /// every device's validation refuses), as a device refusing its
     /// allocation would: a unit test.
@@ -1101,6 +1126,10 @@ impl Renderer {
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
             atlas_fault: None,
+            #[cfg(test)]
+            chart_fault: None,
+            #[cfg(test)]
+            chart_during_write: None,
             #[cfg(test)]
             buffer_fault: false,
             #[cfg(test)]
@@ -1789,6 +1818,7 @@ impl Renderer {
             side: pages.side(),
             pages: &levels,
             text_layer: pages.text_layer().is_some(),
+            chart_layer: pages.chart_layer().is_some(),
         };
         let layers =
             skin_atlas::check_pages(&upload, &device.limits()).map_err(RenderError::Atlas)?;
@@ -2241,6 +2271,127 @@ impl Renderer {
         self.admit_charge(kind, pages_texels(pages), None)?;
         self.result_pages = Some(self.pages_for(pages)?);
         Ok(())
+    }
+
+    /// Publishes the chart's own images into the committed play
+    /// installation's chart layer (S10-12 design §5.3), outside every
+    /// frame's build: `images` holds the fitted stage file and back image,
+    /// `None` for one that is absent.
+    ///
+    /// 1. **Invalidate**: before the first byte, the installation's images
+    ///    become unavailable (its loading frames draw neither them nor what
+    ///    their fields condition) and the prepared attempt's absent.
+    /// 2. **Write** each image's levels into its slot inside error scopes,
+    ///    level `k` at the slot's origin `>> k`, submit, and wait for the
+    ///    GPU.
+    /// 3. **Re-check** that the installation, its pages and the device are
+    ///    the ones the write began on.
+    /// 4. **Publish** the table: the installation's frames and its
+    ///    prepared attempt draw the images, and their fields read them.
+    ///
+    /// The images never change during an attempt: the caller publishes
+    /// only before one opens.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::NoChartLayer`] with no committed play installation
+    ///   keeping a chart layer: nothing changes.
+    /// - [`RenderError::ChartImage`] for an image that does not fit its
+    ///   slot, and [`RenderError::Atlas`] for a write the device refused:
+    ///   both refusals ([`RenderError::is_refusal`]), after which the
+    ///   images are absent for the installation, its fields reading false
+    ///   (S10-12 design D-chart-5); nothing stale draws.
+    /// - A device lost while waiting, or an installation or device that
+    ///   changed: the images stay unavailable, as the first step left them.
+    pub fn publish_chart_images(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        use skin_model::chart_image::{ChartImage, ChartTable, ChartUv};
+        let Some(installed) = self.installed.clone() else {
+            return Err(RenderError::NoChartLayer);
+        };
+        let bundle = Arc::clone(installed.bundle());
+        let (Some(layer), Some(at)) = (bundle.chart_layer(), self.atlas.chart_layer()) else {
+            return Err(RenderError::NoChartLayer);
+        };
+        if u32::from(layer) != at {
+            return Err(RenderError::NoChartLayer);
+        }
+        let began = (self.device_generation(), bundle.atlas_id());
+        // 1. Unavailable from the first byte.
+        installed.loading().set_chart_images(None);
+        self.skin.set_chart_images(ChartTable::ABSENT);
+        let absent = |r: &mut Self| {
+            installed
+                .loading()
+                .set_chart_images(Some(ChartTable::ABSENT));
+            r.skin.set_chart_images(ChartTable::ABSENT);
+        };
+        let side = self.atlas.side();
+        let mut uvs = [None; 2];
+        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+            let Some(f) = image else {
+                continue;
+            };
+            // Every level the array has, no more and no fewer.
+            let uv = ChartUv::of(f, which, side, layer)
+                .filter(|_| u32::try_from(f.levels().len()).ok() == Some(self.atlas.levels()));
+            let Some(uv) = uv else {
+                absent(self);
+                return Err(RenderError::ChartImage { which });
+            };
+            if let Some(slot) = uvs.get_mut(which.index()) {
+                *slot = Some(uv);
+            }
+        }
+        // 2. Every level of every present image, in its slot.
+        let ((), refused) = skin_atlas::scoped(self.gpu.device(), || {
+            for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+                let (Some(f), Some((origin, _))) = (image, which.slot(side)) else {
+                    continue;
+                };
+                for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
+                    let Some(size) = f.level_size(level) else {
+                        continue;
+                    };
+                    skin_atlas::write_region(
+                        self.gpu.queue(),
+                        self.atlas.texture(),
+                        (at, k),
+                        origin.map(|o| o >> k),
+                        size,
+                        bytes,
+                    );
+                }
+            }
+            #[cfg(test)]
+            {
+                self.chart_during_write = Some(installed.loading().chart_images());
+                if let Some(fault) = self.chart_fault.take() {
+                    fault(&self.gpu);
+                }
+            }
+            self.gpu.queue().submit([]);
+        });
+        if let Some(e) = refused {
+            absent(self);
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
+        wait_for_gpu(&self.gpu)?;
+        // 3. Still the installation, the pages and the device it began on.
+        let same = self.installed.as_ref().is_some_and(|i| {
+            Arc::ptr_eq(i.bundle(), &bundle) && i.loading().same(installed.loading())
+        }) && (self.device_generation(), bundle.atlas_id()) == began;
+        if !same {
+            return Err(RenderError::ChartChanged);
+        }
+        // 4. Published.
+        let [stage, back] = uvs;
+        let table = ChartTable::new(stage, back);
+        installed.loading().set_chart_images(Some(table));
+        self.skin.set_chart_images(table);
+        Ok(table)
     }
 
     /// The result kind's pages-only installation's pages, if it has one:
@@ -4283,6 +4434,7 @@ mod tests {
             side: 128,
             pages: &[page],
             text_layer: false,
+            chart_layer: false,
         };
         r.install_atlas(&pages, ClipTable::default()).unwrap();
         let sprite = |x, color| Sprite {
@@ -4442,6 +4594,7 @@ mod tests {
             side: 256,
             pages: &[page],
             text_layer: false,
+            chart_layer: false,
         };
         r.atlas_fault = Some(|gpu| {
             let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
@@ -4556,6 +4709,7 @@ mod tests {
             side: 384,
             pages: &[page],
             text_layer: false,
+            chart_layer: false,
         };
         r.install_atlas(&pages, ClipTable::default()).unwrap();
         assert_eq!(r.atlas_size(), (384, 2));
@@ -4687,6 +4841,137 @@ mod tests {
     /// Level `k` of the atlas's text layer, read back: RGBA8, `side >> k`
     /// texels square.
     fn read_text_layer(r: &Renderer, k: u32) -> Vec<u8> {
+        read_layer(r, r.atlas.text_layer().unwrap(), k)
+    }
+
+    /// A `w`×`h` picture of `rgb`, read and fitted into `which`'s slot of
+    /// a chart layer of side `side`.
+    fn chart_picture(
+        which: skin_model::chart_image::ChartImage,
+        side: u32,
+        [w, h]: [u32; 2],
+        [r, g, b]: [u8; 3],
+    ) -> skin_model::chart_image::Fitted {
+        let d = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(d.path().join("p.png")).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels = [r, g, b, 255].repeat(usize::try_from(w * h).unwrap());
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+        let dir = skin_model::chart_image::ChartDir::new(d.path()).unwrap();
+        let slot = which.slot(side).unwrap().1;
+        skin_model::chart_image::read(&dir, "p.png", &[], slot, &|| false, &|_| None)
+            .image
+            .unwrap()
+    }
+
+    /// A renderer with a committed play installation keeping a chart
+    /// layer, and the folder its image lives in.
+    fn chart_renderer() -> (Renderer, tempfile::TempDir, u32) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = crate::test_common::offscreen(1_920, 1_080);
+        let look = crate::test_decl::Look {
+            chart: true,
+            ..crate::test_decl::Look::left([255, 0, 0, 255])
+        };
+        let (b, _) = crate::test_decl::bundle(&r, dir.path(), &look);
+        crate::test_common::install(&mut r, &b, 1);
+        let side = b.side();
+        (r, dir, side)
+    }
+
+    /// Each level `k` of a chart image is written at its slot's origin
+    /// `>> k`, its whole allocation and nothing past it: the stage file's
+    /// at the top left, the back image's at the top right. While the
+    /// writes were queued, the installation's images were unavailable.
+    #[test]
+    fn chart_images_are_written_at_their_slots_at_every_level() {
+        use skin_model::chart_image::{ChartImage, ChartTable};
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [5, 3], [10, 20, 30]);
+        let back = chart_picture(ChartImage::Back, side, [5, 3], [40, 50, 60]);
+        assert_eq!(stage.padded(), [24, 24]);
+        let table = r.publish_chart_images([Some(&stage), Some(&back)]).unwrap();
+        assert_eq!(
+            r.chart_during_write,
+            Some(None),
+            "unavailable while written"
+        );
+        assert_eq!(
+            r.installed.as_ref().unwrap().loading().chart_images(),
+            Some(table)
+        );
+        assert_ne!(table, ChartTable::ABSENT);
+        let layer = r.atlas.chart_layer().unwrap();
+        for k in 0..4 {
+            let level = read_layer(&r, layer, k);
+            let s = side >> k;
+            let at = |x: u32, y: u32| &level[((y * s + x) * 4) as usize..][..4];
+            assert_eq!(
+                at(0, 0),
+                [10, 20, 30, 255],
+                "level {k}: the stage file's origin"
+            );
+            let end = 24 >> k;
+            assert_eq!(at(end - 1, end - 1), [10, 20, 30, 255], "level {k}");
+            assert_eq!(at(end, 0), [0; 4], "level {k}: nothing past the allocation");
+            assert_eq!(
+                at(s / 2, 0),
+                [40, 50, 60, 255],
+                "level {k}: the back image's origin"
+            );
+            assert_eq!(at(s / 2 - 1, 0), [0; 4], "level {k}");
+        }
+        // A publication over published images: unavailable from its first
+        // byte, never the old table over the texels being replaced.
+        r.publish_chart_images([None, Some(&back)]).unwrap();
+        assert_eq!(
+            r.chart_during_write,
+            Some(None),
+            "invalidated before the write"
+        );
+    }
+
+    /// A write the device refuses, or a picture fitted for another slot,
+    /// leaves the images absent for the installation: a refusal, and
+    /// nothing stale drawn.
+    #[test]
+    fn a_refused_chart_publication_leaves_the_images_absent() {
+        use skin_model::chart_image::{ChartImage, ChartTable};
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
+        r.publish_chart_images([Some(&stage), None]).unwrap();
+        r.chart_fault = Some(refuse);
+        let e = r.publish_chart_images([Some(&stage), None]).unwrap_err();
+        assert!(
+            matches!(e, RenderError::Atlas(UploadError::Device(_))),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        let presented = || r.installed.as_ref().unwrap().loading().chart_images();
+        assert_eq!(presented(), Some(ChartTable::ABSENT));
+
+        r.publish_chart_images([Some(&stage), None]).unwrap();
+        let wide = chart_picture(ChartImage::Stage, side * 2, [side + 100, 8], [1, 2, 3]);
+        let e = r.publish_chart_images([Some(&wide), None]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                RenderError::ChartImage {
+                    which: ChartImage::Stage
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(e.is_refusal());
+        let presented = r.installed.as_ref().unwrap().loading().chart_images();
+        assert_eq!(presented, Some(ChartTable::ABSENT));
+    }
+
+    /// Level `k` of atlas layer `z`, read back: RGBA8, `side >> k` texels
+    /// square.
+    fn read_layer(r: &Renderer, z: u32, k: u32) -> Vec<u8> {
         let device = r.gpu.device();
         let side = r.atlas.side() >> k;
         let row = side * 4;
@@ -4704,11 +4989,7 @@ mod tests {
             wgpu::TexelCopyTextureInfo {
                 texture: r.atlas.texture(),
                 mip_level: k,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: r.atlas.text_layer().unwrap(),
-                },
+                origin: wgpu::Origin3d { x: 0, y: 0, z },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {

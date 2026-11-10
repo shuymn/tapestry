@@ -977,11 +977,21 @@ fn loading_frames() {
         structure: true,
         chart_text: true,
         progress: true,
+        chart: true,
         ..Look::left([255, 0, 0, 255])
     };
     let (b, _) = bundle(&r, dir.path(), &look);
     let token = r.install(ScreenKind::Play, &b, 1).unwrap();
     r.commit(token).unwrap();
+    // The chart's stage file published into the chart layer between
+    // frames, outside the count; its back image absent (S10-12).
+    let stage = chart_picture(
+        skin_model::chart_image::ChartImage::Stage,
+        b.side(),
+        [64, 48],
+    );
+    let table = r.publish_chart_images([Some(&stage), None]).unwrap();
+    assert!(table.present(skin_model::chart_image::ChartImage::Stage));
     // The chosen chart's text prepared and installed for lifetime 1
     // between frames, outside the count.
     r.enter_loading(1);
@@ -1072,6 +1082,27 @@ fn loading_frames() {
         second_allocs, 0,
         "a second lifetime's first frame allocated"
     );
+}
+
+/// A `w`×`h` green picture, read and fitted into `which`'s slot of a
+/// chart layer of side `side`.
+fn chart_picture(
+    which: skin_model::chart_image::ChartImage,
+    side: u32,
+    [w, h]: [u32; 2],
+) -> skin_model::chart_image::Fitted {
+    let d = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(d.path().join("p.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels = [0, 255, 0, 255].repeat(usize::try_from(w * h).unwrap());
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+    let dir = skin_model::chart_image::ChartDir::new(d.path()).unwrap();
+    let slot = which.slot(side).unwrap().1;
+    skin_model::chart_image::read(&dir, "p.png", &[], slot, &|| false, &|_| None)
+        .image
+        .unwrap()
 }
 
 /// The presentation snapshots the simple skin's frames are made from:

@@ -175,6 +175,7 @@ fn install(r: &mut Renderer, atlas: &skin_model::Atlas) {
             side: atlas.side(),
             pages: &levels,
             text_layer: false,
+            chart_layer: false,
         },
         ClipTable::new(Vec::new()).unwrap(),
     )
