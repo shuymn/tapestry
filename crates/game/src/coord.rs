@@ -46,8 +46,10 @@ use std::time::Duration;
 
 use bms_model::Speed;
 
+mod owned;
 mod scoped;
 
+pub use owned::{Handed, OwnedJob, Promotion, Settled, Waited, WorkerLease, WorkerLeases};
 pub use scoped::{Failure, Joined, LoadFailure, ScopedJob, Spawner};
 
 /// Foreground permits: the chosen chart's decode threads, from a choice to
@@ -230,15 +232,54 @@ pub enum Outcome<T> {
 ///
 /// The panic, when `work` panicked.
 pub fn catch<T>(work: impl FnOnce() -> T) -> Result<T, JobPanic> {
-    panic::catch_unwind(AssertUnwindSafe(work)).map_err(|payload| {
-        let payload: &(dyn Any + Send) = &*payload;
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_owned())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "a panic without a message".to_owned());
-        JobPanic(message)
-    })
+    panic::catch_unwind(AssertUnwindSafe(work)).map_err(|payload| panic_of(&*payload))
+}
+
+/// A caught panic's message.
+fn panic_of(payload: &(dyn Any + Send)) -> JobPanic {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned());
+    JobPanic(message)
+}
+
+/// Who answers for a job's failure as it publishes its outcome: the
+/// chosen chart's foreground work, or speculative work. The coordinator
+/// records it and decides nothing by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Owner {
+    /// Foreground work: its failure is the run's.
+    Foreground,
+    /// Speculative work: its failure is recoverable unless a promotion
+    /// made a waiter responsible for it.
+    Speculative,
+}
+
+impl Owner {
+    /// The owner a job begun in `class` has until told otherwise.
+    const fn of(class: Class) -> Self {
+        match class {
+            Class::Foreground => Self::Foreground,
+            Class::Maintenance | Class::Speculative => Self::Speculative,
+        }
+    }
+}
+
+/// A job's published outcome, with who answered for it as it published:
+/// its owner then, and whether a promotion of the live job had made a
+/// waiter responsible for it (nothing withdraws that). The callers'
+/// rule: a panic is fatal when the owner was [`Owner::Foreground`] or the
+/// job `responsible`, otherwise recoverable; a cancellation is no failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Observed<T> {
+    /// How it ended.
+    pub outcome: Outcome<T>,
+    /// Its owner as it published.
+    pub owner: Owner,
+    /// A promotion of the live job made a waiter responsible for it.
+    pub responsible: bool,
 }
 
 /// Where a job is in its cancellation.
@@ -263,6 +304,10 @@ struct Job {
     base: Class,
     /// Foreground interest: it should run on a foreground permit.
     promoted: bool,
+    /// Who answers for it as it publishes.
+    owner: Owner,
+    /// A promotion of it while live made a waiter responsible for it.
+    responsible: bool,
     /// A keyed job's `Arc<Slot<T>>`.
     slot: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -361,14 +406,16 @@ impl State {
         }
     }
 
-    /// Removes a finished job.
-    fn finish(&mut self, id: u64) {
-        if let Some(job) = self.jobs.remove(&id)
-            && let Some(key) = job.key
-            && self.keys.get(&key) == Some(&id)
+    /// Removes a finished job, returned so that it drops after the lock is
+    /// let go.
+    fn finish(&mut self, id: u64) -> Option<Job> {
+        let job = self.jobs.remove(&id)?;
+        if let Some(key) = &job.key
+            && self.keys.get(key) == Some(&id)
         {
-            self.keys.remove(&key);
+            self.keys.remove(key);
         }
+        Some(job)
     }
 
     fn set_promoted(&mut self, id: u64, promoted: bool) {
@@ -378,15 +425,93 @@ impl State {
     }
 }
 
-/// Where a keyed job's outcome waits for its subscribers.
+/// Where a keyed job's outcome waits for its subscribers: published once,
+/// under the state lock, behind an `Arc`, so a reader clones the `Arc`
+/// under the slot's mutex and the payload only after letting it go.
 struct Slot<T> {
-    outcome: Mutex<Option<Outcome<T>>>,
+    published: Mutex<Option<Arc<Observed<T>>>>,
+}
+
+impl<T> Slot<T> {
+    const fn new() -> Self {
+        Self {
+            published: Mutex::new(None),
+        }
+    }
+
+    /// The published record, if any; no payload is cloned under the lock.
+    fn record(&self) -> Option<Arc<Observed<T>>> {
+        self.published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 struct Shared {
     caps: Caps,
     state: Mutex<State>,
     changed: Condvar,
+    /// Owned jobs dropped without being settled (tests).
+    #[cfg(test)]
+    unsettled: std::sync::atomic::AtomicUsize,
+    /// Where tests hold a job's finish.
+    #[cfg(test)]
+    cuts: Mutex<Cuts>,
+}
+
+/// Where a test holds a job's end: between its computation and its
+/// finish, and inside the finish between the registry removal and the
+/// publication, the state lock held (tests).
+#[cfg(test)]
+#[derive(Default)]
+struct Cuts {
+    before_finish: Option<Arc<Gate>>,
+    in_finish: Option<Arc<Gate>>,
+}
+
+/// A point threads stop at until a test opens it (tests).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Gate {
+    /// Someone arrived; it is open.
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+impl Gate {
+    /// Arrives, and waits until it is open.
+    pub(crate) fn pass(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.0 = true;
+        self.changed.notify_all();
+        while !s.1 {
+            s = self.changed.wait(s).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Arrives without waiting: a signal.
+    pub(crate) fn arrive(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).0 = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits until a thread arrived; `false` after `timeout`.
+    pub(crate) fn reached(&self, timeout: Duration) -> bool {
+        let s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (s, _) = self
+            .changed
+            .wait_timeout_while(s, timeout, |s| !s.0)
+            .unwrap_or_else(PoisonError::into_inner);
+        s.0
+    }
+
+    /// Lets every thread through, now and later.
+    pub(crate) fn open(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.changed.notify_all();
+    }
 }
 
 impl Shared {
@@ -435,8 +560,47 @@ impl Coordinator {
                     keys: HashMap::new(),
                 }),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                unsettled: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(test)]
+                cuts: Mutex::new(Cuts::default()),
             }),
         }
+    }
+
+    /// Holds each job's end from now on: before its finish, or inside it
+    /// between the registry removal and the publication (tests).
+    #[cfg(test)]
+    pub(crate) fn cut(&self, in_finish: bool) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        let mut cuts = self
+            .shared
+            .cuts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if in_finish {
+            cuts.in_finish = Some(Arc::clone(&gate));
+        } else {
+            cuts.before_finish = Some(Arc::clone(&gate));
+        }
+        gate
+    }
+
+    /// Whether the state lock is free now, found without waiting (tests).
+    #[cfg(test)]
+    pub(crate) fn state_free(&self) -> bool {
+        !matches!(
+            self.shared.state.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    /// Owned jobs dropped without being settled (tests).
+    #[cfg(test)]
+    pub(crate) fn unsettled_drops(&self) -> usize {
+        self.shared
+            .unsettled
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Its caps.
@@ -539,7 +703,7 @@ impl Coordinator {
     /// live generations: a stale subscriber neither keeps a job alive nor
     /// withdraws its cancel.
     #[must_use]
-    pub fn begin<T: Clone + Send + 'static>(
+    pub fn begin<T: Clone + Send + Sync + 'static>(
         &self,
         key: JobKey,
         class: Class,
@@ -557,9 +721,7 @@ impl Coordinator {
             (id, slot, false)
         } else {
             let id = state.next_id();
-            let slot = Arc::new(Slot {
-                outcome: Mutex::new(None),
-            });
+            let slot = Arc::new(Slot::new());
             let any_slot: Arc<dyn Any + Send + Sync> = Arc::clone(&slot) as _;
             state.jobs.insert(
                 id,
@@ -569,6 +731,8 @@ impl Coordinator {
                     cancel: Cancel::No,
                     base: class,
                     promoted: false,
+                    owner: Owner::of(class),
+                    responsible: false,
                     slot: Some(any_slot),
                 },
             );
@@ -609,6 +773,8 @@ impl Coordinator {
                     cancel: Cancel::No,
                     base: class,
                     promoted: false,
+                    owner: Owner::of(class),
+                    responsible: false,
                     slot: None,
                 },
             );
@@ -630,13 +796,11 @@ impl Coordinator {
         if self.current(handle.subscriber.scope) != handle.subscriber.generation {
             return Taken::Stale;
         }
+        // The payload is cloned after the slot's lock is let go.
         handle
             .slot
-            .outcome
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .map_or(Taken::Pending, Taken::Ready)
+            .record()
+            .map_or(Taken::Pending, |r| Taken::Ready(r.outcome.clone()))
     }
 }
 
@@ -848,27 +1012,74 @@ impl<T> Runner<T> {
             thread: thread::current().id(),
             lease: Mutex::new(None),
             mode: Mutex::new(self.base),
+            fault: Mutex::new(None),
         };
         let computed = catch(|| ctx.admit().then(|| work(&ctx)));
+        // A hook's panic stays the job's even when its work caught it.
+        let fault = ctx
+            .fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // Its permit is given back before the outcome is published.
         drop(ctx);
         let cancelled = self.coord.shared.lock().observe(self.id);
-        match computed {
-            Err(panic) => Outcome::Panicked(panic),
-            Ok(None) => Outcome::Cancelled,
-            Ok(Some(_)) if cancelled => Outcome::Cancelled,
-            Ok(Some(value)) => Outcome::Done(value),
+        match (computed, fault) {
+            // A panic comes before an observed cancel.
+            (Err(panic), _) | (Ok(_), Some(panic)) => Outcome::Panicked(panic),
+            (Ok(None), None) => Outcome::Cancelled,
+            (Ok(Some(_)), None) if cancelled => Outcome::Cancelled,
+            (Ok(Some(value)), None) => Outcome::Done(value),
         }
     }
 
+    /// Out of the registry and published in one critical section, so an
+    /// observer under the lock finds the job live or published, never
+    /// neither; a later begin of the key starts anew. Only prepared values
+    /// move under the lock, and the removed entry drops after it.
     fn finish(&mut self, outcome: Outcome<T>) {
         self.done = true;
         let id = self.id;
-        // Out of the registry first: a later begin of the key starts anew.
-        self.coord.shared.update(|state| state.finish(id));
-        if let Some(slot) = &self.slot {
-            *slot.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(outcome);
+        #[cfg(test)]
+        let cut = |in_finish: bool| {
+            let cuts = self
+                .coord
+                .shared
+                .cuts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if in_finish {
+                cuts.in_finish.clone()
+            } else {
+                cuts.before_finish.clone()
+            }
+        };
+        #[cfg(test)]
+        if let Some(gate) = cut(false) {
+            gate.pass();
         }
+        let mut state = self.coord.shared.lock();
+        let removed = state.finish(id);
+        let (owner, responsible) = removed
+            .as_ref()
+            .map_or((Owner::of(self.base), false), |j| (j.owner, j.responsible));
+        #[cfg(test)]
+        if let Some(gate) = cut(true) {
+            gate.pass();
+        }
+        if let Some(slot) = &self.slot {
+            let record = Arc::new(Observed {
+                outcome,
+                owner,
+                responsible,
+            });
+            *slot
+                .published
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(record);
+        }
+        drop(state);
+        drop(removed);
         self.coord.shared.changed.notify_all();
     }
 }
@@ -893,6 +1104,8 @@ pub struct Ctx<'a> {
     lease: Mutex<Option<Lease>>,
     /// The class the thread's mode was last set for.
     mode: Mutex<Class>,
+    /// A hook's panic, kept even when the work caught its unwinding.
+    fault: Mutex<Option<JobPanic>>,
 }
 
 impl std::fmt::Debug for Ctx<'_> {
@@ -957,6 +1170,13 @@ impl Ctx<'_> {
         *self.lease() = None;
         let out = wait();
         self.admit().then_some(out)
+    }
+
+    /// The class the job should run in now: foreground while promoted,
+    /// else the class it was begun in.
+    #[must_use]
+    pub fn wanted(&self) -> Class {
+        self.want()
     }
 
     fn want(&self) -> Class {
@@ -1030,11 +1250,20 @@ impl Ctx<'_> {
 
     /// Calls the hook when `class` differs from the class the thread's
     /// mode was last set for, and records it once the hook returned: a
-    /// hook that unwinds leaves the record as it was.
+    /// hook that unwinds leaves the record as it was, and its panic is
+    /// kept as the job's fault, which the job ends with even when its work
+    /// catches the unwinding.
     fn apply(&self, class: Class) {
         let changed = *self.mode.lock().unwrap_or_else(PoisonError::into_inner) != class;
         if changed {
-            (self.on_class)(class);
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| (self.on_class)(class))) {
+                let mut fault = self.fault.lock().unwrap_or_else(PoisonError::into_inner);
+                if fault.is_none() {
+                    *fault = Some(panic_of(&*payload));
+                }
+                drop(fault);
+                panic::resume_unwind(payload);
+            }
             *self.mode.lock().unwrap_or_else(PoisonError::into_inner) = class;
         }
     }
