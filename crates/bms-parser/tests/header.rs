@@ -115,6 +115,8 @@ fn the_loaders_labels_come_from_the_taken_branches() {
             artist: "Branch two".to_owned(),
             subartist: "Two".to_owned(),
             genre: String::new(),
+            stagefile: String::new(),
+            backbmp: String::new(),
             playlevel: "9a".to_owned(),
             difficulty: "4".to_owned(),
             bga: false,
@@ -203,5 +205,42 @@ fn a_bmp_definition_with_a_path_is_a_bga() {
             .any(|w| matches!(w.kind, bms_parser::WarningKind::UnknownHeader(_))),
         "{:?}",
         loaded.warnings
+    );
+}
+
+/// The stage file and back image are labels: the last declaration in the
+/// branches taken, trimmed, kept as written (separators included) and
+/// never resolved; each draw of a `#RANDOM` chart names its own.
+#[test]
+fn the_stage_file_and_back_image_follow_the_branch_taken() {
+    let chart = |set: u32| {
+        format!(
+            "#PLAYER 1\n#TITLE t\n#BPM 120\n#STAGEFILE top.png\n#BACKBMP top.bmp\n\
+             #SETRANDOM {set}\n\
+             #IF 1\n#STAGEFILE one\\stage.png \t\n#BACKBMP one.bmp\n#ENDIF\n\
+             #IF 2\n#STAGEFILE \u{3000}two.png\n#ENDIF\n#ENDRANDOM\n#00111:01\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let labels = |set| {
+        bms_parser::load_bms(chart(set).as_bytes(), dir.path(), &LoadOptions::default())
+            .unwrap()
+            .labels
+    };
+    let one = labels(1);
+    assert_eq!(one.stagefile, "one\\stage.png");
+    assert_eq!(one.backbmp, "one.bmp");
+    let two = labels(2);
+    assert_eq!(two.stagefile, "two.png");
+    assert_eq!(two.backbmp, "top.bmp");
+    let none = bms_parser::load_bms(
+        b"#PLAYER 1\n#TITLE t\n#BPM 120\n#00111:01\n",
+        dir.path(),
+        &LoadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (none.labels.stagefile, none.labels.backbmp),
+        (String::new(), String::new())
     );
 }
