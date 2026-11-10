@@ -177,6 +177,8 @@ pub use play::schema::{
     Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS,
     READOUT_MAX, field, lane_timer, timer,
 };
+#[cfg(feature = "dev-tools")]
+pub use play::timers::score_fields;
 pub use play::timers::{native_values, settled_point};
 pub use play::{
     Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,

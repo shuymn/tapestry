@@ -99,6 +99,23 @@ pub fn settled_point(t: &Tally, targets: u32) -> Option<i32> {
     (*t != Tally::default()).then(|| point(t, targets))
 }
 
+/// The three score fields a play frame over `t` gives, `[ex_score,
+/// rate.current_bp, rate.whole_bp]`, by `fill_fields`' own formulas, the
+/// attempt having `targets` targets (dev-tools: the replay harness's model
+/// of the source's score data, s7-06e-3-design.md §2a). `None` for a tally
+/// [`Skin::build`](crate::Skin::build) refuses (more counted empty POORs
+/// than POORs).
+#[cfg(feature = "dev-tools")]
+#[must_use]
+pub fn score_fields(t: &Tally, targets: u32, empty_poor_counted: bool) -> Option<[i32; 3]> {
+    let judged = judged_targets(t, empty_poor_counted)?;
+    Some([
+        count(t.ex_score),
+        rate_bp(t.ex_score, judged),
+        rate_bp(t.ex_score, u64::from(targets)),
+    ])
+}
+
 /// The score rate of `ex` over `targets`, in basis points:
 /// `⌊10 000 · ex / (2 · targets)⌋`, 10 000 with no target. Not capped at
 /// 100 %: a custom EX weighting may pass it; only the field's `i32` range

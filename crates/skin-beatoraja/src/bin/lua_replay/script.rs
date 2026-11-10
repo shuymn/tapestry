@@ -213,6 +213,15 @@ impl Script {
         Self::practice("closing", vec![r1, r2])
     }
 
+    /// `zero-score`: R1 misses note 1 and quits at its miss deadline, so
+    /// its only score update has EX 0; R2 every note on time.
+    pub fn zero_score() -> Self {
+        let mut r1 = Round::on_time(7, true);
+        r1.presses[0] = None;
+        r1.end = End::Quit(Self::note_time(0) + 180_000);
+        Self::practice("zero-score", vec![r1, Round::on_time(7, true)])
+    }
+
     /// The script named `name`.
     pub fn named(name: &str) -> Option<Self> {
         match name {
@@ -221,6 +230,7 @@ impl Script {
             "rounds" => Some(Self::rounds()),
             "rounds-unwitnessed" => Some(Self::rounds_unwitnessed()),
             "closing" => Some(Self::closing()),
+            "zero-score" => Some(Self::zero_score()),
             _ => None,
         }
     }
@@ -319,8 +329,8 @@ impl Round {
         chart: &Chart,
         preset: &rules::RulePreset,
         section: Option<&Section>,
-        last: i64,
-        shown: usize,
+        (last, shown): (i64, usize),
+        judged: &dyn Fn(&Tally),
         mut frame: impl FnMut(&Step<'_, '_>) -> Result<(), String>,
     ) -> Result<(Tally, i64), String> {
         let device = device();
@@ -374,6 +384,7 @@ impl Round {
             out.clear();
             ev.advance_to(TimeUs(now), &mut out)
                 .map_err(|e| format!("advance: {e:?}"))?;
+            judged(ev.tally());
             frame(&Step {
                 now: TimeUs(now),
                 rel_us: base + now + LEAD,
@@ -418,6 +429,9 @@ impl Round {
             out.clear();
             ev.advance_to(TimeUs(end), &mut out)
                 .map_err(|e| format!("advance: {e:?}"))?;
+            // The source updates its score data at every judgment, built
+            // frame or not (s7-06e-3-design.md §2a).
+            judged(ev.tally());
             last_rel = base + end + LEAD;
         }
         Ok((*ev.tally(), last_rel + STEP))
