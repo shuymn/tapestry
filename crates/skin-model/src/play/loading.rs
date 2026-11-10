@@ -13,7 +13,7 @@ use rules::GaugeValue;
 use super::schema::{field, timer};
 use super::timers::{chart_fields, covers, level_fields, read_timers};
 use super::{BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
-use crate::chart_image::{ChartImage, ChartTable};
+use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
@@ -398,6 +398,9 @@ pub struct Loading {
     /// while they are unavailable. Kept by [`reset`](Self::reset): they
     /// belong to the installation, and the caller replaces them.
     chart: Option<ChartTable>,
+    /// The live key of the array its frames draw from, set by the frame's
+    /// renderer before each build.
+    chart_live: Option<ChartKey>,
 }
 
 impl Loading {
@@ -413,6 +416,7 @@ impl Loading {
             text: TextTable::new(Vec::new()),
             bitmap: Box::default(),
             chart: None,
+            chart_live: None,
         }
     }
 
@@ -429,6 +433,7 @@ impl Loading {
             text: TextTable::new(vec![None; text_slots]),
             bitmap: vec![None; text_slots].into_boxed_slice(),
             chart: None,
+            chart_live: None,
         }
     }
 
@@ -440,17 +445,31 @@ impl Loading {
         self.chart = table;
     }
 
-    /// The chart images its frames draw; `None` while unavailable.
+    /// The chart images set for it; `None` while unavailable.
     #[must_use]
     pub fn chart_images(&self) -> Option<&ChartTable> {
         self.chart.as_ref()
+    }
+
+    /// Sets the live key of the array its next frames draw from: the
+    /// frame's renderer sets it before each build, from its own state.
+    /// Allocates nothing.
+    pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
+        self.chart_live = live;
+    }
+
+    /// The chart images its frames draw: the table set for it when it
+    /// describes the live array ([`ChartTable::drawable`]); `None`, which
+    /// is unavailable, otherwise.
+    pub(crate) fn drawable_chart(&self) -> Option<&ChartTable> {
+        self.chart.as_ref().filter(|t| t.drawable(self.chart_live))
     }
 
     /// The chosen chart's data `frame` gives, and its images once they
     /// are available ([`Need::met`]).
     pub(crate) fn chosen(&self, frame: &LoadingFrame<'_>) -> u8 {
         frame.chosen()
-            | if self.chart.is_some() {
+            | if self.drawable_chart().is_some() {
                 CHOSEN_IMAGES
             } else {
                 0
@@ -580,7 +599,7 @@ impl Loading {
         for (slot, v) in (field::CHART_DIFFICULTY..).zip(chart_fields(frame.meta())) {
             set(slot, v);
         }
-        if let Some(t) = &self.chart {
+        if let Some(t) = self.drawable_chart() {
             set(
                 field::CHART_STAGEFILE,
                 i32::from(t.present(ChartImage::Stage)),

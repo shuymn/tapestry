@@ -736,8 +736,8 @@ impl Play {
             .chain(self.chart_fields)
             .chain([point_now])
             .chain([
-                i32::from(self.chart_images().present(ChartImage::Stage)),
-                i32::from(self.chart_images().present(ChartImage::Back)),
+                i32::from(self.drawable_chart().present(ChartImage::Stage)),
+                i32::from(self.drawable_chart().present(ChartImage::Back)),
             ]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;

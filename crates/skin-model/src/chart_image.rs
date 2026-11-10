@@ -656,6 +656,39 @@ fn extrude(src: &[u8], content: [u32; 2], padded: [u32; 2]) -> Result<Vec<u8>, A
     Ok(out)
 }
 
+/// The scale of [`exact`]'s fixed point: 2^24.
+const ONE: i128 = 1 << 24;
+
+/// `v` scaled by [`ONE`]: exact for every multiple of 2^-24 (every whole
+/// or keyed coordinate, and an interpolated one to within 2^-25 of a
+/// pixel); `None` for a value that is not finite or past 2^38 in
+/// magnitude, which no placement within MAX_COORD reaches.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn exact(v: [f32; 4]) -> Option<[i128; 4]> {
+    let mut out = [0_i128; 4];
+    for (o, v) in out.iter_mut().zip(v) {
+        let scaled = f64::from(v) * f64::from(1_u32 << 24);
+        if !scaled.is_finite() || scaled.abs() > f64::from(1_u32 << 31) * f64::from(1_u32 << 31) {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a finite whole number within 2^62, checked above"
+        )]
+        let whole = scaled.round() as i64;
+        *o = i128::from(whole);
+    }
+    Some(out)
+}
+
+/// An integer placement coordinate, within MAX_COORD, as `f32`.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn to_f32(v: i128) -> f32 {
+    let clamped = v.clamp(i128::from(i32::MIN), i128::from(i32::MAX));
+    let v = i32::try_from(clamped).unwrap_or(0);
+    f32_of(f64::from(v))
+}
+
 /// Which of a chart's own images an element draws: the stage file
 /// (system image 100) or the back image (101).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -733,21 +766,67 @@ impl ChartUv {
     }
 }
 
+/// The GPU array a chart table describes: the renderer that wrote it,
+/// the installation and atlas it was written for, and the renderer's
+/// resource generation then (S10-12 design §5.3). A table draws only in a
+/// frame whose live key is equal ([`ChartTable::drawable`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChartKey {
+    pub renderer: u64,
+    pub installation: u64,
+    pub atlas: u64,
+    pub generation: u64,
+}
+
 /// The chart images an installation draws, by [`ChartImage::index`]: an
-/// entry without a uv is absent, and draws nothing.
+/// entry without a uv is absent, and draws nothing. Its key names the
+/// array its uvs describe; a table without one describes none.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChartTable {
     uvs: [Option<ChartUv>; 2],
+    key: Option<ChartKey>,
 }
 
 impl ChartTable {
-    /// Both absent.
-    pub const ABSENT: Self = Self { uvs: [None, None] };
+    /// Both absent, of no array.
+    pub const ABSENT: Self = Self {
+        uvs: [None, None],
+        key: None,
+    };
 
-    /// The stage file `stage` and the back image `back`.
+    /// The stage file `stage` and the back image `back`, of no array
+    /// until [`keyed`](Self::keyed).
     #[must_use]
     pub const fn new(stage: Option<ChartUv>, back: Option<ChartUv>) -> Self {
-        Self { uvs: [stage, back] }
+        Self {
+            uvs: [stage, back],
+            key: None,
+        }
+    }
+
+    /// The same table, describing the array `key` names.
+    #[must_use]
+    pub const fn keyed(self, key: ChartKey) -> Self {
+        Self {
+            key: Some(key),
+            ..self
+        }
+    }
+
+    /// The array it describes, if any.
+    #[must_use]
+    pub const fn key(&self) -> Option<ChartKey> {
+        self.key
+    }
+
+    /// Whether a frame whose live key is `live` may draw it: both keys
+    /// known and equal. The one guarantee that no copy draws texels of
+    /// another array, whatever the order of publications, restores, array
+    /// uploads and device loss: the frame's own renderer gives `live`.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn drawable(&self, live: Option<ChartKey>) -> bool {
+        live.is_some() && self.key == live
     }
 
     /// `which`'s uv, `None` when it is absent.
@@ -802,31 +881,48 @@ impl ChartStretch {
         if iw == 0 || ih == 0 {
             return ([x, y, w, h], None);
         }
-        let (fx, fy, fw, fh) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
-        let (iw, ih) = (f64::from(iw), f64::from(ih));
-        let (sx, sy) = (fw / iw, fh / ih);
-        // The edges left, top, right and bottom, rounded half up.
-        let edges = |l: f64, t: f64, r: f64, b: f64| {
-            let up = |v: f64| (v + 0.5).floor();
-            let (l, t) = (up(l), up(t));
-            [f32_of(l), f32_of(t), f32_of(up(r) - l), f32_of(up(b) - t)]
+        // Exact rationals over 2^24 ([`exact`]), so each half-up decision
+        // on whole or keyed coordinates is the importer's, never a float's.
+        let Some([qx, qy, qw, qh]) = exact([x, y, w, h]) else {
+            return ([x, y, w, h], None);
         };
-        let fit_height = |nh: f64| {
-            let top = fy + (fh - nh) / 2.0;
-            edges(fx, top, fx + fw, top + nh)
+        let (iw, ih) = (i128::from(iw), i128::from(ih));
+        // Edge `num / den` (over 2^24) rounded half up: ⌊num / den + 1/2⌋.
+        let up = |num: i128, den: i128| (2 * num + den * ONE).div_euclid(2 * den * ONE);
+        // Integer edges left, top, right and bottom as a rect.
+        let rect = |l: i128, t: i128, r: i128, b: i128| [l, t, r - l, b - t].map(to_f32);
+        // The image's height at the destination's width, centred:
+        // top = y + (h·iw − ih·w) / (2·iw), bottom = y + (h·iw + ih·w) / (2·iw).
+        let fit_height = || {
+            let den = 2 * iw;
+            rect(
+                up(qx, 1),
+                up(den * qy + qh * iw - ih * qw, den),
+                up(qx + qw, 1),
+                up(den * qy + qh * iw + ih * qw, den),
+            )
         };
-        let fit_width = |nw: f64| {
-            let left = fx + (fw - nw) / 2.0;
-            edges(left, fy, left + nw, fy + fh)
+        // The image's width at the destination's height, centred.
+        let fit_width = || {
+            let den = 2 * ih;
+            rect(
+                up(den * qx + qw * ih - iw * qh, den),
+                up(qy, 1),
+                up(den * qx + qw * ih + iw * qh, den),
+                up(qy + qh, 1),
+            )
         };
+        // sx ≤ sy, as w / iw ≤ h / ih.
+        let narrower = qw * ih <= qh * iw;
+        let wider = qw * ih >= qh * iw;
         let rect = match self {
             Self::Fill => [x, y, w, h],
-            Self::Inner if sx <= sy => fit_height(ih * sx),
-            Self::Inner => fit_width(iw * sy),
-            Self::Outer if sx >= sy => fit_height(ih * sx),
-            Self::Outer => fit_width(iw * sy),
-            Self::FitWidth => fit_height(ih * fw / iw),
-            Self::FitHeight => fit_width(iw * fh / ih),
+            Self::Inner if narrower => fit_height(),
+            Self::Inner => fit_width(),
+            Self::Outer if wider => fit_height(),
+            Self::Outer => fit_width(),
+            Self::FitWidth => fit_height(),
+            Self::FitHeight => fit_width(),
             Self::NoExpanding => return ([x, y, w, h], Some(Native::NoLarger(native))),
             Self::NoResize => return ([x, y, w, h], Some(Native::Exact(native))),
         };

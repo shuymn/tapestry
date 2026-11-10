@@ -527,6 +527,9 @@ mod tests {
             [5, 7, 333, 333],
             [10, 10, 2, 2],
             [11, 13, 3, 2],
+            // A square image in 7 × 8: the exact top is a half pixel that
+            // floating division misses.
+            [0, 0, 7, 8],
         ];
         let natives = [
             [200, 100],
@@ -536,6 +539,7 @@ mod tests {
             [1_920, 1_080],
             [2, 1],
             [1, 2],
+            [25, 25],
         ];
         let height = i32::try_from(super::super::geom::HEIGHT).unwrap();
         for (mode, chart) in modes {

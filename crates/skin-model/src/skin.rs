@@ -3009,7 +3009,7 @@ impl Skin {
             state: shown.state(),
             text: shown.text(),
             bitmap: shown.bitmap(),
-            chart: Some(shown.chart_images()),
+            chart: Some(shown.drawable_chart()),
         };
         let scene = Scene {
             turntable: frame.turntable,
@@ -3080,7 +3080,7 @@ impl Skin {
             state: loading.state(),
             text: loading.text(),
             bitmap: loading.bitmap(),
-            chart: loading.chart_images(),
+            chart: loading.drawable_chart(),
         };
         let scene = Scene {
             turntable: frame.turntable,

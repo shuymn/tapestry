@@ -11,7 +11,20 @@ mod play_support;
 mod widget_support;
 
 use bms_model::TimeUs;
-use skin_model::chart_image::{ChartImage, ChartStretch, ChartTable, ChartUv};
+use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
+
+/// The array the tests' tables describe, and the frames' live key.
+const KEY: ChartKey = ChartKey {
+    renderer: 1,
+    installation: 2,
+    atlas: 3,
+    generation: 4,
+};
+
+/// A table of `stage` and `back` describing [`KEY`]'s array.
+fn table(stage: Option<ChartUv>, back: Option<ChartUv>) -> ChartTable {
+    ChartTable::new(stage, back).keyed(KEY)
+}
 use skin_model::{
     AtlasError, AtlasLimits, DecisionDefs, ElementDef, Filter, FrameUv, GUTTER, KeptLayers, Layout,
     LoadError, LoadState, Loading, LoadingFrame, MIN_TEXT_SIDE, Native, Place, QuadBatch,
@@ -113,7 +126,11 @@ impl Loader {
     fn new(skin: Skin) -> Self {
         Self {
             uvs: uvs(&skin),
-            loading: skin.prepare_loading(skin_model::Side::Left),
+            loading: {
+                let mut l = skin.prepare_loading(skin_model::Side::Left);
+                l.set_chart_live(Some(KEY));
+                l
+            },
             batch: QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity()),
             skin,
         }
@@ -160,8 +177,7 @@ fn loading_frames_wait_for_the_images_to_be_published() {
     assert_eq!(drawn(&l.batch), Vec::new(), "unavailable");
 
     let back = back_uv([640, 480]);
-    l.loading
-        .set_chart_images(Some(ChartTable::new(None, Some(back))));
+    l.loading.set_chart_images(Some(table(None, Some(back))));
     l.build();
     assert_eq!(
         drawn(&l.batch),
@@ -176,7 +192,8 @@ fn loading_frames_wait_for_the_images_to_be_published() {
         (0, 1)
     );
 
-    l.loading.set_chart_images(Some(ChartTable::ABSENT));
+    l.loading
+        .set_chart_images(Some(ChartTable::ABSENT.keyed(KEY)));
     l.build();
     let rects: Vec<_> = drawn(&l.batch).into_iter().map(|(r, _)| r).collect();
     assert_eq!(rects, vec![f(NO_BACK_MARK)], "absent: the negation holds");
@@ -192,7 +209,7 @@ fn loading_frames_wait_for_the_images_to_be_published() {
 #[test]
 fn a_reset_keeps_the_published_images() {
     let mut l = Loader::new(skin());
-    let table = ChartTable::new(Some(stage_uv([640, 480])), None);
+    let table = table(Some(stage_uv([640, 480])), None);
     l.loading.set_chart_images(Some(table));
     l.loading.reset();
     assert_eq!(l.loading.chart_images(), Some(&table));
@@ -203,14 +220,14 @@ fn a_reset_keeps_the_published_images() {
 #[test]
 fn a_play_draws_its_images_and_reads_their_fields() {
     let mut h = Harness::new(skin(), &chart(), &play_support::full(0));
+    h.play.set_chart_live(Some(KEY));
     h.frame(0, &[]);
     let rects: Vec<_> = drawn(&h.batch).into_iter().map(|(r, _)| r).collect();
     assert_eq!(rects, vec![f(NO_BACK_MARK)], "absent until set");
     assert_eq!(h.field(field::CHART_STAGEFILE), 0);
 
     let (stage, back) = (stage_uv([640, 480]), back_uv([640, 480]));
-    h.play
-        .set_chart_images(ChartTable::new(Some(stage), Some(back)));
+    h.play.set_chart_images(table(Some(stage), Some(back)));
     h.frame(10, &[]);
     let got = drawn(&h.batch);
     assert_eq!(got[0], (f(STAGE), stage.uv.uv));
@@ -287,8 +304,9 @@ fn a_chart_image_draws_its_stretched_rect() {
     )
     .unwrap();
     let mut h = Harness::new(s, &chart(), &play_support::full(0));
+    h.play.set_chart_live(Some(KEY));
     h.play
-        .set_chart_images(ChartTable::new(Some(stage_uv([200, 100])), None));
+        .set_chart_images(table(Some(stage_uv([200, 100])), None));
     h.frame(0, &[]);
     assert_eq!(drawn(&h.batch)[0].0, [200.0, 100.0, 200.0, 100.0]);
 }
@@ -428,4 +446,81 @@ fn slots_and_uvs_cover_the_content_only() {
     .image
     .unwrap();
     assert!(ChartUv::of(&wide, ChartImage::Stage, 2_048, 7).is_none());
+}
+
+/// A table draws only in a frame whose live key is its own: another
+/// renderer's, installation's, atlas's or generation's table, an unkeyed
+/// one, or any while the live key is unknown (a lost device) reads as
+/// unavailable while loading and absent in a play, whatever was set.
+#[test]
+fn only_a_table_of_the_live_array_draws() {
+    let others = [
+        ChartKey { renderer: 9, ..KEY },
+        ChartKey {
+            installation: 9,
+            ..KEY
+        },
+        ChartKey { atlas: 9, ..KEY },
+        ChartKey {
+            generation: 9,
+            ..KEY
+        },
+    ];
+    let back = back_uv([640, 480]);
+    let mut l = Loader::new(skin());
+    l.loading.set_chart_images(Some(table(None, Some(back))));
+    l.build();
+    assert!(!drawn(&l.batch).is_empty(), "its own array draws");
+    for live in others.map(Some).into_iter().chain([None]) {
+        l.loading.set_chart_live(live);
+        l.build();
+        assert_eq!(drawn(&l.batch), Vec::new(), "{live:?}: unavailable");
+    }
+    l.loading.set_chart_live(Some(KEY));
+    l.loading
+        .set_chart_images(Some(ChartTable::new(None, Some(back))));
+    l.build();
+    assert_eq!(drawn(&l.batch), Vec::new(), "an unkeyed table: unavailable");
+
+    let mut h = Harness::new(skin(), &chart(), &play_support::full(0));
+    h.play.set_chart_images(table(None, Some(back)));
+    for live in others.map(Some).into_iter().chain([None]) {
+        h.play.set_chart_live(live);
+        h.frame(0, &[]);
+        let rects: Vec<_> = drawn(&h.batch).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(rects, vec![f(NO_BACK_MARK)], "{live:?}: absent");
+        assert_eq!(h.field(field::CHART_BACKBMP), 0);
+    }
+    h.play.set_chart_live(Some(KEY));
+    h.frame(10, &[]);
+    assert_eq!(h.field(field::CHART_BACKBMP), 1);
+}
+
+/// Placement is exact: a half-up decision is never moved by a float's
+/// error. 25 × 25 in 7 × 8: the importer's exact top is 1/2, so 1.
+#[test]
+fn placement_rounds_exactly() {
+    let r = [0.0, 0.0, 7.0, 8.0];
+    assert_eq!(
+        ChartStretch::Inner.place(r, [25, 25]).0,
+        [0.0, 1.0, 7.0, 7.0]
+    );
+    assert_eq!(
+        ChartStretch::Outer.place(r, [25, 25]).0,
+        [0.0, 0.0, 8.0, 8.0]
+    );
+}
+
+/// An animated destination is stretched and rounded at each sample: at
+/// whole-pixel keys this is the importer's baked key; between keys the
+/// model's quad snaps to whole pixels where the importer's interpolated
+/// baked keys would sit on a fraction (design note D-chart-8). An `Inner`
+/// destination moving x from 0 to 1, sampled a quarter of the way: the
+/// model places it at 0, the baked keys at 0.25.
+#[test]
+fn an_animated_destination_rounds_at_each_sample() {
+    let at_key = ChartStretch::Inner.place([1.0, 0.0, 7.0, 8.0], [25, 25]).0;
+    assert_eq!(at_key, [1.0, 1.0, 7.0, 7.0]);
+    let quarter = ChartStretch::Inner.place([0.25, 0.0, 7.0, 8.0], [25, 25]).0;
+    assert_eq!(quarter, [0.0, 1.0, 7.0, 7.0]);
 }

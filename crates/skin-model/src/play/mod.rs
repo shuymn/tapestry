@@ -19,7 +19,7 @@ use rules::GaugeValue;
 use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
 use self::schema::{field, timer};
-use crate::chart_image::ChartTable;
+use crate::chart_image::{ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
@@ -531,6 +531,9 @@ pub struct Play {
     /// The chart images its frames draw and whose fields they give:
     /// absent until set ([`set_chart_images`](Self::set_chart_images)).
     chart: ChartTable,
+    /// The live key of the array its frames draw from, set by the frame's
+    /// renderer before each build ([`set_chart_live`](Self::set_chart_live)).
+    chart_live: Option<ChartKey>,
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
     bars: Option<BarScratch>,
@@ -719,6 +722,7 @@ impl Play {
             text: TextTable::default(),
             bitmap: Box::new([]),
             chart: ChartTable::ABSENT,
+            chart_live: None,
             bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
         })
     }
@@ -816,10 +820,28 @@ impl Play {
         self.chart = table;
     }
 
-    /// The chart images its frames draw.
+    /// The chart images set for it.
     #[must_use]
     pub fn chart_images(&self) -> &ChartTable {
         &self.chart
+    }
+
+    /// Sets the live key of the array its next frames draw from: the
+    /// frame's renderer sets it before each build, from its own state.
+    /// Allocates nothing.
+    pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
+        self.chart_live = live;
+    }
+
+    /// The chart images its frames draw: the table set for it when it
+    /// describes the live array ([`ChartTable::drawable`]), else none.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn drawable_chart(&self) -> &ChartTable {
+        if self.chart.drawable(self.chart_live) {
+            &self.chart
+        } else {
+            &ChartTable::ABSENT
+        }
     }
 
     pub(crate) fn set_text(&mut self, table: TextTable) {

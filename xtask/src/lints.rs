@@ -447,7 +447,10 @@ pub const IN_PLAY: &[Site] = &[
             "ChartImage::index",
             "ChartTable::get",
             "ChartTable::present",
+            "ChartTable::drawable",
             "ChartStretch::place",
+            "exact",
+            "to_f32",
         ],
     ),
     Site::Fns(

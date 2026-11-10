@@ -18,7 +18,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
-use skin_model::chart_image::{ChartImage, ChartStretch, ChartTable, ChartUv};
+use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
 use skin_model::{
     ElementDef, Filter, FrameUv, LoadState, LoadingFrame, Place, QuadBatch, Source, TimerRef, timer,
 };
@@ -109,6 +109,14 @@ fn uv(native: [u32; 2]) -> ChartUv {
     }
 }
 
+/// The live key of the tests' frames.
+const KEY: ChartKey = ChartKey {
+    renderer: 1,
+    installation: 2,
+    atlas: 3,
+    generation: 4,
+};
+
 #[test]
 fn chart_image_frames_do_not_allocate() {
     // The positive control: the counter sees an allocation on this thread.
@@ -129,14 +137,21 @@ fn chart_image_frames_do_not_allocate() {
         });
     }
     let skin = load(Vec::new(), elements).unwrap();
+    let other = ChartKey {
+        generation: 5,
+        ..KEY
+    };
     let tables = [
-        ChartTable::new(Some(uv([640, 480])), Some(uv([200, 600]))),
-        ChartTable::new(None, Some(uv([1, 1]))),
-        ChartTable::ABSENT,
+        ChartTable::new(Some(uv([640, 480])), Some(uv([200, 600]))).keyed(KEY),
+        ChartTable::new(None, Some(uv([1, 1]))).keyed(KEY),
+        ChartTable::ABSENT.keyed(KEY),
+        // Another array's: unavailable while loading, absent in a play.
+        ChartTable::new(Some(uv([640, 480])), None).keyed(other),
     ];
 
     // Play frames, the images set between them.
     let mut h = Harness::new(skin.clone(), &chart(), &play_support::full(0));
+    h.play.set_chart_live(Some(KEY));
     h.frame(0, &[]);
     let mut drawn = 0;
     for (k, table) in (1..).zip(tables) {
@@ -152,6 +167,7 @@ fn chart_image_frames_do_not_allocate() {
     // Loading frames: unavailable, then each table, then unavailable.
     let uvs = uvs(&skin);
     let mut loading = skin.prepare_loading(skin_model::Side::Left);
+    loading.set_chart_live(Some(KEY));
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let layout = skin_model::Layout::AUTHOR;
     let covers = readouts_for(VIEW).covers;
@@ -182,6 +198,7 @@ fn chart_image_frames_do_not_allocate() {
         Some(tables[0]),
         Some(tables[1]),
         Some(tables[2]),
+        Some(tables[3]),
         None,
     ];
     for (k, table) in (1..).zip(states) {
