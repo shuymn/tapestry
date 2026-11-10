@@ -3,14 +3,17 @@
 //! data, sent to the render thread in its message, from which a borrowed
 //! [`PlayContext`] is made only for the call that prepares the screen,
 //! with the chart's labels as [`ChartText`], and the attempt's tempo
-//! provider ([`AttemptTempo`]) beside it.
+//! provider ([`AttemptTempo`]) beside it, and the play's best and target
+//! with the chart's 1× profile and MAIN tempo ([`skin_model::PlayScore`]).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::TimeUs;
+use std::sync::Arc;
+
+use bms_model::{ChartProfile, Tempo, TimeUs};
 use game::{Attempt, AttemptKind, AttemptTempo, ChartLabels};
 use skin_beatoraja::JudgeClass;
-use skin_model::{BpmRange, ChartMetadata, ChartText, GaugeDesc, PlayContext, Side};
+use skin_model::{BpmRange, ChartMetadata, ChartText, GaugeDesc, PlayContext, PlayScore, Side};
 
 use crate::imports::facts::{difficulty_of, level_of};
 
@@ -48,6 +51,12 @@ pub struct AttemptContext {
     epoch: u64,
     /// Whether the attempt is autoplay.
     autoplay: bool,
+    /// The play's best and target, read when it began.
+    score: skin_model::ScoreBasis,
+    /// The chart's 1× profile, shared with the loaded chart.
+    profile: Option<Arc<ChartProfile>>,
+    /// The whole chart's MAIN tempo.
+    main: Option<Tempo>,
     /// The scratch lane's notes autoplay's turntable presses, built before
     /// READY; none for a play by hand.
     scratch_notes: Vec<game::ScratchNote>,
@@ -80,6 +89,13 @@ impl AttemptContext {
             tempo: attempt.tempo,
             epoch,
             autoplay,
+            score: skin_model::ScoreBasis {
+                best: attempt.score.best,
+                best_known: attempt.score.best_known,
+                target: attempt.score.target,
+            },
+            profile: attempt.profile,
+            main: attempt.main,
             scratch_notes: Vec::new(),
             carry_key: None,
         }
@@ -171,6 +187,11 @@ impl AttemptContext {
             bpm_range: bpm_range(self.tempo.meta()),
             bpm_whole_change: Some(bpm_whole_change(self.tempo.meta())),
             play_level: Some(self.play_level),
+            score: PlayScore {
+                basis: self.score,
+                profile: self.profile.as_deref(),
+                main: self.main,
+            },
         }
     }
 }
@@ -339,5 +360,54 @@ mod tests {
         assert_eq!(change, Some(false), "both saturate");
         let (change, _) = context(2_147_483_646_000, 2_147_483_647_000);
         assert_eq!(change, Some(true), "the last whole BPM below saturation");
+    }
+
+    /// The context hands the skin the attempt's best and target, the
+    /// load's shared profile itself (not a copy) and the whole chart's
+    /// MAIN tempo; an attempt made without them gives none.
+    #[test]
+    fn the_context_carries_the_score_basis_and_profile() {
+        let preset = rules::tapestry();
+        let chart = bms_model::ChartBuilder::new(150_000)
+            .tap(bms_model::Lane::new(1).unwrap(), TimeUs(1_000_000))
+            .build()
+            .unwrap();
+        let bare = Attempt::new(
+            1,
+            &preset,
+            TimeUs(0),
+            None,
+            TimeUs(1_000_000),
+            &ChartLabels::default(),
+            &chart,
+        );
+        let none = AttemptContext::new(bare.clone(), Side::Left, 0, false);
+        let ctx = none.context();
+        assert_eq!(ctx.score.basis, skin_model::ScoreBasis::default());
+        assert!(ctx.score.profile.is_none() && ctx.score.main.is_none());
+        let profile = std::sync::Arc::new(bms_model::ChartProfile::of(&chart, &[]));
+        let main = chart.timeline.meta().initial;
+        let attempt = Attempt {
+            score: game::ScoreBasis {
+                best: 5,
+                best_known: true,
+                target: 8,
+            },
+            profile: Some(std::sync::Arc::clone(&profile)),
+            main: Some(main),
+            ..bare
+        };
+        let owned = AttemptContext::new(attempt, Side::Left, 0, false);
+        let ctx = owned.context();
+        assert_eq!(
+            ctx.score.basis,
+            skin_model::ScoreBasis {
+                best: 5,
+                best_known: true,
+                target: 8
+            }
+        );
+        assert!(std::ptr::eq(ctx.score.profile.unwrap(), &*profile));
+        assert_eq!(ctx.score.main, Some(main));
     }
 }

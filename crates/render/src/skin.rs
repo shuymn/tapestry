@@ -240,6 +240,20 @@ pub trait PlaySkin: Send {
     /// resources kept, allocating nothing. Nothing by default.
     fn rearm(&mut self) {}
 
+    /// The chart images the prepared attempt draws and whose fields it
+    /// gives, from the next frame on ([`skin_model::Play::set_chart_images`]);
+    /// the renderer's publication sets them, never during an attempt
+    /// (S10-12 design §5.3). Nothing by default: a skin that draws no chart
+    /// image.
+    fn set_chart_images(&mut self, _table: skin_model::chart_image::ChartTable) {}
+
+    /// The live key of the array the next frames are built against: the
+    /// renderer sets it from its own state before each play and loading
+    /// build, and a chart table draws only when its key equals it
+    /// ([`skin_model::chart_image::ChartTable::drawable`]). Nothing by
+    /// default: a skin that draws no chart image.
+    fn set_chart_live(&mut self, _live: Option<skin_model::chart_image::ChartKey>) {}
+
     /// What the prepared attempt gives the next attempt of its play state
     /// ([`skin_model::Play::carry`]); `None` for a skin with no presentation
     /// program state, the default.

@@ -10966,6 +10966,9 @@ pub(crate) mod tests {
     struct FakePlay {
         bank: skin_model::present::Bank,
         slots_run: bool,
+        /// The best and target its context gave, which the skin's `Play`
+        /// keeps ([`skin_model::Play::score`]).
+        score: skin_model::ScoreBasis,
     }
 
     impl Installer {
@@ -11042,6 +11045,7 @@ pub(crate) mod tests {
             self.staged_play = Some(FakePlay {
                 bank: skin_model::present::Bank::of(play.0),
                 slots_run: play.1,
+                score: a.context.score.basis,
             });
             // The skin given is staged with the attempt, as the renderer
             // stages it, and installed only by the commit.
@@ -11088,6 +11092,11 @@ pub(crate) mod tests {
                 {
                     play.bank = skin_model::present::Bank::of(vals);
                 }
+                self.shared
+                    .committed_scores
+                    .lock()
+                    .unwrap()
+                    .push(play.score);
                 self.held_play = Some(play);
             }
             Ok(())
@@ -11417,6 +11426,8 @@ pub(crate) mod tests {
         /// Whether the committed attempt's last build ran its callbacks
         /// with slots on a complete view.
         witness: Arc<AtomicBool>,
+        /// The best and target of each attempt committed, in order.
+        pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
     }
 
     /// What an attempt was offered: `None` fresh, else the cached point and

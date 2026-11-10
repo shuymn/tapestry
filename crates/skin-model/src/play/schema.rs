@@ -248,6 +248,8 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        flag("chart.stagefile", T),
+        flag("chart.backbmp", T),
         Field {
             name: "display_offset.ms",
             ty: FieldTy::Int {
@@ -507,15 +509,22 @@ pub mod field {
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
     /// The source's 7-key point, with its intermediate widths: any `i32`.
     pub const POINT: u16 = 110;
+    /// Whether the chart's stage file is drawable in the installation:
+    /// read from its folder, decoded and published into its chart layer
+    /// (S10-12). While loading it is available only once the images are
+    /// published ([`Loading::set_chart_images`](crate::Loading::set_chart_images)).
+    pub const CHART_STAGEFILE: u16 = 111;
+    /// Whether the chart's back image is, as `chart.stagefile`.
+    pub const CHART_BACKBMP: u16 = 112;
     /// The display offset in whole ms, truncated toward zero as the
     /// selection screen shows it, from the frame's live presentation.
-    pub const DISPLAY_OFFSET_MS: u16 = 111;
+    pub const DISPLAY_OFFSET_MS: u16 = 113;
     /// The speed policy's hi-speed fix, as the selection screen's: 0
     /// Classic; Floating 1 from the start tempo, 2 the maximum, 3 the main
     /// and 4 the minimum.
-    pub const SETTINGS_FIX_HISPEED: u16 = 112;
+    pub const SETTINGS_FIX_HISPEED: u16 = 114;
     /// The number of fields.
-    pub const COUNT: usize = 113;
+    pub const COUNT: usize = 115;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -860,6 +869,19 @@ mod tests {
                 E
             ))
         );
+        // The chart's images, after the point.
+        for (name, s) in [
+            ("chart.stagefile", field::CHART_STAGEFILE),
+            ("chart.backbmp", field::CHART_BACKBMP),
+        ] {
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((FieldTy::Bool, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::CHART_STAGEFILE, field::POINT + 1);
         assert_eq!(slot("display_offset.ms"), Some(field::DISPLAY_OFFSET_MS));
         assert_eq!(
             PLAY.field("display_offset.ms")
@@ -881,7 +903,7 @@ mod tests {
                 .map(|(_, f)| (f.ty, f.export)),
             Some((FieldTy::Int { lo: 0, hi: 4 }, T))
         );
-        assert_eq!(field::COUNT, 113);
+        assert_eq!(field::COUNT, 115);
     }
 
     #[test]

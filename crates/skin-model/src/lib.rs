@@ -115,9 +115,9 @@ mod widget;
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasId, AtlasLimits, CELL_TABLE_BYTES,
-    FILE_TABLE_BYTES, GUTTER, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES, MIN_PAGE_SIDE,
-    MIN_TEXT_SIDE, MIP_LEVELS, PAGE_SIDE_STEP, PackedPages, Page, Variant, cell_fits_page,
-    downsample_rgba,
+    FILE_TABLE_BYTES, GUTTER, KeptLayers, MAX_ATLAS_TEXELS, MAX_PAGE_SIDE, MAX_PAGES,
+    MIN_PAGE_SIDE, MIN_TEXT_SIDE, MIP_LEVELS, PAGE_SIDE_STEP, PackedPages, Page, Variant,
+    cell_fits_page, downsample_rgba,
 };
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use decision::schema::{DECISION, timer as decision_timer};
@@ -183,7 +183,7 @@ pub use play::timers::{native_values, settled_point};
 pub use play::{
     Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
     DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, Play,
-    PlayContext, PrepareError, RoundedDuration, SkinFrame, attempt_targets,
+    PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame, attempt_targets,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{

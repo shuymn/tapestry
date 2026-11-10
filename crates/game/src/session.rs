@@ -15,10 +15,12 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ::audio::{AudioOutput, OutputError};
 use bms_model::{
-    BgmEvent, Chart, ModelError, PresentationError, Speed, TimeSource, TimeUs, VirtualClock,
+    BgmEvent, Chart, ChartProfile, ModelError, PresentationError, Speed, TimeSource, TimeUs,
+    VirtualClock,
 };
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Section, Tally};
 use input::hid::is_axis;
@@ -30,9 +32,9 @@ use replay::{
 };
 use rules::{GaugeKind, GaugeValue, RulePreset};
 
-use crate::attempt::{Attempt, NoteEnd};
+use crate::attempt::{Attempt, NoteEnd, ScoreBasis};
 use crate::autoplay::{Autoplay, AutoplayError};
-use crate::bests::{BestKey, BestLookup, BestView, SavedPlay};
+use crate::bests::{BestKey, BestLookup, BestView, SavedPlay, TargetPlay, score_target};
 use crate::live::{Closing, ClosingEnd, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -443,17 +445,35 @@ pub struct Loaded {
     /// The loaded chart's identity, which a preparation's key reads: each
     /// load is another ([`prep_key`](Self::prep_key)).
     generation: u64,
+    /// The chart's 1× profile as its ingestion built it, kept unchanged
+    /// for the load: a speed change reads the same file, seed and
+    /// transform, whose 1× profile is the same.
+    profile: Arc<ChartProfile>,
+    /// The whole chart's MAIN tempo, computed once when the chart loaded
+    /// from its original tempos, so a speed change keeps it; `None` when
+    /// its histogram is refused.
+    main: Option<bms_model::Tempo>,
+    /// The play's best and target, read for it once
+    /// ([`read_score`](Self::read_score)).
+    score: ScoreBasis,
+    /// The coming play's best as read, under the play preset's SHA-256:
+    /// kept until that play is finished, so a loading opening that begins
+    /// the same play again, or prepares it before it begins, reads no
+    /// more ([`finish_play`](Self::finish_play) forgets it).
+    coming: Option<([u8; 32], BestLookup)>,
 }
 
 /// The identity of the next chart loaded.
 static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// What one read of a chart's file gave: the chart, its record, its labels
-/// and what the loader skipped or assumed, all from one ingestion.
+/// What one read of a chart's file gave: the chart, its record, its labels,
+/// its 1× profile and what the loader skipped or assumed, all from one
+/// ingestion.
 pub(crate) struct ReadChart {
     chart: Chart,
     record: ChartRecord,
     labels: ChartLabels,
+    profile: ChartProfile,
     warnings: Vec<String>,
 }
 
@@ -621,9 +641,11 @@ impl PendingLoad {
                 chart,
                 record: chart_record,
                 labels,
+                profile,
                 warnings,
             }) => {
                 events.on_event(&SessionEvent::Load);
+                let main = crate::tempo::whole_main(&chart, crate::MAIN_HISTOGRAM_LIMIT).ok();
                 let preset = shelf.chosen().clone();
                 let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
                 Ok(Loaded {
@@ -649,6 +671,10 @@ impl PendingLoad {
                     generation: GENERATIONS
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .wrapping_add(1),
+                    profile: Arc::new(profile),
+                    main,
+                    score: ScoreBasis::default(),
+                    coming: None,
                 })
             }
             Err(e) => Err(Box::new((e, shelf))),
@@ -852,6 +878,7 @@ impl Loaded {
             chart,
             record: chart_record,
             labels: ingested.labels,
+            profile: ingested.profile,
             warnings: ingested.warnings,
         })
     }
@@ -911,6 +938,8 @@ impl Loaded {
         self.chart_record = read.record;
         self.labels = read.labels;
         self.warnings = read.warnings;
+        // The profile and MAIN stay the load's: the same file, seed and
+        // transform give the same 1× profile and original tempos.
         self.clear_practice();
         Ok(())
     }
@@ -1305,15 +1334,79 @@ impl Loaded {
     /// file changed since from this one on. The first play reports the
     /// chosen file's error standing when the chart loaded unless its check
     /// found a newer one; a later play only an error its check found.
+    ///
+    /// The play's best and target are set here ([`ScoreBasis`]), the best
+    /// read under its key with the refreshed preset unless this play read
+    /// it already under that key ([`prepare_score`](Self::prepare_score),
+    /// or an earlier begin of the same play the loading state withdrew).
+    /// Every preparation and READY rearm of the attempt keeps them; a
+    /// retry after a finished play reads again, seeing a play counted
+    /// since.
     pub fn begin_play(&mut self) -> PlayStart {
         self.attempt += 1;
         let attempt = self.attempt;
         let checked = self.reload_preset();
+        self.score = self.read_score();
         let standing = self.first_error.take();
         PlayStart {
             attempt,
             reload_error: checked.or(standing),
         }
+    }
+
+    /// The coming play's best and target (stage 3, S10-10; design.md
+    /// "Personal Bests", skin projections). A practice round reads none and
+    /// has neither (0, unknown, target 0). Any other play, autoplay
+    /// included, reads the best under the result's key, the chart file's
+    /// and the play preset's SHA-256, through the record sink: a known
+    /// best gives its EX, a known-empty one 0, and an unavailable one (no
+    /// sink, a failed read) 0, not known. The target is
+    /// [`score_target`] of the player's setting over the chart's judged
+    /// notes and that best, a chart that declares `#RANDOM` or
+    /// `#SETRANDOM` a random one. The coming play reads at most once per
+    /// key: a best already read for it under the same key is taken again.
+    fn read_score(&mut self) -> ScoreBasis {
+        if self.practice.is_some() {
+            return ScoreBasis::default();
+        }
+        let key = BestKey {
+            chart_sha256: self.chart_record.identity.sha256,
+            preset_sha256: replay::preset_hash(&self.preset),
+        };
+        let lookup = match self.coming.take() {
+            Some((preset, lookup)) if preset == key.preset_sha256 => lookup,
+            _ => match self.parts.records.as_mut() {
+                Some(sink) => sink.best_before(&key, &self.preset),
+                None => BestLookup::Unavailable,
+            },
+        };
+        self.coming = Some((key.preset_sha256, lookup.clone()));
+        let (best, best_known) = match lookup {
+            BestLookup::Known(score) => (score.ex.unwrap_or(0), true),
+            BestLookup::KnownEmpty => (0, true),
+            BestLookup::Unavailable => (0, false),
+        };
+        let basis = crate::result_figures::ResultBasis::of(&self.chart, None);
+        let play = if basis.random {
+            TargetPlay::Random
+        } else {
+            TargetPlay::Fixed
+        };
+        ScoreBasis {
+            best,
+            best_known,
+            target: score_target(self.settings.player.target, basis.notes, best, play),
+        }
+    }
+
+    /// The coming play's best and target, set before its attempt is first
+    /// prepared when that comes before the play begins: the loading state
+    /// prepares a chart's first attempt at load-ready
+    /// ([`crate::load_and_open`]), and its skin takes them from that
+    /// preparation. [`begin_play`](Self::begin_play) then reads no more
+    /// under the same key.
+    pub(crate) fn prepare_score(&mut self) {
+        self.score = self.read_score();
     }
 
     /// The play `start` stopped before recording opened (its preparation
@@ -1343,6 +1436,9 @@ impl Loaded {
         };
         Attempt {
             displayed: self.displayed,
+            score: self.score,
+            profile: Some(Arc::clone(&self.profile)),
+            main: self.main,
             ..Attempt::new(
                 self.attempt,
                 &self.preset,
@@ -1621,6 +1717,8 @@ impl Loaded {
     /// saves it, summarizes it through the result extension, and reports
     /// the session events.
     pub fn finish_play(&mut self, outcome: PlayOutcome) -> PlayReport {
+        // The play is over: the next one reads its best again.
+        self.coming = None;
         let PlayOutcome {
             start,
             end,
