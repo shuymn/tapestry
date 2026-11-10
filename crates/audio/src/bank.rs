@@ -1074,10 +1074,11 @@ pub trait Width: Sync {
     /// packet.
     fn at_file(&self, worker: usize) -> bool;
 
-    /// Asked by worker 0 after an `at_file(0)` that went on, before it
-    /// starts worker `worker` (numbered from 1), while fewer than `cap`
-    /// workers run (the decode threads the limits, the cores and the files
-    /// allow) and files are left: whether it may. A `true` may reserve what
+    /// Asked by worker 0 after an `at_file(0)` that went on and its own file
+    /// taken, before it starts worker `worker` (numbered from 1), while
+    /// fewer than `cap` workers run (the decode threads the limits, the
+    /// cores and the files allow) and files were left as it began starting
+    /// them: whether it may. A `true` may reserve what
     /// that worker will hold, and is followed by exactly one
     /// `retire(worker)`.
     fn start(&self, worker: usize, cap: usize) -> bool;
@@ -1154,7 +1155,13 @@ fn pool<T: Send>(
                 halt();
                 break;
             }
-            // Workers for the files left, each on its own start.
+            // Its own file first, so the others never leave it none.
+            let mine = next.fetch_add(1, Ordering::Relaxed);
+            if mine >= jobs {
+                break;
+            }
+            // Workers for the files left as it looks, each on its own
+            // start; one started meanwhile may take them all.
             if next.load(Ordering::Relaxed) < jobs {
                 let mut now = running.load(Ordering::SeqCst);
                 while now < cap {
@@ -1197,9 +1204,7 @@ fn pool<T: Send>(
                 }
                 most = most.max(now);
             }
-            if !take(&mut out) {
-                break;
-            }
+            out.push((mine, f(mine)));
         }
         for extra in extras {
             out.extend(extra.join().unwrap_or_else(|e| panic::resume_unwind(e)));
@@ -1888,6 +1893,15 @@ mod tests {
     }
 
     fn load_on(chart: &Chart, threads: usize, width: &dyn Width) -> Result<SoundBank, BankError> {
+        load_seen(chart, threads, width, &|_, _| {})
+    }
+
+    fn load_seen(
+        chart: &Chart,
+        threads: usize,
+        width: &dyn Width,
+        progress: &(dyn Fn(usize, usize) + Sync),
+    ) -> Result<SoundBank, BankError> {
         let limits = BankLimits {
             max_decode_threads: threads,
             ..BankLimits::default()
@@ -1897,21 +1911,28 @@ mod tests {
             8_000,
             Speed::NORMAL,
             &limits,
-            &|_, _| {},
+            progress,
             &|| false,
             width,
         )
     }
 
-    /// Z4: worker 0 asks before each of its files on the calling thread,
-    /// alone or beside another worker.
+    /// Z4: worker 0 asks before each of its files, and decodes one, on the
+    /// calling thread, alone or beside another worker.
     #[test]
     fn pool_runs_worker_zero_on_the_callers_thread() {
         let (_dir, chart) = distinct(3);
         let me = thread::current().id();
         for grant in [|_| 1, |_| 2] {
             let width = Probe::new(grant);
-            let bank = load_on(&chart, 3, &width).unwrap();
+            let decoded_here = AtomicBool::new(false);
+            let progress = |_, _| {
+                if thread::current().id() == me {
+                    decoded_here.store(true, Ordering::SeqCst);
+                }
+            };
+            let bank = load_seen(&chart, 3, &width, &progress).unwrap();
+            assert!(decoded_here.load(Ordering::SeqCst), "no file decoded here");
             assert_eq!(bank.sounds.len(), 3);
             let calls = width.calls();
             assert!(calls.iter().any(|&(w, _)| w == 0));
