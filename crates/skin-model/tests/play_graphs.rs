@@ -352,6 +352,37 @@ fn the_cursors_follow_the_1x_chart_time() {
     fx.empty(241.0, y);
 }
 
+/// C21: a cursor is drawn only inside the graph, as the source paints it
+/// into the graph's own pixmap: at 2.9 s of 3 the play cursor covers 290 to
+/// 300, not 350; past the chart (an audio tail) none is drawn.
+#[test]
+fn the_cursors_stay_inside_the_graph() {
+    let chart = notes_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let s = skin(
+        vec![el(Source::JudgeGraph(0), [0, 500, 300, 100])],
+        PlayDefs {
+            judge_graphs: vec![notes_graph(false)],
+            ..PlayDefs::default()
+        },
+    );
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let mut fx = Fx::new(s, &chart, &ctx(score));
+    let y = 505.0;
+    fx.frame(2_900);
+    fx.is(291.0, y, rgb(0xff_ffff));
+    fx.is(299.5, y, rgb(0xff_ffff));
+    fx.empty(300.5, y);
+    fx.empty(340.0, y);
+    let drawn = fx.h.batch.quads().len();
+    fx.frame(3_500);
+    fx.empty(355.0, y);
+    assert_eq!(fx.h.batch.quads().len(), drawn - 1);
+}
+
 // ---------------------------------------------------------------------
 // The BPM graph.
 
@@ -478,6 +509,55 @@ fn the_bpm_graph_draws_the_sources_strokes() {
     let half = 128.0 / 255.0;
     let (x, y) = at(80.0, 33.0);
     near(fx.px(x, y).0, over_backdrop(rgb(0x00_00ff), half), 1.0);
+}
+
+/// C22: both clamp ends and a ratio that is not a power of two: 150 at 0,
+/// 173 at 1 000, 1 500 at 2 000 (ten times MAIN), the last note at 4 000.
+/// y of 173 is `⌊(log10(173/150) + log10 8)/(2 log10 8) · 98⌋ = 52`; 1 500
+/// clamps to 8, y 98 (unclamped it would be 103, off the pixmap). The
+/// strokes: green 150 over 0-21 rows 49-50; grey 20-21 row 51; yellow 173
+/// over 20-41 rows 52-53; grey 40-41 rows 54-97; red 1 500 (the highest)
+/// over 40-99 rows 98-99.
+#[test]
+fn the_bpm_graph_clamps_both_ends() {
+    let mut b = ChartBuilder::new(150_000)
+        .bpm(TimeUs(1_000 * MS), 173_000)
+        .bpm(TimeUs(2_000 * MS), 1_500_000);
+    for k in 1..=5 {
+        b = b.tap(lane(1), TimeUs(100 * k * MS));
+    }
+    b = b.tap(lane(1), TimeUs(4_000 * MS));
+    let mut chart = b.build().unwrap();
+    let profile = profile_of(&mut chart, &[]);
+    let score = PlayScore {
+        profile: Some(&profile),
+        main: Some(tempo(150)),
+        ..PlayScore::NONE
+    };
+    let s = skin(
+        vec![el(Source::BpmGraph(0), [0, 0, 100, 100])],
+        PlayDefs {
+            bpm_graphs: vec![bpm_graph(2)],
+            ..PlayDefs::default()
+        },
+    );
+    let mut fx = Fx::new(s, &chart, &ctx(score));
+    fx.frame(0);
+    let at = |c: f32, r: f32| (c + 0.5, 99.5 - r);
+    let (x, y) = at(10.0, 49.0);
+    fx.is(x, y, rgb(0x00_ff00));
+    let (x, y) = at(21.0, 51.0);
+    fx.is(x, y, rgb(0x7f_7f7f));
+    let (x, y) = at(30.0, 52.0);
+    fx.is(x, y, rgb(0xff_ff00));
+    let (x, y) = at(30.0, 54.0);
+    fx.empty(x, y);
+    let (x, y) = at(41.0, 70.0);
+    fx.is(x, y, rgb(0x7f_7f7f));
+    let (x, y) = at(60.0, 98.0);
+    fx.is(x, y, rgb(0xff_0000));
+    let (x, y) = at(90.0, 99.0);
+    fx.is(x, y, rgb(0xff_0000));
 }
 
 /// C22 (G8): a column holding four changes keeps its first three runs and
@@ -655,6 +735,21 @@ fn the_timing_visualizer_bands_and_lines() {
     let a = 128.0 / 255.0;
     let older = line_over(rgb(CYAN), a / 100.0 * 99.0, rgb(RED));
     fx.is(155.5, y, line_over(rgb(CYAN), a / 100.0 * 100.0, older));
+    // Lines are emitted oldest first, each at its own age's alpha: +5 then
+    // +10 give 155 at `a·99/100`, then 160 at `a`.
+    let mut order = Fx::new(s([255; 3], 255), &chart, &ctx(score));
+    order.h.record(5);
+    order.h.record(10);
+    order.frame(0);
+    let lines: Vec<(f32, f32)> = order.h.batch.quads()[band_quads..]
+        .iter()
+        .map(|q| (q.rect[0], q.color[3]))
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].0, 155.0);
+    assert!((lines[0].1 - 128.0 / 255.0 / 100.0 * 99.0).abs() < 1e-6);
+    assert_eq!(lines[1].0, 160.0);
+    assert!((lines[1].1 - 128.0 / 255.0).abs() < 1e-6);
     // A line out of range draws nothing.
     fx.h.record(151);
     fx.frame(20);
@@ -897,7 +992,7 @@ fn reference_ema(alpha: f32, values: impl IntoIterator<Item = i32>) -> i64 {
     for v in values {
         let v = i64::from(v);
         if -150 < v && v < 150 {
-            ema += (alpha * (v - ema) as f32) as i64;
+            ema = ema.wrapping_add((alpha * v.wrapping_sub(ema) as f32) as i64);
         }
     }
     ema
@@ -979,4 +1074,22 @@ fn each_average_consumes_the_ring_once() {
     fresh.h.clear_ring();
     fresh.frame(10);
     assert_eq!(shown_ema(&fresh, 0), 0);
+}
+
+/// C26: any weight the source takes steps as its `long` arithmetic does,
+/// never overflowing. At 1e20 after 1, `(long)(1e20 · 1)` saturates to
+/// `i64::MAX`; after −2 the difference `−2 − MAX` wraps to `MAX`, the
+/// product is past `float`'s range and saturates to `MAX` again, and the
+/// sum wraps to −2: texel 1 002. At −0.5 after 40 the average is −20:
+/// texel 1 020.
+#[test]
+fn extreme_weights_step_as_the_source_does() {
+    for (alpha, values, want) in [(1e20_f32, vec![1, -2], -2), (-0.5, vec![40], -20)] {
+        let mut fx = hit_fx(vec![ema_only(alpha)], &[[0, 300, 2_001, 20]], 255, 0);
+        for v in values {
+            fx.h.record(v);
+            fx.frame(0);
+        }
+        assert_eq!(shown_ema(&fx, 0), want, "{alpha}");
+    }
 }

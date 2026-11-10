@@ -477,6 +477,7 @@ fn score_frames_do_not_allocate() {
         "second round, mid-play",
     );
     skin_b();
+    skin_notes();
     skin_c();
     skin_d();
     one_hour();
@@ -525,7 +526,7 @@ fn graph_frames(name: &str, skin: Skin, chart: &Chart, score: PlayScore<'_>, che
     check(&h, &atlas, &label("ready"));
     assert_eq!(frame(&mut h, 100, tally(0, 0, 1)), 0);
     check(&h, &atlas, &label("empty POOR"));
-    for v in [12, -30, 7] {
+    for v in [600, -700, 7] {
         h.record(v);
     }
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
@@ -629,6 +630,115 @@ fn skin_b() {
     graph_frames("B", skin, &chart, score, &check);
 }
 
+const GREEN: u32 = 0x00_ff00;
+/// The hit-error bands' colours in skin C: PERFECT red, GREAT blue, GOOD
+/// yellow, BAD magenta, beyond cyan; the average green, the centre white.
+const HIT_BANDS: [u32; 5] = [0xff_0000, 0x00_00ff, 0xff_ff00, 0xff_00ff, 0x00_ffff];
+
+/// Skin C's hit-error texel of an offset: `(4 096 − 4)/2` less the offset
+/// scaled by `4 096 / 2 001`, truncated toward 0.
+fn hit_x(v: i64) -> i64 {
+    2_046 + (-v.clamp(-1_000, 1_000) * 4_096) / 2_001
+}
+
+/// The offsets skin C's average has taken by stage ([`graph_frames`]):
+/// none before mid-play; 600, −700 (outside the BAD window, read and
+/// skipped) and 7 then; at the end the newest 100 of the
+/// 127 recorded after them (the first 27 overwritten unread); after a
+/// rearm and in a fresh round none, then 20.
+fn ema_inputs(at: &str) -> Vec<i64> {
+    let tail: Vec<i64> = (0..127).map(|k| (k * 17 % 300) - 150).collect();
+    if at.ends_with(": mid-play") && !at.contains("second round") {
+        vec![600, -700, 7]
+    } else if at.ends_with(": end") {
+        let mut v = vec![600, -700, 7];
+        v.extend(&tail[27..]);
+        v
+    } else if at.ends_with("second round, mid-play") {
+        vec![20]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The average after `values` at weight 0.1, by the source's arithmetic,
+/// over the BAD window (−150, 150).
+fn ema_of(values: &[i64]) -> i64 {
+    let mut ema = 0_i64;
+    for &v in values {
+        if -150 < v && v < 150 {
+            ema = ema.wrapping_add((0.1_f32 * v.wrapping_sub(ema) as f32) as i64);
+        }
+    }
+    ema
+}
+
+/// Skin C's hit-error output: the newest line in its band's colour at the
+/// pixmap's bottom row (only the newest reaches it with decay), every
+/// offset no longer in the ring gone from the middle row (every line in the
+/// ring crosses it), and the average's line and triangle in green.
+fn hit_error_output(h: &Harness, atlas: &Atlas, at: &str) {
+    let px = |x: f64, row: f64| {
+        graph_support::composite(h.batch.quads(), atlas, x as f32, (100.0 + row) as f32, None)
+    };
+    let green = [0.0, 255.0, 0.0];
+    let ema = i64::from(ema_of(&ema_inputs(at)) as i32);
+    let ema_x = hit_x(ema);
+    let ring: Vec<i64> = (0..h.ring_count.min(100))
+        .map(|age| {
+            let slot = (h.ring_count - 1 - age) % 100;
+            i64::from(h.ring[usize::try_from(slot).unwrap()])
+        })
+        .collect();
+    // The average's line, full height, painted last.
+    graph_support::near(px(ema_x as f64 + 2.0, 199.5).0, green, 1.0);
+    // Its triangle from the top: half width 40, depth 66 rows.
+    let tip = ema_x + 2;
+    graph_support::near(px((tip - 39) as f64 + 0.5, 0.5).0, green, 1.0);
+    graph_support::near(px((tip + 39) as f64 + 0.5, 0.5).0, green, 1.0);
+    if let Some(&newest) = ring.first() {
+        let x = hit_x(newest);
+        if (x - ema_x).abs() > 4 {
+            let band = [[-20, 20], [-60, 60], [-100, 100], [-150, 150]]
+                .iter()
+                .position(|&[lo, hi]| lo < newest && newest < hi)
+                .unwrap_or(4);
+            let c = HIT_BANDS[band];
+            let want = [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|v| v as f32);
+            graph_support::near(px(x as f64 + 2.0, 199.5).0, want, 1.0);
+        }
+    }
+    // Offsets recorded before, no longer in the ring: their texels are
+    // empty where nothing in the ring, the centre or the average reaches.
+    let gone: Vec<i64> = if at.ends_with(": end") {
+        [600, -700, 7]
+            .into_iter()
+            .chain((0..27).map(|k| (k * 17 % 300) - 150))
+            .collect()
+    } else if at.ends_with(": rearm") || at.ends_with("second round, READY") {
+        (0..127).map(|k| (k * 17 % 300) - 150).collect()
+    } else {
+        Vec::new()
+    };
+    let busy = |x: i64| {
+        (x - 2_046).abs() < 4
+            || (x - ema_x).abs() < 4
+            || (x - tip).abs() <= 41
+            || ring.iter().any(|&v| (x - hit_x(v)).abs() < 4)
+    };
+    let mut checked = 0;
+    for v in gone {
+        let x = hit_x(v);
+        if !busy(x) {
+            assert_eq!(px(x as f64 + 2.0, 100.5).1, 0, "{at}: {v} ms still drawn");
+            checked += 1;
+        }
+    }
+    if at.ends_with(": end") || at.ends_with(": rearm") {
+        assert!(checked > 0, "{at}: no expired offset was checked");
+    }
+}
+
 /// Skin C: a timing visualizer at jw 1 000 and a hit-error visualizer
 /// 4 096 texels wide over a 100-line window with 4-texel lines and both
 /// average marks.
@@ -661,8 +771,8 @@ fn skin_c() {
         alpha: 0.1,
         line: white,
         center: white,
-        ema: Rgba8::rgb(0x00_ff00, 0xff),
-        bands: [Rgba8::rgb(0xff_0000, 0xff); 5],
+        ema: Rgba8::rgb(GREEN, 0xff),
+        bands: HIT_BANDS.map(|c| Rgba8::rgb(c, 0xff)),
         decay: true,
         solid: 0,
     };
@@ -692,10 +802,7 @@ fn skin_c() {
             })
             .count();
         assert_eq!(lines, usize::try_from(n).unwrap(), "{at}");
-        // The hit-error centre line, white, at texel `(4 096 − 4)/2`.
-        let (rgb, covered) = graph_support::composite(h.batch.quads(), atlas, 2_046.5, 299.0, None);
-        assert!(covered > 0, "{at}");
-        let _ = rgb;
+        hit_error_output(h, atlas, at);
     };
     graph_frames("C", skin, &chart, score, &check);
 }
@@ -789,16 +896,147 @@ fn skin_d() {
         },
     );
     let check = |h: &Harness, atlas: &Atlas, at: &str| {
+        let px = |x: f32, y: f32| graph_support::composite(h.batch.quads(), atlas, x, y, None);
+        let near = |(rgb, covered): ([f32; 3], u32), want: [f32; 3]| {
+            assert!(covered > 0, "{at}: nothing at {want:?}");
+            graph_support::near(rgb, want, 1.0);
+        };
+        // The notes graph: 18 key taps in second 0 of 4 over 400 px, scale
+        // 20 cells of 5 px: bin 0's bottom cell in `cccccc` at x 80, clear
+        // of every cursor; not yet revealed at a round's READY (its 500 ms
+        // reveal starts there).
+        if !at.ends_with("second round, READY") {
+            near(px(80.0, 97.5), [204.0; 3]);
+        }
         // The BPM graph's MAIN row, green, at the left of its rect: 150
         // over 150 is row `⌊98/2⌋ = 49` of 100.
-        let (rgb, covered) =
-            graph_support::composite(h.batch.quads(), atlas, 0.5, 220.0 - 49.5, None);
-        assert!(covered > 0, "{at}");
-        graph_support::near(rgb, [0.0, 255.0, 0.0], 1.0);
-        // The ratio bar of the current rate is drawn.
-        assert!(at_x(h, 0.0) >= 6, "{at}");
+        near(px(0.5, 220.0 - 49.5), [0.0, 255.0, 0.0]);
+        // The timing band, all white, its centre texel under the grid,
+        // while no line crosses it.
+        if h.ring_count == 0 {
+            near(px(150.5, 250.0), [191.25; 3]);
+            near(px(151.5, 250.0), [255.0; 3]);
+        }
+        // The hit-error pixmap, 300 texels over jw 150 (`x = 149 − ⌊v ·
+        // 300 / 301⌋`): the average (the same offsets and weight as skin
+        // C's) green over its texel, its triangle at the top from 4 left of
+        // its tip (its first row 0.4 px tall: 100 rows over 40 px), and the
+        // newest line white.
+        let x_of = |v: i64| 149 + (-v.clamp(-150, 150) * 300) / 301;
+        let ema_x = x_of(i64::from(ema_of(&ema_inputs(at)) as i32));
+        near(px(ema_x as f32 + 0.5, 319.5), [0.0, 255.0, 0.0]);
+        near(px((ema_x + 1 - 4) as f32 + 0.5, 280.2), [0.0, 255.0, 0.0]);
+        if h.ring_count > 0 {
+            let slot = usize::try_from((h.ring_count - 1) % 100).unwrap();
+            let x = x_of(i64::from(h.ring[slot]));
+            if (x - ema_x).abs() > 3 {
+                near(px(x as f32 + 1.0, 319.5), [255.0; 3]);
+            }
+        }
+        // Each score bar is drawn at its own rect.
+        for i in 0..6_u8 {
+            let y = 400.0 + 30.0 * f32::from(i);
+            assert!(
+                h.batch.quads().iter().any(|q| q.rect[1] == y),
+                "{at}: bar {i}"
+            );
+        }
     };
     graph_frames("D", skin, &chart, score, &check);
+}
+
+/// The notes graph at its cap: a 1 022 s chart (1 024 seconds, 512 bins
+/// of 2 s), every category, scale 100, the background, and the cursors.
+/// Bin 2's fullest second, 5, holds one of each category: a scratch long
+/// note's head (5.5 s) and the body of one from 4.2 s, a scratch tap, a
+/// key long note's head and another's body likewise, a key tap and a mine;
+/// second 10 (bin 5) holds 100 key taps, which set the scale.
+fn skin_notes() {
+    let mut b = ChartBuilder::new(150_000)
+        .long(lane(0), TimeUs(4_200 * MS), TimeUs(5_300 * MS))
+        .tap(lane(0), TimeUs(5_400 * MS))
+        .long(lane(0), TimeUs(5_500 * MS), TimeUs(7_000 * MS))
+        .long(lane(1), TimeUs(4_200 * MS), TimeUs(5_300 * MS))
+        .long(lane(2), TimeUs(5_500 * MS), TimeUs(7_000 * MS))
+        .tap(lane(3), TimeUs(5_400 * MS))
+        .mine(lane(4), TimeUs(5_600 * MS), 10)
+        .tap(lane(1), TimeUs(1_022_000 * MS));
+    for k in 0..100_i64 {
+        b = b.tap(
+            lane(1 + u8::try_from(k % 7).unwrap()),
+            TimeUs((10_000 + 10 * k) * MS),
+        );
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    assert_eq!((profile.bins().len(), profile.bin_seconds()), (512, 2));
+    assert_eq!(profile.bins()[2], [1; 7]);
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let def = skin_model::JudgeGraphDef {
+        kind: skin_model::JudgeGraphKind::Notes,
+        delay: TimeUs(0),
+        reverse: false,
+        back: true,
+        chips: 0,
+        solid: 0,
+        fit: skin_model::GraphFit::Stretch,
+    };
+    let skin = graph_skin(
+        vec![screen_el(Source::JudgeGraph(0), [0, 0, 1_024, 500])],
+        PlayDefs {
+            judge_graphs: vec![def],
+            ..PlayDefs::default()
+        },
+    );
+    let colors: [u32; 7] = [
+        0x44_ff44, 0x22_8822, 0xff_4444, 0x44_44ff, 0x22_2288, 0xcc_cccc, 0x88_0000,
+    ];
+    let check = |h: &Harness, atlas: &Atlas, at: &str| {
+        // Bin 2 spans x 4 to 6; cell k of 100 is 5 px, its centre at
+        // y = 497.5 − 5k.
+        for (k, c) in colors.into_iter().enumerate() {
+            let y = 497.5 - 5.0 * k as f32;
+            let (rgb, covered) = graph_support::composite(h.batch.quads(), atlas, 5.0, y, None);
+            assert!(covered > 0, "{at}: cell {k}");
+            let want = [(c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff].map(|v| v as f32);
+            graph_support::near(rgb, want, 1.0);
+        }
+        // Bin 5's hundred taps reach the top cell.
+        let (rgb, _) = graph_support::composite(h.batch.quads(), atlas, 11.0, 2.5, None);
+        graph_support::near(rgb, [204.0; 3], 1.0);
+        // The cursors, full height in white, green or red: the play cursor
+        // while the play runs, a practice round's two lines throughout it.
+        let cursor = |c: [f32; 4]| {
+            [
+                [1.0, 1.0, 1.0],
+                [128.0 / 255.0, 1.0, 128.0 / 255.0],
+                [1.0, 128.0 / 255.0, 128.0 / 255.0],
+            ]
+            .iter()
+            .any(|w| w.iter().zip(c).all(|(a, b)| (a - b).abs() < 1e-3))
+        };
+        let cursors = h
+            .batch
+            .quads()
+            .iter()
+            .filter(|q| q.rect[3] == 500.0 && cursor(q.color))
+            .count();
+        let want = if at.ends_with("second round, mid-play") {
+            3
+        } else if at.ends_with("second round, READY") {
+            2
+        } else if at.ends_with(": ready") || at.ends_with(": rearm") {
+            0
+        } else {
+            1
+        };
+        assert_eq!(cursors, want, "{at}");
+    };
+    graph_frames("notes", skin, &chart, score, &check);
 }
 
 /// The one-hour case: 3 602 seconds take bins of 8 (`⌈3 602 / 512⌉`), 451
