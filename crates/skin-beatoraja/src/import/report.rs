@@ -343,6 +343,26 @@ pub enum NoteKind {
         field: &'static str,
         why: crate::lua::Unsupported,
     },
+    /// A play program callback in `field` run on frames other than the
+    /// source's, by `why` (design.md "beatoraja Lua Skins", differences
+    /// from the source).
+    Schedule {
+        field: &'static str,
+        why: ScheduleWhy,
+    },
+}
+
+/// Why a play program callback runs on frames other than the source's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleWhy {
+    /// Its element was not retained, so its object may be one the source
+    /// removes at installation (a file that does not load, a movie): it
+    /// runs where the source may not call it, never drawn.
+    MayBeRemoved,
+    /// Its image set's selector waits for an availability the source does
+    /// not have: it is skipped where the source calls it, its element
+    /// drawing nothing there either.
+    Availability,
 }
 
 impl fmt::Display for NoteKind {
@@ -395,6 +415,16 @@ impl fmt::Display for NoteKind {
             Self::Callback { field, why } => {
                 write!(f, "a callback in `{field}` replaced by its constant: {why}")
             }
+            Self::Schedule { field, why } => match why {
+                ScheduleWhy::MayBeRemoved => write!(
+                    f,
+                    "a program callback in `{field}` run where the source may have removed its object"
+                ),
+                ScheduleWhy::Availability => write!(
+                    f,
+                    "a program callback in `{field}` skipped while its selector has no value"
+                ),
+            },
             Self::InvalidColour { field } => {
                 write!(
                     f,

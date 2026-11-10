@@ -487,7 +487,7 @@ impl Cx<'_> {
             return Ok(());
         };
         let t = self.model_track(&c, &rects)?;
-        let Some(k) = self.keep_slider_value(v, at)? else {
+        let Some(k) = self.keep_slider_value(v, (&c, &dst.timer), at)? else {
             return Ok(());
         };
         let def = CoverPaintDef {
