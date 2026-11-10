@@ -137,12 +137,15 @@ fn counted_judgments_record_their_offsets_and_nothing_else_does() {
 /// A long note records once, at its counted judgment: a release judged
 /// GREAT 120 ms before the end, farther than its head's 30 ms early press,
 /// records the release's side (120, early); one held through its end
-/// records its head's 7 ms late press. Its `LnHeld` records nothing.
+/// records its head's 7 ms late press; one whose release is judged too
+/// (20 ms early) but whose head is farther off (80 ms late) records the
+/// head's side (-80). Its `LnHeld` records nothing.
 #[test]
 fn a_long_note_records_once_by_its_judgments_side() {
     let chart = ChartBuilder::new(150_000)
         .long(lane(1), TimeUs(1_000 * MS), TimeUs(2_000 * MS))
         .long(lane(2), TimeUs(3_000 * MS), TimeUs(4_000 * MS))
+        .long(lane(3), TimeUs(5_000 * MS), TimeUs(6_000 * MS))
         .build()
         .unwrap();
     let rule = rules::tapestry();
@@ -153,9 +156,11 @@ fn a_long_note_records_once_by_its_judgments_side() {
         release(1_880 * MS, 0, lane(1)),
         press(3_007 * MS, 0, lane(2)),
         release(4_300 * MS, 0, lane(2)),
+        press(5_080 * MS, 0, lane(3)),
+        release(5_980 * MS, 0, lane(3)),
     ];
     let mut stream = Vec::new();
-    for until in (500..=5_000).step_by(500) {
+    for until in (500..=7_000).step_by(500) {
         feed(&mut logic, &mut writer, &mut events, until * MS);
         stream.extend_from_slice(logic.events());
     }
@@ -163,7 +168,7 @@ fn a_long_note_records_once_by_its_judgments_side() {
         .iter()
         .filter(|e| matches!(e.kind, JudgeEventKind::LnHeld { .. }))
         .count();
-    assert_eq!(held, 2);
+    assert_eq!(held, 3);
     let judged: Vec<_> = stream
         .iter()
         .filter_map(|e| match e.kind {
@@ -181,11 +186,12 @@ fn a_long_note_records_once_by_its_judgments_side() {
         [
             (Judgment::Great, Some(-30_000), Some(-120_000)),
             (Judgment::Perfect, Some(7_000), None),
+            (Judgment::Good, Some(80_000), Some(-20_000)),
         ]
     );
     let view = logic.view();
-    assert_eq!(recorded(&view.offsets), [120, -7]);
-    assert_eq!(view.offsets.count(), 2);
+    assert_eq!(recorded(&view.offsets), [120, -7, -80]);
+    assert_eq!(view.offsets.count(), 3);
 }
 
 /// The ring through the play view: empty before any judgment; 37 offsets

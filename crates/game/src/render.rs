@@ -151,7 +151,8 @@ impl OffsetRing {
     /// ring, oldest first: the last `min(count - seen, OFFSET_SLOTS)`. A
     /// reader that kept the count it last read gets each new offset once,
     /// a whole revolution's included; those overwritten before it read
-    /// them are skipped.
+    /// them are skipped. `seen` must come from this ring since its last
+    /// clear: the count restarts at a rearm, so a reader resets `seen` then.
     pub fn since(&self, seen: u32) -> impl Iterator<Item = i32> + '_ {
         let new = self.count.wrapping_sub(seen).min(SLOTS_U32);
         let first = self.count.wrapping_sub(new);
