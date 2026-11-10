@@ -228,6 +228,7 @@ fn context<'a>(
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     }
 }
 

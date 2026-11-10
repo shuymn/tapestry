@@ -302,6 +302,7 @@ pub fn record(
                         bpm_range: None,
                         bpm_whole_change: None,
                         play_level,
+                        score: skin_model::PlayScore::NONE,
                     };
                     let carried = model.carried(carry_safe);
                     let mut play = skin

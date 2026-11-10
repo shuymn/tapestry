@@ -219,6 +219,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     }
 }
 
