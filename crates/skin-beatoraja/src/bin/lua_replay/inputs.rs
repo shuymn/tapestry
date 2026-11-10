@@ -23,6 +23,11 @@ pub struct FrameInputs {
     timers: Vec<i32>,
     state_us: i64,
     host: Host,
+    /// On a play frame, the play state's score data as the source keeps
+    /// it: `None` before its first judgment, else `[ex_score,
+    /// rate.current_bp, rate.whole_bp]` at its last (s7-06e-3-design.md
+    /// §2a).
+    score: Option<[i32; 3]>,
 }
 
 impl FrameInputs {
@@ -32,7 +37,19 @@ impl FrameInputs {
             timers: timers.to_vec(),
             state_us,
             host: Host::Play,
+            score: None,
         }
+    }
+
+    /// The frame with the play state's score data `score`.
+    #[must_use]
+    pub fn with_score(mut self, score: Option<[i32; 3]>) -> Self {
+        self.score = score;
+        self
+    }
+
+    pub fn score(&self) -> Option<[i32; 3]> {
+        self.score
     }
 
     /// A frame of `host`, which reads `fields` and no timer.
@@ -42,6 +59,7 @@ impl FrameInputs {
             timers: Vec::new(),
             state_us,
             host: Host::Outside { allowed, page },
+            score: None,
         }
     }
 

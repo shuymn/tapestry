@@ -59,9 +59,20 @@ pub struct Occurrence {
     pub reason: Option<String>,
     /// Its program callback, when compiled.
     pub program: Option<u16>,
+    /// What it lowered to, when it lowered: the expression the import
+    /// kept for this occurrence (s7-06e-3-design.md §2).
+    pub lowered: Option<LoweredRecord>,
     /// Its definition.
     pub file: String,
     pub line: u32,
+}
+
+/// A lowered occurrence's expression: its source over the play schema and
+/// the availability guards of its reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoweredRecord {
+    pub src: String,
+    pub guards: Vec<&'static str>,
 }
 
 /// What a production import recorded besides its outcome.
@@ -160,6 +171,10 @@ pub(super) fn record(arena: &Arena, an: &Analysis) {
                 disposition: label(&c.disposition),
                 reason: c.why.as_ref().map(super::survey::unsupported),
                 program: c.program,
+                lowered: c.lowered.as_ref().map(|l| LoweredRecord {
+                    src: l.src.clone(),
+                    guards: l.guards.clone(),
+                }),
                 file: at.file,
                 line: at.line,
             }
@@ -255,6 +270,10 @@ pub(crate) struct Frame {
     /// `number` ids answered as unanswered whatever the host (a test's
     /// mutation control).
     deny: BTreeSet<i32>,
+    /// On a play frame, whether the play state has no score data yet: the
+    /// EX score and the score rates then read `Integer.MIN_VALUE`, as the
+    /// source's do (s7-06e-3-design.md §2a).
+    no_score: bool,
     /// On a frame production builds no play frame for (loading, the
     /// practice page), the fields its host answers, by slot; `None` on a
     /// play frame. A read loading any other field, an output or a timer
@@ -281,6 +300,26 @@ impl Frame {
             fields: &self.fields,
             timers: &self.timers,
         }))
+    }
+
+    /// An integer property read through its mapped expression `src` under
+    /// `guard`, plus `delta` (a mutation control): `Integer.MIN_VALUE`
+    /// for a score property (`sentinel`) while the play state has no
+    /// score data, as the source's factory answers (s7-06e-3-design.md
+    /// §2a). `Err(())` when the guard is false, `None` when unanswered.
+    fn property(
+        &mut self,
+        sentinel: bool,
+        guard: Option<&str>,
+        src: &str,
+        delta: i32,
+    ) -> Option<Result<i32, ()>> {
+        let read = if sentinel && self.no_score {
+            Ok(i32::MIN)
+        } else {
+            self.guarded(guard, src)?
+        };
+        Some(read.map(|n| n.saturating_add(delta)))
     }
 
     /// A guarded integer: `Err(())` when the guard is false.
@@ -366,6 +405,22 @@ impl ReferenceVm {
     /// Sets the frame the host answers from: the play schema's fields,
     /// the timers' ms and the state clock.
     pub fn set_frame(&self, fields: &[i32], timers: &[i32], state_us: i64) {
+        self.set_play(fields, timers, state_us, None);
+    }
+
+    /// [`Self::set_frame`] with the play state's score data, as the source
+    /// keeps it across its rounds: `Some(None)` before its first score
+    /// update (the EX score and the score rates read `Integer.MIN_VALUE`),
+    /// `Some(Some([ex_score, rate.current_bp, rate.whole_bp]))` after it,
+    /// those three fields answered from it (s7-06e-3-design.md §2a); `None`
+    /// answers them from `fields`.
+    pub fn set_play(
+        &self,
+        fields: &[i32],
+        timers: &[i32],
+        state_us: i64,
+        score: Option<Option<[i32; 3]>>,
+    ) {
         if let Some(f) = self.pass.replay.borrow_mut().as_mut() {
             f.fields.clear();
             f.fields.extend_from_slice(fields);
@@ -373,6 +428,14 @@ impl ReferenceVm {
             f.timers.extend_from_slice(timers);
             f.state_us = state_us;
             f.allowed = None;
+            f.no_score = matches!(score, Some(None));
+            if let Some(Some(s)) = score {
+                for (slot, v) in SCORE_SLOTS.into_iter().zip(s) {
+                    if let Some(cell) = f.fields.get_mut(usize::from(slot)) {
+                        *cell = v;
+                    }
+                }
+            }
         }
     }
 
@@ -386,6 +449,7 @@ impl ReferenceVm {
             f.timers.clear();
             f.state_us = state_us;
             f.allowed = Some(allowed.to_vec());
+            f.no_score = false;
         }
     }
 
@@ -459,8 +523,8 @@ impl ReferenceVm {
             return PropValue::Unsupported;
         };
         let delta = id.and_then(|i| f.perturb.get(&i)).copied().unwrap_or(0);
-        match f.guarded(v.availability(), v.expr()) {
-            Some(Ok(n)) => PropValue::Value(n.saturating_add(delta)),
+        match f.property(v.pre_judgment(), v.availability(), v.expr(), delta) {
+            Some(Ok(n)) => PropValue::Value(n),
             Some(Err(())) => PropValue::Unavailable,
             None => PropValue::Unsupported,
         }
@@ -614,7 +678,11 @@ pub(super) fn answer(
             match int_in(ScreenKind::Play, n) {
                 IntProp::Shown(v) => {
                     let delta = f.perturb.get(&n).copied().unwrap_or(0);
-                    int(f, v.availability(), v.expr(), id, delta)
+                    match f.property(v.pre_judgment(), v.availability(), v.expr(), delta) {
+                        Some(Ok(n)) => Ok(Value::Number(f64::from(n))),
+                        Some(Err(())) => Err(unavailable(id)),
+                        None => Err(unanswered()),
+                    }
                 }
                 _ => Err(unanswered()),
             }
@@ -681,6 +749,14 @@ pub(super) fn answer(
     })
 }
 
+/// The play fields the source's score data gives: the EX score and the
+/// two score rates (the eight properties `Value::pre_judgment` names).
+const SCORE_SLOTS: [u16; 3] = [
+    skin_model::field::EX_SCORE,
+    skin_model::field::RATE_CURRENT_BP,
+    skin_model::field::RATE_WHOLE_BP,
+];
+
 /// The built-in timer slot of timer id `id`, without custom timers.
 fn builtin_timer(id: i32) -> Option<usize> {
     if id < 0 {
@@ -697,6 +773,48 @@ mod tests {
     use skin_model::field;
 
     use super::Frame;
+
+    /// The eight score properties as the source's score data gives them:
+    /// `Integer.MIN_VALUE` before any, else from the carried fields
+    /// (s7-06e-3-design.md L10); a direct property and a Lua read alike.
+    #[test]
+    fn score_properties_follow_the_score_data() {
+        use crate::import::{IntProp, int_in};
+        let ids = [71, 101, 102, 103, 115, 116, 155, 156];
+        let read = |f: &mut Frame, id: i32| -> Option<i32> {
+            let IntProp::Shown(v) = int_in(skin_model::ScreenKind::Play, id) else {
+                return None;
+            };
+            f.property(v.pre_judgment(), v.availability(), v.expr(), 0)?
+                .ok()
+        };
+        let mut f = Frame {
+            fields: vec![0; field::COUNT],
+            no_score: true,
+            ..Frame::default()
+        };
+        for id in ids {
+            let IntProp::Shown(v) = int_in(skin_model::ScreenKind::Play, id) else {
+                panic!("{id} is mapped");
+            };
+            assert!(v.pre_judgment(), "{id}");
+            assert_eq!(read(&mut f, id), Some(i32::MIN), "{id}");
+        }
+        f.no_score = false;
+        for (slot, v) in super::SCORE_SLOTS.into_iter().zip([6, 10_000, 4_285]) {
+            f.fields[usize::from(slot)] = v;
+        }
+        let got: Vec<Option<i32>> = ids.iter().map(|&id| read(&mut f, id)).collect();
+        let want = [6, 6, 100, 0, 42, 85, 42, 85].map(Some);
+        assert_eq!(got, want);
+        // A perturbation applies after the sentinel is chosen, as after a
+        // mapped value.
+        f.no_score = true;
+        assert_eq!(
+            f.property(true, None, "ex_score", 1),
+            Some(Ok(i32::MIN + 1))
+        );
+    }
 
     /// Off play, a read's availability guard is checked as its value is:
     /// an allowed value behind a guard on a field the host does not give
