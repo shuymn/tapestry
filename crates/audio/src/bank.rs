@@ -368,8 +368,8 @@ pub enum BankWarning {
 /// How a bank was loaded (indicators, not checked).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
-    /// The most decode workers running or started at once, the caller's
-    /// own included, counted at its file boundaries.
+    /// The most decode workers that had taken a file at once, the caller's
+    /// own included: a worker counts from its first file until it ends.
     pub decode_threads: usize,
     /// Distinct files read.
     pub files: usize,
@@ -1103,24 +1103,32 @@ impl Width for Full {
     fn retire(&self, _: usize) {}
 }
 
-/// An extra worker's end: retired, then no longer counted as running, on
-/// its return or its unwinding.
+/// An extra worker's end: no longer counted as decoding (once it took a
+/// file), retired, then no longer counted as running, on its return or its
+/// unwinding.
 struct Retire<'a> {
     width: &'a dyn Width,
     worker: usize,
     running: &'a AtomicUsize,
+    decoding: &'a AtomicUsize,
+    /// It took a file.
+    took: bool,
 }
 
 impl Drop for Retire<'_> {
     fn drop(&mut self) {
+        if self.took {
+            self.decoding.fetch_sub(1, Ordering::SeqCst);
+        }
         self.width.retire(self.worker);
         self.running.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 /// Runs `f(0..jobs)` on at most `cap` workers as `width` allows, results in
-/// job order, with the most workers running or started at once, counted at
-/// worker 0's file boundaries. Worker 0 is the caller's own thread, so a
+/// job order, with the most workers decoding at once: a worker counts from
+/// the first file it takes until it ends, so one that took none never
+/// counts. Worker 0 is the caller's own thread, so a
 /// decode on one worker keeps the caller's priority (the background
 /// loudness measurement's) and a job's checkpoint there moves its permit.
 /// `halt` is called once worker 0 stops; the results are then `None` when a
@@ -1134,19 +1142,12 @@ fn pool<T: Send>(
 ) -> (Option<Vec<T>>, usize) {
     let cap = cap.max(1);
     let next = AtomicUsize::new(0);
-    // Workers running, worker 0 included.
+    // Workers running, and those that took a file; worker 0 in both.
     let running = AtomicUsize::new(1);
-    let mut most = 1;
-    let take = |out: &mut Vec<(usize, T)>| {
-        let i = next.fetch_add(1, Ordering::Relaxed);
-        if i >= jobs {
-            return false;
-        }
-        out.push((i, f(i)));
-        true
-    };
+    let decoding = AtomicUsize::new(1);
+    let most = AtomicUsize::new(1);
     let mut done: Vec<(usize, T)> = thread::scope(|s| {
-        let (take, running) = (&take, &running);
+        let (next, f, running, decoding, most) = (&next, &f, &running, &decoding, &most);
         let mut extras = Vec::new();
         let mut started = 0;
         let mut out = Vec::new();
@@ -1175,11 +1176,24 @@ fn pool<T: Send>(
                         width,
                         worker: k,
                         running,
+                        decoding,
+                        took: false,
                     };
                     let worker = move || {
-                        let _retire = retire;
+                        let mut retire = retire;
                         let mut out = Vec::new();
-                        while width.at_file(k) && take(&mut out) {}
+                        while width.at_file(k) {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= jobs {
+                                break;
+                            }
+                            if !retire.took {
+                                retire.took = true;
+                                let now = decoding.fetch_add(1, Ordering::SeqCst) + 1;
+                                most.fetch_max(now, Ordering::SeqCst);
+                            }
+                            out.push((i, f(i)));
+                        }
                         out
                     };
                     #[cfg(test)]
@@ -1202,7 +1216,6 @@ fn pool<T: Send>(
                         Err(_) => break,
                     }
                 }
-                most = most.max(now);
             }
             out.push((mine, f(mine)));
         }
@@ -1211,6 +1224,7 @@ fn pool<T: Send>(
         }
         out
     });
+    let most = most.into_inner();
     if done.len() < jobs {
         return (None, most);
     }
@@ -1798,19 +1812,29 @@ mod tests {
         Stop,
         /// Waits until every other worker retired, then stops.
         DrainThenStop,
+        /// Says so (`panicked`), then panics.
         Panic,
     }
 
+    /// How long a probe's wait may last before its test fails.
+    const PROBE_WAIT: Duration = Duration::from_secs(60);
+
     /// A width that lets `grant(n)` workers run at once from worker 0's
-    /// `n`th file (from 1), and worker `k ≥ 1` go on while `extra(k)`;
-    /// worker 0 acts at its file `zero.0` as `zero.1` says. Every call is
+    /// `n`th file (from 1), and worker `k ≥ 1` go on while `extra(probe,
+    /// k)`; worker 0 acts at its file `zero.0` as `zero.1` says. The workers
+    /// whose asks are listed in `meet` (worker, nth ask) each wait there
+    /// until all of them have arrived, so they run at once. Every call is
     /// recorded with its thread.
     struct Probe {
         grant: fn(usize) -> usize,
-        extra: fn(usize) -> bool,
+        extra: fn(&Probe, usize) -> bool,
         zero: Option<(usize, Zero)>,
+        meet: Vec<(usize, usize)>,
         files0: AtomicUsize,
         alive: AtomicUsize,
+        panicked: AtomicBool,
+        asks: Mutex<HashMap<usize, usize>>,
+        arrived: (Mutex<usize>, std::sync::Condvar),
         calls: Mutex<Vec<(usize, thread::ThreadId)>>,
         started: Mutex<Vec<usize>>,
         retired: Mutex<Vec<usize>>,
@@ -1820,10 +1844,14 @@ mod tests {
         fn new(grant: fn(usize) -> usize) -> Self {
             Self {
                 grant,
-                extra: |_| true,
+                extra: |_, _| true,
                 zero: None,
+                meet: Vec::new(),
                 files0: AtomicUsize::new(0),
                 alive: AtomicUsize::new(0),
+                panicked: AtomicBool::new(false),
+                asks: Mutex::new(HashMap::new()),
+                arrived: (Mutex::new(0), std::sync::Condvar::new()),
                 calls: Mutex::new(Vec::new()),
                 started: Mutex::new(Vec::new()),
                 retired: Mutex::new(Vec::new()),
@@ -1847,6 +1875,37 @@ mod tests {
         fn retired(&self) -> Vec<usize> {
             Self::sorted(&self.retired)
         }
+
+        /// Waits at a meeting point until every worker listed arrived.
+        fn meet(&self, worker: usize) {
+            let nth = {
+                let mut asks = self.asks.lock().unwrap();
+                let n = asks.entry(worker).or_default();
+                *n += 1;
+                *n
+            };
+            if !self.meet.contains(&(worker, nth)) {
+                return;
+            }
+            let (count, changed) = &self.arrived;
+            let mut c = count.lock().unwrap();
+            *c += 1;
+            changed.notify_all();
+            let began = Instant::now();
+            while *c < self.meet.len() {
+                assert!(began.elapsed() < PROBE_WAIT, "worker {worker} met no one");
+                c = changed.wait_timeout(c, PROBE_WAIT).unwrap().0;
+            }
+        }
+
+        /// Waits until `done`.
+        fn wait(what: &str, done: impl Fn() -> bool) {
+            let began = Instant::now();
+            while !done() {
+                assert!(began.elapsed() < PROBE_WAIT, "{what} never happened");
+                thread::yield_now();
+            }
+        }
     }
 
     impl Width for Probe {
@@ -1855,22 +1914,22 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((worker, thread::current().id()));
+            self.meet(worker);
             if worker > 0 {
-                return (self.extra)(worker);
+                return (self.extra)(self, worker);
             }
             let n = self.files0.fetch_add(1, Ordering::SeqCst) + 1;
             match self.zero {
                 Some((at, how)) if at == n => match how {
                     Zero::Stop => false,
                     Zero::DrainThenStop => {
-                        let began = Instant::now();
-                        while self.alive.load(Ordering::SeqCst) > 0 {
-                            assert!(began.elapsed() < Duration::from_secs(60), "never drained");
-                            thread::yield_now();
-                        }
+                        Self::wait("the drain", || self.alive.load(Ordering::SeqCst) == 0);
                         false
                     }
-                    Zero::Panic => panic!("worker 0 (test)"),
+                    Zero::Panic => {
+                        self.panicked.store(true, Ordering::SeqCst);
+                        panic!("worker 0 (test)")
+                    }
                 },
                 _ => true,
             }
@@ -1918,13 +1977,17 @@ mod tests {
     }
 
     /// Z4: worker 0 asks before each of its files, and decodes one, on the
-    /// calling thread, alone or beside another worker.
+    /// calling thread, alone or beside another worker (the two held at
+    /// their second ask until both are there).
     #[test]
     fn pool_runs_worker_zero_on_the_callers_thread() {
         let (_dir, chart) = distinct(3);
         let me = thread::current().id();
         for grant in [|_| 1, |_| 2] {
-            let width = Probe::new(grant);
+            let mut width = Probe::new(grant);
+            if grant(1) > 1 && cap(3, 3) > 1 {
+                width.meet = vec![(0, 2), (1, 2)];
+            }
             let decoded_here = AtomicBool::new(false);
             let progress = |_, _| {
                 if thread::current().id() == me {
@@ -1953,7 +2016,10 @@ mod tests {
             eprintln!("one core: no second worker to add");
             return;
         }
-        let width = Probe::new(|n| if n < 2 { 1 } else { 2 });
+        let mut width = Probe::new(|n| if n < 2 { 1 } else { 2 });
+        // Worker 0 after its second file and the new worker after its first
+        // meet: both decoded at once.
+        width.meet = vec![(0, 3), (1, 2)];
         let bank = load_on(&chart, 2, &width).unwrap();
         assert_eq!(bank.sounds.len(), 6);
         assert_eq!(bank.stats().decode_threads, 2);
@@ -1965,13 +2031,18 @@ mod tests {
     }
 
     /// Z6: a width allowing more workers than the pool's cap gets the cap:
-    /// no start is asked past it.
+    /// no start is asked past it. Worker 0 and the first other worker are
+    /// held after their first file, so any further worker would decode
+    /// beside them.
     #[test]
     fn workers_never_pass_the_pools_cap() {
         let (_dir, chart) = distinct(4);
-        let width = Probe::new(|_| 8);
-        let bank = load_on(&chart, 2, &width).unwrap();
         let cap = cap(2, 4);
+        let mut width = Probe::new(|_| 8);
+        if cap > 1 {
+            width.meet = vec![(0, 2), (1, 2)];
+        }
+        let bank = load_on(&chart, 2, &width).unwrap();
         assert_eq!(bank.stats().decode_threads, cap);
         assert!(width.started().len() < 4, "{:?}", width.started());
         assert_eq!(width.retired(), width.started());
@@ -1983,9 +2054,14 @@ mod tests {
     fn a_worker_told_to_stop_retires_and_the_rest_decode() {
         let (_dir, chart) = distinct(4);
         let mut width = Probe::new(|_| 2);
-        width.extra = |_| false;
+        width.extra = |_, _| false;
         let bank = load_on(&chart, 2, &width).unwrap();
         assert_eq!(bank.sounds.len(), 4);
+        assert_eq!(
+            bank.stats().decode_threads,
+            1,
+            "a worker with no file counted"
+        );
         let mut asked: Vec<usize> = width
             .calls()
             .iter()
@@ -2042,25 +2118,59 @@ mod tests {
         );
     }
 
-    /// Z10: the bank reports the most workers that ran, not the cap.
+    /// Z10: the bank reports the most workers that decoded at once, not the
+    /// cap: one under a width of one; the cap when every worker is held
+    /// after its first file until all are there; one when the other worker
+    /// started finds no file left.
     #[test]
     fn decode_threads_counts_the_workers_that_ran() {
         let (_dir, chart) = distinct(3);
         let bank = load_on(&chart, 3, &Probe::new(|_| 1)).unwrap();
         assert_eq!(bank.stats().decode_threads, 1);
-        let full = load_on(&chart, 3, &Full).unwrap();
-        assert_eq!(full.stats().decode_threads, cap(3, 3));
+        let cap = cap(3, 3);
+        let mut all = Probe::new(|_| usize::MAX);
+        all.meet = (0..cap).map(|w| (w, 2)).collect();
+        let bank = load_on(&chart, 3, &all).unwrap();
+        assert_eq!(bank.stats().decode_threads, cap);
+        if cap < 2 {
+            return;
+        }
+        let (_dir, two) = distinct(2);
+        // The other worker asks only once worker 0 took both files.
+        let mut late = Probe::new(|_| 2);
+        late.extra = |p, _| {
+            Probe::wait("worker 0's third ask", || {
+                p.files0.load(Ordering::SeqCst) >= 3
+            });
+            true
+        };
+        let bank = load_on(&two, 2, &late).unwrap();
+        assert_eq!(late.started(), [1]);
+        assert_eq!(
+            bank.stats().decode_threads,
+            1,
+            "a worker with no file counted"
+        );
     }
 
     /// Z27: a worker's panic, an extra's or worker 0's, unwinds the load,
-    /// and every worker started is retired exactly once.
+    /// and every worker started is retired exactly once; worker 0's panic
+    /// with another worker held at its next file until it happened.
     #[test]
     fn a_panicking_worker_retires_every_worker_once() {
         let (_dir, chart) = distinct(4);
         let mut extra = Probe::new(|_| 2);
-        extra.extra = |_| panic!("an extra (test)");
+        extra.extra = |_, _| panic!("an extra (test)");
         let mut zero = Probe::new(|_| 2);
         zero.zero = Some((2, Zero::Panic));
+        // The other worker, after its first file, waits for the panic: it
+        // is alive across it.
+        zero.extra = |p, _| {
+            if p.calls().iter().filter(|c| c.0 > 0).count() > 1 {
+                Probe::wait("worker 0's panic", || p.panicked.load(Ordering::SeqCst));
+            }
+            true
+        };
         for (name, width) in [("extra", &extra), ("zero", &zero)] {
             let got = panic::catch_unwind(AssertUnwindSafe(|| load_on(&chart, 2, width)));
             let started = width.started();
@@ -2071,6 +2181,12 @@ mod tests {
         }
         if cap(2, 4) >= 2 {
             assert!(!extra.started().is_empty());
+            assert_eq!(zero.started(), [1]);
+            let calls = zero.calls();
+            assert!(
+                calls.iter().filter(|c| c.0 == 1).count() >= 2,
+                "the other worker never asked again: {calls:?}"
+            );
         }
     }
 }
