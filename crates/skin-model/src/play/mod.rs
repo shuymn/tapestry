@@ -20,6 +20,7 @@ use rules::GaugeValue;
 use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
 use self::schema::{field, timer};
+use self::timers::Settled;
 use crate::chart_image::{ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
@@ -61,24 +62,26 @@ pub enum Attempt<'a> {
 
 /// What an attempt takes over from the earlier attempts of its play state
 /// (design.md "beatoraja Lua Skins", the program's state): the source keeps
-/// its skin's state and its cached point for as long as its play state
-/// lasts (`ScoreDataProperty` of the `MainState`, not reset at
-/// `BMSPlayer.java:582` at `0.8.9`).
+/// its skin's state and its score data (the point, the EX score and the
+/// score rates) for as long as its play state lasts (`ScoreDataProperty`
+/// of the `MainState`, not reset at `BMSPlayer.java:582` at `0.8.9`).
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Continuation<'a> {
     /// The play state's first attempt: the slots at their initial values,
-    /// the point 0 until the first judgment, the program run.
+    /// the score data the attempt's own, the program run.
     #[default]
     Fresh,
-    /// A later attempt of the play state: the point the play state's last
-    /// judgment left, read until this attempt's first judgment, and the
+    /// A later attempt of the play state: the score data the play state's
+    /// last judgment left, read until this attempt's first judgment
+    /// (`None` before any judgment: the attempt's own, as a fresh one's),
+    /// and the
     /// slots as the last witnessed run left them, `None` when no such run
     /// carries them (then the callbacks with slots do not run, their
     /// timers off). A program that is not
     /// [`carry_safe`](crate::present::Present::carry_safe) runs no
     /// callback with slots either.
     Carried {
-        point: i32,
+        score: Option<Settled>,
         bank: Option<&'a crate::present::Bank>,
     },
 }
@@ -527,9 +530,10 @@ pub struct Play {
     /// or a carried one's with its slots carried and a
     /// [`carry_safe`](crate::present::Present::carry_safe) program.
     slots_run: bool,
-    /// The point the play state's last judgment left (0 for a fresh
-    /// attempt), which `point` reads until this attempt's first judgment.
-    cached_point: i32,
+    /// The score data the play state's last judgment left (`None` before
+    /// any), which the score fields read until this attempt's first
+    /// judgment.
+    cached: Option<Settled>,
     /// Whether the attempt has had a judgment: a frame's tally was not the
     /// zero tally. A rearm clears it.
     judged: bool,
@@ -655,11 +659,11 @@ impl Play {
         let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
         let mut bank =
             present.map_or_else(crate::present::Bank::default, crate::present::Present::bank);
-        let (slots_run, cached_point) = match carry {
-            Continuation::Fresh => (true, 0),
-            Continuation::Carried { point, bank: None } => (false, point),
+        let (slots_run, cached) = match carry {
+            Continuation::Fresh => (true, None),
+            Continuation::Carried { score, bank: None } => (false, score),
             Continuation::Carried {
-                point,
+                score,
                 bank: Some(b),
             } => {
                 if !present.map_or(b.values().is_empty(), |p| p.fits(b)) {
@@ -668,7 +672,7 @@ impl Play {
                 bank.copy_from(b);
                 (
                     present.is_none_or(crate::present::Present::carry_safe),
-                    point,
+                    score,
                 )
             }
         };
@@ -742,7 +746,7 @@ impl Play {
             fields: vec![0; field::COUNT.saturating_add(outputs)].into_boxed_slice(),
             bank,
             slots_run,
-            cached_point,
+            cached,
             judged: false,
             terminal: false,
             playhead,
@@ -780,7 +784,7 @@ impl Play {
     /// the reducer, the holds, every timer, the beat and the first
     /// judgment's latch, as a fresh attempt has them. The chart's notes,
     /// the prepared playhead, the gauges, the attached and bitmap text, the
-    /// program's slots, the cached point and a refused build stay, and
+    /// program's slots, the cached score data and a refused build stay, and
     /// nothing is allocated.
     pub fn rearm(&mut self) {
         self.reducer.rearm();

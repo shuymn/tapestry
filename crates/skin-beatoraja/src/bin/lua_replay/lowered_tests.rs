@@ -402,8 +402,8 @@ fn score_data_lives_across_the_play_state() {
     assert!(sentinel(first(0)));
     assert!(!sentinel(first(1)) && !sentinel(first(2)));
     // R1 before its first judgment (READY and the play up to the first
-    // note): no score data, no attribution, a finding; R2 and R3 before
-    // theirs: attributed.
+    // note): no score data, a finding (s7-06s-design.md O2); R2 and R3
+    // before theirs: the carried score data on both sides, agreed.
     assert!(
         r.findings
             .iter()
@@ -412,10 +412,7 @@ fn score_data_lives_across_the_play_state() {
         r.text(0, true, true)
     );
     assert!(!r.findings.is_empty());
-    assert_eq!(
-        r.score_difference.keys().copied().collect::<Vec<_>>(),
-        [2, 3]
-    );
+    assert!(r.buckets.keys().all(|b| !b.contains("score")));
 }
 
 /// L10: the eight score properties' exact answers on each round's first
@@ -472,10 +469,11 @@ fn unwitnessed_rounds_carry_every_judgment() {
     assert_eq!(values_on(&obs, rounds[1][0]), [14]);
 }
 
-/// L11: the score readings' difference is attributed, by round, where only
-/// the score fields explain it (Rm's `getDummyNumber` shape).
+/// s7-06s S8: the score readings agree across rounds (Rm's
+/// `getDummyNumber` shape): production reads the carried score data where
+/// the source does, so the run passes with nothing attributed.
 #[test]
-fn a_score_reading_difference_is_attributed() {
+fn a_score_reading_agrees_across_rounds() {
     let dummy = |n: i32| {
         format!("function() if ms.number(101) < 1 then return 0 else return ms.number({n}) end end")
     };
@@ -486,9 +484,8 @@ fn a_score_reading_difference_is_attributed() {
     );
     let r = run_with(&body, &covered(&body, options(Script::rounds())));
     assert!(r.passes(), "{}", r.text(0, true, true));
-    assert_eq!(
-        r.score_difference.keys().copied().collect::<Vec<_>>(),
-        [2, 3],
+    assert!(
+        r.buckets.keys().all(|b| !b.contains("score")),
         "{}",
         r.text(0, true, true)
     );
@@ -513,11 +510,12 @@ fn a_mismatched_score_input_is_refused() {
     }
 }
 
-/// The replay refuses a run whose score input disagrees with the frames
-/// (its self-check): reached only through a broken model, so this checks
-/// the replay's normal path stays accepted.
+/// The replay refuses a run whose score input disagrees with a play
+/// frame's score fields (its self-check, s7-06s-design.md S7): reached
+/// only through a broken model or carry, so this checks the replay's
+/// normal path, carried rounds' READY included, stays accepted.
 #[test]
-fn the_score_input_matches_every_judged_frame() {
+fn the_score_input_matches_every_play_frame() {
     let body = format!(
         "{VALUES}{}",
         number("m", "function() return ms.number(71) end", 0)
@@ -533,5 +531,25 @@ fn the_score_input_matches_every_judged_frame() {
             Err(Stop::Failed(e)) => panic!("refused: {e}"),
             Err(Stop::Differs) => panic!("the imports differ"),
         }
+    }
+}
+
+/// s7-06s S7: a production carry that drops the score data (a carried
+/// round reading its own fresh values at READY, where the source reads the
+/// last update) is refused at the carried round's first frame.
+#[test]
+fn a_dropped_score_carry_is_refused() {
+    let body = format!(
+        "{VALUES}{}",
+        number("m", "function() return ms.number(71) end", 0)
+    );
+    let d = folder(&body);
+    crate::production::DROP_SCORE_CARRY.with(|s| s.set(true));
+    let got = replay(d.path(), "s.luaskin", &options(Script::rounds()));
+    crate::production::DROP_SCORE_CARRY.with(|s| s.set(false));
+    match got {
+        Err(Stop::Failed(e)) => assert!(e.contains("score input Some([14, "), "{e}"),
+        Ok(_) => panic!("accepted"),
+        Err(Stop::Differs) => panic!("the imports differ"),
     }
 }

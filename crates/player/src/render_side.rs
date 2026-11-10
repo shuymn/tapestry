@@ -3356,13 +3356,13 @@ struct Prepared {
     /// Autoplay's scratch notes, the turntable's once committed.
     scratch_notes: Vec<game::ScratchNote>,
     /// Its play state and chart, what it was offered, the installation
-    /// it draws with and its target count, for the carry's record at its
-    /// commit.
+    /// it draws with and what its score data is over, for the carry's
+    /// record at its commit.
     carry: (
         Option<crate::carry::CarryKey>,
         crate::carry::Offer,
         crate::carry::Installed,
-        u32,
+        crate::carry::Basis,
     ),
     /// The attempt's READY on the chart's axis (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -4829,6 +4829,7 @@ impl Run {
             None => base,
         };
         let text = p.attempt.text();
+        let empty_poor_counted = context.empty_poor_counted;
         // The attempt's target count, which its point is over.
         let targets = skin_model::attempt_targets(chart, &context.attempt);
         let a = AttemptInput {
@@ -4864,7 +4865,10 @@ impl Run {
                     p.attempt.carry_key(),
                     p.offer.clone(),
                     p.installed.clone(),
-                    targets,
+                    crate::carry::Basis {
+                        targets,
+                        empty_poor_counted,
+                    },
                 ),
                 #[cfg(feature = "dev-tools")]
                 ready: p.attempt.ready(),
@@ -5002,12 +5006,12 @@ impl Run {
         self.shared.epochs[1].store(p.presentation.1, Ordering::SeqCst);
         // The committed attempt's `Play` is the screen's now, whatever
         // other kinds commit until the next load, failure or commit.
-        let (key, offer, installed, targets) = &p.carry;
+        let (key, offer, installed, basis) = &p.carry;
         self.carries.on(crate::carry::Event::Committed {
             key: *key,
             offer,
             installed: installed.clone(),
-            targets: *targets,
+            basis: *basis,
             bank: screen.carry().map(|c| c.bank),
         });
         self.current = Some(p.presentation);
@@ -11030,8 +11034,8 @@ pub(crate) mod tests {
             // would prepare it: the slots carried, or the initial ones.
             let (offered, play) = match a.continuation {
                 skin_model::Continuation::Fresh => (None, (CARRY_INIT.to_vec(), true)),
-                skin_model::Continuation::Carried { point, bank } => (
-                    Some((point, bank.map(|b| b.values().to_vec()))),
+                skin_model::Continuation::Carried { score, bank } => (
+                    Some((score, bank.map(|b| b.values().to_vec()))),
                     bank.map_or((CARRY_INIT.to_vec(), false), |b| {
                         (b.values().to_vec(), true)
                     }),
@@ -11426,9 +11430,12 @@ pub(crate) mod tests {
         pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
     }
 
-    /// What an attempt was offered: `None` fresh, else the cached point and
+    /// What an attempt was offered: `None` fresh, else the cached score data and
     /// the slots, `None` when not valid.
-    type CarryOffered = Option<(i32, Option<Vec<skin_model::present::Val>>)>;
+    type CarryOffered = Option<(
+        Option<skin_model::Settled>,
+        Option<Vec<skin_model::present::Val>>,
+    )>;
 
     /// The initial slots of the [`Installer`]'s attempts.
     const CARRY_INIT: [skin_model::present::Val; 1] = [skin_model::present::OFF];
@@ -11608,7 +11615,7 @@ pub(crate) mod tests {
         // Round 2 committed with the latch carried.
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, true),
-            Some((200_000, Some(latched())))
+            Some((FULL, Some(latched())))
         );
         // A result upload fails as a lost device: the screen is dropped.
         screens.fail.store(true, Ordering::Release);
@@ -11621,7 +11628,7 @@ pub(crate) mod tests {
         play_round(&link, &chart, poor_tally());
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((0, None))
+            Some((POOR, None))
         );
         link.exit();
     }
@@ -11652,7 +11659,7 @@ pub(crate) mod tests {
             let slots = withdrawn.then(latched);
             assert_eq!(
                 staged_attempt(&screens, &link, &chart, CARRY_KEY, &skin),
-                Some((200_000, slots)),
+                Some((FULL, slots)),
                 "withdrawn: {withdrawn}"
             );
             link.exit();
@@ -11661,7 +11668,7 @@ pub(crate) mod tests {
 
     /// An attempt prepared in place on the installed skin, its selection
     /// cleared (`select(Play, None)`), draws with the same installation:
-    /// it is offered the witnessed slots and the cached point.
+    /// it is offered the witnessed slots and the cached score data.
     #[test]
     fn an_in_place_prepare_keeps_the_record() {
         let (screens, link, chart, _) = witnessed_round();
@@ -11671,7 +11678,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, Some(latched())))
+            Some((FULL, Some(latched())))
         );
         link.exit();
     }
@@ -11682,20 +11689,102 @@ pub(crate) mod tests {
         chart: 1,
     };
 
-    /// A full score over the carry tests' 4 targets: point 200 000.
+    /// A full score over the carry tests' 4 targets: point 200 000, EX 8.
     fn full_tally() -> eval::Tally {
         let mut t = eval::Tally::default();
         t.counts.perfect = 4;
+        t.ex_score = 8;
         t.max_combo = 4;
         t.combo = 4;
         t
     }
+
+    /// The score data [`full_tally`] settles over 4 targets.
+    const FULL: Option<skin_model::Settled> = Some(skin_model::Settled {
+        point: 200_000,
+        ex_score: 8,
+        rate_current_bp: 10_000,
+        rate_whole_bp: 10_000,
+    });
 
     /// One POOR over the carry tests' 4 targets: point 0.
     fn poor_tally() -> eval::Tally {
         let mut t = eval::Tally::default();
         t.counts.poor = 1;
         t
+    }
+
+    /// The score data [`poor_tally`] settles: every reading 0.
+    const POOR: Option<skin_model::Settled> = Some(skin_model::Settled {
+        point: 0,
+        ex_score: 0,
+        rate_current_bp: 0,
+        rate_whole_bp: 0,
+    });
+
+    /// s7-06s S4: the settled score data is over the settled attempt's own
+    /// targets: a round of the play state over 7 taps after a full score
+    /// over 4 is offered the whole rate over 4 (100 %), not over 7, before
+    /// and after that round commits.
+    #[test]
+    fn a_settled_score_is_over_its_own_targets() {
+        let chart = four_taps();
+        let (screens, link, _) = carry_link(&chart);
+        let _ = carried_attempt(&screens, &link, &chart, CARRY_KEY, true);
+        play_round(&link, &chart, full_tally());
+        let lane = Lane::new(1).unwrap();
+        let seven = Arc::new(
+            (0..7)
+                .fold(ChartBuilder::new(120_000), |b, i| {
+                    b.tap(lane, TimeUs(10_000_000 + i * 1_000_000))
+                })
+                .build()
+                .unwrap(),
+        );
+        link.load(Arc::clone(&seven), None).unwrap();
+        // Offered, then committed over 7 targets and offered again: the
+        // record keeps what the 4-target round settled.
+        assert_eq!(
+            carried_attempt(&screens, &link, &seven, CARRY_KEY, true),
+            Some((FULL, None))
+        );
+        assert_eq!(
+            carried_attempt(&screens, &link, &seven, CARRY_KEY, false),
+            Some((FULL, None))
+        );
+        link.exit();
+    }
+
+    /// s7-06s S4b: the settlement counts the empty POORs as the committed
+    /// attempt's preset does: one PGREAT and two POORs, one of them an
+    /// empty POOR the preset counts, judge two targets (current rate
+    /// 50 %), where an uncounted rule would judge three (33.33 %).
+    #[test]
+    fn the_settlement_counts_empty_poors_as_the_attempt_does() {
+        let chart = four_taps();
+        let (screens, link, _) = carry_link(&chart);
+        let mut counted = rules::tapestry();
+        counted.empty_poor.counted = true;
+        let ready = link.prepare_attempt(
+            preset_attempt(&chart, &counted, None, "T").with_carry_key(Some(CARRY_KEY)),
+            || false,
+        );
+        assert_eq!(ready.unwrap(), Preparation::Ready);
+        link.commit_attempt().unwrap();
+        let mut t = eval::Tally::default();
+        t.counts.perfect = 1;
+        t.counts.poor = 2;
+        t.empty_poor = 1;
+        t.ex_score = 2;
+        t.max_combo = 1;
+        play_round(&link, &chart, t);
+        let offered = carried_attempt(&screens, &link, &chart, CARRY_KEY, false);
+        let score = offered.and_then(|o| o.0).unwrap();
+        assert_eq!(
+            (score.ex_score, score.rate_current_bp, score.rate_whole_bp),
+            (2, 5_000, 2_500)
+        );
+        link.exit();
     }
 
     /// A render thread on new installers with `chart` loaded and a play
@@ -11783,7 +11872,7 @@ pub(crate) mod tests {
             None
         );
         play_round(&link, &chart, full_tally());
-        let carried = Some((200_000, Some(latched())));
+        let carried = Some((FULL, Some(latched())));
         // Committed, never started, then given up.
         *screens.round.lock().unwrap() = None;
         assert_eq!(
@@ -11810,7 +11899,7 @@ pub(crate) mod tests {
         play_round(&link, &chart, full_tally());
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, None))
+            Some((FULL, None))
         );
         link.exit();
     }
@@ -11834,10 +11923,11 @@ pub(crate) mod tests {
             let _ = carried_attempt(&screens, &link, &chart, CARRY_KEY, true);
             play_round(&link, &chart, poor_tally());
             let third = carried_attempt(&screens, &link, &chart, CARRY_KEY, false);
+            // The score data carries whatever the slots: round 2's.
             let slots = witnessed_first.then(latched);
             assert_eq!(
                 third,
-                Some((0, slots)),
+                Some((POOR, slots)),
                 "witnessed first: {witnessed_first}"
             );
             link.exit();
@@ -11858,7 +11948,7 @@ pub(crate) mod tests {
         link.discard_attempt();
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, Some(latched())))
+            Some((FULL, Some(latched())))
         );
         link.exit();
     }
@@ -11878,7 +11968,7 @@ pub(crate) mod tests {
         play_round(&link, &chart, full_tally());
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, Some(latched())))
+            Some((FULL, Some(latched())))
         );
         link.exit();
     }
@@ -11910,7 +12000,7 @@ pub(crate) mod tests {
             let slots = refused.then(latched);
             assert_eq!(
                 carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-                Some((200_000, slots)),
+                Some((FULL, slots)),
                 "refused: {refused}"
             );
             link.exit();
@@ -11932,7 +12022,7 @@ pub(crate) mod tests {
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, Some(latched())))
+            Some((FULL, Some(latched())))
         );
         let next = crate::carry::CarryKey {
             play_state: 2,
@@ -11962,7 +12052,7 @@ pub(crate) mod tests {
         link.prepare().unwrap();
         assert_eq!(
             carried_attempt(&screens, &link, &chart, CARRY_KEY, false),
-            Some((200_000, None))
+            Some((FULL, None))
         );
         link.exit();
     }

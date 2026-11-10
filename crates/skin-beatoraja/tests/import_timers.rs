@@ -193,29 +193,43 @@ fn custom_timers_alias_supported_built_ins() {
     }
 }
 
+/// The round's judgments behind an EX score of `ex`: PERFECTs and at most
+/// one GREAT.
+fn judged_ex(ex: u32) -> eval::Tally {
+    let mut t = tally(ex, 1);
+    t.counts.perfect = ex / 2;
+    t.counts.great = ex % 2;
+    t
+}
+
 #[test]
 fn rank_timers_open_at_their_thresholds() {
     // ⌈2·i·100/27⌉ for i = 18, 21, 24.
     for (id, ex) in [(348, 134), (349, 156), (350, 178)] {
         let mut d = images(&[&format!(r#""timer": {id},"#)], "").drawn();
-        d.tally = tally(ex - 1, 1);
+        d.tally = judged_ex(ex - 1);
         assert!(d.frame(10, &[]).is_empty(), "{id}");
-        d.tally = tally(ex, 1);
+        d.tally = judged_ex(ex);
         assert_eq!(d.frame(20, &[]).len(), 1, "{id}");
         // The timer starts when the condition first holds.
         assert_eq!(d.rects(70), [[50, 1_070, 10, 10]]);
+        // An EX score the round has no judgment for (a play state's carried
+        // one) waits (s7-06s-design.md §2.4).
+        let mut d = images(&[&format!(r#""timer": {id},"#)], "").drawn();
+        d.tally = tally(ex, 1);
+        assert!(d.frame(10, &[]).is_empty(), "{id}: unjudged");
     }
     // At 27 notes each threshold is a whole score, 2·i, and opens there.
     for (id, ex) in [(348, 36), (349, 42), (350, 48)] {
         let mut d = images(&[&format!(r#""timer": {id},"#)], "").drawn_over(27);
-        d.tally = tally(ex - 1, 1);
+        d.tally = judged_ex(ex - 1);
         assert!(d.frame(10, &[]).is_empty(), "{id}");
-        d.tally = tally(ex, 1);
+        d.tally = judged_ex(ex);
         assert_eq!(d.frame(20, &[]).len(), 1, "{id}");
     }
     // No notes: never.
     let mut d = images(&[r#""timer": 348,"#], "").drawn_over(0);
-    d.tally = tally(1_000, 1);
+    d.tally = judged_ex(1_000);
     assert!(d.frame(10, &[]).is_empty());
     // Each rank compiles once per skin.
     let loaded = images(
