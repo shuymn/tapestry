@@ -67,7 +67,7 @@ pub use audio_loop::{
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
-    SavedPlay,
+    SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
 pub use driver::{AdjustDriver, InputPump};
 pub use error::{Chain, IoFailure};

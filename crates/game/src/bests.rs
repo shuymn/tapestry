@@ -7,6 +7,7 @@ use bms_model::Chart;
 use eval::Tally;
 use replay::PlayRecord;
 use rules::RulePreset;
+use serde::{Deserialize, Serialize};
 
 use crate::result_figures::{Rate, ResultFigures};
 use crate::results::ResultSummary;
@@ -179,4 +180,211 @@ pub enum BestView {
     },
     /// The play was not counted, and why.
     NotCounted(String),
+}
+
+/// The target score a play is paced against (`target` in `player.toml`,
+/// design.md "Settings Files"): a rank's 27th of the largest EX score, the
+/// largest itself, or the next rank's above the personal best.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScoreTarget {
+    /// 17/27.
+    #[serde(rename = "a-")]
+    AMinus,
+    /// 18/27.
+    #[serde(rename = "a")]
+    A,
+    /// 19/27.
+    #[serde(rename = "a+")]
+    APlus,
+    /// 20/27.
+    #[serde(rename = "aa-")]
+    AaMinus,
+    /// 21/27.
+    #[serde(rename = "aa")]
+    Aa,
+    /// 22/27.
+    #[serde(rename = "aa+")]
+    AaPlus,
+    /// 23/27.
+    #[serde(rename = "aaa-")]
+    AaaMinus,
+    /// 24/27.
+    #[serde(rename = "aaa")]
+    Aaa,
+    /// 25/27.
+    #[serde(rename = "aaa+")]
+    AaaPlus,
+    /// 26/27.
+    #[serde(rename = "max-")]
+    MaxMinus,
+    /// The largest EX score, the default.
+    #[default]
+    #[serde(rename = "max")]
+    Max,
+    /// The first rank's 27th from 15/27 (A-'s band floor, the source's
+    /// first) to 26/27 above the personal best, else the largest.
+    #[serde(rename = "next")]
+    Next,
+}
+
+impl ScoreTarget {
+    /// Every target, in the order of their values.
+    pub const ALL: [Self; 12] = [
+        Self::AMinus,
+        Self::A,
+        Self::APlus,
+        Self::AaMinus,
+        Self::Aa,
+        Self::AaPlus,
+        Self::AaaMinus,
+        Self::Aaa,
+        Self::AaaPlus,
+        Self::MaxMinus,
+        Self::Max,
+        Self::Next,
+    ];
+
+    /// A rank target's 27ths.
+    const fn rank(self) -> Option<u64> {
+        Some(match self {
+            Self::AMinus => 17,
+            Self::A => 18,
+            Self::APlus => 19,
+            Self::AaMinus => 20,
+            Self::Aa => 21,
+            Self::AaPlus => 22,
+            Self::AaaMinus => 23,
+            Self::Aaa => 24,
+            Self::AaaPlus => 25,
+            Self::MaxMinus => 26,
+            Self::Max | Self::Next => return None,
+        })
+    }
+}
+
+/// What kind of play a [`score_target`] is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetPlay {
+    /// A full play of a chart with no `#RANDOM`.
+    Fixed,
+    /// A full play of a `#RANDOM` chart: its best may be another draw's,
+    /// so [`ScoreTarget::Next`] gives the largest EX score.
+    Random,
+    /// A practice round: no target, 0.
+    Practice,
+}
+
+/// The target EX score of `target` for a chart of `notes` notes, whose
+/// largest EX score is `2 · notes`, against the personal best EX score
+/// `best` (design.md "Personal Bests"): `⌈2n·k/27⌉` for a rank of k 27ths,
+/// `2n` for [`ScoreTarget::Max`], and for [`ScoreTarget::Next`] the first
+/// `⌈2n·i/27⌉` above `best` for `i` from 15 to 26, `2n` when none is or for
+/// a `#RANDOM` chart; 0 in practice. Exact integers, no float.
+#[must_use]
+pub fn score_target(target: ScoreTarget, notes: u32, best: u32, play: TargetPlay) -> u32 {
+    let max = 2 * u64::from(notes);
+    let at = |k: u64| (max * k).div_ceil(27);
+    let ex = match (play, target.rank()) {
+        (TargetPlay::Practice, _) => 0,
+        (_, Some(k)) => at(k),
+        (TargetPlay::Fixed, None) if target == ScoreTarget::Next => (15..=26)
+            .map(at)
+            .find(|&t| t > u64::from(best))
+            .unwrap_or(max),
+        (_, None) => max,
+    };
+    u32::try_from(ex).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScoreTarget, TargetPlay, score_target};
+
+    const RANKS: [ScoreTarget; 10] = [
+        ScoreTarget::AMinus,
+        ScoreTarget::A,
+        ScoreTarget::APlus,
+        ScoreTarget::AaMinus,
+        ScoreTarget::Aa,
+        ScoreTarget::AaPlus,
+        ScoreTarget::AaaMinus,
+        ScoreTarget::Aaa,
+        ScoreTarget::AaaPlus,
+        ScoreTarget::MaxMinus,
+    ];
+
+    fn fixed(target: ScoreTarget, notes: u32, best: u32) -> u32 {
+        score_target(target, notes, best, TargetPlay::Fixed)
+    }
+
+    /// Each rank is `⌈2n·k/27⌉` exactly, k = 17 (A-) to 26 (MAX-); MAX is
+    /// `2n`. The values are worked by hand: at n = 81 every rank is a
+    /// whole `6k`, so AAA- is 138 (a float `ceil` of `162 · 23/27` gives
+    /// 139); at n = 7 each is `14k/27` rounded up; at n = 1 every rank is
+    /// the whole 2.
+    #[test]
+    fn a_rank_target_is_its_27ths_rounded_up_exactly() {
+        assert_eq!(fixed(ScoreTarget::AaaMinus, 81, 0), 138);
+        for (notes, expected) in [
+            (1, [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]),
+            (7, [9, 10, 10, 11, 11, 12, 12, 13, 13, 14]),
+            (81, [102, 108, 114, 120, 126, 132, 138, 144, 150, 156]),
+        ] {
+            let got = RANKS.map(|r| fixed(r, notes, 0));
+            assert_eq!(got, expected, "n = {notes}");
+            assert_eq!(fixed(ScoreTarget::Max, notes, 0), 2 * notes);
+        }
+        assert_eq!(fixed(ScoreTarget::Max, 0, 0), 0);
+    }
+
+    /// `"next"` at n = 81, whose 27ths are `6i`: the first of `6 · 15` =
+    /// 90 to `6 · 26` = 156 above the best. A best on a threshold gives
+    /// the next one, a best between two the upper; one at 156 or above has
+    /// none and gives 162.
+    #[test]
+    fn next_is_the_first_27th_from_15_above_the_best() {
+        assert_eq!(fixed(ScoreTarget::Next, 81, 0), 90);
+        assert_eq!(fixed(ScoreTarget::Next, 81, 89), 90);
+        for i in 15..26 {
+            assert_eq!(fixed(ScoreTarget::Next, 81, 6 * i), 6 * (i + 1), "on {i}");
+            assert_eq!(
+                fixed(ScoreTarget::Next, 81, 6 * i + 3),
+                6 * (i + 1),
+                "past {i}"
+            );
+        }
+        assert_eq!(fixed(ScoreTarget::Next, 81, 155), 156);
+        assert_eq!(fixed(ScoreTarget::Next, 81, 156), 162);
+        assert_eq!(fixed(ScoreTarget::Next, 81, 162), 162);
+        // n = 7: 15/27 of 14 is 7.78, so 8 above a best of 7.
+        assert_eq!(fixed(ScoreTarget::Next, 7, 7), 8);
+    }
+
+    /// Practice has no target, whatever the choice; a `#RANDOM` chart's
+    /// `"next"` is the largest EX score whatever the best, and its ranks
+    /// stay its own notes' 27ths.
+    #[test]
+    fn practice_gives_0_and_random_next_gives_the_largest() {
+        for target in ScoreTarget::ALL {
+            assert_eq!(
+                score_target(target, 81, 100, TargetPlay::Practice),
+                0,
+                "{target:?}"
+            );
+        }
+        for best in [0, 90, 200] {
+            assert_eq!(
+                score_target(ScoreTarget::Next, 81, best, TargetPlay::Random),
+                162
+            );
+        }
+        assert_eq!(
+            score_target(ScoreTarget::AaaMinus, 81, 0, TargetPlay::Random),
+            138
+        );
+        assert_eq!(
+            score_target(ScoreTarget::Max, 81, 0, TargetPlay::Random),
+            162
+        );
+    }
 }
