@@ -334,7 +334,10 @@ mod tests {
             assert_eq!(got, expected, "n = {notes}");
             assert_eq!(fixed(ScoreTarget::Max, notes, 0), 2 * notes);
         }
-        assert_eq!(fixed(ScoreTarget::Max, 0, 0), 0);
+        // A chart without notes has no target, whatever the choice.
+        for target in ScoreTarget::ALL {
+            assert_eq!(fixed(target, 0, 0), 0, "{target:?}");
+        }
     }
 
     /// `"next"` at n = 81, whose 27ths are `6i`: the first of `6 · 15` =
@@ -356,7 +359,9 @@ mod tests {
         assert_eq!(fixed(ScoreTarget::Next, 81, 155), 156);
         assert_eq!(fixed(ScoreTarget::Next, 81, 156), 162);
         assert_eq!(fixed(ScoreTarget::Next, 81, 162), 162);
-        // n = 7: 15/27 of 14 is 7.78, so 8 above a best of 7.
+        // n = 7: 15/27 of 14 is 7.78, rounded up to 8, both from no best
+        // and above a best of 7.
+        assert_eq!(fixed(ScoreTarget::Next, 7, 0), 8);
         assert_eq!(fixed(ScoreTarget::Next, 7, 7), 8);
     }
 
