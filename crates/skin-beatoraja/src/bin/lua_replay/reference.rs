@@ -663,7 +663,10 @@ impl<'a> Reference<'a> {
     /// Sets the VM's host to frame `f`'s.
     fn host(&self, f: &FrameInputs) {
         match f.host() {
-            Host::Play => self.vm.set_frame(f.fields(), f.timers(), f.state_us()),
+            Host::Play => {
+                self.vm
+                    .set_play(f.fields(), f.timers(), f.state_us(), Some(f.score()));
+            }
             Host::Outside { allowed, page } => {
                 let mut fields = f.fields().to_vec();
                 if let (Some((at, point)), Some(p)) = (self.page_point, *page)
