@@ -200,7 +200,7 @@ pub(crate) struct ScoreInputs {
 }
 
 /// The score fields from `field::BEST_EX`, in slot order.
-pub(crate) fn score_fields(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
+pub(crate) fn score_figures(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
     let ScoreInputs {
         ex,
         judged: p,
@@ -915,7 +915,7 @@ impl Play {
                 i32::from(self.drawable_chart().present(ChartImage::Stage)),
                 i32::from(self.drawable_chart().present(ChartImage::Back)),
             ])
-            .chain(score_fields(score));
+            .chain(score_figures(score));
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
