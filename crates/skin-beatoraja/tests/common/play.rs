@@ -225,6 +225,7 @@ pub fn context_with(
         bpm_range,
         bpm_whole_change,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     }
 }
 

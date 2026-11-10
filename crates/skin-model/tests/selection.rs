@@ -1306,6 +1306,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     };
     assert!(matches!(
         skin.prepare(&chart, &ctx),

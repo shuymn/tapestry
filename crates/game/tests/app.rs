@@ -147,6 +147,7 @@ impl ChartIngest for Charts {
         };
         Ok(Ingested {
             labels: game::ChartLabels::default(),
+            profile: bms_model::ChartProfile::of(&chart, &[]),
             chart,
             warnings: Vec::new(),
         })

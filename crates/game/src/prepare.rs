@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use bms_model::{Chart, Speed};
+use bms_model::{Chart, ChartProfile, Speed};
 use bms_parser::{LoadError, LoadOptions, WarningKind};
 pub use replay::TransformId;
 
@@ -14,6 +14,12 @@ pub struct Ingested {
     pub chart: Chart,
     /// Its descriptive labels, from the same resolution as the chart.
     pub labels: ChartLabels,
+    /// Its notes by second and its tempo rows over its 1× times, as the
+    /// adapter built them before any speed remap
+    /// ([`bms_parser::Loaded::profile`]): the session keeps it unchanged
+    /// and never builds it again from the chart, whose times may be
+    /// remapped.
+    pub profile: ChartProfile,
     /// What the adapter skipped or assumed, one line each. Missing sound
     /// files are not among them: the chart's sound table has each one,
     /// without a path, for the caller to sum up.
@@ -127,6 +133,7 @@ impl ChartIngest for BmsIngest {
                 bga: l.bga,
             },
             chart: loaded.chart,
+            profile: loaded.profile,
             warnings: loaded
                 .warnings
                 .iter()

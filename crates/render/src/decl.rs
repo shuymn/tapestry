@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bms_model::{Chart, TimeUs};
 use eval::Section;
+use skin_model::chart_image::ChartTable;
 use skin_model::{
     Atlas, AtlasId, BitmapLines, BuildError, Canvas, Layout, Loading, PackedPages, Play, Side,
     Skin, SkinFrame, TextRequest, TextSlots, TextTable, TextTableError, UvTable,
@@ -202,13 +203,18 @@ impl SkinBundle {
         {
             return Err(BundleError::Layers { first, last, end });
         }
-        if let Some(layer) = pages.text_layer() {
-            let after = RESERVED_LAYERS.saturating_add(count);
-            if u32::from(layer) != after {
+        // The kept layers follow the pages: the text layer, then the chart
+        // layer.
+        let after = RESERVED_LAYERS.saturating_add(count);
+        let chart_at = after.saturating_add(u32::from(pages.text_layer().is_some()));
+        for (layer, at) in [(pages.text_layer(), after), (pages.chart_layer(), chart_at)] {
+            if let Some(layer) = layer
+                && u32::from(layer) != at
+            {
                 return Err(BundleError::Layers {
                     first: layer,
                     last: layer,
-                    end: after,
+                    end: at,
                 });
             }
         }
@@ -257,6 +263,13 @@ impl SkinBundle {
     #[must_use]
     pub fn text_layer(&self) -> Option<u16> {
         self.pages.text_layer()
+    }
+
+    /// The chart layer after its pages and text layer, if its atlas has
+    /// one: its skin draws the chart's own images (S10-12).
+    #[must_use]
+    pub fn chart_layer(&self) -> Option<u16> {
+        self.pages.chart_layer()
     }
 
     /// Its pages' side.
@@ -378,7 +391,8 @@ pub fn pages_texels(pages: &PackedPages) -> u64 {
     let layers = u64::try_from(pages.pages().len())
         .unwrap_or(u64::MAX)
         .saturating_add(u64::from(RESERVED_LAYERS))
-        .saturating_add(u64::from(pages.text_layer().is_some()));
+        .saturating_add(u64::from(pages.text_layer().is_some()))
+        .saturating_add(u64::from(pages.chart_layer().is_some()));
     side.saturating_mul(side).saturating_mul(layers)
 }
 
@@ -433,6 +447,25 @@ struct Presented {
     /// The revision of the chosen chart's text installed for the
     /// lifetime; `None` until some is.
     text: Option<u64>,
+}
+
+impl LoadingPresentation {
+    /// Sets the chart images the installation's frames draw: `None`
+    /// unavailable, from the first byte of a publication until it is
+    /// published or refused (S10-12 design §5.3). They belong to the
+    /// installation and outlive a lifetime's reset; a loading frame reads
+    /// them from its state, an attempt prepared on the installation from
+    /// here. Allocates nothing.
+    pub(crate) fn set_chart_images(&self, table: Option<ChartTable>) {
+        self.lock().loading.set_chart_images(table);
+    }
+
+    /// The chart images published for the installation; `None` while
+    /// unavailable.
+    #[must_use]
+    pub fn chart_images(&self) -> Option<ChartTable> {
+        self.lock().loading.chart_images().copied()
+    }
 }
 
 impl fmt::Debug for LoadingPresentation {
@@ -617,8 +650,12 @@ impl LoadingPresentation {
         bundle: &SkinBundle,
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
+        live: Option<skin_model::chart_image::ChartKey>,
     ) -> Result<(), BuildError> {
         let mut p = self.lock();
+        // The chart table shared with other holders draws only against
+        // this frame's own array, checked under the same lock.
+        p.loading.set_chart_live(live);
         if p.lifetime != Some(f.lifetime) {
             if p.built {
                 return Ok(());
@@ -704,6 +741,9 @@ pub struct DeclSkin {
     bundle: Arc<SkinBundle>,
     loading: LoadingPresentation,
     play: Option<Play>,
+    /// The live key the renderer set for the next frames
+    /// ([`PlaySkin::set_chart_live`]).
+    chart_live: Option<skin_model::chart_image::ChartKey>,
     /// The attempt's labels, for a captured list's text (dev-tools).
     #[cfg(feature = "dev-tools")]
     labels: [String; 5],
@@ -725,6 +765,7 @@ impl DeclSkin {
             bundle: Arc::clone(&installation.bundle),
             loading: installation.loading.clone(),
             play: None,
+            chart_live: None,
             #[cfg(feature = "dev-tools")]
             labels: Default::default(),
         }
@@ -788,6 +829,9 @@ impl PlaySkin for DeclSkin {
                 reason: e.to_string(),
             })?;
         skin.attach_bitmap_text(&mut play, a.text);
+        // The images published for the installation, absent while none
+        // are: the attempt's fields are fixed from its commit.
+        play.set_chart_images(self.loading.chart_images().unwrap_or(ChartTable::ABSENT));
         self.play = Some(play);
         #[cfg(feature = "dev-tools")]
         {
@@ -834,6 +878,13 @@ impl PlaySkin for DeclSkin {
         }
     }
 
+    /// The prepared attempt's images; nothing without one.
+    fn set_chart_images(&mut self, table: ChartTable) {
+        if let Some(play) = &mut self.play {
+            play.set_chart_images(table);
+        }
+    }
+
     /// The attempt's `Play`'s ([`Play::carry`]); none without one.
     fn carry(&self) -> Option<skin_model::Carry<'_>> {
         self.play.as_ref().map(Play::carry)
@@ -845,10 +896,16 @@ impl PlaySkin for DeclSkin {
         let Some(play) = &mut self.play else {
             return Ok(());
         };
+        play.set_chart_live(self.chart_live);
         let bundle = &*self.bundle;
         bundle
             .skin
             .build(play, &skin_frame(f), &bundle.uvs, out.quads_mut())
+    }
+
+    /// Kept for the next builds, which check every chart table against it.
+    fn set_chart_live(&mut self, live: Option<skin_model::chart_image::ChartKey>) {
+        self.chart_live = live;
     }
 
     /// A presentation built for another lifetime starts afresh.
@@ -863,7 +920,7 @@ impl PlaySkin for DeclSkin {
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
     ) -> Result<(), BuildError> {
-        self.loading.build(&self.bundle, f, out)
+        self.loading.build(&self.bundle, f, out, self.chart_live)
     }
 
     fn capacity(&self) -> u32 {

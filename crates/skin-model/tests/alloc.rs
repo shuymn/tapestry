@@ -1981,6 +1981,7 @@ fn build_does_not_allocate() {
         bpm_range: None,
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -3956,6 +3957,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         }),
         bpm_whole_change: None,
         play_level: None,
+        score: skin_model::PlayScore::NONE,
     };
     let round = PlayContext {
         attempt: Attempt::Section(&section),

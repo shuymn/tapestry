@@ -96,6 +96,44 @@ pub struct AtlasLimits {
     pub reserved_layers: u32,
 }
 
+/// The layers an atlas keeps after its pages, each the page side square
+/// and with no CPU page, in this order: a text layer, which the renderer
+/// writes rasterized lines into, and a chart layer, which it writes the
+/// chart's own images into (S10-12 design §4.3). Either makes the page
+/// side at least [`MIN_TEXT_SIDE`], and the packing's cost and the
+/// [`MAX_ATLAS_TEXELS`] check count each, as the device's layers must hold
+/// them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeptLayers {
+    pub text: bool,
+    pub chart: bool,
+}
+
+impl KeptLayers {
+    /// No layer kept.
+    pub const NONE: Self = Self {
+        text: false,
+        chart: false,
+    };
+
+    /// A text layer when `text` is set, and no chart layer.
+    #[must_use]
+    pub const fn text(text: bool) -> Self {
+        Self { text, chart: false }
+    }
+
+    /// How many layers it keeps.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.text as u32 + self.chart as u32
+    }
+
+    /// Whether it keeps any, which sets the smallest page side.
+    const fn any(self) -> bool {
+        self.text || self.chart
+    }
+}
+
 /// Why an atlas was not built or rebound.
 #[derive(Debug, thiserror::Error)]
 pub enum AtlasError {
@@ -162,6 +200,9 @@ pub struct PackedPages {
     pages: Vec<Page>,
     variant: Variant,
     text_layer: Option<u16>,
+    /// The layer kept for the chart's images, after the pages and the
+    /// text layer, if any.
+    chart_layer: Option<u16>,
     /// The layers kept before the pages when they were packed
     /// ([`AtlasLimits::reserved_layers`]): page `i` is layer
     /// `reserved_layers + i`.
@@ -234,6 +275,22 @@ impl PackedPages {
         self.text_layer
     }
 
+    /// The layer kept for the chart's images, after the pages and the
+    /// text layer, if any.
+    #[must_use]
+    pub fn chart_layer(&self) -> Option<u16> {
+        self.chart_layer
+    }
+
+    /// The layers kept after the pages.
+    #[must_use]
+    pub fn kept(&self) -> KeptLayers {
+        KeptLayers {
+            text: self.text_layer.is_some(),
+            chart: self.chart_layer.is_some(),
+        }
+    }
+
     #[must_use]
     pub fn variant(&self) -> Variant {
         self.variant
@@ -258,11 +315,13 @@ impl PackedPages {
     /// `sheet`'s uv table on these pages: one entry per frame, in the
     /// sheet's frame order, each its cell's placement. O(frames + cells
     /// log cells); it reads no file.
-    fn uvs_for(&self, sheet: &Sheet, variant: Variant, text: bool) -> Result<UvTable, AtlasError> {
-        if variant != self.variant
-            || text != self.text_layer.is_some()
-            || sheet.root() != self.root.as_path()
-        {
+    fn uvs_for(
+        &self,
+        sheet: &Sheet,
+        variant: Variant,
+        kept: KeptLayers,
+    ) -> Result<UvTable, AtlasError> {
+        if variant != self.variant || kept != self.kept() || sheet.root() != self.root.as_path() {
             return Err(AtlasError::NotHeld);
         }
         let files = sheet.files();
@@ -328,6 +387,14 @@ impl Atlas {
         self.pages.text_layer
     }
 
+    /// The layer kept for the chart's images, after the pages and the
+    /// text layer, if the atlas has one ([`KeptLayers`]). It has no CPU
+    /// page: the renderer creates it zeroed and writes the images into it.
+    #[must_use]
+    pub fn chart_layer(&self) -> Option<u16> {
+        self.pages.chart_layer
+    }
+
     /// Every page's side at level 0.
     #[must_use]
     pub fn side(&self) -> u32 {
@@ -380,7 +447,22 @@ impl Atlas {
     /// [`Sheet::atlas_reserving`]) is not the atlas's, or a cell of
     /// `sheet` is not held.
     pub fn rebind(&self, sheet: &Sheet, variant: Variant, text: bool) -> Result<Self, AtlasError> {
-        let uvs = self.pages.uvs_for(sheet, variant, text)?;
+        self.rebind_keeping(sheet, variant, KeptLayers::text(text))
+    }
+
+    /// [`rebind`](Self::rebind), with the layers kept after the pages
+    /// given whole: `kept` must be the atlas's.
+    ///
+    /// # Errors
+    ///
+    /// As [`rebind`](Self::rebind).
+    pub fn rebind_keeping(
+        &self,
+        sheet: &Sheet,
+        variant: Variant,
+        kept: KeptLayers,
+    ) -> Result<Self, AtlasError> {
+        let uvs = self.pages.uvs_for(sheet, variant, kept)?;
         Ok(Self {
             pages: Arc::clone(&self.pages),
             uvs,
@@ -469,7 +551,7 @@ impl Sheet {
         limits: AtlasLimits,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
-        self.atlas_reserving(variant, limits, false, cancel)
+        self.atlas_keeping(variant, limits, KeptLayers::NONE, cancel)
     }
 
     /// [`atlas`](Self::atlas), with a text layer kept after the pages when
@@ -488,8 +570,24 @@ impl Sheet {
         text: bool,
         cancel: &dyn Fn() -> bool,
     ) -> Result<Atlas, AtlasError> {
-        let (rects, packing) = self.packing(variant, limits, text)?;
-        self.build(variant, limits, text, rects, packing, cancel)
+        self.atlas_keeping(variant, limits, KeptLayers::text(text), cancel)
+    }
+
+    /// [`atlas`](Self::atlas), keeping the layers `kept` names after the
+    /// pages ([`KeptLayers`]): the text layer first, then the chart layer.
+    ///
+    /// # Errors
+    ///
+    /// As [`atlas`](Self::atlas).
+    pub fn atlas_keeping(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        kept: KeptLayers,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Atlas, AtlasError> {
+        let (rects, packing) = self.packing(variant, limits, kept)?;
+        self.build(variant, limits, kept, rects, packing, cancel)
     }
 
     /// Whether this sheet's atlas of `variant` fits `limits` (with a text
@@ -508,9 +606,24 @@ impl Sheet {
         limits: AtlasLimits,
         text: bool,
     ) -> Result<u64, AtlasError> {
-        let (_, packing) = self.packing(variant, limits, text)?;
-        let kept = limits.reserved_layers + u32::from(text);
-        Ok(pack::cost(kept, packing.pages, packing.side))
+        self.plan_keeping(variant, limits, KeptLayers::text(text))
+    }
+
+    /// [`plan`](Self::plan), keeping the layers `kept` names
+    /// ([`KeptLayers`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`plan`](Self::plan).
+    pub fn plan_keeping(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        kept: KeptLayers,
+    ) -> Result<u64, AtlasError> {
+        let (_, packing) = self.packing(variant, limits, kept)?;
+        let layers = limits.reserved_layers + kept.count();
+        Ok(pack::cost(layers, packing.pages, packing.side))
     }
 
     /// Each cell's rectangle in the version `variant` reads, and their
@@ -519,10 +632,10 @@ impl Sheet {
         &self,
         variant: Variant,
         limits: AtlasLimits,
-        text: bool,
+        kept: KeptLayers,
     ) -> Result<(Vec<[u32; 4]>, pack::Packing), AtlasError> {
-        let extra = u32::from(text);
-        let min_side = if text { MIN_TEXT_SIDE } else { 0 };
+        let extra = kept.count();
+        let min_side = if kept.any() { MIN_TEXT_SIDE } else { 0 };
         let max_pages = page_cap(&limits, extra)?;
         let cap = pack::side_cap(limits.max_side.min(MAX_PAGE_SIDE));
         let files = self.files();
@@ -569,7 +682,7 @@ impl Sheet {
         &self,
         variant: Variant,
         limits: AtlasLimits,
-        text: bool,
+        kept: KeptLayers,
         rects: Vec<[u32; 4]>,
         packing: pack::Packing,
         cancel: &dyn Fn() -> bool,
@@ -599,9 +712,11 @@ impl Sheet {
             }
         }
 
-        let text_layer = if text {
-            let layer = limits.reserved_layers + packing.pages;
-            Some(u16::try_from(layer).map_err(|_| AtlasError::Limits)?)
+        let after = limits.reserved_layers + packing.pages;
+        let layer = |l: u32| u16::try_from(l).map_err(|_| AtlasError::Limits);
+        let text_layer = if kept.text { Some(layer(after)?) } else { None };
+        let chart_layer = if kept.chart {
+            Some(layer(after + u32::from(kept.text))?)
         } else {
             None
         };
@@ -614,6 +729,7 @@ impl Sheet {
             pages,
             variant,
             text_layer,
+            chart_layer,
             reserved_layers: limits.reserved_layers,
             root: self.root().to_path_buf(),
             files,
@@ -621,7 +737,7 @@ impl Sheet {
         };
         // The sheet's own table is a rebind to the pages it just filled.
         let uvs = pages
-            .uvs_for(self, variant, text)
+            .uvs_for(self, variant, kept)
             .map_err(|_| AtlasError::Misaligned)?;
         Ok(Atlas {
             pages: Arc::new(pages),

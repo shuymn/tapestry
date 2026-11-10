@@ -17,6 +17,7 @@ use super::{
     BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
     RoundedDuration, SkinFrame,
 };
+use crate::chart_image::ChartImage;
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::present::{Clock, Io, Present};
 use crate::widget::gauge::GaugeLook;
@@ -775,7 +776,11 @@ impl Play {
             )
             .chain([r.progress_ppm])
             .chain(self.chart_fields)
-            .chain([score.point]);
+            .chain([score.point])
+            .chain([
+                i32::from(self.drawable_chart().present(ChartImage::Stage)),
+                i32::from(self.drawable_chart().present(ChartImage::Back)),
+            ]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

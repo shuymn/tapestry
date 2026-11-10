@@ -143,6 +143,7 @@ fn install(r: &mut Renderer, clips: Vec<[f32; 4]>) {
             side: 256,
             pages: &pages,
             text_layer: false,
+            chart_layer: false,
         },
         ClipTable::new(clips).unwrap(),
     )
@@ -296,6 +297,7 @@ fn a_side_between_powers_of_two_keeps_its_levels() {
             side: 384,
             pages: &[page],
             text_layer: false,
+            chart_layer: false,
         },
         ClipTable::new(Vec::new()).unwrap(),
     )
@@ -507,6 +509,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
         side: max * 2,
         pages: &[],
         text_layer: false,
+        chart_layer: false,
     };
     let e = r.install_atlas(&past_side, whole()).unwrap_err();
     assert!(
@@ -521,6 +524,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
         side: 256,
         pages: &all,
         text_layer: false,
+        chart_layer: false,
     };
     let e = r.install_atlas(&past_layers, whole()).unwrap_err();
     assert!(
@@ -532,6 +536,7 @@ fn a_refused_atlas_keeps_the_one_in_use() {
         side: 256,
         pages: &all[..1],
         text_layer: false,
+        chart_layer: false,
     };
     let e = r.install_atlas(&short, whole()).unwrap_err();
     assert!(
