@@ -800,6 +800,23 @@ impl AudioControl {
         }
     }
 
+    /// Takes the engine's sounds away: an empty bank and schedule at the
+    /// output's rate are loaded as [`load`](Self::load) loads them, so the
+    /// bank they replace, and the source the last load answered with, are
+    /// freed here once the audio thread has taken them (design.md "Load
+    /// Pipeline": no bank is held beside a new decode).
+    ///
+    /// # Errors
+    ///
+    /// As [`load`](Self::load): [`AudioLoadError::Busy`] while a load that
+    /// timed out is unanswered, [`AudioWaitError::Gone`] once the worker is
+    /// gone, [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`], which
+    /// leaves the unload outstanding.
+    pub fn unload(&mut self) -> Result<(), AudioLoadError> {
+        let empty = Arc::new(SoundBank::from_sounds(self.rate, Vec::new()));
+        self.load(empty, BgmSchedule::new(Vec::new()))
+    }
+
     /// Keeps `periods` periods queued on the output from the audio thread's
     /// next step on, and waits for its answer: the periods the output now
     /// keeps, `None` when it cannot say. Call it between plays, before
