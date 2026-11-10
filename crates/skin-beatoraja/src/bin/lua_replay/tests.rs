@@ -311,15 +311,24 @@ fn an_unavailable_read_agrees() {
 }
 
 /// The hi-speed fix (image index 55) a play callback reads agrees on both
-/// sides: the reference answers it as the program reads it.
+/// sides: the reference answers it as the program reads it. Each fix is
+/// given to every frame and the draw tests it exactly, so a reference
+/// answering any other value draws differently from the program.
 #[test]
 fn an_index_55_read_agrees() {
-    let r = run(&dst(
-        "\"i\"",
-        0,
-        "draw = function() return ms.event_index(55) / 2 >= 0 end,",
-    ));
-    agrees(&r, 1);
+    for fix in 1..=4_u8 {
+        let mut script = Script::full();
+        script.fix_hispeed = fix;
+        let r = run_with(
+            &dst(
+                "\"i\"",
+                0,
+                &format!("draw = function() return ms.event_index(55) / 2 == {fix} / 2 end,"),
+            ),
+            &options(script),
+        );
+        agrees(&r, 1);
+    }
 }
 
 /// R12: a latch agrees on every frame, both invocations, start, elapsed,
