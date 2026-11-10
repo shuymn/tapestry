@@ -11713,7 +11713,8 @@ pub(crate) mod tests {
 
     /// s7-06s S4: the settled score data is over the settled attempt's own
     /// targets: a round of the play state over 7 taps after a full score
-    /// over 4 is offered the whole rate over 4 (100 %), not over 7.
+    /// over 4 is offered the whole rate over 4 (100 %), not over 7, before
+    /// and after that round commits.
     #[test]
     fn a_settled_score_is_over_its_own_targets() {
         let chart = four_taps();
@@ -11730,6 +11731,12 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         link.load(Arc::clone(&seven), None).unwrap();
+        // Offered, then committed over 7 targets and offered again: the
+        // record keeps what the 4-target round settled.
+        assert_eq!(
+            carried_attempt(&screens, &link, &seven, CARRY_KEY, true),
+            Some((FULL, None))
+        );
         assert_eq!(
             carried_attempt(&screens, &link, &seven, CARRY_KEY, false),
             Some((FULL, None))
