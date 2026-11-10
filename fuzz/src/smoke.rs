@@ -378,6 +378,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "judge",
             "gauge",
             "rates",
+            "score figures",
             "readouts",
             "selectors",
             "note_fallbacks",
@@ -985,6 +986,25 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // "00" twice. Each set has one image: gauge type 2, EX 150
                 // and the unresolved value all select it.
                 assert_eq!(drawn, [3 + 2 + 2 + 3; 4], "{name}");
+            }
+            "score figures" => {
+                use skin_beatoraja::DeviationId;
+                // The rates (122, 123, 183, 184) and the paced best's
+                // difference (152) each D4.
+                assert_eq!(
+                    kinds(&i),
+                    [NoteKind::Deviation(DeviationId::D4); 5],
+                    "{name}"
+                );
+                assert_eq!(u.elements, 15, "{name}");
+                // No best and no target (0, not `#RANDOM`), EX 150 over one
+                // judged of 100 targets: bars 110 (0.75) and 111 (past 1,
+                // drawn at 1) and the four at 0 as empty quads; 150, 151
+                // and 121 "0"; 152 under 201 hidden (band AAA) and 153
+                // under -225 hidden (rank D reached); 122 "0" on 351 and
+                // 123 "00" on 352 (both reached at 0); 183 under 207
+                // hidden, 184 "00" under 227 (rank F reached).
+                assert_eq!(drawn, [2 + 4 + 3 + 1 + 2 + 2; 4], "{name}");
             }
             "readouts" => {
                 use skin_beatoraja::{DeviationId, PropertyKind};
