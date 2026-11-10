@@ -61,7 +61,10 @@ pub struct HitErrorDef {
     /// Colour each line by its window band, else by age in `line`.
     pub band_colors: bool,
     pub ema_mode: EmaMode,
-    /// The average's weight of each new offset.
+    /// The average's weight of each new offset: any finite value, as the
+    /// source takes any (`ema += (long)(alpha · (v − ema))`, Java's
+    /// arithmetic, so a weight outside 0 to 1 overshoots or wraps as the
+    /// source's does).
     pub alpha: f32,
     pub line: Rgba8,
     pub center: Rgba8,
@@ -171,13 +174,7 @@ impl HitErrorState {
             for v in offsets.since(self.seen) {
                 let v = i64::from(v);
                 if bad_lo < v && v < bad_hi {
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        clippy::cast_possible_truncation,
-                        reason = "the source's float weight and long cast"
-                    )]
-                    let step = (self.def.alpha * (v - self.ema) as f32) as i64;
-                    self.ema = self.ema.saturating_add(step);
+                    self.ema = ema_step(self.ema, v, self.def.alpha);
                 }
             }
         }
@@ -293,6 +290,21 @@ impl HitErrorState {
             compose::column(c, &self.column, &mut self.edges, &mut self.runs);
         }
     }
+}
+
+/// The source's average step, `ema + (long)(alpha * (value - ema))`, with
+/// Java's semantics for every weight it accepts: the `long` difference and
+/// sum wrap, the difference widens to `float` rounding to nearest, and the
+/// cast saturates (NaN to 0), as Rust's `as` does. So no weight, however
+/// large or negative, overflows.
+pub(crate) fn ema_step(ema: i64, value: i64, alpha: f32) -> i64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "the source's float weight and long cast"
+    )]
+    let step = (alpha * value.wrapping_sub(ema) as f32) as i64;
+    ema.wrapping_add(step)
 }
 
 /// What one hit-error visualizer's frame reads besides its element's.

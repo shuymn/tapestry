@@ -432,6 +432,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/digits.rs"),
     Site::File("crates/skin-model/src/widget/gauge.rs"),
     Site::File("crates/skin-model/src/widget/gauge_graph.rs"),
+    Site::File("crates/skin-model/src/widget/hit_error.rs"),
     Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/judge_graph.rs"),

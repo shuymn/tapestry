@@ -455,6 +455,12 @@ impl JudgeGraph {
                 return;
             };
             for ([l, r], color) in cursors.pieces().into_iter().flatten() {
+                // The source paints the cursors into the graph's own
+                // pixmap: what lies past either edge is not drawn.
+                let (l, r) = (l.max(0.0), r.min(1.0));
+                if r <= l {
+                    continue;
+                }
                 let x = f64::from(g.x);
                 let w = f64::from(g.w);
                 let rect = [x + w * l, f64::from(g.y), w * (r - l), f64::from(g.h)].map(f32_of);
