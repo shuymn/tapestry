@@ -899,11 +899,9 @@ fn slot_six_follows_its_texture() {
     for (src, files, want) in [
         ("a.png", vec![], 0),
         ("missing.png", vec![], 1),
-        ("clip.mp4", vec![("clip.mp4", mp4)], 1),
         ("gone.mp4", vec![], 1),
         ("pics/*.png", vec![], 1),
         ("bad.png", vec![("bad.png", corrupt.as_slice())], 1),
-        ("mv/*", vec![("mv/clip.mp4", mp4)], 1),
     ] {
         let i = import_files(&six_judge(src), &files).unwrap_or_else(|e| panic!("{src}: {e:?}"));
         let mut p = Drawn::new(i.imported.skin, 4);
@@ -914,14 +912,24 @@ fn slot_six_follows_its_texture() {
             "{src}"
         );
     }
+    // Not proven either way: a pattern some file matches, and a movie by
+    // its name that is there, whatever its bytes (the texture getter
+    // decodes it unless a movie object of it came first).
     let png = std::fs::read(FOLDERS.with(|f| f.borrow()[0].path().join("a.png"))).unwrap();
-    assert!(refused(
-        &import_files(
-            &six_judge("pics/*.png"),
-            &[("pics/one.png", png.as_slice())]
-        ),
-        "a judge whose slot-6 texture the import cannot prove"
-    ));
+    for (src, files) in [
+        ("pics/*.png", vec![("pics/one.png", png.as_slice())]),
+        ("clip.mp4", vec![("clip.mp4", mp4)]),
+        ("clip.mp4", vec![("clip.mp4", png.as_slice())]),
+        ("mv/*", vec![("mv/clip.mp4", mp4)]),
+    ] {
+        assert!(
+            refused(
+                &import_files(&six_judge(src), &files),
+                "a judge whose slot-6 texture the import cannot prove"
+            ),
+            "{src}"
+        );
+    }
 }
 
 /// A grouped image whose file choice names a movie is a movie: `len` does
@@ -1014,4 +1022,76 @@ fn a_refused_root_is_not_noted() {
         "{:#?}",
         i.imported.report.notes
     );
+}
+
+/// A pattern whose folder holds only a link out of the skin folder: the
+/// listing skips it where the source would pick it, so the import cannot
+/// prove the image absent. Its timer stays a site, and the latch it shares
+/// with a kept image is refused once the import drops it.
+#[test]
+fn a_pattern_with_a_skipped_entry_is_not_removed() {
+    let outside = tempfile::tempdir().unwrap();
+    common::png(outside.path(), "far.png", 8, 8);
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"g\", path = \"pics/*.png\" }})\n\
+         table.insert(skin.image, {{ id = \"x\", src = \"g\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         local l = latch(100000)\n{}{}",
+        dst("x", "timer = l,"),
+        dst("i", "timer = l,")
+    );
+    let d = folder(&skin(&body));
+    std::fs::create_dir_all(d.path().join("pics")).unwrap();
+    let target = outside.path().join("far.png");
+    let link = d.path().join("pics").join("near.png");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let config = Config {
+        options: vec![Some(905)],
+        ..Config::default()
+    };
+    let i = common::lua_play(&h, &config, &cancel).unwrap();
+    assert!(
+        i.callbacks
+            .contains(&construct("a slot writer a dropped destination calls")),
+        "{:?}",
+        i.callbacks
+    );
+}
+
+/// Pattern listings are charged to the definition's folder entries (T08):
+/// two folders together past the bound stop the import.
+#[test]
+fn pattern_listings_share_the_entry_bound() {
+    use skin_beatoraja::{ImportError, InputLimit};
+    let body = format!(
+        "table.insert(skin.source, {{ id = \"p\", path = \"p/*.png\" }})\n\
+         table.insert(skin.source, {{ id = \"q\", path = \"q/*.png\" }})\n\
+         table.insert(skin.image, {{ id = \"x\", src = \"p\", x = 0, y = 0, w = 8, h = 8 }})\n\
+         table.insert(skin.image, {{ id = \"y\", src = \"q\", x = 0, y = 0, w = 8, h = 8 }})\n{}{}",
+        dst("x", ""),
+        dst("y", "")
+    );
+    let d = folder(&skin(&body));
+    for dir in ["p", "q"] {
+        for k in 0..2_100 {
+            common::write(d.path(), &format!("{dir}/{k}.txt"), b"");
+        }
+    }
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let config = Config {
+        options: vec![Some(905)],
+        ..Config::default()
+    };
+    assert!(matches!(
+        common::lua_play(&h, &config, &cancel),
+        Err(ImportError::Input {
+            limit: InputLimit::ListEntries,
+            ..
+        })
+    ),);
 }

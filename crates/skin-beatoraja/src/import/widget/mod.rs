@@ -311,9 +311,9 @@ impl Cx<'_> {
         };
         // The file choice substituted, then the name classified, as the
         // installation pass reads it ([`Self::resolve_path`]).
-        let name = match self.resolve_path(&path) {
+        let name = match self.resolve_path(&path, at)? {
             Resolved::File(name) => name,
-            Resolved::Movie => {
+            Resolved::Movie(_) => {
                 return missing(NoteKind::Unsupported {
                     object: Object::Movie,
                 });

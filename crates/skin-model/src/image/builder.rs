@@ -335,32 +335,36 @@ impl SheetBuilder {
     /// # Errors
     ///
     /// Why it does not decode, its name or path refused, or an unknown
-    /// file.
-    pub fn validate_file(&self, file: u32) -> Result<(), ImageError> {
+    /// file; `None` when `cancel` stopped it.
+    pub fn validate_file(
+        &self,
+        file: u32,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), Option<ImageError>> {
         let index = usize::try_from(file).unwrap_or(usize::MAX);
         let at = FileAt {
             file: index,
             hi: false,
         };
         let Some(f) = self.files.get(index) else {
-            return Err(ImageError::TooManyFiles { n: index });
+            return Err(Some(ImageError::TooManyFiles { n: index }));
         };
         let (canonical, _) = self
             .source
             .resolve(&self.root, &f.lo.name)
-            .map_err(|e| ImageError::path(at, e))?;
-        match self.source.validate_page(
-            &canonical,
-            at,
-            (f.lo.dims, f.lo.mode),
-            MAX_FILE_BYTES,
-            &|| false,
-        ) {
-            Ok(()) => Ok(()),
-            Err(super::Stop::Image(e)) => Err(e),
-            // `cancel` is never asked to stop.
-            Err(super::Stop::Cancelled) => Ok(()),
-        }
+            .map_err(|e| Some(ImageError::path(at, e)))?;
+        self.source
+            .validate_page(
+                &canonical,
+                at,
+                (f.lo.dims, f.lo.mode),
+                MAX_FILE_BYTES,
+                cancel,
+            )
+            .map_err(|s| match s {
+                super::Stop::Image(e) => Some(e),
+                super::Stop::Cancelled => None,
+            })
     }
 
     /// An admitted file's 1x width and height.

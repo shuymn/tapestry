@@ -43,9 +43,14 @@ pub(super) enum Resolved {
     Absent,
     /// A movie by its resolved name, or a pattern whose matches all are
     /// movies: the source makes a movie object, before it reads `len`
-    /// (`JsonSkinObjectLoader.java:44-49`), never a texture.
-    Movie,
-    /// A pattern some file matches: the source picks one at random.
+    /// (`JsonSkinObjectLoader.java:44-49`). Its texture is unknown unless
+    /// the file is missing: the source's texture getter decodes the file
+    /// whatever its suffix, unless a movie object of it was made first
+    /// (`JsonSkinObjectLoader.java:561-582`).
+    Movie(Option<String>),
+    /// A pattern some file matches, or one the import cannot prove
+    /// unmatched (its listing skipped an entry the source would see): the
+    /// source picks a match at random.
     Matched,
     /// A file, its name resolved.
     File(String),
@@ -58,10 +63,13 @@ pub(super) enum Resolved {
 pub(super) enum Load {
     /// It decodes.
     Loads,
-    /// It does not: no file, a movie, or a file that does not decode.
+    /// It does not, by evidence the import fully sees: no source, a file
+    /// choice of none, a pattern whose whole folder matches nothing, a
+    /// missing file, or a file that does not decode.
     Absent,
-    /// The import cannot tell: a random pick among matches, a file only
-    /// the importer refuses, or a file not decoded here.
+    /// The import cannot tell: a random pick among matches, a movie by its
+    /// name that is there, a file only the importer refuses, or a file not
+    /// decoded here.
     Unknown,
 }
 
@@ -454,11 +462,11 @@ impl Cx<'_> {
     ) -> Result<bool, ImportError> {
         match object {
             Object::Image => {
-                match self.resolve_source(rec)? {
+                match self.resolve_source(rec, at)? {
                     Resolved::Absent => return Ok(true),
                     // A movie is an object whatever its `len`; a random pick
                     // may be one.
-                    Resolved::Movie | Resolved::Matched => return Ok(false),
+                    Resolved::Movie(_) | Resolved::Matched => return Ok(false),
                     Resolved::File(_) => {}
                 }
                 let [len, divx, divy] = self.def.fields(rec, ["len", "divx", "divy"]);
@@ -508,8 +516,8 @@ impl Cx<'_> {
     /// Whether image record `rec`'s source does not resolve without a file
     /// being read: no `source` record of its `src`, one without a `path`,
     /// or a file choice of none.
-    /// Where image record `rec`'s source leads.
-    fn resolve_source(&mut self, rec: u32) -> Result<Resolved, ImportError> {
+    /// Where image record `rec`'s source leads, for the element at `at`.
+    fn resolve_source(&mut self, rec: u32, at: super::Span) -> Result<Resolved, ImportError> {
         let [src] = self.def.fields(rec, ["src"]);
         let src = self.opt_string(src, "src")?;
         let Some(source) = self.source_rec(src.as_deref())? else {
@@ -518,54 +526,94 @@ impl Cx<'_> {
         let Some(path) = self.source_path(source)? else {
             return Ok(Resolved::Absent);
         };
-        Ok(self.resolve_path(&path))
+        self.resolve_path(&path, at)
     }
 
     /// Where source path `path` leads, the file choice substituted before
     /// the name is classified; the one resolution the installation pass
     /// and the placement read ([`Self::src_rect`]).
-    pub(super) fn resolve_path(&self, path: &str) -> Resolved {
+    pub(super) fn resolve_path(
+        &mut self,
+        path: &str,
+        at: super::Span,
+    ) -> Result<Resolved, ImportError> {
         use super::asset::{self, Path};
-        match self.choices.substitute(path) {
+        Ok(match self.choices.substitute(path) {
             Path::Missing => Resolved::Absent,
-            Path::File(p) if asset::is_movie(&p) => Resolved::Movie,
+            Path::File(p) if asset::is_movie(&p) => {
+                Resolved::Movie(Some(asset::resolve(&self.entry_dir, &p)))
+            }
             Path::File(p) => Resolved::File(asset::resolve(&self.entry_dir, &p)),
             // Every match ends with the pattern's tail.
-            Path::Glob if asset::is_movie(path) => Resolved::Movie,
-            Path::Glob => match self.glob_matches(path) {
+            Path::Glob if asset::is_movie(path) => Resolved::Movie(None),
+            Path::Glob => match self.glob_matches(path, at)? {
                 Some(false) => Resolved::Absent,
                 Some(true) | None => Resolved::Matched,
             },
-        }
+        })
     }
 
     /// Whether some file matches pattern `path` as the source picks one
     /// (`SkinLoader.java:107-127`): a name in its folder ending, lowercased,
-    /// with the tail after its last `*` (its `|` part dropped); `None`
-    /// when the folder cannot be listed within the entry bound.
-    fn glob_matches(&self, path: &str) -> Option<bool> {
-        let star = path.rfind('*')?;
-        let mut tail = path.get(star + 1..)?.to_owned();
+    /// with the tail after its last `*` (its `|` part dropped). `None` when
+    /// no match is found but the import cannot prove there is none: the
+    /// listing skipped an entry the source would see (a link out of the
+    /// folder, a name that is not UTF-8), or the folder could not be read.
+    /// Each folder is listed once, charged to the definition's folder
+    /// entries ([`crate::limits::MAX_LIST_ENTRIES`], T08); past them the
+    /// import stops.
+    fn glob_matches(&mut self, path: &str, at: super::Span) -> Result<Option<bool>, ImportError> {
+        let Some(star) = path.rfind('*') else {
+            return Ok(None);
+        };
+        let mut tail = path.get(star + 1..).unwrap_or("").to_owned();
         if let Some(bar) = path.find('|') {
             let head = path.get(star + 1..bar).unwrap_or("");
-            let rest = path.get(path.rfind('|')? + 1..).unwrap_or("");
+            let rest = path
+                .rfind('|')
+                .and_then(|b| path.get(b + 1..))
+                .unwrap_or("");
             tail = format!("{head}{rest}");
         }
         let folder = path
-            .get(..path.get(..star)?.rfind('/').unwrap_or(0))
+            .get(..path.get(..star).and_then(|h| h.rfind('/')).unwrap_or(0))
             .unwrap_or("");
         let dir = super::asset::resolve(&self.entry_dir, folder);
-        let remaining = crate::limits::MAX_LIST_ENTRIES.saturating_sub(self.def.run.entries);
-        match self.def.root().list(&dir, remaining) {
-            Ok(listing) => Some(
-                listing
-                    .entries
-                    .iter()
-                    .any(|e| e.name.to_lowercase().ends_with(&tail)),
-            ),
-            Err(skin_model::RootError::Missing | skin_model::RootError::NotAFolder) => Some(false),
-            Err(_) => None,
+        if !self.listings.contains_key(&dir) {
+            let remaining = crate::limits::MAX_LIST_ENTRIES.saturating_sub(self.def.run.entries);
+            let listed = match self.def.root().list(&dir, remaining) {
+                Ok(listing) => {
+                    self.def.run.entries += listing.enumerated;
+                    let skipped = listing.enumerated > listing.entries.len();
+                    Some((
+                        listing.entries.into_iter().map(|e| e.name).collect(),
+                        skipped,
+                    ))
+                }
+                Err(skin_model::RootError::Missing | skin_model::RootError::NotAFolder) => {
+                    Some((Vec::new(), false))
+                }
+                Err(skin_model::RootError::TooManyEntries { .. }) => {
+                    return Err(ImportError::Input {
+                        at: Some(self.loc(at)),
+                        limit: crate::error::InputLimit::ListEntries,
+                    });
+                }
+                Err(_) => None,
+            };
+            self.listings.insert(dir.clone(), listed);
         }
+        Ok(match self.listings.get(&dir) {
+            Some(Some((names, skipped))) => {
+                let found = names.iter().any(|n| n.to_lowercase().ends_with(&tail));
+                if found || !*skipped {
+                    Some(found)
+                } else {
+                    None
+                }
+            }
+            Some(None) | None => None,
+        })
     }
 
     /// Whether image record `rec`'s texture loads: the one decision the
@@ -583,11 +631,12 @@ impl Cx<'_> {
         decode: bool,
         at: super::Span,
     ) -> Result<Load, ImportError> {
-        let name = match self.resolve_source(rec)? {
-            Resolved::Absent | Resolved::Movie => return Ok(Load::Absent),
-            Resolved::Matched => return Ok(Load::Unknown),
-            Resolved::File(_) if !decode => return Ok(Load::Unknown),
-            Resolved::File(name) => name,
+        let (name, movie) = match self.resolve_source(rec, at)? {
+            Resolved::Absent => return Ok(Load::Absent),
+            Resolved::Matched | Resolved::Movie(None) => return Ok(Load::Unknown),
+            Resolved::File(_) | Resolved::Movie(_) if !decode => return Ok(Load::Unknown),
+            Resolved::File(name) => (name, false),
+            Resolved::Movie(Some(name)) => (name, true),
         };
         let def = skin_model::FileDef {
             path: name,
@@ -599,12 +648,21 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))?;
         Ok(match admitted {
             Err(super::asset::Failed::File { refused: false }) => Load::Absent,
+            // A movie that is there: the texture getter may decode it, or
+            // find a movie object of it made first.
+            _ if movie => Load::Unknown,
             Err(_) => Load::Unknown,
-            Ok(file) => match self.assets.validate(file) {
-                Ok(()) => Load::Loads,
-                Err(false) => Load::Absent,
-                Err(true) => Load::Unknown,
-            },
+            Ok(file) => {
+                let def = &*self.def;
+                match self.assets.validate(file, &|| def.is_cancelled()) {
+                    Ok(()) => Load::Loads,
+                    Err(super::asset::Invalid::Fails) => Load::Absent,
+                    Err(super::asset::Invalid::Refused) => Load::Unknown,
+                    Err(super::asset::Invalid::Cancelled) => {
+                        return Err(crate::resolve::Definition::cancellation(Some(self.loc(at))));
+                    }
+                }
+            }
         })
     }
 

@@ -151,6 +151,17 @@ pub(crate) fn resolve(dir: &str, name: &str) -> String {
     Root::normalise(&joined).unwrap_or(joined)
 }
 
+/// Why a file did not prove to decode ([`Assets::validate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Invalid {
+    /// It does not decode.
+    Fails,
+    /// Only this importer refuses it (a cap): the source may decode it.
+    Refused,
+    /// The import was cancelled.
+    Cancelled,
+}
+
 /// Why an asset request stopped the import: an aggregate limit, or a
 /// cancellation, which no cache keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,10 +508,14 @@ impl Assets {
     }
 
     /// Whether admitted file `file` decodes completely
-    /// ([`SheetBuilder::validate_file`]): `Err(refused)`, `refused` when
-    /// only this importer refuses it (a cap), not the file itself.
-    pub(crate) fn validate(&self, file: u32) -> Result<(), bool> {
-        self.builder.validate_file(file).map_err(|e| refused(&e))
+    /// ([`SheetBuilder::validate_file`]), `cancel` asked as it goes.
+    pub(crate) fn validate(&self, file: u32, cancel: &dyn Fn() -> bool) -> Result<(), Invalid> {
+        match self.builder.validate_file(file, cancel) {
+            Ok(()) => Ok(()),
+            Err(None) => Err(Invalid::Cancelled),
+            Err(Some(e)) if refused(&e) => Err(Invalid::Refused),
+            Err(Some(_)) => Err(Invalid::Fails),
+        }
     }
 
     /// The error a failed file was cached with, taken: a critical user

@@ -472,6 +472,10 @@ pub(crate) struct Cx<'d> {
     /// The schedule notes, by callback, held until the slot roots close
     /// ([`Cx::schedule_notes`]).
     schedule: Vec<(u16, Span, NoteKind)>,
+    /// Each folder a source pattern lists, by name: its entries' names and
+    /// whether the listing skipped one, or `None` when it could not be
+    /// read; listed and charged once.
+    listings: HashMap<String, Option<(Vec<String>, bool)>>,
     /// While a number's destination is read, its value's expression: a
     /// program draw after it runs only while the value is no sentinel.
     number_value: Option<String>,
@@ -603,6 +607,7 @@ impl<'d> Cx<'d> {
             prepare: prepare::Prepare::Open,
             sentinel_read: false,
             schedule: Vec::new(),
+            listings: HashMap::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
             ranks: [None; 3],
