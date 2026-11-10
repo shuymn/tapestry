@@ -65,9 +65,6 @@ pub struct Report {
     pub carry_safe: bool,
     /// Lowered invocations compared and agreed, by frame kind and consumer.
     pub lowered: BTreeMap<(&'static str, &'static str), usize>,
-    /// Lowered invocations attributed to the score readings across rounds,
-    /// by round (from 1).
-    pub score_difference: BTreeMap<usize, usize>,
 }
 
 impl Report {
@@ -123,9 +120,6 @@ impl Report {
         }
         for ((kind, field), n) in &self.lowered {
             let _ = writeln!(o, "lowered {field} agreed on {kind} frames: {n}");
-        }
-        for (r, n) in &self.score_difference {
-            let _ = writeln!(o, "round {r} score readings across rounds: {n}");
         }
         let listed = |o: &mut String, label: &str, l: &[Listed]| {
             let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

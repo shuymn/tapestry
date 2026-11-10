@@ -395,14 +395,16 @@ fn score_frames_do_not_allocate() {
     let mut round = h.skin.prepare(&chart, &practice).unwrap();
     std::mem::swap(&mut h.play, &mut round);
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
-    let point = h.field(skin_model::field::POINT);
+    // The first round's score data, carried: the projections ignore it.
+    let score = skin_model::settled(&tally(2, 1, 0), 7, false);
+    assert!(score.is_some());
     let mut next = h
         .skin
         .prepare_carried(
             &chart,
             &practice,
             Continuation::Carried {
-                point,
+                score,
                 bank: Some(h.play.bank()),
             },
         )

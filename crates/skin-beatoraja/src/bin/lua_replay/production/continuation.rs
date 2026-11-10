@@ -6,7 +6,7 @@
 
 use eval::Tally;
 use skin_model::present::Bank;
-use skin_model::{Carry, Continuation};
+use skin_model::{Carry, Continuation, Settled};
 
 /// What a round took over, as the comparator reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,10 +36,11 @@ impl Carried {
 }
 
 /// The record of one play state: nothing before its first round, then
-/// the cached point and the slots, `None` once invalid.
+/// the cached score data (`None` before any judgment) and the slots,
+/// `None` once invalid.
 #[derive(Debug, Default)]
 pub struct Model {
-    record: Option<(i32, Option<Bank>)>,
+    record: Option<(Option<Settled>, Option<Bank>)>,
 }
 
 impl Model {
@@ -47,8 +48,8 @@ impl Model {
     pub fn offer(&self) -> Continuation<'_> {
         match &self.record {
             None => Continuation::Fresh,
-            Some((point, bank)) => Continuation::Carried {
-                point: *point,
+            Some((score, bank)) => Continuation::Carried {
+                score: *score,
                 bank: bank.as_ref(),
             },
         }
@@ -65,25 +66,27 @@ impl Model {
         }
     }
 
-    /// The cached point: the last settled round's, 0 before any.
-    pub fn point(&self) -> i32 {
-        self.record.as_ref().map_or(0, |r| r.0)
+    /// The cached score data: the last settled judgment's, `None` before
+    /// any.
+    pub fn score(&self) -> Option<Settled> {
+        self.record.as_ref().and_then(|r| r.0)
     }
 
     /// Settles the round that took the current offer and ended with
-    /// `tally`, its `Play` showing `carry`: the point from the final tally
-    /// (kept for the zero tally); the slots copied only when the incoming
+    /// `tally`, its `Play` showing `carry`, under its preset's empty-POOR
+    /// rule: the score data from the final tally (kept for the zero tally
+    /// and a refused one); the slots copied only when the incoming
     /// ones were valid (or the round fresh) and the round's last build ran
     /// them on a complete view, else `None` from then on.
-    pub fn settle(&mut self, tally: &Tally, carry: &Carry<'_>) {
-        let (point, valid) = match &self.record {
-            None => (0, true),
-            Some((p, b)) => (*p, b.is_some()),
+    pub fn settle(&mut self, tally: &Tally, carry: &Carry<'_>, empty_poor_counted: bool) {
+        let (score, valid) = match &self.record {
+            None => (None, true),
+            Some((s, b)) => (*s, b.is_some()),
         };
-        let point = skin_model::settled_point(tally, carry.targets).unwrap_or(point);
+        let score = skin_model::settled(tally, carry.targets, empty_poor_counted).or(score);
         let witnessed = carry.slots_run && carry.terminal;
         let bank = (valid && witnessed).then(|| carry.bank.clone());
-        self.record = Some((point, bank));
+        self.record = Some((score, bank));
     }
 }
 
@@ -113,9 +116,9 @@ mod tests {
         tally.counts.perfect = 7;
         let mut m = Model::default();
         assert_eq!(m.carried(true), Carried::Fresh);
-        m.settle(&tally, &carry(&bank, false));
-        let point = m.point();
-        assert!(point > 0);
+        m.settle(&tally, &carry(&bank, false), false);
+        let score = m.score();
+        assert!(score.is_some_and(|s| s.point > 0 && s.ex_score == 0));
         assert_eq!(
             m.carried(true),
             Carried::Carried {
@@ -123,11 +126,11 @@ mod tests {
                 carry_safe: true
             }
         );
-        m.settle(&Tally::default(), &carry(&bank, true));
-        assert_eq!(m.point(), point, "the zero tally keeps the point");
+        m.settle(&Tally::default(), &carry(&bank, true), false);
+        assert_eq!(m.score(), score, "the zero tally keeps the score data");
         assert_eq!(m.carried(true).refused(), Some("invalid bank"));
         let mut w = Model::default();
-        w.settle(&tally, &carry(&bank, true));
+        w.settle(&tally, &carry(&bank, true), false);
         assert_eq!(w.carried(false).refused(), Some("not carry-safe"));
         assert_eq!(w.carried(true).refused(), None);
     }

@@ -508,7 +508,9 @@ fn a_new_round_starts_its_projections_fresh() {
     fx.frame(1_300, tally(2, 1, 0, 0));
     assert_eq!(fx.figures().current, vec![1]);
     fx.bar(1, Some((5, 6)));
-    let point = fx.field(field::POINT);
+    // The first round's score data, carried: the projections ignore it.
+    let score = skin_model::settled(&tally(2, 1, 0, 0), 7, false);
+    assert!(score.is_some());
     let mut next = {
         let carry = fx.h.play.carry();
         fx.h.skin
@@ -516,7 +518,7 @@ fn a_new_round_starts_its_projections_fresh() {
                 &chart,
                 &practice,
                 Continuation::Carried {
-                    point,
+                    score,
                     bank: Some(carry.bank),
                 },
             )

@@ -180,7 +180,7 @@ pub use play::schema::{
 };
 #[cfg(feature = "dev-tools")]
 pub use play::timers::score_fields;
-pub use play::timers::{native_values, settled_point};
+pub use play::timers::{Settled, native_values, settled};
 pub use play::{
     Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
     DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, Play,

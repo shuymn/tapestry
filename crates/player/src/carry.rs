@@ -1,7 +1,8 @@
 //! What a play state's attempts take over from one another on the render
 //! thread (design.md "beatoraja Lua Skins", the program's state): the
-//! source keeps its skin's state and its cached point for as long as its
-//! play state lasts (`ScoreDataProperty` of the `MainState`, not reset at
+//! source keeps its skin's state and its score data (the point, the EX
+//! score and the score rates) for as long as its play state lasts
+//! (`ScoreDataProperty` of the `MainState`, not reset at
 //! `BMSPlayer.java:582` at `0.8.9`), so a practice session's rounds carry
 //! both.
 //!
@@ -9,9 +10,9 @@
 //! screen, so a screen built again keeps it. It keeps three identities
 //! apart, each changed only by its own events, every one through
 //! [`Carries::on`]:
-//! - the committed attempt: its target count, over which its final tally
-//!   gives the point whatever the skin, and whether it is committed,
-//!   started or settled;
+//! - the committed attempt: its target count and empty-POOR rule, over
+//!   which its final tally gives the score data whatever the skin, and
+//!   whether it is committed, started or settled;
 //! - what the screen's `Play` gives at the settlement, the only place the
 //!   attempt's slots can be read from (none once the screen lost it);
 //! - the play installation the slots belong to.
@@ -19,14 +20,14 @@
 //! The slots are valid only through an unbroken chain of runs that ran the
 //! callbacks with slots on a complete view, on the installation they
 //! belong to; anything else invalidates them for the rest of the play
-//! state, and the point stays.
+//! state, and the score data stays.
 
 use std::sync::{Arc, Weak};
 
 use eval::Tally;
 use render::SkinBundle;
-use skin_model::Carry;
 use skin_model::present::Bank;
+use skin_model::{Carry, Settled};
 
 /// Which play state and chart an attempt belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +43,13 @@ pub struct CarryKey {
 pub enum Offer {
     /// The play state's first attempt.
     Fresh,
-    /// A later attempt: the cached point and the slots, `None` when they
-    /// are not valid.
-    Carried { point: i32, bank: Option<Bank> },
+    /// A later attempt: the cached score data (`None` before the play
+    /// state's first judgment) and the slots, `None` when they are not
+    /// valid.
+    Carried {
+        score: Option<Settled>,
+        bank: Option<Bank>,
+    },
 }
 
 impl Offer {
@@ -52,8 +57,8 @@ impl Offer {
     pub fn continuation(&self) -> skin_model::Continuation<'_> {
         match self {
             Self::Fresh => skin_model::Continuation::Fresh,
-            Self::Carried { point, bank } => skin_model::Continuation::Carried {
-                point: *point,
+            Self::Carried { score, bank } => skin_model::Continuation::Carried {
+                score: *score,
                 bank: bank.as_ref(),
             },
         }
@@ -93,17 +98,26 @@ impl Installed {
     }
 }
 
+/// What a committed attempt's score data is over: its target count and
+/// whether its preset counts an empty POOR among the POORs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Basis {
+    pub targets: u32,
+    pub empty_poor_counted: bool,
+}
+
 /// Every event that changes the record or one of its identities.
 #[derive(Debug)]
 pub enum Event<'a> {
     /// An attempt of `key` offered `offer` was committed: it draws with
-    /// `installed`, has `targets` targets, and the screen holds its `Play`,
-    /// whose slots are `bank` (`None` for the built-in skin's).
+    /// `installed`, its score data is over `basis`, and the screen holds
+    /// its `Play`, whose slots are `bank` (`None` for the built-in
+    /// skin's).
     Committed {
         key: Option<CarryKey>,
         offer: &'a Offer,
         installed: Installed,
-        targets: u32,
+        basis: Basis,
         bank: Option<&'a Bank>,
     },
     /// A play installation was committed: a selection's bundle, or the
@@ -137,12 +151,14 @@ enum Phase {
 #[derive(Debug)]
 struct Record {
     key: CarryKey,
-    point: i32,
+    /// The score data the play state's last judgment left, `None` before
+    /// any.
+    score: Option<Settled>,
     bank: Option<Bank>,
     /// The installation the slots belong to.
     installed: Installed,
-    /// The committed attempt's target count, which its point is over.
-    targets: u32,
+    /// What the committed attempt's score data is over.
+    basis: Basis,
     phase: Phase,
 }
 
@@ -154,7 +170,7 @@ pub struct Carries {
 
 impl Carries {
     /// What an attempt of `key` drawing with `installed` takes over: fresh
-    /// for a play state with no record; else the cached point, with the
+    /// for a play state with no record; else the cached score data, with the
     /// slots when they are valid and belong to `installed`. A record whose
     /// attempt started and was never settled offers no slots, and the
     /// attempt's commit records none ([`Event::Committed`]). It changes
@@ -173,7 +189,7 @@ impl Carries {
         let valid =
             r.phase != Phase::Started && r.key.chart == key.chart && r.installed.same(installed);
         Offer::Carried {
-            point: r.point,
+            score: r.score,
             bank: r.bank.clone().filter(|_| valid),
         }
     }
@@ -186,9 +202,9 @@ impl Carries {
                 key,
                 offer,
                 installed,
-                targets,
+                basis,
                 bank,
-            } => self.committed(key, offer, installed, targets, bank),
+            } => self.committed(key, offer, installed, basis, bank),
             Event::Installed(installed) => {
                 if let Some(r) = &mut self.record
                     && !r.installed.same(&installed)
@@ -208,7 +224,7 @@ impl Carries {
         }
     }
 
-    /// A fresh attempt starts the record; a carried one keeps its point
+    /// A fresh attempt starts the record; a carried one keeps its score data
     /// and takes its slots only when the offer's were valid and its
     /// installation is the record's.
     fn committed(
@@ -216,31 +232,32 @@ impl Carries {
         key: Option<CarryKey>,
         offer: &Offer,
         installed: Installed,
-        targets: u32,
+        basis: Basis,
         bank: Option<&Bank>,
     ) {
         let Some(key) = key else {
             return;
         };
-        let (point, same) = match (offer, &self.record) {
+        let (score, same) = match (offer, &self.record) {
             (Offer::Carried { .. }, Some(r)) if r.key.play_state == key.play_state => {
-                (r.point, r.installed.same(&installed))
+                (r.score, r.installed.same(&installed))
             }
-            _ => (0, true),
+            _ => (None, true),
         };
         let bank = (offer.valid() && same).then(|| bank.cloned().unwrap_or_default());
         self.record = Some(Record {
             key,
-            point,
+            score,
             bank,
             installed,
-            targets,
+            basis,
             phase: Phase::Idle,
         });
     }
 
-    /// The point from the final tally over the attempt's targets (kept for
-    /// the zero tally); the slots stay valid only when they were, the
+    /// The score data from the final tally over the attempt's basis (kept,
+    /// the point included, for the zero tally and for a tally the skin
+    /// refuses); the slots stay valid only when they were, the
     /// screen still holds the attempt's `Play`, and its last build ran the
     /// callbacks with slots on a complete view.
     fn settled(&mut self, tally: &Tally, held: Option<Carry<'_>>) {
@@ -250,8 +267,9 @@ impl Carries {
         if r.phase != Phase::Started {
             return;
         }
-        if let Some(p) = skin_model::settled_point(tally, r.targets) {
-            r.point = p;
+        let b = r.basis;
+        if let Some(s) = skin_model::settled(tally, b.targets, b.empty_poor_counted) {
+            r.score = Some(s);
         }
         let witnessed = held.filter(|c| c.slots_run && c.terminal);
         match (&mut r.bank, witnessed) {
@@ -264,19 +282,127 @@ impl Carries {
 
 #[cfg(test)]
 mod tests {
-    use super::{Carries, CarryKey, Event, Installed, Offer};
+    use super::{Basis, Carries, CarryKey, Event, Installed, Offer};
 
     const KEY: CarryKey = CarryKey {
         play_state: 1,
         chart: 1,
     };
 
-    /// A round with the built-in skin, which gives no program state, settles
-    /// the point over the attempt's target count; a declarative skin
-    /// installed after it in the play state reads that point (code review
-    /// r1, finding 2), its slots invalid.
+    /// The carry tests' attempts: 4 targets, empty POORs uncounted.
+    const BASIS: Basis = Basis {
+        targets: 4,
+        empty_poor_counted: false,
+    };
+
+    /// 4 PGREATs over 4 targets but one EX short of the maximum (a custom
+    /// weighting): point 200 000, EX 7, both rates 87.5 %.
+    fn seven() -> eval::Tally {
+        let mut t = eval::Tally::default();
+        t.counts.perfect = 4;
+        t.ex_score = 7;
+        t.max_combo = 4;
+        t.combo = 4;
+        t
+    }
+
+    /// The score data [`seven`] settles over 4 targets.
+    const SEVEN: skin_model::Settled = skin_model::Settled {
+        point: 200_000,
+        ex_score: 7,
+        rate_current_bp: 8_750,
+        rate_whole_bp: 8_750,
+    };
+
+    /// A played round of the play state: committed with `offer`, started
+    /// and settled with `tally`.
+    fn round(c: &mut Carries, offer: &Offer, tally: &eval::Tally) {
+        c.on(Event::Committed {
+            key: Some(KEY),
+            offer,
+            installed: Installed::Simple,
+            basis: BASIS,
+            bank: None,
+        });
+        c.on(Event::Started);
+        c.on(Event::Settled { tally, held: None });
+    }
+
+    /// s7-06s S4: the zero tally (a round with no judgment) keeps the play
+    /// state's score data, the point included.
     #[test]
-    fn a_simple_skin_round_settles_the_point() {
+    fn the_zero_tally_keeps_the_score() {
+        let mut c = Carries::default();
+        round(&mut c, &Offer::Fresh, &seven());
+        let offer = c.offer(Some(KEY), &Installed::Simple);
+        round(&mut c, &offer, &eval::Tally::default());
+        assert_eq!(
+            c.offer(Some(KEY), &Installed::Simple),
+            Offer::Carried {
+                score: Some(SEVEN),
+                bank: None
+            }
+        );
+    }
+
+    /// s7-06s S5 (O7): a final tally the skin refuses (more counted empty
+    /// POORs than POORs) keeps all four previous values, the point
+    /// included, and no score data before any valid settlement.
+    #[test]
+    fn a_refused_tally_keeps_the_score() {
+        let mut refused = eval::Tally::default();
+        refused.counts.perfect = 1;
+        refused.empty_poor = 1;
+        refused.ex_score = 2;
+        refused.max_combo = 1;
+        let counted = Basis {
+            empty_poor_counted: true,
+            ..BASIS
+        };
+        let committed = |c: &mut Carries, offer: &Offer| {
+            c.on(Event::Committed {
+                key: Some(KEY),
+                offer,
+                installed: Installed::Simple,
+                basis: counted,
+                bank: None,
+            });
+            c.on(Event::Started);
+        };
+        let mut c = Carries::default();
+        committed(&mut c, &Offer::Fresh);
+        c.on(Event::Settled {
+            tally: &refused,
+            held: None,
+        });
+        let none = Offer::Carried {
+            score: None,
+            bank: None,
+        };
+        assert_eq!(c.offer(Some(KEY), &Installed::Simple), none);
+        let mut c = Carries::default();
+        round(&mut c, &Offer::Fresh, &seven());
+        let offer = c.offer(Some(KEY), &Installed::Simple);
+        committed(&mut c, &offer);
+        c.on(Event::Settled {
+            tally: &refused,
+            held: None,
+        });
+        assert_eq!(
+            c.offer(Some(KEY), &Installed::Simple),
+            Offer::Carried {
+                score: Some(SEVEN),
+                bank: None
+            }
+        );
+    }
+
+    /// A round with the built-in skin, which gives no program state, settles
+    /// the score data over the attempt's target count; a declarative skin
+    /// installed after it in the play state reads it (code review r1,
+    /// finding 2), its slots invalid.
+    #[test]
+    fn a_simple_skin_round_settles_the_score() {
         let mut c = Carries::default();
         let offer = c.offer(Some(KEY), &Installed::Simple);
         assert_eq!(offer, Offer::Fresh);
@@ -284,16 +410,12 @@ mod tests {
             key: Some(KEY),
             offer: &offer,
             installed: Installed::Simple,
-            targets: 4,
+            basis: BASIS,
             bank: None,
         });
         c.on(Event::Started);
-        let mut t = eval::Tally::default();
-        t.counts.perfect = 4;
-        t.max_combo = 4;
-        t.combo = 4;
         c.on(Event::Settled {
-            tally: &t,
+            tally: &seven(),
             held: None,
         });
         let skin = crate::render_side::tests::bundle();
@@ -302,7 +424,7 @@ mod tests {
         assert_eq!(
             c.offer(Some(KEY), &installed),
             Offer::Carried {
-                point: 200_000,
+                score: Some(SEVEN),
                 bank: None
             }
         );
@@ -321,19 +443,19 @@ mod tests {
             key: Some(KEY),
             offer: &Offer::Fresh,
             installed: Installed::Simple,
-            targets: 4,
+            basis: BASIS,
             bank: Some(&bank),
         });
         assert_eq!(
             c.offer(Some(KEY), &Installed::Simple),
             Offer::Carried {
-                point: 0,
+                score: None,
                 bank: Some(bank.clone())
             }
         );
         c.on(Event::Started);
         let unsettled = Offer::Carried {
-            point: 0,
+            score: None,
             bank: None,
         };
         assert_eq!(c.offer(Some(KEY), &Installed::Simple), unsettled);
@@ -342,7 +464,7 @@ mod tests {
             key: Some(KEY),
             offer: &unsettled,
             installed: Installed::Simple,
-            targets: 4,
+            basis: BASIS,
             bank: Some(&bank),
         });
         assert_eq!(c.offer(Some(KEY), &Installed::Simple), unsettled);
