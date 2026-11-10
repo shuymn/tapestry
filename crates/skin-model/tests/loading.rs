@@ -94,6 +94,7 @@ fn skin(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap()
@@ -744,6 +745,7 @@ fn bitmap_text_skin(sheet: skin_model::Sheet) -> Skin {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap()
@@ -832,6 +834,7 @@ fn a_fields_empty_string_is_the_fields_loading_slot() {
             },
             bomb_up_to: Some(skin_model::Grade::Bad),
             close: None,
+            loadend: None,
             present: None,
         })
         .unwrap(),
@@ -997,4 +1000,34 @@ fn a_loading_number_leaves_out_the_i32_extremes() {
     assert_eq!(extremes("2147483647"), [0_u16; 0]);
     assert_eq!(extremes("-2147483647 - 1"), [0_u16; 0]);
     assert_eq!(extremes("2147483646"), [2, 1, 4, 7, 4, 8, 3, 6, 4, 6]);
+}
+
+/// A play skin's declared `loadend` reaches the built skin unchanged:
+/// none, 0, 500 ms and the largest the import makes (`i32::MAX` ms), with
+/// no cap.
+#[test]
+fn the_built_skin_keeps_its_loadend() {
+    for loadend in [
+        None,
+        Some(TimeUs(0)),
+        Some(TimeUs(500_000)),
+        Some(TimeUs(2_147_483_647_000)),
+    ] {
+        let built = Skin::new(SkinDef {
+            fit: Fit::Adapt,
+            regions: play_support::REGIONS,
+            whens: Vec::new(),
+            sheet: sheet(),
+            lanes: None,
+            elements: Vec::new(),
+            widgets: WidgetDefs::default(),
+            bomb_up_to: Some(skin_model::Grade::Bad),
+            close: None,
+            loadend,
+            present: None,
+        })
+        .unwrap();
+        assert_eq!(built.loadend(), loadend);
+        assert_eq!(built.close(), None);
+    }
 }

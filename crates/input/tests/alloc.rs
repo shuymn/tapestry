@@ -288,6 +288,11 @@ fn menu_does_not_allocate() {
     })
     .unwrap();
     adjust.set_panel_roles(1, 0);
+    // START is a tuning control: its presses and releases write the
+    // activity record.
+    adjust.set_tuning_controls(1);
+    let record = std::sync::Arc::new(input::ActivityRecord::default());
+    adjust.set_activity(std::sync::Arc::clone(&record));
     let level = adjust.panel_level();
     set.set_adjustment(adjust);
     let mut opened = 0_u64;
@@ -365,5 +370,7 @@ fn menu_does_not_allocate() {
     assert!(opened > 0, "{opened}");
     assert!(popped > 1_000, "{popped}");
     assert!(menu.dropped() > 1_000, "{}", menu.dropped());
+    let activity = record.read().unwrap().input;
+    assert!(activity.revision > 1_000, "{activity:?}");
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
 }

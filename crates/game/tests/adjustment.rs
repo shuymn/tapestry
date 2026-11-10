@@ -5,8 +5,8 @@
 
 use bms_model::{Speed, TimeUs};
 use game::adjustment::{
-    Adjustment, AxisQuantum, ControlId, ControlRoles, Event, Head, HeldSet, Observation,
-    PresentationReader, PresentationSnapshot, PresentationWriter, Role, TempoMap,
+    Acceptance, Adjustment, AxisQuantum, ControlId, ControlRoles, Event, Head, HeldSet,
+    Observation, PresentationReader, PresentationSnapshot, PresentationWriter, Role, TempoMap,
     presentation_link,
 };
 use game::{
@@ -1584,5 +1584,139 @@ fn the_records_tuning_bounds_are_the_play_options() {
             *covers.get_mut(kind) = Cover { amount, on: true };
             check(d, covers);
         }
+    }
+}
+
+// ---- Acceptance and the refresh's solve ----
+
+fn lift_and_hidden() -> Covers {
+    Covers {
+        lift: Cover {
+            amount: 100,
+            on: true,
+        },
+        hidden: Cover {
+            amount: 100,
+            on: true,
+        },
+        ..Covers::default()
+    }
+}
+
+#[test]
+fn the_accepted_count_moves_with_each_accepted_change() {
+    let mut rig = Rig::prepared(
+        options(SpeedMode::Floating, 100, 300, lift_and_hidden()),
+        constant(150),
+    );
+    let mut counts = Vec::new();
+    // A speed step.
+    rig.at(0).tap(F2);
+    rig.snap();
+    counts.push(rig.a.accepted());
+    // Opposite steps at one time cancel: no change.
+    rig.at(10 * MS).press(F1).press(F2).release(F1).release(F2);
+    rig.snap();
+    counts.push(rig.a.accepted());
+    // A modifier alone changes nothing; SELECT and a white key lower G.
+    rig.at(20 * MS).press(SELECT);
+    rig.snap();
+    counts.push(rig.a.accepted());
+    rig.at(30 * MS).tap(WHITE).release(SELECT);
+    rig.snap();
+    counts.push(rig.a.accepted());
+    // START and SELECT together switch the LIFT/HIDDEN+ target.
+    rig.at(40 * MS).press(START).press(SELECT);
+    rig.at(50 * MS).release(SELECT).release(START);
+    let s = rig.snap();
+    assert_eq!(s.target, Some(CoverKind::Hidden));
+    counts.push(rig.a.accepted());
+    // A double START toggles SUDDEN+.
+    double_start(&mut rig, 1_000 * MS);
+    assert!(rig.snap().options.covers().sudden.on);
+    counts.push(rig.a.accepted());
+    // START and an auxiliary key at SUDDEN+'s end: accepted, clamped.
+    rig.at(2_000 * MS).press(START).tap(AUX_NEG).release(START);
+    assert_eq!(rig.snap().options.covers().sudden.amount, 0);
+    counts.push(rig.a.accepted());
+    // Closed: a press is no change.
+    rig.at(3_000 * MS).ev(Event::Acceptance(Acceptance::Closed));
+    rig.at(3_010 * MS).tap(F2);
+    rig.snap();
+    counts.push(rig.a.accepted());
+    assert_eq!(counts, [1, 1, 1, 2, 3, 4, 5, 5]);
+}
+
+#[test]
+fn a_hold_taken_before_the_close_acts_nothing_in_the_gap_and_resumes() {
+    let q = AxisQuantum::per_step(1).unwrap();
+    let axis = |delta| Event::Axis {
+        control: AXIS,
+        delta,
+        quantum: q,
+    };
+    let amount = |rig: &mut Rig| rig.snap().options.covers().sudden.amount;
+    let mut rig = Rig::prepared(
+        options(SpeedMode::Classic, 200, 300, sudden(500)),
+        constant(150),
+    );
+    // START with the scratch held, F2 held, and the axis's baseline.
+    rig.at(0).press(START).press(SCRATCH_POS).press(F2);
+    rig.at(MS).ev(axis(0));
+    assert_eq!(amount(&mut rig), 501);
+    let h0 = rig.snap().hispeed;
+    rig.at(10 * MS).ev(Event::Acceptance(Acceptance::Closed));
+    assert!(!rig.a.accepting());
+    // In the gap: ticks past the deadline, a keyboard repeat, an axis.
+    rig.at(50 * MS).ev(Event::Tick);
+    rig.at(60 * MS).ev(Event::Repeat(F2));
+    rig.at(70 * MS).ev(axis(3));
+    let s = rig.snap();
+    assert_eq!(s.options.covers().sudden.amount, 501);
+    assert_eq!(s.hispeed, h0);
+    rig.at(80 * MS).ev(Event::Acceptance(Acceptance::Open));
+    assert!(rig.a.accepting());
+    // Reopened: the holds taken before the close act again.
+    rig.at(100 * MS).ev(Event::Tick);
+    rig.at(110 * MS).ev(Event::Repeat(F2));
+    rig.at(120 * MS).ev(axis(2));
+    let s = rig.snap();
+    assert_eq!(
+        s.options.covers().sudden.amount,
+        504,
+        "a tick, then 2 steps"
+    );
+    assert_ne!(s.hispeed, h0);
+}
+
+#[test]
+fn resolve_keeps_repeat_deadlines_and_axis_remainders() {
+    // 4 counts a step; 3 counts left over before the solve.
+    let q = AxisQuantum::per_step(4).unwrap();
+    let axis = |delta| Event::Axis {
+        control: AXIS,
+        delta,
+        quantum: q,
+    };
+    let refs = Some(References::all(bpm(150)));
+    for resolve in [true, false] {
+        let mut rig = Rig::prepared(PlayOptions::default(), constant(150));
+        rig.at(0).press(SELECT);
+        rig.at(MS).ev(axis(0));
+        rig.at(2 * MS).ev(axis(3));
+        assert_eq!(g(&rig.snap()), 300);
+        let solved = if resolve {
+            rig.a
+                .resolve(TimeUs(-1_000_000), refs, Speed::NORMAL, &rig.map)
+        } else {
+            rig.a
+                .attach(TimeUs(-1_000_000), refs, Speed::NORMAL, &rig.map)
+        };
+        assert_eq!(solved, Ok(()));
+        rig.at(4 * MS).ev(axis(1));
+        // Resolved, the remainder carries into a step; attached, the
+        // context ended and the report is a new baseline.
+        let want = if resolve { 301 } else { 300 };
+        assert_eq!(g(&rig.snap()), want, "resolve {resolve}");
     }
 }

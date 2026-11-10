@@ -1220,6 +1220,7 @@ fn def_with(elements: Vec<skin_model::ElementDef>, lanes: Option<LanesDef>) -> S
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     }
 }

@@ -631,6 +631,7 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
         widgets,
         bomb_up_to: None,
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap()

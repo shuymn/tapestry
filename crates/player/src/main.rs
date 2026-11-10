@@ -951,6 +951,8 @@ fn rig<'a>(
         result_skin: crate::result_skin::ResultSkin::default(),
         result_chart: None,
         prep: None,
+        accepted_at_o1: None,
+        accepted_focus: None,
         preps: 0,
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,
@@ -963,6 +965,12 @@ fn rig<'a>(
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
+        #[cfg(test)]
+        audio_lost: std::sync::Arc::default(),
+        #[cfg(test)]
+        opening_gates: std::sync::Arc::default(),
+        #[cfg(test)]
+        ended_plays: Vec::new(),
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1875,6 +1883,36 @@ mod tests {
         Controls, Mode, axis_mode, diagnostic, input_side, menu_input, open_window_and_input,
         sources,
     };
+
+    /// A hang guard that ends the test process (tests): armed, a detached
+    /// thread waits on a channel for the watchdog's time
+    /// (`TAPESTRY_TEST_WATCHDOG`, seconds); unless the guard is dropped
+    /// first, it prints what never ended and aborts. A panic inside a
+    /// thread scope would only unwind into the scope's join of threads
+    /// that never end.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) struct Watchdog(
+        #[expect(dead_code, reason = "dropped to disarm")] std::sync::mpsc::Sender<()>,
+    );
+
+    #[cfg(feature = "dev-tools")]
+    impl Watchdog {
+        /// Armed for `what`.
+        pub(crate) fn arm(what: &str) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let what = what.to_owned();
+            let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+            let after =
+                std::time::Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600));
+            std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(after) {
+                    eprintln!("watchdog: {what} never ended; aborting");
+                    std::process::abort();
+                }
+            });
+            Self(tx)
+        }
+    }
 
     /// Both launch paths, `tapestry play <chart>` as song selection, make
     /// the quit key a command taken once by the play or result it arrives
