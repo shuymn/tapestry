@@ -153,7 +153,6 @@ fn luaj_hint(obs: &Observed, c: u32) -> String {
 struct LoweredExpr {
     guards: Vec<Program>,
     src: Program,
-    truthy: bool,
 }
 
 fn compile_lowered(field: &str, l: &LoweredRecord) -> Result<LoweredExpr, String> {
@@ -166,19 +165,18 @@ fn compile_lowered(field: &str, l: &LoweredRecord) -> Result<LoweredExpr, String
         .map(|g| compile(g, &scope, Ty::Bool).map_err(|e| format!("guard {g}: {e:?}")))
         .collect::<Result<Vec<_>, _>>()?;
     let src = compile(&l.src, &scope, ty).map_err(|e| format!("{}: {e:?}", l.src))?;
-    Ok(LoweredExpr {
-        guards,
-        src,
-        truthy,
-    })
+    Ok(LoweredExpr { guards, src })
 }
 
 /// The first difference between a lowered occurrence's expression on
 /// `fields` and `timers` and the reference's invocation: the class (a
 /// false guard is unavailable), then the converted value (`toboolean` for
-/// a `draw` or an `op`, `toint` for a `value`). An invocation that could
-/// not complete or raised has no expression counterpart.
+/// a `draw` or an `op`, `toint` for a `value`, by the reference
+/// occurrence's own consumer `field`, whatever the record says). An
+/// invocation that could not complete or raised has no expression
+/// counterpart.
 fn lowered_differ(
+    field: &str,
     e: &LoweredExpr,
     fields: &[i32],
     timers: &[i32],
@@ -199,7 +197,7 @@ fn lowered_differ(
         }
         Outcome::Value(r) => {
             let v = e.src.eval(&state);
-            let (got, want) = if e.truthy {
+            let (got, want) = if field != "value" {
                 (i32::from(v != 0), i32::from(luaj_bool(r)))
             } else {
                 (v, luaj_toint(r))
@@ -914,16 +912,21 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                                 continue;
                             }
                         };
-                        let Some(d) = lowered_differ(e, &pf.fields, &pf.timers, outcome) else {
+                        let Some(d) = lowered_differ(key.field, e, &pf.fields, &pf.timers, outcome)
+                        else {
                             rep.agreed += 1;
                             *rep.lowered.entry((label, key.field)).or_default() += 1;
                             continue;
                         };
                         let explained = match pf.score {
-                            Some(s) if pf.zero_tally => {
-                                lowered_differ(e, &with_score(&pf.fields, s), &pf.timers, outcome)
-                                    .is_none()
-                            }
+                            Some(s) if pf.zero_tally => lowered_differ(
+                                key.field,
+                                e,
+                                &with_score(&pf.fields, s),
+                                &pf.timers,
+                                outcome,
+                            )
+                            .is_none(),
                             _ => false,
                         };
                         if explained {
