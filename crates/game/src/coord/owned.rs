@@ -5,9 +5,18 @@
 //! - **Lifecycle under one lock.** A job is live (queued or computing,
 //!   promotable), ending (its cancel requested or already seen: it ends
 //!   cancelled and cannot be revived) or published (out of the registry,
-//!   its outcome in its slot). `Runner::finish` removes it and publishes
-//!   in one critical section, so the coordinator's lock never sees it as
-//!   neither. Its thread may still run after publication (unwinding).
+//!   its outcome in its slot). `Runner::finish` removes it, reads its
+//!   final cancel and publishes in one critical section, so the
+//!   coordinator's lock never sees it as neither. Its thread may still run
+//!   after publication (unwinding).
+//! - **Ending is final.** Only a current subscriber withdraws a requested
+//!   cancel. An owned job's only subscriber is its owner's, whose
+//!   generation never becomes current again once stale, and no `begin`
+//!   joins an owned job (a same-key `begin` starts a job of its own and
+//!   takes the key), so no entry point (`begin`, `spawn_owned`,
+//!   `advance`, a promotion or demotion, a checkpoint, a wait or a read)
+//!   brings an ending owned job back. Keyed jobs keep their resubscription
+//!   (design.md "Load Pipeline", A→B→A).
 //! - **Who answers for it.** The outcome is published with its owner then
 //!   ([`Owner`]) and whether a promotion of the live job made a waiter
 //!   responsible for it; nothing withdraws responsibility, a stopped wait
@@ -28,12 +37,20 @@
 //! **What the bound covers.** It is there so that work that hangs (a
 //! decoder stuck on a crafted file, design.md "Threat Model") cannot
 //! freeze the thread that settles it: the work and everything it calls
-//! are covered. The result type's `Clone` and `Drop`, and the job
-//! thread's own exit after its work (the hook's captures dropping, its
-//! thread-local destructors, which a join waits for even once the thread
-//! reports finished) are first-party code that does not block: a precondition
-//! of [`Coordinator::spawn_owned`], not something a settle can bound. An
-//! abandonment clones no result.
+//! are covered. Everything else a settle runs, or waits for, is
+//! first-party code that does not block, a precondition rather than
+//! something a settle can bound:
+//!
+//! - the result type's `Clone` and `Drop`;
+//! - the job thread's own exit after its work: the hook's captures
+//!   dropping and its thread-local destructors, which a join waits for
+//!   even once the thread reports finished;
+//! - the caller's `terminal` and `clock`, and the drop of the cause they
+//!   gave (also while a panic of theirs unwinds the settle);
+//! - the drop of a panic payload taken at the join, or dropped with a
+//!   finished thread's handle.
+//!
+//! An abandonment clones no result.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -141,7 +158,7 @@ impl Coordinator {
     /// Precondition (module doc, what the bound covers): `T`'s `Clone` and
     /// `Drop`, `on_class`'s captures' `Drop` and the thread-local
     /// destructors the job's thread runs at its exit do not block. `work`
-    /// may.
+    /// may. The job is never joined by a [`begin`](Self::begin) of its key.
     ///
     /// # Errors
     ///
@@ -185,6 +202,7 @@ impl Coordinator {
                 promoted,
                 owner,
                 responsible: false,
+                owned: true,
                 slot: Some(any_slot),
             },
         );
@@ -317,6 +335,12 @@ impl<T: Clone> OwnedJob<T> {
     /// the thread is detached. Without a cause the wait is not bounded.
     /// The caller looks at terminal failures again before any return that
     /// does not end the run.
+    ///
+    /// The bound covers the job's work only. Precondition (module doc):
+    /// `terminal` and `clock` return; the cause `C`'s `Drop` does not block,
+    /// also while a panic of `terminal` or `clock` unwinds this settle; and
+    /// so do `T`'s `Clone` and `Drop`, the job thread's exit, and the drop
+    /// of a panic payload taken at the join.
     pub fn settle<C>(
         mut self,
         bound: Duration,

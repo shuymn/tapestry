@@ -1302,7 +1302,9 @@ impl Clone for Asking {
     }
 }
 
-/// Y29: run on its own thread, so a deadlock fails this test by name.
+/// Y29: run on its own thread, so a deadlock fails this test by name. The
+/// probes hold weak references, so the fixture lets its payloads go and
+/// the owned job is settled at the end.
 #[test]
 fn a_payload_clone_may_query_the_coordinator() {
     let _w = Watchdog::arm("a_payload_clone_may_query_the_coordinator");
@@ -1319,9 +1321,11 @@ fn a_payload_clone_may_query_the_coordinator() {
             Owner::Foreground,
             move |_| Asking(c, p),
         ));
-        let again = Arc::clone(&job);
+        let again = Arc::downgrade(&job);
         let _ = owned_probe.set(Box::new(move || {
-            let _ = again.poll();
+            if let Some(job) = again.upgrade() {
+                let _ = job.poll();
+            }
         }));
         let _ = outcome(&job);
         let (handle, runner) =
@@ -1331,9 +1335,11 @@ fn a_payload_clone_may_query_the_coordinator() {
         let _ = runner
             .unwrap()
             .run(&|| false, &|_| {}, move |_| Asking(c, p));
-        let (c, h) = (coord.clone(), Arc::clone(&handle));
+        let (c, h) = (coord.clone(), Arc::downgrade(&handle));
         let _ = keyed_probe.set(Box::new(move || {
-            let _ = c.take(&h);
+            if let Some(h) = h.upgrade() {
+                let _ = c.take(&h);
+            }
         }));
         thread::scope(|s| {
             for _ in 0..2 {
@@ -1353,16 +1359,39 @@ fn a_payload_clone_may_query_the_coordinator() {
                 });
             }
         });
+        let job = Arc::into_inner(job).expect("the probes hold no strong reference");
+        let settled = job.settle(*LONG, &Instant::now, &mut || None::<()>);
+        assert!(
+            matches!(
+                settled,
+                Settled::Joined {
+                    after_panic: None,
+                    ..
+                }
+            ),
+            "the job's thread panicked"
+        );
+        assert!(
+            Arc::into_inner(handle).is_some(),
+            "the probes hold no strong reference"
+        );
         let _ = tx.send(());
     });
     assert!(rx.recv_timeout(*LONG).is_ok(), "a payload clone deadlocked");
 }
 
-/// An `Ending` job's computed result is not published: the final cancel
-/// is read in the same critical section as the publication. A job whose
-/// work returned, held before its finish; the choice advances; it is
-/// found ending; let go, it publishes `Cancelled`. The same for a keyed
-/// job, whose `run` returns what was published.
+/// Y30: an `Ending` job's computed result is not published: the final
+/// cancel is read in the same critical section as the publication, and
+/// nothing brings an owned job back from `Ending`. Each case holds a job
+/// whose work returned before its finish, advances the choice, finds it
+/// ending, then lets it go:
+///
+/// - an owned job: it publishes `Cancelled`;
+/// - an owned job, and between `Ending` and its finish a same-key,
+///   same-type `begin` with a current subscriber, its handle kept: the
+///   `begin` does not join it (a job of its own begins), so nothing
+///   withdraws its cancel, and it publishes `Cancelled`;
+/// - a keyed job: `run` returns what was published, `Cancelled`.
 #[test]
 fn an_ending_job_never_publishes_done() {
     let _w = Watchdog::arm("an_ending_job_never_publishes_done");
@@ -1384,6 +1413,27 @@ fn an_ending_job_never_publishes_done() {
 
     let coord = Coordinator::new(CAPS);
     let cut = coord.cut(false);
+    let job = spawn(
+        &coord,
+        "a",
+        Class::Foreground,
+        false,
+        Owner::Foreground,
+        |_| 1_u32,
+    );
+    reach(&cut, "the owned finish");
+    let _ = coord.advance(Scope::Choice);
+    assert_eq!(job.promote_unless_ended(), Promotion::Ending);
+    let (joiner, own) =
+        coord.begin::<u32>(key("a"), Class::Foreground, coord.subscriber(Scope::Choice));
+    assert!(own.is_some(), "a begin joined an owned job");
+    assert_eq!(job.promote_unless_ended(), Promotion::Ending);
+    cut.open();
+    assert_eq!(outcome(&job).outcome, Outcome::Cancelled);
+    drop((own, joiner));
+
+    let coord = Coordinator::new(CAPS);
+    let cut = coord.cut(false);
     let (handle, runner) =
         coord.begin::<u32>(key("b"), Class::Foreground, coord.subscriber(Scope::Choice));
     let runner = runner.unwrap();
@@ -1397,6 +1447,67 @@ fn an_ending_job_never_publishes_done() {
     assert_eq!(
         handle.slot.record().map(|r| r.outcome.clone()),
         Some(Outcome::Cancelled)
+    );
+}
+
+/// A result whose drop asks the coordinator: a drop run under its lock
+/// deadlocks.
+#[derive(Clone, Debug)]
+struct Discarded(Coordinator, Arc<AtomicBool>);
+
+impl Drop for Discarded {
+    fn drop(&mut self) {
+        let _ = self.0.current(Scope::Choice);
+        let _ = self.0.held(Class::Foreground);
+        self.1.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Y31: the result an `Ending` job discards at its finish drops after the
+/// finish lets its lock go, without a panic. Run on its own thread, so a
+/// deadlock fails this test by name.
+#[test]
+fn a_discarded_result_drops_after_the_lock() {
+    let _w = Watchdog::arm("a_discarded_result_drops_after_the_lock");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let coord = Coordinator::new(CAPS);
+        let cut = coord.cut(false);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (c, d) = (coord.clone(), Arc::clone(&dropped));
+        let job = spawn(
+            &coord,
+            "a",
+            Class::Foreground,
+            false,
+            Owner::Foreground,
+            move |_| Discarded(c, d),
+        );
+        reach(&cut, "the finish");
+        let _ = coord.advance(Scope::Choice);
+        assert!(matches!(job.promote_unless_ended(), Promotion::Ending));
+        cut.open();
+        assert!(matches!(outcome(&job).outcome, Outcome::Cancelled));
+        let settled = job.settle(*LONG, &Instant::now, &mut || None::<()>);
+        assert!(
+            matches!(
+                settled,
+                Settled::Joined {
+                    after_panic: None,
+                    ..
+                }
+            ),
+            "{settled:?}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the discarded result never dropped"
+        );
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(*LONG).is_ok(),
+        "a discarded result's drop deadlocked"
     );
 }
 

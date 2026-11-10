@@ -308,6 +308,10 @@ struct Job {
     owner: Owner,
     /// A promotion of it while live made a waiter responsible for it.
     responsible: bool,
+    /// An owned job ([`Coordinator::spawn_owned`]): its owner's is its only
+    /// subscriber, never joined by a `begin`, so once that subscriber is
+    /// stale nothing withdraws its cancel.
+    owned: bool,
     /// A keyed job's `Arc<Slot<T>>`.
     slot: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -701,7 +705,8 @@ impl Coordinator {
     /// [`Runner`] is returned with the handle, for the caller to run on a
     /// permit of `class`. Either way the cancel is decided again on the
     /// live generations: a stale subscriber neither keeps a job alive nor
-    /// withdraws its cancel.
+    /// withdraws its cancel. An owned job of `key` is never joined: a job
+    /// of its own begins beside it, and takes the key.
     #[must_use]
     pub fn begin<T: Clone + Send + Sync + 'static>(
         &self,
@@ -712,7 +717,7 @@ impl Coordinator {
         let mut state = self.shared.lock();
         let sub = state.next_id();
         let joined = state.keys.get(&key).copied().and_then(|id| {
-            let job = state.jobs.get_mut(&id)?;
+            let job = state.jobs.get_mut(&id).filter(|job| !job.owned)?;
             let slot = Arc::clone(job.slot.as_ref()?).downcast::<Slot<T>>().ok()?;
             job.subscribers.push((sub, subscriber));
             Some((id, slot))
@@ -733,6 +738,7 @@ impl Coordinator {
                     promoted: false,
                     owner: Owner::of(class),
                     responsible: false,
+                    owned: false,
                     slot: Some(any_slot),
                 },
             );
@@ -775,6 +781,7 @@ impl Coordinator {
                     promoted: false,
                     owner: Owner::of(class),
                     responsible: false,
+                    owned: false,
                     slot: None,
                 },
             );
