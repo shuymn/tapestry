@@ -294,6 +294,9 @@ struct Loader {
     screen_failed: bool,
     /// Screen preparations from this one on fail (1-based).
     screen_fails_from: usize,
+    /// From this time on, the next look at the commands (`take`) also
+    /// loses the screen: a loss between two looks at it.
+    screen_fails_at_take: Option<i64>,
     prepares: usize,
     screen: ScreenKey,
     /// Final readinesses answering `Stale` with these screens, in order.
@@ -371,6 +374,7 @@ impl Loader {
             output_failed: false,
             screen_failed: false,
             screen_fails_from: usize::MAX,
+            screen_fails_at_take: None,
             prepares: 0,
             screen: ScreenKey::default(),
             stale: Vec::new(),
@@ -497,6 +501,10 @@ impl Rig for Loader {
 
     fn take(&mut self) -> Option<Command> {
         let now = self.clock.now().0;
+        if self.screen_fails_at_take.is_some_and(|at| at <= now) {
+            self.screen_fails_at_take = None;
+            self.screen_failed = true;
+        }
         let i = self.commands.iter().position(|&(at, _)| at <= now)?;
         Some(self.commands.remove(i).1)
     }
@@ -1260,6 +1268,27 @@ fn a_screen_lost_while_a_committed_minimum_runs_ends_the_run() {
         assert!(rig.reports.is_empty(), "quit {with_quit}");
         assert_eq!(loaded.attempt().number, 0, "quit {with_quit}");
     }
+}
+
+/// I8: the screen lost after the commit's wait looked at it, while it
+/// looks for a quit, is never built again: the next look ends the run.
+#[test]
+fn a_screen_lost_between_two_looks_after_the_commit_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+    rig.screen_fails_at_take = Some(T0 + 2 * SECOND);
+    let ran = run(&mut loaded, &mut rig);
+    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
+    assert!(rig.screen_fails_at_take.is_none(), "the loss came");
+    // O2's preparation only: no recovery after the commit.
+    assert_eq!(rig.count("screen"), 1);
+    assert_eq!(rig.count("commit"), 1);
+    assert_eq!(rig.count("end loading"), 0);
+    assert_eq!(rig.count("open"), 0);
+    assert!(rig.reports.is_empty());
+    assert_eq!(loaded.attempt().number, 0);
 }
 
 /// The waits of L10 to L12, each holding the wait from its first slice to

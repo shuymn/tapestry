@@ -691,15 +691,22 @@ fn wait_loading<R: LoadingRig>(
         if rig.quitting() {
             return Ok(false);
         }
-        if committed && rig.screen_failed() {
+        // One look at the screen per pass, used by both exits below: a
+        // screen lost after it is seen at the next pass.
+        let lost = rig.screen_failed();
+        if committed && lost {
             return Err(LiveError::ScreenLost);
         }
         if quit_look(rig) || opener.latch == PrepState::Cancelled {
             return Ok(false);
         }
         // A screen built again keeps the loading lifetime: its first
-        // frame, if not presented yet, still starts the minimum.
-        if rig.screen_failed() {
+        // frame, if not presented yet, still starts the minimum. After the
+        // commit nothing is built again: the run ends instead.
+        if lost {
+            if committed {
+                return Err(LiveError::ScreenLost);
+            }
             rig.prepare_screen().map_err(LiveError::Screen)?;
         }
         if opener.ack.is_none()
