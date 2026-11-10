@@ -502,8 +502,7 @@ pub enum CommitError {
 /// resource generation when they were written (S10-12 design §5.3).
 #[derive(Clone, Copy, Debug)]
 struct PublishedChart {
-    generation: u64,
-    atlas: AtlasId,
+    key: skin_model::chart_image::ChartKey,
     table: skin_model::chart_image::ChartTable,
 }
 
@@ -2368,10 +2367,12 @@ impl Renderer {
         if u32::from(layer) != at {
             return Err(RenderError::NoChartLayer);
         }
+        let Some(key) = self.chart_key() else {
+            return Err(RenderError::DeviceLost);
+        };
         let began = PublishedChart {
-            generation: self.resources,
-            atlas: bundle.atlas_id(),
-            table: ChartTable::ABSENT,
+            key,
+            table: ChartTable::ABSENT.keyed(key),
         };
         // 1. Unavailable from the first byte.
         self.chart = None;
@@ -2444,16 +2445,20 @@ impl Renderer {
         // on a device not lost.
         let same = self.installed.as_ref().is_some_and(|i| {
             Arc::ptr_eq(i.bundle(), &bundle) && i.loading().same(installed.loading())
-        }) && self.resources == began.generation
-            && !self.gpu.lost();
+        }) && self.chart_key() == Some(key);
         if !same {
             return Err(RenderError::ChartChanged);
         }
         // 4. Published.
         let [stage, back] = uvs;
-        let table = ChartTable::new(stage, back);
+        let table = ChartTable::new(stage, back).keyed(key);
         self.chart = Some(PublishedChart { table, ..began });
         self.sync_chart();
+        // A loss after the re-check discards the publication: it is the
+        // device's failure, never a success.
+        if self.valid_chart() != Some(table) {
+            return Err(RenderError::DeviceLost);
+        }
         Ok(table)
     }
 
@@ -2472,11 +2477,24 @@ impl Renderer {
     /// lost since.
     fn valid_chart(&self) -> Option<skin_model::chart_image::ChartTable> {
         let p = self.chart?;
+        (self.chart_key() == Some(p.key)).then_some(p.table)
+    }
+
+    /// The live key of the play installation's chart layer: this renderer,
+    /// the installation (its presentation's number), its atlas and the
+    /// resource generation; `None` without an installation or once the
+    /// device is lost. Frames are built against it
+    /// ([`PlaySkin::set_chart_live`]), so a chart table drawn from any
+    /// copy describes this very array.
+    #[must_use]
+    pub fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
         let installed = self.installed.as_ref()?;
-        (p.generation == self.resources
-            && p.atlas == installed.bundle().atlas_id()
-            && !self.gpu.lost())
-        .then_some(p.table)
+        (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
+            renderer: self.id,
+            installation: installed.loading().id(),
+            atlas: installed.bundle().atlas_id().0,
+            generation: self.resources,
+        })
     }
 
     /// Copies the valid chart images ([`valid_chart`](Self::valid_chart))
@@ -2876,6 +2894,8 @@ impl Renderer {
             target: self.target(),
             ..*f
         };
+        let live = self.chart_key();
+        self.skin.set_chart_live(live);
         if let Err(e) = self.staging.build(self.skin.as_mut(), &f) {
             self.refused = Some(e);
             return Err(e);
@@ -3012,6 +3032,8 @@ impl Renderer {
             target: self.target(),
             ..*f
         };
+        let live = self.chart_key();
+        self.skin.set_chart_live(live);
         if let Err(e) = self.staging.build_loading(self.skin.as_mut(), &f) {
             self.loading_refused = Some((f.lifetime, e));
             return Err(e);
@@ -5056,8 +5078,9 @@ mod tests {
             "{e:?}"
         );
         assert!(e.is_refusal());
+        let absent = ChartTable::ABSENT.keyed(r.chart_key().unwrap());
         let presented = || r.installed.as_ref().unwrap().loading().chart_images();
-        assert_eq!(presented(), Some(ChartTable::ABSENT));
+        assert_eq!(presented(), Some(absent));
 
         r.publish_chart_images([Some(&stage), None]).unwrap();
         let wide = chart_picture(ChartImage::Stage, side * 2, [side + 100, 8], [1, 2, 3]);
@@ -5073,7 +5096,7 @@ mod tests {
         );
         assert!(e.is_refusal());
         let presented = r.installed.as_ref().unwrap().loading().chart_images();
-        assert_eq!(presented, Some(ChartTable::ABSENT));
+        assert_eq!(presented, Some(absent));
     }
 
     /// A device destroyed while the writes are queued: the wait may still
@@ -5091,6 +5114,53 @@ mod tests {
         assert!(r.gpu.lost());
         assert_eq!(r.installed.as_ref().unwrap().loading().chart_images(), None);
         assert_eq!(r.valid_chart(), None);
+    }
+
+    /// A loss after a publication: every copy of the table stays where it
+    /// is, but no frame draws it, since frames are built against the live
+    /// key, which a lost device has none of; a publication then fails as
+    /// the device's.
+    #[test]
+    fn a_loss_after_publication_leaves_no_drawable_copy() {
+        use skin_model::chart_image::ChartImage;
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
+        let table = r.publish_chart_images([Some(&stage), None]).unwrap();
+        assert!(table.drawable(r.chart_key()));
+        r.gpu.device().destroy();
+        // The device reports its loss at its next poll.
+        let _ = r.gpu.device().poll(wgpu::PollType::wait_indefinitely());
+        assert!(r.gpu.lost());
+        assert_eq!(r.chart_key(), None);
+        let copy = r.installed.as_ref().unwrap().loading().chart_images();
+        assert_eq!(copy, Some(table), "the copy is still there");
+        assert!(!table.drawable(r.chart_key()), "but draws nowhere");
+        let e = r.publish_chart_images([Some(&stage), None]).unwrap_err();
+        assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+    }
+
+    /// The play pages uploaded again through `install_atlas` after a
+    /// publication: a new array, zeroed, so the published table no longer
+    /// draws, though its copies stay, until it is published again.
+    #[test]
+    fn an_atlas_upload_after_publication_leaves_no_drawable_copy() {
+        use skin_model::chart_image::ChartImage;
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
+        let table = r.publish_chart_images([Some(&stage), None]).unwrap();
+        let bundle = std::sync::Arc::clone(r.installed.as_ref().unwrap().bundle());
+        let levels = crate::decl::page_levels(bundle.atlas_pages());
+        let pages = AtlasPages {
+            side: bundle.side(),
+            pages: &levels,
+            text_layer: bundle.text_layer().is_some(),
+            chart_layer: true,
+        };
+        r.install_atlas(&pages, bundle.clips().clone()).unwrap();
+        assert!(!table.drawable(r.chart_key()), "another generation's array");
+        assert_eq!(r.valid_chart(), None);
+        let again = r.publish_chart_images([Some(&stage), None]).unwrap();
+        assert!(again.drawable(r.chart_key()));
     }
 
     /// Level `k` of atlas layer `z`, read back: RGBA8, `side >> k` texels

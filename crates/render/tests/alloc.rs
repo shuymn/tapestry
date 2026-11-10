@@ -1009,6 +1009,8 @@ fn loading_frames() {
     assert_eq!(r.text_report().counts.placements, 4);
     assert_eq!(r.install_staged_loading_text(), Ok(true));
     let mut skin = DeclSkin::of(&r.installation(ScreenKind::Play).unwrap());
+    // Built against the renderer's live array, as its own frames are.
+    skin.set_chart_live(r.chart_key());
     let mut staging = Staging::with_runs(
         skin.capacity(),
         skin.run_capacity(),

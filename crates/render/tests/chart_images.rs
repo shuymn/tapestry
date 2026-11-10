@@ -212,6 +212,44 @@ fn a_restore_makes_the_images_unavailable_until_republished() {
     assert_eq!(at(&p, NO_BACK_MARK), BLACK);
 }
 
+/// Two renderers sharing one installation, as a recovery restores it into
+/// another: whatever the first publishes afterwards into the shared
+/// loading state, the second's frames read the images unavailable, since
+/// a table draws only against its own renderer's array.
+#[test]
+fn another_renderers_publication_never_draws_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = chart();
+    let mut r1 = offscreen(1_920, 1_080);
+    let (b, _) = bundle(&r1, dir.path(), &chart_look());
+    install(&mut r1, &b, 1);
+    let stage = picture(ChartImage::Stage, b.side(), [64, 64], GREEN);
+    r1.publish_chart_images([Some(&stage), None]).unwrap();
+    let installation = r1.installation(skin_model::ScreenKind::Play).unwrap();
+
+    let mut r2 = offscreen(1_920, 1_080);
+    let text2 = MenuText::new(&r2);
+    r2.restore(skin_model::ScreenKind::Play, &installation)
+        .unwrap();
+    // The first publishes again, and commits an attempt, after the restore.
+    r1.publish_chart_images([Some(&stage), None]).unwrap();
+    let ctx = context(&GAUGES, false);
+    let token = r1.stage(&b, &attempt(&r1, &chart, &ctx), 2).unwrap();
+    r1.commit(token).unwrap();
+    assert!(
+        installation.loading().chart_images().is_some(),
+        "the shared copy is R1's"
+    );
+    let p = loading(&mut r2, &text2, &frame(1));
+    for rect in [CHART_STAGE, BACK_MARK, NO_BACK_MARK] {
+        assert_eq!(at(&p, rect), BLACK, "{rect:?}: R1's table in R2's frame");
+    }
+    // R1 still draws its own.
+    let text1 = MenuText::new(&r1);
+    let p = loading(&mut r1, &text1, &frame(1));
+    assert_eq!(at(&p, CHART_STAGE), GREEN);
+}
+
 /// With no play installation keeping a chart layer, nothing is published.
 #[test]
 fn no_chart_layer_publishes_nothing() {

@@ -650,8 +650,12 @@ impl LoadingPresentation {
         bundle: &SkinBundle,
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
+        live: Option<skin_model::chart_image::ChartKey>,
     ) -> Result<(), BuildError> {
         let mut p = self.lock();
+        // The chart table shared with other holders draws only against
+        // this frame's own array, checked under the same lock.
+        p.loading.set_chart_live(live);
         if p.lifetime != Some(f.lifetime) {
             if p.built {
                 return Ok(());
@@ -737,6 +741,9 @@ pub struct DeclSkin {
     bundle: Arc<SkinBundle>,
     loading: LoadingPresentation,
     play: Option<Play>,
+    /// The live key the renderer set for the next frames
+    /// ([`PlaySkin::set_chart_live`]).
+    chart_live: Option<skin_model::chart_image::ChartKey>,
     /// The attempt's labels, for a captured list's text (dev-tools).
     #[cfg(feature = "dev-tools")]
     labels: [String; 5],
@@ -758,6 +765,7 @@ impl DeclSkin {
             bundle: Arc::clone(&installation.bundle),
             loading: installation.loading.clone(),
             play: None,
+            chart_live: None,
             #[cfg(feature = "dev-tools")]
             labels: Default::default(),
         }
@@ -888,10 +896,16 @@ impl PlaySkin for DeclSkin {
         let Some(play) = &mut self.play else {
             return Ok(());
         };
+        play.set_chart_live(self.chart_live);
         let bundle = &*self.bundle;
         bundle
             .skin
             .build(play, &skin_frame(f), &bundle.uvs, out.quads_mut())
+    }
+
+    /// Kept for the next builds, which check every chart table against it.
+    fn set_chart_live(&mut self, live: Option<skin_model::chart_image::ChartKey>) {
+        self.chart_live = live;
     }
 
     /// A presentation built for another lifetime starts afresh.
@@ -906,7 +920,7 @@ impl PlaySkin for DeclSkin {
         f: &LoadingFrame<'_>,
         out: &mut SpriteBatch,
     ) -> Result<(), BuildError> {
-        self.loading.build(&self.bundle, f, out)
+        self.loading.build(&self.bundle, f, out, self.chart_live)
     }
 
     fn capacity(&self) -> u32 {
