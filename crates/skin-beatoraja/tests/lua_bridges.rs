@@ -512,3 +512,33 @@ fn combo_break_follows_each_snapshot() {
     d.tally = counts(1, [0, 1], 0);
     assert_eq!(read(&mut d), [2]);
 }
+
+/// s7-06f-design.md F5: a frame-time `main_state.offset` read stays
+/// unsupported: a decorative value is replaced by its constant, the reason
+/// naming `main_state.offset`, and one that is critical (it reads the EX
+/// score) refuses the skin, where the analysis meets the read's table
+/// indexed as an unresolved callee.
+#[test]
+fn a_frame_time_offset_read_follows_its_role() {
+    let offset = Unsupported::HostApi(4);
+    let i = import(&folder(&image_set(
+        "function() return ms.offset(71).w end",
+        "",
+    )))
+    .unwrap();
+    assert_eq!(i.callbacks, [Disposition::Replaced(offset)]);
+    match import(&folder(&image_set(
+        "function() return ms.number(101) + ms.offset(71).w end",
+        "",
+    ))) {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "value",
+                    why,
+                },
+            ..
+        }) => assert_eq!(why, Unsupported::Unresolved("callee")),
+        other => panic!("{other:?}"),
+    }
+}

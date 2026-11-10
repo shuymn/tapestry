@@ -19,8 +19,9 @@
 //! the network or audio, none of which an import may, and is refused
 //! rather than answered with an invented value; only `main_state.option`,
 //! `main_state.number` and `main_state.text` answer, from the import facts
-//! of the pass's snapshot and the scene's constants ([`super::facts`]).
-//! These three return a status into Lua, never a Rust error, and are
+//! of the pass's snapshot and the scene's constants ([`super::facts`]),
+//! and `main_state.offset`, from the configuration ([`offset`]).
+//! These four return a status into Lua, never a Rust error, and are
 //! counted as host calls like every other.
 //! There each module is read-only: the skin gets an empty proxy whose `__index` is the
 //! module's table, out of the skin's reach, and whose `__newindex`
@@ -114,6 +115,12 @@ const OPTION: u16 = 0;
 const NUMBER: u16 = 1;
 /// `main_state.text`'s index in [`HOST_APIS`].
 const TEXT: u16 = 3;
+/// `main_state.offset`'s index in [`HOST_APIS`].
+const OFFSET: u16 = 4;
+
+/// The source's last offset id (`MainController.java:124-125` at `0.8.9`,
+/// `OFFSET_MAX`): its array holds ids 0 to this.
+const OFFSET_MAX: i32 = 199;
 
 /// A host API's argument as an import fact's id: a Lua integer within
 /// `i32` (the integer subtype: `33.0` and `"33"` are not), or a refusal,
@@ -259,6 +266,41 @@ fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaStrin
     }
 }
 
+/// `main_state.offset(n)` during the configured pass: a fresh table of
+/// offset `n`'s `x`, `y`, `w`, `h`, `r` and `a` as Lua integers, its
+/// configured value when the header declares it, else zeros
+/// ([`super::config::Bridge::offset`]). The source answers from its
+/// process-wide offset array as an earlier load left it
+/// (`MainStatePropertyLuaApiExporter.java:191-204`, `MainState.java:116-148`
+/// at `0.8.9`); this import's configuration is that array's value once the
+/// skin has loaded with it (design.md "Differences from the source"). Its
+/// argument is checked as `number`'s, and an id past the source's array
+/// (0 to [`OFFSET_MAX`]) is refused as one, fatal and located: a `pcall`
+/// does not recover either, where the source coerces its argument and its
+/// protected call survives the index. On a screen's runtime it reads live
+/// state, refused.
+fn offset(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<Value> {
+    #[cfg(feature = "dev-tools")]
+    if pass.in_runtime()
+        && let Some(r) = super::replay::answer(lua, pass, OFFSET, &args)
+    {
+        return r;
+    }
+    let bridge = match &pass.bridge {
+        Some(b) if !pass.in_runtime() => b,
+        _ => return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OFFSET })),
+    };
+    let n = fact_id(lua, pass, &args, "offset")?;
+    if !(0..=OFFSET_MAX).contains(&n) {
+        pass.count_fact(|| "offset argument".to_owned());
+        return Err(pass.ledger.fail_lua(lua, LuaWhy::FactArgument));
+    }
+    Ok(Value::Table(super::config::offset_table(
+        lua,
+        bridge.offset(n),
+    )?))
+}
+
 /// `main_state.number(n)` on a screen's runtime: the profile's bridge
 /// over the frame's fields; for an id it omits, the source's value in the
 /// feature's absence ([`super::runtime::absent`]), else 0, noted once.
@@ -342,6 +384,8 @@ pub(super) fn install(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<()> {
                 host(lua, pass, 1, number)?
             } else if index == TEXT {
                 host(lua, pass, 1, text)?
+            } else if index == OFFSET {
+                host(lua, pass, 1, offset)?
             } else {
                 // A reference's play host answers what it can (dev-tools),
                 // its one argument passed.
