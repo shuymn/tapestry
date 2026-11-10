@@ -1041,7 +1041,8 @@ struct Shared {
     #[cfg(test)]
     commit_timed_out: AtomicBool,
     /// While set, a commit waits between its receipt and its loading
-    /// time's declaration, and says so in `declaration_held` (tests).
+    /// time's declaration, and says so in `declaration_held`, at most
+    /// [`hook_bound`] (tests).
     #[cfg(test)]
     hold_declaration: AtomicBool,
     #[cfg(test)]
@@ -1579,6 +1580,18 @@ pub enum RenderEnd {
     Stuck,
 }
 
+/// How long a test hook waits on its other side: `TAPESTRY_TEST_WATCHDOG`
+/// seconds, else 60 (tests).
+#[cfg(test)]
+fn hook_bound() -> Duration {
+    Duration::from_secs(
+        std::env::var("TAPESTRY_TEST_WATCHDOG")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+    )
+}
+
 /// The game thread's end of the render thread.
 pub struct RenderLink {
     tx: Sender<RenderMsg>,
@@ -1982,10 +1995,16 @@ impl RenderLink {
                 {
                     self.shared.commit_timed_out.store(true, Ordering::Release);
                     // A test holding the render thread between the receipt
-                    // and the declaration reads the receipt only then.
+                    // and the declaration reads the receipt only then; a
+                    // render thread that never gets there fails the test.
+                    let deadline = Instant::now() + hook_bound();
                     while self.shared.hold_declaration.load(Ordering::Acquire)
                         && !self.shared.declaration_held.load(Ordering::Acquire)
                     {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the render thread never held its declaration"
+                        );
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
@@ -4819,9 +4838,15 @@ impl Run {
         };
         drop(commits);
         #[cfg(test)]
-        while self.shared.hold_declaration.load(Ordering::Acquire) {
-            self.shared.declaration_held.store(true, Ordering::Release);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        {
+            // Held at most the hook's bound: a test that never lets go
+            // does not keep the render thread.
+            let deadline = Instant::now() + hook_bound();
+            while self.shared.hold_declaration.load(Ordering::Acquire) && Instant::now() < deadline
+            {
+                self.shared.declaration_held.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         // Before the answer, outside the commits' lock: the opener reads
         // the minimum again once the commit is answered (or, past the
@@ -12005,17 +12030,26 @@ pub(crate) mod tests {
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
+        /// Lets the render thread go when dropped, the test failing
+        /// included.
+        struct Hold(Arc<super::Shared>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.hold_declaration.store(false, Ordering::Release);
+            }
+        }
         link.set_timeouts(Duration::from_millis(100), Duration::from_secs(5));
         link.shared.commit_timed_out.store(false, Ordering::Release);
         link.shared.declaration_held.store(false, Ordering::Release);
         link.shared.hold_declaration.store(true, Ordering::Release);
+        let hold = Hold(Arc::clone(&link.shared));
         link.commit_attempt().unwrap();
         // Read past the bound, with the render thread held between the
         // receipt and its own declaration: only the receipt declared it.
         assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
         assert!(link.shared.declaration_held.load(Ordering::Acquire));
         assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
-        link.shared.hold_declaration.store(false, Ordering::Release);
+        drop(hold);
         link.set_timeouts(Duration::from_secs(10), Duration::from_secs(5));
         link.end_loading().unwrap();
         link.exit();
