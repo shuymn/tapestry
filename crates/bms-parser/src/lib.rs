@@ -172,8 +172,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use bms_model::{
-    Chart, ChartIdentity, ChartSummary, ChartTimeline, MAX_TIMELINE_POINTS, ModelError, NoteKind,
-    ScrollMap, SoundId, SoundRef, Speed, TimeUs,
+    Chart, ChartIdentity, ChartProfile, ChartSummary, ChartTimeline, MAX_TIMELINE_POINTS,
+    ModelError, NoteKind, ScrollMap, SoundId, SoundRef, Speed, TimeUs,
 };
 
 pub use error::{LoadError, Warning, WarningKind};
@@ -272,6 +272,9 @@ pub struct Loaded {
     pub chart: Chart,
     /// Its labels besides the title, from the same resolution.
     pub labels: Labels,
+    /// Its notes by second and its tempo rows, from its 1× times whatever
+    /// the speed it was loaded at.
+    pub profile: ChartProfile,
     /// Warnings in the order they arose.
     pub warnings: Vec<Warning>,
 }
@@ -420,6 +423,7 @@ fn build(
             e => LoadError::Model(e),
         })
     };
+    let long_stops = std::mem::take(&mut timeline.long_stops);
     let real_scroll = timeline.real.take();
     let real_rows = timeline.real_rows.take();
     let scroll = compile(timeline.initial_rate, timeline.segments)?;
@@ -453,6 +457,9 @@ fn build(
         .validate_presentation_links()
         .map_err(|e| LoadError::Links(Box::new(e)))?;
     chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    // Before the remap below: the only point that holds the 1× times.
+    let profile = ChartProfile::of(&chart, &long_stops);
+    drop(long_stops);
     if files.is_some() {
         chart.identity.resolved_hash = hash::resolved_hash(&chart);
         chart.identity.played_hash = chart.identity.resolved_hash;
@@ -487,6 +494,7 @@ fn build(
     Ok(Loaded {
         chart,
         labels,
+        profile,
         warnings,
     })
 }
