@@ -109,6 +109,11 @@ pub enum Probe {
     /// On the game thread at each slice of its wait for the screen's
     /// chart.
     Screen,
+    /// On the game thread in the release barrier, before the unload.
+    Barrier,
+    /// On the game thread once the Bank job is joined, before its bank is
+    /// wrapped and registered.
+    Joined,
 }
 
 /// A load's test hook: the probe, the run's controls and whether the job
@@ -290,6 +295,8 @@ struct JobHost<'a, 'c> {
     ctx: &'a game::coord::Ctx<'c>,
     #[cfg(test)]
     decodes: Option<&'a Decodes>,
+    #[cfg(feature = "dev-tools")]
+    witness: &'a Arc<crate::bank_witness::BankWitness>,
 }
 
 impl crate::loudness::Host for JobHost<'_, '_> {
@@ -297,6 +304,9 @@ impl crate::loudness::Host for JobHost<'_, '_> {
         let normal = bms_model::Speed::NORMAL;
         let chart = self.reader.read(normal)?;
         let (ctx, controls) = (self.ctx, self.controls);
+        // Accounted from before its decode to its bank's registration.
+        #[cfg(feature = "dev-tools")]
+        let token = self.witness.decode();
         let bank = decode_on_permits(
             ctx,
             self.coord,
@@ -312,7 +322,10 @@ impl crate::loudness::Host for JobHost<'_, '_> {
                     .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
             },
         )?;
-        Ok((chart, Arc::new(bank)))
+        let bank = Arc::new(bank);
+        #[cfg(feature = "dev-tools")]
+        token.register(&bank);
+        Ok((chart, bank))
     }
 
     fn measuring(&mut self, _name: &str) {}
@@ -387,6 +400,14 @@ pub struct Selection {
     /// for a cancel (tests).
     #[cfg(test)]
     pub after_bank: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The release barrier's unload fails with this, once, before it is
+    /// sent (tests: the rig's audio thread cannot be held from answering).
+    #[cfg(test)]
+    pub unload_fault: Option<game::AudioLoadError>,
+    /// Every bank the chosen chart's load decodes and every decode in
+    /// flight, checked by the release barrier (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub witness: Arc<crate::bank_witness::BankWitness>,
 }
 
 impl Selection {
@@ -1554,6 +1575,36 @@ fn hold(
 }
 
 impl PlayerRig<'_> {
+    /// The release barrier (design.md "Load Pipeline"), on the game thread
+    /// before a bank decode begins: every earlier bank's owners go first.
+    /// The scoped jobs of the previous load were joined when it returned;
+    /// the previous chart's restorer is dropped (it holds the engine's
+    /// bank, and would restore no round of this chart); the engine's bank
+    /// is unloaded, freed here once the audio thread took the empty one.
+    /// The witness then finds no bank alive and no decode in flight
+    /// (dev-tools).
+    ///
+    /// # Errors
+    ///
+    /// The unload's ([`game::AudioControl::unload`]): nothing is decoded.
+    fn release_banks(&mut self) -> Result<(), game::AudioLoadError> {
+        self.restorer = None;
+        #[cfg(test)]
+        {
+            let decodes = self.selection.as_ref().and_then(|s| s.decodes.clone());
+            probe(decodes.as_deref(), Probe::Barrier, self.controls, &|| false);
+            if let Some(fault) = self.selection.as_mut().and_then(|s| s.unload_fault.take()) {
+                return Err(fault);
+            }
+        }
+        self.audio.control.unload()?;
+        #[cfg(feature = "dev-tools")]
+        if let Some(sel) = &self.selection {
+            sel.witness.check();
+        }
+        Ok(())
+    }
+
     /// Gives the select screen's updates the settings a skin shows
     /// (docs/stage3.md §3, Selection): the play options in force, the
     /// chosen preset's displayed gauge and the settings keys' values.
@@ -2063,8 +2114,6 @@ impl AppRig for PlayerRig<'_> {
         let page = sel.loading.clone();
         #[cfg(feature = "dev-tools")]
         let slow = sel.script.as_mut().and_then(|s| s.slow_load.take());
-        // The previous chart's restorer never restores this one's rounds.
-        self.restorer = None;
         let chart = loaded.chart();
         let warnings = loaded.warnings();
         log::info!("loaded the chart ({} warnings)", warnings.len());
@@ -2138,6 +2187,15 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
+        // Every earlier bank's owners go before this decode begins; an
+        // unload the audio thread does not take refuses the load here.
+        self.release_banks().map_err(ChartLoadError::Audio)?;
+        // A quit or a close during the unload, whose wait reads neither:
+        // nothing is decoded.
+        if cancelled(self.controls) {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
         let progress = Progress::new(self.render.loading(), page.clone());
         let controls = self.controls;
         // A script's `quit-decoding` presses the quit key once the first
@@ -2159,6 +2217,11 @@ impl AppRig for PlayerRig<'_> {
         // bank is made.
         let (adjust, input) = (&mut self.adjust, &self.input);
         let job = (game::coord::JobKind::Bank, loaded.path().to_owned(), speed);
+        // The decode is accounted from before its job exists to its bank's
+        // registration; declared before the result, so a result dropped on
+        // a cancel or a refusal goes first.
+        #[cfg(feature = "dev-tools")]
+        let token = sel.witness.decode();
         let decoded = std::thread::scope(|s| {
             let decode = |ctx: &game::coord::Ctx<'_>| {
                 decode_on_permits(
@@ -2202,12 +2265,17 @@ impl AppRig for PlayerRig<'_> {
                 }),
             }
         });
+        #[cfg(test)]
+        probe(decodes.as_deref(), Probe::Joined, controls, &|| false);
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("decoding", self.adjust.as_ref());
         let bank = match decoded {
             Joined::Done(Ok(bank)) => {
                 progress.completed();
-                Arc::new(bank)
+                let bank = Arc::new(bank);
+                #[cfg(feature = "dev-tools")]
+                token.register(&bank);
+                bank
             }
             Joined::Done(Err(audio::BankError::Cancelled))
             | Joined::Cancelled(Some(Err(audio::BankError::Cancelled))) => {
@@ -2234,8 +2302,9 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // The engine frees the chart before's bank here, so a measurement's
-        // 1× bank is never held beside both.
+        // The engine takes the new bank in place of the empty one the
+        // release barrier left: the previous chart's bank was freed before
+        // the decode.
         self.audio
             .control
             .load(Arc::clone(&bank), audio::BgmSchedule::new(schedule))
@@ -2280,6 +2349,8 @@ impl AppRig for PlayerRig<'_> {
                 bank
             };
             let reader = loaded.reader();
+            #[cfg(feature = "dev-tools")]
+            let witness = Arc::clone(&sel.witness);
             let job = (
                 game::coord::JobKind::Measure,
                 loaded.path().to_owned(),
@@ -2306,6 +2377,8 @@ impl AppRig for PlayerRig<'_> {
                         ctx,
                         #[cfg(test)]
                         decodes: decodes.as_deref(),
+                        #[cfg(feature = "dev-tools")]
+                        witness: &witness,
                     };
                     crate::loudness::measure(chart, &bank, Some(&key), &name, &mut host)
                 };
@@ -2960,6 +3033,9 @@ pub(crate) mod tests {
             spawner: game::coord::Spawner::SYSTEM,
             decodes: None,
             after_bank: None,
+            unload_fault: None,
+            #[cfg(feature = "dev-tools")]
+            witness: crate::bank_witness::BankWitness::new(),
         }
     }
 
@@ -4785,6 +4861,9 @@ pub(crate) mod tests {
             spawner: game::coord::Spawner::SYSTEM,
             decodes: None,
             after_bank: None,
+            unload_fault: None,
+            #[cfg(feature = "dev-tools")]
+            witness: crate::bank_witness::BankWitness::new(),
         };
         let listed: usize = roots.iter().map(|r| walk_count(r)).sum();
         settle(&mut sel);

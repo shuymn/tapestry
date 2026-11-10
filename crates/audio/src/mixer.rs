@@ -471,6 +471,12 @@ impl Mixer {
         self.saturated
     }
 
+    /// The master volume.
+    #[must_use]
+    pub const fn volume(&self) -> f32 {
+        self.volume
+    }
+
     /// Sets the master volume, applied with the gain before the soft
     /// clipper.
     ///

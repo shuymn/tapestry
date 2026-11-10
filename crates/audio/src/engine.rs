@@ -191,6 +191,92 @@ pub struct AudioEngine {
     scheduled_dropped: u64,
     underruns: u64,
     deferred_wakes: u64,
+    tone: Tone,
+}
+
+/// The decision tone's partials: frequency in Hz and weight.
+const TONE_PARTIALS: [(f32, f32); 2] = [(880.0, 0.6), (1_320.0, 0.4)];
+/// The decision tone's length, its attack and its level before the volume.
+const TONE_SECONDS: f32 = 0.6;
+const TONE_ATTACK_SECONDS: f32 = 0.005;
+const TONE_LEVEL: f32 = 0.25;
+
+/// The decision tone (design.md "Play Lifecycle", the decision screen's
+/// sound): a short chime the engine makes itself, outside the mixer and
+/// the bank, so no bank's installation or release, stop, restart, seek or
+/// ring-out cuts it. It is added after the mixer's output stage at the
+/// master volume only, not the play's gain, and allocates nothing.
+#[derive(Debug)]
+struct Tone {
+    rate: f32,
+    /// Its length in frames.
+    length: u32,
+    /// The next frame of the sounding tone; `None` when silent.
+    at: Option<u32>,
+}
+
+impl Tone {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "a rate up to MAX_RATE and a length under a second fit an f32 and a u32"
+    )]
+    fn new(rate: u32) -> Self {
+        let rate = rate as f32;
+        Self {
+            rate,
+            length: (TONE_SECONDS * rate) as u32,
+            at: None,
+        }
+    }
+
+    /// Starts it from its beginning, sounding or not.
+    const fn start(&mut self) {
+        self.at = Some(0);
+    }
+
+    /// Whether it sounds.
+    const fn sounding(&self) -> bool {
+        self.at.is_some()
+    }
+
+    /// Its sample at frame `at`.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a frame under a second of samples is exact in an f32"
+    )]
+    fn sample(&self, at: u32) -> f32 {
+        let t = at as f32 / self.rate;
+        let attack = (t / TONE_ATTACK_SECONDS).min(1.0);
+        let fall = 1.0 - t / TONE_SECONDS;
+        let envelope = attack * fall * fall;
+        let sum: f32 = TONE_PARTIALS
+            .iter()
+            .map(|&(f, w)| w * (std::f32::consts::TAU * f * t).sin())
+            .sum();
+        sum * envelope * TONE_LEVEL
+    }
+
+    /// Adds it to the interleaved block `buf` at `volume`, clamped to full
+    /// scale; leaves `buf` untouched when it does not sound.
+    fn add(&mut self, buf: &mut [f32], volume: f32) {
+        let Some(mut at) = self.at else {
+            return;
+        };
+        for frame in buf.as_chunks_mut::<CHANNELS>().0 {
+            if at >= self.length {
+                self.at = None;
+                return;
+            }
+            let s = self.sample(at) * volume;
+            for x in frame {
+                *x = (*x + s).clamp(-1.0, 1.0);
+            }
+            at += 1;
+        }
+        self.at = Some(at);
+    }
 }
 
 impl AudioEngine {
@@ -259,6 +345,7 @@ impl AudioEngine {
             scheduled_dropped: 0,
             underruns: 0,
             deferred_wakes: 0,
+            tone: Tone::new(rate),
         })
     }
 
@@ -297,6 +384,20 @@ impl AudioEngine {
     #[must_use]
     pub fn scheduled_dropped(&self) -> u64 {
         self.scheduled_dropped
+    }
+
+    /// Starts the decision tone from its beginning, from the next block
+    /// on: it sounds over whatever the engine plays, and nothing the engine
+    /// does to its chart (a [`replace`](Self::replace), a stop, a restart,
+    /// a seek, a ring-out) stops it.
+    pub const fn play_tone(&mut self) {
+        self.tone.start();
+    }
+
+    /// Whether the decision tone sounds.
+    #[must_use]
+    pub const fn tone_sounding(&self) -> bool {
+        self.tone.sounding()
     }
 
     /// Sets the master volume.
@@ -604,6 +705,7 @@ impl AudioEngine {
             out.write(|buf| {
                 report.frames = (buf.len() / CHANNELS) as u32;
                 self.mixer.render(&self.bank, buf);
+                self.tone.add(buf, self.mixer.volume());
             })?;
             report.active_voices = self.mixer.sounding();
             report.bgm_left = self.bgm.len() - self.next_bgm;
@@ -705,6 +807,7 @@ impl AudioEngine {
             }
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);
+            self.tone.add(buf, self.mixer.volume());
             // Rendering reached a ring-out's end: everything stopped there,
             // a seek still waiting included, and nothing of the schedule
             // starts any more.
