@@ -386,6 +386,8 @@ fn consumers(arena: &Arena, an: &Analysis, completed: bool) -> Vec<(Loc, Consume
             Disposition::ClassifiedOnly => match unused.get(&c) {
                 Some(Unused::Dropped) => "element dropped earlier",
                 Some(Unused::FoldedFalse) => "condition folded false",
+                Some(Unused::Removed) => "object removed at installation",
+                Some(Unused::Inert) => "inert without an authored key",
                 None if completed => "field not consumed",
                 None => "import stopped earlier",
             },

@@ -156,8 +156,17 @@ impl Program {
     /// positive witness over every operation, so an operation added later
     /// must be classified here.
     pub(crate) fn reads_only(&self, slot: u16) -> bool {
+        self.loads_only(&|s| s == slot)
+    }
+
+    /// Whether every read the program performs is a load of a field
+    /// `allowed` accepts: any output and any timer operand gives false,
+    /// whatever `allowed` says. A positive witness over every operation,
+    /// so an operation added later must be classified here.
+    #[must_use]
+    pub fn loads_only(&self, allowed: &dyn Fn(u16) -> bool) -> bool {
         self.ops.iter().all(|op| match *op {
-            Op::Load { slot: s, .. } => s == slot,
+            Op::Load { slot, .. } => allowed(slot),
             Op::Output { .. } | Op::Elapsed(_) | Op::On(_) => false,
             Op::Const(_) | Op::Un(_) | Op::Bin(_) | Op::Select => true,
         })
@@ -278,5 +287,41 @@ impl Stack {
         };
         self.sp = top;
         self.v.get(top).copied().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Op, OutTy, Program, Ty};
+
+    fn program(ops: Vec<Op>) -> Program {
+        Program {
+            ops: ops.into_boxed_slice(),
+            ty: Ty::Bool,
+            stack: 2,
+        }
+    }
+
+    /// An allowed field passes; a field it refuses, an output and either
+    /// timer operand fail whatever `allowed` says.
+    #[test]
+    fn loads_only_refuses_timers_and_outputs() {
+        let all = |_| true;
+        let load = |slot| Op::Load { slot, lo: 0, hi: 1 };
+        assert!(program(vec![load(3), Op::Const(1)]).loads_only(&|s| s == 3));
+        assert!(!program(vec![load(4)]).loads_only(&|s| s == 3));
+        for op in [
+            Op::On(0),
+            Op::Elapsed(0),
+            Op::Output {
+                slot: 0,
+                ty: OutTy::Bool,
+                ok: false,
+            },
+        ] {
+            assert!(!program(vec![op]).loads_only(&all), "{op:?}");
+        }
+        assert!(program(vec![load(3)]).reads_only(3));
+        assert!(!program(vec![load(3), Op::On(0)]).reads_only(3));
     }
 }
