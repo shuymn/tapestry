@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
-use eval::{GaugeState, InputFacts, JudgeEvent, NoteFacts, Tally};
+use eval::{GaugeState, InputFacts, JudgeEvent, JudgeEventKind, NoteFacts, Tally, side_deviation};
+use rules::Judgment;
 
 use crate::logic::EventSink;
 
@@ -57,7 +58,123 @@ pub struct PlayView {
     /// The number of events this candidate emitted so far: its effects
     /// with a lower sequence number are the ones this view includes.
     pub events: u64,
+    /// The candidate's newest judgment offsets, copied whole with every
+    /// view, so no effect's loss loses one.
+    pub offsets: OffsetRing,
 }
+
+/// How many judgment offsets an [`OffsetRing`] keeps.
+pub const OFFSET_SLOTS: usize = 100;
+
+/// The newest [`OFFSET_SLOTS`] judgment offsets of a READY candidate, in
+/// whole ms, early positive (note time minus press, truncated toward 0):
+/// one per judgment the tally counts as PERFECT to BAD, a long note's by
+/// the side its judgment took ([`eval::side_deviation`]); never a POOR, an
+/// empty POOR or a miss. The logic step records them as it hands the
+/// events on and copies the ring into every [`PlayView`]; a rearm clears
+/// it. 404 bytes, never allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OffsetRing {
+    /// The slots; the next offset goes to `count % OFFSET_SLOTS`.
+    ms: [i32; OFFSET_SLOTS],
+    /// Offsets recorded so far, never capped at the slots: a reader that
+    /// kept the count it last read sees how many arrived since. It wraps
+    /// only past `u32::MAX` judgments, beyond any play's events.
+    count: u32,
+}
+
+impl OffsetRing {
+    /// A ring with nothing recorded.
+    pub const EMPTY: Self = Self {
+        ms: [0; OFFSET_SLOTS],
+        count: 0,
+    };
+
+    /// The offset `e` records, if any: a press judged PERFECT to BAD on
+    /// its note, as note time minus press in ms truncated toward 0, a long
+    /// note finished by a release by the side its judgment took.
+    fn offset_of(e: &JudgeEvent) -> Option<i32> {
+        let JudgeEventKind::Judged {
+            judgment,
+            deviation: Some(head),
+            release,
+            ..
+        } = e.kind
+        else {
+            return None;
+        };
+        if !matches!(
+            judgment,
+            Judgment::Perfect | Judgment::Great | Judgment::Good | Judgment::Bad
+        ) {
+            return None;
+        }
+        let side = side_deviation(Some(head), release).unwrap_or(head);
+        let ms = side.0.saturating_neg() / 1_000;
+        Some(i32::try_from(ms).unwrap_or(if ms < 0 { i32::MIN } else { i32::MAX }))
+    }
+
+    /// Records `e`'s offset, if it has one: a press judged PERFECT to BAD
+    /// on its note.
+    pub fn record(&mut self, e: &JudgeEvent) {
+        if let Some(ms) = Self::offset_of(e) {
+            self.push(ms);
+        }
+    }
+
+    /// Records one offset, overwriting the oldest once the ring is full.
+    fn push(&mut self, ms: i32) {
+        if let Some(slot) = self.ms.get_mut(Self::slot(self.count)) {
+            *slot = ms;
+        }
+        self.count = self.count.wrapping_add(1);
+    }
+
+    /// Forgets everything recorded.
+    pub fn clear(&mut self) {
+        *self = Self::EMPTY;
+    }
+
+    /// Offsets recorded so far, the overwritten ones included.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.count
+    }
+
+    /// The slot the next offset goes to.
+    #[must_use]
+    pub const fn head(&self) -> usize {
+        Self::slot(self.count)
+    }
+
+    /// The offsets recorded after the first `seen` that are still in the
+    /// ring, oldest first: the last `min(count - seen, OFFSET_SLOTS)`. A
+    /// reader that kept the count it last read gets each new offset once,
+    /// a whole revolution's included; those overwritten before it read
+    /// them are skipped. `seen` must come from this ring since its last
+    /// clear: the count restarts at a rearm, so a reader resets `seen` then.
+    pub fn since(&self, seen: u32) -> impl Iterator<Item = i32> + '_ {
+        let new = self.count.wrapping_sub(seen).min(SLOTS_U32);
+        let first = self.count.wrapping_sub(new);
+        (0..new).filter_map(move |i| self.ms.get(Self::slot(first.wrapping_add(i))).copied())
+    }
+
+    /// Every offset still in the ring, oldest first.
+    pub fn recorded(&self) -> impl Iterator<Item = i32> + '_ {
+        self.since(0)
+    }
+
+    const fn slot(count: u32) -> usize {
+        (count % SLOTS_U32) as usize
+    }
+}
+
+/// [`OFFSET_SLOTS`] as the count's type.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "OFFSET_SLOTS is 100, far within u32"
+)]
+const SLOTS_U32: u32 = OFFSET_SLOTS as u32;
 
 /// The logic thread's end of the play view.
 pub type ViewWriter = triple_buffer::Input<PlayView>;
@@ -323,6 +440,7 @@ mod tests {
             playing: false,
             closing: None,
             events: 0,
+            offsets: super::OffsetRing::EMPTY,
         }
     }
 
