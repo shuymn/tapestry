@@ -553,3 +553,36 @@ fn a_dropped_score_carry_is_refused() {
         Err(Stop::Differs) => panic!("the imports differ"),
     }
 }
+
+/// s10-10-design.md C28: `float_number(113)` read against 0 lowers, and
+/// the reference host answers it as the source's float rate, `(float) B /
+/// (n · 2)`: with a best of 11 the draw against 0 holds on both sides and
+/// with none it does not, compared on every frame it is reached.
+#[test]
+fn the_best_rate_agrees_with_the_source_s_float() {
+    let body = format!(
+        "{}{}",
+        dst(
+            "\"i\"",
+            0,
+            "draw = function() return ms.float_number(113) ~= 0 end,"
+        ),
+        dst(
+            "\"i\"",
+            100,
+            "draw = function() return ms.float_number(113) == 0 end,"
+        )
+    );
+    for basis in [Some((11, 13)), None] {
+        crate::production::SCORE_BASIS.with(|s| s.set(basis));
+        let r = run_with(&body, &options(Script::full()));
+        crate::production::SCORE_BASIS.with(|s| s.set(None));
+        assert!(r.passes(), "{basis:?}: {}", r.text(0, true, true));
+        assert_eq!(
+            lowered(&r, "draw"),
+            r.frames * 2,
+            "{basis:?}: {}",
+            r.text(0, true, true)
+        );
+    }
+}
