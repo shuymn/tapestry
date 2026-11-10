@@ -494,6 +494,25 @@ fn a_score_reading_difference_is_attributed() {
     );
 }
 
+/// A score input that disagrees with a judged frame's fields (a wrong
+/// model, injected: EX + 2) is refused, so the run never compares on it.
+#[test]
+fn a_mismatched_score_input_is_refused() {
+    let body = format!(
+        "{VALUES}{}",
+        number("m", "function() return ms.number(71) end", 0)
+    );
+    let d = folder(&body);
+    crate::production::SCORE_SKEW.with(|s| s.set(2));
+    let got = replay(d.path(), "s.luaskin", &options(Script::rounds()));
+    crate::production::SCORE_SKEW.with(|s| s.set(0));
+    match got {
+        Err(Stop::Failed(e)) => assert!(e.contains("score input"), "{e}"),
+        Ok(_) => panic!("accepted"),
+        Err(Stop::Differs) => panic!("the imports differ"),
+    }
+}
+
 /// The replay refuses a run whose score input disagrees with the frames
 /// (its self-check): reached only through a broken model, so this checks
 /// the replay's normal path stays accepted.

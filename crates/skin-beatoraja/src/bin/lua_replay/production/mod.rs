@@ -24,6 +24,25 @@ use self::continuation::{Carried, Model};
 use crate::inputs::FrameInputs;
 use crate::script::{End, Phase, STEP, Script};
 
+#[cfg(test)]
+thread_local! {
+    /// A test's offset of the score input's EX score: a wrong model of
+    /// the source's score data, which the record loop must refuse.
+    pub static SCORE_SKEW: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// The score input's EX-score offset: a test's, else 0.
+fn skew() -> i32 {
+    #[cfg(test)]
+    {
+        SCORE_SKEW.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
+
 /// Where a play frame stands in its round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -330,7 +349,10 @@ pub fn record(
                     let targets = skin_model::attempt_targets(&chart, &ctx.attempt);
                     let judged = |t: &eval::Tally| {
                         if *t != eval::Tally::default() {
-                            score.set(skin_model::score_fields(t, targets, ctx.empty_poor_counted));
+                            score.set(
+                                skin_model::score_fields(t, targets, ctx.empty_poor_counted)
+                                    .map(|[e, c, w]| [e.saturating_add(skew()), c, w]),
+                            );
                         }
                     };
                     let (tally, took) = r.play(
