@@ -3479,7 +3479,8 @@ fn a_screen_lost_after_the_preparation_is_rebuilt() {
 /// The first attempt of a chart's load opens out of its loading state
 /// only once the loading minimum has passed, counted from the loading
 /// state's first presented frame: at the play choice, and at a practice
-/// Start, whose following round opens with no loading state of its own.
+/// Start, whose following round opens with no loading state of its own;
+/// each round's attempt carries its play's number.
 #[test]
 fn the_first_attempt_of_a_load_waits_the_loading_minimum() {
     let floor = game::LOADING_FLOOR.0;
@@ -3514,6 +3515,11 @@ fn the_first_attempt_of_a_load_waits_the_loading_minimum() {
         rig.opened_at[0] - entered >= floor,
         "{:?} from {entered}",
         rig.opened_at
+    ); // The first round, prepared before its play began, and the second,
+    // prepared after, each carry their play's number.
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 2]
     );
 }
 
