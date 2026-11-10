@@ -215,8 +215,8 @@ fn an_image_set_selects_by_value_then_by_ref() {
     let prop = |kind, id| NoteKind::UnsupportedProperty { kind, id };
     for (fields, why) in [
         (
-            r#", "value": 150, "ref": 40"#,
-            prop(PropertyKind::Integer, Some(150)),
+            r#", "value": 154, "ref": 40"#,
+            prop(PropertyKind::Integer, Some(154)),
         ),
         (
             r#", "value": "myscript", "ref": 40"#,

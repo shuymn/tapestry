@@ -357,6 +357,7 @@ fn reader(api: u16) -> Option<(usize, u8)> {
         ("main_state", "option") => Some((1, BOOL)),
         ("main_state", "text") => Some((1, STR)),
         ("main_state", "gauge_type") => Some((0, INT)),
+        ("main_state", "float_number") => Some((1, FLT)),
         _ => None,
     }
 }

@@ -334,6 +334,35 @@ pub(crate) enum Cond {
     Undefined(i32),
 }
 
+/// The current rate's rank bands, 200 (AAA) to 207 (F), as the play
+/// computes them (`rank_1p_aaa`..`rank_1p_f`; `BooleanPropertyFactory.java:
+/// 280-288`, `:587-594` at `0.8.9`).
+const RANK_CURRENT: [&str; 8] = [
+    "rank.current.0",
+    "rank.current.1",
+    "rank.current.2",
+    "rank.current.3",
+    "rank.current.4",
+    "rank.current.5",
+    "rank.current.6",
+    "rank.current.7",
+];
+
+/// The ranks the whole-chart rate reached, 220 (AAA) to 227 (F)
+/// (`rank_aaa`..`rank_f`, `qualifyRank`; `BooleanPropertyFactory.java:
+/// 619-626`). Exact where the source compares in `f32`, as the rank timers
+/// are ([`super::timer::rank_source`]).
+const RANK_WHOLE: [&str; 8] = [
+    "rank.whole.0",
+    "rank.whole.1",
+    "rank.whole.2",
+    "rank.whole.3",
+    "rank.whole.4",
+    "rank.whole.5",
+    "rank.whole.6",
+    "rank.whole.7",
+];
+
 /// A built-in's model expression, described without building it.
 #[derive(Clone, Copy)]
 enum Body {
@@ -422,6 +451,14 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         182 => (Body::Text("chart.judge_class == 2"), false),
         183 => (Body::Text("chart.judge_class == 3"), false),
         184 => (Body::Text("chart.judge_class == 4"), false),
+        200..=207 => (
+            Body::Text(RANK_CURRENT.get(usize::try_from(id - 200).ok()?)?),
+            false,
+        ),
+        220..=227 => (
+            Body::Text(RANK_WHOLE.get(usize::try_from(id - 220).ok()?)?),
+            false,
+        ),
         _ => return None,
     })
 }
@@ -739,8 +776,8 @@ mod tests {
             let scope = skin_model::Scope::new(&skin_model::PLAY);
             assert!(skin_model::compile(&src, &scope, skin_model::Ty::Bool).is_ok());
         }
-        // The rank conditions stay unsupported.
-        for id in [200, 207, 220, 300, 320, 340, 347] {
+        // The ranks' neighbours stay unsupported.
+        for id in [300, 320, 340, 347] {
             assert_eq!(numeric(id, &none), Cond::Unsupported(id));
         }
     }
@@ -757,7 +794,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 86);
+        assert_eq!(exprs.len(), 118);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
@@ -879,7 +916,7 @@ mod tests {
         assert_eq!(numeric(900, &items), Cond::Fold(true));
         assert_eq!(numeric(-900, &items), Cond::Fold(false));
         assert_eq!(numeric(901, &items), Cond::Undefined(901));
-        assert_eq!(numeric(202, &items), Cond::Unsupported(202));
+        assert_eq!(numeric(300, &items), Cond::Unsupported(300));
         // The BGA built-ins win over items declared with their numbers.
         let items = BTreeMap::from([(40, true), (41, true)]);
         assert_eq!(numeric(40, &items), Cond::Unsupported(40));

@@ -366,6 +366,27 @@ pub(crate) enum Value {
     /// information on a direct launch too (`PlayerResource.java:175`,
     /// `song/SongData.java:130-139`, `:219`).
     SongTotal,
+    /// The play's best and target EX scores (`highscore`, 150, and
+    /// `target_score2` and `target_score`, 151 and 121;
+    /// `IntegerPropertyFactory.java:189, 195-196, 618-625` at `0.8.9`): B
+    /// and T, read once per play (docs/stage3.md S10-10).
+    BestEx,
+    TargetEx,
+    /// The current EX score's differences from the best and the target
+    /// paced to the judged targets (`diff_highscore`, 152, and
+    /// `diff_targetscore`, 153; `:197-198`, `:702-710`): the best paced
+    /// linearly where the source follows a stored best play's ghost (G9),
+    /// drawn only while `best.valid` (not for a `#RANDOM` chart, G15).
+    BestDiff,
+    TargetDiff,
+    /// The target's and the best's rates over the attempt's targets,
+    /// whole percent and hundredths (D4; `target_score_rate` 122 and its
+    /// `afterdot` 123, `:190-191`; `best_rate` 183 and its `afterdot` 184,
+    /// `:260-261`): the best's drawn only while `best.valid`.
+    TargetRatePercent,
+    TargetRateFraction,
+    BestRatePercent,
+    BestRateFraction,
     /// A selection number, over the selection schema
     /// ([`super::selection::profile::number`]).
     Selection(SelValue),
@@ -412,6 +433,14 @@ impl Value {
         match self {
             Self::ExScore => "ex_score",
             Self::MaxCombo => "max_combo",
+            Self::BestEx => "best.ex",
+            Self::TargetEx => "target.ex",
+            Self::BestDiff => "best.diff",
+            Self::TargetDiff => "target.diff",
+            Self::TargetRatePercent => "target.rate_bp / 100",
+            Self::TargetRateFraction => "target.rate_bp % 100",
+            Self::BestRatePercent => "best.rate_bp / 100",
+            Self::BestRateFraction => "best.rate_bp % 100",
             Self::Notes => "notes",
             Self::Point => "point",
             Self::GaugePercent => "gauge / 10",
@@ -483,6 +512,7 @@ impl Value {
             Self::Duration | Self::DurationGreen => Some("duration.valid"),
             Self::PlayLevel => Some("chart.level_valid"),
             Self::SongTotal => Some("chart.total_valid"),
+            Self::BestDiff | Self::BestRatePercent | Self::BestRateFraction => Some("best.valid"),
             Self::DurationVariant(n) => DURATION_VARIANTS_VALID.get(usize::from(n / 2)).copied(),
             Self::Selection(v) => Some(v.availability()),
             Self::Result(v) => Some(v.guard),
@@ -515,6 +545,9 @@ impl Value {
             Self::ExScore
                 | Self::MaxCombo
                 | Self::Point
+                | Self::BestEx
+                | Self::TargetEx
+                | Self::TargetDiff
                 | Self::GaugePercent
                 | Self::Count(_)
                 | Self::ScoredPoor
@@ -672,6 +705,14 @@ fn shown(id: i32) -> Option<Value> {
         75 | 105 => Value::MaxCombo,
         74 | 106 => Value::Notes,
         100 => Value::Point,
+        150 => Value::BestEx,
+        151 | 121 => Value::TargetEx,
+        152 => Value::BestDiff,
+        153 => Value::TargetDiff,
+        122 => Value::TargetRatePercent,
+        123 => Value::TargetRateFraction,
+        183 => Value::BestRatePercent,
+        184 => Value::BestRateFraction,
         107 => Value::GaugePercent,
         407 => Value::GaugeTenths,
         102 => Value::CurrentRatePercent,
@@ -1056,7 +1097,7 @@ mod tests {
         assert_eq!(int_by_id(112), IntProp::Shown(Value::Count(2)));
         assert_eq!(int_by_id(9_999), IntProp::Null);
         assert_eq!(int_by_id(0), IntProp::Null);
-        assert_eq!(int_by_id(150), IntProp::Unsupported(Some(150)));
+        assert_eq!(int_by_id(154), IntProp::Unsupported(Some(154)));
         for (id, name, value) in [
             (102, "score_rate", Value::CurrentRatePercent),
             (103, "score_rate_afterdot", Value::CurrentRateFraction),
@@ -1347,6 +1388,8 @@ mod range_tests {
                 // point, whose wrapped terms reach all of `i32`.
                 let least = match v {
                     Value::PlayLevel | Value::RecentTiming => -i64::from(i32::MAX),
+                    // A difference from the best or the target is signed.
+                    Value::BestDiff | Value::TargetDiff => -i64::from(skin_model::MAX_COUNT),
                     Value::Point => i64::from(i32::MIN),
                     _ => 0,
                 };

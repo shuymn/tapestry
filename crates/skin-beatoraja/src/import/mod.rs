@@ -38,8 +38,8 @@ use bms_model::TimeUs;
 use skin_model::{
     Anchor, AngleFollow, Blend, CycleDef, DecisionDefs, DecisionTiming, Ease, ElementDef, Filter,
     Fit, Follow, Grade, KeyDef, LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place,
-    Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind, SelectionDefs, Skin,
-    SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
+    PlayDefs, Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind,
+    SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -495,7 +495,7 @@ pub(crate) struct Cx<'d> {
     /// only when its value is not negative (`SkinImage.java:127-132`).
     /// Cleared after each element.
     value_gate: Option<String>,
-    ranks: [Option<u16>; 3],
+    ranks: [Option<u16>; timer::WHEN_TIMERS],
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
     widgets: WidgetDefs,
@@ -625,7 +625,7 @@ impl<'d> Cx<'d> {
             listings: HashMap::new(),
             number_value: None,
             interference: std::cell::Cell::new(None),
-            ranks: [None; 3],
+            ranks: [None; timer::WHEN_TIMERS],
             elements: Vec::new(),
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
@@ -1160,6 +1160,10 @@ impl<'d> Cx<'d> {
             Object::Judge => self.judge(dst, orec)?,
             Object::Gauge => self.gauge(dst, orec)?,
             Object::Slider => self.slider(dst, orec)?,
+            // A score graph (`type` 110 to 115, `SkinGraph.java:95-106`) is
+            // a ratio bar of the play's score rate; any other type is
+            // dropped as every graph was before.
+            Object::Graph if self.score_graph(orec)? => self.ratio_bar(dst, orec, true)?,
             _ => {
                 self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }
@@ -2151,7 +2155,10 @@ impl<'d> Cx<'d> {
             };
             Skin::new_decision(def, defs)
         } else {
-            Skin::new(def)
+            let widgets = PlayDefs {
+                ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
+            };
+            Skin::new_play(def, widgets)
         };
         let skin = loaded
             .map(|s| s.with_outputs(self.outputs.len()))
