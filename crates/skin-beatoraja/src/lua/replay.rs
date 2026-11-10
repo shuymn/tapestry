@@ -16,7 +16,7 @@
 //! Nothing here runs in an attempt: it exists only with `dev-tools`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use mlua::{Function, Lua, MultiValue, Value};
@@ -250,6 +250,15 @@ pub(crate) struct Frame {
     timers: Vec<i32>,
     state_us: i64,
     perturb: BTreeMap<i32, i32>,
+    /// `number` ids answered as unanswered whatever the host (a test's
+    /// mutation control).
+    deny: BTreeSet<i32>,
+    /// On a frame production builds no play frame for (loading, the
+    /// practice page), the fields its host answers, by slot; `None` on a
+    /// play frame. A read loading any other field, an output or a timer
+    /// operand, its availability guard's included, is unanswered there,
+    /// and so is `timer`.
+    allowed: Option<Vec<bool>>,
     /// Compiled reads by source text: `None` when it does not compile.
     cache: HashMap<String, Option<Program>>,
 }
@@ -261,6 +270,11 @@ impl Frame {
             .entry(src.to_owned())
             .or_insert_with(|| compile(src, &Scope::new(&PLAY), ty).ok())
             .as_ref()?;
+        if let Some(allowed) = &self.allowed
+            && !p.loads_only(&|slot| allowed.get(usize::from(slot)).copied().unwrap_or(false))
+        {
+            return None;
+        }
         Some(p.eval(&State {
             fields: &self.fields,
             timers: &self.timers,
@@ -356,6 +370,28 @@ impl ReferenceVm {
             f.timers.clear();
             f.timers.extend_from_slice(timers);
             f.state_us = state_us;
+            f.allowed = None;
+        }
+    }
+
+    /// Sets a frame production builds no play frame for: the host answers
+    /// only reads that load fields `allowed` accepts (by slot) from
+    /// `fields`, and the state clock; every timer read is unanswered.
+    pub fn set_outside(&self, fields: &[i32], allowed: &[bool], state_us: i64) {
+        if let Some(f) = self.pass.replay.borrow_mut().as_mut() {
+            f.fields.clear();
+            f.fields.extend_from_slice(fields);
+            f.timers.clear();
+            f.state_us = state_us;
+            f.allowed = Some(allowed.to_vec());
+        }
+    }
+
+    /// Makes every later `number(id)` unanswered: a test's mutation
+    /// control.
+    pub fn deny(&self, id: i32) {
+        if let Some(f) = self.pass.replay.borrow_mut().as_mut() {
+            f.deny.insert(id);
         }
     }
 
@@ -570,6 +606,9 @@ pub(super) fn answer(
                 return Some(Err(unanswered()));
             };
             let n = i32::try_from(id).unwrap_or(i32::MAX);
+            if f.deny.contains(&n) {
+                return Some(Err(unanswered()));
+            }
             match int_in(ScreenKind::Play, n) {
                 IntProp::Shown(v) => {
                     let delta = f.perturb.get(&n).copied().unwrap_or(0);
@@ -610,6 +649,7 @@ pub(super) fn answer(
             let t = f.state_us as f64;
             Ok(Value::Number(t))
         }
+        "timer" if f.allowed.is_some() => Err(unanswered()),
         "timer" => {
             let Some(id) = arg(args).and_then(|n| i32::try_from(n).ok()) else {
                 return Some(Err(unanswered()));
