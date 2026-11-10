@@ -828,6 +828,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cancel_while_a_file_is_validated_stops_and_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        png(dir.path(), "a.png", 4, 4);
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        let mut budget = Budget::default();
+        let def = FileDef {
+            path: "a.png".to_owned(),
+            hi: None,
+        };
+        let Ok(Ok(file)) = assets.admit(&mut budget, def) else {
+            panic!("a.png is admitted");
+        };
+        // Cancelled as its pixels are decoded (a judge's slot-6 texture):
+        // the import stops, and the verdict is not cached.
+        assert_eq!(assets.validate(file, &|| true), Err(Invalid::Cancelled));
+        assert_eq!(assets.validate(file, &|| false), Ok(()));
+    }
+
+    #[test]
     fn a_cancel_while_pages_are_validated_stops_and_is_not_kept() {
         let dir = tempfile::tempdir().unwrap();
         let one = "info face=\"t\" size=8 padding=0,0,0,0\n\

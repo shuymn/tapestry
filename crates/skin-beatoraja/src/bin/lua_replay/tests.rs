@@ -223,6 +223,28 @@ fn a_negative_selector_stops_the_conditions() {
     agrees(&control, 1);
 }
 
+/// §7.1's stateless control: a timer that stores nothing, under the same
+/// negative selector, is compiled with the selector as its gate. The
+/// source skips it while the selector is negative, production's program
+/// skips it on those frames too, and both run it once the point reaches
+/// 100 000: the comparison agrees frame by frame.
+#[test]
+fn a_negative_selector_skips_a_stateless_timer() {
+    let body = "skin.imageset = { { id = \"s\", images = { \"i\", \"j\" },\n\
+           value = function() if ms.number(100) < 100000 then return -1 end return 0 end } }\n\
+         table.insert(skin.destination, { id = \"s\", timer = function() return ms.time() end, loop = 2000,\n\
+           dst = { { time = 0, x = 0, y = 0, w = 10, h = 10 }, { time = 2000, x = 100, y = 0, w = 10, h = 10 } } })\n";
+    let r = run(body);
+    agrees(&r, 1);
+    // Skipped on the frames before 100 000 points, run after.
+    assert!(r.production_runs > 0, "{}", r.text(0, true, true));
+    assert!(
+        r.production_runs < 2 * r.frames,
+        "{}",
+        r.text(0, true, true)
+    );
+}
+
 /// R7: a threshold flips on the frame it is crossed, on both sides.
 #[test]
 fn a_threshold_flips_on_one_frame() {
