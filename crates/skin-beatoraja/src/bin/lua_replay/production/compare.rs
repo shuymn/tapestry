@@ -10,7 +10,7 @@ use skin_beatoraja::lua::replay::{LoweredRecord, Occurrence};
 use skin_beatoraja::lua::survey::Became;
 use skin_model::present::trace::{Converted, Event, Skip};
 use skin_model::present::{Fail, Val};
-use skin_model::{MAX_ELAPSED_MS, PLAY, Program, Scope, State, Ty, compile, field};
+use skin_model::{MAX_ELAPSED_MS, PLAY, Program, Scope, State, Ty, compile};
 
 use super::{FrameKind, ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
@@ -205,26 +205,6 @@ fn lowered_differ(
             (got != want).then(|| format!("lowered: production {got}, reference {want} ({r:?})"))
         }
     }
-}
-
-/// `fields` with the score data's three fields set to `s`: the state the
-/// reference host answered the score properties from (s7-06e-3-design.md
-/// §2a, the causation check).
-fn with_score(fields: &[i32], s: [i32; 3]) -> Vec<i32> {
-    let mut out = fields.to_vec();
-    for (slot, v) in [
-        field::EX_SCORE,
-        field::RATE_CURRENT_BP,
-        field::RATE_WHOLE_BP,
-    ]
-    .into_iter()
-    .zip(s)
-    {
-        if let Some(c) = out.get_mut(usize::from(slot)) {
-            *c = v;
-        }
-    }
-    out
 }
 
 /// An occurrence's identity as the comparator joins on it: destination,
@@ -591,10 +571,6 @@ fn place(kind: FrameKind) -> String {
     }
 }
 
-/// The bucket of a lowered consumer's disagreement the score data alone
-/// explains (design.md "Differences from the source").
-const SCORE_DIFFERENCE: &str = "score readings across rounds (difference)";
-
 /// A key for findings no occurrence names.
 const UNKNOWN: Key = Key {
     dest: usize::MAX,
@@ -894,8 +870,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 }
                 // A lowered occurrence: its expression on this frame's
                 // production state against the closure (s7-06e-3-design.md
-                // §2), a disagreement attributed to the score data only when
-                // the score fields alone explain it (§2a).
+                // §2); a disagreement is a finding.
                 if let Some(o) = lowered_rec {
                     let expr = lowered.entry(join(&key)).or_insert_with(|| {
                         o.lowered
@@ -918,23 +893,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                             *rep.lowered.entry((label, key.field)).or_default() += 1;
                             continue;
                         };
-                        let explained = match pf.score {
-                            Some(s) if pf.zero_tally => lowered_differ(
-                                key.field,
-                                e,
-                                &with_score(&pf.fields, s),
-                                &pf.timers,
-                                outcome,
-                            )
-                            .is_none(),
-                            _ => false,
-                        };
-                        if explained {
-                            *rep.buckets.entry(SCORE_DIFFERENCE.to_owned()).or_default() += 1;
-                            *rep.score_difference.entry(round + 1).or_default() += 1;
-                        } else {
-                            find(key, i, d);
-                        }
+                        find(key, i, d);
                     }
                     continue;
                 }
@@ -1946,10 +1905,10 @@ mod tests {
         });
     }
 
-    /// s7-06e-3-design.md W11: a wrong lowered expression reading the
-    /// score on a later round's READY stays a finding: substituting the
-    /// carried score data does not make `max(ex_score, 1)` agree with the
-    /// closure's 0 (zero-score: R2 READY carries EX 0).
+    /// A wrong lowered expression reading the score on a later round's
+    /// READY is a finding: `max(ex_score, 1)` against the closure's 0
+    /// (zero-score: R2 READY carries EX 0), compared directly
+    /// (s7-06s-design.md S8).
     #[test]
     fn a_wrong_score_expression_stays_a_finding() {
         use crate::script::Script;
@@ -1985,7 +1944,67 @@ mod tests {
             r.text(0, true, true)
         );
         assert!(
-            !r.score_difference.contains_key(&2),
+            r.buckets.keys().all(|b| !b.contains("score")),
+            "{}",
+            r.text(0, true, true)
+        );
+    }
+
+    /// s7-06s S8: the old fresh score fields on a carried round's READY,
+    /// injected after the record loop's self-check, are a lowered finding
+    /// there, never an attribution: the comparator holds no waiver for the
+    /// score readings across rounds (Rm's `getDummyNumber` shape).
+    #[test]
+    fn stale_score_fields_on_a_carried_frame_are_found() {
+        use crate::script::Script;
+        use crate::tests::pieces_over;
+        use skin_model::field;
+        let body = "skin.value = { { id = \"s\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+               value = function() if ms.number(101) < 1 then return 0 else return ms.number(101) end end } }\n\
+             table.insert(skin.destination, { id = \"s\", dst = { { x = 0, y = 0, w = 60, h = 6 } } })\n";
+        let (run, obs) = pieces_over(body, Script::rounds());
+        let clean = compare(&run, &obs, &[]);
+        assert!(
+            clean
+                .findings
+                .iter()
+                .all(|f| !f.place.starts_with("round 2 ")),
+            "{}",
+            clean.text(0, true, true)
+        );
+        let (mut run, obs) = pieces_over(body, Script::rounds());
+        let i = run
+            .frames
+            .iter()
+            .position(|f| {
+                matches!(
+                    f.kind,
+                    super::super::FrameKind::Play {
+                        round: 1,
+                        stage: super::super::Stage::Ready,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let f = &mut run.frames[i];
+        for (slot, v) in [
+            (field::EX_SCORE, 0),
+            (field::RATE_CURRENT_BP, 10_000),
+            (field::RATE_WHOLE_BP, 0),
+        ] {
+            f.fields[usize::from(slot)] = v;
+        }
+        let r = compare(&run, &obs, &[]);
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.place == "round 2 ready" && f.what.starts_with("lowered:")),
+            "{}",
+            r.text(0, true, true)
+        );
+        assert!(
+            r.buckets.keys().all(|b| !b.contains("score")),
             "{}",
             r.text(0, true, true)
         );

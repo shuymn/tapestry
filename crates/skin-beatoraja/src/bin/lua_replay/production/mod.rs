@@ -31,6 +31,26 @@ thread_local! {
     pub static SCORE_SKEW: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether a test drops the carried score data from each round's
+    /// offer: a wrong model of the player's carry, which the record loop
+    /// must refuse at a carried round's first frame.
+    pub static DROP_SCORE_CARRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The round's offer: the model's, its score data dropped by a test.
+fn offer(model: &Model) -> skin_model::Continuation<'_> {
+    let offer = model.offer();
+    #[cfg(test)]
+    if DROP_SCORE_CARRY.with(std::cell::Cell::get)
+        && let skin_model::Continuation::Carried { bank, .. } = offer
+    {
+        return skin_model::Continuation::Carried { score: None, bank };
+    }
+    offer
+}
+
 /// The score input's EX-score offset: a test's, else 0.
 fn skew() -> i32 {
     #[cfg(test)]
@@ -100,10 +120,6 @@ pub(in crate::production) struct FrameTrace {
     /// read (empty off play).
     pub(in crate::production) fields: Vec<i32>,
     pub(in crate::production) timers: Vec<i32>,
-    /// The play state's score data as the reference host answers it.
-    pub(in crate::production) score: Option<[i32; 3]>,
-    /// Whether the round has no judgment yet (its tally the zero tally).
-    pub(in crate::production) zero_tally: bool,
 }
 
 /// One round as production played it: what it took over and the witness
@@ -274,8 +290,6 @@ pub fn record(
                             kind: FrameKind::Loading,
                             fields: Vec::new(),
                             timers: Vec::new(),
-                            score: None,
-                            zero_tally: true,
                         });
                         t += STEP;
                     }
@@ -284,7 +298,7 @@ pub fn record(
                 Phase::Page { len_us } => {
                     let mut fields = vec![0; field::COUNT];
                     if let Some(p) = fields.get_mut(usize::from(field::POINT)) {
-                        *p = model.point();
+                        *p = model.score().map_or(0, |s| s.point);
                     }
                     let mut t = 0;
                     while t < *len_us {
@@ -303,8 +317,6 @@ pub fn record(
                             kind: FrameKind::Page,
                             fields: Vec::new(),
                             timers: Vec::new(),
-                            score: score.get(),
-                            zero_tally: true,
                         });
                         t += STEP;
                     }
@@ -341,12 +353,17 @@ pub fn record(
                     };
                     let carried = model.carried(carry_safe);
                     let mut play = skin
-                        .prepare_carried(&chart, &ctx, model.offer())
+                        .prepare_carried(&chart, &ctx, offer(&model))
                         .map_err(|e| format!("prepare: {e:?}"))?;
                     let round = rounds.len();
                     let mut rearmed = false;
                     let base = clock;
                     let targets = skin_model::attempt_targets(&chart, &ctx.attempt);
+                    let fresh = skin_model::score_fields(
+                        &eval::Tally::default(),
+                        targets,
+                        ctx.empty_poor_counted,
+                    );
                     let judged = |t: &eval::Tally| {
                         if *t != eval::Tally::default() {
                             score.set(
@@ -400,17 +417,21 @@ pub fn record(
                             let fields = s.fields.get(..field::COUNT).unwrap_or(s.fields);
                             let outs = s.fields.get(field::COUNT..).unwrap_or_default().to_vec();
                             // The score input is the source's score data:
-                            // once the round has a judgment it must be the
-                            // frame's own score fields (s7-06e-3-design.md
-                            // §2a), else the harness's model is wrong.
-                            let zero_tally = *st.ev.tally() == eval::Tally::default();
+                            // on every play frame production's score fields
+                            // must be it, the carried data before the
+                            // round's first judgment included, and before
+                            // the play state's first judgment the round's
+                            // own for no judgment (s7-06s-design.md §2.5);
+                            // else the harness's model or production's carry
+                            // is wrong.
+                            let want = score.get().or(fresh);
                             let own = [
                                 field::EX_SCORE,
                                 field::RATE_CURRENT_BP,
                                 field::RATE_WHOLE_BP,
                             ]
                             .map(|f| fields.get(usize::from(f)).copied().unwrap_or(0));
-                            if !zero_tally && score.get() != Some(own) {
+                            if want != Some(own) {
                                 return Err(format!(
                                     "score input {:?} differs from the frame's {own:?} at {}",
                                     score.get(),
@@ -441,8 +462,6 @@ pub fn record(
                                 },
                                 fields: fields.to_vec(),
                                 timers: s.timers.to_vec(),
-                                score: score.get(),
-                                zero_tally,
                             });
                             Ok(())
                         },
@@ -453,7 +472,7 @@ pub fn record(
                         slots_run: carry.slots_run,
                         terminal: carry.terminal,
                     });
-                    model.settle(&tally, &carry);
+                    model.settle(&tally, &carry, ctx.empty_poor_counted);
                     slots = play.state().timers.len();
                     clock = base + took;
                 }
