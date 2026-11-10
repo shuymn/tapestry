@@ -4,7 +4,7 @@
 //! speed, the only point that holds them (design.md "Practice Speed
 //! Changes").
 
-use crate::{Chart, Lane, NoteKind, Tempo, TimeUs};
+use crate::{Chart, Lane, NoteKind, Tempo, TimeUs, TimelineId};
 
 /// The note categories of a second, in [`ChartProfile::seconds`]' order.
 pub const NOTE_CATEGORIES: usize = 7;
@@ -25,9 +25,6 @@ pub const KEY_LONG_BODY: usize = 4;
 pub const KEY_TAP: usize = 5;
 /// A mine, scratch or key.
 pub const MINE: usize = 6;
-
-/// The shortest STOP that stops the speed rows: one whole ms.
-const STOP_ROW_US: i64 = 1_000;
 
 /// One tempo row of [`ChartProfile::speeds`]: from `ms`, the chart's 1×
 /// time in whole ms truncated, the chart scrolls at `tempo`, or stands
@@ -51,16 +48,18 @@ pub struct ChartProfile {
 
 impl ChartProfile {
     /// The profile of `chart`, whose times must be its 1× times and whose
-    /// `meta.length` its summary's length.
+    /// `meta.length` its summary's length. `long_stops` are the rows, in
+    /// order, where a STOP of at least 1 ms starts: its own length
+    /// truncated to µs, which the rows' floored times cannot give.
     #[must_use]
-    pub fn of(chart: &Chart) -> Self {
+    pub fn of(chart: &Chart, long_stops: &[TimelineId]) -> Self {
         let seconds = seconds(chart);
         let (bins, bin_seconds) = condense(&seconds);
         Self {
             seconds,
             bins,
             bin_seconds,
-            speeds: speeds(chart),
+            speeds: speeds(chart, long_stops),
         }
     }
 
@@ -93,7 +92,8 @@ impl ChartProfile {
     /// The tempo rows, in time order: the initial tempo at 0; at each
     /// point (a note's head or end, a BGM event, a tempo change, a STOP's
     /// start or a bar line, never a STOP's end) a stopped row where a STOP
-    /// of at least 1 ms starts unless already stopped, otherwise a row
+    /// of at least 1 ms starts (one of the `long_stops` given to
+    /// [`of`](Self::of)) unless already stopped, otherwise a row
     /// where the tempo differs from the current one; and the current tempo
     /// at the last point unless a row is already there.
     #[must_use]
@@ -178,7 +178,7 @@ fn ms_of(t: TimeUs) -> u32 {
     u32::try_from(t.0.max(0) / 1_000).unwrap_or(u32::MAX)
 }
 
-fn speeds(chart: &Chart) -> Vec<SpeedRow> {
+fn speeds(chart: &Chart, long_stops: &[TimelineId]) -> Vec<SpeedRow> {
     let points = chart.timeline.points();
     let mut current = Some(chart.timeline.meta().initial);
     let mut rows = vec![SpeedRow {
@@ -193,12 +193,9 @@ fn speeds(chart: &Chart) -> Vec<SpeedRow> {
         if prev.is_some_and(|q| q.pos == p.pos && q.at < p.at) {
             continue;
         }
-        let stop = points
-            .get(i + 1)
-            .filter(|q| q.pos == p.pos && q.at > p.at)
-            .map_or(0, |q| q.at.0 - p.at.0);
+        let id = TimelineId(u32::try_from(i).unwrap_or(u32::MAX));
         let ms = ms_of(p.at);
-        if stop >= STOP_ROW_US {
+        if long_stops.binary_search(&id).is_ok() {
             if current.is_some() {
                 current = None;
                 rows.push(SpeedRow { ms, tempo: None });

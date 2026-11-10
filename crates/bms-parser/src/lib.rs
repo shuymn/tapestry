@@ -417,6 +417,7 @@ fn build(
             e => LoadError::Model(e),
         })
     };
+    let long_stops = std::mem::take(&mut timeline.long_stops);
     let real_scroll = timeline.real.take();
     let real_rows = timeline.real_rows.take();
     let scroll = compile(timeline.initial_rate, timeline.segments)?;
@@ -451,7 +452,8 @@ fn build(
         .map_err(|e| LoadError::Links(Box::new(e)))?;
     chart.meta.length = bms_model::ChartSummary::of(&chart).length;
     // Before the remap below: the only point that holds the 1× times.
-    let profile = ChartProfile::of(&chart);
+    let profile = ChartProfile::of(&chart, &long_stops);
+    drop(long_stops);
     if files.is_some() {
         chart.identity.resolved_hash = hash::resolved_hash(&chart);
         chart.identity.played_hash = chart.identity.resolved_hash;

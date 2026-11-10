@@ -97,8 +97,10 @@ fn notes_count_in_their_1x_seconds_whatever_the_speed() {
 
 /// `⌊length / 1 s⌋ + 2` seconds: up to 512 a bin is one second; a chart
 /// whose last note is at 510 s has 512, one past it (511 s) 513, in bins
-/// of 2 s, 257 of them, each its fullest second's counts (the earliest on
-/// a tie), not their sum.
+/// of 2 s, 257 of them, each its fullest second's counts over every
+/// category (the earliest on a tie), not their sum: two mines outweigh a
+/// tap, and two long-note bodies a tap, though the tap's second holds more
+/// taps.
 #[test]
 fn past_512_seconds_a_bin_takes_its_fullest_second() {
     let at_510 = load("#BPM 120\n#25511:01\n");
@@ -108,10 +110,16 @@ fn past_512_seconds_a_bin_takes_its_fullest_second() {
     assert_eq!(at_510.bins()[510], [0, 0, 0, 0, 0, 1, 0]);
 
     // Second 0: a key tap; second 1: a scratch tap (a tie, the earliest
-    // wins). Second 2: one key tap; second 3: two (the fullest).
+    // wins). Second 2: one key tap; second 3: two (the fullest). Second 4:
+    // a key tap; second 5: two mines. Seconds 9 and 10: a scratch and a
+    // key long note from 9.5 s to 10.5 s, their heads in second 9, their
+    // bodies alone in second 10; second 11: a tap.
     let at_511 = load(
-        "#BPM 120\n#00011:01000000\n#00016:00000100\n\
-         #00112:01000000\n#00113:00000100\n#00114:00000001\n#25511:0001\n",
+        "#BPM 120\n#LNTYPE 1\n#00011:01000000\n#00016:00000100\n\
+         #00112:01000000\n#00113:00000100\n#00114:00000001\n\
+         #00215:01000000\n#002D1:00000100\n#002D2:00000100\n\
+         #00456:00000001\n#00453:00000001\n#00556:00010000\n#00553:00010000\n\
+         #00514:00000100\n#25511:0001\n",
     );
     assert_eq!(at_511.seconds().len(), 513);
     assert_eq!(at_511.bin_seconds(), 2);
@@ -119,9 +127,12 @@ fn past_512_seconds_a_bin_takes_its_fullest_second() {
     let bins = at_511.bins();
     assert_eq!(bins[0], [0, 0, 0, 0, 0, 1, 0]);
     assert_eq!(bins[1], [0, 0, 0, 0, 0, 2, 0]);
+    assert_eq!(bins[2], [0, 0, 0, 0, 0, 0, 2]);
+    assert_eq!(bins[4], [1, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(bins[5], [0, 1, 0, 0, 1, 0, 0]);
     assert_eq!(bins[255], [0, 0, 0, 0, 0, 1, 0]);
     let drawn = bins.iter().filter(|b| b.iter().any(|&c| c > 0)).count();
-    assert_eq!(drawn, 3);
+    assert_eq!(drawn, 6);
 }
 
 /// A STOP of 2 ms and a change to 240 BPM at one point give only the
@@ -134,7 +145,9 @@ fn a_stop_with_a_tempo_change_gives_only_the_stopped_row() {
 }
 
 /// A STOP below 1 ms is no stop: with a change at its point, the tempo's
-/// row (500 µs); alone, no row at all (999 µs).
+/// row (500 µs); alone, no row at all (999 µs), even from a fractional
+/// start whose floored end lies 1 000 µs after its floored start (999.5 µs
+/// from 666 666⅔ µs at 180 BPM).
 #[test]
 fn a_sub_ms_stop_stops_nothing() {
     let with_change =
@@ -145,6 +158,22 @@ fn a_sub_ms_stop_stops_nothing() {
     );
     let alone = load("#BPM 120\n#STOP01 0.095904\n#00011:01000001\n#00009:00000100\n");
     assert_eq!(rows(&alone), [(0, bpm(120)), (1_500, bpm(120))]);
+    let fractional = load_at(
+        "#BPM 180\n#STOP01 0.143928\n#00011:01000001\n#00009:00000100\n",
+        20,
+    );
+    let points: Vec<i64> = fractional
+        .chart
+        .timeline
+        .points()
+        .iter()
+        .map(|p| p.at.0)
+        .collect();
+    assert_eq!(points, [0, 666_666, 667_666, 1_000_999]);
+    assert_eq!(
+        rows(&fractional.profile),
+        [(0, bpm(180)), (1_000, bpm(180))]
+    );
 }
 
 /// A STOP of 500 ms from 1.5 s: its end (2.0 s) is no point, so the speed

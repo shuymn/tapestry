@@ -104,6 +104,11 @@ pub struct Timeline {
     pub real_rows: Option<Vec<TimeUs>>,
     /// Each bar line's row, beside `bar_lines`.
     pub bar_ids: Vec<TimelineId>,
+    /// The rows where a STOP of at least 1 000 µs starts, its exact length
+    /// truncated to µs (a whole ms, as the source's STOP is), in row order:
+    /// the floored times around a fractional start cannot tell 999.5 µs
+    /// from 1 000.
+    pub long_stops: Vec<TimelineId>,
     /// The tempo of the `#BPM` header, or the default.
     pub initial_tempo: Tempo,
     /// The scroll rate before time 0, from the `#BPM` header.
@@ -326,6 +331,7 @@ pub fn compute(
         rows: Vec::with_capacity(charge.rows),
         real_rows: real.as_ref().map(|_| Vec::with_capacity(charge.rows)),
         bar_ids: Vec::with_capacity(charge.bars),
+        long_stops: Vec::new(),
         initial_tempo,
         initial_rate,
         segments: vec![first(initial_rate)],
@@ -498,6 +504,9 @@ pub fn compute(
             let stop = segment(&here, &us_per_beat, 0).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, stop);
             let length = units * &us_per_beat / BigInt::from(STOP_UNITS_PER_BEAT);
+            if length >= int(1_000) {
+                timeline.long_stops.push(id);
+            }
             time.add(&length, max_bits).map_err(|()| overflow())?;
             let (end, remainder) = to_micros(&time, &cap, measure)?;
             let change = Change {
