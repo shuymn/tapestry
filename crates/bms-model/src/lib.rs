@@ -13,6 +13,7 @@ mod chart;
 mod clock;
 mod error;
 mod presentation;
+mod profile;
 mod scroll;
 mod speed;
 mod timeline;
@@ -24,6 +25,10 @@ pub use chart::{
 };
 pub use clock::{TimeSource, VirtualClock};
 pub use error::{EndpointLocation, EndpointPart, ModelError, PresentationError};
+pub use profile::{
+    ChartProfile, KEY_LONG_BODY, KEY_LONG_HEAD, KEY_TAP, MINE, NOTE_BINS, NOTE_CATEGORIES,
+    SCRATCH_LONG_BODY, SCRATCH_LONG_HEAD, SCRATCH_TAP, SpeedRow,
+};
 pub use scroll::{BEAT, DOMAIN, FRAC_BITS, Position, ScrollChange, ScrollMap, ScrollSegment};
 pub use speed::Speed;
 pub use timeline::{
