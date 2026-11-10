@@ -151,6 +151,17 @@ pub(crate) fn resolve(dir: &str, name: &str) -> String {
     Root::normalise(&joined).unwrap_or(joined)
 }
 
+/// Why a file did not prove to decode ([`Assets::validate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Invalid {
+    /// It does not decode.
+    Fails,
+    /// Only this importer refuses it (a cap): the source may decode it.
+    Refused,
+    /// The import was cancelled.
+    Cancelled,
+}
+
 /// Why an asset request stopped the import: an aggregate limit, or a
 /// cancellation, which no cache keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,6 +507,17 @@ impl Assets {
         Ok(result)
     }
 
+    /// Whether admitted file `file` decodes completely
+    /// ([`SheetBuilder::validate_file`]), `cancel` asked as it goes.
+    pub(crate) fn validate(&self, file: u32, cancel: &dyn Fn() -> bool) -> Result<(), Invalid> {
+        match self.builder.validate_file(file, cancel) {
+            Ok(()) => Ok(()),
+            Err(None) => Err(Invalid::Cancelled),
+            Err(Some(e)) if refused(&e) => Err(Invalid::Refused),
+            Err(Some(_)) => Err(Invalid::Fails),
+        }
+    }
+
     /// The error a failed file was cached with, taken: a critical user
     /// refuses the import with it.
     pub(crate) fn take_error(&mut self, path: &str) -> Option<ImageError> {
@@ -803,6 +825,25 @@ mod tests {
         assert_eq!(assets.fnt_file(&mut budget, "p.fnt", &|| false), Ok(Ok(0)));
         assert_eq!((budget.usage.images, budget.usage.file_attempts), (2, 3));
         assert_eq!((budget.usage.fonts, budget.usage.glyphs), (1, 2));
+    }
+
+    #[test]
+    fn a_cancel_while_a_file_is_validated_stops_and_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        png(dir.path(), "a.png", 4, 4);
+        let mut assets = Assets::new(&Root::new(dir.path()).unwrap());
+        let mut budget = Budget::default();
+        let def = FileDef {
+            path: "a.png".to_owned(),
+            hi: None,
+        };
+        let Ok(Ok(file)) = assets.admit(&mut budget, def) else {
+            panic!("a.png is admitted");
+        };
+        // Cancelled as its pixels are decoded (a judge's slot-6 texture):
+        // the import stops, and the verdict is not cached.
+        assert_eq!(assets.validate(file, &|| true), Err(Invalid::Cancelled));
+        assert_eq!(assets.validate(file, &|| false), Ok(()));
     }
 
     #[test]

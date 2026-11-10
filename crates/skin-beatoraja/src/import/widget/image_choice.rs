@@ -33,8 +33,13 @@ use crate::error::ImportError;
 /// An image set's selector as the source resolves it: its `value` through
 /// the value-property factory, else its `ref` as an image-index property.
 pub(in super::super) enum SetSelector {
-    /// A selector the model runs.
-    Expr { src: String, deviates: bool },
+    /// A selector the model runs, and the availability its value waits
+    /// for, which the source does not ([`ScheduleWhy::Availability`](super::super::report::ScheduleWhy)).
+    Expr {
+        src: String,
+        deviates: bool,
+        guard: Option<&'static str>,
+    },
     /// Neither resolves: entry 0.
     Null,
     /// A property the model has no value for.
@@ -70,6 +75,7 @@ pub(in super::super) fn set_selector(kind: ScreenKind, value: &Prop, r: i32) -> 
         IntProp::Shown(v) => SetSelector::Expr {
             src: value_selector(v),
             deviates: value_deviates(v),
+            guard: v.availability(),
         },
         IntProp::Unsupported(id) => SetSelector::Unsupported {
             why: NoteKind::UnsupportedProperty {
@@ -94,6 +100,7 @@ pub(in super::super) fn set_selector(kind: ScreenKind, value: &Prop, r: i32) -> 
             p => SetSelector::Expr {
                 src: p.selector().unwrap_or("0").to_owned(),
                 deviates: p.deviates(),
+                guard: None,
             },
         },
     }

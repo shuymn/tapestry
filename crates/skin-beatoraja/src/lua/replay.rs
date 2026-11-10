@@ -175,6 +175,8 @@ pub(super) fn record(arena: &Arena, an: &Analysis) {
                 match u {
                     Unused::Dropped => "dropped",
                     Unused::FoldedFalse => "folded",
+                    Unused::Removed => "removed",
+                    Unused::Inert => "inert",
                 },
             )
         })

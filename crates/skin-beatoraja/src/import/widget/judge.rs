@@ -26,6 +26,7 @@ use super::super::track::{self, Stretch};
 use super::super::{Common, Cx, Dst, Opts};
 use super::number;
 use crate::error::ImportError;
+use crate::import::prepare::{Load, Prepare};
 
 #[cfg(test)]
 thread_local! {
@@ -112,7 +113,10 @@ impl Cx<'_> {
             Some(f) => self.def.bool(f, "shift")?,
             None => false,
         };
-        // The outer destination: lifetime, timer and conditions.
+        // The outer destination: lifetime, timer and conditions, its
+        // callbacks run only once a judgment exists
+        // (`SkinJudge.java:98-103`).
+        self.prepare = Prepare::JudgeOuter;
         let Some(c) = self.common_with(
             role,
             &dst,
@@ -126,6 +130,26 @@ impl Cx<'_> {
             return Ok(());
         };
 
+        // Whether the source has a slot-6 part, which takes PERFECT at a
+        // full gauge from slot 0 (`SkinJudge.java:107-109`,
+        // `JsonPlaySkinObjectLoader.java:230-239`): whether its texture
+        // loads, whatever the import makes of its track.
+        let full_part = match images.get(JudgeSlot::PerfectAtMax.index()) {
+            Some(&g) => match self.read_nested(g)?.0 {
+                Some(id) => match self.image_rec(&id)? {
+                    Some(img) => match self.texture(img, true, at)? {
+                        Load::Loads => Some(true),
+                        Load::Absent => Some(false),
+                        // Neither is assumed: PERFECT's parts follow their
+                        // role ([`Prepare::before`]).
+                        Load::Unknown => None,
+                    },
+                    None => Some(false),
+                },
+                None => Some(false),
+            },
+            None => Some(false),
+        };
         let mut grades: [Option<PendingGrade>; JudgeSlot::COUNT] = Default::default();
         if images.len() > JudgeSlot::COUNT {
             self.ignored(at, NoteKind::Ignored { field: "images" });
@@ -141,6 +165,10 @@ impl Cx<'_> {
                 continue;
             };
             if let Some(slot) = grades.get_mut(k) {
+                // Only the selected grade prepares (`SkinJudge.java:105-116`).
+                if let Some(&s) = JudgeSlot::ALL.get(k) {
+                    self.prepare = Prepare::JudgeGrade { slot: s, full_part };
+                }
                 #[cfg(feature = "dev-tools")]
                 {
                     self.part_path = format!("def.images.{}", k + 1);
@@ -174,6 +202,8 @@ impl Cx<'_> {
             let Some(value) = self.value_rec(&id)? else {
                 continue;
             };
+            // Prepared only when its grade drew (`SkinJudge.java:122-126`).
+            self.prepare = Prepare::JudgeCombo;
             #[cfg(feature = "dev-tools")]
             {
                 self.part_path = format!("def.numbers.{}", k + 1);
