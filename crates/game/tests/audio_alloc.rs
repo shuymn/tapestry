@@ -1,6 +1,7 @@
-//! The audio thread neither allocates nor frees across retries, loads and
-//! practice rounds' restores: each play's command queue and restore, and
-//! each bank a load replaces, go back to the game thread to be dropped
+//! The audio thread neither allocates nor frees across retries, loads,
+//! practice rounds' restores and the decision tone: each play's command
+//! queue and restore, and each bank a load replaces, go back to the game
+//! thread to be dropped
 //! there, and the control messages travel through a preallocated queue. Only the audio loop's steps are counted
 //! (see `counting`); this file holds a single test. Profiles and the
 //! positive control: design.md "Scope of No Allocation".
@@ -140,6 +141,16 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         n += 1;
         assert!(n < 200, "never done");
     }
+    assert_eq!(counting::calls(), 0);
+    // The decision tone: its first start, a start again while it sounds,
+    // and the steps it sounds through, each start taken in the worker's
+    // control step: nothing allocated or freed.
+    control.play_tone();
+    steps(&mut worker, 5);
+    assert!(worker.engine().tone_sounding());
+    control.play_tone();
+    steps(&mut worker, 80);
+    assert!(!worker.engine().tone_sounding());
     assert_eq!(counting::calls(), 0);
     // Three gated practice attempts with one rearm each, the game thread
     // taking back none of the restores the rearms replace: the first fills
