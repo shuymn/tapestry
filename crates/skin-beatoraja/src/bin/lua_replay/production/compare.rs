@@ -680,16 +680,18 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 // expected, and each source invocation is the `outside`
                 // bucket's; a stopped slotted root is a finding, any other
                 // stopped root needs a reviewed entry (O1).
-                // A sample of a timer outside the program's slots is the
-                // loading frame's own (its built-in and `when` timers).
+                // A loading frame builds the skin's loading state, so a
+                // sample of a timer outside the program's slots is its own
+                // (its built-in and `when` timers); a page builds nothing.
                 let program_slot = |slot: usize| run.timer_slots.values().any(|&s| s == slot);
+                let loading = matches!(pf.kind, FrameKind::Loading);
                 for e in &pf.events {
                     let k = match *e {
                         Event::Ran { k, .. }
                         | Event::Skipped { k, .. }
                         | Event::Timer { k, .. } => key_k(k),
-                        Event::Sampled { slot, .. } if program_slot(slot) => UNKNOWN,
-                        Event::Sampled { .. } => continue,
+                        Event::Sampled { slot, .. } if loading && !program_slot(slot) => continue,
+                        Event::Sampled { .. } => UNKNOWN,
                     };
                     find(k, i, "production event on an outside frame".into());
                 }
@@ -1754,12 +1756,21 @@ mod tests {
                 },
             );
         };
-        // A production event on an outside frame.
+        // A production event on an outside frame, and a sample on a page
+        // (a page builds nothing, so even a built-in timer's is one).
         found("production event on an outside frame", &|run, _| {
             run.frames[0].events.push(Event::Skipped {
                 k: 0,
                 why: Skip::Gate,
             });
+        });
+        found("production event on an outside frame", &|run, _| {
+            let f = run
+                .frames
+                .iter_mut()
+                .find(|f| matches!(f.kind, FrameKind::Page))
+                .unwrap();
+            f.events.push(Event::Sampled { slot: 0, age_us: 0 });
         });
         // `SlotsOff` on a fresh round, and on a valid carry-safe one.
         for round in [0, 1] {
