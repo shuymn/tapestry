@@ -2359,6 +2359,26 @@ impl Skin {
         format!("{:?}", self.present)
     }
 
+    /// Whether the presentation program's slotted callbacks may run on a
+    /// carried state ([`Present::carry_safe`](crate::present::Present::carry_safe));
+    /// true without a program (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn program_carry_safe(&self) -> bool {
+        self.present
+            .as_ref()
+            .is_none_or(crate::present::Present::carry_safe)
+    }
+
+    /// Per program callback, whether it loads or stores a slot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn program_slotted(&self) -> Vec<bool> {
+        self.present
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.slotted().to_vec())
+    }
+
     /// The lanes' bar groups: the groups a [`Play`] from
     /// [`prepare`](Self::prepare) holds work for.
     #[must_use]

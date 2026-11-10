@@ -7,6 +7,7 @@
 //! reference gets only the frames' inputs ([`FrameInputs`]).
 
 pub mod compare;
+pub mod continuation;
 
 use std::collections::BTreeMap;
 
@@ -15,11 +16,55 @@ use skin_beatoraja::lua::replay::Recorded;
 use skin_model::present::trace::{self, Event};
 use skin_model::{
     AtlasLimits, Attempt, ChartMetadata, CoverSettings, FrameReadouts, Gain, GaugeDesc, LaneView,
-    Layout, PlayContext, QuadBatch, Side, Skin, SkinFrame, Variant, field,
+    Layout, LoadState, LoadingField, LoadingFrame, PlayContext, QuadBatch, Side, Skin, SkinFrame,
+    Variant, field, loading_field,
 };
 
+use self::continuation::{Carried, Model};
 use crate::inputs::FrameInputs;
-use crate::script::{STATE_AT_ZERO, Script};
+use crate::script::{End, Phase, STEP, Script};
+
+/// Where a play frame stands in its round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    Ready,
+    RearmedReady,
+    Play,
+    Tail,
+    Failed,
+    Closing,
+}
+
+/// What a frame is: a play frame of a round, or a frame production
+/// builds no play frame for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::production) enum FrameKind {
+    Play {
+        round: usize,
+        stage: Stage,
+        carried: Carried,
+    },
+    Loading,
+    Page,
+}
+
+impl FrameKind {
+    /// The label a report counts the frame under.
+    pub(in crate::production) fn label(self) -> &'static str {
+        match self {
+            Self::Play { stage, .. } => match stage {
+                Stage::Ready => "ready",
+                Stage::RearmedReady => "rearmed ready",
+                Stage::Play => "play",
+                Stage::Tail => "tail",
+                Stage::Failed => "failed",
+                Stage::Closing => "closing",
+            },
+            Self::Loading => "loading",
+            Self::Page => "page",
+        }
+    }
+}
 
 /// One frame's trace. Its fields, and [`ProductionRun`]'s, are
 /// `pub(in crate::production)`: readable here and in [`compare`] only, as
@@ -31,6 +76,16 @@ pub(in crate::production) struct FrameTrace {
     /// The program's output cells after the build: callback `k`'s value
     /// at `2k`, whether it gave one at `2k + 1`, as expressions read them.
     pub(in crate::production) outs: Vec<i32>,
+    pub(in crate::production) kind: FrameKind,
+}
+
+/// One round as production played it: what it took over and the witness
+/// its `Play` showed at its end.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::production) struct RoundTrace {
+    pub(in crate::production) carried: Carried,
+    pub(in crate::production) slots_run: bool,
+    pub(in crate::production) terminal: bool,
 }
 
 /// What production did, owned and unreadable outside this module.
@@ -43,6 +98,10 @@ pub struct ProductionRun {
     pub(in crate::production) callbacks: usize,
     /// The program's structure ([`skin_model::Skin::program_structure`]).
     pub(in crate::production) structure: String,
+    /// Per callback, whether it loads or stores a slot.
+    pub(in crate::production) slotted: Vec<bool>,
+    pub(in crate::production) carry_safe: bool,
+    pub(in crate::production) rounds: Vec<RoundTrace>,
 }
 
 const LIMITS: AtlasLimits = AtlasLimits {
@@ -67,12 +126,42 @@ fn readouts() -> FrameReadouts {
     }
 }
 
+/// The fields a loading frame's host answers (s7-06e-2-design.md §5):
+/// those loading gives with no gauge descriptor and only the chosen
+/// chart's play level (when known), and the point, 0 there as the
+/// source's fresh score data holds it.
+fn loading_allowed(level: bool) -> Vec<bool> {
+    (0..field::COUNT)
+        .map(|slot| {
+            let slot = u16::try_from(slot).unwrap_or(u16::MAX);
+            slot == field::POINT
+                || match loading_field(slot) {
+                    Some(LoadingField::Live | LoadingField::Setting | LoadingField::Before) => true,
+                    Some(LoadingField::Chosen) => {
+                        level && matches!(slot, field::CHART_LEVEL | field::CHART_LEVEL_VALID)
+                    }
+                    _ => false,
+                }
+        })
+        .collect()
+}
+
+/// The fields a page frame's host answers: the point only.
+fn page_allowed() -> Vec<bool> {
+    (0..field::COUNT)
+        .map(|slot| u16::try_from(slot).is_ok_and(|s| s == field::POINT))
+        .collect()
+}
+
 /// Plays `script` over `skin`, as production imported it, recording
-/// each frame: the run and the frames' inputs.
+/// each frame: the run and the frames' inputs. Each round is prepared
+/// with what the harness's model of the carry offers
+/// (s7-06e-2-design.md §4).
 ///
 /// # Errors
 ///
-/// The atlas, the preparation, a frame's build or the evaluator failing.
+/// The atlas, a preparation, a frame's build or the evaluator failing.
+#[expect(clippy::too_many_lines, reason = "one loop over the phases")]
 pub fn record(
     skin: &Skin,
     recorded: Recorded,
@@ -82,74 +171,227 @@ pub fn record(
     let chart = script.chart();
     let preset = rules::tapestry();
     let gauges: Vec<GaugeDesc> = preset.gauges.iter().map(GaugeDesc::from_rule).collect();
-    let ctx = PlayContext {
-        meta: ChartMetadata::UNKNOWN,
-        autoplay: false,
-        gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
-        empty_poor_breaks_combo: false,
-        empty_poor_counted: false,
-        scratch: Side::Left,
-        ln_default: rules::LnMode::Ln,
-        last_note_end: script.last_note(),
-        bpm_range: None,
-        bpm_whole_change: None,
-        play_level,
-    };
+    let survival = preset
+        .gauges
+        .iter()
+        .position(|g| g.id == "survival")
+        .unwrap_or(0);
     let uvs = skin
         .atlas(Variant::Lo, LIMITS, &|| false)
         .map_err(|e| format!("atlas: {e:?}"))?
         .into_parts()
         .1;
-    let mut play = skin
-        .prepare(&chart, &ctx)
-        .map_err(|e| format!("prepare: {e:?}"))?;
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let view = LaneView {
         gain: Gain::new(8, 3),
         ..LaneView::NONE
     };
     let end = script.last_note();
+    let carry_safe = skin.program_carry_safe();
+    let mut model = Model::default();
     let mut frames = Vec::new();
     let mut inputs = Vec::new();
+    let mut rounds = Vec::new();
+    let mut clock = script.origin;
+    let mut pages = 0;
+    let mut slots = 0;
     trace::arm();
-    let played = script.play(&chart, &preset, |now, effects, ev| {
-        let state_us = now.0 + STATE_AT_ZERO;
-        let frame = SkinFrame {
-            state_us,
-            now,
-            display_offset: TimeUs(0),
-            tally: ev.tally(),
-            gauges: ev.gauges(),
-            gauge: 0,
-            effects,
-            notes: ev.notes(),
-            input: ev.input(),
-            complete: ev.is_complete(),
-            target: [1_920, 1_080],
-            layout: &Layout::AUTHOR,
-            turntable: 0,
-            lanes: view,
-            playing: now <= end,
-            closing: None,
-            readouts: readouts(),
-        };
-        batch.clear();
-        skin.build(&mut play, &frame, &uvs, &mut batch)
-            .map_err(|e| format!("build at {}: {e:?}", now.0))?;
-        let st = play.state();
-        let fields = st.fields.get(..field::COUNT).unwrap_or(st.fields);
-        let outs = st.fields.get(field::COUNT..).unwrap_or_default().to_vec();
-        inputs.push(FrameInputs::new(fields, st.timers, state_us));
-        frames.push(FrameTrace {
-            events: trace::take(),
-            now,
-            state_us,
-            outs,
-        });
+    let mut played = || -> Result<(), String> {
+        for phase in &script.phases {
+            match phase {
+                Phase::Loading { len_us } => {
+                    let mut loading = skin.prepare_loading(Side::Left);
+                    let allowed = loading_allowed(play_level.is_some());
+                    let since = TimeUs(clock);
+                    let mut t = 0;
+                    while t < *len_us {
+                        let state_us = clock + t;
+                        let frame = LoadingFrame {
+                            now: TimeUs(state_us),
+                            load: LoadState {
+                                since,
+                                percent: i32::try_from(t * 100 / len_us).unwrap_or(100),
+                            },
+                            target: [1_920, 1_080],
+                            layout: &Layout::AUTHOR,
+                            lanes: view,
+                            covers: readouts().covers,
+                            gauge: None,
+                            play_level,
+                            difficulty: None,
+                            bga: None,
+                            autoplay: false,
+                            turntable: 0,
+                        };
+                        batch.clear();
+                        skin.build_loading(&mut loading, &frame, &uvs, &mut batch)
+                            .map_err(|e| format!("loading build at {state_us}: {e:?}"))?;
+                        let st = loading.state();
+                        let mut fields =
+                            st.fields.get(..field::COUNT).unwrap_or(st.fields).to_vec();
+                        if let Some(p) = fields.get_mut(usize::from(field::POINT)) {
+                            *p = 0;
+                        }
+                        inputs.push(FrameInputs::outside(
+                            &fields,
+                            allowed.clone(),
+                            None,
+                            state_us,
+                        ));
+                        frames.push(FrameTrace {
+                            events: trace::take(),
+                            now: TimeUs(state_us),
+                            state_us,
+                            outs: Vec::new(),
+                            kind: FrameKind::Loading,
+                        });
+                        t += STEP;
+                    }
+                    clock += len_us;
+                }
+                Phase::Page { len_us } => {
+                    let mut fields = vec![0; field::COUNT];
+                    if let Some(p) = fields.get_mut(usize::from(field::POINT)) {
+                        *p = model.point();
+                    }
+                    let mut t = 0;
+                    while t < *len_us {
+                        let state_us = clock + t;
+                        inputs.push(FrameInputs::outside(
+                            &fields,
+                            page_allowed(),
+                            Some(pages),
+                            state_us,
+                        ));
+                        frames.push(FrameTrace {
+                            events: trace::take(),
+                            now: TimeUs(state_us),
+                            state_us,
+                            outs: Vec::new(),
+                            kind: FrameKind::Page,
+                        });
+                        t += STEP;
+                    }
+                    pages += 1;
+                    clock += len_us;
+                }
+                Phase::Round(r) => {
+                    let mut starts: Vec<rules::GaugeValue> =
+                        gauges.iter().map(|g| g.start).collect();
+                    if r.survival
+                        && let Some(s) = starts.get_mut(survival)
+                    {
+                        *s = rules::GaugeValue::centi_percent(100);
+                    }
+                    let section = script.section(starts);
+                    let shown = if r.survival { survival } else { 0 };
+                    let ctx = PlayContext {
+                        meta: ChartMetadata::UNKNOWN,
+                        autoplay: false,
+                        gauges: &gauges,
+                        attempt: if r.section {
+                            Attempt::Section(&section)
+                        } else {
+                            Attempt::Full { lead_in: TimeUs(0) }
+                        },
+                        empty_poor_breaks_combo: false,
+                        empty_poor_counted: false,
+                        scratch: Side::Left,
+                        ln_default: rules::LnMode::Ln,
+                        last_note_end: end,
+                        bpm_range: None,
+                        bpm_whole_change: None,
+                        play_level,
+                    };
+                    let carried = model.carried(carry_safe);
+                    let mut play = skin
+                        .prepare_carried(&chart, &ctx, model.offer())
+                        .map_err(|e| format!("prepare: {e:?}"))?;
+                    let round = rounds.len();
+                    let mut rearmed = false;
+                    let base = clock;
+                    let (tally, took) = r.play(
+                        &chart,
+                        &preset,
+                        r.section.then_some(&section),
+                        end.0,
+                        shown,
+                        |st| {
+                            if st.rearmed && !rearmed {
+                                play.rearm();
+                                rearmed = true;
+                            }
+                            let now = st.now;
+                            let state_us = base + st.rel_us;
+                            let ready = now.0 < 0;
+                            let playing = if r.section {
+                                !ready && st.closing.is_none() && now <= end
+                            } else {
+                                now <= end
+                            };
+                            let frame = SkinFrame {
+                                state_us,
+                                now,
+                                display_offset: TimeUs(0),
+                                tally: st.ev.tally(),
+                                gauges: st.ev.gauges(),
+                                gauge: shown,
+                                effects: st.effects,
+                                notes: st.ev.notes(),
+                                input: st.ev.input(),
+                                complete: st.ev.is_complete(),
+                                target: [1_920, 1_080],
+                                layout: &Layout::AUTHOR,
+                                turntable: 0,
+                                lanes: view,
+                                playing,
+                                closing: st.closing,
+                                readouts: readouts(),
+                            };
+                            batch.clear();
+                            skin.build(&mut play, &frame, &uvs, &mut batch)
+                                .map_err(|e| format!("build at {}: {e:?}", now.0))?;
+                            let s = play.state();
+                            let fields = s.fields.get(..field::COUNT).unwrap_or(s.fields);
+                            let outs = s.fields.get(field::COUNT..).unwrap_or_default().to_vec();
+                            inputs.push(FrameInputs::new(fields, s.timers, state_us));
+                            let stage = match (st.closing, ready, st.rearmed) {
+                                (Some(_), _, _) if r.end == End::Fail => Stage::Failed,
+                                (Some(_), _, _) => Stage::Closing,
+                                (None, true, false) => Stage::Ready,
+                                (None, true, true) => Stage::RearmedReady,
+                                (None, false, _) if now > end => Stage::Tail,
+                                (None, false, _) => Stage::Play,
+                            };
+                            frames.push(FrameTrace {
+                                events: trace::take(),
+                                now,
+                                state_us,
+                                outs,
+                                kind: FrameKind::Play {
+                                    round,
+                                    stage,
+                                    carried,
+                                },
+                            });
+                            Ok(())
+                        },
+                    )?;
+                    let carry = play.carry();
+                    rounds.push(RoundTrace {
+                        carried,
+                        slots_run: carry.slots_run,
+                        terminal: carry.terminal,
+                    });
+                    model.settle(&tally, &carry);
+                    slots = play.state().timers.len();
+                    clock = base + took;
+                }
+            }
+        }
         Ok(())
-    });
-    let slots = play.state().timers.len();
+    };
+    let played = played();
     trace::disarm();
     played?;
     let mut timers: Vec<u16> = last_records(&recorded)
@@ -172,6 +414,9 @@ pub fn record(
             timer_slots,
             callbacks: skin.program_callbacks(),
             structure: skin.program_structure(),
+            slotted: skin.program_slotted(),
+            carry_safe,
+            rounds,
         },
         inputs,
     ))

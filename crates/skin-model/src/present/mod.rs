@@ -385,6 +385,13 @@ impl Present {
         self.carry_safe
     }
 
+    /// Per callback, whether it loads or stores a slot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn slotted(&self) -> &[bool] {
+        &self.slotted
+    }
+
     /// Whether `bank` fits the program's slots: one value a slot, each in
     /// its slot's domain (V7's rule for initial values).
     #[must_use]
