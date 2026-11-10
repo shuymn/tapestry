@@ -86,6 +86,21 @@ impl Spawner {
             .name(format!("load-{}", kind_name(kind).replace(' ', "-")))
             .spawn_scoped(scope, f)
     }
+
+    /// Starts an owned job's thread, named for its kind
+    /// ([`Coordinator::spawn_owned`]).
+    pub(super) fn spawn_owned(
+        self,
+        kind: JobKind,
+        f: impl FnOnce() + Send + 'static,
+    ) -> io::Result<thread::JoinHandle<()>> {
+        if self.refused.contains(&kind) {
+            return Err(io::Error::other("refused (test)"));
+        }
+        thread::Builder::new()
+            .name(format!("job-{}", kind_name(kind).replace(' ', "-")))
+            .spawn(f)
+    }
 }
 
 /// A foreground job running on its own scoped thread.
