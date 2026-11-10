@@ -11160,6 +11160,7 @@ pub(crate) mod tests {
                 _ => format!("{kind:?} {request}"),
             };
             while self.shared.hold_install.load(Ordering::Acquire) {
+                self.shared.install_held.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
             if self.shared.fail.load(Ordering::Acquire) {
@@ -11389,6 +11390,8 @@ pub(crate) mod tests {
         stalled: Arc<AtomicBool>,
         /// Installations wait while set.
         pub(crate) hold_install: Arc<AtomicBool>,
+        /// Set once an installation waits on `hold_install`.
+        pub(crate) install_held: Arc<AtomicBool>,
         /// Installations are refused while set.
         pub(crate) refuse_install: Arc<AtomicBool>,
         /// Loading frames are refused while set.

@@ -385,9 +385,9 @@ fn the_play_setup_reaches_the_figures() {
     // were scheduled. The first frame comes after it.
     let before: i64 = stdout
         .lines()
-        .find_map(|l| l.strip_prefix("dev: play started "))
+        .find_map(|l| l.strip_prefix("dev: setup ended "))
         .and_then(|l| l.strip_suffix(" us before chart time 0"))
-        .unwrap_or_else(|| panic!("no start line: {stdout}"))
+        .unwrap_or_else(|| panic!("no setup line: {stdout}"))
         .parse()
         .unwrap();
     assert!(0 < setup, "{setup}");

@@ -2084,7 +2084,7 @@ impl Rig for PlayerRig<'_> {
         // the READY figures (dev-tools witness): negative once it ends late.
         #[cfg(feature = "dev-tools")]
         println!(
-            "dev: play started {} us before chart time 0",
+            "dev: setup ended {} us before chart time 0",
             origin.0 - started.0
         );
         #[cfg(feature = "dev-tools")]
