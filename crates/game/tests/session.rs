@@ -3130,16 +3130,21 @@ fn a_ready_rearm_reads_no_best_again() {
 }
 
 /// C13: the parser's 1× profile reaches the attempt unchanged through the
-/// production ingestion at ×1.5: notes at exactly 1 000 000 µs, 3 s and
-/// 4 s stay in seconds 1, 3 and 4, where the remapped chart has them at
-/// 666 666 µs (second 0), 2 s and 2.666 666 s. A speed change keeps the
-/// load's profile and whole-chart MAIN tempo.
+/// production ingestion at ×1.5. The chart starts at 240 BPM with one note
+/// at 0, changes to 120 BPM at 1 s with notes at exactly 1 000 000 µs,
+/// 1.5 s, 2 s and 2.5 s, then has a 0.5 s STOP and a note at 3 s. The
+/// profile keeps the notes in their 1× seconds (the remapped chart has the
+/// first 120 BPM note at 666 666 µs, second 0) and the STOP's stopped row,
+/// which the parser's own STOP lengths give. MAIN is the whole chart's,
+/// 120, neither the initial tempo nor a practice section's (240 over the
+/// first note alone). A speed change keeps the load's profile and MAIN.
 #[test]
 fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
     let path = root.path().join("second.bms");
-    let text = "#BPM 120\n#WAV01 a.wav\n#00011:0001\n#00111:0001\n#00211:01\n";
+    let text = "#BPM 240\n#WAV01 a.wav\n#STOP01 48\n#00011:01\n#00103:78\n\
+                #00111:01010101\n#00209:01\n#00211:01\n";
     fs::write(&path, text).unwrap();
     let settings = tapestry_settings(&root);
     let parts = Parts::standard(&root, &settings.player);
@@ -3151,14 +3156,9 @@ fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
         .lanes
         .iter()
         .flatten()
-        .map(|n| n.time)
+        .map(|n| n.time.0)
         .collect();
-    // A measure is 2 s at 120 BPM: the middles of measures 0 and 1 at 1 s
-    // and 3 s, measure 2 at 4 s; at ×1.5, two thirds of each.
-    assert_eq!(
-        times,
-        [TimeUs(666_666), TimeUs(2_000_000), TimeUs(2_666_666)]
-    );
+    assert_eq!(&times[..2], [0, 666_666]);
     let opts = bms_parser::LoadOptions {
         seed: config().seed,
         ..bms_parser::LoadOptions::default()
@@ -3167,14 +3167,38 @@ fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
         .unwrap()
         .profile;
     let tap = |s: usize| parser.seconds()[s][bms_model::KEY_TAP];
-    assert_eq!((tap(0), tap(1), tap(2), tap(3), tap(4)), (0, 1, 0, 1, 1));
+    assert_eq!((tap(0), tap(1), tap(2), tap(3)), (1, 2, 2, 1));
+    let bpm = |b: i64| bms_model::Tempo::from_milli(b * 1_000).unwrap();
+    let rows: Vec<_> = parser.speeds().iter().map(|r| (r.ms, r.tempo)).collect();
+    assert!(rows.contains(&(1_000, Some(bpm(120)))), "{rows:?}");
+    assert!(rows.contains(&(3_000, None)), "{rows:?}");
     loaded.begin_play();
     let profile = loaded.attempt().profile.unwrap();
     assert_eq!(*profile, parser);
-    let main = loaded.attempt().main;
-    assert_eq!(main, Some(loaded.chart().timeline.meta().initial));
+    assert_eq!(loaded.chart().timeline.meta().initial, bpm(240));
+    assert_eq!(loaded.attempt().main, Some(bpm(120)));
+    // A practice round over the first note alone: its own MAIN is 240,
+    // the attempt's stays the whole chart's.
+    let practice = game::Practice {
+        start: TimeUs(0),
+        end: TimeUs(500 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: true,
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+    loaded.begin_play();
+    let round = loaded.attempt();
+    let whole = game::AttemptTempo::prepare(loaded.chart(), None);
+    assert_ne!(
+        round.tempo.references().unwrap().main,
+        whole.references().unwrap().main,
+        "the section's MAIN is another"
+    );
+    assert_eq!(round.main, Some(bpm(120)));
+    assert!(Arc::ptr_eq(&profile, round.profile.as_ref().unwrap()));
     loaded.set_speed(bms_model::Speed::NORMAL).unwrap();
     let again = loaded.attempt();
     assert!(Arc::ptr_eq(&profile, again.profile.as_ref().unwrap()));
-    assert_eq!(again.main, main);
+    assert_eq!(again.main, Some(bpm(120)));
 }
