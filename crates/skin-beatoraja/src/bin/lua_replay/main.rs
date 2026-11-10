@@ -2,7 +2,7 @@
 //! reference executor; docs/stage3.md S7-06e), for the developer's PC:
 //! `lua_replay [--autoplay on|off] [--class veryhard|hard|normal|easy|veryeasy|none]
 //! [--level <n>] [--option <name> <item>]... [--file <name> <candidate>]...
-//! [--script full|mixed] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
+//! [--script full|mixed|rounds|rounds-unwitnessed|closing] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
 //! <root> <entry> [<root> <entry>]...`
 //!
 //! Each play skin is imported twice. The production import's frames are
@@ -28,6 +28,8 @@ mod observed;
 mod production;
 mod reference;
 mod report;
+#[cfg(test)]
+mod rounds_tests;
 mod script;
 #[cfg(test)]
 mod tests;
@@ -43,7 +45,7 @@ use crate::script::Script;
 
 const USAGE: &str = "usage: lua_replay [--autoplay on|off] \
      [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>] \
-     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed] \
+     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|rounds-unwitnessed|closing] \
      [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
 
 /// What the flags ask for.
@@ -58,6 +60,13 @@ pub struct Options {
     pub local: bool,
     /// Every finding printed, not only the first [`report::SHOWN`].
     pub all: bool,
+    /// A test's override of one practice page's point (its ordinal, the
+    /// point).
+    #[cfg(test)]
+    pub page_point: Option<(usize, i32)>,
+    /// `number` ids a test makes unanswered on every frame.
+    #[cfg(test)]
+    pub deny: Vec<i32>,
 }
 
 /// The options the flags at the front of `args` give, and the arguments
@@ -72,6 +81,10 @@ fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
         isolation: Vec::new(),
         local: false,
         all: false,
+        #[cfg(test)]
+        page_point: None,
+        #[cfg(test)]
+        deny: Vec::new(),
     };
     loop {
         match args {
@@ -181,7 +194,18 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
     for &(id, d) in &o.perturb {
         vm.perturb(id, d);
     }
-    let mut observed = reference::Reference::new(&vm, &rec.items, &rec.sources).run(&inputs);
+    let reference = reference::Reference::new(&vm, &rec.items, &rec.sources);
+    #[cfg(test)]
+    let reference = {
+        for &id in &o.deny {
+            vm.deny(id);
+        }
+        match o.page_point {
+            Some((page, point)) => reference.page_point(page, point),
+            None => reference,
+        }
+    };
+    let mut observed = reference.run(&inputs);
     observed.root = root.to_path_buf();
     Ok(production::compare::compare(&prod, &observed, &o.isolation))
 }

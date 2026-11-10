@@ -12,7 +12,7 @@ use skin_model::MAX_ELAPSED_MS;
 use skin_model::present::trace::{Converted, Event, Skip};
 use skin_model::present::{Fail, Val};
 
-use super::{ProductionRun, last_records};
+use super::{FrameKind, ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
 use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern};
 use crate::report::{Finding, Report, Stopped};
@@ -236,6 +236,10 @@ struct Schema<'a> {
     callbacks: u16,
     is_timer: &'a dyn Fn(u16) -> bool,
     timer_slots: &'a BTreeMap<u16, usize>,
+    /// Per callback, whether it loads or stores a slot.
+    slotted: &'a [bool],
+    /// Why this frame's round refuses its slots, if it does.
+    refused: Option<&'static str>,
 }
 
 /// Whether a timer invocation's conversion is on: given, and not the off
@@ -345,6 +349,34 @@ fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>)
         let installed = p.timer.get(&k).is_some_and(|t| t.3.is_some());
         if p.sampled.contains_key(&slot) && !installed {
             kbad(k, format!("timer {k}: sampled with no installed start"));
+        }
+    }
+    // The slots (s7-06e-2-design.md §6.2): a slotted callback is a timer;
+    // `SlotsOff` only on one, and only where the round refuses its slots,
+    // where every slotted callback's first event is one.
+    for k in 0..s.callbacks {
+        let slotted = s.slotted.get(usize::from(k)).copied().unwrap_or(false);
+        let off = matches!(p.first.get(&k), Some(First::Skipped(Skip::SlotsOff)));
+        if slotted && !(s.is_timer)(k) {
+            kbad(k, format!("callback {k}: slotted but not a timer"));
+        }
+        if off && !slotted {
+            kbad(
+                k,
+                format!("callback {k}: SlotsOff on a callback with no slot"),
+            );
+        } else if off && s.refused.is_none() {
+            kbad(
+                k,
+                format!("callback {k}: SlotsOff on a round whose slots run"),
+            );
+        } else if slotted && !off && s.refused.is_some() {
+            kbad(
+                k,
+                format!(
+                    "callback {k}: slotted callback ran where the continuation refuses its slots"
+                ),
+            );
         }
     }
     (p, bad)
@@ -471,6 +503,14 @@ fn catalogue(rf: &RefFrame, installed: &[Vec<Key>]) -> (Vec<Vec<Occ>>, Vec<Missh
     (out, bad)
 }
 
+/// Where a frame stands, as a finding prints it.
+fn place(kind: FrameKind) -> String {
+    match kind {
+        FrameKind::Play { round, .. } => format!("round {} {}", round + 1, kind.label()),
+        FrameKind::Loading | FrameKind::Page => kind.label().to_owned(),
+    }
+}
+
 /// A key for findings no occurrence names.
 const UNKNOWN: Key = Key {
     dest: usize::MAX,
@@ -554,20 +594,27 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
     let key_k = |k: u16| key_of.get(&k).copied().unwrap_or(UNKNOWN);
     let is_timer = |k: u16| key_of.get(&k).is_some_and(|key| key.field == "timer");
     let callbacks = u16::try_from(run.callbacks).unwrap_or(u16::MAX);
-    let schema = Schema {
-        callbacks,
-        is_timer: &is_timer,
-        timer_slots: &run.timer_slots,
-    };
     let mut findings: Vec<Finding> = Vec::new();
+    let places: Vec<String> = run.frames.iter().map(|f| place(f.kind)).collect();
     let mut find = |key: Key, frame: usize, what: String| {
         findings.push(Finding {
             key,
             site: site(&key),
             frame,
+            place: places.get(frame).cloned().unwrap_or_default(),
             what,
         });
     };
+    rep.carry_safe = run.carry_safe;
+    for (i, r) in run.rounds.iter().enumerate() {
+        rep.rounds.push(format!(
+            "round {} {:?}: slots run {}, terminal {}",
+            i + 1,
+            r.carried,
+            r.slots_run,
+            r.terminal
+        ));
+    }
     if run.frames.len() != obs.frames.len() {
         find(
             UNKNOWN,
@@ -610,11 +657,101 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             }
         }
     }
-    let mut stopped: BTreeMap<u32, (&'static str, usize, Key)> = BTreeMap::new();
+    let mut stopped: BTreeMap<(&'static str, u32), (&'static str, usize, Key)> = BTreeMap::new();
     for (i, (pf, rf)) in run.frames.iter().zip(&obs.frames).enumerate() {
-        let (p, pbad) = production_shapes(&pf.events, &schema);
+        let label = pf.kind.label();
+        rep.kinds.entry(label).or_default().0 += 1;
+        let agreed_before = rep.agreed;
         let (cat, rbad) = catalogue(rf, &obs.installed);
-        for (k, key, what) in pbad.into_iter().chain(rbad) {
+        for (_, key, what) in rbad {
+            find(key.unwrap_or(UNKNOWN), i, what);
+        }
+        let (round, carried) = match pf.kind {
+            FrameKind::Play { round, carried, .. } => (round, carried),
+            FrameKind::Loading | FrameKind::Page => {
+                if !rf.outside {
+                    find(
+                        UNKNOWN,
+                        i,
+                        "frame kind: production outside, reference play".into(),
+                    );
+                }
+                // Production builds no play frame here: no event is
+                // expected, and each source invocation is the `outside`
+                // bucket's; a stopped slotted root is a finding, any other
+                // stopped root needs a reviewed entry (O1).
+                // A sample of a timer outside the program's slots is the
+                // loading frame's own (its built-in and `when` timers).
+                let program_slot = |slot: usize| run.timer_slots.values().any(|&s| s == slot);
+                for e in &pf.events {
+                    let k = match *e {
+                        Event::Ran { k, .. }
+                        | Event::Skipped { k, .. }
+                        | Event::Timer { k, .. } => key_k(k),
+                        Event::Sampled { slot, .. } if program_slot(slot) => UNKNOWN,
+                        Event::Sampled { .. } => continue,
+                    };
+                    find(k, i, "production event on an outside frame".into());
+                }
+                let bucket = format!("outside ({label})");
+                for occ in cat.iter().flatten() {
+                    let key = occ.key;
+                    let calls: Vec<Outcome> = match occ.first {
+                        Point::Ran { outcome, .. } => {
+                            std::iter::once(outcome).chain(occ.second).collect()
+                        }
+                        Point::NotReached { .. } => Vec::new(),
+                    };
+                    rep.points += calls.len().max(1);
+                    for outcome in calls {
+                        let api = match outcome {
+                            Outcome::Unanswered(a) => Some(a),
+                            Outcome::Budget => Some("budget"),
+                            _ => None,
+                        };
+                        let Some(api) = api else {
+                            *rep.buckets.entry(bucket.clone()).or_default() += 1;
+                            continue;
+                        };
+                        match cx.compiled(&key) {
+                            Some(k)
+                                if run.slotted.get(usize::from(k)).copied().unwrap_or(false) =>
+                            {
+                                find(
+                                    key,
+                                    i,
+                                    format!("a slotted root stopped on an outside frame ({api})"),
+                                );
+                            }
+                            _ => {
+                                stopped
+                                    .entry(("outside", key.callable))
+                                    .or_insert((api, 0, key))
+                                    .1 += 1;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        };
+        if rf.outside {
+            find(
+                UNKNOWN,
+                i,
+                "frame kind: production play, reference outside".into(),
+            );
+        }
+        let refused = carried.refused();
+        let schema = Schema {
+            callbacks,
+            is_timer: &is_timer,
+            timer_slots: &run.timer_slots,
+            slotted: &run.slotted,
+            refused,
+        };
+        let (p, pbad) = production_shapes(&pf.events, &schema);
+        for (k, key, what) in pbad {
             find(key.unwrap_or_else(|| k.map_or(UNKNOWN, key_k)), i, what);
         }
         rep.production_runs += p.order.len();
@@ -627,8 +764,16 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         // follows.
         for occs in &cat {
             let mut blocked = false;
+            let mut slots_off = false;
             for occ in occs {
                 let key = occ.key;
+                if slots_off {
+                    find(
+                        key,
+                        i,
+                        "an occurrence after a slotted callback held by SlotsOff".into(),
+                    );
+                }
                 let k = cx.compiled(&key);
                 let calls = match occ.first {
                     Point::Ran { outcome, .. } => {
@@ -649,7 +794,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     if let Some(api) = api
                         && k.is_none()
                     {
-                        stopped.entry(key.callable).or_insert((api, 0, key)).1 += 1;
+                        stopped
+                            .entry(("play", key.callable))
+                            .or_insert((api, 0, key))
+                            .1 += 1;
                     }
                 }
                 let Some(k) = k else {
@@ -662,6 +810,22 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     continue;
                 };
                 seen.insert(k);
+                // A slotted callback the round's continuation holds: every
+                // effect of it this frame is the carried-state limit's
+                // (s7-06e-2-design.md §6.2); anywhere else production's
+                // shapes reported it.
+                if matches!(p.first.get(&k), Some(First::Skipped(Skip::SlotsOff))) {
+                    used.insert((k, 1));
+                    used.insert((k, 2));
+                    slots_off = true;
+                    if let Some(why) = refused {
+                        *rep.buckets
+                            .entry(format!("carried-state limit: {why}"))
+                            .or_default() += calls.len();
+                        *rep.slots_off.entry((round + 1, why)).or_default() += calls.len();
+                    }
+                    continue;
+                }
                 rep.matched += calls.len().max(1);
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
@@ -856,13 +1020,23 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 );
             }
         }
+        let agreed = rep.agreed - agreed_before;
+        rep.kinds.entry(label).or_default().1 += agreed;
+        if i == 0
+            || !matches!(run.frames.get(i - 1).map(|f| f.kind), Some(FrameKind::Play { round: r, .. }) if r == round)
+        {
+            rep.first_agreed.push(agreed);
+        }
     }
-    // Stopped roots and their isolation entries.
-    for (callable, (api, count, key)) in stopped {
+    // Stopped roots and their isolation entries, by the kind of frame
+    // they stopped on: an entry covering a root's outside stops leaves its
+    // play stops to e-1's rule.
+    for ((kind, callable), (api, count, key)) in stopped {
         let s = obs.sites.get(&callable).cloned().unwrap_or_default();
         let disposition = cx.attribute(&key).unwrap_or_else(|| "compiled".into());
         let covered = cover(&s, iso, obs, &cx);
         rep.stopped.push(Stopped {
+            kind,
             site: s,
             api,
             count,
@@ -1184,6 +1358,8 @@ mod tests {
             callbacks: 1,
             is_timer: &is_timer,
             timer_slots: &slots,
+            slotted: &[],
+            refused: None,
         };
         let orphan = [
             Event::Skipped {
@@ -1528,5 +1704,98 @@ mod tests {
             assert_eq!(a.recorded.occurrences, b.recorded.occurrences, "{what}");
             assert!(!a.same_import(&b.recorded, &b.structure), "{what}");
         }
+    }
+
+    /// s7-06e-2-design.md §6: the rounds' and outside frames' rules,
+    /// each broken on one side, are found by their own message.
+    #[test]
+    fn rounds_and_outside_mutations_are_found() {
+        use skin_model::present::Fail;
+
+        use crate::production::FrameKind;
+        use crate::script::Script;
+        use crate::tests::{LATCH, dst, pieces_over};
+        let body = format!(
+            "{LATCH}{}{}",
+            dst("-111", 0, "timer = latch, loop = -1,"),
+            dst("\"i\"", 100, "timer = latch, loop = -1,")
+        );
+        let (run, obs) = pieces_over(&body, Script::rounds());
+        let r = compare(&run, &obs, &[]);
+        assert!(r.passes(), "{}", r.text(0, true, true));
+        let found = |what: &str,
+                     f: &dyn Fn(
+            &mut crate::production::ProductionRun,
+            &mut crate::observed::Observed,
+        )| {
+            let (mut run, mut obs) = pieces_over(&body, Script::rounds());
+            f(&mut run, &mut obs);
+            let r = compare(&run, &obs, &[]);
+            assert!(
+                r.findings.iter().any(|x| x.what.contains(what)),
+                "{what}: {}",
+                r.text(0, true, true)
+            );
+        };
+        let first_of = |run: &crate::production::ProductionRun, round: usize| {
+            run.frames
+                .iter()
+                .position(|f| matches!(f.kind, FrameKind::Play { round: r, .. } if r == round))
+                .unwrap()
+        };
+        let hold = |f: &mut crate::production::FrameTrace| {
+            f.events
+                .retain(|e| !matches!(e, Event::Ran { k: 0, .. } | Event::Timer { k: 0, .. }));
+            f.events.insert(
+                0,
+                Event::Skipped {
+                    k: 0,
+                    why: Skip::SlotsOff,
+                },
+            );
+        };
+        // A production event on an outside frame.
+        found("production event on an outside frame", &|run, _| {
+            run.frames[0].events.push(Event::Skipped {
+                k: 0,
+                why: Skip::Gate,
+            });
+        });
+        // `SlotsOff` on a fresh round, and on a valid carry-safe one.
+        for round in [0, 1] {
+            found("SlotsOff on a round whose slots run", &|run, _| {
+                let i = first_of(run, round);
+                hold(&mut run.frames[i]);
+            });
+        }
+        // A slotted callback running on a refused round.
+        found("ran where the continuation refuses its slots", &|run, _| {
+            let i = first_of(run, 2);
+            let f = &mut run.frames[i];
+            f.events
+                .retain(|e| !matches!(e, Event::Skipped { k: 0, .. }));
+            f.events.insert(
+                0,
+                Event::Ran {
+                    k: 0,
+                    call: 1,
+                    result: Err(Fail::Error),
+                    conv: Converted::Long(Some(i64::MIN)),
+                },
+            );
+        });
+        // `SlotsOff` on a callback with no slot.
+        found("SlotsOff on a callback with no slot", &|run, _| {
+            run.slotted = vec![false; run.slotted.len()];
+        });
+        // An outside frame's catalogue broken: a point omitted.
+        found("partition", &|_, obs| {
+            let f = obs.frames.iter_mut().find(|f| f.outside).unwrap();
+            f.points.pop();
+        });
+        // The frame kinds disagreeing.
+        found("frame kind", &|_, obs| {
+            obs.frames[0].outside = false;
+        });
     }
 }

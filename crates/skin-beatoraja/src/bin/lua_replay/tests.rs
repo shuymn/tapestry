@@ -26,7 +26,7 @@ fn png(dir: &Path, name: &str, w: u32, h: u32) {
 /// A play skin folder whose configured pass runs `body`, with `ms` the
 /// host module, an option `fc` (905 off, the default; 906 on), source
 /// `a` (64×64), images `i` and `j`.
-fn folder(body: &str) -> TempDir {
+pub(crate) fn folder(body: &str) -> TempDir {
     let d = tempfile::tempdir().unwrap();
     let text = format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080,\n\
@@ -48,7 +48,7 @@ fn folder(body: &str) -> TempDir {
     d
 }
 
-fn options(script: Script) -> Options {
+pub(crate) fn options(script: Script) -> Options {
     let mut facts = ImportFacts::unavailable(ScreenKind::Play);
     facts.autoplay = Fact::Known(false);
     facts.judge_class = Fact::Known(Some(JudgeClass::Normal));
@@ -62,10 +62,12 @@ fn options(script: Script) -> Options {
         isolation: Vec::new(),
         local: true,
         all: true,
+        page_point: None,
+        deny: Vec::new(),
     }
 }
 
-fn run_with(body: &str, o: &Options) -> Report {
+pub(crate) fn run_with(body: &str, o: &Options) -> Report {
     let d = folder(body);
     match replay(d.path(), "s.luaskin", o) {
         Ok(r) => r,
@@ -85,7 +87,7 @@ fn agrees(r: &Report, compiled: usize) {
     assert!(compiled == 0 || r.matched > 0, "{}", r.text(0, true, true));
 }
 
-fn dst(id: &str, x: i32, fields: &str) -> String {
+pub(crate) fn dst(id: &str, x: i32, fields: &str) -> String {
     format!(
         "table.insert(skin.destination, {{ id = {id}, {fields} dst = {{ {{ x = {x}, y = 0, w = 64, h = 64 }} }} }})\n"
     )
@@ -96,7 +98,7 @@ fn dst(id: &str, x: i32, fields: &str) -> String {
 const HALF_POINT: &str = "function() return ms.number(100) / 2 >= 0 end";
 
 /// The latch: the state clock stored once the point reaches 200 000.
-const LATCH: &str = "local latch = (function()\n\
+pub(crate) const LATCH: &str = "local latch = (function()\n\
        local state = ms.timer_off_value\n\
        return function()\n\
          if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
@@ -332,8 +334,9 @@ fn a_timer_age_with_a_sub_ms_start_agrees() {
          end)()\n";
     let mut s = Script::full();
     let pressed = Script::note_time(0) + 999;
-    s.presses[0] = Some(999);
-    s.extra = vec![pressed + 1];
+    let r = s.round_mut(0).unwrap();
+    r.presses[0] = Some(999);
+    r.extra = vec![pressed + 1];
     assert_eq!((pressed + STATE_AT_ZERO) % 1_000, 999);
     let mut o = options(s);
     o.local = true;
@@ -925,8 +928,16 @@ fn a_nested_op_keeps_its_index_and_path() {
 /// A fixture's production run and what the reference observed, apart, for
 /// the comparator's own tests.
 pub fn pieces(body: &str) -> (crate::production::ProductionRun, crate::observed::Observed) {
+    pieces_over(body, Script::full())
+}
+
+/// [`pieces`] over `script`.
+pub fn pieces_over(
+    body: &str,
+    script: Script,
+) -> (crate::production::ProductionRun, crate::observed::Observed) {
     let d = folder(body);
-    let o = options(Script::full());
+    let o = options(script);
     let cancel = skin_beatoraja::Cancel::new();
     let h = skin_beatoraja::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let config = skin_beatoraja::Config::named(h.header(), [], []).unwrap();
