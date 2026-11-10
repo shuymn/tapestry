@@ -337,6 +337,10 @@ pub enum RenderError {
     /// A skin's atlas was not uploaded; the atlas in use stays.
     #[error("atlas")]
     Atlas(#[source] UploadError),
+    /// The device was lost or destroyed while chart images were written:
+    /// they stay unavailable, and the screen's recovery follows.
+    #[error("device lost")]
+    DeviceLost,
     /// No committed play installation keeps a chart layer: no chart image
     /// was published.
     #[error("chart images: no play installation keeps a chart layer")]
@@ -491,6 +495,16 @@ pub enum CommitError {
     /// ([`Renderer::disable_result`]).
     #[error("the result skin is disabled for this run")]
     ResultDisabled,
+}
+
+/// Chart images published into a play installation's chart layer, and
+/// the array they describe: its installation's atlas and the renderer's
+/// resource generation when they were written (S10-12 design §5.3).
+#[derive(Clone, Copy, Debug)]
+struct PublishedChart {
+    generation: u64,
+    atlas: AtlasId,
+    table: skin_model::chart_image::ChartTable,
 }
 
 /// The GPU and CPU resources a declarative skin's installation replaces
@@ -987,6 +1001,18 @@ pub struct Renderer {
     /// were queued: a unit test checks they were unavailable then.
     #[cfg(test)]
     chart_during_write: Option<Option<skin_model::chart_image::ChartTable>>,
+    /// The image each of the last publication's submissions wrote, with
+    /// the waits finished before it was queued: a unit test checks there
+    /// is one image per submission, each waited for before the next.
+    #[cfg(test)]
+    chart_submissions: Vec<(skin_model::chart_image::ChartImage, usize)>,
+    /// The waits the last publication finished.
+    #[cfg(test)]
+    chart_waits: usize,
+    /// The chart images last published into the play installation's
+    /// chart layer, with the array they were written into
+    /// ([`Renderer::publish_chart_images`]).
+    chart: Option<PublishedChart>,
     /// A staging's instance buffer is made invalid (both map modes, which
     /// every device's validation refuses), as a device refusing its
     /// allocation would: a unit test.
@@ -1130,6 +1156,11 @@ impl Renderer {
             chart_fault: None,
             #[cfg(test)]
             chart_during_write: None,
+            #[cfg(test)]
+            chart_submissions: Vec::new(),
+            #[cfg(test)]
+            chart_waits: 0,
+            chart: None,
             #[cfg(test)]
             buffer_fault: false,
             #[cfg(test)]
@@ -1281,6 +1312,7 @@ impl Renderer {
         }
         self.skin = skin;
         self.installed = None;
+        self.chart = None;
         self.installed_text = Holder::default();
         self.installed_loading = Holder::default();
         self.refused = None;
@@ -2167,6 +2199,8 @@ impl Renderer {
         self.loading_refused = None;
         self.started = None;
         self.project();
+        // The chart images valid for the array now in use, or none.
+        self.sync_chart();
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
@@ -2278,16 +2312,29 @@ impl Renderer {
     /// frame's build: `images` holds the fitted stage file and back image,
     /// `None` for one that is absent.
     ///
+    /// **The rule.** A published table describes the texels of one GPU
+    /// array: it is valid only for the installation, its atlas and the
+    /// resource generation it was written into, on a device not lost
+    /// since ([`PublishedChart`]). The renderer keeps it, and copies it
+    /// only into what draws from that array: the installation's loading
+    /// presentation and the committed attempt, each time the play
+    /// installation is activated ([`sync_chart`](Self::sync_chart)). So a
+    /// staged attempt committed on the same array takes the current one,
+    /// and an array made again (a restore, new resources, another
+    /// renderer) leaves the images unavailable until they are published
+    /// into it.
+    ///
     /// 1. **Invalidate**: before the first byte, the installation's images
     ///    become unavailable (its loading frames draw neither them nor what
-    ///    their fields condition) and the prepared attempt's absent.
-    /// 2. **Write** each image's levels into its slot inside error scopes,
-    ///    level `k` at the slot's origin `>> k`, submit, and wait for the
-    ///    GPU.
-    /// 3. **Re-check** that the installation, its pages and the device are
-    ///    the ones the write began on.
-    /// 4. **Publish** the table: the installation's frames and its
-    ///    prepared attempt draw the images, and their fields read them.
+    ///    their fields condition) and the committed attempt's absent.
+    /// 2. **Write** one image at a time: its levels into its slot inside
+    ///    error scopes, level `k` at the slot's origin `>> k`, submit, and
+    ///    wait for the GPU before the next image is queued, so the queue
+    ///    stages one image's levels at most (design note §4.4).
+    /// 3. **Re-check** that the device was not lost, and that the
+    ///    installation, its atlas and the resource generation are the ones
+    ///    the write began on.
+    /// 4. **Publish** the table.
     ///
     /// The images never change during an attempt: the caller publishes
     /// only before one opens.
@@ -2297,12 +2344,15 @@ impl Renderer {
     /// - [`RenderError::NoChartLayer`] with no committed play installation
     ///   keeping a chart layer: nothing changes.
     /// - [`RenderError::ChartImage`] for an image that does not fit its
-    ///   slot, and [`RenderError::Atlas`] for a write the device refused:
-    ///   both refusals ([`RenderError::is_refusal`]), after which the
-    ///   images are absent for the installation, its fields reading false
-    ///   (S10-12 design D-chart-5); nothing stale draws.
-    /// - A device lost while waiting, or an installation or device that
-    ///   changed: the images stay unavailable, as the first step left them.
+    ///   slot, and [`RenderError::Atlas`] for a write the device refused
+    ///   (after its submitted work is waited for): both refusals
+    ///   ([`RenderError::is_refusal`]), after which the images are absent
+    ///   for the installation, its fields reading false (S10-12 design
+    ///   D-chart-5); nothing stale draws.
+    /// - [`RenderError::DeviceLost`] for a device lost or destroyed during
+    ///   the publication, a failing wait's error, or
+    ///   [`RenderError::ChartChanged`]: the images stay unavailable, as the
+    ///   first step left them.
     pub fn publish_chart_images(
         &mut self,
         images: [Option<&skin_model::chart_image::Fitted>; 2],
@@ -2318,16 +2368,20 @@ impl Renderer {
         if u32::from(layer) != at {
             return Err(RenderError::NoChartLayer);
         }
-        let began = (self.device_generation(), bundle.atlas_id());
-        // 1. Unavailable from the first byte.
-        installed.loading().set_chart_images(None);
-        self.skin.set_chart_images(ChartTable::ABSENT);
-        let absent = |r: &mut Self| {
-            installed
-                .loading()
-                .set_chart_images(Some(ChartTable::ABSENT));
-            r.skin.set_chart_images(ChartTable::ABSENT);
+        let began = PublishedChart {
+            generation: self.resources,
+            atlas: bundle.atlas_id(),
+            table: ChartTable::ABSENT,
         };
+        // 1. Unavailable from the first byte.
+        self.chart = None;
+        self.sync_chart();
+        #[cfg(test)]
+        {
+            self.chart_during_write = None;
+            self.chart_submissions.clear();
+            self.chart_waits = 0;
+        }
         let side = self.atlas.side();
         let mut uvs = [None; 2];
         for (which, image) in ChartImage::ALL.into_iter().zip(images) {
@@ -2338,19 +2392,20 @@ impl Renderer {
             let uv = ChartUv::of(f, which, side, layer)
                 .filter(|_| u32::try_from(f.levels().len()).ok() == Some(self.atlas.levels()));
             let Some(uv) = uv else {
-                absent(self);
+                self.chart = Some(began);
+                self.sync_chart();
                 return Err(RenderError::ChartImage { which });
             };
             if let Some(slot) = uvs.get_mut(which.index()) {
                 *slot = Some(uv);
             }
         }
-        // 2. Every level of every present image, in its slot.
-        let ((), refused) = skin_atlas::scoped(self.gpu.device(), || {
-            for (which, image) in ChartImage::ALL.into_iter().zip(images) {
-                let (Some(f), Some((origin, _))) = (image, which.slot(side)) else {
-                    continue;
-                };
+        // 2. One image at a time, each waited for before the next.
+        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+            let (Some(f), Some((origin, _))) = (image, which.slot(side)) else {
+                continue;
+            };
+            let ((), refused) = skin_atlas::scoped(self.gpu.device(), || {
                 for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
                     let Some(size) = f.level_size(level) else {
                         continue;
@@ -2364,34 +2419,79 @@ impl Renderer {
                         bytes,
                     );
                 }
-            }
-            #[cfg(test)]
-            {
-                self.chart_during_write = Some(installed.loading().chart_images());
-                if let Some(fault) = self.chart_fault.take() {
-                    fault(&self.gpu);
+                #[cfg(test)]
+                {
+                    self.chart_during_write = Some(installed.loading().chart_images());
+                    self.chart_submissions.push((which, self.chart_waits));
+                    if let Some(fault) = self.chart_fault.take() {
+                        fault(&self.gpu);
+                    }
                 }
+                self.gpu.queue().submit([]);
+            });
+            // Submitted work is waited for, a refused write's included.
+            let waited = self.wait_chart();
+            if waited.is_err() || self.gpu.lost() {
+                return Err(waited.err().unwrap_or(RenderError::DeviceLost));
             }
-            self.gpu.queue().submit([]);
-        });
-        if let Some(e) = refused {
-            absent(self);
-            return Err(RenderError::Atlas(UploadError::Device(e)));
+            if let Some(e) = refused {
+                self.chart = Some(began);
+                self.sync_chart();
+                return Err(RenderError::Atlas(UploadError::Device(e)));
+            }
         }
-        wait_for_gpu(&self.gpu)?;
-        // 3. Still the installation, the pages and the device it began on.
+        // 3. Still the installation, its atlas and the array written into,
+        // on a device not lost.
         let same = self.installed.as_ref().is_some_and(|i| {
             Arc::ptr_eq(i.bundle(), &bundle) && i.loading().same(installed.loading())
-        }) && (self.device_generation(), bundle.atlas_id()) == began;
+        }) && self.resources == began.generation
+            && !self.gpu.lost();
         if !same {
             return Err(RenderError::ChartChanged);
         }
         // 4. Published.
         let [stage, back] = uvs;
         let table = ChartTable::new(stage, back);
-        installed.loading().set_chart_images(Some(table));
-        self.skin.set_chart_images(table);
+        self.chart = Some(PublishedChart { table, ..began });
+        self.sync_chart();
         Ok(table)
+    }
+
+    /// Waits for the GPU between a chart publication's images.
+    fn wait_chart(&mut self) -> Result<(), RenderError> {
+        #[cfg(test)]
+        {
+            self.chart_waits += 1;
+        }
+        wait_for_gpu(&self.gpu)
+    }
+
+    /// The chart images valid for the play installation in use: the
+    /// published table, if it was written into the array in use (its
+    /// installation's atlas, this resource generation) on a device not
+    /// lost since.
+    fn valid_chart(&self) -> Option<skin_model::chart_image::ChartTable> {
+        let p = self.chart?;
+        let installed = self.installed.as_ref()?;
+        (p.generation == self.resources
+            && p.atlas == installed.bundle().atlas_id()
+            && !self.gpu.lost())
+        .then_some(p.table)
+    }
+
+    /// Copies the valid chart images ([`valid_chart`](Self::valid_chart))
+    /// into the play installation's loading presentation, `None` without
+    /// them, and into the committed attempt, absent without them.
+    fn sync_chart(&mut self) {
+        let valid = self.valid_chart();
+        if valid.is_none() {
+            self.chart = None;
+        }
+        if let Some(installed) = &self.installed {
+            installed.loading().set_chart_images(valid);
+        }
+        self.skin
+            .set_chart_images(valid.unwrap_or(skin_model::chart_image::ChartTable::ABSENT));
     }
 
     /// The result kind's pages-only installation's pages, if it has one:
@@ -4893,6 +4993,13 @@ mod tests {
         let back = chart_picture(ChartImage::Back, side, [5, 3], [40, 50, 60]);
         assert_eq!(stage.padded(), [24, 24]);
         let table = r.publish_chart_images([Some(&stage), Some(&back)]).unwrap();
+        // One image per submission, each waited for before the next is
+        // queued: its waits before it, then its own.
+        assert_eq!(
+            r.chart_submissions,
+            [(ChartImage::Stage, 0), (ChartImage::Back, 1)]
+        );
+        assert_eq!(r.chart_waits, 2);
         assert_eq!(
             r.chart_during_write,
             Some(None),
@@ -4967,6 +5074,23 @@ mod tests {
         assert!(e.is_refusal());
         let presented = r.installed.as_ref().unwrap().loading().chart_images();
         assert_eq!(presented, Some(ChartTable::ABSENT));
+    }
+
+    /// A device destroyed while the writes are queued: the wait may still
+    /// return, but the publication fails as the device's and the images
+    /// stay unavailable, never published over texels that were dropped.
+    #[test]
+    fn a_device_lost_during_a_chart_publication_publishes_nothing() {
+        use skin_model::chart_image::ChartImage;
+        let (mut r, _dir, side) = chart_renderer();
+        let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
+        r.publish_chart_images([Some(&stage), None]).unwrap();
+        r.chart_fault = Some(|gpu| gpu.device().destroy());
+        let e = r.publish_chart_images([Some(&stage), None]).unwrap_err();
+        assert!(!e.is_refusal(), "{e:?}");
+        assert!(r.gpu.lost());
+        assert_eq!(r.installed.as_ref().unwrap().loading().chart_images(), None);
+        assert_eq!(r.valid_chart(), None);
     }
 
     /// Level `k` of atlas layer `z`, read back: RGBA8, `side >> k` texels

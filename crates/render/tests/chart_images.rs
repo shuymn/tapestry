@@ -128,6 +128,90 @@ fn a_prepared_attempt_draws_the_published_images() {
     assert_eq!(at(&p, NO_BACK_MARK), BLACK);
 }
 
+/// The play frame of a committed attempt, read back.
+fn play_frame(r: &mut render::Renderer) -> Vec<u8> {
+    let v = view(0, 0);
+    r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
+    read_back(r)
+}
+
+/// An attempt staged before the images are published, or before they are
+/// published again, takes the images valid at its commit: never the copy
+/// it made when it was staged.
+#[test]
+fn a_staged_attempt_takes_the_images_valid_at_its_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let chart = chart();
+    let mut r = offscreen(1_920, 1_080);
+    let (b, _) = bundle(&r, dir.path(), &chart_look());
+    install(&mut r, &b, 1);
+    let side = b.side();
+    let stage = picture(ChartImage::Stage, side, [64, 64], GREEN);
+    let back = picture(ChartImage::Back, side, [64, 64], BLUE);
+    let ctx = context(&GAUGES, false);
+
+    // Staged, then published, then committed.
+    let token = r.stage(&b, &attempt(&r, &chart, &ctx), 2).unwrap();
+    r.publish_chart_images([Some(&stage), None]).unwrap();
+    r.commit(token).unwrap();
+    let p = play_frame(&mut r);
+    assert_eq!(at(&p, CHART_STAGE), GREEN);
+    assert_eq!(at(&p, CHART_BACK), BLACK);
+    assert_eq!(at(&p, NO_BACK_MARK), RED);
+
+    // Staged on those images, published again, then committed.
+    let token = r.stage(&b, &attempt(&r, &chart, &ctx), 3).unwrap();
+    r.publish_chart_images([None, Some(&back)]).unwrap();
+    r.commit(token).unwrap();
+    let p = play_frame(&mut r);
+    assert_eq!(at(&p, CHART_STAGE), BLACK, "the copy staged is not drawn");
+    assert_eq!(at(&p, CHART_BACK), BLUE);
+    assert_eq!(at(&p, BACK_MARK), RED);
+    assert_eq!(at(&p, NO_BACK_MARK), BLACK);
+}
+
+/// A restored installation's array is made again, zeroed: its images are
+/// unavailable until they are published into it, on this renderer and on
+/// another one the installation is restored into.
+#[test]
+fn a_restore_makes_the_images_unavailable_until_republished() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (b, _) = bundle(&r, dir.path(), &chart_look());
+    install(&mut r, &b, 1);
+    let stage = picture(ChartImage::Stage, b.side(), [64, 64], GREEN);
+    r.publish_chart_images([Some(&stage), None]).unwrap();
+    let installation = r.installation(skin_model::ScreenKind::Play).unwrap();
+    assert!(installation.loading().chart_images().is_some());
+
+    r.restore(skin_model::ScreenKind::Play, &installation)
+        .unwrap();
+    assert_eq!(installation.loading().chart_images(), None);
+    let p = loading(&mut r, &text, &frame(1));
+    for rect in [CHART_STAGE, BACK_MARK, NO_BACK_MARK] {
+        assert_eq!(
+            at(&p, rect),
+            BLACK,
+            "{rect:?}: unavailable after the restore"
+        );
+    }
+    r.publish_chart_images([Some(&stage), None]).unwrap();
+    let p = loading(&mut r, &text, &frame(1));
+    assert_eq!(at(&p, CHART_STAGE), GREEN);
+
+    // Another renderer the installation is restored into.
+    let mut other = offscreen(1_920, 1_080);
+    let text = MenuText::new(&other);
+    other
+        .restore(skin_model::ScreenKind::Play, &installation)
+        .unwrap();
+    assert_eq!(installation.loading().chart_images(), None);
+    let p = loading(&mut other, &text, &frame(1));
+    assert_eq!(at(&p, CHART_STAGE), BLACK);
+    assert_eq!(at(&p, NO_BACK_MARK), BLACK);
+}
+
 /// With no play installation keeping a chart layer, nothing is published.
 #[test]
 fn no_chart_layer_publishes_nothing() {
