@@ -154,7 +154,9 @@ impl Coordinator {
     /// returned [`OwnedJob`]: in `class`, promoted from the start when
     /// `promoted`, answered for by `owner`, for `subscriber`. `on_class`
     /// is called on the job's thread at each change of the class it
-    /// computes in; it drops after the job publishes.
+    /// computes in, from the normal mode of its new thread (the
+    /// foreground's), so a first admission in another class calls it; it
+    /// drops after the job publishes.
     ///
     /// Precondition (module doc, what the bound covers): `T`'s `Clone` and
     /// `Drop`, `on_class`'s captures' `Drop` and the thread-local
@@ -218,10 +220,13 @@ impl Coordinator {
             subscriber,
             slot: Arc::clone(&slot),
         };
+        // Its thread is new, in the normal mode: a first admission in
+        // another class calls `on_class`, one in the foreground does not.
         let runner = Runner {
             coord: self.clone(),
             id,
             base: class,
+            mode: Class::Foreground,
             slot: Some(Arc::clone(&slot)),
             done: false,
         };

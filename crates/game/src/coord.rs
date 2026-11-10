@@ -775,6 +775,7 @@ impl Coordinator {
             coord: self.clone(),
             id,
             base: class,
+            mode: class,
             slot: Some(slot),
             done: false,
         });
@@ -807,6 +808,7 @@ impl Coordinator {
             coord: self.clone(),
             id,
             base: class,
+            mode: class,
             slot: None,
             done: false,
         }
@@ -975,6 +977,12 @@ pub struct Runner<T> {
     coord: Coordinator,
     id: u64,
     base: Class,
+    /// The class its thread's mode is in as it begins: its base for a task
+    /// or a joinable job, whose caller set the thread up (the background
+    /// worker enters background mode before its jobs; a scoped job's base
+    /// is the foreground); the normal mode, the foreground's, for an owned
+    /// job's new thread.
+    mode: Class,
     slot: Option<Arc<Slot<T>>>,
     done: bool,
 }
@@ -1005,7 +1013,8 @@ impl<T> Runner<T> {
     /// cancelled job never ends done. A panic in `work`, in its admission
     /// or in a hook is caught. `on_class` is called on this thread each
     /// time the class the job computes in changes, starting from the class
-    /// it was begun in (the player changes its thread's mode there).
+    /// its thread's mode is in as it begins (the player changes its
+    /// thread's mode there): a first admission in another class calls it.
     pub fn run(
         mut self,
         stop: &(dyn Fn() -> bool + Sync),
@@ -1037,7 +1046,7 @@ impl<T> Runner<T> {
             on_class,
             thread: thread::current().id(),
             lease: Mutex::new(None),
-            mode: Mutex::new(self.base),
+            mode: Mutex::new(self.mode),
             fault: Mutex::new(None),
         };
         let computed = catch(|| ctx.admit().then(|| work(&ctx)));
