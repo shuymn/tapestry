@@ -36,6 +36,14 @@
 //! expression and its guards, and the report adds the configuration as
 //! resolved and a `destination` line per destination with what the import
 //! made of it and its notes. That output stays on the developer's PC.
+//! Each imported gauge widget is listed with its segments and motion.
+//!
+//! `lua_report --catalogue <root> <entry> [<root> <entry>]...` prints, per
+//! skin, its header as the importer parses it, one tab-separated line per
+//! named option item (`option`, the option, the item) and per named file
+//! choice candidate (`file`, the choice, the candidate): the
+//! configurations a sweep reports each of. It names the skin's own
+//! options, so it too stays on the developer's PC.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -56,7 +64,8 @@ use skin_model::{
 const USAGE: &str = "usage: lua_report [--autoplay on|off] \
                      [--class veryhard|hard|normal|easy|veryeasy|none] \
                      [--level <n>|pending] [--result dense] [--option <name> <item>]... \
-                     [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...";
+                     [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...\n\
+                     \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -258,6 +267,9 @@ fn report(index: usize, survey: &Survey) -> String {
             skin_model::MAX_SKIN_OPS
         ));
     }
+    for (segments, motion) in &survey.gauges {
+        line(&format!("  gauge segments {segments} motion {motion}"));
+    }
     let u = survey.usage;
     line(&format!(
         "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {}) \
@@ -375,8 +387,48 @@ fn survey_entry(
     }
 }
 
+/// The header catalogue of each `<root> <entry>` pair in `args`, as
+/// `--catalogue` prints it; a header refused prints its refusal's label.
+fn catalogue(args: &[String]) -> String {
+    let mut s = String::new();
+    for pair in args.chunks(2) {
+        let [root, entry] = pair else { continue };
+        let _ = writeln!(s, "skin\t{root}\t{entry}");
+        let h = match skin_beatoraja::read_lua_header(&PathBuf::from(root), entry, &Cancel::new()) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = writeln!(s, "refused\t{e}");
+                continue;
+            }
+        };
+        let header = h.header();
+        for o in &header.options {
+            let Some(name) = &o.name else { continue };
+            for item in o.items.iter().filter_map(|i| i.name.as_ref()) {
+                let _ = writeln!(s, "option\t{name}\t{item}");
+            }
+        }
+        for f in &header.files {
+            let Some(name) = &f.name else { continue };
+            for c in &f.candidates {
+                let _ = writeln!(s, "file\t{name}\t{c}");
+            }
+        }
+    }
+    s
+}
+
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((flag, args)) = all.split_first()
+        && flag == "--catalogue"
+    {
+        if args.is_empty() || !args.len().is_multiple_of(2) {
+            usage();
+        }
+        print!("{}", catalogue(args));
+        return;
+    }
     let Some((facts, choice, local, args)) = facts(&all) else {
         usage()
     };
