@@ -13,6 +13,7 @@ use rules::GaugeValue;
 use super::schema::{field, timer};
 use super::timers::{chart_fields, covers, level_fields, read_timers};
 use super::{BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
+use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
@@ -190,7 +191,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // chart.judge_class_valid
         // The point, 110: from the counts, unavailable as they are.
         Unavailable, // point
-        // The best and the target, 111 to 120: read at load-ready, but not
+        // The chart's images, 111 and 112: given once they are published.
+        Chosen, // chart.stagefile
+        Chosen, // chart.backbmp
+        // The best and the target, 113 to 122: read at load-ready, but not
         // shown while the play screen loads, so they do not appear partway
         // through its loading lifetime; with them their rates, the flags
         // that compare against them, and whether the chart declares
@@ -206,7 +210,7 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Unavailable, // best.rate_ppm
         Unavailable, // best.reached
         Unavailable, // target.reached
-        // The ranks, 121 to 136: false until the first judgment.
+        // The ranks, 123 to 138: false until the first judgment.
         Before, // rank.current.0
         Before, // rank.current.1
         Before, // rank.current.2
@@ -247,16 +251,19 @@ pub fn loading_field(slot: u16) -> Option<LoadingField> {
 }
 
 /// The chosen chart's data a loading frame may give, as bits of
-/// [`Need::chosen`]: its play level, its difficulty, whether it has a BGA.
+/// [`Need::chosen`]: its play level, its difficulty, whether it has a BGA,
+/// and its images, which the state gives once they are published.
 const CHOSEN_LEVEL: u8 = 1;
 const CHOSEN_DIFFICULTY: u8 = 2;
 const CHOSEN_BGA: u8 = 4;
+const CHOSEN_IMAGES: u8 = 8;
 
 /// The chosen chart's datum [`LoadingField::Chosen`] field `slot` reads.
 const fn chosen_bit(slot: u16) -> u8 {
     match slot {
         field::CHART_LEVEL | field::CHART_LEVEL_VALID => CHOSEN_LEVEL,
         field::CHART_DIFFICULTY | field::CHART_DIFFICULTY_VALID => CHOSEN_DIFFICULTY,
+        field::CHART_STAGEFILE | field::CHART_BACKBMP => CHOSEN_IMAGES,
         _ => CHOSEN_BGA,
     }
 }
@@ -445,6 +452,13 @@ pub struct Loading {
     text: TextTable,
     /// The installed bitmap lines, one per text slot.
     bitmap: Box<[Option<GlyphLine>]>,
+    /// The chart images published for this state's installation; `None`
+    /// while they are unavailable. Kept by [`reset`](Self::reset): they
+    /// belong to the installation, and the caller replaces them.
+    chart: Option<ChartTable>,
+    /// The live key of the array its frames draw from, set by the frame's
+    /// renderer before each build.
+    chart_live: Option<ChartKey>,
 }
 
 impl Loading {
@@ -459,6 +473,8 @@ impl Loading {
             scratch,
             text: TextTable::new(Vec::new()),
             bitmap: Box::default(),
+            chart: None,
+            chart_live: None,
         }
     }
 
@@ -474,7 +490,48 @@ impl Loading {
             scratch,
             text: TextTable::new(vec![None; text_slots]),
             bitmap: vec![None; text_slots].into_boxed_slice(),
+            chart: None,
+            chart_live: None,
         }
+    }
+
+    /// Sets the chart images its frames draw and whose fields they give:
+    /// `None` makes them unavailable (S10-12 design §5.3, the first step
+    /// of a publication), `Some` available, an absent entry drawing nothing
+    /// and reading false. Allocates nothing.
+    pub fn set_chart_images(&mut self, table: Option<ChartTable>) {
+        self.chart = table;
+    }
+
+    /// The chart images set for it; `None` while unavailable.
+    #[must_use]
+    pub fn chart_images(&self) -> Option<&ChartTable> {
+        self.chart.as_ref()
+    }
+
+    /// Sets the live key of the array its next frames draw from: the
+    /// frame's renderer sets it before each build, from its own state.
+    /// Allocates nothing.
+    pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
+        self.chart_live = live;
+    }
+
+    /// The chart images its frames draw: the table set for it when it
+    /// describes the live array ([`ChartTable::drawable`]); `None`, which
+    /// is unavailable, otherwise.
+    pub(crate) fn drawable_chart(&self) -> Option<&ChartTable> {
+        self.chart.as_ref().filter(|t| t.drawable(self.chart_live))
+    }
+
+    /// The chosen chart's data `frame` gives, and its images once they
+    /// are available ([`Need::met`]).
+    pub(crate) fn chosen(&self, frame: &LoadingFrame<'_>) -> u8 {
+        frame.chosen()
+            | if self.drawable_chart().is_some() {
+                CHOSEN_IMAGES
+            } else {
+                0
+            }
     }
 
     /// Starts the state afresh in place, as
@@ -600,6 +657,13 @@ impl Loading {
         for (slot, v) in (field::CHART_DIFFICULTY..).zip(chart_fields(frame.meta())) {
             set(slot, v);
         }
+        if let Some(t) = self.drawable_chart() {
+            set(
+                field::CHART_STAGEFILE,
+                i32::from(t.present(ChartImage::Stage)),
+            );
+            set(field::CHART_BACKBMP, i32::from(t.present(ChartImage::Back)));
+        }
         self.fields = fields;
         for (slot, start) in (0..timer::BUILTIN).zip(self.starts.iter_mut()) {
             *start = match loading_timer(slot) {
@@ -608,7 +672,7 @@ impl Loading {
             };
         }
         let descriptor = gauge.is_some();
-        let chosen = frame.chosen();
+        let chosen = self.chosen(frame);
         read_timers(
             frame.now,
             &self.fields,
@@ -642,6 +706,8 @@ mod tests {
             "chart.difficulty_valid",
             "chart.bga",
             "chart.bga_valid",
+            "chart.stagefile",
+            "chart.backbmp",
         ];
         for name in chosen {
             assert_eq!(class(name), Some(LoadingField::Chosen), "{name}");

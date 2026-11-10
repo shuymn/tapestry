@@ -261,6 +261,8 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        flag("chart.stagefile", T),
+        flag("chart.backbmp", T),
         count("best.ex", E),
         count("target.ex", E),
         diff("best.diff"),
@@ -537,51 +539,58 @@ pub mod field {
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
     /// The source's 7-key point, with its intermediate widths: any `i32`.
     pub const POINT: u16 = 110;
+    /// Whether the chart's stage file is drawable in the installation:
+    /// read from its folder, decoded and published into its chart layer
+    /// (S10-12). While loading it is available only once the images are
+    /// published ([`Loading::set_chart_images`](crate::Loading::set_chart_images)).
+    pub const CHART_STAGEFILE: u16 = 111;
+    /// Whether the chart's back image is, as `chart.stagefile`.
+    pub const CHART_BACKBMP: u16 = 112;
     /// The play's best EX score B
     /// ([`ScoreBasis::best`](crate::ScoreBasis::best)): 0 when known
     /// empty, unavailable (no library, a failed read) or in a practice
     /// round.
-    pub const BEST_EX: u16 = 111;
+    pub const BEST_EX: u16 = 113;
     /// The play's target EX score T
     /// ([`ScoreBasis::target`](crate::ScoreBasis::target)).
-    pub const TARGET_EX: u16 = 112;
+    pub const TARGET_EX: u16 = 114;
     /// The EX score less the best paced linearly to the judged targets,
     /// `ex − ⌊B · p / n⌋` (`p` the judged targets, `n` the attempt's
     /// targets; 0 at `n = 0`), clamped to ±[`MAX_COUNT`](super::MAX_COUNT).
     /// Shown only while `best.valid`.
-    pub const BEST_DIFF: u16 = 113;
+    pub const BEST_DIFF: u16 = 115;
     /// The EX score less the target paced alike, `ex − ⌊T · p / n⌋`.
-    pub const TARGET_DIFF: u16 = 114;
+    pub const TARGET_DIFF: u16 = 116;
     /// B's rate over the attempt's targets, `⌊10 000 · B / 2n⌋` basis
     /// points, 0 at `n = 0`. Shown only while `best.valid`.
-    pub const BEST_RATE_BP: u16 = 115;
+    pub const BEST_RATE_BP: u16 = 117;
     /// T's rate alike.
-    pub const TARGET_RATE_BP: u16 = 116;
+    pub const TARGET_RATE_BP: u16 = 118;
     /// Whether the values measured against the best are shown: false for a
     /// chart that declares `#RANDOM` or `#SETRANDOM`, whose best may come
     /// from another draw. Not whether the best was read: an unavailable
     /// best is the empty score, shown.
-    pub const BEST_VALID: u16 = 117;
+    pub const BEST_VALID: u16 = 119;
     /// B's rate in parts per million, `⌊10⁶ · B / 2n⌋`: 0 at `n = 0` and
     /// while `best.valid` is false. Nonzero for any best above 0 while
     /// `2n ≤ 10⁶`, which the parser's object cap keeps.
-    pub const BEST_RATE_PPM: u16 = 118;
+    pub const BEST_RATE_PPM: u16 = 120;
     /// Whether the attempt has a judgment and its EX score is at least B.
-    pub const BEST_REACHED: u16 = 119;
+    pub const BEST_REACHED: u16 = 121;
     /// Whether the attempt has a judgment and its EX score is at least T.
-    pub const TARGET_REACHED: u16 = 120;
+    pub const TARGET_REACHED: u16 = 122;
     /// The first of the eight current-rank flags, `rank.current.K` at
-    /// `121 + K`: the band of the rate over the judged targets, from
+    /// `123 + K`: the band of the rate over the judged targets, from
     /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27 up to
     /// the band above; see [`rank_current`].
-    pub const RANK_CURRENT: u16 = 121;
+    pub const RANK_CURRENT: u16 = 123;
     /// The first of the eight whole-rank flags, `rank.whole.K` at
-    /// `129 + K`: the rate over the attempt's targets at least
+    /// `131 + K`: the rate over the attempt's targets at least
     /// [`RANK_TWENTY_SEVENTHS`](super::RANK_TWENTY_SEVENTHS)`[K]`/27; see
     /// [`rank_whole`].
-    pub const RANK_WHOLE: u16 = 129;
+    pub const RANK_WHOLE: u16 = 131;
     /// The number of fields.
-    pub const COUNT: usize = 137;
+    pub const COUNT: usize = 139;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -938,6 +947,19 @@ mod tests {
                 E
             ))
         );
+        // The chart's images, after the point.
+        for (name, s) in [
+            ("chart.stagefile", field::CHART_STAGEFILE),
+            ("chart.backbmp", field::CHART_BACKBMP),
+        ] {
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((FieldTy::Bool, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::CHART_STAGEFILE, field::POINT + 1);
         let int = |lo, hi| FieldTy::Int { lo, hi };
         let score = [
             ("best.ex", field::BEST_EX, int(0, MAX_COUNT), E),
@@ -957,7 +979,7 @@ mod tests {
             ("target.reached", field::TARGET_REACHED, FieldTy::Bool, T),
         ];
         for (i, (name, s, ty, export)) in score.into_iter().enumerate() {
-            assert_eq!(usize::from(s), 111 + i, "{name}");
+            assert_eq!(usize::from(s), 113 + i, "{name}");
             assert_eq!(slot(name), Some(s), "{name}");
             assert_eq!(
                 PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
@@ -967,8 +989,8 @@ mod tests {
         }
         for k in 0..8_u16 {
             for (kind, s, first) in [
-                ("current", field::rank_current(k), 121),
-                ("whole", field::rank_whole(k), 129),
+                ("current", field::rank_current(k), 123),
+                ("whole", field::rank_whole(k), 131),
             ] {
                 let name = format!("rank.{kind}.{k}");
                 assert_eq!(s, first + k, "{name}");
@@ -980,7 +1002,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(field::COUNT, 137);
+        assert_eq!(field::COUNT, 139);
     }
 
     #[test]

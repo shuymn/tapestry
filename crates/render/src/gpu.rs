@@ -1,5 +1,8 @@
 //! Instance, adapter and device setup on DX12.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::RenderError;
 
 /// Which DX12 adapter to render with.
@@ -20,9 +23,20 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     info: wgpu::AdapterInfo,
+    /// Set by the device's lost callback: on the pinned wgpu a device lost
+    /// or destroyed while writes are queued drops them and a wait still
+    /// returns, so a write that must reach the GPU checks this after its
+    /// wait (the chart images' publication, S10-12).
+    lost: Arc<AtomicBool>,
 }
 
 impl Gpu {
+    /// Whether the device was lost or destroyed since it was created.
+    #[must_use]
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
     /// The device.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -96,10 +110,14 @@ pub(crate) fn device(adapter: &wgpu::Adapter) -> Result<Gpu, RenderError> {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(RenderError::Device)?;
+    let lost = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&lost);
+    device.set_device_lost_callback(move |_, _| flag.store(true, Ordering::Release));
     Ok(Gpu {
         device,
         queue,
         info: adapter.get_info(),
+        lost,
     })
 }
 
