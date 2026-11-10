@@ -290,14 +290,12 @@ impl BpmGraph {
             u32::try_from(shown).unwrap_or(raster.cols)
         };
         let region = super::judge_graph::placed(rect, brush);
-        let [fx, fy] = brush.pivot;
-        let [px, py, pw, ph] = region;
         let r = Raster {
             region,
             cols: raster.cols,
             rows: raster.rows,
             from_bottom: true,
-            pivot: [px + fx * pw, py + fy * ph],
+            pivot: super::judge_graph::drawn_pivot(region, None, brush.pivot),
         };
         r.draw(&raster.runs, upto, brush, f, self.solid.filter, out);
     }

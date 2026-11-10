@@ -153,9 +153,8 @@ impl TimingVisualizer {
         let filter = self.solid.filter;
         // The source draws nothing of the band at alpha 0.
         if brush.color[3] > 0.0 {
-            let [px, py, pw, ph] = super::judge_graph::placed(rect, brush);
-            let [fx, fy] = brush.pivot;
-            let pivot = [px + fx * pw, py + fy * ph];
+            let region @ [px, py, pw, ph] = super::judge_graph::placed(rect, brush);
+            let pivot = super::judge_graph::drawn_pivot(region, None, brush.pivot);
             let (x, w) = (f64::from(px), f64::from(pw));
             let n = f64::from(def.texels());
             for run in d.band {

@@ -314,14 +314,12 @@ impl HitError {
             return;
         };
         let region = super::judge_graph::placed(rect, brush);
-        let [px, py, pw, ph] = region;
-        let [fx, fy] = brush.pivot;
         let r = Raster {
             region,
             cols: self.def.width,
             rows: 2 * self.def.window,
             from_bottom: false,
-            pivot: [px + fx * pw, py + fy * ph],
+            pivot: super::judge_graph::drawn_pivot(region, None, brush.pivot),
         };
         r.draw(d.state.runs(), u32::MAX, brush, f, self.solid.filter, out);
     }
