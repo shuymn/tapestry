@@ -439,6 +439,17 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/song_list.rs"),
     Site::File("crates/skin-model/src/widget/text.rs"),
     Site::File("crates/skin-model/src/widget/timing_graph.rs"),
+    // A chart image's table and stretch, read by every frame that draws
+    // one (S10-12); the read path in the same file is preparation work.
+    Site::Fns(
+        "crates/skin-model/src/chart_image.rs",
+        &[
+            "ChartImage::index",
+            "ChartTable::get",
+            "ChartTable::present",
+            "ChartStretch::place",
+        ],
+    ),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],

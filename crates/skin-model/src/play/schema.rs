@@ -245,6 +245,8 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        flag("chart.stagefile", T),
+        flag("chart.backbmp", T),
     ],
     timers: &[
         timer("ready", E),
@@ -495,8 +497,15 @@ pub mod field {
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
     /// The source's 7-key point, with its intermediate widths: any `i32`.
     pub const POINT: u16 = 110;
+    /// Whether the chart's stage file is drawable in the installation:
+    /// read from its folder, decoded and published into its chart layer
+    /// (S10-12). While loading it is available only once the images are
+    /// published ([`Loading::set_chart_images`](crate::Loading::set_chart_images)).
+    pub const CHART_STAGEFILE: u16 = 111;
+    /// Whether the chart's back image is, as `chart.stagefile`.
+    pub const CHART_BACKBMP: u16 = 112;
     /// The number of fields.
-    pub const COUNT: usize = 111;
+    pub const COUNT: usize = 113;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -841,7 +850,20 @@ mod tests {
                 E
             ))
         );
-        assert_eq!(field::COUNT, 111);
+        // The chart's images, after the point.
+        for (name, s) in [
+            ("chart.stagefile", field::CHART_STAGEFILE),
+            ("chart.backbmp", field::CHART_BACKBMP),
+        ] {
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((FieldTy::Bool, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::CHART_STAGEFILE, field::POINT + 1);
+        assert_eq!(field::COUNT, 113);
     }
 
     #[test]

@@ -37,10 +37,13 @@ use std::time::SystemTime;
 
 use image::RgbaImage;
 
+use crate::atlas::uv::FrameUv;
 use crate::atlas::{ALIGN, GUTTER, MAX_PAGE_SIDE, MIP_LEVELS, downsample_rgba, premultiply};
+use crate::canvas::f32_of;
 use crate::image::decode::{self, DecodeError, Mode, Site};
 use crate::image::path::{self, PathError};
 use crate::image::{MAX_FILE_BYTES, MAX_IMAGE_TEXELS, MAX_PATH_BYTES, MAX_SIDE};
+use crate::place::Native;
 
 /// A chart's folder, canonical: every name is resolved inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -651,6 +654,171 @@ fn extrude(src: &[u8], content: [u32; 2], padded: [u32; 2]) -> Result<Vec<u8>, A
         }
     }
     Ok(out)
+}
+
+/// Which of a chart's own images an element draws: the stage file
+/// (system image 100) or the back image (101).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChartImage {
+    Stage,
+    Back,
+}
+
+impl ChartImage {
+    /// Both, in table order.
+    pub const ALL: [Self; 2] = [Self::Stage, Self::Back];
+
+    /// Its index in a [`ChartTable`].
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Stage => 0,
+            Self::Back => 1,
+        }
+    }
+
+    /// Its slot in a chart layer of side `side`, gutters included, and
+    /// the slot's origin: the stage file at the top left, the back image
+    /// at the top right, each half the side square (S10-12 design §4.3).
+    /// `None` for a side whose half is no [`Slot`].
+    #[must_use]
+    pub fn slot(self, side: u32) -> Option<([u32; 2], Slot)> {
+        let half = side / 2;
+        let origin = match self {
+            Self::Stage => [0, 0],
+            Self::Back => [half, 0],
+        };
+        Slot::new([half, half]).map(|s| (origin, s))
+    }
+}
+
+/// Where a published chart image lies in its installation's chart layer:
+/// its content's uv (never the padding or gutter), and its native size,
+/// which stretch reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChartUv {
+    pub uv: FrameUv,
+    pub native: [u32; 2],
+}
+
+impl ChartUv {
+    /// The uv of `fitted` written in `which`'s slot of layer `layer`, a
+    /// chart layer of side `side`: level 0 at the slot's origin, its
+    /// content [`GUTTER`] texels in. `None` for a side with no such slot,
+    /// or content that does not fit it.
+    #[must_use]
+    pub fn of(fitted: &Fitted, which: ChartImage, side: u32, layer: u16) -> Option<Self> {
+        let ([ox, oy], slot) = which.slot(side)?;
+        let [pw, ph] = fitted.padded;
+        let [sw, sh] = slot.size();
+        if pw > sw || ph > sh {
+            return None;
+        }
+        let [cw, ch] = fitted.content;
+        let s = f64::from(side);
+        let at = |v: u32| f32_of(f64::from(v) / s);
+        Some(Self {
+            uv: FrameUv {
+                uv: [
+                    at(ox + GUTTER),
+                    at(oy + GUTTER),
+                    at(ox + GUTTER + cw),
+                    at(oy + GUTTER + ch),
+                ],
+                layer,
+            },
+            native: fitted.native,
+        })
+    }
+}
+
+/// The chart images an installation draws, by [`ChartImage::index`]: an
+/// entry without a uv is absent, and draws nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChartTable {
+    uvs: [Option<ChartUv>; 2],
+}
+
+impl ChartTable {
+    /// Both absent.
+    pub const ABSENT: Self = Self { uvs: [None, None] };
+
+    /// The stage file `stage` and the back image `back`.
+    #[must_use]
+    pub const fn new(stage: Option<ChartUv>, back: Option<ChartUv>) -> Self {
+        Self { uvs: [stage, back] }
+    }
+
+    /// `which`'s uv, `None` when it is absent.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn get(&self, which: ChartImage) -> Option<ChartUv> {
+        self.uvs.get(which.index()).copied().flatten()
+    }
+
+    /// Whether `which` is present: drawable from this table.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn present(&self, which: ChartImage) -> bool {
+        self.get(which).is_some()
+    }
+}
+
+/// How a chart image meets its destination: the stretch a skin names
+/// (`skin/StretchType.java` at `0.8.9`), applied at placement against the
+/// image's native size, which no import can know. The importer's cropping
+/// stretches have no case here: it drops them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartStretch {
+    /// The destination as given (0, and any other mode the importer keeps).
+    Fill,
+    /// 1: the image's aspect, inside the destination, centred.
+    Inner,
+    /// 2: the image's aspect, covering the destination, centred.
+    Outer,
+    /// 4: the destination's width, the image's aspect.
+    FitWidth,
+    /// 6: the destination's height, the image's aspect.
+    FitHeight,
+    /// 8: the native size, shrunk to fit and never enlarged, at placement.
+    NoExpanding,
+    /// 9: exactly the native size, at placement.
+    NoResize,
+}
+
+impl ChartStretch {
+    /// The destination `[x, y, w, h]` (author pixels) of an image of
+    /// `native` texels, and the native size the quad keeps at placement
+    /// for [`NoExpanding`](Self::NoExpanding) and
+    /// [`NoResize`](Self::NoResize), as an imported image's stretch is
+    /// baked (the importer's `track::stretch`, in `f64`). An image without
+    /// area keeps the destination.
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn place(self, [x, y, w, h]: [f32; 4], native: [u32; 2]) -> ([f32; 4], Option<Native>) {
+        let [iw, ih] = native;
+        if iw == 0 || ih == 0 {
+            return ([x, y, w, h], None);
+        }
+        let (fx, fy, fw, fh) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+        let (iw, ih) = (f64::from(iw), f64::from(ih));
+        let (sx, sy) = (fw / iw, fh / ih);
+        let fit_height = |nh: f64| [x, f32_of(fy + (fh - nh) / 2.0), w, f32_of(nh)];
+        let fit_width = |nw: f64| [f32_of(fx + (fw - nw) / 2.0), y, f32_of(nw), h];
+        let rect = match self {
+            Self::Fill => [x, y, w, h],
+            Self::Inner if sx <= sy => fit_height(ih * sx),
+            Self::Inner => fit_width(iw * sy),
+            Self::Outer if sx >= sy => fit_height(ih * sx),
+            Self::Outer => fit_width(iw * sy),
+            Self::FitWidth => fit_height(ih * fw / iw),
+            Self::FitHeight => fit_width(iw * fh / ih),
+            Self::NoExpanding => return ([x, y, w, h], Some(Native::NoLarger(native))),
+            Self::NoResize => return ([x, y, w, h], Some(Native::Exact(native))),
+        };
+        (rect, None)
+    }
 }
 
 #[cfg(test)]

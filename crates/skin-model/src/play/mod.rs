@@ -19,6 +19,7 @@ use rules::GaugeValue;
 use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
 use self::schema::{field, timer};
+use crate::chart_image::ChartTable;
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::widget::Starts;
@@ -527,6 +528,9 @@ pub struct Play {
     text: TextTable,
     /// The attempt's bitmap lines by text slot, empty until laid out.
     bitmap: Box<[Option<GlyphLine>]>,
+    /// The chart images its frames draw and whose fields they give:
+    /// absent until set ([`set_chart_images`](Self::set_chart_images)).
+    chart: ChartTable,
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
     bars: Option<BarScratch>,
@@ -714,6 +718,7 @@ impl Play {
             gauges: ctx.gauges.into(),
             text: TextTable::default(),
             bitmap: Box::new([]),
+            chart: ChartTable::ABSENT,
             bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
         })
     }
@@ -800,6 +805,21 @@ impl Play {
     /// The attempt's rasterized lines.
     pub(crate) fn text(&self) -> &TextTable {
         &self.text
+    }
+
+    /// Sets the chart images its frames draw and whose fields
+    /// (`chart.stagefile`, `chart.backbmp`) they give, from the next
+    /// frame on; kept by [`rearm`](Self::rearm). The caller sets them
+    /// before the attempt opens and never during it (S10-12 design §5.3).
+    /// Allocates nothing.
+    pub fn set_chart_images(&mut self, table: ChartTable) {
+        self.chart = table;
+    }
+
+    /// The chart images its frames draw.
+    #[must_use]
+    pub fn chart_images(&self) -> &ChartTable {
+        &self.chart
     }
 
     pub(crate) fn set_text(&mut self, table: TextTable) {

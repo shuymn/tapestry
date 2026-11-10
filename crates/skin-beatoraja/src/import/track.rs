@@ -504,6 +504,57 @@ pub(crate) fn one_branch(shared: Branches) -> bool {
 mod tests {
     use super::*;
 
+    /// A chart image's stretch at placement (`skin_model::chart_image`)
+    /// meets a destination as an imported image's baked stretch does, for
+    /// every mode it keeps, wide and tall images, and boxes of every
+    /// aspect; 8 and 9 keep the same native size at placement.
+    #[test]
+    fn chart_image_stretches_agree_with_the_baked_ones() {
+        use skin_model::chart_image::ChartStretch;
+        let modes = [
+            (0, ChartStretch::Fill),
+            (1, ChartStretch::Inner),
+            (2, ChartStretch::Outer),
+            (4, ChartStretch::FitWidth),
+            (6, ChartStretch::FitHeight),
+        ];
+        let boxes = [
+            [100, 100, 400, 100],
+            [-30, 20, 100, 400],
+            [0, 0, 640, 480],
+            [5, 7, 333, 333],
+        ];
+        let natives = [[200, 100], [100, 200], [640, 480], [1, 1], [1_920, 1_080]];
+        for (mode, chart) in modes {
+            for b in boxes {
+                for n in natives {
+                    let [x, y, w, h] = b.map(Q::int);
+                    let (baked, _) = stretch(Stretch::of(mode), Rect { x, y, w, h }, n).unwrap();
+                    let baked = [baked.x, baked.y, baked.w, baked.h].map(Q::to_f32);
+                    let (placed, native) = chart.place(b.map(|v| v as f32), n);
+                    assert_eq!(native, None);
+                    for (p, q) in placed.iter().zip(baked) {
+                        assert!(
+                            (p - q).abs() <= 1e-3,
+                            "mode {mode} {b:?} {n:?}: {placed:?} {baked:?}"
+                        );
+                    }
+                }
+            }
+        }
+        for n in natives {
+            let r = [0.0, 0.0, 10.0, 10.0];
+            assert_eq!(
+                ChartStretch::NoExpanding.place(r, n).1,
+                Stretch::of(8).native(n)
+            );
+            assert_eq!(
+                ChartStretch::NoResize.place(r, n).1,
+                Stretch::of(9).native(n)
+            );
+        }
+    }
+
     fn key(at: i64, x: i32) -> SrcKey {
         SrcKey {
             at,
