@@ -1471,6 +1471,11 @@ impl Spans {
     }
 }
 
+/// When the earliest of the preparations before a wait charged together
+/// began and the latest ended (tests).
+#[cfg(test)]
+pub type Charge = (Instant, Instant);
+
 /// One select or result skin frame (dev-tools).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenFrame {
@@ -1484,7 +1489,7 @@ pub struct ScreenFrame {
     /// When the earliest preparation before a wait charged to it began
     /// and the latest ended (tests).
     #[cfg(test)]
-    pub charged: Option<(Instant, Instant)>,
+    pub charged: Option<Charge>,
 }
 
 /// A select or result screen's lifetime as `tapestry measure select`
@@ -1639,10 +1644,10 @@ pub struct ScreenFrames {
     /// When the earliest preparation before a wait not yet charged began
     /// and the latest ended (tests).
     #[cfg(test)]
-    pending: Option<(Instant, Instant)>,
+    pending: Option<Charge>,
     /// What the last take of it held (tests).
     #[cfg(test)]
-    taken: Option<(Instant, Instant)>,
+    taken: Option<Charge>,
 }
 
 impl Default for ScreenFrames {
@@ -1939,14 +1944,14 @@ pub struct FramesProbe {
     pub result: (Option<u64>, Vec<Spans>),
     /// When the preparation before a wait charged to each of the result's
     /// frames began and ended ([`ScreenFrame::charged`]).
-    pub charged: Vec<Option<(Instant, Instant)>>,
+    pub charged: Vec<Option<Charge>>,
 }
 
 impl ScreenFrames {
     /// What a test sees of it (tests): the lifetime held, and its frames'
     /// spans and charges.
     #[cfg(test)]
-    pub fn probe(&self) -> (Option<u64>, Vec<Spans>, Vec<Option<(Instant, Instant)>>) {
+    pub fn probe(&self) -> (Option<u64>, Vec<Spans>, Vec<Option<Charge>>) {
         (
             self.lifetime,
             self.frames.iter().map(|f| f.spans).collect(),
