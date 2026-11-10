@@ -265,7 +265,7 @@ pub(crate) fn score_ratios(s: ScoreInputs) -> [Option<Ratio>; 6] {
     let judged = match (updated, p) {
         (false, _) => RATIO_ZERO,
         (true, 0) => RATIO_ONE,
-        (true, p) => Ratio::new(u64::from(ex), p.saturating_mul(2)).unwrap_or(RATIO_ZERO),
+        (true, p) => over_chart(u64::from(ex), p),
     };
     let compared = |r: Ratio| (!random).then_some(r);
     [
