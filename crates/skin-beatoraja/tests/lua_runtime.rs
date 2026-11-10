@@ -1106,3 +1106,27 @@ fn two_callbacks_on_one_line_are_two_sites() {
         .count();
     assert_eq!(errors, 2, "{notes:?}");
 }
+
+/// s7-06f-design.md F6: on a screen's runtime `main_state.offset` reads
+/// live state: the callback calling it raises, as every unbridged host read
+/// does there, where the import's configured pass answers it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_runtime_refuses_an_offset_read() {
+    untimed();
+    let mut i = import(&entry(
+        "",
+        &["function() return ms.offset(71).w + 1 end"],
+        "function() return true end",
+    ));
+    let routed = i
+        .callbacks
+        .iter()
+        .filter(|d| **d == Disposition::Runtime)
+        .count();
+    assert_eq!(routed, 1, "{:?}", i.callbacks);
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).status()[0], CallStatus::Error);
+}

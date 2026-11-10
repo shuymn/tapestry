@@ -12,6 +12,9 @@
 //!   absent with no candidate.
 //! - `offset[name]`: the offset `name`'s `x`, `y`, `w`, `h`, `r` and `a`,
 //!   the configured value of an offset the header declares, else zeros.
+//!
+//! The same values answer `main_state.offset(id)` by id
+//! ([`Bridge::offset`]), a nameless declared offset's included.
 //! - `get_path(path)`: `path`, relative to the entry's folder, with the
 //!   file choice that prefixes it substituted by the same candidate, as
 //!   the importer resolves a source path ([`Choices`]); `nil` when the
@@ -26,6 +29,7 @@
 //! decides the definition it returns. Of entries sharing a name, the
 //! last declared wins. An entry without a name is absent.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mlua::{Function, Lua, Table, Value};
@@ -42,6 +46,9 @@ pub(crate) struct Bridge {
     enabled: Vec<i32>,
     files: Vec<(String, String)>,
     offsets: Vec<(String, OffsetValue)>,
+    /// Every offset the header declares, by id, named or not: its
+    /// configured value, else zeros.
+    offset_ids: BTreeMap<i32, OffsetValue>,
     choices: Choices,
 }
 
@@ -71,21 +78,32 @@ impl Bridge {
                 Some((f.name.clone()?, chosen.clone()))
             })
             .collect();
+        let configured = |id: i32| config.offsets.get(&id).copied().unwrap_or_default();
         let offsets = header
             .offsets
             .iter()
-            .filter_map(|o| {
-                let v = config.offsets.get(&o.id).copied().unwrap_or_default();
-                Some((o.name.clone()?, v))
-            })
+            .filter_map(|o| Some((o.name.clone()?, configured(o.id))))
+            .collect();
+        let offset_ids = header
+            .offsets
+            .iter()
+            .map(|o| (o.id, configured(o.id)))
             .collect();
         Self {
             options,
             enabled,
             files,
             offsets,
+            offset_ids,
             choices,
         }
+    }
+
+    /// Offset `id` as the import applies it: its configured value when
+    /// the header declares it (`import/mod.rs`, a destination's offsets),
+    /// else zeros.
+    pub(crate) fn offset(&self, id: i32) -> OffsetValue {
+        self.offset_ids.get(&id).copied().unwrap_or_default()
     }
 
     /// `path` with its file choice substituted.
@@ -95,6 +113,23 @@ impl Bridge {
             Path::Missing | Path::Glob => None,
         }
     }
+}
+
+/// A fresh table of `v`'s `x`, `y`, `w`, `h`, `r` and `a`, Lua integers:
+/// an entry of `skin_config.offset`, and `main_state.offset`'s answer.
+pub(super) fn offset_table(lua: &Lua, v: OffsetValue) -> mlua::Result<Table> {
+    let t = lua.create_table_with_capacity(0, 6)?;
+    for (k, n) in [
+        ("x", v.x),
+        ("y", v.y),
+        ("w", v.w),
+        ("h", v.h),
+        ("r", v.r),
+        ("a", v.a),
+    ] {
+        t.raw_set(k, n)?;
+    }
+    Ok(t)
 }
 
 /// Sets the global `skin_config` of a configured pass's VM: plain tables
@@ -119,18 +154,7 @@ pub(super) fn install(
     }
     let offset = lua.create_table()?;
     for (name, v) in &bridge.offsets {
-        let t = lua.create_table()?;
-        for (k, n) in [
-            ("x", v.x),
-            ("y", v.y),
-            ("w", v.w),
-            ("h", v.h),
-            ("r", v.r),
-            ("a", v.a),
-        ] {
-            t.raw_set(k, n)?;
-        }
-        offset.raw_set(name.as_str(), t)?;
+        offset.raw_set(name.as_str(), offset_table(lua, *v)?)?;
     }
     // The library checks the argument; the host returns a path or nil and
     // never raises an error.

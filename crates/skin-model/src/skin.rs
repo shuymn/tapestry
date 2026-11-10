@@ -2471,6 +2471,14 @@ impl Skin {
             .is_none_or(crate::present::Present::carry_safe)
     }
 
+    /// Each gauge widget's segments and motion, in widget order
+    /// (dev-tools): what a report shows a gauge imported as.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn gauge_shapes(&self) -> Vec<(u16, crate::widget::gauge::Motion)> {
+        self.gauges.iter().map(|g| (g.segments, g.motion)).collect()
+    }
+
     /// Per program callback, whether it loads or stores a slot (dev-tools).
     #[cfg(feature = "dev-tools")]
     #[must_use]
