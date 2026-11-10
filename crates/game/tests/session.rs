@@ -261,6 +261,41 @@ fn retry_resets_judgment_and_starts_a_new_log() {
     );
 }
 
+/// `Session::play` is one attempt (plan §2.4.1, the path table): a retry
+/// during it ends that play, saved once, and returns its report without a
+/// result or a second play; the next attempt is the next call's.
+#[test]
+fn session_play_keeps_its_one_attempt_wrapper() {
+    let (_dir, root) = temp_root();
+    let chart = taps(&NOTES);
+    let events = Events::default();
+    let mut s = session(&root, &chart, &events);
+    let mut first = vec![connect(0)];
+    first.extend(presses(&NOTES));
+    let one = s
+        .play(script(first, &[(1_500 * MS, Command::Retry)]))
+        .unwrap();
+    assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Retry));
+    assert_eq!(number(&one), 1);
+    let saved: Vec<_> = fs::read_dir(root.records())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert_eq!(
+        *events.0.borrow(),
+        vec![
+            SessionEvent::Load,
+            SessionEvent::Start { attempt: 1 },
+            SessionEvent::Retry { attempt: 1 },
+            SessionEvent::End {
+                attempt: 1,
+                status: EndStatus::EndedMidway
+            },
+        ]
+    );
+}
+
 #[test]
 fn held_control_across_retry_then_released() {
     let (_dir, root) = temp_root();

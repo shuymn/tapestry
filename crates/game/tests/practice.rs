@@ -1754,7 +1754,7 @@ fn a_preparations_key_moves_with_each_input_it_reads() {
             ("kind", c.kind),
             ("gauges", c.gauges),
             ("preset", c.preset),
-            ("settings", c.settings),
+            ("displayed", c.displayed),
             ("screen", c.screen),
         ] {
             if on {

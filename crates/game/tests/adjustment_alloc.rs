@@ -1,7 +1,8 @@
 //! The adjustment reducer and its publication allocate nothing once built
 //! (design.md "Scope of No Allocation"): the first and later inputs, every
 //! kind of request and solve, repeats, an axis, a READY phase change, a
-//! loss and its resynchronization, full covers, a new attempt and each
+//! loss and its resynchronization, the acceptance closed and reopened,
+//! full covers, a new attempt, a solve within the context and each
 //! drain's snapshot. This file holds a single test, so the harness's other
 //! threads are not tracked.
 
@@ -9,8 +10,8 @@ mod counting;
 
 use bms_model::{Speed, TimeUs};
 use game::adjustment::{
-    Adjustment, AxisQuantum, ControlId, ControlRoles, Event, Head, HeldSet, Observation, Role,
-    TempoMap, presentation_link,
+    Acceptance, Adjustment, AxisQuantum, ControlId, ControlRoles, Event, Head, HeldSet,
+    Observation, Role, TempoMap, presentation_link,
 };
 use game::{Cover, Covers, HiSpeedSettings, PlayOptions, Ratio, References, SpeedMode};
 
@@ -141,6 +142,10 @@ fn the_reducer_and_its_publication_allocate_nothing() {
         o(613, Event::Release(c(1))),
         o(614, Event::Ownership),
         o(615, Event::Tick),
+        o(616, Event::Acceptance(Acceptance::Closed)),
+        o(617, Event::Press(c(8))),
+        o(618, Event::Acceptance(Acceptance::Open)),
+        o(619, Event::Release(c(8))),
     ];
     let mut b = Adjustment::new(classic, roles, TimeUs(-2_000_000), 0);
     let (mut wb, mut rb) = presentation_link(&b.snapshot());
@@ -156,12 +161,22 @@ fn the_reducer_and_its_publication_allocate_nothing() {
     a.enter_attempt(Some(TimeUs(-2_000_000)), &Map);
     a.drain(script.iter().copied(), &Map, &mut w);
     let _ = r.read();
+    // Solved again within the context.
+    let resolved = a.resolve(
+        TimeUs(-1_000_000),
+        Some(References::all(Ratio::integer(150))),
+        Speed::NORMAL,
+        &Map,
+    );
+    a.publish(&mut w);
+    let _ = r.read();
     // Full covers, Classic: a cover operation at the end.
     b.drain(script.iter().copied(), &Map, &mut wb);
     let s = *rb.read();
     let calls = counting::calls() - before;
     counting::track(false);
     assert_eq!(calls, 0, "the reducer allocated or freed {calls} times");
+    assert_eq!(resolved, Ok(()));
     assert!(s.hispeed.is_some());
     assert_eq!(a.diagnostics().unrepresentable, 0);
 }

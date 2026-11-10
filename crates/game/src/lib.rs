@@ -28,6 +28,7 @@ mod hispeed;
 mod keys;
 pub mod live;
 mod logic;
+pub mod opening;
 mod policy;
 mod practice;
 mod practice_screen;
@@ -87,6 +88,10 @@ pub use live::{
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
+};
+pub use opening::{
+    AcceptanceRevision, LOADING_FLOOR, LoadingOpener, LoadingRig, QUIET, Revalidated,
+    TuningSnapshot, load_and_open, loading_minimum, minimum_ends,
 };
 pub use policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,

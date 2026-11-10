@@ -7,6 +7,7 @@ use bms_model::Speed;
 use rules::GaugeValue;
 
 use crate::attempt::AttemptKind;
+use crate::policy::GaugeIndex;
 
 /// The screen's structural inputs a preparation was staged with: its
 /// device, the target size it laid the attempt out for, and the play
@@ -36,8 +37,12 @@ pub struct PrepKey {
     pub(crate) kind: AttemptKind,
     /// The play preset's canonical bytes, hashed.
     pub(crate) preset: u64,
-    /// The settings' version: it moves whenever they may have changed.
-    pub(crate) settings: u64,
+    /// The displayed gauge the attempt resolved
+    /// ([`Loaded::displayed`](crate::Loaded::displayed)): the loading
+    /// descriptor and the attempt's gauge read it. The player's other
+    /// settings (volume, offsets, hi-speed, covers) reach the attempt at
+    /// its opening and are not in the key.
+    pub(crate) displayed: GaugeIndex,
     /// The screen's structural inputs, once a preparation was staged with
     /// them; `None` before.
     pub(crate) screen: Option<ScreenKey>,
@@ -56,7 +61,7 @@ pub struct Changes {
     pub kind: bool,
     pub gauges: bool,
     pub preset: bool,
-    pub settings: bool,
+    pub displayed: bool,
     pub screen: bool,
 }
 
@@ -69,7 +74,7 @@ impl Changes {
             || self.kind
             || self.gauges
             || self.preset
-            || self.settings
+            || self.displayed
             || self.screen)
     }
 }
@@ -107,7 +112,7 @@ impl PrepKey {
             kind: self.kind != other.kind,
             gauges: gauges(&self.kind) != gauges(&other.kind),
             preset: self.preset != other.preset,
-            settings: self.settings != other.settings,
+            displayed: self.displayed != other.displayed,
             screen: self.screen != other.screen,
         }
     }

@@ -306,6 +306,16 @@ pub struct PlayerRig<'a> {
     pub result_chart: Option<skin_model::ResultChart>,
     /// The attempt's preparation begun last, until the next.
     pub prep: Option<AttemptPrep>,
+    /// The reducer's count of accepted adjustments when the loading
+    /// state's opening took its starting settings, read after a fence
+    /// ([`game::LoadingRig::apply_snapshot`]): what the revalidation
+    /// compares.
+    pub accepted_at_o1: Option<u64>,
+    /// The window's focus-loss generation the loading state's tuning
+    /// acceptance closed with, while it is closed: the opening asked for
+    /// carries it, and the input thread defers it when focus was lost
+    /// since.
+    pub accepted_focus: Option<u64>,
     /// The preparations begun so far: each one's ticket.
     pub preps: u64,
     /// The result's presentation (the S10-09i design's D1): its lifetime,
@@ -340,6 +350,16 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: the audio output reads as lost while set, from any thread.
+    #[cfg(test)]
+    pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: where the loading opener's steps wait while a test holds
+    /// them.
+    #[cfg(test)]
+    pub opening_gates: std::sync::Arc<loading::OpeningGates>,
+    /// Tests: each ended play's end and record, in order.
+    #[cfg(test)]
+    pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -536,21 +556,56 @@ impl PlayerRig<'_> {
     }
 
     /// The preparation begun last dropped (design.md "Play Lifecycle",
-    /// preparing each attempt: the handle owns its subjobs). A job still
-    /// running is settled as the run's end settles it, within the stop
-    /// bound: the specialization's outcome kept, the image stage's images
-    /// handed back. An unanswered render request is discarded as it drops.
-    fn drop_prep(&mut self) {
+    /// preparing each attempt: the handle owns its subjobs), on its
+    /// replacement or its discard, which do not end the run: a job still
+    /// running is settled as the attempt's quit settles it, waited for to
+    /// its thread's end, while the run's end ([`run_ends`](Self::run_ends))
+    /// is still asked and, once it came, bounds the wait by the stop bound.
+    /// The specialization's outcome is kept from a successful run, the
+    /// image stage's images handed back unless it was abandoned. An
+    /// unanswered render request is discarded as it drops. `None` when no
+    /// preparation was begun.
+    fn drop_prep(&mut self) -> Option<crate::imports::Settled> {
+        let mut prep = self.prep.take()?;
+        let settled = match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
+            PrepStage::Skin(mut job) => match self.pending.take() {
+                Some(mut pending) => {
+                    let settled = pending.settle(&mut job, || self.run_ends());
+                    self.pending = Some(pending);
+                    settled
+                }
+                None => crate::imports::Settled::Ended,
+            },
+            PrepStage::Image(_, mut job) => {
+                let mut result = std::mem::take(&mut self.result_skin);
+                let settled = result.settle_image_stage(&mut job, || self.run_ends());
+                self.result_skin = result;
+                settled
+            }
+            PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered(_) => {
+                crate::imports::Settled::Ended
+            }
+        };
+        Some(settled)
+    }
+
+    /// The preparation begun last dropped as the run ends (its shut-down):
+    /// a job still running is cancelled and given up within the stop
+    /// bound, the specialization's outcome kept from a successful run and
+    /// the image stage's images handed back unless it was abandoned.
+    fn end_prep(&mut self) {
         let Some(mut prep) = self.prep.take() else {
             return;
         };
         match std::mem::replace(&mut prep.stage, PrepStage::Answered(None)) {
             PrepStage::Skin(mut job) => {
                 if let Some(pending) = self.pending.as_mut() {
-                    pending.settle(&mut job);
+                    let _ = pending.settle(&mut job, || true);
                 }
             }
-            PrepStage::Image(_, mut job) => self.result_skin.settle_image_stage(&mut job),
+            PrepStage::Image(_, mut job) => {
+                let _ = self.result_skin.settle_image_stage(&mut job, || true);
+            }
             PrepStage::Screen(_) | PrepStage::Ended(_) | PrepStage::Answered(_) => {}
         }
     }
@@ -647,8 +702,12 @@ impl PlayerRig<'_> {
         self.presenter.lines(&mut self.render, lines);
     }
 
-    /// The result's lifetime ends: nothing of it is drawn any more.
+    /// The result's lifetime ends: nothing of it is drawn any more, and
+    /// the input offset keys stop working (design.md "Play Lifecycle",
+    /// tuning while loading) whether selection, the practice page or a
+    /// retry's preparation comes next.
     pub(crate) fn leave_result(&mut self) {
+        let _ = self.controls.tuning().close_end_screen();
         #[cfg(feature = "dev-tools")]
         if self.presenter.current() {
             crate::dev::print_result_work("left");
@@ -1033,7 +1092,7 @@ impl PlayerRig<'_> {
     pub fn shut_down(mut self) -> RenderEnd {
         // A preparation still running settles its job before the render
         // thread and the skins go.
-        self.drop_prep();
+        self.end_prep();
         self.persist();
         let ended = self.render.exit();
         self.audio.exit();
@@ -1333,7 +1392,10 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn now(&self) -> TimeUs {
-        self.clock.now()
+        let now = self.clock.now();
+        #[cfg(test)]
+        self.opening_gates.read_clock(now);
+        now
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -1577,7 +1639,7 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn discard_attempt(&mut self) {
-        self.drop_prep();
+        let _ = self.drop_prep();
         self.render.discard_attempt();
     }
 
@@ -1585,6 +1647,8 @@ impl Rig for PlayerRig<'_> {
     /// the opening returns to the same loading state ([`defer`](Rig::defer));
     /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
+        #[cfg(test)]
+        self.opening_gates.ending();
         let loading = self
             .selection
             .as_mut()
@@ -1626,9 +1690,29 @@ impl Rig for PlayerRig<'_> {
     /// started, or, without one, the result skin's image stage, or the
     /// render thread asked; it returns at once, and the polls drive the
     /// rest ([`poll_preparation`](Rig::poll_preparation)). A preparation
-    /// begun before is dropped, its unanswered request discarded.
+    /// begun before is dropped first ([`drop_prep`](Self::drop_prep)), its
+    /// job settled and its unanswered request discarded. Once that settle
+    /// is over, the run's end is looked at again: when it came, however
+    /// the settle ended, nothing new begins and the handle is cancelled.
     fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
-        self.drop_prep();
+        if self.drop_prep().is_some() && self.run_ends() {
+            self.preps += 1;
+            self.prep = Some(AttemptPrep {
+                ticket: self.preps,
+                attempt: None,
+                loading_gauge: None,
+                displayed: loaded.displayed().0,
+                chart: crate::result_skin::attempt_chart(loaded),
+                class: crate::result_skin::attempt_class(loaded),
+                labels: None,
+                scratch_notes: Vec::new(),
+                carry_key: None,
+                specialized: false,
+                staging: Instant::now(),
+                stage: PrepStage::Ended(Preparation::Cancelled),
+            });
+            return game::PrepHandle::new(key, self.preps);
+        }
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
         self.preps += 1;
@@ -1792,6 +1876,7 @@ impl Rig for PlayerRig<'_> {
             logic: thread::current(),
             recorded: self.recorded.clone(),
             gate: None,
+            focus: None,
         });
         #[cfg(feature = "dev-tools")]
         if opened.is_ok() {
@@ -1858,7 +1943,16 @@ impl Rig for PlayerRig<'_> {
             logic: thread::current(),
             recorded: self.recorded.clone(),
             gate: Some(generation),
+            focus: self.accepted_focus,
         })?;
+        #[cfg(test)]
+        if opened.is_none() {
+            self.opening_gates.deferred.pass();
+        }
+        if opened.is_some() {
+            // Recording opened: acceptance with it.
+            self.accepted_focus = None;
+        }
         #[cfg(feature = "dev-tools")]
         if opened.is_some() {
             Self::print_lua("open");
@@ -2136,6 +2230,10 @@ impl Rig for PlayerRig<'_> {
     /// A gated candidate's cancellation the audio thread never
     /// acknowledged counts as its stall.
     fn audio_failure(&self) -> Option<OutputError> {
+        #[cfg(test)]
+        if self.audio_lost.load(std::sync::atomic::Ordering::Acquire) {
+            return Some(OutputError::DeviceLost);
+        }
         crate::start_gate::output_failure(&self.audio.control, self.gate.as_ref())
     }
 
@@ -2223,6 +2321,8 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn ended(&mut self, report: &PlayReport) {
+        #[cfg(test)]
+        self.ended_plays.push((report.end, report.record.clone()));
         // The play state's carry takes the final tally.
         self.render.settled(report.tally);
         // The result is another scene: held adjustment controls act no more
@@ -2537,6 +2637,11 @@ pub(crate) fn scripted_end_over(after: Duration, shown: Duration, render: &Rende
     shown >= after
         && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
+
+mod loading;
+
+#[cfg(all(test, feature = "dev-tools"))]
+mod prep_tests;
 
 #[cfg(all(test, feature = "dev-tools"))]
 mod tests {

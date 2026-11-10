@@ -170,6 +170,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // The input thread.
+    Site::File("crates/input/src/activity.rs"),
     Site::File("crates/input/src/adjust.rs"),
     Site::File("crates/input/src/autoplay.rs"),
     Site::File("crates/input/src/cadence.rs"),
@@ -225,7 +226,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns(
         "crates/game/src/live.rs",
         &[
-            "play_and_next",
+            "ready_standard",
+            "open_and_play",
             "run_tail",
             "TailStage::begin",
             "TailStage::over",
@@ -248,6 +250,8 @@ pub const IN_PLAY: &[Site] = &[
             "cancel_reason",
         ],
     ),
+    // The loading opener's deferral, as `open_gated`'s.
+    Site::Fns("crates/game/src/opening.rs", &["open_loading"]),
     Site::Fns(
         "crates/game/src/session.rs",
         &[
@@ -324,6 +328,7 @@ pub const IN_PLAY: &[Site] = &[
             "Controls::wake_game",
             "Controls::command",
             "Controls::set_command",
+            "Controls::settings_key",
         ],
     ),
     Site::File("crates/player/src/tuning.rs"),
