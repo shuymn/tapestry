@@ -920,33 +920,33 @@ mod tests {
     }
 
     /// A play that asks to open before the window shows waits for it: the
-    /// window thread's show, made later, ends the wait. The opener's wait
-    /// is bounded by an hour, so only the show's wake ends it within the
-    /// test's watchdog ([`wait_until`](crate::render_side::tests::wait_until)).
+    /// window thread's show, made later, ends the wait.
     #[test]
     fn a_play_opening_before_the_show_waits_for_it() {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
-
-        use crate::render_side::tests::wait_until;
-
         let shared = std::sync::Arc::new(super::Shared::default());
         let shown = super::WindowShown(std::sync::Arc::clone(&shared));
         let window_side = std::sync::Arc::clone(&shared);
-        let opener = std::thread::spawn(move || shown.wait(Duration::from_secs(3_600)));
+        let opener = std::thread::spawn(move || shown.wait_to_open());
         std::thread::sleep(Duration::from_millis(100));
         // Still waiting: nothing showed the window.
         assert!(!opener.is_finished());
         let c = Controls::new(QpcClock::start());
         let mut showing = super::Showing::new(Instant::now());
         window_side.presented.store(true, Ordering::Release);
+        let showed = Instant::now();
         assert_eq!(
-            showing.poll(&FakeShow::default(), &c, &window_side, Instant::now()),
+            showing.poll(&FakeShow::default(), &c, &window_side, showed),
             None
         );
+        opener.join().unwrap();
         // Woken by the show, not by the wait's bound.
-        assert!(wait_until(|| opener.is_finished()), "the show woke no one");
-        assert!(opener.join().unwrap());
+        assert!(
+            showed.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            showed.elapsed()
+        );
     }
 
     /// Without a frame the window is shown at its deadline, and not before;

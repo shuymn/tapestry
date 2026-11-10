@@ -353,10 +353,6 @@ pub struct PlayerRig<'a> {
     /// Tests: the audio output reads as lost while set, from any thread.
     #[cfg(test)]
     pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Tests: the looks the result upload's wait has begun, each after
-    /// seeing no reason to stop ([`upload_result`](Self::upload_result)).
-    #[cfg(test)]
-    pub result_upload_looks: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Tests: where the loading opener's steps wait while a test holds
     /// them.
     #[cfg(test)]
@@ -777,9 +773,6 @@ impl PlayerRig<'_> {
                 println!("dev: result upload withdrawn");
                 return;
             }
-            #[cfg(test)]
-            self.result_upload_looks
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let why = match pending.poll(crate::render_side::SELECT_SLICE) {
                 None => continue,
                 Some(Ok(Preparation::Ready)) => return,
@@ -798,8 +791,25 @@ impl PlayerRig<'_> {
     fn settle_result(&mut self) {
         let mut result = std::mem::take(&mut self.result_skin);
         let rig = &*self;
-        result.settle(|| rig.run_ends());
+        // When the run's end was first seen (dev-tools witness).
+        #[cfg(feature = "dev-tools")]
+        let ended: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+        result.settle(|| {
+            let ends = rig.run_ends();
+            #[cfg(feature = "dev-tools")]
+            if ends && ended.get().is_none() {
+                ended.set(Some(std::time::Instant::now()));
+            }
+            ends
+        });
         self.result_skin = result;
+        #[cfg(feature = "dev-tools")]
+        if let Some(at) = ended.get() {
+            println!(
+                "dev: result skin settled {} ms after the run's end",
+                at.elapsed().as_millis()
+            );
+        }
         // The job's thread has ended, and its VMs with it, unless the
         // run's end gave it up (dev-tools witness).
         #[cfg(feature = "dev-tools")]
@@ -2080,13 +2090,6 @@ impl Rig for PlayerRig<'_> {
         self.ready_state_at = Some(ready_state_at);
         self.origin = Some(origin);
         println!("play started");
-        // Where the setup's end lies from chart time 0, on the same clock as
-        // the READY figures (dev-tools witness): negative once it ends late.
-        #[cfg(feature = "dev-tools")]
-        println!(
-            "dev: setup ended {} us before chart time 0",
-            origin.0 - started.0
-        );
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("ready");
         // A chart's first play: a retry runs from its own receipt.

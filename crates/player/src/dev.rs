@@ -1472,9 +1472,10 @@ impl Spans {
 }
 
 /// When the earliest of the preparations before a wait charged together
-/// began and the latest ended (tests).
+/// began and the latest ended, and the preparation taken for them
+/// (tests).
 #[cfg(test)]
-pub type Charge = (Instant, Instant);
+pub type Charge = (Instant, Instant, Duration);
 
 /// One select or result skin frame (dev-tools).
 #[derive(Clone, Copy, Debug, Default)]
@@ -1703,17 +1704,27 @@ impl ScreenFrames {
             .saturating_add(now.saturating_duration_since(since));
         #[cfg(test)]
         {
-            self.pending = Some(self.pending.map_or((since, now), |(a, _)| (a, now)));
+            self.pending = Some(
+                self.pending
+                    .map_or((since, now, Duration::ZERO), |(a, _, _)| {
+                        (a, now, Duration::ZERO)
+                    }),
+            );
         }
     }
 
     /// The preparation before the wait not yet charged, taken.
     pub fn take_before_wait(&mut self) -> Duration {
+        let taken = std::mem::take(&mut self.before_wait);
         #[cfg(test)]
         {
-            self.taken = self.pending.take();
+            let (from, to) = self
+                .pending
+                .take()
+                .map_or((Instant::now(), Instant::now()), |(a, b, _)| (a, b));
+            self.taken = Some((from, to, taken));
         }
-        std::mem::take(&mut self.before_wait)
+        taken
     }
 
     /// One skin frame of `lifetime`: its spans, its runtime's sample,

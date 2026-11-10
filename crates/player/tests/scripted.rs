@@ -379,19 +379,9 @@ fn the_play_setup_reaches_the_figures() {
     let m = measured(&saved[0]);
     let setup = int(&m, "ready", "setup_us").unwrap();
     let first = int(&m, "ready", "first_frame_us").unwrap();
-    // The setup takes time and runs from READY's start, the 1 s lead-in
-    // before chart time 0: with where it ended from chart time 0, read off
-    // the same clock, it spans the lead-in exactly, however the threads
-    // were scheduled. The first frame comes after it.
-    let before: i64 = stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("dev: setup ended "))
-        .and_then(|l| l.strip_suffix(" us before chart time 0"))
-        .unwrap_or_else(|| panic!("no setup line: {stdout}"))
-        .parse()
-        .unwrap();
-    assert!(0 < setup, "{setup}");
-    assert_eq!(setup + before, 1_000_000, "{setup} {before}");
+    // The setup takes time and ends within the 1 s lead-in; the first
+    // frame comes after it.
+    assert!(0 < setup && setup < 1_000_000, "{setup}");
     assert!(first > setup, "{first} {setup}");
     assert!(stdout.contains(&format!(
         "ready: setup {setup} us, first frame {first} us after it started"

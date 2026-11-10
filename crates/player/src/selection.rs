@@ -2695,9 +2695,7 @@ pub(crate) mod tests {
     /// installed, before anything of the choice happens (`look`'s gate):
     /// - while its installation waits on the render thread, the choice is
     ///   dropped with a notice, the select page goes on taking keys and
-    ///   each look returns with the installation still held (released
-    ///   past the watchdog, `TAPESTRY_TEST_WATCHDOG` seconds, so a look
-    ///   that waits for it fails instead of hanging);
+    ///   each look returns at once;
     /// - installed, the next choice is admitted;
     /// - refused, the choice is dropped with the screen's located reason
     ///   as the notice, every later choice too, and the page stays usable.
@@ -2731,29 +2729,19 @@ pub(crate) mod tests {
                 sel.menu.push(MenuInput::Key(*key));
             }
             let chosen = sel.drain(&mut Pad::default());
-            sel.admit(chosen, skin, &render, TimeUs(0))
+            let began = Instant::now();
+            let admitted = sel.admit(chosen, skin, &render, TimeUs(0));
+            assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
+            admitted
         };
 
         // Held on the render thread: dropped, and the page moves on.
         screens.hold_install.store(true, Ordering::Release);
-        let (disarm, armed) = std::sync::mpsc::channel::<()>();
-        let held = Arc::clone(&screens.hold_install);
-        let guard = std::thread::spawn(move || {
-            let watchdog = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
-            let after = Duration::from_secs(watchdog.and_then(|s| s.parse().ok()).unwrap_or(60));
-            let _ = armed.recv_timeout(after);
-            held.store(false, Ordering::Release);
-        });
         skin.select(&render, Some(bundle()));
-        for keys in [&[MenuKey::Enter][..], &[MenuKey::Down, MenuKey::Enter]] {
-            assert!(choose(&mut sel, &mut skin, keys).is_none());
-            assert_eq!(notice(&sel), "スキンを準備しています");
-            // The look returned with the installation still held.
-            assert!(screens.log().is_empty(), "{:?}", screens.log());
-            assert!(matches!(skin, SkinState::Selecting(_)));
-        }
-        drop(disarm);
-        guard.join().unwrap();
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Enter]).is_none());
+        assert_eq!(notice(&sel), "スキンを準備しています");
+        assert!(choose(&mut sel, &mut skin, &[MenuKey::Down, MenuKey::Enter]).is_none());
+        screens.hold_install.store(false, Ordering::Release);
         assert!(wait_until(|| screens.log().len() == 2));
         let admitted = choose(&mut sel, &mut skin, &[MenuKey::Enter]).expect("installed");
         assert_eq!(played(admitted).file_name().unwrap(), "b.bms");

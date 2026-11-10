@@ -814,9 +814,6 @@ pub struct Job<T> {
     attempt_cancelled: bool,
     /// The run's end came: the job is cancelled and given up at this time.
     stop_by: Option<Instant>,
-    /// When the run's end was seen, for the give-up's line (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    run_end_seen: Option<Instant>,
     /// The tally of the test thread that started it (tests).
     #[cfg(test)]
     tally: Arc<tests::Tally>,
@@ -886,8 +883,6 @@ pub fn spawn_job_with<T: Send + 'static>(
         outcome: None,
         attempt_cancelled: false,
         stop_by: None,
-        #[cfg(feature = "dev-tools")]
-        run_end_seen: None,
         #[cfg(test)]
         tally: tests::spawning(),
     })
@@ -975,10 +970,6 @@ impl<T> Job<T> {
             if self.stop_by.is_none() && end_run() {
                 self.cancel.cancel();
                 self.stop_by = Some(now + STOP_WAIT);
-                #[cfg(feature = "dev-tools")]
-                {
-                    self.run_end_seen = Some(now);
-                }
                 #[cfg(test)]
                 self.tally.settling(now, self.stop_by);
             }
@@ -990,20 +981,9 @@ impl<T> Job<T> {
             }
             #[cfg(test)]
             self.tally.looked(now);
-            if let Some(d) = self.stop_by
-                && now >= d
-            {
+            if self.stop_by.is_some_and(|d| now >= d) {
                 #[cfg(test)]
                 self.tally.gave_up(now);
-                // The deadline the decision held, from the run's end: the
-                // stop bound, whatever the threads' scheduling.
-                #[cfg(feature = "dev-tools")]
-                if let Some(seen) = self.run_end_seen {
-                    println!(
-                        "dev: skin job given up {} ms after the run's end",
-                        d.saturating_duration_since(seen).as_millis()
-                    );
-                }
                 // Detached: the handle and the receiver go, so a late
                 // outcome is dropped on its own thread.
                 self.handle = None;

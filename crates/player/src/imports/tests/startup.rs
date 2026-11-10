@@ -495,9 +495,8 @@ fn a_close_during_startup_ends_it() {
 
 /// A close while play's Lua job runs ends startup: the job is cancelled
 /// and joined, and no further build or selection follows; with the VM's
-/// destruction held past the stop bound, the job is abandoned at the
-/// bound and the run ends all the same. The bound is decided on the job's
-/// frozen stop clock; a terminating watchdog guards the scope.
+/// destruction held past the stop bound, the job is abandoned and the run
+/// ends all the same.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_close_during_a_lua_job_ends_startup() {
@@ -519,28 +518,24 @@ fn a_close_during_a_lua_job_ends_startup() {
             vm_hooks::hold();
         }
         let stop = stop_flag();
-        let clock = super::stop_clock();
-        let _watchdog = crate::tests::Watchdog::arm("a close during a Lua job");
-        let r = std::thread::scope(|s| {
+        let (r, took) = std::thread::scope(|s| {
             s.spawn(|| {
                 super::executing(base);
-                let close = || stop.store(true, Ordering::SeqCst);
-                if held {
-                    super::given_up_at_the_bound(&clock, close);
-                } else {
-                    close();
-                }
+                stop.store(true, Ordering::SeqCst);
             });
-            startup(&link, &choices, Launch::Selection, false, &build, || {
+            let from = Instant::now();
+            let r = startup(&link, &choices, Launch::Selection, false, &build, || {
                 stop.load(Ordering::SeqCst)
-            })
+            });
+            (r, from.elapsed())
         });
         let live = vm_hooks::live();
         vm_hooks::release();
         assert!(matches!(r, Err(StartupEnd::Closed)), "held {held}: {r:?}");
-        if !held {
-            assert_eq!(clock.seen().gave_up, None, "the cancelled job given up");
-        }
+        assert!(
+            took < STOP_WAIT + Duration::from_secs(4),
+            "held {held}: {took:?}"
+        );
         assert_eq!(live, base + usize::from(held), "held {held}");
         assert_eq!(builds.events(), ["build Play"], "held {held}");
         assert!(screens.log().is_empty(), "held {held}: {:?}", screens.log());

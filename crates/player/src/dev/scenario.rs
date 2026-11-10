@@ -3412,13 +3412,12 @@ mod tests {
     }
 
     /// The render thread stalled in a capture's read-back holds no lock:
-    /// settling the play returns while the read-back is still held, and
-    /// fails the capture as unanswered; the run's outcome is a failure. A
-    /// settle that waited for the read-back would never return, as the
-    /// release comes after it: the watchdog ends that.
+    /// settling the play does not wait for it, and fails the capture as
+    /// unanswered; the run's outcome is a failure.
     #[test]
     fn a_stalled_read_back_settles_without_waiting() {
         use std::sync::mpsc;
+        use std::time::{Duration, Instant};
 
         use super::{FrameSink as _, ScenarioFrames};
         use crate::render_side::RenderEnd;
@@ -3438,10 +3437,9 @@ mod tests {
             sink.frame(&screen, &drawn(1, 0));
         });
         stalled.recv().unwrap();
-        let watchdog = crate::tests::Watchdog::arm("a settle during a stalled read-back");
+        let begun = Instant::now();
         let settled = c.settle(1, false).unwrap();
-        drop(watchdog);
-        assert!(!render.is_finished());
+        assert!(begun.elapsed() < Duration::from_secs(1));
         assert_eq!(settled.failed[0].1, "the render thread did not answer");
         let e = super::conclude::<std::io::Error>(Ok(()), None, None, RenderEnd::Joined, &c);
         assert!(e.is_ok(), "a reported failure is the script's to report");

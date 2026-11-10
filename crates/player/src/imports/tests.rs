@@ -124,10 +124,12 @@ impl Tally {
 /// now on until dropped, and what the decision saw since (tests): a
 /// settlement's begin and its bound observed inside the decision, the
 /// time moved only by [`advance`](Self::advance).
+#[cfg(feature = "dev-tools")]
 #[derive(Debug)]
 pub(crate) struct StopClock(Arc<Tally>);
 
 /// Freezes this thread's jobs' stop decision clock ([`StopClock`]).
+#[cfg(feature = "dev-tools")]
 pub(crate) fn stop_clock() -> StopClock {
     let t = tally();
     *t.decision() = Decision {
@@ -137,6 +139,7 @@ pub(crate) fn stop_clock() -> StopClock {
     StopClock(t)
 }
 
+#[cfg(feature = "dev-tools")]
 impl StopClock {
     /// The decision's time now.
     pub(crate) fn now(&self) -> Instant {
@@ -190,17 +193,7 @@ impl StopClock {
     }
 }
 
-/// A settle, its wait deciding on `clock`, cancelled its job at the
-/// wait's first look, as the attempt's quit does, and never saw the run's
-/// end nor gave the job up: it ended with its thread.
-#[track_caller]
-pub(crate) fn cancelled_at_once(clock: &StopClock) {
-    let d = clock.seen();
-    assert_eq!(d.settling, Some(clock.now()), "cancelled at once: {d:?}");
-    assert_eq!(d.stopped, None, "{d:?}");
-    assert_eq!(d.gave_up, None, "{d:?}");
-}
-
+#[cfg(feature = "dev-tools")]
 impl Drop for StopClock {
     fn drop(&mut self) {
         self.0.decision().frozen = None;
@@ -381,13 +374,9 @@ impl Drop for Serial {
     }
 }
 
-/// How long a test waits for what must come however late a loaded
-/// machine runs it: it only catches what never happens.
-const WATCHDOG: Duration = Duration::from_secs(30);
-
-/// Waits up to [`WATCHDOG`] for `done`.
+/// Waits up to 30 s for `done`.
 fn wait_until(done: impl Fn() -> bool) -> bool {
-    let end = Instant::now() + WATCHDOG;
+    let end = Instant::now() + Duration::from_secs(30);
     while Instant::now() < end {
         if done() {
             return true;
@@ -1352,8 +1341,7 @@ const LOOP_STEPS: u64 = 20;
 /// job ends with the Lua cancellation, not a cap. With the VM's destruction held, the
 /// runner stays blocked midway, the VM still counted, and returns only
 /// once it is released and gone; with the job's thread held after its
-/// send, the runner stays blocked until that is released too. The stop's
-/// bound is decided on a frozen clock, so only the job's end answers.
+/// send, the runner stays blocked until that is released too.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
@@ -1363,12 +1351,11 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     let dropped = Arc::new(Mutex::new(None));
     let base = vm_hooks::live();
     let midway = Duration::from_millis(300);
-    let _clock = stop_clock();
 
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
     executing(base);
     stop.store(true, Ordering::SeqCst);
-    cancelled(rx.recv_timeout(WATCHDOG).unwrap());
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
     assert_eq!(vm_hooks::live(), base);
 
     // The VM's destruction held, released before the stop bound.
@@ -1383,7 +1370,7 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
     );
     assert_eq!(vm_hooks::live(), base + 1);
     vm_hooks::release();
-    cancelled(rx.recv_timeout(WATCHDOG).unwrap());
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
     assert_eq!(vm_hooks::live(), base);
 
     // The thread held after its send.
@@ -1398,7 +1385,7 @@ fn a_stop_mid_lua_cancels_and_returns_after_the_vm_and_the_thread() {
         early.is_err(),
         "returned before the thread ended: {early:?}"
     );
-    cancelled(rx.recv_timeout(WATCHDOG).unwrap());
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
 }
 
 /// A job's `sent` callback runs once on its thread, after its send and
@@ -1428,42 +1415,15 @@ fn a_jobs_sent_callback_runs_once_before_its_thread_ends() {
     assert!(rx.try_recv().is_err(), "the callback ran once");
 }
 
-/// How long past [`STOP_WAIT`] a test waits for a runner that must not
-/// answer: a runner bounded by the stop wait would have answered by then.
+/// How late past [`STOP_WAIT`] a runner that gives up at the bound may
+/// return on a loaded machine: its slices and the scheduler. The jobs it
+/// is checked against cannot end before the test releases them, which it
+/// does only after waiting [`HELD_FOR`]: a runner that waited for its job
+/// would answer nothing within that wait.
 const LATE: Duration = Duration::from_millis(750);
-
-/// Gives the run's end with `give` and lets the job's wait, deciding on
-/// the frozen `clock`, reach its bound: the wait saw the end and set its
-/// deadline [`STOP_WAIT`] from it, looked just before the deadline and
-/// went on waiting, then gave the job up at the deadline's first look.
-/// The clock stays frozen, so the bound is the only end the wait can take
-/// while the job is held; a wait that went on past it is reported, the
-/// clock thawed so that its runner answers.
-#[track_caller]
-fn given_up_at_the_bound(clock: &StopClock, give: impl FnOnce()) {
-    give();
-    assert!(
-        wait_until(|| clock.seen().stopped.is_some()),
-        "the run's end never seen"
-    );
-    let (seen, by) = clock.seen().stopped.expect("seen");
-    assert_eq!(by - seen, STOP_WAIT, "bounded from the run's end");
-    clock.advance_to(by - Duration::from_micros(1));
-    clock.continued_now();
-    assert_eq!(clock.seen().gave_up, None, "given up before the bound");
-    clock.advance_to(by);
-    clock.looked_now();
-    let looks = clock.seen().looks;
-    assert!(wait_until(|| {
-        let d = clock.seen();
-        d.gave_up.is_some() || d.looks > looks
-    }));
-    let gave_up = clock.seen().gave_up;
-    if gave_up != Some(by) {
-        clock.thaw();
-        panic!("given up at the bound: {gave_up:?}, bound {by:?}");
-    }
-}
+/// How long the abandonment tests wait for the runner, the job held
+/// meanwhile; past [`STOP_WAIT`] + [`LATE`].
+const HELD_FOR: Duration = Duration::from_secs(7);
 
 /// A VM held past the stop bound when the run ends: the runner gives up
 /// at the bound, the VM still counted and the job started but not
@@ -1482,12 +1442,15 @@ fn a_job_past_the_stop_wait_is_abandoned() {
     let base = vm_hooks::live();
     let (started_before, joined) = counted();
     vm_hooks::hold();
-    let clock = stop_clock();
     let (stop, rx) = started(looping_job(dir.path(), &dropped));
     executing(base);
-    given_up_at_the_bound(&clock, || stop.store(true, Ordering::SeqCst));
-    let ran = rx.recv_timeout(WATCHDOG);
+    let stopped = Instant::now();
+    stop.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(HELD_FOR);
+    let after = stopped.elapsed();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    assert!(after >= STOP_WAIT, "{after:?}");
+    assert!(after < STOP_WAIT + LATE, "{after:?}");
     assert_eq!(vm_hooks::live(), base + 1);
     assert_eq!(counted(), (started_before + 1, joined));
     drop(serial);
@@ -1503,7 +1466,6 @@ fn a_job_past_the_stop_wait_is_abandoned() {
 fn a_received_outcome_still_waits_within_the_stop_bound() {
     let _serial = serial();
     hold_exit(true);
-    let clock = stop_clock();
     let (stop, rx) = started(|_: &Cancel| 7_u32);
     assert!(
         wait_until(|| exit_waiting() == 1),
@@ -1512,14 +1474,16 @@ fn a_received_outcome_still_waits_within_the_stop_bound() {
         WORKERS.load(Ordering::SeqCst)
     );
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
-    given_up_at_the_bound(&clock, || stop.store(true, Ordering::SeqCst));
-    let ran = rx.recv_timeout(WATCHDOG);
+    let stopped = Instant::now();
+    stop.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(HELD_FOR);
+    let after = stopped.elapsed();
     hold_exit(false);
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
-    drop(clock);
+    assert!(after >= STOP_WAIT && after < STOP_WAIT + LATE, "{after:?}");
     // Released, an unstopped job's outcome comes once its thread ends.
     let (_stop, rx) = started(|_: &Cancel| 7_u32);
-    assert!(matches!(rx.recv_timeout(WATCHDOG), Ok(Ran::Done(7))));
+    assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
 }
 
 /// Cancelling the attempt while the looping pass's Lua executes cancels
@@ -1549,7 +1513,7 @@ fn an_attempts_cancel_waits_for_the_thread_past_the_stop_bound() {
     assert_eq!(vm_hooks::live(), base + 1);
     assert_eq!(counted(), (started + 1, joined));
     vm_hooks::release();
-    cancelled(rx.recv_timeout(WATCHDOG).unwrap());
+    cancelled(rx.recv_timeout(STOP_WAIT).unwrap());
     assert_eq!(vm_hooks::live(), base);
     assert_eq!(counted(), (started + 1, joined + 1));
 }
@@ -1570,7 +1534,7 @@ fn an_attempts_cancel_never_abandons_a_held_thread() {
         early.is_err(),
         "returned before the thread ended: {early:?}"
     );
-    assert!(matches!(rx.recv_timeout(WATCHDOG), Ok(Ran::Done(7))));
+    assert!(matches!(rx.recv_timeout(STOP_WAIT), Ok(Ran::Done(7))));
 }
 
 /// The escalation: the attempt cancelled and the VM's destruction held
@@ -1588,20 +1552,18 @@ fn the_runs_end_during_an_attempts_cancel_abandons_within_the_bound() {
     let base = vm_hooks::live();
     let (started, joined) = counted();
     vm_hooks::hold();
-    let clock = stop_clock();
     let (signals, rx) = started_job(looping_job(dir.path(), &dropped));
     executing(base);
     signals.attempt.store(true, Ordering::SeqCst);
     assert!(wait_until(|| vm_hooks::waiting() == 1));
-    // The quit's wait has no bound: past the stop wait it goes on.
-    assert!(wait_until(|| clock.seen().settling.is_some()));
-    let quit = clock.seen().settling.expect("quit");
-    clock.advance_to(quit + STOP_WAIT + LATE);
-    clock.continued_now();
-    assert_eq!(clock.seen().gave_up, None, "the quit gave the job up");
-    given_up_at_the_bound(&clock, || signals.end.store(true, Ordering::SeqCst));
-    let ran = rx.recv_timeout(WATCHDOG);
+    let early = rx.recv_timeout(STOP_WAIT + Duration::from_millis(500));
+    assert!(early.is_err(), "{early:?}");
+    let ended = Instant::now();
+    signals.end.store(true, Ordering::SeqCst);
+    let ran = rx.recv_timeout(HELD_FOR);
+    let after = ended.elapsed();
     assert!(matches!(ran, Ok(Ran::Abandoned)), "{ran:?}");
+    assert!(after >= STOP_WAIT && after < STOP_WAIT + LATE, "{after:?}");
     assert_eq!(counted(), (started + 1, joined));
     drop(serial);
     assert_eq!(WORKERS.load(Ordering::SeqCst), 0);
@@ -1657,14 +1619,14 @@ fn a_panic_and_a_silent_end_are_told_apart() {
     #[cfg(feature = "dev-tools")]
     let (started_before, joined) = counted();
     let (_stop, rx) = started(|_: &Cancel| -> u32 { panic!("the job panics") });
-    match rx.recv_timeout(WATCHDOG).unwrap() {
+    match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, PANICKED),
         other => panic!("{other:?}"),
     }
     #[cfg(feature = "dev-tools")]
     assert_eq!(counted(), (started_before + 1, joined + 1));
     let (_stop, rx) = started(|_: &Cancel| -> u32 { std::panic::panic_any(Bomb) });
-    match rx.recv_timeout(WATCHDOG).unwrap() {
+    match rx.recv_timeout(STOP_WAIT).unwrap() {
         Ran::Refused(why) => assert_eq!(why, ENDED),
         other => panic!("{other:?}"),
     }

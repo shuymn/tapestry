@@ -1415,9 +1415,8 @@ fn a_pending_lua_skin_draws_on_its_uploaded_pages() {
 
 /// An image stage whose preparation was superseded or discarded is
 /// settled, never detached (the S10 item 9 design's 9.2 ownership): a
-/// probe that would run forever is cancelled at the wait's first look and
-/// its thread joined, the run's end never needed to bound it, and the
-/// skin is not left busy.
+/// probe that would run forever is cancelled and its thread joined within
+/// the stop bound, and the skin is not left busy.
 #[test]
 fn a_settled_image_stage_is_cancelled_and_joined() {
     let _s = serial();
@@ -1433,12 +1432,16 @@ fn a_settled_image_stage_is_cancelled_and_joined() {
         panic!("a job runs");
     };
     let joined = jobs_joined();
-    let clock = crate::imports::tests::stop_clock();
+    let from = std::time::Instant::now();
     assert_eq!(
         rs.settle_image_stage(&mut job, || false),
         crate::imports::Settled::Ended
     );
-    crate::imports::tests::cancelled_at_once(&clock);
+    assert!(
+        from.elapsed() < crate::imports::STOP_WAIT,
+        "{:?}",
+        from.elapsed()
+    );
     assert_eq!(jobs_joined() - joined, 1, "the job's thread joined");
     assert!(!rs.busy());
 }

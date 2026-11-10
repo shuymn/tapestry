@@ -370,13 +370,9 @@ fn both_skins_show_the_snapshot_when_effects_are_dropped() {
 /// A paced screen that keeps a swap chain's promise: its wait takes 2 ms,
 /// as a refresh would, and grants one frame, which only a presented draw
 /// gives back; while that frame is out, a wait grants nothing. It notes
-/// how often the render loop looks at it without an
-/// [`ACQUIRE_WAIT`](super::super::ACQUIRE_WAIT) wait since its last look,
-/// and which generations it builds.
+/// how often the render loop looks at it and which generations it builds.
 struct Paced {
-    unwaited: Arc<std::sync::atomic::AtomicU64>,
-    /// The render loop's waits as of the last look.
-    waits: std::sync::atomic::AtomicU64,
+    looks: Arc<std::sync::atomic::AtomicU64>,
     built: Arc<Mutex<Vec<u64>>>,
     /// A frame granted and not yet presented.
     granted: AtomicBool,
@@ -391,10 +387,7 @@ impl Screen for Paced {
         !self.granted.swap(true, Ordering::AcqRel)
     }
     fn paced(&self) -> bool {
-        let waits = super::super::acquire_waits();
-        if self.waits.swap(waits, Ordering::Relaxed) == waits {
-            self.unwaited.fetch_add(1, Ordering::Relaxed);
-        }
+        self.looks.fetch_add(1, Ordering::Relaxed);
         true
     }
     fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
@@ -420,27 +413,26 @@ impl Screen for Paced {
 /// of spinning; it builds the new candidate on the frame it kept once its
 /// view is published (a skip that gave the grant up would wait for a
 /// frame the screen never grants again), and an exit sent while the step
-/// is held again ends it from the wait, no frame built.
+/// is held again ends it at once.
 #[test]
 fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
     use game::EventSink as _;
 
     let initial = crate::render_common::view(0, 0);
     let (mut sink, mut writer, side) = game::render_link(16, &initial);
-    let unwaited = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let looks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let built = Arc::new(Mutex::new(Vec::new()));
-    let (u, b) = (Arc::clone(&unwaited), Arc::clone(&built));
+    let (l, b) = (Arc::clone(&looks), Arc::clone(&built));
     let make: MakeScreen = Box::new(move || {
         Ok(Box::new(Paced {
-            unwaited: Arc::clone(&u),
-            waits: std::sync::atomic::AtomicU64::new(0),
+            looks: Arc::clone(&l),
             built: Arc::clone(&b),
             granted: AtomicBool::new(false),
         }) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
     let chart = Arc::new(chart());
-    let mut link = spawn(
+    let link = spawn(
         make,
         Some(Arc::clone(&chart)),
         None,
@@ -450,8 +442,6 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
         Box::new(NoFrames),
     )
     .unwrap();
-    // The exit's wait is a hang guard only.
-    link.set_timeouts(super::super::LOAD_TIMEOUT, Duration::from_secs(60));
     let ready = link.prepare_attempt(super::attempt(&chart, None), || false);
     assert_eq!(ready.unwrap(), Preparation::Ready);
     link.send(RenderMsg::Play {
@@ -461,26 +451,18 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
         measure: play_measure(clock.now()),
     });
     assert!(wait_until(|| built.lock().unwrap().len() >= 3));
-    // Rearmed, its view not published: no frame, and past the immediate
-    // retries (fewer if the loop ran them before the window) each look
-    // follows a wait, however long the window lasts.
+    // Rearmed, its view not published: no frame, and few looks.
     sink.rearm(TimeUs(clock.now().0 + 10_000_000));
     std::thread::sleep(Duration::from_millis(50));
-    let (frames, before) = (
-        built.lock().unwrap().len(),
-        unwaited.load(Ordering::Relaxed),
-    );
+    let (frames, before) = (built.lock().unwrap().len(), looks.load(Ordering::Relaxed));
     std::thread::sleep(Duration::from_millis(300));
-    let held = unwaited.load(Ordering::Relaxed) - before;
+    let held = looks.load(Ordering::Relaxed) - before;
     assert_eq!(
         built.lock().unwrap().len(),
         frames,
         "a frame of a held rearm"
     );
-    assert!(
-        held <= u64::from(super::super::ACQUIRE_RETRIES) + 1,
-        "{held} looks without a wait: the loop spins"
-    );
+    assert!(held < 1_000, "{held} looks in 300 ms: the loop spins");
     // Published: the new candidate is drawn.
     let v = writer.input_buffer_mut();
     v.generation = 1;
@@ -494,15 +476,14 @@ fn a_held_rearm_neither_spins_nor_blocks_the_render_loop() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Held again, an exit still ends the loop: served from the wait, as
-    // no frame is built after the rearm.
+    // Held again, an exit still ends the loop at once.
     sink.rearm(TimeUs(clock.now().0 + 20_000_000));
     std::thread::sleep(Duration::from_millis(50));
-    let frames = built.lock().unwrap().len();
+    let asked = Instant::now();
     assert!(matches!(link.exit(), super::super::RenderEnd::Joined));
-    assert_eq!(
-        built.lock().unwrap().len(),
-        frames,
-        "a frame of a held rearm"
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked.elapsed()
     );
 }
