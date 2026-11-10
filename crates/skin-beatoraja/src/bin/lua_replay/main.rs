@@ -2,7 +2,7 @@
 //! reference executor; docs/stage3.md S7-06e), for the developer's PC:
 //! `lua_replay [--autoplay on|off] [--class veryhard|hard|normal|easy|veryeasy|none]
 //! [--level <n>] [--option <name> <item>]... [--file <name> <candidate>]...
-//! [--script full|mixed|rounds|rounds-unwitnessed|closing] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
+//! [--script full|mixed|rounds|rounds-unwitnessed|closing|zero-score] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
 //! <root> <entry> [<root> <entry>]...`
 //!
 //! Each play skin is imported twice. The production import's frames are
@@ -24,6 +24,8 @@
 mod hints;
 mod inputs;
 mod isolation;
+#[cfg(test)]
+mod lowered_tests;
 mod observed;
 mod production;
 mod reference;
@@ -45,7 +47,7 @@ use crate::script::Script;
 
 const USAGE: &str = "usage: lua_replay [--autoplay on|off] \
      [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>] \
-     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|rounds-unwitnessed|closing] \
+     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|rounds-unwitnessed|closing|zero-score] \
      [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
 
 /// What the flags ask for.

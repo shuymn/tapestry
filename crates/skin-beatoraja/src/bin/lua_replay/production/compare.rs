@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use skin_beatoraja::lua::replay::Occurrence;
+use skin_beatoraja::lua::replay::{LoweredRecord, Occurrence};
 use skin_beatoraja::lua::survey::Became;
-use skin_model::MAX_ELAPSED_MS;
 use skin_model::present::trace::{Converted, Event, Skip};
 use skin_model::present::{Fail, Val};
+use skin_model::{MAX_ELAPSED_MS, PLAY, Program, Scope, State, Ty, compile, field};
 
 use super::{FrameKind, ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
@@ -147,6 +147,86 @@ fn luaj_hint(obs: &Observed, c: u32) -> String {
         format!(" [luaj-operator: {} at line {first}]", ops.join(" "))
     }
 }
+/// A lowered occurrence's expression compiled as the import compiled it
+/// (s7-06e-3-design.md §2): its guards and its source over the play
+/// schema, `Bool` for a `draw` or an `op`, `Int` for a `value`.
+struct LoweredExpr {
+    guards: Vec<Program>,
+    src: Program,
+}
+
+fn compile_lowered(field: &str, l: &LoweredRecord) -> Result<LoweredExpr, String> {
+    let scope = Scope::new(&PLAY);
+    let truthy = field != "value";
+    let ty = if truthy { Ty::Bool } else { Ty::Int };
+    let guards = l
+        .guards
+        .iter()
+        .map(|g| compile(g, &scope, Ty::Bool).map_err(|e| format!("guard {g}: {e:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let src = compile(&l.src, &scope, ty).map_err(|e| format!("{}: {e:?}", l.src))?;
+    Ok(LoweredExpr { guards, src })
+}
+
+/// The first difference between a lowered occurrence's expression on
+/// `fields` and `timers` and the reference's invocation: the class (a
+/// false guard is unavailable), then the converted value (`toboolean` for
+/// a `draw` or an `op`, `toint` for a `value`, by the reference
+/// occurrence's own consumer `field`, whatever the record says). An
+/// invocation that could not complete or raised has no expression
+/// counterpart.
+fn lowered_differ(
+    field: &str,
+    e: &LoweredExpr,
+    fields: &[i32],
+    timers: &[i32],
+    refo: Outcome,
+) -> Option<String> {
+    let state = State { fields, timers };
+    let given = e.guards.iter().all(|g| g.eval(&state) != 0);
+    match refo {
+        Outcome::Unanswered(api) => Some(format!("reference could not complete ({api})")),
+        Outcome::Budget => Some("reference could not complete (budget)".into()),
+        Outcome::Error => Some("a Lua error where the expression gives a value".into()),
+        Outcome::Unavailable if given => {
+            Some("class: production value, reference unavailable".into())
+        }
+        Outcome::Unavailable => None,
+        Outcome::Value(_) if !given => {
+            Some("class: production unavailable, reference value".into())
+        }
+        Outcome::Value(r) => {
+            let v = e.src.eval(&state);
+            let (got, want) = if field != "value" {
+                (i32::from(v != 0), i32::from(luaj_bool(r)))
+            } else {
+                (v, luaj_toint(r))
+            };
+            (got != want).then(|| format!("lowered: production {got}, reference {want} ({r:?})"))
+        }
+    }
+}
+
+/// `fields` with the score data's three fields set to `s`: the state the
+/// reference host answered the score properties from (s7-06e-3-design.md
+/// §2a, the causation check).
+fn with_score(fields: &[i32], s: [i32; 3]) -> Vec<i32> {
+    let mut out = fields.to_vec();
+    for (slot, v) in [
+        field::EX_SCORE,
+        field::RATE_CURRENT_BP,
+        field::RATE_WHOLE_BP,
+    ]
+    .into_iter()
+    .zip(s)
+    {
+        if let Some(c) = out.get_mut(usize::from(slot)) {
+            *c = v;
+        }
+    }
+    out
+}
+
 /// An occurrence's identity as the comparator joins on it: destination,
 /// consumer, index, callable and object path (s7-06e-1-r1-tables.md, A4).
 type Join = (usize, &'static str, u32, u32, &'static str);
@@ -511,6 +591,10 @@ fn place(kind: FrameKind) -> String {
     }
 }
 
+/// The bucket of a lowered consumer's disagreement the score data alone
+/// explains (design.md "Differences from the source").
+const SCORE_DIFFERENCE: &str = "score readings across rounds (difference)";
+
 /// A key for findings no occurrence names.
 const UNKNOWN: Key = Key {
     dest: usize::MAX,
@@ -658,6 +742,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         }
     }
     let mut stopped: BTreeMap<(&'static str, u32), (&'static str, usize, Key)> = BTreeMap::new();
+    let mut lowered: BTreeMap<Join, Result<LoweredExpr, String>> = BTreeMap::new();
     for (i, (pf, rf)) in run.frames.iter().zip(&obs.frames).enumerate() {
         let label = pf.kind.label();
         rep.kinds.entry(label).or_default().0 += 1;
@@ -787,6 +872,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 };
                 // Points: an invocation each, or one not reached.
                 rep.points += calls.len().max(1);
+                let lowered_rec = cx
+                    .rec(&key)
+                    .filter(|o| k.is_none() && o.disposition == "lowered");
+                let lowered_here = lowered_rec.is_some();
                 for &(_, outcome) in &calls {
                     let api = match outcome {
                         Outcome::Unanswered(a) => Some(a),
@@ -795,12 +884,59 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     };
                     if let Some(api) = api
                         && k.is_none()
+                        && !lowered_here
                     {
                         stopped
                             .entry(("play", key.callable))
                             .or_insert((api, 0, key))
                             .1 += 1;
                     }
+                }
+                // A lowered occurrence: its expression on this frame's
+                // production state against the closure (s7-06e-3-design.md
+                // §2), a disagreement attributed to the score data only when
+                // the score fields alone explain it (§2a).
+                if let Some(o) = lowered_rec {
+                    let expr = lowered.entry(join(&key)).or_insert_with(|| {
+                        o.lowered
+                            .as_ref()
+                            .ok_or_else(|| "a lowered occurrence with no expression".to_owned())
+                            .and_then(|l| compile_lowered(key.field, l))
+                    });
+                    for &(_, outcome) in &calls {
+                        rep.matched += 1;
+                        let e = match expr {
+                            Ok(e) => e,
+                            Err(why) => {
+                                find(key, i, format!("lowered expression: {why}"));
+                                continue;
+                            }
+                        };
+                        let Some(d) = lowered_differ(key.field, e, &pf.fields, &pf.timers, outcome)
+                        else {
+                            rep.agreed += 1;
+                            *rep.lowered.entry((label, key.field)).or_default() += 1;
+                            continue;
+                        };
+                        let explained = match pf.score {
+                            Some(s) if pf.zero_tally => lowered_differ(
+                                key.field,
+                                e,
+                                &with_score(&pf.fields, s),
+                                &pf.timers,
+                                outcome,
+                            )
+                            .is_none(),
+                            _ => false,
+                        };
+                        if explained {
+                            *rep.buckets.entry(SCORE_DIFFERENCE.to_owned()).or_default() += 1;
+                            *rep.score_difference.entry(round + 1).or_default() += 1;
+                        } else {
+                            find(key, i, d);
+                        }
+                    }
+                    continue;
                 }
                 let Some(k) = k else {
                     if !calls.is_empty() {
@@ -1808,5 +1944,50 @@ mod tests {
         found("frame kind", &|_, obs| {
             obs.frames[0].outside = false;
         });
+    }
+
+    /// s7-06e-3-design.md W11: a wrong lowered expression reading the
+    /// score on a later round's READY stays a finding: substituting the
+    /// carried score data does not make `max(ex_score, 1)` agree with the
+    /// closure's 0 (zero-score: R2 READY carries EX 0).
+    #[test]
+    fn a_wrong_score_expression_stays_a_finding() {
+        use crate::script::Script;
+        use crate::tests::pieces_over;
+        let body = "skin.value = { { id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+               value = function() return ms.number(71) end } }\n\
+             table.insert(skin.destination, { id = \"m\", dst = { { x = 0, y = 0, w = 60, h = 6 } } })\n";
+        let (run, obs) = pieces_over(body, Script::zero_score());
+        let clean = compare(&run, &obs, &[]);
+        assert!(
+            clean
+                .findings
+                .iter()
+                .all(|f| f.place.starts_with("round 1 ")),
+            "{}",
+            clean.text(0, true, true)
+        );
+        let (mut run, obs) = pieces_over(body, Script::zero_score());
+        let mut n = 0;
+        for o in &mut run.recorded.occurrences {
+            if let Some(l) = o.lowered.as_mut() {
+                l.src = "max(ex_score, 1)".to_owned();
+                n += 1;
+            }
+        }
+        assert_eq!(n, 1);
+        let r = compare(&run, &obs, &[]);
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.place == "round 2 ready" && f.what.starts_with("lowered:")),
+            "{}",
+            r.text(0, true, true)
+        );
+        assert!(
+            !r.score_difference.contains_key(&2),
+            "{}",
+            r.text(0, true, true)
+        );
     }
 }
