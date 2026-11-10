@@ -2933,9 +2933,10 @@ fn take_loading(
 /// The loading frame of lifetime `lifetime` at `now` on the loading clock
 /// (design.md "Rendering and Skins", loading state): its origin, progress,
 /// gauge descriptor and text revision from the lifetime's newest state
-/// `update`; the author's layout, and the covers and `adjusting` of the
-/// adjustments' newest `snapshot` (every cover 0 and off without one), no
-/// gain, which a loading frame has none of. Without a state yet it is the
+/// `update`; the author's layout, and the covers, `adjusting`, display
+/// offset and hi-speed fix of the adjustments' newest `snapshot` (every
+/// cover 0 and off, no offset and Classic without one), no gain, which a
+/// loading frame has none of. Without a state yet it is the
 /// lifetime's first moment: from `now`, nothing loaded. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn loading_frame_of(
@@ -2945,15 +2946,16 @@ fn loading_frame_of(
     snapshot: Option<&game::adjustment::PresentationSnapshot>,
     turntable: i32,
 ) -> LoadingFrame<'static> {
-    let (lanes, covers) = match snapshot {
+    let (lanes, readouts, display_offset) = match snapshot {
         Some(s) => {
             let (lanes, readouts) =
                 render::presentation::frame(s, None, None, Speed::NORMAL, false);
-            (lanes, readouts.covers)
+            (lanes, readouts, TimeUs(s.display_offset_us))
         }
         None => (
             skin_model::LaneView::NONE,
-            skin_model::FrameReadouts::UNAVAILABLE.covers,
+            skin_model::FrameReadouts::UNAVAILABLE,
+            TimeUs(0),
         ),
     };
     let (since, percent, gauge, play_level, text, autoplay) = match update {
@@ -2979,7 +2981,9 @@ fn loading_frame_of(
         layout: &skin_model::Layout::AUTHOR,
         turntable,
         lanes,
-        covers,
+        covers: readouts.covers,
+        display_offset,
+        fix_hispeed: readouts.fix_hispeed,
         gauge,
         play_level,
         autoplay,
@@ -12519,6 +12523,58 @@ pub(crate) mod tests {
         assert!(!autoplay(None));
         assert!(autoplay(Some(&update(true))));
         assert!(!autoplay(Some(&update(false))));
+    }
+
+    /// C2, C3: a loading frame carries the adjustments' newest display
+    /// offset and hi-speed fix down to the model's frame, the offset as the
+    /// selection screen reads the same tuning (its ms truncated toward
+    /// zero); with no snapshot, no offset and Classic.
+    #[test]
+    fn a_loading_frame_carries_the_snapshots_settings() {
+        use game::adjustment::PresentationSnapshot;
+        let hispeed = game::HiSpeedSettings {
+            reference: game::HiSpeedReference::Main,
+            ..game::HiSpeedSettings::default()
+        };
+        let snapshot = |display_offset_us| PresentationSnapshot {
+            options: game::PlayOptions::new(hispeed, game::Covers::default()).unwrap(),
+            hispeed: None,
+            target: None,
+            display_offset_us,
+            adjusting: false,
+            generation: 0,
+            sequence: 1,
+            epoch: 0,
+            scratch: game::ScratchInput::NONE,
+        };
+        let settings = skin_model::SelectionSettings {
+            display_offset_ms: 0,
+            master_volume: skin_model::MasterVolume::of_gain(0.0),
+            speed: skin_model::SpeedView::Classic,
+            order: skin_model::SelectionOrder::Title,
+            gauge: None,
+            covers_on: [false; 3],
+        };
+        for (us, ms) in [
+            (-15_600, -15),
+            (-15_000, -15),
+            (0, 0),
+            (1_500, 1),
+            (15_000, 15),
+        ] {
+            let f = super::loading_frame_of(1, TimeUs(1_000), None, Some(&snapshot(us)), 0).model();
+            assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(us), 3), "{us}");
+            let tuning = crate::tuning::LiveTuning::new(game::Tuning {
+                volume_percent: 100,
+                display_offset_us: us,
+                input_offset_us: 0,
+            });
+            let shown = crate::selection_skin::live_settings(&settings, &tuning);
+            assert_eq!(shown.display_offset_ms, ms, "{us}");
+            assert_eq!(f.display_offset.0 / 1_000, i64::from(ms), "{us}");
+        }
+        let f = super::loading_frame_of(1, TimeUs(1_000), None, None, 0).model();
+        assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(0), 0));
     }
 
     /// Counts the frames the render thread finished.

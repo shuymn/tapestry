@@ -216,6 +216,8 @@ pub fn record(
                             layout: &Layout::AUTHOR,
                             lanes: view,
                             covers: readouts().covers,
+                            display_offset: TimeUs(0),
+                            fix_hispeed: readouts().fix_hispeed,
                             gauge: None,
                             play_level,
                             difficulty: None,

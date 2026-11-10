@@ -173,9 +173,9 @@ pub use play::loading::{
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade,
-    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS, READOUT_MAX,
-    field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX,
+    Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RATE_BASIS_POINTS,
+    READOUT_MAX, field, lane_timer, timer,
 };
 pub use play::timers::{native_values, settled_point};
 pub use play::{

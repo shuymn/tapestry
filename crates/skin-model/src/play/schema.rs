@@ -37,6 +37,9 @@ pub const COVER_PERMILLE: i32 = 1_000;
 /// The largest `duration.green`: three fifths of [`READOUT_MAX`], rounded
 /// down.
 pub const GREEN_MAX: i32 = READOUT_MAX / 5 * 3 + READOUT_MAX % 5 * 3 / 5;
+/// The largest `settings.fix_hispeed`: 4, Floating from the minimum
+/// tempo.
+pub const FIX_HISPEED_MAX: i32 = 4;
 /// The largest `native.hispeed.x100`: the multiplier's maximum, 20.
 const NATIVE_HISPEED_MAX: i32 = 2_000;
 /// The largest `native.target.green`: the target green number's maximum.
@@ -245,6 +248,15 @@ pub static PLAY: Schema = Schema {
             },
             export: E,
         },
+        Field {
+            name: "display_offset.ms",
+            ty: FieldTy::Int {
+                lo: -READOUT_MAX,
+                hi: READOUT_MAX,
+            },
+            export: T,
+        },
+        int("settings.fix_hispeed", FIX_HISPEED_MAX, T),
     ],
     timers: &[
         timer("ready", E),
@@ -495,8 +507,15 @@ pub mod field {
     pub const CHART_JUDGE_CLASS_VALID: u16 = 109;
     /// The source's 7-key point, with its intermediate widths: any `i32`.
     pub const POINT: u16 = 110;
+    /// The display offset in whole ms, truncated toward zero as the
+    /// selection screen shows it, from the frame's live presentation.
+    pub const DISPLAY_OFFSET_MS: u16 = 111;
+    /// The speed policy's hi-speed fix, as the selection screen's: 0
+    /// Classic; Floating 1 from the start tempo, 2 the maximum, 3 the main
+    /// and 4 the minimum.
+    pub const SETTINGS_FIX_HISPEED: u16 = 112;
     /// The number of fields.
-    pub const COUNT: usize = 111;
+    pub const COUNT: usize = 113;
 
     /// The `judge.lane.N` slot of `lane`: the lane's visual state as the
     /// source codes it, 0 to [`LANE_JUDGE_MAX`](super::LANE_JUDGE_MAX).
@@ -841,7 +860,28 @@ mod tests {
                 E
             ))
         );
-        assert_eq!(field::COUNT, 111);
+        assert_eq!(slot("display_offset.ms"), Some(field::DISPLAY_OFFSET_MS));
+        assert_eq!(
+            PLAY.field("display_offset.ms")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: -READOUT_MAX,
+                    hi: READOUT_MAX
+                },
+                T
+            ))
+        );
+        assert_eq!(
+            slot("settings.fix_hispeed"),
+            Some(field::SETTINGS_FIX_HISPEED)
+        );
+        assert_eq!(
+            PLAY.field("settings.fix_hispeed")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((FieldTy::Int { lo: 0, hi: 4 }, T))
+        );
+        assert_eq!(field::COUNT, 113);
     }
 
     #[test]

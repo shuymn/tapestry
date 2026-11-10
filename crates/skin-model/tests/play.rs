@@ -1197,6 +1197,63 @@ fn clocks(h: &Harness) -> (i32, i32) {
     )
 }
 
+/// C2: `settings.fix_hispeed` is the frame's hi-speed fix, 0 Classic and
+/// 1 to 4 Floating from the start, maximum, main and minimum tempos; a fix
+/// above 4 is a malformed frame.
+#[test]
+fn the_hispeed_fix_reads_the_frame() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    for (t, fix) in (0..=4).enumerate() {
+        h.readouts = Some(FrameReadouts {
+            fix_hispeed: fix,
+            ..UNKNOWN
+        });
+        h.frame(100 * i64::try_from(t).unwrap(), &[]);
+        assert_eq!(h.field(field::SETTINGS_FIX_HISPEED), i32::from(fix));
+    }
+    h.readouts = Some(FrameReadouts {
+        fix_hispeed: 5,
+        ..UNKNOWN
+    });
+    assert_eq!(
+        h.try_frame_us(600 * MS, &[]),
+        Err(skin_model::BuildError::InvalidReadouts)
+    );
+}
+
+/// C3: `display_offset.ms` is the frame's display offset in whole ms
+/// truncated toward zero, as the selection screen shows it (−15 600 µs is
+/// −15 where a floor gives −16, 1 500 µs is 1 where rounding gives 2), and
+/// follows the offset live: one play's next frame reads the new offset.
+#[test]
+fn the_display_offset_reads_whole_ms_truncated_and_live() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    let cases = [
+        (-15_600, -15),
+        (-15_000, -15),
+        (-999, 0),
+        (0, 0),
+        (1_000, 1),
+        (1_500, 1),
+        (15_000, 15),
+        (i64::MAX, i32::MAX - 1),
+        (i64::MIN, -(i32::MAX - 1)),
+    ];
+    for (t, (us, ms)) in cases.into_iter().enumerate() {
+        h.offset = TimeUs(us);
+        h.frame(100 * i64::try_from(t).unwrap(), &[]);
+        assert_eq!(h.field(field::DISPLAY_OFFSET_MS), ms, "{us}");
+    }
+}
+
 /// The remaining time counts to the last resolved object: a background
 /// sound's start past the last note, a mine's time, a long note's end;
 /// completion changes nothing.

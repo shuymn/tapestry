@@ -259,6 +259,8 @@ pub fn input<'a>(
 /// text. The renderer applies its own target.
 pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> LoadingFrame<'static> {
     LoadingFrame {
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
         difficulty: None,
         bga: None,
         autoplay: false,
