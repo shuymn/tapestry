@@ -1539,7 +1539,7 @@ Which tests check part of each row's mitigation. `Tagged tests` is generated fro
 | T05 | Unverified | |
 | T06 | Unverified | CI step "Production excludes dev-tools", with "Development build includes dev-tools (positive control)" |
 | T07 | Unverified | |
-| T08 | `crates/skin-model/tests/present.rs`: `the_verifier_refuses_each_rule` | |
+| T08 | `crates/skin-model/tests/chart_image.rs`: `a_fifo_is_refused_without_opening_it`, `an_overlong_name_is_refused_whole_never_shortened`, `files_over_the_byte_cap_are_refused_before_reading`, `links_out_of_the_folder_escape_and_links_inside_resolve`, `names_that_leave_the_folder_are_unresolved_without_reading`; `crates/skin-model/tests/present.rs`: `the_verifier_refuses_each_rule` | |
 | T09 | `crates/player/src/main.rs`: `a_play_leaves_the_screens_runtimes_at_rest_until_its_end`; `crates/skin-beatoraja/src/lua/tests.rs`: `no_skin_code_runs_after_a_fact_stop_inside_a_protected_call`; `crates/skin-beatoraja/tests/lua_facts.rs`: `protected_calls_do_not_catch_a_play_level_refusal_or_a_pending_read`; `crates/skin-beatoraja/tests/lua_runtime.rs`: `a_host_panic_stops_the_runtime`, `a_kept_heap_over_the_cap_refuses_the_import`, `each_frame_cap_stops_a_call_alone`, `loaders_raise_at_runtime_however_reached`, `the_budget_stops_the_runtime_after_three_frames`, `the_memory_cap_stops_the_runtime` | |
 | T10 | Unverified | |
 | T11 | Unverified | |

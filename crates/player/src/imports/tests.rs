@@ -1467,7 +1467,12 @@ fn a_received_outcome_still_waits_within_the_stop_bound() {
     let _serial = serial();
     hold_exit(true);
     let (stop, rx) = started(|_: &Cancel| 7_u32);
-    assert!(wait_until(|| exit_waiting() == 1));
+    assert!(
+        wait_until(|| exit_waiting() == 1),
+        "{} at the exit gate, {} workers",
+        exit_waiting(),
+        WORKERS.load(Ordering::SeqCst)
+    );
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     let stopped = Instant::now();
     stop.store(true, Ordering::SeqCst);
