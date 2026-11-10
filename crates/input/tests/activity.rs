@@ -155,10 +155,14 @@ fn lose_focus(set: &mut SourceSet, focus: &PresentationFocus, lost: i64, back: i
     set.tick_presentation(TimeUs(back));
 }
 
-/// The focus loss disarms the tuning controls held then (design.md "Play
-/// Lifecycle", the window has focus): F2 held across a loss and its
-/// return, and the window's F1 the same, leave the record held at the
-/// loss; their repeats and release move nothing; a fresh press counts.
+/// A tuning control held across a focus loss, or come to be held while
+/// focus was away, is disarmed until its last holder releases it
+/// (design.md "Play Lifecycle", the window has focus): F2 held across a
+/// loss and its return, and the window's F1 the same, leave the record
+/// held at the loss; the window's F1 queued before a loss and taken by
+/// its recovery, the window's made-up release and press around a loss,
+/// and F2 pressed while focus is away never hold it. Their repeats and
+/// release move nothing; a fresh press while focused counts.
 #[test]
 fn a_tuning_control_held_across_a_focus_loss_is_disarmed() {
     let (mut set, record, mut window) = rig(8);
@@ -212,4 +216,88 @@ fn a_tuning_control_held_across_a_focus_loss_is_disarmed() {
     assert!(window_fresh.held);
     assert_eq!(window_fresh.revision, window_lost.revision + 1);
     assert_eq!(window_fresh.last, Some(TimeUs(130 * MS)));
+    window.key(0, WindowKeyEvent::Release, false);
+    set.tick_presentation(TimeUs(140 * MS));
+    let idle = input(&record);
+    assert!(!idle.held);
+    // F1 queued, not yet taken, when focus goes: the loss's recovery
+    // takes it from the window's held keys, its queued press dropped.
+    window.key(0, WindowKeyEvent::Press, false);
+    focus.set(false);
+    set.tick_presentation(TimeUs(150 * MS));
+    assert_eq!(input(&record), idle, "a hold taken by the recovery");
+    focus.set(true);
+    set.tick_presentation(TimeUs(160 * MS));
+    assert_eq!(input(&record), idle, "and by the return's");
+    window.key(0, WindowKeyEvent::Release, false);
+    set.tick_presentation(TimeUs(170 * MS));
+    assert_eq!(input(&record), idle, "its release");
+    window.key(0, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(180 * MS));
+    let queued_fresh = input(&record);
+    assert_eq!(
+        queued_fresh,
+        SectionValue {
+            revision: idle.revision + 1,
+            last: Some(TimeUs(180 * MS)),
+            held: true,
+            ..SectionValue::default()
+        }
+    );
+    // The window's made-up release as focus goes and press as it comes
+    // back: the return's recovery takes F1 held again.
+    window.key(0, WindowKeyEvent::Release, true);
+    focus.set(false);
+    set.tick_presentation(TimeUs(190 * MS));
+    let made_up_lost = input(&record);
+    assert!(!made_up_lost.held, "dropped at the loss");
+    assert_eq!(made_up_lost.revision, queued_fresh.revision + 1);
+    window.key(0, WindowKeyEvent::Press, true);
+    focus.set(true);
+    set.tick_presentation(TimeUs(200 * MS));
+    assert_eq!(input(&record), made_up_lost, "a made-up press");
+    window.key(0, WindowKeyEvent::Repeat, false);
+    set.tick_presentation(TimeUs(210 * MS));
+    assert_eq!(input(&record), made_up_lost, "its repeat");
+    window.key(0, WindowKeyEvent::Release, false);
+    set.tick_presentation(TimeUs(220 * MS));
+    assert_eq!(input(&record), made_up_lost, "its release");
+    window.key(0, WindowKeyEvent::Press, false);
+    set.tick_presentation(TimeUs(230 * MS));
+    let made_up_fresh = input(&record);
+    assert_eq!(
+        made_up_fresh,
+        SectionValue {
+            revision: made_up_lost.revision + 1,
+            last: Some(TimeUs(230 * MS)),
+            held: true,
+            ..SectionValue::default()
+        }
+    );
+    window.key(0, WindowKeyEvent::Release, false);
+    set.tick_presentation(TimeUs(240 * MS));
+    let idle = input(&record);
+    assert!(!idle.held);
+    // F2 first pressed while focus is away.
+    focus.set(false);
+    set.tick_presentation(TimeUs(250 * MS));
+    key(&mut set, 260 * MS, F2, 1);
+    assert_eq!(input(&record), idle, "a press while focus is away");
+    focus.set(true);
+    set.tick_presentation(TimeUs(270 * MS));
+    assert_eq!(input(&record), idle, "held into the return");
+    key(&mut set, 280 * MS, F2, 1);
+    assert_eq!(input(&record), idle, "its repeat");
+    key(&mut set, 290 * MS, F2, 0);
+    assert_eq!(input(&record), idle, "its release");
+    key(&mut set, 300 * MS, F2, 1);
+    assert_eq!(
+        input(&record),
+        SectionValue {
+            revision: idle.revision + 1,
+            last: Some(TimeUs(300 * MS)),
+            held: true,
+            ..SectionValue::default()
+        }
+    );
 }

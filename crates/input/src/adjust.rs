@@ -498,6 +498,21 @@ impl WindowKeys {
     }
 }
 
+/// What changed the held set where the tap writes the activity record
+/// ([`AdjustmentTap::admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// Control `n` pressed: it arms while focused.
+    Press(u8),
+    /// Another event of control `n`: a key repeat or a release.
+    Event(u8),
+    /// A focus loss: what is held is carried across it.
+    Loss,
+    /// The held set taken without an event of its own: a recovery's
+    /// baseline, a recount, an unverified state, a second holder.
+    Held,
+}
+
 /// What the tap owes before any later observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Marker {
@@ -642,12 +657,16 @@ pub struct AdjustmentTap {
     /// each, whose holds and events the activity record's input section
     /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
     tuning: u128,
-    /// The tuning controls held at a focus loss, a bit each: disarmed
-    /// until their last holder releases them, they are not held in the
-    /// record and their repeats and release count nothing (design.md
-    /// "Play Lifecycle", the window has focus). The start gate's holds
-    /// do not follow it.
+    /// The disarmed tuning controls, a bit each ([`admit`](Self::admit)):
+    /// held across a focus loss, or come to be held other than by a press
+    /// while focused, they are not held in the record and their repeats
+    /// and release count nothing until their last holder releases them
+    /// (design.md "Play Lifecycle", the window has focus). The start
+    /// gate's holds do not follow it.
     disarmed: u128,
+    /// The controls held at the last admission, a bit each: one held now
+    /// and not then has come to be held since.
+    admitted: u128,
     /// The record the tap writes its section of, if any.
     activity: Option<Arc<ActivityRecord>>,
     /// The input section as last written.
@@ -722,6 +741,7 @@ pub fn adjustment_queue(
             panel_losses: 0,
             tuning: 0,
             disarmed: 0,
+            admitted: 0,
             activity: None,
             written: SectionValue::default(),
             seen_at: TimeUs(i64::MIN),
@@ -803,17 +823,41 @@ impl AdjustmentTap {
         self.unverified || self.held_set() & self.tuning & !self.disarmed != 0
     }
 
-    /// Whether number `n` is a disarmed tuning control.
-    const fn disarmed(&self, n: u8) -> bool {
-        self.disarmed & (1_u128 << (n & 127)) != 0
+    /// Decides, for every way a control comes to be held, whether it is
+    /// armed: one held across a focus loss, or come to be held other than
+    /// by `change`'s press while focused (a recovery's baseline, a
+    /// recount, a press while focus is away), is disarmed; a disarmed
+    /// control no longer held is armed again.
+    fn admit(&mut self, change: Change) {
+        let held = self.held_set();
+        let entered = held & !self.admitted;
+        let armed = match change {
+            Change::Press(n) if self.focused => 1_u128 << (n & 127),
+            _ => 0,
+        };
+        let carried = if matches!(change, Change::Loss) {
+            held
+        } else {
+            0
+        };
+        self.disarmed = (self.disarmed | carried | (entered & !armed)) & held & self.tuning;
+        self.admitted = held;
     }
 
-    /// Writes the input section: the revision moves when `counted` (an
-    /// event of a tuning control) or when whether one is held changed,
-    /// the last activity then taking `at`, else the latest time seen. A
-    /// disarmed control no longer held is armed again first.
-    fn publish_activity(&mut self, at: Option<TimeUs>, counted: bool) {
-        self.disarmed &= self.held_set();
+    /// Writes the input section once [`admit`](Self::admit) has decided
+    /// what `change` arms: the revision moves at an event of a tuning
+    /// control disarmed neither before nor after it, or when whether one
+    /// is held changed, the last activity then taking `at`, else the
+    /// latest time seen.
+    fn publish_activity(&mut self, at: Option<TimeUs>, change: Change) {
+        let before = self.disarmed;
+        self.admit(change);
+        let counted = match change {
+            Change::Press(n) | Change::Event(n) => {
+                self.tuning & !(before | self.disarmed) & (1_u128 << (n & 127)) != 0
+            }
+            Change::Loss | Change::Held => false,
+        };
         let held = self.activity_held();
         if !counted && held == self.written.held {
             return;
@@ -908,8 +952,7 @@ impl AdjustmentTap {
         if lost {
             // The tuning controls held now are disarmed, and the record
             // drops them at the loss.
-            self.disarmed |= self.held_set() & self.tuning;
-            self.publish_activity(None, false);
+            self.publish_activity(None, Change::Loss);
         }
         if lost || back {
             // What was derived from the focus before is resolved now: the
@@ -990,7 +1033,6 @@ impl AdjustmentTap {
     /// followed by [`TapEvent::Cancelled`].
     pub(crate) fn button(&mut self, n: u8, was: bool, now: bool, at: TimeUs, foreground: bool) {
         let latched = self.latched & (1_u128 << (n & 127)) != 0;
-        let disarmed = self.disarmed(n);
         let Some(h) = self.holders.get_mut(usize::from(n)) else {
             return;
         };
@@ -1019,9 +1061,13 @@ impl AdjustmentTap {
         }
         self.seen_at = self.seen_at.max(at);
         // Written before the event is queued, so before any marker after
-        // it; a disarmed control's repeat or release counts nothing.
-        let tuning = self.tuning & (1_u128 << (n & 127)) != 0 && !disarmed;
-        self.publish_activity(Some(at), tuning && event.is_some());
+        // it, and only once its arming is decided.
+        let change = match event {
+            Some(TapEvent::Press(_)) => Change::Press(n),
+            Some(_) => Change::Event(n),
+            None => Change::Held,
+        };
+        self.publish_activity(Some(at), change);
         if let Some(event) = event {
             self.observe(at, event, foreground);
         }
@@ -1061,7 +1107,7 @@ impl AdjustmentTap {
         {
             self.owed.push(Marker::Cancelled { generation });
         }
-        self.publish_activity(None, false);
+        self.publish_activity(None, Change::Held);
     }
 
     /// READY candidate `generation` opened at this boundary, its chart
@@ -1191,7 +1237,6 @@ impl AdjustmentTap {
                 continue;
             };
             let bit = 1_u8 << key;
-            let disarmed = self.disarmed(n);
             let tap = match event {
                 WindowKeyEvent::Press if self.window_held & bit == 0 => {
                     self.window_held |= bit;
@@ -1204,8 +1249,11 @@ impl AdjustmentTap {
                 WindowKeyEvent::Repeat if self.window_held & bit != 0 => TapEvent::Repeat(n),
                 _ => continue,
             };
-            let tuning = self.tuning & (1_u128 << (n & 127)) != 0 && !disarmed;
-            self.publish_activity(Some(at), tuning);
+            let change = match tap {
+                TapEvent::Press(_) => Change::Press(n),
+                _ => Change::Event(n),
+            };
+            self.publish_activity(Some(at), change);
             self.observe(at, tap, true);
         }
         if overflow
@@ -1271,7 +1319,7 @@ impl AdjustmentTap {
                     }
                     // A baseline that changes what is held is written
                     // before it is sent.
-                    self.publish_activity(Some(at), false);
+                    self.publish_activity(Some(at), Change::Held);
                     let held = self.held_set();
                     self.send(at, TapEvent::Resync { held, verified });
                 }
