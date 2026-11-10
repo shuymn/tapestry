@@ -420,3 +420,19 @@ fn outside_entries_waive_nothing_on_play_frames() {
         r.text(0, true, true)
     );
 }
+
+/// C9: a whole-chart script keeps e-1's frames: one round, its READY,
+/// play and tail only, on the state clock e-1 used.
+#[test]
+fn whole_chart_scripts_keep_their_frames() {
+    use crate::script::{LEAD, STATE_AT_ZERO};
+    let (r, _, inputs) = pieces(&latch_pair(), Script::full());
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    assert!(inputs.iter().all(FrameInputs::is_play));
+    assert_eq!(inputs[0].state_us(), STATE_AT_ZERO - LEAD);
+    assert_eq!(
+        r.kinds.keys().copied().collect::<Vec<_>>(),
+        ["play", "ready", "tail"]
+    );
+    assert_eq!(r.rounds.len(), 1);
+}
