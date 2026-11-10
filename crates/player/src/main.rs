@@ -38,13 +38,6 @@ mod log_file;
 mod loudness;
 mod measure;
 mod menu_screen;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the practice page begins them with the decision screen"
-    )
-)]
 mod page_jobs;
 mod play;
 mod power;

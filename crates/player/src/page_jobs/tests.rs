@@ -491,17 +491,21 @@ fn a_refused_background_entry_runs_no_speculation() {
     seam.refuse_enter.store(true, Ordering::SeqCst);
     let script = Script::new(&coord);
     script.hold(PageAt::File(0), 2);
+    // Its first cancel that says stop, after the refusal: held there, the
+    // job unpublished.
+    script.hold(PageAt::Stopped, 1);
     let (job, mode) = bank(&coord, &chart, true, &seam, &script);
     script.reach(PageAt::File(0), 2);
     job.demote();
     script.release(PageAt::File(0), 2);
-    until("the refusal", || mode.refused());
-    let promoted = job.promote_unless_ended();
+    script.reach(PageAt::Stopped, 1);
+    assert!(mode.refused());
+    assert!(matches!(
+        job.promote_unless_ended(),
+        game::coord::Promotion::Live
+    ));
+    script.release(PageAt::Stopped, 1);
     let o = outcome(&job);
-    assert!(
-        matches!(promoted, game::coord::Promotion::Live)
-            || matches!(promoted, game::coord::Promotion::Published(_))
-    );
     assert!(
         matches!(
             o.outcome,

@@ -22,6 +22,14 @@
 //! The page that owns them comes with the decision screen (docs/stage3.md
 //! S10); until then nothing begins them.
 
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the practice page begins them with the decision screen"
+    )
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
