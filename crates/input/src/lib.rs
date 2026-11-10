@@ -16,7 +16,8 @@
 //! through a bounded queue; nothing of it is recorded. The play
 //! adjustments' controls go through their own bounded tap
 //! ([`AdjustmentTap`]), recording open or not, which also keeps the
-//! physical hold latch ([`HoldLatch`]).
+//! physical hold latch ([`HoldLatch`]) and writes the tuning controls'
+//! activity into the loading state's record ([`ActivityRecord`]).
 //!
 //! [`ScriptedInput`] feeds a scenario or a recorded log through the same
 //! path. [`autoplay`] makes the inputs that hit every note of a chart, and
@@ -38,6 +39,7 @@
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 #![cfg_attr(windows, deny(unsafe_code))]
 
+pub mod activity;
 mod adjust;
 mod autoplay;
 pub mod cadence;
@@ -56,6 +58,7 @@ mod win;
 
 use bms_model::TimeUs;
 
+pub use activity::{ActivityRead, ActivityRecord, READ_TRIES, Section, SectionValue, Writing};
 pub use adjust::{
     ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, GatePhase, GateState,
     Hold, HoldLatch, MAX_TAPPED, PanelLevel, Panels, PresentationFocus, RESERVED, StartGate,

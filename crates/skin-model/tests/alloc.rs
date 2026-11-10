@@ -1224,6 +1224,7 @@ fn load(
         widgets,
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap();
@@ -2523,6 +2524,7 @@ fn bitmap_skin() -> (tempfile::TempDir, Skin) {
         },
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap();
@@ -2658,6 +2660,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         widgets: skin_model::WidgetDefs::default(),
         bomb_up_to: Some(skin_model::Grade::Bad),
         close: None,
+        loadend: None,
         present: None,
     })
     .unwrap();

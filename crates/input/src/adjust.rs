@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bms_model::TimeUs;
 use eval::ControlId;
 
+use crate::activity::{ActivityRecord, SectionValue};
 use crate::hid::{HidProduct, wrapped};
 use crate::sources::DeviceKind;
 
@@ -497,6 +498,21 @@ impl WindowKeys {
     }
 }
 
+/// What changed the held set where the tap writes the activity record
+/// ([`AdjustmentTap::admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Change {
+    /// Control `n` pressed: it arms while focused.
+    Press(u8),
+    /// Another event of control `n`: a key repeat or a release.
+    Event(u8),
+    /// A focus loss: what is held is carried across it.
+    Loss,
+    /// The held set taken without an event of its own: a recovery's
+    /// baseline, a recount, an unverified state, a second holder.
+    Held,
+}
+
 /// What the tap owes before any later observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Marker {
@@ -637,6 +653,27 @@ pub struct AdjustmentTap {
     panels: Arc<AtomicU64>,
     /// The focus losses counted at the level's last publication.
     panel_losses: u64,
+    /// The numbers of the tuning controls (START, SELECT, F1, F2), a bit
+    /// each, whose holds and events the activity record's input section
+    /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
+    tuning: u128,
+    /// The disarmed tuning controls, a bit each ([`admit`](Self::admit)):
+    /// held across a focus loss, or come to be held other than by a press
+    /// while focused, they are not held in the record and their repeats
+    /// and release count nothing until their last holder releases them
+    /// (design.md "Play Lifecycle", the window has focus). The start
+    /// gate's holds do not follow it.
+    disarmed: u128,
+    /// The controls held at the last admission, a bit each: one held now
+    /// and not then has come to be held since.
+    admitted: u128,
+    /// The record the tap writes its section of, if any.
+    activity: Option<Arc<ActivityRecord>>,
+    /// The input section as last written.
+    written: SectionValue,
+    /// The latest time stamp the tap was given: what a recount or an
+    /// unverified state is stamped with.
+    seen_at: TimeUs,
 }
 
 /// The logic thread's end of the tap.
@@ -702,6 +739,12 @@ pub fn adjustment_queue(
             panel_roles: [0; 2],
             panels: Arc::new(AtomicU64::new(0)),
             panel_losses: 0,
+            tuning: 0,
+            disarmed: 0,
+            admitted: 0,
+            activity: None,
+            written: SectionValue::default(),
+            seen_at: TimeUs(i64::MIN),
         },
         AdjustmentReceiver {
             queue: consumer,
@@ -731,6 +774,13 @@ impl AdjustmentTap {
         &self.gate
     }
 
+    /// Presses of a latched control so far, wrapping, as the latch counts
+    /// them ([`Hold::presses`]).
+    #[must_use]
+    pub const fn presses(&self) -> u64 {
+        self.presses
+    }
+
     /// Whether START or SELECT is held, or may be: what defers an opening.
     #[must_use]
     pub fn holding(&self) -> bool {
@@ -742,6 +792,86 @@ impl AdjustmentTap {
     /// ([`publish_panels`](Self::publish_panels)).
     pub const fn set_panel_roles(&mut self, start: u128, select: u128) {
         self.panel_roles = [start, select];
+    }
+
+    /// Numbers `tuning` (a bit each) are the tuning controls: START,
+    /// SELECT, F1 and F2, whichever are tapped. Their holds and events go
+    /// to the activity record ([`set_activity`](Self::set_activity)),
+    /// whatever the latch reports.
+    pub const fn set_tuning_controls(&mut self, tuning: u128) {
+        self.tuning = tuning;
+    }
+
+    /// Writes the input section of `record` from now on (design.md "Play
+    /// Lifecycle", tuning while loading): at each press, key repeat and
+    /// release of a tuning control, before the tap queues it, and at each
+    /// change of whether one is held (a removed device, an unverified
+    /// held state), the revision moves and the last activity takes the
+    /// event's time. Written at once with what is held.
+    pub fn set_activity(&mut self, record: Arc<ActivityRecord>) {
+        self.written = SectionValue::default();
+        self.activity = Some(record);
+        if let Some(record) = &self.activity {
+            self.written.held = self.activity_held();
+            record.input.publish(self.written);
+        }
+    }
+
+    /// Whether the record's input section is held: a tuning control held
+    /// and not disarmed, or the held state unverified.
+    fn activity_held(&self) -> bool {
+        self.unverified || self.held_set() & self.tuning & !self.disarmed != 0
+    }
+
+    /// Decides, for every way a control comes to be held, whether it is
+    /// armed: one held across a focus loss, or come to be held other than
+    /// by `change`'s press while focused (a recovery's baseline, a
+    /// recount, a press while focus is away), is disarmed; a disarmed
+    /// control no longer held is armed again.
+    fn admit(&mut self, change: Change) {
+        let held = self.held_set();
+        let entered = held & !self.admitted;
+        let armed = match change {
+            Change::Press(n) if self.focused => 1_u128 << (n & 127),
+            _ => 0,
+        };
+        let carried = if matches!(change, Change::Loss) {
+            held
+        } else {
+            0
+        };
+        self.disarmed = (self.disarmed | carried | (entered & !armed)) & held & self.tuning;
+        self.admitted = held;
+    }
+
+    /// Writes the input section once [`admit`](Self::admit) has decided
+    /// what `change` arms: the revision moves at an event of a tuning
+    /// control disarmed neither before nor after it, or when whether one
+    /// is held changed, the last activity then taking `at`, else the
+    /// latest time seen.
+    fn publish_activity(&mut self, at: Option<TimeUs>, change: Change) {
+        let before = self.disarmed;
+        self.admit(change);
+        let counted = match change {
+            Change::Press(n) | Change::Event(n) => {
+                self.tuning & !(before | self.disarmed) & (1_u128 << (n & 127)) != 0
+            }
+            Change::Loss | Change::Held => false,
+        };
+        let held = self.activity_held();
+        if !counted && held == self.written.held {
+            return;
+        }
+        let at = at.unwrap_or(self.seen_at);
+        let w = &mut self.written;
+        w.revision = w.revision.wrapping_add(1);
+        w.held = held;
+        if at.0 != i64::MIN {
+            w.last = Some(w.last.map_or(at, |l| l.max(at)));
+        }
+        if let Some(record) = &self.activity {
+            record.input.publish(*w);
+        }
     }
 
     /// A handle on the panels' level.
@@ -819,6 +949,11 @@ impl AdjustmentTap {
         let back = focused && !self.focused;
         self.losses = losses;
         self.focused = focused;
+        if lost {
+            // The tuning controls held now are disarmed, and the record
+            // drops them at the loss.
+            self.publish_activity(None, Change::Loss);
+        }
         if lost || back {
             // What was derived from the focus before is resolved now: the
             // recovery's Lost or Resync closes the reducer's open group, so
@@ -888,6 +1023,7 @@ impl AdjustmentTap {
         if self.active && (owners_changed || self.held_set() != before) {
             self.owed.push(Marker::Recovery { lost: false });
         }
+        // Writes the record too, held as recounted.
         self.set_unverified(unverified);
     }
 
@@ -923,6 +1059,15 @@ impl AdjustmentTap {
         if let Some(generation) = self.store_latch() {
             self.cancelled = Some(generation);
         }
+        self.seen_at = self.seen_at.max(at);
+        // Written before the event is queued, so before any marker after
+        // it, and only once its arming is decided.
+        let change = match event {
+            Some(TapEvent::Press(_)) => Change::Press(n),
+            Some(_) => Change::Event(n),
+            None => Change::Held,
+        };
+        self.publish_activity(Some(at), change);
         if let Some(event) = event {
             self.observe(at, event, foreground);
         }
@@ -962,6 +1107,7 @@ impl AdjustmentTap {
         {
             self.owed.push(Marker::Cancelled { generation });
         }
+        self.publish_activity(None, Change::Held);
     }
 
     /// READY candidate `generation` opened at this boundary, its chart
@@ -985,6 +1131,7 @@ impl AdjustmentTap {
     /// Sends what is owed, stamped `at` or later, as far as the queue has
     /// room.
     pub(crate) fn send_owed(&mut self, at: TimeUs) {
+        self.seen_at = self.seen_at.max(at);
         if self.active {
             self.flush(at);
         }
@@ -995,6 +1142,7 @@ impl AdjustmentTap {
     /// sent while a tapped control is held, and once more at a later time
     /// once nothing is, so the reducer's last group closes.
     pub fn tick(&mut self, at: TimeUs) {
+        self.seen_at = self.seen_at.max(at);
         if !self.active {
             return;
         }
@@ -1101,6 +1249,11 @@ impl AdjustmentTap {
                 WindowKeyEvent::Repeat if self.window_held & bit != 0 => TapEvent::Repeat(n),
                 _ => continue,
             };
+            let change = match tap {
+                TapEvent::Press(_) => Change::Press(n),
+                _ => Change::Event(n),
+            };
+            self.publish_activity(Some(at), change);
             self.observe(at, tap, true);
         }
         if overflow
@@ -1164,6 +1317,9 @@ impl AdjustmentTap {
                             }
                         };
                     }
+                    // A baseline that changes what is held is written
+                    // before it is sent.
+                    self.publish_activity(Some(at), Change::Held);
                     let held = self.held_set();
                     self.send(at, TapEvent::Resync { held, verified });
                 }
