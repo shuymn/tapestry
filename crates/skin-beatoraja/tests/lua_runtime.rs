@@ -886,6 +886,45 @@ fn a_negative_ref_selector_skips_its_runtime_draws() {
     assert_eq!(outputs(&f), [2, 1]);
 }
 
+/// A grouped image (`len` above 1) selects by its `ref` as an image set
+/// does (`SkinImage.java:127-132`): its runtime draw runs only when that
+/// selector is not negative.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_grouped_image_s_negative_ref_skips_its_runtime_draws() {
+    untimed();
+    let text = entry(
+        "local c = 0",
+        &["function() return c end"],
+        "function() return true end",
+    )
+    .replace(
+        "return skin\n",
+        "skin.image[#skin.image + 1] = { id = \"gr\", src = \"s\", x = 0, y = 0, w = 8, h = 8, divx = 2, len = 2, ref = 370 }\n\
+         skin.destination[#skin.destination + 1] = { id = \"gr\",\n\
+           draw = function() c = c + 1 return true end,\n\
+           dst = { { x = 600, y = 0, w = 8, h = 8 } } }\n\
+         return skin\n",
+    );
+    let mut i = import(&text);
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 2, "{:?}", i.callbacks);
+    let set = |played| fields(n, &[("selected.played", played), ("cursor.chart", 1)]);
+    for _ in 0..2 {
+        let mut f = set(0);
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0, 0]);
+        assert_eq!(runtime(&mut i).status()[1], CallStatus::Skipped);
+    }
+    for _ in 0..2 {
+        let mut f = set(1);
+        runtime(&mut i).frame(&mut f, &[]);
+    }
+    let mut f = set(1);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [2, 1]);
+}
+
 /// C4 on a result screen: a read answers through the result profile's
 /// bridge over the result state, absent-feature ids with the source's
 /// value.

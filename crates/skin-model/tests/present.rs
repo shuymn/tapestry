@@ -252,6 +252,18 @@ fn the_verifier_refuses_each_rule() {
     let mut b = one();
     b.push(Cb::ret(Val::Bool(true), Conv::Truthy).after(0));
     assert_eq!(refused(plain_raw(b.0)), PresentError::After { callback: 1 });
+    // A slider's value follows a draw, never a timer or another value.
+    let mut b = one();
+    b.push(Cb::ret(Val::Int(1), Conv::Float).after(0));
+    assert!(plain_raw(b.0).is_ok());
+    let mut b = Builder::default();
+    b.push(Cb::ret(Val::Int(1), Conv::Timer));
+    b.push(Cb::ret(Val::Int(1), Conv::Float).after(0));
+    assert_eq!(refused(plain_raw(b.0)), PresentError::After { callback: 1 });
+    let mut b = Builder::default();
+    b.push(Cb::ret(Val::Int(1), Conv::Float));
+    b.push(Cb::ret(Val::Int(1), Conv::Float).after(0));
+    assert_eq!(refused(plain_raw(b.0)), PresentError::After { callback: 1 });
     // V5: callbacks whose per-frame cost passes the skin's total.
     let mut b = Builder::default();
     let mut code = vec![Insn::Const { dst: 0, k: 0 }; MAX_CALLBACK_OPS - 1];

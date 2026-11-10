@@ -181,14 +181,16 @@ fn a_system_image_is_an_object() {
 }
 
 /// R6 and §7.1: a negative image-set selector stops the conditions and
-/// the timer in the source; production invokes the latch anyway and
-/// stores its start early, a finding until the production fix: the
-/// latch sets at the first judgment in production, at 100 000 points in
-/// the source, so their starts and ages differ from then on. The
-/// control, selector 0, agrees.
+/// the timer in the source. Production gates the set's callbacks by the
+/// selector, and a latch under that gate is a slot root the program does
+/// not run on every play frame: refused, it runs nowhere, and every
+/// source invocation is attributed to that record. A control selecting 0
+/// through a function is gated and refused the same way; one with no
+/// selector (entry 0, never negative) has no gate, and agrees with the
+/// latch running.
 #[test]
 fn a_negative_selector_stops_the_conditions() {
-    let set = |sel: &str| {
+    let set = |value: &str| {
         format!(
             "local latch = (function()\n\
                local state = ms.timer_off_value\n\
@@ -197,36 +199,50 @@ fn a_negative_selector_stops_the_conditions() {
                  return state\n\
                end\n\
              end)()\n\
-             skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}, value = function() {sel} end }} }}\n\
+             skin.imageset = {{ {{ id = \"s\", images = {{ \"i\", \"j\" }}{value} }} }}\n\
              table.insert(skin.destination, {{ id = \"s\", timer = latch, loop = 2000,\n\
                dst = {{ {{ time = 0, x = 0, y = 0, w = 10, h = 10 }}, {{ time = 2000, x = 100, y = 0, w = 10, h = 10 }} }} }})\n"
         )
     };
     let r = run(&set(
-        "if ms.number(100) < 100000 then return -1 end return 0",
+        ", value = function() if ms.number(100) < 100000 then return -1 end return 0 end",
     ));
-    assert!(!r.passes(), "{}", r.text(0, true, true));
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    assert_eq!(r.production_runs, 0, "{}", r.text(0, true, true));
     assert!(
-        r.findings
-            .iter()
-            .any(|f| f.what.contains("not in the source")),
+        r.buckets
+            .keys()
+            .any(|k| k.contains("a slot writer the program does not run on every play frame")),
         "{}",
         r.text(0, true, true)
     );
-    // Once the source runs the latch, its start is later than
-    // production's: the stored start and the drawn age differ.
-    assert!(
-        r.findings.iter().any(|f| f.what.starts_with("raw")),
-        "{}",
-        r.text(0, true, true)
-    );
-    assert!(
-        r.findings.iter().any(|f| f.what.starts_with("timer:")),
-        "{}",
-        r.text(0, true, true)
-    );
-    let control = run(&set("return 0"));
+    let gated = run(&set(", value = function() return 0 end"));
+    assert!(gated.passes(), "{}", gated.text(0, true, true));
+    assert_eq!(gated.production_runs, 0, "{}", gated.text(0, true, true));
+    let control = run(&set(""));
     agrees(&control, 1);
+}
+
+/// §7.1's stateless control: a timer that stores nothing, under the same
+/// negative selector, is compiled with the selector as its gate. The
+/// source skips it while the selector is negative, production's program
+/// skips it on those frames too, and both run it once the point reaches
+/// 100 000: the comparison agrees frame by frame.
+#[test]
+fn a_negative_selector_skips_a_stateless_timer() {
+    let body = "skin.imageset = { { id = \"s\", images = { \"i\", \"j\" },\n\
+           value = function() if ms.number(100) < 100000 then return -1 end return 0 end } }\n\
+         table.insert(skin.destination, { id = \"s\", timer = function() return ms.time() end, loop = 2000,\n\
+           dst = { { time = 0, x = 0, y = 0, w = 10, h = 10 }, { time = 2000, x = 100, y = 0, w = 10, h = 10 } } })\n";
+    let r = run(body);
+    agrees(&r, 1);
+    // Skipped on the frames before 100 000 points, run after.
+    assert!(r.production_runs > 0, "{}", r.text(0, true, true));
+    assert!(
+        r.production_runs < 2 * r.frames,
+        "{}",
+        r.text(0, true, true)
+    );
 }
 
 /// R7: a threshold flips on the frame it is crossed, on both sides.
@@ -438,11 +454,10 @@ fn a_write_free_entry_passes() {
 /// R22 and s7-06e-design.md §7.3: the source's installation removes a
 /// number under a disabled option, an absent option, without a keyframe,
 /// and under a named static condition that is false (`table_song`
-/// outside a table), so it never reads their values; production compiles
-/// each value and runs it every frame, found as invocations with no
-/// source point until the production fix. A number under the selected
-/// option, or under the negated static condition, is installed and
-/// agrees on every frame.
+/// outside a table), so it never reads their values; production's
+/// installation pass removes the same objects and compiles none of their
+/// values. A number under the selected option, or under the negated
+/// static condition, is installed and agrees on every frame.
 #[test]
 fn pruning_invokes_nothing() {
     let v = "value = function() return ms.number(100) / 2 end";
@@ -456,18 +471,8 @@ fn pruning_invokes_nothing() {
     let r = run(&body);
     assert_eq!(r.removed.len(), 4, "{}", r.text(0, true, true));
     assert_eq!(r.points, 0, "{}", r.text(0, true, true));
-    let extra = r
-        .findings
-        .iter()
-        .filter(|f| f.what.starts_with("production invocation"))
-        .count();
-    assert_eq!(
-        extra,
-        r.compiled.len() * r.frames,
-        "{}",
-        r.text(0, true, true)
-    );
-    assert!(r.compiled.len() >= 3, "{}", r.text(0, true, true));
+    assert!(r.compiled.is_empty(), "{}", r.text(0, true, true));
+    assert!(r.passes(), "{}", r.text(0, true, true));
     let selected = format!(
         "{body}table.insert(skin.destination, {{ id = \"m\", op = {{ 905 }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n\
          table.insert(skin.destination, {{ id = \"m\", op = {{ \"!table_song\" }}, dst = {{ {{ x = 0, y = 0, w = 6, h = 6 }} }} }})\n"
@@ -480,10 +485,12 @@ fn pruning_invokes_nothing() {
 
 /// R22 (B1) and s7-06e-design.md §7.3: an image whose declared source
 /// does not load is removed by the source's installation, so its draw is
-/// never invoked; production keeps the compiled draw and runs it every
-/// frame, found as invocations with no source point until the production
-/// fix. A movie source makes the object unmodelled: its compiled draw is
-/// one finding.
+/// never invoked. Production's installation pass claims removal only on
+/// evidence it sees without reading a file, so it keeps the compiled draw
+/// and runs it every frame (design.md "Differences from the source",
+/// play program schedule: noted at the callback, never drawn), found as
+/// invocations with no source point. A movie source makes the object
+/// unmodelled: its compiled draw is one finding.
 #[test]
 fn an_unloadable_image_is_removed() {
     let body = format!(
@@ -686,11 +693,13 @@ fn a_group_with_empty_arrays_is_removed() {
 }
 
 /// B2: an image set whose selected entry's source fact is unknown (a
-/// glob) is never taken as a hole: sampling is undecided, a finding.
+/// glob) is never taken as a hole: sampling is undecided, a finding. Its
+/// timer is stateless: a latch under the set's selector gate is refused.
 #[test]
 fn an_unknown_entry_is_inconclusive() {
     let body = format!(
-        "{LATCH}table.insert(skin.source, {{ id = \"glob\", path = \"x/*.png\" }})\n\
+        "local latch = function() return ms.time() end\n\
+         table.insert(skin.source, {{ id = \"glob\", path = \"x/*.png\" }})\n\
          table.insert(skin.image, {{ id = \"u\", src = \"glob\", x = 0, y = 0, w = 8, h = 8 }})\n\
          skin.imageset = {{ {{ id = \"h\", images = {{ \"i\", \"u\" }}, value = function() return ms.number(100) * 0 + 1 end }} }}\n{}",
         dst("\"h\"", 0, "timer = latch, loop = -1,")
@@ -794,6 +803,8 @@ fn integer_fields_truncate_and_movies_come_first() {
         disabled.text(0, true, true)
     );
     assert_eq!(disabled.points, 0, "{}", disabled.text(0, true, true));
+    // Production removes it too: no value compiled, none invoked.
+    assert!(disabled.passes(), "{}", disabled.text(0, true, true));
     let group = |divx: &str| {
         run(&format!(
             "table.insert(skin.image, {{ id = \"g\", src = \"a\", x = 0, y = 0, w = 8, h = 8, divx = {divx}, divy = 1, len = 2, ref = 0 }})\n{}",

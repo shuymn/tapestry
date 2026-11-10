@@ -7,7 +7,7 @@
 //! | V1 | at most [`MAX_CALLBACKS`] callbacks, one signature entry each matching its conversion; constants and reads fit `u16` indices; at most [`MAX_SKIN_OPS`] instructions |
 //! | V2 | each span inside the code, 1 to [`MAX_CALLBACK_OPS`] long, with at most [`MAX_REGISTERS`] registers |
 //! | V3 | every register below the callback's count, every constant and read index valid, every jump forward and within the span (`pc < to <= len`; the end returns nil) |
-//! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback, or, for a timer callback, an earlier `draw` or timer |
+//! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback, for a timer callback an earlier `draw` or timer, or for a slider's `Float` value an earlier `draw` |
 //! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, each gate's, and every slot the callback loads or stores; a timer callback's twice, for its two invocations) charged to the skin's [`SkinOps`] |
 //! | V7 | at most [`MAX_SLOTS`] slots, each domain's bounds ordered and within ±2^53, each initial value within its slot's domain, every slot and domain index valid, and each store's domain within its slot's |
 //!
@@ -49,7 +49,7 @@ pub enum PresentError {
     #[error("callback {callback}'s gate is not a boolean read")]
     Gate { callback: usize },
     #[error(
-        "callback {callback} follows a callback that is not an earlier number value, or for a timer an earlier draw or timer"
+        "callback {callback} follows a callback that is not an earlier number value, for a timer an earlier draw or timer, or for a slider value an earlier draw"
     )]
     After { callback: usize },
     #[error("the program and the skin's expressions exceed {MAX_SKIN_OPS} operations a frame")]
@@ -319,6 +319,9 @@ fn v4_gating(def: &PresentDef, cb: &CallbackDef, k: usize) -> Result<(), Present
             && def.callbacks.get(usize::from(a)).is_some_and(|c| {
                 c.conv == Conv::Int
                     || (cb.conv == Conv::Timer && matches!(c.conv, Conv::Truthy | Conv::Timer))
+                    // A slider reads its value only when it draws
+                    // (`SkinSlider.java:105-113` at `0.8.9`).
+                    || (cb.conv == Conv::Float && c.conv == Conv::Truthy)
             });
         if !earlier {
             return Err(PresentError::After { callback: k });
