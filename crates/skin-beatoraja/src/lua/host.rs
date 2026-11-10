@@ -137,6 +137,12 @@ fn fact_id(lua: &Lua, pass: &Pass, args: &MultiValue, api: &str) -> mlua::Result
 /// the snapshot has unavailable and a built-in that is not a fact. A fact
 /// the snapshot has pending stops the pass by the same fatal path.
 fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
+    #[cfg(feature = "dev-tools")]
+    if pass.in_runtime()
+        && let Some(r) = super::replay::answer(lua, pass, OPTION, &args)
+    {
+        return r.map(|v| matches!(v, Value::Boolean(true)));
+    }
     let n = fact_id(lua, pass, &args, "option")?;
     if pass.in_runtime() {
         return Ok(runtime_option(pass, n));
@@ -185,6 +191,12 @@ fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
 /// integer within `i32` refuses ([`LuaWhy::FactArgument`]). Every refusal
 /// is fatal and located, as `option`'s.
 fn number(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<Value> {
+    #[cfg(feature = "dev-tools")]
+    if pass.in_runtime()
+        && let Some(r) = super::replay::answer(lua, pass, NUMBER, &args)
+    {
+        return r;
+    }
     let n = fact_id(lua, pass, &args, "number")?;
     if pass.in_runtime() {
         return Ok(Value::Number(f64::from(runtime_number(pass, n))));
@@ -331,9 +343,26 @@ pub(super) fn install(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<()> {
             } else if index == TEXT {
                 host(lua, pass, 1, text)?
             } else {
-                host(lua, pass, 0, move |lua, pass, _| -> mlua::Result<()> {
-                    Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))
-                })?
+                // A reference's play host answers what it can (dev-tools),
+                // its one argument passed.
+                #[cfg(feature = "dev-tools")]
+                let arity = 1;
+                #[cfg(not(feature = "dev-tools"))]
+                let arity = 0;
+                host(
+                    lua,
+                    pass,
+                    arity,
+                    move |lua, pass, _args| -> mlua::Result<Value> {
+                        #[cfg(feature = "dev-tools")]
+                        if pass.in_runtime()
+                            && let Some(r) = super::replay::answer(lua, pass, index, &_args)
+                        {
+                            return r;
+                        }
+                        Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: index }))
+                    },
+                )?
             };
             pass.host_api(f.to_pointer().addr(), index);
             t.raw_set(api, f)?;

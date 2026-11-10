@@ -311,7 +311,7 @@ impl Cx<'_> {
                         field,
                         role,
                         (Disposition::Replaced(why), Some(why)),
-                        None,
+                        (None, None),
                     );
                     #[cfg(feature = "dev-tools")]
                     self.unused(id, crate::lua::callback::Unused::Inert);

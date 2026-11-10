@@ -1378,12 +1378,29 @@ impl Cx<'_> {
         role: Role,
         d: (Disposition, Option<Unsupported>),
     ) {
-        self.record(at, field, role, d, None);
+        self.record(at, field, role, d, (None, None));
+    }
+
+    /// [`Self::outcome`] of a callback compiled as program callback `k`.
+    fn compiled(&self, at: (u32, u32), field: &'static str, role: Role, k: u16) {
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Compiled, None),
+            (None, Some(k)),
+        );
     }
 
     /// [`Self::outcome`] of callable `c` at node `id`, lowered to `l`.
     fn lowered_outcome(&self, at: (u32, u32), field: &'static str, role: Role, l: &Lowered) {
-        self.record(at, field, role, (Disposition::Lowered, None), Some(l));
+        self.record(
+            at,
+            field,
+            role,
+            (Disposition::Lowered, None),
+            (Some(l), None),
+        );
     }
 
     /// [`Self::outcome`]'s work, with what the callback lowered to, if it
@@ -1394,13 +1411,13 @@ impl Cx<'_> {
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
-        lowered: Option<&Lowered>,
+        (lowered, program): (Option<&Lowered>, Option<u16>),
     ) {
         let Some(an) = self.analysis() else {
             return;
         };
         an.set_outcome(c, d);
-        self.consumed(id, field, role, (d, why), lowered);
+        self.consumed(id, field, role, (d, why), (lowered, program));
     }
 
     /// The report's record of the consumer at node `id` in `field`, for an
@@ -1412,7 +1429,7 @@ impl Cx<'_> {
         field: &'static str,
         role: Role,
         (d, why): (Disposition, Option<Unsupported>),
-        lowered: Option<&Lowered>,
+        (lowered, program): (Option<&Lowered>, Option<u16>),
     ) {
         #[cfg(feature = "dev-tools")]
         if let Some(an) = self.analysis() {
@@ -1428,15 +1445,28 @@ impl Cx<'_> {
                     disposition: d,
                     why,
                     element: self.element.clone(),
+                    // A value belongs to the definition (`def`), the other
+                    // consumers to the destination; a nested part has its
+                    // own path.
+                    path: match (self.part_path.as_str(), field) {
+                        ("", "value") => "def".to_owned(),
+                        (p, _) => p.to_owned(),
+                    },
+                    index: if field == "op" {
+                        self.op_positions.get(&id).copied().unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    },
                     lowered: lowered.map(|l| crate::lua::survey::Lowered {
                         src: l.src.clone(),
                         guards: l.guards.clone(),
                         constant: l.constant,
                     }),
+                    program,
                 });
         }
         #[cfg(not(feature = "dev-tools"))]
-        let _ = (id, field, role, d, why, lowered);
+        let _ = (id, field, role, d, why, lowered, program);
     }
 
     /// A program callback at node `id` in `field`, compiled for the play
@@ -1458,7 +1488,7 @@ impl Cx<'_> {
             field,
             role,
             (Disposition::Replaced(why), Some(why)),
-            None,
+            (None, None),
         );
         #[cfg(feature = "dev-tools")]
         if let Some(an) = self.analysis() {
@@ -1709,17 +1739,20 @@ impl Cx<'_> {
                     "value",
                     role,
                     (Disposition::Lowered, None),
-                    Some(&Lowered {
-                        src: format!("{fold:?}"),
-                        guards: Vec::new(),
-                        part: None,
-                        essential: None,
-                        deviates: false,
-                        sentinel: false,
-                        known: None,
-                        #[cfg(feature = "dev-tools")]
-                        constant: matches!(fold, TextFold::Literal(_)),
-                    }),
+                    (
+                        Some(&Lowered {
+                            src: format!("{fold:?}"),
+                            guards: Vec::new(),
+                            part: None,
+                            essential: None,
+                            deviates: false,
+                            sentinel: false,
+                            known: None,
+                            #[cfg(feature = "dev-tools")]
+                            constant: matches!(fold, TextFold::Literal(_)),
+                        }),
+                        None,
+                    ),
                 );
                 Ok(Ok(fold))
             }
@@ -1867,7 +1900,7 @@ impl Cx<'_> {
             }
             Ok(Lowering::Compiled(l, prog)) => match self.draw_program(prog, conds, at)? {
                 Ok(k) => {
-                    self.outcome((c, id), field, role, (Disposition::Compiled, None));
+                    self.compiled((c, id), field, role, k);
                     self.compiled_at(id, field, k);
                     *deviates |= l.deviates;
                     self.read_sentinel(l.sentinel);
@@ -2049,7 +2082,7 @@ impl Cx<'_> {
                 let gate = self.install.gate.clone();
                 match self.program(prog, gate, None, at)? {
                     Ok(k) => {
-                        self.outcome((c, id), "value", role, (Disposition::Compiled, None));
+                        self.compiled((c, id), "value", role, k);
                         self.compiled_at(id, "value", k);
                         self.read_sentinel(l.sentinel);
                         return Ok(Some(NumberValue {
@@ -2155,7 +2188,7 @@ impl Cx<'_> {
         };
         match gated {
             Ok(k) => {
-                self.outcome(v.at, "value", v.role, (Disposition::Compiled, None));
+                self.compiled(v.at, "value", v.role, k);
                 self.compiled_at(v.at.1, "value", k);
                 Ok(Some(k))
             }
@@ -2425,7 +2458,7 @@ impl Cx<'_> {
                                     let n = r.consumers.len() - 1;
                                     self.install.consumers.push((inst, n));
                                 }
-                                self.outcome((c, id), "timer", role, (Disposition::Compiled, None));
+                                self.compiled((c, id), "timer", role, k);
                                 self.compiled_at(id, "timer", k);
                                 self.read_sentinel(l.sentinel);
                                 return Ok(Ok(TimerRef::Output(k)));

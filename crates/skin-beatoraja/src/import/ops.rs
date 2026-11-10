@@ -564,7 +564,7 @@ pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
 }
 
 /// The id of boolean property `name`, without `!` prefixes.
-fn named_id(name: &str) -> Option<i32> {
+pub(crate) fn named_id(name: &str) -> Option<i32> {
     if let Some(&(id, _)) = KNOWN_BOOLEAN_IDS.iter().find(|(_, n)| *n == name) {
         return Some(id);
     }

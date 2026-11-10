@@ -623,6 +623,17 @@ pub(crate) fn value_prop(kind: ScreenKind, value: &super::Prop) -> IntProp {
     }
 }
 
+/// Integer property `name` on a `kind` screen as the factory resolves
+/// it, with its id when it has one; `None` for a name the factory does
+/// not know, which the source runs as a script (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub(crate) fn int_named(kind: ScreenKind, name: &str) -> Option<(IntProp, Option<i32>)> {
+    match name_id(name) {
+        Some(id) => Some((int_in(kind, id), Some(id))),
+        None => int_by_name(name).map(|p| (p, None)),
+    }
+}
+
 /// The id of integer property `name`, when the factory names one.
 fn name_id(name: &str) -> Option<i32> {
     VALUE_TYPES

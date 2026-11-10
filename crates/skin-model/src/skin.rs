@@ -2337,6 +2337,15 @@ impl Skin {
         self.present.as_ref().map_or(0, Present::len)
     }
 
+    /// The presentation program's structure, written out (dev-tools): its
+    /// instructions, constants, reads, gates, slots and signature, which
+    /// two imports' programs are equal exactly when.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn program_structure(&self) -> String {
+        format!("{:?}", self.present)
+    }
+
     /// The lanes' bar groups: the groups a [`Play`] from
     /// [`prepare`](Self::prepare) holds work for.
     #[must_use]

@@ -169,7 +169,14 @@ impl Cx<'_> {
                 if let Some(&s) = JudgeSlot::ALL.get(k) {
                     self.prepare = Prepare::JudgeGrade { slot: s, full_part };
                 }
-                *slot = self.grade(&gdst, img)?;
+                #[cfg(feature = "dev-tools")]
+                {
+                    self.part_path = format!("def.images.{}", k + 1);
+                }
+                let g = self.grade(&gdst, img);
+                #[cfg(feature = "dev-tools")]
+                self.part_path.clear();
+                *slot = g?;
             }
         }
         if grades.iter().all(Option::is_none) {
@@ -197,7 +204,14 @@ impl Cx<'_> {
             };
             // Prepared only when its grade drew (`SkinJudge.java:122-126`).
             self.prepare = Prepare::JudgeCombo;
-            if let Some(combo) = self.combo(&ndst, value)? {
+            #[cfg(feature = "dev-tools")]
+            {
+                self.part_path = format!("def.numbers.{}", k + 1);
+            }
+            let combo = self.combo(&ndst, value);
+            #[cfg(feature = "dev-tools")]
+            self.part_path.clear();
+            if let Some(combo) = combo? {
                 combos[k] = Some(combo);
             }
         }
