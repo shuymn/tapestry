@@ -1224,32 +1224,42 @@ fn a_quit_while_a_committed_minimum_runs_keeps_the_installation() {
     assert_tuning_open(&mut rig);
 }
 
-/// L5b, O12a: the screen lost while the committed minimum runs ends the
-/// run as a lost screen: it is not built again (the replacement would
-/// hold no prepared attempt), the commit is not taken again, loading is
-/// not ended and recording never opens.
+/// L5b, O12a, I8: the screen lost while the committed minimum runs ends
+/// the run as a lost screen, alone or with a quit in the same slice (the
+/// run's end goes before the quit): it is not built again (the
+/// replacement would hold no prepared attempt), the commit is not taken
+/// again, loading is not ended and recording never opens.
 #[test]
 fn a_screen_lost_while_a_committed_minimum_runs_ends_the_run() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut loaded = loaded(dir.path());
-    let mut rig = Loader::new(&loaded);
-    rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
-    rig.at(T0 + 2 * SECOND, Happen::ScreenFails);
-    let ran = run(&mut loaded, &mut rig);
-    assert!(matches!(ran, Err(LiveError::ScreenLost)), "{ran:?}");
-    assert_eq!(rig.clock.now().0, T0 + 2 * SECOND);
-    assert_eq!(
-        last_steps(&rig, 3),
-        ["commit", "reopen", "end presentation"]
-    );
-    // O2's preparation only: no recovery after the commit.
-    assert_eq!(rig.count("screen"), 1);
-    assert_eq!(rig.count("commit"), 1);
-    assert_eq!(rig.count("discard"), 0);
-    assert_eq!(rig.count("end loading"), 0);
-    assert_eq!(rig.count("open"), 0);
-    assert!(rig.reports.is_empty());
-    assert_eq!(loaded.attempt().number, 0);
+    for with_quit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.commit_loadend = Some(Some(TimeUs(3 * SECOND)));
+        rig.at(T0 + 2 * SECOND, Happen::ScreenFails);
+        if with_quit {
+            rig.at(T0 + 2 * SECOND, Happen::Quit);
+        }
+        let ran = run(&mut loaded, &mut rig);
+        assert!(
+            matches!(ran, Err(LiveError::ScreenLost)),
+            "quit {with_quit}: {ran:?}"
+        );
+        assert_eq!(rig.clock.now().0, T0 + 2 * SECOND, "quit {with_quit}");
+        assert_eq!(
+            last_steps(&rig, 3),
+            ["commit", "reopen", "end presentation"],
+            "quit {with_quit}"
+        );
+        // O2's preparation only: no recovery after the commit.
+        assert_eq!(rig.count("screen"), 1, "quit {with_quit}");
+        assert_eq!(rig.count("commit"), 1, "quit {with_quit}");
+        assert_eq!(rig.count("discard"), 0, "quit {with_quit}");
+        assert_eq!(rig.count("end loading"), 0, "quit {with_quit}");
+        assert_eq!(rig.count("open"), 0, "quit {with_quit}");
+        assert!(rig.reports.is_empty(), "quit {with_quit}");
+        assert_eq!(loaded.attempt().number, 0, "quit {with_quit}");
+    }
 }
 
 /// The waits of L10 to L12, each holding the wait from its first slice to

@@ -680,22 +680,26 @@ fn wait_loading<R: LoadingRig>(
         } else {
             rig.wait();
         }
-        // A thread's failure first, then a refusal, then the player.
+        // The exits in order, those that end the run first: a thread's
+        // failure, a refusal, a close, and after the commit a lost screen
+        // (design.md "Rendering and Skins": nothing would draw the play);
+        // then the player's quit and a cancelled preparation.
         threads_over(rig)?;
         if let PrepState::Refused(why) = &opener.latch {
             return Err(LiveError::Preparation(why.clone()));
+        }
+        if rig.quitting() {
+            return Ok(false);
+        }
+        if committed && rig.screen_failed() {
+            return Err(LiveError::ScreenLost);
         }
         if quit_look(rig) || opener.latch == PrepState::Cancelled {
             return Ok(false);
         }
         // A screen built again keeps the loading lifetime: its first
-        // frame, if not presented yet, still starts the minimum. After the
-        // commit, a lost screen ends the run (design.md "Rendering and
-        // Skins": nothing would draw the play).
+        // frame, if not presented yet, still starts the minimum.
         if rig.screen_failed() {
-            if committed {
-                return Err(LiveError::ScreenLost);
-            }
             rig.prepare_screen().map_err(LiveError::Screen)?;
         }
         if opener.ack.is_none()
