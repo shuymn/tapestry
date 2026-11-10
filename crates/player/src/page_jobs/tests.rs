@@ -754,6 +754,18 @@ fn a_promotion_after_the_checkpoint_widens_at_the_next_file() {
         until("the job's handle", || promote.get().is_some());
         let _ = promote.get().unwrap().promote_unless_ended();
     });
+    // An extra started at the first file waits at its first ask, holding
+    // its permit, until worker 0 asks for its second file.
+    let extras = cap(8) - 1;
+    for k in 1..=extras {
+        script.hold(PageAt::File(k), 1);
+    }
+    let release = Arc::clone(&script);
+    script.act(PageAt::File(0), 2, move || {
+        for k in 1..=extras {
+            release.release(PageAt::File(k), 1);
+        }
+    });
     let (job, _mode) = bank(&coord, &chart, false, &seam, &script);
     let _ = slot.set(job);
     let job = slot.get().unwrap();
@@ -764,6 +776,8 @@ fn a_promotion_after_the_checkpoint_widens_at_the_next_file() {
         .iter()
         .position(|e| e.0 == PageAt::File(0) && e.1 == 2)
         .unwrap();
+    // Its own speculative permit only: no extra holds a foreground one.
+    assert_eq!(log[second].2, (0, 1), "{log:?}");
     assert!(
         log[..second]
             .iter()
