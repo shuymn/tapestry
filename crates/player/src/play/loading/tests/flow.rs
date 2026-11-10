@@ -56,6 +56,53 @@ fn chart(text: &str, settings: game::Settings) -> (tempfile::TempDir, game::Load
     (dir, loaded)
 }
 
+/// A record sink that saves nothing and answers every best read with
+/// `answer`.
+struct Answers(game::BestLookup);
+
+impl game::RecordSink for Answers {
+    fn save(&mut self, _: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Err(std::io::Error::other("not saved").into())
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.0.clone()
+    }
+}
+
+/// A chart at 120 BPM with 27 notes, LIFT and HIDDEN on, the player's
+/// target `target`, its best reads answered with `answer` (no library for
+/// `None`).
+fn notes_27(
+    target: game::ScoreTarget,
+    answer: Option<game::BestLookup>,
+) -> (tempfile::TempDir, game::Loaded) {
+    let mut settings = covers();
+    settings.player.target = target;
+    let dir = tempfile::tempdir().unwrap();
+    let root = game::DataRoot::new(dir.path().join("root"));
+    let path = dir.path().join("a.bms");
+    std::fs::write(&path, format!("#BPM 120\n#00111:{}\n", "01".repeat(27))).unwrap();
+    let config = game::SessionConfig {
+        lead_in: TimeUs(1_000_000),
+        step: TimeUs(1_000),
+        start: TimeUs(0),
+        effects: 64,
+        seed: 1,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: replay::BuildProvenance::Development,
+        receive: replay::ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    let parts = game::Parts {
+        records: answer.map(|a| Box::new(Answers(a)) as Box<dyn game::RecordSink>),
+        ..game::Parts::unsaved(&settings.player)
+    };
+    let loaded = game::Loaded::load(root, settings, &path, config, parts).unwrap();
+    (dir, loaded)
+}
+
 /// A chart at 120 BPM with one note, LIFT and HIDDEN on.
 fn plain() -> (tempfile::TempDir, game::Loaded) {
     chart("#PLAYLEVEL 13\n#BPM 120\n#00111:01\n", covers())
@@ -282,6 +329,43 @@ fn the_final_readiness_stamps_the_attempts_epoch() {
         assert_eq!(fenced(rig), accepted, "the refresh is no change");
         assert_eq!(selected(rig), Some(CoverKind::Hidden));
     });
+}
+
+/// The play skin committed out of the loading state prepares the play's
+/// best and target, set before the preparation begun at load-ready, the
+/// preset and screen unchanged so that preparation is the one committed
+/// (stage 3, S10-10): 27 notes, a known best of 40 under `"next"` gives
+/// rank 21, 42; no library under `"max"` gives 54.
+#[test]
+fn the_committed_play_skin_has_the_plays_best_and_target() {
+    let known = game::BestLookup::Known(game::BestScore {
+        plays: 1,
+        ex: Some(40),
+        bp: Some(0),
+        clear: None,
+    });
+    let cases = [
+        (game::ScoreTarget::Next, Some(known), (40, true, 42)),
+        (game::ScoreTarget::Max, None, (0, false, 54)),
+    ];
+    for (target, answer, (best, best_known, t)) in cases {
+        let (_dir, mut loaded) = notes_27(target, answer);
+        on_loading(&mut loaded, None, false, |rig, side, loaded| {
+            side.loading_end.hold(true);
+            let ended = open_with(loaded, rig, side, || side.quit_at_the_end_of_loading());
+            assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+            assert_eq!(rig.preps, 1, "{target:?}: the load-ready preparation");
+            assert_eq!(
+                *side.screens.committed_scores.lock().unwrap(),
+                [skin_model::ScoreBasis {
+                    best,
+                    best_known,
+                    target: t,
+                }],
+                "{target:?}"
+            );
+        });
+    }
 }
 
 /// E1b: a pending play skin whose specialization still runs at O5: the

@@ -77,6 +77,7 @@ impl ChartIngest for Built {
     ) -> Result<Ingested, IngestError> {
         Ok(Ingested {
             labels: game::ChartLabels::default(),
+            profile: bms_model::ChartProfile::of(&self.0, &[]),
             chart: self.0.clone(),
             warnings: Vec::new(),
         })
@@ -1692,6 +1693,7 @@ impl ChartIngest for Capped {
         *self.seen.lock().unwrap() = Some(bytes.len());
         Ok(Ingested {
             labels: game::ChartLabels::default(),
+            profile: bms_model::ChartProfile::of(&self.chart, &[]),
             chart: self.chart.clone(),
             warnings: Vec::new(),
         })
@@ -2852,4 +2854,351 @@ fn a_practice_set_before_the_session_starts_is_checked_against_its_engine() {
         .play(script(vec![connect(0)], &[(12_000 * MS, Command::Quit)]))
         .unwrap();
     assert!(report.record.is_some());
+}
+
+/// A record sink that saves locally and answers every best read with
+/// `answer`, noting each key it is asked.
+struct Lookup {
+    local: game::LocalRecords,
+    answer: game::BestLookup,
+    asked: Arc<std::sync::Mutex<Vec<game::BestKey>>>,
+}
+
+impl game::RecordSink for Lookup {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, SaveError> {
+        self.local.save(rec)
+    }
+
+    fn best_before(&mut self, key: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.asked.lock().unwrap().push(*key);
+        self.answer.clone()
+    }
+}
+
+/// `n` taps on key 1, 100 ms apart from 1 s, the file's SHA-256 all 7s.
+fn taps_n(n: i64) -> Chart {
+    let mut b = ChartBuilder::new(150_000);
+    for i in 0..n {
+        b = b.tap(lane(1), TimeUs((1_000 + 100 * i) * MS));
+    }
+    let mut chart = b.build().unwrap();
+    chart.identity.sha256 = [7; 32];
+    chart
+}
+
+/// The keys a [`Lookup`] was asked.
+type Asked = Arc<std::sync::Mutex<Vec<game::BestKey>>>;
+
+/// `chart` loaded with the player's `target`, its best reads answered with
+/// `answer` (no record sink for `None`), an autoplay session when
+/// `autoplay`; and the keys asked.
+fn scored(
+    root: &DataRoot,
+    chart: Chart,
+    target: game::ScoreTarget,
+    answer: Option<game::BestLookup>,
+    autoplay: bool,
+) -> (Loaded, Asked) {
+    let mut settings = tapestry_settings(root);
+    settings.player.target = target;
+    let asked = Asked::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        records: answer.map(|answer| {
+            Box::new(Lookup {
+                local: game::LocalRecords::new(root.records()),
+                answer,
+                asked: Arc::clone(&asked),
+            }) as Box<dyn game::RecordSink>
+        }),
+        ..Parts::standard(root, &settings.player)
+    };
+    let config = SessionConfig {
+        autoplay: autoplay.then_some(game::AutoKeySounds::Scheduled),
+        ..config()
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config, parts).unwrap();
+    (loaded, asked)
+}
+
+/// C11 (stage 3, S10-10): a play reads its best once as it begins, under
+/// the result's key (the chart file's and the play preset's SHA-256): a
+/// known best gives its EX, a known-empty one 0, both known; a failed read
+/// or no library gives 0, not known, the target still from the setting;
+/// an autoplay reads as a play does; a `#RANDOM` chart's `"next"` is the
+/// maximum, its ranks over the drawn chart's notes. 27 notes: a maximum of
+/// 54, rank `k` at `2k`.
+#[test]
+fn a_play_begins_with_its_best_and_target_by_case() {
+    use game::{BestLookup, ScoreBasis, ScoreTarget};
+    let known = BestLookup::Known(game::BestScore {
+        plays: 2,
+        ex: Some(40),
+        bp: Some(3),
+        clear: Some(game::BestLamp::Failed),
+    });
+    let basis = |best, best_known, target| ScoreBasis {
+        best,
+        best_known,
+        target,
+    };
+    let random = || {
+        let mut chart = taps_n(27);
+        chart.identity.random_results = vec![1];
+        chart
+    };
+    let next = ScoreTarget::Next;
+    let cases = [
+        // `"next"` above 40: rank 21, 42.
+        (
+            "known",
+            taps_n(27),
+            Some(known.clone()),
+            next,
+            false,
+            basis(40, true, 42),
+            1,
+        ),
+        // `"next"` above 0: rank 15, 30.
+        (
+            "known empty",
+            taps_n(27),
+            Some(BestLookup::KnownEmpty),
+            next,
+            false,
+            basis(0, true, 30),
+            1,
+        ),
+        (
+            "failed read",
+            taps_n(27),
+            Some(BestLookup::Unavailable),
+            next,
+            false,
+            basis(0, false, 30),
+            1,
+        ),
+        (
+            "no library",
+            taps_n(27),
+            None,
+            ScoreTarget::AMinus,
+            false,
+            basis(0, false, 34),
+            0,
+        ),
+        (
+            "autoplay",
+            taps_n(27),
+            Some(known.clone()),
+            next,
+            true,
+            basis(40, true, 42),
+            1,
+        ),
+        (
+            "random next",
+            random(),
+            Some(known.clone()),
+            next,
+            false,
+            basis(40, true, 54),
+            1,
+        ),
+        (
+            "random rank",
+            random(),
+            Some(known),
+            ScoreTarget::AMinus,
+            false,
+            basis(40, true, 34),
+            1,
+        ),
+    ];
+    for (name, chart, answer, target, autoplay, expected, reads) in cases {
+        let (_dir, root) = temp_root();
+        let (mut loaded, asked) = scored(&root, chart, target, answer, autoplay);
+        assert_eq!(
+            loaded.attempt().score,
+            ScoreBasis::default(),
+            "{name}: before"
+        );
+        loaded.begin_play();
+        assert_eq!(loaded.attempt().score, expected, "{name}");
+        let key = game::BestKey {
+            chart_sha256: [7; 32],
+            preset_sha256: replay::preset_hash(loaded.preset()),
+        };
+        assert_eq!(*asked.lock().unwrap(), vec![key; reads], "{name}");
+    }
+}
+
+/// C11: a practice round reads nothing and has neither a best nor a
+/// target; the full play after it reads again.
+#[test]
+fn a_practice_round_reads_no_best() {
+    use game::{BestLookup, ScoreBasis, ScoreTarget};
+    let (_dir, root) = temp_root();
+    let known = BestLookup::Known(game::BestScore {
+        plays: 1,
+        ex: Some(40),
+        bp: Some(3),
+        clear: None,
+    });
+    let (mut loaded, asked) = scored(&root, taps_n(27), ScoreTarget::Max, Some(known), false);
+    let practice = game::Practice {
+        start: TimeUs(0),
+        end: TimeUs(2_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: true,
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+    loaded.begin_play();
+    assert_eq!(loaded.attempt().score, ScoreBasis::default());
+    assert!(asked.lock().unwrap().is_empty());
+    loaded.set_practice(None).unwrap();
+    loaded.begin_play();
+    assert_eq!(
+        loaded.attempt().score,
+        ScoreBasis {
+            best: 40,
+            best_known: true,
+            target: 54
+        }
+    );
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+/// C12: a READY candidate cancelled by a hold of START and rearmed by its
+/// release reads no best again: the play's one read stands.
+#[test]
+fn a_ready_rearm_reads_no_best_again() {
+    const START: ControlId = ControlId(0x12);
+    let start = |at: i64, value| {
+        item(
+            at * MS,
+            Action::Packet(Packet {
+                device: DeviceId(0),
+                control: START,
+                value,
+                background: false,
+            }),
+        )
+    };
+    let (_dir, root) = temp_root();
+    let chart = taps(&NOTES[..3]);
+    let (loaded, asked) = scored(
+        &root,
+        chart.clone(),
+        game::ScoreTarget::Max,
+        Some(game::BestLookup::KnownEmpty),
+        false,
+    );
+    let audio = steady_audio(&chart, common::bank(&chart));
+    let mut s = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
+    let d = DeviceSettings::default();
+    let keys = game::KeyConfigs {
+        keyboard: d.keyboard,
+        controller: d.controller,
+        controller_device: None,
+    };
+    let plan = game::AdjustmentConfig::default()
+        .plan(&keys, None, None)
+        .unwrap();
+    let options = game::PlayOptions::new(
+        game::HiSpeedSettings {
+            mode: game::SpeedMode::Classic,
+            ..game::HiSpeedSettings::default()
+        },
+        game::Covers::default(),
+    )
+    .unwrap();
+    s.with_start_gate(&plan, options).unwrap();
+    // START held at −300 ms, released at 200 ms: READY rearms there, its
+    // chart time 0 at 1.2 s of the script.
+    let mut items = vec![connect(0), start(-300, 1), start(200, 0)];
+    for &(n, t) in &NOTES[..3] {
+        items.push(key((1_200 + t) * MS, 0, n, 1));
+        items.push(key((1_240 + t) * MS, 0, n, 0));
+    }
+    let report = s.play(script(items, &[])).unwrap();
+    assert_eq!(report.end, PlayEnd::Completed);
+    // The rearm happened: one cancelled opening.
+    assert_eq!(report.record.as_ref().unwrap().history.openings.len(), 1);
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+/// C13: the parser's 1× profile reaches the attempt unchanged through the
+/// production ingestion at ×1.5. The chart starts at 240 BPM with one note
+/// at 0, changes to 120 BPM at 1 s with notes at exactly 1 000 000 µs,
+/// 1.5 s, 2 s and 2.5 s, then has a 0.5 s STOP and a note at 3 s. The
+/// profile keeps the notes in their 1× seconds (the remapped chart has the
+/// first 120 BPM note at 666 666 µs, second 0) and the STOP's stopped row,
+/// which the parser's own STOP lengths give. MAIN is the whole chart's,
+/// 120, neither the initial tempo nor a practice section's (240 over the
+/// first note alone). A speed change keeps the load's profile and MAIN.
+#[test]
+fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let path = root.path().join("second.bms");
+    let text = "#BPM 240\n#WAV01 a.wav\n#STOP01 48\n#00011:01\n#00103:78\n\
+                #00111:01010101\n#00209:01\n#00211:01\n";
+    fs::write(&path, text).unwrap();
+    let settings = tapestry_settings(&root);
+    let parts = Parts::standard(&root, &settings.player);
+    let speed = bms_model::Speed::from_twentieths(30).unwrap();
+    let at_speed = SessionConfig { speed, ..config() };
+    let mut loaded = Loaded::load(root.clone(), settings, &path, at_speed, parts).unwrap();
+    let times: Vec<_> = loaded
+        .chart()
+        .lanes
+        .iter()
+        .flatten()
+        .map(|n| n.time.0)
+        .collect();
+    assert_eq!(&times[..2], [0, 666_666]);
+    let opts = bms_parser::LoadOptions {
+        seed: config().seed,
+        ..bms_parser::LoadOptions::default()
+    };
+    let parser = bms_parser::load_bms(text.as_bytes(), root.path(), &opts)
+        .unwrap()
+        .profile;
+    let tap = |s: usize| parser.seconds()[s][bms_model::KEY_TAP];
+    assert_eq!((tap(0), tap(1), tap(2), tap(3)), (1, 2, 2, 1));
+    let bpm = |b: i64| bms_model::Tempo::from_milli(b * 1_000).unwrap();
+    let rows: Vec<_> = parser.speeds().iter().map(|r| (r.ms, r.tempo)).collect();
+    assert!(rows.contains(&(1_000, Some(bpm(120)))), "{rows:?}");
+    assert!(rows.contains(&(3_000, None)), "{rows:?}");
+    loaded.begin_play();
+    let profile = loaded.attempt().profile.unwrap();
+    assert_eq!(*profile, parser);
+    assert_eq!(loaded.chart().timeline.meta().initial, bpm(240));
+    assert_eq!(loaded.attempt().main, Some(bpm(120)));
+    // A practice round over the first note alone: its own MAIN is 240,
+    // the attempt's stays the whole chart's.
+    let practice = game::Practice {
+        start: TimeUs(0),
+        end: TimeUs(500 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: true,
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+    loaded.begin_play();
+    let round = loaded.attempt();
+    let whole = game::AttemptTempo::prepare(loaded.chart(), None);
+    assert_ne!(
+        round.tempo.references().unwrap().main,
+        whole.references().unwrap().main,
+        "the section's MAIN is another"
+    );
+    assert_eq!(round.main, Some(bpm(120)));
+    assert!(Arc::ptr_eq(&profile, round.profile.as_ref().unwrap()));
+    loaded.set_speed(bms_model::Speed::NORMAL).unwrap();
+    let again = loaded.attempt();
+    assert!(Arc::ptr_eq(&profile, again.profile.as_ref().unwrap()));
+    assert_eq!(again.main, Some(bpm(120)));
 }
