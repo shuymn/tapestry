@@ -275,6 +275,11 @@ const READY_NUMBERS: [Option<i64>; 9] = [
 
 #[test]
 fn score_frames_do_not_allocate() {
+    // The positive control: the counter sees an allocation on this thread.
+    let n = counted(|| {
+        std::hint::black_box(Vec::<u8>::with_capacity(64));
+    });
+    assert!(n > 0, "the counter missed an allocation");
     let chart = chart();
     let basis = ScoreBasis {
         best: 11,
