@@ -115,7 +115,9 @@ pub use presets::{
 };
 pub use queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS, QueueChoice, RAISED_QUEUED_PERIODS};
 pub use ready_history::{HistoryFull, HistoryRecorder};
-pub use render::{PlayView, RenderSide, RenderSink, ViewWriter, render_link};
+pub use render::{
+    OFFSET_SLOTS, OffsetRing, PlayView, RenderSide, RenderSink, ViewWriter, render_link,
+};
 pub use restore::{Restore, RestoreError, RestoreRefusal, Restored, Restorer};
 pub use result_figures::{
     MAX_TIMELINE_BINS, Rate, ResultBasis, ResultFigures, TIMELINE_BIN_US, TIMELINE_CHANNELS,
