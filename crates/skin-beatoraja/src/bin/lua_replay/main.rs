@@ -24,6 +24,8 @@
 mod hints;
 mod inputs;
 mod isolation;
+#[cfg(test)]
+mod lowered_tests;
 mod observed;
 mod production;
 mod reference;

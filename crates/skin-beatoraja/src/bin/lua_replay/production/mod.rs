@@ -77,6 +77,14 @@ pub(in crate::production) struct FrameTrace {
     /// at `2k`, whether it gave one at `2k + 1`, as expressions read them.
     pub(in crate::production) outs: Vec<i32>,
     pub(in crate::production) kind: FrameKind,
+    /// The play schema's fields and the timers' ms the frame's expressions
+    /// read (empty off play).
+    pub(in crate::production) fields: Vec<i32>,
+    pub(in crate::production) timers: Vec<i32>,
+    /// The play state's score data as the reference host answers it.
+    pub(in crate::production) score: Option<[i32; 3]>,
+    /// Whether the round has no judgment yet (its tally the zero tally).
+    pub(in crate::production) zero_tally: bool,
 }
 
 /// One round as production played it: what it took over and the witness
@@ -195,6 +203,7 @@ pub fn record(
     let mut clock = script.origin;
     let mut pages = 0;
     let mut slots = 0;
+    let score: std::cell::Cell<Option<[i32; 3]>> = std::cell::Cell::new(None);
     trace::arm();
     let mut played = || -> Result<(), String> {
         for phase in &script.phases {
@@ -244,6 +253,10 @@ pub fn record(
                             state_us,
                             outs: Vec::new(),
                             kind: FrameKind::Loading,
+                            fields: Vec::new(),
+                            timers: Vec::new(),
+                            score: None,
+                            zero_tally: true,
                         });
                         t += STEP;
                     }
@@ -269,6 +282,10 @@ pub fn record(
                             state_us,
                             outs: Vec::new(),
                             kind: FrameKind::Page,
+                            fields: Vec::new(),
+                            timers: Vec::new(),
+                            score: score.get(),
+                            zero_tally: true,
                         });
                         t += STEP;
                     }
@@ -310,12 +327,18 @@ pub fn record(
                     let round = rounds.len();
                     let mut rearmed = false;
                     let base = clock;
+                    let targets = skin_model::attempt_targets(&chart, &ctx.attempt);
+                    let judged = |t: &eval::Tally| {
+                        if *t != eval::Tally::default() {
+                            score.set(skin_model::score_fields(t, targets, ctx.empty_poor_counted));
+                        }
+                    };
                     let (tally, took) = r.play(
                         &chart,
                         &preset,
                         r.section.then_some(&section),
-                        end.0,
-                        shown,
+                        (end.0, shown),
+                        &judged,
                         |st| {
                             if st.rearmed && !rearmed {
                                 play.rearm();
@@ -354,7 +377,28 @@ pub fn record(
                             let s = play.state();
                             let fields = s.fields.get(..field::COUNT).unwrap_or(s.fields);
                             let outs = s.fields.get(field::COUNT..).unwrap_or_default().to_vec();
-                            inputs.push(FrameInputs::new(fields, s.timers, state_us));
+                            // The score input is the source's score data:
+                            // once the round has a judgment it must be the
+                            // frame's own score fields (s7-06e-3-design.md
+                            // §2a), else the harness's model is wrong.
+                            let zero_tally = *st.ev.tally() == eval::Tally::default();
+                            let own = [
+                                field::EX_SCORE,
+                                field::RATE_CURRENT_BP,
+                                field::RATE_WHOLE_BP,
+                            ]
+                            .map(|f| fields.get(usize::from(f)).copied().unwrap_or(0));
+                            if !zero_tally && score.get() != Some(own) {
+                                return Err(format!(
+                                    "score input {:?} differs from the frame's {own:?} at {}",
+                                    score.get(),
+                                    now.0
+                                ));
+                            }
+                            inputs.push(
+                                FrameInputs::new(fields, s.timers, state_us)
+                                    .with_score(score.get()),
+                            );
                             let stage = match (st.closing, ready, st.rearmed) {
                                 (Some(_), _, _) if r.end == End::Fail => Stage::Failed,
                                 (Some(_), _, _) => Stage::Closing,
@@ -373,6 +417,10 @@ pub fn record(
                                     stage,
                                     carried,
                                 },
+                                fields: fields.to_vec(),
+                                timers: s.timers.to_vec(),
+                                score: score.get(),
+                                zero_tally,
                             });
                             Ok(())
                         },
