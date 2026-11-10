@@ -47,7 +47,8 @@ mod wasapi;
 
 pub use bank::{
     BankError, BankLimits, BankWarning, Cap, Conversion, Found, LoadStats, MAX_RATE, MIN_RATE,
-    Sound, SoundBank, Speed, Stage, load_bank, load_bank_at, load_bank_reporting, plan_conversion,
+    Sound, SoundBank, Speed, Stage, Width, load_bank, load_bank_at, load_bank_reporting,
+    load_bank_width, plan_conversion,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{

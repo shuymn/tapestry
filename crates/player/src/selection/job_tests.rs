@@ -65,6 +65,28 @@ fn song(dir: &Path, extra: &str) -> PathBuf {
     path
 }
 
+/// [`song`] with `more` other sounds of their own contents beside
+/// `key.wav`, each played as BGM: `1 + more` distinct files.
+fn song_of(dir: &Path, more: usize) -> PathBuf {
+    let path = song(dir, "");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    let mut bgm = String::from("01");
+    for i in 0..more {
+        let id = format!("{:02}", i + 2);
+        let name = format!("more{i}.wav");
+        std::fs::write(
+            dir.join("song").join(&name),
+            wav(&square(0.5, 1_000 + 500 * i as i16)),
+        )
+        .unwrap();
+        text.push_str(&format!("#WAV{id} {name}\n"));
+        bgm.push_str(&id);
+    }
+    text.push_str(&format!("#00201:{bgm}\n"));
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
 fn settings() -> game::Settings {
     game::Settings {
         device: game::DeviceSettings::default(),
@@ -182,8 +204,34 @@ fn decodes_with(hook: Option<Hook>) -> Decodes {
     }
 }
 
+/// The speed of each decode begun.
+fn begun(d: &Decodes) -> Vec<Speed> {
+    d.begun.lock().unwrap().iter().map(|b| b.0).collect()
+}
+
+/// The speed of each decode begun, with the foreground permits held then.
+fn begun_held(d: &Decodes) -> Vec<(Speed, usize)> {
+    d.begun.lock().unwrap().clone()
+}
+
+/// Each decode that made a bank: its speed, its most workers at once and
+/// the permits its other workers still held as its pool returned.
 fn decoded(d: &Decodes) -> Vec<(Speed, usize, usize)> {
     d.decodes.lock().unwrap().clone()
+}
+
+/// The workers a decode of `files` distinct files runs beside `k`
+/// foreground permits held elsewhere: one on its job's permit and one on
+/// each free permit, at most the pool's cap (the default thread count, the
+/// cores and the files).
+fn granted(k: usize, files: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let cap = audio::BankLimits::default()
+        .max_decode_threads
+        .min(cores)
+        .min(files)
+        .max(1);
+    (game::coord::FOREGROUND_PERMITS - k).min(cap)
 }
 
 fn analysis(d: &Decodes) -> Option<usize> {
@@ -298,7 +346,7 @@ fn a_bank_thread_that_cannot_start_fails_the_load() {
         })
     );
     assert!(!installed);
-    assert!(decoded(&b.decodes).is_empty());
+    assert!(begun(&b.decodes).is_empty());
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
 
@@ -328,7 +376,7 @@ fn a_measure_thread_that_cannot_start_fails_the_load() {
         })
     );
     assert!(installed);
-    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(begun(&b.decodes).len(), 1);
     assert_eq!(analysis(&b.decodes), None);
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
@@ -395,7 +443,7 @@ fn a_1x_decode_panic_fails_the_load() {
     };
     assert!(why.contains("injected 1x decode panic (test)"), "{why}");
     assert!(installed);
-    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    let speeds: Vec<_> = begun(&b.decodes);
     assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
     assert_eq!(analysis(&b.decodes), None);
     assert_eq!(b.coord.held(Class::Foreground), 0);
@@ -468,7 +516,7 @@ fn a_bank_too_large_is_refused_through_its_job() {
         "{got:?}"
     );
     assert!(!installed);
-    assert_eq!(decoded(&b.decodes).len(), 1, "not through the Bank job");
+    assert_eq!(begun(&b.decodes).len(), 1, "not through the Bank job");
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
 
@@ -490,7 +538,7 @@ fn an_unplayable_autoplay_chart_begins_no_bank_job() {
     });
     assert!(matches!(got, Err(ChartLoadError::Autoplay(_))), "{got:?}");
     assert!(!installed);
-    assert!(decoded(&b.decodes).is_empty());
+    assert!(begun(&b.decodes).is_empty());
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
 
@@ -522,7 +570,7 @@ fn leave_while_the_bank_waits_for_a_permit(how: Leave) {
     );
     assert_eq!(got, Loading::Cancelled);
     assert!(!installed);
-    assert!(decoded(&b.decodes).is_empty(), "the decode ran");
+    assert!(begun(&b.decodes).is_empty(), "the decode ran");
     assert_eq!(
         b.coord.held(Class::Foreground),
         game::coord::FOREGROUND_PERMITS
@@ -638,7 +686,7 @@ fn leave_while_the_load_waits_for_the_background(how: Leave) {
         });
         assert_eq!(got, Loading::Cancelled);
         assert!(!installed(rig, &loaded));
-        assert!(decoded(&b.decodes).is_empty());
+        assert!(begun(&b.decodes).is_empty());
         // The background's promoted permit, until its next check.
         assert_eq!(
             (
@@ -693,7 +741,7 @@ fn leave_while_the_bank_decodes(how: Leave) {
         "the wait never stopped the job"
     );
     assert!(!installed);
-    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(begun(&b.decodes).len(), 1);
     assert_eq!(analysis(&b.decodes), None);
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
@@ -706,6 +754,54 @@ fn a_quit_while_the_bank_decodes_leaves() {
 #[test]
 fn closing_while_the_bank_decodes_ends_the_run() {
     leave_while_the_bank_decodes(Leave::Close);
+}
+
+/// Z14: a scoped decode's own cancel reads the run's controls. The quit
+/// key pressed as the decode begins, the game thread's wait held so that it
+/// never stops the job, stops the decode by itself: the Bank's at 1×, and
+/// at 1.5× the Measure job's 1× decode (`at_normal`). No bank is made.
+#[test]
+fn a_quit_stops_the_scoped_decode_by_itself() {
+    for (speed, kind, ends) in [
+        (Speed::NORMAL, JobKind::Bank, 1),
+        (Speed::FASTEST, JobKind::Measure, 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = song(dir.path(), "");
+        let loaded = loaded(dir.path(), &path, speed);
+        let ended = Arc::new(Mutex::new(None::<Arc<Decodes>>));
+        let seen = Arc::clone(&ended);
+        let decodes = decodes_with(hook(move |p, controls, _| {
+            if p == Probe::Decode(Speed::NORMAL) {
+                controls.command(game::Command::Quit);
+            }
+            if p == Probe::Wait(kind) {
+                let d = seen.lock().unwrap().clone().unwrap();
+                until("the decode's end", || {
+                    d.ended.load(Ordering::SeqCst) >= ends
+                });
+            }
+        }));
+        let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
+        *ended.lock().unwrap() = Some(Arc::clone(&b.decodes));
+        let got = on_rig(
+            b.sel.take().unwrap(),
+            &Installers::default(),
+            false,
+            |rig| outcome(rig.load_chart(&loaded)),
+        );
+        assert_eq!(got, Loading::Cancelled, "{kind:?}");
+        let banks: Vec<Speed> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+        let want: &[Speed] = if speed == Speed::NORMAL {
+            &[]
+        } else {
+            &[Speed::FASTEST]
+        };
+        assert_eq!(banks, want, "{kind:?}: the 1× decode made a bank");
+        assert_eq!(b.coord.held(Class::Foreground), 0);
+        // The hook held the record: let it go.
+        ended.lock().unwrap().take();
+    }
 }
 
 /// F15: the quit after the Bank job joined with its bank, before the
@@ -742,7 +838,7 @@ fn a_quit_after_the_bank_is_made_installs_nothing() {
     });
     assert_eq!(got, Loading::Cancelled);
     assert!(!installed, "the bank was installed");
-    assert_eq!(decoded(&b.decodes).len(), 1);
+    assert_eq!(begun(&b.decodes).len(), 1);
     assert_eq!(analysis(&b.decodes), None);
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
@@ -806,7 +902,7 @@ fn leave_during_the_1x_decode(how: Leave) {
             "the wait never stopped the job"
         );
         assert!(installed(rig, &loaded));
-        let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+        let speeds: Vec<_> = begun(&b.decodes);
         assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
         assert_eq!(b.coord.held(Class::Foreground), 0);
         // Looked up only now: a look-up takes a job waiting in the
@@ -860,13 +956,14 @@ fn a_quit_during_the_screen_wait_leaves() {
 
 /// F21: the chart's background measurement, promoted by the load's wait,
 /// ends; the wait returns with its foreground permit given back, so the
-/// Bank decode is granted every foreground permit.
+/// Bank decode of four files is granted every foreground permit its pool
+/// runs a worker for.
 #[test]
 fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
     let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
+    let path = song_of(dir.path(), 3);
     let loaded = loaded(dir.path(), &path, Speed::NORMAL);
-    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let mut b = bench(dir.path(), meeting(granted(0, 4)), Spawner::SYSTEM);
     let s = b.sel.take().unwrap();
     worker(&s.shelf).queue(job(&path));
     assert_eq!(b.stepper.said(), Said::Block(0));
@@ -883,20 +980,65 @@ fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
             outcome(rig.load_chart(&loaded))
         });
         assert_eq!(got, Loading::Ready);
-        let all = game::coord::FOREGROUND_PERMITS;
-        assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, all, all)]);
+        // Its job's own permit only as it began: the background's is back.
+        assert_eq!(begun_held(&b.decodes), [(Speed::NORMAL, 1)]);
+        assert_eq!(decoded(&b.decodes), [(Speed::NORMAL, granted(0, 4), 0)]);
         assert_eq!(b.coord.held(Class::Foreground), 0);
     });
 }
 
-/// A load at `speed` with `k` foreground permits held elsewhere: what its
-/// decodes and analysis recorded. The permits held elsewhere are all that
-/// is held once it returns.
-fn load_beside(k: usize, speed: Speed) -> Arc<Decodes> {
+/// A record whose decodes each hold their first `workers` workers after
+/// their first file until all of them are there, so they decode at once
+/// whatever the scheduling. A worker that never comes fails the test.
+fn meeting(workers: usize) -> Decodes {
+    #[derive(Default)]
+    struct Meet {
+        asks: std::collections::HashMap<usize, usize>,
+        arrived: usize,
+    }
+    let meet = Arc::new((Mutex::new(Meet::default()), std::sync::Condvar::new()));
+    let reset = Arc::clone(&meet);
+    let at = Arc::clone(&meet);
+    Decodes {
+        // Each decode meets on its own.
+        hook: hook(move |p, _, _| {
+            if matches!(p, Probe::Decode(_)) {
+                *reset.0.lock().unwrap() = Meet::default();
+            }
+        }),
+        at_file: Some(super::FileHook(Arc::new(move |worker| {
+            let (state, changed) = &*at;
+            let mut m = state.lock().unwrap();
+            let nth = {
+                let n = m.asks.entry(worker).or_default();
+                *n += 1;
+                *n
+            };
+            if nth != 2 || m.arrived >= workers {
+                return;
+            }
+            m.arrived += 1;
+            changed.notify_all();
+            let began = Instant::now();
+            while m.arrived < workers {
+                assert!(began.elapsed() < watchdog() / 2, "only {} met", m.arrived);
+                m = changed.wait_timeout(m, watchdog() / 2).unwrap().0;
+            }
+        }))),
+        ..Decodes::default()
+    }
+}
+
+/// A load at `speed` of a chart of `files` distinct sounds with `k`
+/// foreground permits held elsewhere, its decodes' workers meeting as
+/// [`meeting`] says for [`granted`]'s count: what its decodes and analysis
+/// recorded. The permits held elsewhere are all that is held once it
+/// returns.
+fn load_beside(k: usize, files: usize, speed: Speed) -> Arc<Decodes> {
     let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
+    let path = song_of(dir.path(), files - 1);
     let loaded = loaded(dir.path(), &path, speed);
-    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let mut b = bench(dir.path(), meeting(granted(k, files)), Spawner::SYSTEM);
     let held: Vec<Lease> = (0..k)
         .map(|_| b.coord.try_lease(Class::Foreground).unwrap())
         .collect();
@@ -913,16 +1055,33 @@ fn load_beside(k: usize, speed: Speed) -> Arc<Decodes> {
     b.decodes
 }
 
-/// F22: with `k` foreground permits held elsewhere, the Bank decode is
-/// granted its job's permit and every free one: a limit of 4 − k, at
-/// least its own, the foreground then full.
+/// F22: with `k` foreground permits held elsewhere, the Bank decode of
+/// four files runs on its job's permit and every free one its pool runs a
+/// worker for: 4 − k workers on four cores, at least its own, the
+/// foreground then full.
 #[test]
 fn the_decode_limit_is_the_free_foreground_permits() {
-    let all = game::coord::FOREGROUND_PERMITS;
-    for k in 0..all {
-        let d = load_beside(k, Speed::NORMAL);
-        assert_eq!(decoded(&d), [(Speed::NORMAL, all - k, all)], "k = {k}");
+    for k in 0..game::coord::FOREGROUND_PERMITS {
+        let d = load_beside(k, 4, Speed::NORMAL);
+        assert_eq!(begun_held(&d), [(Speed::NORMAL, k + 1)], "k = {k}");
+        assert_eq!(decoded(&d), [(Speed::NORMAL, granted(k, 4), 0)], "k = {k}");
         assert_eq!(analysis(&d), Some(k + 1), "k = {k}");
+    }
+}
+
+/// Z12: a decode of one file takes no permit for a worker the pool would
+/// not run: one worker, its job's permit only, whatever is free.
+#[test]
+fn a_decode_takes_permits_only_for_workers_that_run() {
+    for speed in [Speed::NORMAL, Speed::FASTEST] {
+        for k in 0..game::coord::FOREGROUND_PERMITS {
+            let d = load_beside(k, 1, speed);
+            let mut want = vec![(speed, 1, 0)];
+            if speed != Speed::NORMAL {
+                want.push((Speed::NORMAL, 1, 0));
+            }
+            assert_eq!(decoded(&d), want, "k = {k}, {speed:?}");
+        }
     }
 }
 
@@ -930,15 +1089,17 @@ fn the_decode_limit_is_the_free_foreground_permits() {
 /// Measure job's 1× decode draws the free permits as the Bank decode does.
 #[test]
 fn a_measurement_decode_draws_free_foreground_permits() {
-    let all = game::coord::FOREGROUND_PERMITS;
-    for k in 0..all {
-        let d = load_beside(k, Speed::FASTEST);
+    for k in 0..game::coord::FOREGROUND_PERMITS {
+        let d = load_beside(k, 4, Speed::FASTEST);
+        let workers = granted(k, 4);
+        assert_eq!(
+            begun_held(&d),
+            [(Speed::FASTEST, k + 1), (Speed::NORMAL, k + 1)],
+            "k = {k}"
+        );
         assert_eq!(
             decoded(&d),
-            [
-                (Speed::FASTEST, all - k, all),
-                (Speed::NORMAL, all - k, all)
-            ],
+            [(Speed::FASTEST, workers, 0), (Speed::NORMAL, workers, 0)],
             "k = {k}"
         );
     }
@@ -949,7 +1110,7 @@ fn a_measurement_decode_draws_free_foreground_permits() {
 #[test]
 fn a_measurement_holds_one_permit_during_its_analysis() {
     for k in 0..game::coord::FOREGROUND_PERMITS {
-        let d = load_beside(k, Speed::FASTEST);
+        let d = load_beside(k, 4, Speed::FASTEST);
         assert_eq!(analysis(&d), Some(k + 1), "k = {k}");
     }
 }
@@ -1036,7 +1197,7 @@ fn a_cached_gain_begins_no_measure_job() {
             sel(rig).spawner = Spawner::refusing(&[JobKind::Measure]);
             assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
             assert_eq!(sel(rig).shelf.gain(), measured);
-            assert_eq!(decoded(&again).len(), 1);
+            assert_eq!(begun(&again).len(), 1);
             assert_eq!(analysis(&again), None);
         },
     );
@@ -1068,7 +1229,7 @@ fn an_unreadable_1x_chart_plays_at_the_headroom() {
             assert!(unmeasured(rig, &loaded));
         },
     );
-    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    let speeds: Vec<_> = begun(&b.decodes);
     assert_eq!(speeds, [Speed::FASTEST], "the 1× bank was decoded");
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
@@ -1108,7 +1269,7 @@ fn a_sound_changed_between_the_speed_bank_and_its_1x_reread_plays_at_the_headroo
             assert!(unmeasured(rig, &loaded));
         },
     );
-    let speeds: Vec<_> = decoded(&b.decodes).iter().map(|d| d.0).collect();
+    let speeds: Vec<_> = begun(&b.decodes);
     assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
     assert_eq!(analysis(&b.decodes), None, "analyzed under another key");
     assert_eq!(b.coord.held(Class::Foreground), 0);

@@ -1,4 +1,4 @@
-//! Owned jobs: one test per row of the slice's lifecycle table (Y1-Y29)
+//! Owned jobs: one test per row of the lifecycle table (Y1-Y32, Z1-Z2)
 //! and its in-flight rows (YI1-YI10). Threads meet at gates and
 //! channels; a settle's bound is read on a test clock, never the wall
 //! clock. Every test arms a watchdog that aborts the process, naming the
@@ -447,10 +447,55 @@ fn promotion_and_demotion_move_at_the_owners_checkpoint() {
     assert_eq!(next(&both), Some(Class::Speculative));
     drop(step_tx);
     let _ = outcome(&job);
+    // Its new thread entered the speculative mode at its admission (Z1),
+    // then each move at a checkpoint called the hook once.
     assert_eq!(
         *hook.lock().unwrap(),
-        [Class::Foreground, Class::Speculative]
+        [Class::Speculative, Class::Foreground, Class::Speculative]
     );
+}
+
+/// Z1, Z2: an owned job's new thread is in the normal mode. Admitted
+/// speculative, it calls the hook once with that class, on its own
+/// thread, before its work; promoted at its spawn and admitted in the
+/// foreground, it calls none.
+#[test]
+fn an_owned_jobs_first_speculative_admission_enters_background_mode() {
+    let _w = Watchdog::arm("an_owned_jobs_first_speculative_admission_enters_background_mode");
+    let coord = Coordinator::new(CAPS);
+    for promoted in [false, true] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hooked = Arc::clone(&calls);
+        let seen = Arc::clone(&calls);
+        let job = coord
+            .spawn_owned(
+                Spawner::SYSTEM,
+                key(if promoted { "promoted" } else { "speculative" }),
+                (Class::Speculative, promoted, Owner::Speculative),
+                coord.subscriber(Scope::Choice),
+                move |c| hooked.lock().unwrap().push((c, thread::current().id())),
+                move |ctx| {
+                    (
+                        ctx.class(),
+                        seen.lock().unwrap().len(),
+                        thread::current().id(),
+                    )
+                },
+            )
+            .unwrap();
+        let Outcome::Done((class, before_work, job_thread)) = outcome(&job).outcome else {
+            panic!("not done");
+        };
+        let calls = calls.lock().unwrap().clone();
+        if promoted {
+            assert_eq!(class, Some(Class::Foreground));
+            assert!(calls.is_empty(), "{calls:?}");
+        } else {
+            assert_eq!(class, Some(Class::Speculative));
+            assert_eq!(calls, [(Class::Speculative, job_thread)]);
+            assert_eq!(before_work, 1);
+        }
+    }
 }
 
 /// YI4: while the hook runs on the job's thread for a promotion (held
@@ -733,9 +778,10 @@ fn in_the_hook(c: Class) {
     assert!(c != Class::Foreground, "in the hook");
 }
 
-/// Y14, four cases: a panic in the work; in the hook at admission; in the
-/// hook at a checkpoint after a promotion; and in the hook where the work
-/// catches it and returns normally, passing no checkpoint after.
+/// Y14, four cases: a panic in the work; in the hook at admission (the
+/// first speculative one, which calls it, Z1); in the hook at a checkpoint
+/// after a promotion; and in the hook where the work catches it and
+/// returns normally, passing no checkpoint after.
 #[test]
 fn an_owned_panic_carries_its_owner_and_responsibility() {
     let _w = Watchdog::arm("an_owned_panic_carries_its_owner_and_responsibility");
@@ -775,7 +821,16 @@ fn an_owned_panic_carries_its_owner_and_responsibility() {
         }
         job
     };
-    let at_admission = hooked("admission", true, |_| 1);
+    let at_admission = coord
+        .spawn_owned(
+            Spawner::SYSTEM,
+            key("admission"),
+            (Class::Speculative, false, Owner::Speculative),
+            coord.subscriber(Scope::Choice),
+            |c| assert!(c != Class::Speculative, "in the hook"),
+            |_| 1_u32,
+        )
+        .unwrap();
     let o = outcome(&at_admission);
     assert!(matches!(o.outcome, Outcome::Panicked(ref p) if p.0 == "in the hook"));
     assert_eq!((o.owner, o.responsible), (Owner::Speculative, false));

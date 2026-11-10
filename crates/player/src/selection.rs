@@ -64,17 +64,26 @@ const PICK_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 const QUERY_BATCH: usize = crate::select::QUEUED_KEYS / 2;
 
 /// What a load's job threads report of their decodes (tests): each
-/// decode's speed, its granted thread limit and the foreground permits
-/// held as it began, and the permits held at a measurement's first check.
+/// decode's speed and the foreground permits held as it begins; each
+/// decode that made a bank, with its most workers at once and the permits
+/// its other workers still held as its pool returned; the decodes that
+/// returned; and the permits held at a measurement's first check.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct Decodes {
-    /// `(speed, max_decode_threads, held)` per decode.
+    /// `(speed, foreground permits held)` as each decode begins.
+    pub begun: Mutex<Vec<(bms_model::Speed, usize)>>,
+    /// `(speed, decode_threads, permits left)` per decode that made a bank.
     pub decodes: Mutex<Vec<(bms_model::Speed, usize, usize)>>,
+    /// Decodes that returned, whatever they gave.
+    pub ended: std::sync::atomic::AtomicUsize,
     /// Foreground permits held at the analysis's first check.
     pub analysis: Mutex<Option<usize>>,
     /// Called at each [`Probe`] of the load.
     pub hook: Option<Hook>,
+    /// Called by each decode worker, with its index, as it asks before a
+    /// file.
+    pub at_file: Option<FileHook>,
     /// The measurement's analysis is given a bank whose rate its meter
     /// refuses, so it fails without a panic.
     pub refuse_meter: std::sync::atomic::AtomicBool,
@@ -108,6 +117,18 @@ pub enum Probe {
 #[derive(Clone)]
 pub struct Hook(pub Arc<HookFn>);
 
+/// A decode worker's test hook, called with its index (tests).
+#[cfg(test)]
+#[derive(Clone)]
+pub struct FileHook(pub Arc<dyn Fn(usize) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for FileHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FileHook")
+    }
+}
+
 /// What a [`Hook`] calls (tests).
 #[cfg(test)]
 pub type HookFn = dyn Fn(Probe, &crate::controls::Controls, &dyn Fn() -> bool) + Send + Sync;
@@ -132,43 +153,128 @@ fn probe(
     }
 }
 
-/// Decodes `chart`'s bank at `speed` on the calling job's foreground permit
-/// and every foreground permit free now, at most [`audio::BankLimits`]'
-/// default thread count (design.md "Load Pipeline": the decode pool draws
-/// the foreground permits); the extra permits are given back as the decode
-/// returns. The pool's threads are fewer still on fewer cores or files.
-fn decode_on_permits(
+/// Where a decode calls its test hooks (tests): the load's record and
+/// probe, and a call at each worker's file boundary.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub struct DecodeProbe<'a> {
+    /// The load's record and its run's controls.
+    pub load: Option<(&'a Decodes, &'a crate::controls::Controls)>,
+    /// Called with the worker's index as it asks before a file.
+    pub at_file: Option<&'a (dyn Fn(usize) + Sync)>,
+}
+
+/// A decode's width on its job's permits (design.md "Load Pipeline": the
+/// decode pool draws the foreground permits). Worker 0 is the job's own
+/// thread, whose checkpoint before each file moves its permit to the class
+/// the job wants and calls its class hook. Each other worker is started on
+/// a foreground permit reserved for it alone ([`game::coord::WorkerLeases`],
+/// within the pool's cap), only while the job's own permit is a foreground
+/// one, so no permit is taken for a worker that does not run; once the job
+/// does not want the foreground, a worker retires at its next file and its
+/// permit goes back.
+struct PermitWidth<'a, 'c> {
+    ctx: &'a game::coord::Ctx<'c>,
+    leases: game::coord::WorkerLeases<'a>,
+    /// Each other worker's permit, by its index, while it runs or starts.
+    held: Mutex<Vec<(usize, game::coord::WorkerLease)>>,
+    /// The decode's cancel, which stops worker 0 too.
+    cancel: &'a (dyn Fn() -> bool + Sync),
+    #[cfg(test)]
+    at_file: Option<&'a (dyn Fn(usize) + Sync)>,
+}
+
+impl audio::Width for PermitWidth<'_, '_> {
+    fn at_file(&self, worker: usize) -> bool {
+        #[cfg(test)]
+        if let Some(at_file) = self.at_file {
+            at_file(worker);
+        }
+        if worker == 0 {
+            !self.ctx.checkpoint() && !(self.cancel)()
+        } else {
+            self.ctx.wanted() == game::coord::Class::Foreground
+        }
+    }
+
+    fn start(&self, worker: usize, cap: usize) -> bool {
+        // Worker 0's permit moves at its own checkpoint: a promotion since
+        // then widens the decode at its next file.
+        if self.ctx.class() != Some(game::coord::Class::Foreground) {
+            return false;
+        }
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(lease) = self.leases.reserve(self.ctx, cap, held.len()) else {
+            return false;
+        };
+        held.push((worker, lease));
+        true
+    }
+
+    fn retire(&self, worker: usize) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let lease = held
+            .iter()
+            .position(|(w, _)| *w == worker)
+            .map(|i| held.swap_remove(i).1);
+        drop(held);
+        if let Some(lease) = lease {
+            lease.retire();
+        }
+    }
+}
+
+/// Decodes `chart`'s bank at `speed` on `ctx`'s job: on its own thread and
+/// permit, and on other workers on the foreground permits free as it goes
+/// ([`PermitWidth`]), at most [`audio::BankLimits`]' default thread count,
+/// fewer on fewer cores or files. Every permit taken for those workers is
+/// given back as each one ends. `cancel` stops it at the next file or
+/// packet.
+pub(crate) fn decode_on_permits(
+    ctx: &game::coord::Ctx<'_>,
     coord: &game::coord::Coordinator,
     (chart, rate, speed): (&bms_model::Chart, u32, bms_model::Speed),
     progress: &(dyn Fn(usize, usize) + Sync),
     cancel: &(dyn Fn() -> bool + Sync),
-    #[cfg(test)] probed: Option<(&Decodes, &crate::controls::Controls, &game::coord::Ctx<'_>)>,
+    #[cfg(test)] hooks: DecodeProbe<'_>,
 ) -> Result<audio::SoundBank, audio::BankError> {
-    let base = audio::BankLimits::default();
-    let extra: Vec<game::coord::Lease> = (1..base.max_decode_threads)
-        .map_while(|_| coord.try_lease(game::coord::Class::Foreground))
-        .collect();
-    let limits = audio::BankLimits {
-        max_decode_threads: 1 + extra.len(),
-        ..base
-    };
     #[cfg(test)]
-    if let Some((d, controls, ctx)) = probed {
-        d.decodes
+    if let Some((d, controls)) = hooks.load {
+        d.begun
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push((
-                speed,
-                limits.max_decode_threads,
-                coord.held(game::coord::Class::Foreground),
-            ));
+            .push((speed, coord.held(game::coord::Class::Foreground)));
         probe(Some(d), Probe::Decode(speed), controls, &|| ctx.cancelled());
         if d.no_digest.load(std::sync::atomic::Ordering::SeqCst) {
+            d.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(audio::SoundBank::from_sounds(rate, Vec::new()));
         }
     }
-    let bank = audio::load_bank_reporting(chart, rate, speed, &limits, progress, cancel);
-    drop(extra);
+    let width = PermitWidth {
+        ctx,
+        leases: game::coord::WorkerLeases::new(coord),
+        held: Mutex::new(Vec::new()),
+        cancel,
+        #[cfg(test)]
+        at_file: hooks.at_file,
+    };
+    let limits = audio::BankLimits::default();
+    let bank = audio::load_bank_width(chart, rate, speed, &limits, progress, cancel, &width);
+    #[cfg(test)]
+    if let Some((d, _)) = hooks.load {
+        if let Ok(bank) = &bank {
+            let left = width
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            d.decodes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((speed, bank.stats().decode_threads, left));
+        }
+        d.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     bank
 }
 
@@ -192,12 +298,19 @@ impl crate::loudness::Host for JobHost<'_, '_> {
         let chart = self.reader.read(normal)?;
         let (ctx, controls) = (self.ctx, self.controls);
         let bank = decode_on_permits(
+            ctx,
             self.coord,
             (&chart, self.rate, normal),
             &|_, _| {},
             &|| ctx.cancelled() || cancelled(controls),
             #[cfg(test)]
-            self.decodes.map(|d| (d, controls, ctx)),
+            DecodeProbe {
+                load: self.decodes.map(|d| (d, controls)),
+                at_file: self
+                    .decodes
+                    .and_then(|d| d.at_file.as_ref())
+                    .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
+            },
         )?;
         Ok((chart, Arc::new(bank)))
     }
@@ -2049,6 +2162,7 @@ impl AppRig for PlayerRig<'_> {
         let decoded = std::thread::scope(|s| {
             let decode = |ctx: &game::coord::Ctx<'_>| {
                 decode_on_permits(
+                    ctx,
                     &coord,
                     (chart, rate, speed),
                     &|done, files| {
@@ -2062,7 +2176,13 @@ impl AppRig for PlayerRig<'_> {
                     },
                     &|| ctx.cancelled() || cancelled(controls),
                     #[cfg(test)]
-                    decodes.as_deref().map(|d| (d, controls, ctx)),
+                    DecodeProbe {
+                        load: decodes.as_deref().map(|d| (d, controls)),
+                        at_file: decodes
+                            .as_deref()
+                            .and_then(|d| d.at_file.as_ref())
+                            .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
+                    },
                 )
             };
             match coord.run_scoped(s, spawner, job, decode) {
