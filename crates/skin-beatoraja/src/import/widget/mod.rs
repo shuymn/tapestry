@@ -295,6 +295,38 @@ impl Cx<'_> {
         grid: [u32; 2],
         holes: bool,
     ) -> Result<Result<Placed, Unplaced>, ImportError> {
+        let r = self.src_rect_admitted(role, at, s, grid, holes)?;
+        #[cfg(feature = "dev-tools")]
+        if let Some(src) = s.src.as_deref() {
+            use crate::lua::replay::SourceFact;
+            let fact = match &r {
+                Ok(_) => Some(SourceFact::Loaded),
+                Err(u) => match u.why {
+                    NoteKind::UndefinedSource => None,
+                    NoteKind::MissingAsset if u.missing => Some(SourceFact::Missing),
+                    NoteKind::Unsupported {
+                        object: Object::Movie,
+                    } => Some(SourceFact::Movie),
+                    NoteKind::SourceRect | NoteKind::OverCap { .. } => Some(SourceFact::Loaded),
+                    _ => Some(SourceFact::Unknown),
+                },
+            };
+            if let Some(f) = fact {
+                crate::lua::replay::record_source(src, f);
+            }
+        }
+        Ok(r)
+    }
+
+    /// [`Self::src_rect`]'s work.
+    fn src_rect_admitted(
+        &mut self,
+        role: Role,
+        at: Span,
+        s: &SrcImage,
+        grid: [u32; 2],
+        holes: bool,
+    ) -> Result<Result<Placed, Unplaced>, ImportError> {
         let missing = |why| Ok(Err(Unplaced { why, missing: true }));
         let refused = |why| {
             Ok(Err(Unplaced {

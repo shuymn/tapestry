@@ -31,6 +31,8 @@
 
 mod exec;
 pub mod num;
+#[cfg(feature = "dev-tools")]
+pub mod trace;
 mod verify;
 
 use crate::expr::Program;
