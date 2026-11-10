@@ -900,7 +900,7 @@ fn settled_reads_as_the_last_frame() {
                 continue;
             };
             let mut h = Harness::empty(&chart, &ctx);
-            h.tally = t.clone();
+            h.tally = *t;
             h.frame(2_000, &[]);
             assert_eq!(
                 s,
