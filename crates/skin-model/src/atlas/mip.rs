@@ -8,7 +8,7 @@ use image::RgbaImage;
 use super::GUTTER;
 
 /// `c` premultiplied by alpha `a`, rounded to nearest.
-fn premultiply(c: u8, a: u8) -> u8 {
+pub(crate) fn premultiply(c: u8, a: u8) -> u8 {
     u8::try_from((u16::from(c) * u16::from(a) + 127) / 255).unwrap_or(u8::MAX)
 }
 

@@ -90,6 +90,7 @@
 
 mod atlas;
 mod canvas;
+pub mod chart_image;
 mod decision;
 mod expr;
 mod image;

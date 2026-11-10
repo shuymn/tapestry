@@ -248,6 +248,12 @@ pub struct Labels {
     pub subartist: String,
     /// `#GENRE`.
     pub genre: String,
+    /// `#STAGEFILE`: the name of the chart's stage file in its folder, as
+    /// written (trimmed); resolved only by its reader
+    /// (`skin_model::chart_image`), never here.
+    pub stagefile: String,
+    /// `#BACKBMP`: the name of the chart's back image, as `stagefile`.
+    pub backbmp: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
     /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
