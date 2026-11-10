@@ -88,6 +88,8 @@ pub struct RefFrame {
     /// Each installed object's points, in schedule order: the range of
     /// `points` its prepare path gave.
     pub objects: Vec<std::ops::Range<usize>>,
+    /// A frame production builds no play frame for (loading, the page).
+    pub outside: bool,
 }
 
 /// An object the reference did not run, with the callables it holds.

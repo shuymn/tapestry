@@ -15,7 +15,7 @@ use mlua::{Function, Table, Value};
 use skin_beatoraja::lua::replay::{Called, PropValue, ReferenceVm, SourceFact};
 use skin_beatoraja::lua::runtime::{to_bool, to_int};
 
-use crate::inputs::FrameInputs;
+use crate::inputs::{FrameInputs, Host};
 use crate::observed::{
     Cause, Key, Listed, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern,
 };
@@ -198,6 +198,8 @@ pub struct Reference<'a> {
     sources: &'a BTreeMap<String, SourceFact>,
     objects: Vec<Obj>,
     observed: Observed,
+    /// A test's override of one page's point.
+    page_point: Option<(usize, i32)>,
 }
 
 impl<'a> Reference<'a> {
@@ -215,6 +217,7 @@ impl<'a> Reference<'a> {
             sources,
             objects: Vec::new(),
             observed: Observed::default(),
+            page_point: None,
         };
         if let Value::Table(skin) = vm.skin().clone() {
             r.resolve(&skin);
@@ -633,14 +636,20 @@ impl<'a> Reference<'a> {
         }
     }
 
-    /// Runs every frame of `frames`.
+    /// Runs every frame of `frames`: installation first, on the first play
+    /// frame's host, since it reads only the play state's static facts;
+    /// then each frame on its own host (s7-06e-2-design.md §5).
     pub fn run(mut self, frames: &[FrameInputs]) -> Observed {
-        for (i, f) in frames.iter().enumerate() {
-            self.vm.set_frame(f.fields(), f.timers(), f.state_us());
-            if i == 0 {
-                self.install();
-            }
-            let mut out = RefFrame::default();
+        if let Some(f) = frames.iter().find(|f| f.is_play()).or(frames.first()) {
+            self.host(f);
+            self.install();
+        }
+        for f in frames {
+            self.host(f);
+            let mut out = RefFrame {
+                outside: !f.is_play(),
+                ..RefFrame::default()
+            };
             for o in &self.objects {
                 let from = out.points.len();
                 prepare(self.vm, self.items, o, &mut out);
@@ -649,6 +658,31 @@ impl<'a> Reference<'a> {
             self.observed.frames.push(out);
         }
         self.observed
+    }
+
+    /// Sets the VM's host to frame `f`'s.
+    fn host(&self, f: &FrameInputs) {
+        match f.host() {
+            Host::Play => self.vm.set_frame(f.fields(), f.timers(), f.state_us()),
+            Host::Outside { allowed, page } => {
+                let mut fields = f.fields().to_vec();
+                if let (Some((at, point)), Some(p)) = (self.page_point, *page)
+                    && at == p
+                    && let Some(cell) = fields.get_mut(usize::from(skin_model::field::POINT))
+                {
+                    *cell = point;
+                }
+                self.vm.set_outside(&fields, allowed, f.state_us());
+            }
+        }
+    }
+
+    /// Answers the point as `point` on the practice page of ordinal `page`
+    /// (a test's mutation control, as `--perturb` is for play frames).
+    #[cfg(test)]
+    pub fn page_point(mut self, page: usize, point: i32) -> Self {
+        self.page_point = Some((page, point));
+        self
     }
 }
 
