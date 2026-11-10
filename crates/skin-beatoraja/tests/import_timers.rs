@@ -229,7 +229,7 @@ fn rank_timers_open_at_their_thresholds() {
     }
     // No notes: never.
     let mut d = images(&[r#""timer": 348,"#], "").drawn_over(0);
-    d.tally = tally(1_000, 1);
+    d.tally = judged_ex(1_000);
     assert!(d.frame(10, &[]).is_empty());
     // Each rank compiles once per skin.
     let loaded = images(
