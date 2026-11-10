@@ -171,7 +171,9 @@ fn conditions_run_in_the_source_order() {
     );
     let r = run(&body);
     agrees(&r, 3);
-    assert_eq!(r.matched, r.frames * 3);
+    // Three program callbacks a frame (the first `op` skipped), and the
+    // third element's lowered draw, compared since e-3.
+    assert_eq!(r.matched, r.frames * 4);
 }
 
 /// R5: a negative id is a system image, scheduled.

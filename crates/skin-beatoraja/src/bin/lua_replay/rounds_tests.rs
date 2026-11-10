@@ -80,13 +80,13 @@ fn latch_pair() -> String {
     )
 }
 
-/// A latch the carry cannot run: its return reads the combo
+/// A latch the carry cannot run: its return reads the max combo
 /// (`lua_callbacks.rs`, `a_program_reading_other_fields_does_not_carry`).
-const COMBO_LATCH: &str = "local latch = (function()\n\
+const MAX_COMBO_LATCH: &str = "local latch = (function()\n\
        local state = ms.timer_off_value\n\
        return function()\n\
          if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
-         if ms.number(71) >= 0 then return state end\n\
+         if ms.number(75) >= 0 then return state end\n\
          return ms.timer_off_value\n\
        end\n\
      end)()\n";
@@ -213,10 +213,10 @@ fn a_quit_round_refuses_the_slots() {
         [(2, "invalid bank"), (3, "invalid bank")]
     );
     // Not carry-safe: round 2 refused for it, round 3 for the bank round
-    // 2 could not witness. Its read of the combo stops it on every outside
+    // 2 could not witness. Its read of the max combo stops it on every outside
     // frame, a finding no entry waives.
     let body = format!(
-        "{COMBO_LATCH}{}",
+        "{MAX_COMBO_LATCH}{}",
         dst("-111", 0, "timer = latch, loop = -1,")
     );
     let (r, _, _) = pieces(&body, Script::rounds());
@@ -283,13 +283,13 @@ fn an_outside_frame_write_is_found() {
 }
 
 /// The draws of `outside_hosts_answer_only_their_fields`, one destination
-/// (and so one line) each: the cover (a setting), the point, the combo, the
+/// (and so one line) each: the cover (a setting), the point, the max combo, the
 /// loading timer through `option(80)`, the play level (its guard).
 fn host_reads() -> String {
     [
         "ms.number(14) >= 0",
         "ms.number(100) >= 0",
-        "ms.number(71) >= 0",
+        "ms.number(75) >= 0",
         "ms.option(80)",
         "ms.number(96) >= 0",
     ]
@@ -327,7 +327,7 @@ fn outside_hosts_answer_only_their_fields() {
         "{}",
         r.text(0, true, true)
     );
-    // The cover and the play level on the page only; the combo and
+    // The cover and the play level on the page only; the max combo and
     // the loading timer on both; the point never.
     assert_eq!(
         counts,
@@ -372,15 +372,15 @@ fn installation_reads_the_first_play_frame() {
 /// a finding, and no entry covers a stopped slotted root.
 #[test]
 fn outside_entries_waive_nothing_on_play_frames() {
-    // A compiled draw reading the combo, made unanswered on play frames
+    // A compiled draw reading the max combo, made unanswered on play frames
     // too.
     let body = dst(
         "\"i\"",
         0,
-        "draw = function() return ms.number(71) / 3 >= 0 end,",
+        "draw = function() return ms.number(75) / 3 >= 0 end,",
     );
     let mut o = options(Script::rounds());
-    o.deny = vec![71];
+    o.deny = vec![75];
     let r = run_with(&body, &o);
     let line = r
         .stopped
@@ -402,9 +402,9 @@ fn outside_entries_waive_nothing_on_play_frames() {
         r.text(0, true, true)
     );
     assert!(!r.passes());
-    // The latch reading the combo, with an entry naming it.
+    // The latch reading the max combo, with an entry naming it.
     let body = format!(
-        "{COMBO_LATCH}{}",
+        "{MAX_COMBO_LATCH}{}",
         dst("-111", 0, "timer = latch, loop = -1,")
     );
     let r = run_with(&body, &options(Script::rounds()));
