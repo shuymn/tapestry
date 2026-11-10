@@ -156,7 +156,9 @@ impl Script {
     }
 
     /// A practice play state of 7 notes: loading, the page, then `rounds`
-    /// each followed by the page.
+    /// each followed by the page. The last page is compared like every
+    /// outside frame, but no later play frame observes a write made there
+    /// (s7-06e-2-design.md §6.3).
     pub fn practice(name: &'static str, rounds: Vec<Round>) -> Self {
         let mut phases = vec![
             Phase::Loading { len_us: OUTSIDE },
@@ -358,7 +360,13 @@ impl Round {
             End::Tail | End::Fail => end,
         };
         let mut failed: Option<TimeUs> = None;
-        for now in self.times(cut) {
+        // A quit is an instant of its own: its frame is built and the
+        // round settles with the tally there, a judgment due at it included.
+        let mut times = self.times(cut);
+        if matches!(self.end, End::Quit(_) | End::QuitClosing(_)) && times.last() != Some(&cut) {
+            times.push(cut);
+        }
+        for now in times {
             while let Some(i) = inputs.get(next).filter(|i| i.received.0 <= now) {
                 ev.push_input(*i).map_err(|e| format!("input: {e:?}"))?;
                 next += 1;

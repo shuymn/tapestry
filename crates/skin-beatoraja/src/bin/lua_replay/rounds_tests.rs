@@ -436,3 +436,22 @@ fn whole_chart_scripts_keep_their_frames() {
     );
     assert_eq!(r.rounds.len(), 1);
 }
+
+/// C2: a quit is its own instant: a round quit exactly at its first
+/// note's miss deadline settles with that POOR, so the next page reads
+/// the point 0, not the 200 000 round 1 left.
+#[test]
+fn a_quit_settles_the_judgment_due_at_it() {
+    let r1 = Round::on_time(7, true);
+    let mut r2 = Round::on_time(7, true);
+    r2.presses[0] = None;
+    r2.end = crate::script::End::Quit(Script::note_time(0) + 180_000);
+    let script = Script::practice("quit-at-a-miss", vec![r1, r2]);
+    let (r, _, inputs) = pieces(&latch_pair(), script);
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    let point = usize::from(skin_model::field::POINT);
+    let rounds = rounds_of(&inputs);
+    let after = |round: usize| rounds[round].last().unwrap() + 1;
+    assert_eq!(inputs[after(0)].fields()[point], 200_000);
+    assert_eq!(inputs[after(1)].fields()[point], 0);
+}
