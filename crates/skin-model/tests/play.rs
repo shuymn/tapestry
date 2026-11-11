@@ -2202,7 +2202,7 @@ fn an_overflowing_rhythm_is_off() {
     )
     .unwrap();
     let mut h = Harness::empty(&chart, &full(0));
-    // 100 µs: 100 · (10³⁰ − 10⁻¹⁸ BPM) · 20 / (1 200 · 10¹⁸), floored.
+    // 100 µs: 100 · (10³⁰ − 1 tempo units) · 20 / (1 200 · 10¹⁸), floored.
     assert_eq!(rhythm_at(&mut h, 100), Some(1_666_666_666_666));
     assert_eq!(rhythm_at(&mut h, 10_000_000_000), None);
 }
