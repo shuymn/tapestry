@@ -1718,7 +1718,7 @@ mod tests {
     fn isolation_evidence_is_per_occurrence() {
         let body = "local n\n\
              skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
-               value = function() if ms.float_number(113) ~= 0 then n = 1 else n = 2 end return n end } }\n\
+               value = function() if ms.float_number(114) ~= 0 then n = 1 else n = 2 end return n end } }\n\
              local rd = function() return n ~= nil end\n\
              table.insert(skin.destination, { id = \"i\", draw = rd, dst = { { x = 0, y = 0, w = 6, h = 6 } } })\n\
              table.insert(skin.destination, { id = \"i\", draw = rd, dst = { { x = 9, y = 0, w = 6, h = 6 } } })\n\

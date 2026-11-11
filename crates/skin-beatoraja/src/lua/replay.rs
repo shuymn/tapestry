@@ -696,6 +696,23 @@ pub(super) fn answer(
                 None => Ok(Value::Number(0.0)),
             }
         }
+        // The best's rate as the source's score data holds it,
+        // `(float) B / (n * 2)` (`ScoreDataProperty.java:161` at `0.8.9`),
+        // from the frame's best and target count: `NaN` or infinite with no
+        // target, as Java's `float` division gives.
+        "float_number" if arg(args) == Some(113) => {
+            match (f.guarded(None, "best.ex"), f.guarded(None, "notes")) {
+                (Some(Ok(b)), Some(Ok(n))) => {
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "Java's int to float conversion, as the source's"
+                    )]
+                    let rate = b as f32 / n.wrapping_mul(2) as f32;
+                    Ok(Value::Number(f64::from(rate)))
+                }
+                _ => Err(unanswered()),
+            }
+        }
         // The image index the play's callbacks bridge: the hi-speed fix.
         "event_index" => match arg(args).and_then(|n| i32::try_from(n).ok()) {
             Some(id) if index_in(ScreenKind::Play, id) == IndexProp::FixHispeed => {
