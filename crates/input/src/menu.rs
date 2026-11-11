@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eval::ControlId;
 
+use crate::activity::{ActivityRecord, Ingress};
 use crate::gate::{DeviceId, Packet};
 use crate::hid::{AxisCap, HidProduct, wrapped};
 
@@ -109,14 +110,17 @@ pub struct MenuTap {
     /// The panel the held START and SELECT open as packets are offered
     /// ([`set_panel`](Self::set_panel)), sent with each event.
     panel: Option<u8>,
-    queue: rtrb::Producer<(MenuEvent, Option<u8>)>,
+    queue: rtrb::Producer<(MenuEvent, Option<u8>, Ingress)>,
     dropped: Arc<AtomicU64>,
+    /// The record whose ingress word each event is stamped with as it is
+    /// sent ([`set_activity`](Self::set_activity)).
+    activity: Option<Arc<ActivityRecord>>,
 }
 
 /// The game thread's end of the queue.
 #[derive(Debug)]
 pub struct MenuReceiver {
-    queue: rtrb::Consumer<(MenuEvent, Option<u8>)>,
+    queue: rtrb::Consumer<(MenuEvent, Option<u8>, Ingress)>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -148,6 +152,7 @@ pub fn menu_queue(bindings: MenuBindings) -> (MenuTap, MenuReceiver) {
             panel: None,
             queue: producer,
             dropped: Arc::clone(&dropped),
+            activity: None,
         },
         MenuReceiver {
             queue: consumer,
@@ -165,6 +170,14 @@ impl MenuTap {
             self.reset();
         }
         self.active = active;
+    }
+
+    /// Each event is stamped from here with `record`'s ingress word as it
+    /// is sent (design.md "Play Lifecycle", the decision screen), which the
+    /// game thread validates where it takes the event; without one, with
+    /// [`Ingress::INITIAL`].
+    pub fn set_activity(&mut self, record: Arc<ActivityRecord>) {
+        self.activity = Some(record);
     }
 
     /// The panel START and SELECT open as they are held now (`None`:
@@ -274,8 +287,12 @@ impl MenuTap {
     fn send(&mut self, event: MenuEvent, count: u64) {
         let room = self.queue.slots() as u64;
         let mut over = count.saturating_sub(room);
+        let stamp = self
+            .activity
+            .as_ref()
+            .map_or(Ingress::INITIAL, |r| r.ingress());
         for _ in 0..count.min(room) {
-            if self.queue.push((event, self.panel)).is_ok() {
+            if self.queue.push((event, self.panel, stamp)).is_ok() {
                 self.sent = true;
             } else {
                 over += 1;
@@ -296,10 +313,16 @@ impl MenuReceiver {
     /// Takes the oldest event with the panel START and SELECT opened as it
     /// was sent ([`MenuTap::set_panel`]).
     pub fn pop_panel(&mut self) -> Option<(MenuEvent, Option<usize>)> {
+        self.pop_stamped().map(|(event, panel, _)| (event, panel))
+    }
+
+    /// [`pop_panel`](Self::pop_panel), with the ingress word the event was
+    /// sent under ([`MenuTap::set_activity`]).
+    pub fn pop_stamped(&mut self) -> Option<(MenuEvent, Option<usize>, Ingress)> {
         self.queue
             .pop()
             .ok()
-            .map(|(event, panel)| (event, panel.map(usize::from)))
+            .map(|(event, panel, stamp)| (event, panel.map(usize::from), stamp))
     }
 
     /// Events dropped so far because the queue was full.

@@ -934,15 +934,21 @@ enum Next {
     End,
 }
 
-/// The decision screen's one look from `origin`, with `reply` in hand:
-/// the rig's tick, then the terminal causes and the escape read now, then
-/// [`Decision::classify`]. A play's step runs here.
+/// The decision screen's one look from `origin`, with `reply` in hand: a
+/// screen lost meanwhile built again ([`recover_decision`]), the rig's
+/// tick, then the terminal causes and the escape read now, then
+/// [`Decision::classify`]. A play's step runs here. Every look of the
+/// screen comes here, the chart's read's included, so the screen is
+/// recovered while the read is pending as while the flow holds.
 fn serve<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
     origin: Origin,
     reply: Option<Reply>,
 ) -> Result<Next, LiveError<R::ScreenError>> {
+    if rig.screen_failed() {
+        recover_decision(rig)?;
+    }
     rig.decision_tick(origin)?;
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && rig.decision_escape();
@@ -961,6 +967,32 @@ fn serve<R: AppRig>(
     )
 }
 
+/// The screen lost during the decision screen, built again: its
+/// presentation is sent again, its deadline kept and its tone not played
+/// again ([`AppRig::recovered_decision`]). The rebuild's wait answers no
+/// terminal cause, so a failure that came while it waited, seen when it
+/// fails, ends the run with its own cause, and a close as a close (the
+/// look that follows ends it), before the screen's error is reported.
+///
+/// # Errors
+///
+/// A thread's failure, else the screen's that cannot be built again.
+fn recover_decision<R: AppRig>(rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
+    match rig.prepare_screen() {
+        Ok(()) => {
+            rig.recovered_decision();
+            Ok(())
+        }
+        Err(e) => {
+            threads_over(rig)?;
+            if rig.quitting() {
+                return Ok(());
+            }
+            Err(LiveError::Screen(e))
+        }
+    }
+}
+
 /// How a wait the rig owns left the decision screen, as App routes it.
 const fn next_of(v: Verdict) -> Next {
     match v {
@@ -974,7 +1006,7 @@ const fn next_of(v: Verdict) -> Next {
 
 /// The decision screen, nothing in its waits but its looks, until a look
 /// gives more than [`Next::Go`]: what it gave. A screen lost meanwhile is
-/// built again and its presentation sent again.
+/// recovered by the next look ([`serve`]).
 fn hold<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
@@ -984,11 +1016,6 @@ fn hold<R: AppRig>(
         let next = serve(d, rig, origin, None)?;
         if next != Next::Go {
             return Ok(next);
-        }
-        if rig.screen_failed() {
-            rig.prepare_screen().map_err(LiveError::Screen)?;
-            rig.recovered_decision();
-            continue;
         }
         let now = rig.now();
         let until = d.deadline().map_or(now.0, |at| at.0).max(now.0 + 1);

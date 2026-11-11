@@ -57,30 +57,13 @@ use crate::window::ImeSwitch;
 /// ask: a close, the input thread's failure and the audio output's.
 pub(crate) struct Looks<'r> {
     controls: &'r crate::controls::Controls,
-    input: &'r crate::input_side::InputLink,
-    adjust: Option<&'r game::AdjustDriver>,
-    audio: &'r game::AudioControl,
-    gate: Option<&'r crate::start_gate::PlayerGate>,
-    #[cfg(test)]
-    lost: &'r std::sync::atomic::AtomicBool,
+    failures: &'r crate::failures::Failures,
 }
 
 impl Looks<'_> {
     /// Whether the run is ending or a thread failed, now.
     pub(crate) fn terminal(&self) -> Option<crate::page_jobs::Terminal> {
-        #[cfg(test)]
-        let lost = self.lost.load(std::sync::atomic::Ordering::Acquire);
-        #[cfg(not(test))]
-        let lost = false;
-        let input = self
-            .input
-            .failure()
-            .or_else(|| self.adjust.and_then(game::AdjustDriver::failure));
-        (self.controls.quitting()
-            || input.is_some()
-            || lost
-            || crate::start_gate::output_failure(self.audio, self.gate).is_some())
-        .then_some(crate::page_jobs::Terminal)
+        (self.controls.quitting() || self.failures.any()).then_some(crate::page_jobs::Terminal)
     }
 }
 
@@ -90,12 +73,7 @@ macro_rules! looks {
     ($rig:ident) => {
         crate::selection::Looks {
             controls: $rig.controls,
-            input: &$rig.input,
-            adjust: $rig.adjust.as_ref(),
-            audio: &$rig.audio.control,
-            gate: $rig.gate.as_ref(),
-            #[cfg(test)]
-            lost: &$rig.audio_lost,
+            failures: &$rig.failures,
         }
     };
 }
@@ -555,8 +533,9 @@ impl Selection {
     ) -> Option<Pick> {
         // The controller's events join the window's, within their bound,
         // with the panel open as each was sent.
-        while let Some((event, panel)) = pad.pop_panel() {
-            self.menu.push(MenuInput::Pad { event, panel });
+        while let Some((event, panel, stamp)) = pad.pop_stamped() {
+            self.menu
+                .push_stamped(MenuInput::Pad { event, panel }, Some(stamp));
         }
         pad.report_dropped("select");
         while let Some(input) = self.menu.pop() {
@@ -1465,6 +1444,29 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
     controls.quitting() || controls.leaving() || controls.serve_decision()
 }
 
+/// Past the decision screen's time while practice waits for its read: the
+/// escape is let through ([`Controls::let_escape`]), then the quit key, an
+/// Escape from the window's `menu` queue or a Back from the controller's
+/// `pad`, each admitted by the stamp its producer gave it
+/// ([`Controls::admits_escape`]), taken; everything else queued is dropped.
+///
+/// [`Controls::let_escape`]: crate::controls::Controls::let_escape
+/// [`Controls::admits_escape`]: crate::controls::Controls::admits_escape
+fn take_escape(
+    controls: &crate::controls::Controls,
+    menu: Option<&MenuQueue>,
+    pad: &mut crate::result_input::Pad,
+) -> bool {
+    controls.let_escape();
+    let quit = controls.take_leave();
+    let escape = menu.is_some_and(|m| m.take_escape(|s| controls.admits_escape(s)));
+    let mut back = false;
+    while let Some((event, _, stamp)) = pad.pop_stamped() {
+        back |= event == input::MenuEvent::Back && controls.admits_escape(stamp);
+    }
+    quit || escape || back
+}
+
 /// The chart chosen, `chart`, as the loading state's and the decision
 /// screen's lines name it: from its library entry, the chosen preset and
 /// the session.
@@ -1614,7 +1616,7 @@ fn hold(
         }
         // Its quit or close in the loading state, once the decision screen
         // that discards every press has passed.
-        if !acted && held >= total / 2 && controls.ingress_open() {
+        if !acted && held >= total / 2 && controls.ingress().is_open() {
             acted = true;
             if slow.quit {
                 controls.command(game::Command::Quit);
@@ -2062,6 +2064,38 @@ impl PlayerRig<'_> {
 }
 
 impl PlayerRig<'_> {
+    /// `f` with `decision` watched by the waits it owns
+    /// ([`Controls::serve_decision`], reached from every wait's stop), when
+    /// the screen shows; `decision` comes back as they left it.
+    ///
+    /// [`Controls::serve_decision`]: crate::controls::Controls::serve_decision
+    fn watching<T>(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut game::Decision,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if !decision.on() {
+            return f(self);
+        }
+        let reveal = self.render.reveal_handle();
+        let name = file_name(loaded.path());
+        self.controls
+            .watch_decision(crate::controls::DecisionWatch {
+                decision: *decision,
+                reveal: Box::new(move || {
+                    println!("load: the play screen loads {name}");
+                    reveal();
+                }),
+                failures: self.failures.clone(),
+            });
+        let out = f(self);
+        if let Some(d) = self.controls.unwatch_decision() {
+            *decision = d;
+        }
+        out
+    }
+
     /// [`AppRig::load_chart`]'s load, its waits' stops serving the
     /// decision screen when one is watched.
     fn load_watched(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
@@ -2420,16 +2454,16 @@ impl AppRig for PlayerRig<'_> {
     }
 
     /// The decision screen begins: the input epoch first, so nothing
-    /// observed before the choice acts after it, then the attempt's entry
-    /// (its loading-time adjustments are its own), the built-in
-    /// presentation and its tone; a play's loading lifetime is made now,
-    /// held until the deadline reveals it.
+    /// observed before the choice acts after it, then the built-in
+    /// presentation and its tone, and a play's loading lifetime, made now
+    /// and held until the deadline reveals it; then the attempt's entry
+    /// (its loading-time adjustments are its own), whose fence waits on the
+    /// input thread with the screen already showing.
     fn entered_decision(&mut self, pick: &Pick) {
         self.controls.close_epoch();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
         }
-        self.enter_attempt();
         self.render.leave_selection();
         let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
         let Some(sel) = &mut self.selection else {
@@ -2450,6 +2484,10 @@ impl AppRig for PlayerRig<'_> {
             show_stage(&self.render, Some(&page), Stage::Chart);
             sel.loading = Some(page);
         }
+        // The attempt's entry last: its fence waits on the input thread,
+        // and the screen and its tone are already out (its wait is bounded,
+        // not served: design.md "Play Lifecycle", the decision screen).
+        self.enter_attempt();
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {
@@ -2487,17 +2525,12 @@ impl AppRig for PlayerRig<'_> {
     /// the quit key, Escape or the controller's Back, taken; everything
     /// else queued is dropped.
     fn decision_escape(&mut self) -> bool {
-        self.controls.let_escape();
-        let quit = self.controls.take_leave();
-        let escape = self
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.menu.take_escape());
-        let mut back = false;
-        while let Some(event) = self.result_input.pad.pop() {
-            back |= event == input::MenuEvent::Back;
-        }
-        quit || escape || back
+        let menu = self.selection.as_ref().map(|s| &s.menu);
+        take_escape(
+            self.controls,
+            menu.map(AsRef::as_ref),
+            &mut self.result_input.pad,
+        )
     }
 
     /// The screen was built again during the decision screen: its
@@ -2513,29 +2546,8 @@ impl AppRig for PlayerRig<'_> {
         loaded: &Loaded,
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
-        if !decision.on() {
-            return self.load_watched(loaded);
-        }
-        // The load's waits serve the decision screen from their stops; it
-        // comes back as they left it.
         let stepped = decision.stepped();
-        let input = self.input.gone_probe();
-        let output = self.audio.control.failure_probe();
-        let reveal = self.render.reveal_handle();
-        let name = file_name(loaded.path());
-        self.controls
-            .watch_decision(crate::controls::DecisionWatch {
-                decision: *decision,
-                reveal: Box::new(move || {
-                    println!("load: the play screen loads {name}");
-                    reveal();
-                }),
-                failed: Box::new(move || input() || output.failed()),
-            });
-        let loading = self.load_watched(loaded);
-        if let Some(d) = self.controls.unwatch_decision() {
-            *decision = d;
-        }
+        let loading = self.watching(loaded, decision, |rig| rig.load_watched(loaded));
         if decision.stepped() && !stepped {
             // The deadline's step ran inside a wait: the opening's
             // reducer count is forgotten, as at its own step.
@@ -2674,12 +2686,31 @@ impl AppRig for PlayerRig<'_> {
         loaded: &Loaded,
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
-        if let Some(failure) = self
-            .release_banks(None)
-            .map_err(ChartLoadError::Audio)?
-            .failure()
-        {
-            return Ok(Loading::Failed(failure));
+        // The page's 1× bank is decoded as a play's is (design.md "Load
+        // Pipeline"): the chart's background measurement waited for, the
+        // release barrier, then the decode, never beside the background's
+        // bank. The waits serve the decision screen.
+        let ready = self.watching(loaded, decision, |rig| {
+            let sel = rig.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            let controls = rig.controls;
+            let waited = sel.shelf.wait_background(
+                loaded.path(),
+                &file_name(loaded.path()),
+                || cancelled(controls),
+                || {},
+            );
+            if waited == Loading::Cancelled {
+                println!("practice: the read's wait was cancelled");
+                return Ok(Loading::Cancelled);
+            }
+            Ok(rig
+                .release_banks(None)
+                .map_err(ChartLoadError::Audio)?
+                .failure()
+                .map_or(Loading::Ready, Loading::Failed))
+        })?;
+        if ready != Loading::Ready {
+            return Ok(ready);
         }
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let chart = crate::page_jobs::PageChart {
@@ -3742,6 +3773,202 @@ pub(crate) mod tests {
                 },
             );
         }
+    }
+
+    /// Stops the input thread at its next fence, `before` run there on the
+    /// input thread before the fence is answered; `f` runs on the game
+    /// thread meanwhile, and the thread goes on once `f` returned.
+    #[cfg(feature = "dev-tools")]
+    fn at_fence(
+        rig: &mut crate::play::PlayerRig<'_>,
+        before: Box<dyn FnOnce(&mut input::SourceSet) + Send>,
+        f: &mut dyn FnMut(&mut crate::play::PlayerRig<'_>),
+    ) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume) = std::sync::mpsc::channel();
+        rig.input.fence_gate(crate::input_side::FenceGate {
+            before,
+            reached,
+            resume,
+        });
+        f(rig);
+        assert!(
+            reached_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
+            "the gate was reached"
+        );
+        resume_tx.send(()).unwrap();
+    }
+
+    /// The choice's decision screen is out before its input fence: at the
+    /// fence, held before its answer, its presentation and its tone were
+    /// already sent (a fence that takes the whole time still shows the
+    /// screen). A recovery sends the presentation again and no tone (ND2);
+    /// a second choice sounds its tone again (ND1).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_decision_screen_is_out_before_its_fence() {
+        use game::AppRig as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        let chart = dir.path().join("x.bms");
+        crate::tests::on_rig_hooked(
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            },
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            input::QpcClock::start(),
+            |rig, _, end| {
+                rig.selection = Some(sel);
+                let (thread, _jobs, _waker, _clock) = input_thread(end);
+                let sent = rig.render.decisions_sent();
+                let tones = rig.audio.control.failure_probe();
+                let tones_now = tones.clone();
+                let (seen_tx, seen) = std::sync::mpsc::channel();
+                let pick = game::Pick::Play(chart.clone());
+                at_fence(
+                    rig,
+                    Box::new(move |_| {
+                        let _ = seen_tx.send((sent(), tones_now.tone_requests()));
+                    }),
+                    &mut |rig| rig.entered_decision(&pick),
+                );
+                assert_eq!(
+                    seen.recv_timeout(Duration::from_secs(60)).unwrap(),
+                    (1, 1),
+                    "the presentation and the tone before the fence"
+                );
+                let sent = rig.render.decisions_sent();
+                rig.recovered_decision();
+                assert_eq!((sent(), tones.tone_requests()), (2, 1), "no second tone");
+                rig.closed_epoch();
+                rig.entered_decision(&game::Pick::Practice(chart.clone()));
+                assert_eq!((sent(), tones.tone_requests()), (3, 2), "a tone a choice");
+                thread.stop().unwrap();
+            },
+        );
+    }
+
+    /// Finding 10 at the fence (START on E as installed): START pressed
+    /// during the decision screen and held through a refusal's return
+    /// opens no panel even as seen by the return's own fence, the input
+    /// thread held right after answering it: the held panels are masked
+    /// before any level or fence answer is published. A fresh press opens
+    /// it (the positive control).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_panel_held_through_the_decision_screen_is_masked_at_the_fence() {
+        use bms_model::TimeSource as _;
+        use game::AppRig as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        crate::tests::on_rig_hooked(
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            },
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            input::QpcClock::start(),
+            |rig, _, end| {
+                let level = rig.panels.clone().expect("installed with the tap");
+                rig.selection = Some(sel);
+                let (thread, jobs, waker, clock) = input_thread(end);
+                let press = |code, value| {
+                    jobs.send(Box::new(move |s: &mut input::SourceSet| {
+                        key_batch(s, clock.now(), code, value);
+                    }))
+                    .unwrap();
+                    waker.wake();
+                };
+                // A wake of the input thread after everything sent before.
+                let boundary = || {
+                    let (seen, seen_rx) = std::sync::mpsc::channel();
+                    jobs.send(Box::new(move |_: &mut input::SourceSet| {
+                        seen.send(()).unwrap();
+                    }))
+                    .unwrap();
+                    waker.wake();
+                    seen_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                    // Its whole boundary, the menu's included.
+                    waker.wake();
+                };
+                rig.entered_selection();
+                // The choice closes the word and the input thread sees it;
+                // START comes down during the decision screen, after that.
+                rig.controls.close_epoch();
+                boundary();
+                boundary();
+                press(0x12, 1);
+                boundary();
+                boundary();
+                // A refusal's return: the word opens, selection is entered
+                // and its fence answered; the thread stops after it.
+                rig.closed_epoch();
+                at_fence(rig, Box::new(|_| {}), &mut |rig| rig.entered_selection());
+                assert!(!level.read().start, "held through the screen: no panel");
+                press(0x12, 0);
+                press(0x12, 1);
+                assert!(crate::render_side::tests::wait_until(|| level.read().start));
+                thread.stop().unwrap();
+            },
+        );
+    }
+
+    /// The controller's Back past the decision screen's time: one sent
+    /// before the escape was let through (queued before the screen, or
+    /// during it) is stale and does not leave; one sent after it leaves.
+    /// The quit key likewise, through the controls' word.
+    #[test]
+    fn only_a_fresh_back_leaves_the_waiting_decision_screen() {
+        use eval::ControlId;
+        use input::{MenuAction, MenuBindings, MenuEvent};
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        controls.quit_leaves();
+        let (mut tap, receiver) = input::menu_queue(MenuBindings {
+            product: controller_product(),
+            controls: vec![(ControlId(3), MenuAction::Press(MenuEvent::Back))],
+            step: 1,
+            relative: None,
+            wrap: None,
+        });
+        tap.set_activity(Arc::clone(controls.tuning().activity()));
+        tap.set_active(true);
+        let back = |tap: &mut input::MenuTap| {
+            for value in [1, 0] {
+                tap.offer(
+                    &input::Packet {
+                        device: input::DeviceId(7),
+                        control: ControlId(3),
+                        value,
+                        background: false,
+                    },
+                    None,
+                );
+            }
+        };
+        let mut pad = Pad {
+            receiver: Some(receiver),
+            dropped: 0,
+        };
+        let queue = MenuQueue::gated(Arc::clone(controls.tuning()));
+        back(&mut tap);
+        controls.close_epoch();
+        back(&mut tap);
+        controls.command(game::Command::Quit);
+        assert!(
+            !super::take_escape(&controls, Some(&queue), &mut pad),
+            "a stale Back left"
+        );
+        back(&mut tap);
+        assert!(
+            super::take_escape(&controls, Some(&queue), &mut pad),
+            "a fresh Back did not"
+        );
+        controls.command(game::Command::Quit);
+        assert!(
+            super::take_escape(&controls, Some(&queue), &mut pad),
+            "the quit key did not"
+        );
     }
 
     /// What the panels fixture's last six elements showed in each

@@ -51,8 +51,8 @@ pub struct DecisionWatch {
     /// The held loading lifetime revealed: the deadline step's first
     /// part, before the input epoch ends.
     pub reveal: Box<dyn Fn() + Send + Sync>,
-    /// Whether the input or the audio thread failed.
-    pub failed: Box<dyn Fn() -> bool + Send + Sync>,
+    /// The rig's thread failures, as the rig itself reads them.
+    pub failures: crate::failures::Failures,
 }
 
 impl std::fmt::Debug for DecisionWatch {
@@ -165,6 +165,17 @@ impl Controls {
     /// Shows the measurement overlay if hidden, hides it if shown.
     pub fn toggle_overlay(&self) {
         self.overlay.fetch_xor(true, Ordering::AcqRel);
+    }
+
+    /// The overlay key pressed in the window: it toggles the overlay only
+    /// while the ingress word is open, checked and toggled in one tuning
+    /// step, so a choice cannot fall between the two.
+    pub fn overlay_key(&self) {
+        self.tuning.with_ingress(|word| {
+            if word.is_open() {
+                self.toggle_overlay();
+            }
+        });
     }
 
     /// Hands over the input side's focus latch, once.
@@ -323,13 +334,32 @@ impl Controls {
 
     /// Past the decision screen's time while practice waits for its read
     /// (design.md "Play Lifecycle", the practice page): the quit key and
-    /// Back leave from here. Nothing outside the epoch.
+    /// Back leave from here. The ingress word moves to a new closed
+    /// generation in the same tuning step, so only an Escape or a Back
+    /// observed from here carries a stamp the escape admits
+    /// ([`admits_escape`](Self::admits_escape)); one queued before is
+    /// stale. Once per epoch; nothing outside it.
     pub fn let_escape(&self) {
-        let _ = self
-            .command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                (w & EPOCH != 0).then_some(w | ESCAPE)
-            });
+        let w = self.command.load(Ordering::Acquire);
+        if w & EPOCH == 0 || w & ESCAPE != 0 {
+            return;
+        }
+        self.tuning.close_ingress(|| {
+            let _ = self
+                .command
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                    (w & EPOCH != 0).then_some((w | ESCAPE) & !LEAVE)
+                });
+        });
+    }
+
+    /// Whether an Escape or a Back stamped `stamp` by its producer leaves
+    /// the decision screen: observed after the escape was let through, in
+    /// its generation. Read under the tuning step lock, so the word cannot
+    /// move between this check and its effect.
+    pub fn admits_escape(&self, stamp: input::Ingress) -> bool {
+        self.tuning
+            .with_ingress(|word| word == stamp && self.escaping())
     }
 
     /// The quit key pressed since the escape was let through, taken.
@@ -353,6 +383,7 @@ impl Controls {
 
     /// Whether the decision screen's epoch lets the quit key and Back
     /// through ([`let_escape`](Self::let_escape)).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn escaping(&self) -> bool {
         self.command.load(Ordering::Acquire) & ESCAPE != 0
     }
@@ -392,7 +423,16 @@ impl Controls {
         if w.decision.left().is_some() {
             return true;
         }
-        let terminal = self.quitting() || (w.failed)();
+        let terminal = self.quitting() || w.failures.any();
+        // For practice the deadline is the page's entry, which the flow
+        // takes once the read's waits return: here only a terminal cause
+        // leaves.
+        if w.decision.practice() {
+            if terminal {
+                w.decision.leave(game::Verdict::End);
+            }
+            return terminal;
+        }
         let now = self.clock.now();
         match w
             .decision
@@ -416,13 +456,8 @@ impl Controls {
         }
     }
 
-    /// Whether tuning observations act now: the ingress word is open.
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn ingress_open(&self) -> bool {
-        self.tuning.activity().ingress().is_open()
-    }
-
     /// The ingress word now, which an observation is stamped with.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn ingress(&self) -> input::Ingress {
         self.tuning.activity().ingress()
     }
@@ -505,7 +540,9 @@ impl Controls {
         let Some(keys) = keys.as_mut() else {
             return;
         };
-        keys.key(key, event, synthetic);
+        // Stamped as the window observes it: a key queued during the
+        // decision screen does not act after it.
+        keys.key_stamped(key, event, synthetic, self.ingress());
         if let Some(w) = self.input.get() {
             w.wake();
         }
@@ -621,7 +658,7 @@ mod tests {
         c.command(Command::Retry);
         let retried = c.retry_at();
         c.close_epoch();
-        assert!(!c.ingress_open());
+        assert!(!c.ingress().is_open());
         assert_eq!(c.take(), None);
         c.command(Command::Quit);
         c.command(Command::Retry);
@@ -629,7 +666,7 @@ mod tests {
         assert!(!c.leaving());
         assert_eq!(c.retry_at(), retried);
         c.open_epoch();
-        assert!(c.ingress_open());
+        assert!(c.ingress().is_open());
         assert_eq!(c.take(), Some(Command::Suspend));
         assert_eq!(c.take(), None);
         c.command(Command::Quit);
@@ -659,30 +696,95 @@ mod tests {
         assert!(!c.escaping());
     }
 
+    /// The rig's thread failures for a watcher test, read the way the rig
+    /// reads them: an input link and an audio control of their own, and an
+    /// adjustment driver's latch. The worker and the hook come back so the
+    /// test can end the threads' ends itself.
+    fn failures() -> (
+        crate::failures::Failures,
+        game::AudioWorker,
+        crate::input_side::Hook,
+        crate::input_side::InputLink,
+        game::AdjustDriver,
+    ) {
+        use std::sync::Arc;
+        let bank = Arc::new(audio::SoundBank::from_sounds(
+            48_000,
+            vec![audio::Sound::mono(vec![0; 480])],
+        ));
+        let engine =
+            audio::AudioEngine::with_schedule(bank, Vec::new(), 48_000, 480, 16, 0).unwrap();
+        let (control, worker) = game::audio_control(engine);
+        let controls = Arc::new(Controls::new(QpcClock::start()));
+        let (hook, link) = crate::input_side::link(
+            controls,
+            crate::input_side::Mode::Clock,
+            input::Waker::new().unwrap(),
+        );
+        let device = game::DeviceSettings::default();
+        let keys = game::KeyConfigs {
+            keyboard: device.keyboard.clone(),
+            controller: device.controller.clone(),
+            controller_device: None,
+        };
+        let plan = game::AdjustmentConfig::default()
+            .plan(&keys, None, None)
+            .unwrap();
+        let (driver, _tap, _reader) =
+            game::AdjustDriver::new(&plan, game::PlayOptions::default(), 0).unwrap();
+        let mut failures = crate::failures::Failures::new(
+            link.failure_handle(),
+            control.failure_probe(),
+            Arc::default(),
+        );
+        failures.install(driver.failure_cell(), Arc::default());
+        // The control lives as long as the test needs the probe only.
+        drop(control);
+        (failures, worker, hook, link, driver)
+    }
+
+    /// A pump whose input thread never answers: the driver's next wait
+    /// times out while the thread itself is alive.
+    struct Silent;
+
+    impl game::InputPump for Silent {
+        fn request_fence(&mut self, _n: u64) {}
+        fn wake(&mut self) {}
+        fn display_offset_us(&self) -> i64 {
+            0
+        }
+        fn park(&mut self) -> Result<(), game::InputWaitError> {
+            Err(game::InputWaitError::Timeout)
+        }
+    }
+
     /// The decision screen watched by a chart's load (E1, E6, E7 at the
     /// player's waits): before the deadline a look goes on and reveals
     /// nothing; at it the play's step runs once, the ingress opened, the
-    /// lifetime revealed and the scene moved, and the wait goes on; a
-    /// thread's failure, or a close, then stops every look, the screen
-    /// left to end the run.
+    /// lifetime revealed and the scene moved, and the wait goes on; then a
+    /// close, the audio thread's end dropped (its consumer abandoned), or
+    /// an adjustment fence timed out with the input thread alive, each
+    /// read through the rig's own failure state, stops every look, the
+    /// screen left to end the run. Before the cause (the positive
+    /// control) the same look goes on.
     #[test]
     fn a_load_wait_serves_the_deadline_once_and_stops_at_a_failure() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for close in [false, true] {
+        for cause in ["close", "audio gone", "fence timed out"] {
             let c = Controls::new(QpcClock::start());
             let now = bms_model::TimeSource::now(&c.clock);
             let reveals = Arc::new(AtomicUsize::new(0));
-            let failed = Arc::new(AtomicBool::new(false));
+            let (failures, worker, _hook, _link, mut driver) = failures();
             let watch = |decision| {
-                let (reveals, failed) = (Arc::clone(&reveals), Arc::clone(&failed));
+                let reveals = Arc::clone(&reveals);
                 super::DecisionWatch {
                     decision,
                     reveal: Box::new(move || {
                         reveals.fetch_add(1, Ordering::SeqCst);
                     }),
-                    failed: Box::new(move || failed.load(Ordering::SeqCst)),
+                    failures: failures.clone(),
                 }
             };
             c.close_epoch();
@@ -693,7 +795,7 @@ mod tests {
             )));
             assert!(!c.serve_decision());
             assert_eq!(reveals.load(Ordering::SeqCst), 0);
-            assert!(!c.ingress_open());
+            assert!(!c.ingress().is_open());
             let served = c.unwatch_decision().unwrap();
             assert!(!served.stepped());
             // The same screen, its deadline due.
@@ -707,19 +809,21 @@ mod tests {
             assert!(!c.serve_decision());
             assert!(!c.serve_decision());
             assert_eq!(reveals.load(Ordering::SeqCst), 1);
-            assert!(c.ingress_open());
+            assert!(c.ingress().is_open());
             assert_eq!(c.scene(), scene + 1);
-            assert!(!c.decision_left());
-            if close {
-                c.close();
-            } else {
-                failed.store(true, Ordering::SeqCst);
+            assert!(!c.decision_left(), "{cause}: nothing failed yet");
+            match cause {
+                "close" => c.close(),
+                "audio gone" => drop(worker),
+                _ => {
+                    assert!(driver.enter_attempt(None, &mut Silent).is_err());
+                }
             }
-            assert!(c.serve_decision());
+            assert!(c.serve_decision(), "{cause}");
             assert!(c.decision_left());
             let left = c.unwatch_decision().unwrap();
             assert!(left.stepped());
-            assert_eq!(left.left(), Some(game::Verdict::End), "close {close}");
+            assert_eq!(left.left(), Some(game::Verdict::End), "{cause}");
             // Nothing watched: no look stops anything.
             assert!(!c.serve_decision());
         }

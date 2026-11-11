@@ -1375,3 +1375,49 @@ fn a_refused_page_measurement_is_tried_once() {
         },
     );
 }
+
+/// The page's read waits for the chart's background measurement before
+/// its 1× bank begins (design.md "Load Pipeline", the release barrier):
+/// held at its first block, the measurement is promoted by the wait, and
+/// the page's decode has not begun while it is held, so the two banks are
+/// never alive together; once it ended the read goes on and the page's
+/// bank is made. The read serves the decision screen meanwhile.
+#[test]
+fn the_page_waits_for_the_charts_background_measurement() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "pbg", &page);
+    let s = b.sel.take().unwrap();
+    crate::shelf::tests::worker(&s.shelf).queue(crate::shelf::tests::job(&path));
+    assert_eq!(b.stepper.said(), crate::background::tests::Said::Block(0));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Steps the measurement until its check finds it promoted
+                // by the read's wait; it ends unpromoted when nothing
+                // waits for it.
+                while b.mode.leaves.load(Ordering::SeqCst) == 0 {
+                    b.stepper.step();
+                    assert!(
+                        matches!(b.stepper.said(), crate::background::tests::Said::Block(_)),
+                        "the measurement ended with no read waiting for it"
+                    );
+                }
+                assert!(
+                    page.seen.lock().unwrap().is_empty(),
+                    "the page's decode began beside the background's bank"
+                );
+                b.stepper.finish();
+            });
+            let now = bms_model::TimeSource::now(&rig.clock);
+            let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
+            outcome(rig.practice_read(&read, &mut decision))
+        });
+        assert_eq!(got, Loading::Ready);
+        passes_until_idle(rig);
+        assert!(sel(rig).page.kept().is_some());
+    });
+}

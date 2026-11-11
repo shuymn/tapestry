@@ -305,9 +305,37 @@ pub struct InputState {
     connected: AtomicBool,
     /// The hook was dropped: the input thread ended, or is unwinding.
     gone: AtomicBool,
+    /// The first handshake of the link that failed: once set, no request
+    /// is sent and no reply read, so a late reply to a request that timed
+    /// out is never taken for the answer to another.
+    failed: std::sync::OnceLock<InputWaitError>,
     /// The hook's wakes so far (dev-tools).
     #[cfg(feature = "dev-tools")]
     wakes: std::sync::atomic::AtomicU64,
+}
+
+impl InputState {
+    /// Why the input thread failed: a handshake's failure, or the hook
+    /// gone. The one reading of it.
+    fn failure(&self) -> Option<InputWaitError> {
+        self.failed.get().copied().or_else(|| {
+            self.gone
+                .load(Ordering::Acquire)
+                .then_some(InputWaitError::Gone)
+        })
+    }
+}
+
+/// The input link's failure, readable from any thread
+/// ([`InputLink::failure_handle`]).
+#[derive(Clone, Debug)]
+pub struct InputFailure(Arc<InputState>);
+
+impl InputFailure {
+    /// As [`InputLink::failure`].
+    pub fn get(&self) -> Option<InputWaitError> {
+        self.0.failure()
+    }
 }
 
 /// Candidate `generation`'s recording opened at this boundary: published
@@ -348,10 +376,6 @@ pub struct InputLink {
     timeout: Duration,
     /// The awake-time clock the wait is measured on.
     awake: fn() -> Duration,
-    /// The first handshake's failure: once set, no request is sent and no
-    /// reply read, so a late reply to a request that timed out is never
-    /// taken for the answer to another.
-    failed: Option<InputWaitError>,
     /// Rearms to the input thread, and back ([`rearm`](Self::rearm)).
     rearms: rtrb::Producer<Box<Rearm>>,
     rearmed: rtrb::Consumer<Box<Rearm>>,
@@ -400,7 +424,9 @@ impl InputLink {
     /// Hands the input thread the adjustment controls' tap: sent without
     /// waiting, as [`feed`](Self::feed). A failed link sends nothing.
     pub fn tap(&self, tap: input::AdjustmentTap) {
-        if self.failed.is_none() && self.requests.send(Request::Tap(Box::new(tap))).is_ok() {
+        if self.state.failed.get().is_none()
+            && self.requests.send(Request::Tap(Box::new(tap))).is_ok()
+        {
             self.waker.wake();
         }
     }
@@ -409,7 +435,7 @@ impl InputLink {
     /// stream at its next boundary: sent without waiting; the answer is
     /// the tap's marker. A failed link sends nothing.
     pub fn request_fence(&self, n: u64) {
-        if self.failed.is_none() && self.requests.send(Request::Fence(n)).is_ok() {
+        if self.state.failed.get().is_none() && self.requests.send(Request::Fence(n)).is_ok() {
             self.waker.wake();
         }
     }
@@ -418,7 +444,9 @@ impl InputLink {
     /// ([`Request::LoadingScript`]; dev-tools). A failed link sends nothing.
     #[cfg(feature = "dev-tools")]
     pub fn loading_script(&self, at: TimeUs) {
-        if self.failed.is_none() && self.requests.send(Request::LoadingScript { at }).is_ok() {
+        if self.state.failed.get().is_none()
+            && self.requests.send(Request::LoadingScript { at }).is_ok()
+        {
             self.waker.wake();
         }
     }
@@ -427,7 +455,9 @@ impl InputLink {
     /// dev-tools).
     #[cfg(feature = "dev-tools")]
     pub fn end_loading_script(&self) {
-        if self.failed.is_none() && self.requests.send(Request::EndLoadingScript).is_ok() {
+        if self.state.failed.get().is_none()
+            && self.requests.send(Request::EndLoadingScript).is_ok()
+        {
             self.waker.wake();
         }
     }
@@ -460,7 +490,7 @@ impl InputLink {
     /// tests). A failed link sends nothing.
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn fence_gate(&self, gate: FenceGate) {
-        if self.failed.is_none()
+        if self.state.failed.get().is_none()
             && self
                 .requests
                 .send(Request::FenceGate(Box::new(gate)))
@@ -475,7 +505,7 @@ impl InputLink {
     /// nothing.
     #[cfg(test)]
     pub fn open_gate(&self, gate: OpenGate) {
-        if self.failed.is_none()
+        if self.state.failed.get().is_none()
             && self
                 .requests
                 .send(Request::OpenGate(Box::new(gate)))
@@ -510,7 +540,7 @@ impl InputLink {
     /// As [`open`](Self::open); `rearm` and its readers are then lost with
     /// the link.
     pub fn rearm(&mut self, mut rearm: Box<Rearm>) -> Result<Box<Rearm>, InputWaitError> {
-        if let Some(e) = self.failed {
+        if let Some(e) = self.state.failed.get().copied() {
             return Err(e);
         }
         rearm.outcome = RearmOutcome::Pending;
@@ -532,7 +562,7 @@ impl InputLink {
             }
         });
         if let Err(e) = answer {
-            self.failed = Some(e);
+            let _ = self.state.failed.set(e);
         }
         answer
     }
@@ -568,7 +598,7 @@ impl InputLink {
     /// closing ([`hand_off`](Self::hand_off)). A failed wait fails the
     /// link, so a late answer is never taken for another request's.
     fn exchange(&mut self, kind: HandoffKind) -> Result<Closing, InputWaitError> {
-        if let Some(e) = self.failed {
+        if let Some(e) = self.state.failed.get().copied() {
             return Err(e);
         }
         let sent = self.handoffs.push(kind).map_err(|_| InputWaitError::Gone);
@@ -595,7 +625,7 @@ impl InputLink {
                 Ok(closing)
             }
             Err(e) => {
-                self.failed = Some(e);
+                let _ = self.state.failed.set(e);
                 Err(e)
             }
         }
@@ -628,7 +658,7 @@ impl InputLink {
             input,
             queue_capacity,
         };
-        if self.failed.is_none() && self.requests.send(feed).is_ok() {
+        if self.state.failed.get().is_none() && self.requests.send(feed).is_ok() {
             self.waker.wake();
         }
     }
@@ -642,7 +672,7 @@ impl InputLink {
             mode: Box::new(mode),
             sources,
         };
-        if self.failed.is_none() && self.requests.send(switch).is_ok() {
+        if self.state.failed.get().is_none() && self.requests.send(switch).is_ok() {
             self.waker.wake();
         }
     }
@@ -650,7 +680,7 @@ impl InputLink {
     /// Lets the input thread go idle: sent without waiting, since nothing
     /// answers it. A failed link sends nothing.
     pub fn idle(&self) {
-        if self.failed.is_none() && self.requests.send(Request::Idle).is_ok() {
+        if self.state.failed.get().is_none() && self.requests.send(Request::Idle).is_ok() {
             self.waker.wake();
         }
     }
@@ -659,12 +689,12 @@ impl InputLink {
     /// once, in order, so with the link failed at the first wait that does
     /// not end in a reply, the reply read is always this request's.
     fn ask(&mut self, request: Request) -> Result<Reply, InputWaitError> {
-        if let Some(e) = self.failed {
+        if let Some(e) = self.state.failed.get().copied() {
             return Err(e);
         }
         let reply = self.wait(request);
         if let Err(e) = reply {
-            self.failed = Some(e);
+            let _ = self.state.failed.set(e);
         }
         reply
     }
@@ -691,18 +721,14 @@ impl InputLink {
 
     /// Why the input thread failed, once known: a handshake's failure, or
     /// the hook gone (the thread ended or panicked). One atomic load.
-    /// Whether the input thread is gone, from any thread.
-    pub fn gone_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
-        let state = Arc::clone(&self.state);
-        move || state.gone.load(Ordering::Acquire)
+    pub fn failure(&self) -> Option<InputWaitError> {
+        self.state.failure()
     }
 
-    pub fn failure(&self) -> Option<InputWaitError> {
-        self.failed.or(self
-            .state
-            .gone
-            .load(Ordering::Acquire)
-            .then_some(InputWaitError::Gone))
+    /// The link's failure as a handle read from any thread
+    /// ([`crate::failures::Failures`]).
+    pub fn failure_handle(&self) -> InputFailure {
+        InputFailure(Arc::clone(&self.state))
     }
 
     /// The input thread's wakes so far: what its cadence costs while
@@ -859,7 +885,6 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             waker,
             timeout: INPUT_TIMEOUT,
             awake: awake_time,
-            failed: None,
             rearms: rearm_tx,
             rearmed: rearmed_rx,
             handoffs: handoff_tx,
@@ -1076,17 +1101,10 @@ impl Hook {
     /// SELECT held across a new ingress generation opens no panel until
     /// released.
     fn menu(&mut self, sources: &mut SourceSet) {
-        let word = self.controls.ingress();
-        if word != self.ingress_seen {
-            self.ingress_seen = word;
-            if let Some(tap) = sources.adjustment_mut() {
-                tap.mask_held_panels();
-            }
-        }
+        let mut wake = self.publish_panels(sources);
         let active = self.phase == Phase::Idle
             && self.controls.focused()
-            && (word.is_open() || self.controls.escaping());
-        let mut wake = self.publish_panels(sources);
+            && (self.ingress_seen.is_open() || self.controls.escaping());
         if let Some(menu) = sources.menu_mut() {
             menu.set_active(active);
             wake |= menu.take_sent();
@@ -1097,10 +1115,19 @@ impl Hook {
     }
 
     /// Publishes the panels' level as [`menu`](Self::menu) says; `true`
-    /// when it changed.
-    fn publish_panels(&self, sources: &mut SourceSet) -> bool {
-        let active =
-            self.phase == Phase::Idle && self.controls.focused() && self.controls.ingress_open();
+    /// when it changed. The one point every panel level and every fence's
+    /// answer is published after: a new ingress generation seen here first
+    /// masks the START and SELECT held across it, so neither a level nor a
+    /// fence answer shows a panel held through the decision screen.
+    fn publish_panels(&mut self, sources: &mut SourceSet) -> bool {
+        let word = self.controls.ingress();
+        if word != self.ingress_seen {
+            self.ingress_seen = word;
+            if let Some(tap) = sources.adjustment_mut() {
+                tap.mask_held_panels();
+            }
+        }
+        let active = self.phase == Phase::Idle && self.controls.focused() && word.is_open();
         let (_, losses) = self.controls.presentation_focus().read();
         sources
             .adjustment_mut()
@@ -2105,8 +2132,8 @@ mod autoplay_tests {
     #[test]
     fn a_failed_link_sends_no_switch() {
         let mut sources = full_set();
-        let (_controls, mut hook, mut link) = hooked(&sources);
-        link.failed = Some(game::InputWaitError::Timeout);
+        let (_controls, mut hook, link) = hooked(&sources);
+        let _ = link.state.failed.set(game::InputWaitError::Timeout);
         link.switch(Mode::Autoplay(AutoplayInput::new(events())), switched());
         hook.wake(&mut sources, TimeUs(0));
         assert_eq!(sources.devices().count(), 4);

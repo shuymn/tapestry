@@ -1032,6 +1032,9 @@ struct Shared {
     /// Presented loading frames acknowledged so far (tests).
     #[cfg(test)]
     loading_acked: AtomicU64,
+    /// The decision screen's presentations sent (tests).
+    #[cfg(test)]
+    decisions_sent: AtomicU64,
     /// The end or pause of a loading lifetime waits here before its
     /// answer (tests).
     #[cfg(test)]
@@ -1109,6 +1112,8 @@ impl Shared {
             loading_ack_pass: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             loading_acked: AtomicU64::new(0),
+            #[cfg(test)]
+            decisions_sent: AtomicU64::new(0),
             #[cfg(test)]
             loading_end_gate: Arc::default(),
             #[cfg(test)]
@@ -2355,7 +2360,17 @@ impl RenderLink {
     /// the next screen: kept through the chart's load and the screen's
     /// recovery, and not a loading lifetime.
     pub fn show_decision(&self, page: MenuPage) {
+        #[cfg(test)]
+        self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
         self.send(RenderMsg::Decision(Box::new(page)));
+    }
+
+    /// How many decision presentations were sent, readable from another
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decisions_sent(&self) -> impl Fn() -> u64 + Send + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.decisions_sent.load(Ordering::SeqCst)
     }
 
     /// Loading ended (selection, the practice page): its lifetime ends, so

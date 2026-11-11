@@ -372,6 +372,8 @@ struct Shared {
     /// The decision tone asked to start: not a control message, so it
     /// never waits behind one.
     tone: AtomicBool,
+    /// The decision tones asked for so far.
+    tones: AtomicU64,
     /// The latest report that the sealed play's audio has ended: its
     /// generation in the high 32 bits, the key-sound commands the audio
     /// thread had taken from its queue in the low 32.
@@ -411,6 +413,22 @@ struct Shared {
     rate: u32,
     period: u32,
     failure: OnceLock<OutputError>,
+    /// The audio thread's end was dropped: the thread ended or is
+    /// unwinding.
+    gone: AtomicBool,
+}
+
+impl Shared {
+    /// The output's failure: one the audio thread latched, else its end
+    /// gone. The one reading of it, from the game thread's control and
+    /// from any thread through an [`OutputProbe`].
+    fn failure(&self) -> Option<OutputError> {
+        self.failure.get().copied().or_else(|| {
+            self.gone
+                .load(Ordering::Acquire)
+                .then_some(OutputError::DeviceLost)
+        })
+    }
 }
 
 /// The output's latched failure, from any thread
@@ -419,16 +437,23 @@ struct Shared {
 pub struct OutputProbe(Arc<Shared>);
 
 impl OutputProbe {
-    /// Whether the audio thread latched a failure.
+    /// The output's failure, as [`AudioControl::failure`] reads it.
     #[must_use]
-    pub fn failed(&self) -> bool {
-        self.0.failure.get().is_some()
+    pub fn failure(&self) -> Option<OutputError> {
+        self.0.failure()
+    }
+
+    /// How many decision tones were asked for
+    /// ([`AudioControl::play_tone`]).
+    #[must_use]
+    pub fn tone_requests(&self) -> u64 {
+        self.0.tones.load(Ordering::Acquire)
     }
 }
 
 impl std::fmt::Debug for OutputProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("OutputProbe").field(&self.failed()).finish()
+        f.debug_tuple("OutputProbe").field(&self.failure()).finish()
     }
 }
 
@@ -927,8 +952,7 @@ impl AudioControl {
     /// The output's failure, once it failed.
     #[must_use]
     pub fn failure(&self) -> Option<OutputError> {
-        let gone = self.ctl.is_abandoned().then_some(OutputError::DeviceLost);
-        self.shared.failure.get().copied().or(gone)
+        self.shared.failure()
     }
 
     /// The output's failure as the audio thread latched it, readable from
@@ -959,6 +983,7 @@ impl AudioControl {
     /// a UI sound outside every bank, which loading or unloading a bank does
     /// not cut ([`AudioEngine::play_tone`]).
     pub fn play_tone(&self) {
+        self.shared.tones.fetch_add(1, Ordering::AcqRel);
         self.shared.tone.store(true, Ordering::Release);
     }
 
@@ -978,6 +1003,14 @@ impl AudioControl {
     /// Ends the worker's loop.
     pub fn exit(&mut self) {
         self.send(AudioCtl::Exit);
+    }
+}
+
+impl Drop for AudioWorker {
+    /// The thread's end goes with it, so the control reads the output as
+    /// gone, as it would an abandoned queue.
+    fn drop(&mut self) {
+        self.shared.gone.store(true, Ordering::Release);
     }
 }
 

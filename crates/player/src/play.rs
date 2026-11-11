@@ -161,6 +161,9 @@ pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf
 
 /// The game's threads as a rig.
 pub struct PlayerRig<'a> {
+    /// The input and audio threads' failures, as one state every reader
+    /// asks ([`crate::failures::Failures`]).
+    pub failures: crate::failures::Failures,
     /// The input thread.
     pub input: InputLink,
     /// The audio thread.
@@ -382,7 +385,7 @@ pub struct PlayerRig<'a> {
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: the audio output reads as lost while set, from any thread.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: where the loading opener's steps wait while a test holds
     /// them.
@@ -2290,11 +2293,7 @@ impl Rig for PlayerRig<'_> {
     /// A gated candidate's cancellation the audio thread never
     /// acknowledged counts as its stall.
     fn audio_failure(&self) -> Option<OutputError> {
-        #[cfg(test)]
-        if self.audio_lost.load(std::sync::atomic::Ordering::Acquire) {
-            return Some(OutputError::DeviceLost);
-        }
-        crate::start_gate::output_failure(&self.audio.control, self.gate.as_ref())
+        self.failures.output()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -2342,7 +2341,7 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn input_failure(&self) -> Option<InputWaitError> {
-        self.input.failure().or(self.adjustments_failure())
+        self.failures.input()
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
@@ -3128,6 +3127,125 @@ mod tests {
         );
         assert_eq!(held.load(Ordering::SeqCst), met.load(Ordering::SeqCst));
         assert!(controls.tuning().step_free());
+    }
+
+    /// The input side, synchronous, gated as the player's pump is: a fence
+    /// is answered at once, and a drain validates under the tuning's lock.
+    struct SyncPump<'a> {
+        set: &'a mut input::SourceSet,
+        tuning: &'a crate::tuning::LiveTuning,
+        now: TimeUs,
+    }
+
+    impl game::InputPump for SyncPump<'_> {
+        fn request_fence(&mut self, n: u64) {
+            let now = self.now;
+            self.set.adjustment_mut().unwrap().fence(n, now);
+        }
+        fn wake(&mut self) {
+            self.set.tick_presentation(self.now);
+        }
+        fn display_offset_us(&self) -> i64 {
+            0
+        }
+        fn with_ingress(&mut self, f: &mut game::IngressDrain<'_>) {
+            self.tuning.with_ingress(|word| f(Some(word), &|| {}));
+        }
+        fn park(&mut self) -> Result<(), game::InputWaitError> {
+            Err(game::InputWaitError::Timeout)
+        }
+    }
+
+    /// F2 from the window in an autoplay session, queued for the input
+    /// thread during the decision screen and taken by the tap only after
+    /// the reopening, does not act: the observation carries the word the
+    /// window saw it under. Queued with the word open (the positive
+    /// control), it moves the hi-speed.
+    #[test]
+    fn a_window_speed_key_queued_in_the_epoch_does_not_act_after_it() {
+        use std::sync::Arc;
+        for crossing in [true, false] {
+            let controls = crate::controls::Controls::new(input::QpcClock::start());
+            let device = game::DeviceSettings::default();
+            let keys = game::KeyConfigs {
+                keyboard: device.keyboard.clone(),
+                controller: device.controller.clone(),
+                controller_device: None,
+            };
+            let plan = game::AdjustmentConfig::default()
+                .plan(&keys, None, None)
+                .unwrap();
+            let (mut driver, mut tap, mut reader) =
+                game::AdjustDriver::new(&plan, game::PlayOptions::default(), 0).unwrap();
+            tap.set_activity(Arc::clone(controls.tuning().activity()));
+            let number = |code| {
+                plan.bindings
+                    .controls
+                    .iter()
+                    .find(|(c, _)| *c == input::TapControl::Key(eval::ControlId(code)))
+                    .map(|&(_, n)| n)
+            };
+            let [f1, f2] = game::SPEED_KEYS;
+            let (window, receiver) = input::window_keys();
+            tap.set_window_keys(receiver, [number(f1), number(f2)]);
+            controls.set_window_keys(window);
+            let mut set = input::SourceSet::new(input::SourceConfig {
+                max_devices: 2,
+                max_sources: 2,
+                max_held: 8,
+                queue_capacity: 64,
+                max_arrivals: 2,
+            })
+            .unwrap();
+            set.set_presentation_focus(input::PresentationFocus::new());
+            set.begin_batch(TimeUs(0));
+            set.connect(input::DeviceId(1), input::DeviceKind::Keyboard);
+            set.end_batch(TimeUs(1));
+            set.set_adjustment(tap);
+            let tuning = Arc::clone(controls.tuning());
+            fn pump<'a>(
+                set: &'a mut input::SourceSet,
+                tuning: &'a crate::tuning::LiveTuning,
+                at: i64,
+            ) -> SyncPump<'a> {
+                SyncPump {
+                    set,
+                    tuning,
+                    now: TimeUs(at),
+                }
+            }
+            driver
+                .enter_attempt(Some(TimeUs(-2_000_000)), &mut pump(&mut set, &tuning, 2))
+                .unwrap();
+            let chart = bms_model::ChartBuilder::new(150_000).build().unwrap();
+            driver
+                .attach(
+                    game::AttemptTempo::prepare(&chart, None),
+                    TimeUs(-2_000_000),
+                    &mut pump(&mut set, &tuning, 3),
+                )
+                .unwrap();
+            driver.pump(&mut pump(&mut set, &tuning, 4));
+            let before = reader.read().hispeed;
+            if crossing {
+                controls.close_epoch();
+            }
+            controls.window_key(1, input::WindowKeyEvent::Press, false);
+            controls.window_key(1, input::WindowKeyEvent::Release, false);
+            if crossing {
+                controls.open_epoch();
+            }
+            // The tap takes the window's queue at its next tick.
+            set.tick_presentation(TimeUs(10_000));
+            set.tick_presentation(TimeUs(11_000));
+            driver.pump(&mut pump(&mut set, &tuning, 12_000));
+            let after = reader.read().hispeed;
+            if crossing {
+                assert_eq!(after, before, "a key from the epoch acted after it");
+            } else {
+                assert_ne!(after, before, "the positive control moved nothing");
+            }
+        }
     }
 
     /// A scenario's `until` is due at its chart time exactly: chart time 0

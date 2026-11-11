@@ -258,7 +258,9 @@ impl MenuQueue {
         }
     }
 
-    /// Queues `input`, unstamped: the game thread's own, always taken.
+    /// Queues `input`, unstamped: the game thread's own (a development
+    /// script's, a test's), always taken.
+    #[cfg(any(test, feature = "dev-tools"))]
     pub fn push(&self, input: MenuInput) {
         self.push_stamped(input, None);
     }
@@ -304,16 +306,16 @@ impl MenuQueue {
         }
     }
 
-    /// Takes every input queued, valid or not, and whether one was the
-    /// Escape key: what the decision screen reads past its time
-    /// (design.md "Play Lifecycle", the practice page).
-    pub fn take_escape(&self) -> bool {
-        let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        let escape = q
-            .iter()
-            .any(|(i, _)| matches!(i, MenuInput::Key(MenuKey::Escape)));
-        q.clear();
-        escape
+    /// Takes every input queued, and whether one was an Escape whose stamp
+    /// `admits`: what the decision screen reads past its time (design.md
+    /// "Play Lifecycle", the practice page). An unstamped input is never
+    /// an escape.
+    pub fn take_escape(&self, admits: impl Fn(input::Ingress) -> bool) -> bool {
+        let taken =
+            std::mem::take(&mut *self.inputs.lock().unwrap_or_else(PoisonError::into_inner));
+        taken.into_iter().any(|(i, stamp)| {
+            matches!(i, MenuInput::Key(MenuKey::Escape)) && stamp.is_some_and(&admits)
+        })
     }
 
     /// Keys dropped so far.

@@ -191,7 +191,7 @@ pub fn press_loading(phase: LoadPhase) {
 pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
     // Due in the loading state: the decision screen before it discards
     // every press, so one there stays due.
-    if !STALLED.load(Ordering::SeqCst) || !controls.ingress_open() {
+    if !STALLED.load(Ordering::SeqCst) || !controls.ingress().is_open() {
         return;
     }
     let due = PRESS_LOADING
@@ -211,7 +211,7 @@ pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
 /// which serves the decision screen's deadline meanwhile.
 pub fn quit_loading(controls: &crate::controls::Controls) {
     let began = std::time::Instant::now();
-    while !controls.ingress_open() && !controls.quitting() && began.elapsed() < STEP_TIMEOUT {
+    while !controls.ingress().is_open() && !controls.quitting() && began.elapsed() < STEP_TIMEOUT {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     controls.command(game::Command::Quit);

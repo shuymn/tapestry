@@ -130,8 +130,28 @@ pub struct AdjustDriver {
     pending: Option<u64>,
     /// The epoch of the attempt prepared.
     active: Option<u64>,
-    /// The first wait on the input thread that failed: terminal.
-    failed: Option<InputWaitError>,
+    /// The first wait on the input thread that failed: terminal, readable
+    /// from any thread ([`failure_cell`](Self::failure_cell)).
+    failed: InputFailureCell,
+}
+
+/// The first wait of a driver on the input thread that failed, latched
+/// once, shared by the driver and whoever watches it from another thread
+/// or while the driver is lent out ([`AdjustDriver::failure_cell`]).
+#[derive(Clone, Debug, Default)]
+pub struct InputFailureCell(std::sync::Arc<std::sync::OnceLock<InputWaitError>>);
+
+impl InputFailureCell {
+    /// The failure latched, if one was.
+    #[must_use]
+    pub fn get(&self) -> Option<InputWaitError> {
+        self.0.get().copied()
+    }
+
+    /// Latches `e` unless a failure was latched before.
+    fn latch(&self, e: InputWaitError) {
+        let _ = self.0.set(e);
+    }
 }
 
 impl AdjustDriver {
@@ -178,7 +198,7 @@ impl AdjustDriver {
                 next_epoch: 1,
                 pending: None,
                 active: None,
-                failed: None,
+                failed: InputFailureCell::default(),
             },
             tap,
             reader,
@@ -329,7 +349,7 @@ impl AdjustDriver {
         input: &mut impl InputPump,
         done: impl Fn(&Self) -> bool,
     ) -> Result<(), InputWaitError> {
-        if let Some(e) = self.failed {
+        if let Some(e) = self.failed.get() {
             return Err(e);
         }
         loop {
@@ -339,7 +359,7 @@ impl AdjustDriver {
             }
             // The pump's awake deadline is the wait's only end.
             if let Err(e) = input.park() {
-                self.failed = Some(e);
+                self.failed.latch(e);
                 return Err(e);
             }
         }
@@ -348,8 +368,14 @@ impl AdjustDriver {
     /// The first wait on the input thread that failed, if one did: the run
     /// ends with it, and the driver asks nothing more of the input thread.
     #[must_use]
-    pub const fn failure(&self) -> Option<InputWaitError> {
-        self.failed
+    pub fn failure(&self) -> Option<InputWaitError> {
+        self.failed.get()
+    }
+
+    /// The driver's latched failure, as a handle read from anywhere.
+    #[must_use]
+    pub fn failure_cell(&self) -> InputFailureCell {
+        self.failed.clone()
     }
 
     /// Fences the input thread: returns once everything it observed before
@@ -369,7 +395,7 @@ impl AdjustDriver {
         acceptance: Option<Acceptance>,
         input: &mut impl InputPump,
     ) -> Result<(), InputWaitError> {
-        if let Some(e) = self.failed {
+        if let Some(e) = self.failed.get() {
             return Err(e);
         }
         let n = self.fence_asked.wrapping_add(1);

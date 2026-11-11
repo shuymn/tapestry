@@ -32,6 +32,7 @@ mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod end_screen;
+mod failures;
 mod imports;
 mod input_side;
 mod keys;
@@ -853,7 +854,10 @@ fn install_adjustments(rig: &mut PlayerRig<'_>, settings: &Settings) -> anyhow::
     }
     rig.panels = Some(tap.panel_level());
     rig.render.presentation(reader);
-    rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
+    let gate = crate::start_gate::PlayerGate::install(&rig.input, tap);
+    rig.failures
+        .install(driver.failure_cell(), gate.stall_flag());
+    rig.gate = Some(gate);
     rig.adjust = Some(driver);
     Ok(())
 }
@@ -874,7 +878,16 @@ fn rig<'a>(
         steps,
     } = threads;
     let device = &settings.device;
+    #[cfg(test)]
+    let audio_lost = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+    let failures = failures::Failures::new(
+        input.failure_handle(),
+        audio.control.failure_probe(),
+        #[cfg(test)]
+        std::sync::Arc::clone(&audio_lost),
+    );
     let mut rig = PlayerRig {
+        failures,
         input,
         audio,
         render,
@@ -969,8 +982,8 @@ fn rig<'a>(
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
-        #[cfg(test)]
-        audio_lost: std::sync::Arc::default(),
+        #[cfg(all(test, feature = "dev-tools"))]
+        audio_lost,
         #[cfg(test)]
         opening_gates: std::sync::Arc::default(),
         #[cfg(test)]
@@ -1077,7 +1090,9 @@ fn menu_input(
     )
     .filter(|_| !autoplay);
     let pad = bindings.map(|b| {
-        let (tap, receiver) = input::menu_queue(b);
+        let (mut tap, receiver) = input::menu_queue(b);
+        // Each event stamped with the ingress word as it is sent.
+        tap.set_activity(Arc::clone(tuning.activity()));
         sources.set_menu(tap);
         receiver
     });

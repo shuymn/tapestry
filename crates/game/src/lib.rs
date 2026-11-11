@@ -74,7 +74,7 @@ pub use bests::{
     SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
 pub use decision::{DECISION_TIME, Decision, Origin, Reply, Verdict};
-pub use driver::{AdjustDriver, IngressDrain, InputPump};
+pub use driver::{AdjustDriver, IngressDrain, InputFailureCell, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{

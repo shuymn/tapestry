@@ -25,10 +25,10 @@ impl Pad {
         self.receiver.as_mut()?.pop()
     }
 
-    /// Takes the next event with the panel open as it was sent
-    /// ([`input::MenuReceiver::pop_panel`]).
-    pub fn pop_panel(&mut self) -> Option<(input::MenuEvent, Option<usize>)> {
-        self.receiver.as_mut()?.pop_panel()
+    /// Takes the next event with its panel and the ingress word it was sent
+    /// under ([`input::MenuReceiver::pop_stamped`]).
+    pub fn pop_stamped(&mut self) -> Option<(input::MenuEvent, Option<usize>, input::Ingress)> {
+        self.receiver.as_mut()?.pop_stamped()
     }
 
     /// Drops what is queued.

@@ -489,6 +489,15 @@ struct Headless {
     served_load_ms: Option<i64>,
     /// The chosen chart at each decision screen's entry.
     decisions: Vec<(usize, i64)>,
+    /// Each recovery of the decision screen: the clock, and the origin of
+    /// the look before it.
+    recovered_decisions: Vec<(i64, Option<game::Origin>)>,
+    /// The screen fails this long (ms) after the first decision screen
+    /// begins.
+    screen_fails_in_decision: Option<i64>,
+    /// The input thread fails this long (ms) after the first decision
+    /// screen begins.
+    input_fails_in_decision: Option<i64>,
     /// The clock at each deadline step.
     deadline_steps: Vec<i64>,
     /// The decision screen's epochs closed.
@@ -713,6 +722,9 @@ impl Headless {
             decision_step_ms: 100,
             served_load_ms: None,
             decisions: Vec::new(),
+            recovered_decisions: Vec::new(),
+            screen_fails_in_decision: None,
+            input_fails_in_decision: None,
             deadline_steps: Vec::new(),
             closed_epochs: 0,
             decision_looks: Vec::new(),
@@ -1452,6 +1464,12 @@ impl AppRig for Headless {
     fn entered_decision(&mut self, pick: &Pick) {
         let i = self.chosen.unwrap();
         self.decisions.push((i, self.at()));
+        if let Some(ms) = self.screen_fails_in_decision.take() {
+            self.screen_fails_at = self.at() + ms * MS;
+        }
+        if let Some(ms) = self.input_fails_in_decision.take() {
+            self.input_fails_at = self.at() + ms * MS;
+        }
         // The attempt's reset at the choice; the loading state shows at
         // the deadline.
         if let Pick::Play(_) = pick {
@@ -1463,6 +1481,11 @@ impl AppRig for Headless {
             }
             self.loading = Some(i);
         }
+    }
+
+    fn recovered_decision(&mut self) {
+        let before = self.decision_looks.last().map(|&(o, _)| o);
+        self.recovered_decisions.push((self.at(), before));
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
@@ -5379,5 +5402,83 @@ fn a_failure_while_waiting_ends_the_run() {
             run.rig.page_entered_at.is_empty(),
             "{what}: the page opened"
         );
+    }
+}
+
+/// E8, ND1, ND2: the screen lost while practice waits past the deadline
+/// for its read is built again while the read is pending, the look before
+/// the recovery being the read's, its presentation sent again with no
+/// second decision screen (no second tone), and the page opens once the
+/// read is done, after the unchanged deadline.
+#[test]
+fn a_screen_lost_during_a_pending_read_is_rebuilt_with_no_second_tone() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let run = run_late_read(acts, false, |rig| {
+        rig.screen_fails_in_decision = Some(1_500);
+    });
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    let choice = chosen_at(rig, P);
+    let [(recovered, before)] = rig.recovered_decisions[..] else {
+        panic!("{:?}", rig.recovered_decisions);
+    };
+    assert_eq!(
+        before,
+        Some(game::Origin::Read),
+        "recovered during the read"
+    );
+    assert!(
+        recovered >= choice + 1_500 * MS,
+        "{recovered} from {choice}"
+    );
+    assert_eq!(rig.decisions.len(), 1, "one decision screen, one tone");
+    let entered = rig.page_entered_at[0];
+    assert!(entered > choice + 1_500 * MS, "{entered} from {choice}");
+    assert!(entered >= recovered, "{entered} {recovered}");
+}
+
+/// A second choice shows a second decision screen (its tone again); a
+/// recovery between them does not.
+#[test]
+fn each_choice_shows_its_own_decision_screen() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (6_000, Act::Back),
+        (8_000, Act::Choose(0)),
+        (14_000, Act::Close),
+    ];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+    });
+    ran.unwrap();
+    assert_eq!(rig.decisions.len(), 2, "{:?}", rig.decisions);
+    assert_eq!(
+        rig.recovered_decisions.len(),
+        1,
+        "{:?}",
+        rig.recovered_decisions
+    );
+}
+
+/// A recovery's rebuild that fails while the input thread failed
+/// meanwhile ends the run with the input thread's failure, not the
+/// screen's; with nothing else failed (the positive control) the screen's
+/// error ends it.
+#[test]
+fn a_failed_recovery_reports_a_thread_failure_first() {
+    for input_failed in [true, false] {
+        let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
+        let (_rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            decided(rig);
+            rig.screen_fails_in_decision = Some(500);
+            rig.input_fails_in_decision = input_failed.then_some(500);
+            rig.prepare_fails_from = 1;
+        });
+        if input_failed {
+            assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
+        } else {
+            assert!(matches!(ran, Err(LiveError::Screen(_))), "{ran:?}");
+        }
     }
 }
