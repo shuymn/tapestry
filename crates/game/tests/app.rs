@@ -470,6 +470,13 @@ struct Headless {
     /// The plays saved when each pause came.
     paused_before_save: Vec<usize>,
     entries: usize,
+    /// The idle waits made so far at each pass of the practice page that
+    /// polled its jobs.
+    page_polls: Vec<usize>,
+    /// The page's read is refused.
+    refuse_page_read: bool,
+    /// The page's `n`th poll (from 1) fails the run.
+    page_fails_at: Option<usize>,
     violations: Vec<String>,
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
@@ -664,6 +671,9 @@ impl Headless {
             play: None,
             finalized: Vec::new(),
             idle_waits: Vec::new(),
+            page_polls: Vec::new(),
+            refuse_page_read: false,
+            page_fails_at: None,
             edits: Vec::new(),
             presets: Vec::new(),
             chosen_names: Vec::new(),
@@ -1336,6 +1346,24 @@ impl AppRig for Headless {
         self.in_selection = true;
         self.entries += 1;
         self.seen.push(Seen::Select);
+    }
+
+    fn practice_read(&mut self, _loaded: &game::Loaded) -> Result<(), BankLost> {
+        if self.refuse_page_read {
+            return Err(BankLost);
+        }
+        Ok(())
+    }
+
+    fn poll_page(&mut self) -> Result<(), LiveError<SurfaceLost>> {
+        self.page_polls.push(self.idle_waits.len());
+        if self.page_fails_at == Some(self.page_polls.len()) {
+            return Err(LiveError::Load(game::coord::LoadFailure {
+                job: game::coord::JobKind::Bank,
+                cause: game::coord::Failure::Panicked(game::coord::JobPanic("test".to_owned())),
+            }));
+        }
+        Ok(())
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
@@ -4791,4 +4819,46 @@ fn an_audio_failure_during_a_cancelled_load_ends_the_run_at_the_next_look() {
         assert_eq!(run.rig.seen, seen);
         assert_eq!(run.rig.opens, 0);
     }
+}
+
+/// The practice page polls its jobs on every pass with no input: one poll
+/// before each idle wait, and one at the pass that takes Back.
+#[test]
+fn the_page_polls_its_jobs_on_every_pass_with_no_input() {
+    let acts = vec![
+        (0, Act::Practice(P)),
+        (1_000, Act::Page(PracticeInput::Back)),
+        (500, Act::Close),
+    ];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let polls = &rig.page_polls;
+    assert!(polls.len() >= 4, "{polls:?}");
+    assert!(
+        polls.windows(2).all(|w| w[1] == w[0] + 1),
+        "an idle wait without a poll: {polls:?}"
+    );
+}
+
+/// A refused page read returns to selection with the refusal, and the
+/// page never opens.
+#[test]
+fn a_refused_page_read_returns_to_selection() {
+    let acts = vec![(0, Act::Practice(P)), (500, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_page_read = true);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert_eq!(rig.seen, [Seen::Select, Seen::Select, Seen::Refused(P)]);
+    assert!(rig.page_polls.is_empty());
+}
+
+/// A page job's failure the run ends with, found by a pass of the page
+/// with no input, ends the run with it.
+#[test]
+fn a_page_job_failure_ends_the_run_at_its_pass() {
+    let acts = vec![(0, Act::Practice(P)), (5_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.page_fails_at = Some(3));
+    assert!(matches!(ran, Err(LiveError::Load(_))), "{ran:?}");
+    assert_eq!(rig.page_polls.len(), 3);
 }
