@@ -734,9 +734,8 @@ struct KeyInput<'a> {
 /// stamped as observed; a release to tuning; a real press to tuning and
 /// the system controls, then to the menus as a key and its printable text,
 /// stamped with the ingress word as observed (design.md "Play Lifecycle",
-/// the decision screen). While the word is closed nothing goes to the
-/// menus, but Escape once the decision screen lets it through; a repeat
-/// goes only while the scene of its key's press is current, so a key held
+/// the decision screen), which is checked where it is taken; a repeat goes
+/// only while the scene of its key's press is current, so a key held
 /// across a scene change needs a fresh press; a made-up press goes nowhere
 /// but the held state.
 fn keyboard(controls: &Controls, keys: &mut Keys, menu: Option<&MenuQueue>, e: KeyInput<'_>) {
@@ -776,12 +775,12 @@ fn keyboard(controls: &Controls, keys: &mut Keys, menu: Option<&MenuQueue>, e: K
         .text
         .filter(|t| !t.chars().any(char::is_control))
         .map(|t| MenuInput::Text(t.to_owned()));
+    // Every input goes with the word it was observed under; where it is
+    // taken, one from the decision screen is dropped, and an Escape past
+    // its time is the screen's to take (`Controls::admits_escape`).
     let stamp = controls.ingress();
     for input in key.into_iter().chain(text) {
-        let escape = matches!(input, MenuInput::Key(MenuKey::Escape)) && controls.escaping();
-        if stamp.is_open() || escape {
-            send_menu(menu, controls, input, Some(stamp));
-        }
+        send_menu(menu, controls, input, Some(stamp));
     }
 }
 
@@ -1882,8 +1881,9 @@ mod tests {
         assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
         assert_eq!(w.2.pop(), Some(MenuInput::Text("a".to_owned())));
         close(&w.0);
-        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
         key_press(&mut w, code(KeyCode::KeyA), false, false, Some("a"));
+        // Down is the last key pressed, in the epoch's scene.
+        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
         assert_eq!(w.2.pop(), None, "published in the epoch");
         open(&w.0);
         key_press(&mut w, code(KeyCode::ArrowDown), true, false, None);

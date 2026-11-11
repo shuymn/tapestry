@@ -489,9 +489,9 @@ struct Headless {
     served_load_ms: Option<i64>,
     /// The chosen chart at each decision screen's entry.
     decisions: Vec<(usize, i64)>,
-    /// Each recovery of the decision screen: the clock, and the origin of
-    /// the look before it.
-    recovered_decisions: Vec<(i64, Option<game::Origin>)>,
+    /// Each recovery of the decision screen: the clock, and how many looks
+    /// came before it (the look that made it is the next one recorded).
+    recovered_decisions: Vec<(i64, usize)>,
     /// The screen fails this long (ms) after the first decision screen
     /// begins.
     screen_fails_in_decision: Option<i64>,
@@ -1484,8 +1484,8 @@ impl AppRig for Headless {
     }
 
     fn recovered_decision(&mut self) {
-        let before = self.decision_looks.last().map(|&(o, _)| o);
-        self.recovered_decisions.push((self.at(), before));
+        let looks = self.decision_looks.len();
+        self.recovered_decisions.push((self.at(), looks));
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
@@ -5419,13 +5419,15 @@ fn a_screen_lost_during_a_pending_read_is_rebuilt_with_no_second_tone() {
     run.ran.as_ref().unwrap();
     let rig = &run.rig;
     let choice = chosen_at(rig, P);
-    let [(recovered, before)] = rig.recovered_decisions[..] else {
+    let [(recovered, looks)] = rig.recovered_decisions[..] else {
         panic!("{:?}", rig.recovered_decisions);
     };
+    // The look the recovery came in is the read's, not the page's hold
+    // after it.
     assert_eq!(
-        before,
+        rig.decision_looks.get(looks).map(|&(o, _)| o),
         Some(game::Origin::Read),
-        "recovered during the read"
+        "recovered only after the read"
     );
     assert!(
         recovered >= choice + 1_500 * MS,

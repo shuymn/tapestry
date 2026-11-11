@@ -3777,12 +3777,14 @@ pub(crate) mod tests {
 
     /// Stops the input thread at its next fence, `before` run there on the
     /// input thread before the fence is answered; `f` runs on the game
-    /// thread meanwhile, and the thread goes on once `f` returned.
+    /// thread meanwhile, and `held` runs while the thread is stopped after
+    /// its answer; the thread then goes on.
     #[cfg(feature = "dev-tools")]
     fn at_fence(
         rig: &mut crate::play::PlayerRig<'_>,
         before: Box<dyn FnOnce(&mut input::SourceSet) + Send>,
         f: &mut dyn FnMut(&mut crate::play::PlayerRig<'_>),
+        held: &mut dyn FnMut(),
     ) {
         let (reached, reached_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume) = std::sync::mpsc::channel();
@@ -3796,6 +3798,7 @@ pub(crate) mod tests {
             reached_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
             "the gate was reached"
         );
+        held();
         resume_tx.send(()).unwrap();
     }
 
@@ -3832,6 +3835,7 @@ pub(crate) mod tests {
                         let _ = seen_tx.send((sent(), tones_now.tone_requests()));
                     }),
                     &mut |rig| rig.entered_decision(&pick),
+                    &mut || {},
                 );
                 assert_eq!(
                     seen.recv_timeout(Duration::from_secs(60)).unwrap(),
@@ -3904,8 +3908,18 @@ pub(crate) mod tests {
                 // A refusal's return: the word opens, selection is entered
                 // and its fence answered; the thread stops after it.
                 rig.closed_epoch();
-                at_fence(rig, Box::new(|_| {}), &mut |rig| rig.entered_selection());
-                assert!(!level.read().start, "held through the screen: no panel");
+                let mut shown = None;
+                at_fence(
+                    rig,
+                    Box::new(|_| {}),
+                    &mut |rig| rig.entered_selection(),
+                    &mut || shown = Some(level.read().start),
+                );
+                assert_eq!(
+                    shown,
+                    Some(false),
+                    "held through the screen: a panel at the fence"
+                );
                 press(0x12, 0);
                 press(0x12, 1);
                 assert!(crate::render_side::tests::wait_until(|| level.read().start));

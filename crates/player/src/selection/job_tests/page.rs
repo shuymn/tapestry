@@ -1385,32 +1385,45 @@ fn a_refused_page_measurement_is_tried_once() {
 #[test]
 fn the_page_waits_for_the_charts_background_measurement() {
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
     let dir = tempfile::tempdir().unwrap();
     let page = Arc::new(Page::default());
     let (mut b, path) = plain(dir.path(), "pbg", &page);
     let s = b.sel.take().unwrap();
-    crate::shelf::tests::worker(&s.shelf).queue(crate::shelf::tests::job(&path));
+    let worker = crate::shelf::tests::worker(&s.shelf);
+    worker.queue(crate::shelf::tests::job(&path));
+    let wanted = worker.wanted(&path);
     assert_eq!(b.stepper.said(), crate::background::tests::Said::Block(0));
     let read = loaded(dir.path(), &path, Speed::NORMAL);
     let b = b;
     on_rig(s, &Installers::default(), false, |rig| {
         let got = std::thread::scope(|scope| {
             scope.spawn(|| {
-                // Steps the measurement until its check finds it promoted
-                // by the read's wait; it ends unpromoted when nothing
-                // waits for it.
-                while b.mode.leaves.load(Ordering::SeqCst) == 0 {
-                    b.stepper.step();
-                    assert!(
-                        matches!(b.stepper.said(), crate::background::tests::Said::Block(_)),
-                        "the measurement ended with no read waiting for it"
-                    );
+                // The read waits for the measurement, held at its block: a
+                // read that does not is found when the bound runs out, the
+                // measurement then let go so nothing waits for it.
+                let began = Instant::now();
+                while !wanted() && began.elapsed() < watchdog() {
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
                 }
+                let waited = wanted();
+                let alone = page.seen.lock().unwrap().is_empty();
+                if waited {
+                    // Its check finds it promoted by the wait.
+                    while b.mode.leaves.load(Ordering::SeqCst) == 0 {
+                        b.stepper.step();
+                        assert!(matches!(
+                            b.stepper.said(),
+                            crate::background::tests::Said::Block(_)
+                        ));
+                    }
+                }
+                b.stepper.finish();
+                assert!(waited, "the page's read did not wait for the measurement");
                 assert!(
-                    page.seen.lock().unwrap().is_empty(),
+                    alone,
                     "the page's decode began beside the background's bank"
                 );
-                b.stepper.finish();
             });
             let now = bms_model::TimeSource::now(&rig.clock);
             let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
