@@ -183,6 +183,26 @@ fn on_rig<R>(
     out
 }
 
+/// [`on_rig`] with its audio thread held by `gate` while it is held.
+fn on_gated_rig<R>(
+    sel: Selection,
+    gate: &Arc<crate::dev::AudioGate>,
+    f: impl FnOnce(&mut PlayerRig<'_>) -> R,
+) -> R {
+    let (out, _) = crate::tests::on_rig_gated(
+        settings(),
+        Installers::default().spawn_bare(),
+        input::QpcClock::start(),
+        Some(Arc::clone(gate)),
+        |rig, _, _| {
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            f(rig)
+        },
+    );
+    out
+}
+
 /// The load's outcome; a refusal panics with its reason.
 fn outcome(got: Result<Loading, ChartLoadError>) -> Loading {
     got.unwrap_or_else(|e| panic!("refused: {}", Chain(&e)))
@@ -1452,3 +1472,4 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
 }
 
 mod page;
+mod served;

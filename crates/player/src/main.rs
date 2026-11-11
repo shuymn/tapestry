@@ -2138,6 +2138,18 @@ mod tests {
         clock: QpcClock,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
     ) -> (R, bool) {
+        on_rig_gated(settings, render, clock, None, f)
+    }
+
+    /// [`on_rig_hooked`], its audio thread held by `gate` while it is.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_rig_gated<R>(
+        settings: game::Settings,
+        render: crate::render_side::RenderLink,
+        clock: QpcClock,
+        gate: Option<Arc<crate::dev::AudioGate>>,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
+    ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
         let controls = super::controls(&settings, clock);
@@ -2145,7 +2157,9 @@ mod tests {
         let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());
         let (audio, opened) = crate::audio_side::spawn(
             move || {
-                Ok::<_, std::convert::Infallible>((crate::dev::recording_output(clock, 1), None))
+                let mut out = crate::dev::recording_output(clock, 1);
+                out.gate = gate;
+                Ok::<_, std::convert::Infallible>((out, None))
             },
             |_| {},
         )

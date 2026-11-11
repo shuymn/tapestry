@@ -1,8 +1,7 @@
 //! WARP's turn among the tests that share one process (design.md "Testing
-//! Strategy"): WARP's shader compiler faults when two devices in one process
-//! compile at once, so a test that draws on WARP alongside others in its
-//! process, as the release allocation guards do, takes the turn first and
-//! holds it until its renderer is gone.
+//! Strategy"): a test that draws on WARP alongside others in its process, as
+//! the release allocation guards do, takes the turn first and holds it until
+//! its renderer is gone, so one WARP device at a time is alive there.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 

@@ -1542,3 +1542,68 @@ fn an_observation_stamped_under_another_word_does_not_act() {
         assert_eq!(drain(&mut rig, word).hispeed, Some(r(37, 10)), "{case}");
     }
 }
+
+/// The input side inside a decision screen being left: the fence asked is
+/// never answered, and every look leaves.
+struct Leaving {
+    asked: Option<u64>,
+}
+
+impl InputPump for Leaving {
+    fn request_fence(&mut self, n: u64) {
+        self.asked = Some(n);
+    }
+    fn wake(&mut self) {}
+    fn display_offset_us(&self) -> i64 {
+        0
+    }
+    fn look(&mut self) -> game::Verdict {
+        game::Verdict::End
+    }
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        Err(InputWaitError::Timeout)
+    }
+}
+
+/// A1 (driver), A5: a provisional close whose fence a look left stops
+/// unanswered with nothing latched, and keeps no hold: its marker,
+/// answered late, stops no drain (F2 pressed after it acts), and a newer
+/// fence is answered by its own number.
+#[test]
+fn a_stopped_provisional_close_leaves_no_hold() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+    rig.drain();
+    let mut leaving = Leaving { asked: None };
+    rig.driver.close_provisionally(&mut leaving).unwrap();
+    let late = leaving.asked.expect("its fence asked");
+    // The late answer, then a press after it.
+    let now = TimeUs(rig.now);
+    rig.set.adjustment_mut().unwrap().fence(late, now);
+    rig.keys(10 * MS, &[(F2, true)]);
+    assert_eq!(
+        rig.snap().hispeed,
+        Some(r(345, 100)),
+        "drained past the marker"
+    );
+    // Nothing latched: the next fence is asked and answered.
+    rig.close();
+    assert!(!rig.driver.accepting());
+}
+
+/// A1 (driver): an attempt's entry whose fence a look left is not entered
+/// and latches nothing: the served form returns the verdict, and the next
+/// entry goes through.
+#[test]
+fn a_left_entry_fence_latches_nothing() {
+    let mut rig = Rig::new(options(SpeedMode::Classic, 320, 300, Covers::default()));
+    let mut leaving = Leaving { asked: None };
+    assert_eq!(
+        rig.driver.enter_attempt_served(None, &mut leaving),
+        Ok(game::Served::Left(game::Verdict::End))
+    );
+    assert!(rig.driver.failure_cell().get().is_none());
+    rig.enter(-1_000_000);
+    rig.attach(tempo(150, None), -1_000_000).unwrap();
+}

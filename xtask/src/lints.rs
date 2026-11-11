@@ -252,6 +252,7 @@ pub const IN_PLAY: &[Site] = &[
     ),
     // The loading opener's deferral, as `open_gated`'s.
     Site::Fns("crates/game/src/opening.rs", &["open_loading"]),
+    Site::Fns("crates/game/src/decision.rs", &["Verdict::leaves"]),
     Site::Fns(
         "crates/game/src/session.rs",
         &[
@@ -286,6 +287,7 @@ pub const IN_PLAY: &[Site] = &[
             "serve_adjustments",
             "PlayerPump::display_offset_us",
             "PlayerPump::with_ingress",
+            "PlayerPump::look",
             "between_ingress",
             "PlayerRig::send_end",
             "PlayerRig::now",

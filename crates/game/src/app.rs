@@ -143,9 +143,12 @@ pub trait AppRig: LoadingRig {
     }
     /// The decision screen begins for `pick` (design.md "Play Lifecycle",
     /// the decision screen): its presentation and tone, its input epoch,
-    /// and the attempt's reset at the choice. Nothing by default.
-    fn entered_decision(&mut self, pick: &Pick) {
-        let _ = pick;
+    /// and the attempt's reset at the choice, whose wait serves `d`: a
+    /// leaving verdict a look returned there is left in `d`
+    /// ([`Decision::leave`]) for App to route before the chart is read.
+    /// Nothing by default.
+    fn entered_decision(&mut self, pick: &Pick, d: &mut Decision) {
+        let _ = (pick, d);
     }
     /// Each look of the decision screen from `origin`, before its
     /// classification: what needs no wait (the page's jobs in
@@ -526,9 +529,13 @@ impl App {
                 Ok(session) => {
                     decision = Decision::begin(rig.now(), rig.decision_time(), practice);
                     if decision.on() {
-                        rig.entered_decision(&pick);
+                        rig.entered_decision(&pick, &mut decision);
                     }
-                    self.play_chart(&chart, practice, session, &mut decision, rig)?
+                    // A look inside the choice's own wait left the screen.
+                    match decision.take_left() {
+                        Some(left) => left_by(Ok(next_of(left)), rig)?,
+                        None => self.play_chart(&chart, practice, session, &mut decision, rig)?,
+                    }
                 }
             };
             match went {
