@@ -609,8 +609,8 @@ impl PageJobs {
             return;
         }
         match self.claim(shelf, &chart.path, &key) {
-            Claim::Reused(_) => self.gain_known = true,
-            Claim::Running | Claim::Settling => {}
+            // A reused result is kept by the claim.
+            Claim::Reused(_) | Claim::Running | Claim::Settling => {}
             Claim::Taken | Claim::Free => {
                 let mode =
                     JobMode::new(Arc::clone(&self.mode), format!("loudness: {}", chart.name));
