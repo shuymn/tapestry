@@ -244,6 +244,7 @@ impl<'a> Rig<'a> {
             self.play.rearm();
         }
         let f = FrameInput {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now,
             display_offset: TimeUs(0),

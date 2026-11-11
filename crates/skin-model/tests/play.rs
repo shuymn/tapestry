@@ -1159,6 +1159,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
         let tally = h.tally;
         let layout = h.layout;
         let f = skin_model::SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now * MS),
             display_offset: TimeUs(0),
@@ -2123,6 +2124,126 @@ fn an_attempts_state_counts_each_gauge() {
     let three = bytes(&[GAUGES[0], GAUGES[1], GAUGES[0]]);
     let each = size_of::<GaugeDesc>() + 2 * size_of::<Option<TimeUs>>() + size_of::<GaugeValue>();
     assert_eq!(three - one, 2 * each as u64);
+}
+
+/// The application fields of the last frame `h` built: `app.fps`, the six
+/// `clock.*` fields and the three uptime fields.
+fn app_fields(h: &Harness) -> [i32; 10] {
+    std::array::from_fn(|k| h.field(field::APP_FPS + u16::try_from(k).unwrap()))
+}
+
+/// Readouts at 59 fps, the local time 2026-11-11 23:59:58 and `uptime_ms`
+/// since launch.
+fn app_at(uptime_ms: i64) -> skin_model::AppReadouts {
+    skin_model::AppReadouts {
+        fps: 59,
+        uptime_us: uptime_ms * MS,
+        local: skin_model::LocalTime {
+            year: 2_026,
+            month: 11,
+            day: 11,
+            hour: 23,
+            minute: 59,
+            second: 58,
+        },
+    }
+}
+
+/// C7, C8: `app.fps` and `clock.*` are the frame's: the presents of the
+/// last second, the local year, month 1-12, day, 24-hour hour, minute and
+/// second, whatever the attempt's state (READY, playing, Closing).
+#[test]
+fn the_application_fields_read_the_frame() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.readouts = Some(UNKNOWN);
+    h.app = app_at(3_725_999);
+    for (t, playing, closing) in [
+        (-500, false, None),
+        (500, true, None),
+        (900, false, Some(800)),
+    ] {
+        h.playing = playing;
+        h.closing = closing.map(|c| TimeUs(c * MS));
+        h.frame(t, &[]);
+        assert_eq!(
+            app_fields(&h),
+            [59, 2_026, 11, 11, 23, 59, 58, 1, 2, 5],
+            "{t}"
+        );
+    }
+    // The ring's cap, the largest year and a fresh second.
+    h.app.fps = 1_024;
+    h.app.local.year = 30_827;
+    h.app.local.second = 0;
+    h.frame(1_000, &[]);
+    assert_eq!(app_fields(&h)[..7], [1_024, 30_827, 11, 11, 23, 59, 0]);
+}
+
+/// C9: the uptime fields are ⌊u/3 600 000⌋ unwrapped, ⌊u/60 000⌋ % 60 and
+/// ⌊u/1 000⌋ % 60 of the uptime u in ms, taken from the µs uptime before
+/// any field is stored: past 24 h the hours go on, and past `i32::MAX` ms
+/// (about 24.855 days) nothing saturates or wraps.
+#[test]
+fn the_uptime_fields_split_the_launch_clock() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.readouts = Some(UNKNOWN);
+    for (t, (u, want)) in [
+        (3_725_999, [1, 2, 5]),
+        (90_000_000, [25, 0, 0]),
+        (2_160_000_000, [600, 0, 0]),
+        (2_160_061_999, [600, 1, 1]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h.app = app_at(u);
+        h.frame(100 * i64::try_from(t).unwrap(), &[]);
+        assert_eq!(app_fields(&h)[7..], want, "{u}");
+    }
+}
+
+/// Application readouts outside their fields' ranges are a malformed
+/// frame, refused as the other readouts are.
+#[test]
+fn malformed_application_readouts_are_refused() {
+    let chart = ChartBuilder::new(BPM_150)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let bad = [
+        skin_model::AppReadouts {
+            fps: 1_025,
+            ..app_at(0)
+        },
+        skin_model::AppReadouts {
+            uptime_us: -1,
+            ..app_at(0)
+        },
+    ];
+    let mut months = app_at(0);
+    months.local.month = 0;
+    let mut hours = app_at(0);
+    hours.local.hour = 24;
+    let mut seconds = app_at(0);
+    seconds.local.second = 60;
+    for app in bad.into_iter().chain([months, hours, seconds]) {
+        let mut h = Harness::empty(&chart, &full(0));
+        h.readouts = Some(UNKNOWN);
+        h.app = app;
+        assert_eq!(
+            h.try_frame_us(0, &[]),
+            Err(skin_model::BuildError::InvalidReadouts),
+            "{app:?}"
+        );
+    }
 }
 
 /// The worked chart of the rhythm clock: 120 BPM with bar lines at 0 and

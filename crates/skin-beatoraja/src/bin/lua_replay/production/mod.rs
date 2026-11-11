@@ -253,6 +253,7 @@ pub fn record(
                     while t < *len_us {
                         let state_us = clock + t;
                         let frame = LoadingFrame {
+                            app: skin_model::AppReadouts::LAUNCH,
                             now: TimeUs(state_us),
                             load: LoadState {
                                 since,
@@ -397,6 +398,7 @@ pub fn record(
                                 now <= end
                             };
                             let frame = SkinFrame {
+                                app: skin_model::AppReadouts::LAUNCH,
                                 state_us,
                                 now,
                                 display_offset: TimeUs(0),
