@@ -2150,7 +2150,7 @@ impl RenderLink {
 
     /// Holds every chart publication before it publishes while `on`, at
     /// most [`hook_bound`] each (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn hold_chart_publications(&self, on: bool) {
         self.shared.chart_hold.store(on, Ordering::SeqCst);
     }
