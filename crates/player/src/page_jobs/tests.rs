@@ -13,7 +13,8 @@ use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
 use game::coord::{Caps, Class, Coordinator, Observed, OwnedJob, Owner, Scope, Spawner, Waited};
 
 use super::{
-    JobMode, PageAt, PageBank, PageMeasure, PageProbe, spawn_page_bank, spawn_page_measure,
+    JobMode, PageAt, PageBank, PageMeasure, PageProbe, PageSink, spawn_page_bank,
+    spawn_page_measure,
 };
 use crate::loudness::fixture::{RATE, square, wav};
 use crate::priority::{PriorityError, ThreadMode};
@@ -260,7 +261,14 @@ fn bank(
         coord.subscriber(Scope::Choice),
         ("page.bms".into(), Arc::clone(chart), RATE),
         (promoted, Owner::Speculative),
-        Arc::clone(&mode),
+        (
+            Arc::clone(&mode),
+            PageSink::default(),
+            #[cfg(feature = "dev-tools")]
+            None,
+            #[cfg(not(feature = "dev-tools"))]
+            (),
+        ),
         Some(script.probe()),
     )
     .unwrap();
@@ -792,4 +800,59 @@ fn a_promotion_after_the_checkpoint_widens_at_the_next_file() {
     }
     let d = DECODE.to_owned();
     assert_eq!(seam.calls(), [Call::Enter(d.clone()), Call::Leave(d)]);
+}
+
+/// P12: a close on the page with two jobs that do not stop (the bank held
+/// at its first file, the measurement at its first block): both are
+/// settled against one shared deadline, the close's time plus
+/// [`STOP_WAIT`](super::STOP_WAIT) on the settle's clock, and abandoned
+/// there, not each after a bound of its own.
+#[test]
+fn a_close_on_the_page_settles_within_one_bound() {
+    use std::sync::atomic::AtomicU64;
+    let dir = tempfile::tempdir().unwrap();
+    let coord = coordinator(4, 2);
+    let chart = chart(dir.path(), 1, 0.2);
+    let seam = Arc::new(Seam::default());
+    let script = Script::new(&coord);
+    script.hold(PageAt::File(0), 1);
+    script.hold(PageAt::Block, 1);
+    let (bank, _) = bank(&coord, &chart, false, &seam, &script);
+    let (measure, _) = measure(&coord, &chart, false, &seam, &script);
+    script.reach(PageAt::File(0), 1);
+    script.reach(PageAt::Block, 1);
+    // The settle's clock: 10 ms on each reading, from 0.
+    let base = Instant::now();
+    let ticks = Arc::new(AtomicU64::new(0));
+    let read = Arc::clone(&ticks);
+    let mut page = super::PageJobs {
+        bank: Some(bank),
+        measure: Some(measure),
+        ..super::PageJobs::new(Arc::clone(&seam) as Arc<dyn ThreadMode>)
+    };
+    page.set_clock(Arc::new(move || {
+        base + Duration::from_millis(10 * read.fetch_add(1, Ordering::SeqCst))
+    }));
+    let mut asked = 0;
+    let found = page.leave(None, &mut || {
+        asked += 1;
+        Some(super::Terminal)
+    });
+    assert!(
+        found.failure().is_none(),
+        "nothing fatal: the jobs were left"
+    );
+    let elapsed = Duration::from_millis(10 * ticks.load(Ordering::SeqCst));
+    assert!(
+        elapsed < super::STOP_WAIT + Duration::from_millis(100),
+        "both settled within one bound: {elapsed:?}"
+    );
+    assert!(
+        elapsed >= super::STOP_WAIT,
+        "the bound was waited out: {elapsed:?}"
+    );
+    assert_eq!(asked, 1, "the cause is asked once, then shared");
+    assert!(!page.decoding() && !page.measuring());
+    script.release(PageAt::File(0), 1);
+    script.release(PageAt::Block, 1);
 }

@@ -112,6 +112,37 @@ pub trait AppRig: LoadingRig {
     fn configure(&mut self, config: &mut SessionConfig, parts: &mut Parts) {
         let _ = (config, parts);
     }
+    /// The chart chosen to practice was read at 1× (`loaded`), before its
+    /// practice page opens: the rig may begin its page jobs (design.md
+    /// "State Model", the practice page). Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// Why the chart cannot be practised: a refused load, which returns to
+    /// selection with its reason. [`Loading::Failed`] ends the run.
+    fn practice_read(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError> {
+        let _ = loaded;
+        Ok(Loading::Ready)
+    }
+    /// Each pass of the practice page, whatever the input: the rig
+    /// advances its page jobs. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// A failure of a page job the run ends with.
+    fn poll_page(&mut self) -> Result<(), LiveError<Self::ScreenError>> {
+        Ok(())
+    }
+    /// The chart chosen is left (Back, a refusal), before selection is
+    /// entered again: the rig settles what it kept of it. Nothing by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// A failure found in what it settled that the run ends with.
+    fn left_chart(&mut self) -> Result<(), LiveError<Self::ScreenError>> {
+        Ok(())
+    }
     /// The practice screen was entered, or returned to: called when it
     /// opens and after every return to it (a refused Start, the rounds
     /// left, a rebuilt screen), before anything is read there. The model
@@ -436,11 +467,12 @@ impl App {
                 Pick::Practice(chart) => (chart, true),
             };
             match self.play_chart(&chart, practice, rig)? {
-                Chosen::Left(Leave::Back) => {}
+                Chosen::Left(Leave::Back) => rig.left_chart()?,
                 Chosen::Left(Leave::Quit) => return Ok(()),
                 // A refusal never hides a thread's failure: the run ends
                 // with it instead.
                 Chosen::Refused(reason) => {
+                    rig.left_chart()?;
                     threads_over(rig)?;
                     refusal = Some(LoadRefusal { chart, reason });
                 }
@@ -551,7 +583,14 @@ impl App {
             }
         };
         let chosen = if practice {
-            practice_chart(&mut loaded, rig, &self.coord, self.spawner).map(Chosen::Left)
+            match rig.practice_read(&loaded) {
+                Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
+                Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
+                Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Ready) => {
+                    practice_chart(&mut loaded, rig, &self.coord, self.spawner).map(Chosen::Left)
+                }
+            }
         } else {
             match rig.load_chart(&loaded) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
@@ -598,6 +637,8 @@ fn practice_chart<R: AppRig>(
         if rig.quitting() {
             return Ok(Leave::Quit);
         }
+        // The page's jobs go on with no input.
+        rig.poll_page()?;
         // The quit key goes back; the other controls and a result's
         // commands mean nothing here.
         let mut back = false;

@@ -72,13 +72,20 @@ impl BankWitness {
         (s.in_flight, alive)
     }
 
-    /// The release barrier's check, before a bank decode begins: no decode
-    /// in flight and no registered bank alive; a violation is recorded and
-    /// logged.
-    pub fn check(&self) {
+    /// The release barrier's check, before a bank decode begins or a kept
+    /// bank is installed: no decode in flight and no registered bank alive
+    /// but `allowed`, the practice page's 1× bank a Start at 1× installs;
+    /// a violation is recorded and logged.
+    pub fn check(&self, allowed: Option<&Arc<audio::SoundBank>>) {
         let mut s = self.state();
         s.checks += 1;
-        let alive = s.alive();
+        let alive = s.alive()
+            - allowed.map_or(0, |a| {
+                s.banks
+                    .iter()
+                    .filter(|b| std::ptr::eq(b.as_ptr(), Arc::as_ptr(a)))
+                    .count()
+            });
         if s.in_flight != 0 || alive != 0 {
             let line = format!(
                 "bank witness: at a decode's start {} decodes in flight and {alive} banks alive",
@@ -142,16 +149,16 @@ mod tests {
         let w = BankWitness::new();
         let token = w.decode();
         assert_eq!(w.now(), (1, 0));
-        w.check();
+        w.check(None);
         assert_eq!(w.record().1.len(), 1, "a decode in flight");
         let b = bank();
         assert_eq!(w.now(), (1, 0), "a bank made, not yet registered");
         token.register(&b);
         assert_eq!(w.now(), (0, 1));
-        w.check();
+        w.check(None);
         drop(b);
         assert_eq!(w.now(), (0, 0));
-        w.check();
+        w.check(None);
         let (checks, violations) = w.record();
         assert_eq!(checks, 3);
         assert_eq!(violations.len(), 2, "{violations:?}");
@@ -163,8 +170,26 @@ mod tests {
         let w = BankWitness::new();
         drop(w.decode());
         assert_eq!(w.now(), (0, 0));
-        w.check();
+        w.check(None);
         assert!(w.record().1.is_empty());
+    }
+
+    /// The allowed bank alone alive passes a check; another bank alive
+    /// beside it does not, and neither does it once not allowed.
+    #[test]
+    fn only_the_allowed_bank_may_be_alive_at_a_check() {
+        let w = BankWitness::new();
+        let (kept, other) = (bank(), bank());
+        w.decode().register(&kept);
+        w.check(Some(&kept));
+        assert!(w.record().1.is_empty(), "{:?}", w.record().1);
+        w.check(Some(&other));
+        assert_eq!(w.record().1.len(), 1, "the kept bank, not allowed");
+        w.decode().register(&other);
+        w.check(Some(&kept));
+        assert_eq!(w.record().1.len(), 2, "another bank beside the allowed one");
+        w.check(None);
+        assert_eq!(w.record().1.len(), 3);
     }
 
     /// A third bank alive at a registration is a violation.

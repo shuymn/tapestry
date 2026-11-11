@@ -72,6 +72,8 @@ pub(crate) fn analyze(
     bank: Arc<SoundBank>,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> Analyzed {
+    #[cfg(test)]
+    analyses::began(chart);
     let began = Instant::now();
     let run = panic::catch_unwind(AssertUnwindSafe(
         || -> Result<Option<Measurement>, AnalysisError> {
@@ -229,6 +231,36 @@ pub(crate) fn log_line(line: &str, warn: bool) {
     } else {
         println!("{line}");
         log::info!("{line}");
+    }
+}
+
+/// Real analyses begun, by chart (tests): every test counting them uses a
+/// chart of its own, so tests running beside it do not count into it.
+#[cfg(test)]
+pub(crate) mod analyses {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static BEGUN: Mutex<Option<HashMap<[u8; 32], usize>>> = Mutex::new(None);
+
+    pub(super) fn began(chart: &bms_model::Chart) {
+        let mut begun = BEGUN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *begun
+            .get_or_insert_with(HashMap::new)
+            .entry(chart.identity.resolved_hash)
+            .or_default() += 1;
+    }
+
+    /// The analyses begun of the chart whose resolved hash is `hash`.
+    pub(crate) fn of(hash: [u8; 32]) -> usize {
+        BEGUN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|b| b.get(&hash).copied())
+            .unwrap_or(0)
     }
 }
 
