@@ -135,8 +135,9 @@ fn guard_field(src: &str) -> Option<i64> {
         .map(|&(_, v)| v)
 }
 
-/// The largest value of the state clock: 2^53 µs.
-const CLOCK_MAX: i64 = 1 << 53;
+/// The state clock's integer bound, ±2^53 µs: past it the program reads
+/// the clock as the double the source holds, a float.
+const CLOCK: i64 = 1 << 53;
 
 fn refusal<T>(what: &'static str) -> R<T> {
     Err(Stop::Unsupported(super::Unsupported::Construct(what)))
@@ -173,7 +174,9 @@ fn value_domain<L: Leaves>(
             off: true,
             ints: None,
         },
-        Node::StateUs => ints(0, CLOCK_MAX),
+        // The clock's integers; past ±2^53 µs (285 years of state time) it
+        // is a float this domain does not hold (design.md, the state clock).
+        Node::StateUs => ints(-CLOCK, CLOCK),
         Node::Read { .. } => match leaves.range(v) {
             Some((lo, hi)) if res.kind(v) == INT => ints(lo, hi),
             _ => return refusal("a slot written a read it cannot bound"),
@@ -429,7 +432,7 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
             Node::Read { .. } => leaves
                 .range(r)
                 .map(|(lo, hi)| (i128::from(lo), i128::from(hi))),
-            Node::StateUs => Some((0, i128::from(CLOCK_MAX))),
+            Node::StateUs => Some((-i128::from(CLOCK), i128::from(CLOCK))),
             Node::Neg(x) => exact(get(x).map(|(lo, hi)| (-hi, -lo)))?,
             // Both operands bounded: both may be integers (bounds are
             // given exactly to the nodes that may be).
