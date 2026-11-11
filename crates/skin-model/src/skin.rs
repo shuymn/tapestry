@@ -2730,6 +2730,37 @@ impl Skin {
                 .any(|e| matches!(e.kind, Kind::ChartImage(..)))
     }
 
+    /// Keeps its chart layer only if its atlas of `variant` can hold it
+    /// within `limits`: when the plan with it is refused by the per-atlas
+    /// cap ([`AtlasError::AtlasTooLarge`]), the pages the device's layers
+    /// leave ([`AtlasError::TooManyPages`]) or the layers themselves
+    /// ([`AtlasError::Limits`]), and the plan without it is not, it gives
+    /// the layer up ([`without_chart_layer`](Self::without_chart_layer))
+    /// and returns that refusal (S10-12 design §4.3, finding 10). Any other
+    /// outcome keeps everything as it is, for the build to report. Reads
+    /// no file; load-stage work.
+    pub fn fit_chart_layer(&mut self, variant: Variant, limits: AtlasLimits) -> Option<AtlasError> {
+        let kept = self.kept_layers();
+        if !kept.chart {
+            return None;
+        }
+        let refused = match self.sheet.plan_keeping(variant, limits, kept) {
+            Err(
+                e @ (AtlasError::AtlasTooLarge { .. }
+                | AtlasError::TooManyPages
+                | AtlasError::Limits),
+            ) => e,
+            Ok(_) | Err(_) => return None,
+        };
+        let without = KeptLayers {
+            chart: false,
+            ..kept
+        };
+        self.sheet.plan_keeping(variant, limits, without).ok()?;
+        self.without_chart_layer();
+        Some(refused)
+    }
+
     /// Gives up its chart layer, for an atlas that cannot hold one (S10-12
     /// design §4.3, finding 10): it then keeps none
     /// ([`kept_layers`](Self::kept_layers)), and its chart-image elements

@@ -448,6 +448,114 @@ fn a_skin_without_its_chart_layer_keeps_none() {
     assert_eq!(drawn(&h.batch), drawn(&kept.batch));
 }
 
+/// A play skin of `cells` square images of `side` texels, each drawn,
+/// each its own cut, with a chart image: its atlas needs a page per cell
+/// at sides below twice `side`.
+fn big_skin(cells: usize, side: u32) -> Skin {
+    let sheet = skin_model::Sheet::new(
+        play_support::white_root(),
+        vec![skin_model::FileDef {
+            path: "white.png".into(),
+            hi: None,
+        }],
+        (0..cells)
+            .map(|i| skin_model::ImageDef {
+                file: 0,
+                // Each its own cell: equal cuts would share one.
+                rect: Some([0, 0, side + u32::try_from(i).unwrap(), side]),
+                grid: [1, 1],
+                cycle: None,
+                filter: Filter::Linear,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let mut elements = vec![chart_image(ChartImage::Back, ChartStretch::Fill, BACK)];
+    for i in 0..cells {
+        elements.push(ElementDef {
+            source: Source::Image(u32::try_from(i).unwrap()),
+            ..mark(STAGE, "true")
+        });
+    }
+    Skin::new(def(Vec::new(), sheet, elements)).unwrap()
+}
+
+/// The fallback keeps the chart layer when the atlas holds it, and gives
+/// it up for each refusal it can matter to, when the plan without it fits:
+/// the layers the device has (`Limits`), the pages they leave
+/// (`TooManyPages`) and the per-atlas cap (`AtlasTooLarge`).
+#[test]
+fn the_chart_layer_is_given_up_only_where_it_does_not_fit() {
+    let lo = Variant::Lo;
+    // It fits: kept, nothing returned.
+    let mut s = skin();
+    let roomy = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 16,
+        reserved_layers: 1,
+    };
+    assert!(s.fit_chart_layer(lo, roomy).is_none());
+    assert!(s.has_chart_images());
+
+    // One page and the reserved layer: no layer left for the chart.
+    let mut s = skin();
+    let tight = AtlasLimits {
+        max_layers: 2,
+        ..roomy
+    };
+    assert!(matches!(
+        s.fit_chart_layer(lo, tight),
+        Some(AtlasError::Limits)
+    ));
+    assert!(!s.has_chart_images());
+    assert!(s.atlas(lo, tight, &|| false).is_ok());
+
+    // Three 1 500-texel cells at side 2 048: three pages. With the chart
+    // layer the device's four layers leave two pages; without it, three.
+    let mut s = big_skin(3, 1_500);
+    let four = AtlasLimits {
+        max_side: 2_048,
+        max_layers: 4,
+        reserved_layers: 1,
+    };
+    assert!(matches!(
+        s.fit_chart_layer(lo, four),
+        Some(AtlasError::TooManyPages)
+    ));
+    assert!(!s.has_chart_images());
+    assert_eq!(
+        s.sheet().plan_keeping(lo, four, s.kept_layers()).unwrap(),
+        4 * 1_536 * 1_536,
+        "three pages and the reserved layer, at a side the chart layer no longer raises"
+    );
+
+    // Three 8 000-texel cells, a page each: with the chart layer five
+    // layers of about 64 Mi texels pass the 256 Mi cap; without it, four
+    // stay within it.
+    let mut s = big_skin(3, 8_000);
+    let big = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 16,
+        reserved_layers: 1,
+    };
+    assert!(matches!(
+        s.fit_chart_layer(lo, big),
+        Some(AtlasError::AtlasTooLarge { .. })
+    ));
+    assert!(!s.has_chart_images());
+    let without = s.sheet().plan_keeping(lo, big, s.kept_layers()).unwrap();
+    assert!(without <= skin_model::MAX_ATLAS_TEXELS, "{without}");
+
+    // A cell too large for any side: no fallback, the build refuses.
+    let mut s = big_skin(1, 9_000);
+    assert!(s.fit_chart_layer(lo, big).is_none());
+    assert!(s.has_chart_images());
+    assert!(matches!(
+        s.atlas(lo, big, &|| false),
+        Err(AtlasError::CellTooLarge { .. })
+    ));
+}
+
 /// The plan's shape names the plan's own figures: its side, its pages,
 /// every layer it charges and their texels.
 #[cfg(feature = "dev-tools")]
