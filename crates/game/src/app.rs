@@ -119,10 +119,10 @@ pub trait AppRig: LoadingRig {
     /// # Errors
     ///
     /// Why the chart cannot be practised: a refused load, which returns to
-    /// selection with its reason.
-    fn practice_read(&mut self, loaded: &Loaded) -> Result<(), Self::BankError> {
+    /// selection with its reason. [`Loading::Failed`] ends the run.
+    fn practice_read(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError> {
         let _ = loaded;
-        Ok(())
+        Ok(Loading::Ready)
     }
     /// Each pass of the practice page, whatever the input: the rig
     /// advances its page jobs. Nothing by default.
@@ -585,7 +585,9 @@ impl App {
         let chosen = if practice {
             match rig.practice_read(&loaded) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
-                Ok(()) => {
+                Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
+                Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Ready) => {
                     practice_chart(&mut loaded, rig, &self.coord, self.spawner).map(Chosen::Left)
                 }
             }

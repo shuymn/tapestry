@@ -10,7 +10,7 @@ use game::coord::{JobKind, LoadFailure, OwnedJob, Promotion, Waited};
 
 use super::{ChartLoadError, Progress, cancelled, decode_on_permits};
 use crate::background::Claim;
-use crate::page_jobs::{PageChart, Taken, taken};
+use crate::page_jobs::{PageChart, Taken};
 use crate::play::PlayerRig;
 
 /// What a step of the Start came to.
@@ -26,41 +26,34 @@ pub(super) enum Got<T> {
 impl PlayerRig<'_> {
     /// A page job of `kind` joined by a Start: promoted (the Start is
     /// responsible for it from here) and waited for while the adjustments
-    /// are served, then settled; what its published outcome means, or, when
-    /// it was ending, what a panic it published during the settle means. A
-    /// quit gives the job back, demoted, for the page to keep.
+    /// are served, then settled: what its settle found
+    /// ([`crate::page_jobs::settled`]). A quit gives the job back, demoted,
+    /// for the page to keep.
     fn join_page<T: Clone>(
         &mut self,
         job: OwnedJob<T>,
         kind: JobKind,
     ) -> Result<Option<Taken<T>>, OwnedJob<T>> {
-        let observed = match job.promote_unless_ended() {
-            Promotion::Live => {
-                #[cfg(test)]
-                if let Some(sel) = &self.selection {
-                    sel.page.probe(crate::page_jobs::PageAt::Promoted(kind));
-                }
-                let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
-                let waited = job.wait(crate::play::MARKER_PARK, || {
-                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                    cancelled(controls)
-                });
-                match waited {
-                    Waited::Done(o) => Some(o),
-                    Waited::Stopped(_) => return Err(job),
-                }
+        if let Promotion::Live = job.promote_unless_ended() {
+            #[cfg(test)]
+            if let Some(sel) = &self.selection {
+                sel.page.probe(crate::page_jobs::PageAt::Promoted(kind));
             }
-            Promotion::Published(o) => Some(o),
-            Promotion::Ending => None,
-        };
+            let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+            let waited = job.wait(crate::play::MARKER_PARK, || {
+                crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                cancelled(controls)
+            });
+            if let Waited::Stopped(_) = waited {
+                return Err(job);
+            }
+        }
+        // Published or ending: what its settle finds is its outcome.
         let looks = super::looks!(self);
-        let late = self.selection.as_ref().and_then(|sel| {
+        Ok(self.selection.as_ref().and_then(|sel| {
             sel.page
                 .settle_one(kind, Some(job), &mut || looks.terminal())
-        });
-        Ok(observed
-            .map(|o| taken(kind, &o))
-            .or_else(|| late.map(Taken::Fatal)))
+        }))
     }
 
     /// The page's 1× bank for a Start: the one kept, the page's job joined
@@ -105,8 +98,11 @@ impl PlayerRig<'_> {
         }
         // Nothing to join: the Start decodes it, as a load does, after the
         // release barrier (a bank of another speed may be installed).
-        self.release_banks(None).map_err(ChartLoadError::Audio)?;
-        if let Some(failure) = self.selection.as_mut().and_then(|s| s.page.take_fatal()) {
+        if let Some(failure) = self
+            .release_banks(None)
+            .map_err(ChartLoadError::Audio)?
+            .failure()
+        {
             return Ok(Got::Failed(failure));
         }
         if cancelled(self.controls) {
@@ -118,6 +114,31 @@ impl PlayerRig<'_> {
             sel.page.keep_bank(&mut sel.shelf, page, Arc::clone(bank));
         }
         Ok(got)
+    }
+
+    /// The one way a practice Start accepts the gain of its bank at another
+    /// speed: the bank's key against the 1× key the gain is of (the page's
+    /// 1× bank, looked up or measured), whatever the Start knew as it
+    /// began. Sounds replaced since: `false`, the 1× graph forgotten so it
+    /// runs again, once (`retried`); replaced again, the Start plays at the
+    /// headroom.
+    pub(super) fn speed_gain(
+        &mut self,
+        chart: &bms_model::Chart,
+        bank: &audio::SoundBank,
+        retried: &mut bool,
+    ) -> Result<bool, ChartLoadError> {
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        if sel.page.bank_key() == crate::loudness::key(chart, bank) {
+            return Ok(true);
+        }
+        if std::mem::replace(retried, true) {
+            println!("load: the sounds changed again; this Start plays at the headroom");
+            return Ok(true);
+        }
+        println!("load: the sounds changed since their gain was measured");
+        sel.page.forget();
+        Ok(false)
     }
 
     /// The gain of the page's chart before the Start's bank: known, or the

@@ -1614,12 +1614,15 @@ impl PlayerRig<'_> {
     fn release_banks(
         &mut self,
         kept: Option<&Arc<audio::SoundBank>>,
-    ) -> Result<(), game::AudioLoadError> {
+    ) -> Result<crate::page_jobs::Settlement, game::AudioLoadError> {
         self.restorer = None;
         let looks = looks!(self);
-        if let Some(sel) = &mut self.selection {
-            sel.page.settle(kept.is_some(), &mut || looks.terminal());
-        }
+        let settled = self.selection.as_mut().map(|sel| {
+            sel.page
+                .settle(kept.is_some(), &mut || looks.terminal())
+                .failure()
+        });
+        let settled = crate::page_jobs::Settlement::of(settled.flatten());
         #[cfg(test)]
         {
             let decodes = self.selection.as_ref().and_then(|s| s.decodes.clone());
@@ -1633,7 +1636,7 @@ impl PlayerRig<'_> {
         if let Some(sel) = &self.selection {
             sel.witness.check(kept);
         }
-        Ok(())
+        Ok(settled)
     }
 
     /// Gives the select screen's updates the settings a skin shows
@@ -2227,13 +2230,13 @@ impl AppRig for PlayerRig<'_> {
             .section()
             .and(self.selection.as_ref())
             .and_then(|s| s.page.chart_of(loaded.path()).cloned());
-        // At another speed with the gain known, the 1× bank is not needed;
-        // the speed's bank then shows whether the sounds are still the ones
-        // the gain is of, and when they are not, the 1× graph runs again.
-        let mut known = speed != bms_model::Speed::NORMAL
-            && self.selection.as_ref().is_some_and(|s| s.page.gain_known());
-        let mut checked = false;
+        let mut retried = false;
         let bank = loop {
+            // At another speed with the gain known, the 1× bank is not
+            // needed. This only spares the decode: the speed's bank is
+            // checked against the gain's key below whatever it says.
+            let known = speed != bms_model::Speed::NORMAL
+                && self.selection.as_ref().is_some_and(|s| s.page.gain_known());
             let mut reused = None;
             if let Some(practised) = practised.as_ref().filter(|_| !known) {
                 let bank = match self.page_bank(practised, &progress)? {
@@ -2260,9 +2263,11 @@ impl AppRig for PlayerRig<'_> {
             // Every earlier bank's owners go before this decode begins (the
             // page's kept bank stays when this Start installs it); an unload
             // the audio thread does not take refuses the load here.
-            self.release_banks(reused.as_ref())
-                .map_err(ChartLoadError::Audio)?;
-            if let Some(failure) = self.selection.as_mut().and_then(|s| s.page.take_fatal()) {
+            if let Some(failure) = self
+                .release_banks(reused.as_ref())
+                .map_err(ChartLoadError::Audio)?
+                .failure()
+            {
                 return Ok(Loading::Failed(failure));
             }
             // A quit or a close during the unload, whose wait reads neither:
@@ -2282,13 +2287,10 @@ impl AppRig for PlayerRig<'_> {
                     Got::Failed(failure) => return Ok(Loading::Failed(failure)),
                 },
             };
-            // Sounds replaced since the gain was known: their gain is
-            // measured, once, on 1× again.
-            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-            if known && !checked && sel.page.bank_key() != crate::loudness::key(chart, &bank) {
-                println!("load: the sounds changed since their gain was measured");
-                sel.page.forget();
-                (known, checked) = (false, true);
+            if practised.is_some()
+                && speed != bms_model::Speed::NORMAL
+                && !self.speed_gain(chart, &bank, &mut retried)?
+            {
                 drop(bank);
                 continue;
             }
@@ -2467,9 +2469,8 @@ impl AppRig for PlayerRig<'_> {
         };
         sel.coord.advance(game::coord::Scope::Choice);
         sel.page
-            .leave(Some(&mut sel.shelf), &mut || looks.terminal());
-        sel.page
-            .take_fatal()
+            .leave(Some(&mut sel.shelf), &mut || looks.terminal())
+            .failure()
             .map_or(Ok(()), |f| Err(game::LiveError::Load(f)))
     }
 
@@ -2520,8 +2521,14 @@ impl AppRig for PlayerRig<'_> {
     /// The played bank goes first (the release barrier), then the page's
     /// 1× bank begins at background priority (design.md "State Model",
     /// the practice page).
-    fn practice_read(&mut self, loaded: &Loaded) -> Result<(), ChartLoadError> {
-        self.release_banks(None).map_err(ChartLoadError::Audio)?;
+    fn practice_read(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+        if let Some(failure) = self
+            .release_banks(None)
+            .map_err(ChartLoadError::Audio)?
+            .failure()
+        {
+            return Ok(Loading::Failed(failure));
+        }
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let chart = crate::page_jobs::PageChart {
             path: loaded.path().to_owned(),
@@ -2536,7 +2543,7 @@ impl AppRig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             &sel.witness,
         );
-        Ok(())
+        Ok(Loading::Ready)
     }
 
     fn poll_page(&mut self) -> Result<(), game::LiveError<ScreenError>> {

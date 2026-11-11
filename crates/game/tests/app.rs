@@ -1348,11 +1348,11 @@ impl AppRig for Headless {
         self.seen.push(Seen::Select);
     }
 
-    fn practice_read(&mut self, _loaded: &game::Loaded) -> Result<(), BankLost> {
+    fn practice_read(&mut self, _loaded: &game::Loaded) -> Result<Loading, BankLost> {
         if self.refuse_page_read {
             return Err(BankLost);
         }
-        Ok(())
+        Ok(Loading::Ready)
     }
 
     fn poll_page(&mut self) -> Result<(), LiveError<SurfaceLost>> {

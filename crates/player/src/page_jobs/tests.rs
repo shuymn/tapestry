@@ -834,10 +834,14 @@ fn a_close_on_the_page_settles_within_one_bound() {
         base + Duration::from_millis(10 * read.fetch_add(1, Ordering::SeqCst))
     }));
     let mut asked = 0;
-    page.leave(None, &mut || {
+    let found = page.leave(None, &mut || {
         asked += 1;
         Some(super::Terminal)
     });
+    assert!(
+        found.failure().is_none(),
+        "nothing fatal: the jobs were left"
+    );
     let elapsed = Duration::from_millis(10 * ticks.load(Ordering::SeqCst));
     assert!(
         elapsed < super::STOP_WAIT + Duration::from_millis(100),
