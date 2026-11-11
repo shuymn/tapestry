@@ -1238,8 +1238,8 @@ fn play(
     let ran = skins_then_chart(&mut loaded, &mut rig);
     #[cfg(feature = "dev-tools")]
     let script_failed = result_script_failure(&rig);
-    let rendered = rig.shut_down();
-    window_thread.close_after(rendered != RenderEnd::Stuck);
+    let ended = rig.shut_down();
+    window_thread.close_after(ended.rendered != RenderEnd::Stuck);
     // Not joined: an input thread that stopped answering must not hold up
     // the exit or the report of why the run ended. Its wake report is not
     // used here.
@@ -1250,6 +1250,7 @@ fn play(
         t.detach();
     }
     ran?;
+    ended.page?;
     #[cfg(feature = "dev-tools")]
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the result script failed: {why}");
@@ -1739,10 +1740,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         let script = rig.selection.as_mut().and_then(|sel| sel.script.take());
         (sc, script)
     });
-    let rendered = rig.shut_down();
+    let ended = rig.shut_down();
+    let rendered = ended.rendered;
     if let Some(w) = window_thread {
         w.close_after(rendered != RenderEnd::Stuck);
     }
+    // A practice page job's panic found as the run ended ends it with it.
+    let ran = ran.and(ended.page.map_err(game::LiveError::Load));
     // As in `play`: not joined.
     if let Some(t) = raw_thread {
         t.detach();
@@ -1871,10 +1875,11 @@ fn headless(
     let ran = skins_then_chart(&mut loaded, &mut rig);
     let script_failed = result_script_failure(&rig);
     // Offscreen: no window to keep.
-    let _ = rig.shut_down();
+    let ended = rig.shut_down();
     // As in `play`: not joined.
     input_thread.detach();
     ran?;
+    ended.page?;
     if let Some(why) = script_failed {
         anyhow::bail!("dev: the result script failed: {why}");
     }

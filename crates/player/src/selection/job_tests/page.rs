@@ -923,9 +923,9 @@ fn sounds_replaced_after_the_page_measured_are_measured_again() {
 }
 
 /// A failure of the input or audio thread that comes after the leave's
-/// settle began bounds it: a page bank that never stops (held at its
-/// file) is given up within the stop bound on the settle's clock, and the
-/// chart is left.
+/// settle took its first, healthy, look at the terminal causes bounds it:
+/// a page bank that never stops (held at its file) is given up within the
+/// stop bound on the settle's clock, and the chart is left.
 #[test]
 fn a_failure_during_the_leave_bounds_its_settle() {
     let dir = tempfile::tempdir().unwrap();
@@ -949,13 +949,15 @@ fn a_failure_during_the_leave_bounds_its_settle() {
                 )
             }));
             let lost = Arc::clone(&rig.audio_lost);
-            let coord = b.coord.clone();
-            let choice = coord.current(Scope::Choice);
+            // The failure comes right after the settle's first look, which
+            // found none.
+            let fails = Arc::clone(&lost);
+            page.on(PageAt::Looked, move || {
+                fails.store(true, std::sync::atomic::Ordering::Release);
+            });
             let returned = std::sync::atomic::AtomicBool::new(false);
             let bounded = std::thread::scope(|s| {
                 let helper = s.spawn(|| {
-                    until("the leave began", || coord.current(Scope::Choice) != choice);
-                    lost.store(true, std::sync::atomic::Ordering::Release);
                     let began = std::time::Instant::now();
                     while !returned.load(std::sync::atomic::Ordering::SeqCst)
                         && began.elapsed() < watchdog() / 2
@@ -1076,6 +1078,196 @@ fn a_failed_page_measurement_is_measured_again_by_the_start() {
                     .look_up_page(&chart, &bank, "a.bms")
                     .is_none(),
                 "the Start's measurement kept"
+            );
+        },
+    );
+}
+
+/// The sounds replaced while the page still measures the old ones: a
+/// Start at another speed joins that measurement, then its speed's bank
+/// shows other sounds, so it measures them on 1× again before it plays,
+/// not at the headroom.
+#[test]
+fn sounds_replaced_during_the_page_measurement_are_measured_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "r2-gain", &page);
+    let (held, go) = page.hold(PageAt::Block);
+    page.on(PageAt::Promoted(JobKind::Measure), move || {
+        go.send(()).unwrap()
+    });
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let hash = hash(dir.path(), &path);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            until("the page measures", || {
+                rig.poll_page().unwrap();
+                sel(rig).page.measuring()
+            });
+            held.recv_timeout(watchdog())
+                .expect("inside the page's measurement");
+            assert!(!sel(rig).page.gain_known(), "the gain unknown at the Start");
+            write_sound(dir.path(), 9_000);
+            let fast = practiced(dir.path(), &path, Speed::FASTEST);
+            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                2,
+                "the replaced sounds were not measured"
+            );
+            assert_ne!(
+                sel(rig).shelf.gain(),
+                audio::Gain::HEADROOM,
+                "played at the headroom"
+            );
+        },
+    );
+    assert_eq!(witnessed(&b).1, Vec::<String>::new());
+}
+
+/// A Start's quit leaves the page bank promoted; the run then ends (a
+/// close) before the page looks at it again, and it panics while the run's
+/// end settles it: the run ends with that panic, after its cleanup.
+#[test]
+fn a_responsible_panic_at_the_runs_end_ends_the_run_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "r2-end", &page);
+    let (held, go) = page.hold(PageAt::File(0));
+    page.panic_at(PageAt::File(0));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let start = practiced(dir.path(), &path, Speed::NORMAL);
+    let ended = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            held.recv_timeout(watchdog()).expect("the page's decode");
+            rig.controls.command(game::Command::Quit);
+            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            while game::Rig::take(rig).is_some() {}
+            // Published only once the run's end looks at it.
+            page.on(PageAt::Looked, move || go.send(()).unwrap());
+            rig.page_at_end()
+        },
+    );
+    assert!(
+        matches!(
+            ended,
+            Err(game::coord::LoadFailure {
+                job: JobKind::Bank,
+                cause: game::coord::Failure::Panicked(_),
+            })
+        ),
+        "the panic dropped at the run's end: {ended:?}"
+    );
+}
+
+/// A page bank the Start was responsible for publishes its bank, then its
+/// thread panics as it ends: found by the page's next pass, or by a Start
+/// that joins it, the panic ends the run; the bank is not kept.
+#[test]
+fn a_panic_after_publication_ends_the_run_through_the_pass_and_the_start() {
+    for joined in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let page = Arc::new(Page::default());
+        let (mut b, path) = plain(dir.path(), "r2-after", &page);
+        let (held, go) = page.hold(PageAt::File(0));
+        sel_of(&mut b).page.panic_after_publication = true;
+        let read = loaded(dir.path(), &path, Speed::NORMAL);
+        let start = practiced(dir.path(), &path, Speed::NORMAL);
+        let failure = on_rig(
+            b.sel.take().unwrap(),
+            &Installers::default(),
+            false,
+            |rig| {
+                rig.practice_read(&read).unwrap();
+                held.recv_timeout(watchdog()).expect("the page's decode");
+                if joined {
+                    page.on(PageAt::Promoted(JobKind::Bank), move || {
+                        go.send(()).unwrap()
+                    });
+                    match outcome(rig.load_chart(&start)) {
+                        Loading::Failed(f) => Some(f),
+                        other => panic!("the panic after publication was dropped: {other:?}"),
+                    }
+                } else {
+                    rig.controls.command(game::Command::Quit);
+                    assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+                    while game::Rig::take(rig).is_some() {}
+                    go.send(()).unwrap();
+                    let mut ended = None;
+                    until("the page's pass finds the panic", || {
+                        match rig.poll_page() {
+                            Err(game::LiveError::Load(f)) => ended = Some(f),
+                            Err(e) => panic!("{e:?}"),
+                            Ok(()) => assert!(
+                                sel(rig).page.kept().is_none(),
+                                "the panic after publication was dropped"
+                            ),
+                        }
+                        ended.is_some()
+                    });
+                    ended
+                }
+            },
+        );
+        assert!(
+            matches!(
+                failure,
+                Some(game::coord::LoadFailure {
+                    job: JobKind::Bank,
+                    cause: game::coord::Failure::Panicked(_),
+                })
+            ),
+            "joined: {joined}: {failure:?}"
+        );
+    }
+}
+
+/// The bench's selection, before the rig takes it.
+fn sel_of(b: &mut Bench) -> &mut super::Selection {
+    b.sel.as_mut().unwrap()
+}
+
+/// The page's measurement whose thread is refused is tried once: later
+/// passes begin none, and the Start measures.
+#[test]
+fn a_refused_page_measurement_is_tried_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = page_bench(
+        dir.path(),
+        "r2-tried",
+        Decodes::default(),
+        Spawner::refusing_owned(&[JobKind::Measure]),
+        &page,
+        Arc::new(crate::priority::Unchanged),
+    );
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let start = practiced(dir.path(), &path, Speed::NORMAL);
+    let hash = hash(dir.path(), &path);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            passes_until_idle(rig);
+            for _ in 0..3 {
+                rig.poll_page().unwrap();
+            }
+            assert_eq!(page.count(PageAt::Measuring), 1, "the page tried again");
+            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                1,
+                "measured by the Start"
             );
         },
     );

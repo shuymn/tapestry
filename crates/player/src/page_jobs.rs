@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use bms_model::{Chart, Speed};
 use game::coord::{
-    Class, Coordinator, Ctx, Failure, JobKey, JobKind, LoadFailure, Observed, Outcome, OwnedJob,
-    Owner, Scope, Settled, Spawner, Subscriber,
+    Class, Coordinator, Ctx, Failure, JobKey, JobKind, LoadFailure, Outcome, OwnedJob, Owner,
+    Scope, Settled, Spawner, Subscriber,
 };
 use library::LoudnessKey;
 
@@ -80,6 +80,10 @@ pub enum PageAt {
     /// A Start promoted the page's job of this kind, on the game thread,
     /// before it waits for it.
     Promoted(JobKind),
+    /// A settle looked at the terminal causes, on the game thread.
+    Looked,
+    /// The page begins its measurement's job, on the game thread.
+    Measuring,
 }
 
 /// A page job's test probe (tests).
@@ -98,6 +102,10 @@ pub struct JobMode {
     refused: AtomicBool,
     /// A refused call was logged.
     logged: AtomicBool,
+    /// Its job's thread panics as it lets the mode go, after its result
+    /// was published (tests).
+    #[cfg(test)]
+    panic_at_drop: AtomicBool,
     /// Refused calls, and lines logged for them (tests).
     #[cfg(test)]
     refusals: (
@@ -127,6 +135,8 @@ impl JobMode {
             logged: AtomicBool::new(false),
             #[cfg(test)]
             refusals: Default::default(),
+            #[cfg(test)]
+            panic_at_drop: AtomicBool::new(false),
         })
     }
 
@@ -183,6 +193,18 @@ impl JobMode {
             self.refusals.1.load(Ordering::Relaxed),
             self.refusals.0.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// The job's thread lets its mode go last, after its result was published:
+/// a panic there is a panic after publication (tests).
+#[cfg(test)]
+impl Drop for JobMode {
+    fn drop(&mut self) {
+        assert!(
+            !self.panic_at_drop.load(Ordering::Relaxed) || std::thread::panicking(),
+            "a page job's panic after publication (test)"
+        );
     }
 }
 
@@ -366,24 +388,65 @@ pub enum Taken<T> {
     Fatal(LoadFailure),
 }
 
-/// What `observed` of a page job of `kind` means for the page.
-pub fn taken<T: Clone>(kind: JobKind, observed: &Observed<T>) -> Taken<T> {
-    match &observed.outcome {
-        Outcome::Done(v) => Taken::Done(v.clone()),
-        Outcome::Cancelled => Taken::Redo,
-        Outcome::Panicked(p) if observed.owner == Owner::Foreground || observed.responsible => {
-            Taken::Fatal(LoadFailure {
-                job: kind,
-                cause: Failure::Panicked(p.clone()),
-            })
-        }
-        Outcome::Panicked(p) => {
+/// What a settled page job of `kind` means for the page: the one way a
+/// settle's result becomes the page's state. Its published outcome and the
+/// panic of its thread after publication are both read, under the
+/// responsibility rule ([`game::coord::Observed`]): a panic is fatal when the job was
+/// the foreground's or a Start was responsible for it, and otherwise left
+/// to a Start (logged here, once). None when nothing was published (the
+/// job ending, or left past its bound with nothing).
+#[must_use]
+pub fn settled<T: Clone>(kind: JobKind, settled: Settled<T, Terminal>) -> Option<Taken<T>> {
+    let (observed, after) = match settled {
+        Settled::Joined {
+            observed,
+            after_panic,
+            ..
+        } => (observed, after_panic),
+        Settled::Abandoned { observed, .. } => {
             crate::loudness::log_line(
-                &format!("practice: a page job stopped unexpectedly ({p}); a Start does it again"),
+                "practice: a page job did not stop in time and is left",
                 true,
             );
-            Taken::Redo
+            (observed.map(|o| (*o).clone()), None)
         }
+    };
+    let observed = observed?;
+    let panic = match (&observed.outcome, after) {
+        (Outcome::Panicked(p), _) => p.clone(),
+        (_, Some(p)) => p,
+        (Outcome::Done(v), None) => return Some(Taken::Done(v.clone())),
+        (Outcome::Cancelled, None) => return Some(Taken::Redo),
+    };
+    if observed.owner == Owner::Foreground || observed.responsible {
+        return Some(Taken::Fatal(LoadFailure {
+            job: kind,
+            cause: Failure::Panicked(panic),
+        }));
+    }
+    crate::loudness::log_line(
+        &format!("practice: a page job stopped unexpectedly ({panic}); a Start does it again"),
+        true,
+    );
+    Some(Taken::Redo)
+}
+
+/// What a settle of the page's jobs found that the run ends with: a panic
+/// a Start was responsible for. The caller must act on it.
+#[must_use]
+#[derive(Debug)]
+pub struct Settlement(Option<LoadFailure>);
+
+impl Settlement {
+    /// A settle that found `failure`.
+    pub const fn of(failure: Option<LoadFailure>) -> Self {
+        Self(failure)
+    }
+
+    /// The failure the run ends with, if any.
+    #[must_use]
+    pub fn failure(self) -> Option<LoadFailure> {
+        self.0
     }
 }
 
@@ -421,12 +484,10 @@ pub struct PageJobs {
     /// The gain needs no measurement: looked up, taken from the
     /// background, or measured. A failed measurement leaves it unknown.
     gain_known: bool,
-    /// The page has tried its one measurement: a failure or an own cancel
-    /// is left to the Start, and the page does not measure again.
+    /// The page has tried its one measurement: a failure, an own cancel or
+    /// a refused thread is left to the Start, and the page does not
+    /// measure again.
     measure_tried: bool,
-    /// A page job's panic the run ends with, published while it was
-    /// settled: kept until the caller takes it.
-    fatal: Option<LoadFailure>,
     /// The chart is claimed from the background ([`Shelf::claim`]).
     claimed: bool,
     /// An ordinary refusal of the 1× bank, kept for the Start.
@@ -440,6 +501,9 @@ pub struct PageJobs {
     /// The jobs' probe (tests).
     #[cfg(test)]
     pub probe: Option<PageProbe>,
+    /// The next job begun panics after its result is published (tests).
+    #[cfg(test)]
+    pub panic_after_publication: bool,
 }
 
 impl std::fmt::Debug for PageJobs {
@@ -466,7 +530,6 @@ impl PageJobs {
             bank_key: None,
             gain_known: false,
             measure_tried: false,
-            fatal: None,
             claimed: false,
             refusal: None,
             mode,
@@ -474,6 +537,8 @@ impl PageJobs {
             clock: Arc::new(Instant::now),
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            panic_after_publication: false,
         }
     }
 
@@ -516,6 +581,11 @@ impl PageJobs {
     ) {
         debug_assert!(self.bank.is_none() && self.measure.is_none() && self.kept.is_none());
         let mode = JobMode::new(Arc::clone(&self.mode), format!("sounds: {}", chart.name));
+        #[cfg(test)]
+        mode.panic_at_drop.store(
+            std::mem::take(&mut self.panic_after_publication),
+            Ordering::Relaxed,
+        );
         match spawn_page_bank(
             coord,
             spawner,
@@ -563,27 +633,26 @@ impl PageJobs {
         let Some(chart) = self.chart.clone() else {
             return Ok(());
         };
-        // Each job's outcome is the one observed here: its settle adds none.
-        if let Some(observed) = self.bank.as_ref().and_then(OwnedJob::poll) {
+        // A published job is settled, and what its settle found is its
+        // outcome ([`settled`]).
+        if self.bank.as_ref().is_some_and(|j| j.poll().is_some()) {
             let job = self.bank.take();
-            let _ = self.settle_one(JobKind::Bank, job, &mut || None);
-            match taken(JobKind::Bank, &observed) {
-                Taken::Done(Ok(bank)) => self.keep_bank(shelf, &chart, bank),
-                Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo => {}
-                Taken::Done(Err(e)) => self.refusal = Some(e),
-                Taken::Fatal(f) => return Err(f),
+            match self.settle_one(JobKind::Bank, job, &mut || None) {
+                Some(Taken::Done(Ok(bank))) => self.keep_bank(shelf, &chart, bank),
+                Some(Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo) | None => {}
+                Some(Taken::Done(Err(e))) => self.refusal = Some(e),
+                Some(Taken::Fatal(f)) => return Err(f),
             }
         }
-        if let Some(observed) = self.measure.as_ref().and_then(OwnedJob::poll) {
+        if self.measure.as_ref().is_some_and(|j| j.poll().is_some()) {
             let job = self.measure.take();
-            let _ = self.settle_one(JobKind::Measure, job, &mut || None);
-            match taken(JobKind::Measure, &observed) {
-                Taken::Done(Ok(m)) => self.keep_measured(shelf, m),
+            match self.settle_one(JobKind::Measure, job, &mut || None) {
+                Some(Taken::Done(Ok(m))) => self.keep_measured(shelf, m),
                 // Left to the Start, which measures in the foreground.
-                Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo => {
+                Some(Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo) | None => {
                     self.measure_tried = true;
                 }
-                Taken::Fatal(f) => return Err(f),
+                Some(Taken::Fatal(f)) => return Err(f),
             }
         }
         self.claim_or_measure(coord, spawner, shelf, &chart);
@@ -628,12 +697,6 @@ impl PageJobs {
         self.measure_tried = false;
     }
 
-    /// A page job's panic the run ends with, published while it was
-    /// settled, taken.
-    pub fn take_fatal(&mut self) -> Option<LoadFailure> {
-        self.fatal.take()
-    }
-
     /// On a miss with no measurement running: the chart claimed from the
     /// background, then measured by the page unless the background has it
     /// or had it measured already.
@@ -654,6 +717,10 @@ impl PageJobs {
             // A reused result is kept by the claim.
             Claim::Reused(_) | Claim::Running | Claim::Settling => {}
             Claim::Taken | Claim::Free => {
+                // One attempt: a refused thread is left to the Start too.
+                self.measure_tried = true;
+                #[cfg(test)]
+                self.probe(PageAt::Measuring);
                 let mode =
                     JobMode::new(Arc::clone(&self.mode), format!("loudness: {}", chart.name));
                 match spawn_page_measure(
@@ -753,28 +820,29 @@ impl PageJobs {
     }
 
     /// Settles `job` of `kind`, if any, as one of [`settle`](Self::settle)'s:
-    /// a panic it publishes meanwhile that the run ends with.
+    /// what it found ([`settled`]).
+    #[must_use]
     pub fn settle_one<T: Clone>(
         &self,
         kind: JobKind,
         job: Option<OwnedJob<T>>,
         terminal: &mut dyn FnMut() -> Option<Terminal>,
-    ) -> Option<LoadFailure> {
+    ) -> Option<Taken<T>> {
         let mut first = None;
         job.and_then(|job| self.settle_job(kind, job, &mut first, terminal))
     }
 
     /// Settles one job of `kind` against the shared deadline: [`STOP_WAIT`]
     /// from `first`, the first cause's time, once one was seen. `terminal`
-    /// is asked at every slice. A panic it published that the run ends
-    /// with (a Start was responsible for it) is returned, not dropped.
+    /// is asked at every slice. What it found ([`settled`]).
+    #[must_use]
     fn settle_job<T: Clone>(
         &self,
         kind: JobKind,
         job: OwnedJob<T>,
         first: &mut Option<Instant>,
         terminal: &mut dyn FnMut() -> Option<Terminal>,
-    ) -> Option<LoadFailure> {
+    ) -> Option<Taken<T>> {
         let clock = Arc::clone(&self.clock);
         let now = move || clock();
         let bound = first.map_or(STOP_WAIT, |at| {
@@ -785,58 +853,55 @@ impl PageJobs {
                 return Some(Terminal);
             }
             let c = terminal();
+            // After each look at the terminal causes (tests).
+            #[cfg(test)]
+            self.probe(PageAt::Looked);
             if c.is_some() {
                 *first = Some(now());
             }
             c
         };
-        let observed = match job.settle(bound, &now, &mut cause) {
-            Settled::Joined { observed, .. } => observed,
-            Settled::Abandoned { observed, .. } => {
-                crate::loudness::log_line(
-                    "practice: a page job did not stop in time and is left",
-                    true,
-                );
-                observed.map(|o| (*o).clone())
-            }
-        };
-        match observed.map(|o| taken(kind, &o)) {
-            Some(Taken::Fatal(f)) => Some(f),
-            _ => None,
-        }
+        settled(kind, job.settle(bound, &now, &mut cause))
     }
 
     /// Settles every job of the page against one shared deadline, the
     /// first terminal cause's time plus [`STOP_WAIT`] (with no cause the
     /// threads are waited for), and drops the kept bank unless `keep_bank`
     /// (a Start at 1× installs it). The page's chart stays.
-    pub fn settle(&mut self, keep_bank: bool, terminal: &mut dyn FnMut() -> Option<Terminal>) {
+    pub fn settle(
+        &mut self,
+        keep_bank: bool,
+        terminal: &mut dyn FnMut() -> Option<Terminal>,
+    ) -> Settlement {
         let mut first = None;
+        let mut fatal = None;
         if let Some(job) = self.bank.take()
-            && let Some(f) = self.settle_job(JobKind::Bank, job, &mut first, terminal)
+            && let Some(Taken::Fatal(f)) = self.settle_job(JobKind::Bank, job, &mut first, terminal)
         {
-            self.fatal.get_or_insert(f);
+            fatal.get_or_insert(f);
         }
         if let Some(job) = self.measure.take()
-            && let Some(f) = self.settle_job(JobKind::Measure, job, &mut first, terminal)
+            && let Some(Taken::Fatal(f)) =
+                self.settle_job(JobKind::Measure, job, &mut first, terminal)
         {
-            self.fatal.get_or_insert(f);
+            fatal.get_or_insert(f);
         }
         if !keep_bank {
             self.kept = None;
         }
+        Settlement(fatal)
     }
 
     /// The chart is left (Back, another choice, the run's end): every job
     /// settled as [`settle`](Self::settle), the bank dropped, the claim
-    /// given back to the background, nothing of the page kept but a fatal
-    /// panic published meanwhile ([`take_fatal`](Self::take_fatal)).
+    /// given back to the background, nothing of the page kept; what the
+    /// settle found.
     pub fn leave(
         &mut self,
         shelf: Option<&mut Shelf>,
         terminal: &mut dyn FnMut() -> Option<Terminal>,
-    ) {
-        self.settle(false, terminal);
+    ) -> Settlement {
+        let found = self.settle(false, terminal);
         if let (Some(chart), Some(shelf)) = (&self.chart, shelf)
             && self.claimed
         {
@@ -850,6 +915,7 @@ impl PageJobs {
         self.claimed = false;
         self.refusal = None;
         self.show(None);
+        found
     }
 }
 

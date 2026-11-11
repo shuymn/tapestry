@@ -1504,9 +1504,14 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
     let measured_at = at(0, "loudness: a.bms measured in ");
     assert!(
         measured_at < ready,
-        "measured after the chart was ready:
-{stdout}"
+        "measured after the chart was ready:\n{stdout}"
     );
+    // Measured by the Start (after the play screen began loading), the
+    // loading state said so before the chart was ready.
+    if measured_at > shown {
+        let measuring = at(shown, "load: measuring the loudness");
+        assert!(measuring < ready, "{stdout}");
+    }
     at(ready, "play started");
     assert!(
         !lines(&stdout, "dev: loading frames ").is_empty(),
