@@ -43,7 +43,7 @@
 //!   ([`Worker::stop_within`]). One guard publishes the thread's end
 //!   however it ends, so no waiter is left behind.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,6 +142,9 @@ struct State {
     wanted: Option<PathBuf>,
     /// Jobs ended and not yet taken.
     results: Vec<Finished>,
+    /// Charts the practice page measures itself ([`Worker::claim`]):
+    /// never queued, never taken, until [`Worker::unclaim`].
+    claimed: HashSet<PathBuf>,
 }
 
 impl State {
@@ -161,12 +164,82 @@ impl State {
     fn holds(&self, path: &Path) -> bool {
         self.current.as_ref().is_some_and(|j| j.path() == path)
     }
+
+    /// Takes the next waiting job as the one in hand, when none is held
+    /// and no pause is requested; a claimed chart's job is never taken.
+    fn pop(&mut self) {
+        if self.current.is_none() && !self.pause {
+            while let Some(job) = self.waiting.pop_front() {
+                if !self.claimed.contains(job.path()) {
+                    self.current = Some(job);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// What [`Worker::claim`] finds for `path`, without changing anything.
+    fn decide(&self, path: &Path, key: &LoudnessKey) -> Decision {
+        if let Some(i) = self
+            .results
+            .iter()
+            .position(|f| f.path == path && f.measured.is_some_and(|(k, _)| k == *key))
+        {
+            return Decision::Reuse(i);
+        }
+        if self.holds(path) {
+            return if self.may_run(path) {
+                Decision::Running
+            } else if self.promoter.is_some() {
+                Decision::Settling
+            } else {
+                Decision::TakeCurrent
+            };
+        }
+        if self.waiting.iter().any(|j| j.path() == path) {
+            Decision::TakeWaiting
+        } else {
+            Decision::Free
+        }
+    }
+}
+
+/// [`State::decide`]'s finding, taken by [`Worker::claim`] in the same
+/// critical section.
+#[derive(Clone, Copy, Debug)]
+enum Decision {
+    Reuse(usize),
+    Running,
+    Settling,
+    TakeCurrent,
+    TakeWaiting,
+    Free,
+}
+
+/// What became of a chart the practice page measures ([`Worker::claim`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Claim {
+    /// The thread measured it, under the page's key: its row, taken.
+    Reused(LoudnessRow),
+    /// The thread measures it now and goes on: claim again later.
+    Running,
+    /// The thread was told to stop it for a pause and has not returned:
+    /// claim again later.
+    Settling,
+    /// The thread had it, kept or waiting, and gave it up: the page
+    /// measures it.
+    Taken,
+    /// The thread had nothing of it: the page measures it.
+    Free,
 }
 
 #[derive(Debug, Default)]
-struct Shared {
+pub(crate) struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// Where a claim and the thread's pop wait while a test holds them.
+    #[cfg(test)]
+    hooks: tests::Hooks,
 }
 
 impl Shared {
@@ -268,7 +341,10 @@ impl Worker {
             if s.finished || s.shutdown {
                 return Queued::Ended;
             }
-            if s.holds(job.path()) || s.waiting.iter().any(|j| j.path() == job.path()) {
+            if s.holds(job.path())
+                || s.claimed.contains(job.path())
+                || s.waiting.iter().any(|j| j.path() == job.path())
+            {
                 return Queued::Already;
             }
             s.waiting.push_back(job);
@@ -289,6 +365,54 @@ impl Worker {
             s.waiting.retain(|j| j.path() != path);
             s.waiting.len() != before
         })
+    }
+
+    /// The practice page measures the chart at `path`, its 1× bank keyed
+    /// `key`, unless this thread has or does: decided and taken in one
+    /// critical section, so the thread's pop, its stop and its release
+    /// each come wholly before or after. A result under `key` is taken
+    /// ([`Claim::Reused`]); one under another key stays for the shelf. On
+    /// [`Claim::Taken`] and [`Claim::Free`] the chart is claimed: a job
+    /// kept for a pause or waiting is dropped, and none of it is queued or
+    /// taken until [`unclaim`](Self::unclaim).
+    pub fn claim(&self, path: &Path, key: &LoudnessKey) -> Claim {
+        self.shared.update(|s| {
+            let decision = s.decide(path, key);
+            #[cfg(test)]
+            self.shared.hooks.decided(&self.shared);
+            match decision {
+                Decision::Reuse(i) => {
+                    let finished = s.results.remove(i);
+                    match finished.measured {
+                        Some((_, row)) => Claim::Reused(row),
+                        None => Claim::Free,
+                    }
+                }
+                Decision::Running => Claim::Running,
+                Decision::Settling => Claim::Settling,
+                Decision::TakeCurrent => {
+                    s.current = None;
+                    s.claimed.insert(path.to_owned());
+                    Claim::Taken
+                }
+                Decision::TakeWaiting => {
+                    s.waiting.retain(|j| j.path() != path);
+                    s.claimed.insert(path.to_owned());
+                    Claim::Taken
+                }
+                Decision::Free => {
+                    s.claimed.insert(path.to_owned());
+                    Claim::Free
+                }
+            }
+        })
+    }
+
+    /// The practice page no longer measures `path`: it may be queued again.
+    pub fn unclaim(&self, path: &Path) {
+        self.shared.update(|s| {
+            s.claimed.remove(path);
+        });
     }
 
     /// Whether the thread holds the job of `path`: measuring it, or about
@@ -423,9 +547,11 @@ fn run(shared: &Shared, measure: &mut Measure, coord: &Coordinator, mode: &dyn T
                 if s.shutdown {
                     return;
                 }
-                if s.current.is_none() && !s.pause {
-                    s.current = s.waiting.pop_front();
+                #[cfg(test)]
+                if s.current.is_none() && !s.pause && !s.waiting.is_empty() {
+                    s = shared.hooks.before_pop(shared, s);
                 }
+                s.pop();
                 if let Some(job) = &s.current
                     && s.may_run(job.path())
                 {
@@ -654,6 +780,78 @@ pub(crate) mod tests {
 
     use super::{Finished, Job, Measure, Outcome, Queued, Worker};
     use crate::priority::{PriorityError, ThreadMode, Unchanged};
+
+    /// A claim's test hook, run between its decision and its take with the
+    /// state's lock held.
+    type Decided = Box<dyn Fn(&super::Shared) + Send + Sync>;
+
+    /// Where a claim and the thread's pop wait while a test holds them.
+    #[derive(Default)]
+    pub(crate) struct Hooks {
+        /// Run by every claim between its decision and its take.
+        decided: Mutex<Option<Decided>>,
+        /// Run once, the lock let go, before the thread's next pop of a
+        /// waiting job.
+        pop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl std::fmt::Debug for Hooks {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Hooks").finish_non_exhaustive()
+        }
+    }
+
+    impl Hooks {
+        pub(super) fn decided(&self, shared: &super::Shared) {
+            if let Some(hook) = &*self.decided.lock().unwrap() {
+                hook(shared);
+            }
+        }
+
+        /// The pop's hold: the guard let go while the hook runs, then
+        /// taken again.
+        pub(super) fn before_pop<'a>(
+            &self,
+            shared: &'a super::Shared,
+            guard: std::sync::MutexGuard<'a, super::State>,
+        ) -> std::sync::MutexGuard<'a, super::State> {
+            let Some(hook) = self.pop.lock().unwrap().take() else {
+                return guard;
+            };
+            drop(guard);
+            hook();
+            shared.lock()
+        }
+    }
+
+    impl Worker {
+        /// Runs `hook` in every claim between its decision and its take.
+        pub(crate) fn on_decided(&self, hook: impl Fn(&super::Shared) + Send + Sync + 'static) {
+            *self.shared.hooks.decided.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        /// Runs `hook` once before the thread's next pop of a waiting job,
+        /// the state's lock let go.
+        pub(crate) fn before_pop(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.shared.hooks.pop.lock().unwrap() = Some(Box::new(hook));
+        }
+    }
+
+    /// The thread's pop, attempted from a test: `None` when the state's
+    /// lock is held elsewhere (observed, never waited for), else the job
+    /// held after it.
+    pub(crate) fn try_pop(shared: &super::Shared) -> Option<Option<PathBuf>> {
+        let mut s = match shared.state.try_lock() {
+            Ok(s) => s,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        };
+        s.pop();
+        let held = s.current.as_ref().map(|j| j.path().to_owned());
+        drop(s);
+        shared.changed.notify_all();
+        Some(held)
+    }
 
     /// How long a test waits for what must happen however late a loaded
     /// machine runs it.

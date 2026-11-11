@@ -1600,7 +1600,7 @@ impl PlayerRig<'_> {
         self.audio.control.unload()?;
         #[cfg(feature = "dev-tools")]
         if let Some(sel) = &self.selection {
-            sel.witness.check();
+            sel.witness.check(None);
         }
         Ok(())
     }
