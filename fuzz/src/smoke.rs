@@ -1462,9 +1462,18 @@ fn skin_png_seeds_build_or_fail_as_built() {
 #[test]
 fn present_seeds_verify_or_fail_as_built() {
     let seeds = seeds::presents();
-    assert_names(&seeds, &["accepted", "jump_back", "enum_read"]);
+    assert_names(
+        &seeds,
+        &[
+            "accepted",
+            "jump_back",
+            "enum_read",
+            "const_edge",
+            "const_wide",
+        ],
+    );
     for (name, data) in &seeds {
-        let want = (*name == "accepted").then_some(2);
+        let want = matches!(*name, "accepted" | "const_edge").then_some(2);
         assert_eq!(crate::present(data), want, "{name}");
     }
 }

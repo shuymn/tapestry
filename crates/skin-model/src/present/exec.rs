@@ -10,7 +10,7 @@
 //! converted as its consumer converts it ([`super::num::to_bool`],
 //! [`super::num::to_int`], [`super::num::to_float`], a float stored as
 //! its bits): a Lua error gives the source's caught value (false, 0, `0f`)
-//! with `ok` 1; an unavailable read or an overflow gives `ok` 0;
+//! with `ok` 1; an unavailable read gives `ok` 0;
 //! an integer result of `i32::MIN` or `i32::MAX` gives `ok` 0, as the
 //! source's number draws nothing for those (`SkinNumber.java:139-143` at
 //! `0.8.9`). No heap, no recursion, no indexing.
@@ -28,7 +28,7 @@
 //!
 //! Slots are loaded and stored in the bank in place: the compiler emits a
 //! callback's stores together at its end, after every value they store is
-//! in a register, so an unavailable read or an overflow before them ends
+//! in a register, so an unavailable read or a Lua error before them ends
 //! the invocation with none of them.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -294,7 +294,7 @@ impl Present {
                     continue;
                 }
                 Insn::Ret { src } => return Ok(get(src)),
-                Insn::StateUs { dst } => (dst, Val::Int(clock.state_us)),
+                Insn::StateUs { dst } => (dst, num::clock(clock.state_us)),
                 Insn::LoadSlot { dst, slot } => (
                     dst,
                     bank.vals
@@ -356,7 +356,7 @@ fn start_of(r: Result<Val, Fail>) -> Option<i64> {
     match r {
         Ok(v) => Some(num::to_long(v)),
         Err(Fail::Error) => Some(i64::MIN),
-        Err(Fail::Unavailable | Fail::Overflow) => None,
+        Err(Fail::Unavailable) => None,
     }
 }
 
@@ -373,7 +373,7 @@ fn f32_bits(f: f32) -> i32 {
 /// a float as its bits, a Lua error the source's caught `0f` (+0's bits).
 fn convert(conv: Conv, r: Result<Val, Fail>) -> (i32, bool) {
     match (conv, r) {
-        (_, Err(Fail::Unavailable | Fail::Overflow)) => (0, false),
+        (_, Err(Fail::Unavailable)) => (0, false),
         (_, Err(Fail::Error)) => (0, true),
         (Conv::Truthy, Ok(v)) => (i32::from(num::to_bool(v)), true),
         (Conv::Int, Ok(v)) => {

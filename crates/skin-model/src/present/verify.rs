@@ -6,7 +6,7 @@
 //! |---|---|
 //! | V1 | at most [`MAX_CALLBACKS`] callbacks, one signature entry each matching its conversion; constants and reads fit `u16` indices; at most [`MAX_SKIN_OPS`] instructions |
 //! | V2 | each span inside the code, 1 to [`MAX_CALLBACK_OPS`] long, with at most [`MAX_REGISTERS`] registers |
-//! | V3 | every register below the callback's count, every constant and read index valid, every jump forward and within the span (`pc < to <= len`; the end returns nil) |
+//! | V3 | every register below the callback's count, every constant and read index valid, every integer a `Const` loads within ±2^53, every jump forward and within the span (`pc < to <= len`; the end returns nil) |
 //! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback, for a timer callback an earlier `draw` or timer, or for a slider's `Float` value an earlier `draw` |
 //! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, each gate's, and every slot the callback loads or stores; a timer callback's twice, for its two invocations) charged to the skin's [`SkinOps`] |
 //! | V7 | at most [`MAX_SLOTS`] slots, each domain's bounds ordered and within ±2^53, each initial value within its slot's domain, every slot and domain index valid, and each store's domain within its slot's |
@@ -18,7 +18,7 @@
 
 use super::{
     CallbackDef, Conv, Domain, Insn, MAX_CALLBACK_OPS, MAX_CALLBACKS, MAX_REGISTERS, MAX_SLOTS,
-    OutTy, Present, PresentDef, ReadDef,
+    OutTy, Present, PresentDef, ReadDef, Val,
 };
 use crate::expr::{MAX_SKIN_OPS, Program, SkinOps};
 use crate::schema::Ty;
@@ -40,6 +40,8 @@ pub enum PresentError {
     Registers { callback: usize },
     #[error("callback {callback}'s instruction {pc} names a register, constant or read it lacks")]
     Operand { callback: usize, pc: usize },
+    #[error("callback {callback}'s instruction {pc} loads an integer past ±2^53")]
+    Constant { callback: usize, pc: usize },
     #[error("callback {callback}'s instruction {pc} jumps backward or past its end")]
     Jump { callback: usize, pc: usize },
     #[error("read {read} is not an integer or boolean, or its guard is not a boolean")]
@@ -199,8 +201,13 @@ fn v3(def: &PresentDef, cb: &CallbackDef, code: &[Insn], k: usize) -> Result<(),
         match *insn {
             Insn::Const { dst, k: c } => {
                 reg(dst)?;
-                if usize::from(c) >= def.consts.len() {
-                    return Err(operand);
+                match def.consts.get(usize::from(c)) {
+                    None => return Err(operand),
+                    // Every integer the program holds is an exact double.
+                    Some(&Val::Int(n)) if n.unsigned_abs() > EXACT.unsigned_abs() => {
+                        return Err(PresentError::Constant { callback: k, pc });
+                    }
+                    Some(_) => {}
                 }
             }
             Insn::Read { dst, read } => {
