@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use game::coord::{JobKind, LoadFailure, Promotion, Waited};
+use game::coord::{JobKind, LoadFailure, OwnedJob, Promotion, Waited};
 
 use super::{ChartLoadError, Progress, cancelled, decode_on_permits};
 use crate::background::Claim;
@@ -34,6 +34,42 @@ impl PlayerRig<'_> {
         .then_some(Terminal)
     }
 
+    /// A page job of `kind` joined by a Start: promoted (the Start is
+    /// responsible for it from here) and waited for while the adjustments
+    /// are served, then settled; what its published outcome means, none
+    /// when it was ending. A quit gives the job back, demoted, for the page
+    /// to keep.
+    fn join_page<T: Clone>(
+        &mut self,
+        job: OwnedJob<T>,
+        kind: JobKind,
+    ) -> Result<Option<Taken<T>>, OwnedJob<T>> {
+        let observed = match job.promote_unless_ended() {
+            Promotion::Live => {
+                #[cfg(test)]
+                if let Some(sel) = &self.selection {
+                    sel.page.probe(crate::page_jobs::PageAt::Promoted(kind));
+                }
+                let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+                let waited = job.wait(crate::play::MARKER_PARK, || {
+                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                    cancelled(controls)
+                });
+                match waited {
+                    Waited::Done(o) => Some(o),
+                    Waited::Stopped(_) => return Err(job),
+                }
+            }
+            Promotion::Published(o) => Some(o),
+            Promotion::Ending => None,
+        };
+        let terminal = self.page_terminal();
+        if let Some(sel) = &self.selection {
+            sel.page.settle_one(Some(job), &mut || terminal);
+        }
+        Ok(observed.map(|o| taken(kind, &o)))
+    }
+
     /// The page's 1× bank for a Start: the one kept, the page's job joined
     /// (promoted, so it is the Start's responsibility from here), or, when
     /// the page has none to give, decoded now as a load's.
@@ -50,47 +86,28 @@ impl PlayerRig<'_> {
             return Ok(Got::Ready(Arc::clone(bank)));
         }
         if let Some(job) = sel.page.take_bank() {
-            let observed = match job.promote_unless_ended() {
-                Promotion::Live => {
-                    #[cfg(test)]
-                    sel.page
-                        .probe(crate::page_jobs::PageAt::Promoted(JobKind::Bank));
-                    let shown = Arc::clone(progress);
-                    sel.page.show(Some(Box::new(move |done, files| {
-                        shown.decoded(done, files)
-                    })));
-                    let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
-                    let waited = job.wait(crate::play::MARKER_PARK, || {
-                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                        cancelled(controls)
-                    });
-                    let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-                    sel.page.show(None);
-                    match waited {
-                        Waited::Done(o) => Some(o),
-                        // A quit: the job goes on for the page, demoted, and
-                        // the next Start takes it.
-                        Waited::Stopped(_) => {
-                            sel.page.put_bank(job);
-                            return Ok(Got::Cancelled);
-                        }
-                    }
-                }
-                Promotion::Published(o) => Some(o),
-                Promotion::Ending => None,
-            };
-            let terminal = self.page_terminal();
+            let shown = Arc::clone(progress);
+            sel.page.show(Some(Box::new(move |done, files| {
+                shown.decoded(done, files)
+            })));
+            let joined = self.join_page(job, JobKind::Bank);
             let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-            sel.page.settle_one(Some(job), &mut || terminal);
-            match observed.as_ref().map(|o| taken(JobKind::Bank, o)) {
-                Some(Taken::Done(Ok(bank))) => {
+            sel.page.show(None);
+            match joined {
+                // A quit: the job goes on for the page, demoted, and the
+                // next Start takes it.
+                Err(job) => {
+                    sel.page.put_bank(job);
+                    return Ok(Got::Cancelled);
+                }
+                Ok(Some(Taken::Done(Ok(bank)))) => {
                     progress.completed();
                     sel.page.keep_bank(&mut sel.shelf, page, Arc::clone(&bank));
                     return Ok(Got::Ready(bank));
                 }
-                Some(Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo) | None => {}
-                Some(Taken::Done(Err(e))) => return Err(ChartLoadError::Sounds(e)),
-                Some(Taken::Fatal(f)) => return Ok(Got::Failed(f)),
+                Ok(Some(Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo) | None) => {}
+                Ok(Some(Taken::Done(Err(e)))) => return Err(ChartLoadError::Sounds(e)),
+                Ok(Some(Taken::Fatal(f))) => return Ok(Got::Failed(f)),
             }
         }
         // Nothing to join: the Start decodes it, as a load does.
@@ -116,38 +133,19 @@ impl PlayerRig<'_> {
             return Ok(Got::Ready(()));
         };
         if let Some(job) = sel.page.take_measure() {
-            let observed = match job.promote_unless_ended() {
-                Promotion::Live => {
-                    #[cfg(test)]
-                    sel.page
-                        .probe(crate::page_jobs::PageAt::Promoted(JobKind::Measure));
-                    let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
-                    let waited = job.wait(crate::play::MARKER_PARK, || {
-                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                        cancelled(controls)
-                    });
-                    match waited {
-                        Waited::Done(o) => Some(o),
-                        Waited::Stopped(_) => {
-                            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-                            sel.page.put_measure(job);
-                            return Ok(Got::Cancelled);
-                        }
-                    }
-                }
-                Promotion::Published(o) => Some(o),
-                Promotion::Ending => None,
-            };
-            let terminal = self.page_terminal();
+            let joined = self.join_page(job, JobKind::Measure);
             let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-            sel.page.settle_one(Some(job), &mut || terminal);
-            match observed.as_ref().map(|o| taken(JobKind::Measure, o)) {
-                Some(Taken::Done(Ok(m))) => {
+            match joined {
+                Err(job) => {
+                    sel.page.put_measure(job);
+                    return Ok(Got::Cancelled);
+                }
+                Ok(Some(Taken::Done(Ok(m)))) => {
                     sel.page.keep_measured(&mut sel.shelf, m);
                     return Ok(Got::Ready(()));
                 }
-                Some(Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo) | None => {}
-                Some(Taken::Fatal(f)) => return Ok(Got::Failed(f)),
+                Ok(Some(Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo) | None) => {}
+                Ok(Some(Taken::Fatal(f))) => return Ok(Got::Failed(f)),
             }
         }
         // The background may have it: taken, waited for, or left to the
