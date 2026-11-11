@@ -1463,14 +1463,15 @@ fn leaving_while_the_page_waits_for_the_background_begins_no_bank() {
     read_with_the_background_held(dir.path(), "pbl", &page, |b, rig, _| {
         rig.left_chart().unwrap();
         b.stepper.finish();
+        assert!(crate::shelf::tests::worker(&sel(rig).shelf).wait_results(1, watchdog()));
+        // The measurement is done: a waiting bank would begin at a pass.
         for _ in 0..3 {
             rig.poll_page().unwrap();
         }
         assert!(
-            page.seen.lock().unwrap().is_empty(),
+            !sel(rig).page.decoding(),
             "a bank began after the chart was left"
         );
-        assert!(!sel(rig).page.decoding());
-        assert!(crate::shelf::tests::worker(&sel(rig).shelf).wait_results(1, watchdog()));
+        assert!(page.seen.lock().unwrap().is_empty());
     });
 }
