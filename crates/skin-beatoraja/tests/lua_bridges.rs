@@ -8,7 +8,7 @@ mod common;
 use common::play::{Drawn, Loader, context, round};
 use skin_beatoraja::lua::{Disposition, Unsupported};
 use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
-use skin_model::{GaugeDesc, GaugeLook, LoadingGauge, PlayContext, Quad};
+use skin_model::{GaugeDesc, GaugeLook, LoadingGauge, PlayContext, PlayScore, Quad, ScoreBasis};
 use tempfile::TempDir;
 
 /// A skin folder whose `s.luaskin` runs `body` with `ms` the host module,
@@ -540,5 +540,319 @@ fn a_frame_time_offset_read_follows_its_role() {
             ..
         }) => assert_eq!(why, Unsupported::Unresolved("callee")),
         other => panic!("{other:?}"),
+    }
+}
+
+/// The play of s10-10-design.md §8: a chart of 7 notes (2n = 14), the best
+/// 11 and the target 13, both read; drawn as `#RANDOM` when `random`.
+fn scored(body: &str, random: bool) -> Drawn {
+    scored_by(body, random, 11, 13)
+}
+
+/// [`scored`] with the best `best` (unread when 0) and the target `target`.
+fn scored_by(body: &str, random: bool, best: u32, target: u32) -> Drawn {
+    let mut d = drawn(body, 7);
+    if random {
+        d.chart.identity.random_results = vec![1];
+    }
+    let ctx = PlayContext {
+        score: PlayScore {
+            basis: ScoreBasis {
+                best,
+                best_known: best > 0,
+                target,
+            },
+            ..PlayScore::NONE
+        },
+        ..context()
+    };
+    d.play = d.skin.prepare(&d.chart, &ctx).unwrap();
+    d
+}
+
+/// §8's progress: 3 judged targets (2 PERFECT, 1 GREAT), EX 5.
+fn judged_five() -> eval::Tally {
+    let mut t = common::play::tally(5, 3);
+    t.counts.perfect = 2;
+    t.counts.great = 1;
+    t
+}
+
+/// `ex` EX over `ex / 2` PERFECTs and, for an odd `ex`, one GREAT.
+fn judged_ex(ex: u32) -> eval::Tally {
+    let mut t = common::play::tally(ex, ex / 2 + ex % 2);
+    t.counts.perfect = ex / 2;
+    t.counts.great = ex % 2;
+    t
+}
+
+/// The digits a number of `prop` shows in [`scored`] over `tally`, as
+/// [`digits`] reads them.
+fn score_digits(prop: &str, tally: eval::Tally, random: bool) -> String {
+    let mut d = scored(
+        &format!(
+            "skin.value = {{\n\
+               {{ id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8, {prop} }},\n\
+               {{ id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 }} }}\n\
+             table.insert(skin.destination, {{ id = \"v\", dst = {{ {{ x = 0, y = 900, w = 6, h = 6 }} }} }})\n\
+             table.insert(skin.destination, {{ id = \"ex\", dst = {{ {{ x = 0, y = 100, w = 6, h = 6 }} }} }})"
+        ),
+        random,
+    );
+    d.tally = tally;
+    let glyphs = d.ex_glyphs(1_000);
+    d.tally = tally;
+    let mut shown: Vec<_> = d
+        .frame(1_000, &[])
+        .into_iter()
+        .filter(|q| q.rect[1] < 500.0)
+        .collect();
+    shown.sort_by(|a, b| a.rect[0].total_cmp(&b.rect[0]));
+    shown
+        .iter()
+        .map(|q| glyphs[&q.uv.map(f32::to_bits)])
+        .collect()
+}
+
+/// s10-10-design.md C28: the best's and the target's numbers show §8's
+/// independent values, by `ref` and read by a callback: 150 the best 11,
+/// 151 and 121 the target 13, 152 the best's paced difference 1 (5 −
+/// ⌊11·3/7⌋), 153 the target's 0 (5 − ⌊13·3/7⌋), 122/123 the target's
+/// rate 92.85 and 183/184 the best's 78.57.
+#[test]
+fn the_score_figures_show_their_fields() {
+    for (id, want) in [
+        (150, "11"),
+        (151, "13"),
+        (121, "13"),
+        (152, "1"),
+        (153, "0"),
+        (122, "92"),
+        (123, "85"),
+        (183, "78"),
+        (184, "57"),
+    ] {
+        for prop in [
+            format!("ref = {id}"),
+            format!("value = function() return ms.number({id}) end"),
+        ] {
+            assert_eq!(score_digits(&prop, judged_five(), false), want, "{prop}");
+        }
+    }
+}
+
+/// s10-10-design.md C28, G15: for a `#RANDOM` chart the best's paced
+/// difference and rate draw nothing (`best.valid`), by `ref` and in a
+/// callback, while the best itself and the target's figures still show.
+#[test]
+fn a_random_chart_hides_the_comparisons_with_the_best() {
+    for id in [152, 183, 184] {
+        for prop in [
+            format!("ref = {id}"),
+            format!("value = function() return ms.number({id}) end"),
+        ] {
+            assert_eq!(score_digits(&prop, judged_five(), true), "", "{prop}");
+        }
+    }
+    assert_eq!(score_digits("ref = 150", judged_five(), true), "11");
+    assert_eq!(score_digits("ref = 153", judged_five(), true), "0");
+}
+
+/// Images `i0` drawn `10 + k` wide under the `k`-th of `ops`, each on
+/// its own destination, so a frame's widths read which hold.
+fn conditions(ops: &[i32]) -> String {
+    ops.iter()
+        .enumerate()
+        .map(|(k, op)| {
+            format!(
+                "table.insert(skin.destination, {{ id = \"i0\", op = {{ {op} }},\n\
+                   dst = {{ {{ x = 0, y = 0, w = {w}, h = 10 }} }} }})\n",
+                w = 10 + k
+            )
+        })
+        .collect()
+}
+
+/// s10-10-design.md C28: options 200 to 207 hold the current rate's band
+/// and 220 to 227 the whole-chart ranks reached, as the play computes
+/// them: none before the first judgment; over §8's progress (5/6 judged,
+/// 5/14 whole) only 201 (AA) and 225 to 227.
+#[test]
+fn the_rank_options_read_the_play_s_ranks() {
+    let ops: Vec<i32> = (200..=207).chain(220..=227).collect();
+    let mut d = scored(&conditions(&ops), false);
+    assert_eq!(read(&mut d), Vec::<i32>::new());
+    d.tally = judged_five();
+    let on: Vec<i32> = read(&mut d)
+        .iter()
+        .map(|&k| ops[usize::try_from(k).unwrap()])
+        .collect();
+    assert_eq!(on, [201, 225, 226, 227]);
+}
+
+/// s10-10-design.md C28: timers 351 and 352 start at the update whose EX
+/// reaches the best (11) and the target (13): neither at EX 5, the best's
+/// alone at 12, both at 13.
+#[test]
+fn the_best_and_target_timers_start_on_reaching_them() {
+    let body = "table.insert(skin.destination, { id = \"i0\", timer = 351,\n\
+                  dst = { { x = 0, y = 0, w = 11, h = 10 } } })\n\
+                table.insert(skin.destination, { id = \"i0\", timer = 352,\n\
+                  dst = { { x = 0, y = 0, w = 12, h = 10 } } })\n";
+    let mut d = scored(body, false);
+    d.tally = judged_five();
+    assert_eq!(read(&mut d), Vec::<i32>::new());
+    d.tally = judged_ex(12);
+    assert_eq!(read(&mut d), [1]);
+    d.tally = judged_ex(13);
+    assert_eq!(read(&mut d), [1, 2]);
+}
+
+/// A `graph` of `ty` cutting image `i0`'s source 140 px wide from the
+/// left, drawn at y `y`.
+fn score_graph(ty: i32, y: i32) -> String {
+    format!(
+        "table.insert(skin.graph, {{ id = \"g{ty}\", src = \"a\", x = 0, y = 0, w = 64, h = 4, type = {ty}, angle = 0 }})\n\
+         table.insert(skin.destination, {{ id = \"g{ty}\", dst = {{ {{ x = 0, y = {y}, w = 140, h = 4 }} }} }})\n"
+    )
+}
+
+/// s10-10-design.md C28, C29: graph types 110 to 115 are ratio bars of
+/// the play's score rates, each cut to §8's exact rate of 140 px: 110 5/14,
+/// 111 5/6, 112 4/14, 113 11/14, 114 5/14, 115 13/14; type 116 is dropped
+/// with the note every graph had.
+#[test]
+fn score_graphs_cut_to_their_rates() {
+    let mut body = String::from("skin.graph = {}\n");
+    for (k, ty) in (110..=116).enumerate() {
+        body.push_str(&score_graph(ty, 100 + 10 * i32::try_from(k).unwrap()));
+    }
+    let dir = folder(&body);
+    let i = import(&dir).unwrap();
+    let dropped: Vec<_> = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| {
+            n.kind
+                == NoteKind::Unsupported {
+                    object: skin_beatoraja::Object::Graph,
+                }
+        })
+        .collect();
+    assert_eq!(dropped.len(), 1, "{:?}", i.imported.report.notes);
+    let mut d = scored(&body, false);
+    d.tally = judged_five();
+    let mut widths: Vec<(i32, f32)> = d
+        .frame(1_000, &[])
+        .iter()
+        .map(|q| (round(q.rect)[1], q.rect[2]))
+        .collect();
+    // The destinations' `y` is from the top: the first graph is lowest.
+    widths.sort_by_key(|&(y, _)| -y);
+    let want = [
+        140.0 * 5.0 / 14.0,
+        140.0 * 5.0 / 6.0,
+        140.0 * 4.0 / 14.0,
+        140.0 * 11.0 / 14.0,
+        140.0 * 5.0 / 14.0,
+        140.0 * 13.0 / 14.0,
+    ];
+    assert_eq!(widths.len(), want.len(), "{widths:?}");
+    for ((_, got), want) in widths.iter().zip(want) {
+        assert!((got - want).abs() < 1e-3, "{widths:?}");
+    }
+}
+
+/// s10-10-design.md C28 and design.md "Rendering and Skins": a
+/// `float_number` read is taken only as an operand of `==` or `~=` whose
+/// other operand is the literal 0 (parentheses aside). Every other use is
+/// refused as no expression's type, even where
+/// the use would fold to a constant (Lua's truthiness, `not`, arithmetic
+/// whose result is only tested for truth), through a local, or against a
+/// zero computed from literals.
+#[test]
+fn other_uses_of_the_best_rate_are_refused() {
+    for draw in [
+        "return ms.float_number(113)",
+        "return not ms.float_number(113)",
+        "return ms.float_number(113) + 1",
+        "local r = ms.float_number(113) return r == 0",
+        "return ms.float_number(113) == (1 - 1)",
+    ] {
+        let body = format!(
+            "table.insert(skin.destination, {{ id = \"i0\",
+               draw = function() {draw} end,
+               dst = {{ {{ x = 0, y = 0, w = 11, h = 10 }} }} }})
+"
+        );
+        let i = import(&folder(&body)).unwrap();
+        assert_eq!(
+            i.callbacks,
+            [Disposition::Replaced(Unsupported::Type)],
+            "{draw}"
+        );
+        let refused: Vec<NoteKind> = i
+            .imported
+            .report
+            .notes
+            .iter()
+            .filter(|n| matches!(n.kind, NoteKind::Callback { .. }))
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(
+            refused,
+            [NoteKind::Callback {
+                field: "draw",
+                why: Unsupported::Type
+            }],
+            "{draw}"
+        );
+    }
+    // The literal may sit in parentheses, on either side.
+    let body = "table.insert(skin.destination, { id = \"i0\",
+                  draw = function() return (0) ~= (ms.float_number(113)) end,
+                  dst = { { x = 0, y = 0, w = 11, h = 10 } } })
+";
+    let i = import(&folder(body)).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered]);
+}
+
+/// s10-10-design.md C28: `float_number(113)` is the best's rate, read
+/// against 0: drawn as non-zero with a best (11), as zero with none and
+/// for a `#RANDOM` chart (G15). Any other use of it is no expression's
+/// type, and another id is unmapped: neither lowers, each follows its
+/// role.
+#[test]
+fn the_best_rate_reads_against_zero() {
+    let body = "table.insert(skin.destination, { id = \"i0\",\n\
+                  draw = function() return ms.float_number(113) ~= 0 end,\n\
+                  dst = { { x = 0, y = 0, w = 11, h = 10 } } })\n\
+                table.insert(skin.destination, { id = \"i0\",\n\
+                  draw = function() return 0.0 == ms.float_number(113) end,\n\
+                  dst = { { x = 0, y = 0, w = 12, h = 10 } } })\n";
+    let i = import(&folder(body)).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered, Disposition::Lowered]);
+    for (random, best, want) in [(false, 11, [1]), (false, 0, [2]), (true, 11, [2])] {
+        let mut d = scored_by(body, random, best, 13);
+        d.tally = judged_five();
+        assert_eq!(read(&mut d), want, "random {random}, best {best}");
+    }
+    for (draw, why) in [
+        ("ms.float_number(113) > 0", Unsupported::Type),
+        ("ms.float_number(113) + 1 == 1", Unsupported::Type),
+        (
+            "ms.float_number(114) ~= 0",
+            Unsupported::Unmapped { api: 2, id: 114 },
+        ),
+    ] {
+        let body = format!(
+            "table.insert(skin.destination, {{ id = \"i0\",\n\
+               draw = function() return {draw} end,\n\
+               dst = {{ {{ x = 0, y = 0, w = 11, h = 10 }} }} }})\n"
+        );
+        let i = import(&folder(&body)).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Replaced(why)], "{draw}");
     }
 }

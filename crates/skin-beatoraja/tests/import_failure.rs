@@ -369,9 +369,9 @@ fn image_choices_refuse_but_keep_genuine_holes() {
     // A group by an unsupported index, a set by an unsupported value.
     let r = images("", &[&fail("grp", "")]);
     refused_as_failure(r, &at("grp"), prop(PropertyKind::ImageIndex, Some(43)));
-    let set = r#""imageset": [{"id": "s", "images": ["i"], "value": 150}]"#;
+    let set = r#""imageset": [{"id": "s", "images": ["i"], "value": 154}]"#;
     let r = images(set, &[&fail("s", "")]);
-    refused_as_failure(r, &at("s"), prop(PropertyKind::Integer, Some(150)));
+    refused_as_failure(r, &at("s"), prop(PropertyKind::Integer, Some(154)));
     // A set entry missing for the source too is a hole, as it is
     // anywhere; one only this importer refuses is not.
     let set = r#""imageset": [{"id": "s", "images": ["i", "gone"], "value": 110}]"#;

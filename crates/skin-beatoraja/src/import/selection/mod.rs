@@ -22,8 +22,8 @@ use std::collections::HashMap;
 
 use skin_model::{
     End, ImagePartDef, KeyDef, LEVEL_STYLES, LampKey, LevelDef, MAX_PLACEMENTS, PartDef,
-    PlacementDef, Program, RatioBarDef, RatioForm, RowLabel, RowStyle, RowTextDef, SliderDirection,
-    SongListDef, Source, Track, Ty,
+    PlacementDef, Program, RatioBarDef, RatioForm, RatioSource, RowLabel, RowStyle, RowTextDef,
+    ScoreRate, ScreenKind, SliderDirection, SongListDef, Source, Track, Ty,
 };
 
 use self::profile::Class;
@@ -181,7 +181,12 @@ impl Cx<'_> {
     /// image `range` along its `angle` (`skin/SkinSlider.java:117-119`), a
     /// graph cuts it to its ratio of its width, or with `angle` 1 of its
     /// height from the bottom (`skin/SkinGraph.java:98-106`).
-    fn ratio_bar(&mut self, dst: Dst, rec: u32, graph: bool) -> Result<(), ImportError> {
+    pub(in crate::import) fn ratio_bar(
+        &mut self,
+        dst: Dst,
+        rec: u32,
+        graph: bool,
+    ) -> Result<(), ImportError> {
         let at = dst.span;
         let role = Role::Decorative;
         let [ty, angle, range, value, ref_num, changeable, event] = self.def.fields(
@@ -210,7 +215,9 @@ impl Cx<'_> {
             Some(f) => self.def.bool(f, "changeable")?,
             None => true,
         };
-        let (kind, class) = if graph {
+        let (kind, class) = if graph && self.kind == ScreenKind::Play {
+            (PropertyKind::Graph, score_graph(ty).map(Class::Bridge))
+        } else if graph {
             (PropertyKind::Graph, profile::graph(ty))
         } else {
             (PropertyKind::Slider, profile::slider(ty))
@@ -286,6 +293,13 @@ impl Cx<'_> {
         });
         self.sel.bar_spans.push(at);
         self.push(c, Source::RatioBar(index), t)
+    }
+
+    /// Whether graph `rec` of a play skin is a score graph: its `type`
+    /// read as [`Self::ratio_bar`] reads it is one of 110 to 115.
+    pub(in crate::import) fn score_graph(&mut self, rec: u32) -> Result<bool, ImportError> {
+        let [ty] = self.def.fields(rec, ["type"]);
+        Ok(score_graph(self.int_or(ty, "type", 0)?).is_some())
     }
 
     /// A destination naming the `songlist`: one song list element, the
@@ -988,4 +1002,14 @@ fn worst_quads(l: &SongListDef) -> u32 {
         .saturating_add(cells)
         .saturating_add(u32::try_from(RowLabel::COUNT).unwrap_or(u32::MAX));
     per_slot.saturating_mul(u32::try_from(l.placements.len()).unwrap_or(u32::MAX))
+}
+
+/// A play skin's graph `type` as the play's score rate (`SkinGraph.java:
+/// 95-106`, `FloatPropertyFactory.java:297-302` at `0.8.9`): 110 the
+/// current EX over the whole chart, 111 over the judged notes, 112 and
+/// 113 the best paced and whole, 114 and 115 the target's; any other type
+/// is none.
+fn score_graph(ty: i32) -> Option<RatioSource> {
+    let k = usize::try_from(ty.checked_sub(110)?).ok()?;
+    ScoreRate::ALL.get(k).copied().map(RatioSource::Score)
 }
