@@ -98,12 +98,14 @@ impl PlayerRig<'_> {
         }
         // Nothing to join: the Start decodes it, as a load does, after the
         // release barrier (a bank of another speed may be installed).
-        if let Some(failure) = self
-            .release_banks(None)
-            .map_err(ChartLoadError::Audio)?
-            .failure()
-        {
-            return Ok(Got::Failed(failure));
+        match self.release_banks(None).map_err(ChartLoadError::Audio)? {
+            // A Start is past the decision screen: no look leaves here.
+            game::Served::Left(_) => return Ok(Got::Cancelled),
+            game::Served::Done(settled) => {
+                if let Some(failure) = settled.failure() {
+                    return Ok(Got::Failed(failure));
+                }
+            }
         }
         if cancelled(self.controls) {
             return Ok(Got::Cancelled);

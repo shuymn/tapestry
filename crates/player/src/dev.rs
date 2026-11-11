@@ -2329,6 +2329,54 @@ impl Drop for Stop {
 pub struct Paced<O> {
     inner: O,
     clock: QpcClock,
+    /// Holds the audio thread between its passes (tests).
+    #[cfg(test)]
+    pub gate: Option<Arc<AudioGate>>,
+}
+
+/// The audio thread held between two passes while it is held (tests):
+/// whatever the control queue carries meanwhile waits there, untaken.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct AudioGate {
+    held: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+    /// The audio thread is waiting at the gate.
+    stopped: AtomicBool,
+}
+
+#[cfg(test)]
+impl AudioGate {
+    /// Holds the audio thread at its next pass.
+    pub fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+
+    /// Lets it go.
+    pub fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.changed.notify_all();
+    }
+
+    /// Whether the audio thread waits at the gate now.
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Waits while held, at most 60 s.
+    fn pass(&self) {
+        let mut held = self.held.lock().unwrap();
+        let began = std::time::Instant::now();
+        while *held && began.elapsed() < Duration::from_secs(60) {
+            self.stopped.store(true, Ordering::Release);
+            held = self
+                .changed
+                .wait_timeout(held, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+        self.stopped.store(false, Ordering::Release);
+    }
 }
 
 /// The recording output of a scripted run: 48 kHz, 10 ms periods, waking
@@ -2338,6 +2386,8 @@ pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutpu
     Paced {
         inner: RecordingOutput::new(device, 48_000 * seconds),
         clock,
+        #[cfg(test)]
+        gate: None,
     }
 }
 
@@ -2351,6 +2401,10 @@ impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
     }
 
     fn wait(&mut self) -> Wake {
+        #[cfg(test)]
+        if let Some(gate) = &self.gate {
+            gate.pass();
+        }
         let left = self.inner.next_wake().0 - self.clock.now().0;
         if left > 0 {
             std::thread::sleep(Duration::from_micros(left.unsigned_abs()));
@@ -2382,6 +2436,8 @@ pub fn sound_recording(clock: QpcClock, seconds: usize) -> Paced<SoundRecording>
     Paced {
         inner: SoundRecording::new(device, 48_000 * seconds),
         clock,
+        #[cfg(test)]
+        gate: None,
     }
 }
 

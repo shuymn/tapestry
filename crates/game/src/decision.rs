@@ -63,6 +63,27 @@ pub enum Verdict {
     Back,
 }
 
+impl Verdict {
+    /// Whether the decision screen is left: the run ends, or selection
+    /// returns. A wait that gets one stops and hands it to its caller.
+    #[must_use]
+    pub const fn leaves(self) -> bool {
+        matches!(self, Self::End | Self::Return | Self::Back)
+    }
+}
+
+/// How a wait the decision screen serves ended: its operation done, or the
+/// screen left by the verdict a look returned (the operation left running,
+/// its answer going nowhere). A wait never decides a transition itself; it
+/// hands the classified one to its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Served<T> {
+    /// The operation answered.
+    Done(T),
+    /// A look left the decision screen with this verdict.
+    Left(Verdict),
+}
+
 /// The decision screen of one choice, or none ([`Decision::off`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Decision {

@@ -70,6 +70,9 @@ const MARKER_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) struct PlayerPump<'a> {
     pub(crate) input: &'a InputLink,
     pub(crate) tuning: &'a crate::tuning::LiveTuning,
+    /// The controls whose watched decision screen each slice of a wait
+    /// looks at ([`Controls::look`]); none: no look.
+    pub(crate) look: Option<&'a Controls>,
     /// When this pump's waits began, in awake time: they end
     /// [`MARKER_TIMEOUT`] of awake time later, a suspend not counted.
     pub(crate) since: Option<Duration>,
@@ -93,6 +96,12 @@ impl game::InputPump for PlayerPump<'_> {
     fn with_ingress(&mut self, f: &mut game::IngressDrain<'_>) {
         self.tuning
             .with_ingress(|word| f(Some(word), &between_ingress));
+    }
+
+    fn look(&mut self) -> game::Verdict {
+        self.look
+            .and_then(Controls::look)
+            .unwrap_or(game::Verdict::Continue)
     }
 
     fn park(&mut self) -> Result<(), InputWaitError> {
@@ -150,6 +159,7 @@ pub(crate) fn serve_adjustments(
         driver.pump(&mut PlayerPump {
             input,
             tuning,
+            look: None,
             since: None,
         });
     }
@@ -1081,7 +1091,7 @@ impl PlayerRig<'_> {
     /// epoch ([`Controls::next_scene`]), so a held F3 to F8 repeats no
     /// action. Every scene change and attempt entry calls it, beside the
     /// adjustments' context change.
-    fn next_window_scene(&self) {
+    pub(crate) fn next_window_scene(&self) {
         self.controls.next_scene();
     }
 
@@ -1125,9 +1135,22 @@ impl PlayerRig<'_> {
         let pump = PlayerPump {
             input: &self.input,
             tuning: self.controls.tuning(),
+            look: None,
             since: None,
         };
         self.adjust.as_mut().map(|d| (d, pump))
+    }
+
+    /// [`adjustments`](Self::adjustments), the pump's waits looking at the
+    /// watched decision screen ([`Controls::look`]).
+    pub(crate) fn adjustments_watched(
+        &mut self,
+    ) -> Option<(&mut game::AdjustDriver, PlayerPump<'_>)> {
+        let controls = self.controls;
+        self.adjustments().map(|(driver, mut pump)| {
+            pump.look = Some(controls);
+            (driver, pump)
+        })
     }
 
     /// The practice page's jobs end with the run, within the bound: what
@@ -3034,6 +3057,7 @@ mod tests {
         let mut pump = super::PlayerPump {
             input: &link,
             tuning: controls.tuning(),
+            look: None,
             since: None,
         };
         AWAKE_MS.store(1_000, Ordering::SeqCst);
@@ -3118,6 +3142,7 @@ mod tests {
         driver.pump(&mut super::PlayerPump {
             input: &link,
             tuning: controls.tuning(),
+            look: None,
             since: None,
         });
         super::BETWEEN_INGRESS.with_borrow_mut(|f| *f = None);

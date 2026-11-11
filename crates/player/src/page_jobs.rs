@@ -495,6 +495,9 @@ pub struct PageJobs {
     /// The page's chart, read, whose 1× bank waits for its prerequisites
     /// ([`defer`](Self::defer)).
     pending: Option<PageChart>,
+    /// The release barrier's unload for the waiting bank, sent or not,
+    /// polled with no wait until the audio thread answers it.
+    unloading: Option<game::Switch>,
     /// The decision screen shows: the jobs begun are promoted and answered
     /// for by the choice (`Owner::Foreground`) until the page opens
     /// ([`hand_to_page`](Self::hand_to_page)).
@@ -540,6 +543,7 @@ impl PageJobs {
             claimed: false,
             refusal: None,
             pending: None,
+            unloading: None,
             deciding: false,
             mode,
             sink: PageSink::default(),
@@ -646,7 +650,19 @@ impl PageJobs {
     /// The bank waiting for its prerequisites, given up (a Start decodes
     /// its own).
     pub fn take_pending(&mut self) -> Option<PageChart> {
+        // Its unload left (an answer late, the next switch takes it).
+        self.unloading = None;
         self.pending.take()
+    }
+
+    /// The waiting bank's unload, while it runs.
+    pub fn unloading(&mut self) -> Option<&mut game::Switch> {
+        self.unloading.as_mut()
+    }
+
+    /// The waiting bank's unload begins (`Some`) or ends (`None`).
+    pub fn set_unloading(&mut self, unload: Option<game::Switch>) {
+        self.unloading = unload;
     }
 
     /// The waiting bank begins ([`begin`](Self::begin)), its prerequisites
@@ -992,7 +1008,7 @@ impl PageJobs {
     ) -> Settlement {
         // A bank still waiting for the background goes with it, and the
         // background's measurement goes on on its own.
-        if self.pending.take().is_some()
+        if self.take_pending().is_some()
             && let Some(shelf) = shelf.as_deref_mut()
         {
             shelf.stop_awaiting();
