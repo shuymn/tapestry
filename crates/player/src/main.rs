@@ -1650,6 +1650,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         script: s.dev.script,
         coord: coord.clone(),
         spawner: game::coord::Spawner::SYSTEM,
+        page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Checked::SYSTEM)),
         #[cfg(test)]
         decodes: None,
         #[cfg(test)]

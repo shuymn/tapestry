@@ -1090,6 +1090,12 @@ impl PlayerRig<'_> {
     /// must stay open until the process exits.
     #[must_use]
     pub fn shut_down(mut self) -> RenderEnd {
+        // The practice page's jobs end with the run, within the bound.
+        if let Some(sel) = &mut self.selection {
+            sel.page.leave(Some(&mut sel.shelf), &mut || {
+                Some(crate::page_jobs::Terminal)
+            });
+        }
         // A preparation still running settles its job before the render
         // thread and the skins go.
         self.end_prep();
