@@ -462,7 +462,8 @@ fn results_convert_as_the_source() {
             conv,
         )
     };
-    let overflow = Cb::code(
+    // 2^53 + 7 rounds to 2^53 + 8, whose low 32 bits are 8.
+    let promoted = Cb::code(
         vec![
             Insn::Const { dst: 0, k: 0 },
             Insn::Const { dst: 1, k: 1 },
@@ -474,7 +475,7 @@ fn results_convert_as_the_source() {
             },
             Insn::Ret { src: 0 },
         ],
-        vec![Val::Int(i64::MAX), Val::Int(1)],
+        vec![Val::Int(1 << 53), Val::Int(7)],
         vec![],
         Conv::Int,
     );
@@ -512,7 +513,7 @@ fn results_convert_as_the_source() {
         (error(Conv::Truthy), [0, 1]),
         (unavailable(Conv::Int), [0, 0]),
         (unavailable(Conv::Truthy), [0, 0]),
-        (overflow, [0, 0]),
+        (promoted, [8, 1]),
         (floor, [-3, 1]),
         // The end of a span with no `Ret` returns nil.
         (
@@ -586,5 +587,141 @@ fn a_reserved_value_draws_no_number() {
         let mut h = harness(s);
         h.frame(1_000, &[]);
         assert_eq!(!drawn(&h).is_empty(), shown, "{value}");
+    }
+}
+
+/// One `Arith` of registers `a` and `b` into `dst`.
+fn op(op: Arith, dst: u8, a: u8, b: u8) -> Insn {
+    Insn::Arith { op, dst, a, b }
+}
+
+/// A chain over reads of non-default values, each operation rounding its
+/// exact result once, as the source's does (design.md "beatoraja Lua
+/// Skins", numbers; the source's values from its interpreter). The reads
+/// are of the combo, so the operands are built in the frame.
+#[test]
+fn a_chain_of_reads_rounds_at_each_operation() {
+    // The combo at its largest, so the read of 2^31 - 1 stays within `i32`.
+    let combo = 9_999_999;
+    let plus = |n: i64| read(&format!("combo + {}", n - combo), Ty::Int, None);
+    let two = |x: i64, y: i64| vec![plus(x), plus(y)];
+    // (a * b) * 3.
+    let a = Cb::code(
+        vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Read { dst: 1, read: 1 },
+            op(Arith::Mul, 0, 0, 1),
+            Insn::Const { dst: 1, k: 0 },
+            op(Arith::Mul, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(3)],
+        two(2_147_483_647, 4_194_305),
+        Conv::Int,
+    );
+    // n = 2^27 * 2^26 = 2^53; (n + 1) + k.
+    let b = |k: i64| {
+        Cb::code(
+            vec![
+                Insn::Read { dst: 0, read: 0 },
+                Insn::Read { dst: 1, read: 1 },
+                op(Arith::Mul, 0, 0, 1),
+                Insn::Const { dst: 1, k: 0 },
+                op(Arith::Add, 0, 0, 1),
+                Insn::Const { dst: 1, k: 1 },
+                op(Arith::Add, 0, 0, 1),
+                Insn::Ret { src: 0 },
+            ],
+            vec![Val::Int(1), Val::Int(k)],
+            two(134_217_728, 67_108_864),
+            Conv::Int,
+        )
+    };
+    // floor(2^60) + 1, the float kept past 2^53.
+    let floor = Cb::code(
+        vec![
+            Insn::Const { dst: 0, k: 0 },
+            Insn::Math {
+                f: MathFn::Floor,
+                dst: 0,
+                a: 0,
+            },
+            Insn::Const { dst: 1, k: 1 },
+            op(Arith::Add, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Float(2.0_f64.powi(60)), Val::Int(1)],
+        vec![],
+        Conv::Int,
+    );
+    let mut p = Builder::default();
+    p.push(a);
+    p.push(b(1));
+    p.push(b(2));
+    p.push(floor);
+    assert_eq!(
+        outputs(plain(p).unwrap(), 4, 9_999_999),
+        [[2_134_900_736, 1], [0, 1], [2, 1], [0, 1]]
+    );
+}
+
+/// V3: a `Const` loading an integer past ±2^53 is refused, at either
+/// sign; ±2^53 itself, and such an integer in the pool that no `Const`
+/// loads, are accepted.
+#[test]
+fn a_constant_past_2_53_is_refused() {
+    let ret = |k: i64| plain(one_ret(Val::Int(k)));
+    for k in [(1 << 53) + 1, -(1 << 53) - 1, i64::MAX, i64::MIN] {
+        assert_eq!(
+            refused(ret(k)),
+            PresentError::Constant { callback: 0, pc: 0 },
+            "{k}"
+        );
+    }
+    for k in [1 << 53, -(1 << 53)] {
+        assert_eq!(outputs(ret(k).unwrap(), 1, 0), [[0, 1]], "{k}");
+    }
+    let mut b = Builder::default();
+    b.push(Cb::code(
+        vec![Insn::Const { dst: 0, k: 1 }, Insn::Ret { src: 0 }],
+        vec![Val::Int((1 << 53) + 1), Val::Int(5)],
+        vec![],
+        Conv::Int,
+    ));
+    assert_eq!(outputs(plain(b).unwrap(), 1, 0), [[5, 1]]);
+}
+
+/// A program of one callback returning `v` as a number's value.
+fn one_ret(v: Val) -> Builder {
+    let mut b = Builder::default();
+    b.push(Cb::ret(v, Conv::Int));
+    b
+}
+
+/// The state clock is the source's `main_state.time()`: an integer within
+/// ±2^53 and past it the double the source holds (2^53 + 1 rounding to
+/// 2^53, 2^53 + 2 exact), negative values kept.
+#[test]
+fn the_state_clock_reads_as_the_source_s_double() {
+    let mut b = Builder::default();
+    b.push(Cb::code(
+        vec![Insn::StateUs { dst: 0 }, Insn::Ret { src: 0 }],
+        vec![],
+        vec![],
+        Conv::Int,
+    ));
+    let mut h = harness(plain(b).unwrap());
+    for (us, shown) in [
+        (-1, -1),
+        (-7_000_003, -7_000_003),
+        (1 << 53, 0),
+        ((1 << 53) + 1, 0),
+        ((1 << 53) + 2, 2),
+        ((1 << 53) + 6, 6),
+    ] {
+        h.state_us = us;
+        h.frame(1_000, &[]);
+        let f = h.play.state().fields;
+        assert_eq!([f[slot(0)], f[slot(0) + 1]], [shown, 1], "{us}");
     }
 }

@@ -10,13 +10,16 @@
 //!   grid of integers and floats (zeros of both signs, infinities, NaN,
 //!   values near 2^31 and 2^53), generated from the source's pinned
 //!   interpreter by `xtask/luaj/luaj_table.sh`.
-//! - Where the Lua 5.4 VM the sandbox runs agrees with it (`+ - *`, `//`,
-//!   which the source does not have, and the `math` functions away from a
-//!   zero's sign), the grid is also checked against that VM.
+//! - Where the Lua 5.4 VM the sandbox runs agrees with it (`+ - *` of
+//!   integers within ±2^53 whose result stays within it, or with a float,
+//!   `//`, which the source does not have, and the `math` functions by
+//!   value, away from a zero's sign), the grid is also checked against
+//!   that VM.
 //!
-//! An integer result past ±2^53 is outside the accepted domain (the
-//! compiler proves accepted code never reaches it): there the program
-//! reports an overflow where `i64` would wrap, and is not compared.
+//! Every value is the double the source holds and an integer is kept as
+//! one only within ±2^53: an integer result past it is the double of the
+//! exact result, rounded once, which the table pins; no result is an
+//! integer outside ±2^53, even where its double matches.
 
 use mlua::{Function, Lua, Value};
 use skin_beatoraja::lua::num_scan::todouble;
@@ -65,20 +68,9 @@ fn same(ours: Val, theirs: Val) -> bool {
     }
 }
 
-/// Whether integer operation `op` of `a` and `b` leaves ±2^53, outside the
-/// accepted domain.
-fn outside(op: &str, a: Val, b: Val) -> bool {
-    let (Val::Int(x), Val::Int(y)) = (a, b) else {
-        return false;
-    };
-    let (x, y) = (i128::from(x), i128::from(y));
-    let r = match op {
-        "add" => x + y,
-        "sub" => x - y,
-        "mul" => x * y,
-        _ => return false,
-    };
-    r.abs() > i128::from(TWO_53)
+/// Whether `r` is an integer outside ±2^53, which no result may be.
+fn wide_int(r: Result<Val, Fail>) -> bool {
+    matches!(r, Ok(Val::Int(n)) if n.unsigned_abs() > TWO_53.unsigned_abs())
 }
 
 #[test]
@@ -97,9 +89,6 @@ fn every_operation_matches_the_source_interpreter() {
         let ours: Result<Val, Fail> = match words[..] {
             [op, a, b] => {
                 let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
-                if outside(op, a, b) {
-                    continue;
-                }
                 let arith_op = |o| arith(o, a, b);
                 match op {
                     "add" => arith_op(Arith::Add),
@@ -128,6 +117,7 @@ fn every_operation_matches_the_source_interpreter() {
             }
             _ => panic!("{line}"),
         };
+        assert!(!wide_int(ours), "{lhs}: {ours:?} is an integer past ±2^53");
         match (ours, theirs) {
             (Ok(o), Some(t)) => assert!(same(o, t), "{lhs}: {o:?} vs the source's {t:?}"),
             (Err(Fail::Error), None) => {}
@@ -135,7 +125,7 @@ fn every_operation_matches_the_source_interpreter() {
         }
         checked += 1;
     }
-    assert!(checked > 9_000, "{checked}");
+    assert!(checked > 9_800, "{checked}");
 }
 
 /// A slider value's `tofloat()` line: `tofloat <operand> as <value the
@@ -191,12 +181,12 @@ fn grid() -> Vec<Val> {
         -3,
         7,
         -7,
+        2_147_483_647,
+        -2_147_483_648,
+        TWO_53 - 1,
+        -TWO_53 + 1,
         TWO_53,
-        TWO_53 + 1,
-        -TWO_53 - 1,
-        1 << 62,
-        i64::MAX,
-        i64::MIN,
+        -TWO_53,
     ];
     let floats = [
         0.0,
@@ -258,51 +248,59 @@ fn vm(f: &Function, args: &[Val]) -> Option<Val> {
         .map(|v| from_lua(&v))
 }
 
-/// The program's result against the VM's: equal, an error where the VM
-/// raises, or an overflow exactly where `wraps`.
-fn check(what: &str, ours: Result<Val, Fail>, theirs: Option<Val>, wraps: bool) {
+/// The program's result against the VM's, compared by `eq`: equal, or an
+/// error where the VM raises.
+fn check(what: &str, ours: Result<Val, Fail>, theirs: Option<Val>, eq: fn(Val, Val) -> bool) {
     match (ours, theirs) {
-        (Ok(a), Some(b)) if !wraps => assert!(same_54(a, b), "{what}: {a:?} vs the VM's {b:?}"),
+        (Ok(a), Some(b)) => assert!(eq(a, b), "{what}: {a:?} vs the VM's {b:?}"),
         (Err(Fail::Error), None) => {}
-        (Err(Fail::Overflow), Some(_)) if wraps => {}
-        (o, t) => panic!("{what} (wraps {wraps}): {o:?} vs the VM's {t:?}"),
+        (o, t) => panic!("{what}: {o:?} vs the VM's {t:?}"),
     }
 }
 
-/// Where Lua 5.4 and the source agree: `+ - *` and `//`, each integer
-/// operation's overflow computed exactly.
+/// The same number by value (any NaN equal to any NaN, the two zeros
+/// equal), or the same boolean or nil: Lua 5.4's subtype aside.
+fn same_value(a: Val, b: Val) -> bool {
+    match (double(a), double(b)) {
+        (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x == y,
+        (None, None) => a == b,
+        _ => false,
+    }
+}
+
+/// Where Lua 5.4 and the source agree: `+ - *` and `//`, integers only
+/// where the exact result stays within ±2^53 (past it Lua 5.4 keeps an
+/// integer, or wraps, where the source rounds to a double, which the
+/// table pins).
 #[test]
 fn arithmetic_matches_the_lua_vm_where_it_agrees() {
     let lua = Lua::new();
     let ops = [
-        (
-            Arith::Add,
-            "+",
-            i64::checked_add as fn(i64, i64) -> Option<i64>,
-        ),
-        (Arith::Sub, "-", i64::checked_sub),
-        (Arith::Mul, "*", i64::checked_mul),
-        (Arith::IDiv, "//", |a: i64, b: i64| {
-            if b == 0 { Some(0) } else { a.checked_div(b) }
-        }),
+        (Arith::Add, "+", (|a, b| a + b) as fn(i128, i128) -> i128),
+        (Arith::Sub, "-", |a, b| a - b),
+        (Arith::Mul, "*", |a, b| a * b),
+        (Arith::IDiv, "//", |a, b| if b == 0 { 0 } else { a / b }),
     ];
+    let mut skipped = 0;
     let g = grid();
-    for (op, sym, checked) in ops {
+    for (op, sym, exact) in ops {
         let f: Function = lua
             .load(format!("return function(a, b) return a {sym} b end"))
             .eval()
             .unwrap();
         for &a in &g {
             for &b in &g {
-                let wraps = match (a, b) {
-                    (Val::Int(x), Val::Int(y)) => checked(x, y).is_none(),
-                    _ => false,
-                };
+                if let (Val::Int(x), Val::Int(y)) = (a, b)
+                    && exact(i128::from(x), i128::from(y)).abs() > i128::from(TWO_53)
+                {
+                    skipped += 1;
+                    continue;
+                }
                 check(
                     &format!("{a:?} {sym} {b:?}"),
                     arith(op, a, b),
                     vm(&f, &[a, b]),
-                    wraps,
+                    same_54,
                 );
             }
         }
@@ -311,10 +309,12 @@ fn arithmetic_matches_the_lua_vm_where_it_agrees() {
                 &format!("{bad:?} {sym}"),
                 arith(op, bad, Val::Int(1)),
                 vm(&f, &[bad, Val::Int(1)]),
-                false,
+                same_54,
             );
         }
     }
+    // The grid reaches past ±2^53, so the restriction above is not empty.
+    assert!(skipped > 0);
 }
 
 #[test]
@@ -328,20 +328,36 @@ fn math_matches_the_lua_vm_where_it_agrees() {
     ] {
         let lf: Function = lua.load(format!("return math.{name}")).eval().unwrap();
         for &a in &g {
-            let wraps = f == MathFn::Abs && a == Val::Int(i64::MIN);
-            check(&format!("{name}({a:?})"), math(f, a), vm(&lf, &[a]), wraps);
+            let ours = math(f, a);
+            check(&format!("{name}({a:?})"), ours, vm(&lf, &[a]), same_value);
+            representation(&format!("{name}({a:?})"), f, a, ours);
         }
         check(
             &format!("{name}(nil)"),
             math(f, Val::Nil),
             vm(&lf, &[Val::Nil]),
-            false,
+            same_value,
         );
     }
     let lneg: Function = lua.load("return function(a) return -a end").eval().unwrap();
     for &a in &g {
-        let wraps = a == Val::Int(i64::MIN);
-        check(&format!("-{a:?}"), neg(a), vm(&lneg, &[a]), wraps);
+        let ours = neg(a);
+        check(&format!("-{a:?}"), ours, vm(&lneg, &[a]), same_value);
+        representation(&format!("-{a:?}"), MathFn::Abs, a, ours);
+    }
+}
+
+/// The representation the comparison by value leaves open: no integer
+/// past ±2^53, and `floor` or `ceil` (`f`) of a float whose result is
+/// past it (an infinity and NaN included) that float, where Lua 5.4 gives
+/// an integer for one that fits `i64` (`floor(-2^63)`).
+fn representation(what: &str, f: MathFn, a: Val, ours: Result<Val, Fail>) {
+    assert!(!wide_int(ours), "{what}: {ours:?} is an integer past ±2^53");
+    if f != MathFn::Abs
+        && let (Val::Float(x), Ok(r)) = (a, ours)
+        && (x.is_nan() || x.floor().abs() > 9_007_199_254_740_992.0)
+    {
+        assert!(matches!(r, Val::Float(_)), "{what}: {r:?} is not a float");
     }
 }
 

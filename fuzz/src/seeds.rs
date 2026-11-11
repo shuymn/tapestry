@@ -55,10 +55,18 @@ pub fn presents() -> Vec<Seed> {
     let mut kind = accepted.to_vec();
     kind[0] |= 0x80;
     kind[16] = 3;
+    // The value a constant: 2^53 (pool 6), accepted; 2^53 + 1 (pool 8),
+    // refused by V3.
+    let mut edge = accepted.to_vec();
+    edge[15..19].copy_from_slice(&[0, 0, 6, 0]);
+    let mut wide = accepted.to_vec();
+    wide[15..19].copy_from_slice(&[0, 0, 8, 0]);
     vec![
         ("accepted", accepted.to_vec()),
         ("jump_back", jump),
         ("enum_read", kind),
+        ("const_edge", edge),
+        ("const_wide", wide),
     ]
 }
 
@@ -1464,6 +1472,22 @@ pub fn skin_imports() -> Vec<Seed> {
                     {"id": "r123", "timer": 352, "dst": [{"x": 200, "y": 220, "w": 10, "h": 10}]},
                     {"id": "r183", "op": [207], "dst": [{"x": 200, "y": 240, "w": 10, "h": 10}]},
                     {"id": "r184", "op": [227], "dst": [{"x": 200, "y": 260, "w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
+            "play graphs",
+            play_skin(
+                r##""judgegraph": [{"id": "ng", "delay": 0}, {"id": "jg", "type": 1}],
+                "bpmgraph": [{"id": "bg", "mainBPMColor": "#12ab34", "otherBPMColor": "ff00"}],
+                "timingvisualizer": [{"id": "tv", "PRColor": "#20304080"}, {"id": "tw", "judgeWidthMillis": 1001}],
+                "hiterrorvisualizer": [{"id": "he", "lineWidth": 6, "windowLength": 80, "alpha": 0.5}],
+                "destination": [
+                    {"id": "ng", "dst": [{"x": 10, "y": 10, "w": 300, "h": 100}]},
+                    {"id": "jg", "dst": [{"x": 10, "y": 120, "w": 300, "h": 100}]},
+                    {"id": "bg", "dst": [{"x": 10, "y": 230, "w": 300, "h": 100}]},
+                    {"id": "tv", "dst": [{"x": 400, "y": 10, "w": 301, "h": 20}]},
+                    {"id": "tw", "dst": [{"x": 400, "y": 40, "w": 301, "h": 20}]},
+                    {"id": "he", "dst": [{"x": 400, "y": 70, "w": 406, "h": 50}]}]"##,
             ),
         ),
         (

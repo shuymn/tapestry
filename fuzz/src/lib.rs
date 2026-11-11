@@ -2724,6 +2724,15 @@ fn check_usage(i: &Imported) {
                 "a clamped colour's severity"
             );
             assert!(n.at.is_some(), "an unlocated clamped colour");
+        } else if let NoteKind::InvalidColour { .. } = n.kind {
+            // A graph's or visualizer's colour that does not parse draws
+            // red or its default (design.md "Rendering and Skins").
+            assert_eq!(
+                n.severity,
+                Severity::Fallback,
+                "an invalid colour's severity"
+            );
+            assert!(n.at.is_some(), "an unlocated invalid colour");
         } else {
             assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
         }
@@ -3387,8 +3396,11 @@ pub fn present_def(data: &[u8]) -> skin_model::present::PresentDef {
         Val::Int(0),
         Val::Int(3),
         Val::Int(-7),
-        Val::Int(i64::MAX),
-        Val::Int(i64::MIN),
+        // ±2^53, which V3 accepts, and one past each, which it refuses.
+        Val::Int(1 << 53),
+        Val::Int(-(1 << 53)),
+        Val::Int((1 << 53) + 1),
+        Val::Int(-(1 << 53) - 1),
         Val::Int(i64::from(i32::MAX)),
         Val::Float(0.5),
         Val::Float(-0.0),

@@ -28,9 +28,11 @@
 //!   never-assigned local whose every initialization the provenance marker
 //!   recorded as the host module's `timer_off_value`
 //!   ([`super::instrument`]), with the module's proxy as the pass built it,
-//!   which is the off value. Every folded operand and result stays within
-//!   2^53. Values construction computed are taken as the source's, under
-//!   the construction premise, whatever arithmetic gave them.
+//!   which is the off value. Every folded integer stays within 2^53: an
+//!   integer result past it folds to the source's double, as the program
+//!   computes it ([`skin_model::present::num`]). Values construction
+//!   computed are taken as the source's, under the construction premise,
+//!   whatever arithmetic gave them.
 //! - **What stays residual**: host reads with a known integer argument
 //!   ([`Node::Read`], each recorded in [`Residual::reads`] as it is
 //!   created on a reached path), `main_state.time()` ([`Node::StateUs`],
@@ -186,7 +188,8 @@ pub(crate) enum Node {
     },
     /// A value no path gives: a return that did not happen.
     Unreachable,
-    /// The frame's state clock, `main_state.time()`: µs, 0 to 2^53.
+    /// The frame's state clock, `main_state.time()`: µs, an integer within
+    /// ±2^53 and past it the double the source holds.
     StateUs,
     /// A slot's value as the invocation begins: the off value or an
     /// integer.
@@ -214,23 +217,23 @@ pub(crate) fn num_val(v: Val) -> Option<present::Val> {
     })
 }
 
-/// A value the program's numerics gave, as a known value: an integer past
-/// [`EXACT`] does not fold.
-fn known_of(v: present::Val) -> R<Val> {
-    Ok(match v {
+/// A value the program's numerics gave, as a known value: an integer is
+/// within [`EXACT`], a result past it the source's double.
+fn known_of(v: present::Val) -> Val {
+    match v {
         present::Val::Nil => Val::Nil,
         present::Val::Bool(b) => Val::Bool(b),
-        present::Val::Int(n) if n.unsigned_abs() <= EXACT => Val::Int(n),
-        present::Val::Int(_) => return refuse(Unsupported::Range),
+        present::Val::Int(n) => Val::Int(n),
         present::Val::Float(f) => Val::Float(f.to_bits()),
-    })
+    }
 }
 
-/// A numeric operation's failure: a definite Lua error, or an overflow.
+/// A numeric operation's failure: a definite Lua error (an unavailable
+/// read is never folded).
 fn failed<T>(f: present::Fail) -> R<T> {
     match f {
         present::Fail::Error => construct("a Lua error"),
-        present::Fail::Overflow | present::Fail::Unavailable => refuse(Unsupported::Range),
+        present::Fail::Unavailable => refuse(Unsupported::Range),
     }
 }
 
@@ -501,7 +504,8 @@ impl<'a> Eval<'a> {
             Node::Known(v) => (v.kind(), 1),
             Node::Read { api, .. } => (reader(api).map_or(0, |(_, k)| k), 1),
             Node::Unreachable => (0, 1),
-            Node::StateUs => (INT, 1),
+            // An integer within ±2^53, past it a float (the source's double).
+            Node::StateUs => (INT | FLT, 1),
             Node::Slot(_) => (INT | OFF, 1),
             Node::Not(x) => (BOOL, h(x)),
             Node::Neg(x) => (k(x) & NUM, h(x)),
@@ -1392,8 +1396,7 @@ impl<'a> Eval<'a> {
             k if k & !NUM == 0 => match self.val(v).and_then(num_val) {
                 Some(x) => {
                     let r = num::neg(x).or_else(failed)?;
-                    let r = known_of(r)?;
-                    self.known(r)
+                    self.known(known_of(r))
                 }
                 None => self.push(Node::Neg(v)),
             },
@@ -1478,8 +1481,7 @@ impl<'a> Eval<'a> {
                 }
                 if let Some((p, q)) = nums {
                     let r = num::arith(arith(op), p, q).or_else(failed)?;
-                    let r = known_of(r)?;
-                    return self.known(r);
+                    return self.known(known_of(r));
                 }
                 self.push(Node::Arith(op, x, y))
             }
@@ -1595,7 +1597,7 @@ impl<'a> Eval<'a> {
                     MathOp::Ceil => present::MathFn::Ceil,
                     _ => present::MathFn::Abs,
                 };
-                let r = known_of(num::math(fun, v).or_else(failed)?)?;
+                let r = known_of(num::math(fun, v).or_else(failed)?);
                 return self.known(r);
             }
             return self.push(Node::Math(op, acc, acc));
@@ -1607,8 +1609,7 @@ impl<'a> Eval<'a> {
             ) {
                 (Some(a), Some(b)) => {
                     let r = num::extreme(op == MathOp::Max, a, b).or_else(failed)?;
-                    let r = known_of(r)?;
-                    self.known(r)?
+                    self.known(known_of(r))?
                 }
                 _ => self.push(Node::Math(op, acc, x))?,
             };

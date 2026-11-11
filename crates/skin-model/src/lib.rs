@@ -222,7 +222,7 @@ pub use track::{
 };
 pub use widget::bar::{BarGroupDef, BarGroupError, MAX_BAR_GROUPS};
 pub use widget::bpm_graph::{
-    BpmColors, BpmGraphDef, MAX_BPM_COLUMNS, RUNS_PER_COLUMN, bpm_columns,
+    BpmColors, BpmGraphDef, MAX_BPM_COLUMNS, MAX_BPM_LINE_WIDTH, RUNS_PER_COLUMN, bpm_columns,
 };
 pub use widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, MAX_SLIDE, Slider,

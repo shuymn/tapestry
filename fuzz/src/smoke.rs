@@ -379,6 +379,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "gauge",
             "rates",
             "score figures",
+            "play graphs",
             "readouts",
             "selectors",
             "note_fallbacks",
@@ -1006,6 +1007,32 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // hidden, 184 "00" under 227 (rank F reached).
                 assert_eq!(drawn, [2 + 4 + 3 + 1 + 2 + 2; 4], "{name}");
             }
+            "play graphs" => {
+                // The type-1 judge graph and the timing visualizer past 1 000
+                // ms drop; the BPM graph's four-digit colour keeps its
+                // default.
+                assert_eq!(
+                    kinds(&i),
+                    [
+                        NoteKind::UnsupportedField { field: "type" },
+                        NoteKind::InvalidColour {
+                            field: "otherBPMColor"
+                        },
+                        NoteKind::UnsupportedField {
+                            field: "judgeWidthMillis"
+                        },
+                    ],
+                    "{name}"
+                );
+                assert_eq!(u.elements, 6, "{name}");
+                // With no chart profile, no windows and an empty ring, the
+                // notes and BPM graphs draw nothing; the timing band is its
+                // 31 grid texels (every 10th of 301, the centre among them)
+                // and the hit-error pixmap its centre line, four columns
+                // wide (`lineWidth` 6 clamped), under the average's line at
+                // 0 on the same columns, one run each.
+                assert_eq!(drawn, [31 + 4; 4], "{name}");
+            }
             "readouts" => {
                 use skin_beatoraja::DeviationId;
                 // Each readout number D4, and none for the adjustment
@@ -1435,9 +1462,18 @@ fn skin_png_seeds_build_or_fail_as_built() {
 #[test]
 fn present_seeds_verify_or_fail_as_built() {
     let seeds = seeds::presents();
-    assert_names(&seeds, &["accepted", "jump_back", "enum_read"]);
+    assert_names(
+        &seeds,
+        &[
+            "accepted",
+            "jump_back",
+            "enum_read",
+            "const_edge",
+            "const_wide",
+        ],
+    );
     for (name, data) in &seeds {
-        let want = (*name == "accepted").then_some(2);
+        let want = matches!(*name, "accepted" | "const_edge").then_some(2);
         assert_eq!(crate::present(data), want, "{name}");
     }
 }

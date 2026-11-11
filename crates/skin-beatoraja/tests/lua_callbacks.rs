@@ -2024,6 +2024,36 @@ fn a_carried_round_keeps_its_latch() {
     assert!(fresh.frame(1_000, &[]).is_empty());
 }
 
+/// A latch storing a negative state clock carries it: the clock's slot
+/// domain holds the negative integers the source's `main_state.time()`
+/// gives, so the next round prepares on it and keeps its start.
+#[test]
+fn a_carried_round_keeps_a_negative_clock() {
+    use skin_model::Continuation;
+    use skin_model::present::Val;
+    let d = timer_skin(STATE, LATCH_BODY, 1);
+    let skin = import(&d, 905).unwrap().imported.skin;
+    let mut r1 = Drawn::over_section(skin.clone(), 4, &round());
+    full_score(&mut r1, 4);
+    r1.state_us = -3_000_000;
+    r1.complete = true;
+    assert_eq!(r1.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&r1), [Val::Int(-3_000_000)]);
+    let carry = r1.play.carry();
+    let mut r2 = Drawn::over_carried(
+        skin,
+        4,
+        &round(),
+        Continuation::Carried {
+            score: Some(full(200_000)),
+            bank: Some(carry.bank),
+        },
+    );
+    r2.state_us = 2_000_000;
+    assert_eq!(r2.frame(1_000, &[]).len(), 1);
+    assert_eq!(bank(&r2), [Val::Int(-3_000_000)]);
+}
+
 /// Before a carried round's first judgment the point reads the play
 /// state's cached point; from its first judgment, a POOR or an empty
 /// POOR, its own. A cache of 0 reads 0.
@@ -2369,7 +2399,9 @@ fn a_rank_timer_waits_for_the_rounds_judgment() {
 
 /// A carried bank is checked against the program before use: another
 /// length, or a value of the right length outside its slot's domain,
-/// refuses the attempt.
+/// refuses the attempt. A clock slot's domain is the clock's integers,
+/// ±2^53 µs, negative ones included; a clock stored past it, a float
+/// (285 years of state time), is outside it (design.md, the state clock).
 #[test]
 fn a_continuation_of_another_shape_is_refused() {
     use skin_model::present::{Bank, OFF, Val};
@@ -2382,7 +2414,12 @@ fn a_continuation_of_another_shape_is_refused() {
         attempt: skin_model::Attempt::Section(&section),
         ..common::play::context_with(None, None)
     };
-    for vals in [vec![], vec![OFF, OFF], vec![Val::Int(-5)]] {
+    for vals in [
+        vec![],
+        vec![OFF, OFF],
+        vec![Val::Int(-(1 << 53) - 1)],
+        vec![Val::Float(9_007_199_254_740_994.0)],
+    ] {
         let b = Bank::of(vals.clone());
         let carry = Continuation::Carried {
             score: None,
@@ -2394,11 +2431,14 @@ fn a_continuation_of_another_shape_is_refused() {
             "{vals:?}"
         );
     }
-    // The control: a value in the domain is taken.
-    let b = Bank::of(vec![Val::Int(5)]);
-    let carry = Continuation::Carried {
-        score: None,
-        bank: Some(&b),
-    };
-    assert!(skin.prepare_carried(&chart, &ctx, carry).is_ok());
+    // The controls: values in the domain are taken, a negative clock
+    // and the clock's bounds included.
+    for v in [5, -5, 1 << 53, -(1 << 53)] {
+        let b = Bank::of(vec![Val::Int(v)]);
+        let carry = Continuation::Carried {
+            score: None,
+            bank: Some(&b),
+        };
+        assert!(skin.prepare_carried(&chart, &ctx, carry).is_ok(), "{v}");
+    }
 }

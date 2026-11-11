@@ -128,5 +128,55 @@ public class Probe {
                 System.out.println(u + " " + a + " = " + r);
             }
         }
+        // Single operations whose integer result leaves ±2^53, each link of
+        // a chain the program rounds once per operation, and floors and
+        // conversions of the doubles past it.
+        String[][] extra = {
+            {"mul", "i:2147483647", "i:4194305"},
+            {"mul", "f:434000003fe00000", "i:3"},
+            {"add", "i:9007199254740991", "i:2"},
+            {"add", "f:4340000000000000", "i:1"},
+            {"mul", "i:2147483646", "i:21474836"},
+            {"mul", "i:2147483645", "i:21474836"},
+            {"div", "f:43647ae13f851eb8", "i:21474836"},
+            {"mul", "f:41dfffffff3fffff", "f:3fe3333333333333"},
+            {"mul", "i:9007199254740991", "i:9007199254740991"},
+            {"sub", "i:-9007199254740991", "i:9007199254740991"},
+            {"floor", "f:4270000000000800"},
+            {"floor", "f:4320000000000001"},
+            {"ceil", "f:4320000000000001"},
+            {"floor", "f:43b0000000000000"},
+            {"floor", "f:c3e0000000000000"},
+            {"ceil", "f:c3e0000000000000"},
+            {"floor", "f:43e0000000000000"},
+            {"ceil", "f:43e0000000000000"},
+            {"neg", "f:c3e0000000000000"},
+            {"abs", "i:-9007199254740991"},
+            {"toint", "f:43647ae13f851eb8"},
+            {"toint", "f:43cffffff3400000"},
+            {"toint", "f:435b4e81aa3d70a4"},
+            {"tofloat", "f:434000003fe00000"},
+        };
+        for (String[] row : extra) {
+            String op = row[0];
+            LuaValue x = num(row[1]);
+            String r;
+            try {
+                if (row.length == 3) {
+                    int k = java.util.Arrays.asList(bin).indexOf(op);
+                    r = show(ops[k].apply(x, num(row[2])));
+                } else if (op.equals("toint")) {
+                    r = "i:" + x.toint();
+                } else if (op.equals("tofloat")) {
+                    System.out.println("tofloat " + row[1] + " as " + show(x) + " = g:" + fbits(x.tofloat()));
+                    continue;
+                } else {
+                    r = show(op.equals("neg") ? x.neg() : math.get(op).call(x));
+                }
+            } catch (LuaError | ArithmeticException e) {
+                r = "error";
+            }
+            System.out.println(String.join(" ", row) + " = " + r);
+        }
     }
 }
