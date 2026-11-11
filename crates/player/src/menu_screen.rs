@@ -1500,14 +1500,16 @@ mod tests {
             play_level: Some(12),
             difficulty: Some(4),
             bga: Some(true),
+            length_us: Some(bms_model::TimeUs(125_400_000)),
         };
         assert_eq!(fields_changed(&chart, &chart.clone()), TextSlots::NONE);
-        // The play level, the difficulty and the BGA flag are no text: they
-        // name no slot.
+        // The play level, the difficulty, the BGA flag and the length are
+        // no text: they name no slot.
         let level = ChosenChart {
             play_level: None,
             difficulty: None,
             bga: None,
+            length_us: None,
             ..chart.clone()
         };
         assert_eq!(fields_changed(&chart, &level), TextSlots::NONE);

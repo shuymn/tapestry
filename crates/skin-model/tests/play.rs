@@ -2474,3 +2474,41 @@ fn an_overflowing_rhythm_is_off() {
     assert_eq!(rhythm_at(&mut h, 100), Some(1_666_666_666_666));
     assert_eq!(rhythm_at(&mut h, 10_000_000_000), None);
 }
+
+/// C15: `chart.length_ms` is the chart's 1× length (`ChartMeta::length`)
+/// in whole ms, rounded down: 125 400 ms from 125 400 999 µs, the same in
+/// READY, during the play, after its end and in a practice round at
+/// k = 10, whatever the chart's own playback times; capped at `i32::MAX`
+/// and 0 for a chart built in code.
+#[test]
+fn the_length_field_is_the_1x_charts_length() {
+    let mut chart = two_tempos();
+    let read = |chart: &bms_model::Chart, ctx: &PlayContext<'_>, at: &[i64]| {
+        let mut h = Harness::empty(chart, ctx);
+        at.iter()
+            .map(|&ms| {
+                h.frame(ms, &[]);
+                h.field(field::CHART_LENGTH_MS)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read(&chart, &full(0), &[0]), [0], "built in code");
+    chart.meta.length = TimeUs(125_400_999);
+    assert_eq!(
+        read(&chart, &full(1_000), &[-500, 1_200, 60_000]),
+        [125_400; 3]
+    );
+    let s = section(500, 3_000, 0);
+    let in_round = PlayContext {
+        score: skin_model::PlayScore {
+            speed: bms_model::Speed::from_twentieths(10).unwrap(),
+            ..skin_model::PlayScore::NONE
+        },
+        ..in_section(&s)
+    };
+    for _round in 0..2 {
+        assert_eq!(read(&chart, &in_round, &[400, 1_200]), [125_400; 2]);
+    }
+    chart.meta.length = TimeUs(i64::MAX);
+    assert_eq!(read(&chart, &full(0), &[0]), [i32::MAX]);
+}

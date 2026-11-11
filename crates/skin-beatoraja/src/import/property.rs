@@ -322,6 +322,15 @@ pub(crate) enum Value {
     /// The tempo at the display head, whole (`nowbpm`, `:204`), while it
     /// is known.
     BpmNow,
+    /// The load's progress in % (`loading_progress`, `:224-229`), from
+    /// tapestry's load, where the source averages its BGA's and audio's
+    /// loaders.
+    LoadPercent,
+    /// The chart's 1× length's minutes within the hour and seconds within
+    /// the minute (`chartlength_minute`, `chartlength_second`,
+    /// `:473-478`), from its notes' ends and its background sounds.
+    LengthMinutes,
+    LengthSeconds,
     /// The elapsed play time's minutes and seconds (`playtime_minute`,
     /// `playtime_second`, `:205-206`).
     ElapsedMinutes,
@@ -509,6 +518,9 @@ impl Value {
             Self::BpmMin => "bpm.min_x100 / 100",
             Self::BpmMain => "chart.main_bpm",
             Self::BpmNow => "bpm.current_x100 / 100",
+            Self::LoadPercent => "load.percent",
+            Self::LengthMinutes => "chart.length_ms / 60000 % 60",
+            Self::LengthSeconds => "chart.length_ms / 1000 % 60",
             Self::ElapsedMinutes => "time.elapsed_s / 60",
             Self::ElapsedSeconds => "time.elapsed_s % 60",
             Self::RemainingMinutes => "time.remaining_s / 60",
@@ -660,6 +672,9 @@ impl Value {
                 .and_then(|k| k.parse::<i64>().ok())
                 .filter(|&k| k > 0)
         };
+        // The last operator bounds the value: `x / a % k` is within
+        // `0..k`, as `x % k` is, for a nonnegative `x`.
+        let op = op.map(|r| r.rfind(['/', '%']).and_then(|i| r.get(i..)).unwrap_or(r));
         match op {
             Some(r) if r.starts_with('/') => by(r).map_or((lo, hi), |k| (lo / k, hi / k)),
             Some(r) if r.starts_with('%') => by(r).map_or((lo, hi), |k| (0, hi.min(k - 1))),
@@ -782,6 +797,9 @@ fn shown(id: i32) -> Option<Value> {
         525 => Value::RecentTiming,
         368 => Value::SongTotal,
         12 => Value::DisplayOffset,
+        165 => Value::LoadPercent,
+        1_163 => Value::LengthMinutes,
+        1_164 => Value::LengthSeconds,
         20..=29 => Value::App(u8::try_from(id - 20).ok()?),
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
@@ -1318,8 +1336,41 @@ mod tests {
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);
         assert_eq!(int_by_id(131), IntProp::Null);
-        for id in [1_163, 1_164, 372, 373] {
+        for id in [372, 373] {
             assert_eq!(int_by_id(id), IntProp::Unsupported(Some(id)), "{id}");
+        }
+        // The load's progress and the chart's 1× length, each from
+        // tapestry's own data (G8, G15: D4 notes), always known in a play.
+        for (id, name, value, expr, range) in [
+            (
+                165,
+                "loading_progress",
+                Value::LoadPercent,
+                "load.percent",
+                100,
+            ),
+            (
+                1_163,
+                "chartlength_minute",
+                Value::LengthMinutes,
+                "chart.length_ms / 60000 % 60",
+                59,
+            ),
+            (
+                1_164,
+                "chartlength_second",
+                Value::LengthSeconds,
+                "chart.length_ms / 1000 % 60",
+                59,
+            ),
+        ] {
+            assert_eq!(int_by_id(id), IntProp::Shown(value), "{id}");
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            assert_eq!((value.expr(), value.availability()), (expr, None));
+            assert_eq!(value.range(), (0, range), "{id}");
+            assert!(value.deviates() && value.part().is_none(), "{id}");
+            let scope = skin_model::Scope::new(&skin_model::PLAY);
+            assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
         }
         // 1312 to 1327: each variant's ms and green, under its validity,
         // by numeric id only.

@@ -607,6 +607,7 @@ fn the_loading_frames_leave_out_the_best_and_the_target() {
         fix_hispeed: 0,
         difficulty: None,
         bga: None,
+        length: None,
         autoplay: false,
         now: TimeUs(500 * MS),
         load: skin_model::LoadState {
