@@ -455,6 +455,36 @@ impl Settlement {
 #[derive(Clone, Copy, Debug)]
 pub struct Terminal;
 
+/// The page's chart waiting for its bank's prerequisites, and the scan's
+/// pause its looks took.
+#[derive(Debug)]
+struct Pending {
+    chart: PageChart,
+    pause: PagePause,
+}
+
+/// The scan's pause the waiting page bank took itself, or none
+/// ([`PageJobs::hold_pause`]): whoever ends the bank's wait decides what
+/// becomes of it, releasing it while the page stays or handing it over to
+/// what comes next.
+#[derive(Debug)]
+#[must_use = "the page's own pause is released or handed over"]
+pub struct PagePause(bool);
+
+impl PagePause {
+    /// The page stays: the pause, if the bank took one, is released, and
+    /// the scan goes on as the page's entry let it.
+    pub fn release(self, shelf: &mut Shelf) {
+        if self.0 {
+            shelf.release();
+        }
+    }
+
+    /// The pause, if any, is the caller's from here: a Start's load, which
+    /// keeps the scan paused, or a leave, whose next screen releases it.
+    pub const fn hand_over(self) {}
+}
+
 /// How long a settle with a terminal cause waits for the jobs, in all
 /// (design.md "Play Lifecycle", Who loads).
 pub const STOP_WAIT: Duration = crate::shelf::STOP_TIMEOUT;
@@ -493,8 +523,11 @@ pub struct PageJobs {
     /// An ordinary refusal of the 1× bank, kept for the Start.
     refusal: Option<audio::BankError>,
     /// The page's chart, read, whose 1× bank waits for its prerequisites
-    /// ([`defer`](Self::defer)).
-    pending: Option<PageChart>,
+    /// ([`defer`](Self::defer)), and the scan's pause it took.
+    pending: Option<Pending>,
+    /// The release barrier's unload for the waiting bank, sent or not,
+    /// polled with no wait until the audio thread answers it.
+    unloading: Option<game::Switch>,
     /// The decision screen shows: the jobs begun are promoted and answered
     /// for by the choice (`Owner::Foreground`) until the page opens
     /// ([`hand_to_page`](Self::hand_to_page)).
@@ -540,6 +573,7 @@ impl PageJobs {
             claimed: false,
             refusal: None,
             pending: None,
+            unloading: None,
             deciding: false,
             mode,
             sink: PageSink::default(),
@@ -635,39 +669,67 @@ impl PageJobs {
     /// [`begin`](Self::begin), as it stands when the bank begins.
     pub fn defer(&mut self, chart: PageChart, deciding: bool) {
         self.deciding = deciding;
-        self.pending = Some(chart);
+        self.pending = Some(Pending {
+            chart,
+            pause: PagePause(false),
+        });
     }
 
     /// The chart whose bank waits for its prerequisites.
     pub fn pending_path(&self) -> Option<&Path> {
-        self.pending.as_ref().map(|c| c.path.as_path())
+        self.pending.as_ref().map(|p| p.chart.path.as_path())
     }
 
-    /// The bank waiting for its prerequisites, given up (a Start decodes
-    /// its own).
-    pub fn take_pending(&mut self) -> Option<PageChart> {
-        self.pending.take()
+    /// The bank waiting for its prerequisites, given up, with the scan's
+    /// pause it took, which the caller releases or takes over
+    /// ([`PagePause`]). Its unload is left (a late answer is taken by the
+    /// next switch).
+    pub fn take_pending(&mut self) -> Option<(PageChart, PagePause)> {
+        self.unloading = None;
+        self.pending.take().map(|p| (p.chart, p.pause))
+    }
+
+    /// The waiting bank's look at the background took the scan's pause
+    /// after the page had released it: the pause is the bank's, given back
+    /// by whoever ends its wait ([`take_pending`](Self::take_pending),
+    /// [`begin_pending`](Self::begin_pending)).
+    pub const fn hold_pause(&mut self) {
+        if let Some(p) = &mut self.pending {
+            p.pause = PagePause(true);
+        }
+    }
+
+    /// The waiting bank's unload, while it runs.
+    pub fn unloading(&mut self) -> Option<&mut game::Switch> {
+        self.unloading.as_mut()
+    }
+
+    /// The waiting bank's unload begins (`Some`) or ends (`None`).
+    pub fn set_unloading(&mut self, unload: Option<game::Switch>) {
+        self.unloading = unload;
     }
 
     /// The waiting bank begins ([`begin`](Self::begin)), its prerequisites
-    /// held.
+    /// held; the scan's pause it took comes back to the caller.
     pub fn begin_pending(
         &mut self,
         coord: &Coordinator,
         spawner: Spawner,
         #[cfg(feature = "dev-tools")] witness: &Arc<crate::bank_witness::BankWitness>,
-    ) {
-        if let Some(chart) = self.pending.take() {
-            let deciding = self.deciding;
-            self.begin(
-                coord,
-                spawner,
-                chart,
-                deciding,
-                #[cfg(feature = "dev-tools")]
-                witness,
-            );
-        }
+    ) -> PagePause {
+        let Some(Pending { chart, pause }) = self.pending.take() else {
+            return PagePause(false);
+        };
+        let deciding = self.deciding;
+        self.begin(
+            coord,
+            spawner,
+            chart,
+            deciding,
+            #[cfg(feature = "dev-tools")]
+            witness,
+        );
+        pause
     }
 
     /// Whether a job begun now is promoted, and who answers for it.
@@ -991,11 +1053,13 @@ impl PageJobs {
         terminal: &mut dyn FnMut() -> Option<Terminal>,
     ) -> Settlement {
         // A bank still waiting for the background goes with it, and the
-        // background's measurement goes on on its own.
-        if self.pending.take().is_some()
-            && let Some(shelf) = shelf.as_deref_mut()
-        {
-            shelf.stop_awaiting();
+        // background's measurement goes on on its own. The pause it took is
+        // the leave's: the screen after it (selection) releases the scan.
+        if let Some((_, pause)) = self.take_pending() {
+            pause.hand_over();
+            if let Some(shelf) = shelf.as_deref_mut() {
+                shelf.stop_awaiting();
+            }
         }
         let found = self.settle(false, terminal);
         if let (Some(chart), Some(shelf)) = (&self.chart, shelf)

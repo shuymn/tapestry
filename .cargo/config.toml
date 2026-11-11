@@ -3,3 +3,11 @@
 # commands it runs (such as `cargo xtask portable test`) never overwrite the
 # running xtask executable, which Windows does not allow.
 xtask = "run --quiet --locked --profile xtask --package xtask --"
+
+# At most 8 tests at once per test process (design.md "Testing Strategy"):
+# every test that draws on WARP holds a device of its own, and with one
+# thread per core overlapping runs exhaust the system's commit. An explicit
+# --test-threads, or the variable set by the caller, still wins; nextest
+# schedules by its own -j.
+[env]
+RUST_TEST_THREADS = "8"

@@ -498,6 +498,8 @@ struct Headless {
     /// The input thread fails this long (ms) after the first decision
     /// screen begins.
     input_fails_in_decision: Option<i64>,
+    /// The window closes inside the choice's own wait.
+    close_in_entry: bool,
     /// The screen fails as the practice page's chart is read, its
     /// prerequisites waiting: the page's hold finds it.
     screen_fails_in_jobs: bool,
@@ -729,6 +731,7 @@ impl Headless {
             screen_fails_in_decision: None,
             input_fails_in_decision: None,
             screen_fails_in_jobs: false,
+            close_in_entry: false,
             deadline_steps: Vec::new(),
             closed_epochs: 0,
             decision_looks: Vec::new(),
@@ -1470,9 +1473,15 @@ impl AppRig for Headless {
         self.decision_ms.map(|ms| TimeUs(ms * MS))
     }
 
-    fn entered_decision(&mut self, pick: &Pick) {
+    fn entered_decision(&mut self, pick: &Pick, d: &mut Decision) {
         let i = self.chosen.unwrap();
         self.decisions.push((i, self.at()));
+        // A look inside the choice's own wait (its input fence) left the
+        // screen: the window closed there.
+        if std::mem::take(&mut self.close_in_entry) {
+            self.quitting = true;
+            d.leave(game::Verdict::End);
+        }
         if let Some(ms) = self.screen_fails_in_decision.take() {
             self.screen_fails_at = self.at() + ms * MS;
         }
@@ -5519,4 +5528,21 @@ fn a_screen_lost_while_the_page_waits_is_rebuilt() {
     let entered = rig.page_entered_at[0];
     assert!(entered >= choice + 1_500 * MS, "{entered} from {choice}");
     assert!(entered >= recovered, "{entered} {recovered}");
+}
+
+/// A close seen inside the choice's own wait (its input fence) is routed
+/// by App before anything of the chart is read: the run quits, no read, no
+/// load, no loading state.
+#[test]
+fn a_leave_inside_the_entry_wait_is_routed_before_the_read() {
+    let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.close_in_entry = true;
+    });
+    ran.unwrap();
+    assert_eq!(rig.decisions.len(), 1);
+    assert!(rig.decision_looks.is_empty(), "{:?}", rig.decision_looks);
+    assert!(rig.loading_pages.is_empty());
+    assert!(rig.deadline_steps.is_empty());
 }
