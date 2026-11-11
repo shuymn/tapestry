@@ -499,8 +499,17 @@ pub(crate) struct Cx<'d> {
     elements: Vec<ElementDef>,
     element_spans: Vec<Span>,
     widgets: WidgetDefs,
-    /// A result skin's judge graphs, by [`Source::JudgeGraph`] index.
+    /// A result skin's judge graphs or a play skin's notes graphs, by
+    /// [`Source::JudgeGraph`] index.
     judge_graphs: Vec<skin_model::JudgeGraphDef>,
+    /// A play skin's BPM graphs, by [`Source::BpmGraph`] index.
+    bpm_graphs: Vec<skin_model::BpmGraphDef>,
+    /// A play skin's timing visualizers, by [`Source::TimingVisualizer`]
+    /// index.
+    timing_visualizers: Vec<skin_model::TimingVisualizerDef>,
+    /// A play skin's hit-error visualizers, by
+    /// [`Source::HitErrorVisualizer`] index.
+    hit_errors: Vec<skin_model::HitErrorDef>,
     /// A result skin's gauge graphs, by [`Source::GaugeGraph`] index.
     gauge_graphs: Vec<skin_model::GaugeGraphDef>,
     /// A result skin's timing distributions, by [`Source::TimingGraph`]
@@ -630,6 +639,9 @@ impl<'d> Cx<'d> {
             element_spans: Vec::new(),
             widgets: WidgetDefs::default(),
             judge_graphs: Vec::new(),
+            bpm_graphs: Vec::new(),
+            timing_visualizers: Vec::new(),
+            hit_errors: Vec::new(),
             gauge_graphs: Vec::new(),
             timing_graphs: Vec::new(),
             lanes: None,
@@ -1164,6 +1176,10 @@ impl<'d> Cx<'d> {
             // a ratio bar of the play's score rate; any other type is
             // dropped as every graph was before.
             Object::Graph if self.score_graph(orec)? => self.ratio_bar(dst, orec, true)?,
+            Object::JudgeGraph => self.judge_graph(dst, orec)?,
+            Object::BpmGraph => self.bpm_graph(dst, orec)?,
+            Object::TimingVisualizer => self.timing_visualizer(dst, orec)?,
+            Object::HitErrorVisualizer => self.hit_error(dst, orec)?,
             _ => {
                 self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }
@@ -2155,11 +2171,12 @@ impl<'d> Cx<'d> {
             };
             Skin::new_decision(def, defs)
         } else {
-            // The play graphs and visualizers are not imported yet: only
-            // the score bars.
             let widgets = PlayDefs {
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
-                ..PlayDefs::default()
+                judge_graphs: std::mem::take(&mut self.judge_graphs),
+                bpm_graphs: std::mem::take(&mut self.bpm_graphs),
+                timing_visualizers: std::mem::take(&mut self.timing_visualizers),
+                hit_errors: std::mem::take(&mut self.hit_errors),
             };
             Skin::new_play(def, widgets)
         };

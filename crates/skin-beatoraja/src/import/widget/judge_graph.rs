@@ -1,9 +1,11 @@
-//! A result skin's `judgegraph` (`skin/json/JsonSkin.java:263-271`,
+//! A `judgegraph` (`skin/json/JsonSkin.java:263-271`,
 //! `skin/json/JsonSkinObjectLoader.java:475-481`,
-//! `skin/SkinNoteDistributionGraph.java` at `0.8.9`): types 1 (by
-//! judgment) and 2 (early and late) become the model's judge graph,
-//! drawn on a generated chip grid and a white image; type 0 (the note
-//! distribution) and any other type are dropped with a note.
+//! `skin/SkinNoteDistributionGraph.java` at `0.8.9`), drawn on a generated
+//! chip grid and a white image: on a result skin, types 1 (by judgment)
+//! and 2 (early and late) become the model's judge graph; on a play skin,
+//! type 0 becomes its notes graph, the chart's notes by second. Any other
+//! type is dropped with a note: type 0 on a result and types 1 and 2 on
+//! play are not drawn yet.
 //!
 //! Its destination keeps its track, timer, visibility, blend, colour,
 //! alpha and angle; its stretch fits the whole graph as the source fits
@@ -12,7 +14,7 @@
 //! to soften. A flag field is on only at 1, as the source reads it.
 
 use bms_model::TimeUs;
-use skin_model::{Filter, GraphFit, JudgeGraphDef, JudgeGraphKind, Source};
+use skin_model::{Filter, GraphFit, JudgeGraphDef, JudgeGraphKind, ScreenKind, Source};
 
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Span};
@@ -43,7 +45,7 @@ impl Cx<'_> {
     /// The judge graph record `rec` at `dst`.
     pub(in super::super) fn judge_graph(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let role = Role::Decorative;
+        let role = Role::Decorative.or_failure(dst.failure);
         let [ty, back_off, delay, reverse, no_gap, no_gap_x] = self.def.fields(
             rec,
             [
@@ -55,9 +57,10 @@ impl Cx<'_> {
                 "noGapX",
             ],
         );
-        let kind = match self.int_or(ty, "type", 0)? {
-            1 => JudgeGraphKind::Judgment,
-            2 => JudgeGraphKind::EarlyLate,
+        let kind = match (self.kind, self.int_or(ty, "type", 0)?) {
+            (ScreenKind::Play, 0) => JudgeGraphKind::Notes,
+            (ScreenKind::Result, 1) => JudgeGraphKind::Judgment,
+            (ScreenKind::Result, 2) => JudgeGraphKind::EarlyLate,
             _ => return self.drop_el(role, at, NoteKind::UnsupportedField { field: "type" }),
         };
         let back = self.int_or(back_off, "backTexOff", 0)? != 1;
@@ -97,7 +100,7 @@ impl Cx<'_> {
         self.push(c, Source::JudgeGraph(index), t)
     }
 
-    /// The opaque white system image the result graphs tint, drawn
+    /// The opaque white system image the graphs and visualizers tint, drawn
     /// nearest, charged and added once; a limit is located at `at`.
     pub(super) fn graph_white(&mut self, at: Span) -> Result<u32, ImportError> {
         let white = [255; 4];
@@ -110,7 +113,7 @@ impl Cx<'_> {
             .map_err(|l| self.limit(at, l))
     }
 
-    /// A result graph element's track: each key's rect, unbaked.
+    /// A graph or visualizer element's track: each key's rect, unbaked.
     pub(super) fn graph_track(
         &mut self,
         c: &super::super::Common,
