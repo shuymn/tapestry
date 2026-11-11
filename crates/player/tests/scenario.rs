@@ -1454,8 +1454,9 @@ fn onset_peaks(stdout: &str) -> Vec<f64> {
 }
 
 /// A practice at 75 % of a quiet chart the library misses measures the
-/// chart at 1× (read again with its 1× sounds) during the Start's load, so
-/// its first round plays at that gain, not the headroom; a later 1× play
+/// chart once at 1×, on the practice page or during the Start's load
+/// (whichever comes first), before the round's READY state, so its first
+/// round plays at that gain, not the headroom; a later 1× play
 /// finds that measurement by the chart's 1× key and measures nothing: its
 /// sounds peak as loud as the round's, about four times the headroom's.
 #[test]
@@ -1464,8 +1465,8 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
     let a = write_chart(&fx.library(), "a", "譜面A");
     write_wav_at(&fx.library().join("a").join("key.wav"), 1_000);
     write_log(&fx.base.join("logs").join("a.tprl"), &hits(&a, |_| true), 1);
-    // The practice: measured at its Start, its round's four presses at the
-    // gain.
+    // The practice: measured on its page or at its Start, its round's four
+    // presses at the gain.
     let (out, stdout, stderr) = fx.run(&scenario(&[
         "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 75, \
          lead_in_ms = 2000, gauge = 20, repeat = true, input = \"logs/a.tprl\", rounds = 1 }",
@@ -1488,8 +1489,9 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
         .unwrap();
     // The +6 dB cap: four times the headroom.
     assert!(db > 5.5, "{stdout}");
-    // The Start left the practice page for the play screen's loading state, which said
-    // the measurement and was drawn, up to the round's READY state.
+    // The Start left the practice page for the play screen's loading state,
+    // which was drawn up to the round's READY state; the one measurement came
+    // before the chart was ready, on the page or in that loading state.
     let all: Vec<&str> = stdout.lines().collect();
     let at = |from: usize, line: &str| {
         (from..all.len())
@@ -1498,8 +1500,13 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
     };
     let page = at(0, "practice: on the practice screen");
     let shown = at(page, "load: the play screen loads a.bms");
-    let measuring = at(shown, "load: measuring the loudness");
-    let ready = at(measuring, "load: the chart is ready ");
+    let ready = at(shown, "load: the chart is ready ");
+    let measured_at = at(0, "loudness: a.bms measured in ");
+    assert!(
+        measured_at < ready,
+        "measured after the chart was ready:
+{stdout}"
+    );
     at(ready, "play started");
     assert!(
         !lines(&stdout, "dev: loading frames ").is_empty(),
