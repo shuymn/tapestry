@@ -375,6 +375,7 @@ pub static PLAY: Schema = Schema {
         timer("mine.7", T),
         timer("loading", E),
         timer("screen", E),
+        timer("rhythm", E),
     ],
     enums: &[EnumDef {
         name: "gauge_kind",
@@ -706,8 +707,12 @@ pub mod timer {
     /// The screen's start, which an untimed element runs on: the loading
     /// lifetime's origin while loading, `ready`'s start in a play.
     pub const SCREEN: u16 = 56;
+    /// The rhythm clock: its start is `now` less the time since the
+    /// latest bar line at 1 000 ms per chart beat, from `play`'s start
+    /// through the completed tail to the progress end + 5 s, then held.
+    pub const RHYTHM: u16 = 57;
     /// The number of built-in timers.
-    pub const BUILTIN: u16 = 57;
+    pub const BUILTIN: u16 = 58;
 }
 
 /// A judgment as the skin shows it: the five grades and the empty POOR.
@@ -1171,6 +1176,7 @@ mod tests {
             ("combo.up", timer::COMBO_UP),
             ("loading", timer::LOADING),
             ("screen", timer::SCREEN),
+            ("rhythm", timer::RHYTHM),
         ];
         for (name, slot) in timers {
             assert_eq!(PLAY.timer(name).map(|(s, _)| s), Some(slot), "{name}");

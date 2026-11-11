@@ -8,6 +8,7 @@ use bms_model::{BEAT, DOMAIN, Lane, TimeUs};
 use eval::Tally;
 use rules::GaugeValue;
 
+use super::rhythm::TAIL_US;
 use super::schema::{
     COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, FPS_MAX, GAUGE_PERMILLE, Grade,
     JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
@@ -1049,6 +1050,7 @@ impl Play {
             last_note = Some(self.last_note_end);
         }
         let beat = ready.and_then(|_| self.beat_start(now, frame.display_offset));
+        let rhythm = self.rhythm_start(frame);
         let judge = self.reducer.judge;
         let mut set = |slot: u16, start: Option<TimeUs>| {
             if let Some(s) = self.starts.get_mut(usize::from(slot)) {
@@ -1063,6 +1065,7 @@ impl Play {
         set(timer::FULL_COMBO, self.reducer.full_combo);
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);
+        set(timer::RHYTHM, rhythm);
         set(timer::JUDGE, judge.map(|(_, at)| at));
         for grade in Grade::ALL {
             let at = judge.filter(|&(g, _)| g == grade).map(|(_, at)| at);
@@ -1091,6 +1094,27 @@ impl Play {
             set(lane_timer(LaneTimer::Hold, lane), hold);
             set(lane_timer(LaneTimer::Mine, lane), mine);
         }
+    }
+
+    /// The `rhythm` timer's start: `now` less the rhythm clock's value
+    /// ([`Rhythm`](super::rhythm::Rhythm)) on the play clock, not the
+    /// display clock. Off before `play` starts. The clock runs while the
+    /// frame is playing, and through the completed tail outside Closing
+    /// until the progress end + 5 s; from then, in Closing and on any
+    /// other frame (a quit that admits no Closing), the last start holds,
+    /// so the timer runs 1:1. Off for a frame whose value overflows.
+    fn rhythm_start(&mut self, frame: &SkinFrame<'_>) -> Option<TimeUs> {
+        let now = frame.now;
+        if now < self.play_at {
+            return None;
+        }
+        let tail_end = self.readout_end.0.saturating_add(TAIL_US);
+        let tail = frame.complete && now.0 < tail_end;
+        if frame.closing.is_some() || !(frame.playing || tail) {
+            return self.timer(timer::RHYTHM);
+        }
+        let value = self.rhythm.value(self.playhead.timeline(), now)?;
+        now.checked_sub(TimeUs(value))
     }
 
     /// The `beat` timer's start: the latest integer-beat crossing of the
