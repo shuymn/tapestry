@@ -60,17 +60,36 @@ const fn kind_name(kind: JobKind) -> &'static str {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Spawner {
     refused: &'static [JobKind],
+    /// Kinds refused for owned jobs only.
+    refused_owned: &'static [JobKind],
 }
 
 impl Spawner {
     /// The system's threads.
-    pub const SYSTEM: Self = Self { refused: &[] };
+    pub const SYSTEM: Self = Self {
+        refused: &[],
+        refused_owned: &[],
+    };
 
     /// The system's threads, except for `refused`'s jobs (tests).
     #[doc(hidden)]
     #[must_use]
     pub const fn refusing(refused: &'static [JobKind]) -> Self {
-        Self { refused }
+        Self {
+            refused,
+            refused_owned: &[],
+        }
+    }
+
+    /// The system's threads, except for owned jobs of `refused`'s kinds
+    /// (tests): a scoped job of the same kind still starts.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn refusing_owned(refused: &'static [JobKind]) -> Self {
+        Self {
+            refused: &[],
+            refused_owned: refused,
+        }
     }
 
     fn spawn<'scope, 'env, T: Send + 'scope>(
@@ -94,7 +113,7 @@ impl Spawner {
         kind: JobKind,
         f: impl FnOnce() + Send + 'static,
     ) -> io::Result<thread::JoinHandle<()>> {
-        if self.refused.contains(&kind) {
+        if self.refused.contains(&kind) || self.refused_owned.contains(&kind) {
             return Err(io::Error::other("refused (test)"));
         }
         thread::Builder::new()

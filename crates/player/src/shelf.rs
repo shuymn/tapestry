@@ -41,7 +41,7 @@ use library::{
 
 use game::coord::{Class, Coordinator, Lease};
 
-use crate::background::{Job, Queued, Worker};
+use crate::background::{Claim, Job, Queued, Worker};
 use crate::loudness::Loudness;
 #[cfg(test)]
 use crate::priority::Unchanged;
@@ -598,6 +598,43 @@ impl Shelf {
             println!("loudness: {name} is no longer waiting in the background");
         }
         self.loudness.look_up(&self.library, chart, bank, name)
+    }
+
+    /// The practice page's lookup of its 1× `bank` of `chart` (`name` in
+    /// the log): the background's measurements kept first, the gain
+    /// looked up; the key to measure on a miss. Unlike
+    /// [`look_up`](Self::look_up) it takes nothing from the background's
+    /// queue: [`claim`](Self::claim) decides that.
+    pub fn look_up_page(
+        &mut self,
+        chart: &Chart,
+        bank: &SoundBank,
+        name: &str,
+    ) -> Option<library::LoudnessKey> {
+        self.adopt();
+        self.loudness.look_up(&self.library, chart, bank, name)
+    }
+
+    /// The practice page measures the chart at `path` under `key` unless
+    /// the background has or does ([`Worker::claim`]); a row the
+    /// background measured under `key` is kept. [`Claim::Free`] without a
+    /// background thread.
+    pub fn claim(&mut self, path: &Path, key: &library::LoudnessKey) -> Claim {
+        let Some(worker) = &self.background else {
+            return Claim::Free;
+        };
+        let claim = worker.claim(path, key);
+        if let Claim::Reused(row) = &claim {
+            self.loudness.adopt(&self.library, *key, *row);
+        }
+        claim
+    }
+
+    /// The practice page no longer measures the chart at `path`.
+    pub fn unclaim(&self, path: &Path) {
+        if let Some(worker) = &self.background {
+            worker.unclaim(path);
+        }
     }
 
     /// The second half of [`loaded`](Self::loaded): the measurement `m` of
