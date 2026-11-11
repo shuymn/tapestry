@@ -1169,11 +1169,24 @@ fn a_responsible_panic_at_the_runs_end_ends_the_run_with_it() {
 }
 
 /// A page bank the Start was responsible for publishes its bank, then its
-/// thread panics as it ends: found by the page's next pass, or by a Start
-/// that joins it, the panic ends the run; the bank is not kept.
+/// thread panics as it ends: found by the page's next pass, the panic ends
+/// the run; the bank is not kept.
 #[test]
-fn a_panic_after_publication_ends_the_run_through_the_pass_and_the_start() {
-    for joined in [false, true] {
+fn a_panic_after_publication_ends_the_run_through_the_pass() {
+    panic_after_publication(false);
+}
+
+/// As [`a_panic_after_publication_ends_the_run_through_the_pass`], found
+/// by a Start that joins the bank.
+#[test]
+fn a_panic_after_publication_ends_the_run_through_the_start() {
+    panic_after_publication(true);
+}
+
+/// A panic after publication of a page bank a Start was responsible for,
+/// found through a Start that joins it (`joined`) or the page's pass.
+fn panic_after_publication(joined: bool) {
+    {
         let dir = tempfile::tempdir().unwrap();
         let page = Arc::new(Page::default());
         let (mut b, path) = plain(dir.path(), "r2-after", &page);
