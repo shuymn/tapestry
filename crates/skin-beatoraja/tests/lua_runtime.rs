@@ -130,6 +130,54 @@ fn untimed() {
     skin_beatoraja::lua::vm_hooks::set_frame_time(Some(std::time::Duration::from_secs(3_600)));
 }
 
+/// Off play no program runs: a root that reaches integer arithmetic able
+/// to leave `i32` keeps `Range` from the expression proof, and with the
+/// kept VM the bounded runtime, while one whose large arithmetic is
+/// discarded lowers, as on play (the expressions emit only what the root
+/// reaches); the control, a read alone, lowers.
+#[test]
+fn large_arithmetic_off_play_lowers_only_when_discarded() {
+    let values = [
+        "function() local n = ms.number(77) return n * n * n * n end",
+        "function() local n = ms.number(77) local u = n * n * n * n return 1 end",
+        "function() return ms.number(77) end",
+    ];
+    let text = entry("", &values, "nil");
+    let numbers = |c: &[Disposition]| c.get(..3).map(<[Disposition]>::to_vec);
+    let lowered = Disposition::Lowered;
+    // Without the kept VM: refused by role.
+    let d = common::selection::folder("");
+    common::write(d.path(), "s.luaskin", text.as_bytes());
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = ImportFacts::unavailable(ScreenKind::Selection);
+    let i = match h
+        .import(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap()
+    {
+        LuaOutcome::Imported(i) => i,
+        LuaOutcome::Pending(p) => panic!("{p:?}"),
+    };
+    assert_eq!(
+        numbers(&i.callbacks),
+        Some(vec![
+            Disposition::Replaced(skin_beatoraja::lua::Unsupported::Range),
+            lowered,
+            lowered,
+        ]),
+        "{:?}",
+        i.callbacks
+    );
+    // With it: the bounded runtime.
+    let i = import(&text);
+    assert_eq!(
+        numbers(&i.callbacks),
+        Some(vec![Disposition::Runtime, lowered, lowered]),
+        "{:?}",
+        i.callbacks
+    );
+}
+
 /// C1, C4, C8, C12: callbacks no expression represents run on the kept
 /// VM; their reads answer from the screen's fields through the profile,
 /// an omitted id with the source's value in the feature's absence; a
