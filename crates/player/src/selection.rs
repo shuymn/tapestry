@@ -2180,7 +2180,7 @@ impl AppRig for PlayerRig<'_> {
         // "Load Pipeline").
         let practised = loaded
             .section()
-            .and_then(|_| self.selection.as_ref())
+            .and(self.selection.as_ref())
             .and_then(|s| s.page.chart_of(loaded.path()).cloned());
         let mut reused = None;
         // At another speed with the gain known, the 1× bank is not needed.

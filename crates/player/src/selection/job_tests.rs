@@ -731,7 +731,8 @@ fn closing_while_the_bank_decodes_ends_the_run() {
 /// never stops the job, stops the Bank's decode by itself. No bank is made.
 #[test]
 fn a_quit_stops_the_scoped_decode_by_itself() {
-    for (speed, kind, ends) in [(Speed::NORMAL, JobKind::Bank, 1)] {
+    let (speed, kind, ends) = (Speed::NORMAL, JobKind::Bank, 1);
+    {
         let dir = tempfile::tempdir().unwrap();
         let path = song(dir.path(), "");
         let loaded = loaded(dir.path(), &path, speed);

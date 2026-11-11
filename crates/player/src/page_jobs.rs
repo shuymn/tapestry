@@ -49,6 +49,14 @@ pub type PageBank = Result<Arc<audio::SoundBank>, audio::BankError>;
 /// chart plays at the headroom, or its cancel.
 pub type PageMeasure = Result<Option<audio::Measurement>, crate::loudness::Cancelled>;
 
+/// The bank's account in the witness, from before its job begins to its
+/// registration (dev-tools); nothing otherwise.
+#[cfg(feature = "dev-tools")]
+pub type PageToken = Option<crate::bank_witness::DecodeToken>;
+/// The bank's account in the witness (dev-tools only).
+#[cfg(not(feature = "dev-tools"))]
+pub type PageToken = ();
+
 /// Where the page bank's decode reports its files: nowhere, or a Start's
 /// loading state while the Start waits for it ([`PageJobs::show`]).
 pub type PageSink = Arc<Mutex<Option<Box<dyn Fn(usize, usize) + Send>>>>;
@@ -192,9 +200,7 @@ pub fn spawn_page_bank(
     subscriber: Subscriber,
     (path, chart, rate): (PathBuf, Arc<Chart>, u32),
     (promoted, owner): (bool, Owner),
-    mode: Arc<JobMode>,
-    sink: PageSink,
-    #[cfg(feature = "dev-tools")] token: Option<crate::bank_witness::DecodeToken>,
+    (mode, sink, token): (Arc<JobMode>, PageSink, PageToken),
     #[cfg(test)] probe: Option<PageProbe>,
 ) -> Result<OwnedJob<PageBank>, LoadFailure> {
     let key = JobKey {
@@ -257,6 +263,8 @@ pub fn spawn_page_bank(
             if let (Some(token), Ok(bank)) = (token, &bank) {
                 token.register(bank);
             }
+            #[cfg(not(feature = "dev-tools"))]
+            let () = token;
             bank
         },
     )
@@ -502,10 +510,14 @@ impl PageJobs {
             coord.subscriber(Scope::Choice),
             (chart.path.clone(), Arc::clone(&chart.chart), chart.rate),
             (false, Owner::Speculative),
-            mode,
-            Arc::clone(&self.sink),
-            #[cfg(feature = "dev-tools")]
-            Some(witness.decode()),
+            (
+                mode,
+                Arc::clone(&self.sink),
+                #[cfg(feature = "dev-tools")]
+                Some(witness.decode()),
+                #[cfg(not(feature = "dev-tools"))]
+                (),
+            ),
             #[cfg(test)]
             self.probe.clone(),
         ) {
