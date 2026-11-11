@@ -486,7 +486,7 @@ struct Headless {
     /// in ms (none: as without one).
     served_load_ms: Option<i64>,
     /// The chosen chart at each decision screen's entry.
-    decisions: Vec<usize>,
+    decisions: Vec<(usize, i64)>,
     /// The clock at each deadline step.
     deadline_steps: Vec<i64>,
     /// The decision screen's epochs closed.
@@ -499,6 +499,16 @@ struct Headless {
     escape_when_waiting: bool,
     /// Escapes taken.
     escapes: usize,
+    /// Told at the first decision look that finds the run ending (a close
+    /// or a thread's failure).
+    ending_seen: Option<mpsc::Sender<()>>,
+    /// A play's load finishes at its deadline, its bank refused: a reply
+    /// in hand with the deadline due.
+    refuse_load_at_deadline: bool,
+    /// The clock at each refusal shown.
+    refused_at: Vec<i64>,
+    /// The clock at each entry into the practice page.
+    page_entered_at: Vec<i64>,
     violations: Vec<String>,
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
@@ -706,6 +716,10 @@ impl Headless {
             waiting_seen: None,
             escape_when_waiting: false,
             escapes: 0,
+            ending_seen: None,
+            refuse_load_at_deadline: false,
+            refused_at: Vec::new(),
+            page_entered_at: Vec::new(),
             edits: Vec::new(),
             presets: Vec::new(),
             chosen_names: Vec::new(),
@@ -1270,6 +1284,14 @@ impl AppRig for Headless {
                 }
             }
         }
+        if self.refuse_load_at_deadline
+            && let Some(deadline) = decision.deadline()
+        {
+            // The job finished, refused, before any look; the clock is at
+            // the deadline when the flow looks at it.
+            self.clock.advance(TimeUs((deadline.0 - self.at()).max(0)));
+            return Err(BankLost);
+        }
         let now = self.clock.now();
         if let Some(driver) = &mut self.adjust {
             driver
@@ -1340,6 +1362,7 @@ impl AppRig for Headless {
                 .push(format!("refused {}", refusal.chart.display()));
         }
         self.seen.push(Seen::Refused(self.chosen.unwrap()));
+        self.refused_at.push(self.at());
         let kind = match &refusal.reason {
             Refused::Chart(SessionError::Io { .. }) => "io",
             Refused::Chart(SessionError::Preset(_)) => "preset",
@@ -1424,7 +1447,7 @@ impl AppRig for Headless {
 
     fn entered_decision(&mut self, pick: &Pick) {
         let i = self.chosen.unwrap();
-        self.decisions.push(i);
+        self.decisions.push((i, self.at()));
         // The attempt's reset at the choice; the loading state shows at
         // the deadline.
         if let Pick::Play(_) = pick {
@@ -1442,6 +1465,13 @@ impl AppRig for Headless {
         self.clock.advance(TimeUs(self.decision_step_ms * MS));
         self.tick();
         self.decision_looks.push((origin, self.at()));
+        if (self.quitting()
+            || game::Rig::input_failure(self).is_some()
+            || game::Rig::audio_failure(self).is_some())
+            && let Some(seen) = self.ending_seen.take()
+        {
+            let _ = seen.send(());
+        }
         Ok(())
     }
 
@@ -1478,6 +1508,7 @@ impl AppRig for Headless {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.page_entered_at.push(self.at());
         self.job_left();
         self.loading = None;
         self.seen
