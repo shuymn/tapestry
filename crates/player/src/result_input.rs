@@ -25,9 +25,17 @@ impl Pad {
         self.receiver.as_mut()?.pop()
     }
 
-    /// Takes the next event with its panel and the ingress word it was sent
-    /// under ([`input::MenuReceiver::pop_stamped`]).
-    pub fn pop_stamped(&mut self) -> Option<(input::MenuEvent, Option<usize>, input::Ingress)> {
+    /// Takes the next event with its panel, the ingress word it was sent
+    /// under and the time it was observed
+    /// ([`input::MenuReceiver::pop_stamped`]).
+    pub fn pop_stamped(
+        &mut self,
+    ) -> Option<(
+        input::MenuEvent,
+        Option<usize>,
+        input::Ingress,
+        bms_model::TimeUs,
+    )> {
         self.receiver.as_mut()?.pop_stamped()
     }
 

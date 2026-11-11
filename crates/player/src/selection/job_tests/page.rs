@@ -1376,61 +1376,101 @@ fn a_refused_page_measurement_is_tried_once() {
     );
 }
 
-/// The page's read waits for the chart's background measurement before
-/// its 1× bank begins (design.md "Load Pipeline", the release barrier):
-/// held at its first block, the measurement is promoted by the wait, and
-/// the page's decode has not begun while it is held, so the two banks are
-/// never alive together; once it ended the read goes on and the page's
-/// bank is made. The read serves the decision screen meanwhile.
-#[test]
-fn the_page_waits_for_the_charts_background_measurement() {
-    use std::sync::atomic::Ordering;
+/// The page's chart read while its background measurement runs, held at
+/// a block (the rig's read, then its looks): the read returns at once, the
+/// bank waiting; the page's looks and the page's entry at the deadline go
+/// on with no bank begun beside the background's; once the measurement is
+/// done the next look begins the bank, the page's own by then.
+fn read_with_the_background_held(
+    dir: &Path,
+    tag: &str,
+    page: &Arc<Page>,
+    after: impl FnOnce(&Bench, &mut PlayerRig<'_>, &game::Loaded),
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
-    let dir = tempfile::tempdir().unwrap();
-    let page = Arc::new(Page::default());
-    let (mut b, path) = plain(dir.path(), "pbg", &page);
+    let (mut b, path) = plain(dir, tag, page);
     let s = b.sel.take().unwrap();
-    let worker = crate::shelf::tests::worker(&s.shelf);
-    worker.queue(crate::shelf::tests::job(&path));
-    let wanted = worker.wanted(&path);
+    crate::shelf::tests::worker(&s.shelf).queue(crate::shelf::tests::job(&path));
     assert_eq!(b.stepper.said(), crate::background::tests::Said::Block(0));
-    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let read = loaded(dir, &path, Speed::NORMAL);
     let b = b;
     on_rig(s, &Installers::default(), false, |rig| {
-        let got = std::thread::scope(|scope| {
+        let returned = AtomicBool::new(false);
+        let let_go = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            // A read that waits for the measurement is let go when the bound
+            // runs out, so the test fails by its assertion, not a hang.
             scope.spawn(|| {
-                // The read waits for the measurement, held at its block: a
-                // read that does not is found when the bound runs out, the
-                // measurement then let go so nothing waits for it.
                 let began = Instant::now();
-                while !wanted() && began.elapsed() < watchdog() {
+                while !returned.load(Ordering::SeqCst) && began.elapsed() < watchdog() {
                     std::thread::park_timeout(std::time::Duration::from_millis(1));
                 }
-                let waited = wanted();
-                let alone = page.seen.lock().unwrap().is_empty();
-                if waited {
-                    // Its check finds it promoted by the wait.
-                    while b.mode.leaves.load(Ordering::SeqCst) == 0 {
-                        b.stepper.step();
-                        assert!(matches!(
-                            b.stepper.said(),
-                            crate::background::tests::Said::Block(_)
-                        ));
-                    }
+                if !returned.load(Ordering::SeqCst) {
+                    let_go.store(true, Ordering::SeqCst);
+                    b.stepper.finish();
                 }
-                b.stepper.finish();
-                assert!(waited, "the page's read did not wait for the measurement");
-                assert!(
-                    alone,
-                    "the page's decode began beside the background's bank"
-                );
             });
             let now = bms_model::TimeSource::now(&rig.clock);
             let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
-            outcome(rig.practice_read(&read, &mut decision))
+            let got = outcome(rig.practice_read(&read, &mut decision));
+            returned.store(true, Ordering::SeqCst);
+            assert_eq!(got, Loading::Ready);
         });
-        assert_eq!(got, Loading::Ready);
+        assert!(
+            !let_go.load(Ordering::SeqCst),
+            "the page's read waited for the background measurement"
+        );
+        after(&b, rig, &read);
+    });
+}
+
+/// The background held past the deadline: the page's looks begin no bank
+/// beside it, the page opens at its entry with the bank waiting, and once
+/// the measurement is done the next look begins the bank, the page's own
+/// (unpromoted), which is made.
+#[test]
+fn the_page_bank_waits_for_the_background_past_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    read_with_the_background_held(dir.path(), "pbg", &page, |b, rig, _| {
+        for _ in 0..3 {
+            rig.poll_page().unwrap();
+        }
+        assert!(
+            page.seen.lock().unwrap().is_empty(),
+            "the page's decode began beside the background's bank"
+        );
+        assert!(!sel(rig).page.decoding());
+        // The deadline: the page opens, its bank still waiting.
+        rig.closed_epoch();
+        b.stepper.finish();
+        until("the page's bank begun", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.decoding() || sel(rig).page.kept().is_some()
+        });
         passes_until_idle(rig);
         assert!(sel(rig).page.kept().is_some());
+    });
+}
+
+/// Leaving the chart while its bank waits for the background: no bank
+/// begins after, and the measurement goes on on its own to its result.
+#[test]
+fn leaving_while_the_page_waits_for_the_background_begins_no_bank() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    read_with_the_background_held(dir.path(), "pbl", &page, |b, rig, _| {
+        rig.left_chart().unwrap();
+        b.stepper.finish();
+        for _ in 0..3 {
+            rig.poll_page().unwrap();
+        }
+        assert!(
+            page.seen.lock().unwrap().is_empty(),
+            "a bank began after the chart was left"
+        );
+        assert!(!sel(rig).page.decoding());
+        assert!(crate::shelf::tests::worker(&sel(rig).shelf).wait_results(1, watchdog()));
     });
 }

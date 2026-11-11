@@ -372,7 +372,8 @@ struct Shared {
     /// The decision tone asked to start: not a control message, so it
     /// never waits behind one.
     tone: AtomicBool,
-    /// The decision tones asked for so far.
+    /// The decision tones asked for so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
     tones: AtomicU64,
     /// The latest report that the sealed play's audio has ended: its
     /// generation in the high 32 bits, the key-sound commands the audio
@@ -444,7 +445,8 @@ impl OutputProbe {
     }
 
     /// How many decision tones were asked for
-    /// ([`AudioControl::play_tone`]).
+    /// ([`AudioControl::play_tone`]; dev-tools).
+    #[cfg(feature = "dev-tools")]
     #[must_use]
     pub fn tone_requests(&self) -> u64 {
         self.0.tones.load(Ordering::Acquire)
@@ -983,6 +985,7 @@ impl AudioControl {
     /// a UI sound outside every bank, which loading or unloading a bank does
     /// not cut ([`AudioEngine::play_tone`]).
     pub fn play_tone(&self) {
+        #[cfg(feature = "dev-tools")]
         self.shared.tones.fetch_add(1, Ordering::AcqRel);
         self.shared.tone.store(true, Ordering::Release);
     }

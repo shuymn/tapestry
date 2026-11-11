@@ -1517,7 +1517,7 @@ impl AppRig for Headless {
         self.closed_epochs += 1;
     }
 
-    fn decision_escape(&mut self) -> bool {
+    fn decision_escape(&mut self, _deadline: TimeUs) -> bool {
         if let Some(seen) = self.waiting_seen.take() {
             let _ = seen.send(());
         }
@@ -5483,4 +5483,31 @@ fn a_failed_recovery_reports_a_thread_failure_first() {
             assert!(matches!(ran, Err(LiveError::Screen(_))), "{ran:?}");
         }
     }
+}
+
+/// The screen lost while the practice page's chart is read and its
+/// prerequisites still wait, held to the deadline: rebuilt during that
+/// hold, its presentation sent again, no second decision screen, and the
+/// page opens after the deadline.
+#[test]
+fn a_screen_lost_while_the_page_waits_is_rebuilt() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let [(recovered, looks)] = rig.recovered_decisions[..] else {
+        panic!("{:?}", rig.recovered_decisions);
+    };
+    assert_eq!(
+        rig.decision_looks.get(looks).map(|&(o, _)| o),
+        Some(game::Origin::Jobs),
+        "recovered in the page's hold"
+    );
+    assert!(recovered < choice + 1_500 * MS, "{recovered} from {choice}");
+    assert_eq!(rig.decisions.len(), 1);
+    let entered = rig.page_entered_at[0];
+    assert!(entered >= choice + 1_500 * MS, "{entered} from {choice}");
 }

@@ -326,7 +326,6 @@ pub const IN_PLAY: &[Site] = &[
             "Controls::take_with",
             "Controls::leaving",
             "Controls::ingress",
-            "Controls::escaping",
             "Controls::retry_at",
             "Controls::quitting",
             "Controls::focused",
@@ -337,6 +336,7 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     Site::File("crates/player/src/tuning.rs"),
+    Site::File("crates/player/src/failures.rs"),
     Site::File("crates/player/src/start_gate.rs"),
     // The audio thread.
     Site::File("crates/game/src/audio_loop.rs"),

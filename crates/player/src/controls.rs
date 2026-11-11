@@ -15,8 +15,9 @@
 //! decision screen) is kept in the same word as the pending commands, so
 //! a command is published wholly before or wholly after the epoch's open
 //! and close: while it is closed the quit key and retry are dropped and a
-//! suspend kept; past the screen's time, while practice waits for its
-//! read, the quit key is let through to leave.
+//! suspend kept. A quit key press in the epoch is kept apart with the time
+//! it was observed, which the decision screen past its time reads
+//! ([`Controls::take_quit_since`]).
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
@@ -36,9 +37,6 @@ const SUSPEND: u8 = 2;
 const LEAVE: u8 = 4;
 /// The decision screen's input epoch is open: quit and retry are dropped.
 const EPOCH: u8 = 8;
-/// Past the decision screen's time, practice waiting for its read: the
-/// quit key leaves again.
-const ESCAPE: u8 = 16;
 
 /// The decision screen as the waits inside a chart's load serve it
 /// (design.md "Play Lifecycle", the decision screen): every wait's stop
@@ -72,6 +70,9 @@ pub struct Controls {
     command: AtomicU8,
     /// When the latest retry was received, on the clock.
     retry_at: AtomicI64,
+    /// When the latest quit key press in the decision screen's epoch was
+    /// observed, on the clock; `i64::MIN` for none.
+    quit_in_epoch: AtomicI64,
     quit: AtomicBool,
     /// The quit key leaves the chart rather than latching [`quit`](Self::quit).
     leaves: AtomicBool,
@@ -121,6 +122,7 @@ impl Controls {
             clock,
             command: AtomicU8::new(NONE),
             retry_at: AtomicI64::new(i64::MIN),
+            quit_in_epoch: AtomicI64::new(i64::MIN),
             quit: AtomicBool::new(false),
             leaves: AtomicBool::new(false),
             focused: AtomicBool::new(true),
@@ -136,8 +138,7 @@ impl Controls {
         }
     }
 
-    /// The clock's time now.
-    #[cfg(feature = "dev-tools")]
+    /// The clock's time now: what a producer observes an input at.
     pub fn now(&self) -> TimeUs {
         self.clock.now()
     }
@@ -239,22 +240,21 @@ impl Controls {
             Command::Retry => RETRY,
             Command::Suspend => SUSPEND,
         };
-        // In the decision screen's epoch only a suspend is kept, and the
-        // quit key once its escape is let through.
+        // In the decision screen's epoch only a suspend is kept; a quit
+        // key press is kept apart, with the time it was observed.
         let set = self
             .command
             .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                let dropped = w & EPOCH != 0
-                    && match bit {
-                        LEAVE => w & ESCAPE == 0,
-                        RETRY => true,
-                        _ => false,
-                    };
+                let dropped = w & EPOCH != 0 && matches!(bit, LEAVE | RETRY);
                 (!dropped).then_some(w | bit)
             })
             .is_ok();
         if set && bit == RETRY {
             self.retry_at.store(self.clock.now().0, Ordering::Release);
+        }
+        if !set && bit == LEAVE {
+            self.quit_in_epoch
+                .store(self.clock.now().0, Ordering::Release);
         }
     }
 
@@ -311,8 +311,9 @@ impl Controls {
             let _ = self
                 .command
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                    Some((w | EPOCH) & !(LEAVE | RETRY | ESCAPE))
+                    Some((w | EPOCH) & !(LEAVE | RETRY))
                 });
+            self.quit_in_epoch.store(i64::MIN, Ordering::Release);
         });
         self.wake_game();
     }
@@ -326,49 +327,21 @@ impl Controls {
             let _ = self
                 .command
                 .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                    Some(w & !(EPOCH | LEAVE | RETRY | ESCAPE))
+                    Some(w & !(EPOCH | LEAVE | RETRY))
                 });
+            self.quit_in_epoch.store(i64::MIN, Ordering::Release);
         });
         self.wake_game();
     }
 
-    /// Past the decision screen's time while practice waits for its read
-    /// (design.md "Play Lifecycle", the practice page): the quit key and
-    /// Back leave from here. The ingress word moves to a new closed
-    /// generation in the same tuning step, so only an Escape or a Back
-    /// observed from here carries a stamp the escape admits
-    /// ([`admits_escape`](Self::admits_escape)); one queued before is
-    /// stale. Once per epoch; nothing outside it.
-    pub fn let_escape(&self) {
-        let w = self.command.load(Ordering::Acquire);
-        if w & EPOCH == 0 || w & ESCAPE != 0 {
-            return;
-        }
-        self.tuning.close_ingress(|| {
-            let _ = self
-                .command
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                    (w & EPOCH != 0).then_some((w | ESCAPE) & !LEAVE)
-                });
-        });
-    }
-
-    /// Whether an Escape or a Back stamped `stamp` by its producer leaves
-    /// the decision screen: observed after the escape was let through, in
-    /// its generation. Read under the tuning step lock, so the word cannot
-    /// move between this check and its effect.
-    pub fn admits_escape(&self, stamp: input::Ingress) -> bool {
-        self.tuning
-            .with_ingress(|word| word == stamp && self.escaping())
-    }
-
-    /// The quit key pressed since the escape was let through, taken.
-    pub fn take_leave(&self) -> bool {
-        self.command
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                (w & LEAVE != 0).then_some(w & !LEAVE)
-            })
-            .is_ok()
+    /// Whether the quit key was pressed in the decision screen's epoch at
+    /// or after `deadline`, as the window observed its press, taken: the
+    /// decision screen past its time reads it (design.md "Play Lifecycle",
+    /// the practice page). A press observed before `deadline` is not, when
+    /// ever it is taken.
+    pub fn take_quit_since(&self, deadline: TimeUs) -> bool {
+        let at = self.quit_in_epoch.swap(i64::MIN, Ordering::AcqRel);
+        at != i64::MIN && at >= deadline.0
     }
 
     /// Whether a wait inside a chart's load left the decision screen
@@ -379,13 +352,6 @@ impl Controls {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|w| w.decision.left().is_some())
-    }
-
-    /// Whether the decision screen's epoch lets the quit key and Back
-    /// through ([`let_escape`](Self::let_escape)).
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn escaping(&self) -> bool {
-        self.command.load(Ordering::Acquire) & ESCAPE != 0
     }
 
     /// The waits of a chart's load serve `watch` from now on, until
@@ -675,25 +641,29 @@ mod tests {
     }
 
     /// Past the decision screen's time, while practice waits for its read
-    /// (W3): the quit key, dropped before (the positive control), leaves
-    /// once the escape is let through, taken once; outside the epoch the
-    /// escape is not let through.
+    /// (W3): a quit key press is taken by the time it was observed, against
+    /// the deadline, whenever it is taken: one observed before the deadline
+    /// does not leave, one observed at or after it does, once; neither is
+    /// a pending quit while the epoch lasts, and the epoch's end drops one.
     #[test]
-    fn the_escape_lets_the_quit_key_through_in_the_epoch_only() {
+    fn a_quit_in_the_epoch_is_taken_by_its_observation_time() {
         let c = Controls::new(QpcClock::start());
         c.quit_leaves();
-        c.let_escape();
-        assert!(!c.escaping());
         c.close_epoch();
         c.command(Command::Quit);
-        assert!(!c.take_leave());
-        c.let_escape();
-        assert!(c.escaping());
+        let after = c.now();
+        let deadline = bms_model::TimeUs(after.0 + 1);
+        while c.now().0 < deadline.0 {
+            std::thread::yield_now();
+        }
+        assert!(!c.leaving(), "no pending quit in the epoch");
+        assert!(!c.take_quit_since(deadline), "observed before the deadline");
         c.command(Command::Quit);
-        assert!(c.take_leave());
-        assert!(!c.take_leave());
+        assert!(c.take_quit_since(deadline));
+        assert!(!c.take_quit_since(deadline), "taken once");
+        c.command(Command::Quit);
         c.open_epoch();
-        assert!(!c.escaping());
+        assert!(!c.take_quit_since(deadline), "dropped at the epoch's end");
     }
 
     /// The rig's thread failures for a watcher test, read the way the rig

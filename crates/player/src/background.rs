@@ -458,14 +458,6 @@ impl Worker {
         });
     }
 
-    /// Whether a load waits for `path`'s measurement now
-    /// ([`promote`](Self::promote)), readable from another thread (tests).
-    #[cfg(all(test, feature = "dev-tools"))]
-    pub(crate) fn wanted(&self, path: &Path) -> impl Fn() -> bool + Send + 'static {
-        let (shared, path) = (Arc::clone(&self.shared), path.to_owned());
-        move || shared.lock().wanted.as_deref() == Some(path.as_path())
-    }
-
     /// The load no longer waits for `path`'s measurement: it goes on in
     /// the background.
     pub fn demote(&self, path: &Path) {

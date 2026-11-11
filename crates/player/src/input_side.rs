@@ -1102,9 +1102,10 @@ impl Hook {
     /// released.
     fn menu(&mut self, sources: &mut SourceSet) {
         let mut wake = self.publish_panels(sources);
-        let active = self.phase == Phase::Idle
-            && self.controls.focused()
-            && (self.ingress_seen.is_open() || self.controls.escaping());
+        // The controller's menu observes through the decision screen too:
+        // its events carry the word and the time they were observed at, and
+        // those of the screen are rejected where they are taken.
+        let active = self.phase == Phase::Idle && self.controls.focused();
         if let Some(menu) = sources.menu_mut() {
             menu.set_active(active);
             wake |= menu.take_sent();
@@ -4197,6 +4198,10 @@ mod panel_tests {
                     control: 8,
                     lane: 0,
                 },
+                game::LaneKey {
+                    control: 2,
+                    lane: 2,
+                },
             ];
             device.controller_device = Some(PRODUCT.into());
             let keys = KeyConfigs::from(&device);
@@ -4284,6 +4289,42 @@ mod panel_tests {
 
     fn key(control: ControlId, value: i32) -> (DeviceId, ControlId, i32) {
         (KEYBOARD, control, value)
+    }
+
+    /// The controller's menu observes through the decision screen: the
+    /// epoch closed and the thread idle (a boundary seen since, which
+    /// would otherwise have turned the menu off), a Back pressed after the
+    /// screen's time `T` is queued in its own batch with its receive time
+    /// and leaves the waiting screen; one pressed before `T` does not.
+    /// Nothing is discarded before it is observed.
+    #[test]
+    fn a_fresh_back_reaches_the_waiting_decision_screen() {
+        let mut r = Rig::new();
+        r.controls.close_epoch();
+        r.wake();
+        r.batch(&[(PAD, ControlId(2), 1), (PAD, ControlId(2), 0)], false);
+        let deadline = TimeUs(r.now + 1);
+        r.batch(&[(PAD, ControlId(2), 1), (PAD, ControlId(2), 0)], false);
+        let (_tap, empty) = input::menu_queue(input::MenuBindings {
+            product: PRODUCT,
+            controls: Vec::new(),
+            step: 1,
+            relative: None,
+            wrap: None,
+        });
+        let mut pad = crate::result_input::Pad {
+            receiver: Some(std::mem::replace(&mut r.menu, empty)),
+            dropped: 0,
+        };
+        let stale = pad.pop_stamped();
+        assert!(
+            stale.is_some_and(|(e, _, _, at)| e == input::MenuEvent::Back && at.0 < deadline.0),
+            "the Back before T was observed: {stale:?}"
+        );
+        assert!(
+            crate::selection::take_escape(&r.controls, None, &mut pad, deadline),
+            "the fresh Back was lost"
+        );
     }
 
     /// START pressed during the decision screen and held through a

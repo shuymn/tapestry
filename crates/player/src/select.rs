@@ -242,11 +242,21 @@ pub const QUEUED_KEYS: usize = 64;
 /// there. Text and compositions join only those with the same stamp.
 #[derive(Debug, Default)]
 pub struct MenuQueue {
-    inputs: Mutex<VecDeque<(MenuInput, Option<input::Ingress>)>>,
+    inputs: Mutex<VecDeque<(MenuInput, Option<Observed>)>>,
     dropped: AtomicU64,
     /// The tuning whose ingress word validates stamped inputs; none: every
     /// input is taken.
     gate: Option<Arc<crate::tuning::LiveTuning>>,
+}
+
+/// How the window observed an input: the ingress word then, and when, on
+/// the clock (design.md "Play Lifecycle", the decision screen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observed {
+    /// The ingress word it was observed under.
+    pub stamp: input::Ingress,
+    /// When it was observed.
+    pub at: bms_model::TimeUs,
 }
 
 impl MenuQueue {
@@ -265,10 +275,15 @@ impl MenuQueue {
         self.push_stamped(input, None);
     }
 
-    /// Queues `input` observed under the ingress word `stamp`.
-    pub fn push_stamped(&self, input: MenuInput, stamp: Option<input::Ingress>) {
+    /// Queues `input` as it was `observed` (none: the game thread's own).
+    /// Text and a composition join only one observed under the same word.
+    pub fn push_stamped(&self, input: MenuInput, observed: Option<Observed>) {
+        let stamp = observed.map(|o| o.stamp);
         let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        let last = q.back_mut().filter(|(_, s)| *s == stamp).map(|(i, _)| i);
+        let last = q
+            .back_mut()
+            .filter(|(_, o)| o.map(|o| o.stamp) == stamp)
+            .map(|(i, _)| i);
         match (input, last) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
@@ -278,12 +293,12 @@ impl MenuQueue {
                     .filter(|(i, _)| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
                     .count();
                 if keys < QUEUED_KEYS {
-                    q.push_back((key, stamp));
+                    q.push_back((key, observed));
                 } else {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            (input, _) => q.push_back((input, stamp)),
+            (input, _) => q.push_back((input, observed)),
         }
     }
 
@@ -291,13 +306,13 @@ impl MenuQueue {
     /// stale ones before it.
     pub fn pop(&self) -> Option<MenuInput> {
         loop {
-            let (input, stamp) = self
+            let (input, observed) = self
                 .inputs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()?;
-            let valid = match (stamp, &self.gate) {
-                (Some(stamp), Some(gate)) => gate.with_ingress(|word| word.admits(stamp)),
+            let valid = match (observed, &self.gate) {
+                (Some(o), Some(gate)) => gate.with_ingress(|word| word.admits(o.stamp)),
                 _ => true,
             };
             if valid {
@@ -306,15 +321,16 @@ impl MenuQueue {
         }
     }
 
-    /// Takes every input queued, and whether one was an Escape whose stamp
-    /// `admits`: what the decision screen reads past its time (design.md
-    /// "Play Lifecycle", the practice page). An unstamped input is never
-    /// an escape.
-    pub fn take_escape(&self, admits: impl Fn(input::Ingress) -> bool) -> bool {
+    /// Takes every input queued, and whether one was an Escape observed at
+    /// or after `deadline`: what the decision screen reads past its time
+    /// (design.md "Play Lifecycle", the practice page). One the window did
+    /// not observe is never an escape.
+    pub fn take_escape(&self, deadline: bms_model::TimeUs) -> bool {
         let taken =
             std::mem::take(&mut *self.inputs.lock().unwrap_or_else(PoisonError::into_inner));
-        taken.into_iter().any(|(i, stamp)| {
-            matches!(i, MenuInput::Key(MenuKey::Escape)) && stamp.is_some_and(&admits)
+        taken.into_iter().any(|(i, observed)| {
+            matches!(i, MenuInput::Key(MenuKey::Escape))
+                && observed.is_some_and(|o| o.at.0 >= deadline.0)
         })
     }
 

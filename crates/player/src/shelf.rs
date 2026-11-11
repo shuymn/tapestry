@@ -192,6 +192,9 @@ pub struct Shelf {
     /// The background measurement of charts whose load was cancelled
     /// during theirs; none when its thread could not start.
     background: Option<Worker>,
+    /// The chart whose background measurement a wait promoted and still
+    /// waits for ([`background_ready`](Self::background_ready)).
+    awaiting: Option<std::path::PathBuf>,
     /// Passes completed (dev-tools and tests).
     #[cfg(any(test, feature = "dev-tools"))]
     passes: u64,
@@ -270,6 +273,7 @@ impl Shelf {
             outcome: Outcome::Ended,
             loudness: Loudness::default(),
             background,
+            awaiting: None,
             #[cfg(any(test, feature = "dev-tools"))]
             passes: 0,
             #[cfg(feature = "dev-tools")]
@@ -683,38 +687,84 @@ impl Shelf {
         mut cancelled: impl FnMut() -> bool,
         measuring: impl FnOnce(),
     ) -> game::Loading {
+        let mut measuring = Some(measuring);
+        loop {
+            if self.background_look(chart, name, BACKGROUND_SLICE, &mut measuring) {
+                return game::Loading::Ready;
+            }
+            if cancelled() {
+                self.stop_awaiting();
+                return game::Loading::Cancelled;
+            }
+        }
+    }
+
+    /// One look of [`wait_background`](Self::wait_background) that does not
+    /// wait: whether the load of `chart` may go on now, its background
+    /// measurement done (its result kept) or another chart's stopped for
+    /// the pause. While the chart's measurement runs it is promoted, until
+    /// it is done or [`stop_awaiting`](Self::stop_awaiting). What the
+    /// practice page's read polls before its bank (design.md "Load
+    /// Pipeline").
+    pub fn background_ready(&mut self, chart: &Path, name: &str) -> bool {
+        self.background_look(chart, name, Duration::ZERO, &mut None::<fn()>)
+    }
+
+    /// The wait's look, waiting at most `slice`; `measuring` is called the
+    /// first time it finds the chart's measurement running.
+    fn background_look(
+        &mut self,
+        chart: &Path,
+        name: &str,
+        slice: Duration,
+        measuring: &mut Option<impl FnOnce()>,
+    ) -> bool {
         // Requested at the choice; here again for a load without one.
         self.choose(chart);
         let Some(worker) = &self.background else {
-            return game::Loading::Ready;
+            return true;
         };
+        let promoted = self.awaiting.as_deref() == Some(chart);
         if !worker.holds(chart) {
-            while !worker.wait_paused(BACKGROUND_SLICE) {
-                if cancelled() {
-                    return game::Loading::Cancelled;
-                }
+            if promoted {
+                // Done while it was waited for.
+                return self.settle_awaited();
             }
-            return game::Loading::Ready;
+            return worker.wait_paused(slice);
         }
-        measuring();
-        let line = format!("loudness: waiting for {name}'s measurement in the background");
-        println!("{line}");
-        log::info!("{line}");
-        #[cfg(feature = "dev-tools")]
-        crate::dev::release_background();
-        worker.promote(chart);
-        let mut waited = game::Loading::Ready;
-        while !worker.wait_done(chart, BACKGROUND_SLICE) {
-            if cancelled() {
-                waited = game::Loading::Cancelled;
-                break;
+        if !promoted {
+            if let Some(measuring) = measuring.take() {
+                measuring();
             }
+            let line = format!("loudness: waiting for {name}'s measurement in the background");
+            println!("{line}");
+            log::info!("{line}");
+            #[cfg(feature = "dev-tools")]
+            crate::dev::release_background();
+            worker.promote(chart);
+            self.awaiting = Some(chart.to_owned());
         }
-        worker.demote(chart);
-        if waited == game::Loading::Ready {
-            self.adopt();
+        if worker.wait_done(chart, slice) {
+            return self.settle_awaited();
         }
-        waited
+        false
+    }
+
+    /// The awaited measurement is done: demoted back, its result kept.
+    fn settle_awaited(&mut self) -> bool {
+        if let (Some(chart), Some(worker)) = (self.awaiting.take(), &self.background) {
+            worker.demote(&chart);
+        }
+        self.adopt();
+        true
+    }
+
+    /// The load no longer waits for the background measurement it
+    /// promoted: it goes on in the background.
+    pub fn stop_awaiting(&mut self) {
+        if let (Some(chart), Some(worker)) = (self.awaiting.take(), &self.background) {
+            worker.demote(&chart);
+        }
     }
 
     /// Keeps the background's measurements in memory, those still wanted.

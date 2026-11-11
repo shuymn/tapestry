@@ -165,8 +165,11 @@ pub trait AppRig: LoadingRig {
     /// input epoch ends. Nothing by default.
     fn closed_epoch(&mut self) {}
     /// Past the deadline while practice waits for its read: whether Back
-    /// or the quit key was pressed, taken. Never by default.
-    fn decision_escape(&mut self) -> bool {
+    /// or the quit key was pressed at or after `deadline`, as its press
+    /// was observed, taken; one observed before it, whenever it is taken,
+    /// is not. Never by default.
+    fn decision_escape(&mut self, deadline: TimeUs) -> bool {
+        let _ = deadline;
         false
     }
     /// The screen was built again during the decision screen: its
@@ -951,7 +954,7 @@ fn serve<R: AppRig>(
     }
     rig.decision_tick(origin)?;
     let terminal = rig.quitting() || threads_over(rig).is_err();
-    let escape = d.waiting() && rig.decision_escape();
+    let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
     Ok(
         match d.classify(origin, rig.now(), terminal, escape, reply) {
             Verdict::Continue => Next::Go,

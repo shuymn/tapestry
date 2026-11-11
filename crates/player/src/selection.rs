@@ -533,9 +533,11 @@ impl Selection {
     ) -> Option<Pick> {
         // The controller's events join the window's, within their bound,
         // with the panel open as each was sent.
-        while let Some((event, panel, stamp)) = pad.pop_stamped() {
-            self.menu
-                .push_stamped(MenuInput::Pad { event, panel }, Some(stamp));
+        while let Some((event, panel, stamp, at)) = pad.pop_stamped() {
+            self.menu.push_stamped(
+                MenuInput::Pad { event, panel },
+                Some(crate::select::Observed { stamp, at }),
+            );
         }
         pad.report_dropped("select");
         while let Some(input) = self.menu.pop() {
@@ -1444,25 +1446,24 @@ fn cancelled(controls: &crate::controls::Controls) -> bool {
     controls.quitting() || controls.leaving() || controls.serve_decision()
 }
 
-/// Past the decision screen's time while practice waits for its read: the
-/// escape is let through ([`Controls::let_escape`]), then the quit key, an
-/// Escape from the window's `menu` queue or a Back from the controller's
-/// `pad`, each admitted by the stamp its producer gave it
-/// ([`Controls::admits_escape`]), taken; everything else queued is dropped.
-///
-/// [`Controls::let_escape`]: crate::controls::Controls::let_escape
-/// [`Controls::admits_escape`]: crate::controls::Controls::admits_escape
-fn take_escape(
+/// Past the decision screen's `deadline` while practice waits for its
+/// read: whether the quit key, an Escape from the window's `menu` queue or
+/// a Back from the controller's `pad` was observed at or after it, each by
+/// the time its producer observed the press, taken once here; everything
+/// else queued is dropped. A press observed before the deadline does not
+/// leave, however late it is taken; one observed after it does, however
+/// late the screen looks.
+pub(crate) fn take_escape(
     controls: &crate::controls::Controls,
     menu: Option<&MenuQueue>,
     pad: &mut crate::result_input::Pad,
+    deadline: TimeUs,
 ) -> bool {
-    controls.let_escape();
-    let quit = controls.take_leave();
-    let escape = menu.is_some_and(|m| m.take_escape(|s| controls.admits_escape(s)));
+    let quit = controls.take_quit_since(deadline);
+    let escape = menu.is_some_and(|m| m.take_escape(deadline));
     let mut back = false;
-    while let Some((event, _, stamp)) = pad.pop_stamped() {
-        back |= event == input::MenuEvent::Back && controls.admits_escape(stamp);
+    while let Some((event, _, _, at)) = pad.pop_stamped() {
+        back |= event == input::MenuEvent::Back && at.0 >= deadline.0;
     }
     quit || escape || back
 }
@@ -2063,7 +2064,50 @@ impl PlayerRig<'_> {
     }
 }
 
+/// Why the page's waiting bank did not begin.
+enum PageBegin {
+    /// The release barrier found a failure the run ends with.
+    Failed(game::coord::LoadFailure),
+    /// The audio thread refused the barrier's unload.
+    Refused(game::AudioLoadError),
+}
+
 impl PlayerRig<'_> {
+    /// The page's waiting 1× bank ([`PageJobs::defer`]) begins once its
+    /// prerequisites hold, looked at with no wait: the chart's background
+    /// measurement done (its result kept), then the release barrier. While
+    /// the background measures the chart, nothing; the next look tries
+    /// again.
+    ///
+    /// [`PageJobs::defer`]: crate::page_jobs::PageJobs::defer
+    fn begin_page_when_ready(&mut self) -> Result<(), PageBegin> {
+        let Some(sel) = &mut self.selection else {
+            return Ok(());
+        };
+        let Some(path) = sel.page.pending_path().map(std::path::Path::to_path_buf) else {
+            return Ok(());
+        };
+        if !sel.shelf.background_ready(&path, &file_name(&path)) {
+            return Ok(());
+        }
+        if let Some(failure) = self
+            .release_banks(None)
+            .map_err(PageBegin::Refused)?
+            .failure()
+        {
+            return Err(PageBegin::Failed(failure));
+        }
+        if let Some(sel) = &mut self.selection {
+            sel.page.begin_pending(
+                &sel.coord,
+                sel.spawner,
+                #[cfg(feature = "dev-tools")]
+                &sel.witness,
+            );
+        }
+        Ok(())
+    }
+
     /// `f` with `decision` watched by the waits it owns
     /// ([`Controls::serve_decision`], reached from every wait's stop), when
     /// the screen shows; `decision` comes back as they left it.
@@ -2113,6 +2157,11 @@ impl PlayerRig<'_> {
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         if loaded.section().is_some() {
             sel.chosen_at = now;
+            // A Start decodes its own: a page bank still waiting for the
+            // background is given up, and the Start waits for it itself.
+            if sel.page.take_pending().is_some() {
+                sel.shelf.stop_awaiting();
+            }
         }
         // Requested again after the practice page released it, as a
         // choice does.
@@ -2524,12 +2573,13 @@ impl AppRig for PlayerRig<'_> {
     /// Past the decision screen's time while practice waits for its read:
     /// the quit key, Escape or the controller's Back, taken; everything
     /// else queued is dropped.
-    fn decision_escape(&mut self) -> bool {
+    fn decision_escape(&mut self, deadline: TimeUs) -> bool {
         let menu = self.selection.as_ref().map(|s| &s.menu);
         take_escape(
             self.controls,
             menu.map(AsRef::as_ref),
             &mut self.result_input.pad,
+            deadline,
         )
     }
 
@@ -2687,31 +2737,11 @@ impl AppRig for PlayerRig<'_> {
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
         // The page's 1× bank is decoded as a play's is (design.md "Load
-        // Pipeline"): the chart's background measurement waited for, the
+        // Pipeline"): once the chart's background measurement is done, the
         // release barrier, then the decode, never beside the background's
-        // bank. The waits serve the decision screen.
-        let ready = self.watching(loaded, decision, |rig| {
-            let sel = rig.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-            let controls = rig.controls;
-            let waited = sel.shelf.wait_background(
-                loaded.path(),
-                &file_name(loaded.path()),
-                || cancelled(controls),
-                || {},
-            );
-            if waited == Loading::Cancelled {
-                println!("practice: the read's wait was cancelled");
-                return Ok(Loading::Cancelled);
-            }
-            Ok(rig
-                .release_banks(None)
-                .map_err(ChartLoadError::Audio)?
-                .failure()
-                .map_or(Loading::Ready, Loading::Failed))
-        })?;
-        if ready != Loading::Ready {
-            return Ok(ready);
-        }
+        // bank. Its prerequisites are looked at with no wait, here and at
+        // every look of the decision screen and pass of the page, so both
+        // are served meanwhile and the page may open before its bank.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let chart = crate::page_jobs::PageChart {
             path: loaded.path().to_owned(),
@@ -2721,18 +2751,29 @@ impl AppRig for PlayerRig<'_> {
         };
         // Through the decision screen the 1× bank is the choice's,
         // promoted; the page takes it over when it opens.
-        sel.page.begin(
-            &sel.coord,
-            sel.spawner,
-            chart,
-            decision.on(),
-            #[cfg(feature = "dev-tools")]
-            &sel.witness,
-        );
-        Ok(Loading::Ready)
+        sel.page.defer(chart, decision.on());
+        match self.begin_page_when_ready() {
+            Ok(()) => Ok(Loading::Ready),
+            Err(PageBegin::Failed(failure)) => Ok(Loading::Failed(failure)),
+            Err(PageBegin::Refused(e)) => Err(ChartLoadError::Audio(e)),
+        }
     }
 
     fn poll_page(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        match self.begin_page_when_ready() {
+            Ok(()) => {}
+            Err(PageBegin::Failed(failure)) => return Err(game::LiveError::Load(failure)),
+            Err(PageBegin::Refused(e)) => {
+                // Left to a Start, which releases again before its decode.
+                crate::loudness::log_line(
+                    &format!("practice: the page's bank cannot begin ({e}); a Start decodes it"),
+                    true,
+                );
+                if let Some(sel) = &mut self.selection {
+                    sel.page.take_pending();
+                }
+            }
+        }
         let Some(sel) = &mut self.selection else {
             return Ok(());
         };
@@ -3338,6 +3379,7 @@ pub(crate) mod tests {
                 background: false,
             },
             None,
+            bms_model::TimeUs(0),
         );
         assert_eq!(
             sel.drain(&mut pad),
@@ -3435,6 +3477,7 @@ pub(crate) mod tests {
                     background: false,
                 },
                 None,
+                bms_model::TimeUs(0),
             );
         };
         sel.feed.enter(TimeUs(0));
@@ -3616,6 +3659,7 @@ pub(crate) mod tests {
                         background: false,
                     },
                     None,
+                    bms_model::TimeUs(0),
                 );
             };
             send(Some(0), 2);
@@ -3928,16 +3972,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// The controller's Back past the decision screen's time: one sent
-    /// before the escape was let through (queued before the screen, or
-    /// during it) is stale and does not leave; one sent after it leaves.
-    /// The quit key likewise, through the controls' word.
+    /// The controller's Back past the decision screen's time `T` is taken
+    /// by the time its packet was received: one received before `T` does
+    /// not leave, though taken after it; one received after it does.
     #[test]
-    fn only_a_fresh_back_leaves_the_waiting_decision_screen() {
+    fn a_back_is_taken_by_its_observation_time() {
+        use bms_model::TimeUs;
         use eval::ControlId;
         use input::{MenuAction, MenuBindings, MenuEvent};
         let controls = crate::controls::Controls::new(input::QpcClock::start());
-        controls.quit_leaves();
         let (mut tap, receiver) = input::menu_queue(MenuBindings {
             product: controller_product(),
             controls: vec![(ControlId(3), MenuAction::Press(MenuEvent::Back))],
@@ -3947,7 +3990,7 @@ pub(crate) mod tests {
         });
         tap.set_activity(Arc::clone(controls.tuning().activity()));
         tap.set_active(true);
-        let back = |tap: &mut input::MenuTap| {
+        let back = |tap: &mut input::MenuTap, at: i64| {
             for value in [1, 0] {
                 tap.offer(
                     &input::Packet {
@@ -3957,6 +4000,7 @@ pub(crate) mod tests {
                         background: false,
                     },
                     None,
+                    TimeUs(at),
                 );
             }
         };
@@ -3965,23 +4009,17 @@ pub(crate) mod tests {
             dropped: 0,
         };
         let queue = MenuQueue::gated(Arc::clone(controls.tuning()));
-        back(&mut tap);
+        let deadline = TimeUs(100);
         controls.close_epoch();
-        back(&mut tap);
-        controls.command(game::Command::Quit);
+        back(&mut tap, 99);
         assert!(
-            !super::take_escape(&controls, Some(&queue), &mut pad),
-            "a stale Back left"
+            !super::take_escape(&controls, Some(&queue), &mut pad, deadline),
+            "a Back from before T left"
         );
-        back(&mut tap);
+        back(&mut tap, 100);
         assert!(
-            super::take_escape(&controls, Some(&queue), &mut pad),
-            "a fresh Back did not"
-        );
-        controls.command(game::Command::Quit);
-        assert!(
-            super::take_escape(&controls, Some(&queue), &mut pad),
-            "the quit key did not"
+            super::take_escape(&controls, Some(&queue), &mut pad, deadline),
+            "a Back at T did not leave"
         );
     }
 

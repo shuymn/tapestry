@@ -775,9 +775,9 @@ fn keyboard(controls: &Controls, keys: &mut Keys, menu: Option<&MenuQueue>, e: K
         .text
         .filter(|t| !t.chars().any(char::is_control))
         .map(|t| MenuInput::Text(t.to_owned()));
-    // Every input goes with the word it was observed under; where it is
-    // taken, one from the decision screen is dropped, and an Escape past
-    // its time is the screen's to take (`Controls::admits_escape`).
+    // Every input goes with the word and the time it was observed at;
+    // where it is taken, one from the decision screen is dropped, and an
+    // Escape observed past its time is the screen's to take.
     let stamp = controls.ingress();
     for input in key.into_iter().chain(text) {
         send_menu(menu, controls, input, Some(stamp));
@@ -849,7 +849,11 @@ fn send_menu(
     input: MenuInput,
     stamp: Option<input::Ingress>,
 ) {
-    menu.push_stamped(input, stamp);
+    let at = controls.now();
+    menu.push_stamped(
+        input,
+        stamp.map(|stamp| crate::select::Observed { stamp, at }),
+    );
     controls.wake_game();
 }
 
@@ -1727,7 +1731,13 @@ mod tests {
     ) {
         let now = tuning.activity().ingress();
         if let Some((input, stamp)) = session.event(ime, now) {
-            queue.push_stamped(input, Some(stamp));
+            queue.push_stamped(
+                input,
+                Some(crate::select::Observed {
+                    stamp,
+                    at: bms_model::TimeUs(0),
+                }),
+            );
         }
     }
 
@@ -1785,7 +1795,13 @@ mod tests {
         tuning.close_ingress(|| {});
         tuning.open_ingress(|| {});
         for (input, stamp) in held.into_iter().flatten() {
-            queue.push_stamped(input, Some(stamp));
+            queue.push_stamped(
+                input,
+                Some(crate::select::Observed {
+                    stamp,
+                    at: bms_model::TimeUs(0),
+                }),
+            );
         }
         assert_eq!(queue.pop(), None);
         publish(&tuning, &queue, &mut session, commit("化"));
@@ -1907,27 +1923,27 @@ mod tests {
         assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
     }
 
-    /// Past the decision screen's time, while practice waits for its read:
-    /// an Escape queued before the screen (the practice choice's own
-    /// queue) is stale and does not leave; one pressed in the screen
-    /// before the escape is let through is not published; one pressed after
-    /// it leaves.
+    /// Past the decision screen's time `T`, while practice waits for its
+    /// read, an Escape is taken by the time the window observed it: one
+    /// observed after `T` leaves however late the screen looks (no look
+    /// arms anything before it); one observed before `T` (in the screen,
+    /// or queued with the choice) does not, though taken after it.
     #[test]
-    fn only_a_fresh_escape_leaves_the_waiting_decision_screen() {
+    fn an_escape_is_taken_by_its_observation_time() {
         use winit::keyboard::KeyCode;
         let mut w = window();
+        // Observed before T, with the choice and in the screen.
         key_press(&mut w, code(KeyCode::Escape), false, false, None);
         close(&w.0);
         key_press(&mut w, code(KeyCode::Escape), false, false, None);
-        w.0.let_escape();
-        assert!(
-            !w.2.take_escape(|s| w.0.admits_escape(s)),
-            "a stale Escape left"
-        );
+        let before = w.0.now();
+        let deadline = bms_model::TimeUs(before.0 + 1);
+        while w.0.now().0 < deadline.0 {
+            std::thread::yield_now();
+        }
+        assert!(!w.2.take_escape(deadline), "an Escape from before T left");
+        // Observed after T, before any look of the screen.
         key_press(&mut w, code(KeyCode::Escape), false, false, None);
-        assert!(
-            w.2.take_escape(|s| w.0.admits_escape(s)),
-            "a fresh Escape did not"
-        );
+        assert!(w.2.take_escape(deadline), "an Escape after T did not leave");
     }
 }
