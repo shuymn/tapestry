@@ -206,6 +206,17 @@ pub trait LoadingRig: Rig {
     fn loadend(&self) -> Option<TimeUs> {
         None
     }
+    /// Whether the skin refused a loading frame of lifetime `lifetime`:
+    /// nothing of it is drawn again, so its first frame may never be
+    /// acknowledged. None refused by default.
+    ///
+    /// # Errors
+    ///
+    /// The refusal, as the end of that lifetime reports it.
+    fn loading_refusal(&self, lifetime: u64) -> Result<(), Self::ScreenError> {
+        let _ = lifetime;
+        Ok(())
+    }
     /// A copy of the tuning, taken under the tuning step lock and with
     /// the reducer's count read after a fence. [`TuningSnapshot::IDLE`]
     /// by default.
@@ -686,9 +697,11 @@ fn wait_loading<R: LoadingRig>(
             rig.wait();
         }
         // The exits in order, those that end the run first: a thread's
-        // failure, a refusal, a close, and after the commit a lost screen
-        // (design.md "Rendering and Skins": nothing would draw the play);
-        // then the player's quit and a cancelled preparation.
+        // failure, a refusal, a close, a refused loading frame (its
+        // lifetime draws nothing more, so its minimum may never start)
+        // and after the commit a lost screen (design.md "Rendering and
+        // Skins": nothing would draw the play); then the player's quit and
+        // a cancelled preparation.
         threads_over(rig)?;
         if let PrepState::Refused(why) = &opener.latch {
             return Err(LiveError::Preparation(why.clone()));
@@ -696,6 +709,8 @@ fn wait_loading<R: LoadingRig>(
         if rig.quitting() {
             return Ok(false);
         }
+        rig.loading_refusal(opener.lifetime)
+            .map_err(LiveError::Screen)?;
         // One look at the screen per pass, used by both exits below: a
         // screen lost after it is seen at the next pass.
         let lost = rig.screen_failed();
