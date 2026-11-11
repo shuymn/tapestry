@@ -7,8 +7,8 @@ use bms_model::{Chart, TimeUs};
 use eval::{JudgeEvent, Section};
 use game::PlayView;
 use skin_model::{
-    BuildError, Canvas, ChartText, CoverSettings, Fit, FrameReadouts, LaneView, Layout, LoadState,
-    LoadingGauge, PlayContext,
+    AppReadouts, BuildError, Canvas, ChartText, CoverSettings, Fit, FrameReadouts, LaneView,
+    Layout, LoadState, LoadingGauge, PlayContext,
 };
 
 use crate::{Gpu, MAX_SPRITES, SpriteBatch};
@@ -53,6 +53,9 @@ pub struct FrameInput<'a> {
     /// The turntable's angle on the play state's clock
     /// ([`skin_model::SkinFrame::turntable`]).
     pub turntable: i32,
+    /// The application's readouts at the frame
+    /// ([`skin_model::SkinFrame::app`]).
+    pub app: AppReadouts,
 }
 
 impl FrameInput<'_> {
@@ -113,6 +116,9 @@ pub struct LoadingFrame<'a> {
     /// The turntable's angle on the play state's clock
     /// ([`skin_model::LoadingFrame::turntable`]).
     pub turntable: i32,
+    /// The application's readouts at the frame
+    /// ([`skin_model::LoadingFrame::app`]).
+    pub app: AppReadouts,
 }
 
 impl<'a> LoadingFrame<'a> {
@@ -123,6 +129,7 @@ impl<'a> LoadingFrame<'a> {
             difficulty: self.difficulty,
             bga: self.bga,
             autoplay: self.autoplay,
+            app: self.app,
             now: self.now,
             load: self.load,
             target: self.target,

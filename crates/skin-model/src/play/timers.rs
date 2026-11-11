@@ -10,13 +10,13 @@ use rules::GaugeValue;
 
 use super::rhythm::TAIL_US;
 use super::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX,
-    LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
-    RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, FPS_MAX, GAUGE_PERMILLE, Grade,
+    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
+    RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, YEAR_MAX, field, lane_timer, timer,
 };
 use super::{
-    BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
-    RoundedDuration, SkinFrame,
+    AppReadouts, BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts,
+    NativeValues, Play, RoundedDuration, SkinFrame,
 };
 use crate::chart_image::ChartImage;
 use crate::expr::{Program, State, TIMER_OFF};
@@ -332,6 +332,7 @@ struct Readouts {
     green: i32,
     duration_valid: i32,
     settings: [i32; 2],
+    app: [i32; APP_FIELDS],
 }
 
 /// The cover fields of one frame, `field::COVER_PERMILLE` to
@@ -481,6 +482,51 @@ pub(crate) fn settings_fields(display_offset: TimeUs, fix_hispeed: u8) -> Option
     let ms = display_offset.0 / 1_000;
     let ms = i32::try_from(ms.clamp(-i64::from(READOUT_MAX), i64::from(READOUT_MAX))).ok()?;
     Some([ms, fix])
+}
+
+/// The number of application fields, `field::APP_FPS` to
+/// `field::APP_UPTIME_S`.
+pub(crate) const APP_FIELDS: usize = (field::APP_UPTIME_S - field::APP_FPS + 1) as usize;
+
+/// µs in an hour, a minute and a second.
+const HOUR_US: i64 = 3_600_000_000;
+const MINUTE_US: i64 = 60_000_000;
+const SECOND_US: i64 = 1_000_000;
+
+/// The application fields, `field::APP_FPS` to `field::APP_UPTIME_S`, a
+/// play's and a loading frame's alike: the presents per second, the local
+/// date and time, and the uptime's whole hours (unwrapped, bounded by
+/// `i32::MAX`), its minutes within the hour and its seconds within the
+/// minute, each taken from the `i64` µs uptime before it is stored, as the
+/// source divides its `long` ms (`IntegerPropertyFactory.java:105-107`).
+/// `None` for a value outside its field's range.
+pub(crate) fn app_fields(app: &AppReadouts) -> Option<[i32; APP_FIELDS]> {
+    let t = &app.local;
+    let fps = i32::from(app.fps);
+    let ok = fps <= FPS_MAX
+        && app.uptime_us >= 0
+        && i32::from(t.year) <= YEAR_MAX
+        && (1..=12).contains(&t.month)
+        && (1..=31).contains(&t.day)
+        && t.hour <= 23
+        && t.minute <= 59
+        && t.second <= 59;
+    if !ok {
+        return None;
+    }
+    let u = app.uptime_us;
+    Some([
+        fps,
+        i32::from(t.year),
+        i32::from(t.month),
+        i32::from(t.day),
+        i32::from(t.hour),
+        i32::from(t.minute),
+        i32::from(t.second),
+        i32::try_from(u / HOUR_US).unwrap_or(i32::MAX),
+        i32::try_from(u / MINUTE_US % 60).ok()?,
+        i32::try_from(u / SECOND_US % 60).ok()?,
+    ])
 }
 
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
@@ -713,6 +759,7 @@ impl Play {
         }
         let native = native_values(&frame.lanes, r).ok()?;
         let settings = settings_fields(frame.display_offset, r.fix_hispeed)?;
+        let app = app_fields(&frame.app)?;
         let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
             Some((
                 i32::try_from(b.min_x100).ok()?,
@@ -746,6 +793,7 @@ impl Play {
             green,
             duration_valid,
             settings,
+            app,
         })
     }
 
@@ -963,7 +1011,8 @@ impl Play {
                 i32::from(self.drawable_chart().present(ChartImage::Back)),
             ])
             .chain(score_figures(inputs))
-            .chain(r.settings);
+            .chain(r.settings)
+            .chain(r.app);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

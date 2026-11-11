@@ -240,6 +240,7 @@ pub fn input<'a>(
     effects: &'a [JudgeEvent],
 ) -> FrameInput<'a> {
     FrameInput {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now,
         display_offset,
@@ -260,6 +261,7 @@ pub fn input<'a>(
 /// text. The renderer applies its own target.
 pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> LoadingFrame<'static> {
     LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         display_offset: TimeUs(0),
         fix_hispeed: 0,
         difficulty: None,

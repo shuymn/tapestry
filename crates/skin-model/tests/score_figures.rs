@@ -602,6 +602,7 @@ fn the_loading_frames_leave_out_the_best_and_the_target() {
     let mut batch = skin_model::QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let layout = skin_model::Layout::AUTHOR;
     let frame = skin_model::LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         display_offset: TimeUs(0),
         fix_hispeed: 0,
         difficulty: None,
