@@ -140,6 +140,7 @@ impl Loader {
         self.batch.clear();
         let layout = Layout::AUTHOR;
         let frame = LoadingFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             display_offset: TimeUs(0),
             fix_hispeed: 0,
             difficulty: None,

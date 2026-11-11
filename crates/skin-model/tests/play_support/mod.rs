@@ -408,6 +408,9 @@ pub struct Harness {
     /// ([`Harness::record`]).
     pub ring: [i32; skin_model::OFFSET_SLOTS],
     pub ring_count: u32,
+    /// The application's readouts each frame gives: by default
+    /// [`AppReadouts::LAUNCH`](skin_model::AppReadouts::LAUNCH).
+    pub app: skin_model::AppReadouts,
 }
 
 impl Harness {
@@ -437,6 +440,7 @@ impl Harness {
             input: eval::InputFacts::NONE,
             ring: [0; skin_model::OFFSET_SLOTS],
             ring_count: 0,
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -472,6 +476,7 @@ impl Harness {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            app: self.app,
             state_us: self.state_us,
             now: TimeUs(now_us),
             display_offset: self.offset,

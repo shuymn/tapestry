@@ -778,6 +778,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         let mut notes = eval::NoteFacts::new(&chart);
         notes.set_done(lane, 0);
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -832,6 +833,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         }
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -931,6 +933,7 @@ fn lane_order_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
             display_offset: TimeUs(0),
@@ -1021,6 +1024,7 @@ fn gauge_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
                 display_offset: TimeUs(0),
@@ -1143,6 +1147,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
@@ -1263,6 +1268,7 @@ fn grade_anchor_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -1337,6 +1343,7 @@ fn loading_probes(
             hidden: 0,
         };
         let frame = LoadingFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             display_offset: TimeUs(0),
             fix_hispeed: 0,
             autoplay: false,
@@ -1361,6 +1368,7 @@ fn loading_probes(
     }
     // Covers the frame's lanes do not show: refused, then for good.
     let mut frame = LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         display_offset: TimeUs(0),
         fix_hispeed: 0,
         autoplay: false,
@@ -1452,6 +1460,7 @@ fn digit_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now,
             display_offset: TimeUs(0),
@@ -1541,6 +1550,7 @@ fn long_note_probes(
                 notes.set_hold(lane, Some(hold));
             }
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(ms * 1_000),
                 display_offset: TimeUs(0),
@@ -1611,6 +1621,7 @@ fn bar_probes(
         };
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(offset * 1_000),
@@ -1723,6 +1734,7 @@ fn choice_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -1822,6 +1834,7 @@ fn rate_and_kind_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(2_000_000),
                 display_offset: TimeUs(0),
@@ -2104,6 +2117,7 @@ fn readout_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(now_ms * 1_000),
                 display_offset: TimeUs(0),
@@ -3599,6 +3613,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
             ..Default::default()
         };
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(i64::from(combo) * 16_000),
             display_offset: TimeUs(0),

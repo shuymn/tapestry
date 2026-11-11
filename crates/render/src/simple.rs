@@ -1349,6 +1349,7 @@ mod tests {
 
     fn frame<'a>(view: &'a PlayView, now: i64, effects: &'a [JudgeEvent]) -> FrameInput<'a> {
         FrameInput {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),

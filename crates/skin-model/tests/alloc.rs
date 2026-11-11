@@ -1800,6 +1800,7 @@ fn stretch(
             }
         }
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: offset,
@@ -2188,6 +2189,7 @@ fn build_does_not_allocate() {
     programs_do_not_allocate(&chart, &full);
     slots_do_not_allocate(&chart, &full);
     carried_slots_do_not_allocate(&chart, &full);
+    app_readouts_do_not_allocate(&chart, &full, &views, &descs);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
     skin.attach_text(&mut play, text_table()).unwrap();
@@ -2196,6 +2198,7 @@ fn build_does_not_allocate() {
     batch.clear();
     let notes = NoteFacts::default();
     let frame = SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(5_000 * MS),
         display_offset: TimeUs(0),
@@ -2276,6 +2279,7 @@ fn build_does_not_allocate() {
         batch.clear();
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
@@ -2323,6 +2327,7 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             display_offset: TimeUs(0),
             fix_hispeed: 0,
             difficulty: None,
@@ -2368,6 +2373,7 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         display_offset: TimeUs(0),
         fix_hispeed: 0,
         difficulty: (no % 7 != 6).then_some(u8::try_from(no % 6).unwrap()),
@@ -2606,6 +2612,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         };
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -2724,6 +2731,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 play_support::follow(&mut notes, &c, e);
             }
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -2766,6 +2774,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         for _ in 0..3 {
             batch.clear();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(1_000 * MS),
                 display_offset: TimeUs(0),
@@ -2915,6 +2924,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     play_support::follow(&mut notes, &chart, e);
                 }
                 let frame = SkinFrame {
+                    app: skin_model::AppReadouts::LAUNCH,
                     state_us: 0,
                     now: TimeUs(now),
                     display_offset: TimeUs(0),
@@ -2962,6 +2972,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         hidden: 0,
                     };
                     let frame = SkinFrame {
+                        app: skin_model::AppReadouts::LAUNCH,
                         state_us: 0,
                         now: TimeUs(from + (k + 1) * 700 * MS),
                         display_offset: TimeUs(0),
@@ -3000,6 +3011,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
             for _ in 0..2 {
                 batch.clear();
                 let frame = SkinFrame {
+                    app: skin_model::AppReadouts::LAUNCH,
                     state_us: 0,
                     now: TimeUs(from + 9_000 * MS),
                     display_offset: TimeUs(0),
@@ -3226,6 +3238,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let t = tally(u32::try_from(i / 17).unwrap_or(0));
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -3285,6 +3298,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         batch.clear();
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(1_000 * MS),
             display_offset: TimeUs(0),
@@ -3420,6 +3434,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     // A frame at `now` µs, shown `offset` µs ahead, on the stack.
     let notes = NoteFacts::default();
     let frame_at = |now: i64, offset: i64, target, lanes, readouts| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(offset),
@@ -3681,6 +3696,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
         let target = TARGETS[i % TARGETS.len()];
         let notes = NoteFacts::default();
         let frame = SkinFrame {
+            app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
@@ -3835,6 +3851,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
             let view = views.lanes[(no / 7) % views.lanes.len()];
             let notes = NoteFacts::default();
             let frame = SkinFrame {
+                app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
@@ -3997,6 +4014,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
     };
     let notes = NoteFacts::default();
     let frame = |now: i64, readouts: FrameReadouts| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
@@ -4154,6 +4172,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
     let lanes = LaneView::NONE;
     // (now, playing, complete, closing)
     let frame = |now: i64, playing: bool, complete: bool, closing: Option<TimeUs>| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
@@ -4442,6 +4461,7 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let notes = NoteFacts::default();
     let layout = SkinLayout::AUTHOR;
     let frame = |now: i64, t: &'static Tally| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
@@ -4530,6 +4550,184 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     ALLOCS.store(0, Ordering::Relaxed);
 }
 
+/// The application readouts of frame `no`: the presents per second up to
+/// the ring's 1 024, the local time through a day's end and a year's, and
+/// the uptime from 23 h 59 min 59 s on, past `i32::MAX` ms after 300
+/// frames.
+fn app_for(no: usize) -> skin_model::AppReadouts {
+    let k = i64::try_from(no).unwrap();
+    let base = if no < 300 {
+        86_399_000_000
+    } else {
+        2_147_483_000_000
+    };
+    skin_model::AppReadouts {
+        fps: u16::try_from(no * 7 % 1_025).unwrap(),
+        uptime_us: base + k * 16_667,
+        local: skin_model::LocalTime {
+            year: 2_026 + u16::from(no % 600 > 300),
+            month: if no % 600 > 300 { 1 } else { 12 },
+            day: if no % 600 > 300 { 1 } else { 31 },
+            hour: u8::try_from(23 * (no % 2)).unwrap(),
+            minute: u8::try_from(no % 60).unwrap(),
+            second: u8::try_from(no / 60 % 60).unwrap(),
+        },
+    }
+}
+
+/// The application fields (design.md "Scope of No Allocation"): numbers on
+/// each of the ten and a `when` timer reading the clock, over play frames
+/// and loading frames whose readouts move every frame and cross the
+/// uptime's `i32::MAX` ms: nothing allocates; with a positive control.
+fn app_readouts_do_not_allocate(
+    chart: &Chart,
+    ctx: &PlayContext<'_>,
+    views: &Views,
+    descs: &[GaugeDesc],
+) {
+    let int = |src: &str| {
+        skin_model::compile(
+            src,
+            &skin_model::Scope::new(&skin_model::PLAY),
+            skin_model::Ty::Int,
+        )
+        .unwrap()
+    };
+    let names = [
+        "app.fps",
+        "clock.year",
+        "clock.month",
+        "clock.day",
+        "clock.hour",
+        "clock.minute",
+        "clock.second",
+        "app.uptime_h",
+        "app.uptime_m",
+        "app.uptime_s",
+    ];
+    let numbers = names
+        .iter()
+        .map(|name| NumberDef {
+            digits: DigitsDef {
+                image: u32::from(DIGITS_10),
+                set: GlyphSet::Ten,
+                cells: 10,
+                align: Align::Right,
+                pad: Pad::Blank,
+                space: 0,
+                offsets: Vec::new(),
+            },
+            value: int(name),
+        })
+        .collect();
+    let mut elements: Vec<ElementDef> = (0..10)
+        .map(|k| {
+            widget(
+                Source::Number(k),
+                track(0, Ease::Linear, End::Hold),
+                TimerRef::Builtin(timer::SCREEN),
+                Place::SCREEN,
+            )
+        })
+        .collect();
+    elements.push(widget(
+        Source::Image(u32::from(timer::BUILTIN)),
+        track(0, Ease::Linear, End::Hold),
+        TimerRef::When(0),
+        Place::SCREEN,
+    ));
+    elements.push(lanes_support::lanes_element());
+    let loaded = load(
+        // The sheet's cycles name 32 `when` timers.
+        (0..32)
+            .map(|_| bool_program("clock.hour == 23 && app.uptime_h >= 24 && app.fps > 0"))
+            .collect(),
+        elements,
+        skin_model::WidgetDefs {
+            numbers,
+            ..skin_model::WidgetDefs::default()
+        },
+    );
+    let skin = &loaded.skin;
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let notes = NoteFacts::default();
+    let t = tally(3);
+    let frame = |now: i64, app| SkinFrame {
+        app,
+        state_us: now,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        turntable: 0,
+        lanes: play_support::VIEW,
+        readouts: readouts_for(play_support::VIEW),
+        playing: true,
+        closing: None,
+    };
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    let mut loading = skin.prepare_loading(Side::Left);
+    // Per frame kind, the most digits drawn and whether the timer drew.
+    let (mut digits, mut timed) = ([0; 2], [false; 2]);
+    let digit = |q: &skin_model::Quad| {
+        loaded
+            .shows
+            .get(&uv_key(q.uv, q.layer))
+            .is_some_and(|&(image, _)| image == DIGITS_10)
+    };
+    let when = |q: &skin_model::Quad| {
+        loaded
+            .shows
+            .get(&uv_key(q.uv, q.layer))
+            .is_some_and(|&(image, _)| image == timer::BUILTIN)
+    };
+    TRACK.with(|t| t.set(true));
+    for no in 0..600 {
+        let now = i64::try_from(no).unwrap() * 16 * MS;
+        batch.clear();
+        skin.build(&mut play, &frame(now, app_for(no)), &loaded.uvs, &mut batch)
+            .expect("the play frame builds");
+        digits[0] = digits[0].max(batch.quads().iter().filter(|q| digit(q)).count());
+        timed[0] |= batch.quads().iter().any(when);
+    }
+    for no in 0..600 {
+        batch.clear();
+        let f = LoadingFrame {
+            app: app_for(no),
+            ..loading_frame(views, descs, TimeUs(0), no * 5 + 2)
+        };
+        skin.build_loading(&mut loading, &f, &loaded.uvs, &mut batch)
+            .expect("the loading frame builds");
+        digits[1] = digits[1].max(batch.quads().iter().filter(|q| digit(q)).count());
+        timed[1] |= batch.quads().iter().any(when);
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "application readouts: allocations"
+    );
+    // Every number drew: at least a digit each, the year four and the
+    // uptime's hours six once past `i32::MAX` ms (596 523).
+    assert!(digits.iter().all(|&d| d >= 20), "{digits:?}");
+    assert_eq!(timed, [true, true], "the clock's timer");
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
 /// A latch on a slot, the timer of two objects of one closure, built
 /// frame after frame as its condition comes and goes, through a rearm:
 /// slots, timer callbacks' two runs and their timers allocate nothing;
@@ -4602,6 +4800,7 @@ fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let notes = NoteFacts::default();
     let layout = SkinLayout::AUTHOR;
     let frame = |now: i64, t: &'static Tally| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: now + 500_000,
         now: TimeUs(now),
         display_offset: TimeUs(0),
@@ -4723,6 +4922,7 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let zero: &'static Tally = Box::leak(Box::new(Tally::default()));
     let judged: &'static Tally = Box::leak(Box::new(tally(5)));
     let frame = |now: i64, t: &'static Tally| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
         state_us: now + 500_000,
         now: TimeUs(now),
         display_offset: TimeUs(0),
