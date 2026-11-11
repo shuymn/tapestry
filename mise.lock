@@ -26,24 +26,27 @@ url_api = "https://api.github.com/repos/rhysd/actionlint/releases/assets/3849249
 provenance = "github-attestations"
 
 [[tools."aqua:rustsec/rustsec/cargo-audit"]]
-version = "0.22.2"
+version = "0.23.0"
 backend = "aqua:rustsec/rustsec/cargo-audit"
 specifiers = ["0"]
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.linux-x64"]
-checksum = "sha256:ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39"
-url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz"
-url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439291614"
+checksum = "sha256:b77993532b253fcbf550996d7716465ec3d734d4e74e7f87bfb65a19add0fb59"
+checksum_source = "mise-versions"
+url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-unknown-linux-gnu-v0.23.0.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/731640338"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.macos-arm64"]
-checksum = "sha256:847831323de932155b226ab60ee4a180e13e5d007a019f0d4b7b4d89a6de2ab2"
-url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-apple-darwin-v0.22.2.tgz"
-url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439292734"
+checksum = "sha256:845ec02452dd233c292be887700ac99a38a697299423081ee0d8ea1a0c961464"
+checksum_source = "mise-versions"
+url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-apple-darwin-v0.23.0.tgz"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/731639243"
 
 [tools."aqua:rustsec/rustsec/cargo-audit"."platforms.windows-x64"]
-checksum = "sha256:0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be2710ab"
-url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/cargo-audit-x86_64-pc-windows-msvc-v0.22.2.zip"
-url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/439294720"
+checksum = "sha256:aafeb61206730029601a72e669a12231f8674427e6248d02f6cb382cb36d56b4"
+checksum_source = "mise-versions"
+url = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-pc-windows-msvc-v0.23.0.zip"
+url_api = "https://api.github.com/repos/rustsec/rustsec/releases/assets/731651972"
 
 [[tools.cargo-deny]]
 version = "0.20.2"
@@ -66,27 +69,27 @@ url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/carg
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471599057"
 
 [[tools."github:babarot/gh-infra"]]
-version = "0.19.0"
+version = "0.20.0"
 backend = "github:babarot/gh-infra"
 specifiers = ["0"]
 
 [tools."github:babarot/gh-infra"."platforms.linux-x64"]
-checksum = "sha256:53279aaff9ec965e352f4ddb260edfafbac21992732dab4c76a9de59414c651d"
+checksum = "sha256:78e66c9c441c1df9fb14f0945e9b60aeef9b428098bbf531de4fa017872f8687"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991219"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.20.0/gh-infra_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/730122243"
 
 [tools."github:babarot/gh-infra"."platforms.macos-arm64"]
-checksum = "sha256:91b4241a43b3ebf07209ba26deb68f5a85abdf93a9de3cfb32416c0ba6dbbad2"
+checksum = "sha256:456d80aa86f6a184b0b447cf915ae9aa537fd9d52ef8ae62b83d8396d84ce686"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991190"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.20.0/gh-infra_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/730122136"
 
 [tools."github:babarot/gh-infra"."platforms.windows-x64"]
-checksum = "sha256:de81ed20a3fd7b75202f5d964e26fb00384e2aa3c99a7b9fadf636ef72e45a79"
+checksum = "sha256:4fe63eacd4c70f80d33d211802f96a66c83b860e3666af0cc6096fe932b501d3"
 checksum_source = "mise-versions"
-url = "https://github.com/babarot/gh-infra/releases/download/v0.19.0/gh-infra_windows_amd64.zip"
-url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/703991223"
+url = "https://github.com/babarot/gh-infra/releases/download/v0.20.0/gh-infra_windows_amd64.zip"
+url_api = "https://api.github.com/repos/babarot/gh-infra/releases/assets/730122221"
 
 [[tools."github:bnjbvr/cargo-machete"]]
 version = "0.9.2"
