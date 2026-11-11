@@ -1260,6 +1260,7 @@ fn each_kind_draws_its_own_widgets() {
             ),
             PlayDefs {
                 ratio_bars: sel().ratio_bars,
+                ..PlayDefs::default()
             },
         ),
         ScreenKind::Play,

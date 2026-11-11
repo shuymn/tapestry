@@ -133,6 +133,13 @@ pub struct Attempt {
     /// section's that [`tempo`](Self::tempo) gives in practice; `None`
     /// from [`Attempt::new`] and when its histogram is refused.
     pub main: Option<Tempo>,
+    /// The preset's key judge areas for the chart's rank
+    /// ([`judge_areas`](crate::judge_areas)), which a play skin's
+    /// visualizers band their offsets by.
+    pub areas: [[i16; 2]; 5],
+    /// The speed the chart is loaded at: [`Speed::NORMAL`] from
+    /// [`Attempt::new`], the play's from [`crate::Loaded::attempt`].
+    pub speed: Speed,
 }
 
 /// What an attempt's notes end at (design.md "Play Lifecycle"; the skin
@@ -206,6 +213,8 @@ impl Attempt {
             score: ScoreBasis::default(),
             profile: None,
             main: None,
+            areas: crate::judge_areas(chart, preset),
+            speed: Speed::NORMAL,
         }
     }
 }

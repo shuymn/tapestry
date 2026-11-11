@@ -84,7 +84,10 @@ fn skin() -> Skin {
     let whens = vec![bool_program("best.reached"), bool_program("target.reached")];
     Skin::new_play(
         def(whens, white_sheet(), elements),
-        PlayDefs { ratio_bars: bars },
+        PlayDefs {
+            ratio_bars: bars,
+            ..PlayDefs::default()
+        },
     )
     .unwrap()
 }
@@ -583,7 +586,14 @@ fn the_loading_frames_leave_out_the_best_and_the_target() {
             ..screen(Source::Image(0), [x, 300, 10, 10])
         });
     }
-    let skin = Skin::new_play(d, PlayDefs { ratio_bars: bars }).unwrap();
+    let skin = Skin::new_play(
+        d,
+        PlayDefs {
+            ratio_bars: bars,
+            ..PlayDefs::default()
+        },
+    )
+    .unwrap();
     let atlas = skin
         .sheet()
         .atlas(Variant::Lo, graph_support::LIMITS, &|| false)

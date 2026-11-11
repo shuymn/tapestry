@@ -41,6 +41,7 @@ use crate::select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 use crate::selection::{SelectionLabels, SelectionSettings, SelectionView};
 use crate::track::{MAX_KEY_US, Sample, Track};
 use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
+use crate::widget::bpm_graph::{BpmDraw, BpmGraph, BpmGraphDef, bpm_columns};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
     SliderRate, TrimOutcome,
@@ -50,13 +51,16 @@ use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
 use crate::widget::gauge_graph::{GaugeGraph, GaugeGraphDef, GaugeGraphDraw};
 use crate::widget::glyphs;
 use crate::widget::glyphs::{BitmapLines, GlyphLine};
+use crate::widget::hit_error::{
+    HitError, HitErrorDef, HitErrorDraw, MAX_HIT_ERROR_WIDTH, MAX_HIT_ERROR_WINDOW,
+};
 use crate::widget::image_choice::{
     ChoicePart, ImageChoice, ImageChoiceDef, ImageChoiceError, MAX_IMAGE_CHOICE_REFS,
 };
 use crate::widget::judge::{
     ComboStrip, GradeImage, Judge, JudgeDef, JudgeDraw, JudgeError, JudgePart, JudgeSlot,
 };
-use crate::widget::judge_graph::{GraphDraw, JudgeGraph, JudgeGraphDef};
+use crate::widget::judge_graph::{GraphData, GraphDraw, JudgeGraph, JudgeGraphDef, JudgeGraphKind};
 use crate::widget::lanes::LaneView;
 use crate::widget::lanes::{Draw, LANE_QUADS, LANE_RESERVED, Lanes, LanesDef, LanesError, Side};
 use crate::widget::ratio_bar::{
@@ -73,6 +77,9 @@ use crate::widget::text::{
     TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
 };
 use crate::widget::timing_graph::{TimingGraph, TimingGraphDef, TimingGraphDraw};
+use crate::widget::timing_vis::{
+    MAX_JUDGE_WIDTH, TimingDraw, TimingVisualizer, TimingVisualizerDef,
+};
 use crate::widget::{Brush, Frame, ImageRef, Starts, sample};
 
 /// The most elements one skin may hold.
@@ -138,6 +145,15 @@ pub enum Source {
     /// [`ResultDefs::timing_graphs`]: the view's deviations over the
     /// element's rect.
     TimingGraph(u32),
+    /// The BPM graph at this index of [`PlayDefs::bpm_graphs`]: the
+    /// chart's tempo rows over the element's rect, its pixmap sized by the
+    /// element's first key.
+    BpmGraph(u32),
+    /// The timing visualizer at this index of
+    /// [`PlayDefs::timing_visualizers`].
+    TimingVisualizer(u32),
+    /// The hit-error visualizer at this index of [`PlayDefs::hit_errors`].
+    HitErrorVisualizer(u32),
     /// The chart's own image `which` (play only, S10-12): its installed
     /// uv and native size ([`ChartTable`]), on the element's track, met by
     /// `stretch` at placement and sampled with `filter`. An absent image,
@@ -171,6 +187,29 @@ pub struct PlayDefs {
     /// The ratio bars [`Source::RatioBar`] draws: each of a
     /// [`RatioSource::Score`] source.
     pub ratio_bars: Vec<RatioBarDef>,
+    /// The notes graphs [`Source::JudgeGraph`] draws: each of
+    /// [`JudgeGraphKind::Notes`].
+    pub judge_graphs: Vec<JudgeGraphDef>,
+    pub bpm_graphs: Vec<BpmGraphDef>,
+    pub timing_visualizers: Vec<TimingVisualizerDef>,
+    pub hit_errors: Vec<HitErrorDef>,
+}
+
+/// Why a play graph or visualizer was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VisualizerError {
+    #[error("its image does not exist")]
+    UnknownImage,
+    #[error("its line width is outside its range")]
+    LineWidth,
+    #[error("its judge width is not 1 to {MAX_JUDGE_WIDTH} ms")]
+    JudgeWidth,
+    #[error("its width is outside its range")]
+    Width,
+    #[error("its window is not 1 to {MAX_HIT_ERROR_WINDOW} lines")]
+    Window,
+    #[error("its average's weight is not finite")]
+    Alpha,
 }
 
 /// The widgets only a selection skin draws.
@@ -372,6 +411,24 @@ pub enum LoadError {
     GaugeGraphImage { graph: usize },
     #[error("timing distribution {graph}'s image does not exist")]
     TimingGraphImage { graph: usize },
+    #[error("BPM graph {graph}")]
+    BpmGraph {
+        graph: usize,
+        #[source]
+        error: VisualizerError,
+    },
+    #[error("timing visualizer {visualizer}")]
+    TimingVisualizer {
+        visualizer: usize,
+        #[source]
+        error: VisualizerError,
+    },
+    #[error("hit-error visualizer {visualizer}")]
+    HitErrorVisualizer {
+        visualizer: usize,
+        #[source]
+        error: VisualizerError,
+    },
     #[error("ratio bar {bar}")]
     RatioBar {
         bar: usize,
@@ -403,6 +460,13 @@ enum Kind {
     GaugeGraph(usize),
     /// The timing distribution's index.
     TimingGraph(usize),
+    /// The BPM graph's index and the element's slot among the BPM graph
+    /// elements.
+    BpmGraph(usize, usize),
+    /// The timing visualizer's index and the element's slot.
+    TimingVisualizer(usize, usize),
+    /// The hit-error visualizer's index and the element's slot.
+    HitError(usize, usize),
     /// The chart's own image, its filter and stretch.
     ChartImage(ChartImage, Filter, ChartStretch),
 }
@@ -470,6 +534,8 @@ enum Phase<'a> {
         notes: &'a NoteFacts,
         gauges: &'a [GaugeState],
         shown: usize,
+        /// The view's judgment offsets, which the visualizers draw.
+        offsets: crate::play::Offsets<'a>,
     },
     /// The loading runtime: no chart, the gauge from the frame's
     /// descriptor, if any, and the chosen chart's data the frame gives
@@ -528,6 +594,14 @@ pub struct Skin {
     decision_timing: crate::decision::DecisionTiming,
     gauge_graphs: Box<[GaugeGraph]>,
     timing_graphs: Box<[TimingGraph]>,
+    bpm_graphs: Box<[BpmGraph]>,
+    timing_visualizers: Box<[TimingVisualizer]>,
+    hit_errors: Box<[HitError]>,
+    /// What a play prepares for its graph and visualizer elements, by
+    /// slot: whether a notes graph is drawn, each BPM graph element's
+    /// graph and pixmap size, each timing and hit-error visualizer
+    /// element's definition.
+    plan: GraphPlan,
     /// The slider elements that take a press.
     sliders: usize,
     /// The callbacks whose outputs a selection or result state carries
@@ -907,6 +981,9 @@ fn check_widget_images(
         | Source::JudgeGraph(_)
         | Source::GaugeGraph(_)
         | Source::TimingGraph(_)
+        | Source::BpmGraph(_)
+        | Source::TimingVisualizer(_)
+        | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. } => {}
     }
     Ok(())
@@ -963,6 +1040,9 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::JudgeGraph(_)
         | Source::GaugeGraph(_)
         | Source::TimingGraph(_)
+        | Source::BpmGraph(_)
+        | Source::TimingVisualizer(_)
+        | Source::HitErrorVisualizer(_)
         | Source::ChartImage { .. } => {}
     }
     Ok(())
@@ -975,8 +1055,25 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
 /// characters, or [`MAX_TEXT_BYTES`] for a field; for a judge graph, its
 /// background's and one per channel of every bin; for a gauge graph or a
 /// timing distribution, its pieces at worst.
-fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) -> u32 {
-    match source {
+fn worst(
+    e: &ElementDef,
+    w: &WidgetDefs,
+    sel: &SelectionDefs,
+    res: &ResultDefs,
+    play: &PlayDefs,
+) -> u32 {
+    match e.source {
+        Source::BpmGraph(i) => play
+            .bpm_graphs
+            .get(index(i))
+            .map_or(0, |_| BpmGraphDef::quads(bpm_size(e)[0])),
+        Source::TimingVisualizer(i) => play
+            .timing_visualizers
+            .get(index(i))
+            .map_or(0, TimingVisualizerDef::quads),
+        Source::HitErrorVisualizer(i) => {
+            play.hit_errors.get(index(i)).map_or(0, HitErrorDef::quads)
+        }
         Source::Image(_)
         | Source::Lanes
         | Source::ImageChoice(_)
@@ -1004,6 +1101,85 @@ fn worst(source: Source, w: &WidgetDefs, sel: &SelectionDefs, res: &ResultDefs) 
             .get(index(i))
             .map_or(0, TimingGraphDef::quads),
     }
+}
+
+/// A BPM graph element's pixmap: its first key's width, at most
+/// [`MAX_BPM_COLUMNS`](crate::widget::bpm_graph::MAX_BPM_COLUMNS) columns,
+/// and its height, in reference pixels.
+fn bpm_size(e: &ElementDef) -> [u32; 2] {
+    e.track
+        .rects()
+        .next()
+        .map_or([0; 2], |[_, _, w, h]| [bpm_columns(w), h.unsigned_abs()])
+}
+
+/// What a play prepares for its graph and visualizer elements, by slot.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GraphPlan {
+    /// Whether an element draws a notes graph.
+    pub(crate) notes: bool,
+    /// Each BPM graph element's graph and pixmap size.
+    pub(crate) bpm: Box<[(BpmGraphDef, [u32; 2])]>,
+    pub(crate) timing: Box<[TimingVisualizerDef]>,
+    pub(crate) hit: Box<[HitErrorDef]>,
+}
+
+/// The checks of a play skin's graphs and visualizers, every one whether
+/// an element draws it or not: each image exists ([`exists`]), and each
+/// parameter is within its range.
+fn check_play_widgets(play: &PlayDefs, exists: &impl Fn(u32) -> bool) -> Result<(), LoadError> {
+    use VisualizerError as V;
+    for (graph, g) in play.bpm_graphs.iter().enumerate() {
+        let error = if !exists(g.solid) {
+            Some(V::UnknownImage)
+        } else if g.line_width == 0 || g.line_width > MAX_COORD.unsigned_abs() {
+            Some(V::LineWidth)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(LoadError::BpmGraph { graph, error });
+        }
+    }
+    let judge = |jw: u32| (1..=MAX_JUDGE_WIDTH).contains(&jw);
+    let line = |lw: u32| (1..=4).contains(&lw);
+    for (visualizer, v) in play.timing_visualizers.iter().enumerate() {
+        let error = if !exists(v.solid) {
+            Some(V::UnknownImage)
+        } else if !judge(v.judge_width) {
+            Some(V::JudgeWidth)
+        } else if !line(v.line_width) {
+            Some(V::LineWidth)
+        } else if v.width == 0 || v.width > MAX_COORD.unsigned_abs() {
+            Some(V::Width)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(LoadError::TimingVisualizer { visualizer, error });
+        }
+    }
+    for (visualizer, v) in play.hit_errors.iter().enumerate() {
+        let error = if !exists(v.solid) {
+            Some(V::UnknownImage)
+        } else if !judge(v.judge_width) {
+            Some(V::JudgeWidth)
+        } else if !line(v.line_width) {
+            Some(V::LineWidth)
+        } else if !(1..=MAX_HIT_ERROR_WIDTH).contains(&v.width) {
+            Some(V::Width)
+        } else if !(1..=MAX_HIT_ERROR_WINDOW).contains(&v.window) {
+            Some(V::Window)
+        } else if !v.alpha.is_finite() {
+            Some(V::Alpha)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(LoadError::HitErrorVisualizer { visualizer, error });
+        }
+    }
+    Ok(())
 }
 
 /// The regions' boxes from the elements' keys and the lanes' rect.
@@ -1040,6 +1216,9 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::JudgeGraph(_)
             | Source::GaugeGraph(_)
             | Source::TimingGraph(_)
+            | Source::BpmGraph(_)
+            | Source::TimingVisualizer(_)
+            | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. } => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
@@ -1074,6 +1253,9 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::JudgeGraph(_)
                     | Source::GaugeGraph(_)
                     | Source::TimingGraph(_)
+                    | Source::BpmGraph(_)
+                    | Source::TimingVisualizer(_)
+                    | Source::HitErrorVisualizer(_)
                     | Source::ChartImage { .. } => e.track.bounds(),
                 };
                 if let Some(b) = b {
@@ -1288,7 +1470,20 @@ fn selection_text(def: &SkinDef, source: Source) -> bool {
 /// graph or ratio bar of a score rate; a result skin none of these but
 /// its graphs; a decision skin only images, image choices whose selector
 /// is a constant, and chart text. The ratio bars are `sel`'s.
-fn check_kind(def: &SkinDef, kind: ScreenKind, sel: &SelectionDefs) -> Result<(), LoadError> {
+fn check_kind(
+    def: &SkinDef,
+    kind: ScreenKind,
+    sel: &SelectionDefs,
+    res: &ResultDefs,
+) -> Result<(), LoadError> {
+    // Whether a judge graph element's graph is a notes graph, `None` for an
+    // unknown graph: a play skin draws only notes graphs, a result skin
+    // none.
+    let notes = |i: u32| {
+        res.judge_graphs
+            .get(index(i))
+            .map(|g| g.kind == JudgeGraphKind::Notes)
+    };
     // Whether a ratio bar element's source is a play's score rate, `None`
     // for an unknown bar: a play skin refuses one here, a selection skin
     // later.
@@ -1317,6 +1512,9 @@ fn check_kind(def: &SkinDef, kind: ScreenKind, sel: &SelectionDefs) -> Result<()
                 | Source::JudgeGraph(_)
                 | Source::GaugeGraph(_)
                 | Source::TimingGraph(_)
+                | Source::BpmGraph(_)
+                | Source::TimingVisualizer(_)
+                | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. } => false,
             },
             ScreenKind::Selection => match e.source {
@@ -1331,31 +1529,38 @@ fn check_kind(def: &SkinDef, kind: ScreenKind, sel: &SelectionDefs) -> Result<()
                         | Source::JudgeGraph(_)
                         | Source::GaugeGraph(_)
                         | Source::TimingGraph(_)
+                        | Source::BpmGraph(_)
+                        | Source::TimingVisualizer(_)
+                        | Source::HitErrorVisualizer(_)
                 ),
             },
-            ScreenKind::Result => {
-                !selection_text(def, e.source)
-                    && !matches!(
-                        e.source,
-                        Source::Lanes
-                            | Source::Gauge(_)
-                            | Source::Judge(_)
-                            | Source::CoverPaint(_)
-                            | Source::SongList
-                            | Source::RatioBar(_)
-                            | Source::ChartImage { .. }
-                    )
-            }
-            ScreenKind::Play => match e.source {
-                Source::RatioBar(i) => score(i) == Some(true),
+            ScreenKind::Result => match e.source {
+                Source::JudgeGraph(i) => notes(i) != Some(true),
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
                             e.source,
-                            Source::SongList
-                                | Source::JudgeGraph(_)
-                                | Source::GaugeGraph(_)
-                                | Source::TimingGraph(_)
+                            Source::Lanes
+                                | Source::Gauge(_)
+                                | Source::Judge(_)
+                                | Source::CoverPaint(_)
+                                | Source::SongList
+                                | Source::RatioBar(_)
+                                | Source::ChartImage { .. }
+                                | Source::BpmGraph(_)
+                                | Source::TimingVisualizer(_)
+                                | Source::HitErrorVisualizer(_)
+                        )
+                }
+            },
+            ScreenKind::Play => match e.source {
+                Source::RatioBar(i) => score(i) == Some(true),
+                Source::JudgeGraph(i) => notes(i) == Some(true),
+                _ => {
+                    !selection_text(def, e.source)
+                        && !matches!(
+                            e.source,
+                            Source::SongList | Source::GaugeGraph(_) | Source::TimingGraph(_)
                         )
                 }
             },
@@ -1621,11 +1826,28 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new_play(def: SkinDef, widgets: PlayDefs) -> Result<Self, LoadError> {
+        let PlayDefs {
+            ratio_bars,
+            judge_graphs,
+            bpm_graphs,
+            timing_visualizers,
+            hit_errors,
+        } = widgets;
         let sel = SelectionDefs {
             song_list: None,
-            ratio_bars: widgets.ratio_bars,
+            ratio_bars,
         };
-        Self::load(def, ScreenKind::Play, sel, ResultDefs::default())
+        let res = ResultDefs {
+            judge_graphs,
+            ..ResultDefs::default()
+        };
+        let play = PlayDefs {
+            bpm_graphs,
+            timing_visualizers,
+            hit_errors,
+            ..PlayDefs::default()
+        };
+        Self::load(def, ScreenKind::Play, sel, res, play)
     }
 
     /// Loads a selection skin: the checks of [`new`](Self::new) over the
@@ -1644,7 +1866,13 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new_selection(def: SkinDef, widgets: SelectionDefs) -> Result<Self, LoadError> {
-        Self::load(def, ScreenKind::Selection, widgets, ResultDefs::default())
+        Self::load(
+            def,
+            ScreenKind::Selection,
+            widgets,
+            ResultDefs::default(),
+            PlayDefs::default(),
+        )
     }
 
     /// Loads a result skin: the checks of [`new`](Self::new) over the
@@ -1662,7 +1890,13 @@ impl Skin {
     ///
     /// The first check that fails.
     pub fn new_result(def: SkinDef, widgets: ResultDefs) -> Result<Self, LoadError> {
-        Self::load(def, ScreenKind::Result, SelectionDefs::default(), widgets)
+        Self::load(
+            def,
+            ScreenKind::Result,
+            SelectionDefs::default(),
+            widgets,
+            PlayDefs::default(),
+        )
     }
 
     /// Loads a decision skin: the checks of [`new`](Self::new) over the
@@ -1683,6 +1917,7 @@ impl Skin {
             ScreenKind::Decision,
             SelectionDefs::default(),
             ResultDefs::default(),
+            PlayDefs::default(),
         )?;
         skin.decision_timing = defs.timing;
         Ok(skin)
@@ -1696,6 +1931,7 @@ impl Skin {
         kind: ScreenKind,
         sel: SelectionDefs,
         res: ResultDefs,
+        play: PlayDefs,
     ) -> Result<Self, LoadError> {
         let present = def.present.take();
         if present.is_some() && kind != ScreenKind::Play {
@@ -1721,7 +1957,7 @@ impl Skin {
         {
             return Err(LoadError::SongList(SongListError::TooManyPlacements { n }));
         }
-        check_kind(&def, kind, &sel)?;
+        check_kind(&def, kind, &sel, &res)?;
         if whens.len() > MAX_WHEN_TIMERS {
             return Err(LoadError::TooManyWhenTimers { n: whens.len() });
         }
@@ -1736,6 +1972,9 @@ impl Skin {
             res.judge_graphs.len(),
             res.gauge_graphs.len(),
             res.timing_graphs.len(),
+            play.bpm_graphs.len(),
+            play.timing_visualizers.len(),
+            play.hit_errors.len(),
         ] {
             if n > MAX_ELEMENTS {
                 return Err(LoadError::TooManyWidgets { n });
@@ -1836,6 +2075,9 @@ impl Skin {
                 | Source::JudgeGraph(_)
                 | Source::GaugeGraph(_)
                 | Source::TimingGraph(_)
+                | Source::BpmGraph(_)
+                | Source::TimingVisualizer(_)
+                | Source::HitErrorVisualizer(_)
                 | Source::ChartImage { .. } => {}
             }
         }
@@ -1872,6 +2114,9 @@ impl Skin {
             Source::JudgeGraph(i) => res.judge_graphs.get(index(i)).is_none(),
             Source::GaugeGraph(i) => res.gauge_graphs.get(index(i)).is_none(),
             Source::TimingGraph(i) => res.timing_graphs.get(index(i)).is_none(),
+            Source::BpmGraph(i) => play.bpm_graphs.get(index(i)).is_none(),
+            Source::TimingVisualizer(i) => play.timing_visualizers.get(index(i)).is_none(),
+            Source::HitErrorVisualizer(i) => play.hit_errors.get(index(i)).is_none(),
         }) {
             return Err(LoadError::UnknownWidget { element });
         }
@@ -1889,6 +2134,9 @@ impl Skin {
             | Source::JudgeGraph(_)
             | Source::GaugeGraph(_)
             | Source::TimingGraph(_)
+            | Source::BpmGraph(_)
+            | Source::TimingVisualizer(_)
+            | Source::HitErrorVisualizer(_)
             | Source::ChartImage { .. } => false,
         }) {
             return Err(LoadError::UnknownImage { element });
@@ -1903,7 +2151,12 @@ impl Skin {
         if let Some(element) = elements.iter().position(|e| {
             matches!(
                 e.source,
-                Source::JudgeGraph(_) | Source::GaugeGraph(_) | Source::TimingGraph(_)
+                Source::JudgeGraph(_)
+                    | Source::GaugeGraph(_)
+                    | Source::TimingGraph(_)
+                    | Source::BpmGraph(_)
+                    | Source::TimingVisualizer(_)
+                    | Source::HitErrorVisualizer(_)
             ) && e.place.native.is_some()
         }) {
             return Err(LoadError::GraphNative { element });
@@ -1914,6 +2167,7 @@ impl Skin {
         if let Some(graph) = res.timing_graphs.iter().position(|g| !exists(g.solid)) {
             return Err(LoadError::TimingGraphImage { graph });
         }
+        check_play_widgets(&play, &exists)?;
         check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
         for (element, e) in elements.iter().enumerate() {
             let fonts = [def.sheet.font_count(), def.sheet.bitmap_font_count()];
@@ -2040,7 +2294,7 @@ impl Skin {
         }
         let widget_quads = elements
             .iter()
-            .fold(0_u64, |n, e| n + u64::from(worst(e.source, w, &sel, &res)));
+            .fold(0_u64, |n, e| n + u64::from(worst(e, w, &sel, &res, &play)));
         if widget_quads > u64::from(MAX_WIDGET_QUADS) {
             return Err(LoadError::TooManyWidgetQuads { n: widget_quads });
         }
@@ -2193,6 +2447,63 @@ impl Skin {
                 solid: image(def.solid),
             })
             .collect();
+        let mut plan = GraphPlan::default();
+        let mut bpm_plan = Vec::new();
+        let mut timing_plan = Vec::new();
+        let mut hit_plan = Vec::new();
+        for e in &def.elements {
+            match e.source {
+                Source::JudgeGraph(_) if kind == ScreenKind::Play => plan.notes = true,
+                Source::BpmGraph(i) => {
+                    if let Some(&g) = play.bpm_graphs.get(index(i)) {
+                        bpm_plan.push((g, bpm_size(e)));
+                    }
+                }
+                Source::TimingVisualizer(i) => {
+                    if let Some(&v) = play.timing_visualizers.get(index(i)) {
+                        timing_plan.push(v);
+                    }
+                }
+                Source::HitErrorVisualizer(i) => {
+                    if let Some(&v) = play.hit_errors.get(index(i)) {
+                        hit_plan.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        plan.bpm = bpm_plan.into_boxed_slice();
+        plan.timing = timing_plan.into_boxed_slice();
+        plan.hit = hit_plan.into_boxed_slice();
+        let bpm_graphs: Box<[BpmGraph]> = play
+            .bpm_graphs
+            .into_iter()
+            .map(|def| BpmGraph {
+                def,
+                solid: image(def.solid),
+            })
+            .collect();
+        let timing_visualizers: Box<[TimingVisualizer]> = play
+            .timing_visualizers
+            .into_iter()
+            .map(|def| TimingVisualizer {
+                def,
+                solid: image(def.solid),
+            })
+            .collect();
+        let hit_errors: Box<[HitError]> = play
+            .hit_errors
+            .into_iter()
+            .map(|def| HitError {
+                def,
+                solid: image(def.solid),
+            })
+            .collect();
+        let (mut bpm_slot, mut timing_slot, mut hit_slot) = (0, 0, 0);
+        let next = |n: &mut usize| {
+            *n += 1;
+            *n - 1
+        };
         let elements = def
             .elements
             .into_iter()
@@ -2250,6 +2561,11 @@ impl Skin {
                     Source::JudgeGraph(i) => Kind::JudgeGraph(index(i)),
                     Source::GaugeGraph(i) => Kind::GaugeGraph(index(i)),
                     Source::TimingGraph(i) => Kind::TimingGraph(index(i)),
+                    Source::BpmGraph(i) => Kind::BpmGraph(index(i), next(&mut bpm_slot)),
+                    Source::TimingVisualizer(i) => {
+                        Kind::TimingVisualizer(index(i), next(&mut timing_slot))
+                    }
+                    Source::HitErrorVisualizer(i) => Kind::HitError(index(i), next(&mut hit_slot)),
                     Source::ChartImage {
                         which,
                         filter,
@@ -2317,6 +2633,10 @@ impl Skin {
             decision_timing: crate::decision::DecisionTiming::default(),
             gauge_graphs,
             timing_graphs,
+            bpm_graphs,
+            timing_visualizers,
+            hit_errors,
+            plan,
             sliders,
             outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
@@ -2990,6 +3310,7 @@ impl Skin {
             self.lanes.is_some(),
             self.bar_group_count(),
             self.bomb_up_to,
+            &self.plan,
         )
     }
 
@@ -3076,6 +3397,7 @@ impl Skin {
                 notes: frame.notes,
                 gauges: frame.gauges,
                 shown: frame.gauge,
+                offsets: frame.offsets,
             },
         };
         self.draw(&rt, &scene, bars.as_mut(), uvs, &canvas, &placement, out);
@@ -4308,15 +4630,51 @@ impl Skin {
                     }
                 }
                 Kind::JudgeGraph(i) => {
-                    if let (Some(g), Phase::Result { res }) =
-                        (self.judge_graphs.get(i), scene.phase)
+                    let data = match scene.phase {
+                        Phase::Result { res } => Some(GraphData::Timelines(res.timelines())),
+                        Phase::Play { play, .. } => play
+                            .notes_graph(now)
+                            .map(|(bins, cursors)| GraphData::Notes { bins, cursors }),
+                        Phase::Loading { .. } | Phase::Selection { .. } | Phase::Decision => None,
+                    };
+                    if let (Some(g), Some(data)) = (self.judge_graphs.get(i), data) {
+                        let screen = match scene.phase {
+                            Phase::Play { .. } => play_screen_elapsed(rt.starts, now),
+                            _ => screen_elapsed(rt.starts, now),
+                        };
+                        let d = GraphDraw { at, data, screen };
+                        g.draw(&d, rect, &brush, out);
+                    }
+                }
+                Kind::BpmGraph(i, slot) => {
+                    if let (Some(g), Phase::Play { play, .. }) =
+                        (self.bpm_graphs.get(i), scene.phase)
+                        && let Some(raster) = play.bpm_raster(slot)
                     {
-                        let d = GraphDraw {
+                        let d = BpmDraw {
                             at,
-                            timelines: res.timelines(),
-                            screen: screen_elapsed(rt.starts, now),
+                            raster,
+                            screen: play_screen_elapsed(rt.starts, now),
                         };
                         g.draw(&d, rect, &brush, out);
+                    }
+                }
+                Kind::TimingVisualizer(i, slot) => {
+                    if let (Some(v), Phase::Play { play, offsets, .. }) =
+                        (self.timing_visualizers.get(i), scene.phase)
+                        && let Some(band) = play.timing_band(slot)
+                    {
+                        let d = TimingDraw { at, band, offsets };
+                        v.draw(&d, rect, &brush, out);
+                    }
+                }
+                Kind::HitError(i, slot) => {
+                    if let (Some(v), Phase::Play { play, .. }) =
+                        (self.hit_errors.get(i), scene.phase)
+                        && let Some(state) = play.hit_error(slot)
+                    {
+                        let d = HitErrorDraw { at, state };
+                        v.draw(&d, rect, &brush, out);
                     }
                 }
                 Kind::GaugeGraph(i) => {
@@ -4369,6 +4727,13 @@ impl Skin {
     pub const fn element_count(&self) -> usize {
         self.elements.len()
     }
+}
+
+/// The result screen timer's elapsed µs at `now`, `None` while it is off.
+fn play_screen_elapsed(starts: Starts<'_>, now: TimeUs) -> Option<i64> {
+    starts
+        .at(usize::from(crate::play::schema::timer::SCREEN))
+        .map(|at| elapsed_us(now, at))
 }
 
 /// The result screen timer's elapsed µs at `now`, `None` while it is off.

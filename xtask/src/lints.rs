@@ -426,10 +426,13 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/place.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
     Site::File("crates/skin-model/src/widget/bar.rs"),
+    Site::File("crates/skin-model/src/widget/bpm_graph.rs"),
+    Site::File("crates/skin-model/src/widget/compose.rs"),
     Site::File("crates/skin-model/src/widget/cover_paint.rs"),
     Site::File("crates/skin-model/src/widget/digits.rs"),
     Site::File("crates/skin-model/src/widget/gauge.rs"),
     Site::File("crates/skin-model/src/widget/gauge_graph.rs"),
+    Site::File("crates/skin-model/src/widget/hit_error.rs"),
     Site::File("crates/skin-model/src/widget/image_choice.rs"),
     Site::File("crates/skin-model/src/widget/judge.rs"),
     Site::File("crates/skin-model/src/widget/judge_graph.rs"),
@@ -439,6 +442,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/song_list.rs"),
     Site::File("crates/skin-model/src/widget/text.rs"),
     Site::File("crates/skin-model/src/widget/timing_graph.rs"),
+    Site::File("crates/skin-model/src/widget/timing_vis.rs"),
     // A chart image's table and stretch, read by every frame that draws
     // one (S10-12); the read path in the same file is preparation work.
     Site::Fns(
