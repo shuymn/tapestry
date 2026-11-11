@@ -254,7 +254,7 @@ pub const LIMITS: AtlasLimits = AtlasLimits {
 
 /// A folder holding `white.png`, one opaque white texel, under the
 /// target's test folder; written once, atomically.
-fn white_root() -> &'static Path {
+pub fn white_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-play");

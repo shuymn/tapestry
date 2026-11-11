@@ -611,6 +611,9 @@ pub struct Skin {
     /// This skin's identity, which a selection, result or decision state
     /// it makes carries: a clone keeps it, another load takes the next.
     id: u64,
+    /// Its chart layer was given up because the atlas could not hold it
+    /// ([`without_chart_layer`](Skin::without_chart_layer)).
+    chart_layer_dropped: bool,
 }
 
 /// The next skin's identity.
@@ -2640,6 +2643,7 @@ impl Skin {
             sliders,
             outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
+            chart_layer_dropped: false,
         })
     }
 
@@ -2714,13 +2718,56 @@ impl Skin {
     }
 
     /// Whether some element draws one of the chart's own images
-    /// ([`Source::ChartImage`]): its installation then keeps a chart
-    /// layer.
+    /// ([`Source::ChartImage`]) and its chart layer was not given up
+    /// ([`without_chart_layer`](Self::without_chart_layer)): its
+    /// installation then keeps a chart layer.
     #[must_use]
     pub fn has_chart_images(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e.kind, Kind::ChartImage(..)))
+        !self.chart_layer_dropped
+            && self
+                .elements
+                .iter()
+                .any(|e| matches!(e.kind, Kind::ChartImage(..)))
+    }
+
+    /// Keeps its chart layer only if its atlas of `variant` can hold it
+    /// within `limits`: when the plan with it is refused by the per-atlas
+    /// cap ([`AtlasError::AtlasTooLarge`]), the pages the device's layers
+    /// leave ([`AtlasError::TooManyPages`]) or the layers themselves
+    /// ([`AtlasError::Limits`]), and the plan without it is not, it gives
+    /// the layer up ([`without_chart_layer`](Self::without_chart_layer))
+    /// and returns that refusal (S10-12 design §4.3, finding 10). Any other
+    /// outcome keeps everything as it is, for the build to report. Reads
+    /// no file; load-stage work.
+    pub fn fit_chart_layer(&mut self, variant: Variant, limits: AtlasLimits) -> Option<AtlasError> {
+        let kept = self.kept_layers();
+        if !kept.chart {
+            return None;
+        }
+        let refused = match self.sheet.plan_keeping(variant, limits, kept) {
+            Err(
+                e @ (AtlasError::AtlasTooLarge { .. }
+                | AtlasError::TooManyPages
+                | AtlasError::Limits),
+            ) => e,
+            Ok(_) | Err(_) => return None,
+        };
+        let without = KeptLayers {
+            chart: false,
+            ..kept
+        };
+        self.sheet.plan_keeping(variant, limits, without).ok()?;
+        self.without_chart_layer();
+        Some(refused)
+    }
+
+    /// Gives up its chart layer, for an atlas that cannot hold one (S10-12
+    /// design §4.3, finding 10): it then keeps none
+    /// ([`kept_layers`](Self::kept_layers)), and its chart-image elements
+    /// stay but draw nothing, as with no table published, so their
+    /// fields read absent and a skin's "no image" presentation shows.
+    pub fn without_chart_layer(&mut self) {
+        self.chart_layer_dropped = true;
     }
 
     /// Whether some text element or song list row style is rasterized: set

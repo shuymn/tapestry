@@ -871,9 +871,10 @@ impl ChartStretch {
     /// `native` texels, and the native size the quad keeps at placement
     /// for [`NoExpanding`](Self::NoExpanding) and
     /// [`NoResize`](Self::NoResize), as an imported image's stretch is
-    /// baked (the importer's `track::stretch`, in `f64`), its edges then
-    /// rounded half up as the importer rounds a baked key's (y down,
-    /// `Rect::model_from`). An image without area keeps the destination.
+    /// baked (the importer's `track::stretch`, over exact rationals), its
+    /// edges then rounded half up as the importer rounds a baked key's (y
+    /// down, `Rect::model_from`). An image without area keeps the
+    /// destination.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn place(self, [x, y, w, h]: [f32; 4], native: [u32; 2]) -> ([f32; 4], Option<Native>) {

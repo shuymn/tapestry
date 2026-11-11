@@ -1714,6 +1714,25 @@ fn an_installed_skin_logs_its_summary_and_notes() {
     let kept = Kept::default();
     log_installed(ScreenKind::Play, &summary, atlas, texels, &kept);
     assert_eq!(kept.0.into_inner().unwrap().len(), 3);
+    // A chart layer given up: one more config line, before the notes, so
+    // the cap never hides it, even with 150 notes.
+    summary.chart_layer = Some("too many pages".to_owned());
+    let line = "skin: play: config: Warning: the chart layer does not fit (too many pages); \
+                the chart's own images are absent";
+    let kept = Kept::default();
+    log_installed(ScreenKind::Play, &summary, atlas, texels, &kept);
+    let logged = kept.0.into_inner().unwrap();
+    assert_eq!(logged.len(), 4, "{logged:?}");
+    assert_eq!(logged[1], line);
+    summary.notes = vec![note; 150];
+    let kept = Kept::default();
+    log_installed(ScreenKind::Play, &summary, atlas, texels, &kept);
+    let logged = kept.0.into_inner().unwrap();
+    assert_eq!(logged[1], line, "kept under the cap");
+    assert_eq!(
+        logged[101],
+        "skin: play: 51 more notes not logged (151 kept), 0 more not kept"
+    );
 }
 
 /// Through the run's sink, which cuts a record at 1 KiB, a skin of many

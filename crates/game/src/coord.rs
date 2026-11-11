@@ -190,6 +190,9 @@ pub enum JobKind {
     Bank,
     /// The chosen chart's loudness measured, its cache missed.
     Measure,
+    /// The chosen chart's stage file and back image read and fitted (its
+    /// owned image worker, S10-12).
+    ChartImages,
 }
 
 /// What tells jobs apart: two of one key are one job. The speed is
@@ -272,6 +275,10 @@ impl Owner {
 /// waiter responsible for it (nothing withdraws that). The callers'
 /// rule: a panic is fatal when the owner was [`Owner::Foreground`] or the
 /// job `responsible`, otherwise recoverable; a cancellation is no failure.
+/// One exception: a [`JobKind::ChartImages`] job's panic is that job's own
+/// terminal absence (its images not yet finished are absent) and never the
+/// run's, whatever its owner, as the chart's images are decorative and the
+/// source catches their failures (S10-12, design C13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed<T> {
     /// How it ended.

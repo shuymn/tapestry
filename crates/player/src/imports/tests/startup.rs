@@ -65,6 +65,7 @@ fn bundled(_: ScreenKind, _: &SkinChoice, _: bool, _: &ImportTarget, _: &Cancel)
             usage: Usage::default(),
             notes: Vec::new(),
             suppressed: 0,
+            chart_layer: None,
         },
         crate::screens::ScriptSlot::default(),
     )
