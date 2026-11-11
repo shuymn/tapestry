@@ -1312,3 +1312,119 @@ fn the_decision_tone_starts_with_a_load_pending() {
     assert!(worker.engine().tone_sounding());
     assert!(out.samples()[from..].iter().any(|&x| x != 0.0));
 }
+
+/// C1: a switch sent and left unanswered (the worker held) leaves its load
+/// outstanding; once the worker answers it, late, the next switch takes
+/// that answer first, so it is not `Busy`, then goes through: the engine
+/// and the seek source hold the second bank, and the first switch's bank
+/// is freed on this thread.
+#[test]
+fn a_left_switch_is_drained_and_replaced() {
+    use std::sync::Arc;
+
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    let first = bank(&chart);
+    let left = Arc::downgrade(&first);
+    let mut switch = control
+        .switch(first, audio::BgmSchedule::new(Vec::new()))
+        .unwrap();
+    assert_eq!(control.poll_switch(&mut switch), game::SwitchPoll::Pending);
+    assert!(switch.sent());
+    // Left: its caller goes, the load still queued.
+    drop(switch);
+    worker.step(&mut out).unwrap();
+    assert!(left.upgrade().is_some(), "taken late: the engine holds it");
+    let second = bank(&chart);
+    let mut next = control
+        .switch(
+            Arc::clone(&second),
+            audio::BgmSchedule::new(chart.bgm.clone()),
+        )
+        .unwrap();
+    let done = loop {
+        if let game::SwitchPoll::Done(done) = control.poll_switch(&mut next) {
+            break done;
+        }
+        assert!(
+            control.expired(&next).is_none(),
+            "the next switch waited out"
+        );
+        worker.step(&mut out).unwrap();
+    };
+    assert_eq!(done, Ok(()));
+    assert!(Arc::ptr_eq(worker.engine().bank(), &second));
+    assert!(control.seek_source().matches(&chart.bgm));
+    assert!(left.upgrade().is_none(), "the late answer was kept");
+}
+
+/// C4: a switch whose push finds the control queue full keeps its bank and
+/// schedule, unsent, with nothing outstanding; once there is room the
+/// original bank and schedule are installed. Kept full to its bound, it
+/// ends in `Timeout` with nothing outstanding, and the next load goes
+/// through.
+#[test]
+fn a_full_control_queue_keeps_the_switch_unsent() {
+    use std::sync::Arc;
+
+    let chart = chart();
+    let (_held, mut control, mut worker, mut out) = rig_holding(&chart);
+    let fill = |control: &mut AudioControl| {
+        // The queue's capacity, from the game crate's control queue.
+        for _ in 0..16 {
+            control.cancel();
+        }
+    };
+    fill(&mut control);
+    let original = bank(&chart);
+    let mut switch = control
+        .switch(
+            Arc::clone(&original),
+            audio::BgmSchedule::new(chart.bgm.clone()),
+        )
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(control.poll_switch(&mut switch), game::SwitchPoll::Pending);
+        assert!(!switch.sent(), "full: nothing sent");
+    }
+    // Room: the worker drains the queue.
+    worker.step(&mut out).unwrap();
+    let done = loop {
+        if let game::SwitchPoll::Done(done) = control.poll_switch(&mut switch) {
+            break done;
+        }
+        assert!(
+            control.expired(&switch).is_none(),
+            "the original never sent"
+        );
+        worker.step(&mut out).unwrap();
+    };
+    assert_eq!(done, Ok(()));
+    assert!(Arc::ptr_eq(worker.engine().bank(), &original));
+    assert!(control.seek_source().matches(&chart.bgm));
+    // Kept full to the bound.
+    fill(&mut control);
+    let mut kept = control
+        .switch(bank(&chart), audio::BgmSchedule::new(Vec::new()))
+        .unwrap();
+    let expired = loop {
+        assert_eq!(control.poll_switch(&mut kept), game::SwitchPoll::Pending);
+        if let Some(expired) = control.expired(&kept) {
+            break expired;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!(
+        expired,
+        game::AudioLoadError::Wait(game::AudioWaitError::Timeout)
+    );
+    assert!(!kept.sent());
+    drop(kept);
+    // Nothing outstanding: the next load is not refused as busy.
+    let next = bank(&chart);
+    answered(&mut worker, &mut out, || {
+        control.load(Arc::clone(&next), audio::BgmSchedule::new(Vec::new()))
+    })
+    .unwrap();
+    assert!(Arc::ptr_eq(worker.engine().bank(), &next));
+}

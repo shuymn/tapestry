@@ -459,6 +459,33 @@ impl std::fmt::Debug for OutputProbe {
     }
 }
 
+/// A switch of the engine's sounds ([`AudioControl::switch`]): the bank
+/// and schedule it owns until they are sent, the number they were sent
+/// under, and when it was made.
+#[derive(Debug)]
+pub struct Switch {
+    unsent: Option<(Arc<SoundBank>, BgmSchedule)>,
+    id: Option<u64>,
+    since: Instant,
+}
+
+impl Switch {
+    /// Whether its load is in the control queue (or answered).
+    #[must_use]
+    pub const fn sent(&self) -> bool {
+        self.id.is_some()
+    }
+}
+
+/// A look at a [`Switch`] ([`AudioControl::poll_switch`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwitchPoll {
+    /// Not answered yet: unsent, or sent and waiting for the audio thread.
+    Pending,
+    /// Answered, or the audio thread is gone.
+    Done(Result<(), AudioLoadError>),
+}
+
 /// The game thread's end.
 #[derive(Debug)]
 pub struct AudioControl {
@@ -487,6 +514,9 @@ pub struct AudioControl {
     accepted: Option<Arc<AtomicU64>>,
     /// The number of the latest queue change asked for.
     queue_change: u32,
+    /// Pushes of a switch taken as a full queue still to come (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    full_for: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// The audio thread's end: the engine and the play it is playing.
@@ -572,6 +602,8 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         loads: loads_rx,
         load_id: 0,
         outstanding: None,
+        #[cfg(feature = "dev-tools")]
+        full_for: Arc::default(),
         rate,
         shared: Arc::clone(&shared),
         generation: 0,
@@ -768,7 +800,8 @@ impl AudioControl {
     /// Hands another chart's `bank` and `schedule` to the engine, between
     /// plays, and waits until the audio thread has taken them: what they
     /// replace comes back and is freed here, never on the audio thread.
-    /// Nothing sounds until the next [`play`](Self::play).
+    /// Nothing sounds until the next [`play`](Self::play). A
+    /// [`switch`](Self::switch) polled to its answer or its bound.
     ///
     /// # Errors
     ///
@@ -776,22 +809,110 @@ impl AudioControl {
     /// output's, sent nowhere; [`AudioWaitError::Gone`] once the worker is
     /// gone, and [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`]. A load
     /// that timed out stays outstanding: the engine may still take it, and
-    /// until its answer comes back, which is freed here, every later load is
-    /// refused with [`AudioLoadError::Busy`] and sends nothing. So at most
-    /// one load is ever queued or answered, and the audio thread always has
-    /// room for its answer.
+    /// until its answer comes back, which is freed here, no later load is
+    /// sent, and a load made meanwhile is refused at once with
+    /// [`AudioLoadError::Busy`]. So at most one load is ever queued or
+    /// answered, and the audio thread always has room for its answer.
     pub fn load(
         &mut self,
         bank: Arc<SoundBank>,
         schedule: BgmSchedule,
     ) -> Result<(), AudioLoadError> {
+        let mut switch = self.switch(bank, schedule)?;
+        loop {
+            if let SwitchPoll::Done(done) = self.poll_switch(&mut switch) {
+                return done;
+            }
+            // An earlier load still unanswered refuses this one at once.
+            if !switch.sent() && self.outstanding.is_some() {
+                return Err(AudioLoadError::Busy);
+            }
+            if let Some(expired) = self.expired(&switch) {
+                return Err(expired);
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    /// A switch of the engine's sounds to `bank` and `schedule`, made but
+    /// not sent: it owns them until [`poll_switch`](Self::poll_switch) has
+    /// put them in the control queue, and its bound ([`SWITCH_TIMEOUT`])
+    /// runs from here. Its caller polls it at each of its own slices and
+    /// may leave it at any of them.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioLoadError::RateMismatch`] for a bank at another rate than the
+    /// output's.
+    pub fn switch(
+        &self,
+        bank: Arc<SoundBank>,
+        schedule: BgmSchedule,
+    ) -> Result<Switch, AudioLoadError> {
         if bank.rate() != self.rate {
             return Err(AudioLoadError::RateMismatch {
                 bank: bank.rate(),
                 output: self.rate,
             });
         }
-        // The answer to a load that timed out is freed first.
+        Ok(Switch {
+            unsent: Some((bank, schedule)),
+            id: None,
+            since: Instant::now(),
+        })
+    }
+
+    /// [`switch`](Self::switch) to an empty bank and schedule at the
+    /// output's rate: the unload of [`unload`](Self::unload).
+    #[must_use]
+    pub fn unload_switch(&self) -> Switch {
+        Switch {
+            unsent: Some((
+                Arc::new(SoundBank::from_sounds(self.rate, Vec::new())),
+                BgmSchedule::new(Vec::new()),
+            )),
+            id: None,
+            since: Instant::now(),
+        }
+    }
+
+    /// One look at `switch`, waiting for nothing. Unsent: the answer of an
+    /// earlier switch still outstanding is taken first (freed here, as
+    /// [`load`](Self::load) frees it); while one is outstanding nothing is
+    /// sent. Then one push of its load: a full control queue keeps the
+    /// bank and schedule in the switch, unsent, and assigns nothing, so no
+    /// number is ever outstanding that the worker was not given. Sent: its
+    /// answer, if it came. [`SwitchPoll::Pending`] until then; a switch
+    /// dropped sent stays outstanding, as a load that timed out does, and
+    /// the next switch takes its answer.
+    pub fn poll_switch(&mut self, switch: &mut Switch) -> SwitchPoll {
+        if let Some(id) = switch.id {
+            if let Ok(retired) = self.loads.pop() {
+                let (answered, taken) = (retired.id, retired.taken);
+                if answered == id && taken {
+                    self.source = retired.source.clone();
+                }
+                drop(retired);
+                if answered == id {
+                    self.outstanding = None;
+                    // The engine refuses only another rate, checked at the
+                    // switch.
+                    return SwitchPoll::Done(if taken {
+                        Ok(())
+                    } else {
+                        Err(AudioLoadError::RateMismatch {
+                            bank: self.rate,
+                            output: self.rate,
+                        })
+                    });
+                }
+            }
+            if self.loads.is_abandoned() {
+                return SwitchPoll::Done(Err(AudioWaitError::Gone.into()));
+            }
+            return SwitchPoll::Pending;
+        }
+        // The answer to a load left unanswered is freed first.
         if self.outstanding.is_some() {
             if let Ok(late) = self.loads.pop() {
                 if Some(late.id) == self.outstanding {
@@ -804,49 +925,63 @@ impl AudioControl {
                 drop(late);
             }
             if self.outstanding.is_some() {
-                return Err(if self.loads.is_abandoned() {
-                    AudioWaitError::Gone.into()
-                } else {
-                    AudioLoadError::Busy
-                });
+                if self.loads.is_abandoned() {
+                    return SwitchPoll::Done(Err(AudioWaitError::Gone.into()));
+                }
+                return SwitchPoll::Pending;
             }
         }
         if self.ctl.is_abandoned() {
-            return Err(AudioWaitError::Gone.into());
+            return SwitchPoll::Done(Err(AudioWaitError::Gone.into()));
         }
-        self.load_id += 1;
-        let id = self.load_id;
-        self.outstanding = Some(id);
-        self.send(AudioCtl::Load { bank, schedule, id });
-        let deadline = Instant::now() + SWITCH_TIMEOUT;
-        loop {
-            if let Ok(retired) = self.loads.pop() {
-                let (answered, taken) = (retired.id, retired.taken);
-                if answered == id && taken {
-                    self.source = retired.source.clone();
-                }
-                drop(retired);
-                if answered == id {
-                    self.outstanding = None;
-                    // The engine refuses only another rate, checked above.
-                    return if taken {
-                        Ok(())
-                    } else {
-                        Err(AudioLoadError::RateMismatch {
-                            bank: self.rate,
-                            output: self.rate,
-                        })
-                    };
-                }
-            }
-            if self.loads.is_abandoned() {
-                return Err(AudioWaitError::Gone.into());
-            }
-            if Instant::now() >= deadline {
-                return Err(AudioWaitError::Timeout.into());
-            }
-            std::thread::sleep(Duration::from_micros(500));
+        #[cfg(feature = "dev-tools")]
+        if self
+            .full_for
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return SwitchPoll::Pending;
         }
+        let Some((bank, schedule)) = switch.unsent.take() else {
+            return SwitchPoll::Pending;
+        };
+        let id = self.load_id.wrapping_add(1);
+        match self.ctl.push(AudioCtl::Load { bank, schedule, id }) {
+            Ok(()) => {
+                self.load_id = id;
+                self.outstanding = Some(id);
+                switch.id = Some(id);
+            }
+            Err(rtrb::PushError::Full(AudioCtl::Load { bank, schedule, .. })) => {
+                switch.unsent = Some((bank, schedule));
+            }
+            Err(rtrb::PushError::Full(_)) => {}
+        }
+        SwitchPoll::Pending
+    }
+
+    /// How many more pushes of a switch find the control queue full
+    /// (dev-tools): set it, and that many looks keep the load unsent, as
+    /// [`poll_switch`](Self::poll_switch) keeps it when the queue is full.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn forced_full(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::clone(&self.full_for)
+    }
+
+    /// Why `switch` ends unanswered once its bound has passed, if it has:
+    /// [`AudioWaitError::Timeout`] once sent or while the control queue
+    /// stayed full; [`AudioLoadError::Busy`] while an earlier load's answer
+    /// kept it from being sent.
+    #[must_use]
+    pub fn expired(&self, switch: &Switch) -> Option<AudioLoadError> {
+        (switch.since.elapsed() >= SWITCH_TIMEOUT).then(|| {
+            if switch.id.is_none() && self.outstanding.is_some() {
+                AudioLoadError::Busy
+            } else {
+                AudioWaitError::Timeout.into()
+            }
+        })
     }
 
     /// Takes the engine's sounds away: an empty bank and schedule at the
@@ -857,10 +992,7 @@ impl AudioControl {
     ///
     /// # Errors
     ///
-    /// As [`load`](Self::load): [`AudioLoadError::Busy`] while a load that
-    /// timed out is unanswered, [`AudioWaitError::Gone`] once the worker is
-    /// gone, [`AudioWaitError::Timeout`] after [`SWITCH_TIMEOUT`], which
-    /// leaves the unload outstanding.
+    /// As [`load`](Self::load).
     pub fn unload(&mut self) -> Result<(), AudioLoadError> {
         let empty = Arc::new(SoundBank::from_sounds(self.rate, Vec::new()));
         self.load(empty, BgmSchedule::new(Vec::new()))

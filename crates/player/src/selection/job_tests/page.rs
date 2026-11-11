@@ -19,6 +19,7 @@ use super::{
 use crate::page_jobs::{PageAt, PageJobs, PageProbe};
 use crate::play::PlayerRig;
 use crate::render_side::tests::Installers;
+use crate::selection::Loaded;
 
 /// A chart `dir/song/a.bms` of its own title `tag` (its resolved hash its
 /// own, so its analyses are counted apart), playing `key.wav`.
@@ -138,6 +139,17 @@ fn plain(dir: &Path, tag: &str, page: &Arc<Page>) -> (Bench, PathBuf) {
     )
 }
 
+/// The page's read, its release barrier's unload polled until the audio
+/// thread answered it (the bank begun then, unless the background holds
+/// the chart), as the decision screen's looks poll it.
+fn read_page(rig: &mut PlayerRig<'_>, read: &Loaded) {
+    rig.practice_read(read, &mut game::Decision::off()).unwrap();
+    until("the barrier's unload answered", || {
+        assert!(rig.begin_page_when_ready().is_ok());
+        sel(rig).page.unloading().is_none()
+    });
+}
+
 /// The page's passes until its jobs have all been taken.
 fn passes_until_idle(rig: &mut PlayerRig<'_>) {
     until("the page's jobs taken", || {
@@ -170,8 +182,7 @@ fn the_page_begins_its_1x_bank_under_page_policy() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             assert_eq!(b.coord.held(Class::Speculative), 1);
             assert_eq!(b.coord.held(Class::Foreground), 0);
@@ -199,8 +210,7 @@ fn the_page_advances_its_jobs_without_input() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.poll_page().unwrap();
             assert!(!sel(rig).page.measuring(), "nothing published yet");
@@ -241,8 +251,7 @@ fn a_responsible_page_panic_ends_the_run_at_the_next_pass() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
             assert_eq!(
@@ -287,13 +296,11 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             rig.left_chart().unwrap();
             rig.entered_selection();
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             until("the bank kept", || {
                 rig.poll_page().unwrap();
                 sel(rig).page.kept().is_some()
@@ -320,8 +327,7 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             rig.load_chart(&start, &mut game::Decision::off())
         },
@@ -358,8 +364,7 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             assert!(sel(rig).page.kept().is_none(), "nothing kept");
             assert_eq!(
@@ -391,8 +396,7 @@ fn a_start_at_1x_joins_the_bank_in_each_state() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read, &mut game::Decision::off())
-                    .unwrap();
+                read_page(rig, &read);
                 if queued {
                     assert_eq!(b.coord.held(Class::Speculative), 1, "the lease only");
                     let (coord, controls) = (b.coord.clone(), rig.controls);
@@ -469,8 +473,7 @@ fn a_finished_bank_is_not_installed_after_a_quit() {
         |rig| {
             // The read's own barrier passes before the hook is armed.
             sel(rig).decodes = None;
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             sel(rig).decodes = Some(Arc::clone(&b.decodes));
             passes_until_idle(rig);
             assert_eq!(
@@ -499,8 +502,7 @@ fn a_quit_while_joining_keeps_the_page_job_for_the_next_start() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             let choice = b.coord.current(Scope::Choice);
             rig.controls.command(game::Command::Quit);
@@ -541,8 +543,7 @@ fn a_panic_in_a_joined_page_job_ends_the_run() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read, &mut game::Decision::off())
-                    .unwrap();
+                read_page(rig, &read);
                 held.recv_timeout(watchdog()).expect("the page's decode");
                 if after_quit {
                     rig.controls.command(game::Command::Quit);
@@ -602,8 +603,7 @@ fn a_speculative_failure_is_redone_by_the_start() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read, &mut game::Decision::off())
-                    .unwrap();
+                read_page(rig, &read);
                 passes_until_idle(rig);
                 assert_eq!(
                     outcome(rig.load_chart(&start, &mut game::Decision::off())),
@@ -656,8 +656,7 @@ fn another_speed_measures_on_1x_before_its_own_decode() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             order.lock().unwrap().clear();
             // No page pass: the Start finds the bank and the gain unknown.
             assert_eq!(
@@ -718,8 +717,7 @@ fn back_settles_the_page_jobs_in_each_state() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read, &mut game::Decision::off())
-                    .unwrap();
+                read_page(rig, &read);
                 let choice = b.coord.current(Scope::Choice);
                 if let Some((held, go)) = hold {
                     held.recv_timeout(watchdog()).expect("running");
@@ -774,8 +772,7 @@ fn page_entry_releases_the_played_bank_first() {
                 outcome(rig.load_chart(&played, &mut game::Decision::off())),
                 Loading::Ready
             );
-            rig.practice_read(&played, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &played);
             passes_until_idle(rig);
         },
     );
@@ -799,8 +796,7 @@ fn a_start_at_1x_reuses_the_page_bank_until_another_speed_releases_it() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             for speed in [Speed::NORMAL, Speed::NORMAL, Speed::FASTEST, Speed::NORMAL] {
                 let start = practiced(dir.path(), &path, speed);
@@ -869,8 +865,7 @@ fn a_return_to_1x_releases_the_speed_bank_before_its_decode() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             for speed in [Speed::FASTEST, Speed::NORMAL] {
                 let start = practiced(dir.path(), &path, speed);
@@ -939,8 +934,7 @@ fn sounds_replaced_after_the_page_measured_are_measured_again() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             assert!(sel(rig).page.gain_known());
             assert_eq!(crate::loudness::analyses::of(hash), 1);
@@ -1003,8 +997,7 @@ fn a_failure_during_the_leave_bounds_its_settle() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             let base = std::time::Instant::now();
             let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1066,8 +1059,7 @@ fn a_responsible_panic_during_the_leave_ends_the_run() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
             assert_eq!(
@@ -1117,8 +1109,7 @@ fn a_failed_page_measurement_is_measured_again_by_the_start() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             // The page tries once: its next passes measure nothing.
             assert_eq!(
@@ -1177,8 +1168,7 @@ fn sounds_replaced_during_the_page_measurement_are_measured_again() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             until("the page measures", || {
                 rig.poll_page().unwrap();
                 sel(rig).page.measuring()
@@ -1224,8 +1214,7 @@ fn a_responsible_panic_at_the_runs_end_ends_the_run_with_it() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
             assert_eq!(
@@ -1281,8 +1270,7 @@ fn panic_after_publication(joined: bool) {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read, &mut game::Decision::off())
-                    .unwrap();
+                read_page(rig, &read);
                 held.recv_timeout(watchdog()).expect("the page's decode");
                 if joined {
                     page.on(PageAt::Promoted(JobKind::Bank), move || {
@@ -1356,8 +1344,7 @@ fn a_refused_page_measurement_is_tried_once() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read, &mut game::Decision::off())
-                .unwrap();
+            read_page(rig, &read);
             passes_until_idle(rig);
             for _ in 0..3 {
                 rig.poll_page().unwrap();
@@ -1474,4 +1461,215 @@ fn leaving_while_the_page_waits_for_the_background_begins_no_bank() {
         );
         assert!(page.seen.lock().unwrap().is_empty());
     });
+}
+
+/// A hook holding the audio thread at `gate` at the first release
+/// barrier, until the audio thread waits there.
+fn gate_at_first_barrier(gate: &Arc<crate::dev::AudioGate>) -> Option<super::Hook> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let gate = Arc::clone(gate);
+    let armed = AtomicBool::new(true);
+    hook(move |p, _, _| {
+        if p == Probe::Barrier && armed.swap(false, Ordering::AcqRel) {
+            gate.hold();
+            until("the audio thread at its gate", || gate.stopped());
+        }
+    })
+}
+
+/// The page's entry at its deadline as App takes it: the screen's look at
+/// the page's jobs past `T` returns the page's step, then App's page entry
+/// hooks run (the epoch closed, the practice page entered); the page is
+/// entered: its input open and the scan's pause released.
+fn enter_page_at_deadline(rig: &mut PlayerRig<'_>, read: &Loaded, decision: &mut game::Decision) {
+    use bms_model::TimeSource as _;
+    // The choice closed the input epoch.
+    rig.controls.close_epoch();
+    assert!(!rig.controls.ingress().is_open(), "the choice's epoch");
+    let now = rig.clock.now();
+    assert_eq!(
+        decision.classify(game::Origin::Jobs, now, false, false, None),
+        game::Verdict::Step,
+        "the page's entry at the deadline"
+    );
+    rig.closed_epoch();
+    rig.entered_practice(&game::PracticeScreen::new(
+        read.chart(),
+        &rules::tapestry(),
+        0,
+    ));
+    assert!(rig.controls.ingress().is_open(), "the page's input");
+    assert!(
+        !sel(rig).shelf.paused(),
+        "the page's entry released the scan"
+    );
+}
+
+/// A decision screen of a practice choice whose deadline is due.
+fn due_practice(rig: &PlayerRig<'_>) -> game::Decision {
+    use bms_model::TimeSource as _;
+    let now = rig.clock.now();
+    game::Decision::begin(
+        bms_model::TimeUs(now.0 - game::DECISION_TIME.0),
+        Some(game::DECISION_TIME),
+        true,
+    )
+}
+
+/// C3: the page's read with its release barrier's unload held at the audio
+/// thread: the read returns, the unload in flight; the page's entry and
+/// its passes go on with no bank begun; once the audio thread answers the
+/// unload, a pass begins the bank.
+#[test]
+fn the_page_opens_while_its_barrier_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let (mut b, path) = page_bench(
+        dir.path(),
+        "c3",
+        decodes_with(gate_at_first_barrier(&gate)),
+        Spawner::SYSTEM,
+        &page,
+        Arc::new(crate::priority::Unchanged),
+    );
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    super::on_gated_rig(b.sel.take().unwrap(), &gate, |rig| {
+        let mut decision = due_practice(rig);
+        assert_eq!(
+            outcome(rig.practice_read(&read, &mut decision)),
+            Loading::Ready,
+            "the read waited for the unload"
+        );
+        assert!(gate.stopped(), "the unload answered");
+        assert!(sel(rig).page.unloading().is_some());
+        // The page's entry at its deadline and its passes, the unload
+        // still held.
+        enter_page_at_deadline(rig, &read, &mut decision);
+        assert!(sel(rig).page.unloading().is_some(), "the unload answered");
+        for _ in 0..3 {
+            rig.poll_page().unwrap();
+        }
+        assert!(
+            page.seen.lock().unwrap().is_empty(),
+            "a bank began before the unload answered"
+        );
+        assert!(sel(rig).page.unloading().is_some());
+        gate.release();
+        until("the page's bank begun", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.decoding() || sel(rig).page.kept().is_some()
+        });
+        passes_until_idle(rig);
+        assert!(sel(rig).page.kept().is_some());
+    });
+    assert_eq!(witnessed(&b).1, Vec::<String>::new());
+}
+
+/// C3c: the page open and its bank waiting for the background, which its
+/// look found measuring the chart after the page's entry, so the look took
+/// the scan's pause; once the measurement is done the barrier's unload is
+/// refused, and the page gives the bank up to a Start: the pause the bank
+/// took is released with it, and the page's scan goes on.
+#[test]
+fn a_refused_page_barrier_releases_the_pause_it_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "c3c", &page);
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let s = b.sel.take().unwrap();
+    crate::shelf::tests::worker(&s.shelf).queue(crate::shelf::tests::job(&path));
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        until("the background measuring the chart", || {
+            b.stepper.said() == crate::background::tests::Said::Block(0)
+        });
+        // The choice paused the scan, then the page read its chart.
+        sel(rig).shelf.pause();
+        let mut decision = due_practice(rig);
+        assert_eq!(
+            outcome(rig.practice_read(&read, &mut decision)),
+            Loading::Ready
+        );
+        enter_page_at_deadline(rig, &read, &mut decision);
+        // The bank's look takes the pause while the background measures.
+        rig.poll_page().unwrap();
+        assert!(sel(rig).shelf.paused(), "the bank's look took no pause");
+        assert!(sel(rig).page.pending_path().is_some());
+        // The measurement done, the barrier's unload is refused.
+        sel(rig).unload_fault = Some(game::AudioLoadError::Busy);
+        b.stepper.finish();
+        until("the bank given up", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.pending_path().is_none()
+        });
+        assert!(!sel(rig).page.decoding());
+        assert!(
+            !sel(rig).shelf.paused(),
+            "the scan left paused after the bank was given up"
+        );
+    });
+}
+
+/// C3b: the unload held, and the background resumes measuring the chart
+/// meanwhile (the page's entry ended the scan's pause): once the unload
+/// answers, the bank is admitted only after the background is looked at
+/// again, so no bank begins while the background holds the chart; it
+/// begins once the measurement is done, the witness finding no other bank
+/// alive.
+#[test]
+fn the_page_admits_its_bank_after_the_background_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let (mut b, path) = page_bench(
+        dir.path(),
+        "c3b",
+        decodes_with(gate_at_first_barrier(&gate)),
+        Spawner::SYSTEM,
+        &page,
+        Arc::new(crate::priority::Unchanged),
+    );
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let s = b.sel.take().unwrap();
+    let b = b;
+    super::on_gated_rig(s, &gate, |rig| {
+        let mut decision = due_practice(rig);
+        assert_eq!(
+            outcome(rig.practice_read(&read, &mut decision)),
+            Loading::Ready
+        );
+        assert!(sel(rig).page.unloading().is_some());
+        // The page's entry releases the scan's pause.
+        enter_page_at_deadline(rig, &read, &mut decision);
+        crate::shelf::tests::worker(&sel(rig).shelf).queue(crate::shelf::tests::job(&path));
+        until("the background measuring the chart", || {
+            b.stepper.said() == crate::background::tests::Said::Block(0)
+        });
+        gate.release();
+        until("the unload answered", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.unloading().is_none()
+        });
+        for _ in 0..3 {
+            rig.poll_page().unwrap();
+        }
+        assert!(
+            page.seen.lock().unwrap().is_empty(),
+            "the page's bank began beside the background's"
+        );
+        assert!(!sel(rig).page.decoding());
+        // Meanwhile the look at the background paused the scan again.
+        assert!(sel(rig).shelf.paused());
+        b.stepper.finish();
+        until("the page's bank begun", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.decoding() || sel(rig).page.kept().is_some()
+        });
+        // The page released the scan at its entry: the pause its look took
+        // is given back with the bank's admission.
+        assert!(!sel(rig).shelf.paused(), "the scan left paused on the page");
+        passes_until_idle(rig);
+    });
+    assert_eq!(witnessed(&b).1, Vec::<String>::new());
 }

@@ -40,12 +40,17 @@ const EPOCH: u8 = 8;
 
 /// The decision screen as the waits inside a chart's load serve it
 /// (design.md "Play Lifecycle", the decision screen): every wait's stop
-/// asks [`Controls::serve_decision`], which classifies at one point
+/// asks [`Controls::look`], which classifies at one point
 /// ([`game::Decision::classify`]) and runs the play's deadline step there,
 /// on whichever thread asks.
 pub struct DecisionWatch {
-    /// The decision screen, lent by the flow for the load.
+    /// The decision screen, lent by the flow for the wait.
     pub decision: game::Decision,
+    /// Where the screen is while the wait runs: a play's load
+    /// ([`game::Origin::Load`]), or practice before its chart is read
+    /// ([`game::Origin::Read`], so its deadline sets the screen waiting
+    /// for the read and never steps inside a rig's wait).
+    pub origin: game::Origin,
     /// The held loading lifetime revealed: the deadline step's first
     /// part, before the input epoch ends.
     pub reveal: Box<dyn Fn() + Send + Sync>,
@@ -345,7 +350,7 @@ impl Controls {
     }
 
     /// Whether a wait inside a chart's load left the decision screen
-    /// ([`serve_decision`](Self::serve_decision)).
+    /// ([`look`](Self::look)).
     pub fn decision_left(&self) -> bool {
         self.watch
             .lock()
@@ -363,6 +368,16 @@ impl Controls {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watch);
     }
 
+    /// The watched decision as it stands (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn watched(&self) -> Option<game::Decision> {
+        self.watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|w| w.decision)
+    }
+
     /// The load's waits serve no decision screen any more: the one they
     /// served, as they left it.
     pub fn unwatch_decision(&self) -> Option<game::Decision> {
@@ -373,53 +388,40 @@ impl Controls {
             .map(|w| w.decision)
     }
 
-    /// One look of the decision screen from inside a chart's load
-    /// ([`game::Origin::Load`]): a close or a thread's failure ends it
-    /// (the wait stops, and the flow finds why); the deadline runs the
-    /// play's step here, once, and the wait goes on. Whether the wait is
-    /// to stop. Nothing without a decision screen watched.
-    pub fn serve_decision(&self) -> bool {
+    /// One look of the decision screen from inside a wait the rig owns:
+    /// the verdict [`game::Decision::classify`] returns from the watch's
+    /// origin, with the run's terminal causes (a close, the rig's thread
+    /// failures), handed to the waiting caller, which acts on it. The
+    /// play's step runs here, once, and the wait goes on; a leaving verdict
+    /// is kept in the decision ([`game::Decision::leave`]) for App to route
+    /// and returned again by every later look. The escape is not read
+    /// here: a press counts by when it was observed, at App's next look.
+    /// `None` without a decision screen watched.
+    pub fn look(&self) -> Option<game::Verdict> {
         let mut watch = self
             .watch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(w) = watch.as_mut() else {
-            return false;
-        };
-        if w.decision.left().is_some() {
-            return true;
+        let w = watch.as_mut()?;
+        if let Some(left) = w.decision.left() {
+            return Some(left);
         }
         let terminal = self.quitting() || w.failures.any();
-        // For practice the deadline is the page's entry, which the flow
-        // takes once the read's waits return: here only a terminal cause
-        // leaves.
-        if w.decision.practice() {
-            if terminal {
-                w.decision.leave(game::Verdict::End);
-            }
-            return terminal;
-        }
         let now = self.clock.now();
-        match w
-            .decision
-            .classify(game::Origin::Load, now, terminal, false, None)
-        {
-            game::Verdict::Continue => false,
-            game::Verdict::Step => {
-                // The play's deadline step: the lifetime shown, the
-                // loading state's tuning epoch, the input epoch's end, and
-                // a new scene. Each a lock-held update or a queued message.
-                (w.reveal)();
-                self.tuning.enter_loading(now);
-                self.open_epoch();
-                self.next_scene();
-                false
-            }
-            left => {
-                w.decision.leave(left);
-                true
-            }
+        let seen = w.decision.classify(w.origin, now, terminal, false, None);
+        if seen == game::Verdict::Step && !w.decision.practice() {
+            // The play's deadline step: the lifetime shown, the loading
+            // state's tuning epoch, the input epoch's end, and a new scene.
+            // Each a lock-held update or a queued message.
+            (w.reveal)();
+            self.tuning.enter_loading(now);
+            self.open_epoch();
+            self.next_scene();
         }
+        if seen.leaves() {
+            w.decision.leave(seen);
+        }
+        Some(seen)
     }
 
     /// The ingress word now, which an observation is stamped with.
@@ -751,6 +753,7 @@ mod tests {
                 let reveals = Arc::clone(&reveals);
                 super::DecisionWatch {
                     decision,
+                    origin: game::Origin::Load,
                     reveal: Box::new(move || {
                         reveals.fetch_add(1, Ordering::SeqCst);
                     }),
@@ -763,7 +766,7 @@ mod tests {
                 Some(game::DECISION_TIME),
                 false,
             )));
-            assert!(!c.serve_decision());
+            assert!(!c.look().is_some_and(game::Verdict::leaves));
             assert_eq!(reveals.load(Ordering::SeqCst), 0);
             assert!(!c.ingress().is_open());
             let served = c.unwatch_decision().unwrap();
@@ -776,8 +779,8 @@ mod tests {
                 false,
             )));
             let scene = c.scene();
-            assert!(!c.serve_decision());
-            assert!(!c.serve_decision());
+            assert!(!c.look().is_some_and(game::Verdict::leaves));
+            assert!(!c.look().is_some_and(game::Verdict::leaves));
             assert_eq!(reveals.load(Ordering::SeqCst), 1);
             assert!(c.ingress().is_open());
             assert_eq!(c.scene(), scene + 1);
@@ -789,13 +792,13 @@ mod tests {
                     assert!(driver.enter_attempt(None, &mut Silent).is_err());
                 }
             }
-            assert!(c.serve_decision(), "{cause}");
+            assert!(c.look().is_some_and(game::Verdict::leaves), "{cause}");
             assert!(c.decision_left());
             let left = c.unwatch_decision().unwrap();
             assert!(left.stepped());
             assert_eq!(left.left(), Some(game::Verdict::End), "{cause}");
             // Nothing watched: no look stops anything.
-            assert!(!c.serve_decision());
+            assert!(!c.look().is_some_and(game::Verdict::leaves));
         }
     }
 }
