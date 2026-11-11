@@ -194,6 +194,18 @@ fn on_loading<R>(
     held_ack: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
+    on_loading_with(loaded, pending, held_ack, false, f)
+}
+
+/// [`on_loading`], with every loading frame refused from before the
+/// lifetime begins while `refused`.
+fn on_loading_with<R>(
+    loaded: &mut game::Loaded,
+    pending: Option<&str>,
+    held_ack: bool,
+    refused: bool,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
+) -> R {
     let _serial = imports::serial();
     // Built under the lock: its base import's VM is counted by the
     // serialized tests that read the live VM count.
@@ -221,6 +233,9 @@ fn on_loading<R>(
         rig.pending = pending;
         rig.controls.quit_leaves();
         rig.render.hold_loading_ack(held_ack);
+        screens
+            .refuse_loading
+            .store(refused, std::sync::atomic::Ordering::Release);
         rig.entered_selection();
         rig.entered_loading(loaded.path());
         if let Some((driver, mut pump)) = rig.adjustments() {
@@ -545,6 +560,55 @@ fn a_quit_at_the_last_look_reopens_tuning_on_the_page() {
 /// last read before each end of loading it asked.
 fn ends(side: &Side<'_>) -> Vec<TimeUs> {
     side.gates.ends.lock().unwrap().clone()
+}
+
+/// The skin refuses the loading lifetime's first frame: no frame of the
+/// lifetime is presented, so its minimum never starts, and the wait ends
+/// the run with the refusal, as the end of the lifetime would report it,
+/// with no input from the player. Nothing opens: no end of loading is
+/// asked, no epoch is refreshed and the attempt took no number.
+#[test]
+fn a_refused_first_loading_frame_ends_the_run() {
+    let (_dir, mut loaded) = plain();
+    on_loading_with(&mut loaded, None, false, true, |rig, side, loaded| {
+        let lifetime = rig.render.loading_lifetime();
+        let frames = || {
+            side.screens
+                .loading
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let ended = open_with(loaded, rig, side, || {
+            until("the first loading frame refused", || frames() == 1);
+            // Half the watchdog: a wait that never ends fails here, with
+            // its reason, before the run's own watchdog aborts the process.
+            let began = Instant::now();
+            while !side.returned.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    began.elapsed() < watchdog() / 2,
+                    "the run never ended on the refusal"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        assert!(
+            matches!(
+                ended,
+                Err(LiveError::Screen(ScreenError::LoadingRefused(
+                    skin_model::BuildError::InvalidReadouts
+                )))
+            ),
+            "{ended:?}"
+        );
+        assert_eq!(frames(), 1, "the refused lifetime drew again");
+        assert_eq!(
+            rig.render.loading_refused(lifetime),
+            Some(skin_model::BuildError::InvalidReadouts)
+        );
+        assert_eq!(rig.render.loading_ack(), None, "a frame was presented");
+        assert!(ends(side).is_empty(), "loading ended: {:?}", ends(side));
+        assert_eq!(side.gates.refresh.passed(), 0, "an opening began");
+        assert_eq!(loaded.attempt().number, 0, "the attempt took a number");
+    });
 }
 
 /// L1 and L3, the opener's side: the minimum counts from the render

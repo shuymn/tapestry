@@ -95,6 +95,12 @@ impl LoadingRig for PlayerRig<'_> {
         self.render.loading_loadend()
     }
 
+    fn loading_refusal(&self, lifetime: u64) -> Result<(), crate::render_side::ScreenError> {
+        self.render.loading_refused(lifetime).map_or(Ok(()), |why| {
+            Err(crate::render_side::ScreenError::LoadingRefused(why))
+        })
+    }
+
     /// The tuning's copy under its step lock, with the reducer's count as
     /// last drained: no fence.
     fn tuning_snapshot(&mut self) -> Result<TuningSnapshot, InputWaitError> {
