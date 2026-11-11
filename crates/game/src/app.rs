@@ -31,8 +31,9 @@ use bms_model::Speed;
 use crate::attempt::PreparationRefusal;
 use crate::coord::{Caps, Coordinator, JobKind, Joined, LoadFailure, Spawner};
 use crate::error::Chain;
-use crate::live::{Leave, LiveError, Rig, run_chart, run_over, threads_over};
+use crate::live::{Leave, LiveError, Rig, run_over, threads_over};
 use crate::logic::LogicError;
+use crate::opening::{LoadingRig, load_and_open};
 use crate::policy::{SessionEvent, SessionEventSink, SharedEvents};
 use crate::practice::PracticeError;
 use crate::practice_screen::{PracticeActed, PracticeInput, PracticeScreen};
@@ -51,8 +52,10 @@ pub const IDLE_WAIT: TimeUs = TimeUs(250_000);
 /// it.
 pub const LOAD_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// The world the scene flow runs in.
-pub trait AppRig: Rig {
+/// The world the scene flow runs in. A chart's first attempt after its
+/// load opens out of the loading state ([`load_and_open`]), so the rig is
+/// a [`LoadingRig`].
+pub trait AppRig: LoadingRig {
     /// Why the sound bank of a chart cannot be built.
     type BankError: std::error::Error + Send + Sync + 'static;
 
@@ -554,7 +557,7 @@ impl App {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
                 Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
                 Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
-                Ok(Loading::Ready) => match run_chart(&mut loaded, rig) {
+                Ok(Loading::Ready) => match load_and_open(&mut loaded, rig) {
                     Ok(leave) => Ok(Chosen::Left(leave)),
                     Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
                     Err(LiveError::Preparation(e)) => Ok(Chosen::Refused(Refused::Preparation(e))),
@@ -713,7 +716,7 @@ fn start_rounds<R: AppRig>(
         Loading::Cancelled => return cancelled(rig).map_err(Stopped::Run),
         Loading::Failed(failure) => return Err(Stopped::Run(LiveError::Load(failure))),
     }
-    match run_chart(loaded, rig) {
+    match load_and_open(loaded, rig) {
         Ok(leave) => Ok(leave),
         Err(LiveError::Logic(e)) => Err(notice(&e)),
         Err(LiveError::Restore(e)) => Err(notice(&e)),
