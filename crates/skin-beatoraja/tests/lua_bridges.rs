@@ -420,7 +420,7 @@ fn an_image_sets_reads_carry_its_role_through_the_mapping() {
     p.tally.ex_score = 2;
     assert_eq!(entry(&p.frame(1_000, &[])), Some(2));
 
-    let unsupported = "op = { 289 },";
+    let unsupported = "op = { 1177 },";
     assert!(matches!(
         import(&folder(&image_set(critical, unsupported))),
         Err(ImportError::Critical { .. })

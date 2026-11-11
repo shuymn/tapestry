@@ -696,6 +696,16 @@ pub(super) fn answer(
                 None => Ok(Value::Number(0.0)),
             }
         }
+        // The image index the play's callbacks bridge: the hi-speed fix.
+        "event_index" => match arg(args).and_then(|n| i32::try_from(n).ok()) {
+            Some(id) if index_in(ScreenKind::Play, id) == IndexProp::FixHispeed => {
+                match IndexProp::FixHispeed.selector() {
+                    Some(src) => int(f, None, src, i64::from(id), 0),
+                    None => Err(unanswered()),
+                }
+            }
+            _ => Err(unanswered()),
+        },
         "gauge_type" => match IndexProp::GaugeKind.selector() {
             Some(src) => int(f, Some("gauge.valid"), src, 0, 0),
             None => Err(unanswered()),

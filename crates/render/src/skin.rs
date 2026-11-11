@@ -88,6 +88,11 @@ pub struct LoadingFrame<'a> {
     pub lanes: LaneView,
     /// The stored cover settings `lanes` follows.
     pub covers: CoverSettings,
+    /// The display offset ([`skin_model::LoadingFrame::display_offset`]).
+    pub display_offset: TimeUs,
+    /// The speed policy's hi-speed fix
+    /// ([`skin_model::LoadingFrame::fix_hispeed`]).
+    pub fix_hispeed: u8,
     /// The shown gauge's descriptor; `None` leaves what depends on it
     /// undrawn.
     pub gauge: Option<LoadingGauge>,
@@ -125,6 +130,8 @@ impl<'a> LoadingFrame<'a> {
             turntable: self.turntable,
             lanes: self.lanes,
             covers: self.covers,
+            display_offset: self.display_offset,
+            fix_hispeed: self.fix_hispeed,
             gauge: self.gauge,
             play_level: self.play_level,
         }
