@@ -203,16 +203,6 @@ fn the_fade_out_timer_is_never_set_on_play() {
         dst("c2", "", 15),
         dst("c40", "", 16),
     ));
-    let r = loaded.report();
-    assert_eq!(
-        common::kinds(r),
-        [timer(TimerWhy::Unset(2)), timer(TimerWhy::Unset(2))],
-        "{r:?}"
-    );
-    assert!(
-        r.notes.iter().all(|n| n.severity == Severity::Ignored),
-        "{r:?}"
-    );
     let skin = loaded.ok().skin.clone();
     let mut d = Drawn::new(skin.clone(), 100);
     let lead_in = PlayContext {
@@ -253,6 +243,17 @@ fn the_fade_out_timer_is_never_set_on_play() {
     assert_eq!(closing, [11, 12, 13, 14, 15, 16], "Closing");
     assert_eq!(c2_closing, c2, "Closing");
     assert_eq!(d.play.timer(slot::FAILED), d.closing, "the failure runs");
+    // Kept, not dropped: each reads `Unset`, ignored.
+    let r = loaded.report();
+    assert_eq!(
+        common::kinds(r),
+        [timer(TimerWhy::Unset(2)), timer(TimerWhy::Unset(2))],
+        "{r:?}"
+    );
+    assert!(
+        r.notes.iter().all(|n| n.severity == Severity::Ignored),
+        "{r:?}"
+    );
 }
 
 #[test]

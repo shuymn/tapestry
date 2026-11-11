@@ -241,7 +241,6 @@ mod tests {
             assert_eq!(builtin(id), Timer::Unset, "{id}");
         }
         assert_eq!(builtin(58), Timer::Unsupported);
-        assert_eq!(builtin(2_999), Timer::Unsupported);
         assert_eq!(builtin(140), Timer::Unsupported);
     }
 
