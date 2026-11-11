@@ -1960,7 +1960,7 @@ pub(crate) mod tests {
         use game::coord::Coordinator;
         use library::LoudnessKey;
 
-        use super::super::{Claim, Job, Measure, Worker};
+        use super::super::{Claim, Finished, Job, Measure, Worker};
         use super::{CAPS, Mode, WATCHDOG, results, try_pop};
         use crate::loudness::analyses;
         use crate::loudness::fixture::{RATE, square, wav};
@@ -2089,12 +2089,19 @@ pub(crate) mod tests {
             (worker, coord)
         }
 
-        /// A wait for the thread to be past `path`: `other` queued after
-        /// it is measured, so the thread took `path` already or never will.
-        fn past(worker: &Worker, other: &Song) {
+        /// A wait for the thread to be past the claimed `claimed`: `other`
+        /// queued after it is measured, and nothing of `claimed` ended on
+        /// the thread meanwhile.
+        fn past(worker: &Worker, claimed: &Song, other: &Song) {
             worker.queue(other.job.clone());
-            let done = results(worker, 1);
-            assert!(done.iter().any(|f| f.path == other.job.path()), "{done:?}");
+            let mut done = Vec::new();
+            while !done.iter().any(|f: &Finished| f.path == other.job.path()) {
+                done.extend(results(worker, 1));
+            }
+            assert!(
+                !done.iter().any(|f| f.path == claimed.job.path()),
+                "the thread measured the claimed chart: {done:?}"
+            );
         }
 
         /// The thread held before its pop of `song`, waiting: the pop's
@@ -2138,7 +2145,7 @@ pub(crate) mod tests {
             assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
             go.send(()).unwrap();
             page_measures(&s);
-            past(&worker, &other);
+            past(&worker, &s, &other);
             assert_eq!(analyses::of(s.hash), 1, "claim first");
             drop(worker);
             // The pop first.
@@ -2180,7 +2187,7 @@ pub(crate) mod tests {
             );
             go.send(()).unwrap();
             page_measures(&s);
-            past(&worker, &other);
+            past(&worker, &s, &other);
             assert_eq!(analyses::of(s.hash), 1);
         }
 
@@ -2213,7 +2220,7 @@ pub(crate) mod tests {
             assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
             worker.release();
             page_measures(&s);
-            past(&worker, &other);
+            past(&worker, &s, &other);
             assert_eq!(analyses::of(s.hash), 2, "the stopped one and the page's");
         }
 
@@ -2253,7 +2260,7 @@ pub(crate) mod tests {
             assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
             worker.release();
             page_measures(&s);
-            past(&worker, &other);
+            past(&worker, &s, &other);
             assert_eq!(analyses::of(s.hash), 2, "claimed first");
         }
 
