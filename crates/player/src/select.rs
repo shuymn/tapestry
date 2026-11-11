@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use eval::ControlId;
 use input::hid::{HidProduct, is_axis};
@@ -234,40 +234,86 @@ pub const QUEUED_KEYS: usize = 64;
 /// before it, so its last state, the end of a composition included, always
 /// arrives. Only keys are bounded ([`QUEUED_KEYS`]); a key past the bound
 /// is dropped and counted.
+///
+/// What the window publishes carries the ingress word it was observed
+/// under (design.md "Play Lifecycle", the decision screen), and is
+/// validated where it is taken: under the tuning step lock, an input
+/// stamped with another generation, or under a closed word, is dropped
+/// there. Text and compositions join only those with the same stamp.
 #[derive(Debug, Default)]
 pub struct MenuQueue {
-    inputs: Mutex<VecDeque<MenuInput>>,
+    inputs: Mutex<VecDeque<(MenuInput, Option<input::Ingress>)>>,
     dropped: AtomicU64,
+    /// The tuning whose ingress word validates stamped inputs; none: every
+    /// input is taken.
+    gate: Option<Arc<crate::tuning::LiveTuning>>,
 }
 
 impl MenuQueue {
-    /// Queues `input`.
+    /// A queue whose stamped inputs `tuning`'s ingress word validates.
+    pub fn gated(tuning: Arc<crate::tuning::LiveTuning>) -> Self {
+        Self {
+            gate: Some(tuning),
+            ..Self::default()
+        }
+    }
+
+    /// Queues `input`, unstamped: the game thread's own, always taken.
     pub fn push(&self, input: MenuInput) {
+        self.push_stamped(input, None);
+    }
+
+    /// Queues `input` observed under the ingress word `stamp`.
+    pub fn push_stamped(&self, input: MenuInput, stamp: Option<input::Ingress>) {
         let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        match (input, q.back_mut()) {
+        let last = q.back_mut().filter(|(_, s)| *s == stamp).map(|(i, _)| i);
+        match (input, last) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
             (key @ (MenuInput::Key(_) | MenuInput::Pad { .. }), _) => {
                 let keys = q
                     .iter()
-                    .filter(|i| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
+                    .filter(|(i, _)| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
                     .count();
                 if keys < QUEUED_KEYS {
-                    q.push_back(key);
+                    q.push_back((key, stamp));
                 } else {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            (input, _) => q.push_back(input),
+            (input, _) => q.push_back((input, stamp)),
         }
     }
 
-    /// Takes the oldest input.
+    /// Takes the oldest input whose stamp is valid now, dropping the
+    /// stale ones before it.
     pub fn pop(&self) -> Option<MenuInput> {
-        self.inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+        loop {
+            let (input, stamp) = self
+                .inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()?;
+            let valid = match (stamp, &self.gate) {
+                (Some(stamp), Some(gate)) => gate.with_ingress(|word| word.admits(stamp)),
+                _ => true,
+            };
+            if valid {
+                return Some(input);
+            }
+        }
+    }
+
+    /// Takes every input queued, valid or not, and whether one was the
+    /// Escape key: what the decision screen reads past its time
+    /// (design.md "Play Lifecycle", the practice page).
+    pub fn take_escape(&self) -> bool {
+        let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let escape = q
+            .iter()
+            .any(|(i, _)| matches!(i, MenuInput::Key(MenuKey::Escape)));
+        q.clear();
+        escape
     }
 
     /// Keys dropped so far.

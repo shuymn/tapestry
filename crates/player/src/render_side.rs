@@ -2181,7 +2181,7 @@ impl RenderLink {
     /// As [`PendingLoad::wait_serving`].
     #[cfg(test)]
     pub fn load(&self, chart: Arc<Chart>, section: Option<Section>) -> Result<(), ScreenError> {
-        self.begin_load(chart, section).wait_serving(self, || {})
+        self.begin_load(chart, section).wait_serving(self, || false)
     }
 
     /// Starts preparing `chart` for every play from now on; the game
@@ -2341,21 +2341,14 @@ impl RenderLink {
     /// here, and the render thread signalled. Waits for nothing. Nothing
     /// for a lifetime not held.
     pub fn reveal_loading(&self) {
-        let mut producer = self.shared.producer();
-        let mut slot = self.shared.loading_slot();
-        if !std::mem::take(&mut slot.held) {
-            return;
-        }
-        let lifetime = slot.lifetime;
-        if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
-            let update = state.restart(self.clock.now());
-            slot.offer(lifetime, None, Some(Box::new(update)));
-        }
-        if !slot.signaled {
-            slot.signaled = true;
-            // A thread that already ended ignores it.
-            let _ = self.tx.send(RenderMsg::Loading(lifetime));
-        }
+        reveal(&self.shared, self.clock, &self.tx);
+    }
+
+    /// [`reveal_loading`](Self::reveal_loading), from any thread: what a
+    /// wait inside a chart's load runs at the decision screen's deadline.
+    pub fn reveal_handle(&self) -> impl Fn() + Send + Sync + 'static {
+        let (shared, clock, tx) = (Arc::clone(&self.shared), self.clock, self.tx.clone());
+        move || reveal(&shared, clock, &tx)
     }
 
     /// The decision screen's built-in presentation, `page`, drawn until
@@ -2543,7 +2536,8 @@ impl PendingLoad {
     }
 
     /// Waits for the answer, at most the answer's bound from here, calling
-    /// `serve` every [`CANCEL_POLL`] at most meanwhile: the game thread
+    /// `serve` every [`CANCEL_POLL`] at most meanwhile (`true` stops the
+    /// wait, `Ok` with no answer taken): the game thread
     /// serves the adjustments through the chart's load on the render
     /// thread.
     ///
@@ -2554,7 +2548,7 @@ impl PendingLoad {
     pub fn wait_serving(
         self,
         link: &RenderLink,
-        mut serve: impl FnMut(),
+        mut serve: impl FnMut() -> bool,
     ) -> Result<(), ScreenError> {
         let deadline = Instant::now() + link.answer_timeout;
         loop {
@@ -2565,9 +2559,33 @@ impl PendingLoad {
                 Err(mpsc::RecvTimeoutError::Timeout) if left.is_zero() => {
                     return Err(ScreenError::NoAnswer);
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => serve(),
+                // The caller stopped the wait: its answer goes nowhere.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if serve() {
+                        return Ok(());
+                    }
+                }
             }
         }
+    }
+}
+
+/// The held loading lifetime revealed ([`RenderLink::reveal_loading`]).
+fn reveal(shared: &Shared, clock: QpcClock, tx: &Sender<RenderMsg>) {
+    let mut producer = shared.producer();
+    let mut slot = shared.loading_slot();
+    if !std::mem::take(&mut slot.held) {
+        return;
+    }
+    let lifetime = slot.lifetime;
+    if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
+        let update = state.restart(clock.now());
+        slot.offer(lifetime, None, Some(Box::new(update)));
+    }
+    if !slot.signaled {
+        slot.signaled = true;
+        // A thread that already ended ignores it.
+        let _ = tx.send(RenderMsg::Loading(lifetime));
     }
 }
 

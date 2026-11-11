@@ -189,7 +189,9 @@ pub fn press_loading(phase: LoadPhase) {
 /// Presses F2 on the window when a `press-loading` press is due in
 /// `phase`, the load's phase now, while that phase holds.
 pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
-    if !STALLED.load(Ordering::SeqCst) {
+    // Due in the loading state: the decision screen before it discards
+    // every press, so one there stays due.
+    if !STALLED.load(Ordering::SeqCst) || !controls.ingress_open() {
         return;
     }
     let due = PRESS_LOADING
@@ -200,6 +202,19 @@ pub fn press_due(controls: &crate::controls::Controls, phase: LoadPhase) {
         controls.window_key(1, input::WindowKeyEvent::Release, false);
         println!("dev: F2 pressed while {phase:?}");
     }
+}
+
+/// A script's quit key press during a load (`quit-decoding`,
+/// `quit-measuring`), from the load's job thread: pressed once the
+/// loading state shows, the decision screen before it discarding every
+/// press, at most [`STEP_TIMEOUT`] later. Never from the game thread,
+/// which serves the decision screen's deadline meanwhile.
+pub fn quit_loading(controls: &crate::controls::Controls) {
+    let began = std::time::Instant::now();
+    while !controls.ingress_open() && !controls.quitting() && began.elapsed() < STEP_TIMEOUT {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    controls.command(game::Command::Quit);
 }
 
 /// What a script does to the next specialization of its stage (a pending

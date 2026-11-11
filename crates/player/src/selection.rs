@@ -393,6 +393,9 @@ pub struct Selection {
     pub loading: Option<LoadingText>,
     /// Whether the chart chosen last was chosen to practice.
     pub practicing: bool,
+    /// The decision screen's presentation while it shows, sent again when
+    /// the screen is built again, and the chosen chart's file name.
+    pub decision: Option<(crate::menu_screen::MenuPage, String)>,
     /// When selection was last entered.
     pub entered_at: TimeUs,
     /// The page changed since it was last sent.
@@ -1454,9 +1457,35 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
-/// Whether the quit key or a window close cancels the load.
+/// Whether the quit key or a window close cancels the load, or the
+/// decision screen its waits serve ([`Controls::serve_decision`]) was left.
+///
+/// [`Controls::serve_decision`]: crate::controls::Controls::serve_decision
 fn cancelled(controls: &crate::controls::Controls) -> bool {
-    controls.quitting() || controls.leaving()
+    controls.quitting() || controls.leaving() || controls.serve_decision()
+}
+
+/// The chart chosen, `chart`, as the loading state's and the decision
+/// screen's lines name it: from its library entry, the chosen preset and
+/// the session.
+fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> LoadingText {
+    let entry = sel.screen.selected().filter(|e| e.path == chart);
+    let header = entry.map(|e| &e.header);
+    let mut title = header
+        .and_then(|h| h.title.clone())
+        .unwrap_or_else(|| file_name(chart));
+    if let Some(sub) = header.and_then(|h| h.subtitle.as_deref()) {
+        title.push(' ');
+        title.push_str(sub);
+    }
+    LoadingText {
+        title,
+        artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
+        preset: sel.screen.preset().to_owned(),
+        practice: sel.practicing,
+        autoplay,
+        chart: entry.map_or_else(ChosenChart::default, chosen_chart),
+    }
 }
 
 /// What a loading frame may show of a chart, from its library entry.
@@ -1568,7 +1597,8 @@ fn hold(
     // Every checkpoint printed.
     let mut printed = Vec::new();
     loop {
-        if controls.quitting() || controls.leaving() {
+        // The hold's look serves the decision screen too.
+        if cancelled(controls) {
             return true;
         }
         let held = began.elapsed();
@@ -1582,7 +1612,9 @@ fn hold(
         {
             return false;
         }
-        if !acted && held >= total / 2 {
+        // Its quit or close in the loading state, once the decision screen
+        // that discards every press has passed.
+        if !acted && held >= total / 2 && controls.ingress_open() {
             acted = true;
             if slow.quit {
                 controls.command(game::Command::Quit);
@@ -1732,12 +1764,7 @@ impl PlayerRig<'_> {
             log::info!("select: chose {}{what}", path.display());
             sel.dirty = true;
             sel.practicing = matches!(pick, Pick::Practice(_));
-            // A chart to play enters the play screen's loading state at once
-            // (`entered_loading`); the practice page reads it first.
-            if sel.practicing {
-                let reading = Message::Reading { name: &name }.text();
-                sel.show(&self.render, Some(&reading), now);
-            }
+            // The decision screen follows at once (`entered_decision`).
         } else {
             sel.show(&self.render, None, now);
         }
@@ -2034,105 +2061,10 @@ impl PlayerRig<'_> {
     }
 }
 
-impl AppRig for PlayerRig<'_> {
-    type BankError = ChartLoadError;
-
-    /// A scenario's chart plays the input of its `play` step: autoplay
-    /// unsaved, or a log saved and counted.
-    #[cfg(feature = "dev-tools")]
-    fn configure(&mut self, config: &mut game::SessionConfig, parts: &mut game::Parts) {
-        let Some(sc) = &mut self.scenario else {
-            return;
-        };
-        let script = self.selection.as_ref().and_then(|s| s.script.as_ref());
-        // A chart's input comes from its `play` step, or from its
-        // `practice` step's page keys, P pressed or about to be.
-        let input = match script.and_then(crate::dev::SelectScript::front) {
-            Some(&SelectStep::Play(p)) => p.input,
-            Some(&SelectStep::PracticeKey(input)) => input,
-            Some(&SelectStep::PracticeSet(goal)) => goal.input,
-            _ => {
-                sc.chart_input = None;
-                return;
-            }
-        };
-        sc.chart_input = Some(input);
-        sc.practice = None;
-        sc.rounds = 0;
-        sc.nearest = None;
-        match input {
-            InputRef::Auto => {
-                config.autoplay = Some(game::AutoKeySounds::Scheduled);
-                parts.records = None;
-                self.autoplay = true;
-            }
-            InputRef::Log(_) => {
-                config.autoplay = None;
-                self.autoplay = false;
-            }
-        }
-    }
-
-    fn choose(&mut self) -> Option<Pick> {
-        self.look()
-    }
-
-    /// The play screen's loading state, its lines from the chart's library
-    /// entry (its title and artist) and the chosen preset, at the chart's
-    /// stage: a loading lifetime begins, with the shown gauge's descriptor
-    /// from the validated preset selection has chosen.
-    fn entered_loading(&mut self, chart: &std::path::Path) {
-        // The coming attempt's entry: its loading-time adjustments are its
-        // own, and solve nothing until its chart is read. A failed fence is
-        // the input thread's failure, which ends the run.
-        self.enter_attempt();
-        // Tuning's loading epoch: a settings key down now holds the
-        // loading state until released, and steps nothing.
-        self.begin_loading_epoch();
-        // Selection is left: nothing of it is drawn again.
-        self.render.leave_selection();
-        let Some(sel) = &mut self.selection else {
-            return;
-        };
-        let entry = sel.screen.selected().filter(|e| e.path == chart);
-        let header = entry.map(|e| &e.header);
-        let mut title = header
-            .and_then(|h| h.title.clone())
-            .unwrap_or_else(|| file_name(chart));
-        if let Some(sub) = header.and_then(|h| h.subtitle.as_deref()) {
-            title.push(' ');
-            title.push_str(sub);
-        }
-        let page = LoadingText {
-            title,
-            artist: header.and_then(|h| h.artist.clone()).unwrap_or_default(),
-            preset: sel.screen.preset().to_owned(),
-            practice: sel.practicing,
-            autoplay: self.autoplay,
-            chart: entry.map_or_else(ChosenChart::default, chosen_chart),
-        };
-        println!("load: the play screen loads {}", file_name(chart));
-        let gauge = sel
-            .screen
-            .bests_preset()
-            .and_then(|p| crate::play::loading_gauge(p, self.gauge));
-        self.render.begin_loading(&page, gauge);
-        show_stage(&self.render, Some(&page), Stage::Chart);
-        sel.loading = Some(page);
-    }
-
-    fn load_cancelled(&self) -> bool {
-        cancelled(self.controls)
-    }
-
-    fn load_chart(
-        &mut self,
-        loaded: &Loaded,
-        decision: &mut game::Decision,
-    ) -> Result<Loading, ChartLoadError> {
-        // The decision screen's looks inside this load's waits come with
-        // the decision screen's player side.
-        let _ = decision;
+impl PlayerRig<'_> {
+    /// [`AppRig::load_chart`]'s load, its waits' stops serving the
+    /// decision screen when one is watched.
+    fn load_watched(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
         // The chart, speed and section are final: the presentation solves
         // for them once, so what the player adjusts while loading applies
         // to this attempt. A refusal is reported by the play's preparation
@@ -2375,6 +2307,10 @@ impl AppRig for PlayerRig<'_> {
             &|| probe(decodes.as_deref(), Probe::Screen, controls, &|| false),
         )
         .map_err(ChartLoadError::Screen)?;
+        if self.controls.decision_left() {
+            println!("load: cancelled");
+            return Ok(Loading::Cancelled);
+        }
         #[cfg(feature = "dev-tools")]
         crate::dev::print_adjustments("chart-load", self.adjust.as_ref());
         let ready = self.clock.now();
@@ -2401,6 +2337,211 @@ impl AppRig for PlayerRig<'_> {
             ms(measured, ready),
         );
         Ok(Loading::Ready)
+    }
+}
+
+impl AppRig for PlayerRig<'_> {
+    type BankError = ChartLoadError;
+
+    /// A scenario's chart plays the input of its `play` step: autoplay
+    /// unsaved, or a log saved and counted.
+    #[cfg(feature = "dev-tools")]
+    fn configure(&mut self, config: &mut game::SessionConfig, parts: &mut game::Parts) {
+        let Some(sc) = &mut self.scenario else {
+            return;
+        };
+        let script = self.selection.as_ref().and_then(|s| s.script.as_ref());
+        // A chart's input comes from its `play` step, or from its
+        // `practice` step's page keys, P pressed or about to be.
+        let input = match script.and_then(crate::dev::SelectScript::front) {
+            Some(&SelectStep::Play(p)) => p.input,
+            Some(&SelectStep::PracticeKey(input)) => input,
+            Some(&SelectStep::PracticeSet(goal)) => goal.input,
+            _ => {
+                sc.chart_input = None;
+                return;
+            }
+        };
+        sc.chart_input = Some(input);
+        sc.practice = None;
+        sc.rounds = 0;
+        sc.nearest = None;
+        match input {
+            InputRef::Auto => {
+                config.autoplay = Some(game::AutoKeySounds::Scheduled);
+                parts.records = None;
+                self.autoplay = true;
+            }
+            InputRef::Log(_) => {
+                config.autoplay = None;
+                self.autoplay = false;
+            }
+        }
+    }
+
+    fn choose(&mut self) -> Option<Pick> {
+        self.look()
+    }
+
+    /// The play screen's loading state, its lines from the chart's library
+    /// entry (its title and artist) and the chosen preset, at the chart's
+    /// stage: a loading lifetime begins, with the shown gauge's descriptor
+    /// from the validated preset selection has chosen.
+    fn entered_loading(&mut self, chart: &std::path::Path) {
+        // The coming attempt's entry: its loading-time adjustments are its
+        // own, and solve nothing until its chart is read. A failed fence is
+        // the input thread's failure, which ends the run.
+        self.enter_attempt();
+        // Tuning's loading epoch: a settings key down now holds the
+        // loading state until released, and steps nothing.
+        self.begin_loading_epoch();
+        // Selection is left: nothing of it is drawn again.
+        self.render.leave_selection();
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let page = loading_text(sel, chart, self.autoplay);
+        println!("load: the play screen loads {}", file_name(chart));
+        let gauge = sel
+            .screen
+            .bests_preset()
+            .and_then(|p| crate::play::loading_gauge(p, self.gauge));
+        self.render.begin_loading(&page, gauge);
+        show_stage(&self.render, Some(&page), Stage::Chart);
+        sel.loading = Some(page);
+    }
+
+    fn load_cancelled(&self) -> bool {
+        cancelled(self.controls)
+    }
+
+    fn decision_time(&self) -> Option<TimeUs> {
+        Some(game::DECISION_TIME)
+    }
+
+    /// The decision screen begins: the input epoch first, so nothing
+    /// observed before the choice acts after it, then the attempt's entry
+    /// (its loading-time adjustments are its own), the built-in
+    /// presentation and its tone; a play's loading lifetime is made now,
+    /// held until the deadline reveals it.
+    fn entered_decision(&mut self, pick: &Pick) {
+        self.controls.close_epoch();
+        if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
+            ime.set(false);
+        }
+        self.enter_attempt();
+        self.render.leave_selection();
+        let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let page = loading_text(sel, chart, self.autoplay);
+        println!("decision: {} chosen", file_name(chart));
+        let shown = page.decision();
+        self.render.show_decision(shown.clone());
+        sel.decision = Some((shown, file_name(chart)));
+        self.audio.control.play_tone();
+        if matches!(pick, Pick::Play(_)) {
+            let gauge = sel
+                .screen
+                .bests_preset()
+                .and_then(|p| crate::play::loading_gauge(p, self.gauge));
+            self.render.begin_loading_held(&page, gauge);
+            show_stage(&self.render, Some(&page), Stage::Chart);
+            sel.loading = Some(page);
+        }
+    }
+
+    fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {
+        // The page's jobs go on through the decision screen.
+        if origin == game::Origin::Jobs {
+            self.poll_page()?;
+        }
+        Ok(())
+    }
+
+    /// The play's deadline: the loading state's tuning epoch, the input
+    /// epoch's end, the held lifetime shown, and a new scene. Waits for
+    /// nothing.
+    fn deadline_step(&mut self) {
+        if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
+            println!("load: the play screen loads {name}");
+        }
+        self.render.reveal_loading();
+        self.begin_loading_epoch();
+        self.controls.open_epoch();
+        self.controls.next_scene();
+    }
+
+    /// The decision screen is left for the practice page or selection: the
+    /// input epoch ends, and the page's jobs are the page's from here.
+    fn closed_epoch(&mut self) {
+        self.controls.open_epoch();
+        if let Some(sel) = &mut self.selection {
+            sel.decision = None;
+            sel.page.hand_to_page();
+        }
+    }
+
+    /// Past the decision screen's time while practice waits for its read:
+    /// the quit key, Escape or the controller's Back, taken; everything
+    /// else queued is dropped.
+    fn decision_escape(&mut self) -> bool {
+        self.controls.let_escape();
+        let quit = self.controls.take_leave();
+        let escape = self
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.menu.take_escape());
+        let mut back = false;
+        while let Some(event) = self.result_input.pad.pop() {
+            back |= event == input::MenuEvent::Back;
+        }
+        quit || escape || back
+    }
+
+    /// The screen was built again during the decision screen: its
+    /// presentation is sent again; the tone is not played again.
+    fn recovered_decision(&mut self) {
+        if let Some((page, _)) = self.selection.as_ref().and_then(|s| s.decision.clone()) {
+            self.render.show_decision(page);
+        }
+    }
+
+    fn load_chart(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut game::Decision,
+    ) -> Result<Loading, ChartLoadError> {
+        if !decision.on() {
+            return self.load_watched(loaded);
+        }
+        // The load's waits serve the decision screen from their stops; it
+        // comes back as they left it.
+        let stepped = decision.stepped();
+        let input = self.input.gone_probe();
+        let output = self.audio.control.failure_probe();
+        let reveal = self.render.reveal_handle();
+        let name = file_name(loaded.path());
+        self.controls
+            .watch_decision(crate::controls::DecisionWatch {
+                decision: *decision,
+                reveal: Box::new(move || {
+                    println!("load: the play screen loads {name}");
+                    reveal();
+                }),
+                failed: Box::new(move || input() || output.failed()),
+            });
+        let loading = self.load_watched(loaded);
+        if let Some(d) = self.controls.unwatch_decision() {
+            *decision = d;
+        }
+        if decision.stepped() && !stepped {
+            // The deadline's step ran inside a wait: the opening's
+            // reducer count is forgotten, as at its own step.
+            self.accepted_at_o1 = None;
+        }
+        loading
     }
 
     fn show_refusal(&mut self, refusal: &LoadRefusal<ChartLoadError>) {
@@ -2533,7 +2674,6 @@ impl AppRig for PlayerRig<'_> {
         loaded: &Loaded,
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
-        let _ = decision;
         if let Some(failure) = self
             .release_banks(None)
             .map_err(ChartLoadError::Audio)?
@@ -2548,10 +2688,13 @@ impl AppRig for PlayerRig<'_> {
             name: file_name(loaded.path()),
             rate: sel.rate,
         };
+        // Through the decision screen the 1× bank is the choice's,
+        // promoted; the page takes it over when it opens.
         sel.page.begin(
             &sel.coord,
             sel.spawner,
             chart,
+            decision.on(),
             #[cfg(feature = "dev-tools")]
             &sel.witness,
         );
@@ -2681,6 +2824,9 @@ fn wait_chart_load(
         #[cfg(feature = "dev-tools")]
         crate::dev::press_due(controls, crate::dev::LoadPhase::ChartLoad);
         crate::play::serve_adjustments(adjust.as_deref_mut(), input, controls.tuning());
+        // The decision screen is served here too; a look that leaves it
+        // stops the wait.
+        controls.serve_decision()
     })
 }
 
@@ -3019,6 +3165,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            decision: None,
             practicing: false,
             entered_at: TimeUs(0),
             dirty: false,
@@ -4848,6 +4995,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            decision: None,
             practicing: false,
             entered_at: TimeUs(0),
             dirty: false,

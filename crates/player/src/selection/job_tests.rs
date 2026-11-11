@@ -143,6 +143,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         chosen_at: TimeUs(0),
         loading: None,
         practicing: false,
+        decision: None,
         entered_at: TimeUs(0),
         dirty: false,
         search_pending: false,

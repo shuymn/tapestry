@@ -492,6 +492,10 @@ pub struct PageJobs {
     claimed: bool,
     /// An ordinary refusal of the 1× bank, kept for the Start.
     refusal: Option<audio::BankError>,
+    /// The decision screen shows: the jobs begun are promoted and answered
+    /// for by the choice (`Owner::Foreground`) until the page opens
+    /// ([`hand_to_page`](Self::hand_to_page)).
+    deciding: bool,
     /// The thread mode the jobs change at their class.
     mode: Arc<dyn crate::priority::ThreadMode>,
     /// Where the bank's decode reports its files.
@@ -532,6 +536,7 @@ impl PageJobs {
             measure_tried: false,
             claimed: false,
             refusal: None,
+            deciding: false,
             mode,
             sink: PageSink::default(),
             clock: Arc::new(Instant::now),
@@ -570,15 +575,19 @@ impl PageJobs {
 
     /// The page opens for `chart`: its 1× bank begins on `coord` as an
     /// owned job of base class speculative, unpromoted, answered for by
-    /// the page (`Owner::Speculative`). A refused thread leaves the decode
-    /// to the Start.
+    /// the page (`Owner::Speculative`); while `deciding` (the decision
+    /// screen shows), promoted and answered for by the choice
+    /// (`Owner::Foreground`) until [`hand_to_page`](Self::hand_to_page). A refused
+    /// thread leaves the decode to the Start.
     pub fn begin(
         &mut self,
         coord: &Coordinator,
         spawner: Spawner,
         chart: PageChart,
+        deciding: bool,
         #[cfg(feature = "dev-tools")] witness: &Arc<crate::bank_witness::BankWitness>,
     ) {
+        self.deciding = deciding;
         debug_assert!(self.bank.is_none() && self.measure.is_none() && self.kept.is_none());
         let mode = JobMode::new(Arc::clone(&self.mode), format!("sounds: {}", chart.name));
         #[cfg(test)]
@@ -591,7 +600,7 @@ impl PageJobs {
             spawner,
             coord.subscriber(Scope::Choice),
             (chart.path.clone(), Arc::clone(&chart.chart), chart.rate),
-            (false, Owner::Speculative),
+            self.class(),
             (
                 mode,
                 Arc::clone(&self.sink),
@@ -613,6 +622,40 @@ impl PageJobs {
             ),
         }
         self.chart = Some(chart);
+    }
+
+    /// Whether a job begun now is promoted, and who answers for it.
+    const fn class(&self) -> (bool, Owner) {
+        if self.deciding {
+            (true, Owner::Foreground)
+        } else {
+            (false, Owner::Speculative)
+        }
+    }
+
+    /// The practice page opens from the decision screen: its jobs are
+    /// demoted and handed to the page (`Owner::Speculative`), so they run
+    /// at background priority and a failure from here is the page's to
+    /// redo (design.md "State Model", the practice page). One published
+    /// already is judged by the owner it published under.
+    pub fn hand_to_page(&mut self) {
+        if !std::mem::take(&mut self.deciding) {
+            return;
+        }
+        if let Some(job) = &self.bank {
+            job.demote();
+            let _ = job.to_owner(Owner::Speculative);
+        }
+        if let Some(job) = &self.measure {
+            job.demote();
+            let _ = job.to_owner(Owner::Speculative);
+        }
+    }
+
+    /// Whether the jobs are the decision screen's ([`begin`](Self::begin)).
+    #[cfg(test)]
+    pub const fn deciding(&self) -> bool {
+        self.deciding
     }
 
     /// Advances the jobs with no input (each pass of the page): a published
@@ -733,7 +776,7 @@ impl PageJobs {
                         bank,
                         chart.name.clone(),
                     ),
-                    (false, Owner::Speculative),
+                    self.class(),
                     mode,
                     #[cfg(test)]
                     self.probe.clone(),

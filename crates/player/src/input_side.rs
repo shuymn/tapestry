@@ -691,6 +691,12 @@ impl InputLink {
 
     /// Why the input thread failed, once known: a handshake's failure, or
     /// the hook gone (the thread ended or panicked). One atomic load.
+    /// Whether the input thread is gone, from any thread.
+    pub fn gone_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let state = Arc::clone(&self.state);
+        move || state.gone.load(Ordering::Acquire)
+    }
+
     pub fn failure(&self) -> Option<InputWaitError> {
         self.failed.or(self
             .state
@@ -774,6 +780,9 @@ pub struct Hook {
     participants: Vec<(DeviceId, Option<u64>)>,
     /// The input thread's phase.
     phase: Phase,
+    /// The ingress word the last boundary saw: a new generation masks the
+    /// panels held across it.
+    ingress_seen: input::Ingress,
     /// A script's timeline: the first opening's chart time 0 on the
     /// clock, which a rearm moves by the wait between the release the
     /// script is held at and the rearm (dev-tools).
@@ -827,6 +836,7 @@ pub fn link(controls: Arc<Controls>, mode: Mode, waker: Waker) -> (Hook, InputLi
             origin: None,
             participants: Vec::new(),
             phase: Phase::Tail,
+            ingress_seen: input::Ingress::INITIAL,
             script_origin: None,
             #[cfg(feature = "dev-tools")]
             released: None,
@@ -1059,8 +1069,23 @@ impl Hook {
     /// panel at the boundary it is seen at; the game thread is woken when
     /// the level changed. The level is published before that wake and a
     /// fence's answer, so a game thread they let go reads it.
-    fn menu(&self, sources: &mut SourceSet) {
-        let active = self.phase == Phase::Idle && self.controls.focused();
+    ///
+    /// While the decision screen's epoch is open (design.md "Play
+    /// Lifecycle", the decision screen) neither is: the menu source only
+    /// once Back is let through past the screen's time, and a START or
+    /// SELECT held across a new ingress generation opens no panel until
+    /// released.
+    fn menu(&mut self, sources: &mut SourceSet) {
+        let word = self.controls.ingress();
+        if word != self.ingress_seen {
+            self.ingress_seen = word;
+            if let Some(tap) = sources.adjustment_mut() {
+                tap.mask_held_panels();
+            }
+        }
+        let active = self.phase == Phase::Idle
+            && self.controls.focused()
+            && (word.is_open() || self.controls.escaping());
         let mut wake = self.publish_panels(sources);
         if let Some(menu) = sources.menu_mut() {
             menu.set_active(active);
@@ -1074,7 +1099,8 @@ impl Hook {
     /// Publishes the panels' level as [`menu`](Self::menu) says; `true`
     /// when it changed.
     fn publish_panels(&self, sources: &mut SourceSet) -> bool {
-        let active = self.phase == Phase::Idle && self.controls.focused();
+        let active =
+            self.phase == Phase::Idle && self.controls.focused() && self.controls.ingress_open();
         let (_, losses) = self.controls.presentation_focus().read();
         sources
             .adjustment_mut()

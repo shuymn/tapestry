@@ -265,6 +265,9 @@ struct App {
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
     ime: ImeState,
+    /// The IME composition in progress and the ingress word it began
+    /// under.
+    composition: ImeSession,
     /// Set once the window is made.
     showing: Option<Showing>,
     shared: Arc<Shared>,
@@ -338,13 +341,24 @@ impl ApplicationHandler<Ask> for App {
                     }
                     return;
                 }
-                if !is_synthetic {
-                    key_pressed(
-                        &self.controls,
-                        event.physical_key,
-                        event.repeat,
-                        &mut self.keys,
-                    );
+                // A made-up press (a focus change) is nothing to the menus.
+                if is_synthetic {
+                    return;
+                }
+                key_pressed(
+                    &self.controls,
+                    event.physical_key,
+                    event.repeat,
+                    &mut self.keys,
+                );
+                // A repeat acts only while the scene of its key's press is
+                // current: a key held across the decision screen, or any
+                // other scene change, needs a fresh press.
+                let scene = self.controls.scene();
+                if !event.repeat {
+                    self.keys.menu_press = Some((event.physical_key, scene));
+                } else if self.keys.menu_press != Some((event.physical_key, scene)) {
+                    return;
                 }
                 if let Some(menu) = &self.menu {
                     let key = menu_key(event.physical_key, event.repeat).map(MenuInput::Key);
@@ -353,21 +367,23 @@ impl ApplicationHandler<Ask> for App {
                         .text
                         .filter(|t| !t.chars().any(char::is_control))
                         .map(|t| MenuInput::Text(t.to_string()));
+                    let stamp = self.controls.ingress();
                     for input in key.into_iter().chain(text) {
-                        send_menu(menu, &self.controls, input);
+                        // While the decision screen's epoch is open nothing
+                        // is published, but Escape once it lets it through.
+                        let escape = matches!(input, MenuInput::Key(MenuKey::Escape))
+                            && self.controls.escaping();
+                        if stamp.is_open() || escape {
+                            send_menu(menu, &self.controls, input, Some(stamp));
+                        }
                     }
                 }
             }
             WindowEvent::Ime(ime) => {
                 if let Some(menu) = &self.menu {
-                    let input = match ime {
-                        Ime::Commit(text) => Some(MenuInput::Text(text)),
-                        Ime::Preedit(text, _) => Some(MenuInput::Preedit(text)),
-                        Ime::Disabled => Some(MenuInput::Preedit(String::new())),
-                        Ime::Enabled => None,
-                    };
-                    if let Some(input) = input {
-                        send_menu(menu, &self.controls, input);
+                    let now = self.controls.ingress();
+                    if let Some((input, stamp)) = self.composition.event(ime, now) {
+                        send_menu(menu, &self.controls, input, Some(stamp));
                     }
                 }
             }
@@ -620,6 +636,7 @@ pub fn open(
                 window: None,
                 menu,
                 ime: ImeState::default(),
+                composition: ImeSession::default(),
                 showing: None,
                 shared: thread_shared,
             };
@@ -719,6 +736,9 @@ struct Keys {
     /// The scene epoch each settings key's press was taken in, while it is
     /// held: its repeats act only while that epoch is current.
     pressed_in: [Option<u64>; 6],
+    /// The last key pressed for the menus and the scene epoch it was
+    /// pressed in: only it repeats, while that epoch is current.
+    menu_press: Option<(PhysicalKey, u64)>,
 }
 
 impl Keys {
@@ -731,6 +751,7 @@ impl Keys {
             overlay: window_key(game::OVERLAY_KEY),
             speed: game::SPEED_KEYS.map(window_key),
             pressed_in: [None; 6],
+            menu_press: None,
         }
     }
 
@@ -776,7 +797,10 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut K
     } else if repeat {
         // The others take the first press only.
     } else if key == keys.overlay {
-        controls.toggle_overlay();
+        // Discarded in the decision screen's epoch, as every key is.
+        if controls.ingress_open() {
+            controls.toggle_overlay();
+        }
     } else if Some(key) == keys.retry {
         controls.command(Command::Retry);
     } else if Some(key) == keys.quit {
@@ -791,10 +815,59 @@ fn key_released(controls: &Controls, key: PhysicalKey, keys: &Keys) {
     }
 }
 
-/// Hands `input` to the select screen and wakes the game thread.
-fn send_menu(menu: &MenuQueue, controls: &Controls, input: MenuInput) {
-    menu.push(input);
+/// Hands `input`, observed under the ingress word `stamp`, to the select
+/// screen and wakes the game thread.
+fn send_menu(
+    menu: &MenuQueue,
+    controls: &Controls,
+    input: MenuInput,
+    stamp: Option<input::Ingress>,
+) {
+    menu.push_stamped(input, stamp);
     controls.wake_game();
+}
+
+/// An IME composition and the ingress word it began under (design.md
+/// "Play Lifecycle", the decision screen): its preedits and its commit
+/// carry that stamp, so a composition open at the choice, or begun in the
+/// decision screen, commits nothing after it. The window decides nothing;
+/// the stamp is validated where the input is taken.
+#[derive(Debug, Default)]
+struct ImeSession {
+    /// The composition's stamp, and whether it was cleared (an empty
+    /// preedit, which comes before its commit too).
+    current: Option<(input::Ingress, bool)>,
+}
+
+impl ImeSession {
+    /// The input for `ime` and its stamp, `now` the ingress word as the
+    /// window observes it.
+    fn event(&mut self, ime: Ime, now: input::Ingress) -> Option<(MenuInput, input::Ingress)> {
+        match ime {
+            Ime::Preedit(text, _) if !text.is_empty() => {
+                let stamp = match self.current {
+                    Some((stamp, false)) => stamp,
+                    _ => now,
+                };
+                self.current = Some((stamp, false));
+                Some((MenuInput::Preedit(text), stamp))
+            }
+            Ime::Preedit(_, _) => {
+                let stamp = self.current.map_or(now, |(s, _)| s);
+                self.current = Some((stamp, true));
+                Some((MenuInput::Preedit(String::new()), stamp))
+            }
+            Ime::Commit(text) => {
+                let stamp = self.current.take().map_or(now, |(s, _)| s);
+                Some((MenuInput::Text(text), stamp))
+            }
+            Ime::Disabled => {
+                let stamp = self.current.take().map_or(now, |(s, _)| s);
+                Some((MenuInput::Preedit(String::new()), stamp))
+            }
+            Ime::Enabled => None,
+        }
+    }
 }
 
 /// The select screen's key for a key pressed in the window: navigation
@@ -1603,5 +1676,93 @@ mod tests {
         }
         assert_eq!(asks.read.last(), Some(&None));
         assert_eq!(asks.read.len(), 2);
+    }
+
+    /// A queue validated by a fresh tuning's ingress word, and the window's
+    /// IME session.
+    fn gated() -> (
+        std::sync::Arc<crate::tuning::LiveTuning>,
+        crate::select::MenuQueue,
+        super::ImeSession,
+    ) {
+        let tuning = std::sync::Arc::clone(
+            crate::controls::Controls::new(input::QpcClock::start()).tuning(),
+        );
+        let queue = crate::select::MenuQueue::gated(std::sync::Arc::clone(&tuning));
+        (tuning, queue, super::ImeSession::default())
+    }
+
+    /// `ime` through the session, published under the word now.
+    fn publish(
+        tuning: &crate::tuning::LiveTuning,
+        queue: &crate::select::MenuQueue,
+        session: &mut super::ImeSession,
+        ime: winit::event::Ime,
+    ) {
+        let now = tuning.activity().ingress();
+        if let Some((input, stamp)) = session.event(ime, now) {
+            queue.push_stamped(input, Some(stamp));
+        }
+    }
+
+    fn preedit(text: &str) -> winit::event::Ime {
+        winit::event::Ime::Preedit(text.to_owned(), None)
+    }
+
+    fn commit(text: &str) -> winit::event::Ime {
+        winit::event::Ime::Commit(text.to_owned())
+    }
+
+    /// E17: a composition open at the choice, and one begun during the
+    /// decision screen, apply neither their preedits nor their commits
+    /// after it (committed after the deadline or after a refusal's return
+    /// alike: both reopen the word); a composition begun after the
+    /// reopening commits (the positive control).
+    #[test]
+    fn an_ime_composition_from_the_epoch_commits_nothing() {
+        use crate::select::MenuInput;
+        for begun_in_epoch in [false, true] {
+            let (tuning, queue, mut session) = gated();
+            if !begun_in_epoch {
+                publish(&tuning, &queue, &mut session, preedit("か"));
+                assert_eq!(queue.pop(), Some(MenuInput::Preedit("か".to_owned())));
+            }
+            tuning.close_ingress(|| {});
+            if begun_in_epoch {
+                publish(&tuning, &queue, &mut session, preedit("か"));
+            }
+            tuning.open_ingress(|| {});
+            publish(&tuning, &queue, &mut session, preedit("かな"));
+            publish(&tuning, &queue, &mut session, preedit(""));
+            publish(&tuning, &queue, &mut session, commit("仮名"));
+            assert_eq!(queue.pop(), None, "begun in the epoch {begun_in_epoch}");
+            publish(&tuning, &queue, &mut session, preedit("あ"));
+            publish(&tuning, &queue, &mut session, commit("亜"));
+            assert_eq!(queue.pop(), Some(MenuInput::Preedit("あ".to_owned())));
+            assert_eq!(queue.pop(), Some(MenuInput::Text("亜".to_owned())));
+        }
+    }
+
+    /// E17b: a preedit and a commit stamped while the word was open, and
+    /// published only after a choice and a reopening (the window thread
+    /// held between its stamp and its enqueue), are not applied where the
+    /// queue is taken; a fresh session's commit is.
+    #[test]
+    fn a_stamped_commit_published_after_the_epoch_is_not_applied() {
+        use crate::select::MenuInput;
+        let (tuning, queue, mut session) = gated();
+        let stamp = tuning.activity().ingress();
+        let held = [
+            session.event(preedit("か"), stamp),
+            session.event(commit("可"), stamp),
+        ];
+        tuning.close_ingress(|| {});
+        tuning.open_ingress(|| {});
+        for (input, stamp) in held.into_iter().flatten() {
+            queue.push_stamped(input, Some(stamp));
+        }
+        assert_eq!(queue.pop(), None);
+        publish(&tuning, &queue, &mut session, commit("化"));
+        assert_eq!(queue.pop(), Some(MenuInput::Text("化".to_owned())));
     }
 }

@@ -36,13 +36,6 @@ pub enum LoadInput {
     Gauge(Option<LoadingGauge>),
     /// The chosen chart's fields, replacing those before; a change takes
     /// the next text revision.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only fixtures report later fields until the selection's producer does"
-        )
-    )]
     Chart(ChosenChart),
 }
 
