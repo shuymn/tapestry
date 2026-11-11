@@ -540,14 +540,12 @@ impl App {
                 // with it instead. The decision screen holds it to its
                 // deadline.
                 Chosen::Refused(reason) => {
-                    if decision.on() && !decision.past(rig.now()) {
-                        match hold_refusal(&mut decision, rig)? {
-                            Next::End => match ended(rig)? {
-                                Leave::Quit => return Ok(()),
-                                Leave::Back => {}
-                            },
-                            _ => {}
-                        }
+                    if decision.on()
+                        && !decision.past(rig.now())
+                        && hold_refusal(&mut decision, rig)? == Next::End
+                        && ended(rig)? == Leave::Quit
+                    {
+                        return Ok(());
                     }
                     if decision.on() {
                         rig.closed_epoch();

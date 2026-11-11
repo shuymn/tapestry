@@ -413,6 +413,25 @@ struct Shared {
     failure: OnceLock<OutputError>,
 }
 
+/// The output's latched failure, from any thread
+/// ([`AudioControl::failure_probe`]).
+#[derive(Clone)]
+pub struct OutputProbe(Arc<Shared>);
+
+impl OutputProbe {
+    /// Whether the audio thread latched a failure.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.0.failure.get().is_some()
+    }
+}
+
+impl std::fmt::Debug for OutputProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OutputProbe").field(&self.failed()).finish()
+    }
+}
+
 /// The game thread's end.
 #[derive(Debug)]
 pub struct AudioControl {
@@ -910,6 +929,13 @@ impl AudioControl {
     pub fn failure(&self) -> Option<OutputError> {
         let gone = self.ctl.is_abandoned().then_some(OutputError::DeviceLost);
         self.shared.failure.get().copied().or(gone)
+    }
+
+    /// The output's failure as the audio thread latched it, readable from
+    /// any thread.
+    #[must_use]
+    pub fn failure_probe(&self) -> OutputProbe {
+        OutputProbe(Arc::clone(&self.shared))
     }
 
     /// Sets the master volume from the next engine step on, whatever the

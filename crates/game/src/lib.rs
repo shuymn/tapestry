@@ -66,7 +66,7 @@ pub use attempt::{
 };
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
-    Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
+    OutputProbe, Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{
@@ -74,7 +74,7 @@ pub use bests::{
     SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
 pub use decision::{DECISION_TIME, Decision, Origin, Reply, Verdict};
-pub use driver::{AdjustDriver, InputPump};
+pub use driver::{AdjustDriver, IngressDrain, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{

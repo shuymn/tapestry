@@ -148,6 +148,12 @@ impl Decision {
         self.deadline.is_none_or(|d| now.0 >= d.0)
     }
 
+    /// How a wait the rig owns left the screen, if it did.
+    #[must_use]
+    pub const fn left(&self) -> Option<Verdict> {
+        self.left
+    }
+
     /// How a wait the rig owns left the screen, taken.
     pub const fn take_left(&mut self) -> Option<Verdict> {
         self.left.take()

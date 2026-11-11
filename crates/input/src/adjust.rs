@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bms_model::TimeUs;
 use eval::ControlId;
 
-use crate::activity::{ActivityRecord, SectionValue};
+use crate::activity::{ActivityRecord, Ingress, SectionValue};
 use crate::hid::{HidProduct, wrapped};
 use crate::sources::DeviceKind;
 
@@ -164,6 +164,10 @@ pub struct TapObservation {
     pub seq: u64,
     /// What happened.
     pub event: TapEvent,
+    /// The ingress word when the tap queued it (design.md "Play
+    /// Lifecycle", the decision screen); [`Ingress::INITIAL`] without an
+    /// activity record.
+    pub ingress: Ingress,
 }
 
 /// What the latch reads ([`HoldLatch::read`]).
@@ -653,6 +657,10 @@ pub struct AdjustmentTap {
     panels: Arc<AtomicU64>,
     /// The focus losses counted at the level's last publication.
     panel_losses: u64,
+    /// START and SELECT controls held since before the last return from
+    /// the decision screen ([`mask_held_panels`](Self::mask_held_panels)):
+    /// no panel until each is released.
+    panel_mask: u128,
     /// The numbers of the tuning controls (START, SELECT, F1, F2), a bit
     /// each, whose holds and events the activity record's input section
     /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
@@ -739,6 +747,7 @@ pub fn adjustment_queue(
             panel_roles: [0; 2],
             panels: Arc::new(AtomicU64::new(0)),
             panel_losses: 0,
+            panel_mask: 0,
             tuning: 0,
             disarmed: 0,
             admitted: 0,
@@ -842,6 +851,7 @@ impl AdjustmentTap {
         };
         self.disarmed = (self.disarmed | carried | (entered & !armed)) & held & self.tuning;
         self.admitted = held;
+        self.panel_mask &= held;
     }
 
     /// Writes the input section once [`admit`](Self::admit) has decided
@@ -853,8 +863,11 @@ impl AdjustmentTap {
         let before = self.disarmed;
         self.admit(change);
         let counted = match change {
+            // Not while the ingress word is closed: the decision screen's
+            // observations are no activity (design.md "Play Lifecycle").
             Change::Press(n) | Change::Event(n) => {
                 self.tuning & !(before | self.disarmed) & (1_u128 << (n & 127)) != 0
+                    && self.activity.as_ref().is_none_or(|r| r.ingress().is_open())
             }
             Change::Loss | Change::Held => false,
         };
@@ -884,13 +897,22 @@ impl AdjustmentTap {
     /// tap hold them (the generation 0).
     #[must_use]
     pub fn held_panels(&self) -> Panels {
-        let held = self.held_set();
+        let held = self.held_set() & !self.panel_mask;
         let [start, select] = self.panel_roles;
         Panels {
             start: held & start != 0,
             select: held & select != 0,
             generation: 0,
         }
+    }
+
+    /// The decision screen's epoch ended (design.md "Play Lifecycle", the
+    /// decision screen): a START or SELECT held now opens no panel until
+    /// released, while the held set itself, which the loading state's
+    /// hold and the start gate read, stays.
+    pub fn mask_held_panels(&mut self) {
+        let [start, select] = self.panel_roles;
+        self.panel_mask = self.held_set() & (start | select);
     }
 
     /// Publishes the panels' level at a boundary: START and SELECT as held
@@ -1376,7 +1398,17 @@ impl AdjustmentTap {
     fn send(&mut self, at: TimeUs, event: TapEvent) {
         let at = at.max(self.last_at);
         let seq = self.seq;
-        if self.queue.push(TapObservation { at, seq, event }).is_err() {
+        let ingress = self
+            .activity
+            .as_ref()
+            .map_or(Ingress::INITIAL, |r| r.ingress());
+        let observation = TapObservation {
+            at,
+            seq,
+            event,
+            ingress,
+        };
+        if self.queue.push(observation).is_err() {
             // The reserved slots make this unreachable for what is owed,
             // and an observation is pushed only with room.
             self.dropped.fetch_add(1, Ordering::Relaxed);

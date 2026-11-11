@@ -40,7 +40,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use bms_model::{Speed, TimeUs};
-use input::{AdjustmentReceiver, AdjustmentTap, TapError, TapEvent, adjustment_queue};
+use input::{AdjustmentReceiver, AdjustmentTap, Ingress, TapError, TapEvent, adjustment_queue};
 
 use crate::adjust_keys::AdjustmentPlan;
 use crate::adjustment::{
@@ -54,6 +54,11 @@ use crate::session::Loaded;
 use crate::tempo::AttemptTempo;
 use crate::turntable::ScratchDevice;
 
+/// What a drain runs under [`InputPump::with_ingress`]: given the ingress
+/// word (none: no gate) and the meeting point between each validation and
+/// its action.
+pub type IngressDrain<'a> = dyn FnMut(Option<Ingress>, &dyn Fn()) + 'a;
+
 /// The input thread, as the driver's waits need it.
 pub trait InputPump {
     /// Asks the input thread to answer fence `n` at its next boundary.
@@ -62,6 +67,15 @@ pub trait InputPump {
     fn wake(&mut self);
     /// The display offset now, µs: what the drain cuts in when it changed.
     fn display_offset_us(&self) -> i64;
+    /// Runs `f` with the ingress word now and the step lock its writers
+    /// take held (design.md "Play Lifecycle", the decision screen), so a
+    /// drain inside validates each observation's stamp and acts on it
+    /// before the word can change; `f`'s second argument is called between
+    /// each validation and its action (a test's meeting point). `None`
+    /// (by default): no ingress gate, every observation acts.
+    fn with_ingress(&mut self, f: &mut IngressDrain<'_>) {
+        f(None, &|| {});
+    }
     /// Waits a millisecond at most for the input thread to make progress:
     /// the only end of a driver's wait other than its answer.
     ///
@@ -107,6 +121,9 @@ pub struct AdjustDriver {
     opening: bool,
     /// The generation of the last cancellation taken.
     cancelled: Option<u32>,
+    /// Whether the last observation validated was stamped with the
+    /// current ingress word: the reducer is told when it flips.
+    admitted: bool,
     /// The next presentation epoch, counting the run's attempts from 1.
     next_epoch: u64,
     /// The epoch attached for the coming attempt, not yet prepared.
@@ -157,6 +174,7 @@ impl AdjustDriver {
                 attached: None,
                 opening: false,
                 cancelled: None,
+                admitted: true,
                 next_epoch: 1,
                 pending: None,
                 active: None,
@@ -173,6 +191,20 @@ impl AdjustDriver {
     /// then.
     #[must_use]
     pub fn drain(&mut self, display_offset_us: i64) -> bool {
+        self.drain_gated(display_offset_us, None, &|| {})
+    }
+
+    /// [`drain`](Self::drain), each control's observation validated
+    /// against the ingress `word` (none: no gate): one stamped with another
+    /// generation, or under a closed word, is taken with presses discarded
+    /// ([`Event::Ingress`]); a release always acts on the held set.
+    /// `between` runs after each validation, before its action.
+    fn drain_gated(
+        &mut self,
+        display_offset_us: i64,
+        word: Option<Ingress>,
+        between: &dyn Fn(),
+    ) -> bool {
         if self.holding {
             return self.receiver.owed();
         }
@@ -191,6 +223,7 @@ impl AdjustDriver {
             hold_after,
             opening,
             cancelled,
+            admitted,
             ..
         } = self;
         let hold_after = *hold_after;
@@ -200,7 +233,7 @@ impl AdjustDriver {
         });
         let opens_at = *opens_at;
         let popped = std::iter::from_fn(|| if stopped.get() { None } else { receiver.pop() });
-        let observed = popped.filter_map(|o| {
+        let mut one = |o: input::TapObservation| -> Option<Augmented> {
             // Every movement of the scratch axis turns the turntable,
             // before the plan drops one without an adjustment quantum.
             scratch.observe(&o);
@@ -240,6 +273,27 @@ impl AdjustDriver {
                 }
                 _ => plan.observation(&o).map(Augmented::Obs),
             }
+        };
+        let observed = popped.flat_map(|o| {
+            // A control's observation, except a release, is validated
+            // against its stamp; the reducer hears when that flips.
+            let gated = matches!(
+                o.event,
+                TapEvent::Press(_) | TapEvent::Repeat(_) | TapEvent::Axis { .. } | TapEvent::Tick
+            );
+            let flip = word.filter(|_| gated).and_then(|w| {
+                let valid = w.admits(o.ingress);
+                between();
+                (valid != *admitted).then(|| {
+                    *admitted = valid;
+                    Augmented::Obs(Observation {
+                        time: o.at,
+                        seq: o.seq,
+                        event: Event::Ingress(valid),
+                    })
+                })
+            });
+            [flip, one(o)].into_iter().flatten()
         });
         let items = cut.into_iter().chain(observed);
         match tempo {
@@ -257,7 +311,14 @@ impl AdjustDriver {
 
     /// One drain from `input`, waking it when the tap is owed room.
     pub fn pump(&mut self, input: &mut impl InputPump) {
-        if self.drain(input.display_offset_us()) {
+        // Read before the step lock is taken: the pump's own read takes
+        // nothing, and nothing inside may call back into it.
+        let offset = input.display_offset_us();
+        let mut owed = false;
+        input.with_ingress(&mut |word, between| {
+            owed = self.drain_gated(offset, word, between);
+        });
+        if owed {
             input.wake();
         }
     }

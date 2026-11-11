@@ -140,15 +140,63 @@ pub struct ActivityRead {
     pub input: SectionValue,
 }
 
-/// The record: the window side's section, the input side's, and the
-/// candidate generation whose recording the input thread opened last.
-#[derive(Debug, Default)]
+/// The ingress word as one observation was stamped with, or as it is now
+/// (design.md "Play Lifecycle", the decision screen): a generation and
+/// whether tuning observations act. The decision screen's choice closes
+/// it and every exit opens it, each a new generation, so an observation
+/// acts only when the word it was stamped with is the current one and
+/// open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ingress(u64);
+
+impl Ingress {
+    /// The word before any choice: open, generation 0.
+    pub const INITIAL: Self = Self(1);
+
+    /// Whether observations stamped with it act while it is current.
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// The next generation, `open` or closed.
+    #[must_use]
+    pub const fn next(self, open: bool) -> Self {
+        Self((self.0 & !1).wrapping_add(2) | open as u64)
+    }
+
+    /// Whether an observation stamped `stamp` acts under `self`, the word
+    /// now: the same generation, open.
+    #[must_use]
+    pub fn admits(self, stamp: Self) -> bool {
+        self == stamp && self.is_open()
+    }
+}
+
+/// The record: the window side's section, the input side's, the
+/// candidate generation whose recording the input thread opened last, and
+/// the ingress word.
+#[derive(Debug)]
 pub struct ActivityRecord {
     /// Written under the tuning step lock.
     pub window: Section,
     /// Written by the input thread's adjustment tap.
     pub input: Section,
     opened: AtomicU32,
+    /// Written only under the tuning step lock; read lock-free by the
+    /// stamps.
+    ingress: AtomicU64,
+}
+
+impl Default for ActivityRecord {
+    fn default() -> Self {
+        Self {
+            window: Section::default(),
+            input: Section::default(),
+            opened: AtomicU32::new(0),
+            ingress: AtomicU64::new(Ingress::INITIAL.0),
+        }
+    }
 }
 
 impl ActivityRecord {
@@ -192,6 +240,17 @@ impl ActivityRecord {
     /// Candidate `generation`'s recording opened (the input thread).
     pub fn set_opened(&self, generation: u32) {
         self.opened.store(generation, Ordering::Release);
+    }
+
+    /// The ingress word now: what an observation is stamped with.
+    pub fn ingress(&self) -> Ingress {
+        Ingress(self.ingress.load(Ordering::Acquire))
+    }
+
+    /// The ingress word becomes `word`. The caller holds the tuning step
+    /// lock, under which every observation is validated.
+    pub fn set_ingress(&self, word: Ingress) {
+        self.ingress.store(word.0, Ordering::Release);
     }
 }
 
