@@ -4286,6 +4286,33 @@ mod panel_tests {
         (KEYBOARD, control, value)
     }
 
+    /// START pressed during the decision screen and held through a
+    /// return's reopening: the boundary that answers the return's fence
+    /// masks it before it publishes the level or the answer, so no level
+    /// showing it is ever published (the level's generation does not
+    /// move); a fresh press opens the panel (the positive control).
+    #[test]
+    fn a_panel_held_through_the_epoch_is_masked_before_the_fence_answer() {
+        let mut r = Rig::new();
+        r.controls.close_epoch();
+        r.wake();
+        r.batch(&[key(E, 1)], false);
+        assert!(!r.level.read().start, "closed in the epoch");
+        r.controls.open_epoch();
+        let before = r.level.read().generation;
+        r.link.request_fence(1);
+        r.wake();
+        assert_eq!(
+            r.level.read().generation,
+            before,
+            "a level with the held START was published"
+        );
+        assert!(!r.level.read().start);
+        r.batch(&[key(E, 0)], false);
+        r.batch(&[key(E, 1)], false);
+        assert!(r.level.read().start);
+    }
+
     #[test]
     fn panels_follow_start_and_select_and_no_lost_release_keeps_one() {
         let mut r = Rig::new();
