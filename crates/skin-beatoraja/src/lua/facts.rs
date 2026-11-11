@@ -405,6 +405,10 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
     let fact = match id {
         AUTOPLAY_OFF | AUTOPLAY_ON if facts.scene != ScreenKind::Play => return constant(false),
         COURSE_MODE | crate::import::ops::TABLE_SONG => return constant(false),
+        // Play's other constants: no replay, course stage or constant mode.
+        _ if facts.scene == ScreenKind::Play && crate::import::ops::play_constant_false(id) => {
+            return constant(false);
+        }
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
         _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
         // The result profile's: a constant, or a result fact.

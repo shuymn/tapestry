@@ -361,6 +361,12 @@ pub struct FrameReadouts {
     pub duration_variants: [Option<DurationRatio>; 8],
     /// The native block's inputs (slots 75 to 85).
     pub native: NativeReadouts,
+    /// The speed policy's hi-speed fix (`settings.fix_hispeed`), as the
+    /// selection screen's: 0 Classic; Floating 1 from the start tempo, 2
+    /// the maximum, 3 the main and 4 the minimum. A value above
+    /// [`FIX_HISPEED_MAX`](crate::FIX_HISPEED_MAX) is
+    /// malformed.
+    pub fix_hispeed: u8,
 }
 
 impl FrameReadouts {
@@ -385,6 +391,7 @@ impl FrameReadouts {
             target_green: None,
             floating: false,
         },
+        fix_hispeed: 0,
     };
 }
 

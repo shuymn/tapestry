@@ -378,13 +378,13 @@ fn ignored_fields_beside_a_value_are_noted_and_type_four_is_not_sudden_s() {
 
 #[test]
 fn an_uncompilable_value_drops_the_slider_with_its_cause() {
-    let why = Unsupported::Unmapped { api: 6, id: 55 };
-    let i = down("return ms.event_index(55)");
+    let why = Unsupported::Unmapped { api: 6, id: 54 };
+    let i = down("return ms.event_index(54)");
     let Disposition::Replaced(got) = i.callbacks[0] else {
         panic!("{:?}", i.callbacks)
     };
     assert!(
-        matches!(got, Unsupported::Unmapped { id: 55, .. }),
+        matches!(got, Unsupported::Unmapped { id: 54, .. }),
         "{got:?} {why:?}"
     );
     assert!(common::has(
@@ -396,7 +396,7 @@ fn an_uncompilable_value_drops_the_slider_with_its_cause() {
     ));
     assert_eq!(drawn(&i, 0, None), None);
     // Over the lanes, a decorative paint still: the skin imports.
-    let lua = skin(2, "return ms.event_index(55)", "", "offset = 4,", true);
+    let lua = skin(2, "return ms.event_index(54)", "", "offset = 4,", true);
     assert!(load(&lua).is_ok());
     // A table, and a Lua error, as the residual refuses them.
     for body in ["return {}", "return nil + 1"] {
@@ -450,7 +450,7 @@ fn a_critical_read_promotes_the_whole_slider() {
     assert!(near(q[0].rect[1], TOP), "{q:?}");
     // Not compiled, it refuses; so does an unresolvable callee.
     for body in [
-        "return ms.number(71) + ms.event_index(55)",
+        "return ms.number(71) + ms.event_index(54)",
         "return ms.number(71) + undefined_helper()",
     ] {
         match load(&skin(2, body, "", "", false)) {
@@ -476,7 +476,7 @@ fn a_critical_read_promotes_the_whole_slider() {
 
 #[test]
 fn as_failure_presentation_an_uncompilable_value_refuses() {
-    let lua = skin(2, "return ms.event_index(55)", "", "timer = 3,", false);
+    let lua = skin(2, "return ms.event_index(54)", "", "timer = 3,", false);
     assert!(load(&lua).is_err());
 }
 
