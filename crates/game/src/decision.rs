@@ -67,6 +67,7 @@ impl Verdict {
     /// Whether the decision screen is left: the run ends, or selection
     /// returns. A wait that gets one stops and hands it to its caller.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn leaves(self) -> bool {
         matches!(self, Self::End | Self::Return | Self::Back)
     }

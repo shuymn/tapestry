@@ -98,6 +98,7 @@ impl game::InputPump for PlayerPump<'_> {
             .with_ingress(|word| f(Some(word), &between_ingress));
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn look(&mut self) -> game::Verdict {
         self.look
             .and_then(Controls::look)

@@ -498,6 +498,10 @@ pub struct PageJobs {
     /// The release barrier's unload for the waiting bank, sent or not,
     /// polled with no wait until the audio thread answers it.
     unloading: Option<game::Switch>,
+    /// The scan's pause was requested by a look at the background for the
+    /// waiting bank after the page had released it: the page's own, given
+    /// back when the bank is admitted.
+    paused_here: bool,
     /// The decision screen shows: the jobs begun are promoted and answered
     /// for by the choice (`Owner::Foreground`) until the page opens
     /// ([`hand_to_page`](Self::hand_to_page)).
@@ -544,6 +548,7 @@ impl PageJobs {
             refusal: None,
             pending: None,
             unloading: None,
+            paused_here: false,
             deciding: false,
             mode,
             sink: PageSink::default(),
@@ -650,9 +655,22 @@ impl PageJobs {
     /// The bank waiting for its prerequisites, given up (a Start decodes
     /// its own).
     pub fn take_pending(&mut self) -> Option<PageChart> {
-        // Its unload left (an answer late, the next switch takes it).
+        // Its unload left (an answer late, the next switch takes it); a
+        // pause it took is the leave's or the Start's from here.
         self.unloading = None;
+        self.paused_here = false;
         self.pending.take()
+    }
+
+    /// The waiting bank's look at the background took the scan's pause
+    /// (see the field).
+    pub const fn hold_pause(&mut self) {
+        self.paused_here = true;
+    }
+
+    /// Whether the waiting bank holds a pause of its own, given up here.
+    pub const fn take_pause(&mut self) -> bool {
+        std::mem::replace(&mut self.paused_here, false)
     }
 
     /// The waiting bank's unload, while it runs.

@@ -1477,13 +1477,48 @@ fn gate_at_first_barrier(gate: &Arc<crate::dev::AudioGate>) -> Option<super::Hoo
     })
 }
 
+/// The page's entry at its deadline as App takes it: the screen's look at
+/// the page's jobs past `T` returns the page's step, then App's page entry
+/// hooks run (the epoch closed, the practice page entered); the page is
+/// entered: its input open and the scan's pause released.
+fn enter_page_at_deadline(rig: &mut PlayerRig<'_>, read: &Loaded, decision: &mut game::Decision) {
+    use bms_model::TimeSource as _;
+    let now = rig.clock.now();
+    assert_eq!(
+        decision.classify(game::Origin::Jobs, now, false, false, None),
+        game::Verdict::Step,
+        "the page's entry at the deadline"
+    );
+    rig.closed_epoch();
+    rig.entered_practice(&game::PracticeScreen::new(
+        read.chart(),
+        &rules::tapestry(),
+        0,
+    ));
+    assert!(rig.controls.ingress().is_open(), "the page's input");
+    assert!(
+        !sel(rig).shelf.paused(),
+        "the page's entry released the scan"
+    );
+}
+
+/// A decision screen of a practice choice whose deadline is due.
+fn due_practice(rig: &PlayerRig<'_>) -> game::Decision {
+    use bms_model::TimeSource as _;
+    let now = rig.clock.now();
+    game::Decision::begin(
+        bms_model::TimeUs(now.0 - game::DECISION_TIME.0),
+        Some(game::DECISION_TIME),
+        true,
+    )
+}
+
 /// C3: the page's read with its release barrier's unload held at the audio
 /// thread: the read returns, the unload in flight; the page's entry and
 /// its passes go on with no bank begun; once the audio thread answers the
 /// unload, a pass begins the bank.
 #[test]
 fn the_page_opens_while_its_barrier_runs() {
-    use bms_model::TimeSource as _;
     let dir = tempfile::tempdir().unwrap();
     let page = Arc::new(Page::default());
     let gate = Arc::new(crate::dev::AudioGate::default());
@@ -1497,8 +1532,7 @@ fn the_page_opens_while_its_barrier_runs() {
     );
     let read = loaded(dir.path(), &path, Speed::NORMAL);
     super::on_gated_rig(b.sel.take().unwrap(), &gate, |rig| {
-        let now = rig.clock.now();
-        let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
+        let mut decision = due_practice(rig);
         assert_eq!(
             outcome(rig.practice_read(&read, &mut decision)),
             Loading::Ready,
@@ -1506,8 +1540,10 @@ fn the_page_opens_while_its_barrier_runs() {
         );
         assert!(gate.stopped(), "the unload answered");
         assert!(sel(rig).page.unloading().is_some());
-        // The page's entry and its passes, the unload still held.
-        rig.closed_epoch();
+        // The page's entry at its deadline and its passes, the unload
+        // still held.
+        enter_page_at_deadline(rig, &read, &mut decision);
+        assert!(sel(rig).page.unloading().is_some(), "the unload answered");
         for _ in 0..3 {
             rig.poll_page().unwrap();
         }
@@ -1535,7 +1571,6 @@ fn the_page_opens_while_its_barrier_runs() {
 /// alive.
 #[test]
 fn the_page_admits_its_bank_after_the_background_again() {
-    use bms_model::TimeSource as _;
     let dir = tempfile::tempdir().unwrap();
     let page = Arc::new(Page::default());
     let gate = Arc::new(crate::dev::AudioGate::default());
@@ -1551,17 +1586,14 @@ fn the_page_admits_its_bank_after_the_background_again() {
     let s = b.sel.take().unwrap();
     let b = b;
     super::on_gated_rig(s, &gate, |rig| {
-        let now = rig.clock.now();
-        let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
+        let mut decision = due_practice(rig);
         assert_eq!(
             outcome(rig.practice_read(&read, &mut decision)),
             Loading::Ready
         );
         assert!(sel(rig).page.unloading().is_some());
-        // The page's entry: the scan's pause released, as its entry
-        // routine releases it.
-        rig.closed_epoch();
-        sel(rig).shelf.release();
+        // The page's entry releases the scan's pause.
+        enter_page_at_deadline(rig, &read, &mut decision);
         crate::shelf::tests::worker(&sel(rig).shelf).queue(crate::shelf::tests::job(&path));
         until("the background measuring the chart", || {
             b.stepper.said() == crate::background::tests::Said::Block(0)
@@ -1579,11 +1611,16 @@ fn the_page_admits_its_bank_after_the_background_again() {
             "the page's bank began beside the background's"
         );
         assert!(!sel(rig).page.decoding());
+        // Meanwhile the look at the background paused the scan again.
+        assert!(sel(rig).shelf.paused());
         b.stepper.finish();
         until("the page's bank begun", || {
             rig.poll_page().unwrap();
             sel(rig).page.decoding() || sel(rig).page.kept().is_some()
         });
+        // The page released the scan at its entry: the pause its look took
+        // is given back with the bank's admission.
+        assert!(!sel(rig).shelf.paused(), "the scan left paused on the page");
         passes_until_idle(rig);
     });
     assert_eq!(witnessed(&b).1, Vec::<String>::new());

@@ -2127,6 +2127,21 @@ impl PlayerRig<'_> {
     }
 }
 
+/// The waiting page bank's look at `chart`'s background measurement, with
+/// no wait ([`Shelf::background_ready`]). The look requests the scan's
+/// pause; one it requests after the page released it is the page's own,
+/// held until the bank is admitted.
+///
+/// [`Shelf::background_ready`]: crate::shelf::Shelf::background_ready
+fn page_background_ready(sel: &mut Selection, chart: &std::path::Path, name: &str) -> bool {
+    let was = sel.shelf.paused();
+    let ready = sel.shelf.background_ready(chart, name);
+    if !was && sel.shelf.paused() {
+        sel.page.hold_pause();
+    }
+    ready
+}
+
 /// Why the page's waiting bank did not begin.
 enum PageBegin {
     /// The release barrier found a failure the run ends with.
@@ -2156,7 +2171,7 @@ impl PlayerRig<'_> {
         };
         let name = file_name(&path);
         if sel.page.unloading().is_none() {
-            if !sel.shelf.background_ready(&path, &name) {
+            if !page_background_ready(sel, &path, &name) {
                 return Ok(());
             }
             if let Some(failure) = self.release_owners(None).failure() {
@@ -2183,18 +2198,20 @@ impl PlayerRig<'_> {
         sel.page.set_unloading(None);
         answered.map_err(PageBegin::Refused)?;
         // Admitted only beside no background bank, looked at again.
-        if !sel.shelf.background_ready(&path, &name) {
+        if !page_background_ready(sel, &path, &name) {
             return Ok(());
         }
         #[cfg(feature = "dev-tools")]
         sel.witness.check(None);
-        if let Some(sel) = &mut self.selection {
-            sel.page.begin_pending(
-                &sel.coord,
-                sel.spawner,
-                #[cfg(feature = "dev-tools")]
-                &sel.witness,
-            );
+        sel.page.begin_pending(
+            &sel.coord,
+            sel.spawner,
+            #[cfg(feature = "dev-tools")]
+            &sel.witness,
+        );
+        // The scan goes on, as the page's entry let it.
+        if sel.page.take_pause() {
+            sel.shelf.release();
         }
         Ok(())
     }
