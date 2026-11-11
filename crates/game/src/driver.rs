@@ -48,6 +48,7 @@ use crate::adjustment::{
     PresentationReader, PresentationSnapshot, PresentationWriter, presentation_link,
 };
 use crate::attempt::PreparationRefusal;
+use crate::decision::{Served, Verdict};
 use crate::hispeed::PlayOptions;
 use crate::live::InputWaitError;
 use crate::session::Loaded;
@@ -75,6 +76,14 @@ pub trait InputPump {
     /// (by default): no ingress gate, every observation acts.
     fn with_ingress(&mut self, f: &mut IngressDrain<'_>) {
         f(None, &|| {});
+    }
+    /// The decision screen's look at each slice of a wait, between a drain
+    /// and the park: [`Verdict::Continue`] goes on waiting, a leaving
+    /// verdict stops the wait without latching anything
+    /// ([`Served::Left`]). Continue by default: no decision screen is
+    /// served.
+    fn look(&mut self) -> Verdict {
+        Verdict::Continue
     }
     /// Waits a millisecond at most for the input thread to make progress:
     /// the only end of a driver's wait other than its answer.
@@ -349,13 +358,29 @@ impl AdjustDriver {
         input: &mut impl InputPump,
         done: impl Fn(&Self) -> bool,
     ) -> Result<(), InputWaitError> {
+        self.wait_served(input, done).map(|_| ())
+    }
+
+    /// [`wait_until`](Self::wait_until), the pump's look asked after each
+    /// drain: a leaving verdict ends the wait as [`Served::Left`], nothing
+    /// latched, so a close is never taken for the input thread's failure.
+    /// The park's error (gone, or the awake bound) is latched as before.
+    fn wait_served(
+        &mut self,
+        input: &mut impl InputPump,
+        done: impl Fn(&Self) -> bool,
+    ) -> Result<Served<()>, InputWaitError> {
         if let Some(e) = self.failed.get() {
             return Err(e);
         }
         loop {
             self.pump(input);
             if done(self) {
-                return Ok(());
+                return Ok(Served::Done(()));
+            }
+            let seen = input.look();
+            if seen.leaves() {
+                return Ok(Served::Left(seen));
             }
             // The pump's awake deadline is the wait's only end.
             if let Err(e) = input.park() {
@@ -395,6 +420,17 @@ impl AdjustDriver {
         acceptance: Option<Acceptance>,
         input: &mut impl InputPump,
     ) -> Result<(), InputWaitError> {
+        self.fence_served(acceptance, input).map(|_| ())
+    }
+
+    /// [`fence_with`](Self::fence_with), served ([`wait_served`](Self::wait_served)).
+    /// A fence left unanswered is harmless: the next fence waits for its
+    /// own, later number, and the late answer carries no acceptance.
+    fn fence_served(
+        &mut self,
+        acceptance: Option<Acceptance>,
+        input: &mut impl InputPump,
+    ) -> Result<Served<()>, InputWaitError> {
         if let Some(e) = self.failed.get() {
             return Err(e);
         }
@@ -402,7 +438,7 @@ impl AdjustDriver {
         self.fence_asked = n;
         self.at_fence = acceptance.map(|a| (n, a));
         input.request_fence(n);
-        let waited = self.wait_until(input, |d| d.fence_answered == n);
+        let waited = self.wait_served(input, |d| d.fence_answered == n);
         self.at_fence = None;
         waited
     }
@@ -438,12 +474,13 @@ impl AdjustDriver {
         input: &mut impl InputPump,
     ) -> Result<(), InputWaitError> {
         self.hold_after = Some(self.fence_asked.wrapping_add(1));
-        let closed = self.fence_with(Some(Acceptance::Closed), input);
-        if closed.is_err() {
+        let closed = self.fence_served(Some(Acceptance::Closed), input);
+        // Unanswered (failed or left), its late answer must hold nothing.
+        if !matches!(closed, Ok(Served::Done(()))) {
             self.hold_after = None;
             self.holding = false;
         }
-        closed
+        closed.map(|_| ())
     }
 
     /// Keeps a provisional close ([`close_provisionally`](Self::close_provisionally)):
@@ -544,7 +581,25 @@ impl AdjustDriver {
         opens_at: Option<TimeUs>,
         input: &mut impl InputPump,
     ) -> Result<(), InputWaitError> {
-        self.fence(input)?;
+        self.enter_attempt_served(opens_at, input).map(|_| ())
+    }
+
+    /// [`enter_attempt`](Self::enter_attempt), its fence serving the
+    /// decision screen: left, the attempt is not entered (a later
+    /// [`begin_presentation`](Self::begin_presentation) enters it, and a
+    /// leaving verdict leaves the chart anyway).
+    ///
+    /// # Errors
+    ///
+    /// As [`enter_attempt`](Self::enter_attempt).
+    pub fn enter_attempt_served(
+        &mut self,
+        opens_at: Option<TimeUs>,
+        input: &mut impl InputPump,
+    ) -> Result<Served<()>, InputWaitError> {
+        if let Served::Left(seen) = self.fence_served(None, input)? {
+            return Ok(Served::Left(seen));
+        }
         match &self.tempo {
             Some(t) => self.reducer.enter_attempt(opens_at, t),
             None => self.reducer.enter_attempt(opens_at, &NoTempo),
@@ -557,7 +612,7 @@ impl AdjustDriver {
         self.invalidate();
         self.reducer.set_epoch(0);
         self.pump(input);
-        Ok(())
+        Ok(Served::Done(()))
     }
 
     /// The attempt's chart is final: fences the input thread, then gives
@@ -577,6 +632,16 @@ impl AdjustDriver {
         input: &mut impl InputPump,
     ) -> Result<u64, Result<AttachError, InputWaitError>> {
         self.fence(input).map_err(Err)?;
+        self.attach_fenced(tempo, opens_at, input)
+    }
+
+    /// [`attach`](Self::attach) once its fence answered.
+    fn attach_fenced(
+        &mut self,
+        tempo: AttemptTempo,
+        opens_at: TimeUs,
+        input: &mut impl InputPump,
+    ) -> Result<u64, Result<AttachError, InputWaitError>> {
         let speed = tempo.speed();
         let references = tempo.references().ok();
         let attached = self.reducer.attach(opens_at, references, speed, &tempo);
@@ -741,6 +806,24 @@ impl AdjustDriver {
             loaded,
             self.attach(loaded.attempt_tempo(), loaded.opens_at(), input),
         )
+    }
+
+    /// [`attach_loaded`](Self::attach_loaded), its fence serving the
+    /// decision screen: left, nothing is attached.
+    ///
+    /// # Errors
+    ///
+    /// As [`attach_loaded`](Self::attach_loaded).
+    pub fn attach_loaded_served(
+        &mut self,
+        loaded: &Loaded,
+        input: &mut impl InputPump,
+    ) -> Result<Served<Option<PreparationRefusal>>, InputWaitError> {
+        if let Served::Left(seen) = self.fence_served(None, input)? {
+            return Ok(Served::Left(seen));
+        }
+        let attached = self.attach_fenced(loaded.attempt_tempo(), loaded.opens_at(), input);
+        refusal(loaded, attached).map(Served::Done)
     }
 
     /// The presentation takes the attempt `loaded` describes again, as it
