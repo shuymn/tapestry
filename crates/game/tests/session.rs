@@ -3210,3 +3210,63 @@ fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
     assert!(Arc::ptr_eq(&profile, again.profile.as_ref().unwrap()));
     assert_eq!(again.main, Some(bpm(120)));
 }
+
+/// The whole chart's MAIN tempo a play skin's main BPM reads, through the
+/// production ingestion: 10 notes at 120 BPM in measure 1 and 11 at 180 BPM
+/// in measure 2 give 180, neither the initial tempo nor the first notes'.
+/// A practice round over measure 1 alone, whose own MAIN is 120, keeps 180,
+/// and so does a load at k = 10 (50 %) and its rounds.
+#[test]
+fn the_attempts_main_is_the_whole_charts_in_a_section_and_at_any_speed() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let path = root.path().join("main.bms");
+    let text = "#BPM 120
+#WAV01 a.wav
+#00111:01010101010101010101
+                #00203:B4
+#00212:0101010101010101010101
+";
+    fs::write(&path, text).unwrap();
+    let bpm = |b: i64| bms_model::Tempo::from_milli(b * 1_000).unwrap();
+    for twentieths in [20, 10] {
+        let settings = tapestry_settings(&root);
+        let parts = Parts::standard(&root, &settings.player);
+        let speed = bms_model::Speed::from_twentieths(twentieths).unwrap();
+        let at_speed = SessionConfig { speed, ..config() };
+        let mut loaded = Loaded::load(root.clone(), settings, &path, at_speed, parts).unwrap();
+        assert_eq!(loaded.chart().lanes.iter().flatten().count(), 21);
+        assert_eq!(loaded.chart().timeline.meta().initial, bpm(120));
+        loaded.begin_play();
+        assert_eq!(loaded.attempt().main, Some(bpm(180)), "{twentieths}");
+        // Measure 1, 2 s to 4 s in the chart's 1× time.
+        let practice = game::Practice {
+            start: TimeUs(1_900 * MS),
+            end: TimeUs(3_950 * MS),
+            lead_in: TimeUs(1_000 * MS),
+            initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+            repeat: true,
+        };
+        loaded.set_practice(Some(practice)).unwrap();
+        loaded.begin_play();
+        let round = loaded.attempt();
+        assert_eq!(
+            round.tempo.references().unwrap().main,
+            game::AttemptTempo::prepare(&chart_at_120(), None)
+                .references()
+                .unwrap()
+                .main,
+            "{twentieths}: the section's own MAIN is 120"
+        );
+        assert_eq!(round.main, Some(bpm(180)), "{twentieths}");
+        assert_eq!(round.speed, speed);
+    }
+}
+
+/// A chart whose MAIN is 120 BPM.
+fn chart_at_120() -> bms_model::Chart {
+    bms_model::ChartBuilder::new(120_000)
+        .tap(bms_model::Lane::new(1).unwrap(), TimeUs(1_000 * MS))
+        .build()
+        .unwrap()
+}

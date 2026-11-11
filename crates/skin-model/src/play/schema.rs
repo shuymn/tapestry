@@ -316,6 +316,8 @@ pub static PLAY: Schema = Schema {
         int("app.uptime_h", i32::MAX, T),
         int("app.uptime_m", 59, T),
         int("app.uptime_s", 59, T),
+        int("chart.main_bpm", READOUT_MAX, T),
+        flag("chart.main_bpm_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -638,8 +640,16 @@ pub mod field {
     pub const APP_UPTIME_M: u16 = 149;
     /// The uptime's seconds within its minute.
     pub const APP_UPTIME_S: u16 = 150;
+    /// The whole chart's MAIN tempo in whole BPM, truncated: the
+    /// attempt's [`PlayScore::main`](crate::PlayScore::main), the 1×
+    /// chart's whatever section a practice round plays and whatever its
+    /// speed; 0 while `chart.main_bpm_valid` is false.
+    pub const CHART_MAIN_BPM: u16 = 151;
+    /// Whether it is known: false without a MAIN tempo and past the
+    /// readout maximum.
+    pub const CHART_MAIN_BPM_VALID: u16 = 152;
     /// The number of fields.
-    pub const COUNT: usize = 151;
+    pub const COUNT: usize = 153;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -1096,7 +1106,27 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(field::COUNT, 151);
+        assert_eq!(slot("chart.main_bpm"), Some(field::CHART_MAIN_BPM));
+        assert_eq!(
+            PLAY.field("chart.main_bpm").map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: READOUT_MAX
+                },
+                T
+            ))
+        );
+        assert_eq!(
+            slot("chart.main_bpm_valid"),
+            Some(field::CHART_MAIN_BPM_VALID)
+        );
+        assert_eq!(
+            PLAY.field("chart.main_bpm_valid")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((FieldTy::Bool, T))
+        );
+        assert_eq!(field::COUNT, 153);
     }
 
     #[test]

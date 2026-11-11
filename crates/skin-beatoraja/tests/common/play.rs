@@ -358,6 +358,28 @@ impl Drawn {
         Self::over_context(skin, chart, &context_with(bpm_range, bpm_whole_change))
     }
 
+    /// `skin` played over `chart` whose whole MAIN tempo is `main` and BPM
+    /// range `bpm_range`.
+    #[allow(dead_code, reason = "not every test binary reads the main BPM")]
+    pub fn over_main(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        main: Option<bms_model::Tempo>,
+        bpm_range: Option<BpmRange>,
+    ) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                score: skin_model::PlayScore {
+                    main,
+                    ..skin_model::PlayScore::NONE
+                },
+                ..context_with(bpm_range, None)
+            },
+        )
+    }
+
     /// `skin` played over a chart of `notes` notes as a section attempt
     /// (a practice round) over `section`.
     pub fn over_section(skin: Skin, notes: u32, section: &eval::Section) -> Self {
