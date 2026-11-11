@@ -1047,12 +1047,22 @@ fn a_failed_page_measurement_is_measured_again_by_the_start() {
         |rig| {
             rig.practice_read(&read).unwrap();
             passes_until_idle(rig);
-            assert!(!sel(rig).page.gain_known(), "a failure is not a known gain");
+            // The page tries once: its next passes measure nothing.
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                1,
+                "the page measured again"
+            );
             for _ in 0..3 {
                 rig.poll_page().unwrap();
                 assert!(!sel(rig).page.measuring(), "the page measured again");
             }
-            assert_eq!(crate::loudness::analyses::of(hash), 1, "one page attempt");
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                1,
+                "the page measured again"
+            );
+            assert!(!sel(rig).page.gain_known(), "a failure is not a known gain");
             assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
             assert_eq!(
                 crate::loudness::analyses::of(hash),
