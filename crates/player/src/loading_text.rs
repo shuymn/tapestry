@@ -105,6 +105,11 @@ pub struct ChosenChart {
     /// Whether it defines a BGA image, as its entry records: known once
     /// the entry is.
     pub bga: Option<bool>,
+    /// Its length at 1×, as its entry's summary records it (the latest of
+    /// every note's end and every background sound, the loader's
+    /// [`ChartSummary::length`](bms_model::ChartSummary::length)): known
+    /// once the entry is and the loader read its seed-0 branch.
+    pub length_us: Option<bms_model::TimeUs>,
 }
 
 /// The chart being loaded, as its lines name it.

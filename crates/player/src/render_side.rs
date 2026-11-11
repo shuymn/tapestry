@@ -2995,10 +2995,13 @@ fn loading_frame_of(
         ),
         None => (now, 0, None, None, 0, false),
     };
-    let (difficulty, bga) = update.map_or((None, None), |u| (u.chart.difficulty, u.chart.bga));
+    let (difficulty, bga, length) = update.map_or((None, None, None), |u| {
+        (u.chart.difficulty, u.chart.bga, u.chart.length_us)
+    });
     LoadingFrame {
         difficulty,
         bga,
+        length,
         lifetime,
         now,
         load: skin_model::LoadState { since, percent },
@@ -12615,6 +12618,40 @@ pub(crate) mod tests {
             (Some(4), Some(true))
         );
         assert_eq!(read(2, Some(&update(2, None, None))), (None, None));
+    }
+
+    /// A loading frame's chart length is its lifetime's chosen chart's
+    /// library length in the same way: none before a publication, none
+    /// for a chart without one, and the model's frame carries it.
+    #[test]
+    fn a_loading_frame_reads_its_lifetimes_length() {
+        let update = |lifetime, length_us| {
+            let text = LoadingText {
+                chart: ChosenChart {
+                    length_us,
+                    ..ChosenChart::default()
+                },
+                ..LoadingText::default()
+            };
+            crate::loading_state::LifetimeState::new(lifetime, TimeUs(0), &text, None)
+                .apply(LoadInput::Stage(Stage::Chart))
+        };
+        let read = |lifetime, u: Option<&LoadingUpdate>| {
+            let f = super::loading_frame_of(
+                lifetime,
+                TimeUs(1_000),
+                u,
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            );
+            assert_eq!(f.model().length, f.length);
+            f.length
+        };
+        let l = TimeUs(125_400_000);
+        assert_eq!(read(1, None), None);
+        assert_eq!(read(1, Some(&update(1, Some(l)))), Some(l));
+        assert_eq!(read(2, Some(&update(2, None))), None);
     }
 
     /// Through the model's loading frame, an imported skin draws the

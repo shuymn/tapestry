@@ -184,8 +184,8 @@ pub struct DecisionDefs {
 /// The widgets only a play skin draws.
 #[derive(Clone, Debug, Default)]
 pub struct PlayDefs {
-    /// The ratio bars [`Source::RatioBar`] draws: each of a
-    /// [`RatioSource::Score`] source.
+    /// The ratio bars [`Source::RatioBar`] draws: each of a play's source
+    /// ([`RatioSource::play`]).
     pub ratio_bars: Vec<RatioBarDef>,
     /// The notes graphs [`Source::JudgeGraph`] draws: each of
     /// [`JudgeGraphKind::Notes`].
@@ -1484,14 +1484,9 @@ fn check_kind(
             .get(index(i))
             .map(|g| g.kind == JudgeGraphKind::Notes)
     };
-    // Whether a ratio bar element's source is a play's score rate, `None`
-    // for an unknown bar: a play skin refuses one here, a selection skin
-    // later.
-    let score = |i: u32| {
-        sel.ratio_bars
-            .get(index(i))
-            .map(|b| matches!(b.source, RatioSource::Score(_)))
-    };
+    // Whether a ratio bar element's source is a play's, `None` for an
+    // unknown bar: a play skin refuses one here, a selection skin later.
+    let score = |i: u32| sel.ratio_bars.get(index(i)).map(|b| b.source.play());
     for (element, e) in def.elements.iter().enumerate() {
         let ok = match kind {
             ScreenKind::Decision => match e.source {
@@ -1817,7 +1812,7 @@ impl Skin {
 
     /// Loads a play skin with the widgets only a play skin draws in
     /// `widgets`: the checks of [`new`](Self::new), and every ratio bar's
-    /// image exists, its source is a [`RatioSource::Score`] (an element
+    /// image exists, its source is a play's ([`RatioSource::play`]: an element
     /// drawing one of another source is refused,
     /// [`LoadError::SourceKind`]) and a slider's range is at most
     /// [`MAX_COORD`]. A play records no slider press.
@@ -2524,12 +2519,16 @@ impl Skin {
                     };
                     // A progress slider reads `time.progress_ppm`, which
                     // loading knows (0) and nothing else needs; a score
-                    // rate reads as its class.
+                    // rate reads as its class, a progress bar as its
+                    // field's.
                     let rate = match e.source {
                         Source::RatioBar(i) => match ratio_bars.get(index(i)).map(|b| b.def.source)
                         {
                             Some(RatioSource::Score(r)) => Need::of_class(Some(loading_rate(r)), 0),
-                            _ => Need::default(),
+                            Some(s) => s.field().map_or_else(Need::default, |(slot, _)| {
+                                Need::of_class(crate::loading_field(slot), 0)
+                            }),
+                            None => Need::default(),
                         },
                         _ => Need::default(),
                     };
@@ -4604,6 +4603,15 @@ impl Skin {
                             (RatioSource::Score(_), Phase::Loading { .. }) => {
                                 crate::selection::Ratio::new(0, 1)
                             }
+                            // A progress reads its field in the build's own
+                            // state, a play's or the loading runtime's.
+                            (
+                                RatioSource::LoadProgress | RatioSource::SongProgress,
+                                Phase::Play { .. } | Phase::Loading { .. },
+                            ) => b.source.field().and_then(|(slot, full)| {
+                                let v = state.fields.get(usize::from(slot))?;
+                                crate::selection::Ratio::new(u64::try_from(*v).ok()?, full)
+                            }),
                             _ => None,
                         };
                         if let Some(v) = value {

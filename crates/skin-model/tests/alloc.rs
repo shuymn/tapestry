@@ -2251,6 +2251,7 @@ fn build_does_not_allocate() {
     readouts_do_not_allocate(&loaded, &descs);
     rhythm_does_not_allocate(&descs);
     main_bpm_does_not_allocate(&descs);
+    progress_and_length_do_not_allocate(&descs);
     loading_does_not_allocate(&loaded, &views, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
@@ -2337,6 +2338,7 @@ fn build_does_not_allocate() {
             fix_hispeed: 0,
             difficulty: None,
             bga: None,
+            length: None,
             autoplay: false,
             now: TimeUs(ms * MS),
             load: LoadState {
@@ -2383,6 +2385,7 @@ fn loading_frame<'a>(
         fix_hispeed: 0,
         difficulty: (no % 7 != 6).then_some(u8::try_from(no % 6).unwrap()),
         bga: (no % 4 != 3).then_some(no % 8 < 4),
+        length: None,
         autoplay: no.is_multiple_of(2),
         now: TimeUs(since.0 + i64::try_from(no).unwrap() * 16 * MS),
         load: LoadState {
@@ -4367,6 +4370,198 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
         "{read:?}"
     );
     assert!(drawn > 0, "{drawn}");
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
+/// The load's and the play's progress bars (graphs 102 and 101) and the
+/// chart's 1× length (`chart.length_ms`, read by a `when` timer's
+/// program), over a play's frames from READY past its end, a rearm, a
+/// practice round at k = 10 and loading frames with and without a chosen
+/// length: nothing allocates; each bar draws, the length reads 125 400
+/// throughout; with a positive control.
+fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
+    let mut chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(2), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    chart.meta.length = TimeUs(125_400 * MS);
+    let rect = |r: [i32; 4]| {
+        let mut props = [None; 9];
+        for (p, v) in props.iter_mut().zip(r) {
+            *p = Some(v);
+        }
+        Track::new(
+            &[KeyDef {
+                at: TimeUs(0),
+                props,
+            }],
+            Ease::Linear,
+            End::Hold,
+        )
+        .unwrap()
+    };
+    let bar = |i: u32, r| ElementDef {
+        source: Source::RatioBar(i),
+        track: rect(r),
+        ..play_support::element(TimerRef::Builtin(timer::SCREEN), 0)
+    };
+    let ratio_bars = vec![
+        skin_model::RatioBarDef {
+            image: 0,
+            form: skin_model::RatioForm::Bar { vertical: false },
+            source: skin_model::RatioSource::LoadProgress,
+        },
+        skin_model::RatioBarDef {
+            image: 0,
+            form: skin_model::RatioForm::Bar { vertical: true },
+            source: skin_model::RatioSource::SongProgress,
+        },
+    ];
+    let skin = Skin::new_play(
+        play_support::def(
+            vec![bool_program("chart.length_ms == 125400")],
+            play_support::white_sheet(),
+            vec![
+                bar(0, [0, 0, 200, 20]),
+                bar(1, [300, 0, 20, 200]),
+                play_support::element(TimerRef::When(0), 400),
+            ],
+        ),
+        skin_model::PlayDefs {
+            ratio_bars,
+            ..skin_model::PlayDefs::default()
+        },
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let round = Section {
+        start: TimeUs(500 * MS),
+        end: TimeUs(1_200 * MS),
+        lead_in: TimeUs(0),
+        initial_gauges: vec![descs[0].start, descs[1].start],
+    };
+    let ctx = |attempt, speed| PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
+        autoplay: false,
+        gauges: descs,
+        attempt,
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(2_000 * MS),
+        bpm_range: None,
+        bpm_whole_change: None,
+        play_level: None,
+        score: skin_model::PlayScore {
+            speed,
+            ..skin_model::PlayScore::NONE
+        },
+    };
+    let full = ctx(
+        Attempt::Full {
+            lead_in: TimeUs(500 * MS),
+        },
+        bms_model::Speed::NORMAL,
+    );
+    let practice = ctx(
+        Attempt::Section(&round),
+        bms_model::Speed::from_twentieths(10).unwrap(),
+    );
+    let t = tally(0);
+    let gauges = [descs[0].start, descs[1].start].map(state);
+    let notes = NoteFacts::default();
+    let lanes = LaneView::NONE;
+    let frame = |now: i64| SkinFrame {
+        state_us: 0,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        turntable: 0,
+        lanes,
+        readouts: readouts_for(lanes),
+        app: skin_model::AppReadouts::LAUNCH,
+        playing: true,
+        closing: None,
+    };
+    let loading_frame = |no: i64| LoadingFrame {
+        app: skin_model::AppReadouts::LAUNCH,
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
+        difficulty: None,
+        bga: None,
+        length: (no % 3 != 2).then_some(TimeUs(125_400 * MS)),
+        autoplay: false,
+        now: TimeUs(no * 16 * MS),
+        load: LoadState {
+            since: TimeUs(0),
+            percent: i32::try_from(no % 101).unwrap(),
+        },
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        turntable: 0,
+        lanes,
+        covers: readouts_for(lanes).covers,
+        gauge: None,
+        play_level: None,
+    };
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut plays = [
+        skin.prepare(&chart, &full).unwrap(),
+        skin.prepare(&chart, &practice).unwrap(),
+    ];
+    let mut loading = skin.prepare_loading(Side::Left);
+    let (mut read, mut drawn, mut loading_drawn) = (Vec::with_capacity(1_024), 0, 0);
+    let mut results = Ok(());
+    TRACK.with(|t| t.set(true));
+    for play in &mut plays {
+        for pass in 0..2 {
+            if pass == 1 {
+                play.rearm();
+            }
+            for now in (-500 * MS..=3_000 * MS).step_by(16 * MS as usize) {
+                batch.clear();
+                results = results.and(skin.build(play, &frame(now), &uvs, &mut batch));
+                if read.len() < read.capacity() {
+                    read.push(play.state().fields[usize::from(field::CHART_LENGTH_MS)]);
+                }
+                drawn += batch.quads().len();
+            }
+        }
+    }
+    for no in 0..300 {
+        batch.clear();
+        results =
+            results.and(skin.build_loading(&mut loading, &loading_frame(no), &uvs, &mut batch));
+        loading_drawn += batch.quads().len();
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "progress and length: allocations"
+    );
+    assert_eq!(results, Ok(()));
+    assert!(
+        !read.is_empty() && read.iter().all(|&r| r == 125_400),
+        "{read:?}"
+    );
+    assert!(drawn > 0 && loading_drawn > 0, "{drawn} {loading_drawn}");
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

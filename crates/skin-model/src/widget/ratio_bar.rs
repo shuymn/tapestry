@@ -24,9 +24,41 @@ pub enum RatioSource {
     /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
     /// the settings.
     MasterVolume,
-    /// A play's score rate: a play skin's only source, and only a play
-    /// skin's.
+    /// A play's score rate: a play skin's source, and only a play skin's,
+    /// as the two below.
     Score(ScoreRate),
+    /// The load's progress, `load.percent / 100`: live while the play
+    /// screen loads, 1 in a play's frames.
+    LoadProgress,
+    /// The attempt's progress, `time.progress_ppm / 10⁶`: 0 while loading
+    /// and in READY, 1 from the attempt's end.
+    SongProgress,
+}
+
+impl RatioSource {
+    /// Whether it is a play's source, which only a play skin draws.
+    #[must_use]
+    pub const fn play(self) -> bool {
+        matches!(
+            self,
+            Self::Score(_) | Self::LoadProgress | Self::SongProgress
+        )
+    }
+
+    /// The play field it reads and the field's full scale, for the two
+    /// progress sources; `None` for any other.
+    #[must_use]
+    pub fn field(self) -> Option<(u16, u64)> {
+        use crate::play::schema::field;
+        match self {
+            Self::LoadProgress => Some((field::LOAD_PERCENT, 100)),
+            Self::SongProgress => Some((
+                field::TIME_PROGRESS_PPM,
+                u64::from(crate::play::schema::PROGRESS_FULL.unsigned_abs()),
+            )),
+            Self::ListPosition | Self::ExRate | Self::MasterVolume | Self::Score(_) => None,
+        }
+    }
 }
 
 /// A play's score rate, exact, with `ex` the EX score, `p` the judged
