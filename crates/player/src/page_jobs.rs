@@ -67,6 +67,11 @@ pub enum PageAt {
     Stopped,
     /// The measurement asks before a block.
     Block,
+    /// The bank's decode made its bank.
+    Decoded,
+    /// A Start promoted the page's job of this kind, on the game thread,
+    /// before it waits for it.
+    Promoted(JobKind),
 }
 
 /// A page job's test probe (tests).
@@ -242,6 +247,10 @@ pub fn spawn_page_bank(
                 },
             )
             .map(Arc::new);
+            #[cfg(test)]
+            if bank.is_ok() {
+                at(PageAt::Decoded);
+            }
             // Accounted from before the job began to its bank's
             // registration, before it is published (dev-tools).
             #[cfg(feature = "dev-tools")]
@@ -624,6 +633,26 @@ impl PageJobs {
     /// The gain was found without the page: no Start measures it.
     pub const fn known(&mut self) {
         self.gain_known = true;
+    }
+
+    /// Whether the page's measurement runs (tests).
+    #[cfg(test)]
+    pub const fn measuring(&self) -> bool {
+        self.measure.is_some()
+    }
+
+    /// Whether the page's bank job runs (tests).
+    #[cfg(test)]
+    pub const fn decoding(&self) -> bool {
+        self.bank.is_some()
+    }
+
+    /// Says `at` to the jobs' probe, on the game thread (tests).
+    #[cfg(test)]
+    pub fn probe(&self, at: PageAt) {
+        if let Some(probe) = &self.probe {
+            probe(at);
+        }
     }
 
     /// The chart claimed from the background under `key`, the claim

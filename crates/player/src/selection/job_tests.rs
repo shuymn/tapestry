@@ -1373,3 +1373,5 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
     });
     assert_eq!(witnessed(&b), (2, Vec::new()));
 }
+
+mod page;
