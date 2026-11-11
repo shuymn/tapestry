@@ -342,12 +342,12 @@ fn a_helper_with_known_arguments_lowers_as_a_conditional() {
 #[test]
 fn r4_conditionals_need_all_four_proofs() {
     use Disposition::{Lowered, Replaced};
-    // int-or-bool: a string value is no type a number takes; a raw timer
-    // value is an integer of no known bound (its start or the off value),
-    // which a number's value may not convert.
+    // int-or-bool: a string value is no type a number takes, nor a raw
+    // timer value (its start or the off value), which no backend reads as
+    // a value.
     for (value, why) in [
         ("function() return ms.text(1) end", Unsupported::Type),
-        ("function() return ms.timer(41) end", Unsupported::Range),
+        ("function() return ms.timer(41) end", Unsupported::Type),
     ] {
         let entry = number("", value);
         assert!(closed(&entry), "{value}");
@@ -750,130 +750,29 @@ fn integers_follow_the_source_s_double_model() {
     }
 }
 
-/// Folding equals evaluation past 2^53: a number's value folded from
-/// literals at import gives what the program gives when it runs the same
-/// operations on reads of those values, each built in the frame from
-/// fields of non-default values (a read is an `i32`, so `n = 2^53` is
-/// `2^27 · 2^26`). The program's side is a verified program built by hand
-/// with the instructions the compiler emits. The value ends in the floor
-/// of `% 2^32`, an integer the expressions hold, so the fold lowers to it;
-/// each pair checks the value, the fold's disposition and the run's
-/// availability, so neither side passes by giving a default 0.
+/// Folding equals evaluation past 2^53, the folded half: a number's value
+/// folded from literals at import. The value ends in the floor of
+/// `% 2^32`, an integer the expressions hold, so the fold lowers to it.
+/// The executed half, the same operations compiled into the program over
+/// reads of those values, with the same expected values, is
+/// `tests/lua_callbacks.rs` `folding_past_2_53_equals_the_compiled_program`.
 #[test]
 fn folding_past_2_53_equals_evaluation() {
-    use skin_model::present::{
-        Arith, Bank, CallbackDef, Clock, Conv, Insn, Io, MathFn, OutTy, Present, PresentDef,
-        ReadDef, Val,
-    };
-    let field = |name: &str| PLAY.fields.iter().position(|f| f.name == name).unwrap();
-    let (x, y) = (field("time.elapsed_s"), field("best.rate_ppm"));
-    let read = |name: &str| ReadDef {
-        value: compile(name, &Scope::new(&PLAY), Ty::Int).unwrap(),
-        guard: None,
-    };
-    // Reads `a` and `b`, then `a * b`, then each of `ops` with its
-    // constant, in order, then `math.floor`.
-    let run_program = |a: i32, b: i32, ops: &[(Arith, i64)]| {
-        let mut code = vec![
-            Insn::Read { dst: 0, read: 0 },
-            Insn::Read { dst: 1, read: 1 },
-            Insn::Arith {
-                op: Arith::Mul,
-                dst: 0,
-                a: 0,
-                b: 1,
-            },
-        ];
-        for (k, &(op, _)) in ops.iter().enumerate() {
-            code.push(Insn::Const {
-                dst: 1,
-                k: u16::try_from(k).unwrap(),
-            });
-            code.push(Insn::Arith {
-                op,
-                dst: 0,
-                a: 0,
-                b: 1,
-            });
-        }
-        code.push(Insn::Math {
-            f: MathFn::Floor,
-            dst: 0,
-            a: 0,
-        });
-        code.push(Insn::Ret { src: 0 });
-        let def = PresentDef {
-            callbacks: vec![CallbackDef {
-                start: 0,
-                len: u16::try_from(code.len()).unwrap(),
-                regs: 2,
-                conv: Conv::Int,
-                gate: None,
-                after: None,
-            }],
-            code,
-            consts: ops.iter().map(|&(_, k)| Val::Int(k)).collect(),
-            reads: vec![read("time.elapsed_s"), read("best.rate_ppm")],
-            signature: vec![OutTy::Int],
-            slots: vec![],
-            domains: vec![],
-        };
-        let p =
-            Present::verify(def, PLAY.fields.len(), &mut skin_model::SkinOps::default()).unwrap();
-        let mut fields = vec![0; PLAY.fields.len()];
-        fields[x] = a;
-        fields[y] = b;
-        let state = State {
-            fields: &fields,
-            timers: &[],
-        };
-        let mut outs = [0; 2];
-        p.run(&mut Io {
-            state: &state,
-            clock: Clock {
-                state_us: 0,
-                now: bms_model::TimeUs(0),
-            },
-            bank: &mut Bank::default(),
-            outs: &mut outs,
-            timers: &mut [],
-            slots: true,
-        });
-        outs
-    };
-    let (mul, add, rem) = (Arith::Mul, Arith::Add, Arith::Mod);
-    let m = 1_i64 << 32;
-    for (folded, a, b, ops, want) in [
+    for (folded, want) in [
         // A: the product's tie rounds, then the product by 3 again (rounded
         // once at the end, 2 134 900 732).
         (
             "math.floor(2147483647 * 4194305 * 3 % 4294967296)",
-            2_147_483_647,
-            4_194_305,
-            vec![(mul, 3), (rem, m)],
             2_134_900_736,
         ),
         // B: 2^53 + 1 rounds to 2^53, and + 1 again: 0 (exactly, 2).
-        (
-            "math.floor((134217728 * 67108864 + 1 + 1) % 4294967296)",
-            134_217_728,
-            67_108_864,
-            vec![(add, 1), (add, 1), (rem, m)],
-            0,
-        ),
+        ("math.floor((134217728 * 67108864 + 1 + 1) % 4294967296)", 0),
         // Its control: 2^53 + 2 is exact.
-        (
-            "math.floor((134217728 * 67108864 + 1 + 2) % 4294967296)",
-            134_217_728,
-            67_108_864,
-            vec![(add, 1), (add, 2), (rem, m)],
-            2,
-        ),
+        ("math.floor((134217728 * 67108864 + 1 + 2) % 4294967296)", 2),
     ] {
         let r = run(&number("", &format!("function() return {folded} end")));
         assert_eq!(r.callbacks, [Disposition::Lowered], "{folded}");
-        assert_eq!(r.lowered, [want.to_string()], "{folded}");
-        assert_eq!(run_program(a, b, &ops), [want, 1], "{folded}");
+        assert_eq!(r.lowered, [i64::to_string(&want)], "{folded}");
     }
 }
 

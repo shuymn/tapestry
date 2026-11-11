@@ -14,13 +14,14 @@
 //! Every node the evaluation reached is checked before anything is
 //! emitted, whether or not its value reaches the result, since Lua runs it
 //! all the same: every integer is bounded from the ranges of what it reads,
-//! and an integer arithmetic result, and an integer a number's value
-//! converts, must lie within ±2^53, where the source's doubles hold it
-//! exactly, so nothing wraps and the source's double path agrees; an
-//! integer `//` whose divisor can be 0 is refused, since Lua 5.4 raises
-//! there (the source has no `//`; its `%` by 0 is NaN, which the program
-//! keeps). A `math.floor` or `ceil` of a float is an integer of no known
-//! bound. And every read a reached path performs keeps its availability:
+//! each bound clamped to ±2^53, the program's integers. A node whose bounds
+//! would leave ±2^53 may hold the source's double instead (the program's
+//! integer arithmetic gives it there), and so may every node that uses
+//! it, so a `math.floor` or `ceil` of it is bounded as of a float: of no
+//! known bound within ±2^53. An integer `//` whose divisor can be 0 is
+//! refused, since Lua 5.4 raises there (the source has no `//`; its `%`
+//! by 0 is NaN, which the program keeps). And every read a reached path
+//! performs keeps its availability:
 //! the guards of reads whose values are discarded are read first, so an
 //! unavailable one gives no value, as a lowered expression's joined guards
 //! do. Each refusal is [`Unsupported`] and follows the callback's role.
@@ -385,13 +386,19 @@ pub(crate) fn slots<L: Leaves>(
 /// An integer part's bounds, `None` for a node that is never an integer.
 pub(crate) type Iv = Option<(i128, i128)>;
 
-const FULL: Iv = Some((i64::MIN as i128, i64::MAX as i128));
+/// An integer of no known bound: any the program holds, within ±2^53.
+fn full() -> Iv {
+    let e = i128::from(EXACT);
+    Some((-e, e))
+}
 
-fn exact(iv: Iv) -> R<Iv> {
+/// `iv` clamped to ±2^53, and whether it left them: there the node may
+/// hold the source's double rather than an integer.
+fn clamp(iv: Iv) -> (Iv, bool) {
     let e = i128::from(EXACT);
     match iv {
-        Some((lo, hi)) if lo < -e || hi > e => Err(Stop::Unsupported(Unsupported::Range)),
-        _ => Ok(iv),
+        Some((lo, hi)) => (Some((lo.clamp(-e, e), hi.clamp(-e, e))), lo < -e || hi > e),
+        None => (None, false),
     }
 }
 
@@ -413,19 +420,27 @@ fn floor_div(a: i128, b: i128) -> i128 {
 }
 
 /// Every node of `res` checked, operands before the nodes that use them,
-/// each node that may be an integer given bounds (the whole of `i64` when
-/// nothing narrower is known), each that never is none,
-/// before either backend is chosen (a lowered expression too runs every
-/// reached operation in the source):
-/// its integer part's bounds, each arithmetic result's within ±2^53 and
-/// each integer `//`'s divisor proven nonzero.
+/// each node that may be an integer given bounds (±2^53 when nothing
+/// narrower is known), each that never is none, before either backend is
+/// chosen (a lowered expression too runs every reached operation in the
+/// source): its integer part's bounds, clamped to ±2^53, and each integer
+/// `//`'s divisor proven nonzero.
+///
+/// Every integer a node holds at run time lies within its bounds. Bounds
+/// that would leave ±2^53 mark the node: there the program's integer
+/// arithmetic gives the source's double, which later operations may bring
+/// back anywhere within ±2^53, so every node using a marked one is marked
+/// too, and a `math.floor` or `ceil` of a marked node, like one of a
+/// float, is of no known bound.
 pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) -> R<Vec<Iv>> {
     let n = res.len();
     let mut ivs: Vec<Iv> = Vec::with_capacity(n as usize);
+    let mut marks: Vec<bool> = Vec::with_capacity(n as usize);
     for r in 0..n {
         charge(an, "compile:interval", 1)?;
         did("compile:interval");
         let get = |x: u32| ivs.get(x as usize).copied().flatten();
+        let marked = |x: u32| marks.get(x as usize).copied().unwrap_or(false);
         let ints = |x: u32| res.kind(x) & INT != 0;
         let iv = match res.node(r) {
             Node::Known(Val::Int(k)) => Some((i128::from(k), i128::from(k))),
@@ -433,7 +448,7 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                 .range(r)
                 .map(|(lo, hi)| (i128::from(lo), i128::from(hi))),
             Node::StateUs => Some((-i128::from(CLOCK), i128::from(CLOCK))),
-            Node::Neg(x) => exact(get(x).map(|(lo, hi)| (-hi, -lo)))?,
+            Node::Neg(x) => get(x).map(|(lo, hi)| (-hi, -lo)),
             // Both operands bounded: both may be integers (bounds are
             // given exactly to the nodes that may be).
             Node::Arith(op, a, b) => match (get(a), get(b)) {
@@ -444,17 +459,19 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                         let hi = c.iter().copied().max().unwrap_or(0);
                         Some((lo, hi))
                     };
+                    // Every bound is within ±2^53, so no corner passes
+                    // 2^106.
                     match op {
-                        Bin::Add => exact(corners(&|p, q| p + q))?,
-                        Bin::Sub => exact(corners(&|p, q| p - q))?,
-                        Bin::Mul => exact(corners(&|p, q| p.saturating_mul(q)))?,
+                        Bin::Add => corners(&|p, q| p + q),
+                        Bin::Sub => corners(&|p, q| p - q),
+                        Bin::Mul => corners(&|p, q| p * q),
                         Bin::Div => None,
                         Bin::IDiv if bl <= 0 && bh >= 0 => {
                             return Err(Stop::Unsupported(Unsupported::Construct(
                                 "an integer // whose divisor can be 0",
                             )));
                         }
-                        Bin::IDiv => exact(corners(&floor_div))?,
+                        Bin::IDiv => corners(&floor_div),
                         // `%`, the source's `a - b * floor(a / b)` in
                         // doubles: exact, so smaller than the divisor in
                         // magnitude (NaN, a float, for a zero divisor),
@@ -468,7 +485,7 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                             if a_max + m < i128::from(EXACT) {
                                 (m > 0).then_some((1 - m, m - 1))
                             } else {
-                                FULL
+                                full()
                             }
                         }
                     }
@@ -476,27 +493,35 @@ pub(crate) fn intervals<L: Leaves>(an: &Analysis, leaves: &L, res: &Residual) ->
                 _ => None,
             },
             Node::Math(f, a, b) => match f {
-                MathOp::Floor | MathOp::Ceil if res.kind(a) & FLT != 0 => FULL,
+                MathOp::Floor | MathOp::Ceil if res.kind(a) & FLT != 0 || marked(a) => full(),
                 MathOp::Floor | MathOp::Ceil => get(a),
-                MathOp::Abs => exact(get(a).map(|(lo, hi)| {
+                MathOp::Abs => get(a).map(|(lo, hi)| {
                     let low = if lo <= 0 && hi >= 0 {
                         0
                     } else {
                         lo.abs().min(hi.abs())
                     };
                     (low, lo.abs().max(hi.abs()))
-                }))?,
+                }),
                 MathOp::Max | MathOp::Min => hull(get(a), get(b)),
             },
             Node::Select { then, other, .. } => hull(get(then), get(other)),
             _ => None,
         };
+        // A node using a marked one may hold a double too.
+        let uses = match res.node(r) {
+            Node::Neg(x) => marked(x),
+            Node::Arith(_, a, b) | Node::Math(_, a, b) => marked(a) || marked(b),
+            Node::Select { then, other, .. } => marked(then) || marked(other),
+            _ => false,
+        };
+        let (iv, left) = clamp(iv);
         // "Of no known bound" is not "never an integer": a node that may
         // be an integer and that no rule above bounds (a timer read, whose
-        // start or off value is any `long`) gets the whole of `i64`, so
-        // arithmetic on it meets the ±2^53 rule.
-        let iv = if ints(r) { iv.or(FULL) } else { None };
+        // start or off value is any `long`) gets the whole of ±2^53.
+        let iv = if ints(r) { iv.or_else(full) } else { None };
         ivs.push(iv);
+        marks.push(left || uses);
     }
     Ok(ivs)
 }
@@ -511,15 +536,13 @@ struct C<'a, L> {
 /// `res`, converted by `conv` (a `draw`, a number's value or a timer),
 /// compiled into one callback, its slots `slots` proven ([`slots`]).
 ///
-/// `root` is the root's integer bounds from [`intervals`], run before the
-/// backend was chosen; each node is charged again here, as the walk it
-/// replaces was.
+/// [`intervals`] ran before the backend was chosen; each node is charged
+/// again here, as the walk it replaces was.
 pub(crate) fn compile<L: Leaves>(
     an: &Analysis,
     leaves: &mut L,
     res: &Residual,
     conv: Conv,
-    root: Iv,
     slots: &[Slot],
 ) -> R<Compiled> {
     let conv = match conv {
@@ -532,9 +555,6 @@ pub(crate) fn compile<L: Leaves>(
     for _ in 0..res.len() {
         charge(an, "compile:interval", 1)?;
         did("compile:interval");
-    }
-    if conv == present::Conv::Int {
-        exact(root)?;
     }
     let guards = leaves.guards(res);
     let mut c = C {

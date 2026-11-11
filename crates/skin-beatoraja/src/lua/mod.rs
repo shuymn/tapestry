@@ -48,6 +48,8 @@ pub(crate) mod callback;
 mod callback_tests;
 mod clock;
 pub(crate) mod compile;
+#[cfg(test)]
+mod compile_tests;
 mod config;
 mod convert;
 mod effects;
