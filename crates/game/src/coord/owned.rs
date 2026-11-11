@@ -166,8 +166,8 @@ impl Coordinator {
     /// # Errors
     ///
     /// A job of `key` already runs (of any kind of result):
-    /// [`Failure::AlreadyRuns`], nothing is replaced or joined. Or the thread could not start: the job ended
-    /// cancelled and holds nothing.
+    /// [`Failure::AlreadyRuns`], nothing is replaced or joined. Or the
+    /// thread could not start: the job ended cancelled and holds nothing.
     pub fn spawn_owned<T, W, C>(
         &self,
         spawner: Spawner,
