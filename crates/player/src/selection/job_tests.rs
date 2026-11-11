@@ -150,6 +150,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         script: None,
         coord: coord.clone(),
         spawner,
+        page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
         decodes: Some(Arc::clone(&decodes)),
         after_bank: None,
         unload_fault: None,
@@ -414,42 +415,6 @@ fn a_bank_panic_fails_the_load() {
         })
     );
     assert!(!installed);
-    assert_eq!(analysis(&b.decodes), None);
-    assert_eq!(b.coord.held(Class::Foreground), 0);
-}
-
-/// F7: a panic in the Measure job's 1× decode (a load at 1.5×) is not the
-/// analysis's: it fails the load, naming the measurement.
-#[test]
-fn a_1x_decode_panic_fails_the_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
-    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
-    let decodes = decodes_with(hook(|p, _, _| {
-        assert_ne!(
-            p,
-            Probe::Decode(Speed::NORMAL),
-            "injected 1x decode panic (test)"
-        );
-    }));
-    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
-    let (got, installed) = on_rig(
-        b.sel.take().unwrap(),
-        &Installers::default(),
-        false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
-    );
-    let Loading::Failed(LoadFailure {
-        job: JobKind::Measure,
-        cause: Failure::Panicked(JobPanic(why)),
-    }) = &got
-    else {
-        panic!("{got:?}");
-    };
-    assert!(why.contains("injected 1x decode panic (test)"), "{why}");
-    assert!(installed);
-    let speeds: Vec<_> = begun(&b.decodes);
-    assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
     assert_eq!(analysis(&b.decodes), None);
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
@@ -763,14 +728,11 @@ fn closing_while_the_bank_decodes_ends_the_run() {
 
 /// Z14: a scoped decode's own cancel reads the run's controls. The quit
 /// key pressed as the decode begins, the game thread's wait held so that it
-/// never stops the job, stops the decode by itself: the Bank's at 1×, and
-/// at 1.5× the Measure job's 1× decode (`at_normal`). No bank is made.
+/// never stops the job, stops the Bank's decode by itself. No bank is made.
 #[test]
 fn a_quit_stops_the_scoped_decode_by_itself() {
-    for (speed, kind, ends) in [
-        (Speed::NORMAL, JobKind::Bank, 1),
-        (Speed::FASTEST, JobKind::Measure, 2),
-    ] {
+    let (speed, kind, ends) = (Speed::NORMAL, JobKind::Bank, 1);
+    {
         let dir = tempfile::tempdir().unwrap();
         let path = song(dir.path(), "");
         let loaded = loaded(dir.path(), &path, speed);
@@ -797,12 +759,7 @@ fn a_quit_stops_the_scoped_decode_by_itself() {
         );
         assert_eq!(got, Loading::Cancelled, "{kind:?}");
         let banks: Vec<Speed> = decoded(&b.decodes).iter().map(|d| d.0).collect();
-        let want: &[Speed] = if speed == Speed::NORMAL {
-            &[]
-        } else {
-            &[Speed::FASTEST]
-        };
-        assert_eq!(banks, want, "{kind:?}: the 1× decode made a bank");
+        assert_eq!(banks, [], "{kind:?}: the decode made a bank");
         assert_eq!(b.coord.held(Class::Foreground), 0);
         // The hook held the record: let it go.
         ended.lock().unwrap().take();
@@ -886,45 +843,6 @@ fn a_quit_inside_the_running_analysis_leaves_it_to_the_background() {
 #[test]
 fn closing_inside_the_running_analysis_ends_the_run() {
     leave_inside_the_running_analysis(Leave::Close);
-}
-
-/// F16b: a load at 1.5×; `how` from inside the Measure job's 1× decode,
-/// held until the wait asked the job to stop: the load is cancelled. A
-/// quit leaves the chart to the background; a close leaves nothing.
-fn leave_during_the_1x_decode(how: Leave) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
-    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
-    let (hook, stopped) = leave_at(Probe::Decode(Speed::NORMAL), how);
-    let decodes = decodes_with(hook);
-    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
-    let s = b.sel.take().unwrap();
-    let b = b;
-    on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
-        assert!(
-            stopped.load(Ordering::SeqCst),
-            "the wait never stopped the job"
-        );
-        assert!(installed(rig, &loaded));
-        let speeds: Vec<_> = begun(&b.decodes);
-        assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
-        assert_eq!(b.coord.held(Class::Foreground), 0);
-        // Looked up only now: a look-up takes a job waiting in the
-        // background as the load's own.
-        left_to_background(&b, rig, how);
-        assert!(unmeasured(rig, &loaded));
-    });
-}
-
-#[test]
-fn a_quit_during_the_1x_decode_leaves_the_measurement_to_the_background() {
-    leave_during_the_1x_decode(Leave::Quit);
-}
-
-#[test]
-fn closing_during_the_1x_decode_ends_the_run() {
-    leave_during_the_1x_decode(Leave::Close);
 }
 
 /// F19: the screen's load of the chart held on the render thread, the
@@ -1081,46 +999,10 @@ fn a_decode_takes_permits_only_for_workers_that_run() {
     for speed in [Speed::NORMAL, Speed::FASTEST] {
         for k in 0..game::coord::FOREGROUND_PERMITS {
             let d = load_beside(k, 1, speed);
-            let mut want = vec![(speed, 1, 0)];
-            if speed != Speed::NORMAL {
-                want.push((Speed::NORMAL, 1, 0));
-            }
-            assert_eq!(decoded(&d), want, "k = {k}, {speed:?}");
+            assert_eq!(decoded(&d), [(speed, 1, 0)], "k = {k}, {speed:?}");
         }
     }
 }
-
-/// F23: a load at 1.5× with `k` foreground permits held elsewhere: the
-/// Measure job's 1× decode draws the free permits as the Bank decode does.
-#[test]
-fn a_measurement_decode_draws_free_foreground_permits() {
-    for k in 0..game::coord::FOREGROUND_PERMITS {
-        let d = load_beside(k, 4, Speed::FASTEST);
-        let workers = granted(k, 4);
-        assert_eq!(
-            begun_held(&d),
-            [(Speed::FASTEST, k + 1), (Speed::NORMAL, k + 1)],
-            "k = {k}"
-        );
-        assert_eq!(
-            decoded(&d),
-            [(Speed::FASTEST, workers, 0), (Speed::NORMAL, workers, 0)],
-            "k = {k}"
-        );
-    }
-}
-
-/// F23: the 1× decode's extra permits are given back before the analysis,
-/// which runs on its job's one: k + 1 held.
-#[test]
-fn a_measurement_holds_one_permit_during_its_analysis() {
-    for k in 0..game::coord::FOREGROUND_PERMITS {
-        let d = load_beside(k, 4, Speed::FASTEST);
-        assert_eq!(analysis(&d), Some(k + 1), "k = {k}");
-    }
-}
-
-// --- The measurement's own outcomes (F6, F27-F31) ---
 
 /// A load whose measurement plays at the headroom: ready and installed,
 /// the gain the headroom, nothing kept.
@@ -1208,79 +1090,6 @@ fn a_cached_gain_begins_no_measure_job() {
     );
     assert_eq!(b.coord.held(Class::Foreground), 0);
 }
-
-/// F30: a load at 1.5× whose chart file is gone before the Measure job
-/// reads it again at 1×: no 1× decode, and it plays at the headroom.
-#[test]
-fn an_unreadable_1x_chart_plays_at_the_headroom() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
-    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
-    let gone = path.clone();
-    let decodes = decodes_with(hook(move |p, _, _| {
-        if p == Probe::BeforeMeasure {
-            std::fs::remove_file(&gone).unwrap();
-        }
-    }));
-    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
-    on_rig(
-        b.sel.take().unwrap(),
-        &Installers::default(),
-        false,
-        |rig| {
-            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
-            assert!(installed(rig, &loaded));
-            assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
-            assert!(unmeasured(rig, &loaded));
-        },
-    );
-    let speeds: Vec<_> = begun(&b.decodes);
-    assert_eq!(speeds, [Speed::FASTEST], "the 1× bank was decoded");
-    assert_eq!(b.coord.held(Class::Foreground), 0);
-}
-
-/// F31: a load at 1.5× whose sound file is replaced between its bank and
-/// the Measure job's 1× reread: the 1× bank's key is another, so nothing
-/// is analyzed or kept under either key, and it plays at the headroom.
-#[test]
-fn a_sound_changed_between_the_speed_bank_and_its_1x_reread_plays_at_the_headroom() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
-    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
-    let before = key_now(&loaded);
-    let songs = dir.path().to_owned();
-    let decodes = decodes_with(hook(move |p, _, _| {
-        if p == Probe::BeforeMeasure {
-            write_sound(&songs, 300);
-        }
-    }));
-    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
-    on_rig(
-        b.sel.take().unwrap(),
-        &Installers::default(),
-        false,
-        |rig| {
-            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
-            assert!(installed(rig, &loaded));
-            assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
-            // Neither the old sounds' key nor the new ones' was kept.
-            let (chart, bank) = &before;
-            assert!(
-                sel(rig)
-                    .shelf
-                    .look_up(chart, bank, "a.bms", loaded.path())
-                    .is_some()
-            );
-            assert!(unmeasured(rig, &loaded));
-        },
-    );
-    let speeds: Vec<_> = begun(&b.decodes);
-    assert_eq!(speeds, [Speed::FASTEST, Speed::NORMAL]);
-    assert_eq!(analysis(&b.decodes), None, "analyzed under another key");
-    assert_eq!(b.coord.held(Class::Foreground), 0);
-}
-
-// --- The release barrier and its witness (C21) ---
 
 /// Where a hook finds the bench's witness once it exists.
 type WitnessSlot = Arc<Mutex<Option<Arc<crate::bank_witness::BankWitness>>>>;
@@ -1376,36 +1185,6 @@ fn every_start_releases_the_previous_starts_bank_first() {
     assert_eq!(seen[0], (0, 0));
     assert!(seen[1..].iter().all(|&s| s == (0, 1)), "{seen:?}");
     assert_eq!(witnessed(&b), (speeds.len(), Vec::new()));
-    slot.lock().unwrap().take();
-}
-
-/// B9: a load at 1.5× whose gain is unknown measures on a 1× bank decoded
-/// beside the installed 1.5× bank: two banks alive then, within the
-/// registration's bound, and the barrier does not run before it.
-#[test]
-fn the_measurement_decode_beside_the_installed_bank_is_bounded() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = song(dir.path(), "");
-    let loaded = loaded(dir.path(), &path, Speed::FASTEST);
-    let slot: WitnessSlot = Arc::new(Mutex::new(None));
-    let at_analysis = Arc::new(Mutex::new(None));
-    let (w, a) = (Arc::clone(&slot), Arc::clone(&at_analysis));
-    let decodes = decodes_with(hook(move |p, _, _| {
-        if p == Probe::Analysis
-            && let Some(w) = w.lock().unwrap().as_ref()
-        {
-            *a.lock().unwrap() = Some(w.now());
-        }
-    }));
-    let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
-    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
-    let s = b.sel.take().unwrap();
-    on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
-    });
-    assert_eq!(begun(&b.decodes), [Speed::FASTEST, Speed::NORMAL]);
-    assert_eq!(*at_analysis.lock().unwrap(), Some((0, 2)));
-    assert_eq!(witnessed(&b), (1, Vec::new()));
     slot.lock().unwrap().take();
 }
 
@@ -1595,3 +1374,5 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
     });
     assert_eq!(witnessed(&b), (2, Vec::new()));
 }
+
+mod page;

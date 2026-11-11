@@ -416,6 +416,17 @@ enum SkinStep {
     Running(Box<crate::imports::Specializing>),
 }
 
+/// How a run's rig ended ([`PlayerRig::shut_down`]).
+#[must_use]
+#[derive(Debug)]
+pub struct Shutdown {
+    /// How the render thread ended.
+    pub rendered: RenderEnd,
+    /// A panic of a practice page job a Start was responsible for, found
+    /// as the run ended: the run ends with it.
+    pub page: Result<(), game::coord::LoadFailure>,
+}
+
 impl PlayerRig<'_> {
     /// The result skin's image stage for the attempt (design D11), begun
     /// after the play skin's specialization and before READY with what the
@@ -1085,18 +1096,36 @@ impl PlayerRig<'_> {
         self.adjust.as_mut().map(|d| (d, pump))
     }
 
+    /// The practice page's jobs end with the run, within the bound: what
+    /// their settle found that the run ends with.
+    pub(crate) fn page_at_end(&mut self) -> Result<(), game::coord::LoadFailure> {
+        self.selection
+            .as_mut()
+            .and_then(|sel| {
+                sel.page
+                    .leave(Some(&mut sel.shelf), &mut || {
+                        Some(crate::page_jobs::Terminal)
+                    })
+                    .failure()
+            })
+            .map_or(Ok(()), Err)
+    }
+
     /// Writes changed settings, then ends the render and audio threads;
-    /// how the render thread ended: when [`RenderEnd::Stuck`], the window
-    /// must stay open until the process exits.
-    #[must_use]
-    pub fn shut_down(mut self) -> RenderEnd {
+    /// how the render thread ended (when [`RenderEnd::Stuck`], the window
+    /// must stay open until the process exits), and what the practice
+    /// page's jobs left that the run ends with.
+    pub fn shut_down(mut self) -> Shutdown {
+        // A panic a Start was responsible for ends the run with it, after the
+        // rest of the cleanup.
+        let page = self.page_at_end();
         // A preparation still running settles its job before the render
         // thread and the skins go.
         self.end_prep();
         self.persist();
-        let ended = self.render.exit();
+        let rendered = self.render.exit();
         self.audio.exit();
-        ended
+        Shutdown { rendered, page }
     }
 
     /// Writes the settings keys' values to `device.toml` and
