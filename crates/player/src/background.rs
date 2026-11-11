@@ -1946,4 +1946,374 @@ pub(crate) mod tests {
         assert!(calls.none());
         assert_eq!(held(&coord), (0, 0));
     }
+
+    /// The practice page's claim against the background (P16), through the
+    /// production measurement: every interleaving a test asserts is held at
+    /// a meeting point (the thread's pop, a check inside its analysis, the
+    /// claim between its decision and its take), never timed. Analyses are
+    /// counted where every real one begins ([`crate::loudness::analyses`]),
+    /// each test on a chart of its own.
+    mod claims {
+        use std::sync::mpsc::{self, Receiver, Sender};
+        use std::sync::{Arc, Mutex};
+
+        use game::coord::Coordinator;
+        use library::LoudnessKey;
+
+        use super::super::{Claim, Job, Measure, Worker};
+        use super::{CAPS, Mode, WATCHDOG, results, try_pop};
+        use crate::loudness::analyses;
+        use crate::loudness::fixture::{RATE, square, wav};
+
+        /// A chart of its own (`tag` makes its hash), its sounds written:
+        /// the background's job of it, its 1× key and its resolved hash.
+        struct Song {
+            _dir: tempfile::TempDir,
+            job: Job,
+            key: LoudnessKey,
+            hash: [u8; 32],
+            chart: bms_model::Chart,
+        }
+
+        fn song(tag: &str) -> Song {
+            let (dir, loaded) = crate::imports::facts::tests::loaded_kept(
+                &format!("#TITLE {tag}\n#WAV01 a.wav\n#00101:01\n"),
+                "beatoraja-style",
+            );
+            std::fs::write(dir.path().join("a.wav"), wav(&square(1.0, 4_000))).unwrap();
+            // Read as the thread reads it, so the keys are the thread's.
+            let chart = loaded
+                .source()
+                .read(
+                    &game::Parts::unsaved(&game::PlayerSettings::default()),
+                    bms_model::Speed::NORMAL,
+                )
+                .unwrap();
+            let bank = audio::load_bank_at(
+                &chart,
+                RATE,
+                audio::Speed::NORMAL,
+                &audio::BankLimits::default(),
+            )
+            .unwrap();
+            let key = crate::loudness::key(&chart, &bank).unwrap();
+            Song {
+                _dir: dir,
+                job: Job {
+                    source: loaded.source(),
+                    rate: RATE,
+                    name: tag.to_owned(),
+                },
+                key,
+                hash: chart.identity.resolved_hash,
+                chart,
+            }
+        }
+
+        /// The page's own measurement of `song`: one real analysis.
+        fn page_measures(song: &Song) {
+            let bank = Arc::new(
+                audio::load_bank_at(
+                    &song.chart,
+                    RATE,
+                    audio::Speed::NORMAL,
+                    &audio::BankLimits::default(),
+                )
+                .unwrap(),
+            );
+            let mut cancelled = || false;
+            let _ = crate::loudness::analyze(&song.chart, bank, &mut cancelled);
+        }
+
+        /// A hold at the first check inside an analysis of a chart: armed
+        /// with its hash, it says when the thread is there and waits for
+        /// `go`.
+        #[derive(Default)]
+        struct Hold {
+            armed: Mutex<Option<[u8; 32]>>,
+            at: Mutex<Option<Sender<()>>>,
+            go: Mutex<Option<Receiver<()>>>,
+        }
+
+        impl Hold {
+            /// Arms it for the next analysis of the chart `hash`; the
+            /// channel says when it holds, the sender lets it go.
+            fn arm(&self, hash: [u8; 32]) -> (Receiver<()>, Sender<()>) {
+                let (at_tx, at) = mpsc::channel();
+                let (go, go_rx) = mpsc::channel();
+                *self.at.lock().unwrap() = Some(at_tx);
+                *self.go.lock().unwrap() = Some(go_rx);
+                *self.armed.lock().unwrap() = Some(hash);
+                (at, go)
+            }
+
+            fn check(&self, hash: [u8; 32], began: usize) {
+                if analyses::of(hash) <= began {
+                    return;
+                }
+                if self.armed.lock().unwrap().take_if(|h| *h == hash).is_none() {
+                    return;
+                }
+                if let Some(at) = self.at.lock().unwrap().take() {
+                    let _ = at.send(());
+                }
+                if let Some(go) = self.go.lock().unwrap().take() {
+                    let _ = go.recv();
+                }
+            }
+        }
+
+        /// A worker on the production measurement, each job held by `hold`
+        /// at its first check inside its analysis when armed.
+        fn started(hold: &Arc<Hold>) -> (Worker, Coordinator) {
+            let hold = Arc::clone(hold);
+            let measure: Measure = Box::new(move |job, stop| {
+                let hash = job
+                    .source
+                    .read(
+                        &game::Parts::unsaved(&game::PlayerSettings::default()),
+                        bms_model::Speed::NORMAL,
+                    )
+                    .map(|c| c.identity.resolved_hash)
+                    .unwrap_or_default();
+                let began = analyses::of(hash);
+                let gated = || {
+                    hold.check(hash, began);
+                    stop()
+                };
+                super::super::measure(job, &gated)
+            });
+            let coord = Coordinator::new(CAPS);
+            let mode = Arc::new(Mode::default());
+            let worker = Worker::start(measure, coord.clone(), mode as _).unwrap();
+            (worker, coord)
+        }
+
+        /// A wait for the thread to be past `path`: `other` queued after
+        /// it is measured, so the thread took `path` already or never will.
+        fn past(worker: &Worker, other: &Song) {
+            worker.queue(other.job.clone());
+            let done = results(worker, 1);
+            assert!(done.iter().any(|f| f.path == other.job.path()), "{done:?}");
+        }
+
+        /// The thread held before its pop of `song`, waiting: the pop's
+        /// channels.
+        fn held_before_pop(worker: &Worker, song: &Song) -> (Receiver<()>, Sender<()>) {
+            let (at_tx, at) = mpsc::channel();
+            let (go, go_rx) = mpsc::channel::<()>();
+            worker.before_pop(move || {
+                let _ = at_tx.send(());
+                let _ = go_rx.recv();
+            });
+            worker.queue(song.job.clone());
+            at.recv_timeout(*WATCHDOG).expect("the pop held");
+            (at, go)
+        }
+
+        /// The counter sees every real analysis: with no claim the
+        /// background and the page both measure the chart, two.
+        #[test]
+        fn the_analysis_count_sees_both_measurements() {
+            let song = song("p16-control");
+            let (worker, _coord) = started(&Arc::default());
+            worker.queue(song.job.clone());
+            assert_eq!(results(&worker, 1).len(), 1);
+            page_measures(&song);
+            assert_eq!(analyses::of(song.hash), 2);
+        }
+
+        /// P16b: the chart waits in the queue, the thread held at its pop.
+        /// A claim first takes it, and the thread never measures it; the
+        /// pop first measures it, the claim finds it running and then its
+        /// result, and the page measures nothing. One analysis either way.
+        #[test]
+        fn the_claim_and_the_dequeue_take_the_chart_once() {
+            let other = song("p16b-other");
+            // Claim first.
+            let s = song("p16b-claim-first");
+            let hold = Arc::new(Hold::default());
+            let (worker, _coord) = started(&hold);
+            let (_at, go) = held_before_pop(&worker, &s);
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
+            go.send(()).unwrap();
+            page_measures(&s);
+            past(&worker, &other);
+            assert_eq!(analyses::of(s.hash), 1, "claim first");
+            drop(worker);
+            // The pop first.
+            let s = song("p16b-pop-first");
+            let (worker, _coord) = started(&hold);
+            let (at, go_analysis) = hold.arm(s.hash);
+            let (_pop, go) = held_before_pop(&worker, &s);
+            go.send(()).unwrap();
+            at.recv_timeout(*WATCHDOG).expect("inside the analysis");
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Running);
+            go_analysis.send(()).unwrap();
+            assert!(worker.wait_done(s.job.path(), *WATCHDOG));
+            assert!(matches!(
+                worker.claim(s.job.path(), &s.key),
+                Claim::Reused(_)
+            ));
+            assert_eq!(analyses::of(s.hash), 1, "the pop first");
+        }
+
+        /// P16f: the claim's decision and its take are one critical
+        /// section. Between them the test attempts the thread's pop with a
+        /// `try_lock`, which finds the lock held: observed, not timed. The
+        /// claim then takes the waiting chart, the thread never measures
+        /// it, and the page's is the one analysis.
+        #[test]
+        fn the_claims_decision_and_take_hold_the_lock() {
+            let other = song("p16f-other");
+            let s = song("p16f");
+            let (worker, _coord) = started(&Arc::default());
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&attempts);
+            worker.on_decided(move |shared| seen.lock().unwrap().push(try_pop(shared)));
+            let (_at, go) = held_before_pop(&worker, &s);
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
+            assert_eq!(
+                *attempts.lock().unwrap(),
+                [None],
+                "the pop found the lock free between the decision and the take"
+            );
+            go.send(()).unwrap();
+            page_measures(&s);
+            past(&worker, &other);
+            assert_eq!(analyses::of(s.hash), 1);
+        }
+
+        /// The chart measured on the thread, held inside its analysis, and
+        /// a pause requested: told to stop, not returned.
+        fn told_to_stop(worker: &Worker, hold: &Hold, s: &Song) -> Sender<()> {
+            let (at, go) = hold.arm(s.hash);
+            worker.queue(s.job.clone());
+            at.recv_timeout(*WATCHDOG).expect("inside the analysis");
+            worker.request_pause(None);
+            go
+        }
+
+        /// P16c: the measurement held inside its analysis, a pause
+        /// requested: the claim finds it settling. Once it returned, kept
+        /// for the pause, the claim takes it, and after the release the
+        /// thread does not measure it again: the stopped analysis and the
+        /// page's, two.
+        #[test]
+        fn the_claim_takes_a_paused_measurement_once() {
+            let other = song("p16c-other");
+            let s = song("p16c");
+            let hold = Arc::new(Hold::default());
+            let (worker, _coord) = started(&hold);
+            let go = told_to_stop(&worker, &hold, &s);
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Settling);
+            go.send(()).unwrap();
+            assert!(worker.wait_paused(*WATCHDOG));
+            assert!(worker.holds(s.job.path()), "kept for the pause");
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
+            worker.release();
+            page_measures(&s);
+            past(&worker, &other);
+            assert_eq!(analyses::of(s.hash), 2, "the stopped one and the page's");
+        }
+
+        /// P16d: the measurement kept for a pause. Released first, the
+        /// claim finds it running again and then its result: the stopped
+        /// analysis and the thread's again, two, none of the page. Claimed
+        /// first, the release measures nothing: the stopped one and the
+        /// page's, two.
+        #[test]
+        fn the_claim_and_the_release_measure_once() {
+            let other = song("p16d-other");
+            let hold = Arc::new(Hold::default());
+            // Released first.
+            let s = song("p16d-release-first");
+            let (worker, _coord) = started(&hold);
+            let go = told_to_stop(&worker, &hold, &s);
+            go.send(()).unwrap();
+            assert!(worker.wait_paused(*WATCHDOG));
+            let (at, go) = hold.arm(s.hash);
+            worker.release();
+            at.recv_timeout(*WATCHDOG).expect("measured again");
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Running);
+            go.send(()).unwrap();
+            assert!(worker.wait_done(s.job.path(), *WATCHDOG));
+            assert!(matches!(
+                worker.claim(s.job.path(), &s.key),
+                Claim::Reused(_)
+            ));
+            assert_eq!(analyses::of(s.hash), 2, "released first");
+            drop(worker);
+            // Claimed first.
+            let s = song("p16d-claim-first");
+            let (worker, _coord) = started(&hold);
+            let go = told_to_stop(&worker, &hold, &s);
+            go.send(()).unwrap();
+            assert!(worker.wait_paused(*WATCHDOG));
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Taken);
+            worker.release();
+            page_measures(&s);
+            past(&worker, &other);
+            assert_eq!(analyses::of(s.hash), 2, "claimed first");
+        }
+
+        /// P16e: a finished measurement of the chart is reused only under
+        /// the page's key. Under it: taken, no analysis of the page. Under
+        /// another key (another rate, not the default): left, and the page
+        /// measures. With no measurement (its file gone, which begins no
+        /// analysis): the page measures.
+        #[test]
+        fn a_finished_measurement_is_reused_only_with_the_pages_key() {
+            // The page's key.
+            let s = song("p16e-same");
+            let (worker, _coord) = started(&Arc::default());
+            worker.queue(s.job.clone());
+            assert!(worker.wait_results(1, *WATCHDOG));
+            assert!(matches!(
+                worker.claim(s.job.path(), &s.key),
+                Claim::Reused(_)
+            ));
+            assert_eq!(analyses::of(s.hash), 1, "reused: none of the page");
+            // Another key.
+            let s = song("p16e-other-key");
+            worker.queue(s.job.clone());
+            assert!(worker.wait_results(1, *WATCHDOG));
+            let other_key = LoudnessKey {
+                rate: s.key.rate + 1,
+                ..s.key
+            };
+            assert_eq!(worker.claim(s.job.path(), &other_key), Claim::Free);
+            page_measures(&s);
+            assert_eq!(analyses::of(s.hash), 2, "another key: the page's too");
+            let left = worker.take_results();
+            assert!(
+                left.iter()
+                    .any(|f| f.path == s.job.path() && f.measured.is_some()),
+                "the other key's result stays for the shelf: {left:?}"
+            );
+            // No measurement: the chart's file is gone before the thread
+            // reads it.
+            let s = song("p16e-failed");
+            std::fs::remove_file(s.job.path()).unwrap();
+            worker.queue(s.job.clone());
+            assert!(worker.wait_results(1, *WATCHDOG));
+            assert_eq!(analyses::of(s.hash), 0, "the failure began no analysis");
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Free);
+            page_measures(&s);
+            assert_eq!(analyses::of(s.hash), 1);
+        }
+
+        /// A claimed chart is not queued again until the page gives it
+        /// back.
+        #[test]
+        fn a_claimed_chart_is_not_queued_until_unclaimed() {
+            let s = song("p16-unclaim");
+            let (worker, _coord) = started(&Arc::default());
+            worker.request_pause(None);
+            assert_eq!(worker.claim(s.job.path(), &s.key), Claim::Free);
+            assert_eq!(worker.queue(s.job.clone()), super::Queued::Already);
+            worker.unclaim(s.job.path());
+            assert_eq!(worker.queue(s.job.clone()), super::Queued::Added);
+        }
+    }
 }
