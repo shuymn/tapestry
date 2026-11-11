@@ -3177,6 +3177,13 @@ fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
     assert_eq!(*profile, parser);
     assert_eq!(loaded.chart().timeline.meta().initial, bpm(240));
     assert_eq!(loaded.attempt().main, Some(bpm(120)));
+    // The attempt carries the speed its chart is loaded at, which places a
+    // play skin's cursors at 1× times, and the preset's judge areas.
+    assert_eq!(loaded.attempt().speed, speed);
+    assert_eq!(
+        loaded.attempt().areas,
+        game::judge_areas(loaded.chart(), &rules::tapestry())
+    );
     // A practice round over the first note alone: its own MAIN is 240,
     // the attempt's stays the whole chart's.
     let practice = game::Practice {
@@ -3199,6 +3206,7 @@ fn the_parsers_1x_profile_reaches_the_attempt_at_another_speed() {
     assert!(Arc::ptr_eq(&profile, round.profile.as_ref().unwrap()));
     loaded.set_speed(bms_model::Speed::NORMAL).unwrap();
     let again = loaded.attempt();
+    assert_eq!(again.speed, bms_model::Speed::NORMAL);
     assert!(Arc::ptr_eq(&profile, again.profile.as_ref().unwrap()));
     assert_eq!(again.main, Some(bpm(120)));
 }

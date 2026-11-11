@@ -1439,6 +1439,7 @@ impl Loaded {
             score: self.score,
             profile: Some(Arc::clone(&self.profile)),
             main: self.main,
+            speed: self.config.speed,
             ..Attempt::new(
                 self.attempt,
                 &self.preset,

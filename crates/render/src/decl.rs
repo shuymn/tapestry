@@ -719,6 +719,10 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         gauge: f.gauge,
         effects: f.effects,
         notes: &view.notes,
+        offsets: skin_model::Offsets {
+            slots: view.offsets.slots(),
+            count: view.offsets.count(),
+        },
         input: &view.input,
         complete: view.complete,
         playing: view.playing,

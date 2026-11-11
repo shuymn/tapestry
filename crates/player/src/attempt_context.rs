@@ -57,6 +57,10 @@ pub struct AttemptContext {
     profile: Option<Arc<ChartProfile>>,
     /// The whole chart's MAIN tempo.
     main: Option<Tempo>,
+    /// The preset's key judge areas for the chart's rank.
+    areas: [[i16; 2]; 5],
+    /// The speed the chart is loaded at.
+    speed: bms_model::Speed,
     /// The scratch lane's notes autoplay's turntable presses, built before
     /// READY; none for a play by hand.
     scratch_notes: Vec<game::ScratchNote>,
@@ -96,6 +100,8 @@ impl AttemptContext {
             },
             profile: attempt.profile,
             main: attempt.main,
+            areas: attempt.areas,
+            speed: attempt.speed,
             scratch_notes: Vec::new(),
             carry_key: None,
         }
@@ -191,6 +197,8 @@ impl AttemptContext {
                 basis: self.score,
                 profile: self.profile.as_deref(),
                 main: self.main,
+                areas: Some(self.areas),
+                speed: self.speed,
             },
         }
     }
@@ -395,6 +403,8 @@ mod tests {
             },
             profile: Some(std::sync::Arc::clone(&profile)),
             main: Some(main),
+            areas: [[-1, 2], [-3, 4], [-5, 6], [-7, 8], [-9, 10]],
+            speed: bms_model::Speed::from_twentieths(30).unwrap(),
             ..bare
         };
         let owned = AttemptContext::new(attempt, Side::Left, 0, false);
@@ -409,5 +419,18 @@ mod tests {
         );
         assert!(std::ptr::eq(ctx.score.profile.unwrap(), &*profile));
         assert_eq!(ctx.score.main, Some(main));
+        // The judge areas and the speed the visualizers and the notes
+        // graph's cursors read.
+        assert_eq!(
+            ctx.score.areas,
+            Some([[-1, 2], [-3, 4], [-5, 6], [-7, 8], [-9, 10]])
+        );
+        assert_eq!(ctx.score.speed.twentieths(), 30);
+        // A bare attempt has the preset's areas for the chart, at 1×.
+        assert_eq!(
+            none.context().score.areas,
+            Some(game::judge_areas(&chart, &preset))
+        );
+        assert_eq!(none.context().score.speed, bms_model::Speed::NORMAL);
     }
 }

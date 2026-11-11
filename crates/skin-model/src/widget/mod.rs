@@ -8,11 +8,14 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
 pub(crate) mod bar;
+pub(crate) mod bpm_graph;
+pub(crate) mod compose;
 pub(crate) mod cover_paint;
 pub(crate) mod digits;
 pub(crate) mod gauge;
 pub(crate) mod gauge_graph;
 pub(crate) mod glyphs;
+pub(crate) mod hit_error;
 pub(crate) mod image_choice;
 pub(crate) mod judge;
 pub(crate) mod judge_graph;
@@ -22,6 +25,7 @@ pub(crate) mod scroll;
 pub(crate) mod song_list;
 pub(crate) mod text;
 pub(crate) mod timing_graph;
+pub(crate) mod timing_vis;
 
 use bms_model::TimeUs;
 
