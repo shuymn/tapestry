@@ -407,6 +407,81 @@ fn a_chart_image_is_plays_and_keeps_a_chart_layer() {
     );
 }
 
+/// A play skin that gives up its chart layer (an atlas that cannot hold
+/// it) keeps none: its plan and atlas lose the layer and the least side
+/// it set, and its chart-image elements stay, drawing nothing.
+#[test]
+fn a_skin_without_its_chart_layer_keeps_none() {
+    let limits = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 16,
+        reserved_layers: 1,
+    };
+    let mut s = skin();
+    let with = s
+        .sheet()
+        .plan_keeping(Variant::Lo, limits, s.kept_layers())
+        .unwrap();
+    s.without_chart_layer();
+    assert!(!s.has_chart_images());
+    assert_eq!(s.kept_layers(), KeptLayers::NONE);
+    let atlas = s.atlas(Variant::Lo, limits, &|| false).unwrap();
+    assert_eq!(atlas.chart_layer(), None);
+    assert!(
+        atlas.side() < MIN_TEXT_SIDE,
+        "no kept layer sets the least side: {}",
+        atlas.side()
+    );
+    let without = s
+        .sheet()
+        .plan_keeping(Variant::Lo, limits, s.kept_layers())
+        .unwrap();
+    assert!(without < with, "{without} < {with}");
+    // The elements stay and draw nothing: the frame is the one the same
+    // skin draws with no chart image published.
+    let mut h = Harness::new(s, &chart(), &play_support::full(0));
+    h.play.set_chart_live(Some(KEY));
+    h.frame(0, &[]);
+    let mut kept = Harness::new(skin(), &chart(), &play_support::full(0));
+    kept.play.set_chart_live(Some(KEY));
+    kept.frame(0, &[]);
+    assert_eq!(drawn(&h.batch), drawn(&kept.batch));
+}
+
+/// The plan's shape names the plan's own figures: its side, its pages,
+/// every layer it charges and their texels.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_plans_shape_names_its_side_pages_and_layers() {
+    let limits = AtlasLimits {
+        max_side: 8_192,
+        max_layers: 16,
+        reserved_layers: 1,
+    };
+    let s = skin();
+    let kept = KeptLayers {
+        text: true,
+        chart: true,
+    };
+    let shape = s.sheet().plan_shape(Variant::Lo, limits, kept).unwrap();
+    assert_eq!(shape.side, MIN_TEXT_SIDE);
+    assert_eq!(shape.layers, 1 + shape.pages + 2);
+    assert_eq!(
+        shape.texels,
+        s.sheet().plan_keeping(Variant::Lo, limits, kept).unwrap()
+    );
+    assert_eq!(
+        shape.texels,
+        u64::from(shape.layers) * u64::from(shape.side) * u64::from(shape.side)
+    );
+    let none = s
+        .sheet()
+        .plan_shape(Variant::Lo, limits, KeptLayers::NONE)
+        .unwrap();
+    assert_eq!(none.layers, 1 + none.pages);
+    assert!(none.side < shape.side);
+}
+
 /// A slot is half the side square, the stage file's at the top left and
 /// the back image's at the top right; a uv covers the content only.
 #[test]
