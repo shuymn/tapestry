@@ -11,8 +11,8 @@ use bms_model::TimeUs;
 use rules::GaugeValue;
 
 use super::schema::{field, timer};
-use super::timers::{chart_fields, covers, level_fields, read_timers, settings_fields};
-use super::{BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
+use super::timers::{app_fields, chart_fields, covers, level_fields, read_timers, settings_fields};
+use super::{AppReadouts, BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
 use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{Program, State, TIMER_OFF};
 use crate::layout::Layout;
@@ -26,7 +26,8 @@ use crate::widget::text::TextTable;
 /// A field's class while the play screen loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadingField {
-    /// Read from the loading frame: `load.percent`.
+    /// Read from the loading frame: `load.percent`, `autoplay` and the
+    /// application's readouts (`app.*`, `clock.*`).
     Live,
     /// The frame's settings: its stored covers, display offset and
     /// hi-speed fix.
@@ -232,6 +233,17 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // snapshot, as its covers.
         Setting, // display_offset.ms
         Setting, // settings.fix_hispeed
+        // The application's, 141 to 150: the frame's, whatever the state.
+        Live, // app.fps
+        Live, // clock.year
+        Live, // clock.month
+        Live, // clock.day
+        Live, // clock.hour
+        Live, // clock.minute
+        Live, // clock.second
+        Live, // app.uptime_h
+        Live, // app.uptime_m
+        Live, // app.uptime_s
     ]
 };
 
@@ -412,6 +424,8 @@ pub struct LoadingFrame<'a> {
     pub bga: Option<bool>,
     /// Whether the attempt being loaded is autoplay.
     pub autoplay: bool,
+    /// The application's readouts, as [`SkinFrame::app`](crate::SkinFrame::app).
+    pub app: AppReadouts,
     /// The turntable's angle, as [`SkinFrame::turntable`](crate::SkinFrame::turntable).
     pub turntable: i32,
 }
@@ -625,7 +639,7 @@ impl Loading {
     /// the origin with every other built-in off, then each `when` timer,
     /// whose condition reads false while `whens_need` is not met.
     ///
-    /// A refused state, or covers or a hi-speed fix
+    /// A refused state, or covers, a hi-speed fix or application readouts
     /// [`Play::build`](crate::Skin::build) would refuse, is refused before
     /// anything changes, and the state is refused with that error from
     /// then on.
@@ -638,9 +652,10 @@ impl Loading {
         if let Some(e) = self.poisoned {
             return Err(e);
         }
-        let (Some(c), Some(settings)) = (
+        let (Some(c), Some(settings), Some(app)) = (
             covers(&frame.lanes, &frame.covers),
             settings_fields(frame.display_offset, frame.fix_hispeed),
+            app_fields(&frame.app),
         ) else {
             self.poisoned = Some(BuildError::InvalidReadouts);
             return Err(BuildError::InvalidReadouts);
@@ -673,6 +688,9 @@ impl Loading {
             set(slot, v);
         }
         for (slot, v) in (field::DISPLAY_OFFSET_MS..).zip(settings) {
+            set(slot, v);
+        }
+        for (slot, v) in (field::APP_FPS..).zip(app) {
             set(slot, v);
         }
         if let Some(t) = self.drawable_chart() {
@@ -714,7 +732,21 @@ mod tests {
     fn every_field_and_timer_has_a_loading_class() {
         assert_eq!(FIELDS.len(), PLAY.fields.len());
         let class = |name: &str| PLAY.field(name).and_then(|(s, _)| loading_field(s));
-        for name in ["load.percent", "autoplay"] {
+        let live = [
+            "load.percent",
+            "autoplay",
+            "app.fps",
+            "clock.year",
+            "clock.month",
+            "clock.day",
+            "clock.hour",
+            "clock.minute",
+            "clock.second",
+            "app.uptime_h",
+            "app.uptime_m",
+            "app.uptime_s",
+        ];
+        for name in live {
             assert_eq!(class(name), Some(LoadingField::Live), "{name}");
         }
         let chosen = [
@@ -773,14 +805,8 @@ mod tests {
             assert_eq!(class(name), Some(LoadingField::Unavailable), "{name}");
         }
         for f in PLAY.fields {
-            let named = [
-                "load.percent",
-                "autoplay",
-                "gauge.kind",
-                "gauge.valid",
-                "time.progress_ppm",
-            ]
-            .contains(&f.name)
+            let named = ["gauge.kind", "gauge.valid", "time.progress_ppm"].contains(&f.name)
+                || live.contains(&f.name)
                 || before.iter().any(|b| b == f.name)
                 || chosen.contains(&f.name)
                 || settings.contains(&f.name);

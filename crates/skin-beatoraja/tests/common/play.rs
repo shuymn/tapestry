@@ -140,6 +140,9 @@ pub struct Drawn {
     /// The display offset each frame gives ([`SkinFrame::display_offset`]):
     /// by default 0.
     pub display_offset: TimeUs,
+    /// The application's readouts each frame gives ([`SkinFrame::app`]):
+    /// by default [`AppReadouts::LAUNCH`](skin_model::AppReadouts::LAUNCH).
+    pub app: skin_model::AppReadouts,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -432,6 +435,7 @@ impl Drawn {
             state_us: 0,
             complete: false,
             display_offset: TimeUs(0),
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -483,6 +487,7 @@ impl Drawn {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            app: self.app,
             state_us: self.state_us,
             now: TimeUs(ms * MS),
             display_offset: self.display_offset,
@@ -593,6 +598,9 @@ pub struct Loader {
     pub display_offset: TimeUs,
     /// The hi-speed fix each frame gives: by default Classic, 0.
     pub fix_hispeed: u8,
+    /// The application's readouts each frame gives: by default
+    /// [`AppReadouts::LAUNCH`](skin_model::AppReadouts::LAUNCH).
+    pub app: skin_model::AppReadouts,
 }
 
 impl Loader {
@@ -619,6 +627,7 @@ impl Loader {
             turntable: 0,
             display_offset: TimeUs(0),
             fix_hispeed: 0,
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -629,6 +638,7 @@ impl Loader {
         let mut covers = readouts_for(view).covers;
         covers.adjusting = self.adjusting;
         let frame = LoadingFrame {
+            app: self.app,
             difficulty: self.difficulty,
             bga: self.bga,
             autoplay: self.autoplay,

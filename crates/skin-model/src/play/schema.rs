@@ -44,6 +44,11 @@ pub const RANK_TWENTY_SEVENTHS: [u32; 8] = [24, 21, 18, 15, 12, 9, 6, 0];
 /// The largest `settings.fix_hispeed`: 4, Floating from the minimum
 /// tempo.
 pub const FIX_HISPEED_MAX: i32 = 4;
+/// The largest `app.fps`: the presents in one second that the player's
+/// ring of present instants holds.
+pub const FPS_MAX: i32 = 1_024;
+/// The largest `clock.year`: the Win32 `SYSTEMTIME`'s.
+pub const YEAR_MAX: i32 = 30_827;
 /// The largest `native.hispeed.x100`: the multiplier's maximum, 20.
 const NATIVE_HISPEED_MAX: i32 = 2_000;
 /// The largest `native.target.green`: the target green number's maximum.
@@ -301,6 +306,16 @@ pub static PLAY: Schema = Schema {
             export: T,
         },
         int("settings.fix_hispeed", FIX_HISPEED_MAX, T),
+        int("app.fps", FPS_MAX, T),
+        int("clock.year", YEAR_MAX, T),
+        int("clock.month", 12, T),
+        int("clock.day", 31, T),
+        int("clock.hour", 23, T),
+        int("clock.minute", 59, T),
+        int("clock.second", 59, T),
+        int("app.uptime_h", i32::MAX, T),
+        int("app.uptime_m", 59, T),
+        int("app.uptime_s", 59, T),
     ],
     timers: &[
         timer("ready", E),
@@ -609,8 +624,22 @@ pub mod field {
     /// Classic; Floating 1 from the start tempo, 2 the maximum, 3 the main
     /// and 4 the minimum.
     pub const SETTINGS_FIX_HISPEED: u16 = 140;
+    /// The presents in the last second, at most
+    /// [`FPS_MAX`](super::FPS_MAX), from the frame's
+    /// [`AppReadouts`](crate::AppReadouts).
+    pub const APP_FPS: u16 = 141;
+    /// The first of the six local date and time fields at the frame:
+    /// `clock.year`, `clock.month` (1 to 12), `clock.day`, `clock.hour`
+    /// (0 to 23), `clock.minute` and `clock.second`.
+    pub const CLOCK_YEAR: u16 = 142;
+    /// The application's uptime since launch in whole hours, unwrapped.
+    pub const APP_UPTIME_H: u16 = 148;
+    /// The uptime's minutes within its hour.
+    pub const APP_UPTIME_M: u16 = 149;
+    /// The uptime's seconds within its minute.
+    pub const APP_UPTIME_S: u16 = 150;
     /// The number of fields.
-    pub const COUNT: usize = 141;
+    pub const COUNT: usize = 151;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -1047,7 +1076,27 @@ mod tests {
                 .map(|(_, f)| (f.ty, f.export)),
             Some((FieldTy::Int { lo: 0, hi: 4 }, T))
         );
-        assert_eq!(field::COUNT, 141);
+        let app = [
+            ("app.fps", field::APP_FPS, 1_024),
+            ("clock.year", field::CLOCK_YEAR, 30_827),
+            ("clock.month", field::CLOCK_YEAR + 1, 12),
+            ("clock.day", field::CLOCK_YEAR + 2, 31),
+            ("clock.hour", field::CLOCK_YEAR + 3, 23),
+            ("clock.minute", field::CLOCK_YEAR + 4, 59),
+            ("clock.second", field::CLOCK_YEAR + 5, 59),
+            ("app.uptime_h", field::APP_UPTIME_H, i32::MAX),
+            ("app.uptime_m", field::APP_UPTIME_M, 59),
+            ("app.uptime_s", field::APP_UPTIME_S, 59),
+        ];
+        for (name, s, hi) in app {
+            assert_eq!(slot(name), Some(s), "{name}");
+            assert_eq!(
+                PLAY.field(name).map(|(_, f)| (f.ty, f.export)),
+                Some((FieldTy::Int { lo: 0, hi }, T)),
+                "{name}"
+            );
+        }
+        assert_eq!(field::COUNT, 151);
     }
 
     #[test]
