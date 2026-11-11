@@ -506,3 +506,22 @@ fn a_failure_visualizer_past_its_caps_refuses() {
         }
     ));
 }
+
+/// C31: a timing visualizer's line width is clamped to 1 to 4 as the
+/// source clamps it, with no note: 6 is 4, so the line of +40 ms covers
+/// `x0 + (301 − 4)/2 + 40 = x0 + 188.5` to `x0 + 192.5`, unrounded.
+#[test]
+fn a_timing_visualizer_clamps_its_line_width() {
+    let (_d, skin, report) = json(
+        r#""timingvisualizer": [{"id": "tv", "lineWidth": 6}],"#,
+        r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
+    );
+    assert_eq!(notes(&report), []);
+    let q = visualized(skin, &[40]);
+    let y = middle(&q);
+    let green = Some(rgba(0x00ff_00ff));
+    assert_eq!(top(&q, 100.0 + 188.6, y), green);
+    assert_eq!(top(&q, 100.0 + 192.4, y), green);
+    assert_ne!(top(&q, 100.0 + 192.6, y), green);
+    assert_ne!(top(&q, 100.0 + 188.4, y), green);
+}
