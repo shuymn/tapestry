@@ -1353,6 +1353,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
         fix_hispeed: 0,
         difficulty: None,
         bga: None,
+        length: None,
         now: TimeUs(0),
         load: LoadState {
             since: TimeUs(0),

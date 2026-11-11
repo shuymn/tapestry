@@ -266,6 +266,7 @@ pub const fn loading_frame(lifetime: u64, now: TimeUs, since: TimeUs) -> Loading
         fix_hispeed: 0,
         difficulty: None,
         bga: None,
+        length: None,
         autoplay: false,
         lifetime,
         now,

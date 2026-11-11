@@ -150,6 +150,7 @@ impl Loader {
             fix_hispeed: self.fix_hispeed,
             difficulty: None,
             bga: None,
+            length: None,
             autoplay: false,
             now: TimeUs(now_us),
             load: LoadState {

@@ -293,6 +293,7 @@ pub fn record(
                             play_level,
                             difficulty: None,
                             bga: None,
+                            length: None,
                             autoplay: false,
                             turntable: 0,
                         };

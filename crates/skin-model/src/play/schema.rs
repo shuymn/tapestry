@@ -318,6 +318,7 @@ pub static PLAY: Schema = Schema {
         int("app.uptime_s", 59, T),
         int("chart.main_bpm", READOUT_MAX, T),
         flag("chart.main_bpm_valid", T),
+        int("chart.length_ms", i32::MAX, T),
     ],
     timers: &[
         timer("ready", E),
@@ -648,8 +649,15 @@ pub mod field {
     /// Whether it is known: false without a MAIN tempo and past the
     /// readout maximum.
     pub const CHART_MAIN_BPM_VALID: u16 = 152;
+    /// The chart's length at 1× in whole ms, rounded down and at most
+    /// `i32::MAX`: the latest of its notes' ends and its background
+    /// sounds ([`ChartMeta::length`](bms_model::ChartMeta::length)), the
+    /// same in every practice round and at every speed. While loading it is
+    /// the chosen chart's library length
+    /// ([`LoadingFrame::length`](crate::LoadingFrame::length)).
+    pub const CHART_LENGTH_MS: u16 = 153;
     /// The number of fields.
-    pub const COUNT: usize = 153;
+    pub const COUNT: usize = 154;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -1126,7 +1134,19 @@ mod tests {
                 .map(|(_, f)| (f.ty, f.export)),
             Some((FieldTy::Bool, T))
         );
-        assert_eq!(field::COUNT, 153);
+        assert_eq!(slot("chart.length_ms"), Some(field::CHART_LENGTH_MS));
+        assert_eq!(field::CHART_LENGTH_MS, 153);
+        assert_eq!(
+            PLAY.field("chart.length_ms").map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: i32::MAX
+                },
+                T
+            ))
+        );
+        assert_eq!(field::COUNT, 154);
     }
 
     #[test]

@@ -1361,6 +1361,7 @@ fn loading_probes(
             play_level: None,
             difficulty: None,
             bga: None,
+            length: None,
         };
         skin.build_loading(&mut loading, &frame, uvs, batch)
             .expect("the loading frame builds");
@@ -1386,6 +1387,7 @@ fn loading_probes(
         play_level: None,
         difficulty: None,
         bga: None,
+        length: None,
     };
     frame.covers.cover = 500;
     assert_eq!(

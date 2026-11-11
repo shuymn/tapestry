@@ -1511,6 +1511,7 @@ fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
             h.difficulty.as_deref().unwrap_or_default(),
         )),
         bga: Some(e.bga),
+        length_us: e.summary.as_ref().map(|s| s.length),
     }
 }
 
@@ -3206,6 +3207,27 @@ pub(crate) mod tests {
         for text in [Some("6"), Some("0"), Some("-1"), Some("2a"), None] {
             assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
         }
+    }
+
+    /// A chosen chart's length is its entry's summary's, the loader's 1×
+    /// length; none for an entry whose seed-0 branch the loader refused.
+    #[test]
+    fn the_chosen_charts_length_comes_from_its_summary() {
+        let mut e = entry(library::Header::default(), false);
+        assert_eq!(chosen_chart(&e).length_us, None);
+        e.summary = Some(bms_model::ChartSummary {
+            taps: 1,
+            longs: 0,
+            mines: 0,
+            length: bms_model::TimeUs(125_400_000),
+            tempo_start: bms_model::Tempo::from_milli(120_000).unwrap(),
+            tempo_min: bms_model::Tempo::from_milli(120_000).unwrap(),
+            tempo_max: bms_model::Tempo::from_milli(120_000).unwrap(),
+        });
+        assert_eq!(
+            chosen_chart(&e).length_us,
+            Some(bms_model::TimeUs(125_400_000))
+        );
     }
 
     /// A healthy screen whose first loading frame comes after the hold's

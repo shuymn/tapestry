@@ -179,6 +179,7 @@ fn chart_image_frames_do_not_allocate() {
             fix_hispeed: 0,
             difficulty: None,
             bga: None,
+            length: None,
             autoplay: false,
             now: TimeUs(now),
             load: LoadState {
