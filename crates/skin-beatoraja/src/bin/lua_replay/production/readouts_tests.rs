@@ -78,8 +78,6 @@ fn play_frames_carry_the_charts_tempo_readouts() {
     let mut script = Script::full();
     script.tempo = CHANGES.to_vec();
     let (run, obs) = pieces_over(&body(), script);
-    let report = compare(&run, &obs, &[]);
-    assert!(report.passes(), "{}", report.text(0, true, true));
     let rate = run
         .recorded
         .occurrences
@@ -137,4 +135,6 @@ fn play_frames_carry_the_charts_tempo_readouts() {
     assert_eq!(reads, play * 4);
     assert_eq!(nil, play);
     assert_eq!(zero, play);
+    let report = compare(&run, &obs, &[]);
+    assert!(report.passes(), "{}", report.text(0, true, true));
 }
