@@ -13,7 +13,7 @@ use bms_model::{Chart, ChartBuilder, ChartProfile, ChartSummary, Lane, Tempo, Ti
 use common::import_sized;
 use common::play::{Drawn, MS};
 use skin_beatoraja::{Cancel, Config, NoteKind, Report, Severity, read_lua_header};
-use skin_model::{PlayScore, Quad, Skin};
+use skin_model::{Filter, PlayScore, Quad, Skin};
 use tempfile::TempDir;
 
 /// PERFECT ±20 ms, GREAT ±60, GOOD ±100, BAD ±120, the empty POOR range
@@ -120,8 +120,9 @@ fn visualized(skin: Skin, offsets: &[i32]) -> Vec<Quad> {
 /// C31: a timing visualizer of the source's defaults, 301 wide over 150 ms
 /// either side, so a texel a pixel. From its left edge `x0`: the bands by
 /// texel, the empty POOR range (0-29) `000000`, BAD (30-49) `880000`, GOOD
-/// (50-89) `888800`, GREAT (90-129) `008800`, PERFECT (130-149) `000088`
-/// (each probed off the grid lines, every 10th texel), and the line of an
+/// (50-89) `888800`, GREAT (90-129) `008800`, PERFECT (130-149) `000088`,
+/// and on the right BAD (251-270) and the empty POOR range (271-300), each
+/// probed off the grid lines (every 10th texel); and the line of an
 /// offset of +40 ms, early to the right, at `x0 + (301 − 1)/2 + 40 = x0 +
 /// 190`, in `00FF00` at its full alpha as the newest of 100.
 #[test]
@@ -146,7 +147,8 @@ fn a_timing_visualizer_draws_the_source_defaults_in_json_and_lua() {
         (55.0, 0x8888_00ff),
         (95.0, 0x0088_00ff),
         (135.0, 0x0000_88ff),
-        (265.0, 0x0000_00ff),
+        (265.0, 0x8800_00ff),
+        (285.0, 0x0000_00ff),
     ] {
         assert_eq!(top(&q, x0 + texel + 0.5, y), Some(rgba(want)), "{texel}");
     }
@@ -269,11 +271,12 @@ fn an_infinite_average_weight_imports() {
         r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
     );
     assert_eq!(notes(&report), []);
-    // A step of +40 saturates: the average's line is off the pixmap's
-    // left edge, clamped to its BAD-window edge, column 150 − 150 = 0.
+    // The step of +40 saturates, `(long) (∞ · 40)`, to `Long.MAX_VALUE`;
+    // the average's line reads its low 32 bits (`intValue`), −1, so it is
+    // at column `150 + 1 = 151`.
     let q = visualized(skin, &[40]);
     let y = middle(&q);
-    assert_eq!(top(&q, 100.5, y), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 151.5, y), Some(rgba(0xff00_00ff)));
 }
 
 /// 150 BPM, 300 from 1 s; notes at 0.1 to 0.5 s (five at 150, so MAIN)
@@ -353,9 +356,10 @@ fn a_bpm_graph_reads_its_colours_as_the_source() {
 }
 
 /// C31: a notes graph is a `judgegraph` of type 0 on play, revealed over
-/// its default 500 ms from the screen's start: at 250 ms fewer of its
-/// quads show than at 1 s, where all of them show, as at 250 ms with a
-/// `delay` of 0. Types 1 and 2 drop with a note.
+/// its default 500 ms from the screen's start (READY, at 0 here): the
+/// chart's notes are in its second second of four, so at 100 ms (a fifth
+/// revealed) they are not drawn yet and at 1 s they are, as at 100 ms with
+/// a `delay` of 0. Types 1 and 2 drop with a note.
 #[test]
 fn a_notes_graph_is_type_0_revealed_over_500_ms() {
     let dst = r#"{"id": "ng", "dst": [{"x": 0, "y": 0, "w": 300, "h": 100}]}"#;
@@ -367,14 +371,22 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
         profile: Some(&profile),
         ..PlayScore::NONE
     };
-    let count = |fields: &str, ms: i64| {
+    let frame = |fields: &str, ms: i64| {
         let (_d, skin, report) = json(&format!(r#""judgegraph": [{{"id": "ng"{fields}}}],"#), dst);
         assert_eq!(notes(&report), [], "{fields}");
-        Drawn::over_score(skin, &chart, score).frame(ms, &[]).len()
+        Drawn::over_score(skin, &chart, score).frame(ms, &[])
     };
-    let (early, late) = (count("", 250), count("", 1_000));
-    assert!(0 < early && early < late, "{early} {late}");
-    assert_eq!(count(r#", "delay": 0"#, 250), late);
+    // The chips are drawn from the chip grid, sampled `NearestBase`; the
+    // background and the cursor from the white image.
+    let chips = |q: Vec<Quad>| -> Vec<Quad> {
+        q.into_iter()
+            .filter(|q| q.filter == Filter::NearestBase)
+            .collect()
+    };
+    let late = chips(frame("", 1_000));
+    assert!(!late.is_empty());
+    assert_eq!(chips(frame("", 100)), []);
+    assert_eq!(chips(frame(r#", "delay": 0"#, 100)), late);
     for ty in [1, 2] {
         let (_d, _skin, report) = json(
             &format!(r#""judgegraph": [{{"id": "ng", "type": {ty}}}],"#),
@@ -389,4 +401,108 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
             "{ty}"
         );
     }
+}
+
+/// C31: a timing visualizer's colours as the source reads them. A checked
+/// colour must be hex digits only, so `#00ff00` draws red with a note
+/// (`colorStringValidation`); the empty POOR colour is read by
+/// `Color.valueOf` alone, so `#20304080` is `20304080`; with `transparent`
+/// 1 that band is clear, whatever its colour.
+#[test]
+fn timing_visualizer_colours_follow_the_source_s_two_readings() {
+    let dst = r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#;
+    let (_d, skin, report) = json(
+        r##""timingvisualizer": [{"id": "tv", "lineColor": "#00ff00", "PRColor": "#20304080"}],"##,
+        dst,
+    );
+    assert_eq!(
+        notes(&report),
+        [(
+            Severity::Fallback,
+            NoteKind::InvalidColour { field: "lineColor" }
+        )]
+    );
+    let q = visualized(skin, &[40]);
+    let y = middle(&q);
+    assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0x2030_4080)));
+    assert_eq!(top(&q, 100.0 + 190.5, y), Some(rgba(0xff00_00ff)));
+    let (_d, skin, report) = json(
+        r#""timingvisualizer": [{"id": "tv", "transparent": 1, "PRColor": "zz"}],"#,
+        dst,
+    );
+    assert_eq!(notes(&report), []);
+    let q = visualized(skin, &[40]);
+    let y = middle(&q);
+    assert_eq!(top(&q, 100.0 + 25.5, y), None);
+    assert_eq!(top(&q, 100.0 + 35.5, y), Some(rgba(0x8800_00ff)));
+}
+
+/// C31: a hit-error visualizer's `hiterrorMode` 0 draws no line, and its
+/// `alpha` is a float in JSON, as a string, and in Lua: 0.5 steps the
+/// average by `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`.
+#[test]
+fn hit_error_lines_and_weight_read_as_the_source() {
+    let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;
+    let (_d, skin, _) = json(
+        r#""hiterrorvisualizer": [{"id": "he", "hiterrorMode": 0}],"#,
+        dst,
+    );
+    let q = visualized(skin, &[40]);
+    assert_eq!(top(&q, 100.0 + 110.5, middle(&q)), None);
+    let weighted = |q: &[Quad]| top(q, 100.0 + 130.5, middle(q));
+    for alpha in ["0.5", "\"0.5\""] {
+        let (_d, skin, report) = json(
+            &format!(r#""hiterrorvisualizer": [{{"id": "he", "alpha": {alpha}}}],"#),
+            dst,
+        );
+        assert_eq!(notes(&report), [], "{alpha}");
+        assert_eq!(
+            weighted(&visualized(skin, &[40])),
+            Some(rgba(0xff00_00ff)),
+            "{alpha}"
+        );
+    }
+    let (_d, skin, _) = lua(
+        "skin.hiterrorvisualizer = { { id = \"he\", alpha = 0.5 } }",
+        "{ id = \"he\", dst = { { x = 100, y = 800, w = 301, h = 60 } } }",
+    );
+    assert_eq!(weighted(&visualized(skin, &[40])), Some(rgba(0xff00_00ff)));
+}
+
+/// A stretch other than the default and a filter are noted and ignored: a
+/// visualizer places its band, lines and pixmap in its rect.
+#[test]
+fn a_visualizer_notes_its_stretch_and_filter() {
+    let (_d, _skin, report) = json(
+        r#""hiterrorvisualizer": [{"id": "he"}],"#,
+        r#"{"id": "he", "stretch": 1, "filter": 1, "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
+    );
+    assert_eq!(
+        notes(&report),
+        [
+            (Severity::Ignored, NoteKind::Ignored { field: "stretch" }),
+            (Severity::Ignored, NoteKind::Ignored { field: "filter" }),
+        ]
+    );
+}
+
+/// A visualizer the failure presentation draws (on the failed timer, 3)
+/// is critical: past its caps it refuses the import rather than drop.
+#[test]
+fn a_failure_visualizer_past_its_caps_refuses() {
+    let l = import_sized(
+        [1_920, 1_080],
+        r#""timingvisualizer": [{"id": "tv", "judgeWidthMillis": 0}],
+           "destination": [{"id": "tv", "timer": 3, "dst": [{"x": 0, "y": 0, "w": 100, "h": 20}]}]"#,
+        &[],
+    );
+    assert!(matches!(
+        l.err(),
+        skin_beatoraja::ImportError::Critical {
+            why: NoteKind::UnsupportedField {
+                field: "judgeWidthMillis"
+            },
+            ..
+        }
+    ));
 }
