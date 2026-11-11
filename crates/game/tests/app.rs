@@ -498,6 +498,9 @@ struct Headless {
     /// The input thread fails this long (ms) after the first decision
     /// screen begins.
     input_fails_in_decision: Option<i64>,
+    /// The screen fails as the practice page's chart is read, its
+    /// prerequisites waiting: the page's hold finds it.
+    screen_fails_in_jobs: bool,
     /// The clock at each deadline step.
     deadline_steps: Vec<i64>,
     /// The decision screen's epochs closed.
@@ -725,6 +728,7 @@ impl Headless {
             recovered_decisions: Vec::new(),
             screen_fails_in_decision: None,
             input_fails_in_decision: None,
+            screen_fails_in_jobs: false,
             deadline_steps: Vec::new(),
             closed_epochs: 0,
             decision_looks: Vec::new(),
@@ -1453,6 +1457,11 @@ impl AppRig for Headless {
     ) -> Result<Loading, BankLost> {
         if self.refuse_page_read {
             return Err(BankLost);
+        }
+        // The page's bank waits for its prerequisites: the screen lost
+        // now is found by the page's hold.
+        if std::mem::take(&mut self.screen_fails_in_jobs) {
+            self.screen_fails_at = self.at();
         }
         Ok(Loading::Ready)
     }
@@ -5494,7 +5503,7 @@ fn a_screen_lost_while_the_page_waits_is_rebuilt() {
     let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
-        rig.screen_fails_in_decision = Some(500);
+        rig.screen_fails_in_jobs = true;
     });
     ran.unwrap();
     let choice = chosen_at(&rig, P);
@@ -5506,8 +5515,8 @@ fn a_screen_lost_while_the_page_waits_is_rebuilt() {
         Some(game::Origin::Jobs),
         "recovered in the page's hold"
     );
-    assert!(recovered < choice + 1_500 * MS, "{recovered} from {choice}");
     assert_eq!(rig.decisions.len(), 1);
     let entered = rig.page_entered_at[0];
     assert!(entered >= choice + 1_500 * MS, "{entered} from {choice}");
+    assert!(entered >= recovered, "{entered} {recovered}");
 }
