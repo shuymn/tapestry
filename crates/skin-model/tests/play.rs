@@ -1306,6 +1306,96 @@ fn the_display_offset_reads_whole_ms_truncated_and_live() {
     }
 }
 
+/// A chart of 10 notes at 120 BPM from 1 s, then 11 at 180 BPM from 6 s,
+/// with its tempo range up to 200 BPM after them.
+fn two_tempos() -> Chart {
+    let b = (0..10).fold(ChartBuilder::new(120_000), |b, i| {
+        b.tap(lane(1), TimeUs((1_000 + 100 * i) * MS))
+    });
+    (0..11)
+        .fold(b.bpm(TimeUs(5_000 * MS), 180_000), |b, i| {
+            b.tap(lane(2), TimeUs((6_000 + 100 * i) * MS))
+        })
+        .bpm(TimeUs(9_000 * MS), 200_000)
+        .build()
+        .unwrap()
+}
+
+/// C6: `chart.main_bpm` is the attempt's whole-chart MAIN tempo in whole
+/// BPM, truncated (150.7 is 150, where rounding gives 151), whatever the
+/// chart's initial, current or highest tempo; the same in a practice
+/// section over the 120 BPM notes alone at k = 10 (50 %), whose own MAIN
+/// would be 120; 0 and invalid without a MAIN tempo or past the readout
+/// maximum, so a number guarded by it draws nothing.
+#[test]
+fn the_main_bpm_reads_the_whole_charts_main_truncated() {
+    let chart = two_tempos();
+    let bpm = |milli| bms_model::Tempo::from_milli(milli);
+    let read = |ctx: &PlayContext<'_>| {
+        let mut h = Harness::empty(&chart, ctx);
+        h.readouts = Some(FrameReadouts {
+            bpm_current_x100: Some(12_000),
+            ..UNKNOWN
+        });
+        h.frame(1_200, &[]);
+        let first = (
+            h.field(field::CHART_MAIN_BPM),
+            h.field(field::CHART_MAIN_BPM_VALID),
+        );
+        h.frame(7_000, &[]);
+        let later = (
+            h.field(field::CHART_MAIN_BPM),
+            h.field(field::CHART_MAIN_BPM_VALID),
+        );
+        assert_eq!(first, later, "constant over the attempt");
+        first
+    };
+    let with_main = |main, ctx: PlayContext<'static>| PlayContext {
+        bpm_range: Some(BpmRange {
+            min_x100: 12_000,
+            max_x100: 20_000,
+        }),
+        score: skin_model::PlayScore {
+            main,
+            ..skin_model::PlayScore::NONE
+        },
+        ..ctx
+    };
+    assert_eq!(read(&with_main(bpm(180_000), full(0))), (180, 1));
+    assert_eq!(read(&with_main(bpm(180_700), full(0))), (180, 1));
+    assert_eq!(read(&with_main(bpm(150_700), full(0))), (150, 1));
+    assert_eq!(read(&with_main(bpm(150_000), full(0))), (150, 1));
+    // A practice round over the 120 BPM notes alone, at k = 10.
+    let s = section(500, 3_000, 0);
+    let in_round = PlayContext {
+        score: skin_model::PlayScore {
+            main: bpm(180_000),
+            speed: bms_model::Speed::from_twentieths(10).unwrap(),
+            ..skin_model::PlayScore::NONE
+        },
+        ..in_section(&s)
+    };
+    let mut h = Harness::empty(&chart, &in_round);
+    h.frame(1_200, &[]);
+    assert_eq!(
+        (
+            h.field(field::CHART_MAIN_BPM),
+            h.field(field::CHART_MAIN_BPM_VALID)
+        ),
+        (180, 1)
+    );
+    // Unknown: none, or past the readout maximum.
+    assert_eq!(read(&with_main(None, full(0))), (0, 0));
+    let past = bms_model::Tempo::from_units(
+        (u128::from(READOUT_MAX.unsigned_abs()) + 1) * bms_model::Tempo::UNITS_PER_BPM,
+    );
+    assert_eq!(read(&with_main(past, full(0))), (0, 0));
+    let last = bms_model::Tempo::from_units(
+        u128::from(READOUT_MAX.unsigned_abs()) * bms_model::Tempo::UNITS_PER_BPM,
+    );
+    assert_eq!(read(&with_main(last, full(0))), (READOUT_MAX, 1));
+}
+
 /// The remaining time counts to the last resolved object: a background
 /// sound's start past the last note, a mine's time, a long note's end;
 /// completion changes nothing.

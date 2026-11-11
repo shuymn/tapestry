@@ -232,6 +232,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // snapshot, as its covers.
         Setting, // display_offset.ms
         Setting, // settings.fix_hispeed
+        // The whole chart's MAIN tempo, 141 and 142: no library main tempo
+        // yet, so only the loaded chart knows it.
+        Unavailable, // chart.main_bpm
+        Unavailable, // chart.main_bpm_valid
     ]
 };
 
@@ -798,6 +802,8 @@ mod tests {
             field::CHART_TOTAL_VALID,
             field::CHART_JUDGE_CLASS,
             field::CHART_JUDGE_CLASS_VALID,
+            field::CHART_MAIN_BPM,
+            field::CHART_MAIN_BPM_VALID,
         ] {
             assert_eq!(loading_field(slot), Some(LoadingField::Unavailable));
         }

@@ -301,6 +301,8 @@ pub static PLAY: Schema = Schema {
             export: T,
         },
         int("settings.fix_hispeed", FIX_HISPEED_MAX, T),
+        int("chart.main_bpm", READOUT_MAX, T),
+        flag("chart.main_bpm_valid", T),
     ],
     timers: &[
         timer("ready", E),
@@ -609,8 +611,16 @@ pub mod field {
     /// Classic; Floating 1 from the start tempo, 2 the maximum, 3 the main
     /// and 4 the minimum.
     pub const SETTINGS_FIX_HISPEED: u16 = 140;
+    /// The whole chart's MAIN tempo in whole BPM, truncated: the
+    /// attempt's [`PlayScore::main`](crate::PlayScore::main), the 1×
+    /// chart's whatever section a practice round plays and whatever its
+    /// speed; 0 while `chart.main_bpm_valid` is false.
+    pub const CHART_MAIN_BPM: u16 = 141;
+    /// Whether it is known: false without a MAIN tempo and past the
+    /// readout maximum.
+    pub const CHART_MAIN_BPM_VALID: u16 = 142;
     /// The number of fields.
-    pub const COUNT: usize = 141;
+    pub const COUNT: usize = 143;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -1047,7 +1057,27 @@ mod tests {
                 .map(|(_, f)| (f.ty, f.export)),
             Some((FieldTy::Int { lo: 0, hi: 4 }, T))
         );
-        assert_eq!(field::COUNT, 141);
+        assert_eq!(slot("chart.main_bpm"), Some(field::CHART_MAIN_BPM));
+        assert_eq!(
+            PLAY.field("chart.main_bpm").map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: READOUT_MAX
+                },
+                T
+            ))
+        );
+        assert_eq!(
+            slot("chart.main_bpm_valid"),
+            Some(field::CHART_MAIN_BPM_VALID)
+        );
+        assert_eq!(
+            PLAY.field("chart.main_bpm_valid")
+                .map(|(_, f)| (f.ty, f.export)),
+            Some((FieldTy::Bool, T))
+        );
+        assert_eq!(field::COUNT, 143);
     }
 
     #[test]
