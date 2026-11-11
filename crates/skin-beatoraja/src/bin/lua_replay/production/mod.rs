@@ -401,6 +401,7 @@ pub fn record(
                                 gauge: shown,
                                 effects: st.effects,
                                 notes: st.ev.notes(),
+                                offsets: skin_model::Offsets::NONE,
                                 input: st.ev.input(),
                                 complete: st.ev.is_complete(),
                                 target: [1_920, 1_080],

@@ -1456,6 +1456,7 @@ impl Loaded {
             score: self.score,
             profile: Some(Arc::clone(&self.profile)),
             main: self.main,
+            speed: self.config.speed,
             ..Attempt::new(
                 if self.ahead {
                     self.attempt + 1

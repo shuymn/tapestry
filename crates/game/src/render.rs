@@ -130,6 +130,14 @@ impl OffsetRing {
         self.count = self.count.wrapping_add(1);
     }
 
+    /// The slots as they stand: the offset recorded `k` judgments ago, for
+    /// `k` below `min(count, OFFSET_SLOTS)`, is at
+    /// `(count − 1 − k) % OFFSET_SLOTS`.
+    #[must_use]
+    pub const fn slots(&self) -> &[i32; OFFSET_SLOTS] {
+        &self.ms
+    }
+
     /// Forgets everything recorded.
     pub fn clear(&mut self) {
         *self = Self::EMPTY;
