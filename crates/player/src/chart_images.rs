@@ -503,3 +503,215 @@ fn log_absent(set: &ChartImages) {
 pub fn folder(path: &Path) -> PathBuf {
     path.parent().map_or_else(PathBuf::new, Path::to_path_buf)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use game::coord::{Caps, Coordinator, JobKind, Scope, Spawner};
+    use skin_model::chart_image::{Absent, ChartImage};
+
+    use super::{ChartImageWorker, Want};
+
+    const CAPS: Caps = Caps {
+        foreground: 4,
+        speculative: 1,
+    };
+    const SIDE: u32 = 2_048;
+
+    /// A `w`×`h` PNG of `rgb` at `dir/name`.
+    fn png(dir: &Path, name: &str, [w, h]: [u32; 2], [r, g, b]: [u8; 3]) {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels = [r, g, b, 255].repeat(usize::try_from(w * h).unwrap());
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+    }
+
+    fn want(dir: &Path, side: Option<u32>) -> Want {
+        Want {
+            dir: dir.to_path_buf(),
+            names: ["s.png".to_owned(), "b.png".to_owned()],
+            side,
+        }
+    }
+
+    /// Steps `w` until `done` or 10 s.
+    fn step_until(
+        w: &mut ChartImageWorker,
+        coord: &Coordinator,
+        spawner: Spawner,
+        done: impl Fn(&ChartImageWorker) -> bool,
+    ) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !done(w) {
+            assert!(Instant::now() < end, "{w:?}");
+            w.step(Some((coord, spawner)), &|| false);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A chart's stage file (640×480) and back image (512×384) are read on
+    /// the worker, one job, and its thread is joined once it ended.
+    #[test]
+    fn the_worker_reads_both_images() {
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        png(d.path(), "b.png", [512, 384], [40, 50, 60]);
+        let coord = Coordinator::new(CAPS);
+        let mut w = ChartImageWorker::default();
+        w.want(want(d.path(), Some(SIDE)));
+        step_until(&mut w, &coord, Spawner::SYSTEM, |w| {
+            w.current().is_some() && w.idle()
+        });
+        let set = w.current().unwrap();
+        assert_eq!(
+            set.read(ChartImage::Stage).image.as_ref().unwrap().native(),
+            [640, 480]
+        );
+        assert_eq!(
+            set.read(ChartImage::Back).image.as_ref().unwrap().native(),
+            [512, 384]
+        );
+        assert_eq!(w.begun, 1);
+        assert!(set.bytes() > 0);
+    }
+
+    /// A retry after an attempt drew the set re-resolves both files: an
+    /// unchanged one keeps its read (the same pixels, not decoded again),
+    /// a rewritten one is read again, and a name missing before and
+    /// present now is read.
+    #[test]
+    fn a_retry_reads_only_what_changed() {
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let mut w = ChartImageWorker::default();
+        let ready = |w: &ChartImageWorker| w.current().is_some() && w.idle();
+        w.want(want(d.path(), Some(SIDE)));
+        step_until(&mut w, &coord, Spawner::SYSTEM, ready);
+        let first = std::sync::Arc::clone(w.current().unwrap());
+        assert!(matches!(
+            first.read(ChartImage::Back).image,
+            Err(Absent::Unresolved(_))
+        ));
+        // Not drawn yet: the same want is the same set.
+        w.want(want(d.path(), Some(SIDE)));
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+        assert!(std::sync::Arc::ptr_eq(w.current().unwrap(), &first));
+        // Drawn, then the back image appears: the stage file kept.
+        w.committed();
+        png(d.path(), "b.png", [512, 384], [40, 50, 60]);
+        w.want(want(d.path(), Some(SIDE)));
+        assert!(w.current().is_none(), "unavailable while re-resolved");
+        step_until(&mut w, &coord, Spawner::SYSTEM, ready);
+        let second = std::sync::Arc::clone(w.current().unwrap());
+        assert!(std::ptr::eq(
+            first.read(ChartImage::Stage),
+            second.read(ChartImage::Stage)
+        ));
+        assert_eq!(
+            second
+                .read(ChartImage::Back)
+                .image
+                .as_ref()
+                .unwrap()
+                .native(),
+            [512, 384]
+        );
+        // Drawn again, the stage file rewritten (another size): read again,
+        // the back image kept.
+        w.committed();
+        std::thread::sleep(Duration::from_millis(20));
+        png(d.path(), "s.png", [320, 240], [70, 80, 90]);
+        w.want(want(d.path(), Some(SIDE)));
+        step_until(&mut w, &coord, Spawner::SYSTEM, ready);
+        let third = w.current().unwrap();
+        assert_eq!(
+            third
+                .read(ChartImage::Stage)
+                .image
+                .as_ref()
+                .unwrap()
+                .native(),
+            [320, 240]
+        );
+        assert!(std::ptr::eq(
+            second.read(ChartImage::Back),
+            third.read(ChartImage::Back)
+        ));
+        assert_eq!(w.begun, 3);
+    }
+
+    /// A thread that cannot start leaves both images absent as failed,
+    /// never a pending wait and never the run's failure.
+    #[test]
+    fn a_refused_thread_leaves_the_images_absent() {
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let mut w = ChartImageWorker::default();
+        w.want(want(d.path(), Some(SIDE)));
+        w.step(
+            Some((&coord, Spawner::refusing_owned(&[JobKind::ChartImages]))),
+            &|| false,
+        );
+        assert!(w.idle());
+        let set = w.current().unwrap();
+        assert_eq!(set.read(ChartImage::Stage).image, Err(Absent::Failed));
+        assert_eq!(set.read(ChartImage::Back).image, Err(Absent::Failed));
+    }
+
+    /// A chart left while its job runs: the job, cancelled through the
+    /// choice's scope, is kept until its thread ends, and the next chart's
+    /// job begins only then (one worker at a time).
+    #[test]
+    fn the_next_job_waits_for_the_last_ones_thread() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        png(a.path(), "s.png", [640, 480], [10, 20, 30]);
+        png(b.path(), "s.png", [320, 240], [70, 80, 90]);
+        let coord = Coordinator::new(CAPS);
+        let mut w = ChartImageWorker::default();
+        w.want(want(a.path(), Some(SIDE)));
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+        assert!(!w.idle(), "A's job runs");
+        // The chart is left: its scope advanced, its want forgotten.
+        coord.advance(Scope::Choice);
+        w.forget();
+        w.want(want(b.path(), Some(SIDE)));
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+        // Either A's thread already ended and B's began, or B waits: never
+        // two jobs alive.
+        step_until(&mut w, &coord, Spawner::SYSTEM, |w| {
+            w.current().is_some() && w.idle()
+        });
+        let set = w.current().unwrap();
+        assert_eq!(
+            set.read(ChartImage::Stage).image.as_ref().unwrap().native(),
+            [320, 240]
+        );
+        assert_eq!(w.begun, 2);
+    }
+
+    /// With no coordinator (the direct launch) the images are read at once
+    /// on the calling thread; a target with no chart layer reads none.
+    #[test]
+    fn the_direct_launch_reads_at_once() {
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let mut w = ChartImageWorker::default();
+        w.want(want(d.path(), Some(SIDE)));
+        w.step(None, &|| false);
+        assert!(w.idle());
+        let set = w.current().unwrap();
+        assert!(set.read(ChartImage::Stage).image.is_ok());
+        let mut none = ChartImageWorker::default();
+        none.want(want(d.path(), None));
+        none.step(None, &|| false);
+        assert!(none.current().is_none());
+        assert_eq!(none.begun, 0);
+    }
+}
