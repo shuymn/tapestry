@@ -343,15 +343,165 @@ fn a_bpm_graph_reads_its_colours_as_the_source() {
         colours(&q),
         [rgba(0x12ab_34ff), rgba(0x7f7f_7fff), rgba(0xff00_00ff)]
     );
-    let (_d, skin, report) = json(
-        r#""bpmgraph": [{"id": "bg", "lineWidth": 2147483647}],"#,
-        r#"{"id": "bg", "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#,
+}
+
+/// C32: a BPM graph's line width is kept up to 16 texels and drops the
+/// graph with a note past it. At 16 over 100 rows the rows of 150 (MAIN)
+/// and 300 sit at `⌊0.5 · 84⌋ = 42` and `⌊(log10 2 + log10 8)/(2 log10 8) ·
+/// 84⌋ = 56`, 14 apart, less than the stroke, so no transition is drawn:
+/// only the default MAIN `00ff00` and highest `ff0000`. At 17 nothing is
+/// drawn, with the note.
+#[test]
+fn a_bpm_graph_keeps_line_widths_up_to_16() {
+    let (chart, profile) = tempo_chart();
+    let main = Tempo::from_units(150 * Tempo::UNITS_PER_BPM).unwrap();
+    let score = PlayScore {
+        profile: Some(&profile),
+        main: Some(main),
+        ..PlayScore::NONE
+    };
+    let dst = r#"{"id": "bg", "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#;
+    let (_d, skin, report) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 16}],"#, dst);
+    assert_eq!(notes(&report), []);
+    let q = Drawn::over_score(skin, &chart, score).frame(0, &[]);
+    assert_eq!(colours(&q), [rgba(0x00ff_00ff), rgba(0xff00_00ff)]);
+    let (_d, skin, report) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 17}],"#, dst);
+    assert_eq!(
+        notes(&report),
+        [(
+            Severity::Dropped,
+            NoteKind::UnsupportedField { field: "lineWidth" }
+        )]
+    );
+    assert_eq!(Drawn::over_score(skin, &chart, score).frame(0, &[]), []);
+}
+
+/// C32: a BPM graph whose stretch is not the default drops with a note:
+/// the source draws its first frame's texture through the stretch with a
+/// negative height. The default stretch (0) is kept.
+#[test]
+fn a_bpm_graph_drops_a_stretch_other_than_the_default() {
+    let (_d, _skin, report) = json(
+        r#""bpmgraph": [{"id": "bg"}],"#,
+        r#"{"id": "bg", "stretch": 9, "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#,
+    );
+    assert_eq!(notes(&report), [(Severity::Dropped, NoteKind::Stretch(9))]);
+    let (_d, _skin, report) = json(
+        r#""bpmgraph": [{"id": "bg"}],"#,
+        r#"{"id": "bg", "stretch": 0, "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#,
     );
     assert_eq!(notes(&report), []);
+}
+
+/// A JSON `null` colour, which fails the source's skin, is noted: a BPM
+/// graph's keeps its default, a visualizer's draws red.
+#[test]
+fn a_null_colour_is_noted() {
+    let (_d, _skin, report) = json(
+        r#""bpmgraph": [{"id": "bg", "mainBPMColor": null}],"#,
+        r#"{"id": "bg", "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#,
+    );
+    assert_eq!(
+        notes(&report),
+        [(
+            Severity::Fallback,
+            NoteKind::InvalidColour {
+                field: "mainBPMColor"
+            }
+        )]
+    );
+    let (_d, skin, report) = json(
+        r#""timingvisualizer": [{"id": "tv", "PGColor": null, "PRColor": null}],"#,
+        r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
+    );
+    assert_eq!(
+        notes(&report),
+        [
+            (
+                Severity::Fallback,
+                NoteKind::InvalidColour { field: "PGColor" }
+            ),
+            (
+                Severity::Fallback,
+                NoteKind::InvalidColour { field: "PRColor" }
+            ),
+        ]
+    );
+    let q = visualized(skin, &[40]);
+    let y = middle(&q);
+    assert_eq!(top(&q, 100.0 + 135.5, y), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0xff00_00ff)));
+}
+
+/// C31: a Lua string `alpha` is LuaJ's `tofloat()`: `"18446744073709551616"`
+/// scans as a wrapping `long`, 0, so the average stays at 0, its line on
+/// the centre's column 150 (drawn after the centre); `" 0.5 "` is 0.5, the
+/// average `⌊0.5 · 40⌋ = 20`, its line at 130. The same JSON string is
+/// `Float.parseFloat`, about 1.8e19: the step saturates to `Long.MAX_VALUE`,
+/// whose low 32 bits are −1, the line at 151.
+#[test]
+fn a_lua_alpha_string_is_luaj_s_float() {
+    let dst = "{ id = \"he\", dst = { { x = 100, y = 800, w = 301, h = 60 } } }";
+    for (alpha, column) in [("18446744073709551616", 150.5), (" 0.5 ", 130.5)] {
+        let (_d, skin, report) = lua(
+            &format!("skin.hiterrorvisualizer = {{ {{ id = \"he\", alpha = \"{alpha}\" }} }}"),
+            dst,
+        );
+        assert_eq!(notes(&report), [], "{alpha}");
+        let q = visualized(skin, &[40]);
+        assert_eq!(
+            top(&q, 100.0 + column, middle(&q)),
+            Some(rgba(0xff00_00ff)),
+            "{alpha}"
+        );
+    }
+    let (_d, skin, _) = json(
+        r#""hiterrorvisualizer": [{"id": "he", "alpha": "18446744073709551616"}],"#,
+        r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
+    );
+    let q = visualized(skin, &[40]);
+    assert_eq!(top(&q, 100.0 + 151.5, middle(&q)), Some(rgba(0xff00_00ff)));
+}
+
+/// C33: a timing visualizer following HIDDEN+ (offset 5) over lanes: with
+/// HIDDEN+ on both its band and its lines draw; with HIDDEN+ off the source
+/// sets its destination's alpha to 0, which hides the band, while the
+/// lines, in their own colour and alpha, still draw: the line of +40 ms in
+/// `00FF00` and no band colour.
+#[test]
+fn a_timing_visualizer_s_lines_outlast_hidden_plus() {
+    let l = common::lanes::with(
+        r#""timingvisualizer": [{"id": "tv"}]"#,
+        &[r#"{"id": "tv", "offset": 5, "dst": [{"x": 500, "y": 1000, "w": 301, "h": 20}]}"#],
+    );
     assert!(
-        !Drawn::over_score(skin, &chart, score)
-            .frame(0, &[])
-            .is_empty()
+        !l.report()
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::RuntimeOffset(_)))
+    );
+    let frame = |enabled: bool| {
+        let score = PlayScore {
+            areas: Some(AREAS),
+            ..PlayScore::NONE
+        };
+        let mut d = Drawn::over_score(l.ok().skin.clone(), &taps(), score);
+        d.record(40);
+        d.view.hidden = if enabled { 100 } else { 0 };
+        let mut readouts = common::play::readouts_for(d.view);
+        (readouts.covers.hidden, readouts.covers.hidden_enabled) = (100, enabled);
+        d.readouts = Some(readouts);
+        d.frame(2_000, &[])
+    };
+    let band = |q: &[Quad]| colours(q).contains(&rgba(0x0000_88ff));
+    let line = |q: &[Quad]| colours(q).contains(&rgba(0x00ff_00ff));
+    let on = frame(true);
+    assert!(band(&on) && line(&on));
+    let off = frame(false);
+    assert!(
+        !band(&off) && line(&off),
+        "HIDDEN+ off: {:?}",
+        colours(&off)
     );
 }
 

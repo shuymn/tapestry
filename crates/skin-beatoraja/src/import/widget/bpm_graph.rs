@@ -4,20 +4,23 @@
 //! drawn on a white system image.
 //!
 //! As the source reads them: `delay` in ms, not positive showing the graph
-//! at once; `lineWidth` not positive is 2, and past [`MAX_COORD`] it is
-//! [`MAX_COORD`], whose strokes already cover any pixmap the model makes,
-//! so the graph draws as the source's does. No field drops it. A colour
-//! keeps its hex digits, wherever they are, up to the first six,
-//! always opaque (`normalizeColorString`, `:230-233`); none left keeps the
-//! default. One to five left fails the source's skin; here the default is
-//! kept with a note.
+//! at once; `lineWidth` not positive is 2. A `lineWidth` past
+//! [`MAX_BPM_LINE_WIDTH`] drops the graph with a note: the source draws
+//! it, but its `int` stroke arithmetic wraps for the largest widths and the
+//! model bounds its preparation by this width. A colour keeps its hex
+//! digits, wherever they are, up to the first six, always opaque
+//! (`normalizeColorString`, `:230-233`); none left keeps the default. One
+//! to five left, or a JSON `null`, fails the source's skin; here the
+//! default is kept with a note.
 //!
 //! Its destination keeps its track, timer, visibility, blend, colour,
-//! alpha and angle. The source paints a texture of the destination's own
-//! size, so neither its stretch nor its filter changes what it draws.
+//! alpha and angle. A stretch other than the default drops the graph with
+//! a note: the source draws its first frame's texture through the stretch
+//! with a negative height (`:105-107`), which the model does not
+//! reproduce. A filter changes nothing, as the strokes are solid.
 
 use bms_model::TimeUs;
-use skin_model::{BpmColors, BpmGraphDef, MAX_COORD, Rgba8, Source, bpm_columns};
+use skin_model::{BpmColors, BpmGraphDef, MAX_BPM_LINE_WIDTH, Rgba8, Source, bpm_columns};
 
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Severity};
@@ -77,15 +80,29 @@ impl Cx<'_> {
         let [delay, line_width] = self.def.fields(rec, ["delay", "lineWidth"]);
         let delay = TimeUs(i64::from(self.int_or(delay, "delay", 0)?.max(0)) * 1_000);
         let line_width = self.int_or(line_width, "lineWidth", 2)?;
-        // Past `MAX_COORD` a stroke already covers any pixmap the model
-        // makes, so the clamp draws what the source draws.
         let line_width = if line_width > 0 { line_width } else { 2 };
-        let line_width = line_width.min(MAX_COORD).unsigned_abs();
+        let Some(line_width) = u32::try_from(line_width)
+            .ok()
+            .filter(|&w| w <= MAX_BPM_LINE_WIDTH)
+        else {
+            return self.drop_el(role, at, NoteKind::UnsupportedField { field: "lineWidth" });
+        };
+        if !matches!(dst.stretch, -1 | 0) {
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
+        }
         let d = BpmColors::DEFAULT;
         let mut c = [d.main, d.min, d.max, d.other, d.stop, d.transition];
         let fields = self.def.fields(rec, NAMES);
         for ((slot, field), name) in c.iter_mut().zip(fields).zip(NAMES) {
             let Some(s) = self.opt_string(field, name)? else {
+                // An explicit JSON `null` fails the source's skin.
+                if field.is_some() {
+                    self.note(
+                        Some(at),
+                        Severity::Fallback,
+                        NoteKind::InvalidColour { field: name },
+                    );
+                }
                 continue;
             };
             match colour(&s) {

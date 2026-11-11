@@ -462,8 +462,9 @@ impl Definition {
 
     /// A `float` field (`JsonValue.asFloat`, Lua's `tofloat`): a number
     /// token's double, or a Lua number, rounded to `f32` as Java's `(float)`
-    /// rounds it, or a string that parses as a decimal number. The value
-    /// may be non-finite; the caller decides.
+    /// rounds it; a JSON string that parses as a decimal number; a Lua
+    /// string as LuaJ converts it ([`crate::lua::num_scan::todouble`]). The
+    /// value may be non-finite; the caller decides.
     pub(crate) fn float(&mut self, id: u32, field: &'static str) -> Result<f32, ImportError> {
         // Java's `(float)` of a `double` or a `long`: round to nearest.
         #[expect(
@@ -488,6 +489,7 @@ impl Definition {
             Scalar::Int(v) => Ok(long(v)),
             Scalar::Float(v) => Ok(narrow(v)),
             Scalar::Str { raw, escaped } => {
+                let lua = self.arena.is_lua_scalar(id);
                 let decoded;
                 let s = if escaped {
                     decoded = self.decode(id, true)?;
@@ -495,6 +497,11 @@ impl Definition {
                 } else {
                     raw
                 };
+                // A Lua string is LuaJ's `tofloat()`: its `todouble()`
+                // (an integer scan that wraps, NaN read as 0) narrowed.
+                if lua {
+                    return Ok(narrow(crate::lua::num_scan::todouble(s.as_bytes())));
+                }
                 s.trim()
                     .parse::<f32>()
                     .map_err(|_| self.type_error(id, field, "a number"))

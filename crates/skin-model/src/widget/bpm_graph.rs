@@ -25,6 +25,10 @@ use crate::quad::QuadBatch;
 pub const MAX_BPM_COLUMNS: u32 = 2_048;
 /// The most runs a column keeps.
 pub const RUNS_PER_COLUMN: u32 = 4;
+/// The widest stroke a BPM graph takes, in texels (provisional, owner
+/// pattern 7): it bounds a preparation's work to the tempo rows times
+/// twice this, and keeps the source's `int` stroke arithmetic exact.
+pub const MAX_BPM_LINE_WIDTH: u32 = 16;
 
 /// A BPM graph's colours, the source's defaults first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +67,8 @@ pub struct BpmGraphDef {
     /// How long the graph takes to reveal, left to right, on the screen
     /// timer; not positive shows it at once.
     pub delay: TimeUs,
-    /// The strokes' width in texels, 1 or more (the source's default 2).
+    /// The strokes' width in texels, 1 to [`MAX_BPM_LINE_WIDTH`] (the
+    /// source's default 2).
     pub line_width: u32,
     pub colors: BpmColors,
     /// A white image every run tints.
@@ -211,6 +216,11 @@ impl BpmGraphDef {
 /// `fills` clipped to `cols` × `rows`, composed per column, each column
 /// capped at [`RUNS_PER_COLUMN`] runs: its first three, then one run in
 /// `transition` from the fourth's bottom to its last's top.
+///
+/// The columns are swept left to right holding only the fills that cover
+/// the current column, in paint order, so the work is the fills' clipped
+/// widths and the storage the most fills one column holds, never a copy
+/// of every fill per column it covers.
 fn compose_columns(
     fills: &[(i64, i64, i64, i64, Rgba8)],
     cols: u32,
@@ -218,29 +228,45 @@ fn compose_columns(
     transition: Rgba8,
 ) -> Box<[Run]> {
     let clamp = |v: i64, top: u32| u32::try_from(v.clamp(0, i64::from(top))).unwrap_or(0);
-    let mut per_column: Vec<Vec<Fill>> = (0..cols).map(|_| Vec::new()).collect();
-    for &(l, r, b, t, color) in fills {
-        let (l, r) = (clamp(l, cols), clamp(r, cols));
-        let (y0, y1) = (clamp(b, rows), clamp(t, rows));
-        if y1 <= y0 {
-            continue;
-        }
-        for c in l..r {
-            if let Some(col) = per_column.get_mut(usize::try_from(c).unwrap_or(usize::MAX)) {
-                col.push(Fill {
+    // Each drawable fill as (left, right, its fill), in paint order.
+    let clipped: Vec<(u32, u32, Fill)> = fills
+        .iter()
+        .filter_map(|&(l, r, b, t, color)| {
+            let (l, r) = (clamp(l, cols), clamp(r, cols));
+            let (y0, y1) = (clamp(b, rows), clamp(t, rows));
+            (y1 > y0 && r > l).then_some((
+                l,
+                r,
+                Fill {
                     y0,
                     y1,
                     color: color.unit(),
-                });
-            }
-        }
-    }
+                },
+            ))
+        })
+        .collect();
+    // The fills by their left column, in paint order within a column.
+    let mut by_left: Vec<usize> = (0..clipped.len()).collect();
+    by_left.sort_by_key(|&k| clipped.get(k).map_or(0, |f| f.0));
+    let mut next = by_left.iter().copied().peekable();
+    let mut active: Vec<usize> = Vec::new();
+    let mut column: Vec<Fill> = Vec::new();
     let mut out = Vec::new();
     let (mut edges, mut runs) = (Vec::new(), Vec::new());
-    for (c, col) in (0_u32..).zip(&per_column) {
+    let cap = usize::try_from(RUNS_PER_COLUMN).unwrap_or(4);
+    for c in 0..cols {
+        active.retain(|&k| clipped.get(k).is_some_and(|f| f.1 > c));
+        let before = active.len();
+        while let Some(k) = next.next_if(|&k| clipped.get(k).is_some_and(|f| f.0 <= c)) {
+            active.push(k);
+        }
+        if active.len() > before {
+            active.sort_unstable();
+        }
+        column.clear();
+        column.extend(active.iter().filter_map(|&k| clipped.get(k).map(|f| f.2)));
         runs.clear();
-        compose::column(c, col, &mut edges, &mut runs);
-        let cap = usize::try_from(RUNS_PER_COLUMN).unwrap_or(4);
+        compose::column(c, &column, &mut edges, &mut runs);
         if runs.len() > cap {
             let rest = runs.get(cap - 1..).unwrap_or_default();
             let (Some(from), Some(to)) = (rest.first(), rest.last()) else {

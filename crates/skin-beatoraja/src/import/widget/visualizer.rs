@@ -133,8 +133,13 @@ impl Cx<'_> {
     ) -> Result<[Rgba8; N], ImportError> {
         let mut out = [RED; N];
         for ((slot, field), (name, default)) in out.iter_mut().zip(fields).zip(names) {
-            let s = self.opt_string(field, name)?;
-            *slot = self.colour_or_red(at, checked(s.as_deref().unwrap_or(default)), name);
+            // An explicit JSON `null` fails the source's skin: red, as an
+            // invalid colour.
+            let s = match (field, self.opt_string(field, name)?) {
+                (Some(_), None) => None,
+                (_, s) => Some(s.unwrap_or_else(|| default.to_owned())),
+            };
+            *slot = self.colour_or_red(at, s.as_deref().and_then(checked), name);
         }
         Ok(out)
     }
@@ -151,8 +156,11 @@ impl Cx<'_> {
         if transparent {
             return Ok(CLEAR);
         }
-        let s = self.opt_string(field, "PRColor")?;
-        Ok(self.colour_or_red(at, value_of(s.as_deref().unwrap_or(default)), "PRColor"))
+        let s = match (field, self.opt_string(field, "PRColor")?) {
+            (Some(_), None) => None,
+            (_, s) => Some(s.unwrap_or_else(|| default.to_owned())),
+        };
+        Ok(self.colour_or_red(at, s.as_deref().and_then(value_of), "PRColor"))
     }
 
     /// `c`, or red with a note on `name`.
