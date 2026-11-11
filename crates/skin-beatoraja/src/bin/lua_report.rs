@@ -261,6 +261,9 @@ fn report(index: usize, survey: &Survey) -> String {
         ));
     }
     line(&format!("  modules: {}", survey.modules));
+    for a in &survey.atlas {
+        line(&format!("  atlas: {a}"));
+    }
     if let Some((ops, callbacks)) = survey.frame_ops {
         line(&format!(
             "  frame: operations {ops} of {}, program callbacks {callbacks}",

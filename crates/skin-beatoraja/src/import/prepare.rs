@@ -228,7 +228,7 @@ enum Static {
 fn static_class(id: i32) -> Static {
     match id {
         ops::TABLE_SONG | ops::COURSE_MODE | 280..=283 | 289 => Static::Known(false),
-        150..=155 | 170 | 176 | 177 | 180..=184 => Static::Chart,
+        150..=155 | 170 | 176 | 177 | 180..=184 | 190 | 191 | 194 | 195 => Static::Chart,
         171..=175
         | 178
         | 179
@@ -238,7 +238,8 @@ fn static_class(id: i32) -> Static {
         | 1161
         | 40
         | 41
-        | 190..=195
+        | 192
+        | 193
         | 50
         | 51
         | 118

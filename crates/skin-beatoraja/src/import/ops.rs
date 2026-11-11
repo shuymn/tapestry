@@ -468,6 +468,12 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         182 => (Body::Text("chart.judge_class == 2"), false),
         183 => (Body::Text("chart.judge_class == 3"), false),
         184 => (Body::Text("chart.judge_class == 4"), false),
+        // The chart's own images: drawable in this installation (S10-12
+        // design §5.3); unavailable while loading until they settle.
+        190 => (Body::Text("!chart.stagefile"), false),
+        191 => (Body::Text("chart.stagefile"), false),
+        194 => (Body::Text("!chart.backbmp"), false),
+        195 => (Body::Text("chart.backbmp"), false),
         200..=207 => (
             Body::Text(RANK_CURRENT.get(usize::try_from(id - 200).ok()?)?),
             false,
