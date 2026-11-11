@@ -645,6 +645,21 @@ fn timers_compare_with_the_off_value() {
     assert_eq!(i.callbacks, [Disposition::Replaced(Unsupported::Type)]);
 }
 
+/// `main_state.timer(140)`, the rhythm clock, lowers to the play's
+/// `rhythm` timer: off before play starts, on from it.
+#[test]
+fn the_rhythm_timer_reads_in_lua() {
+    let d = folder(&skin(&image_at(
+        0,
+        "draw = function() return ms.timer(140) ~= ms.timer_off_value end,",
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [1, 0, 0, 0]);
+    let mut play = Drawn::new(i.imported.skin, 10);
+    assert!(play.frame(-10, &[]).is_empty());
+    assert_eq!(play.frame(10, &[]).len(), 1);
+}
+
 /// A draw callback reading the chart's BPM-change condition lowers, with
 /// one D4 note, and follows the play context's fact.
 #[test]

@@ -53,6 +53,8 @@ pub(crate) fn builtin(id: i32) -> Timer {
         143 => timer::LAST_NOTE,
         48 => timer::FULL_COMBO,
         44 => timer::GAUGE_MAX,
+        // The rhythm clock (`play/RhythmTimerProcessor.java:60-71`).
+        140 => timer::RHYTHM,
         // Every judgment starts both, whichever widget draws it, where the
         // source sets them only for a judge region its judge widget makes
         // (`JudgeManager.java:129, 675-690`).
@@ -236,7 +238,7 @@ mod tests {
         }
         assert_eq!(builtin(58), Timer::Unsupported);
         assert_eq!(builtin(2), Timer::Unsupported);
-        assert_eq!(builtin(140), Timer::Unsupported);
+        assert_eq!(builtin(140), Timer::Builtin(timer::RHYTHM));
     }
 
     #[test]

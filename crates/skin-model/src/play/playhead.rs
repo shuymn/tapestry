@@ -127,6 +127,12 @@ impl ExactPlayhead {
         })
     }
 
+    /// The chart's timeline the playhead follows, shared with the chart.
+    #[must_use]
+    pub(crate) fn timeline(&self) -> &ChartTimeline {
+        &self.timeline
+    }
+
     /// The representative rows, one per stored µs, in time order.
     #[must_use]
     pub fn representatives(&self) -> &[TimelineId] {
