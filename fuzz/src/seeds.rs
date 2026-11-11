@@ -1475,6 +1475,22 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         (
+            "play graphs",
+            play_skin(
+                r##""judgegraph": [{"id": "ng", "delay": 0}, {"id": "jg", "type": 1}],
+                "bpmgraph": [{"id": "bg", "mainBPMColor": "#12ab34", "otherBPMColor": "ff00"}],
+                "timingvisualizer": [{"id": "tv", "PRColor": "#20304080"}, {"id": "tw", "judgeWidthMillis": 1001}],
+                "hiterrorvisualizer": [{"id": "he", "lineWidth": 6, "windowLength": 80, "alpha": 0.5}],
+                "destination": [
+                    {"id": "ng", "dst": [{"x": 10, "y": 10, "w": 300, "h": 100}]},
+                    {"id": "jg", "dst": [{"x": 10, "y": 120, "w": 300, "h": 100}]},
+                    {"id": "bg", "dst": [{"x": 10, "y": 230, "w": 300, "h": 100}]},
+                    {"id": "tv", "dst": [{"x": 400, "y": 10, "w": 301, "h": 20}]},
+                    {"id": "tw", "dst": [{"x": 400, "y": 40, "w": 301, "h": 20}]},
+                    {"id": "he", "dst": [{"x": 400, "y": 70, "w": 406, "h": 50}]}]"##,
+            ),
+        ),
+        (
             "readouts",
             play_skin(
                 r#""image": [{"id": "g", "src": "grid", "w": 4, "h": 4}],

@@ -2724,6 +2724,15 @@ fn check_usage(i: &Imported) {
                 "a clamped colour's severity"
             );
             assert!(n.at.is_some(), "an unlocated clamped colour");
+        } else if let NoteKind::InvalidColour { .. } = n.kind {
+            // A graph's or visualizer's colour that does not parse draws
+            // red or its default (design.md "Rendering and Skins").
+            assert_eq!(
+                n.severity,
+                Severity::Fallback,
+                "an invalid colour's severity"
+            );
+            assert!(n.at.is_some(), "an unlocated invalid colour");
         } else {
             assert_ne!(n.severity, Severity::Fallback, "a fallback of another kind");
         }

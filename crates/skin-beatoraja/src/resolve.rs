@@ -460,6 +460,60 @@ impl Definition {
         }
     }
 
+    /// A `float` field (`JsonValue.asFloat`, Lua's `tofloat`): a number
+    /// token's double, or a Lua number, rounded to `f32` as Java's `(float)`
+    /// rounds it; a JSON string as Java's `Float.parseFloat` reads it
+    /// ([`crate::java_float::parse_float`]); a Lua
+    /// string as LuaJ converts it ([`crate::lua::num_scan::todouble`]). The
+    /// value may be non-finite; the caller decides.
+    pub(crate) fn float(&mut self, id: u32, field: &'static str) -> Result<f32, ImportError> {
+        // Java's `(float)` of a `double` or a `long`: round to nearest.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Java's (float) narrows a double by rounding, as `as` does"
+        )]
+        let narrow = |v: f64| v as f32;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "Java's (float) of a long rounds, as `as` does"
+        )]
+        let long = |v: i64| v as f32;
+        match self.arena.scalar(id) {
+            Scalar::Long(raw) => raw
+                .parse::<i64>()
+                .map(long)
+                .map_err(|_| self.type_error(id, field, "a number")),
+            Scalar::Double(raw) => raw
+                .parse::<f64>()
+                .map(narrow)
+                .map_err(|_| self.type_error(id, field, "a number")),
+            Scalar::Int(v) => Ok(long(v)),
+            Scalar::Float(v) => Ok(narrow(v)),
+            Scalar::Str { raw, escaped } => {
+                let lua = self.arena.is_lua_scalar(id);
+                let decoded;
+                let s = if escaped {
+                    decoded = self.decode(id, true)?;
+                    decoded.as_str()
+                } else {
+                    raw
+                };
+                // A Lua string is LuaJ's `tofloat()`: its `todouble()`
+                // (an integer scan that wraps, NaN read as 0) narrowed.
+                if lua {
+                    return Ok(narrow(crate::lua::num_scan::todouble(s.as_bytes())));
+                }
+                // A JSON string is Java's `Float.parseFloat`.
+                crate::java_float::parse_float(s)
+                    .ok_or_else(|| self.type_error(id, field, "a number"))
+            }
+            Scalar::Callable => Err(self.callable_error(id, field)),
+            Scalar::Null | Scalar::Bool(_) | Scalar::Object | Scalar::Array => {
+                Err(self.type_error(id, field, "a number"))
+            }
+        }
+    }
+
     /// An `int` field read exactly: as [`Self::int`], except that a
     /// number token with a point or an exponent must be a whole number
     /// ([`Q::decimal`]) rather than truncated (an intentional policy for
