@@ -606,31 +606,27 @@ impl PlayerRig<'_> {
         Some(answered)
     }
 
-    /// The chart's images when `loaded` is chosen (S10-12 design §5.3):
-    /// another chart's images, published for the last one, are made
-    /// unavailable before anything of this one draws, and the last one's
-    /// job is left to end; with the play skin in use known (no pending
-    /// skin), the images' job begins now, so they settle while the chart
-    /// loads.
+    /// The chart's images when `loaded` is loaded (S10-12 design §5.3),
+    /// in the generation its choice or Start began
+    /// ([`crate::chart_images::ChartImageWorker::renew`]): with the play
+    /// skin in use known (no pending skin), the images' job begins now and
+    /// publishes them into the skin in use as soon as they are read, so
+    /// the loading frames draw them while the chart's sounds load.
     pub(crate) fn chart_images_at_choice(&mut self, loaded: &Loaded) {
+        if self.pending.is_some() {
+            return;
+        }
         let labels = loaded.labels();
-        let want = crate::chart_images::Want {
+        self.chart_images.want(crate::chart_images::Want {
             dir: crate::chart_images::folder(loaded.path()),
             names: [labels.stagefile.clone(), labels.backbmp.clone()],
             side: self.play_chart,
-        };
-        if !self.chart_images.wants(&want) {
-            self.render.invalidate_chart_images();
-            self.chart_images.forget();
-        }
-        if self.pending.is_none() {
-            self.chart_images.want(want);
-            let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
-            // No coordinator (no song selection): the preparation reads
-            // them.
-            if coord.is_some() {
-                self.chart_images.step(coord, &|| false);
-            }
+        });
+        let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
+        // No coordinator (no song selection): the preparation reads them.
+        if coord.is_some() {
+            let publisher = self.render.chart_publisher();
+            self.chart_images.step(coord, &|| false, Some(&publisher));
         }
     }
 
@@ -639,9 +635,11 @@ impl PlayerRig<'_> {
     /// the staging's request when it has an array of its own, else the
     /// committed installation), the adjustments served meanwhile. `Some`
     /// true once no image worker is alive and the publication returned
-    /// (S10-12 design C4), whatever it left; `Some` false when the wait
-    /// stops ([`preparation_stops`]), the worker kept; `None` at `until`.
-    fn poll_images(&mut self, target: Option<u64>, until: Instant) -> Option<bool> {
+    /// (S10-12 design C4), whatever it left; [`ImagesPoll::Stopped`] when
+    /// the wait stops ([`preparation_stops`]), the worker kept;
+    /// [`ImagesPoll::Expired`] when the publication's answer did not come
+    /// within the render link's bound; `None` at `until`.
+    fn poll_images(&mut self, target: Option<u64>, until: Instant) -> Option<ImagesPoll> {
         let mut worker = std::mem::take(&mut self.chart_images);
         let mut adjust = self.adjust.take();
         let out = loop {
@@ -654,14 +652,18 @@ impl PlayerRig<'_> {
                 )
             };
             let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
-            worker.step(coord, &stops);
+            worker.step(coord, &stops, None);
             // A stop wins over images that settled meanwhile: the attempt
             // is not readied after the quit key or a close.
             if stops() {
-                break Some(false);
+                break Some(ImagesPoll::Stopped);
             }
-            if worker.idle() && worker.publish(&self.render, target).is_some() {
-                break Some(true);
+            if worker.idle() {
+                match worker.publish(&self.render, target) {
+                    crate::chart_images::Publish::Answered(_) => break Some(ImagesPoll::Ready),
+                    crate::chart_images::Publish::Expired => break Some(ImagesPoll::Expired),
+                    crate::chart_images::Publish::Waiting => {}
+                }
             }
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(self.controls, crate::dev::LoadPhase::Preparing);
@@ -1945,7 +1947,8 @@ impl Rig for PlayerRig<'_> {
         // the loading frames draw them while the attempt is prepared.
         if self.pending.is_none() && self.selection.is_some() {
             let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
-            self.chart_images.step(coord, &|| false);
+            let publisher = self.render.chart_publisher();
+            self.chart_images.step(coord, &|| false, Some(&publisher));
             let _ = self.chart_images.publish(&self.render, None);
         }
         let polled = loop {
@@ -1988,16 +1991,28 @@ impl Rig for PlayerRig<'_> {
                         prep.stage = PrepStage::Images(request, target);
                         break Ok(game::PrepPoll::Pending);
                     }
-                    Some(true) => {
+                    Some(ImagesPoll::Ready) => {
                         prep.stage = PrepStage::Answered(Some(request));
                         break Ok(game::PrepPoll::Done(Preparation::Ready));
                     }
-                    Some(false) => {
+                    Some(ImagesPoll::Stopped) => {
                         // Stopped: what the request staged is dropped, as a
                         // stopped Screen stage's is.
                         self.render.discard_attempt();
                         prep.stage = PrepStage::Ended(Preparation::Cancelled);
                         break Ok(game::PrepPoll::Done(Preparation::Cancelled));
+                    }
+                    Some(ImagesPoll::Expired) => {
+                        // The render thread holds the publication: what the
+                        // request staged is dropped and the attempt refused,
+                        // never readied without its images settled.
+                        self.render.discard_attempt();
+                        let refused = Preparation::Refused(game::PreparationRefusal {
+                            location: None,
+                            reason: "the chart's images were not published in time".to_owned(),
+                        });
+                        prep.stage = PrepStage::Ended(refused.clone());
+                        break Ok(game::PrepPoll::Done(refused));
                     }
                 },
                 // Ended or answered: it stays so, for its final readiness
@@ -2689,6 +2704,17 @@ impl ResultRetries {
 
 /// How long the chart images' wait parks between its looks.
 const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Where the wait for the chart's images ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImagesPoll {
+    /// The images settled and their publication for the attempt returned.
+    Ready,
+    /// A stop ([`preparation_stops`]).
+    Stopped,
+    /// The publication's answer did not come within its bound.
+    Expired,
+}
 
 /// Whether a waiting attempt's preparation stops early: the player quit or
 /// left, or the input or audio thread failed, which ends the run with its

@@ -193,10 +193,16 @@ pub trait Screen: Send {
         let _ = target;
         Err(RenderError::NoChartLayer)
     }
-    /// Makes the chart's images unavailable: a new chart was chosen
-    /// ([`render::Renderer::invalidate_chart_images`]). The default has
-    /// none.
+    /// Makes the chart's images unavailable: their generation or target
+    /// is no longer current ([`render::Renderer::invalidate_chart_images`]).
+    /// The default has none.
     fn invalidate_chart_images(&mut self) {}
+    /// The live key of the committed play installation's chart layer
+    /// ([`render::Renderer::chart_key`]); `None` by default, which has no
+    /// chart layer.
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        None
+    }
     /// Stages `skin`'s chart-independent installation of `kind` for
     /// request `request` (its atlas, clips, buffers and loading
     /// presentation, no attempt): it installs nothing until its
@@ -856,15 +862,16 @@ pub enum RenderMsg {
     /// committed play installation; `set` `None` publishes them absent.
     /// Answer what it left.
     ChartImages {
+        /// The images' generation it is for: refused, nothing published,
+        /// once the game thread set another.
+        generation: u64,
         /// The attempt's request, if one is staged for it.
         request: Option<u64>,
         /// The images, or `None` for absent.
         set: Option<Arc<crate::chart_images::ChartImages>>,
         /// Where the answer goes.
-        reply: mpsc::SyncSender<crate::chart_images::Published>,
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
     },
-    /// A new chart was chosen: its images are unavailable until published.
-    ChartImagesInvalidate,
     /// Install this declarative skin's chart-independent installation
     /// for the screen kind, and for play prepare every later attempt
     /// with it; `None` prepares play's later attempts with the skin in
@@ -1046,6 +1053,18 @@ impl FrameSink for NoFrames {
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
+    /// The chart images' generation, which the game thread's worker
+    /// writes ([`crate::chart_images::ChartImageWorker::renew`]) and the
+    /// render thread reads before each frame and publication.
+    chart_generation: Arc<AtomicU64>,
+    /// The chart images' live targets as the render thread last saw them:
+    /// the staging's request and the committed chart layer's key, which
+    /// the game thread checks an acknowledgment against.
+    chart_targets: Mutex<(Option<u64>, Option<skin_model::chart_image::ChartKey>)>,
+    /// While set, a chart publication waits before it publishes, at most
+    /// [`hook_bound`] (tests).
+    #[cfg(test)]
+    chart_hold: AtomicBool,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
     /// The end screen's slot: its newest page, and the pages left with the
@@ -1142,6 +1161,10 @@ impl Shared {
     fn new() -> Self {
         Self {
             failed: AtomicBool::new(false),
+            chart_generation: Arc::default(),
+            chart_targets: Mutex::new((None, None)),
+            #[cfg(test)]
+            chart_hold: AtomicBool::new(false),
             first_frame: AtomicI64::new(i64::MIN),
             end_page: Mutex::new(EndSlot::default()),
             #[cfg(feature = "dev-tools")]
@@ -1678,6 +1701,32 @@ fn hook_bound() -> Duration {
 }
 
 /// The game thread's end of the render thread.
+/// Sends chart publications to the render thread from any thread
+/// ([`RenderLink::chart_publisher`]).
+#[derive(Clone)]
+pub struct ChartPublisher {
+    tx: Sender<RenderMsg>,
+}
+
+impl ChartPublisher {
+    /// Asks the render thread to publish `set` (absent when `None`) of
+    /// `generation` for the attempt of `request`, answering on `reply`.
+    pub fn publish(
+        &self,
+        generation: u64,
+        request: Option<u64>,
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    ) {
+        let _ = self.tx.send(RenderMsg::ChartImages {
+            generation,
+            request,
+            set,
+            reply,
+        });
+    }
+}
+
 pub struct RenderLink {
     tx: Sender<RenderMsg>,
     shared: Arc<Shared>,
@@ -2045,26 +2094,65 @@ impl RenderLink {
     /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
     /// when the render thread is gone.
     /// Asks the render thread to publish the chart's images `set` (absent
-    /// when `None`) for the attempt of `request`, answering on the receiver
-    /// returned, which the caller polls ([`RenderMsg::ChartImages`]).
+    /// when `None`) of `generation` for the attempt of `request`,
+    /// answering on the receiver returned, which the caller polls
+    /// ([`RenderMsg::ChartImages`]).
     pub fn publish_chart_images(
         &self,
+        generation: u64,
         request: Option<u64>,
         set: Option<Arc<crate::chart_images::ChartImages>>,
-    ) -> mpsc::Receiver<crate::chart_images::Published> {
+    ) -> mpsc::Receiver<crate::chart_images::Ack> {
         let (reply, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::ChartImages {
-            request,
-            set,
-            reply,
-        });
+        self.chart_publisher()
+            .publish(generation, request, set, reply);
         rx
     }
 
-    /// Tells the render thread a new chart was chosen: its images are
-    /// unavailable until published ([`RenderMsg::ChartImagesInvalidate`]).
-    pub fn invalidate_chart_images(&self) {
-        self.send(RenderMsg::ChartImagesInvalidate);
+    /// What publishes the chart's images from another thread: the job
+    /// that read them.
+    #[must_use]
+    pub fn chart_publisher(&self) -> ChartPublisher {
+        ChartPublisher {
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Where the chart images' generation is written, for the worker
+    /// ([`crate::chart_images::ChartImageWorker::new`]).
+    #[must_use]
+    pub fn chart_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.chart_generation)
+    }
+
+    /// The present an acknowledgment of `generation`'s images is checked
+    /// against ([`crate::chart_images::PublicationKey::current`]): the
+    /// live targets the render thread mirrored last.
+    #[must_use]
+    pub fn chart_now(&self, generation: u64) -> crate::chart_images::ChartNow {
+        let (staged, committed) = *self
+            .shared
+            .chart_targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        crate::chart_images::ChartNow {
+            generation,
+            staged,
+            committed,
+        }
+    }
+
+    /// How long an answer of the render thread is waited for.
+    #[must_use]
+    pub const fn answer_bound(&self) -> Duration {
+        self.answer_timeout
+    }
+
+    /// Holds every chart publication before it publishes while `on`, at
+    /// most [`hook_bound`] each (tests).
+    #[cfg(test)]
+    pub fn hold_chart_publications(&self, on: bool) {
+        self.shared.chart_hold.store(on, Ordering::SeqCst);
     }
 
     pub fn ready_attempt(&self, request: u64, epoch: u64) -> Result<ReadyAnswer, ScreenError> {
@@ -3017,6 +3105,10 @@ pub fn spawn(
                 requested: 0,
                 attempt: None,
                 prepared: None,
+                chart_generation: 0,
+                chart_table: None,
+                staged_table: None,
+                chart_targets: (None, None),
                 presentation: None,
                 turntable: crate::turntable::Turntable::default(),
                 app: crate::app_clock::AppClock::new(),
@@ -3636,6 +3728,14 @@ struct Run {
     attempt: Option<Preparing>,
     /// The attempt's preparation answered ready and not yet committed.
     prepared: Option<Prepared>,
+    /// The chart images' generation the tables below were checked in.
+    chart_generation: u64,
+    /// What the committed installation's chart table was published for,
+    /// and the staging's.
+    chart_table: Option<crate::chart_images::PublicationKey>,
+    staged_table: Option<crate::chart_images::PublicationKey>,
+    /// The live targets last mirrored to the game thread.
+    chart_targets: (Option<u64>, Option<skin_model::chart_image::ChartKey>),
     /// The adjustments' snapshots ([`RenderMsg::Presentation`]).
     presentation: Option<game::adjustment::PresentationReader>,
     /// The play state's turntable (docs/stage3.md, offset 1).
@@ -3776,6 +3876,7 @@ impl Run {
         let mut mode = Mode::Splash { pending: None };
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
+            self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
             let msg = if idle && self.attempt.is_some() {
                 // A preparation not yet answered is asked again between
@@ -3814,7 +3915,6 @@ impl Run {
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
                         | RenderMsg::ChartImages { .. }
-                        | RenderMsg::ChartImagesInvalidate
                         | RenderMsg::ParkScripts(_))
                 )
             {
@@ -4065,17 +4165,13 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::ChartImages {
+                    generation,
                     request,
                     set,
                     reply,
                 }) => {
-                    let _ = reply.send(self.publish_chart(request, set.as_deref()));
-                    continue;
-                }
-                Ok(RenderMsg::ChartImagesInvalidate) => {
-                    if let Some(screen) = &mut self.screen {
-                        screen.invalidate_chart_images();
-                    }
+                    let ack = self.publish_chart(generation, request, set.as_deref());
+                    let _ = reply.send(ack);
                     continue;
                 }
                 Ok(RenderMsg::Select {
@@ -4304,6 +4400,10 @@ impl Run {
             if matches!(mode, Mode::Result) {
                 self.shared.hold_result_frame();
             }
+            // The chart tables checked last, after the loading lifetime's:
+            // a lifetime begun after a new generation never draws an
+            // earlier one's.
+            self.sync_chart();
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -5192,36 +5292,130 @@ impl Run {
     /// kept for a screen built again. The receipt taken under the
     /// commits' lock is answered: the declared Closing duration of the
     /// declarative installation the attempt draws with, staged or in use.
-    /// Publishes `set` (absent when `None`) for the attempt of `request`:
-    /// into its staged array when the staging has one of its own, else into
-    /// the committed play installation (S10-12 design §5.3).
+    /// The present a chart publication is checked against
+    /// ([`crate::chart_images::PublicationKey::current`]): the game
+    /// thread's generation, and this thread's live targets.
+    fn chart_now(&self) -> crate::chart_images::ChartNow {
+        crate::chart_images::ChartNow {
+            generation: self.shared.chart_generation.load(Ordering::SeqCst),
+            staged: self.prepared.as_ref().map(|p| p.token.request),
+            committed: self.screen.as_ref().and_then(|s| s.chart_key()),
+        }
+    }
+
+    /// Keeps the chart tables current, before every frame and
+    /// publication: a committed table no longer current (another
+    /// generation, its installation or array replaced) is made
+    /// unavailable with the staged one, so no frame draws a table of an
+    /// earlier choice or attempt; a staged one whose staging is gone is
+    /// forgotten. The live targets are mirrored for the game thread.
+    fn sync_chart(&mut self) {
+        let now = self.chart_now();
+        let stale = |k: &Option<crate::chart_images::PublicationKey>| {
+            k.is_some_and(|k| !k.current(&now, k.request))
+        };
+        if self.chart_generation != now.generation || stale(&self.chart_table) {
+            if let Some(screen) = &mut self.screen {
+                screen.invalidate_chart_images();
+            }
+            self.chart_generation = now.generation;
+            self.chart_table = None;
+            self.staged_table = None;
+        }
+        if stale(&self.staged_table) {
+            self.staged_table = None;
+        }
+        let targets = (now.staged, now.committed);
+        if self.chart_targets != targets {
+            self.chart_targets = targets;
+            *self
+                .shared
+                .chart_targets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = targets;
+        }
+    }
+
+    /// Publishes `set` (absent when `None`) of `generation` for the
+    /// attempt of `request`: into its staged array when the staging has
+    /// one of its own, else into the committed play installation (S10-12
+    /// design §5.3). Another generation than the current one publishes
+    /// nothing. The answer says what it was for and where it went.
     fn publish_chart(
         &mut self,
+        generation: u64,
         request: Option<u64>,
         set: Option<&crate::chart_images::ChartImages>,
-    ) -> crate::chart_images::Published {
+    ) -> crate::chart_images::Ack {
+        use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        #[cfg(test)]
+        {
+            let end = Instant::now() + hook_bound();
+            while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        self.sync_chart();
+        let now = self.chart_now();
+        let key = |target| PublicationKey {
+            generation,
+            request,
+            target,
+        };
+        let unpublished = Ack {
+            key: key(PublishedTo::Committed(now.committed)),
+            answer: Err(render::ChartOutcome::Unavailable),
+        };
+        if generation != now.generation {
+            return unpublished;
+        }
         let staged = request.and_then(|r| {
             self.prepared
                 .as_ref()
                 .filter(|p| p.token.request == r)
-                .map(|p| render::ChartTarget::Staged(p.token))
+                .map(|p| (r, render::ChartTarget::Staged(p.token)))
         });
         let Some(screen) = &mut self.screen else {
-            return Err(render::ChartOutcome::Unavailable);
+            return unpublished;
         };
         let publish = |screen: &mut Box<dyn Screen>, target| match set {
             Some(set) => screen.publish_chart_images(target, set.fitted()),
             None => screen.publish_chart_absent(target),
         };
-        let mut answer = staged.map_or(Err(RenderError::NoChartLayer), |t| publish(screen, t));
+        // What a publication left in its target: a table, or an all-absent
+        // one; nothing for the other failures.
+        let left = |answer: &Result<_, RenderError>| {
+            answer.is_ok()
+                || answer
+                    .as_ref()
+                    .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent)
+        };
+        if let Some((r, target)) = staged {
+            let answer = publish(screen, target);
+            if !matches!(answer, Err(RenderError::NoChartLayer)) {
+                let k = key(PublishedTo::Staged(r));
+                if left(&answer) {
+                    self.staged_table = Some(k);
+                }
+                // The game thread logs what it left; this thread draws
+                // frames and logs nothing.
+                return Ack {
+                    key: k,
+                    answer: answer.map_err(|e| e.chart_outcome()),
+                };
+            }
+        }
         // A staging without an array of its own draws from the committed
         // one: published there.
-        if matches!(answer, Err(RenderError::NoChartLayer)) {
-            answer = publish(screen, render::ChartTarget::Committed);
+        let answer = publish(screen, render::ChartTarget::Committed);
+        let k = key(PublishedTo::Committed(screen.chart_key()));
+        if left(&answer) {
+            self.chart_table = Some(k);
         }
-        // The game thread logs what it left; this thread draws frames and
-        // logs nothing.
-        answer.map_err(|e| e.chart_outcome())
+        Ack {
+            key: k,
+            answer: answer.map_err(|e| e.chart_outcome()),
+        }
     }
 
     fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
@@ -5262,6 +5456,18 @@ impl Run {
         if let Err(e) = screen.commit(p.token) {
             screen.discard();
             return Err(e);
+        }
+        // The staged chart table moved into the committed installation
+        // with it: its key is the committed layer's now.
+        if let Some(k) = self
+            .staged_table
+            .take()
+            .filter(|k| k.request == Some(request))
+        {
+            self.chart_table = Some(crate::chart_images::PublicationKey {
+                target: crate::chart_images::PublishedTo::Committed(screen.chart_key()),
+                ..k
+            });
         }
         // A pending skin's specialization committed in the current loading
         // lifetime declares that lifetime's loading time from now on.
@@ -16277,6 +16483,8 @@ pub(crate) mod tests {
     // The select screen's updates through the slot into the skin or the
     // page.
     mod selection;
+    // The chart images' tables: their generation, attempt and target.
+    mod chart;
     // The result screen's presentations through the slot, the commit
     // point and the barrier into the skin or the built-in page.
     #[cfg(feature = "dev-tools")]

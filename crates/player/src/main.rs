@@ -887,6 +887,7 @@ fn rig<'a>(
         #[cfg(test)]
         std::sync::Arc::clone(&audio_lost),
     );
+    let chart_images = crate::chart_images::ChartImageWorker::new(render.chart_generation());
     let mut rig = PlayerRig {
         failures,
         input,
@@ -894,7 +895,7 @@ fn rig<'a>(
         render,
         skin: render_side::SkinState::Ready,
         pending: None,
-        chart_images: crate::chart_images::ChartImageWorker::default(),
+        chart_images,
         play_chart: None,
         controls,
         clock,
@@ -2821,6 +2822,36 @@ mod tests {
             rig.input_failure()
         });
         assert_eq!(failed, Some(game::InputWaitError::Timeout));
+    }
+
+    /// Each choice, loading entry (a practice Start's too) and chart left
+    /// is a new generation of the chart's images, written where the render
+    /// thread reads it before anything of it is drawn.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn each_choice_start_and_leave_renews_the_chart_images() {
+        use game::AppRig as _;
+        let (seen, _) = on_rig(game::DeviceSettings::default(), |rig, _| {
+            let read = |rig: &crate::play::PlayerRig<'_>| {
+                let g = rig.chart_images.generation();
+                assert_eq!(
+                    rig.render
+                        .chart_generation()
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    g
+                );
+                g
+            };
+            let mut seen = vec![read(rig)];
+            rig.entered_decision(&game::Pick::Play(std::path::PathBuf::from("chart.bms")));
+            seen.push(read(rig));
+            rig.entered_loading(std::path::Path::new("chart.bms"));
+            seen.push(read(rig));
+            rig.left_chart().unwrap();
+            seen.push(read(rig));
+            seen
+        });
+        assert_eq!(seen, [0, 1, 2, 3]);
     }
 
     /// Every scene change and attempt entry moves the window's scene epoch

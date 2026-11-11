@@ -895,6 +895,10 @@ impl Screen for MenuScreen {
         self.renderer.invalidate_chart_images();
     }
 
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.renderer.chart_key()
+    }
+
     /// Stages `skin`'s chart-independent installation of `kind`,
     /// answering at once; a refusal on a healthy device
     /// ([`RenderError::is_refusal`]), the texels the screens share

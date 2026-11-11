@@ -250,6 +250,16 @@ impl Slot {
     pub fn max_content(self) -> [u32; 2] {
         self.size.map(|s| s - 2 * GUTTER)
     }
+
+    /// Whether `fitted`'s allocation, padding and gutters included, fits
+    /// it: what [`ChartUv::of`] places, and what a read kept for another
+    /// slot must pass to be reused for this one.
+    #[must_use]
+    pub fn holds(self, fitted: &Fitted) -> bool {
+        let [pw, ph] = fitted.padded;
+        let [sw, sh] = self.size;
+        pw <= sw && ph <= sh
+    }
 }
 
 /// An image fitted into a slot, premultiplied, with its mip levels.
@@ -747,9 +757,7 @@ impl ChartUv {
     #[must_use]
     pub fn of(fitted: &Fitted, which: ChartImage, side: u32, layer: u16) -> Option<Self> {
         let ([ox, oy], slot) = which.slot(side)?;
-        let [pw, ph] = fitted.padded;
-        let [sw, sh] = slot.size();
-        if pw > sw || ph > sh {
+        if !slot.holds(fitted) {
             return None;
         }
         let [cw, ch] = fitted.content;

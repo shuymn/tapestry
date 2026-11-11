@@ -68,9 +68,36 @@ fn the_preparation_waits_for_the_images() {
             [640, 480]
         );
         assert!(
-            rig.chart_images.publish(&rig.render, None).is_some(),
+            matches!(
+                rig.chart_images.publish(&rig.render, None),
+                crate::chart_images::Publish::Answered(_)
+            ),
             "the publication answered before readiness"
         );
+    });
+}
+
+/// A publication whose answer the render thread holds past the link's
+/// bound: the preparation is refused and what it staged discarded, never
+/// ready.
+#[test]
+fn a_publication_never_answered_refuses_the_preparation() {
+    let _serial = imports::serial();
+    let (_dir, l) = chart_with_stage();
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.play_chart = Some(2_048);
+        rig.render
+            .set_timeouts(Duration::from_secs(1), Duration::from_secs(5));
+        rig.render.hold_chart_publications(true);
+        let mut h = begin(rig, &l);
+        let ended = polled(rig, &mut h).unwrap();
+        rig.render.hold_chart_publications(false);
+        assert!(
+            matches!(&ended, Preparation::Refused(r) if r.reason.contains("images")),
+            "{ended:?}"
+        );
+        assert!(rig.commit_attempt().is_err(), "nothing to commit");
     });
 }
 
