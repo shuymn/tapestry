@@ -355,14 +355,19 @@ impl Residual {
         }
     }
 
-    /// A residual of `nodes`, each with its kinds, in order (operands
-    /// first), its root the last: what an evaluation could leave, for a
-    /// shape no closed candidate reaches.
+    /// A residual of `nodes` in order (operands first), each given its
+    /// kinds as an evaluation gives them, its root the last: what an
+    /// evaluation could leave, for a shape no closed candidate reaches.
     #[cfg(test)]
-    pub(crate) fn of(nodes: &[(Node, u8)]) -> Self {
+    pub(crate) fn of(nodes: &[Node]) -> Self {
+        let mut kinds: Vec<u8> = Vec::new();
+        for &n in nodes {
+            let k = kind_of(n, |r| kinds.get(r as usize).copied().unwrap_or(0));
+            kinds.push(k);
+        }
         Self {
-            nodes: nodes.iter().map(|&(n, _)| n).collect(),
-            kinds: nodes.iter().map(|&(_, k)| k).collect(),
+            nodes: nodes.to_vec(),
+            kinds,
             heights: vec![1; nodes.len()],
             reads: Vec::new(),
             root: u32::try_from(nodes.len()).unwrap_or(1).saturating_sub(1),
@@ -515,46 +520,53 @@ pub(crate) fn evaluate(
     Ok(ev.res)
 }
 
+/// The kinds of `node`, its operands' kinds `k`.
+fn kind_of(node: Node, k: impl Fn(u32) -> u8) -> u8 {
+    match node {
+        Node::Known(v) => v.kind(),
+        Node::Read { api, .. } => reader(api).map_or(0, |(_, k)| k),
+        Node::Unreachable => 0,
+        // An integer within ±2^53, past it a float (the source's double).
+        Node::StateUs => INT | FLT,
+        Node::Slot(_) => INT | OFF,
+        Node::Not(_) | Node::Cmp(..) => BOOL,
+        Node::Neg(x) => k(x) & NUM,
+        Node::Arith(op, a, b) => {
+            let (ka, kb) = (k(a), k(b));
+            if op == Bin::Div {
+                FLT
+            } else if op == Bin::Mod {
+                // The source's `%` by a zero integer is NaN.
+                (if ka & kb & INT != 0 { INT | FLT } else { 0 }) | ((ka | kb) & FLT)
+            } else {
+                (if ka & kb & INT != 0 { INT } else { 0 }) | ((ka | kb) & FLT)
+            }
+        }
+        Node::Math(f, a, b) => {
+            let ka = k(a);
+            match f {
+                MathOp::Floor | MathOp::Ceil => (if ka & NUM != 0 { INT } else { 0 }) | (ka & FLT),
+                MathOp::Abs => ka & NUM,
+                MathOp::Max | MathOp::Min => (ka | k(b)) & NUM,
+            }
+        }
+        Node::Select { then, other, .. } => k(then) | k(other),
+    }
+}
+
 impl<'a> Eval<'a> {
     fn push(&mut self, node: Node) -> R<u32> {
         let h = |r: u32| self.res.heights.get(r as usize).copied().unwrap_or(0);
-        let k = |r: u32| self.res.kind(r);
-        let (kind, height) = match node {
-            Node::Known(v) => (v.kind(), 1),
-            Node::Read { api, .. } => (reader(api).map_or(0, |(_, k)| k), 1),
-            Node::Unreachable => (0, 1),
-            // An integer within ±2^53, past it a float (the source's double).
-            Node::StateUs => (INT | FLT, 1),
-            Node::Slot(_) => (INT | OFF, 1),
-            Node::Not(x) => (BOOL, h(x)),
-            Node::Neg(x) => (k(x) & NUM, h(x)),
-            Node::Arith(op, a, b) => {
-                let (ka, kb) = (k(a), k(b));
-                let kind = if op == Bin::Div {
-                    FLT
-                } else if op == Bin::Mod {
-                    // The source's `%` by a zero integer is NaN.
-                    (if ka & kb & INT != 0 { INT | FLT } else { 0 }) | ((ka | kb) & FLT)
-                } else {
-                    (if ka & kb & INT != 0 { INT } else { 0 }) | ((ka | kb) & FLT)
-                };
-                (kind, h(a).max(h(b)))
-            }
-            Node::Math(f, a, b) => {
-                let ka = k(a);
-                let kind = match f {
-                    MathOp::Floor | MathOp::Ceil => {
-                        (if ka & NUM != 0 { INT } else { 0 }) | (ka & FLT)
-                    }
-                    MathOp::Abs => ka & NUM,
-                    MathOp::Max | MathOp::Min => (ka | k(b)) & NUM,
-                };
-                (kind, h(a).max(h(b)))
-            }
-            Node::Cmp(_, a, b) => (BOOL, h(a).max(h(b))),
-            Node::Select { cond, then, other } => {
-                (k(then) | k(other), h(cond).max(h(then)).max(h(other)))
-            }
+        let kind = kind_of(node, |r| self.res.kind(r));
+        let height = match node {
+            Node::Known(_)
+            | Node::Read { .. }
+            | Node::Unreachable
+            | Node::StateUs
+            | Node::Slot(_) => 1,
+            Node::Not(x) | Node::Neg(x) => h(x),
+            Node::Arith(_, a, b) | Node::Math(_, a, b) | Node::Cmp(_, a, b) => h(a).max(h(b)),
+            Node::Select { cond, then, other } => h(cond).max(h(then)).max(h(other)),
         };
         let height = match node {
             Node::Known(_)

@@ -1438,6 +1438,13 @@ fn every_integer_source_is_bounded() {
             "function() local t = ms.timer(0) local unused = t * t return 1 end",
             lowered,
         ),
+        // Its bound is ±2^53 like any other's, so a product of three
+        // stays within `i128` while it is bounded.
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t * t return 1 end",
+            lowered,
+        ),
         (
             "timer",
             "function() local t = ms.timer(0) local unused = t * t return unused ~= nil end",

@@ -6,7 +6,7 @@
 use super::Unsupported;
 use super::callback::Analysis;
 use super::compile::{Iv, Leaf, Leaves, intervals};
-use super::residual::{BOOL, INT, MathOp, Node, R, Residual, Stop, Val};
+use super::residual::{MathOp, Node, R, Residual, Stop, Val};
 use super::syntax::Bin;
 
 /// Every read an integer in `range`.
@@ -28,36 +28,39 @@ impl Leaves for Reads {
     }
 }
 
-/// A residual under construction: each node pushed with its kinds.
+/// `main_state.option` and `main_state.number`, by their indices among
+/// the host's APIs.
+const OPTION: u16 = 0;
+const NUMBER: u16 = 1;
+
+/// A residual under construction, each node given its kinds as an
+/// evaluation gives them.
 #[derive(Default)]
-struct Build(Vec<(Node, u8)>);
+struct Build(Vec<Node>);
 
 impl Build {
-    fn push(&mut self, node: Node, kind: u8) -> u32 {
-        self.0.push((node, kind));
+    fn push(&mut self, node: Node) -> u32 {
+        self.0.push(node);
         u32::try_from(self.0.len() - 1).unwrap()
     }
 
     fn read(&mut self, id: i64) -> u32 {
-        self.push(
-            Node::Read {
-                api: 0,
-                arg: Some(id),
-            },
-            INT,
-        )
+        self.push(Node::Read {
+            api: NUMBER,
+            arg: Some(id),
+        })
     }
 
     fn int(&mut self, n: i64) -> u32 {
-        self.push(Node::Known(Val::Int(n)), INT)
+        self.push(Node::Known(Val::Int(n)))
     }
 
     fn arith(&mut self, op: Bin, a: u32, b: u32) -> u32 {
-        self.push(Node::Arith(op, a, b), INT)
+        self.push(Node::Arith(op, a, b))
     }
 
     fn math(&mut self, f: MathOp, a: u32, b: u32) -> u32 {
-        self.push(Node::Math(f, a, b), INT)
+        self.push(Node::Math(f, a, b))
     }
 
     /// The bounds `intervals` gives, its reads in `range`.
@@ -113,29 +116,23 @@ fn refused(r: &R<Vec<Iv>>) -> bool {
 fn a_promoted_divisor_of_an_integer_floor_division_is_refused() {
     let cases: [(&str, &Wrap); 5] = [
         ("plain", &|_, x| x),
-        ("negation", &|b, x| b.push(Node::Neg(x), INT)),
+        ("negation", &|b, x| b.push(Node::Neg(x))),
         ("abs", &|b, x| b.math(MathOp::Abs, x, x)),
         ("max", &|b, x| {
             let low = b.int(-TWO_53);
             b.math(MathOp::Max, x, low)
         }),
         ("select", &|b, x| {
-            let c = b.push(
-                Node::Read {
-                    api: 0,
-                    arg: Some(1),
-                },
-                BOOL,
-            );
+            let c = b.push(Node::Read {
+                api: OPTION,
+                arg: Some(271),
+            });
             let low = b.int(-TWO_53);
-            b.push(
-                Node::Select {
-                    cond: c,
-                    then: x,
-                    other: low,
-                },
-                INT,
-            )
+            b.push(Node::Select {
+                cond: c,
+                then: x,
+                other: low,
+            })
         }),
     ];
     for (name, wrap) in cases {
@@ -154,7 +151,7 @@ fn the_promoted_divisor_s_own_bounds_exclude_0() {
     let big = b.int(TWO_53);
     let once = b.arith(Bin::Sub, sq, big);
     let twice = b.arith(Bin::Sub, once, big);
-    let neg = b.push(Node::Neg(twice), INT);
+    let neg = b.push(Node::Neg(twice));
     let abs = b.math(MathOp::Abs, twice, twice);
     let ivs = bounds(b.intervals((0, i64::from(i32::MAX) - 1)));
     let at = |n: u32| ivs[n as usize];
@@ -165,9 +162,9 @@ fn the_promoted_divisor_s_own_bounds_exclude_0() {
     assert_eq!(at(abs), Some((e, e)));
 }
 
-/// `x // math.floor(a + b)` over reads in [1, 100]: the sum is an integer
-/// within its bounds, so the floor passes them through and the divisor is
-/// proven nonzero.
+/// `x // math.floor(a + b)` over reads in [1, 100]: the sum of two
+/// integers is of the integer kind and within its bounds, so the floor
+/// passes them through and the divisor is proven nonzero.
 #[test]
 fn an_in_range_divisor_is_bounded() {
     let mut b = Build::default();
