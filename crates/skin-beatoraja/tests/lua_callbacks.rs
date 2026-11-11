@@ -584,36 +584,28 @@ fn a_critical_callback_folds_configuration() {
 #[test]
 fn intermediates_out_of_range_do_not_convert() {
     // In range at the end, out of range on the way: past `i32`, which the
-    // expressions hold, but within Â±2^53, where the program's 64-bit
-    // integers and the source's doubles agree, so the program takes it.
-    let d = folder(&skin(&format!(
-        "{}\n{}",
-        "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
-        "table.insert(skin.destination, { id = \"g\", draw = function()\n\
-           local big = ms.number(110) * 1000\n\
-           return big * 1000 - big * 1000 + 1 > 0\n\
-         end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
-    )));
-    assert_eq!(import(&d, 905).unwrap().callbacks, [Disposition::Compiled]);
-    // Past Â±2^53, critical: refused.
-    let d = folder(&skin(&format!(
-        "{}\n{}",
-        "skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }",
-        "table.insert(skin.destination, { id = \"g\", draw = function()\n\
-           local big = ms.number(110) * 1000000\n\
-           return big * big * big - big * big * big + 1 > 0\n\
-         end, dst = { { x = 100, y = 500, w = 100, h = 10 } } })"
-    )));
-    assert!(matches!(
-        import(&d, 905),
-        Err(ImportError::Lua {
-            why: LuaWhy::Critical {
-                why: Unsupported::Range,
-                ..
-            },
-            ..
-        })
-    ));
+    // expressions hold, so the program takes it, within ±2^53 as integers
+    // and past it as the source's doubles.
+    for (factor, body) in [
+        ("1000", "return big * 1000 - big * 1000 + 1 > 0"),
+        (
+            "1000000",
+            "return big * big * big - big * big * big + 1 > 0",
+        ),
+    ] {
+        let d = folder(&skin(&format!(
+            "skin.gauge = {{ id = \"g\", nodes = {{ \"n0\", \"n1\", \"n2\", \"n3\" }}, parts = 10 }}\n\
+             table.insert(skin.destination, {{ id = \"g\", draw = function()\n\
+               local big = ms.number(110) * {factor}\n\
+               {body}\n\
+             end, dst = {{ {{ x = 100, y = 500, w = 100, h = 10 }} }} }})"
+        )));
+        assert_eq!(
+            import(&d, 905).unwrap().callbacks,
+            [Disposition::Compiled],
+            "{factor}"
+        );
+    }
 }
 
 #[test]
@@ -779,6 +771,51 @@ fn value_skin(value: &str) -> String {
     ))
 }
 
+/// Folding equals evaluation past 2^53, the executed half: the operations
+/// `residual_tests` `folding_past_2_53_equals_evaluation` folds from
+/// literals, compiled into the program over reads, give the values the
+/// fold gives. The reads are the duration and the current BPM, whose
+/// ranges reach past `i32::MAX / 2` (a read is an `i32`): A's 2 147 483 647
+/// is the duration 2 147 483 646 plus 1, and B's `n = 2^53` is
+/// `2^30 · 2^23`. Each checks the value and its availability, so a
+/// defaulted path cannot pass with 0.
+#[test]
+fn folding_past_2_53_equals_the_compiled_program() {
+    let d = folder(&skin(
+        "local function n() return ms.number(312) * ms.number(160) end\n\
+         skin.value = {\n\
+           { id = \"a\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return math.floor((ms.number(312) + 1) * ms.number(160) * 3 % 4294967296) end },\n\
+           { id = \"b\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return math.floor((n() + 1 + 1) % 4294967296) end },\n\
+           { id = \"c\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+             value = function() return math.floor((n() + 1 + 2) % 4294967296) end } }\n\
+         table.insert(skin.destination, { id = \"a\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"b\", dst = { { x = 0, y = 200, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"c\", dst = { { x = 0, y = 300, w = 6, h = 6 } } })",
+    ));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Compiled; 3]);
+    let mut p = Drawn::new(i.imported.skin, 8);
+    let mut frame = |duration: u128, bpm: u32| {
+        p.readouts = Some(skin_model::FrameReadouts {
+            bpm_current_x100: Some(bpm * 100),
+            duration: Some(skin_model::DurationRatio {
+                numerator: duration,
+                denominator: 1,
+            }),
+            ..skin_model::FrameReadouts::UNAVAILABLE
+        });
+        p.frame(1_000, &[]);
+        let f = p.play.state().fields;
+        f[skin_model::field::COUNT..skin_model::field::COUNT + 6].to_vec()
+    };
+    // A: the product's tie rounds, then the product by 3 again.
+    assert_eq!(frame(2_147_483_646, 4_194_305)[..2], [2_134_900_736, 1]);
+    // B and its control: 2^53 + 1 rounds to 2^53, + 1 again 0; + 2 exact.
+    assert_eq!(frame(1 << 30, 1 << 23)[2..], [0, 1, 2, 1]);
+}
+
 /// The remaining-note ratios: the remaining notes over the total, a float
 /// division, times 100 and 10 000. Both compile into the program, and the
 /// numbers show the source's conversion of the float as the counts move.
@@ -829,14 +866,15 @@ fn remaining_note_ratios_compile_into_the_program() {
     assert_eq!(rows(&q), (1, 1));
 }
 
-/// What the program cannot prove is refused by role, also where the
-/// result discards it (Lua runs it all the same): an integer that could
-/// leave ±2^53, and a number's value converting a `math.floor` of a
-/// float, whose integer has no bound; each control compiles. The source's
-/// `%` by 0 is NaN, which the program keeps (no `//`: it is not in the
-/// source's grammar and opens the candidate).
+/// Integer arithmetic whose bound passes ±2^53 is the source's doubles,
+/// accepted whether or not its result is used (Lua runs it all the same),
+/// and so is a number's value converting a `math.floor` of a float. A
+/// root that reaches the large arithmetic compiles; one that discards it
+/// lowers, since the expressions emit only what the root reaches. The
+/// source's `%` by 0 is NaN, which the program keeps (no `//`: it is not
+/// in the source's grammar and opens the candidate).
 #[test]
-fn the_program_refuses_what_it_cannot_prove() {
+fn the_program_takes_arithmetic_past_2_53() {
     for (value, want) in [
         (
             "function() return 10 % ms.number(110) end",
@@ -844,41 +882,51 @@ fn the_program_refuses_what_it_cannot_prove() {
         ),
         (
             "function() local n = ms.number(110) return n * n * n * n * 1.0 end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Compiled,
         ),
         (
             "function() local n = ms.number(110) local unused = n * n * n * n return 1.0 end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Compiled,
         ),
         (
             "function() local n = ms.number(110) return n * n * 1.0 end",
             Disposition::Compiled,
         ),
         // Discarded, the result an integer or a folded truthiness: the
-        // expression backend would take it, but the product is reached.
+        // expressions take it, emitting only the root.
         (
             "function() local n = ms.number(110) local unused = n * n * n * n return 1 end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Lowered,
         ),
         (
             "function() local n = ms.number(110) local u = n * n * n * n return u ~= nil end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Lowered,
         ),
         // The source's `%` rounds once its dividend nears 2^53: its
-        // remainder is then of no known bound, so the product is refused.
+        // remainder is then of no known bound within ±2^53.
         (
             "function() return ((ms.number(110) - 9007199254740991) % 5) * 2251799813685247 end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Compiled,
         ),
         (
             "function() return math.floor(ms.number(110) / 3) end",
-            Disposition::Replaced(Unsupported::Range),
+            Disposition::Compiled,
+        ),
+        // Bounds clamped at every node: a product of six `i32` reads, and
+        // a sum of two of them, would pass `i128`.
+        (
+            "function() local n = ms.number(110) return n * n * n * n * n * n end",
+            Disposition::Compiled,
+        ),
+        (
+            "function() local n = ms.number(110) local p = n * n * n * n * n * n return (p + p) * 1.0 end",
+            Disposition::Compiled,
         ),
     ] {
         let i = import(&folder(&value_skin(value)), 905).unwrap();
         assert_eq!(i.callbacks, [want], "{value}");
     }
-    // A draw only compares the floor, which needs no bound.
+    // A draw only compares the floor.
     let draw = "draw = function() return math.floor(ms.number(110) / 3) > 1 end,";
     let i = import(&folder(&skin(&image_at(0, draw))), 905).unwrap();
     assert_eq!(i.callbacks, [Disposition::Compiled]);
@@ -1330,98 +1378,103 @@ fn an_interference_is_located_at_the_proofs_write() {
     }
 }
 
-/// The integer sources a play skin's callback can reach have a range, and
-/// arithmetic past ±2^53 over it is refused, discarded or not; a source
-/// with no mapped range (a timer's start or off value) is of no known
-/// bound, and the gauge's type is a Java `int`. Rows by source, most with
-/// a control that stays within the range (a timer's control compares it
-/// with the off value, the only use that bounds it). Not covered here:
-/// `event_index`, mapped off play only (the selection and result
-/// profiles, `-1` to `10`), and `//`, which no closed candidate holds.
+/// The integer sources a play skin's callback can reach have a range,
+/// and arithmetic over it that passes ±2^53 is the source's doubles,
+/// discarded or not; a source with no mapped range (a timer's start or
+/// off value) is of no known bound, and the gauge's type is a Java `int`.
+/// Rows by source, each with a control that stays within the range (a
+/// timer's control compares it with the off value). A timer's raw value
+/// is still no value the program reads. Not covered here: `event_index`,
+/// mapped off play only (the selection and result profiles, `-1` to
+/// `10`), and `//`, which no closed candidate holds.
 #[test]
 fn every_integer_source_is_bounded() {
-    let range = Disposition::Replaced(Unsupported::Range);
+    let (compiled, lowered) = (Disposition::Compiled, Disposition::Lowered);
     for (source, value, want) in [
-        // A literal: its own value; one past 2^53 does not fold.
+        // A literal: its own value.
         (
             "literal",
             "function() return ms.number(110) * 4503599627 * 1.0 end",
-            range,
+            compiled,
         ),
         (
             "literal",
             "function() return ms.number(110) * 2 * 1.0 end",
-            Disposition::Compiled,
+            compiled,
         ),
         // A captured integer: its value.
         (
             "captured",
             "function() return ms.number(110) * K * 1.0 end",
-            range,
+            compiled,
         ),
-        (
-            "captured",
-            "function() return (K + 1) * 1.0 end",
-            Disposition::Compiled,
-        ),
+        ("captured", "function() return (K + 1) * 1.0 end", compiled),
         // A mapped number read: its field's range.
         (
             "number",
             "function() local n = ms.number(110) local u = n * n * n * n return 1 end",
-            range,
+            lowered,
         ),
         (
             "number",
             "function() local n = ms.number(110) local u = n * n return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
         // A judgment count: its count's range.
         (
             "judge",
             "function() local j = ms.judge(1) local u = j * j * j * j return 1 end",
-            range,
+            lowered,
         ),
         (
             "judge",
             "function() local j = ms.judge(1) local u = j * j return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
-        // A timer read: of no known bound (its start or the off value).
+        // A timer read: of no known bound (its start or the off value),
+        // within ±2^53 or the source's double past it.
         (
             "timer",
             "function() local t = ms.timer(0) local unused = t * t return 1 end",
-            range,
+            lowered,
+        ),
+        // Its bound is ±2^53 like any other's, so a product of three
+        // stays within `i128` while it is bounded.
+        (
+            "timer",
+            "function() local t = ms.timer(0) local unused = t * t * t return 1 end",
+            lowered,
         ),
         (
             "timer",
             "function() local t = ms.timer(0) local unused = t * t return unused ~= nil end",
-            range,
+            lowered,
         ),
         (
             "timer",
             "function() local t = ms.timer(0) local u = -t return 1 end",
-            range,
+            lowered,
         ),
         (
             "timer",
             "function() local t = ms.timer(0) local u = t + 1 return 1 end",
-            range,
+            lowered,
         ),
         (
             "timer",
             "function() local t = ms.timer(0) local u = t == ms.timer_off_value return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
         // The gauge's type: a Java `int`.
         (
             "gauge_type",
             "function() local g = ms.gauge_type() local u = g * g * g return 1 end",
-            range,
+            lowered,
         ),
         (
             "gauge_type",
             "function() local g = ms.gauge_type() local u = g + 1 return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
         // Operators: each result's range from its operands'; a select's
         // the hull of its arms (here converted as a number's value; the
@@ -1430,32 +1483,32 @@ fn every_integer_source_is_bounded() {
         (
             "math.abs",
             "function() local t = ms.timer(0) local u = math.abs(t) return 1 end",
-            range,
+            lowered,
         ),
         (
             "math.abs",
             "function() local u = math.abs(ms.number(110)) * 2 return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
         (
             "math.max",
             "function() local t = ms.timer(0) local u = math.max(t, 1) * 2 return 1 end",
-            range,
+            lowered,
         ),
         (
             "select",
             "function() if ms.option(271) then return ms.timer(0) end return 0 end",
-            range,
+            Disposition::Replaced(Unsupported::Type),
         ),
         (
             "math.floor",
             "function() local u = math.floor(ms.number(110) / 3) * 2 return 1 end",
-            range,
+            lowered,
         ),
         (
             "%",
             "function() local u = (ms.number(110) % 7) * 1000 return 1 end",
-            Disposition::Lowered,
+            lowered,
         ),
     ] {
         let body = format!(
