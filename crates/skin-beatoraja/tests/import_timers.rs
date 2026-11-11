@@ -150,7 +150,7 @@ fn judge_timers_need_no_judge() {
 
 #[test]
 fn known_unsupported_and_unset_timers() {
-    for n in [140, 2_999] {
+    for n in [58, 2_999] {
         let loaded = images(&[&format!(r#""timer": {n},"#)], "");
         assert!(has(loaded.report(), timer(TimerWhy::Unsupported(n))));
         assert!(loaded.quads(0).is_empty());
@@ -172,6 +172,33 @@ fn known_unsupported_and_unset_timers() {
     let mut d = cycled(r#", "timer": 41"#).drawn();
     let first = d.frame(0, &[])[0].uv;
     assert_ne!(d.frame(150, &[])[0].uv, first);
+}
+
+/// Timer 140 is the rhythm clock (`play/RhythmTimerProcessor.java:60-71`):
+/// on the harness's 150 BPM chart with no bar line, 1 000 ms per beat
+/// runs 2.5 ms of timer per ms of play, as a destination timer, an alias
+/// and a cycle timer.
+#[test]
+fn timer_140_is_the_rhythm_clock() {
+    let alias = r#"{"id": 10000, "timer": 140}"#;
+    for t in [r#""timer": 140,"#, r#""timer": 10000,"#] {
+        let loaded = images(&[t], alias);
+        assert!(
+            loaded.report().notes.is_empty(),
+            "{t}: {:?}",
+            loaded.report()
+        );
+        let mut d = loaded.drawn();
+        // 20 ms of play at 150 BPM: 50 ms of the 100 ms move.
+        assert_eq!(d.rects(20), [[50, 1_070, 10, 10]], "{t}");
+        assert_eq!(d.rects(32), [[80, 1_070, 10, 10]], "{t}");
+    }
+    // A two-frame cycle of 100 ms on 140 shows its second frame from 50
+    // ms of its time: 20 ms of play.
+    let mut d = cycled(r#", "timer": 140"#).drawn();
+    let first = d.frame(0, &[])[0].uv;
+    assert_eq!(d.frame(19, &[])[0].uv, first);
+    assert_ne!(d.frame(20, &[])[0].uv, first);
 }
 
 /// Timer 2, the fade-out, is never set on play (docs/stage3.md D14): a
@@ -265,7 +292,7 @@ fn custom_timers_alias_supported_built_ins() {
     // An alias of `play`; the last of an id wins.
     let custom = r#"{"id": 10000, "timer": 2999}, {"id": 10000, "timer": 41},
                     {"id": 10001, "timer": 10000}, {"id": 10002},
-                    {"id": 10003, "timer": "script()"}, {"id": 10004, "timer": 140}"#;
+                    {"id": 10003, "timer": "script()"}, {"id": 10004, "timer": 58}"#;
     let loaded = images(&[r#""timer": 10000,"#], custom);
     assert!(loaded.report().notes.is_empty(), "{:?}", loaded.report());
     assert_eq!(loaded.drawn().rects(50), [[50, 1_070, 10, 10]]);

@@ -2034,3 +2034,232 @@ fn an_attempts_state_counts_each_gauge() {
     let each = size_of::<GaugeDesc>() + 2 * size_of::<Option<TimeUs>>() + size_of::<GaugeValue>();
     assert_eq!(three - one, 2 * each as u64);
 }
+
+/// The worked chart of the rhythm clock: 120 BPM with bar lines at 0 and
+/// 2 000 000 µs, 180 BPM from 3 000 000, a 500 000 µs STOP from 3 333 333
+/// (to 3 833 333), and a bar line at 4 166 666.
+fn rhythm_chart() -> Chart {
+    ChartBuilder::new(120_000)
+        .bar(TimeUs(0))
+        .bar(TimeUs(2_000_000))
+        .bpm(TimeUs(3_000_000), 180_000)
+        .stop(TimeUs(3_333_333), TimeUs(500_000))
+        .bar(TimeUs(4_166_666))
+        .build()
+        .unwrap()
+}
+
+/// `chart` at the practice speed `k`/20: every row's time stretched to
+/// playback µs, as the loader maps them.
+fn at_speed(mut chart: Chart, k: u32) -> Chart {
+    let speed = bms_model::Speed::from_twentieths(k).unwrap();
+    let times: Vec<TimeUs> = chart
+        .timeline
+        .points()
+        .iter()
+        .map(|p| TimeUs(i64::try_from(speed.stretch(p.at.0.unsigned_abs())).unwrap()))
+        .collect();
+    chart.timeline.remap(&times, speed).unwrap();
+    chart
+}
+
+/// The frame at `now_us` and the rhythm clock's value there in µs: `now`
+/// less its start, `None` while it is off.
+fn rhythm_at(h: &mut Harness, now_us: i64) -> Option<i64> {
+    h.frame_us(now_us, &[]);
+    h.start(timer::RHYTHM).map(|s| now_us - s)
+}
+
+/// While playing, the rhythm clock is the time since the latest bar line
+/// at 1 000 ms per chart beat: continuous across the change to 180 BPM,
+/// running through the STOP at the tempo it holds, 0 at each bar line;
+/// frame by frame and from a fresh play at each instant alike.
+#[test]
+fn the_rhythm_clock_runs_through_a_stop_and_restarts_at_bars() {
+    let chart = rhythm_chart();
+    let want = [
+        (0, 0),
+        (500_000, 1_000_000),
+        (1_999_000, 3_998_000),
+        (2_000_000, 0),
+        (3_000_000, 2_000_000),
+        (3_333_333, 2_999_999),
+        (3_583_333, 3_749_999),
+        (3_833_333, 4_499_999),
+        (4_166_665, 5_499_995),
+        (4_166_666, 0),
+        (4_500_000, 1_000_002),
+    ];
+    let mut h = Harness::empty(&chart, &full(0));
+    for (now, value) in want {
+        assert_eq!(rhythm_at(&mut h, now), Some(value), "at {now}");
+        let mut fresh = Harness::empty(&chart, &full(0));
+        assert_eq!(rhythm_at(&mut fresh, now), Some(value), "fresh at {now}");
+    }
+    // The reading is whole ms.
+    h.frame_us(3_583_333, &[]);
+    assert_eq!(h.elapsed(timer::RHYTHM), 3_749);
+}
+
+/// At a practice speed the rows' playback times carry the speed, which
+/// the clock applies once: one chart beat is 1 000 ms however long it
+/// plays.
+#[test]
+fn the_rhythm_clock_applies_the_speed_once() {
+    // k = 10 at 120 BPM: 1 000 000 playback µs is half a second of chart
+    // time, one beat.
+    let chart = at_speed(
+        ChartBuilder::new(120_000).bar(TimeUs(0)).build().unwrap(),
+        10,
+    );
+    let mut h = Harness::empty(&chart, &full(0));
+    assert_eq!(rhythm_at(&mut h, 1_000_000), Some(1_000_000));
+    // k = 26 at 150 BPM: 1 000 000 · 150 · 26 / 1 200.
+    let chart = at_speed(
+        ChartBuilder::new(150_000).bar(TimeUs(0)).build().unwrap(),
+        26,
+    );
+    let mut h = Harness::empty(&chart, &full(0));
+    assert_eq!(rhythm_at(&mut h, 1_000_000), Some(3_250_000));
+}
+
+/// Off while loading and in READY; on from `play`'s start.
+#[test]
+fn the_rhythm_clock_is_off_before_play() {
+    assert_eq!(
+        skin_model::loading_timer(timer::RHYTHM),
+        Some(skin_model::LoadingTimer::Off)
+    );
+    let chart = rhythm_chart();
+    let mut h = Harness::empty(&chart, &full(1_000));
+    assert_eq!(rhythm_at(&mut h, -500_000), None);
+    assert_eq!(rhythm_at(&mut h, -1), None);
+    assert_eq!(rhythm_at(&mut h, 0), Some(0));
+    assert_eq!(rhythm_at(&mut h, 250_000), Some(500_000));
+    // A round's lead-in is READY on chart time past 0: off until its
+    // section starts at 3 000 000, 1 000 000 µs after a bar line at 120
+    // BPM.
+    let s = section(3_000, 6_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    assert_eq!(rhythm_at(&mut h, 2_500_000), None);
+    assert_eq!(rhythm_at(&mut h, 2_999_999), None);
+    assert_eq!(rhythm_at(&mut h, 3_000_000), Some(2_000_000));
+}
+
+/// After completion, outside Closing, the clock keeps the tempo and its
+/// bar restarts until the progress end + 5 s; from then its start holds,
+/// so it runs 1:1. The chart is at 150 BPM, its last object a tap at
+/// 10 000 000 µs, with bar lines at 0, 8 000 000 and 10 500 000 (after the
+/// end).
+#[test]
+fn the_rhythm_clock_runs_the_tail_then_holds() {
+    let chart = ChartBuilder::new(150_000)
+        .bar(TimeUs(0))
+        .bar(TimeUs(8_000_000))
+        .bar(TimeUs(10_500_000))
+        .tap(lane(1), TimeUs(10_000_000))
+        .build()
+        .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    // The last playing frame, at the end: 2 000 000 µs at 150 BPM.
+    assert_eq!(rhythm_at(&mut h, 10_000_000), Some(5_000_000));
+    h.playing = false;
+    h.complete = true;
+    // Completion + 1 s: 500 000 µs since the bar line after the end.
+    assert_eq!(rhythm_at(&mut h, 11_000_000), Some(1_250_000));
+    // The last frame before the end + 5 s, then held from its start.
+    assert_eq!(rhythm_at(&mut h, 14_999_000), Some(11_247_500));
+    assert_eq!(rhythm_at(&mut h, 15_000_000), Some(11_248_500));
+    assert_eq!(rhythm_at(&mut h, 15_500_000), Some(11_748_500));
+}
+
+/// In Closing, and on a terminal frame that admits none (an autoplay
+/// quit: neither playing nor complete), the start holds from the last
+/// playing frame: 1:1 where integrating at 150 BPM would reach 2 484 000.
+/// The chart's last bar line, at 9 506 400 µs, puts the clock at
+/// 1 234 000 at 10 000 000.
+#[test]
+fn the_rhythm_clock_holds_after_a_stop() {
+    let chart = ChartBuilder::new(150_000)
+        .bar(TimeUs(0))
+        .bar(TimeUs(9_506_400))
+        .tap(lane(1), TimeUs(20_000_000))
+        .build()
+        .unwrap();
+    // Closing at 10 000 000.
+    let mut h = Harness::empty(&chart, &full(0));
+    assert_eq!(rhythm_at(&mut h, 10_000_000), Some(1_234_000));
+    assert_eq!(h.start(timer::RHYTHM), Some(8_766_000));
+    h.closing = Some(TimeUs(10_000_000));
+    h.playing = false;
+    assert_eq!(rhythm_at(&mut h, 10_500_000), Some(1_734_000));
+    // Closing's first frame holds even while it is still playing.
+    let mut h = Harness::empty(&chart, &full(0));
+    assert_eq!(rhythm_at(&mut h, 10_000_000), Some(1_234_000));
+    h.closing = Some(TimeUs(10_100_000));
+    assert_eq!(rhythm_at(&mut h, 10_200_000), Some(1_434_000));
+    // An autoplay quit at 10 000 000.
+    let mut h = Harness::empty(&chart, &full(0));
+    assert_eq!(rhythm_at(&mut h, 10_000_000), Some(1_234_000));
+    h.playing = false;
+    assert_eq!(rhythm_at(&mut h, 10_500_000), Some(1_734_000));
+}
+
+/// A frame whose `now` goes back below the cursor's row reads the clock
+/// afresh from the latest bar line at or before it, a READY rearm's
+/// candidate included.
+#[test]
+fn the_rhythm_clock_rebuilds_when_now_goes_back() {
+    let chart = rhythm_chart();
+    let mut h = Harness::empty(&chart, &full(1_000));
+    assert_eq!(rhythm_at(&mut h, 4_500_000), Some(1_000_002));
+    assert_eq!(rhythm_at(&mut h, 2_500_000), Some(1_000_000));
+    // A rearm: READY again, then play.
+    assert_eq!(rhythm_at(&mut h, 4_500_000), Some(1_000_002));
+    h.play.rearm();
+    assert_eq!(rhythm_at(&mut h, -1_000_000), None);
+    assert_eq!(rhythm_at(&mut h, 2_500_000), Some(1_000_000));
+}
+
+/// A practice round starts its clock from the rhythm since the latest bar
+/// line at or before its start: at k = 10 and 120 BPM, a round starting
+/// 1 000 000 playback µs after a bar line reads 1 000 000 at its start.
+#[test]
+fn a_practice_round_starts_the_rhythm_clock_mid_bar() {
+    // Bar lines at 0 and 2 000 000 chart µs: 0 and 4 000 000 at k = 10.
+    let chart = at_speed(
+        ChartBuilder::new(120_000)
+            .bar(TimeUs(0))
+            .bar(TimeUs(2_000_000))
+            .build()
+            .unwrap(),
+        10,
+    );
+    let s = section(5_000, 8_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    assert_eq!(rhythm_at(&mut h, 4_999_999), None);
+    assert_eq!(rhythm_at(&mut h, 5_000_000), Some(1_000_000));
+}
+
+/// A product past `u128` turns the clock off for that frame, without a
+/// panic: a row at the fastest tempo, 10¹⁰ µs on.
+#[test]
+fn an_overflowing_rhythm_is_off() {
+    let mut chart = ChartBuilder::new(120_000).bar(TimeUs(0)).build().unwrap();
+    let row = bms_model::TimelinePoint {
+        at: TimeUs(0),
+        pos: bms_model::Position(0),
+        tempo: bms_model::Tempo::MAX,
+    };
+    chart.timeline = bms_model::ChartTimeline::new(
+        vec![row],
+        vec![bms_model::TimelineId(0)],
+        bms_model::Tempo::MAX,
+        bms_model::Speed::NORMAL,
+    )
+    .unwrap();
+    let mut h = Harness::empty(&chart, &full(0));
+    // 100 µs: 100 · (10³⁰ − 1 tempo units) · 20 / (1 200 · 10¹⁸), floored.
+    assert_eq!(rhythm_at(&mut h, 100), Some(1_666_666_666_666));
+    assert_eq!(rhythm_at(&mut h, 10_000_000_000), None);
+}
