@@ -164,7 +164,7 @@ fn a_dropped_element_admits_nothing() {
         A,
         r#"{"id": "i", "blend": 9, "dst": [{"w": 1, "h": 1}]},
            {"id": "i", "op": [7777], "dst": [{"w": 1, "h": 1}]},
-           {"id": "i", "timer": 2, "dst": [{"w": 1, "h": 1}]},
+           {"id": "i", "timer": 2999, "dst": [{"w": 1, "h": 1}]},
            {"id": "i", "dst": [{"time": 0, "w": 1, "h": 1}, {"time": 0, "w": 2, "h": 1},
                                {"time": 0, "w": 3, "h": 1}]}"#,
     );
