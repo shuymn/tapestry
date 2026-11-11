@@ -170,7 +170,8 @@ fn the_page_begins_its_1x_bank_under_page_policy() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             assert_eq!(b.coord.held(Class::Speculative), 1);
             assert_eq!(b.coord.held(Class::Foreground), 0);
@@ -198,7 +199,8 @@ fn the_page_advances_its_jobs_without_input() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.poll_page().unwrap();
             assert!(!sel(rig).page.measuring(), "nothing published yet");
@@ -239,10 +241,14 @@ fn a_responsible_page_panic_ends_the_run_at_the_next_pass() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             while game::Rig::take(rig).is_some() {}
             go.send(()).unwrap();
             let mut ended = None;
@@ -281,11 +287,13 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             rig.left_chart().unwrap();
             rig.entered_selection();
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             until("the bank kept", || {
                 rig.poll_page().unwrap();
                 sel(rig).page.kept().is_some()
@@ -312,9 +320,10 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
-            rig.load_chart(&start)
+            rig.load_chart(&start, &mut game::Decision::off())
         },
     );
     assert!(
@@ -349,10 +358,14 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             assert!(sel(rig).page.kept().is_none(), "nothing kept");
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert!(installed(rig, &start));
         },
     );
@@ -378,7 +391,8 @@ fn a_start_at_1x_joins_the_bank_in_each_state() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read).unwrap();
+                rig.practice_read(&read, &mut game::Decision::off())
+                    .unwrap();
                 if queued {
                     assert_eq!(b.coord.held(Class::Speculative), 1, "the lease only");
                     let (coord, controls) = (b.coord.clone(), rig.controls);
@@ -395,7 +409,7 @@ fn a_start_at_1x_joins_the_bank_in_each_state() {
                             go.send(()).unwrap();
                             true
                         });
-                        let got = outcome(rig.load_chart(&start));
+                        let got = outcome(rig.load_chart(&start, &mut game::Decision::off()));
                         assert!(
                             admitted.join().unwrap(),
                             "the queued bank was never admitted by the Start's promotion"
@@ -407,7 +421,10 @@ fn a_start_at_1x_joins_the_bank_in_each_state() {
                     page.on(PageAt::Promoted(JobKind::Bank), move || {
                         go.send(()).unwrap()
                     });
-                    assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+                    assert_eq!(
+                        outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                        Loading::Ready
+                    );
                 }
                 assert!(installed(rig, &start), "queued: {queued}");
             },
@@ -452,10 +469,14 @@ fn a_finished_bank_is_not_installed_after_a_quit() {
         |rig| {
             // The read's own barrier passes before the hook is armed.
             sel(rig).decodes = None;
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             sel(rig).decodes = Some(Arc::clone(&b.decodes));
             passes_until_idle(rig);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             assert!(!installed(rig, &start));
         },
     );
@@ -478,16 +499,23 @@ fn a_quit_while_joining_keeps_the_page_job_for_the_next_start() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             let choice = b.coord.current(Scope::Choice);
             rig.controls.command(game::Command::Quit);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             while game::Rig::take(rig).is_some() {}
             assert_eq!(b.coord.current(Scope::Choice), choice, "the choice stays");
             assert!(sel(rig).page.decoding(), "kept for the page");
             go.send(()).unwrap();
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert!(installed(rig, &start));
         },
     );
@@ -513,11 +541,15 @@ fn a_panic_in_a_joined_page_job_ends_the_run() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read).unwrap();
+                rig.practice_read(&read, &mut game::Decision::off())
+                    .unwrap();
                 held.recv_timeout(watchdog()).expect("the page's decode");
                 if after_quit {
                     rig.controls.command(game::Command::Quit);
-                    assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+                    assert_eq!(
+                        outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                        Loading::Cancelled
+                    );
                     while game::Rig::take(rig).is_some() {}
                     go.send(()).unwrap();
                 } else {
@@ -525,7 +557,7 @@ fn a_panic_in_a_joined_page_job_ends_the_run() {
                         go.send(()).unwrap()
                     });
                 }
-                outcome(rig.load_chart(&start))
+                outcome(rig.load_chart(&start, &mut game::Decision::off()))
             },
         );
         assert!(
@@ -570,9 +602,13 @@ fn a_speculative_failure_is_redone_by_the_start() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read).unwrap();
+                rig.practice_read(&read, &mut game::Decision::off())
+                    .unwrap();
                 passes_until_idle(rig);
-                assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+                assert_eq!(
+                    outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                    Loading::Ready
+                );
                 assert!(installed(rig, &start));
             },
         );
@@ -620,10 +656,14 @@ fn another_speed_measures_on_1x_before_its_own_decode() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             order.lock().unwrap().clear();
             // No page pass: the Start finds the bank and the gain unknown.
-            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&fast, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             while game::Rig::take(rig).is_some() {}
             assert_eq!(
                 *order.lock().unwrap(),
@@ -640,7 +680,10 @@ fn another_speed_measures_on_1x_before_its_own_decode() {
                 "the barrier dropped the 1× bank"
             );
             order.lock().unwrap().clear();
-            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&fast, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert!(installed(rig, &fast));
             assert_eq!(
                 *order.lock().unwrap(),
@@ -675,7 +718,8 @@ fn back_settles_the_page_jobs_in_each_state() {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read).unwrap();
+                rig.practice_read(&read, &mut game::Decision::off())
+                    .unwrap();
                 let choice = b.coord.current(Scope::Choice);
                 if let Some((held, go)) = hold {
                     held.recv_timeout(watchdog()).expect("running");
@@ -726,8 +770,12 @@ fn page_entry_releases_the_played_bank_first() {
         &Installers::default(),
         false,
         |rig| {
-            assert_eq!(outcome(rig.load_chart(&played)), Loading::Ready);
-            rig.practice_read(&played).unwrap();
+            assert_eq!(
+                outcome(rig.load_chart(&played, &mut game::Decision::off())),
+                Loading::Ready
+            );
+            rig.practice_read(&played, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
         },
     );
@@ -751,11 +799,16 @@ fn a_start_at_1x_reuses_the_page_bank_until_another_speed_releases_it() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             for speed in [Speed::NORMAL, Speed::NORMAL, Speed::FASTEST, Speed::NORMAL] {
                 let start = practiced(dir.path(), &path, speed);
-                assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready, "{speed:?}");
+                assert_eq!(
+                    outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                    Loading::Ready,
+                    "{speed:?}"
+                );
                 assert!(installed(rig, &start), "{speed:?}");
             }
         },
@@ -816,11 +869,16 @@ fn a_return_to_1x_releases_the_speed_bank_before_its_decode() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             for speed in [Speed::FASTEST, Speed::NORMAL] {
                 let start = practiced(dir.path(), &path, speed);
-                assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready, "{speed:?}");
+                assert_eq!(
+                    outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                    Loading::Ready,
+                    "{speed:?}"
+                );
             }
             assert_eq!(
                 *seen.lock().unwrap(),
@@ -830,11 +888,14 @@ fn a_return_to_1x_releases_the_speed_bank_before_its_decode() {
             // A refused unload: no decode.
             seen.lock().unwrap().clear();
             let fast = practiced(dir.path(), &path, Speed::FASTEST);
-            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&fast, &mut game::Decision::off())),
+                Loading::Ready
+            );
             seen.lock().unwrap().clear();
             sel(rig).unload_fault = Some(game::AudioLoadError::Busy);
             let start = practiced(dir.path(), &path, Speed::NORMAL);
-            let got = rig.load_chart(&start);
+            let got = rig.load_chart(&start, &mut game::Decision::off());
             assert!(
                 matches!(
                     got,
@@ -878,14 +939,18 @@ fn sounds_replaced_after_the_page_measured_are_measured_again() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             assert!(sel(rig).page.gain_known());
             assert_eq!(crate::loudness::analyses::of(hash), 1);
             write_sound(dir.path(), 9_000);
             order.lock().unwrap().clear();
             let fast = practiced(dir.path(), &path, Speed::FASTEST);
-            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&fast, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(
                 crate::loudness::analyses::of(hash),
                 2,
@@ -938,7 +1003,8 @@ fn a_failure_during_the_leave_bounds_its_settle() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             let base = std::time::Instant::now();
             let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1000,10 +1066,14 @@ fn a_responsible_panic_during_the_leave_ends_the_run() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             while game::Rig::take(rig).is_some() {}
             assert!(sel(rig).page.decoding(), "kept for the page, unpublished");
             let coord = b.coord.clone();
@@ -1047,7 +1117,8 @@ fn a_failed_page_measurement_is_measured_again_by_the_start() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             // The page tries once: its next passes measure nothing.
             assert_eq!(
@@ -1065,7 +1136,10 @@ fn a_failed_page_measurement_is_measured_again_by_the_start() {
                 "the page measured again"
             );
             assert!(!sel(rig).page.gain_known(), "a failure is not a known gain");
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(
                 crate::loudness::analyses::of(hash),
                 2,
@@ -1103,7 +1177,8 @@ fn sounds_replaced_during_the_page_measurement_are_measured_again() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             until("the page measures", || {
                 rig.poll_page().unwrap();
                 sel(rig).page.measuring()
@@ -1113,7 +1188,10 @@ fn sounds_replaced_during_the_page_measurement_are_measured_again() {
             assert!(!sel(rig).page.gain_known(), "the gain unknown at the Start");
             write_sound(dir.path(), 9_000);
             let fast = practiced(dir.path(), &path, Speed::FASTEST);
-            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&fast, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(
                 crate::loudness::analyses::of(hash),
                 2,
@@ -1146,10 +1224,14 @@ fn a_responsible_panic_at_the_runs_end_ends_the_run_with_it() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             held.recv_timeout(watchdog()).expect("the page's decode");
             rig.controls.command(game::Command::Quit);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Cancelled
+            );
             while game::Rig::take(rig).is_some() {}
             // Published only once the run's end looks at it.
             page.on(PageAt::Looked, move || go.send(()).unwrap());
@@ -1199,19 +1281,23 @@ fn panic_after_publication(joined: bool) {
             &Installers::default(),
             false,
             |rig| {
-                rig.practice_read(&read).unwrap();
+                rig.practice_read(&read, &mut game::Decision::off())
+                    .unwrap();
                 held.recv_timeout(watchdog()).expect("the page's decode");
                 if joined {
                     page.on(PageAt::Promoted(JobKind::Bank), move || {
                         go.send(()).unwrap()
                     });
-                    match outcome(rig.load_chart(&start)) {
+                    match outcome(rig.load_chart(&start, &mut game::Decision::off())) {
                         Loading::Failed(f) => Some(f),
                         other => panic!("the panic after publication was dropped: {other:?}"),
                     }
                 } else {
                     rig.controls.command(game::Command::Quit);
-                    assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+                    assert_eq!(
+                        outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                        Loading::Cancelled
+                    );
                     while game::Rig::take(rig).is_some() {}
                     go.send(()).unwrap();
                     let mut ended = None;
@@ -1270,13 +1356,17 @@ fn a_refused_page_measurement_is_tried_once() {
         &Installers::default(),
         false,
         |rig| {
-            rig.practice_read(&read).unwrap();
+            rig.practice_read(&read, &mut game::Decision::off())
+                .unwrap();
             passes_until_idle(rig);
             for _ in 0..3 {
                 rig.poll_page().unwrap();
             }
             assert_eq!(page.count(PageAt::Measuring), 1, "the page tried again");
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(
                 crate::loudness::analyses::of(hash),
                 1,

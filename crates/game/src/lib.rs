@@ -22,6 +22,7 @@ mod audio_loop;
 mod autoplay;
 mod bests;
 pub mod coord;
+pub mod decision;
 mod driver;
 mod error;
 mod hispeed;
@@ -72,6 +73,7 @@ pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
     SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
+pub use decision::{DECISION_TIME, Decision, Origin, Reply, Verdict};
 pub use driver::{AdjustDriver, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;

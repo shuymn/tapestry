@@ -31,10 +31,10 @@ use game::coord::{
 };
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading,
-    LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
-    PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError,
-    SessionEvent, SessionEventSink, Settings,
+    Decision, DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal,
+    Loaded, Loading, LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd,
+    PlayReport, PracticeInput, PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig,
+    SessionError, SessionEvent, SessionEventSink, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -477,6 +477,28 @@ struct Headless {
     refuse_page_read: bool,
     /// The page's `n`th poll (from 1) fails the run.
     page_fails_at: Option<usize>,
+    /// The decision screen's time in ms; none (every existing test) shows
+    /// none.
+    decision_ms: Option<i64>,
+    /// The clock's advance at each decision look, in ms.
+    decision_step_ms: i64,
+    /// How long a play's load takes while it serves the decision screen,
+    /// in ms (none: as without one).
+    served_load_ms: Option<i64>,
+    /// The chosen chart at each decision screen's entry.
+    decisions: Vec<usize>,
+    /// The clock at each deadline step.
+    deadline_steps: Vec<i64>,
+    /// The decision screen's epochs closed.
+    closed_epochs: usize,
+    /// Each decision look's origin and clock.
+    decision_looks: Vec<(game::Origin, i64)>,
+    /// Told at the first look of the wait for a late read.
+    waiting_seen: Option<mpsc::Sender<()>>,
+    /// Back pressed whenever the wait for a late read looks.
+    escape_when_waiting: bool,
+    /// Escapes taken.
+    escapes: usize,
     violations: Vec<String>,
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
@@ -674,6 +696,16 @@ impl Headless {
             page_polls: Vec::new(),
             refuse_page_read: false,
             page_fails_at: None,
+            decision_ms: None,
+            decision_step_ms: 100,
+            served_load_ms: None,
+            decisions: Vec::new(),
+            deadline_steps: Vec::new(),
+            closed_epochs: 0,
+            decision_looks: Vec::new(),
+            waiting_seen: None,
+            escape_when_waiting: false,
+            escapes: 0,
             edits: Vec::new(),
             presets: Vec::new(),
             chosen_names: Vec::new(),
@@ -1210,7 +1242,34 @@ impl AppRig for Headless {
         })
     }
 
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, BankLost> {
+    fn load_chart(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut Decision,
+    ) -> Result<Loading, BankLost> {
+        // A load that serves the decision screen while it runs.
+        if decision.on()
+            && let Some(ms) = self.served_load_ms
+        {
+            let end = self.at() + ms * MS;
+            while self.at() < end {
+                self.clock.advance(TimeUs(self.decision_step_ms * MS));
+                self.tick();
+                let terminal = self.quitting()
+                    || game::Rig::input_failure(self).is_some()
+                    || game::Rig::audio_failure(self).is_some();
+                self.decision_looks.push((game::Origin::Load, self.at()));
+                match decision.classify(game::Origin::Load, self.clock.now(), terminal, false, None)
+                {
+                    game::Verdict::Continue => {}
+                    game::Verdict::Step => game::AppRig::deadline_step(self),
+                    other => {
+                        decision.leave(other);
+                        return Ok(Loading::Cancelled);
+                    }
+                }
+            }
+        }
         let now = self.clock.now();
         if let Some(driver) = &mut self.adjust {
             driver
@@ -1348,11 +1407,63 @@ impl AppRig for Headless {
         self.seen.push(Seen::Select);
     }
 
-    fn practice_read(&mut self, _loaded: &game::Loaded) -> Result<Loading, BankLost> {
+    fn practice_read(
+        &mut self,
+        _loaded: &game::Loaded,
+        _decision: &mut Decision,
+    ) -> Result<Loading, BankLost> {
         if self.refuse_page_read {
             return Err(BankLost);
         }
         Ok(Loading::Ready)
+    }
+
+    fn decision_time(&self) -> Option<TimeUs> {
+        self.decision_ms.map(|ms| TimeUs(ms * MS))
+    }
+
+    fn entered_decision(&mut self, pick: &Pick) {
+        let i = self.chosen.unwrap();
+        self.decisions.push(i);
+        // The attempt's reset at the choice; the loading state shows at
+        // the deadline.
+        if let Pick::Play(_) = pick {
+            let now = self.clock.now();
+            if let Some(driver) = &mut self.adjust {
+                driver
+                    .enter_attempt(None, &mut Pump(&mut self.sources, now))
+                    .unwrap();
+            }
+            self.loading = Some(i);
+        }
+    }
+
+    fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
+        self.clock.advance(TimeUs(self.decision_step_ms * MS));
+        self.tick();
+        self.decision_looks.push((origin, self.at()));
+        Ok(())
+    }
+
+    fn deadline_step(&mut self) {
+        self.deadline_steps.push(self.at());
+        if let Some(i) = self.loading {
+            self.loading_pages.push((i, self.at()));
+        }
+    }
+
+    fn closed_epoch(&mut self) {
+        self.closed_epochs += 1;
+    }
+
+    fn decision_escape(&mut self) -> bool {
+        if let Some(seen) = self.waiting_seen.take() {
+            let _ = seen.send(());
+        }
+        if self.escape_when_waiting {
+            self.escapes += 1;
+        }
+        self.escape_when_waiting
     }
 
     fn poll_page(&mut self) -> Result<(), LiveError<SurfaceLost>> {

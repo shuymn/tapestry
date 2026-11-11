@@ -2125,7 +2125,14 @@ impl AppRig for PlayerRig<'_> {
         cancelled(self.controls)
     }
 
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+    fn load_chart(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut game::Decision,
+    ) -> Result<Loading, ChartLoadError> {
+        // The decision screen's looks inside this load's waits come with
+        // the decision screen's player side.
+        let _ = decision;
         // The chart, speed and section are final: the presentation solves
         // for them once, so what the player adjusts while loading applies
         // to this attempt. A refusal is reported by the play's preparation
@@ -2521,7 +2528,12 @@ impl AppRig for PlayerRig<'_> {
     /// The played bank goes first (the release barrier), then the page's
     /// 1× bank begins at background priority (design.md "State Model",
     /// the practice page).
-    fn practice_read(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+    fn practice_read(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut game::Decision,
+    ) -> Result<Loading, ChartLoadError> {
+        let _ = decision;
         if let Some(failure) = self
             .release_banks(None)
             .map_err(ChartLoadError::Audio)?
