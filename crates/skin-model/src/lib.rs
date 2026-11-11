@@ -174,18 +174,18 @@ pub use play::loading::{
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX,
-    Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
-    RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, FPS_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE,
+    GREEN_MAX, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL,
+    RANK_TWENTY_SEVENTHS, RATE_BASIS_POINTS, READOUT_MAX, YEAR_MAX, field, lane_timer, timer,
 };
 #[cfg(feature = "dev-tools")]
 pub use play::timers::score_fields;
 pub use play::timers::{Settled, native_values, settled};
 pub use play::{
-    Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
-    DurationRatio, FrameReadouts, GaugeDesc, LoadState, NativeReadouts, NativeValues, OFFSET_SLOTS,
-    Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame,
-    attempt_targets,
+    AppReadouts, Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
+    DurationRatio, FrameReadouts, GaugeDesc, LoadState, LocalTime, NativeReadouts, NativeValues,
+    OFFSET_SLOTS, Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis,
+    SkinFrame, attempt_targets,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{

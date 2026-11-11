@@ -503,6 +503,55 @@ pub struct SkinFrame<'a> {
     /// degree: what a turntable follower adds
     /// ([`AngleFollow::Turntable`](crate::AngleFollow::Turntable)).
     pub turntable: i32,
+    /// The application's readouts at the frame: presents per second,
+    /// local time and uptime, whatever the attempt's state.
+    pub app: AppReadouts,
+}
+
+/// The application's readouts at one frame, which the player samples once
+/// per frame whatever the screen (design.md "Rendering and Skins", play
+/// readouts): the frames presented in the last second, the local date and
+/// time, and the uptime on the clock started at launch. Values outside
+/// their fields' ranges are malformed: a build refuses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppReadouts {
+    /// The frames presented in the last 1 000 000 µs, at most
+    /// [`FPS_MAX`](crate::FPS_MAX).
+    pub fps: u16,
+    /// µs since the player's clock started at launch, at least 0.
+    pub uptime_us: i64,
+    /// The local date and time.
+    pub local: LocalTime,
+}
+
+impl AppReadouts {
+    /// No present, the launch instant, at 1970-01-01 00:00:00: a frame
+    /// that has no application clock, such as a tool's or a test's.
+    pub const LAUNCH: Self = Self {
+        fps: 0,
+        uptime_us: 0,
+        local: LocalTime {
+            year: 1_970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+        },
+    };
+}
+
+/// A local date and time: month 1 to 12, day 1 to 31, hour 0 to 23,
+/// minute and second 0 to 59, year at most
+/// [`YEAR_MAX`](crate::YEAR_MAX).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
 }
 
 /// The chart's load as the play screen shows it before READY
@@ -1371,6 +1420,7 @@ mod tests {
         let mut frame =
             |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent], notes: &NoteFacts| {
                 let frame = SkinFrame {
+                    app: crate::AppReadouts::LAUNCH,
                     state_us: 0,
                     now: TimeUs(now_ms * MS),
                     display_offset: TimeUs(0),
@@ -1458,6 +1508,7 @@ mod tests {
             ..tally
         };
         let refused = SkinFrame {
+            app: crate::AppReadouts::LAUNCH,
             state_us: 0,
             now: TimeUs(1_250 * MS),
             display_offset: TimeUs(0),

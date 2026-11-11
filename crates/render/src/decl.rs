@@ -732,6 +732,7 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         turntable: f.turntable,
         lanes: f.lanes,
         readouts: f.readouts,
+        app: f.app,
     }
 }
 
