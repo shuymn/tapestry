@@ -1,0 +1,404 @@
+//! A practice Start of the page's chart (design.md "Load Pipeline"): the
+//! page's 1× bank joined, or decoded again, and its gain known before any
+//! bank of the Start is installed or decoded. At 1× the Start installs that
+//! bank; at another speed the barrier releases it before the speed's own
+//! decode.
+
+use std::sync::Arc;
+
+use game::coord::{JobKind, LoadFailure, Promotion, Waited};
+
+use super::{ChartLoadError, Progress, cancelled, decode_on_permits};
+use crate::background::Claim;
+use crate::page_jobs::{PageChart, Taken, Terminal, taken};
+use crate::play::PlayerRig;
+
+/// What a step of the Start came to.
+pub(super) enum Got<T> {
+    /// Done, with its value.
+    Ready(T),
+    /// The quit key or a close: the load is cancelled.
+    Cancelled,
+    /// A job's failure the run ends with.
+    Failed(LoadFailure),
+}
+
+impl PlayerRig<'_> {
+    /// Whether the run is ending or a thread failed: the cause that bounds
+    /// a page job's settle.
+    pub(super) fn page_terminal(&self) -> Option<Terminal> {
+        use game::Rig as _;
+        (self.controls.quitting()
+            || self.input_failure().is_some()
+            || self.audio_failure().is_some())
+        .then_some(Terminal)
+    }
+
+    /// The page's 1× bank for a Start: the one kept, the page's job joined
+    /// (promoted, so it is the Start's responsibility from here), or, when
+    /// the page has none to give, decoded now as a load's.
+    pub(super) fn page_bank(
+        &mut self,
+        page: &PageChart,
+        progress: &Arc<Progress>,
+    ) -> Result<Got<Arc<audio::SoundBank>>, ChartLoadError> {
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        if let Some(e) = sel.page.take_refusal() {
+            return Err(ChartLoadError::Sounds(e));
+        }
+        if let Some(bank) = sel.page.kept() {
+            return Ok(Got::Ready(Arc::clone(bank)));
+        }
+        if let Some(job) = sel.page.take_bank() {
+            let observed = match job.promote_unless_ended() {
+                Promotion::Live => {
+                    let shown = Arc::clone(progress);
+                    sel.page.show(Some(Box::new(move |done, files| {
+                        shown.decoded(done, files)
+                    })));
+                    let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+                    let waited = job.wait(crate::play::MARKER_PARK, || {
+                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                        cancelled(controls)
+                    });
+                    let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+                    sel.page.show(None);
+                    match waited {
+                        Waited::Done(o) => Some(o),
+                        // A quit: the job goes on for the page, demoted, and
+                        // the next Start takes it.
+                        Waited::Stopped(_) => {
+                            sel.page.put_bank(job);
+                            return Ok(Got::Cancelled);
+                        }
+                    }
+                }
+                Promotion::Published(o) => Some(o),
+                Promotion::Ending => None,
+            };
+            let terminal = self.page_terminal();
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            sel.page.settle_one(Some(job), &mut || terminal);
+            match observed.as_ref().map(|o| taken(JobKind::Bank, o)) {
+                Some(Taken::Done(Ok(bank))) => {
+                    progress.completed();
+                    sel.page.keep_bank(&mut sel.shelf, page, Arc::clone(&bank));
+                    return Ok(Got::Ready(bank));
+                }
+                Some(Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo) | None => {}
+                Some(Taken::Done(Err(e))) => return Err(ChartLoadError::Sounds(e)),
+                Some(Taken::Fatal(f)) => return Ok(Got::Failed(f)),
+            }
+        }
+        // Nothing to join: the Start decodes it, as a load does.
+        let got = self.decode_bank((&page.path, &page.chart), audio::Speed::NORMAL, progress)?;
+        if let Got::Ready(bank) = &got {
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            sel.page.keep_bank(&mut sel.shelf, page, Arc::clone(bank));
+        }
+        Ok(got)
+    }
+
+    /// The gain of the page's chart before the Start's bank: known, or the
+    /// page's measurement joined, or the background's waited for, or
+    /// measured now on `bank`, the 1× bank.
+    pub(super) fn page_gain(
+        &mut self,
+        page: &PageChart,
+        bank: &Arc<audio::SoundBank>,
+        source: game::ChartSource,
+    ) -> Result<Got<()>, ChartLoadError> {
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        let Some(key) = sel.page.key().filter(|_| !sel.page.gain_known()) else {
+            return Ok(Got::Ready(()));
+        };
+        if let Some(job) = sel.page.take_measure() {
+            let observed = match job.promote_unless_ended() {
+                Promotion::Live => {
+                    let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
+                    let waited = job.wait(crate::play::MARKER_PARK, || {
+                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                        cancelled(controls)
+                    });
+                    match waited {
+                        Waited::Done(o) => Some(o),
+                        Waited::Stopped(_) => {
+                            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+                            sel.page.put_measure(job);
+                            return Ok(Got::Cancelled);
+                        }
+                    }
+                }
+                Promotion::Published(o) => Some(o),
+                Promotion::Ending => None,
+            };
+            let terminal = self.page_terminal();
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            sel.page.settle_one(Some(job), &mut || terminal);
+            match observed.as_ref().map(|o| taken(JobKind::Measure, o)) {
+                Some(Taken::Done(Ok(m))) => {
+                    sel.page.keep_measured(&mut sel.shelf, m);
+                    return Ok(Got::Ready(()));
+                }
+                Some(Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo) | None => {}
+                Some(Taken::Fatal(f)) => return Ok(Got::Failed(f)),
+            }
+        }
+        // The background may have it: taken, waited for, or left to the
+        // Start's own measurement.
+        loop {
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            match sel.page.claim(&mut sel.shelf, &page.path, &key) {
+                Claim::Reused(_) => return Ok(Got::Ready(())),
+                Claim::Taken | Claim::Free => break,
+                Claim::Running | Claim::Settling => {
+                    let controls = self.controls;
+                    let render = &self.render;
+                    let stage = sel.loading.clone();
+                    let waited = sel.shelf.wait_background(
+                        &page.path,
+                        &page.name,
+                        || cancelled(controls),
+                        || super::show_stage(render, stage.as_ref(), super::Stage::Loudness),
+                    );
+                    if waited == game::Loading::Cancelled {
+                        return Ok(Got::Cancelled);
+                    }
+                    // The background's measurement, kept by the wait.
+                    if sel
+                        .shelf
+                        .look_up_page(&page.chart, bank, &page.name)
+                        .is_none()
+                    {
+                        sel.page.known();
+                        return Ok(Got::Ready(()));
+                    }
+                }
+            }
+        }
+        self.measure_scoped(&page.chart, bank, key, &page.name, source)
+            .map(|got| match got {
+                Got::Ready(m) => {
+                    if let Some(sel) = self.selection.as_mut() {
+                        sel.page.keep_measured(&mut sel.shelf, m);
+                    }
+                    Got::Ready(())
+                }
+                Got::Cancelled => Got::Cancelled,
+                Got::Failed(f) => Got::Failed(f),
+            })
+    }
+}
+
+impl PlayerRig<'_> {
+    /// The sounds of `chart` (the chart at `path`) decoded at `speed` on
+    /// the Bank job's thread while this one serves the adjustments, so one
+    /// made during a long decode is published before loading ends
+    /// (design.md "Play Adjustments"). The quit key or a close stops the
+    /// decode at the next file or packet, and no bank is made.
+    pub(super) fn decode_bank(
+        &mut self,
+        (path, chart): (&std::path::Path, &bms_model::Chart),
+        speed: audio::Speed,
+        progress: &Arc<Progress>,
+    ) -> Result<Got<Arc<audio::SoundBank>>, ChartLoadError> {
+        let controls = self.controls;
+        // A script's `quit-decoding` presses the quit key once the first
+        // file is decoded (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        let quit_decoding = self
+            .selection
+            .as_mut()
+            .and_then(|s| s.script.as_mut())
+            .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
+        let sel = self.selection.as_ref().ok_or(ChartLoadError::NoSelection)?;
+        let (coord, spawner, rate) = (sel.coord.clone(), sel.spawner, sel.rate);
+        #[cfg(test)]
+        let decodes = sel.decodes.clone();
+        let (adjust, input) = (&mut self.adjust, &self.input);
+        let job = (JobKind::Bank, path.to_owned(), speed);
+        // The decode is accounted from before its job exists to its bank's
+        // registration; declared before the result, so a result dropped on
+        // a cancel or a refusal goes first.
+        #[cfg(feature = "dev-tools")]
+        let token = sel.witness.decode();
+        let decoded = std::thread::scope(|s| {
+            let decode = |ctx: &game::coord::Ctx<'_>| {
+                decode_on_permits(
+                    ctx,
+                    &coord,
+                    (chart, rate, speed),
+                    &|done, files| {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::hold_decoding();
+                        progress.decoded(done, files);
+                        #[cfg(feature = "dev-tools")]
+                        if quit_decoding && done == 1 {
+                            controls.command(game::Command::Quit);
+                        }
+                    },
+                    &|| ctx.cancelled() || cancelled(controls),
+                    #[cfg(test)]
+                    super::DecodeProbe {
+                        load: decodes.as_deref().map(|d| (d, controls)),
+                        at_file: decodes
+                            .as_deref()
+                            .and_then(|d| d.at_file.as_ref())
+                            .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
+                    },
+                )
+            };
+            match coord.run_scoped(s, spawner, job, decode) {
+                Err(failure) => game::coord::Joined::Failed(failure),
+                Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                    #[cfg(test)]
+                    super::probe(
+                        decodes.as_deref(),
+                        super::Probe::Wait(JobKind::Bank),
+                        controls,
+                        &|| false,
+                    );
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
+                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                    cancelled(controls)
+                }),
+            }
+        });
+        #[cfg(test)]
+        super::probe(decodes.as_deref(), super::Probe::Joined, controls, &|| {
+            false
+        });
+        #[cfg(feature = "dev-tools")]
+        crate::dev::print_adjustments("decoding", self.adjust.as_ref());
+        use game::coord::Joined;
+        Ok(match decoded {
+            Joined::Done(Ok(bank)) => {
+                progress.completed();
+                let bank = Arc::new(bank);
+                #[cfg(feature = "dev-tools")]
+                token.register(&bank);
+                Got::Ready(bank)
+            }
+            Joined::Done(Err(audio::BankError::Cancelled))
+            | Joined::Cancelled(Some(Err(audio::BankError::Cancelled))) => {
+                println!("load: cancelled while loading the sounds");
+                Got::Cancelled
+            }
+            Joined::Cancelled(_) => Got::Cancelled,
+            Joined::Done(Err(e)) => return Err(ChartLoadError::Sounds(e)),
+            Joined::Failed(failure) => Got::Failed(failure),
+        })
+    }
+}
+
+impl PlayerRig<'_> {
+    /// The loudness of `chart` (`name` in the log) under `key`, measured on
+    /// its 1× `bank` on the Measure job's thread while this one serves the
+    /// adjustments. The quit key leaves the measurement to the background
+    /// (unless the page claimed the chart: the page measures it again); a
+    /// close leaves nothing.
+    pub(super) fn measure_scoped(
+        &mut self,
+        chart: &bms_model::Chart,
+        bank: &Arc<audio::SoundBank>,
+        key: library::LoudnessKey,
+        name: &str,
+        source: game::ChartSource,
+    ) -> Result<Got<Option<audio::Measurement>>, ChartLoadError> {
+        let controls = self.controls;
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        #[cfg(feature = "dev-tools")]
+        let close = sel
+            .script
+            .as_mut()
+            .is_some_and(|s| std::mem::take(&mut s.close_measuring));
+        #[cfg(feature = "dev-tools")]
+        let quit = sel
+            .script
+            .as_mut()
+            .is_some_and(|s| std::mem::take(&mut s.quit_measuring));
+        let (coord, spawner, rate) = (sel.coord.clone(), sel.spawner, sel.rate);
+        #[cfg(test)]
+        let decodes = sel.decodes.clone();
+        #[cfg(test)]
+        super::probe(
+            decodes.as_deref(),
+            super::Probe::BeforeMeasure,
+            controls,
+            &|| false,
+        );
+        // A bank whose rate the meter refuses (tests).
+        #[cfg(test)]
+        let bank = &if decodes
+            .as_deref()
+            .is_some_and(|d| d.refuse_meter.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            Arc::new(audio::SoundBank::from_sounds(1, Vec::new()))
+        } else {
+            Arc::clone(bank)
+        };
+        let job = (
+            JobKind::Measure,
+            source.path().to_owned(),
+            bms_model::Speed::NORMAL,
+        );
+        let (adjust, input) = (&mut self.adjust, &self.input);
+        let measured = std::thread::scope(|s| {
+            let measure = |ctx: &game::coord::Ctx<'_>| {
+                // A script's `close-measuring` or `quit-measuring` acts
+                // once the measurement holds its permit (dev-tools).
+                #[cfg(feature = "dev-tools")]
+                if close {
+                    controls.close();
+                }
+                #[cfg(feature = "dev-tools")]
+                if quit {
+                    controls.command(game::Command::Quit);
+                }
+                let mut host = super::JobHost {
+                    controls,
+                    #[cfg(test)]
+                    coord: &coord,
+                    ctx,
+                    #[cfg(test)]
+                    decodes: decodes.as_deref(),
+                };
+                crate::loudness::measure(chart, bank, Some(&key), name, &mut host)
+            };
+            match coord.run_scoped(s, spawner, job, measure) {
+                Err(failure) => game::coord::Joined::Failed(failure),
+                Ok(job) => job.wait(crate::play::MARKER_PARK, || {
+                    #[cfg(test)]
+                    super::probe(
+                        decodes.as_deref(),
+                        super::Probe::Wait(JobKind::Measure),
+                        controls,
+                        &|| false,
+                    );
+                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
+                    cancelled(controls)
+                }),
+            }
+        });
+        use game::coord::Joined;
+        Ok(match measured {
+            Joined::Done(Ok(m)) => Got::Ready(m),
+            Joined::Done(Err(crate::loudness::Cancelled)) | Joined::Cancelled(_) => {
+                // The quit key leaves the chart's measurement to the
+                // background; a close ends the run.
+                if !self.controls.quitting()
+                    && let Some(sel) = &self.selection
+                {
+                    sel.shelf.leave_to_background(crate::background::Job {
+                        source,
+                        rate,
+                        name: name.to_owned(),
+                    });
+                }
+                Got::Cancelled
+            }
+            Joined::Failed(failure) => Got::Failed(failure),
+        })
+    }
+}

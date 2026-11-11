@@ -13,7 +13,8 @@ use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
 use game::coord::{Caps, Class, Coordinator, Observed, OwnedJob, Owner, Scope, Spawner, Waited};
 
 use super::{
-    JobMode, PageAt, PageBank, PageMeasure, PageProbe, spawn_page_bank, spawn_page_measure,
+    JobMode, PageAt, PageBank, PageMeasure, PageProbe, PageSink, spawn_page_bank,
+    spawn_page_measure,
 };
 use crate::loudness::fixture::{RATE, square, wav};
 use crate::priority::{PriorityError, ThreadMode};
@@ -261,6 +262,9 @@ fn bank(
         ("page.bms".into(), Arc::clone(chart), RATE),
         (promoted, Owner::Speculative),
         Arc::clone(&mode),
+        PageSink::default(),
+        #[cfg(feature = "dev-tools")]
+        None,
         Some(script.probe()),
     )
     .unwrap();

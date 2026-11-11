@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource, TimeUs};
-use game::coord::Joined;
 use game::{
     AppRig, Chain, LoadRefusal, Loaded, Loading, Pick, PracticeInput, PracticeScreen, Refused,
     ResultScreen, SessionError,
@@ -284,48 +283,21 @@ pub(crate) fn decode_on_permits(
 }
 
 /// What a chart's measurement job lends its measurement, on the job's
-/// thread: the 1× chart read again through the load's reader with its bank
-/// decoded on the job's permits (a practice at another speed), and the
-/// load's cancel. The stage line was shown before the job began.
+/// thread: the load's cancel. It measures the 1× bank it is given only: a
+/// practice at another speed measures on its 1× bank before its own
+/// ([`page_start`]). The stage line was shown before the job began.
 struct JobHost<'a, 'c> {
-    reader: game::ChartReader<'a>,
-    rate: u32,
     controls: &'a crate::controls::Controls,
+    #[cfg(test)]
     coord: &'a game::coord::Coordinator,
     ctx: &'a game::coord::Ctx<'c>,
     #[cfg(test)]
     decodes: Option<&'a Decodes>,
-    #[cfg(feature = "dev-tools")]
-    witness: &'a Arc<crate::bank_witness::BankWitness>,
 }
 
 impl crate::loudness::Host for JobHost<'_, '_> {
     fn at_normal(&mut self) -> anyhow::Result<(bms_model::Chart, Arc<audio::SoundBank>)> {
-        let normal = bms_model::Speed::NORMAL;
-        let chart = self.reader.read(normal)?;
-        let (ctx, controls) = (self.ctx, self.controls);
-        // Accounted from before its decode to its bank's registration.
-        #[cfg(feature = "dev-tools")]
-        let token = self.witness.decode();
-        let bank = decode_on_permits(
-            ctx,
-            self.coord,
-            (&chart, self.rate, normal),
-            &|_, _| {},
-            &|| ctx.cancelled() || cancelled(controls),
-            #[cfg(test)]
-            DecodeProbe {
-                load: self.decodes.map(|d| (d, controls)),
-                at_file: self
-                    .decodes
-                    .and_then(|d| d.at_file.as_ref())
-                    .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
-            },
-        )?;
-        let bank = Arc::new(bank);
-        #[cfg(feature = "dev-tools")]
-        token.register(&bank);
-        Ok((chart, bank))
+        anyhow::bail!("a load measures its 1× bank only")
     }
 
     fn measuring(&mut self, _name: &str) {}
@@ -393,6 +365,8 @@ pub struct Selection {
     pub coord: game::coord::Coordinator,
     /// Starts the load's job threads (tests stand in a refusal).
     pub spawner: game::coord::Spawner,
+    /// The practice page's own jobs for the chosen chart.
+    pub page: crate::page_jobs::PageJobs,
     /// What the load's decodes report (tests).
     #[cfg(test)]
     pub decodes: Option<Arc<Decodes>>,
@@ -1581,14 +1555,26 @@ impl PlayerRig<'_> {
     /// the previous chart's restorer is dropped (it holds the engine's
     /// bank, and would restore no round of this chart); the engine's bank
     /// is unloaded, freed here once the audio thread took the empty one.
-    /// The witness then finds no bank alive and no decode in flight
-    /// (dev-tools).
+    /// The practice page's jobs are settled first and its kept bank
+    /// dropped, unless `kept` is that bank, which a Start at 1× installs.
+    /// The witness then finds no decode in flight and no bank alive but
+    /// `kept` (dev-tools).
     ///
     /// # Errors
     ///
     /// The unload's ([`game::AudioControl::unload`]): nothing is decoded.
-    fn release_banks(&mut self) -> Result<(), game::AudioLoadError> {
+    fn release_banks(
+        &mut self,
+        kept: Option<&Arc<audio::SoundBank>>,
+    ) -> Result<(), game::AudioLoadError> {
         self.restorer = None;
+        let terminal = self.page_terminal();
+        if let Some(sel) = &mut self.selection {
+            let controls = self.controls;
+            sel.page.settle(kept.is_some(), &mut || {
+                terminal.or_else(|| controls.quitting().then_some(crate::page_jobs::Terminal))
+            });
+        }
         #[cfg(test)]
         {
             let decodes = self.selection.as_ref().and_then(|s| s.decodes.clone());
@@ -1600,7 +1586,7 @@ impl PlayerRig<'_> {
         self.audio.control.unload()?;
         #[cfg(feature = "dev-tools")]
         if let Some(sel) = &self.selection {
-            sel.witness.check(None);
+            sel.witness.check(kept);
         }
         Ok(())
     }
@@ -2110,7 +2096,7 @@ impl AppRig for PlayerRig<'_> {
         // Requested again after the practice page released it, as a
         // choice does.
         sel.shelf.choose(loaded.path());
-        let (rate, chosen_at) = (sel.rate, sel.chosen_at);
+        let chosen_at = sel.chosen_at;
         let page = sel.loading.clone();
         #[cfg(feature = "dev-tools")]
         let slow = sel.script.as_mut().and_then(|s| s.slow_load.take());
@@ -2187,108 +2173,59 @@ impl AppRig for PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // Every earlier bank's owners go before this decode begins; an
-        // unload the audio thread does not take refuses the load here.
-        self.release_banks().map_err(ChartLoadError::Audio)?;
+        let progress = Arc::new(Progress::new(self.render.loading(), page.clone()));
+        // A practice Start of the page's chart takes the page's 1× bank and
+        // knows its gain before any bank of its own: at 1× it installs that
+        // bank, at another speed the barrier releases it first (design.md
+        // "Load Pipeline").
+        let practised = loaded
+            .section()
+            .and_then(|_| self.selection.as_ref())
+            .and_then(|s| s.page.chart_of(loaded.path()).cloned());
+        let mut reused = None;
+        if let Some(practised) = &practised {
+            let bank = match self.page_bank(practised, &progress)? {
+                Got::Ready(bank) => bank,
+                Got::Cancelled => {
+                    println!("load: cancelled");
+                    return Ok(Loading::Cancelled);
+                }
+                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+            };
+            show_stage(&self.render, page.as_ref(), Stage::Loudness);
+            match self.page_gain(practised, &bank, loaded.source())? {
+                Got::Ready(()) => {}
+                Got::Cancelled => {
+                    println!("load: cancelled");
+                    return Ok(Loading::Cancelled);
+                }
+                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+            }
+            if speed == bms_model::Speed::NORMAL {
+                reused = Some(bank);
+            }
+        }
+        // Every earlier bank's owners go before this decode begins (the
+        // page's kept bank stays when this Start installs it); an unload
+        // the audio thread does not take refuses the load here.
+        self.release_banks(reused.as_ref())
+            .map_err(ChartLoadError::Audio)?;
         // A quit or a close during the unload, whose wait reads neither:
         // nothing is decoded.
         if cancelled(self.controls) {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        let progress = Progress::new(self.render.loading(), page.clone());
-        let controls = self.controls;
-        // A script's `quit-decoding` presses the quit key once the first
-        // file is decoded (dev-tools).
-        #[cfg(feature = "dev-tools")]
-        let quit_decoding = self
-            .selection
-            .as_mut()
-            .and_then(|s| s.script.as_mut())
-            .is_some_and(|s| std::mem::take(&mut s.quit_decoding));
-        let sel = self.selection.as_ref().ok_or(ChartLoadError::NoSelection)?;
-        let (coord, spawner) = (sel.coord.clone(), sel.spawner);
-        #[cfg(test)]
-        let decodes = sel.decodes.clone();
-        // The sounds decode on the Bank job's thread while this one serves
-        // the adjustments, so one made during a long decode is published
-        // before loading ends (design.md "Play Adjustments"). The quit key
-        // or a close stops the decode at the next file or packet, and no
-        // bank is made.
-        let (adjust, input) = (&mut self.adjust, &self.input);
-        let job = (game::coord::JobKind::Bank, loaded.path().to_owned(), speed);
-        // The decode is accounted from before its job exists to its bank's
-        // registration; declared before the result, so a result dropped on
-        // a cancel or a refusal goes first.
-        #[cfg(feature = "dev-tools")]
-        let token = sel.witness.decode();
-        let decoded = std::thread::scope(|s| {
-            let decode = |ctx: &game::coord::Ctx<'_>| {
-                decode_on_permits(
-                    ctx,
-                    &coord,
-                    (chart, rate, speed),
-                    &|done, files| {
-                        #[cfg(feature = "dev-tools")]
-                        crate::dev::hold_decoding();
-                        progress.decoded(done, files);
-                        #[cfg(feature = "dev-tools")]
-                        if quit_decoding && done == 1 {
-                            controls.command(game::Command::Quit);
-                        }
-                    },
-                    &|| ctx.cancelled() || cancelled(controls),
-                    #[cfg(test)]
-                    DecodeProbe {
-                        load: decodes.as_deref().map(|d| (d, controls)),
-                        at_file: decodes
-                            .as_deref()
-                            .and_then(|d| d.at_file.as_ref())
-                            .map(|h| &*h.0 as &(dyn Fn(usize) + Sync)),
-                    },
-                )
-            };
-            match coord.run_scoped(s, spawner, job, decode) {
-                Err(failure) => Joined::Failed(failure),
-                Ok(job) => job.wait(crate::play::MARKER_PARK, || {
-                    #[cfg(test)]
-                    probe(
-                        decodes.as_deref(),
-                        Probe::Wait(game::coord::JobKind::Bank),
-                        controls,
-                        &|| false,
-                    );
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::press_due(controls, crate::dev::LoadPhase::Decoding);
-                    crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                    cancelled(controls)
-                }),
-            }
-        });
-        #[cfg(test)]
-        probe(decodes.as_deref(), Probe::Joined, controls, &|| false);
-        #[cfg(feature = "dev-tools")]
-        crate::dev::print_adjustments("decoding", self.adjust.as_ref());
-        let bank = match decoded {
-            Joined::Done(Ok(bank)) => {
-                progress.completed();
-                let bank = Arc::new(bank);
-                #[cfg(feature = "dev-tools")]
-                token.register(&bank);
-                bank
-            }
-            Joined::Done(Err(audio::BankError::Cancelled))
-            | Joined::Cancelled(Some(Err(audio::BankError::Cancelled))) => {
-                println!("load: cancelled while loading the sounds");
-                println!("load: cancelled");
-                return Ok(Loading::Cancelled);
-            }
-            Joined::Cancelled(_) => {
-                println!("load: cancelled");
-                return Ok(Loading::Cancelled);
-            }
-            Joined::Done(Err(e)) => return Err(ChartLoadError::Sounds(e)),
-            Joined::Failed(failure) => return Ok(Loading::Failed(failure)),
+        let bank = match reused {
+            Some(bank) => bank,
+            None => match self.decode_bank((loaded.path(), chart), speed, &progress)? {
+                Got::Ready(bank) => bank,
+                Got::Cancelled => {
+                    println!("load: cancelled");
+                    return Ok(Loading::Cancelled);
+                }
+                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+            },
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
@@ -2313,109 +2250,28 @@ impl AppRig for PlayerRig<'_> {
         self.restorer = rounds.map(|s| game::Restorer::new(self.audio.control.seek_source(), s));
         let engine = self.clock.now();
         // Its gain, from the cache, or measured now on the Measure job's
-        // thread, before its first play.
+        // thread, before its first play; a practice Start knew it before.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         let name = sel
             .screen
             .selected()
             .map_or_else(|| "the chart".to_owned(), |e| file_name(&e.path));
-        #[cfg(feature = "dev-tools")]
-        let close = sel
-            .script
-            .as_mut()
-            .is_some_and(|s| std::mem::take(&mut s.close_measuring));
-        #[cfg(feature = "dev-tools")]
-        let quit = sel
-            .script
-            .as_mut()
-            .is_some_and(|s| std::mem::take(&mut s.quit_measuring));
-        if let Some(key) = sel.shelf.look_up(chart, &bank, &name, loaded.path()) {
+        if let Some(key) = sel.shelf.look_up(chart, &bank, &name, loaded.path())
+            && practised.is_none()
+        {
             show_stage(&self.render, page.as_ref(), Stage::Loudness);
-            #[cfg(test)]
-            probe(
-                decodes.as_deref(),
-                Probe::BeforeMeasure,
-                self.controls,
-                &|| false,
-            );
-            // A bank whose rate the meter refuses (tests).
-            #[cfg(test)]
-            let bank = if decodes
-                .as_deref()
-                .is_some_and(|d| d.refuse_meter.load(std::sync::atomic::Ordering::SeqCst))
-            {
-                Arc::new(audio::SoundBank::from_sounds(1, Vec::new()))
-            } else {
-                bank
-            };
-            let reader = loaded.reader();
-            #[cfg(feature = "dev-tools")]
-            let witness = Arc::clone(&sel.witness);
-            let job = (
-                game::coord::JobKind::Measure,
-                loaded.path().to_owned(),
-                bms_model::Speed::NORMAL,
-            );
-            let (adjust, input) = (&mut self.adjust, &self.input);
-            let measured = std::thread::scope(|s| {
-                let measure = |ctx: &game::coord::Ctx<'_>| {
-                    // A script's `close-measuring` or `quit-measuring` acts
-                    // once the measurement holds its permit (dev-tools).
-                    #[cfg(feature = "dev-tools")]
-                    if close {
-                        controls.close();
-                    }
-                    #[cfg(feature = "dev-tools")]
-                    if quit {
-                        controls.command(game::Command::Quit);
-                    }
-                    let mut host = JobHost {
-                        reader,
-                        rate,
-                        controls,
-                        coord: &coord,
-                        ctx,
-                        #[cfg(test)]
-                        decodes: decodes.as_deref(),
-                        #[cfg(feature = "dev-tools")]
-                        witness: &witness,
-                    };
-                    crate::loudness::measure(chart, &bank, Some(&key), &name, &mut host)
-                };
-                match coord.run_scoped(s, spawner, job, measure) {
-                    Err(failure) => Joined::Failed(failure),
-                    Ok(job) => job.wait(crate::play::MARKER_PARK, || {
-                        #[cfg(test)]
-                        probe(
-                            decodes.as_deref(),
-                            Probe::Wait(game::coord::JobKind::Measure),
-                            controls,
-                            &|| false,
-                        );
-                        crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());
-                        cancelled(controls)
-                    }),
+            match self.measure_scoped(chart, &bank, key, &name, loaded.source())? {
+                Got::Ready(m) => {
+                    let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+                    sel.shelf.keep_measured(key, m);
                 }
-            });
-            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
-            match measured {
-                Joined::Done(Ok(m)) => sel.shelf.keep_measured(key, m),
-                Joined::Done(Err(crate::loudness::Cancelled)) | Joined::Cancelled(_) => {
-                    // The quit key leaves the chart's measurement to the
-                    // background; a close ends the run.
-                    if !self.controls.quitting() {
-                        sel.shelf.leave_to_background(crate::background::Job {
-                            source: loaded.source(),
-                            rate,
-                            name,
-                        });
-                    }
-                    // Closing or the quit key: nothing more is prepared, and
-                    // the flow leaves the chart.
+                Got::Cancelled => {
+                    // Closing or the quit key: nothing more is prepared,
+                    // and the flow leaves the chart.
                     println!("load: cancelled");
                     return Ok(Loading::Cancelled);
                 }
-                Joined::Failed(failure) => return Ok(Loading::Failed(failure)),
+                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
             }
         }
         #[cfg(feature = "dev-tools")]
@@ -2428,6 +2284,11 @@ impl AppRig for PlayerRig<'_> {
             return Ok(Loading::Cancelled);
         }
         show_stage(&self.render, page.as_ref(), Stage::Screen);
+        #[cfg(test)]
+        let (decodes, controls) = (
+            self.selection.as_ref().and_then(|s| s.decodes.clone()),
+            self.controls,
+        );
         wait_chart_load(
             screen,
             &self.render,
@@ -2530,6 +2391,16 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn entered_selection(&mut self) {
+        // The chart is left: the page's jobs of it end, and their results go
+        // nowhere (design.md "Load Pipeline").
+        let terminal = self.page_terminal();
+        if let Some(sel) = &mut self.selection {
+            sel.coord.advance(game::coord::Scope::Choice);
+            let controls = self.controls;
+            sel.page.leave(Some(&mut sel.shelf), &mut || {
+                terminal.or_else(|| controls.quitting().then_some(crate::page_jobs::Terminal))
+            });
+        }
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
@@ -2571,6 +2442,37 @@ impl AppRig for PlayerRig<'_> {
         };
         sel.dirty = true;
         sel.show(&self.render, None, self.clock.now());
+    }
+
+    /// The played bank goes first (the release barrier), then the page's
+    /// 1× bank begins at background priority (design.md "State Model",
+    /// the practice page).
+    fn practice_read(&mut self, loaded: &Loaded) -> Result<(), ChartLoadError> {
+        self.release_banks(None).map_err(ChartLoadError::Audio)?;
+        let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+        let chart = crate::page_jobs::PageChart {
+            path: loaded.path().to_owned(),
+            chart: Arc::new(loaded.chart().clone()),
+            name: file_name(loaded.path()),
+            rate: sel.rate,
+        };
+        sel.page.begin(
+            &sel.coord,
+            sel.spawner,
+            chart,
+            #[cfg(feature = "dev-tools")]
+            &sel.witness,
+        );
+        Ok(())
+    }
+
+    fn poll_page(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        let Some(sel) = &mut self.selection else {
+            return Ok(());
+        };
+        sel.page
+            .poll(&sel.coord, sel.spawner, &mut sel.shelf)
+            .map_err(game::LiveError::Load)
     }
 
     /// The one routine of every entry into the practice page: on opening
@@ -2692,6 +2594,9 @@ fn wait_chart_load(
 
 #[cfg(all(test, feature = "dev-tools"))]
 mod job_tests;
+
+mod page_start;
+use page_start::Got;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3031,6 +2936,7 @@ pub(crate) mod tests {
             script: None,
             coord: crate::shelf::tests::coordinator(),
             spawner: game::coord::Spawner::SYSTEM,
+            page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
             decodes: None,
             after_bank: None,
             unload_fault: None,
@@ -4859,6 +4765,7 @@ pub(crate) mod tests {
             script: None,
             coord: crate::shelf::tests::coordinator(),
             spawner: game::coord::Spawner::SYSTEM,
+            page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
             decodes: None,
             after_bank: None,
             unload_fault: None,
