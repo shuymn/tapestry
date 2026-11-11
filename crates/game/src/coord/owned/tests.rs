@@ -292,7 +292,8 @@ fn an_owned_job_whose_thread_is_refused_holds_nothing() {
     assert_eq!(outcome(&job).outcome, Outcome::Done(2));
 }
 
-/// Y2, two cases: a keyed job of another result type, and an owned one.
+/// Y2, two cases: a keyed job of another result type, and an owned one;
+/// both refuse with [`Failure::AlreadyRuns`], never a thread failure.
 #[test]
 fn an_owned_spawn_of_a_running_key_is_refused() {
     let _w = Watchdog::arm("an_owned_spawn_of_a_running_key_is_refused");
@@ -308,10 +309,12 @@ fn an_owned_spawn_of_a_running_key_is_refused() {
         |_| {},
         |_| String::new(),
     );
-    assert!(matches!(
-        refused.unwrap_err().cause,
-        Failure::ThreadStart(_)
-    ));
+    let e = refused.unwrap_err();
+    assert_eq!(e.cause, Failure::AlreadyRuns);
+    assert_eq!(
+        e.to_string(),
+        "the chart's sound decode cannot start: the same job already runs"
+    );
     // The running job is untouched: its own kind still joins it.
     let (joined, none) =
         coord.begin::<u32>(key("a"), Class::Foreground, coord.subscriber(Scope::Choice));
@@ -330,9 +333,24 @@ fn an_owned_spawn_of_a_running_key_is_refused() {
         |_| {},
         |_| 5_u32,
     );
-    assert!(refused.is_err());
+    assert_eq!(refused.unwrap_err().cause, Failure::AlreadyRuns);
+    assert!(!owned.finished(), "the held job's thread is running");
     hold.open();
     assert_eq!(outcome(&owned).outcome, Outcome::Done(1));
+    while !owned.finished() {
+        thread::park_timeout(Duration::from_millis(1));
+    }
+    // Finished: the settle joins at once, with no terminal cause asked for.
+    let begun = Instant::now();
+    let settled = owned.settle(Duration::from_secs(3600), &Instant::now, &mut || None::<()>);
+    assert!(matches!(
+        settled,
+        Settled::Joined {
+            after_panic: None,
+            ..
+        }
+    ));
+    assert!(begun.elapsed() < Duration::from_secs(5));
 }
 
 /// Y3.
@@ -1417,7 +1435,7 @@ fn a_payload_clone_may_query_the_coordinator() {
         // The job's thread clones the published result on its way out:
         // it holds no reference once it has ended.
         let begun = Instant::now();
-        while !job.thread_finished() {
+        while !job.finished() {
             assert!(begun.elapsed() < *LONG, "the job's thread never ended");
             thread::yield_now();
         }
@@ -1714,7 +1732,7 @@ fn a_cause_arriving_at_the_join_is_kept() {
     );
     let _ = outcome(&job);
     let begun = Instant::now();
-    while !job.thread_finished() {
+    while !job.finished() {
         assert!(begun.elapsed() < *LONG, "the job's thread never ended");
         thread::yield_now();
     }

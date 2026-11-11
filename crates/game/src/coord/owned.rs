@@ -165,9 +165,9 @@ impl Coordinator {
     ///
     /// # Errors
     ///
-    /// A job of `key` already runs (of any kind of result): nothing is
-    /// replaced or joined. Or the thread could not start: the job ended
-    /// cancelled and holds nothing.
+    /// A job of `key` already runs (of any kind of result):
+    /// [`Failure::AlreadyRuns`], nothing is replaced or joined. Or the
+    /// thread could not start: the job ended cancelled and holds nothing.
     pub fn spawn_owned<T, W, C>(
         &self,
         spawner: Spawner,
@@ -190,7 +190,10 @@ impl Coordinator {
         let slot = Arc::new(Slot::<T>::new());
         let mut state = self.shared.lock();
         if state.keys.contains_key(&key) {
-            return Err(refused("the job already runs".to_owned()));
+            return Err(LoadFailure {
+                job: kind,
+                cause: Failure::AlreadyRuns,
+            });
         }
         let sub = state.next_id();
         let id = state.next_id();
@@ -395,9 +398,11 @@ impl<T: Clone> OwnedJob<T> {
 }
 
 impl<T> OwnedJob<T> {
-    /// Whether its thread has ended, as the settle would see it (tests).
-    #[cfg(test)]
-    pub(crate) fn thread_finished(&self) -> bool {
+    /// Whether its thread has ended, as the settle would see it: once it
+    /// has, [`settle`](Self::settle) joins at once, so an owner that must
+    /// not wait settles only a finished job.
+    #[must_use]
+    pub fn finished(&self) -> bool {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 }
