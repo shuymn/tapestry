@@ -5216,16 +5216,9 @@ impl Run {
         if matches!(answer, Err(RenderError::NoChartLayer)) {
             answer = publish(screen, render::ChartTarget::Committed);
         }
-        match answer {
-            Ok(table) => Ok(table),
-            Err(e) => {
-                let outcome = e.chart_outcome();
-                if outcome != render::ChartOutcome::NoTarget {
-                    log::warn!("chart images: {}", game::Chain(&e));
-                }
-                Err(outcome)
-            }
-        }
+        // The game thread logs what it left; this thread draws frames and
+        // logs nothing.
+        answer.map_err(|e| e.chart_outcome())
     }
 
     fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
