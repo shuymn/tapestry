@@ -242,6 +242,8 @@ const FINAL: &[(u16, i64)] = &[
     (timer::SCREEN, -1_000 * MS),
     (timer::PLAY, 0),
     (timer::BEAT, 2_400 * MS + 1),
+    // No bar line: 2 500 ms at 150 BPM is 6 250 ms of the rhythm clock.
+    (timer::RHYTHM, -3_750 * MS),
     (J, 2_000 * MS),
     (JP, 2_000 * MS),
     (UP, 2_000 * MS),
@@ -254,9 +256,9 @@ const FINAL: &[(u16, i64)] = &[
 ];
 
 /// Whether a slot is effect-sourced: every built-in but `ready`, `play`,
-/// `failed`, `last_note`, `beat` and `screen`.
+/// `failed`, `last_note`, `beat`, `screen` and `rhythm`.
 fn effect_sourced(slot: u16) -> bool {
-    !matches!(slot, 0..=3 | 6) && slot != timer::SCREEN
+    !matches!(slot, 0..=3 | 6) && slot != timer::SCREEN && slot != timer::RHYTHM
 }
 
 #[track_caller]
