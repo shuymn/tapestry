@@ -174,8 +174,8 @@ pub use play::loading::{
 };
 pub use play::playhead::ExactPlayhead;
 pub use play::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX, Grade,
-    JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
+    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, GAUGE_KIND_ENUM, GAUGE_PERMILLE, GREEN_MAX,
+    Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
     RATE_BASIS_POINTS, READOUT_MAX, field, lane_timer, timer,
 };
 #[cfg(feature = "dev-tools")]

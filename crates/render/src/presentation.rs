@@ -8,7 +8,7 @@
 use bms_model::Speed;
 use game::adjustment::PresentationSnapshot;
 use game::readouts::{Projection, project};
-use game::{Ratio, References};
+use game::{HiSpeedReference, Ratio, References, SpeedMode};
 use skin_model::{DurationRatio, FrameReadouts, Gain, LaneView, NativeReadouts};
 
 use crate::cover_settings;
@@ -55,8 +55,28 @@ pub fn frame(
             target_green: p.target_green,
             floating: p.floating,
         },
+        fix_hispeed: fix_hispeed(&s),
     };
     (lanes, readouts)
+}
+
+/// The speed policy's hi-speed fix in `snapshot`, as the selection screen
+/// numbers it (`skin_model::select`'s `settings.fix_hispeed`): 0 Classic;
+/// Floating 1 from the start tempo, 2 the maximum, 3 the main and 4 the
+/// minimum. The live snapshot's, so a change during play would show at
+/// once (design.md "Play readouts").
+#[must_use]
+pub const fn fix_hispeed(snapshot: &PresentationSnapshot) -> u8 {
+    let h = snapshot.options.hispeed();
+    match h.mode {
+        SpeedMode::Classic => 0,
+        SpeedMode::Floating => match h.reference {
+            HiSpeedReference::Start => 1,
+            HiSpeedReference::Maximum => 2,
+            HiSpeedReference::Main => 3,
+            HiSpeedReference::Minimum => 4,
+        },
+    }
 }
 
 /// `r` ms as the model's exact duration.
@@ -189,6 +209,58 @@ mod tests {
         let u = uncovered.unwrap();
         assert_eq!(u.numerator / u.denominator, 160_000);
         assert_eq!(rest, [None; 6], "no references");
+    }
+
+    /// C2: the hi-speed fix follows the snapshot's speed policy as the
+    /// selection screen numbers it: Classic 0, then Floating from the
+    /// start, maximum, main and minimum tempos 1 to 4, whatever the
+    /// attempt.
+    #[test]
+    fn the_hispeed_fix_follows_the_snapshot_s_policy() {
+        let classic = HiSpeedSettings {
+            mode: SpeedMode::Classic,
+            // A reference Classic ignores.
+            reference: HiSpeedReference::Main,
+            ..HiSpeedSettings::default()
+        };
+        let with = |h| {
+            let mut s = snapshot(Ratio::new(2, 1), Covers::default(), false);
+            s.options = PlayOptions::new(h, Covers::default()).unwrap();
+            s
+        };
+        let refs = Some(References::all(Ratio::integer(150)));
+        let cases = [
+            (classic, 0),
+            (floating(300), 1),
+            (
+                HiSpeedSettings {
+                    reference: HiSpeedReference::Maximum,
+                    ..floating(300)
+                },
+                2,
+            ),
+            (
+                HiSpeedSettings {
+                    reference: HiSpeedReference::Main,
+                    ..floating(300)
+                },
+                3,
+            ),
+            (
+                HiSpeedSettings {
+                    reference: HiSpeedReference::Minimum,
+                    ..floating(300)
+                },
+                4,
+            ),
+        ];
+        for (h, want) in cases {
+            for same in [true, false] {
+                let (_, r) = frame(&with(h), bpm(150), refs, Speed::NORMAL, same);
+                assert_eq!(r.fix_hispeed, want, "{h:?} {same}");
+            }
+            assert_eq!(super::fix_hispeed(&with(h)), want, "{h:?}");
+        }
     }
 
     /// A snapshot of another attempt keeps its covers and `adjusting` but

@@ -7,7 +7,9 @@
 //! keep one; the score rates and the gauge kind under both empty-POOR
 //! policies as the shown gauge switches, a refused inconsistent snapshot,
 //! and the readouts per round: known and unknown metrics, READY,
-//! a STOP, control changes, an invalid frame and the poisoned play; and
+//! a STOP, control changes, an invalid frame and the poisoned play; the
+//! rhythm clock across bar lines, a tempo change, a STOP, the tail past
+//! its end, a rearm and Closing; and
 //! the presentation program's callbacks on every path: the first frame and
 //! later ones, a float result, a caught error, a false gate, a false
 //! guard, a sentinel suppressing the draws after it, and a poisoned play.
@@ -2240,6 +2242,7 @@ fn build_does_not_allocate() {
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
     readouts_do_not_allocate(&loaded, &descs);
+    rhythm_does_not_allocate(&descs);
     loading_does_not_allocate(&loaded, &views, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
@@ -2320,6 +2323,8 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
             difficulty: None,
             bga: None,
             autoplay: false,
@@ -2363,6 +2368,8 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
         difficulty: (no % 7 != 6).then_some(u8::try_from(no % 6).unwrap()),
         bga: (no % 4 != 3).then_some(no % 8 < 4),
         autoplay: no.is_multiple_of(2),
@@ -3897,6 +3904,7 @@ fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
     match frame_no / 7 % 3 {
         0 => base,
         1 => FrameReadouts {
+            fix_hispeed: 0,
             bpm_current_x100: Some(15_000 + k),
             hispeed_x100: Some(100 + k),
             duration: Some(DurationRatio {
@@ -4096,6 +4104,129 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             (Some(4), 0, [true; 2])
         ]
     );
+}
+
+/// The rhythm clock (`rhythm`) read by an element and a `when` timer,
+/// frame by frame across bar lines, a tempo change, a STOP, the completed
+/// tail past the progress end + 5 s, a READY rearm whose `now` goes back,
+/// Closing and a terminal frame without it: nothing allocates; with a
+/// positive control.
+fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
+    let chart = ChartBuilder::new(150_000)
+        .bar(TimeUs(0))
+        .bar(TimeUs(1_600 * MS))
+        .bpm(TimeUs(2_000 * MS), 180_000)
+        .stop(TimeUs(2_500 * MS), TimeUs(500 * MS))
+        .bar(TimeUs(3_600 * MS))
+        .tap(lane(1), TimeUs(4_000 * MS))
+        .bar(TimeUs(4_800 * MS))
+        .build()
+        .unwrap();
+    let skin = play_support::load(
+        vec![bool_program("elapsed(rhythm) < 500")],
+        vec![
+            play_support::element(TimerRef::Builtin(timer::RHYTHM), 1),
+            play_support::element(TimerRef::When(0), 2),
+        ],
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let ctx = PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
+        autoplay: false,
+        gauges: descs,
+        attempt: Attempt::Full {
+            lead_in: TimeUs(1_000 * MS),
+        },
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(4_000 * MS),
+        bpm_range: None,
+        bpm_whole_change: None,
+        play_level: None,
+        score: skin_model::PlayScore::NONE,
+    };
+    let t = tally(0);
+    let gauges = [descs[0].start, descs[1].start].map(state);
+    let notes = NoteFacts::default();
+    let lanes = LaneView::NONE;
+    // (now, playing, complete, closing)
+    let frame = |now: i64, playing: bool, complete: bool, closing: Option<TimeUs>| SkinFrame {
+        state_us: 0,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete,
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        turntable: 0,
+        lanes,
+        readouts: readouts_for(lanes),
+        playing,
+        closing,
+    };
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut play = skin.prepare(&chart, &ctx).unwrap();
+    // The readings seen: off, and every value bucket of 250 ms.
+    let (mut off, mut on, mut drawn) = (0, [false; 4], 0);
+    let mut read = |play: &Play, batch: &QuadBatch| {
+        let ms = play.state().timers[usize::from(timer::RHYTHM)];
+        if ms == skin_model::TIMER_OFF {
+            off += 1;
+        } else if let Some(b) = on.get_mut(usize::try_from(ms / 250).unwrap_or(0).min(3)) {
+            *b = true;
+        }
+        drawn += batch.quads().len();
+    };
+    let mut results = Ok(());
+    TRACK.with(|t| t.set(true));
+    // READY, playing, then the completed tail to past 4 s + 5 s.
+    for now in (-1_000 * MS..=10_000 * MS).step_by(16 * MS as usize) {
+        batch.clear();
+        let playing = now < 4_100 * MS;
+        let f = frame(now, playing, !playing, None);
+        results = results.and(skin.build(&mut play, &f, &uvs, &mut batch));
+        read(&play, &batch);
+    }
+    // A rearm: READY again from below the cursor's row, then play into
+    // Closing at 3 s, then a terminal frame without Closing.
+    play.rearm();
+    for now in (-1_000 * MS..=4_500 * MS).step_by(16 * MS as usize) {
+        batch.clear();
+        let closing = (now >= 3_000 * MS).then_some(TimeUs(3_000 * MS));
+        let f = frame(now, closing.is_none(), false, closing);
+        results = results.and(skin.build(&mut play, &f, &uvs, &mut batch));
+        read(&play, &batch);
+    }
+    batch.clear();
+    results = results.and(skin.build(
+        &mut play,
+        &frame(4_600 * MS, false, false, None),
+        &uvs,
+        &mut batch,
+    ));
+    read(&play, &batch);
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "rhythm: allocations");
+    assert_eq!(results, Ok(()));
+    assert!(
+        off > 0 && on == [true; 4] && drawn > 0,
+        "{off} {on:?} {drawn}"
+    );
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
 }
 
 /// A program on every path (design.md "Scope of No Allocation", the

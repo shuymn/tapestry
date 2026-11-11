@@ -140,6 +140,8 @@ impl Loader {
         self.batch.clear();
         let layout = Layout::AUTHOR;
         let frame = LoadingFrame {
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
             difficulty: None,
             bga: None,
             autoplay: false,

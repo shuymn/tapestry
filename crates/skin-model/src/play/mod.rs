@@ -7,6 +7,7 @@
 pub(crate) mod loading;
 pub(crate) mod playhead;
 pub(crate) mod reducer;
+pub(crate) mod rhythm;
 pub(crate) mod schema;
 pub(crate) mod timers;
 
@@ -19,6 +20,7 @@ use rules::GaugeValue;
 
 use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
+use self::rhythm::Rhythm;
 use self::schema::{field, timer};
 use self::timers::Settled;
 use crate::chart_image::{ChartKey, ChartTable};
@@ -359,6 +361,12 @@ pub struct FrameReadouts {
     pub duration_variants: [Option<DurationRatio>; 8],
     /// The native block's inputs (slots 75 to 85).
     pub native: NativeReadouts,
+    /// The speed policy's hi-speed fix (`settings.fix_hispeed`), as the
+    /// selection screen's: 0 Classic; Floating 1 from the start tempo, 2
+    /// the maximum, 3 the main and 4 the minimum. A value above
+    /// [`FIX_HISPEED_MAX`](crate::FIX_HISPEED_MAX) is
+    /// malformed.
+    pub fix_hispeed: u8,
 }
 
 impl FrameReadouts {
@@ -383,6 +391,7 @@ impl FrameReadouts {
             target_green: None,
             floating: false,
         },
+        fix_hispeed: 0,
     };
 }
 
@@ -617,6 +626,9 @@ pub struct Play {
     display: Position,
     /// The display beat last seen and the µs it was crossed at.
     beat: Option<(i128, i64)>,
+    /// The rhythm clock's cursor over the playhead's timeline; a rearm
+    /// drops it.
+    rhythm: Rhythm,
     ready_at: TimeUs,
     play_at: TimeUs,
     /// The context's [`PlayContext::last_note_end`].
@@ -934,6 +946,7 @@ impl Play {
             playhead,
             display: Position(0),
             beat: None,
+            rhythm: Rhythm::new(chart.timeline.meta().speed.twentieths()),
             ready_at,
             play_at,
             last_note_end: ctx.last_note_end,
@@ -966,8 +979,9 @@ impl Play {
 
     /// Starts the attempt's runtime state over for a rearmed READY
     /// candidate (design.md "Play Lifecycle", the start gate), in place:
-    /// the reducer, the holds, every timer, the beat and the first
-    /// judgment's latch, as a fresh attempt has them. The chart's notes,
+    /// the reducer, the holds, every timer, the beat, the rhythm clock's
+    /// cursor and the first judgment's latch, as a fresh attempt has them.
+    /// The chart's notes,
     /// the prepared playhead, the gauges, the attached and bitmap text, the
     /// program's slots, the cached score data and a refused build stay, and
     /// nothing is allocated.
@@ -979,6 +993,7 @@ impl Play {
         self.starts.fill(None);
         self.ms.fill(TIMER_OFF);
         self.beat = None;
+        self.rhythm.clear();
         self.graphs.hits.iter_mut().for_each(HitErrorState::reset);
     }
 

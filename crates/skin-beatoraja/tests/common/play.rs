@@ -141,6 +141,9 @@ pub struct Drawn {
     /// default empty.
     pub ring: [i32; skin_model::OFFSET_SLOTS],
     pub ring_count: u32,
+    /// The display offset each frame gives ([`SkinFrame::display_offset`]):
+    /// by default 0.
+    pub display_offset: TimeUs,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -459,6 +462,7 @@ impl Drawn {
             complete: false,
             ring: [0; skin_model::OFFSET_SLOTS],
             ring_count: 0,
+            display_offset: TimeUs(0),
         }
     }
 
@@ -512,7 +516,7 @@ impl Drawn {
         let frame = SkinFrame {
             state_us: self.state_us,
             now: TimeUs(ms * MS),
-            display_offset: TimeUs(0),
+            display_offset: self.display_offset,
             tally: &self.tally,
             gauges: &self.gauges,
             gauge: 0,
@@ -619,6 +623,10 @@ pub struct Loader {
     pub autoplay: bool,
     /// The turntable angle each frame gives: by default 0.
     pub turntable: i32,
+    /// The display offset each frame gives: by default 0.
+    pub display_offset: TimeUs,
+    /// The hi-speed fix each frame gives: by default Classic, 0.
+    pub fix_hispeed: u8,
 }
 
 impl Loader {
@@ -643,6 +651,8 @@ impl Loader {
             adjusting: false,
             autoplay: false,
             turntable: 0,
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
         }
     }
 
@@ -666,6 +676,8 @@ impl Loader {
             turntable: self.turntable,
             lanes: view,
             covers,
+            display_offset: self.display_offset,
+            fix_hispeed: self.fix_hispeed,
             gauge: self.gauge,
             play_level: self.play_level,
         };

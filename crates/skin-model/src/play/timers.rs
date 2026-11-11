@@ -8,10 +8,11 @@ use bms_model::{BEAT, DOMAIN, Lane, TimeUs};
 use eval::Tally;
 use rules::GaugeValue;
 
+use super::rhythm::TAIL_US;
 use super::schema::{
-    COVER_PERMILLE, DIFFICULTY_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT,
-    NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS, RATE_BASIS_POINTS, READOUT_MAX,
-    READOUT_MAX_U32, field, lane_timer, timer,
+    COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, GAUGE_PERMILLE, Grade, JUDGE_CLASS_MAX,
+    LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
+    RATE_BASIS_POINTS, READOUT_MAX, READOUT_MAX_U32, field, lane_timer, timer,
 };
 use super::{
     BuildError, ChartMetadata, CoverSettings, DurationRatio, FrameReadouts, NativeValues, Play,
@@ -168,8 +169,8 @@ const RATIO_ONE: Ratio = Ratio {
     denominator: 1,
 };
 
-/// The number of score fields from `field::BEST_EX`.
-pub(crate) const SCORE_FIELDS: usize = field::COUNT - field::BEST_EX as usize;
+/// The number of score fields, from `field::BEST_EX` to the settings.
+pub(crate) const SCORE_FIELDS: usize = (field::DISPLAY_OFFSET_MS - field::BEST_EX) as usize;
 
 /// `x` paced linearly to `p` of `n` targets, `⌊x · p / n⌋`; 0 at `n = 0`.
 /// The product is taken in `u128`, so nothing overflows.
@@ -330,6 +331,7 @@ struct Readouts {
     duration_ms: i32,
     green: i32,
     duration_valid: i32,
+    settings: [i32; 2],
 }
 
 /// The cover fields of one frame, `field::COVER_PERMILLE` to
@@ -463,6 +465,22 @@ pub(crate) const fn level_fields(level: Option<i32>) -> (i32, i32) {
         Some(l) if l != i32::MIN && l != i32::MAX => (l, 1),
         _ => (0, 0),
     }
+}
+
+/// The settings fields, `field::DISPLAY_OFFSET_MS` and
+/// `field::SETTINGS_FIX_HISPEED`, a play's and a loading frame's alike:
+/// the display offset in ms truncated toward zero, as the selection
+/// screen's (`player::selection_skin::live_settings`), bounded by the
+/// readout maximum, and the hi-speed fix. `None` for a fix above
+/// [`FIX_HISPEED_MAX`].
+pub(crate) fn settings_fields(display_offset: TimeUs, fix_hispeed: u8) -> Option<[i32; 2]> {
+    let fix = i32::from(fix_hispeed);
+    if fix > FIX_HISPEED_MAX {
+        return None;
+    }
+    let ms = display_offset.0 / 1_000;
+    let ms = i32::try_from(ms.clamp(-i64::from(READOUT_MAX), i64::from(READOUT_MAX))).ok()?;
+    Some([ms, fix])
 }
 
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
@@ -669,8 +687,8 @@ impl Play {
     }
 
     /// The frame's readout fields, or `None` when a readout is out of
-    /// range or a stored cover setting disagrees with the lanes' effective
-    /// amount (stage3.md R4, R6).
+    /// range, the hi-speed fix is above 4 or a stored cover setting
+    /// disagrees with the lanes' effective amount (stage3.md R4, R6).
     fn readouts(&self, frame: &SkinFrame<'_>) -> Option<Readouts> {
         let r = &frame.readouts;
         let covers = covers(&frame.lanes, &r.covers)?;
@@ -694,6 +712,7 @@ impl Play {
             *fields = duration_fields(rounded);
         }
         let native = native_values(&frame.lanes, r).ok()?;
+        let settings = settings_fields(frame.display_offset, r.fix_hispeed)?;
         let (bpm_min, bpm_max, bpm_range_valid) = self.bpm_range.map_or(Some((0, 0, 0)), |b| {
             Some((
                 i32::try_from(b.min_x100).ok()?,
@@ -726,6 +745,7 @@ impl Play {
             duration_ms,
             green,
             duration_valid,
+            settings,
         })
     }
 
@@ -942,7 +962,8 @@ impl Play {
                 i32::from(self.drawable_chart().present(ChartImage::Stage)),
                 i32::from(self.drawable_chart().present(ChartImage::Back)),
             ])
-            .chain(score_figures(inputs));
+            .chain(score_figures(inputs))
+            .chain(r.settings);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
@@ -980,6 +1001,7 @@ impl Play {
             last_note = Some(self.last_note_end);
         }
         let beat = ready.and_then(|_| self.beat_start(now, frame.display_offset));
+        let rhythm = self.rhythm_start(frame);
         let judge = self.reducer.judge;
         let mut set = |slot: u16, start: Option<TimeUs>| {
             if let Some(s) = self.starts.get_mut(usize::from(slot)) {
@@ -994,6 +1016,7 @@ impl Play {
         set(timer::FULL_COMBO, self.reducer.full_combo);
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);
+        set(timer::RHYTHM, rhythm);
         set(timer::JUDGE, judge.map(|(_, at)| at));
         for grade in Grade::ALL {
             let at = judge.filter(|&(g, _)| g == grade).map(|(_, at)| at);
@@ -1022,6 +1045,27 @@ impl Play {
             set(lane_timer(LaneTimer::Hold, lane), hold);
             set(lane_timer(LaneTimer::Mine, lane), mine);
         }
+    }
+
+    /// The `rhythm` timer's start: `now` less the rhythm clock's value
+    /// ([`Rhythm`](super::rhythm::Rhythm)) on the play clock, not the
+    /// display clock. Off before `play` starts. The clock runs while the
+    /// frame is playing, and through the completed tail outside Closing
+    /// until the progress end + 5 s; from then, in Closing and on any
+    /// other frame (a quit that admits no Closing), the last start holds,
+    /// so the timer runs 1:1. Off for a frame whose value overflows.
+    fn rhythm_start(&mut self, frame: &SkinFrame<'_>) -> Option<TimeUs> {
+        let now = frame.now;
+        if now < self.play_at {
+            return None;
+        }
+        let tail_end = self.readout_end.0.saturating_add(TAIL_US);
+        let tail = frame.complete && now.0 < tail_end;
+        if frame.closing.is_some() || !(frame.playing || tail) {
+            return self.timer(timer::RHYTHM);
+        }
+        let value = self.rhythm.value(self.playhead.timeline(), now)?;
+        now.checked_sub(TimeUs(value))
     }
 
     /// The `beat` timer's start: the latest integer-beat crossing of the
