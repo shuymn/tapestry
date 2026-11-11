@@ -817,7 +817,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 118);
+        assert_eq!(exprs.len(), 126);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
@@ -871,6 +871,26 @@ mod tests {
             let scope = skin_model::Scope::new(&skin_model::PLAY);
             assert!(skin_model::compile(&src, &scope, skin_model::Ty::Bool).is_ok());
         }
+        // The chart's own images (S10-12), 192 and 193 (the banner)
+        // still unsupported.
+        for (id, name, src) in [
+            (190, "no_stagefile", "!chart.stagefile"),
+            (191, "stagefile", "chart.stagefile"),
+            (194, "no_backbmp", "!chart.backbmp"),
+            (195, "backbmp", "chart.backbmp"),
+        ] {
+            assert_eq!(numeric(id, &none), expr(src, false), "{id}");
+            assert_eq!(named(name), Some(expr(src, false)), "{name}");
+            assert_eq!(
+                numeric(-id, &none),
+                expr(&format!("!({src})"), false),
+                "{id}"
+            );
+            let scope = skin_model::Scope::new(&skin_model::PLAY);
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Bool).is_ok());
+        }
+        assert_eq!(numeric(192, &none), Cond::Unsupported(192));
+        assert_eq!(numeric(-193, &none), Cond::Unsupported(-193));
         assert_eq!(numeric(171, &none), Cond::Unsupported(171));
         assert_eq!(numeric(-171, &none), Cond::Unsupported(-171));
     }
