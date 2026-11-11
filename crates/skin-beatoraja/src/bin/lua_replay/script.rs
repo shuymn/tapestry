@@ -21,6 +21,9 @@ pub struct Script {
     /// The state clock (µs) when the first phase begins.
     pub origin: i64,
     pub phases: Vec<Phase>,
+    /// The speed policy's hi-speed fix every frame gives (image index 55,
+    /// `settings.fix_hispeed`): 0 Classic, Floating 1 to 4.
+    pub fix_hispeed: u8,
 }
 
 /// One phase of a play state.
@@ -125,6 +128,7 @@ impl Script {
             notes: round.presses.len(),
             origin: STATE_AT_ZERO - LEAD,
             phases: vec![Phase::Round(round)],
+            fix_hispeed: 0,
         }
     }
 
@@ -173,6 +177,7 @@ impl Script {
             notes: 7,
             origin: 0,
             phases,
+            fix_hispeed: 0,
         }
     }
 

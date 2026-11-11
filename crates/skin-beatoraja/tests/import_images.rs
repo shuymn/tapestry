@@ -80,9 +80,9 @@ fn switching_a_cover_off_mid_play_selects_its_off_image() {
 
 #[test]
 fn one_frame_runs_ignore_their_cycle_timer() {
-    // Timer 2 is unsupported: a run of one frame never cycles, so it
+    // Timer 2999 is unsupported: a run of one frame never cycles, so it
     // does not matter; a run of two does.
-    let l = group(10, r#", "ref": 40, "timer": 2"#);
+    let l = group(10, r#", "ref": 40, "timer": 2999"#);
     assert!(
         l.report()
             .notes
@@ -90,10 +90,12 @@ fn one_frame_runs_ignore_their_cycle_timer() {
             .all(|n| n.severity != Severity::Dropped)
     );
     assert_eq!(frames(&mut l.drawn(), 0), [2]);
-    let l = group(5, r#", "ref": 40, "timer": 2"#);
+    let l = group(5, r#", "ref": 40, "timer": 2999"#);
     assert_eq!(
         common::kinds(l.report()),
-        [NoteKind::Timer(skin_beatoraja::TimerWhy::Unsupported(2))]
+        [NoteKind::Timer(skin_beatoraja::TimerWhy::Unsupported(
+            2_999
+        ))]
     );
     // Runs of no frame: never drawn, nothing admitted.
     let l = group(11, r#", "ref": 40"#);

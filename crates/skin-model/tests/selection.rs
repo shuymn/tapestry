@@ -1348,6 +1348,8 @@ fn the_other_kinds_entry_points_draw_nothing() {
     let layout = skin_model::Layout::AUTHOR;
     let mut loading = skin.prepare_loading(Side::Left);
     let lf = LoadingFrame {
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
         difficulty: None,
         bga: None,
         now: TimeUs(0),

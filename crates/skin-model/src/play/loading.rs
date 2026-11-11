@@ -11,7 +11,7 @@ use bms_model::TimeUs;
 use rules::GaugeValue;
 
 use super::schema::{field, timer};
-use super::timers::{chart_fields, covers, level_fields, read_timers};
+use super::timers::{chart_fields, covers, level_fields, read_timers, settings_fields};
 use super::{BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
 use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{Program, State, TIMER_OFF};
@@ -28,7 +28,8 @@ use crate::widget::text::TextTable;
 pub enum LoadingField {
     /// Read from the loading frame: `load.percent`.
     Live,
-    /// The frame's stored covers.
+    /// The frame's settings: its stored covers, display offset and
+    /// hi-speed fix.
     Setting,
     /// Available while the frame gives a gauge descriptor.
     Descriptor,
@@ -227,6 +228,10 @@ const FIELDS: [LoadingField; field::COUNT] = {
         Before, // rank.whole.5
         Before, // rank.whole.6
         Before, // rank.whole.7
+        // The settings, 139 and 140: the frame's, from the presentation
+        // snapshot, as its covers.
+        Setting, // display_offset.ms
+        Setting, // settings.fix_hispeed
     ]
 };
 
@@ -386,6 +391,12 @@ pub struct LoadingFrame<'a> {
     /// its setting while that cover is on and 0 while it is off, else the
     /// build is refused.
     pub covers: CoverSettings,
+    /// The display offset, as [`SkinFrame::display_offset`](crate::SkinFrame::display_offset).
+    pub display_offset: TimeUs,
+    /// The speed policy's hi-speed fix, as
+    /// [`FrameReadouts::fix_hispeed`](crate::FrameReadouts::fix_hispeed):
+    /// above 4 the build is refused.
+    pub fix_hispeed: u8,
     /// The shown gauge's descriptor; `None` leaves what depends on it
     /// undrawn.
     pub gauge: Option<LoadingGauge>,
@@ -609,14 +620,15 @@ impl Loading {
         &mut self.bitmap
     }
 
-    /// Fills this frame's fields and timers: the frame's progress, stored
-    /// covers and descriptor into the fields, `loading` and `screen` from
+    /// Fills this frame's fields and timers: the frame's progress,
+    /// settings and descriptor into the fields, `loading` and `screen` from
     /// the origin with every other built-in off, then each `when` timer,
     /// whose condition reads false while `whens_need` is not met.
     ///
-    /// A refused state, or covers [`Play::build`](crate::Skin::build)
-    /// would refuse, is refused before anything changes, and the state is
-    /// refused with that error from then on.
+    /// A refused state, or covers or a hi-speed fix
+    /// [`Play::build`](crate::Skin::build) would refuse, is refused before
+    /// anything changes, and the state is refused with that error from
+    /// then on.
     pub(crate) fn fill(
         &mut self,
         frame: &LoadingFrame<'_>,
@@ -626,7 +638,10 @@ impl Loading {
         if let Some(e) = self.poisoned {
             return Err(e);
         }
-        let Some(c) = covers(&frame.lanes, &frame.covers) else {
+        let (Some(c), Some(settings)) = (
+            covers(&frame.lanes, &frame.covers),
+            settings_fields(frame.display_offset, frame.fix_hispeed),
+        ) else {
             self.poisoned = Some(BuildError::InvalidReadouts);
             return Err(BuildError::InvalidReadouts);
         };
@@ -655,6 +670,9 @@ impl Loading {
         set(field::CHART_LEVEL_VALID, level_valid);
         set(field::AUTOPLAY, i32::from(frame.autoplay));
         for (slot, v) in (field::CHART_DIFFICULTY..).zip(chart_fields(frame.meta())) {
+            set(slot, v);
+        }
+        for (slot, v) in (field::DISPLAY_OFFSET_MS..).zip(settings) {
             set(slot, v);
         }
         if let Some(t) = self.drawable_chart() {
@@ -724,6 +742,8 @@ mod tests {
             "lift.enabled",
             "hidden.enabled",
             "cover.adjusting",
+            "display_offset.ms",
+            "settings.fix_hispeed",
         ];
         for name in settings {
             assert_eq!(class(name), Some(LoadingField::Setting), "{name}");

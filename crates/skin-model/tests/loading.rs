@@ -116,6 +116,8 @@ struct Loader {
     gauge: Option<LoadingGauge>,
     play_level: Option<i32>,
     covers: CoverSettings,
+    display_offset: TimeUs,
+    fix_hispeed: u8,
 }
 
 impl Loader {
@@ -132,6 +134,8 @@ impl Loader {
             gauge: None,
             play_level: None,
             covers: readouts_for(VIEW).covers,
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
         }
     }
 
@@ -139,6 +143,8 @@ impl Loader {
         self.batch.clear();
         let layout = Layout::AUTHOR;
         let frame = LoadingFrame {
+            display_offset: self.display_offset,
+            fix_hispeed: self.fix_hispeed,
             difficulty: None,
             bga: None,
             autoplay: false,
@@ -955,6 +961,44 @@ fn a_reset_loading_state_builds_as_a_fresh_one() {
     assert_eq!(l.loading.refused(), None);
     assert_eq!(l.try_build_us(300 * MS), Ok(()));
     assert_eq!(l.count(BACKGROUND), 1);
+}
+
+/// C2, C3: the display offset and the hi-speed fix are settings while
+/// loading: the frame's, read from the presentation snapshot, so a program
+/// reading them draws, the offset in ms truncated toward zero as on a play
+/// frame; a fix above 4 refuses the state.
+#[test]
+fn the_settings_read_the_loading_frame() {
+    let mut l = Loader::new(skin(
+        Vec::new(),
+        None,
+        vec![
+            untimed(Source::Number(0), [0, 200, 80, 20], Place::SCREEN),
+            shown_when(MARK, [0, 0, 10, 10], "settings.fix_hispeed == 3"),
+            shown_when(OTHER, [0, 0, 10, 10], "display_offset.ms == -15"),
+        ],
+        WidgetDefs {
+            numbers: vec![number("settings.fix_hispeed")],
+            ..WidgetDefs::default()
+        },
+    ));
+    l.build(100);
+    assert_eq!([l.count(MARK), l.count(OTHER)], [0, 0]);
+    assert_eq!(l.digits(), [0]);
+    for fix in 0..=4 {
+        l.fix_hispeed = fix;
+        l.display_offset = TimeUs(-15_600);
+        l.build(200);
+        assert_eq!(l.field(field::SETTINGS_FIX_HISPEED), i32::from(fix));
+        assert_eq!(l.field(field::DISPLAY_OFFSET_MS), -15, "{fix}");
+        assert_eq!(l.digits(), [u16::from(fix)], "{fix}");
+        assert_eq!([l.count(MARK), l.count(OTHER)], [usize::from(fix == 3), 1]);
+    }
+    l.display_offset = TimeUs(1_500);
+    l.build(300);
+    assert_eq!(l.field(field::DISPLAY_OFFSET_MS), 1);
+    l.fix_hispeed = 5;
+    assert_eq!(l.try_build_us(400 * MS), Err(BuildError::InvalidReadouts));
 }
 
 /// A refused loading build leaves the state refused: later builds return

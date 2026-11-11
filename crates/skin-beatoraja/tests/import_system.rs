@@ -98,14 +98,14 @@ fn a_system_image_goes_through_the_destination_rules() {
     let l = import_body(
         r#""destination": [
             {"id": "-111", "op": [7777], "dst": [{"w": 1, "h": 1}]},
-            {"id": "-111", "timer": 2, "dst": [{"w": 1, "h": 1}]},
+            {"id": "-111", "timer": 2999, "dst": [{"w": 1, "h": 1}]},
             {"id": "-110", "dst": [{"time": 0, "w": 10, "h": 10, "a": 0},
                                    {"time": 100, "w": 10, "h": 10, "a": 255}]}]"#,
     );
     let r = l.report();
     assert!(
         r.notes.iter().any(|n| n.severity == Severity::Dropped
-            && n.kind == NoteKind::Timer(TimerWhy::Unsupported(2))),
+            && n.kind == NoteKind::Timer(TimerWhy::Unsupported(2_999))),
         "{:?}",
         r.notes
     );

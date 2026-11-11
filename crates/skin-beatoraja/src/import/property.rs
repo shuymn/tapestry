@@ -387,6 +387,10 @@ pub(crate) enum Value {
     TargetRateFraction,
     BestRatePercent,
     BestRateFraction,
+    /// `notesdisplaytiming` (12, `IntegerPropertyFactory.java:67`): the
+    /// display offset in ms, `display_offset.ms`, truncated toward zero as
+    /// the selection screen shows it, live after an offset key.
+    DisplayOffset,
     /// A selection number, over the selection schema
     /// ([`super::selection::profile::number`]).
     Selection(SelValue),
@@ -493,6 +497,7 @@ impl Value {
             Self::PlayLevel => "chart.level",
             Self::RecentTiming => "judge.recent_ms",
             Self::SongTotal => "chart.total",
+            Self::DisplayOffset => "display_offset.ms",
             Self::Selection(v) => v.expr(),
             Self::Result(v) => v.expr,
             Self::DurationVariant(n) => DURATION_VARIANTS
@@ -560,6 +565,7 @@ impl Value {
                 | Self::PlayLevel
                 | Self::RecentTiming
                 | Self::SongTotal
+                | Self::DisplayOffset
                 | Self::Selection(_)
                 | Self::Result(_)
         )
@@ -740,6 +746,7 @@ fn shown(id: i32) -> Option<Value> {
         96 => Value::PlayLevel,
         525 => Value::RecentTiming,
         368 => Value::SongTotal,
+        12 => Value::DisplayOffset,
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
         162 => Value::ElapsedSeconds,
@@ -848,6 +855,15 @@ pub(crate) enum IndexProp {
     /// `option_1p` (42, `IntegerPropertyFactory.java:1136-1143`): the lane
     /// option, 0 (OFF), as tapestry applies none.
     RandomOption,
+    /// `hsfix` (55, `IntegerPropertyFactory.java:1161-1186`): the speed
+    /// policy's hi-speed fix, 0 Classic and Floating 1 to 4 by its
+    /// reference tempo (start, maximum, main, minimum), read from
+    /// `settings.fix_hispeed`, the play's live presentation, where the
+    /// source reads the stored play configuration (D4).
+    FixHispeed,
+    /// `autoadjust` (75, `IntegerPropertyFactory.java:1110`): the
+    /// auto-adjust setting, 0 (off), as tapestry has none.
+    AutoAdjust,
     /// The 1P lanes' visual states (500-507, `:929-935`,
     /// `play/JudgeManager.java:805-811`), by the source's skin offset: 0 the
     /// scratch, 1-7 the keys, as [`bms_model::Lane::index`] numbers them
@@ -891,7 +907,8 @@ impl IndexProp {
             Self::CoverEnabled => "if cover.enabled then 1 else 0",
             Self::LiftEnabled => "if lift.enabled then 1 else 0",
             Self::HiddenEnabled => "if hidden.enabled then 1 else 0",
-            Self::RandomOption => "0",
+            Self::RandomOption | Self::AutoAdjust => "0",
+            Self::FixHispeed => "settings.fix_hispeed",
             Self::LaneJudge(n) => LANE_JUDGES.get(usize::from(n))?,
             Self::Selection(src) => src,
             Self::Unsupported(_) | Self::Unavailable(_) => return None,
@@ -900,12 +917,14 @@ impl IndexProp {
 
     /// Whether the selector differs from the source in an owner-decided
     /// way (D4): the gauge's type projected onto the six looks, and the
-    /// switches read from the play rather than the configuration.
+    /// switches and the hi-speed fix read from the play rather than the
+    /// configuration.
     pub(crate) fn deviates(self) -> bool {
         !matches!(
             self,
             Self::Null
                 | Self::RandomOption
+                | Self::AutoAdjust
                 | Self::LaneJudge(_)
                 | Self::Unsupported(_)
                 | Self::Selection(_)
@@ -972,6 +991,8 @@ pub(crate) fn index_by_id(id: i32) -> IndexProp {
     match id {
         40 => IndexProp::GaugeKind,
         42 => IndexProp::RandomOption,
+        55 => IndexProp::FixHispeed,
+        75 => IndexProp::AutoAdjust,
         330 => IndexProp::CoverEnabled,
         331 => IndexProp::LiftEnabled,
         332 => IndexProp::HiddenEnabled,
@@ -989,8 +1010,15 @@ pub(crate) enum StrProp {
     Field(i32),
     /// A selection screen's own string.
     Screen(SelectionText),
+    /// The empty string, as the scene always holds it: on play the table
+    /// level and name, `tablefull` (1003, `StringPropertyFactory.java:261`),
+    /// as there are no difficulty tables (stage3.md §1). Nothing draws.
+    Empty,
     Unsupported(Option<i32>),
 }
+
+/// `tablefull`, the difficulty table's level and name.
+const TABLE_FULL: i32 = 1_003;
 
 /// String property `id` on a `kind` screen: play's mapping, or the
 /// selection, decision or result profile's ([`selection::profile::text`],
@@ -998,6 +1026,9 @@ pub(crate) enum StrProp {
 /// an id outside it
 /// as the factory knows it ([`str_by_id`]).
 pub(crate) fn str_in(kind: ScreenKind, id: i32) -> StrProp {
+    if kind == ScreenKind::Play && id == TABLE_FULL {
+        return StrProp::Empty;
+    }
     let profile = match kind {
         ScreenKind::Result => Some(result::profile::text(id)),
         ScreenKind::Decision => Some(super::decision::profile::text(id)),
@@ -1278,6 +1309,17 @@ mod tests {
         );
         assert_eq!(int_by_name("nope"), None);
         assert_eq!(str_by_id(13), StrProp::Field(13));
+        // The table texts' whole: empty on play, the factory's elsewhere.
+        assert_eq!(str_in(ScreenKind::Play, 1_003), StrProp::Empty);
+        assert_eq!(
+            str_by_name_in(ScreenKind::Play, "tablefull"),
+            Some(StrProp::Empty)
+        );
+        assert_eq!(
+            str_in(ScreenKind::Play, 1_002),
+            StrProp::Unsupported(Some(1_002))
+        );
+        assert_eq!(str_by_id(1_003), StrProp::Unsupported(Some(1_003)));
         assert_eq!(str_by_id(1_000), StrProp::Unsupported(Some(1_000)));
         assert_eq!(str_by_id(17), StrProp::Null);
         assert_eq!(str_by_name("title"), Some(StrProp::Field(10)));
@@ -1329,10 +1371,16 @@ mod tests {
 
     #[test]
     fn image_indices_resolve() {
-        // Each known range's ends are known, one past them null.
+        // Each known range's ends are known, one past them null; 55 and
+        // 75 are bridged.
+        let known = |id: i32| match id {
+            55 => IndexProp::FixHispeed,
+            75 => IndexProp::AutoAdjust,
+            _ => IndexProp::Unsupported(id),
+        };
         for &(a, b) in INDEX_KNOWN {
-            assert_eq!(index_by_id(a), IndexProp::Unsupported(a));
-            assert_eq!(index_by_id(b), IndexProp::Unsupported(b));
+            assert_eq!(index_by_id(a), known(a));
+            assert_eq!(index_by_id(b), known(b));
         }
         for id in [
             0, 1, 9, 13, 41, 44, 186, 300, 309, 329, 333, 467, 468, 520, 1_700,
@@ -1354,6 +1402,7 @@ mod tests {
         };
         for (id, p, n) in [
             (40, IndexProp::GaugeKind, 34),
+            (55, IndexProp::FixHispeed, 1),
             (330, IndexProp::CoverEnabled, 4),
             (331, IndexProp::LiftEnabled, 4),
             (332, IndexProp::HiddenEnabled, 4),
@@ -1364,6 +1413,14 @@ mod tests {
         }
         assert_eq!(ops(IndexProp::Null), 1);
         assert!(!IndexProp::Null.deviates());
+        // 55 reads the fix itself; 75 is off, as the lane option is.
+        assert_eq!(
+            IndexProp::FixHispeed.selector(),
+            Some("settings.fix_hispeed")
+        );
+        assert_eq!(IndexProp::AutoAdjust.selector(), Some("0"));
+        assert!(!IndexProp::AutoAdjust.deviates());
+        assert_eq!(index_by_id(54), IndexProp::Unsupported(54));
         assert_eq!(IndexProp::Unsupported(42).selector(), None);
     }
 }
@@ -1390,6 +1447,7 @@ mod range_tests {
                     Value::PlayLevel | Value::RecentTiming => -i64::from(i32::MAX),
                     // A difference from the best or the target is signed.
                     Value::BestDiff | Value::TargetDiff => -i64::from(skin_model::MAX_COUNT),
+                    Value::DisplayOffset => -i64::from(i32::MAX - 1),
                     Value::Point => i64::from(i32::MIN),
                     _ => 0,
                 };
