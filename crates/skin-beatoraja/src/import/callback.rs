@@ -756,14 +756,9 @@ impl Lower<'_> {
                         None => Self::text(an, &[if eq { "false" } else { "true" }])?,
                     }));
                 }
-                (Some(Mapped::Zero(field)), Some(v))
-                    if matches!(op, Bin::Eq | Bin::Ne)
-                        && match v {
-                            Val::Int(n) => n == 0,
-                            Val::Float(bits) => f64::from_bits(bits) == 0.0,
-                            _ => false,
-                        } =>
-                {
+                // The residual takes the read only as an operand of `==`
+                // or `~=` whose other operand is the literal 0.
+                (Some(Mapped::Zero(field)), Some(_)) => {
                     let field = *field;
                     return Ok(V::Bool(Self::text(
                         an,

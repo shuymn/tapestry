@@ -32,7 +32,7 @@ use game::coord::{
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
     DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading,
-    LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
+    LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
     PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError,
     SessionEvent, SessionEventSink, Settings,
 };
@@ -452,6 +452,11 @@ struct Headless {
     page_edits: Vec<(usize, Box<dyn FnOnce()>)>,
     /// Each entry into the loading state: the chart and the clock time.
     loading_pages: Vec<(usize, i64)>,
+    /// The loading state's first frame is presented as it is entered, so
+    /// the loading minimum counts from there; otherwise no minimum.
+    loading_minimum: bool,
+    /// When each play opened.
+    opened_at: Vec<i64>,
     /// Whether the loading state showed at each play's start, in order.
     started_loading: Vec<bool>,
     /// The loads, by count from 0, that are cancelled.
@@ -639,6 +644,8 @@ impl Headless {
             round_edits: Vec::new(),
             page_edits: Vec::new(),
             loading_pages: Vec::new(),
+            loading_minimum: false,
+            opened_at: Vec::new(),
             started_loading: Vec::new(),
             cancel_loads: Vec::new(),
             prepared_for: Vec::new(),
@@ -946,6 +953,7 @@ impl Rig for Headless {
         self.script = self.play_script(origin.0, now.0);
         self.opened = true;
         self.opens += 1;
+        self.opened_at.push(now.0);
         Ok(Opening {
             origin,
             start,
@@ -1120,6 +1128,28 @@ impl Rig for Headless {
         if self.seen.last() != Some(&Seen::Shown(report.attempt)) {
             self.seen.push(Seen::Shown(report.attempt));
         }
+    }
+}
+
+/// The loading state with the defaults (no tuning wait, acceptance closed
+/// and reopened with nothing to do) and no minimum to wait, unless
+/// `loading_minimum` presents each loading state's first frame as it is
+/// entered: each entry is a lifetime of its own, acknowledged then.
+impl LoadingRig for Headless {
+    fn loading_lifetime(&self) -> u64 {
+        if self.loading_minimum {
+            self.loading_pages.len() as u64
+        } else {
+            0
+        }
+    }
+
+    fn loading_ack(&self) -> Option<(u64, TimeUs)> {
+        if !self.loading_minimum {
+            return Some((0, TimeUs(i64::MIN)));
+        }
+        let &(_, at) = self.loading_pages.last()?;
+        Some((self.loading_lifetime(), TimeUs(at)))
     }
 }
 
@@ -3377,11 +3407,12 @@ enum Ended {
     Refused,
 }
 
-/// A thread that fails after the attempt was prepared and before recording
-/// opens ends the run with its cause: nothing opens, no play starts. So
-/// does an audio or input failure that stopped the preparation itself, or
-/// that came with the screen's refusal of the attempt, which then shows
-/// nowhere, on selection or on the practice page.
+/// An audio or input thread that fails after the attempt was prepared and
+/// before recording opens ends the run with its cause: nothing opens, no
+/// play starts. So does one that stopped the preparation itself, or that
+/// came with the screen's refusal of the attempt, which then shows
+/// nowhere, on selection or on the practice page. (A screen lost there is
+/// rebuilt by the loading state: `a_screen_lost_after_the_preparation_is_rebuilt`.)
 #[test]
 fn a_failure_after_the_preparation_opens_nothing() {
     use PracticeInput::Confirm;
@@ -3390,7 +3421,6 @@ fn a_failure_after_the_preparation_opens_nothing() {
     round.extend([(10, Act::Page(Confirm)), (4_000, Act::Close)]);
     let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
     for (after, ended, acts) in [
-        (AfterAttempt::Screen, Ended::Ready, &choose),
         (AfterAttempt::Output, Ended::Ready, &choose),
         (AfterAttempt::Input, Ended::Ready, &choose),
         (AfterAttempt::Output, Ended::Stopped, &choose),
@@ -3426,6 +3456,71 @@ fn a_failure_after_the_preparation_opens_nothing() {
             "{after:?}"
         );
     }
+}
+
+/// A screen lost after the attempt was prepared and before the commit: the
+/// loading state rebuilds it and opens the attempt on the rebuilt screen,
+/// never on the lost one, and with nothing else failed the play runs.
+#[test]
+fn a_screen_lost_after_the_preparation_is_rebuilt() {
+    let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, choose.clone(), |_| {});
+    ran.unwrap();
+    let plain = rig.prepares;
+    let (rig, _events, ran) = run(Refusal::Missing, choose, |rig| {
+        rig.fails_after_attempt = Some(AfterAttempt::Screen);
+    });
+    ran.unwrap();
+    assert_eq!(rig.prepares, plain + 1, "the lost screen was not rebuilt");
+    assert_eq!(rig.opens, 1);
+    assert_eq!(rig.attempts.len(), 1);
+}
+
+/// The first attempt of a chart's load opens out of its loading state
+/// only once the loading minimum has passed, counted from the loading
+/// state's first presented frame: at the play choice, and at a practice
+/// Start, whose following round opens with no loading state of its own;
+/// each round's attempt carries its play's number.
+#[test]
+fn the_first_attempt_of_a_load_waits_the_loading_minimum() {
+    let floor = game::LOADING_FLOOR.0;
+    let choose = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, choose, |rig| rig.loading_minimum = true);
+    ran.unwrap();
+    let [(_, entered)] = rig.loading_pages[..] else {
+        panic!("{:?}", rig.loading_pages);
+    };
+    assert_eq!(rig.opened_at.len(), 1);
+    assert!(
+        rig.opened_at[0] - entered >= floor,
+        "{:?} from {entered}",
+        rig.opened_at
+    );
+
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(5));
+    acts.push((10, Act::Page(PracticeInput::Confirm)));
+    // Round 1 runs about 11 s at 75 %: the quit falls inside round 2.
+    acts.push((15_000, Act::Quit));
+    acts.push((1_500, Act::Back));
+    acts.push((500, Act::Page(PracticeInput::Back)));
+    acts.push((500, Act::Close));
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.loading_minimum = true);
+    ran.unwrap();
+    let [(_, entered)] = rig.loading_pages[..] else {
+        panic!("{:?}", rig.loading_pages);
+    };
+    assert_eq!(rig.opened_at.len(), 2, "two rounds");
+    assert!(
+        rig.opened_at[0] - entered >= floor,
+        "{:?} from {entered}",
+        rig.opened_at
+    ); // The first round, prepared before its play began, and the second,
+    // prepared after, each carry their play's number.
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 2]
+    );
 }
 
 /// A chart refused before any play while the audio output has failed ends
@@ -3607,8 +3702,18 @@ fn a_reset_stops_the_first_round() {
     assert_eq!(notices(&rig)[1].as_deref(), Some(REFUSED_15));
     let page = &rig.practice_entries[1];
     assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
-    assert_eq!(initial_gauges(&rig), [[pct(20), pct(100)]]);
-    assert_eq!(rig.attempts[0].number, 1);
+    // The first Start's attempt was prepared at load-ready, before the
+    // edit reached its play, and never opened; the next Start's plays the
+    // reset value.
+    assert_eq!(
+        initial_gauges(&rig),
+        [[pct(15), pct(100)], [pct(20), pct(100)]]
+    );
+    // The stopped round's number went back: both are the first.
+    assert_eq!(
+        rig.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        [1, 1]
+    );
 }
 
 /// A repeated round whose refreshed preset no longer accepts the value set
@@ -3692,7 +3797,17 @@ fn a_reset_survives_the_rule_restored() {
     ];
     let rig = practice_with_edits(None, start_again(), edits);
     assert_eq!(rig.opens, 1);
-    assert_eq!(initial_gauges(&rig), [[pct(20), pct(100)]]);
+    // The refused Start prepared the value set; the next Start prepared
+    // the reset value, and again, still reset, once the restored rule
+    // moved its key before its play began.
+    assert_eq!(
+        initial_gauges(&rig),
+        [
+            [pct(15), pct(100)],
+            [pct(20), pct(100)],
+            [pct(20), pct(100)]
+        ]
+    );
     let page = &rig.practice_entries[2];
     assert_eq!((page.gauge_name(), page.value()), (Some("normal"), pct(20)));
     assert_eq!(notices(&rig)[2], None);
@@ -3714,7 +3829,12 @@ fn a_preset_repaired_on_the_page_plays_at_the_next_start() {
         "{n:?}"
     );
     assert_eq!(rig.opens, 1);
-    assert_eq!(initial_gauges(&rig), [[pct(15), pct(100)]]);
+    // The refused Start's attempt was prepared before its play found the
+    // section refused; the repaired preset's Start plays the same values.
+    assert_eq!(
+        initial_gauges(&rig),
+        [[pct(15), pct(100)], [pct(15), pct(100)]]
+    );
     assert_eq!(n[2], None);
 }
 

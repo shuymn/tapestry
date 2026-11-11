@@ -1028,6 +1028,61 @@ mod tests {
         assert!(s.consumers.iter().all(|c| c.local.is_none()));
     }
 
+    /// design.md "Rendering and Skins": a play skin's `float_number(113)`
+    /// lowers only as an operand of `==` or `~=` against the literal 0;
+    /// each other use is refused as no expression's type, located at its
+    /// own draw, even where Lua would fold it to a constant.
+    #[test]
+    fn each_other_use_of_the_best_rate_is_refused_at_its_draw() {
+        let entry = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }
+             if not skin_config then return skin end
+             local ms = require(\"main_state\")
+             skin.source = { { id = \"a\", path = \"a.png\" } }
+             skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }
+             skin.destination = {
+               { id = \"i\", draw = function() return ms.float_number(113) end, dst = { { w = 1, h = 1 } } },
+               { id = \"i\", draw = function() return not ms.float_number(113) end, dst = { { w = 2, h = 1 } } },
+               { id = \"i\", draw = function() return ms.float_number(113) + 1 end, dst = { { w = 3, h = 1 } } },
+               { id = \"i\", draw = function() local r = ms.float_number(113) return r == 0 end, dst = { { w = 4, h = 1 } } },
+               { id = \"i\", draw = function() return ms.float_number(113) == (1 - 1) end, dst = { { w = 5, h = 1 } } },
+               { id = \"i\", draw = function() return ms.float_number(113) ~= 0 end, dst = { { w = 6, h = 1 } } },
+             }
+             return skin
+";
+        let d = crate::lua::callback_tests::folder(entry);
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            false,
+        );
+        assert_eq!(s.outcome, "imported");
+        let got: Vec<_> = s
+            .consumers
+            .iter()
+            .map(|c| {
+                (
+                    c.at.map(|(_, line, _)| line),
+                    c.disposition.as_str(),
+                    c.reason.as_deref(),
+                )
+            })
+            .collect();
+        let refused = |line| (Some(line), "replaced Type", Some("Type"));
+        assert_eq!(
+            got,
+            [
+                refused(7),
+                refused(8),
+                refused(9),
+                refused(10),
+                refused(11),
+                (Some(12), "lowered", None),
+            ]
+        );
+    }
+
     /// A skin whose destinations each become something else: `on` is its
     /// option's other item.
     const LEDGER: &str = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080,\n\

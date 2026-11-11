@@ -765,6 +765,60 @@ fn score_graphs_cut_to_their_rates() {
     }
 }
 
+/// s10-10-design.md C28 and design.md "Rendering and Skins": a
+/// `float_number` read is taken only as an operand of `==` or `~=` whose
+/// other operand is the literal 0 (parentheses aside). Every other use is
+/// refused as no expression's type, even where
+/// the use would fold to a constant (Lua's truthiness, `not`, arithmetic
+/// whose result is only tested for truth), through a local, or against a
+/// zero computed from literals.
+#[test]
+fn other_uses_of_the_best_rate_are_refused() {
+    for draw in [
+        "return ms.float_number(113)",
+        "return not ms.float_number(113)",
+        "return ms.float_number(113) + 1",
+        "local r = ms.float_number(113) return r == 0",
+        "return ms.float_number(113) == (1 - 1)",
+    ] {
+        let body = format!(
+            "table.insert(skin.destination, {{ id = \"i0\",
+               draw = function() {draw} end,
+               dst = {{ {{ x = 0, y = 0, w = 11, h = 10 }} }} }})
+"
+        );
+        let i = import(&folder(&body)).unwrap();
+        assert_eq!(
+            i.callbacks,
+            [Disposition::Replaced(Unsupported::Type)],
+            "{draw}"
+        );
+        let refused: Vec<NoteKind> = i
+            .imported
+            .report
+            .notes
+            .iter()
+            .filter(|n| matches!(n.kind, NoteKind::Callback { .. }))
+            .map(|n| n.kind)
+            .collect();
+        assert_eq!(
+            refused,
+            [NoteKind::Callback {
+                field: "draw",
+                why: Unsupported::Type
+            }],
+            "{draw}"
+        );
+    }
+    // The literal may sit in parentheses, on either side.
+    let body = "table.insert(skin.destination, { id = \"i0\",
+                  draw = function() return (0) ~= (ms.float_number(113)) end,
+                  dst = { { x = 0, y = 0, w = 11, h = 10 } } })
+";
+    let i = import(&folder(body)).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered]);
+}
+
 /// s10-10-design.md C28: `float_number(113)` is the best's rate, read
 /// against 0: drawn as non-zero with a best (11), as zero with none and
 /// for a `#RANDOM` chart (G15). Any other use of it is no expression's

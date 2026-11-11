@@ -1184,8 +1184,19 @@ impl Shared {
             .loadend = loadend;
     }
 
-    /// What [`presented_loading`](Self::presented_loading) and
-    /// [`committed_loading`](Self::committed_loading) left.
+    /// The skin refused a loading frame of lifetime `lifetime` for `why`:
+    /// published for the game thread's wait, which no acknowledgement
+    /// would otherwise end. Allocates nothing.
+    fn refused_loading(&self, lifetime: u64, why: BuildError) {
+        self.loading_ack
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refused = Some((lifetime, why));
+    }
+
+    /// What [`presented_loading`](Self::presented_loading),
+    /// [`committed_loading`](Self::committed_loading) and
+    /// [`refused_loading`](Self::refused_loading) left.
     fn loading_ack(&self) -> LoadingAck {
         *self
             .loading_ack
@@ -1307,11 +1318,13 @@ impl TestGate {
 /// the last presented loading frame drew with it, or as a specialization
 /// committed since in the current lifetime declares it: the installed
 /// skin's, or none while a pending skin has no specialization committed
-/// in the lifetime.
+/// in the lifetime. With them, the latest lifetime whose loading frame the
+/// skin refused, and why.
 #[derive(Clone, Copy, Debug, Default)]
 struct LoadingAck {
     first: Option<(u64, TimeUs)>,
     loadend: Option<TimeUs>,
+    refused: Option<(u64, BuildError)>,
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -2200,6 +2213,16 @@ impl RenderLink {
     /// loading frame drew with it ([`LoadingAck`]).
     pub fn loading_loadend(&self) -> Option<TimeUs> {
         self.shared.loading_ack().loadend
+    }
+
+    /// Why the skin refused a loading frame of lifetime `lifetime`, if it
+    /// did: nothing of that lifetime is drawn again, so its first frame
+    /// may never be acknowledged.
+    pub fn loading_refused(&self, lifetime: u64) -> Option<BuildError> {
+        self.shared
+            .loading_ack()
+            .refused
+            .and_then(|(l, why)| (l == lifetime).then_some(why))
     }
 
     /// A handle on the loading acknowledgement's test hold, for another
@@ -4275,6 +4298,7 @@ impl Run {
                                 // lifetime is drawn again; the frame
                                 // granted waits for what comes next.
                                 self.loading_refused = Some((lifetime, e));
+                                self.shared.refused_loading(lifetime, e);
                                 eprintln!("render: the loading frame was refused: {}", Chain(&e));
                                 mode = Mode::Idle;
                                 continue;
@@ -11348,7 +11372,8 @@ pub(crate) mod tests {
         hold: Arc<AtomicBool>,
         /// Every frame and installation fails as a lost device while set.
         pub(crate) fail: Arc<AtomicBool>,
-        loading: Arc<AtomicU32>,
+        /// Loading frames drawn, refused ones included.
+        pub(crate) loading: Arc<AtomicU32>,
         /// Loading frames drawn as the pending presentation.
         pending: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
@@ -11361,7 +11386,7 @@ pub(crate) mod tests {
         /// Installations are refused while set.
         pub(crate) refuse_install: Arc<AtomicBool>,
         /// Loading frames are refused while set.
-        refuse_loading: Arc<AtomicBool>,
+        pub(crate) refuse_loading: Arc<AtomicBool>,
         /// A chart's load waits, once noted, while set.
         pub(crate) hold_load: Arc<AtomicBool>,
         /// Set once a chart's load waits on `hold_load`.
