@@ -1483,6 +1483,9 @@ fn gate_at_first_barrier(gate: &Arc<crate::dev::AudioGate>) -> Option<super::Hoo
 /// entered: its input open and the scan's pause released.
 fn enter_page_at_deadline(rig: &mut PlayerRig<'_>, read: &Loaded, decision: &mut game::Decision) {
     use bms_model::TimeSource as _;
+    // The choice closed the input epoch.
+    rig.controls.close_epoch();
+    assert!(!rig.controls.ingress().is_open(), "the choice's epoch");
     let now = rig.clock.now();
     assert_eq!(
         decision.classify(game::Origin::Jobs, now, false, false, None),
@@ -1561,6 +1564,51 @@ fn the_page_opens_while_its_barrier_runs() {
         assert!(sel(rig).page.kept().is_some());
     });
     assert_eq!(witnessed(&b).1, Vec::<String>::new());
+}
+
+/// C3c: the page open and its bank waiting for the background, which its
+/// look found measuring the chart after the page's entry, so the look took
+/// the scan's pause; once the measurement is done the barrier's unload is
+/// refused, and the page gives the bank up to a Start: the pause the bank
+/// took is released with it, and the page's scan goes on.
+#[test]
+fn a_refused_page_barrier_releases_the_pause_it_took() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "c3c", &page);
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let s = b.sel.take().unwrap();
+    crate::shelf::tests::worker(&s.shelf).queue(crate::shelf::tests::job(&path));
+    let b = b;
+    on_rig(s, &Installers::default(), false, |rig| {
+        until("the background measuring the chart", || {
+            b.stepper.said() == crate::background::tests::Said::Block(0)
+        });
+        // The choice paused the scan, then the page read its chart.
+        sel(rig).shelf.pause();
+        let mut decision = due_practice(rig);
+        assert_eq!(
+            outcome(rig.practice_read(&read, &mut decision)),
+            Loading::Ready
+        );
+        enter_page_at_deadline(rig, &read, &mut decision);
+        // The bank's look takes the pause while the background measures.
+        rig.poll_page().unwrap();
+        assert!(sel(rig).shelf.paused(), "the bank's look took no pause");
+        assert!(sel(rig).page.pending_path().is_some());
+        // The measurement done, the barrier's unload is refused.
+        sel(rig).unload_fault = Some(game::AudioLoadError::Busy);
+        b.stepper.finish();
+        until("the bank given up", || {
+            rig.poll_page().unwrap();
+            sel(rig).page.pending_path().is_none()
+        });
+        assert!(!sel(rig).page.decoding());
+        assert!(
+            !sel(rig).shelf.paused(),
+            "the scan left paused after the bank was given up"
+        );
+    });
 }
 
 /// C3b: the unload held, and the background resumes measuring the chart

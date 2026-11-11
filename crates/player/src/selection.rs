@@ -2204,16 +2204,15 @@ impl PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         sel.witness.check(None);
-        sel.page.begin_pending(
-            &sel.coord,
-            sel.spawner,
-            #[cfg(feature = "dev-tools")]
-            &sel.witness,
-        );
-        // The scan goes on, as the page's entry let it.
-        if sel.page.take_pause() {
-            sel.shelf.release();
-        }
+        // The page stays: the scan goes on, as the page's entry let it.
+        sel.page
+            .begin_pending(
+                &sel.coord,
+                sel.spawner,
+                #[cfg(feature = "dev-tools")]
+                &sel.witness,
+            )
+            .release(&mut sel.shelf);
         Ok(())
     }
 
@@ -2280,7 +2279,9 @@ impl PlayerRig<'_> {
             sel.chosen_at = now;
             // A Start decodes its own: a page bank still waiting for the
             // background is given up, and the Start waits for it itself.
-            if sel.page.take_pending().is_some() {
+            if let Some((_, pause)) = sel.page.take_pending() {
+                // The Start's load keeps the scan paused (`choose` below).
+                pause.hand_over();
                 sel.shelf.stop_awaiting();
             }
         }
@@ -2909,8 +2910,11 @@ impl AppRig for PlayerRig<'_> {
                     &format!("practice: the page's bank cannot begin ({e}); a Start decodes it"),
                     true,
                 );
-                if let Some(sel) = &mut self.selection {
-                    sel.page.take_pending();
+                // The page stays: a pause the bank took is released.
+                if let Some(sel) = &mut self.selection
+                    && let Some((_, pause)) = sel.page.take_pending()
+                {
+                    pause.release(&mut sel.shelf);
                 }
             }
         }
