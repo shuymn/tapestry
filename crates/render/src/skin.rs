@@ -108,6 +108,9 @@ pub struct LoadingFrame<'a> {
     /// Whether the chosen chart has a BGA; `None` leaves what depends on it
     /// undrawn.
     pub bga: Option<bool>,
+    /// The chosen chart's length at 1× ([`skin_model::LoadingFrame::length`]);
+    /// `None` leaves what depends on it undrawn.
+    pub length: Option<TimeUs>,
     /// Whether the play loaded is autoplay.
     pub autoplay: bool,
     /// The revision of the loading text installed for this lifetime; 0
@@ -128,6 +131,7 @@ impl<'a> LoadingFrame<'a> {
         skin_model::LoadingFrame {
             difficulty: self.difficulty,
             bga: self.bga,
+            length: self.length,
             autoplay: self.autoplay,
             app: self.app,
             now: self.now,

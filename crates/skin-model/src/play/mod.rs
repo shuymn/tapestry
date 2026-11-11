@@ -697,6 +697,8 @@ pub struct Play {
     /// `chart.main_bpm` and its validity from the context's
     /// [`PlayScore::main`].
     main_bpm: [i32; 2],
+    /// `chart.length_ms` from the chart's 1× length.
+    length_ms: i32,
     /// The context's [`PlayContext::autoplay`].
     pub(crate) autoplay: bool,
     /// The context's play best and target ([`PlayScore::basis`]), which a
@@ -1008,6 +1010,7 @@ impl Play {
             play_level: ctx.play_level,
             chart_fields: timers::chart_fields(ctx.meta),
             main_bpm: timers::main_bpm_fields(ctx.score.main),
+            length_ms: timers::length_ms(chart.meta.length),
             autoplay: ctx.autoplay,
             score: ctx.score.basis,
             random: !chart.identity.random_results.is_empty(),

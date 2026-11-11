@@ -540,6 +540,14 @@ pub(crate) fn main_bpm_fields(main: Option<Tempo>) -> [i32; 2] {
         .map_or([0, 0], |bpm| [bpm, 1])
 }
 
+/// `field::CHART_LENGTH_MS` from a chart's 1× length: whole ms, rounded
+/// down, at least 0 and at most `i32::MAX`. The source's 1163 and 1164
+/// divide its song data's length in ms (`IntegerPropertyFactory.java:
+/// 473-478`).
+pub(crate) fn length_ms(length: TimeUs) -> i32 {
+    i32::try_from(length.0.max(0) / 1_000).unwrap_or(i32::MAX)
+}
+
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
 pub(crate) const CHART_FIELDS: usize = 8;
 
@@ -1024,7 +1032,8 @@ impl Play {
             .chain(score_figures(inputs))
             .chain(r.settings)
             .chain(r.app)
-            .chain(self.main_bpm);
+            .chain(self.main_bpm)
+            .chain([self.length_ms]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

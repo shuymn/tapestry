@@ -1172,10 +1172,11 @@ impl<'d> Cx<'d> {
             Object::Judge => self.judge(dst, orec)?,
             Object::Gauge => self.gauge(dst, orec)?,
             Object::Slider => self.slider(dst, orec)?,
-            // A score graph (`type` 110 to 115, `SkinGraph.java:95-106`) is
-            // a ratio bar of the play's score rate; any other type is
-            // dropped as every graph was before.
-            Object::Graph if self.score_graph(orec)? => self.ratio_bar(dst, orec, true)?,
+            // A play graph (`type` 101, 102 or 110 to 115,
+            // `SkinGraph.java:95-106`) is a ratio bar of the play's
+            // progress, its load's or a score rate; any other type is
+            // dropped.
+            Object::Graph if self.play_graph(orec)? => self.ratio_bar(dst, orec, true)?,
             Object::JudgeGraph => self.judge_graph(dst, orec)?,
             Object::BpmGraph => self.bpm_graph(dst, orec)?,
             Object::TimingVisualizer => self.timing_visualizer(dst, orec)?,

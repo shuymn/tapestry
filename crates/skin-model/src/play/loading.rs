@@ -11,7 +11,9 @@ use bms_model::TimeUs;
 use rules::GaugeValue;
 
 use super::schema::{field, timer};
-use super::timers::{app_fields, chart_fields, covers, level_fields, read_timers, settings_fields};
+use super::timers::{
+    app_fields, chart_fields, covers, length_ms, level_fields, read_timers, settings_fields,
+};
 use super::{AppReadouts, BuildError, ChartMetadata, CoverSettings, GaugeDesc, LoadState};
 use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{Program, State, TIMER_OFF};
@@ -35,7 +37,8 @@ pub enum LoadingField {
     /// Available while the frame gives a gauge descriptor.
     Descriptor,
     /// Available while the frame gives this datum of the chosen chart:
-    /// its play level, its difficulty or whether it has a BGA.
+    /// its play level, its difficulty, whether it has a BGA, its images or
+    /// its length.
     Chosen,
     /// Known before the play starts: it reads its READY value, which a
     /// program may read: `time.progress_ppm`, 0 (the source's
@@ -248,6 +251,9 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // yet, so only the loaded chart knows it.
         Unavailable, // chart.main_bpm
         Unavailable, // chart.main_bpm_valid
+        // The chart's 1× length, 153: the chosen chart's library length,
+        // from the frame.
+        Chosen, // chart.length_ms
     ]
 };
 
@@ -273,11 +279,13 @@ pub fn loading_field(slot: u16) -> Option<LoadingField> {
 
 /// The chosen chart's data a loading frame may give, as bits of
 /// [`Need::chosen`]: its play level, its difficulty, whether it has a BGA,
-/// and its images, which the state gives once they are published.
+/// its images, which the state gives once they are published, and its
+/// length.
 const CHOSEN_LEVEL: u8 = 1;
 const CHOSEN_DIFFICULTY: u8 = 2;
 const CHOSEN_BGA: u8 = 4;
 const CHOSEN_IMAGES: u8 = 8;
+const CHOSEN_LENGTH: u8 = 16;
 
 /// The chosen chart's datum [`LoadingField::Chosen`] field `slot` reads.
 const fn chosen_bit(slot: u16) -> u8 {
@@ -285,6 +293,7 @@ const fn chosen_bit(slot: u16) -> u8 {
         field::CHART_LEVEL | field::CHART_LEVEL_VALID => CHOSEN_LEVEL,
         field::CHART_DIFFICULTY | field::CHART_DIFFICULTY_VALID => CHOSEN_DIFFICULTY,
         field::CHART_STAGEFILE | field::CHART_BACKBMP => CHOSEN_IMAGES,
+        field::CHART_LENGTH_MS => CHOSEN_LENGTH,
         _ => CHOSEN_BGA,
     }
 }
@@ -426,6 +435,9 @@ pub struct LoadingFrame<'a> {
     /// Whether the chosen chart has a BGA, as [`ChartMetadata::bga`];
     /// `None` leaves what depends on it undrawn.
     pub bga: Option<bool>,
+    /// The chosen chart's length at 1×, as its library entry summarizes
+    /// it (`chart.length_ms`); `None` leaves what depends on it undrawn.
+    pub length: Option<TimeUs>,
     /// Whether the attempt being loaded is autoplay.
     pub autoplay: bool,
     /// The application's readouts, as [`SkinFrame::app`](crate::SkinFrame::app).
@@ -450,6 +462,11 @@ impl LoadingFrame<'_> {
                 0
             }
             | if bga != 0 { CHOSEN_BGA } else { 0 }
+            | if self.length.is_some() {
+                CHOSEN_LENGTH
+            } else {
+                0
+            }
     }
 
     /// The chosen chart's metadata as the frame gives it: no total and no
@@ -697,6 +714,9 @@ impl Loading {
         for (slot, v) in (field::APP_FPS..).zip(app) {
             set(slot, v);
         }
+        if let Some(l) = frame.length {
+            set(field::CHART_LENGTH_MS, length_ms(l));
+        }
         if let Some(t) = self.drawable_chart() {
             set(
                 field::CHART_STAGEFILE,
@@ -762,6 +782,7 @@ mod tests {
             "chart.bga_valid",
             "chart.stagefile",
             "chart.backbmp",
+            "chart.length_ms",
         ];
         for name in chosen {
             assert_eq!(class(name), Some(LoadingField::Chosen), "{name}");
