@@ -2,6 +2,7 @@
 //! and image sets), numbers, text and the play objects in their modules.
 
 pub(super) mod bar;
+pub(super) mod bpm_graph;
 pub(super) mod cover_paint;
 pub(super) mod digit_offsets;
 pub(super) mod gauge;
@@ -14,6 +15,7 @@ pub(super) mod number;
 pub(super) mod result_graphs;
 pub(super) mod system;
 pub(super) mod text;
+pub(super) mod visualizer;
 
 use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
 

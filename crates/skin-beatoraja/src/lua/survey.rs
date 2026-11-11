@@ -1091,7 +1091,7 @@ mod tests {
          skin.source = { { id = \"a\", path = \"a.png\" } }\n\
          skin.image = { { id = \"i\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
          skin.value = { { id = \"lv\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 426 } }\n\
-         skin.judgegraph = { { id = \"jg\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+         skin.gaugegraph = { { id = \"jg\" } }\n\
          skin.destination = {\n\
            { id = \"i\", dst = { { w = 64, h = 64 } } },\n\
            { id = \"i\", op = { 906 }, dst = { { w = 64, h = 64 } } },\n\
@@ -1137,7 +1137,7 @@ mod tests {
                 (0, Some("i"), Some("Image"), Became::Retained, 0..1),
                 (1, Some("i"), Some("Image"), Became::Folded, 1..1),
                 (2, Some("lv"), Some("Value"), Became::Dropped, 1..1),
-                (3, Some("jg"), Some("JudgeGraph"), Became::Dropped, 1..1),
+                (3, Some("jg"), Some("GaugeGraph"), Became::Dropped, 1..1),
                 (4, Some("none"), None, Became::Ignored, 1..1),
                 (5, Some("i"), Some("Image"), Became::Retained, 1..2),
             ]
@@ -1271,7 +1271,7 @@ mod tests {
     fn a_note_past_the_cap_still_says_what_became_of_its_destination() {
         let entry = "local s = { type = 0, w = 1920, h = 1080 }\n\
              if not skin_config then return s end\n\
-             s.judgegraph = { { id = \"jg\" } }\n\
+             s.gaugegraph = { { id = \"jg\" } }\n\
              s.destination = {}\n\
              for i = 1, 4097 do s.destination[i] = { id = \"jg\", dst = { { w = 1, h = 1 } } } end\n\
              return s\n";

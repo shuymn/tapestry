@@ -1132,7 +1132,7 @@ fn check_play_widgets(play: &PlayDefs, exists: &impl Fn(u32) -> bool) -> Result<
     for (graph, g) in play.bpm_graphs.iter().enumerate() {
         let error = if !exists(g.solid) {
             Some(V::UnknownImage)
-        } else if g.line_width == 0 || g.line_width > MAX_COORD.unsigned_abs() {
+        } else if !(1..=crate::widget::bpm_graph::MAX_BPM_LINE_WIDTH).contains(&g.line_width) {
             Some(V::LineWidth)
         } else {
             None
@@ -4357,9 +4357,13 @@ impl Skin {
                 _ => None,
             };
             // HIDDEN+'s paint, and what follows HIDDEN+, show only while
-            // HIDDEN+ is on, at any amount.
+            // HIDDEN+ is on, at any amount. The source hides a follower by
+            // its destination's alpha (`play/LaneRenderer.java:334-345`), so
+            // a timing visualizer's lines, drawn in their own colour and
+            // alpha, still show; its band does not.
+            let hidden_off = e.follow.hides(lanes.as_ref());
             if (paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled)
-                || e.follow.hides(lanes.as_ref())
+                || (hidden_off && !matches!(e.kind, Kind::TimingVisualizer(..)))
             {
                 #[cfg(feature = "dev-tools")]
                 out.observed(crate::observation::Outcome::HiddenOff);
@@ -4480,7 +4484,11 @@ impl Skin {
                 map,
                 pivot: e.pivot,
                 angle: radians(s.angle + turn),
-                color: s.color,
+                color: if hidden_off {
+                    [s.color[0], s.color[1], s.color[2], 0.0]
+                } else {
+                    s.color
+                },
                 native: match chart {
                     Some((_, native)) => native,
                     None => choice.map_or(e.native, |p| p.native),

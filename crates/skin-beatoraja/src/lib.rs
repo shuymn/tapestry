@@ -49,6 +49,7 @@
 mod error;
 mod header;
 mod import;
+mod java_float;
 mod json;
 pub mod limits;
 pub mod lua;

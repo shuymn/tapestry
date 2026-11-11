@@ -137,6 +137,10 @@ pub struct Drawn {
     /// Whether evaluation is complete, for every frame
     /// ([`SkinFrame::complete`]): by default not.
     pub complete: bool,
+    /// The judgment offsets' ring each frame gives, and its count: by
+    /// default empty.
+    pub ring: [i32; skin_model::OFFSET_SLOTS],
+    pub ring_count: u32,
     /// The display offset each frame gives ([`SkinFrame::display_offset`]):
     /// by default 0.
     pub display_offset: TimeUs,
@@ -393,6 +397,31 @@ impl Drawn {
         )
     }
 
+    /// `skin` played over `chart` with the score data `score`.
+    #[allow(dead_code, reason = "not every test binary reads score data")]
+    pub fn over_score(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        score: skin_model::PlayScore<'_>,
+    ) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                score,
+                ..context_with(None, None)
+            },
+        )
+    }
+
+    /// Records offset `ms` in the ring, as the play view's ring does.
+    #[allow(dead_code, reason = "not every test binary records offsets")]
+    pub fn record(&mut self, ms: i32) {
+        let head = usize::try_from(self.ring_count).unwrap() % skin_model::OFFSET_SLOTS;
+        self.ring[head] = ms;
+        self.ring_count += 1;
+    }
+
     /// `skin` played over `chart` with the context `ctx`.
     fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
         Self::carried_over(skin, chart, ctx, skin_model::Continuation::Fresh)
@@ -456,6 +485,8 @@ impl Drawn {
             turntable: 0,
             state_us: 0,
             complete: false,
+            ring: [0; skin_model::OFFSET_SLOTS],
+            ring_count: 0,
             display_offset: TimeUs(0),
             app: skin_model::AppReadouts::LAUNCH,
         }
@@ -518,7 +549,10 @@ impl Drawn {
             gauge: 0,
             effects,
             notes: &self.notes,
-            offsets: skin_model::Offsets::NONE,
+            offsets: skin_model::Offsets {
+                slots: &self.ring,
+                count: self.ring_count,
+            },
             input: &self.input,
             complete: self.complete,
             target: self.target,
