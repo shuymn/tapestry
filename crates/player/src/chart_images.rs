@@ -33,6 +33,11 @@ use skin_model::chart_image::{
     self, Absent, ChartDir, ChartImage, ChartTable, FileIdentity, Fitted, Read,
 };
 
+/// Holds every read of the images until let go, or until its cancel
+/// answers (tests).
+#[cfg(test)]
+pub static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What a publication left ([`render::ChartOutcome`] when it failed).
 pub type Published = Result<ChartTable, render::ChartOutcome>;
 
@@ -113,6 +118,10 @@ pub fn read_set(
             return ChartImages::absent(&Absent::Unresolved(chart_image::Unresolved::Io(e.kind())));
         }
     };
+    #[cfg(test)]
+    while HOLD.load(std::sync::atomic::Ordering::Acquire) && !cancel() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let identity: chart_image::Identity<'_> = &file_identity;
     let mut reads = Vec::with_capacity(2);
     for (which, name) in ChartImage::ALL.into_iter().zip(&want.names) {

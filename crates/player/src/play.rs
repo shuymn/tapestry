@@ -655,15 +655,17 @@ impl PlayerRig<'_> {
             };
             let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
             worker.step(coord, &stops);
+            // A stop wins over images that settled meanwhile: the attempt
+            // is not readied after the quit key or a close.
+            if stops() {
+                break Some(false);
+            }
             if worker.idle() && worker.publish(&self.render, target).is_some() {
                 break Some(true);
             }
             #[cfg(feature = "dev-tools")]
             crate::dev::press_due(self.controls, crate::dev::LoadPhase::Preparing);
             serve_adjustments(adjust.as_mut(), &self.input, self.controls.tuning());
-            if stops() {
-                break Some(false);
-            }
             let now = Instant::now();
             if now >= until {
                 break None;
@@ -1991,6 +1993,9 @@ impl Rig for PlayerRig<'_> {
                         break Ok(game::PrepPoll::Done(Preparation::Ready));
                     }
                     Some(false) => {
+                        // Stopped: what the request staged is dropped, as a
+                        // stopped Screen stage's is.
+                        self.render.discard_attempt();
                         prep.stage = PrepStage::Ended(Preparation::Cancelled);
                         break Ok(game::PrepPoll::Done(Preparation::Cancelled));
                     }
