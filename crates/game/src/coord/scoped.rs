@@ -42,6 +42,10 @@ pub enum Failure {
     /// Its thread could not start.
     #[error("cannot start its thread: {0}")]
     ThreadStart(String),
+    /// A job of its key already runs: nothing was started, replaced or
+    /// joined.
+    #[error("cannot start: the same job already runs")]
+    AlreadyRuns,
     /// It panicked.
     #[error("stopped unexpectedly: {0}")]
     Panicked(JobPanic),
@@ -52,6 +56,7 @@ const fn kind_name(kind: JobKind) -> &'static str {
         JobKind::Loudness | JobKind::Measure => "loudness measurement",
         JobKind::Ingest => "read",
         JobKind::Bank => "sound decode",
+        JobKind::ChartImages => "images",
     }
 }
 
@@ -169,7 +174,10 @@ impl Coordinator {
         let key = JobKey { kind, path, speed };
         let (handle, runner) =
             self.begin::<()>(key, Class::Foreground, self.subscriber(Scope::Choice));
-        let runner = runner.ok_or_else(|| failed("the job already runs".to_owned()))?;
+        let runner = runner.ok_or(LoadFailure {
+            job: kind,
+            cause: Failure::AlreadyRuns,
+        })?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = spawner
@@ -242,7 +250,9 @@ mod tests {
     use bms_model::Speed;
 
     use super::{Failure, Joined, LoadFailure, Spawner};
-    use crate::coord::{Caps, Class, Coordinator, FOREGROUND_PERMITS, JobKind, JobPanic};
+    use crate::coord::{
+        Caps, Class, Coordinator, FOREGROUND_PERMITS, JobKey, JobKind, JobPanic, Scope,
+    };
 
     const SLICE: Duration = Duration::from_millis(1);
 
@@ -315,6 +325,38 @@ mod tests {
                 .wait(SLICE, || false)
         });
         assert_eq!(again, Joined::Done(7));
+    }
+
+    /// A scoped job of a key that already runs is refused as such, not as
+    /// a thread that could not start; nothing ran.
+    #[test]
+    fn a_running_key_refuses_a_scoped_job() {
+        let coord = coord();
+        let ran = AtomicUsize::new(0);
+        let key = JobKey {
+            kind: JobKind::Bank,
+            path: PathBuf::from("a.bms"),
+            speed: Speed::NORMAL,
+        };
+        let (first, runner) =
+            coord.begin::<()>(key, Class::Foreground, coord.subscriber(Scope::Choice));
+        assert!(runner.is_some());
+        thread::scope(|s| {
+            let e = coord
+                .run_scoped(s, Spawner::SYSTEM, job(JobKind::Bank), |_| {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap_err();
+            assert_eq!(
+                e,
+                LoadFailure {
+                    job: JobKind::Bank,
+                    cause: Failure::AlreadyRuns,
+                }
+            );
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        drop((first, runner));
     }
 
     /// A stop asked while the work runs, with no checkpoint in it: the
