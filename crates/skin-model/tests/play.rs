@@ -2079,6 +2079,14 @@ fn the_rhythm_clock_is_off_before_play() {
     assert_eq!(rhythm_at(&mut h, -1), None);
     assert_eq!(rhythm_at(&mut h, 0), Some(0));
     assert_eq!(rhythm_at(&mut h, 250_000), Some(500_000));
+    // A round's lead-in is READY on chart time past 0: off until its
+    // section starts at 3 000 000, 1 000 000 µs after a bar line at 120
+    // BPM.
+    let s = section(3_000, 6_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    assert_eq!(rhythm_at(&mut h, 2_500_000), None);
+    assert_eq!(rhythm_at(&mut h, 2_999_999), None);
+    assert_eq!(rhythm_at(&mut h, 3_000_000), Some(2_000_000));
 }
 
 /// After completion, outside Closing, the clock keeps the tempo and its
