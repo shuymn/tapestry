@@ -130,6 +130,15 @@ impl LifetimeState {
         self.lifetime
     }
 
+    /// The lifetime is shown from `origin` on the loading clock (a lifetime
+    /// made at a choice and revealed at the decision screen's deadline):
+    /// the whole state published again under the next sequence number,
+    /// from the new origin.
+    pub fn restart(&mut self, origin: TimeUs) -> LoadingUpdate {
+        self.origin = origin;
+        self.apply(LoadInput::Chart((*self.chart).clone()))
+    }
+
     /// Applies `input` and publishes the whole state under the next
     /// sequence number.
     pub fn apply(&mut self, input: LoadInput) -> LoadingUpdate {

@@ -839,6 +839,9 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
+    /// Draw the decision screen's built-in presentation: a page kept
+    /// through its chart's load and the screen's preparations.
+    Decision(Box<MenuPage>),
     /// Draw the practice page: a [`Menu`](Self::Menu) that is its play
     /// state's presentation, so the play state's turntable is adopted,
     /// resumed when the game resumed it, and ticked on its frames.
@@ -1368,6 +1371,9 @@ struct LoadingSlot {
     /// the render thread takes what waits.
     accepted: u64,
     signaled: bool,
+    /// Made at a choice and not shown until the decision screen's deadline
+    /// reveals it: what is reported waits, and nothing is signalled.
+    held: bool,
 }
 
 /// What the render thread takes from the slot: the newest page and the
@@ -1417,6 +1423,7 @@ impl LoadingSlot {
     fn end(&mut self) {
         self.lifetime = self.lifetime.wrapping_add(1);
         self.signaled = false;
+        self.held = false;
         self.accepted = 0;
         drop(self.page.take());
         drop(self.update.take());
@@ -1588,7 +1595,7 @@ impl LoadingSink {
     /// Signals the render thread, unless a signal waits.
     fn signal(&self) {
         let mut slot = self.shared.loading_slot();
-        if slot.lifetime == self.lifetime && !slot.signaled {
+        if slot.lifetime == self.lifetime && !slot.signaled && !slot.held {
             slot.signaled = true;
             // A thread that already ended ignores it.
             let _ = self.tx.send(RenderMsg::Loading(self.lifetime));
@@ -2295,16 +2302,67 @@ impl RenderLink {
     /// ended ends first, so each beginning has a lifetime of its own.
     /// Its lines and state are then shown through [`loading`](Self::loading).
     pub fn begin_loading(&self, text: &LoadingText, gauge: Option<skin_model::LoadingGauge>) {
+        self.begin_lifetime(text, gauge, false);
+    }
+
+    /// [`begin_loading`](Self::begin_loading), held: made at a choice, its
+    /// reports kept and nothing drawn until
+    /// [`reveal_loading`](Self::reveal_loading) at the decision screen's
+    /// deadline (design.md "Play Lifecycle", the decision screen).
+    pub fn begin_loading_held(&self, text: &LoadingText, gauge: Option<skin_model::LoadingGauge>) {
+        self.begin_lifetime(text, gauge, true);
+    }
+
+    fn begin_lifetime(
+        &self,
+        text: &LoadingText,
+        gauge: Option<skin_model::LoadingGauge>,
+        held: bool,
+    ) {
         let mut producer = self.shared.producer();
-        let current = self.shared.loading_slot().lifetime;
-        let lifetime = if producer.as_ref().is_some_and(|s| s.lifetime() == current) {
-            let mut slot = self.shared.loading_slot();
+        let mut slot = self.shared.loading_slot();
+        if producer
+            .as_ref()
+            .is_some_and(|s| s.lifetime() == slot.lifetime)
+        {
             slot.end();
-            slot.lifetime
-        } else {
-            current
-        };
-        *producer = Some(LifetimeState::new(lifetime, self.clock.now(), text, gauge));
+        }
+        slot.held = held;
+        *producer = Some(LifetimeState::new(
+            slot.lifetime,
+            self.clock.now(),
+            text,
+            gauge,
+        ));
+    }
+
+    /// The held loading lifetime is shown from now: its state published
+    /// again from a new origin on the loading clock, so its timers start
+    /// here, and the render thread signalled. Waits for nothing. Nothing
+    /// for a lifetime not held.
+    pub fn reveal_loading(&self) {
+        let mut producer = self.shared.producer();
+        let mut slot = self.shared.loading_slot();
+        if !std::mem::take(&mut slot.held) {
+            return;
+        }
+        let lifetime = slot.lifetime;
+        if let Some(state) = producer.as_mut().filter(|s| s.lifetime() == lifetime) {
+            let update = state.restart(self.clock.now());
+            slot.offer(lifetime, None, Some(Box::new(update)));
+        }
+        if !slot.signaled {
+            slot.signaled = true;
+            // A thread that already ended ignores it.
+            let _ = self.tx.send(RenderMsg::Loading(lifetime));
+        }
+    }
+
+    /// The decision screen's built-in presentation, `page`, drawn until
+    /// the next screen: kept through the chart's load and the screen's
+    /// recovery, and not a loading lifetime.
+    pub fn show_decision(&self, page: MenuPage) {
+        self.send(RenderMsg::Decision(Box::new(page)));
     }
 
     /// Loading ended (selection, the practice page): its lifetime ends, so
@@ -2861,6 +2919,7 @@ pub fn spawn(
                 turntable: crate::turntable::Turntable::default(),
                 app: crate::app_clock::AppClock::new(),
                 page_turns: false,
+                decision: false,
                 tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
@@ -3071,6 +3130,17 @@ fn pending_presentation(committed: &Committed, specialized_in: Option<u64>, life
 /// comes next replaces it, since a hidden window shows on a presented
 /// frame and a play opens only once the window is shown, and so does the
 /// loading state; anything else stops.
+impl Run {
+    /// What a preparation leaves drawn ([`after_preparing`]), the decision
+    /// screen's page kept too.
+    fn after_preparing(&self, mode: Mode) -> Mode {
+        match mode {
+            decision @ Mode::Menu { loading: None, .. } if self.decision => decision,
+            other => after_preparing(other),
+        }
+    }
+}
+
 fn after_preparing(mode: Mode) -> Mode {
     match mode {
         Mode::Splash { pending } => Mode::Splash { pending },
@@ -3471,6 +3541,10 @@ struct Run {
     /// Whether the page drawn is the practice page
     /// ([`RenderMsg::PracticePage`]), whose frames tick the turntable.
     page_turns: bool,
+    /// Whether the page drawn is the decision screen's
+    /// ([`RenderMsg::Decision`]), which a chart's load or a preparation
+    /// keeps.
+    decision: bool,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
@@ -3678,7 +3752,7 @@ impl Run {
                         }
                     }
                     let _ = reply.send(ready);
-                    mode = after_preparing(mode);
+                    mode = self.after_preparing(mode);
                     continue;
                 }
                 // A test's fence: every message before it was taken, and
@@ -3702,12 +3776,22 @@ impl Run {
                     // A generic page (a preparation's wait, a notice) is
                     // no play state's presentation: no turntable.
                     self.page_turns = false;
+                    self.decision = false;
+                    mode = Self::menu_mode(mode, page, &self.shared, self.started);
+                }
+                Ok(RenderMsg::Decision(page)) => {
+                    // The decision screen is no play state's presentation:
+                    // the turntable is not adopted or ticked (design.md
+                    // :732).
+                    self.page_turns = false;
+                    self.decision = true;
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::PracticePage(page)) => {
                     // The practice page begins or resumes its play
                     // state's presentation.
                     self.page_turns = true;
+                    self.decision = false;
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
@@ -3718,6 +3802,7 @@ impl Run {
                     }
                 }
                 Ok(RenderMsg::SelectionChanged) => {
+                    self.decision = false;
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
@@ -3732,6 +3817,7 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
+                    self.decision = false;
                     self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing, and neither do the
@@ -3809,7 +3895,7 @@ impl Run {
                 Ok(RenderMsg::Prepare(reply)) => {
                     let ready = self.recover();
                     let _ = reply.send(ready);
-                    mode = after_preparing(mode);
+                    mode = self.after_preparing(mode);
                     // A result lifetime draws on from what it presented.
                     if self.result.as_ref().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
@@ -3824,7 +3910,7 @@ impl Run {
                 }) => {
                     self.turntable.begin_presentation();
                     self.begin_attempt(request, attempt, skin, reply);
-                    mode = after_preparing(mode);
+                    mode = self.after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -3884,7 +3970,7 @@ impl Run {
                     };
                     self.reconcile_result();
                     let _ = reply.send(answer);
-                    mode = after_preparing(mode);
+                    mode = self.after_preparing(mode);
                     continue;
                 }
                 Ok(RenderMsg::Play {
