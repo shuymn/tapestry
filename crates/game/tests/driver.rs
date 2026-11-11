@@ -1449,3 +1449,96 @@ fn the_opened_phase_reopens_acceptance() {
         .keys(50 * MS, &[(F2, true)]);
     assert_eq!(rig.snap().hispeed, Some(r(345, 100)));
 }
+
+/// [`Pump`] with an ingress gate: the word the drain validates against.
+struct GatedPump<'a> {
+    pump: Pump<'a>,
+    word: input::Ingress,
+}
+
+impl InputPump for GatedPump<'_> {
+    fn request_fence(&mut self, n: u64) {
+        self.pump.request_fence(n);
+    }
+    fn wake(&mut self) {
+        self.pump.wake();
+    }
+    fn display_offset_us(&self) -> i64 {
+        self.pump.display_offset_us()
+    }
+    fn with_ingress(&mut self, f: &mut game::IngressDrain<'_>) {
+        f(Some(self.word), &|| {});
+    }
+    fn park(&mut self) -> Result<(), InputWaitError> {
+        self.pump.park()
+    }
+}
+
+/// E16 and E16b at the driver: F2 read by the input thread under the
+/// word open before the choice and left undrained in transit, or read
+/// during the decision screen under the closed word, does not act when
+/// drained after the choice or after the reopening: the hi-speed and the
+/// reducer's count are unchanged. The same tap drained under the word it
+/// was stamped with acts (the positive control), and after the reopening
+/// a fresh press acts.
+#[test]
+fn an_observation_stamped_under_another_word_does_not_act() {
+    for case in ["in transit", "in the epoch", "control"] {
+        let mut rig = Rig::new(PlayOptions::default());
+        let record = std::sync::Arc::new(input::ActivityRecord::default());
+        rig.set
+            .adjustment_mut()
+            .unwrap()
+            .set_activity(std::sync::Arc::clone(&record));
+        rig.enter(-2_000_000);
+        rig.attach(tempo(150, None), -2_000_000).unwrap();
+        let mut word = record.ingress();
+        let drain = |rig: &mut Rig, word| {
+            let mut pump = GatedPump {
+                pump: Pump {
+                    set: &mut rig.set,
+                    now: TimeUs(rig.now),
+                    offset: rig.offset,
+                },
+                word,
+            };
+            rig.driver.pump(&mut pump);
+            *rig.reader.read()
+        };
+        let before = drain(&mut rig, word);
+        let accepted = rig.driver.accepted();
+        let close = |word: &mut input::Ingress| {
+            *word = word.next(false);
+            record.set_ingress(*word);
+        };
+        match case {
+            "in transit" => {
+                rig.tap(10 * MS, F2);
+                close(&mut word);
+            }
+            "in the epoch" => {
+                close(&mut word);
+                rig.tap(10 * MS, F2);
+            }
+            _ => {
+                rig.tap(10 * MS, F2);
+            }
+        }
+        if case != "control" {
+            word = word.next(true);
+            record.set_ingress(word);
+        }
+        rig.tick(11 * MS);
+        let after = drain(&mut rig, word);
+        if case == "control" {
+            assert_eq!(after.hispeed, Some(r(37, 10)), "{case}");
+            assert_eq!(rig.driver.accepted(), accepted + 1, "{case}");
+            continue;
+        }
+        assert_eq!(after.hispeed, before.hispeed, "{case}");
+        assert_eq!(rig.driver.accepted(), accepted, "{case}");
+        rig.tap(20 * MS, F2);
+        rig.tick(21 * MS);
+        assert_eq!(drain(&mut rig, word).hispeed, Some(r(37, 10)), "{case}");
+    }
+}

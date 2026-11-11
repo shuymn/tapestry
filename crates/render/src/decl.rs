@@ -383,8 +383,8 @@ impl SkinBundle {
 }
 
 /// The level-0 texels of the atlas array `pages` are uploaded as: its
-/// pages, the renderer's reserved layers and its text layer, if it has
-/// one, at its page side.
+/// pages, the renderer's reserved layers, and its text and chart layers,
+/// if it has them, at its page side.
 #[must_use]
 pub fn pages_texels(pages: &PackedPages) -> u64 {
     let side = u64::from(pages.side());

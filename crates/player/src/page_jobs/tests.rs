@@ -856,3 +856,70 @@ fn a_close_on_the_page_settles_within_one_bound() {
     script.release(PageAt::File(0), 1);
     script.release(PageAt::Block, 1);
 }
+
+/// E12: the page's 1× bank begun in the decision screen is the choice's,
+/// promoted: its threads hold foreground permits; at page entry
+/// ([`super::PageJobs::hand_to_page`]) it is demoted and handed to the page, so
+/// its next file runs on the speculative permit alone, and the bank is
+/// whole. Begun outside the decision screen (the positive control), it
+/// starts speculative.
+#[test]
+fn the_1x_bank_moves_to_speculation_at_page_entry() {
+    for deciding in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let chart = chart(dir.path(), 8, 0.2);
+        let coord = coordinator(4, 1);
+        let seam = Arc::new(Seam::default());
+        let script = Script::new(&coord);
+        let extras = if deciding { cap(8) - 1 } else { 0 };
+        for k in 1..=extras {
+            script.hold(PageAt::File(k), 2);
+        }
+        script.hold(PageAt::File(0), 2);
+        let mut page = super::PageJobs::new(Arc::clone(&seam) as Arc<dyn ThreadMode>);
+        page.probe = Some(script.probe());
+        page.begin(
+            &coord,
+            Spawner::SYSTEM,
+            super::PageChart {
+                path: "page.bms".into(),
+                chart: Arc::clone(&chart),
+                name: "page.bms".to_owned(),
+                rate: RATE,
+            },
+            deciding,
+            #[cfg(feature = "dev-tools")]
+            &crate::bank_witness::BankWitness::new(),
+        );
+        assert_eq!(page.deciding(), deciding);
+        script.reach(PageAt::File(0), 2);
+        for k in 1..=extras {
+            script.reach(PageAt::File(k), 2);
+        }
+        let (foreground, speculative) = held(&coord);
+        if !deciding {
+            assert_eq!((foreground, speculative), (0, 1));
+            script.release(PageAt::File(0), 2);
+            until("the page bank ends", || held(&coord) == (0, 0));
+            continue;
+        }
+        assert_eq!((foreground, speculative), (1 + extras, 0));
+        page.hand_to_page();
+        assert!(!page.deciding());
+        for k in 1..=extras {
+            script.release(PageAt::File(k), 2);
+        }
+        until("the extras' permits back", || held(&coord) == (1, 0));
+        script.release(PageAt::File(0), 2);
+        let job = page.take_bank().unwrap();
+        assert_eq!(sounds(&outcome(&job)), 8);
+        let after: Vec<_> = script
+            .log()
+            .into_iter()
+            .filter(|(at, n, _)| *at == PageAt::File(0) && *n > 2)
+            .collect();
+        assert!(!after.is_empty());
+        assert!(after.iter().all(|(_, _, p)| *p == (0, 1)), "{after:?}");
+        until("every permit back", || held(&coord) == (0, 0));
+    }
+}

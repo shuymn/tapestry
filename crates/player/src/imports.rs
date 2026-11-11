@@ -413,6 +413,11 @@ pub struct Summary {
     pub notes: Vec<Note>,
     /// Notes the import counted only.
     pub suppressed: u32,
+    /// The chart layer given up because the atlas could not hold it
+    /// ([`Skin::fit_chart_layer`]): the plan's refusal with it. The chart's
+    /// images are then absent with this skin (S10-12 design D-chart-5).
+    /// Logged as a config line before the notes.
+    pub chart_layer: Option<String>,
 }
 
 /// A file choice's outcome, by the header's names.
@@ -451,6 +456,7 @@ impl Summary {
             usage: report.usage,
             notes: report.notes,
             suppressed: report.suppressed,
+            chart_layer: None,
         }
     }
 
@@ -668,9 +674,12 @@ fn pack(
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> Result<(Arc<SkinBundle>, Summary), String> {
-    let summary = Summary::of(imported.report, header);
-    let skin = imported.skin;
+    let mut summary = Summary::of(imported.report, header);
+    let mut skin = imported.skin;
     let variant = skin.variant(target.size, &Layout::AUTHOR);
+    summary.chart_layer = skin
+        .fit_chart_layer(variant, target.limits)
+        .map(|e| Chain(&e).to_string());
     let atlas = skin
         .atlas(variant, target.limits, &|| cancel.is_cancelled())
         .map_err(|e| format!("the atlas cannot be built: {}", Chain(&e)))?;
@@ -1167,15 +1176,26 @@ fn log_summary(kind: ScreenKind, head: &str, summary: &Summary, log: &dyn log::L
         let candidate = f.candidate.as_deref().unwrap_or("none");
         let _ = write!(head, "{} = {candidate} ({:?})", f.choice, f.rule);
     }
-    let notes = summary.notes.iter().map(|n| {
-        let at =
-            n.at.map_or_else(|| "config".to_owned(), |at| summary.locate(at));
-        format!("{at}: {:?}: {}", n.severity, n.kind)
-    });
+    // The chart layer given up first, so the log's cap on notes never
+    // hides it.
+    let notes = summary
+        .chart_layer
+        .iter()
+        .map(|why| {
+            format!(
+                "config: Warning: the chart layer does not fit ({why}); the chart's own images are absent"
+            )
+        })
+        .chain(summary.notes.iter().map(|n| {
+            let at =
+                n.at.map_or_else(|| "config".to_owned(), |at| summary.locate(at));
+            format!("{at}: {:?}: {}", n.severity, n.kind)
+        }))
+        .collect::<Vec<_>>();
     log_file::summary_to(
         &format!("skin: {}", name(kind)),
         &head,
-        notes,
+        notes.into_iter(),
         summary.suppressed,
         log,
     );

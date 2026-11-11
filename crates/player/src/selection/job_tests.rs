@@ -143,6 +143,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         chosen_at: TimeUs(0),
         loading: None,
         practicing: false,
+        decision: None,
         entered_at: TimeUs(0),
         dirty: false,
         search_pending: false,
@@ -342,7 +343,12 @@ fn a_bank_thread_that_cannot_start_fails_the_load() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(
         got,
@@ -372,7 +378,12 @@ fn a_measure_thread_that_cannot_start_fails_the_load() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(
         got,
@@ -405,7 +416,12 @@ fn a_bank_panic_fails_the_load() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(
         got,
@@ -438,7 +454,12 @@ fn a_panic_after_a_quit_during_the_decode_still_fails_the_load() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(
         got,
@@ -472,7 +493,12 @@ fn a_bank_too_large_is_refused_through_its_job() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (rig.load_chart(&loaded), installed(rig, &loaded)),
+        |rig| {
+            (
+                rig.load_chart(&loaded, &mut game::Decision::off()),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert!(
         matches!(
@@ -504,7 +530,10 @@ fn an_unplayable_autoplay_chart_begins_no_bank_job() {
         Spawner::refusing(&[JobKind::Bank]),
     );
     let (got, installed) = on_rig(b.sel.take().unwrap(), &Installers::default(), true, |rig| {
-        (rig.load_chart(&loaded), installed(rig, &loaded))
+        (
+            rig.load_chart(&loaded, &mut game::Decision::off()),
+            installed(rig, &loaded),
+        )
     });
     assert!(matches!(got, Err(ChartLoadError::Autoplay(_))), "{got:?}");
     assert!(!installed);
@@ -536,7 +565,12 @@ fn leave_while_the_bank_waits_for_a_permit(how: Leave) {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(got, Loading::Cancelled);
     assert!(!installed);
@@ -588,7 +622,7 @@ fn leave_while_the_measurement_waits_for_a_permit(how: Leave) {
     let s = b.sel.take().unwrap();
     let b = b;
     on_rig(s, &Installers::default(), false, |rig| {
-        let got = outcome(rig.load_chart(&loaded));
+        let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
         assert_eq!(got, Loading::Cancelled);
         assert!(installed(rig, &loaded));
         assert_eq!(analysis(&b.decodes), None, "the analysis ran");
@@ -652,7 +686,7 @@ fn leave_while_the_load_waits_for_the_background(how: Leave) {
                 }
                 how.press(controls);
             });
-            outcome(rig.load_chart(&loaded))
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off()))
         });
         assert_eq!(got, Loading::Cancelled);
         assert!(!installed(rig, &loaded));
@@ -703,7 +737,12 @@ fn leave_while_the_bank_decodes(how: Leave) {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| (outcome(rig.load_chart(&loaded)), installed(rig, &loaded)),
+        |rig| {
+            (
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                installed(rig, &loaded),
+            )
+        },
     );
     assert_eq!(got, Loading::Cancelled);
     assert!(
@@ -755,7 +794,7 @@ fn a_quit_stops_the_scoped_decode_by_itself() {
             b.sel.take().unwrap(),
             &Installers::default(),
             false,
-            |rig| outcome(rig.load_chart(&loaded)),
+            |rig| outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
         );
         assert_eq!(got, Loading::Cancelled, "{kind:?}");
         let banks: Vec<Speed> = decoded(&b.decodes).iter().map(|d| d.0).collect();
@@ -794,7 +833,7 @@ fn a_quit_after_the_bank_is_made_installs_nothing() {
                 Leave::Quit.press(controls);
                 pressed_tx.send(()).unwrap();
             });
-            outcome(rig.load_chart(&loaded))
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off()))
         });
         (got, installed(rig, &loaded))
     });
@@ -820,7 +859,10 @@ fn leave_inside_the_running_analysis(how: Leave) {
     let s = b.sel.take().unwrap();
     let b = b;
     on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Cancelled
+        );
         assert!(
             stopped.load(Ordering::SeqCst),
             "the wait never stopped the job"
@@ -865,7 +907,7 @@ fn a_quit_during_the_screen_wait_leaves() {
     }));
     let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
     let (got, installed, leaving) = on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
-        let got = outcome(rig.load_chart(&loaded));
+        let got = outcome(rig.load_chart(&loaded, &mut game::Decision::off()));
         (got, installed(rig, &loaded), rig.controls.leaving())
     });
     assert_eq!(got, Loading::Ready);
@@ -900,7 +942,7 @@ fn a_load_after_the_background_measurement_ends_is_granted_every_permit() {
                 }
                 b.stepper.finish();
             });
-            outcome(rig.load_chart(&loaded))
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off()))
         });
         assert_eq!(got, Loading::Ready);
         // Its job's own permit only as it began: the background's is back.
@@ -969,7 +1011,7 @@ fn load_beside(k: usize, files: usize, speed: Speed) -> Arc<Decodes> {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| outcome(rig.load_chart(&loaded)),
+        |rig| outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
     );
     assert_eq!(got, Loading::Ready, "k = {k}");
     assert_eq!(b.coord.held(Class::Foreground), k, "k = {k}");
@@ -1016,7 +1058,10 @@ fn at_the_headroom(decodes: Decodes, speed: Speed, spawner: Spawner) -> Arc<Deco
         &Installers::default(),
         false,
         |rig| {
-            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert!(installed(rig, &loaded));
             assert_eq!(sel(rig).shelf.gain(), Gain::HEADROOM);
             assert!(unmeasured(rig, &loaded), "a measurement was kept");
@@ -1075,14 +1120,20 @@ fn a_cached_gain_begins_no_measure_job() {
         &Installers::default(),
         false,
         |rig| {
-            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(analysis(&b.decodes), Some(1));
             let measured = sel(rig).shelf.gain();
             assert_ne!(measured, Gain::HEADROOM);
             let again = Arc::new(Decodes::default());
             sel(rig).decodes = Some(Arc::clone(&again));
             sel(rig).spawner = Spawner::refusing(&[JobKind::Measure]);
-            assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+            assert_eq!(
+                outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                Loading::Ready
+            );
             assert_eq!(sel(rig).shelf.gain(), measured);
             assert_eq!(begun(&again).len(), 1);
             assert_eq!(analysis(&again), None);
@@ -1142,9 +1193,15 @@ fn entering_after_a_play_releases_every_owner_before_decoding() {
     *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
     let s = b.sel.take().unwrap();
     on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&first)), Loading::Ready);
+        assert_eq!(
+            outcome(rig.load_chart(&first, &mut game::Decision::off())),
+            Loading::Ready
+        );
         assert_eq!(b.witness.now(), (0, 1), "the installed bank");
-        assert_eq!(outcome(rig.load_chart(&second)), Loading::Ready);
+        assert_eq!(
+            outcome(rig.load_chart(&second, &mut game::Decision::off())),
+            Loading::Ready
+        );
         assert!(installed(rig, &second));
     });
     assert_eq!(*seen.lock().unwrap(), [(0, 0), (0, 1)]);
@@ -1176,7 +1233,11 @@ fn every_start_releases_the_previous_starts_bank_first() {
     on_rig(s, &Installers::default(), false, |rig| {
         for speed in speeds {
             let start = practiced(dir.path(), &path, speed);
-            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready, "{speed:?}");
+            assert_eq!(
+                outcome(rig.load_chart(&start, &mut game::Decision::off())),
+                Loading::Ready,
+                "{speed:?}"
+            );
             assert!(rig.restorer.is_some(), "{speed:?}");
         }
     });
@@ -1214,7 +1275,7 @@ fn a_decode_is_accounted_from_its_spawn() {
         b.sel.take().unwrap(),
         &Installers::default(),
         false,
-        |rig| outcome(rig.load_chart(&loaded)),
+        |rig| outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
     );
     assert_eq!(got, Loading::Cancelled);
     assert!(begun(&b.decodes).is_empty(), "the decode was entered");
@@ -1245,7 +1306,10 @@ fn a_decode_is_accounted_until_its_bank_is_registered() {
     *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
     let s = b.sel.take().unwrap();
     on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Ready
+        );
         assert_eq!(b.witness.now(), (0, 1));
     });
     assert_eq!(*seen.lock().unwrap(), Some((1, 0)));
@@ -1271,7 +1335,7 @@ fn a_close_or_quit_at_the_unload_cancels_before_the_decode() {
             b.sel.take().unwrap(),
             &Installers::default(),
             false,
-            |rig| outcome(rig.load_chart(&loaded)),
+            |rig| outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
         );
         assert_eq!(got, Loading::Cancelled, "{how:?}");
         assert!(begun(&b.decodes).is_empty());
@@ -1306,7 +1370,7 @@ fn a_failed_unload_refuses_before_decoding() {
             let mut s = b.sel.take().unwrap();
             s.unload_fault = Some(fault);
             let got = on_rig(s, &Installers::default(), false, |rig| {
-                rig.load_chart(&loaded)
+                rig.load_chart(&loaded, &mut game::Decision::off())
             });
             assert!(
                 matches!(got, Err(ChartLoadError::Audio(e)) if e == fault),
@@ -1337,11 +1401,17 @@ fn a_refused_load_after_the_unload_leaves_the_next_load_working() {
     let mut b = bench(dir.path(), decodes, Spawner::SYSTEM);
     let s = b.sel.take().unwrap();
     on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Cancelled
+        );
         assert!(!installed(rig, &loaded));
         assert_eq!(b.witness.now(), (0, 0), "a bank is still held");
         assert_eq!(rig.controls.take(), Some(game::Command::Quit));
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Ready
+        );
         assert!(installed(rig, &loaded));
     });
     assert_eq!(witnessed(&b), (2, Vec::new()));
@@ -1365,12 +1435,18 @@ fn a_quit_during_the_measurement_leaves_its_bank_to_the_next_barrier() {
     let s = b.sel.take().unwrap();
     let b = b;
     on_rig(s, &Installers::default(), false, |rig| {
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Cancelled);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Cancelled
+        );
         assert!(installed(rig, &loaded));
         assert_eq!(b.witness.now(), (0, 1), "the installed bank");
         assert_eq!(rig.controls.take(), Some(game::Command::Quit));
         left_to_background(&b, rig, Leave::Quit);
-        assert_eq!(outcome(rig.load_chart(&loaded)), Loading::Ready);
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Ready
+        );
     });
     assert_eq!(witnessed(&b), (2, Vec::new()));
 }

@@ -96,6 +96,21 @@ pub struct AtlasLimits {
     pub reserved_layers: u32,
 }
 
+/// A planned atlas's shape ([`Sheet::plan_shape`], measurement).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanShape {
+    /// The page side, in texels.
+    pub side: u32,
+    /// The packed pages.
+    pub pages: u32,
+    /// Every layer of the array: the pages, the reserved layers and the
+    /// kept ones.
+    pub layers: u32,
+    /// Level-0 texels over every layer, as the renderer charges them.
+    pub texels: u64,
+}
+
 /// The layers an atlas keeps after its pages, each the page side square
 /// and with no CPU page, in this order: a text layer, which the renderer
 /// writes rasterized lines into, and a chart layer, which it writes the
@@ -624,6 +639,30 @@ impl Sheet {
         let (_, packing) = self.packing(variant, limits, kept)?;
         let layers = limits.reserved_layers + kept.count();
         Ok(pack::cost(layers, packing.pages, packing.side))
+    }
+
+    /// [`plan_keeping`](Self::plan_keeping)'s packing (measurement): its
+    /// page side, its pages, every layer it charges (the reserved ones and
+    /// `kept` included) and its level-0 texels. Reads no file.
+    ///
+    /// # Errors
+    ///
+    /// As [`plan`](Self::plan).
+    #[cfg(feature = "dev-tools")]
+    pub fn plan_shape(
+        &self,
+        variant: Variant,
+        limits: AtlasLimits,
+        kept: KeptLayers,
+    ) -> Result<PlanShape, AtlasError> {
+        let (_, packing) = self.packing(variant, limits, kept)?;
+        let layers = limits.reserved_layers + kept.count();
+        Ok(PlanShape {
+            side: packing.side,
+            pages: packing.pages,
+            layers: layers + packing.pages,
+            texels: pack::cost(layers, packing.pages, packing.side),
+        })
     }
 
     /// Each cell's rectangle in the version `variant` reads, and their

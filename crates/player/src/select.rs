@@ -18,7 +18,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use eval::ControlId;
 use input::hid::{HidProduct, is_axis};
@@ -234,40 +234,104 @@ pub const QUEUED_KEYS: usize = 64;
 /// before it, so its last state, the end of a composition included, always
 /// arrives. Only keys are bounded ([`QUEUED_KEYS`]); a key past the bound
 /// is dropped and counted.
+///
+/// What the window publishes carries the ingress word it was observed
+/// under (design.md "Play Lifecycle", the decision screen), and is
+/// validated where it is taken: under the tuning step lock, an input
+/// stamped with another generation, or under a closed word, is dropped
+/// there. Text and compositions join only those with the same stamp.
 #[derive(Debug, Default)]
 pub struct MenuQueue {
-    inputs: Mutex<VecDeque<MenuInput>>,
+    inputs: Mutex<VecDeque<(MenuInput, Option<Observed>)>>,
     dropped: AtomicU64,
+    /// The tuning whose ingress word validates stamped inputs; none: every
+    /// input is taken.
+    gate: Option<Arc<crate::tuning::LiveTuning>>,
+}
+
+/// How the window observed an input: the ingress word then, and when, on
+/// the clock (design.md "Play Lifecycle", the decision screen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observed {
+    /// The ingress word it was observed under.
+    pub stamp: input::Ingress,
+    /// When it was observed.
+    pub at: bms_model::TimeUs,
 }
 
 impl MenuQueue {
-    /// Queues `input`.
+    /// A queue whose stamped inputs `tuning`'s ingress word validates.
+    pub fn gated(tuning: Arc<crate::tuning::LiveTuning>) -> Self {
+        Self {
+            gate: Some(tuning),
+            ..Self::default()
+        }
+    }
+
+    /// Queues `input`, unstamped: the game thread's own (a development
+    /// script's, a test's), always taken.
+    #[cfg(any(test, feature = "dev-tools"))]
     pub fn push(&self, input: MenuInput) {
+        self.push_stamped(input, None);
+    }
+
+    /// Queues `input` as it was `observed` (none: the game thread's own).
+    /// Text and a composition join only one observed under the same word.
+    pub fn push_stamped(&self, input: MenuInput, observed: Option<Observed>) {
+        let stamp = observed.map(|o| o.stamp);
         let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
-        match (input, q.back_mut()) {
+        let last = q
+            .back_mut()
+            .filter(|(_, o)| o.map(|o| o.stamp) == stamp)
+            .map(|(i, _)| i);
+        match (input, last) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
             (key @ (MenuInput::Key(_) | MenuInput::Pad { .. }), _) => {
                 let keys = q
                     .iter()
-                    .filter(|i| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
+                    .filter(|(i, _)| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
                     .count();
                 if keys < QUEUED_KEYS {
-                    q.push_back(key);
+                    q.push_back((key, observed));
                 } else {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            (input, _) => q.push_back(input),
+            (input, _) => q.push_back((input, observed)),
         }
     }
 
-    /// Takes the oldest input.
+    /// Takes the oldest input whose stamp is valid now, dropping the
+    /// stale ones before it.
     pub fn pop(&self) -> Option<MenuInput> {
-        self.inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+        loop {
+            let (input, observed) = self
+                .inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()?;
+            let valid = match (observed, &self.gate) {
+                (Some(o), Some(gate)) => gate.with_ingress(|word| word.admits(o.stamp)),
+                _ => true,
+            };
+            if valid {
+                return Some(input);
+            }
+        }
+    }
+
+    /// Takes every input queued, and whether one was an Escape observed at
+    /// or after `deadline`: what the decision screen reads past its time
+    /// (design.md "Play Lifecycle", the practice page). One the window did
+    /// not observe is never an escape.
+    pub fn take_escape(&self, deadline: bms_model::TimeUs) -> bool {
+        let taken =
+            std::mem::take(&mut *self.inputs.lock().unwrap_or_else(PoisonError::into_inner));
+        taken.into_iter().any(|(i, observed)| {
+            matches!(i, MenuInput::Key(MenuKey::Escape))
+                && observed.is_some_and(|o| o.at.0 >= deadline.0)
+        })
     }
 
     /// Keys dropped so far.

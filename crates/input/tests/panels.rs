@@ -210,3 +210,30 @@ fn an_overflowing_menu_queue_keeps_no_panel_open() {
     batch(&mut set, 20, &[packet(KEYBOARD, E, 0)], true);
     assert_eq!(held(&level), (false, false, None));
 }
+
+/// Finding 10: a START or SELECT held through the decision screen opens
+/// no panel when it returns to selection, until released (masked when the
+/// return is seen), while the raw held set the loading state's hold reads
+/// keeps it; a fresh press opens the panel. Unmasked (the positive
+/// control), the same hold opens it at once.
+#[test]
+fn a_panel_held_across_the_decision_screen_needs_a_fresh_press() {
+    for masked in [false, true] {
+        let (mut set, level, _) = rig();
+        batch(&mut set, 10, &[packet(KEYBOARD, E, 1)], false);
+        if masked {
+            set.adjustment_mut().unwrap().mask_held_panels();
+        }
+        batch(&mut set, 20, &[], true);
+        let shown = held(&level);
+        if !masked {
+            assert_eq!(shown, (true, false, Some(0)));
+            continue;
+        }
+        assert_eq!(shown, (false, false, None));
+        assert!(set.adjustment_mut().unwrap().holding());
+        batch(&mut set, 30, &[packet(KEYBOARD, E, 0)], true);
+        assert!(batch(&mut set, 40, &[packet(KEYBOARD, E, 1)], true));
+        assert_eq!(held(&level), (true, false, Some(0)));
+    }
+}

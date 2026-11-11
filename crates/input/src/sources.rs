@@ -624,7 +624,7 @@ impl SourceSet {
             .find(|a| a.control == packet.control);
         // The panel START and SELECT open at this packet, in packet order.
         menu.set_panel(self.adjust.as_ref().and_then(|t| t.held_panels().open()));
-        menu.offer(packet, axis);
+        menu.offer(packet, axis, self.batch_at);
     }
 
     /// A device was found. While recording is open it does not take part;

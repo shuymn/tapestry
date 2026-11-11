@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bms_model::TimeUs;
 use eval::ControlId;
 
-use crate::activity::{ActivityRecord, SectionValue};
+use crate::activity::{ActivityRecord, Ingress, SectionValue};
 use crate::hid::{HidProduct, wrapped};
 use crate::sources::DeviceKind;
 
@@ -164,6 +164,10 @@ pub struct TapObservation {
     pub seq: u64,
     /// What happened.
     pub event: TapEvent,
+    /// The ingress word when the tap queued it (design.md "Play
+    /// Lifecycle", the decision screen); [`Ingress::INITIAL`] without an
+    /// activity record.
+    pub ingress: Ingress,
 }
 
 /// What the latch reads ([`HoldLatch::read`]).
@@ -435,7 +439,7 @@ impl WindowKeyShared {
 /// bounded queue of F1 and F2 events for the input thread.
 #[derive(Debug)]
 pub struct WindowKeys {
-    queue: rtrb::Producer<(u8, WindowKeyEvent)>,
+    queue: rtrb::Producer<(u8, WindowKeyEvent, Option<Ingress>)>,
     shared: Arc<WindowKeyShared>,
 }
 
@@ -443,7 +447,7 @@ pub struct WindowKeys {
 /// ([`AdjustmentTap::set_window_keys`]).
 #[derive(Debug)]
 pub struct WindowKeyReceiver {
-    queue: rtrb::Consumer<(u8, WindowKeyEvent)>,
+    queue: rtrb::Consumer<(u8, WindowKeyEvent, Option<Ingress>)>,
     shared: Arc<WindowKeyShared>,
 }
 
@@ -473,6 +477,31 @@ impl WindowKeys {
     /// takes the held state as a baseline instead. `false` when it was not
     /// queued.
     pub fn key(&mut self, key: u8, event: WindowKeyEvent, synthetic: bool) -> bool {
+        self.queue_key(key, event, synthetic, None)
+    }
+
+    /// [`key`](Self::key), observed by the window under the ingress word
+    /// `stamp` (design.md "Play Lifecycle", the decision screen): the
+    /// observation the tap makes of it carries that word, not the one the
+    /// tap reads when it takes the key, so one queued during the decision
+    /// screen does not act after it.
+    pub fn key_stamped(
+        &mut self,
+        key: u8,
+        event: WindowKeyEvent,
+        synthetic: bool,
+        stamp: Ingress,
+    ) -> bool {
+        self.queue_key(key, event, synthetic, Some(stamp))
+    }
+
+    fn queue_key(
+        &mut self,
+        key: u8,
+        event: WindowKeyEvent,
+        synthetic: bool,
+        stamp: Option<Ingress>,
+    ) -> bool {
         let bit = 1_u64 << (key & 1);
         let changed = |w: u64| {
             let held = match event {
@@ -490,7 +519,7 @@ impl WindowKeys {
         if synthetic || before & OVERFLOW != 0 {
             return false;
         }
-        if self.queue.push((key & 1, event)).is_ok() {
+        if self.queue.push((key & 1, event, stamp)).is_ok() {
             return true;
         }
         self.shared.word.fetch_or(OVERFLOW, Ordering::AcqRel);
@@ -653,6 +682,10 @@ pub struct AdjustmentTap {
     panels: Arc<AtomicU64>,
     /// The focus losses counted at the level's last publication.
     panel_losses: u64,
+    /// START and SELECT controls held since before the last return from
+    /// the decision screen ([`mask_held_panels`](Self::mask_held_panels)):
+    /// no panel until each is released.
+    panel_mask: u128,
     /// The numbers of the tuning controls (START, SELECT, F1, F2), a bit
     /// each, whose holds and events the activity record's input section
     /// counts ([`set_tuning_controls`](Self::set_tuning_controls)).
@@ -739,6 +772,7 @@ pub fn adjustment_queue(
             panel_roles: [0; 2],
             panels: Arc::new(AtomicU64::new(0)),
             panel_losses: 0,
+            panel_mask: 0,
             tuning: 0,
             disarmed: 0,
             admitted: 0,
@@ -842,6 +876,7 @@ impl AdjustmentTap {
         };
         self.disarmed = (self.disarmed | carried | (entered & !armed)) & held & self.tuning;
         self.admitted = held;
+        self.panel_mask &= held;
     }
 
     /// Writes the input section once [`admit`](Self::admit) has decided
@@ -849,12 +884,18 @@ impl AdjustmentTap {
     /// control disarmed neither before nor after it, or when whether one
     /// is held changed, the last activity then taking `at`, else the
     /// latest time seen.
-    fn publish_activity(&mut self, at: Option<TimeUs>, change: Change) {
+    fn publish_activity(&mut self, at: Option<TimeUs>, change: Change, stamp: Option<Ingress>) {
         let before = self.disarmed;
         self.admit(change);
         let counted = match change {
+            // Not while the ingress word is closed: the decision screen's
+            // observations are no activity (design.md "Play Lifecycle").
             Change::Press(n) | Change::Event(n) => {
                 self.tuning & !(before | self.disarmed) & (1_u128 << (n & 127)) != 0
+                    && self.activity.as_ref().is_none_or(|r| {
+                        let now = r.ingress();
+                        now.admits(stamp.unwrap_or(now))
+                    })
             }
             Change::Loss | Change::Held => false,
         };
@@ -884,13 +925,22 @@ impl AdjustmentTap {
     /// tap hold them (the generation 0).
     #[must_use]
     pub fn held_panels(&self) -> Panels {
-        let held = self.held_set();
+        let held = self.held_set() & !self.panel_mask;
         let [start, select] = self.panel_roles;
         Panels {
             start: held & start != 0,
             select: held & select != 0,
             generation: 0,
         }
+    }
+
+    /// The decision screen's epoch ended (design.md "Play Lifecycle", the
+    /// decision screen): a START or SELECT held now opens no panel until
+    /// released, while the held set itself, which the loading state's
+    /// hold and the start gate read, stays.
+    pub fn mask_held_panels(&mut self) {
+        let [start, select] = self.panel_roles;
+        self.panel_mask = self.held_set() & (start | select);
     }
 
     /// Publishes the panels' level at a boundary: START and SELECT as held
@@ -952,7 +1002,7 @@ impl AdjustmentTap {
         if lost {
             // The tuning controls held now are disarmed, and the record
             // drops them at the loss.
-            self.publish_activity(None, Change::Loss);
+            self.publish_activity(None, Change::Loss, None);
         }
         if lost || back {
             // What was derived from the focus before is resolved now: the
@@ -1067,9 +1117,9 @@ impl AdjustmentTap {
             Some(_) => Change::Event(n),
             None => Change::Held,
         };
-        self.publish_activity(Some(at), change);
+        self.publish_activity(Some(at), change, None);
         if let Some(event) = event {
-            self.observe(at, event, foreground);
+            self.observe(at, event, foreground, None);
         }
     }
 
@@ -1093,7 +1143,7 @@ impl AdjustmentTap {
                 delta,
                 revolution,
             };
-            self.observe(at, event, foreground);
+            self.observe(at, event, foreground, None);
         }
     }
 
@@ -1107,7 +1157,7 @@ impl AdjustmentTap {
         {
             self.owed.push(Marker::Cancelled { generation });
         }
-        self.publish_activity(None, Change::Held);
+        self.publish_activity(None, Change::Held, None);
     }
 
     /// READY candidate `generation` opened at this boundary, its chart
@@ -1168,7 +1218,7 @@ impl AdjustmentTap {
             self.last_tick = at;
             // Only a tick the reducer takes owes a closing one: a tick
             // dropped (focus away, a loss) made no request.
-            if self.observe(at, TapEvent::Tick, true) && repeats {
+            if self.observe(at, TapEvent::Tick, true, None) && repeats {
                 self.unclosed = Some(at);
             }
         }
@@ -1232,7 +1282,7 @@ impl AdjustmentTap {
             *slot = Some(e);
             taken += 1;
         }
-        for (key, event) in events.into_iter().flatten() {
+        for (key, event, stamp) in events.into_iter().flatten() {
             let Some(n) = numbers.get(usize::from(key)).copied().flatten() else {
                 continue;
             };
@@ -1253,8 +1303,9 @@ impl AdjustmentTap {
                 TapEvent::Press(_) => Change::Press(n),
                 _ => Change::Event(n),
             };
-            self.publish_activity(Some(at), change);
-            self.observe(at, tap, true);
+            // The word the window observed it under, not the one now.
+            self.publish_activity(Some(at), change, stamp);
+            self.observe(at, tap, true, stamp);
         }
         if overflow
             && let Some((keys, _)) = &self.window
@@ -1301,7 +1352,7 @@ impl AdjustmentTap {
             match m {
                 Marker::Recovery { lost } => {
                     if lost {
-                        self.send(at, TapEvent::Lost);
+                        self.send(at, TapEvent::Lost, None);
                     }
                     let verified = self.focused && !self.unverified;
                     // The window's keys: an overflow's acknowledged baseline,
@@ -1319,18 +1370,18 @@ impl AdjustmentTap {
                     }
                     // A baseline that changes what is held is written
                     // before it is sent.
-                    self.publish_activity(Some(at), Change::Held);
+                    self.publish_activity(Some(at), Change::Held, None);
                     let held = self.held_set();
-                    self.send(at, TapEvent::Resync { held, verified });
+                    self.send(at, TapEvent::Resync { held, verified }, None);
                 }
                 Marker::Opened { generation, origin } => {
-                    self.send(at, TapEvent::Opened { generation, origin });
+                    self.send(at, TapEvent::Opened { generation, origin }, None);
                 }
                 Marker::Cancelled { generation } => {
-                    self.send(at, TapEvent::Cancelled { generation });
+                    self.send(at, TapEvent::Cancelled { generation }, None);
                 }
                 Marker::Fence(n) => {
-                    self.send(at, TapEvent::Fence(n));
+                    self.send(at, TapEvent::Fence(n), None);
                 }
             }
             self.owed.pop();
@@ -1358,7 +1409,13 @@ impl AdjustmentTap {
     /// background input, an observation behind something owed, or one the
     /// queue (short of its reserved slots) has no room for. Nothing is sent
     /// while focus is away; its return sends a baseline.
-    fn observe(&mut self, at: TimeUs, event: TapEvent, foreground: bool) -> bool {
+    fn observe(
+        &mut self,
+        at: TimeUs,
+        event: TapEvent,
+        foreground: bool,
+        stamp: Option<Ingress>,
+    ) -> bool {
         if !self.active || !self.focused {
             return false;
         }
@@ -1369,14 +1426,27 @@ impl AdjustmentTap {
             self.flush(at);
             return false;
         }
-        self.send(at, event);
+        self.send(at, event, stamp);
         true
     }
 
-    fn send(&mut self, at: TimeUs, event: TapEvent) {
+    /// Queues `event`, stamped `stamp` (the word its producer observed it
+    /// under), or with none the ingress word now.
+    fn send(&mut self, at: TimeUs, event: TapEvent, stamp: Option<Ingress>) {
         let at = at.max(self.last_at);
         let seq = self.seq;
-        if self.queue.push(TapObservation { at, seq, event }).is_err() {
+        let ingress = stamp.unwrap_or_else(|| {
+            self.activity
+                .as_ref()
+                .map_or(Ingress::INITIAL, |r| r.ingress())
+        });
+        let observation = TapObservation {
+            at,
+            seq,
+            event,
+            ingress,
+        };
+        if self.queue.push(observation).is_err() {
             // The reserved slots make this unreachable for what is owed,
             // and an observation is pushed only with room.
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -1552,7 +1622,7 @@ mod owed_tests {
         while rx.pop().is_some() {}
         // Fill the queue to the last slot.
         for k in 0..ADJUST_QUEUE as i64 {
-            tap.send(TimeUs(k + 1), TapEvent::Tick);
+            tap.send(TimeUs(k + 1), TapEvent::Tick, None);
         }
         tap.owed.push(Marker::Fence(1));
         let rx = std::cell::RefCell::new(rx);

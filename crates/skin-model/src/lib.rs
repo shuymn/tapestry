@@ -112,6 +112,8 @@ mod skin;
 mod track;
 mod widget;
 
+#[cfg(feature = "dev-tools")]
+pub use atlas::PlanShape;
 pub use atlas::uv::{FrameUv, UvTable};
 pub use atlas::{
     ALIGN, ATLAS_TABLE_BYTES, Atlas, AtlasError, AtlasId, AtlasLimits, CELL_TABLE_BYTES,

@@ -32,6 +32,7 @@ mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod end_screen;
+mod failures;
 mod imports;
 mod input_side;
 mod keys;
@@ -853,7 +854,10 @@ fn install_adjustments(rig: &mut PlayerRig<'_>, settings: &Settings) -> anyhow::
     }
     rig.panels = Some(tap.panel_level());
     rig.render.presentation(reader);
-    rig.gate = Some(crate::start_gate::PlayerGate::install(&rig.input, tap));
+    let gate = crate::start_gate::PlayerGate::install(&rig.input, tap);
+    rig.failures
+        .install(driver.failure_cell(), gate.stall_flag());
+    rig.gate = Some(gate);
     rig.adjust = Some(driver);
     Ok(())
 }
@@ -874,7 +878,16 @@ fn rig<'a>(
         steps,
     } = threads;
     let device = &settings.device;
+    #[cfg(test)]
+    let audio_lost = std::sync::Arc::<std::sync::atomic::AtomicBool>::default();
+    let failures = failures::Failures::new(
+        input.failure_handle(),
+        audio.control.failure_probe(),
+        #[cfg(test)]
+        std::sync::Arc::clone(&audio_lost),
+    );
     let mut rig = PlayerRig {
+        failures,
         input,
         audio,
         render,
@@ -969,8 +982,8 @@ fn rig<'a>(
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
-        #[cfg(test)]
-        audio_lost: std::sync::Arc::default(),
+        #[cfg(all(test, feature = "dev-tools"))]
+        audio_lost,
         #[cfg(test)]
         opening_gates: std::sync::Arc::default(),
         #[cfg(test)]
@@ -1068,6 +1081,7 @@ fn menu_input(
     device: &game::DeviceSettings,
     autoplay: bool,
     sources: &mut SourceSet,
+    tuning: &Arc<tuning::LiveTuning>,
 ) -> (Arc<MenuQueue>, result_input::ResultInput) {
     let bindings = select::menu_bindings(
         &device.controller,
@@ -1076,11 +1090,13 @@ fn menu_input(
     )
     .filter(|_| !autoplay);
     let pad = bindings.map(|b| {
-        let (tap, receiver) = input::menu_queue(b);
+        let (mut tap, receiver) = input::menu_queue(b);
+        // Each event stamped with the ingress word as it is sent.
+        tap.set_activity(Arc::clone(tuning.activity()));
         sources.set_menu(tap);
         receiver
     });
-    let menu = Arc::new(MenuQueue::default());
+    let menu = Arc::new(MenuQueue::gated(Arc::clone(tuning)));
     (Arc::clone(&menu), result_input::ResultInput::new(menu, pad))
 }
 
@@ -1127,7 +1143,7 @@ fn play(
     if raw_input {
         axis_mode(&mut sources, device);
     }
-    let (menu, menus) = menu_input(device, !raw_input, &mut sources);
+    let (menu, menus) = menu_input(device, !raw_input, &mut sources, controls.tuning());
     let keys = (device.keyboard.retry, device.keyboard.quit);
     let monitor = device.monitor.clone();
     let wake = move |s: &mut SourceSet, now| {
@@ -1486,7 +1502,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     } else {
         axis_mode(&mut sources, &settings.device);
     }
-    let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources);
+    let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources, controls.tuning());
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1646,6 +1662,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         chosen_at: TimeUs(0),
         loading: None,
         practicing: false,
+        decision: None,
         entered_at: TimeUs(0),
         dirty: true,
         #[cfg(feature = "dev-tools")]
@@ -1962,7 +1979,8 @@ mod tests {
             ..game::DeviceSettings::default()
         };
         let mut set = sources();
-        let (window, mut menus) = menu_input(&configured, false, &mut set);
+        let tuning = Arc::clone(Controls::new(QpcClock::start()).tuning());
+        let (window, mut menus) = menu_input(&configured, false, &mut set, &tuning);
         assert!(Arc::ptr_eq(&window, &menus.menu));
         assert!(menus.pad.receiver.is_some());
         assert!(set.menu_mut().is_some());
@@ -1975,7 +1993,7 @@ mod tests {
             (&game::DeviceSettings::default(), false),
         ] {
             let mut set = sources();
-            let (window, menus) = menu_input(device, autoplay, &mut set);
+            let (window, menus) = menu_input(device, autoplay, &mut set, &tuning);
             assert!(Arc::ptr_eq(&window, &menus.menu));
             assert!(menus.pad.receiver.is_none());
             assert!(set.menu_mut().is_none());
