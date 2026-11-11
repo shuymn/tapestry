@@ -52,6 +52,9 @@ impl PlayerRig<'_> {
         if let Some(job) = sel.page.take_bank() {
             let observed = match job.promote_unless_ended() {
                 Promotion::Live => {
+                    #[cfg(test)]
+                    sel.page
+                        .probe(crate::page_jobs::PageAt::Promoted(JobKind::Bank));
                     let shown = Arc::clone(progress);
                     sel.page.show(Some(Box::new(move |done, files| {
                         shown.decoded(done, files)
@@ -115,6 +118,9 @@ impl PlayerRig<'_> {
         if let Some(job) = sel.page.take_measure() {
             let observed = match job.promote_unless_ended() {
                 Promotion::Live => {
+                    #[cfg(test)]
+                    sel.page
+                        .probe(crate::page_jobs::PageAt::Promoted(JobKind::Measure));
                     let (adjust, input, controls) = (&mut self.adjust, &self.input, self.controls);
                     let waited = job.wait(crate::play::MARKER_PARK, || {
                         crate::play::serve_adjustments(adjust.as_mut(), input, controls.tuning());

@@ -2183,7 +2183,10 @@ impl AppRig for PlayerRig<'_> {
             .and_then(|_| self.selection.as_ref())
             .and_then(|s| s.page.chart_of(loaded.path()).cloned());
         let mut reused = None;
-        if let Some(practised) = &practised {
+        // At another speed with the gain known, the 1× bank is not needed.
+        let known = speed != bms_model::Speed::NORMAL
+            && self.selection.as_ref().is_some_and(|s| s.page.gain_known());
+        if let Some(practised) = practised.as_ref().filter(|_| !known) {
             let bank = match self.page_bank(practised, &progress)? {
                 Got::Ready(bank) => bank,
                 Got::Cancelled => {
