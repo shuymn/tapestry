@@ -391,6 +391,14 @@ pub(crate) enum Value {
     /// display offset in ms, `display_offset.ms`, truncated toward zero as
     /// the selection screen shows it, live after an offset key.
     DisplayOffset,
+    /// The application's readouts, 20 to 29 as `id − 20`
+    /// (`IntegerPropertyFactory.java:98-107`): the frames presented in the
+    /// last second (`current_fps`), the local year, month (1 to 12), day,
+    /// 24-hour hour, minute and second (`currenttime_*`, the source's
+    /// `Calendar` fields with its month made 1-based), and the uptime's
+    /// whole hours, minutes and seconds since launch (`boottime_*`,
+    /// `MainController.java:671-673`), read from `app.*` and `clock.*`.
+    App(u8),
     /// A selection number, over the selection schema
     /// ([`super::selection::profile::number`]).
     Selection(SelValue),
@@ -398,6 +406,20 @@ pub(crate) enum Value {
     /// ([`super::result::profile::number`]).
     Result(ResValue),
 }
+
+/// The fields of [`Value::App`] by `id − 20`.
+const APP_FIELDS: [&str; 10] = [
+    "app.fps",
+    "clock.year",
+    "clock.month",
+    "clock.day",
+    "clock.hour",
+    "clock.minute",
+    "clock.second",
+    "app.uptime_h",
+    "app.uptime_m",
+    "app.uptime_s",
+];
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
 const DURATION_VARIANTS: [&str; 16] = [
@@ -498,6 +520,10 @@ impl Value {
             Self::RecentTiming => "judge.recent_ms",
             Self::SongTotal => "chart.total",
             Self::DisplayOffset => "display_offset.ms",
+            Self::App(n) => APP_FIELDS
+                .get(usize::from(n))
+                .copied()
+                .unwrap_or("app.uptime_s"),
             Self::Selection(v) => v.expr(),
             Self::Result(v) => v.expr,
             Self::DurationVariant(n) => DURATION_VARIANTS
@@ -566,6 +592,7 @@ impl Value {
                 | Self::RecentTiming
                 | Self::SongTotal
                 | Self::DisplayOffset
+                | Self::App(_)
                 | Self::Selection(_)
                 | Self::Result(_)
         )
@@ -747,6 +774,7 @@ fn shown(id: i32) -> Option<Value> {
         525 => Value::RecentTiming,
         368 => Value::SongTotal,
         12 => Value::DisplayOffset,
+        20..=29 => Value::App(u8::try_from(id - 20).ok()?),
         160 => Value::BpmNow,
         161 => Value::ElapsedMinutes,
         162 => Value::ElapsedSeconds,
@@ -1112,6 +1140,49 @@ mod tests {
             assert!(VALUE_TYPES.contains(&(id, name)));
         }
         assert!(STRING_TYPES.contains(&(12, "fulltitle")));
+    }
+
+    /// Numbers 20 to 29 read the application's readouts on play, by id
+    /// and by name, and stay unsupported on selection and result, whose
+    /// rows bridge them (S10-09e, S10-16).
+    #[test]
+    fn application_readouts_resolve_on_play() {
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        let named = [
+            (20, "current_fps", "app.fps", (0, 1_024)),
+            (21, "currenttime_year", "clock.year", (0, 30_827)),
+            (22, "currenttime_month", "clock.month", (0, 12)),
+            (23, "currenttime_day", "clock.day", (0, 31)),
+            (24, "currenttime_hour", "clock.hour", (0, 23)),
+            (25, "currenttime_minute", "clock.minute", (0, 59)),
+            (26, "currenttime_saecond", "clock.second", (0, 59)),
+            (
+                27,
+                "boottime_hour",
+                "app.uptime_h",
+                (0, i64::from(i32::MAX)),
+            ),
+            (28, "boottime_minute", "app.uptime_m", (0, 59)),
+            (29, "boottime_second", "app.uptime_s", (0, 59)),
+        ];
+        for (id, name, expr, range) in named {
+            let value = Value::App(u8::try_from(id - 20).unwrap());
+            assert_eq!(int_in(ScreenKind::Play, id), IntProp::Shown(value), "{id}");
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(value)), "{name}");
+            assert_eq!((value.expr(), value.availability()), (expr, None), "{id}");
+            assert_eq!(value.range(), range, "{id}");
+            assert!(!value.deviates() && value.part().is_none(), "{id}");
+            assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
+            for kind in [ScreenKind::Selection, ScreenKind::Result] {
+                assert_eq!(
+                    int_in(kind, id),
+                    IntProp::Unsupported(Some(id)),
+                    "{kind:?} {id}"
+                );
+            }
+        }
+        assert_eq!(int_by_id(19), IntProp::Unsupported(Some(19)));
+        assert_eq!(int_by_id(30), IntProp::Unsupported(Some(30)));
     }
 
     #[test]

@@ -118,6 +118,7 @@ struct Loader {
     covers: CoverSettings,
     display_offset: TimeUs,
     fix_hispeed: u8,
+    app: skin_model::AppReadouts,
 }
 
 impl Loader {
@@ -136,6 +137,7 @@ impl Loader {
             covers: readouts_for(VIEW).covers,
             display_offset: TimeUs(0),
             fix_hispeed: 0,
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -143,6 +145,7 @@ impl Loader {
         self.batch.clear();
         let layout = Layout::AUTHOR;
         let frame = LoadingFrame {
+            app: self.app,
             display_offset: self.display_offset,
             fix_hispeed: self.fix_hispeed,
             difficulty: None,
@@ -999,6 +1002,54 @@ fn the_settings_read_the_loading_frame() {
     assert_eq!(l.field(field::DISPLAY_OFFSET_MS), 1);
     l.fix_hispeed = 5;
     assert_eq!(l.try_build_us(400 * MS), Err(BuildError::InvalidReadouts));
+}
+
+/// C7-C9 while loading: the application fields are Live, the loading
+/// frame's own readouts, so a program reading them draws; readouts outside
+/// their ranges refuse the state.
+#[test]
+fn the_application_fields_read_the_loading_frame() {
+    let mut l = Loader::new(skin(
+        Vec::new(),
+        None,
+        vec![
+            untimed(Source::Number(0), [0, 200, 80, 20], Place::SCREEN),
+            shown_when(
+                MARK,
+                [0, 0, 10, 10],
+                "clock.month == 11 && clock.hour == 23",
+            ),
+            shown_when(OTHER, [0, 0, 10, 10], "app.uptime_h == 600"),
+        ],
+        WidgetDefs {
+            numbers: vec![number("app.fps")],
+            ..WidgetDefs::default()
+        },
+    ));
+    l.build(100);
+    assert_eq!([l.count(MARK), l.count(OTHER)], [0, 0]);
+    assert_eq!(l.digits(), [0]);
+    l.app = skin_model::AppReadouts {
+        fps: 59,
+        uptime_us: 2_160_061_999_000,
+        local: skin_model::LocalTime {
+            year: 2_026,
+            month: 11,
+            day: 11,
+            hour: 23,
+            minute: 59,
+            second: 58,
+        },
+    };
+    l.build(200);
+    let fields: Vec<i32> = (field::APP_FPS..=field::APP_UPTIME_S)
+        .map(|s| l.field(s))
+        .collect();
+    assert_eq!(fields, [59, 2_026, 11, 11, 23, 59, 58, 600, 1, 1]);
+    assert_eq!(l.digits(), [5, 9]);
+    assert_eq!([l.count(MARK), l.count(OTHER)], [1, 1]);
+    l.app.local.month = 13;
+    assert_eq!(l.try_build_us(300 * MS), Err(BuildError::InvalidReadouts));
 }
 
 /// A refused loading build leaves the state refused: later builds return

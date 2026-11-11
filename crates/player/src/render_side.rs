@@ -2859,6 +2859,7 @@ pub fn spawn(
                 prepared: None,
                 presentation: None,
                 turntable: crate::turntable::Turntable::default(),
+                app: crate::app_clock::AppClock::new(),
                 page_turns: false,
                 tuning: None,
                 current: None,
@@ -2959,8 +2960,9 @@ fn take_loading(
 /// `update`; the author's layout, and the covers, `adjusting`, display
 /// offset and hi-speed fix of the adjustments' newest `snapshot` (every
 /// cover 0 and off, no offset and Classic without one), no gain, which a
-/// loading frame has none of. Without a state yet it is the
-/// lifetime's first moment: from `now`, nothing loaded. Allocates nothing.
+/// loading frame has none of; the application's readouts `app`. Without a
+/// state yet it is the lifetime's first moment: from `now`, nothing
+/// loaded. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn loading_frame_of(
     lifetime: u64,
@@ -2968,6 +2970,7 @@ fn loading_frame_of(
     update: Option<&LoadingUpdate>,
     snapshot: Option<&game::adjustment::PresentationSnapshot>,
     turntable: i32,
+    app: skin_model::AppReadouts,
 ) -> LoadingFrame<'static> {
     let (lanes, readouts, display_offset) = match snapshot {
         Some(s) => {
@@ -3011,6 +3014,7 @@ fn loading_frame_of(
         play_level,
         autoplay,
         text,
+        app,
     }
 }
 
@@ -3461,6 +3465,9 @@ struct Run {
     presentation: Option<game::adjustment::PresentationReader>,
     /// The play state's turntable (docs/stage3.md, offset 1).
     turntable: crate::turntable::Turntable,
+    /// The application clock: every screen's presents, which each play
+    /// and loading frame's readouts count.
+    app: crate::app_clock::AppClock,
     /// Whether the page drawn is the practice page
     /// ([`RenderMsg::PracticePage`]), whose frames tick the turntable.
     page_turns: bool,
@@ -4100,6 +4107,10 @@ impl Run {
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it.
             let frame_at = self.clock.now();
+            // The application's readouts at that instant: the presents of
+            // the last second, the local time and the uptime, the clock
+            // reading 0 at launch.
+            let app = self.app.readouts(frame_at);
             // Whether a result frame was built with its skin (dev-tools:
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
@@ -4233,6 +4244,7 @@ impl Run {
                         overlay: &overlay[..shown],
                         target: screen.target(),
                         turntable: self.turntable.angle(),
+                        app,
                     };
                     let built = screen.build(&f);
                     #[cfg(feature = "dev-tools")]
@@ -4293,6 +4305,7 @@ impl Run {
                             update.as_deref(),
                             snapshot.as_ref(),
                             self.turntable.angle(),
+                            app,
                         );
                         match screen.loading(page, update.as_deref(), *changed, &frame) {
                             Ok(Ok(t)) => Ok(t),
@@ -4524,6 +4537,13 @@ impl Run {
             let presented_at = presented_at.unwrap_or_else(|| self.clock.now());
             if !minimized {
                 self.granted = false;
+            }
+            // Every screen's frame that reached the screen counts towards
+            // the frames per second.
+            if let Ok((timing, _)) = &drawn
+                && timing.presented
+            {
+                self.app.presented(self.clock.now());
             }
             // The play state's turntable ticks on each presented frame of
             // the practice page, loading and play, after it drew; a
@@ -8967,7 +8987,8 @@ pub(crate) mod tests {
     /// A screen noting each frame's chart time with the rearms it was told
     /// of so far.
     struct RearmedFrames {
-        /// Each frame's rearms so far, chart time and state clock.
+        /// Each frame's rearms so far, chart time, state clock and
+        /// application readouts.
         frames: Noted,
         rearms: u32,
     }
@@ -8990,7 +9011,7 @@ pub(crate) mod tests {
             self.frames
                 .lock()
                 .unwrap()
-                .push((self.rearms, f.now, f.state_us));
+                .push((self.rearms, f.now, f.state_us, f.app));
             Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -9009,7 +9030,7 @@ pub(crate) mod tests {
     }
 
     /// The frames [`RearmedFrames`] notes.
-    type Noted = Arc<std::sync::Mutex<Vec<(u32, TimeUs, i64)>>>;
+    type Noted = Arc<std::sync::Mutex<Vec<(u32, TimeUs, i64, skin_model::AppReadouts)>>>;
 
     /// A chart with one tap at 60 s.
     fn late_tap() -> Chart {
@@ -9091,11 +9112,11 @@ pub(crate) mod tests {
             .lock()
             .unwrap()
             .iter()
-            .any(|(_, now, _)| now.0 < -9_000_000)));
+            .any(|(_, now, ..)| now.0 < -9_000_000)));
         let _ = link.finish(clock.now());
         link.exit();
         let frames = frames.lock().unwrap();
-        for &(rearms, now, _) in frames.iter() {
+        for &(rearms, now, ..) in frames.iter() {
             let expected = u32::from(now.0 < -9_000_000);
             assert_eq!(rearms, expected, "a frame at {now:?}");
         }
@@ -9131,7 +9152,7 @@ pub(crate) mod tests {
         link.exit();
         let frames = frames.lock().unwrap();
         let mut last = i64::MIN;
-        for &(rearms, now, state_us) in frames.iter() {
+        for &(rearms, now, state_us, _) in frames.iter() {
             // One sample: the chart time on its candidate's origin, the
             // state clock on the state's.
             let origin = if rearms == 0 { first } else { second };
@@ -9143,6 +9164,51 @@ pub(crate) mod tests {
             assert!(now.0 < 0 && state_us >= 7_000_000 && state_us >= last);
             last = state_us;
         }
+    }
+
+    /// C9: each play frame's uptime is the render thread's clock, the one
+    /// `main` starts at launch, at the frame's own sample: never the state
+    /// clock nor the chart time, through READY and a rearm. C7: the frames
+    /// the screen presented count towards the frames per second.
+    #[test]
+    fn the_uptime_is_the_launch_clock_s_not_the_state_clock() {
+        let (chart, rule, device) = (late_tap(), rules::tapestry(), DeviceProfile::default());
+        let (mut logic, side, frames, clock, link) = rearmed_play(&chart, &rule, &device);
+        // The state entered 7 s ago; the first candidate's chart time 0
+        // lies 2 s ahead.
+        let state_origin = TimeUs(clock.now().0 - 7_000_000);
+        let first = TimeUs(clock.now().0 + 2_000_000);
+        link.send(RenderMsg::Play {
+            side,
+            gauge: 0,
+            measure: play_measure(first),
+            state_origin,
+        });
+        assert!(wait_until(|| frames.lock().unwrap().len() >= 30));
+        logic.rearm(&InputStart::default(), TimeUs(clock.now().0 + 10_000_000));
+        assert!(wait_until(|| frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(rearms, ..)| rearms == 1)));
+        let _ = link.finish(clock.now());
+        link.exit();
+        let end = clock.now();
+        let frames = frames.lock().unwrap();
+        let mut last = 0;
+        for &(rearms, now, state_us, app) in frames.iter() {
+            // One sample: the state clock is the uptime less the state's
+            // origin on the same clock, 7 s apart from it.
+            assert_eq!(app.uptime_us, state_us + state_origin.0, "{rearms} {now:?}");
+            assert_ne!(app.uptime_us, state_us);
+            assert_ne!(app.uptime_us, now.0);
+            assert!(app.uptime_us >= last && app.uptime_us <= end.0);
+            last = app.uptime_us;
+            assert!(app.fps <= 1_024 && (1..=12).contains(&app.local.month));
+        }
+        // The frames the screen presented are counted: unpaced, about one
+        // each 16 ms.
+        assert!(frames.iter().any(|f| f.3.fps >= 10), "{:?}", frames.last());
     }
 
     /// A READY capture belongs to its attempt's first candidate: a real
@@ -12500,7 +12566,15 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let level = |lifetime, u: Option<&LoadingUpdate>| {
-            super::loading_frame_of(lifetime, TimeUs(1_000), u, None, 0).play_level
+            super::loading_frame_of(
+                lifetime,
+                TimeUs(1_000),
+                u,
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            )
+            .play_level
         };
         assert_eq!(level(1, None), None);
         assert_eq!(level(1, Some(&update(1, Some(12)))), Some(12));
@@ -12525,7 +12599,14 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let read = |lifetime, u: Option<&LoadingUpdate>| {
-            let f = super::loading_frame_of(lifetime, TimeUs(1_000), u, None, 0);
+            let f = super::loading_frame_of(
+                lifetime,
+                TimeUs(1_000),
+                u,
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            );
             (f.difficulty, f.bga)
         };
         assert_eq!(read(1, None), (None, None));
@@ -12556,7 +12637,14 @@ pub(crate) mod tests {
                 crate::loading_state::LifetimeState::new(1, TimeUs(0), &text, None)
                     .apply(LoadInput::Stage(Stage::Chart))
             });
-            let frame = super::loading_frame_of(1, TimeUs(1_000), update.as_ref(), None, 0);
+            let frame = super::loading_frame_of(
+                1,
+                TimeUs(1_000),
+                update.as_ref(),
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            );
             batch.clear();
             skin.build_loading(&mut loading, &frame.model(), &uvs, &mut batch)
                 .unwrap();
@@ -12613,7 +12701,14 @@ pub(crate) mod tests {
         let before = this_thread();
         let mut read = [(None, None); 4];
         for (r, u) in read.iter_mut().zip(updates.iter().map(Some).chain([None])) {
-            let f = super::loading_frame_of(1, TimeUs(1_000), u, None, 0);
+            let f = super::loading_frame_of(
+                1,
+                TimeUs(1_000),
+                u,
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            );
             *r = std::hint::black_box((f.difficulty, f.bga));
         }
         assert_eq!(this_thread(), before, "a loading frame allocated");
@@ -12642,9 +12737,16 @@ pub(crate) mod tests {
                 .apply(LoadInput::Stage(Stage::Chart))
         };
         let autoplay = |u: Option<&LoadingUpdate>| {
-            super::loading_frame_of(1, TimeUs(1_000), u, None, 0)
-                .model()
-                .autoplay
+            super::loading_frame_of(
+                1,
+                TimeUs(1_000),
+                u,
+                None,
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            )
+            .model()
+            .autoplay
         };
         assert!(!autoplay(None));
         assert!(autoplay(Some(&update(true))));
@@ -12688,7 +12790,15 @@ pub(crate) mod tests {
             (1_500, 1),
             (15_000, 15),
         ] {
-            let f = super::loading_frame_of(1, TimeUs(1_000), None, Some(&snapshot(us)), 0).model();
+            let f = super::loading_frame_of(
+                1,
+                TimeUs(1_000),
+                None,
+                Some(&snapshot(us)),
+                0,
+                skin_model::AppReadouts::LAUNCH,
+            )
+            .model();
             assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(us), 3), "{us}");
             let tuning = crate::tuning::LiveTuning::new(game::Tuning {
                 volume_percent: 100,
@@ -12699,7 +12809,15 @@ pub(crate) mod tests {
             assert_eq!(shown.display_offset_ms, ms, "{us}");
             assert_eq!(f.display_offset.0 / 1_000, i64::from(ms), "{us}");
         }
-        let f = super::loading_frame_of(1, TimeUs(1_000), None, None, 0).model();
+        let f = super::loading_frame_of(
+            1,
+            TimeUs(1_000),
+            None,
+            None,
+            0,
+            skin_model::AppReadouts::LAUNCH,
+        )
+        .model();
         assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(0), 0));
     }
 
