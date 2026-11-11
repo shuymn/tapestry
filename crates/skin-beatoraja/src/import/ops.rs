@@ -875,6 +875,51 @@ mod tests {
         assert_eq!(numeric(-171, &none), Cond::Unsupported(-171));
     }
 
+    /// The judgment class options on the result screen are play's
+    /// expressions over the result schema's `chart.judge_class`, by id
+    /// and by name, a negation wrapping the whole (180's validity
+    /// included), and no group guard: the class is the chart's under
+    /// every status. The decision screen's stay unsupported.
+    #[test]
+    fn judge_class_conditions_map_on_the_result_screen() {
+        let none = BTreeMap::new();
+        let scope = skin_model::Scope::new(&skin_model::RESULT);
+        for (id, name, src) in [
+            (
+                180,
+                "chart_judge_veryhard",
+                "chart.judge_class_valid && chart.judge_class == 0",
+            ),
+            (181, "chart_judge_hard", "chart.judge_class == 1"),
+            (182, "chart_judge_normal", "chart.judge_class == 2"),
+            (183, "chart_judge_easy", "chart.judge_class == 3"),
+            (184, "chart_judge_veryeasy", "chart.judge_class == 4"),
+        ] {
+            assert_eq!(
+                numeric_in(ScreenKind::Result, id, &none),
+                expr(src, false),
+                "{id}"
+            );
+            assert_eq!(
+                named_in(ScreenKind::Result, name),
+                Some(expr(src, false)),
+                "{name}"
+            );
+            assert_eq!(
+                numeric_in(ScreenKind::Result, -id, &none),
+                expr(&format!("!({src})"), false),
+                "{id}"
+            );
+            assert_eq!(numeric(id, &none), expr(src, false), "{id}: play's");
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Bool).is_ok());
+            assert_eq!(
+                numeric_in(ScreenKind::Decision, id, &none),
+                Cond::Unsupported(id),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn cover_bpm_change_and_timing_conditions_map() {
         let none = BTreeMap::new();
