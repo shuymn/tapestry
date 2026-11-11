@@ -990,7 +990,9 @@ fn loading_frames() {
         b.side(),
         [64, 48],
     );
-    let table = r.publish_chart_images([Some(&stage), None]).unwrap();
+    let table = r
+        .publish_chart_images(render::ChartTarget::Committed, [Some(&stage), None])
+        .unwrap();
     assert!(table.present(skin_model::chart_image::ChartImage::Stage));
     // The chosen chart's text prepared and installed for lifetime 1
     // between frames, outside the count.
@@ -1084,6 +1086,34 @@ fn loading_frames() {
         second_allocs, 0,
         "a second lifetime's first frame allocated"
     );
+    // A new choice's invalidation between frames, then a terminal absence
+    // published (S10-12): the frames reading the images unavailable, then
+    // absent, allocate nothing either.
+    let shown = staging.instances().len();
+    r.invalidate_chart_images();
+    let (unavailable, unavailable_allocs) = counted(|| {
+        staging
+            .build_loading(&mut skin, &next)
+            .map(|()| staging.instances().len())
+    });
+    assert!(
+        unavailable.unwrap() < shown,
+        "the stage file is unavailable"
+    );
+    assert_eq!(
+        unavailable_allocs, 0,
+        "a frame after an invalidation allocated"
+    );
+    r.publish_chart_absent(render::ChartTarget::Committed)
+        .unwrap();
+    skin.set_chart_live(r.chart_key());
+    let (absent, absent_allocs) = counted(|| {
+        staging
+            .build_loading(&mut skin, &next)
+            .map(|()| staging.instances().len())
+    });
+    assert!(absent.unwrap() > 0);
+    assert_eq!(absent_allocs, 0, "a frame with the images absent allocated");
 }
 
 /// A `w`×`h` green picture, read and fitted into `which`'s slot of a
