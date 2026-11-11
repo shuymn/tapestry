@@ -145,6 +145,12 @@ impl Cx<'_> {
                         return Ok(());
                     }
                 },
+                // An empty string draws nothing (`SkinText.java:106-107`),
+                // as a callback's empty result.
+                StrProp::Empty => {
+                    self.ignored(at, NoteKind::Ignored { field: "value" });
+                    return Ok(());
+                }
                 StrProp::Unsupported(id) => {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::String,

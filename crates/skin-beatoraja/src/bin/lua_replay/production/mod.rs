@@ -153,9 +153,11 @@ const LIMITS: AtlasLimits = AtlasLimits {
     reserved_layers: 1,
 };
 
-/// The readouts of a frame: every cover on at 0, nothing else known.
-fn readouts() -> FrameReadouts {
+/// The readouts of a frame: every cover on at 0, the script's hi-speed
+/// fix, nothing else known.
+fn readouts(fix_hispeed: u8) -> FrameReadouts {
     FrameReadouts {
+        fix_hispeed,
         covers: CoverSettings {
             cover: 0,
             lift: 0,
@@ -259,7 +261,9 @@ pub fn record(
                             target: [1_920, 1_080],
                             layout: &Layout::AUTHOR,
                             lanes: view,
-                            covers: readouts().covers,
+                            covers: readouts(script.fix_hispeed).covers,
+                            display_offset: TimeUs(0),
+                            fix_hispeed: script.fix_hispeed,
                             gauge: None,
                             play_level,
                             difficulty: None,
@@ -410,7 +414,7 @@ pub fn record(
                                 lanes: view,
                                 playing,
                                 closing: st.closing,
-                                readouts: readouts(),
+                                readouts: readouts(script.fix_hispeed),
                             };
                             batch.clear();
                             skin.build(&mut play, &frame, &uvs, &mut batch)

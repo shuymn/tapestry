@@ -200,6 +200,8 @@ impl IndexProp {
                 | Self::LiftEnabled
                 | Self::HiddenEnabled
                 | Self::RandomOption
+                | Self::FixHispeed
+                | Self::AutoAdjust
                 | Self::LaneJudge(_)
         )
     }
@@ -212,7 +214,7 @@ enum Static {
     Dynamic,
     /// Static, and its value is known at import: tapestry has no
     /// difficulty table or course (`table_song`, `:351-352`; `mode_course`,
-    /// `:526-527`), so both are false.
+    /// `:526-527`; the course stages, `:521-525`), so all are false.
     Known(bool),
     /// Static, read from the chart (`SongDataBooleanProperty`, `:251-265`,
     /// `:435-452`), which the play maps.
@@ -225,7 +227,7 @@ enum Static {
 /// The class on play of boolean property `id` (its absolute id).
 fn static_class(id: i32) -> Static {
     match id {
-        ops::TABLE_SONG | ops::COURSE_MODE => Static::Known(false),
+        ops::TABLE_SONG | ops::COURSE_MODE | 280..=283 | 289 => Static::Known(false),
         150..=155 | 170 | 176 | 177 | 180..=184 => Static::Chart,
         171..=175
         | 178
@@ -237,8 +239,6 @@ fn static_class(id: i32) -> Static {
         | 40
         | 41
         | 190..=195
-        | 280..=283
-        | 289
         | 50
         | 51
         | 118

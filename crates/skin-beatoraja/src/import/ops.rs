@@ -315,6 +315,23 @@ const LOADED: i32 = 81;
 /// difficulty tables and outside one the source's table name is empty
 /// (`PlayerResource.java:128-129`).
 pub(crate) const TABLE_SONG: i32 = 1_008;
+/// `replay_playing` (`BooleanPropertyFactory.java:422-423`): a replay is
+/// playing, false, as a play never replays a record.
+const REPLAY_PLAYING: i32 = 84;
+/// `course_stage1` to `course_stage4` and `course_stage_final`
+/// (`BooleanPropertyFactory.java:521-525`): the course's stage, false, as
+/// there are no courses.
+const COURSE_STAGES: [i32; 5] = [280, 281, 282, 283, 289];
+/// `constant` (`BooleanPropertyFactory.java:723-735`): the play
+/// configuration's constant mode, false, as tapestry has none.
+const CONSTANT: i32 = 400;
+
+/// Whether play's built-in `id` (positive) is a constant false: a feature
+/// tapestry does not have, shown in its empty state (stage3.md §1).
+pub(crate) fn play_constant_false(id: i32) -> bool {
+    matches!(id, TABLE_SONG | COURSE_MODE | REPLAY_PLAYING | CONSTANT)
+        || COURSE_STAGES.contains(&id)
+}
 
 /// A condition as the importer reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,7 +457,7 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 /// state whichever widget draws it, where the source reads it from a
 /// judge region its judge widget makes (`JudgeManager.java:129, 686`).
 fn built_in_cond(id: i32, negative: bool) -> Cond {
-    if id == TABLE_SONG || id == COURSE_MODE {
+    if play_constant_false(id) {
         return Cond::Fold(negative);
     }
     match builtin(id) {

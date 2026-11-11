@@ -1337,6 +1337,8 @@ fn loading_probes(
             hidden: 0,
         };
         let frame = LoadingFrame {
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
             autoplay: false,
             now: TimeUs(ms * 1_000),
             load: LoadState {
@@ -1359,6 +1361,8 @@ fn loading_probes(
     }
     // Covers the frame's lanes do not show: refused, then for good.
     let mut frame = LoadingFrame {
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
         autoplay: false,
         now: TimeUs(6_000_000),
         load: LoadState {
@@ -2042,6 +2046,7 @@ fn readout_probes(
                 };
                 let floating = k % 2 == 0;
                 let readouts = FrameReadouts {
+                    fix_hispeed: 0,
                     bpm_current_x100: bpm,
                     hispeed_x100: hs,
                     duration: at(0),
@@ -2214,6 +2219,7 @@ pub(crate) fn seeded_readouts(
     let duration_variants = std::array::from_fn(|_| ratio());
     let native = ratio();
     let seeded = FrameReadouts {
+        fix_hispeed: 0,
         bpm_current_x100: bpm,
         hispeed_x100: hispeed,
         duration: ratio(),

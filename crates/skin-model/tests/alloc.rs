@@ -2320,6 +2320,8 @@ fn build_does_not_allocate() {
     for ms in (0..2_000).step_by(16) {
         batch.clear();
         let frame = LoadingFrame {
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
             difficulty: None,
             bga: None,
             autoplay: false,
@@ -2363,6 +2365,8 @@ fn loading_frame<'a>(
 ) -> LoadingFrame<'a> {
     let view = views.lanes[(no / 7) % views.lanes.len()];
     LoadingFrame {
+        display_offset: TimeUs(0),
+        fix_hispeed: 0,
         difficulty: (no % 7 != 6).then_some(u8::try_from(no % 6).unwrap()),
         bga: (no % 4 != 3).then_some(no % 8 < 4),
         autoplay: no.is_multiple_of(2),
@@ -3897,6 +3901,7 @@ fn stretch_readouts(frame_no: usize, view: LaneView) -> FrameReadouts {
     match frame_no / 7 % 3 {
         0 => base,
         1 => FrameReadouts {
+            fix_hispeed: 0,
             bpm_current_x100: Some(15_000 + k),
             hispeed_x100: Some(100 + k),
             duration: Some(DurationRatio {

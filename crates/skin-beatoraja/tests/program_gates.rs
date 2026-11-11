@@ -328,9 +328,35 @@ fn static_folds_remove_the_object() {
         ("op = { -1008 },", 1),
         ("op = { \"!table_song\" },", 1),
         ("draw = 290,", 0),
+        // The course stages are static too (S10-13b), and false.
+        ("op = { 281 },", 0),
+        ("op = { \"course_stage_final\" },", 0),
+        ("op = { -289 },", 1),
     ] {
         let mut p = played(&format!("{number}{}", dst("m", fields)));
         assert_eq!(invoked(&mut p, 1_000, &[]), want, "{fields}");
+    }
+}
+
+/// The replay (84) and constant-mode (400) options fold false but stay
+/// dynamic, as the source evaluates them every frame: the object is kept
+/// and its number's value callback runs before the false condition hides
+/// it. Classifying either as static would remove the object and run
+/// nothing.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn dynamic_constants_keep_the_value_callback() {
+    let number = "skin.value = { { id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,\n\
+         value = function() return ms.number(100) / 2 end } }\n";
+    for fields in [
+        "op = { 84 },",
+        "op = { -84 },",
+        "op = { 400 },",
+        "op = { -400 },",
+    ] {
+        let mut p = played(&format!("{number}{}", dst("m", fields)));
+        assert_eq!(invoked(&mut p, 1_000, &[]), 1, "{fields}");
+        assert_eq!(invoked(&mut p, 1_016, &[]), 1, "{fields}");
     }
 }
 

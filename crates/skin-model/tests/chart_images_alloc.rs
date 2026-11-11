@@ -174,6 +174,8 @@ fn chart_image_frames_do_not_allocate() {
     let build = |loading: &mut skin_model::Loading, batch: &mut QuadBatch, now: i64| {
         batch.clear();
         let frame = LoadingFrame {
+            display_offset: TimeUs(0),
+            fix_hispeed: 0,
             difficulty: None,
             bga: None,
             autoplay: false,

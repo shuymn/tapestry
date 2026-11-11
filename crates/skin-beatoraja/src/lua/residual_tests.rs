@@ -538,8 +538,8 @@ fn host_arguments_fold_from_upvalues() {
     for (op, want) in [
         (271, Disposition::Lowered),
         (
-            289,
-            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 289 }),
+            1_177,
+            Disposition::Replaced(Unsupported::Unmapped { api: 0, id: 1_177 }),
         ),
         (
             2_246,
