@@ -415,9 +415,18 @@ pub struct PageJobs {
     kept: Option<Arc<audio::SoundBank>>,
     /// The 1× bank's loudness key, when its lookup missed.
     key: Option<LoudnessKey>,
+    /// The 1× bank's loudness key, hit or miss: the sounds the known gain
+    /// is of.
+    bank_key: Option<LoudnessKey>,
     /// The gain needs no measurement: looked up, taken from the
-    /// background, measured, or failed (the headroom then).
+    /// background, or measured. A failed measurement leaves it unknown.
     gain_known: bool,
+    /// The page has tried its one measurement: a failure or an own cancel
+    /// is left to the Start, and the page does not measure again.
+    measure_tried: bool,
+    /// A page job's panic the run ends with, published while it was
+    /// settled: kept until the caller takes it.
+    fatal: Option<LoadFailure>,
     /// The chart is claimed from the background ([`Shelf::claim`]).
     claimed: bool,
     /// An ordinary refusal of the 1× bank, kept for the Start.
@@ -454,7 +463,10 @@ impl PageJobs {
             measure: None,
             kept: None,
             key: None,
+            bank_key: None,
             gain_known: false,
+            measure_tried: false,
+            fatal: None,
             claimed: false,
             refusal: None,
             mode,
@@ -551,9 +563,10 @@ impl PageJobs {
         let Some(chart) = self.chart.clone() else {
             return Ok(());
         };
+        // Each job's outcome is the one observed here: its settle adds none.
         if let Some(observed) = self.bank.as_ref().and_then(OwnedJob::poll) {
             let job = self.bank.take();
-            self.settle_one(job, &mut || None);
+            let _ = self.settle_one(JobKind::Bank, job, &mut || None);
             match taken(JobKind::Bank, &observed) {
                 Taken::Done(Ok(bank)) => self.keep_bank(shelf, &chart, bank),
                 Taken::Done(Err(audio::BankError::Cancelled)) | Taken::Redo => {}
@@ -563,10 +576,13 @@ impl PageJobs {
         }
         if let Some(observed) = self.measure.as_ref().and_then(OwnedJob::poll) {
             let job = self.measure.take();
-            self.settle_one(job, &mut || None);
+            let _ = self.settle_one(JobKind::Measure, job, &mut || None);
             match taken(JobKind::Measure, &observed) {
                 Taken::Done(Ok(m)) => self.keep_measured(shelf, m),
-                Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo => {}
+                // Left to the Start, which measures in the foreground.
+                Taken::Done(Err(crate::loudness::Cancelled)) | Taken::Redo => {
+                    self.measure_tried = true;
+                }
                 Taken::Fatal(f) => return Err(f),
             }
         }
@@ -579,17 +595,43 @@ impl PageJobs {
         // A bank without a digest is never cached and plays at the
         // headroom: nothing to measure.
         self.key = shelf.look_up_page(&chart.chart, &bank, &chart.name);
+        self.bank_key = crate::loudness::key(&chart.chart, &bank);
         self.gain_known = self.key.is_none();
         self.kept = Some(bank);
     }
 
-    /// The measurement `m` of the kept key, kept on the shelf; none (it
-    /// failed) leaves the headroom, which no Start measures again.
+    /// The 1× bank's loudness key, hit or miss: the sounds the known gain is
+    /// of.
+    pub const fn bank_key(&self) -> Option<LoudnessKey> {
+        self.bank_key
+    }
+
+    /// The measurement `m` of the kept key, kept on the shelf. None (it
+    /// failed) keeps nothing and leaves the gain unknown, so the next
+    /// Start measures again; the page does not.
     pub fn keep_measured(&mut self, shelf: &mut Shelf, m: Option<audio::Measurement>) {
+        let measured = m.is_some();
         if let Some(key) = self.key {
             shelf.keep_measured(key, m);
         }
-        self.gain_known = true;
+        self.gain_known = measured;
+        self.measure_tried = true;
+    }
+
+    /// The gain known is of sounds since replaced: nothing of the 1× bank
+    /// or its gain is kept, so the Start measures the sounds as they are.
+    pub fn forget(&mut self) {
+        self.kept = None;
+        self.key = None;
+        self.bank_key = None;
+        self.gain_known = false;
+        self.measure_tried = false;
+    }
+
+    /// A page job's panic the run ends with, published while it was
+    /// settled, taken.
+    pub fn take_fatal(&mut self) -> Option<LoadFailure> {
+        self.fatal.take()
     }
 
     /// On a miss with no measurement running: the chart claimed from the
@@ -605,7 +647,7 @@ impl PageJobs {
         let (Some(key), Some(bank)) = (self.key, self.kept.clone()) else {
             return;
         };
-        if self.gain_known || self.measure.is_some() {
+        if self.gain_known || self.measure.is_some() || self.measure_tried {
             return;
         }
         match self.claim(shelf, &chart.path, &key) {
@@ -710,26 +752,29 @@ impl PageJobs {
         *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = show;
     }
 
-    /// Settles `job`, if any, as one of [`settle`](Self::settle)'s.
+    /// Settles `job` of `kind`, if any, as one of [`settle`](Self::settle)'s:
+    /// a panic it publishes meanwhile that the run ends with.
     pub fn settle_one<T: Clone>(
         &self,
+        kind: JobKind,
         job: Option<OwnedJob<T>>,
         terminal: &mut dyn FnMut() -> Option<Terminal>,
-    ) {
-        if let Some(job) = job {
-            let mut first = None;
-            self.settle_job(job, &mut first, terminal);
-        }
+    ) -> Option<LoadFailure> {
+        let mut first = None;
+        job.and_then(|job| self.settle_job(kind, job, &mut first, terminal))
     }
 
-    /// Settles one job against the shared deadline: [`STOP_WAIT`] from
-    /// `first`, the first cause's time, once one was seen.
+    /// Settles one job of `kind` against the shared deadline: [`STOP_WAIT`]
+    /// from `first`, the first cause's time, once one was seen. `terminal`
+    /// is asked at every slice. A panic it published that the run ends
+    /// with (a Start was responsible for it) is returned, not dropped.
     fn settle_job<T: Clone>(
         &self,
+        kind: JobKind,
         job: OwnedJob<T>,
         first: &mut Option<Instant>,
         terminal: &mut dyn FnMut() -> Option<Terminal>,
-    ) {
+    ) -> Option<LoadFailure> {
         let clock = Arc::clone(&self.clock);
         let now = move || clock();
         let bound = first.map_or(STOP_WAIT, |at| {
@@ -745,11 +790,19 @@ impl PageJobs {
             }
             c
         };
-        if let Settled::Abandoned { .. } = job.settle(bound, &now, &mut cause) {
-            crate::loudness::log_line(
-                "practice: a page job did not stop in time and is left",
-                true,
-            );
+        let observed = match job.settle(bound, &now, &mut cause) {
+            Settled::Joined { observed, .. } => observed,
+            Settled::Abandoned { observed, .. } => {
+                crate::loudness::log_line(
+                    "practice: a page job did not stop in time and is left",
+                    true,
+                );
+                observed.map(|o| (*o).clone())
+            }
+        };
+        match observed.map(|o| taken(kind, &o)) {
+            Some(Taken::Fatal(f)) => Some(f),
+            _ => None,
         }
     }
 
@@ -759,11 +812,15 @@ impl PageJobs {
     /// (a Start at 1× installs it). The page's chart stays.
     pub fn settle(&mut self, keep_bank: bool, terminal: &mut dyn FnMut() -> Option<Terminal>) {
         let mut first = None;
-        if let Some(job) = self.bank.take() {
-            self.settle_job(job, &mut first, terminal);
+        if let Some(job) = self.bank.take()
+            && let Some(f) = self.settle_job(JobKind::Bank, job, &mut first, terminal)
+        {
+            self.fatal.get_or_insert(f);
         }
-        if let Some(job) = self.measure.take() {
-            self.settle_job(job, &mut first, terminal);
+        if let Some(job) = self.measure.take()
+            && let Some(f) = self.settle_job(JobKind::Measure, job, &mut first, terminal)
+        {
+            self.fatal.get_or_insert(f);
         }
         if !keep_bank {
             self.kept = None;
@@ -772,7 +829,8 @@ impl PageJobs {
 
     /// The chart is left (Back, another choice, the run's end): every job
     /// settled as [`settle`](Self::settle), the bank dropped, the claim
-    /// given back to the background, nothing of the page kept.
+    /// given back to the background, nothing of the page kept but a fatal
+    /// panic published meanwhile ([`take_fatal`](Self::take_fatal)).
     pub fn leave(
         &mut self,
         shelf: Option<&mut Shelf>,
@@ -786,7 +844,9 @@ impl PageJobs {
         }
         self.chart = None;
         self.key = None;
+        self.bank_key = None;
         self.gain_known = false;
+        self.measure_tried = false;
         self.claimed = false;
         self.refusal = None;
         self.show(None);

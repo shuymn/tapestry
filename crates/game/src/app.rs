@@ -133,6 +133,16 @@ pub trait AppRig: LoadingRig {
     fn poll_page(&mut self) -> Result<(), LiveError<Self::ScreenError>> {
         Ok(())
     }
+    /// The chart chosen is left (Back, a refusal), before selection is
+    /// entered again: the rig settles what it kept of it. Nothing by
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// A failure found in what it settled that the run ends with.
+    fn left_chart(&mut self) -> Result<(), LiveError<Self::ScreenError>> {
+        Ok(())
+    }
     /// The practice screen was entered, or returned to: called when it
     /// opens and after every return to it (a refused Start, the rounds
     /// left, a rebuilt screen), before anything is read there. The model
@@ -457,11 +467,12 @@ impl App {
                 Pick::Practice(chart) => (chart, true),
             };
             match self.play_chart(&chart, practice, rig)? {
-                Chosen::Left(Leave::Back) => {}
+                Chosen::Left(Leave::Back) => rig.left_chart()?,
                 Chosen::Left(Leave::Quit) => return Ok(()),
                 // A refusal never hides a thread's failure: the run ends
                 // with it instead.
                 Chosen::Refused(reason) => {
+                    rig.left_chart()?;
                     threads_over(rig)?;
                     refusal = Some(LoadRefusal { chart, reason });
                 }
