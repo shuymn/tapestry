@@ -38,7 +38,7 @@ fn destination() -> impl Strategy<Value = String> {
         ]),
         prop::collection::vec(key(), 1..5),
         prop::sample::select(vec![-1, 0, 50, 100, 500]),
-        prop::sample::select(vec!["", r#""timer": 0,"#, r#""timer": 2,"#, r#""timer": 41,"#,
+        prop::sample::select(vec!["", r#""timer": 0,"#, r#""timer": 2999,"#, r#""timer": 41,"#,
                                   r#""timer": 46,"#, r#""timer": 348,"#, r#""timer": 10000,"#]),
         prop::collection::vec(prop::sample::select(vec![0, 7_777, 241, 232, -232, 202, 900]), 0..3),
         prop::sample::select(vec![0, 2, 3, 4]),
