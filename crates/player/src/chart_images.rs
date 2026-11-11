@@ -673,27 +673,32 @@ mod tests {
         assert_eq!(set.read(ChartImage::Back).image, Err(Absent::Failed));
     }
 
-    /// A chart left while its job runs: the job, cancelled through the
-    /// choice's scope, is kept until its thread ends, and the next chart's
-    /// job begins only then (one worker at a time).
+    /// A chart left while its job's thread is still in a read: the next
+    /// chart's job does not begin beside it, and begins once that thread
+    /// ended (one worker at a time).
     #[test]
     fn the_next_job_waits_for_the_last_ones_thread() {
+        let _serial = crate::imports::tests::serial();
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         png(a.path(), "s.png", [640, 480], [10, 20, 30]);
         png(b.path(), "s.png", [320, 240], [70, 80, 90]);
         let coord = Coordinator::new(CAPS);
         let mut w = ChartImageWorker::default();
+        super::HOLD.store(true, std::sync::atomic::Ordering::Release);
         w.want(want(a.path(), Some(SIDE)));
         w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
-        assert!(!w.idle(), "A's job runs");
-        // The chart is left: its scope advanced, its want forgotten.
-        coord.advance(Scope::Choice);
+        assert_eq!(w.begun, 1);
+        // A is left with its read held: B asked for, never begun meanwhile.
         w.forget();
         w.want(want(b.path(), Some(SIDE)));
-        w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
-        // Either A's thread already ended and B's began, or B waits: never
-        // two jobs alive.
+        for _ in 0..20 {
+            w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(w.begun, 1, "B began beside A's thread");
+        assert!(!w.idle());
+        super::HOLD.store(false, std::sync::atomic::Ordering::Release);
         step_until(&mut w, &coord, Spawner::SYSTEM, |w| {
             w.current().is_some() && w.idle()
         });
@@ -703,6 +708,7 @@ mod tests {
             [320, 240]
         );
         assert_eq!(w.begun, 2);
+        let _ = Scope::Choice;
     }
 
     /// With no coordinator (the direct launch) the images are read at once
