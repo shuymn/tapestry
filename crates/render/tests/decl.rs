@@ -717,6 +717,9 @@ fn a_skin_frame_reads_one_view() {
     assert_eq!(*s.layout, skin_model::Layout::AUTHOR);
     assert_eq!(s.lanes, f.lanes);
     assert_eq!(s.readouts, f.readouts);
+    // The view's offsets ring, by reference.
+    assert!(std::ptr::eq(s.offsets.slots, v.offsets.slots()));
+    assert_eq!(s.offsets.count, v.offsets.count());
 }
 
 /// A playing frame past the notes' end starts the `last_note` timer through
