@@ -463,9 +463,24 @@ impl Lower<'_> {
         match name {
             // The gauge and the judgments are play's alone.
             "gauge_type" | "judge" if !play => Err(unmapped()),
-            // On play no image index is bridged yet (`event_index(55)`, the
-            // speed policy, is S10-13's): named with its id.
-            "event_index" if play => Err(unmapped()),
+            // On play the speed policy's hi-speed fix (55), 0 to 4, read
+            // from the play's live presentation (D4); no other image index
+            // is bridged yet: named with its id.
+            "event_index" if play => {
+                let id = id.ok_or_else(unmapped)?;
+                match property::index_in(self.kind, id) {
+                    p @ IndexProp::FixHispeed => {
+                        let src = p.selector().ok_or_else(unmapped)?;
+                        self.out.deviates |= p.deviates();
+                        Ok(Mapped::Int {
+                            src: Self::text(self.an, &["(", src, ")"])?,
+                            lo: 0,
+                            hi: i64::from(skin_model::FIX_HISPEED_MAX),
+                        })
+                    }
+                    _ => Err(unmapped()),
+                }
+            }
             // An image index the selection profile bridges, as an image's
             // or an image set's `ref` reads it: -1 (nothing) to 10.
             "event_index" => {
