@@ -10,7 +10,7 @@ mod common;
 use common::play::{Drawn, Loader, round};
 use common::{import_body, kinds};
 use skin_beatoraja::{NoteKind, Object, Severity};
-use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
+use skin_model::chart_image::{ChartKey, ChartStretch, ChartTable, ChartUv};
 use skin_model::{Blend, FrameUv};
 
 const KEY: ChartKey = ChartKey {

@@ -2596,6 +2596,7 @@ impl AppRig for PlayerRig<'_> {
         loaded: &Loaded,
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
+        self.chart_images_at_choice(loaded);
         let stepped = decision.stepped();
         let loading = self.watching(loaded, decision, |rig| rig.load_watched(loaded));
         if decision.stepped() && !stepped {

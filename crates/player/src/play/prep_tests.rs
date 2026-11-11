@@ -150,6 +150,7 @@ fn stage(rig: &PlayerRig<'_>) -> &'static str {
         Some(PrepStage::Skin(_)) => "skin",
         Some(PrepStage::Image(..)) => "image",
         Some(PrepStage::Screen(_)) => "screen",
+        Some(PrepStage::Images(..)) => "images",
         Some(PrepStage::Ended(_)) => "ended",
         Some(PrepStage::Answered(_)) => "answered",
     }

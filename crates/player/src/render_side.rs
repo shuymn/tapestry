@@ -165,6 +165,38 @@ pub trait Screen: Send {
     /// Drops what a preparation staged and was not committed. The default
     /// has nothing to drop.
     fn discard(&mut self) {}
+    /// Publishes the chart's images into `target`
+    /// ([`render::Renderer::publish_chart_images`]). The default draws no
+    /// declarative skin, so it has no chart layer.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    fn publish_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        let _ = (target, images);
+        Err(RenderError::NoChartLayer)
+    }
+    /// Publishes the chart's images absent into `target`
+    /// ([`render::Renderer::publish_chart_absent`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        let _ = target;
+        Err(RenderError::NoChartLayer)
+    }
+    /// Makes the chart's images unavailable: a new chart was chosen
+    /// ([`render::Renderer::invalidate_chart_images`]). The default has
+    /// none.
+    fn invalidate_chart_images(&mut self) {}
     /// Stages `skin`'s chart-independent installation of `kind` for
     /// request `request` (its atlas, clips, buffers and loading
     /// presentation, no attempt): it installs nothing until its
@@ -819,6 +851,20 @@ pub enum RenderMsg {
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
     Discard(u64),
+    /// Publish the chart's images (S10-12): into the staged array of the
+    /// attempt `request` prepared when it has one of its own, else into the
+    /// committed play installation; `set` `None` publishes them absent.
+    /// Answer what it left.
+    ChartImages {
+        /// The attempt's request, if one is staged for it.
+        request: Option<u64>,
+        /// The images, or `None` for absent.
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<crate::chart_images::Published>,
+    },
+    /// A new chart was chosen: its images are unavailable until published.
+    ChartImagesInvalidate,
     /// Install this declarative skin's chart-independent installation
     /// for the screen kind, and for play prepare every later attempt
     /// with it; `None` prepares play's later attempts with the skin in
@@ -1998,6 +2044,29 @@ impl RenderLink {
     ///
     /// [`ScreenError::NoAnswer`] past the bound and [`ScreenError::Ended`]
     /// when the render thread is gone.
+    /// Asks the render thread to publish the chart's images `set` (absent
+    /// when `None`) for the attempt of `request`, answering on the receiver
+    /// returned, which the caller polls ([`RenderMsg::ChartImages`]).
+    pub fn publish_chart_images(
+        &self,
+        request: Option<u64>,
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+    ) -> mpsc::Receiver<crate::chart_images::Published> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ChartImages {
+            request,
+            set,
+            reply,
+        });
+        rx
+    }
+
+    /// Tells the render thread a new chart was chosen: its images are
+    /// unavailable until published ([`RenderMsg::ChartImagesInvalidate`]).
+    pub fn invalidate_chart_images(&self) {
+        self.send(RenderMsg::ChartImagesInvalidate);
+    }
+
     pub fn ready_attempt(&self, request: u64, epoch: u64) -> Result<ReadyAnswer, ScreenError> {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Ready {
@@ -3741,6 +3810,8 @@ impl Run {
                         | RenderMsg::Commit { .. }
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
+                        | RenderMsg::ChartImages { .. }
+                        | RenderMsg::ChartImagesInvalidate
                         | RenderMsg::ParkScripts(_))
                 )
             {
@@ -3988,6 +4059,20 @@ impl Run {
                 }
                 Ok(RenderMsg::Discard(request)) => {
                     self.discard(request);
+                    continue;
+                }
+                Ok(RenderMsg::ChartImages {
+                    request,
+                    set,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.publish_chart(request, set.as_deref()));
+                    continue;
+                }
+                Ok(RenderMsg::ChartImagesInvalidate) => {
+                    if let Some(screen) = &mut self.screen {
+                        screen.invalidate_chart_images();
+                    }
                     continue;
                 }
                 Ok(RenderMsg::Select {
@@ -5104,6 +5189,45 @@ impl Run {
     /// kept for a screen built again. The receipt taken under the
     /// commits' lock is answered: the declared Closing duration of the
     /// declarative installation the attempt draws with, staged or in use.
+    /// Publishes `set` (absent when `None`) for the attempt of `request`:
+    /// into its staged array when the staging has one of its own, else into
+    /// the committed play installation (S10-12 design §5.3).
+    fn publish_chart(
+        &mut self,
+        request: Option<u64>,
+        set: Option<&crate::chart_images::ChartImages>,
+    ) -> crate::chart_images::Published {
+        let staged = request.and_then(|r| {
+            self.prepared
+                .as_ref()
+                .filter(|p| p.token.request == r)
+                .map(|p| render::ChartTarget::Staged(p.token))
+        });
+        let Some(screen) = &mut self.screen else {
+            return Err(render::ChartOutcome::Unavailable);
+        };
+        let publish = |screen: &mut Box<dyn Screen>, target| match set {
+            Some(set) => screen.publish_chart_images(target, set.fitted()),
+            None => screen.publish_chart_absent(target),
+        };
+        let mut answer = staged.map_or(Err(RenderError::NoChartLayer), |t| publish(screen, t));
+        // A staging without an array of its own draws from the committed
+        // one: published there.
+        if matches!(answer, Err(RenderError::NoChartLayer)) {
+            answer = publish(screen, render::ChartTarget::Committed);
+        }
+        match answer {
+            Ok(table) => Ok(table),
+            Err(e) => {
+                let outcome = e.chart_outcome();
+                if outcome != render::ChartOutcome::NoTarget {
+                    log::warn!("chart images: {}", game::Chain(&e));
+                }
+                Err(outcome)
+            }
+        }
+    }
+
     fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
         // The loading lifetime current, if one is begun: a pending skin's
         // specialization committed now draws its loading frames. Read

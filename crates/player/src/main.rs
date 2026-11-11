@@ -28,6 +28,7 @@ mod background;
 mod bank_witness;
 mod bests;
 mod carry;
+mod chart_images;
 mod controls;
 #[cfg(feature = "dev-tools")]
 mod dev;
@@ -893,6 +894,8 @@ fn rig<'a>(
         render,
         skin: render_side::SkinState::Ready,
         pending: None,
+        chart_images: crate::chart_images::ChartImageWorker::default(),
+        play_chart: None,
         controls,
         clock,
         recorded: input_side::Recorded {
@@ -1300,6 +1303,7 @@ fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Res
     match start_skins(rig, loaded.settings(), imports::Launch::Direct) {
         Ok(started) => {
             rig.pending = started.pending;
+            rig.play_chart = started.play_chart;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());
@@ -1706,6 +1710,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             }
             // A pending play skin admits charts, each built for.
             rig.pending = started.pending;
+            rig.play_chart = started.play_chart;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());

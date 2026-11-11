@@ -214,6 +214,10 @@ pub enum Absent {
     Changed,
     #[error("the read was cancelled")]
     Cancelled,
+    /// The worker reading it panicked or could not start (the player's):
+    /// the images it had not finished are absent, and the run goes on.
+    #[error("the image's worker failed")]
+    Failed,
 }
 
 /// A slot of an atlas layer an image is fitted into, its gutters
