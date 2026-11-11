@@ -8606,6 +8606,42 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// N2: a lifetime made at the choice and held is drawn only from its
+    /// reveal at the decision screen's deadline, its state published again
+    /// from the reveal on the loading clock, so its timers start there:
+    /// every loading frame drawn carries an origin at or after the reveal,
+    /// and the first one's acknowledgement is the lifetime's.
+    #[test]
+    fn a_held_lifetime_is_drawn_from_its_reveal() {
+        let (link, seen) = held_loading();
+        link.begin_loading_held(&chosen("One"), None);
+        let lifetime = link.loading_lifetime();
+        let made = link.clock.now();
+        link.loading()
+            .report(LoadInput::Stage(Stage::Chart), Some(one_line("A")));
+        // Strictly later on the loading clock than the lifetime's making.
+        while link.clock.now() == made {
+            std::thread::yield_now();
+        }
+        let revealed = link.clock.now();
+        link.reveal_loading();
+        assert!(wait_until(|| link.loading_ack_held()));
+        link.pass_loading_ack();
+        assert!(wait_until(|| link.loading_acked() == 1));
+        assert_eq!(link.loading_ack().map(|(l, _)| l), Some(lifetime));
+        let frames = seen.lock().unwrap().clone();
+        assert!(!frames.is_empty());
+        for (_, update, _) in &frames {
+            let origin = update.as_ref().map(|u| u.origin);
+            assert!(
+                origin.is_some_and(|o| o >= revealed),
+                "{origin:?} {revealed:?}"
+            );
+        }
+        link.hold_loading_ack(false);
+        link.exit();
+    }
+
     /// L2, the render side: a frame of the lifetime before, held across
     /// the next lifetime's beginning, is acknowledged for the lifetime it
     /// was drawn for, which a look for the new lifetime ignores; the new
