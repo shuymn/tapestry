@@ -30,6 +30,7 @@ use bms_model::Speed;
 
 use crate::attempt::PreparationRefusal;
 use crate::coord::{Caps, Coordinator, JobKind, Joined, LoadFailure, Spawner};
+use crate::decision::{Decision, Origin, Reply, Verdict};
 use crate::error::Chain;
 use crate::live::{Leave, LiveError, Rig, run_over, threads_over};
 use crate::logic::LogicError;
@@ -64,12 +65,19 @@ pub trait AppRig: LoadingRig {
     fn choose(&mut self) -> Option<Pick>;
     /// Builds what the plays of `loaded` need beside it: its sound bank
     /// and the screen's chart, replacing the previous chart's; or stops at
-    /// a cancel ([`Loading::Cancelled`]), and the chart is left.
+    /// a cancel ([`Loading::Cancelled`]), and the chart is left. Its waits
+    /// serve `decision` ([`Decision::classify`] from [`Origin::Load`]): a
+    /// deadline met inside one steps there, and a wait it ends returns
+    /// [`Loading::Cancelled`] with [`Decision::leave`] set.
     ///
     /// # Errors
     ///
     /// Why the bank cannot be built: the chart is refused.
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError>;
+    fn load_chart(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut Decision,
+    ) -> Result<Loading, Self::BankError>;
     /// Whether a load in progress is to stop: the window closing, or a
     /// quit key press waiting to be taken. Asked while the game thread waits
     /// for a load's job, never taking the press; by default the latched
@@ -120,10 +128,54 @@ pub trait AppRig: LoadingRig {
     ///
     /// Why the chart cannot be practised: a refused load, which returns to
     /// selection with its reason. [`Loading::Failed`] ends the run.
-    fn practice_read(&mut self, loaded: &Loaded) -> Result<Loading, Self::BankError> {
-        let _ = loaded;
+    fn practice_read(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut Decision,
+    ) -> Result<Loading, Self::BankError> {
+        let _ = (loaded, decision);
         Ok(Loading::Ready)
     }
+    /// The decision screen's time for the choice about to be made; none
+    /// (by default) shows no decision screen.
+    fn decision_time(&self) -> Option<TimeUs> {
+        None
+    }
+    /// The decision screen begins for `pick` (design.md "Play Lifecycle",
+    /// the decision screen): its presentation and tone, its input epoch,
+    /// and the attempt's reset at the choice. Nothing by default.
+    fn entered_decision(&mut self, pick: &Pick) {
+        let _ = pick;
+    }
+    /// Each look of the decision screen from `origin`, before its
+    /// classification: what needs no wait (the page's jobs in
+    /// [`Origin::Jobs`]). Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// A failure the run ends with.
+    fn decision_tick(&mut self, origin: Origin) -> Result<(), LiveError<Self::ScreenError>> {
+        let _ = origin;
+        Ok(())
+    }
+    /// The play's deadline: its loading state shown, its input epoch over.
+    /// Waits for no acknowledgement. Nothing by default.
+    fn deadline_step(&mut self) {}
+    /// The decision screen is left for selection or the practice page: its
+    /// input epoch ends. Nothing by default.
+    fn closed_epoch(&mut self) {}
+    /// Past the deadline while practice waits for its read: whether Back
+    /// or the quit key was pressed at or after `deadline`, as its press
+    /// was observed, taken; one observed before it, whenever it is taken,
+    /// is not. Never by default.
+    fn decision_escape(&mut self, deadline: TimeUs) -> bool {
+        let _ = deadline;
+        false
+    }
+    /// The screen was built again during the decision screen: its
+    /// presentation is sent again, its tone not played again. Nothing by
+    /// default.
+    fn recovered_decision(&mut self) {}
     /// Each pass of the practice page, whatever the input: the rig
     /// advances its page jobs. Nothing by default.
     ///
@@ -462,16 +514,45 @@ impl App {
                 rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
             };
             refusal = None;
-            let (chart, practice) = match pick {
-                Pick::Play(chart) => (chart, false),
-                Pick::Practice(chart) => (chart, true),
+            let (chart, practice) = match &pick {
+                Pick::Play(chart) => (chart.clone(), false),
+                Pick::Practice(chart) => (chart.clone(), true),
             };
-            match self.play_chart(&chart, practice, rig)? {
-                Chosen::Left(Leave::Back) => rig.left_chart()?,
+            // What the chart loads with, and autoplay's P refused on the
+            // select screen, before any decision screen (design.md :753).
+            let mut decision = Decision::off();
+            let went = match self.session_for(practice, rig) {
+                Err(reason) => Chosen::Refused(reason),
+                Ok(session) => {
+                    decision = Decision::begin(rig.now(), rig.decision_time(), practice);
+                    if decision.on() {
+                        rig.entered_decision(&pick);
+                    }
+                    self.play_chart(&chart, practice, session, &mut decision, rig)?
+                }
+            };
+            match went {
+                Chosen::Left(Leave::Back) => {
+                    if decision.on() {
+                        rig.closed_epoch();
+                    }
+                    rig.left_chart()?;
+                }
                 Chosen::Left(Leave::Quit) => return Ok(()),
                 // A refusal never hides a thread's failure: the run ends
-                // with it instead.
+                // with it instead. The decision screen holds it to its
+                // deadline.
                 Chosen::Refused(reason) => {
+                    if decision.on()
+                        && !decision.past(rig.now())
+                        && hold_refusal(&mut decision, rig)? == Next::End
+                        && ended(rig)? == Leave::Quit
+                    {
+                        return Ok(());
+                    }
+                    if decision.on() {
+                        rig.closed_epoch();
+                    }
                     rig.left_chart()?;
                     threads_over(rig)?;
                     refusal = Some(LoadRefusal { chart, reason });
@@ -487,6 +568,8 @@ impl App {
         &mut self,
         chart: &Path,
         practice: bool,
+        session: (SessionConfig, Parts),
+        decision: &mut Decision,
         rig: &mut R,
     ) -> Result<Chosen<R::BankError>, LiveError<R::ScreenError>> {
         let shelf = match std::mem::replace(&mut self.shelf, Err(lent())) {
@@ -497,9 +580,41 @@ impl App {
             }
         };
         // The one way back for the shelf, whatever the chart did.
-        let (shelf, chosen) = self.play_on(shelf, chart, practice, rig);
+        let (shelf, chosen) = self.play_on(shelf, chart, practice, session, decision, rig);
         self.shelf = Ok(shelf);
         chosen
+    }
+
+    /// What a chart chosen to play (or practice, with `practice`) is
+    /// loaded with: the session's configuration and parts.
+    ///
+    /// # Errors
+    ///
+    /// Autoplay's P, refused on the select screen.
+    fn session_for<R: AppRig>(
+        &mut self,
+        practice: bool,
+        rig: &mut R,
+    ) -> Result<(SessionConfig, Parts), Refused<R::BankError>> {
+        let mut config = self.config.clone();
+        #[cfg_attr(
+            not(feature = "dev-tools"),
+            expect(unused_mut, reason = "the hook changes them")
+        )]
+        let mut parts = (self.parts)(&self.settings);
+        #[cfg(feature = "dev-tools")]
+        rig.configure(&mut config, &mut parts);
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = rig;
+        if practice {
+            // An autoplay session plays whole charts only.
+            if config.autoplay.is_some() {
+                return Err(Refused::Practice(PracticeError::Autoplay));
+            }
+            // The screen's measures are the chart's 1× times.
+            config.speed = Speed::NORMAL;
+        }
+        Ok((config, parts))
     }
 
     /// [`play_chart`](Self::play_chart) on the lent `shelf`, which comes
@@ -509,31 +624,15 @@ impl App {
         shelf: Shelf,
         chart: &Path,
         practice: bool,
+        (config, parts): (SessionConfig, Parts),
+        d: &mut Decision,
         rig: &mut R,
     ) -> (Shelf, Went<R>) {
-        let mut config = self.config.clone();
-        #[cfg_attr(
-            not(feature = "dev-tools"),
-            expect(unused_mut, reason = "the hook changes them")
-        )]
-        let mut parts = (self.parts)(&self.settings);
-        #[cfg(feature = "dev-tools")]
-        rig.configure(&mut config, &mut parts);
-        if practice {
-            // An autoplay session plays whole charts only.
-            if config.autoplay.is_some() {
-                return (
-                    shelf,
-                    Ok(Chosen::Refused(Refused::Practice(PracticeError::Autoplay))),
-                );
-            }
-            // The screen's measures are the chart's 1× times.
-            config.speed = Speed::NORMAL;
-        }
         rig.play_state_began();
-        if !practice {
+        if !practice && !d.on() {
             // The loading state shows before the chart is read; a practice
-            // shows it at each Start instead.
+            // shows it at each Start instead, and with a decision screen it
+            // shows at its deadline.
             rig.entered_loading(chart);
         }
         // Every chart reports to the run's one sink, never the parts' own.
@@ -552,7 +651,9 @@ impl App {
             }
         };
         // Read on its own thread while this one looks for a quit or a
-        // close (design.md "Play Lifecycle", who loads).
+        // close (design.md "Play Lifecycle", who loads), or serves the
+        // decision screen, which records why it stopped the read.
+        let mut why = None;
         let read = {
             let (ingest, transform) = pending.reader();
             let config = pending.config();
@@ -562,6 +663,15 @@ impl App {
                     read_for_load(chart, config, ingest, transform)
                 }) {
                     Err(failure) => Joined::Failed(failure),
+                    Ok(job) if d.on() => {
+                        job.wait(LOAD_SLICE, || match serve(d, rig, Origin::Read, None) {
+                            Ok(Next::Go | Next::Stepped) => false,
+                            other => {
+                                why = Some(other);
+                                true
+                            }
+                        })
+                    }
                     Ok(job) => job.wait(LOAD_SLICE, || rig.load_cancelled()),
                 }
             })
@@ -569,13 +679,34 @@ impl App {
         let read = match read {
             Joined::Done(read) => read,
             Joined::Cancelled(_) => {
-                return (pending.into_shelf(), cancelled(rig).map(Chosen::Left));
+                let left = match why {
+                    None => cancelled(rig).map(Chosen::Left),
+                    Some(next) => left_by(next, rig),
+                };
+                return (pending.into_shelf(), left);
             }
             Joined::Failed(failure) => {
                 return (pending.into_shelf(), Err(LiveError::Load(failure)));
             }
         };
-        let mut loaded = match pending.finish(chart, read) {
+        let finished = pending.finish(chart, read);
+        // The read's reply in hand, a refusal included, is looked at in one
+        // classification before anything acts on it: a refusal with the
+        // deadline due returns without the loading state.
+        if d.on() {
+            let reply = finished.is_err().then_some(Reply::Refusal);
+            match serve(d, rig, Origin::Read, reply) {
+                Ok(Next::Go | Next::Stepped | Next::Return) => {}
+                next => {
+                    let shelf = match finished {
+                        Ok(loaded) => loaded.into_shelf(),
+                        Err(refused) => refused.1,
+                    };
+                    return (shelf, left_by(next, rig));
+                }
+            }
+        }
+        let mut loaded = match finished {
             Ok(loaded) => loaded,
             Err(refused) => {
                 let (e, shelf) = *refused;
@@ -583,24 +714,44 @@ impl App {
             }
         };
         let chosen = if practice {
-            match rig.practice_read(&loaded) {
+            match rig.practice_read(&loaded, d) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
                 Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
-                Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
-                Ok(Loading::Ready) => {
-                    practice_chart(&mut loaded, rig, &self.coord, self.spawner).map(Chosen::Left)
-                }
+                Ok(Loading::Cancelled) => match d.take_left() {
+                    Some(left) => left_by(Ok(next_of(left)), rig),
+                    None => cancelled(rig).map(Chosen::Left),
+                },
+                Ok(Loading::Ready) => match d.take_left() {
+                    Some(left) => left_by(Ok(next_of(left)), rig),
+                    // The page opens at the deadline, its epoch over.
+                    None => match page_entry(d, rig) {
+                        Ok(true) => practice_chart(&mut loaded, rig, &self.coord, self.spawner)
+                            .map(Chosen::Left),
+                        Ok(false) => ended(rig).map(Chosen::Left),
+                        Err(e) => Err(e),
+                    },
+                },
             }
         } else {
-            match rig.load_chart(&loaded) {
+            match rig.load_chart(&loaded, d) {
                 Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
-                Ok(Loading::Cancelled) => cancelled(rig).map(Chosen::Left),
+                Ok(Loading::Cancelled) => match d.take_left() {
+                    Some(left) => left_by(Ok(next_of(left)), rig),
+                    None => cancelled(rig).map(Chosen::Left),
+                },
                 Ok(Loading::Failed(failure)) => Err(LiveError::Load(failure)),
-                Ok(Loading::Ready) => match load_and_open(&mut loaded, rig) {
-                    Ok(leave) => Ok(Chosen::Left(leave)),
-                    Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
-                    Err(LiveError::Preparation(e)) => Ok(Chosen::Refused(Refused::Preparation(e))),
+                // The loading state opens only after the deadline's step.
+                Ok(Loading::Ready) => match ready_at_deadline(d, rig) {
+                    Ok(false) => ended(rig).map(Chosen::Left),
                     Err(e) => Err(e),
+                    Ok(true) => match load_and_open(&mut loaded, rig) {
+                        Ok(leave) => Ok(Chosen::Left(leave)),
+                        Err(LiveError::Logic(e)) => Ok(Chosen::Refused(Refused::Play(e))),
+                        Err(LiveError::Preparation(e)) => {
+                            Ok(Chosen::Refused(Refused::Preparation(e)))
+                        }
+                        Err(e) => Err(e),
+                    },
                 },
             }
         };
@@ -752,7 +903,10 @@ fn start_rounds<R: AppRig>(
     let started = loaded.start_practice(practice);
     *set_up = true;
     started.map_err(|e| Stopped::Notice(e.to_string()))?;
-    match rig.load_chart(loaded).map_err(|e| notice(&e))? {
+    match rig
+        .load_chart(loaded, &mut Decision::off())
+        .map_err(|e| notice(&e))?
+    {
         Loading::Ready => {}
         Loading::Cancelled => return cancelled(rig).map_err(Stopped::Run),
         Loading::Failed(failure) => return Err(Stopped::Run(LiveError::Load(failure))),
@@ -764,6 +918,180 @@ fn start_rounds<R: AppRig>(
         Err(LiveError::Preparation(e)) => Err(notice(&e)),
         Err(e) => Err(Stopped::Run(e)),
     }
+}
+
+/// What App does after a decision screen's look ([`serve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// Go on.
+    Go,
+    /// The play's deadline step ran: its loading state shows.
+    Stepped,
+    /// Practice's deadline: the page opens now.
+    Page,
+    /// Back to selection with the latched refusal.
+    Return,
+    /// Back to selection by the player.
+    Back,
+    /// The run ends, or the window closes ([`ended`]).
+    End,
+}
+
+/// The decision screen's one look from `origin`, with `reply` in hand: a
+/// screen lost meanwhile built again ([`recover_decision`]), the rig's
+/// tick, then the terminal causes and the escape read now, then
+/// [`Decision::classify`]. A play's step runs here. Every look of the
+/// screen comes here, the chart's read's included, so the screen is
+/// recovered while the read is pending as while the flow holds.
+fn serve<R: AppRig>(
+    d: &mut Decision,
+    rig: &mut R,
+    origin: Origin,
+    reply: Option<Reply>,
+) -> Result<Next, LiveError<R::ScreenError>> {
+    if rig.screen_failed() {
+        recover_decision(rig)?;
+    }
+    rig.decision_tick(origin)?;
+    let terminal = rig.quitting() || threads_over(rig).is_err();
+    let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
+    Ok(
+        match d.classify(origin, rig.now(), terminal, escape, reply) {
+            Verdict::Continue => Next::Go,
+            Verdict::Step if d.practice() => Next::Page,
+            Verdict::Step => {
+                rig.deadline_step();
+                Next::Stepped
+            }
+            Verdict::End => Next::End,
+            Verdict::Return => Next::Return,
+            Verdict::Back => Next::Back,
+        },
+    )
+}
+
+/// The screen lost during the decision screen, built again: its
+/// presentation is sent again, its deadline kept and its tone not played
+/// again ([`AppRig::recovered_decision`]). The rebuild's wait answers no
+/// terminal cause, so a failure that came while it waited, seen when it
+/// fails, ends the run with its own cause, and a close as a close (the
+/// look that follows ends it), before the screen's error is reported.
+///
+/// # Errors
+///
+/// A thread's failure, else the screen's that cannot be built again.
+fn recover_decision<R: AppRig>(rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
+    match rig.prepare_screen() {
+        Ok(()) => {
+            rig.recovered_decision();
+            Ok(())
+        }
+        Err(e) => {
+            threads_over(rig)?;
+            if rig.quitting() {
+                return Ok(());
+            }
+            Err(LiveError::Screen(e))
+        }
+    }
+}
+
+/// How a wait the rig owns left the decision screen, as App routes it.
+const fn next_of(v: Verdict) -> Next {
+    match v {
+        Verdict::Continue => Next::Go,
+        Verdict::Step => Next::Stepped,
+        Verdict::End => Next::End,
+        Verdict::Return => Next::Return,
+        Verdict::Back => Next::Back,
+    }
+}
+
+/// The decision screen, nothing in its waits but its looks, until a look
+/// gives more than [`Next::Go`]: what it gave. A screen lost meanwhile is
+/// recovered by the next look ([`serve`]).
+fn hold<R: AppRig>(
+    d: &mut Decision,
+    rig: &mut R,
+    origin: Origin,
+) -> Result<Next, LiveError<R::ScreenError>> {
+    loop {
+        let next = serve(d, rig, origin, None)?;
+        if next != Next::Go {
+            return Ok(next);
+        }
+        let now = rig.now();
+        let until = d.deadline().map_or(now.0, |at| at.0).max(now.0 + 1);
+        rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(until)));
+    }
+}
+
+/// A refusal held to the decision screen's deadline: latched, then held
+/// until it returns, or the run ends ([`Next::End`]).
+fn hold_refusal<R: AppRig>(
+    d: &mut Decision,
+    rig: &mut R,
+) -> Result<Next, LiveError<R::ScreenError>> {
+    match serve(d, rig, Origin::Ready, Some(Reply::Refusal))? {
+        Next::Go => hold(d, rig, Origin::Ready),
+        next => Ok(next),
+    }
+}
+
+/// A loaded play held to its deadline's step: `false` when the run ends
+/// or the window closes first.
+fn ready_at_deadline<R: AppRig>(
+    d: &mut Decision,
+    rig: &mut R,
+) -> Result<bool, LiveError<R::ScreenError>> {
+    if !d.on() || d.stepped() {
+        return Ok(true);
+    }
+    Ok(match hold(d, rig, Origin::Ready)? {
+        Next::Stepped | Next::Go | Next::Page => true,
+        Next::End | Next::Return | Next::Back => false,
+    })
+}
+
+/// A practice chart read: its page's jobs advance until the deadline, then
+/// the page opens with the decision screen's epoch over. `false` when the
+/// run ends or the window closes first.
+fn page_entry<R: AppRig>(d: &mut Decision, rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+    if !d.on() {
+        return Ok(true);
+    }
+    let opens = match hold(d, rig, Origin::Jobs)? {
+        Next::Page | Next::Go | Next::Stepped => true,
+        Next::End | Next::Return | Next::Back => false,
+    };
+    if opens {
+        rig.closed_epoch();
+    }
+    Ok(opens)
+}
+
+/// The decision screen left for `next`, as a chart's outcome.
+fn left_by<R: AppRig, B>(
+    next: Result<Next, LiveError<R::ScreenError>>,
+    rig: &mut R,
+) -> Result<Chosen<B>, LiveError<R::ScreenError>> {
+    match next? {
+        Next::Back | Next::Return | Next::Go | Next::Stepped | Next::Page => {
+            Ok(Chosen::Left(Leave::Back))
+        }
+        Next::End => ended(rig).map(Chosen::Left),
+    }
+}
+
+/// The run ends on a decision screen's look: a thread's failure ends it
+/// with its cause; a close quits.
+fn ended<R: AppRig>(rig: &mut R) -> Result<Leave, LiveError<R::ScreenError>> {
+    threads_over(rig)?;
+    Ok(if rig.quitting() {
+        Leave::Quit
+    } else {
+        Leave::Back
+    })
 }
 
 /// A load the rig cancelled: the quit that cancelled it is taken with it,

@@ -119,6 +119,27 @@ fn run(fx: &Fixture, steps: &str, extra: &[&str]) -> (Output, String) {
     (out, stdout)
 }
 
+/// [`onset_peaks`] without the decision tones: each choice's tone sounds
+/// before the `segments` onsets of the plays it leads to (a retry shows no
+/// decision screen, so its onsets join its choice's).
+fn chart_peaks(stdout: &str, segments: &[usize]) -> Vec<f32> {
+    let peaks = onset_peaks(stdout);
+    assert_eq!(
+        peaks.len(),
+        segments.iter().sum::<usize>() + segments.len(),
+        "{peaks:?}
+{stdout}"
+    );
+    let mut rest = peaks.as_slice();
+    let mut charts = Vec::new();
+    for &n in segments {
+        let (chart, after) = rest[1..].split_at(n);
+        charts.extend_from_slice(chart);
+        rest = after;
+    }
+    charts
+}
+
 /// The lines of `stdout` that start with `prefix`.
 fn lines<'a>(stdout: &'a str, prefix: &str) -> Vec<&'a str> {
     stdout.lines().filter(|l| l.starts_with(prefix)).collect()
@@ -272,8 +293,9 @@ fn a_second_chart_plays_only_its_own_sounds() {
         plays[1].starts_with("play 1: Completed; perfect 16 great 0 good 0 bad 0 poor 0"),
         "{stdout}"
     );
-    // Two plays of chart a, four notes each, one of b's sixteen.
-    let peaks = onset_peaks(&stdout);
+    // Two plays of chart a, four notes each, one of b's sixteen, after
+    // the tone of each chart's choice.
+    let peaks = chart_peaks(&stdout, &[8, 16]);
     assert_eq!(peaks.len(), 24, "{stdout}");
     let (a, b) = peaks.split_at(8);
     assert!(a.iter().all(|&p| p > 0.2), "{peaks:?}");
@@ -362,8 +384,8 @@ fn the_first_play_has_the_measured_gain() {
     // wave's peak, resampling ripple included, scales with its amplitude
     // times its gain, so a's over b's is (1/4)(a's gain over b's), within
     // the printed precision: at the headroom on its first play, a would
-    // have peaked a's gain over 0.5 lower.
-    let peaks = onset_peaks(&stdout);
+    // have peaked a's gain over 0.5 lower. Each choice's tone first.
+    let peaks = chart_peaks(&stdout, &[8, 4, 4]);
     assert_eq!(peaks.len(), 16, "{stdout}");
     let (a, rest) = peaks.split_at(8);
     let (b, again) = rest.split_at(4);
@@ -512,12 +534,13 @@ fn headless_selection_takes_a_size() {
     assert!(seen > 0);
 }
 
-/// Choosing a chart switches at once to the play screen in its loading
-/// state, the lanes and judgment line drawn without notes, the chart's
-/// lines saying each stage over it, drawn on (its frame dumped) while a
-/// slow load holds, until READY.
+/// Choosing a chart shows the decision screen while the load begins, then
+/// at its deadline the play screen in its loading state, the lanes and
+/// judgment line drawn without notes, the chart's lines saying each stage
+/// over it, drawn on (its frame dumped) while a slow load holds, until
+/// READY.
 #[test]
-fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
+fn the_play_screen_loads_after_the_decision_screen_through_a_slow_load() {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 8_000);
     let frames = fx.appdata.join("frames");
@@ -531,10 +554,11 @@ fn the_play_screen_loads_from_the_choice_through_a_slow_load() {
         find_from(&stdout, from, line).unwrap_or_else(|| panic!("no {line}:\n{stdout}"))
     };
     let chose = at(0, "select: chose a.bms");
-    let shown = at(chose, "load: the play screen loads a.bms");
-    let read = at(shown, "load: reading the chart");
+    let decision = at(chose, "decision: a.bms chosen");
+    let read = at(decision, "load: reading the chart");
     let held = at(read, "dev: the load holds 1500 ms");
-    let ready = at(held, "load: the chart is ready ");
+    let shown = at(read, "load: the play screen loads a.bms");
+    let ready = at(held.max(shown), "load: the chart is ready ");
     at(ready, "play started");
     assert!(lines(&stdout, "load: cancelled").is_empty(), "{stdout}");
     // Frames keep being presented through the hold: its checkpoints show
@@ -630,7 +654,10 @@ fn the_quit_key_stops_the_sound_decode() {
         find_from(&stdout, first, "loudness: measuring m.bms").is_some_and(|m| m > back),
         "measured before the cancel:\n{stdout}"
     );
-    let again = at(back, "load: the play screen loads m.bms");
+    // The next choice's load may be ready before its decision screen's
+    // deadline shows the loading state.
+    let again = at(back, "decision: m.bms chosen");
+    at(again, "load: the play screen loads m.bms");
     let ready = at(again, "load: the chart is ready ");
     at(ready, "play started");
     assert_eq!(
@@ -874,10 +901,15 @@ fn refused_chart_shows_its_reason() {
     );
     assert_eq!(lines(&stdout, "select: chose bad.bms").len(), 2, "{stdout}");
     assert_eq!(lines(&stdout, "play started").len(), 1, "{stdout}");
-    // Each choice showed the loading state, which the refusal left.
+    // Each choice showed the decision screen, which the refusal left
+    // without the loading state.
+    assert!(
+        lines(&stdout, "load: the play screen loads bad.bms").is_empty(),
+        "{stdout}"
+    );
     let mut from = 0;
     for _ in 0..2 {
-        let shown = find_from(&stdout, from, "load: the play screen loads bad.bms");
+        let shown = find_from(&stdout, from, "decision: bad.bms chosen");
         let shown = shown.unwrap_or_else(|| panic!("{stdout}"));
         from = find_from(&stdout, shown, "select: refused bad.bms: ").unwrap();
     }

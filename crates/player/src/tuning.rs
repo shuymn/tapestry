@@ -27,7 +27,7 @@ use bms_model::TimeUs;
 use game::{
     AcceptanceRevision, Adjust, Chain, DataRoot, Settings, Tuning, TuningSnapshot, save_settings,
 };
-use input::{ActivityRecord, SectionValue};
+use input::{ActivityRecord, Ingress, SectionValue};
 
 /// The settings keys the window side holds at most: one entry per bound
 /// settings key.
@@ -371,12 +371,16 @@ impl LiveTuning {
     fn key_locked(&self, w: &mut Window, a: Adjust, event: KeyEvent, at: TimeUs) -> bool {
         w.normalize(self.record.opened());
         let refused = self.refused(a);
+        // The key is observed and validated in this one step: under a
+        // closed ingress word (the decision screen) it is held, unarmed,
+        // and is no activity.
+        let admitted = self.record.ingress().is_open();
         match event {
             KeyEvent::Press => {
                 if refused || !w.focused {
                     return false;
                 }
-                let class = if matches!(w.acceptance, Acceptance::Closed { .. }) {
+                let class = if !admitted || matches!(w.acceptance, Acceptance::Closed { .. }) {
                     HoldClass::GapDiscarded
                 } else if at.0 < w.epoch_start.0 {
                     HoldClass::PreLoading
@@ -400,14 +404,14 @@ impl LiveTuning {
             }
             KeyEvent::Repeat => {
                 let fresh = w.entry(a).is_some_and(|e| e.1 == HoldClass::Fresh);
-                if refused || !fresh || w.acceptance != Acceptance::Open {
+                if refused || !fresh || !admitted || w.acceptance != Acceptance::Open {
                     return false;
                 }
                 w.bump(Some(at));
                 self.step_value(a)
             }
             KeyEvent::Release => {
-                if w.remove(a).is_some_and(HoldClass::blocks) {
+                if w.remove(a).is_some_and(HoldClass::blocks) && admitted {
                     w.bump(Some(at));
                 }
                 false
@@ -427,7 +431,10 @@ impl LiveTuning {
         }
         w.focused = focused;
         if focused {
-            w.bump(Some(at));
+            // A return under a closed ingress word is no activity.
+            if self.record.ingress().is_open() {
+                w.bump(Some(at));
+            }
         } else {
             for (_, class) in w.held.iter_mut().flatten() {
                 *class = HoldClass::FocusDisarmed;
@@ -456,6 +463,50 @@ impl LiveTuning {
         w.acceptance = Acceptance::Open;
         w.lost_since_reopen = false;
         self.publish(&w);
+    }
+
+    /// The decision screen's choice (design.md "Play Lifecycle", the
+    /// decision screen): the ingress word closes in a new generation, so
+    /// nothing observed before acts after it, every settings key down is
+    /// unarmed until pressed again, and `also` (the controls' own epoch)
+    /// runs in the same step.
+    pub fn close_ingress(&self, also: impl FnOnce()) {
+        let mut w = self.window();
+        self.record.set_ingress(self.record.ingress().next(false));
+        for (_, class) in w.held.iter_mut().flatten() {
+            if *class == HoldClass::Fresh {
+                *class = HoldClass::GapDiscarded;
+            }
+        }
+        also();
+        self.publish(&w);
+    }
+
+    /// The decision screen is left (its deadline, the practice page, a
+    /// return to selection): the ingress word opens in a new generation,
+    /// and `also` runs in the same step. Nothing when it is open: a
+    /// loading state without a decision screen drops nothing in transit.
+    pub fn open_ingress(&self, also: impl FnOnce()) {
+        let _w = self.window();
+        let word = self.record.ingress();
+        if !word.is_open() {
+            self.record.set_ingress(word.next(true));
+            also();
+        }
+    }
+
+    /// Runs `f` with the ingress word, the step lock held, so what it
+    /// validates acts before the word can change.
+    pub fn with_ingress<R>(&self, f: impl FnOnce(Ingress) -> R) -> R {
+        let _w = self.window();
+        f(self.record.ingress())
+    }
+
+    /// Whether the step lock is free now (tests: the meeting point between
+    /// a drain's validation and its action finds it held).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn step_free(&self) -> bool {
+        self.step.try_lock().is_ok()
     }
 
     /// A copy of the tuning, the step lock held: the values, and the
@@ -833,6 +884,58 @@ mod tests {
         let back = t.snapshot();
         assert!(!back.quiet_at(TimeUs(6 * S - 1)) && back.quiet_at(TimeUs(6 * S)));
         assert!(t.close_unchanged(&back, 1, TimeUs(6 * S)));
+    }
+
+    /// The decision screen's epoch at the settings keys (E5, E16b, N6): a
+    /// key held at the choice is unarmed, its repeats step nothing; a
+    /// press in the epoch is held, steps nothing and is no activity; at
+    /// the deadline the loading state holds on it; after the epoch it
+    /// steps only on a fresh press (the positive control).
+    #[test]
+    fn a_settings_key_in_the_decision_epoch_needs_a_fresh_press() {
+        let t = LiveTuning::new(start());
+        assert!(t.key(Adjust::VolumeDown, KeyEvent::Press, TimeUs(S)));
+        t.close_ingress(|| {});
+        assert_eq!(t.held(), [(Adjust::VolumeDown, HoldClass::GapDiscarded)]);
+        let closed = t.snapshot();
+        assert!(!t.key(Adjust::VolumeDown, KeyEvent::Repeat, TimeUs(2 * S)));
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Press, TimeUs(2 * S)));
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Release, TimeUs(2 * S)));
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Press, TimeUs(3 * S)));
+        let pressed = t.snapshot();
+        assert_eq!(pressed.values, closed.values);
+        assert_eq!(pressed.revision.window, closed.revision.window);
+        assert_eq!(pressed.last_activity, closed.last_activity);
+        // The deadline: the loading state holds on both.
+        t.enter_loading(TimeUs(4 * S));
+        t.open_ingress(|| {});
+        assert_eq!(
+            t.held(),
+            [
+                (Adjust::VolumeDown, HoldClass::PreLoading),
+                (Adjust::DisplayOffsetUp, HoldClass::PreLoading)
+            ]
+        );
+        assert!(!t.key(Adjust::DisplayOffsetUp, KeyEvent::Repeat, TimeUs(5 * S)));
+        assert_eq!(t.snapshot().values, closed.values);
+        t.key(Adjust::DisplayOffsetUp, KeyEvent::Release, TimeUs(5 * S));
+        assert!(t.key(Adjust::DisplayOffsetUp, KeyEvent::Press, TimeUs(6 * S)));
+    }
+
+    /// E11: a focus return during the decision screen is no activity; one
+    /// after it is (the positive control).
+    #[test]
+    fn a_focus_return_in_the_decision_epoch_is_no_activity() {
+        let t = LiveTuning::new(start());
+        t.close_ingress(|| {});
+        t.focus(false, TimeUs(S));
+        let lost = t.snapshot();
+        t.focus(true, TimeUs(2 * S));
+        assert_eq!(t.snapshot().last_activity, lost.last_activity);
+        t.open_ingress(|| {});
+        t.focus(false, TimeUs(3 * S));
+        t.focus(true, TimeUs(4 * S));
+        assert_eq!(t.snapshot().last_activity, Some(TimeUs(4 * S)));
     }
 
     /// A4, a press routed after the loading state began but stamped

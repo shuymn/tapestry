@@ -131,6 +131,24 @@ pub struct LoadingText {
 }
 
 impl LoadingText {
+    /// The decision screen's built-in presentation (design.md "Play
+    /// Lifecycle", the decision screen): the chosen chart's genre, title
+    /// and artist, as its library entry has them.
+    pub fn decision(&self) -> MenuPage {
+        let line = |text: String, style| MenuLine { text, style };
+        MenuPage {
+            lines: vec![
+                line(
+                    self.chart.genre.clone().unwrap_or_default(),
+                    LineStyle::Folder,
+                ),
+                line(self.title.clone(), LineStyle::Title),
+                line(self.artist.clone(), LineStyle::Chart),
+            ],
+            caret: None,
+        }
+    }
+
     /// The lines at `stage`: the heading, the chart's lines and the stage.
     pub fn lines(&self, stage: Stage) -> MenuPage {
         let line = |text: String, style| MenuLine { text, style };

@@ -262,7 +262,7 @@ impl PlayerRig<'_> {
                         progress.decoded(done, files);
                         #[cfg(feature = "dev-tools")]
                         if quit_decoding && done == 1 {
-                            controls.command(game::Command::Quit);
+                            crate::dev::quit_loading(controls);
                         }
                     },
                     &|| ctx.cancelled() || cancelled(controls),
@@ -382,7 +382,7 @@ impl PlayerRig<'_> {
                 }
                 #[cfg(feature = "dev-tools")]
                 if quit {
-                    controls.command(game::Command::Quit);
+                    crate::dev::quit_loading(controls);
                 }
                 let mut host = super::JobHost {
                     controls,

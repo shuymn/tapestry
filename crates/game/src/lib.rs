@@ -22,6 +22,7 @@ mod audio_loop;
 mod autoplay;
 mod bests;
 pub mod coord;
+pub mod decision;
 mod driver;
 mod error;
 mod hispeed;
@@ -65,14 +66,15 @@ pub use attempt::{
 };
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
-    Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
+    OutputProbe, Probed, SWITCH_TIMEOUT, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
     SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
-pub use driver::{AdjustDriver, InputPump};
+pub use decision::{DECISION_TIME, Decision, Origin, Reply, Verdict};
+pub use driver::{AdjustDriver, IngressDrain, InputFailureCell, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{

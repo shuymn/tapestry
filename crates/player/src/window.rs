@@ -265,6 +265,9 @@ struct App {
     /// Where the select screen's input goes, with song selection.
     menu: Option<Arc<MenuQueue>>,
     ime: ImeState,
+    /// The IME composition in progress and the ingress word it began
+    /// under.
+    composition: ImeSession,
     /// Set once the window is made.
     showing: Option<Showing>,
     shared: Arc<Shared>,
@@ -320,55 +323,22 @@ impl ApplicationHandler<Ask> for App {
                 is_synthetic,
                 ..
             } => {
-                let pressed = event.state == ElementState::Pressed;
-                // F1 and F2 reach the adjustments only through the tap, or
-                // in an autoplay session through the window's queue; a
-                // made-up event only updates what the window holds.
-                if let Some(key) = self.keys.speed_key(event.physical_key) {
-                    let e = match (pressed, event.repeat) {
-                        (true, false) => WindowKeyEvent::Press,
-                        (true, true) => WindowKeyEvent::Repeat,
-                        (false, _) => WindowKeyEvent::Release,
-                    };
-                    self.controls.window_key(key, e, is_synthetic);
-                }
-                if !pressed {
-                    if !is_synthetic {
-                        key_released(&self.controls, event.physical_key, &self.keys);
-                    }
-                    return;
-                }
-                if !is_synthetic {
-                    key_pressed(
-                        &self.controls,
-                        event.physical_key,
-                        event.repeat,
-                        &mut self.keys,
-                    );
-                }
-                if let Some(menu) = &self.menu {
-                    let key = menu_key(event.physical_key, event.repeat).map(MenuInput::Key);
-                    // Printable text only: control characters come as keys.
-                    let text = event
-                        .text
-                        .filter(|t| !t.chars().any(char::is_control))
-                        .map(|t| MenuInput::Text(t.to_string()));
-                    for input in key.into_iter().chain(text) {
-                        send_menu(menu, &self.controls, input);
-                    }
-                }
+                keyboard(
+                    &self.controls,
+                    &mut self.keys,
+                    self.menu.as_deref(),
+                    KeyInput {
+                        key: event.physical_key,
+                        pressed: event.state == ElementState::Pressed,
+                        repeat: event.repeat,
+                        synthetic: is_synthetic,
+                        text: event.text.as_deref(),
+                    },
+                );
             }
             WindowEvent::Ime(ime) => {
                 if let Some(menu) = &self.menu {
-                    let input = match ime {
-                        Ime::Commit(text) => Some(MenuInput::Text(text)),
-                        Ime::Preedit(text, _) => Some(MenuInput::Preedit(text)),
-                        Ime::Disabled => Some(MenuInput::Preedit(String::new())),
-                        Ime::Enabled => None,
-                    };
-                    if let Some(input) = input {
-                        send_menu(menu, &self.controls, input);
-                    }
+                    ime_input(&self.controls, &mut self.composition, menu, ime);
                 }
             }
             WindowEvent::Resized(size) => {
@@ -620,6 +590,7 @@ pub fn open(
                 window: None,
                 menu,
                 ime: ImeState::default(),
+                composition: ImeSession::default(),
                 showing: None,
                 shared: thread_shared,
             };
@@ -719,6 +690,9 @@ struct Keys {
     /// The scene epoch each settings key's press was taken in, while it is
     /// held: its repeats act only while that epoch is current.
     pressed_in: [Option<u64>; 6],
+    /// The last key pressed for the menus and the scene epoch it was
+    /// pressed in: only it repeats, while that epoch is current.
+    menu_press: Option<(PhysicalKey, u64)>,
 }
 
 impl Keys {
@@ -731,6 +705,7 @@ impl Keys {
             overlay: window_key(game::OVERLAY_KEY),
             speed: game::SPEED_KEYS.map(window_key),
             pressed_in: [None; 6],
+            menu_press: None,
         }
     }
 
@@ -740,6 +715,80 @@ impl Keys {
             .iter()
             .position(|k| *k == key)
             .and_then(|i| u8::try_from(i).ok())
+    }
+}
+
+/// One keyboard event as the window received it.
+#[derive(Clone, Copy, Debug)]
+struct KeyInput<'a> {
+    key: PhysicalKey,
+    pressed: bool,
+    repeat: bool,
+    /// Made up by the window system for a focus change.
+    synthetic: bool,
+    /// The text it typed, if any.
+    text: Option<&'a str>,
+}
+
+/// One keyboard event: F1 and F2 to the tap's window queue (autoplay),
+/// stamped as observed; a release to tuning; a real press to tuning and
+/// the system controls, then to the menus as a key and its printable text,
+/// stamped with the ingress word as observed (design.md "Play Lifecycle",
+/// the decision screen), which is checked where it is taken; a repeat goes
+/// only while the scene of its key's press is current, so a key held
+/// across a scene change needs a fresh press; a made-up press goes nowhere
+/// but the held state.
+fn keyboard(controls: &Controls, keys: &mut Keys, menu: Option<&MenuQueue>, e: KeyInput<'_>) {
+    // F1 and F2 reach the adjustments only through the tap, or in an
+    // autoplay session through the window's queue; a made-up event only
+    // updates what the window holds.
+    if let Some(key) = keys.speed_key(e.key) {
+        let event = match (e.pressed, e.repeat) {
+            (true, false) => WindowKeyEvent::Press,
+            (true, true) => WindowKeyEvent::Repeat,
+            (false, _) => WindowKeyEvent::Release,
+        };
+        controls.window_key(key, event, e.synthetic);
+    }
+    if !e.pressed {
+        if !e.synthetic {
+            key_released(controls, e.key, keys);
+        }
+        return;
+    }
+    if e.synthetic {
+        return;
+    }
+    key_pressed(controls, e.key, e.repeat, keys);
+    let scene = controls.scene();
+    if !e.repeat {
+        keys.menu_press = Some((e.key, scene));
+    } else if keys.menu_press != Some((e.key, scene)) {
+        return;
+    }
+    let Some(menu) = menu else {
+        return;
+    };
+    let key = menu_key(e.key, e.repeat).map(MenuInput::Key);
+    // Printable text only: control characters come as keys.
+    let text = e
+        .text
+        .filter(|t| !t.chars().any(char::is_control))
+        .map(|t| MenuInput::Text(t.to_owned()));
+    // Every input goes with the word and the time it was observed at;
+    // where it is taken, one from the decision screen is dropped, and an
+    // Escape observed past its time is the screen's to take.
+    let stamp = controls.ingress();
+    for input in key.into_iter().chain(text) {
+        send_menu(menu, controls, input, Some(stamp));
+    }
+}
+
+/// An IME event through the window's `composition`, its input stamped with
+/// the word its composition began under.
+fn ime_input(controls: &Controls, composition: &mut ImeSession, menu: &MenuQueue, ime: Ime) {
+    if let Some((input, stamp)) = composition.event(ime, controls.ingress()) {
+        send_menu(menu, controls, input, Some(stamp));
     }
 }
 
@@ -776,7 +825,8 @@ fn key_pressed(controls: &Controls, key: PhysicalKey, repeat: bool, keys: &mut K
     } else if repeat {
         // The others take the first press only.
     } else if key == keys.overlay {
-        controls.toggle_overlay();
+        // Discarded in the decision screen's epoch, as every key is.
+        controls.overlay_key();
     } else if Some(key) == keys.retry {
         controls.command(Command::Retry);
     } else if Some(key) == keys.quit {
@@ -791,10 +841,63 @@ fn key_released(controls: &Controls, key: PhysicalKey, keys: &Keys) {
     }
 }
 
-/// Hands `input` to the select screen and wakes the game thread.
-fn send_menu(menu: &MenuQueue, controls: &Controls, input: MenuInput) {
-    menu.push(input);
+/// Hands `input`, observed under the ingress word `stamp`, to the select
+/// screen and wakes the game thread.
+fn send_menu(
+    menu: &MenuQueue,
+    controls: &Controls,
+    input: MenuInput,
+    stamp: Option<input::Ingress>,
+) {
+    let at = controls.now();
+    menu.push_stamped(
+        input,
+        stamp.map(|stamp| crate::select::Observed { stamp, at }),
+    );
     controls.wake_game();
+}
+
+/// An IME composition and the ingress word it began under (design.md
+/// "Play Lifecycle", the decision screen): its preedits and its commit
+/// carry that stamp, so a composition open at the choice, or begun in the
+/// decision screen, commits nothing after it. The window decides nothing;
+/// the stamp is validated where the input is taken.
+#[derive(Debug, Default)]
+struct ImeSession {
+    /// The composition's stamp, and whether it was cleared (an empty
+    /// preedit, which comes before its commit too).
+    current: Option<(input::Ingress, bool)>,
+}
+
+impl ImeSession {
+    /// The input for `ime` and its stamp, `now` the ingress word as the
+    /// window observes it.
+    fn event(&mut self, ime: Ime, now: input::Ingress) -> Option<(MenuInput, input::Ingress)> {
+        match ime {
+            Ime::Preedit(text, _) if !text.is_empty() => {
+                let stamp = match self.current {
+                    Some((stamp, false)) => stamp,
+                    _ => now,
+                };
+                self.current = Some((stamp, false));
+                Some((MenuInput::Preedit(text), stamp))
+            }
+            Ime::Preedit(_, _) => {
+                let stamp = self.current.map_or(now, |(s, _)| s);
+                self.current = Some((stamp, true));
+                Some((MenuInput::Preedit(String::new()), stamp))
+            }
+            Ime::Commit(text) => {
+                let stamp = self.current.take().map_or(now, |(s, _)| s);
+                Some((MenuInput::Text(text), stamp))
+            }
+            Ime::Disabled => {
+                let stamp = self.current.take().map_or(now, |(s, _)| s);
+                Some((MenuInput::Preedit(String::new()), stamp))
+            }
+            Ime::Enabled => None,
+        }
+    }
 }
 
 /// The select screen's key for a key pressed in the window: navigation
@@ -1603,5 +1706,244 @@ mod tests {
         }
         assert_eq!(asks.read.last(), Some(&None));
         assert_eq!(asks.read.len(), 2);
+    }
+
+    /// A queue validated by a fresh tuning's ingress word, and the window's
+    /// IME session.
+    fn gated() -> (
+        std::sync::Arc<crate::tuning::LiveTuning>,
+        crate::select::MenuQueue,
+        super::ImeSession,
+    ) {
+        let tuning = std::sync::Arc::clone(
+            crate::controls::Controls::new(input::QpcClock::start()).tuning(),
+        );
+        let queue = crate::select::MenuQueue::gated(std::sync::Arc::clone(&tuning));
+        (tuning, queue, super::ImeSession::default())
+    }
+
+    /// `ime` through the session, published under the word now.
+    fn publish(
+        tuning: &crate::tuning::LiveTuning,
+        queue: &crate::select::MenuQueue,
+        session: &mut super::ImeSession,
+        ime: winit::event::Ime,
+    ) {
+        let now = tuning.activity().ingress();
+        if let Some((input, stamp)) = session.event(ime, now) {
+            queue.push_stamped(
+                input,
+                Some(crate::select::Observed {
+                    stamp,
+                    at: bms_model::TimeUs(0),
+                }),
+            );
+        }
+    }
+
+    fn preedit(text: &str) -> winit::event::Ime {
+        winit::event::Ime::Preedit(text.to_owned(), None)
+    }
+
+    fn commit(text: &str) -> winit::event::Ime {
+        winit::event::Ime::Commit(text.to_owned())
+    }
+
+    /// E17: a composition open at the choice, and one begun during the
+    /// decision screen, apply neither their preedits nor their commits
+    /// after it (committed after the deadline or after a refusal's return
+    /// alike: both reopen the word); a composition begun after the
+    /// reopening commits (the positive control).
+    #[test]
+    fn an_ime_composition_from_the_epoch_commits_nothing() {
+        use crate::select::MenuInput;
+        for begun_in_epoch in [false, true] {
+            let (tuning, queue, mut session) = gated();
+            if !begun_in_epoch {
+                publish(&tuning, &queue, &mut session, preedit("か"));
+                assert_eq!(queue.pop(), Some(MenuInput::Preedit("か".to_owned())));
+            }
+            tuning.close_ingress(|| {});
+            if begun_in_epoch {
+                publish(&tuning, &queue, &mut session, preedit("か"));
+            }
+            tuning.open_ingress(|| {});
+            publish(&tuning, &queue, &mut session, preedit("かな"));
+            publish(&tuning, &queue, &mut session, preedit(""));
+            publish(&tuning, &queue, &mut session, commit("仮名"));
+            assert_eq!(queue.pop(), None, "begun in the epoch {begun_in_epoch}");
+            publish(&tuning, &queue, &mut session, preedit("あ"));
+            publish(&tuning, &queue, &mut session, commit("亜"));
+            assert_eq!(queue.pop(), Some(MenuInput::Preedit("あ".to_owned())));
+            assert_eq!(queue.pop(), Some(MenuInput::Text("亜".to_owned())));
+        }
+    }
+
+    /// E17b: a preedit and a commit stamped while the word was open, and
+    /// published only after a choice and a reopening (the window thread
+    /// held between its stamp and its enqueue), are not applied where the
+    /// queue is taken; a fresh session's commit is.
+    #[test]
+    fn a_stamped_commit_published_after_the_epoch_is_not_applied() {
+        use crate::select::MenuInput;
+        let (tuning, queue, mut session) = gated();
+        let stamp = tuning.activity().ingress();
+        let held = [
+            session.event(preedit("か"), stamp),
+            session.event(commit("可"), stamp),
+        ];
+        tuning.close_ingress(|| {});
+        tuning.open_ingress(|| {});
+        for (input, stamp) in held.into_iter().flatten() {
+            queue.push_stamped(
+                input,
+                Some(crate::select::Observed {
+                    stamp,
+                    at: bms_model::TimeUs(0),
+                }),
+            );
+        }
+        assert_eq!(queue.pop(), None);
+        publish(&tuning, &queue, &mut session, commit("化"));
+        assert_eq!(queue.pop(), Some(MenuInput::Text("化".to_owned())));
+    }
+
+    /// The window's controls, keys and select queue, as the window has
+    /// them.
+    fn window() -> (
+        crate::controls::Controls,
+        super::Keys,
+        crate::select::MenuQueue,
+    ) {
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        controls.quit_leaves();
+        let queue = crate::select::MenuQueue::gated(std::sync::Arc::clone(controls.tuning()));
+        (controls, super::Keys::new(None, None), queue)
+    }
+
+    fn code(code: winit::keyboard::KeyCode) -> winit::keyboard::PhysicalKey {
+        winit::keyboard::PhysicalKey::Code(code)
+    }
+
+    /// A press of `key` in the window, `repeat` and `synthetic` as given,
+    /// typing `text`.
+    fn key_press(
+        w: &mut (
+            crate::controls::Controls,
+            super::Keys,
+            crate::select::MenuQueue,
+        ),
+        key: winit::keyboard::PhysicalKey,
+        repeat: bool,
+        synthetic: bool,
+        text: Option<&str>,
+    ) {
+        let (controls, keys, queue) = w;
+        super::keyboard(
+            controls,
+            keys,
+            Some(queue),
+            super::KeyInput {
+                key,
+                pressed: true,
+                repeat,
+                synthetic,
+                text,
+            },
+        );
+    }
+
+    /// The scene moves at each of the decision screen's edges, as the rig
+    /// moves it: the choice's attempt entry, the deadline, a return.
+    fn close(w: &crate::controls::Controls) {
+        w.close_epoch();
+        w.next_scene();
+    }
+
+    fn open(w: &crate::controls::Controls) {
+        w.open_epoch();
+        w.next_scene();
+    }
+
+    /// The overlay key toggles the overlay outside the decision screen and
+    /// does nothing inside it.
+    #[test]
+    fn the_overlay_key_does_nothing_in_the_decision_epoch() {
+        use std::sync::atomic::Ordering;
+        let mut w = window();
+        let overlay = super::window_key(game::OVERLAY_KEY);
+        let shown = std::sync::Arc::clone(w.0.overlay());
+        key_press(&mut w, overlay, false, false, None);
+        assert!(shown.load(Ordering::SeqCst), "the positive control");
+        close(&w.0);
+        key_press(&mut w, overlay, false, false, None);
+        assert!(shown.load(Ordering::SeqCst), "toggled in the epoch");
+        open(&w.0);
+        key_press(&mut w, overlay, false, false, None);
+        assert!(!shown.load(Ordering::SeqCst));
+    }
+
+    /// Menu keys and typed text reach the select screen outside the
+    /// decision screen and not inside it; a key pressed inside it and held
+    /// across its end repeats nothing until pressed afresh, whose repeats
+    /// then act.
+    #[test]
+    fn menu_keys_and_text_need_a_fresh_press_after_the_epoch() {
+        use crate::select::{MenuInput, MenuKey};
+        use winit::keyboard::KeyCode;
+        let mut w = window();
+        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
+        key_press(&mut w, code(KeyCode::KeyA), false, false, Some("a"));
+        assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
+        assert_eq!(w.2.pop(), Some(MenuInput::Text("a".to_owned())));
+        close(&w.0);
+        key_press(&mut w, code(KeyCode::KeyA), false, false, Some("a"));
+        // Down is the last key pressed, in the epoch's scene.
+        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
+        assert_eq!(w.2.pop(), None, "published in the epoch");
+        open(&w.0);
+        key_press(&mut w, code(KeyCode::ArrowDown), true, false, None);
+        assert_eq!(w.2.pop(), None, "a repeat of a press from the epoch");
+        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
+        key_press(&mut w, code(KeyCode::ArrowDown), true, false, None);
+        assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
+        assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
+    }
+
+    /// A press the window system makes up for a focus change reaches no
+    /// menu; a real one does.
+    #[test]
+    fn a_made_up_press_reaches_no_menu() {
+        use crate::select::{MenuInput, MenuKey};
+        use winit::keyboard::KeyCode;
+        let mut w = window();
+        key_press(&mut w, code(KeyCode::ArrowDown), false, true, None);
+        assert_eq!(w.2.pop(), None);
+        key_press(&mut w, code(KeyCode::ArrowDown), false, false, None);
+        assert_eq!(w.2.pop(), Some(MenuInput::Key(MenuKey::Down)));
+    }
+
+    /// Past the decision screen's time `T`, while practice waits for its
+    /// read, an Escape is taken by the time the window observed it: one
+    /// observed after `T` leaves however late the screen looks (no look
+    /// arms anything before it); one observed before `T` (in the screen,
+    /// or queued with the choice) does not, though taken after it.
+    #[test]
+    fn an_escape_is_taken_by_its_observation_time() {
+        use winit::keyboard::KeyCode;
+        let mut w = window();
+        // Observed before T, with the choice and in the screen.
+        key_press(&mut w, code(KeyCode::Escape), false, false, None);
+        close(&w.0);
+        key_press(&mut w, code(KeyCode::Escape), false, false, None);
+        let before = w.0.now();
+        let deadline = bms_model::TimeUs(before.0 + 1);
+        while w.0.now().0 < deadline.0 {
+            std::thread::yield_now();
+        }
+        assert!(!w.2.take_escape(deadline), "an Escape from before T left");
+        // Observed after T, before any look of the screen.
+        key_press(&mut w, code(KeyCode::Escape), false, false, None);
+        assert!(w.2.take_escape(deadline), "an Escape after T did not leave");
     }
 }

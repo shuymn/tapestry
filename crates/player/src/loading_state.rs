@@ -36,13 +36,6 @@ pub enum LoadInput {
     Gauge(Option<LoadingGauge>),
     /// The chosen chart's fields, replacing those before; a change takes
     /// the next text revision.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "only fixtures report later fields until the selection's producer does"
-        )
-    )]
     Chart(ChosenChart),
 }
 
@@ -128,6 +121,15 @@ impl LifetimeState {
     /// The lifetime it belongs to.
     pub const fn lifetime(&self) -> u64 {
         self.lifetime
+    }
+
+    /// The lifetime is shown from `origin` on the loading clock (a lifetime
+    /// made at a choice and revealed at the decision screen's deadline):
+    /// the whole state published again under the next sequence number,
+    /// from the new origin.
+    pub fn restart(&mut self, origin: TimeUs) -> LoadingUpdate {
+        self.origin = origin;
+        self.apply(LoadInput::Chart((*self.chart).clone()))
     }
 
     /// Applies `input` and publishes the whole state under the next
