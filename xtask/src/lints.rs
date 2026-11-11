@@ -464,6 +464,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The application clock: each frame's readouts and every present.
+    Site::File("crates/player/src/app_clock.rs"),
     Site::File("crates/player/src/turntable.rs"),
     // The play and loading frames' calls through the screen the render
     // thread keeps; its menu preparation runs on menus only, and the
