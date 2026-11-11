@@ -463,6 +463,81 @@ fn a_lua_alpha_string_is_luaj_s_float() {
     assert_eq!(top(&q, 100.0 + 151.5, middle(&q)), Some(rgba(0xff00_00ff)));
 }
 
+/// C31: a JSON string `alpha` is Java's `Float.parseFloat`: `0.5f`,
+/// `0x1p-1` and ` 0.5D ` are all 0.5, so the average after +40 ms is
+/// `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`; `0.5ff` is no float,
+/// and the import refuses the field as the source's skin fails.
+#[test]
+fn a_json_alpha_string_is_java_s_float() {
+    let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;
+    for alpha in ["0.5f", "0x1p-1", " 0.5D "] {
+        let (_d, skin, report) = json(
+            &format!(r#""hiterrorvisualizer": [{{"id": "he", "alpha": "{alpha}"}}],"#),
+            dst,
+        );
+        assert_eq!(notes(&report), [], "{alpha}");
+        let q = visualized(skin, &[40]);
+        assert_eq!(
+            top(&q, 100.0 + 130.5, middle(&q)),
+            Some(rgba(0xff00_00ff)),
+            "{alpha}"
+        );
+    }
+    let l = import_sized(
+        [1_920, 1_080],
+        &format!(
+            r#""hiterrorvisualizer": [{{"id": "he", "alpha": "0.5ff"}}], "destination": [{dst}]"#
+        ),
+        &[],
+    );
+    assert!(
+        matches!(
+            l.err(),
+            skin_beatoraja::ImportError::Type { field: "alpha", .. }
+        ),
+        "0.5ff"
+    );
+}
+
+/// A BPM graph's `filter` is noted and ignored: the source draws a scaled
+/// graph through its bilinear shader, which blends adjoining strokes; the
+/// model keeps them hard. A graph sized by its first key at 100 × 100 and
+/// drawn 200 wide from 1 s (its keys hold 200 until 2 s) shows only its strokes' own colours (MAIN
+/// `00ff00`, the transition `7f7f7f`, the highest `ff0000`), none between
+/// them, across the full 200 pixels.
+#[test]
+fn a_bpm_graph_notes_its_filter_and_keeps_hard_edges() {
+    let (chart, profile) = tempo_chart();
+    let main = Tempo::from_units(150 * Tempo::UNITS_PER_BPM).unwrap();
+    let score = PlayScore {
+        profile: Some(&profile),
+        main: Some(main),
+        ..PlayScore::NONE
+    };
+    let (_d, skin, report) = json(
+        r#""bpmgraph": [{"id": "bg"}],"#,
+        r#"{"id": "bg", "filter": 1, "dst": [
+            {"time": 0, "x": 0, "y": 0, "w": 100, "h": 100},
+            {"time": 1000, "x": 0, "y": 0, "w": 200, "h": 100},
+            {"time": 2000, "x": 0, "y": 0, "w": 200, "h": 100}]}"#,
+    );
+    assert_eq!(
+        notes(&report),
+        [(Severity::Ignored, NoteKind::Ignored { field: "filter" })]
+    );
+    let q = Drawn::over_score(skin, &chart, score).frame(1_000, &[]);
+    assert_eq!(
+        colours(&q),
+        [rgba(0x00ff_00ff), rgba(0x7f7f_7fff), rgba(0xff00_00ff)]
+    );
+    let right = q
+        .iter()
+        .map(|q| q.rect[0] + q.rect[2])
+        .fold(f32::MIN, f32::max);
+    let left = q.iter().map(|q| q.rect[0]).fold(f32::MAX, f32::min);
+    assert!((right - left - 200.0).abs() < 1e-3, "{left} {right}");
+}
+
 /// C33: a timing visualizer following HIDDEN+ (offset 5) over lanes: with
 /// HIDDEN+ on both its band and its lines draw; with HIDDEN+ off the source
 /// sets its destination's alpha to 0, which hides the band, while the

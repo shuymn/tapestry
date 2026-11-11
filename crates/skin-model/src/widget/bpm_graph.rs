@@ -26,8 +26,9 @@ pub const MAX_BPM_COLUMNS: u32 = 2_048;
 /// The most runs a column keeps.
 pub const RUNS_PER_COLUMN: u32 = 4;
 /// The widest stroke a BPM graph takes, in texels (provisional, owner
-/// pattern 7): it bounds a preparation's work to the tempo rows times
-/// twice this, and keeps the source's `int` stroke arithmetic exact.
+/// pattern 7): it bounds how many columns a stroke overhangs its row's
+/// span, so how many strokes one column holds in a preparation, and keeps
+/// the source's `int` stroke arithmetic exact.
 pub const MAX_BPM_LINE_WIDTH: u32 = 16;
 
 /// A BPM graph's colours, the source's defaults first.
@@ -218,9 +219,10 @@ impl BpmGraphDef {
 /// `transition` from the fourth's bottom to its last's top.
 ///
 /// The columns are swept left to right holding only the fills that cover
-/// the current column, in paint order, so the work is the fills' clipped
-/// widths and the storage the most fills one column holds, never a copy
-/// of every fill per column it covers.
+/// the current column, in paint order, so the storage is the most fills
+/// one column holds, never a copy of every fill per column it covers. The
+/// work is each column's fills, which [`compose::column`] rescans once for
+/// each distinct vertical interval between their edges.
 fn compose_columns(
     fills: &[(i64, i64, i64, i64, Rgba8)],
     cols: u32,

@@ -1009,7 +1009,7 @@ fn skin_import_seeds_import_and_draw_as_built() {
             }
             "play graphs" => {
                 // The type-1 judge graph and the timing visualizer past 1 000
-                // ms drop; the BPM graph's five-digit colour keeps its
+                // ms drop; the BPM graph's four-digit colour keeps its
                 // default.
                 assert_eq!(
                     kinds(&i),

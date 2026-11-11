@@ -17,7 +17,9 @@
 //! alpha and angle. A stretch other than the default drops the graph with
 //! a note: the source draws its first frame's texture through the stretch
 //! with a negative height (`:105-107`), which the model does not
-//! reproduce. A filter changes nothing, as the strokes are solid.
+//! reproduce. A `filter` is noted and ignored: the source draws a scaled
+//! graph through its bilinear shader, which blends adjoining strokes'
+//! colours at their edges, where the model draws them hard.
 
 use bms_model::TimeUs;
 use skin_model::{BpmColors, BpmGraphDef, MAX_BPM_LINE_WIDTH, Rgba8, Source, bpm_columns};
@@ -118,6 +120,9 @@ impl Cx<'_> {
         let Some(common) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
         };
+        if dst.filter != 0 {
+            self.ignored(at, NoteKind::Ignored { field: "filter" });
+        }
         let t = self.graph_track(&common)?;
         // Its quads at worst: its first key's columns, as the model sizes
         // its pixmap.
