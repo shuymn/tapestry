@@ -447,7 +447,8 @@ impl Drawn {
     }
 
     /// `skin` played over `chart` with the context `ctx`.
-    fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
+    #[allow(dead_code, reason = "not every test binary gives its own context")]
+    pub fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
         Self::carried_over(skin, chart, ctx, skin_model::Continuation::Fresh)
     }
 
@@ -667,6 +668,8 @@ pub struct Loader {
     /// default none.
     pub difficulty: Option<u8>,
     pub bga: Option<bool>,
+    /// The chosen chart's 1× length the frame gives.
+    pub length: Option<TimeUs>,
     pub percent: i32,
     /// Whether the stored covers are being adjusted: START or SELECT held.
     pub adjusting: bool,
@@ -701,6 +704,7 @@ impl Loader {
             play_level: None,
             difficulty: None,
             bga: None,
+            length: None,
             percent: 0,
             adjusting: false,
             autoplay: false,
@@ -721,6 +725,7 @@ impl Loader {
             app: self.app,
             difficulty: self.difficulty,
             bga: self.bga,
+            length: self.length,
             autoplay: self.autoplay,
             now: TimeUs(ms * MS),
             load: LoadState {

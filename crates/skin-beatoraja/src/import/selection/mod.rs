@@ -216,7 +216,7 @@ impl Cx<'_> {
             None => true,
         };
         let (kind, class) = if graph && self.kind == ScreenKind::Play {
-            (PropertyKind::Graph, score_graph(ty).map(Class::Bridge))
+            (PropertyKind::Graph, play_graph(ty).map(Class::Bridge))
         } else if graph {
             (PropertyKind::Graph, profile::graph(ty))
         } else {
@@ -275,9 +275,15 @@ impl Cx<'_> {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         let s = self.src_image(rec)?;
-        let Some(c) = self.common_with(role, &dst, Opts::default())? else {
+        let Some(mut c) = self.common_with(role, &dst, Opts::default())? else {
             return Ok(());
         };
+        // The progresses follow tapestry's load and end at the last
+        // resolved object (D4).
+        c.display_deviation |= matches!(
+            source,
+            RatioSource::LoadProgress | RatioSource::SongProgress
+        );
         let Some((image, cell)) = self.add_src_image(&c, rec, &s, s.div)? else {
             return Ok(());
         };
@@ -295,11 +301,12 @@ impl Cx<'_> {
         self.push(c, Source::RatioBar(index), t)
     }
 
-    /// Whether graph `rec` of a play skin is a score graph: its `type`
-    /// read as [`Self::ratio_bar`] reads it is one of 110 to 115.
-    pub(in crate::import) fn score_graph(&mut self, rec: u32) -> Result<bool, ImportError> {
+    /// Whether graph `rec` of a play skin is a play graph: its `type`
+    /// read as [`Self::ratio_bar`] reads it is 101, 102 or one of 110 to
+    /// 115.
+    pub(in crate::import) fn play_graph(&mut self, rec: u32) -> Result<bool, ImportError> {
         let [ty] = self.def.fields(rec, ["type"]);
-        Ok(score_graph(self.int_or(ty, "type", 0)?).is_some())
+        Ok(play_graph(self.int_or(ty, "type", 0)?).is_some())
     }
 
     /// A destination naming the `songlist`: one song list element, the
@@ -1004,12 +1011,20 @@ fn worst_quads(l: &SongListDef) -> u32 {
     per_slot.saturating_mul(u32::try_from(l.placements.len()).unwrap_or(u32::MAX))
 }
 
-/// A play skin's graph `type` as the play's score rate (`SkinGraph.java:
-/// 95-106`, `FloatPropertyFactory.java:297-302` at `0.8.9`): 110 the
-/// current EX over the whole chart, 111 over the judged notes, 112 and
-/// 113 the best paced and whole, 114 and 115 the target's; any other type
-/// is none.
-fn score_graph(ty: i32) -> Option<RatioSource> {
+/// A play skin's graph `type` as its source (`SkinGraph.java:95-106` at
+/// `0.8.9`): 101 the play's progress (`BARGRAPH_MUSIC_PROGRESS`,
+/// `skin/SkinProperty.java:190`; `FloatPropertyFactory.java:128-137,
+/// 284`), 102 the load's (`BARGRAPH_LOAD_PROGRESS`, `:191`;
+/// `FloatPropertyFactory.java:285-290`), and the play's score rates
+/// (`FloatPropertyFactory.java:297-302`): 110 the current EX over the
+/// whole chart, 111 over the judged notes, 112 and 113 the best paced and
+/// whole, 114 and 115 the target's; any other type is none.
+fn play_graph(ty: i32) -> Option<RatioSource> {
+    match ty {
+        101 => return Some(RatioSource::SongProgress),
+        102 => return Some(RatioSource::LoadProgress),
+        _ => {}
+    }
     let k = usize::try_from(ty.checked_sub(110)?).ok()?;
     ScoreRate::ALL.get(k).copied().map(RatioSource::Score)
 }

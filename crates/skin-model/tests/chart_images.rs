@@ -145,6 +145,7 @@ impl Loader {
             fix_hispeed: 0,
             difficulty: None,
             bga: None,
+            length: None,
             autoplay: false,
             now: TimeUs(100_000),
             load: LoadState {
