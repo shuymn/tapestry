@@ -2155,8 +2155,11 @@ impl<'d> Cx<'d> {
             };
             Skin::new_decision(def, defs)
         } else {
+            // The play graphs and visualizers are not imported yet: only
+            // the score bars.
             let widgets = PlayDefs {
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
+                ..PlayDefs::default()
             };
             Skin::new_play(def, widgets)
         };
