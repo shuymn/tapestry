@@ -150,7 +150,7 @@ fn judge_timers_need_no_judge() {
 
 #[test]
 fn known_unsupported_and_unset_timers() {
-    for n in [140, 2] {
+    for n in [140, 2_999] {
         let loaded = images(&[&format!(r#""timer": {n},"#)], "");
         assert!(has(loaded.report(), timer(TimerWhy::Unsupported(n))));
         assert!(loaded.quads(0).is_empty());
@@ -174,14 +174,96 @@ fn known_unsupported_and_unset_timers() {
     assert_ne!(d.frame(150, &[])[0].uv, first);
 }
 
+/// Timer 2, the fade-out, is never set on play (docs/stage3.md D14): a
+/// destination on it is never drawn and a cycle on it stays on its first
+/// frame, with an `Unset` note and no drop, through READY (a 2 s lead-in),
+/// Playing, the audio tail and Closing, while the READY, play and failure
+/// timers run. Told apart by width: 10 on timer 2, 11 on READY (40), 12
+/// on play (41), 13 on failure (3), 14 untimed; the cycles are 15 on
+/// timer 2 and 16 on READY.
+#[test]
+fn the_fade_out_timer_is_never_set_on_play() {
+    use bms_model::TimeUs;
+    use common::play::{Drawn, MS, context};
+    use skin_beatoraja::Severity;
+    use skin_model::{Attempt, PlayContext, timer as slot};
+    let dst = |id: &str, t: &str, w: i32| {
+        format!(r#"{{"id": "{id}", {t} "dst": [{{"x": 0, "y": 0, "w": {w}, "h": 10}}]}}"#)
+    };
+    let loaded = import_body(&format!(
+        r#""image": [{{"id": "i", "src": "a", "w": 64, "h": 64}},
+                     {{"id": "c2", "src": "a", "w": 64, "h": 32, "divx": 2, "cycle": 100, "timer": 2}},
+                     {{"id": "c40", "src": "a", "w": 64, "h": 32, "divx": 2, "cycle": 100, "timer": 40}}],
+           "destination": [{}, {}, {}, {}, {}, {}, {}]"#,
+        dst("i", r#""timer": 2,"#, 10),
+        dst("i", r#""timer": 40,"#, 11),
+        dst("i", r#""timer": 41,"#, 12),
+        dst("i", r#""timer": 3,"#, 13),
+        dst("i", "", 14),
+        dst("c2", "", 15),
+        dst("c40", "", 16),
+    ));
+    let skin = loaded.ok().skin.clone();
+    let mut d = Drawn::new(skin.clone(), 100);
+    let lead_in = PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(2_000 * MS),
+        },
+        ..context()
+    };
+    d.play = skin.prepare(&d.chart, &lead_in).unwrap();
+    // Each frame's widths, and the uv of each cycled image.
+    let shown = |d: &mut Drawn, ms: i64| {
+        let q = d.frame(ms, &[]);
+        let w = |q: &skin_model::Quad| q.rect[2].round() as i32;
+        let mut widths: Vec<i32> = q.iter().map(w).collect();
+        widths.sort_unstable();
+        let uv = |width| q.iter().find(|q| w(q) == width).map(|q| q.uv);
+        (widths, uv(15), uv(16))
+    };
+    let (ready, c2, c40) = shown(&mut d, -1_500);
+    assert_eq!(ready, [11, 14, 15, 16], "READY");
+    assert_eq!(d.play.timer(slot::READY), Some(TimeUs(-2_000 * MS)));
+    assert_eq!(d.play.timer(slot::PLAY), None, "READY is before the play");
+    let (later, c2_ready, c40_ready) = shown(&mut d, -1_350);
+    assert_eq!(later, ready);
+    assert_eq!(c2_ready, c2, "READY: the cycle on 2 stays");
+    assert_ne!(c40_ready, c40, "READY: the cycle on 40 runs");
+    let (playing, c2_playing, _) = shown(&mut d, 1_550);
+    assert_eq!(playing, [11, 12, 14, 15, 16], "Playing");
+    assert_eq!(c2_playing, c2, "Playing");
+    d.playing = false;
+    d.complete = true;
+    let (tail, c2_tail, _) = shown(&mut d, 3_050);
+    assert_eq!(tail, [11, 12, 14, 15, 16], "the tail");
+    assert_eq!(c2_tail, c2, "the tail");
+    d.complete = false;
+    d.closing = Some(TimeUs(3_500 * MS));
+    let (closing, c2_closing, _) = shown(&mut d, 4_150);
+    assert_eq!(closing, [11, 12, 13, 14, 15, 16], "Closing");
+    assert_eq!(c2_closing, c2, "Closing");
+    assert_eq!(d.play.timer(slot::FAILED), d.closing, "the failure runs");
+    // Kept, not dropped: each reads `Unset`, ignored.
+    let r = loaded.report();
+    assert_eq!(
+        common::kinds(r),
+        [timer(TimerWhy::Unset(2)), timer(TimerWhy::Unset(2))],
+        "{r:?}"
+    );
+    assert!(
+        r.notes.iter().all(|n| n.severity == Severity::Ignored),
+        "{r:?}"
+    );
+}
+
 #[test]
 fn custom_timers_alias_supported_built_ins() {
     // A declaration in the built-in range has no effect.
-    let loaded = images(&[r#""timer": 2,"#], r#"{"id": 2, "timer": 41}"#);
-    assert!(has(loaded.report(), timer(TimerWhy::CustomBuiltin(2))));
-    assert!(has(loaded.report(), timer(TimerWhy::Unsupported(2))));
+    let loaded = images(&[r#""timer": 2999,"#], r#"{"id": 2999, "timer": 41}"#);
+    assert!(has(loaded.report(), timer(TimerWhy::CustomBuiltin(2_999))));
+    assert!(has(loaded.report(), timer(TimerWhy::Unsupported(2_999))));
     // An alias of `play`; the last of an id wins.
-    let custom = r#"{"id": 10000, "timer": 2}, {"id": 10000, "timer": 41},
+    let custom = r#"{"id": 10000, "timer": 2999}, {"id": 10000, "timer": 41},
                     {"id": 10001, "timer": 10000}, {"id": 10002},
                     {"id": 10003, "timer": "script()"}, {"id": 10004, "timer": 140}"#;
     let loaded = images(&[r#""timer": 10000,"#], custom);
