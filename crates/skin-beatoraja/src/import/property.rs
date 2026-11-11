@@ -314,6 +314,11 @@ pub(crate) enum Value {
     /// `IntegerPropertyFactory.java:161-166`), while the range is known.
     BpmMax,
     BpmMin,
+    /// The whole chart's MAIN tempo, whole (`mainbpm`, `:167-173`, the
+    /// song information's tempo with the most notes,
+    /// `song/SongInformation.java:199-204`), the same in a practice
+    /// section and at any speed, while it is known.
+    BpmMain,
     /// The tempo at the display head, whole (`nowbpm`, `:204`), while it
     /// is known.
     BpmNow,
@@ -502,6 +507,7 @@ impl Value {
             Self::WholeRateFraction => "rate.whole_bp % 100",
             Self::BpmMax => "bpm.max_x100 / 100",
             Self::BpmMin => "bpm.min_x100 / 100",
+            Self::BpmMain => "chart.main_bpm",
             Self::BpmNow => "bpm.current_x100 / 100",
             Self::ElapsedMinutes => "time.elapsed_s / 60",
             Self::ElapsedSeconds => "time.elapsed_s % 60",
@@ -538,6 +544,7 @@ impl Value {
     pub(crate) fn availability(self) -> Option<&'static str> {
         match self {
             Self::BpmMax | Self::BpmMin => Some("bpm.range_valid"),
+            Self::BpmMain => Some("chart.main_bpm_valid"),
             Self::BpmNow => Some("bpm.current_valid"),
             Self::HispeedX100 | Self::HispeedWhole | Self::HispeedFraction => Some("hispeed.valid"),
             Self::Duration | Self::DurationGreen => Some("duration.valid"),
@@ -770,6 +777,7 @@ fn shown(id: i32) -> Option<Value> {
         422 => Value::Late(5),
         90 => Value::BpmMax,
         91 => Value::BpmMin,
+        92 => Value::BpmMain,
         96 => Value::PlayLevel,
         525 => Value::RecentTiming,
         368 => Value::SongTotal,
@@ -1216,6 +1224,7 @@ mod tests {
         for (id, name, value, guard) in [
             (90, "maxbpm", Value::BpmMax, Some("bpm.range_valid")),
             (91, "minbpm", Value::BpmMin, Some("bpm.range_valid")),
+            (92, "mainbpm", Value::BpmMain, Some("chart.main_bpm_valid")),
             (160, "nowbpm", Value::BpmNow, Some("bpm.current_valid")),
             (161, "playtime_minute", Value::ElapsedMinutes, None),
             (162, "playtime_second", Value::ElapsedSeconds, None),
@@ -1309,7 +1318,7 @@ mod tests {
         // Neither is a value property; others keep needing their own data.
         assert_eq!(int_by_id(15), IntProp::Null);
         assert_eq!(int_by_id(131), IntProp::Null);
-        for id in [92, 1_163, 1_164, 372, 373] {
+        for id in [1_163, 1_164, 372, 373] {
             assert_eq!(int_by_id(id), IntProp::Unsupported(Some(id)), "{id}");
         }
         // 1312 to 1327: each variant's ms and green, under its validity,

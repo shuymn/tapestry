@@ -407,6 +407,95 @@ fn an_uncompilable_value_drops_the_slider_with_its_cause() {
     }
 }
 
+/// The adjusted cover's value as a skin writes it: under the hidden
+/// cover's switch, the lanes' visible share left by the lane cover and
+/// the lift, less that share times the current BPM over the maximum at
+/// hi-speed fix MAX (2) or over the main BPM at fix MAIN (3); nil
+/// otherwise.
+const ADJUSTED_COVER: &str = "if ms.option(273) then
+    local visible_area = 1 - (ms.number(14) + ms.number(314)) / 1000
+    local event = ms.event_index(55)
+    if event == 2 then
+        return visible_area - visible_area * ms.number(160) / ms.number(90)
+    elseif event == 3 then
+        return visible_area - visible_area * ms.number(160) / ms.number(92)
+    end
+end";
+
+/// C17: an adjusted cover over the lanes (offset 4, SUDDEN+'s follower)
+/// whose value reads the hi-speed fix, the covers, the current, maximum
+/// and main BPMs and the hidden cover's switch compiles and is retained
+/// with the decorative role (stage3.md's slider rule: none of its reads is
+/// a critical part): with an unsupported blend it drops where a critical
+/// one refuses. With the lane cover at 200 ‰, the lift at 100 ‰, the
+/// current BPM 120, MAIN 150 and the maximum 180, the visible share is
+/// 0.7: at fix MAIN it reads 0.7 − 0.7·120/150 = 0.14 of its range (by
+/// the current BPM it would read 0, by the maximum ≈ 0.2333), at fix MAX
+/// 0.7 − 0.7·120/180 ≈ 0.2333, and at Classic, or with the hidden cover
+/// off, nil, 0, each on top of SUDDEN+'s slide.
+#[test]
+fn an_adjusted_cover_is_decorative_and_reads_the_main_bpm() {
+    let lua = skin(2, ADJUSTED_COVER, "", "offset = 4,", true);
+    let i = load(&lua).unwrap();
+    assert!(compiled(&i), "{:?}", i.callbacks);
+    let view = LaneView {
+        cover: 200,
+        lift: 100,
+        ..LaneView::NONE
+    };
+    let chart = common::play::chart(0);
+    let mut p = Drawn::over_main(
+        i.imported.skin.clone(),
+        &chart,
+        bms_model::Tempo::from_milli(150_000),
+        Some(skin_model::BpmRange {
+            min_x100: 12_000,
+            max_x100: 18_000,
+        }),
+    );
+    p.view = LaneView {
+        gain: p.view.gain,
+        ..view
+    };
+    let mut at = |fix: u8, hidden: bool| {
+        let mut r = readouts_for(view);
+        r.covers.hidden_enabled = hidden;
+        p.readouts = Some(FrameReadouts {
+            fix_hispeed: fix,
+            bpm_current_x100: Some(12_000),
+            ..r
+        });
+        let q = p.frame(1_000, &[]);
+        q.last().expect("drawn").rect[1]
+    };
+    let classic = at(0, true);
+    let main = at(3, true) - classic;
+    let max = at(2, true) - classic;
+    assert!(near(main, 0.14 * RANGE), "{main}");
+    assert!(near(max, (0.7 - 0.7 * 120.0 / 180.0) * RANGE), "{max}");
+    for fix in [1, 4] {
+        assert!(near(at(fix, true), classic), "{fix}");
+    }
+    assert!(near(at(3, false), classic));
+    // Without a MAIN tempo or a BPM range a read is unavailable: it is not
+    // drawn, so it never covers more than the source's would.
+    let mut p = Drawn::over_main(i.imported.skin.clone(), &chart, None, None);
+    p.view = LaneView {
+        gain: p.view.gain,
+        ..view
+    };
+    p.readouts = Some(FrameReadouts {
+        fix_hispeed: 3,
+        bpm_current_x100: Some(12_000),
+        ..readouts_for(view)
+    });
+    assert!(p.frame(1_000, &[]).is_empty());
+    // Decorative: an unsupported blend drops it and the skin imports.
+    let lua = skin(2, ADJUSTED_COVER, "", "offset = 4, blend = 9,", true);
+    let i = load(&lua).unwrap();
+    assert!(!compiled(&i), "{:?}", i.callbacks);
+}
+
 #[test]
 fn a_decorative_slider_dropped_after_its_value_compiled_leaves_no_callback() {
     for dst in ["blend = 9,", ""] {

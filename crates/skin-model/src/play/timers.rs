@@ -4,7 +4,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
-use bms_model::{BEAT, DOMAIN, Lane, TimeUs};
+use bms_model::{BEAT, DOMAIN, Lane, Tempo, TimeUs};
 use eval::Tally;
 use rules::GaugeValue;
 
@@ -529,6 +529,17 @@ pub(crate) fn app_fields(app: &AppReadouts) -> Option<[i32; APP_FIELDS]> {
     ])
 }
 
+/// `field::CHART_MAIN_BPM` and its validity from the attempt's whole-chart
+/// MAIN tempo: whole BPM, truncated as the source's `(int)` cast of its
+/// song information's main BPM (`IntegerPropertyFactory.java:167-173`);
+/// 0 and false without one or past the readout maximum, which the source's
+/// number widget would not draw either (`skin/SkinNumber.java:139`).
+pub(crate) fn main_bpm_fields(main: Option<Tempo>) -> [i32; 2] {
+    main.and_then(|t| i32::try_from(t.units() / Tempo::UNITS_PER_BPM).ok())
+        .filter(|&bpm| bpm <= READOUT_MAX)
+        .map_or([0, 0], |bpm| [bpm, 1])
+}
+
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
 pub(crate) const CHART_FIELDS: usize = 8;
 
@@ -1012,7 +1023,8 @@ impl Play {
             ])
             .chain(score_figures(inputs))
             .chain(r.settings)
-            .chain(r.app);
+            .chain(r.app)
+            .chain(self.main_bpm);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }

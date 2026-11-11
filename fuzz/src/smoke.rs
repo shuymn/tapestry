@@ -1034,18 +1034,14 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [31 + 4; 4], "{name}");
             }
             "readouts" => {
-                use skin_beatoraja::{DeviationId, PropertyKind};
+                use skin_beatoraja::DeviationId;
                 // Each readout number D4, and none for the adjustment
                 // condition, which reads the snapshot; 15 is no value property, so `ref` 71 shows; 131
-                // resolves to nothing; 92 is unsupported.
+                // resolves to nothing; 92, the main BPM, is a readout too.
                 let mut k = kinds(&i);
                 k.sort_by_key(|n| format!("{n:?}"));
-                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 16];
+                let mut want = vec![NoteKind::Deviation(DeviationId::D4); 17];
                 want.push(NoteKind::Ignored { field: "value" });
-                want.push(NoteKind::UnsupportedProperty {
-                    kind: PropertyKind::Integer,
-                    id: Some(92),
-                });
                 want.sort_by_key(|n| format!("{n:?}"));
                 assert_eq!(k, want, "{name}");
                 assert_eq!(u.elements, 24, "{name}");

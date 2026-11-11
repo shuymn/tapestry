@@ -2246,6 +2246,7 @@ fn build_does_not_allocate() {
     assert_eq!(after, Err(BuildError::InconsistentTally));
     readouts_do_not_allocate(&loaded, &descs);
     rhythm_does_not_allocate(&descs);
+    main_bpm_does_not_allocate(&descs);
     loading_does_not_allocate(&loaded, &views, &descs);
     // Both text elements ask for a line; the title is the chart's.
     let chart_text = ChartText {
@@ -4240,6 +4241,128 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
         off > 0 && on == [true; 4] && drawn > 0,
         "{off} {on:?} {drawn}"
     );
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
+/// The whole chart's MAIN tempo (`chart.main_bpm`, 150.7 BPM shown as 150)
+/// read by a `when` timer's program and its validity by an element, over a
+/// play's frames, a rearm and a practice round at k = 10: nothing
+/// allocates; with a positive control.
+fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
+    let chart = ChartBuilder::new(120_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .bpm(TimeUs(1_500 * MS), 180_000)
+        .tap(lane(2), TimeUs(2_000 * MS))
+        .build()
+        .unwrap();
+    let skin = play_support::load(
+        vec![bool_program(
+            "chart.main_bpm == 150 && chart.main_bpm_valid",
+        )],
+        vec![play_support::element(TimerRef::When(0), 1)],
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let round = Section {
+        start: TimeUs(500 * MS),
+        end: TimeUs(1_200 * MS),
+        lead_in: TimeUs(0),
+        initial_gauges: vec![descs[0].start, descs[1].start],
+    };
+    let score = skin_model::PlayScore {
+        main: bms_model::Tempo::from_milli(150_700),
+        ..skin_model::PlayScore::NONE
+    };
+    let ctx = |attempt| PlayContext {
+        meta: skin_model::ChartMetadata::UNKNOWN,
+        autoplay: false,
+        gauges: descs,
+        attempt,
+        empty_poor_breaks_combo: false,
+        empty_poor_counted: false,
+        scratch: Side::Left,
+        ln_default: rules::LnMode::Ln,
+        last_note_end: TimeUs(2_000 * MS),
+        bpm_range: None,
+        bpm_whole_change: None,
+        play_level: None,
+        score,
+    };
+    let full = ctx(Attempt::Full {
+        lead_in: TimeUs(500 * MS),
+    });
+    let practice = PlayContext {
+        score: skin_model::PlayScore {
+            speed: bms_model::Speed::from_twentieths(10).unwrap(),
+            ..score
+        },
+        ..ctx(Attempt::Section(&round))
+    };
+    let t = tally(0);
+    let gauges = [descs[0].start, descs[1].start].map(state);
+    let notes = NoteFacts::default();
+    let lanes = LaneView::NONE;
+    let frame = |now: i64| SkinFrame {
+        state_us: 0,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &SkinLayout::AUTHOR,
+        turntable: 0,
+        lanes,
+        readouts: readouts_for(lanes),
+        app: skin_model::AppReadouts::LAUNCH,
+        playing: true,
+        closing: None,
+    };
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let mut plays = [
+        skin.prepare(&chart, &full).unwrap(),
+        skin.prepare(&chart, &practice).unwrap(),
+    ];
+    let (mut read, mut drawn) = (Vec::with_capacity(512), 0);
+    let mut results = Ok(());
+    TRACK.with(|t| t.set(true));
+    for play in &mut plays {
+        for pass in 0..2 {
+            if pass == 1 {
+                play.rearm();
+            }
+            for now in (-500 * MS..=2_500 * MS).step_by(16 * MS as usize) {
+                batch.clear();
+                results = results.and(skin.build(play, &frame(now), &uvs, &mut batch));
+                let fields = play.state().fields;
+                if read.len() < read.capacity() {
+                    read.push((
+                        fields[usize::from(field::CHART_MAIN_BPM)],
+                        fields[usize::from(field::CHART_MAIN_BPM_VALID)],
+                    ));
+                }
+                drawn += batch.quads().len();
+            }
+        }
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "main BPM: allocations");
+    assert_eq!(results, Ok(()));
+    assert!(
+        !read.is_empty() && read.iter().all(|&r| r == (150, 1)),
+        "{read:?}"
+    );
+    assert!(drawn > 0, "{drawn}");
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

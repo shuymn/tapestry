@@ -429,7 +429,7 @@ fn a_negative_play_level_shows_its_sign_and_digits() {
 
 #[test]
 fn ids_without_these_contracts_stay_unsupported() {
-    for id in [92, 1_163, 1_164, 372, 373] {
+    for id in [1_163, 1_164, 372, 373] {
         let loaded = number(&format!(r#""ref": {id}"#));
         let why = NoteKind::UnsupportedProperty {
             kind: PropertyKind::Integer,
