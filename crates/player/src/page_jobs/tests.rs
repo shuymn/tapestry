@@ -261,10 +261,14 @@ fn bank(
         coord.subscriber(Scope::Choice),
         ("page.bms".into(), Arc::clone(chart), RATE),
         (promoted, Owner::Speculative),
-        Arc::clone(&mode),
-        PageSink::default(),
-        #[cfg(feature = "dev-tools")]
-        None,
+        (
+            Arc::clone(&mode),
+            PageSink::default(),
+            #[cfg(feature = "dev-tools")]
+            None,
+            #[cfg(not(feature = "dev-tools"))]
+            (),
+        ),
         Some(script.probe()),
     )
     .unwrap();

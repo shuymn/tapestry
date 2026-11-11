@@ -32,13 +32,19 @@ fn song(dir: &Path, tag: &str) -> PathBuf {
     path
 }
 
+/// A hold armed at a point: where it says it holds, and what lets it go.
+type Held = (PageAt, Sender<()>, Receiver<()>);
+
+/// Something done once at a point.
+type Action = (PageAt, Box<dyn FnOnce() + Send>);
+
 /// The page jobs' probe: what each said, holds at armed points, one-shot
 /// actions and panics.
 #[derive(Default)]
 struct Page {
     seen: Mutex<Vec<PageAt>>,
-    holds: Mutex<Vec<(PageAt, Sender<()>, Receiver<()>)>>,
-    actions: Mutex<Vec<(PageAt, Box<dyn FnOnce() + Send>)>>,
+    holds: Mutex<Vec<Held>>,
+    actions: Mutex<Vec<Action>>,
     panics: Mutex<Vec<PageAt>>,
 }
 
