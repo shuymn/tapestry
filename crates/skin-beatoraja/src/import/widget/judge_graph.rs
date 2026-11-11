@@ -41,6 +41,16 @@ fn lit(no_gap_x: bool, no_gap_y: bool) -> [u8; 2] {
     [4 + u8::from(no_gap_x), 4 + u8::from(no_gap_y)]
 }
 
+/// A graph's or visualizer's destination: on play it moves with LIFT,
+/// SUDDEN+ and HIDDEN+ (offsets 3 to 5), as every object the source draws
+/// does (`skin/SkinObject.java:404-428`).
+pub(super) fn follows() -> Opts<'static> {
+    Opts {
+        follow: true,
+        ..Opts::default()
+    }
+}
+
 impl Cx<'_> {
     /// The judge graph record `rec` at `dst`.
     pub(in super::super) fn judge_graph(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
@@ -68,7 +78,7 @@ impl Cx<'_> {
         let reverse = self.int_or(reverse, "orderReverse", 0)? == 1;
         let no_gap = self.int_or(no_gap, "noGap", 0)? == 1;
         let no_gap_x = self.int_or(no_gap_x, "noGapX", 0)? == 1;
-        let Some(c) = self.common_with(role, &dst, Opts::default())? else {
+        let Some(c) = self.common_with(role, &dst, follows())? else {
             return Ok(());
         };
         let fit = fit(dst.stretch);

@@ -37,7 +37,7 @@ use skin_model::{
 
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Severity, Span};
-use super::super::{Cx, Dst, Opts};
+use super::super::{Cx, Dst};
 use crate::error::ImportError;
 
 /// The source's error colour: opaque red.
@@ -217,7 +217,7 @@ impl Cx<'_> {
         let fields = self.def.fields(rec, TIMING_NAMES.map(|(n, _)| n));
         let [line, center, pg, gr, gd, bd] = self.checked_colours(at, fields, TIMING_NAMES)?;
         let pr = self.poor_colour(at, transparent, poor, TIMING_POOR)?;
-        let Some(c) = self.common_with(role, &dst, Opts::default())? else {
+        let Some(c) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
         };
         let mut def = TimingVisualizerDef {
@@ -302,7 +302,7 @@ impl Cx<'_> {
         let fields = self.def.fields(rec, HIT_NAMES.map(|(n, _)| n));
         let [line, center, ema, pg, gr, gd, bd] = self.checked_colours(at, fields, HIT_NAMES)?;
         let pr = self.poor_colour(at, transparent, poor, HIT_POOR)?;
-        let Some(c) = self.common_with(role, &dst, Opts::default())? else {
+        let Some(c) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
         };
         let mut def = HitErrorDef {

@@ -525,3 +525,34 @@ fn a_timing_visualizer_clamps_its_line_width() {
     assert_ne!(top(&q, 100.0 + 192.6, y), green);
     assert_ne!(top(&q, 100.0 + 188.4, y), green);
 }
+
+/// C33: a graph or visualizer whose destination lists LIFT, SUDDEN+ or
+/// HIDDEN+ (offsets 3 to 5) moves with it, as every object the source
+/// draws does (one real skin's hit-error visualizer lists offset 3): it is
+/// kept, with no note, and draws.
+#[test]
+fn graphs_and_visualizers_follow_the_covers() {
+    for (table, id) in [
+        ("hiterrorvisualizer", "v"),
+        ("timingvisualizer", "v"),
+        ("bpmgraph", "v"),
+        ("judgegraph", "v"),
+    ] {
+        let (_d, skin, report) = json(
+            &format!(r#""{table}": [{{"id": "{id}"}}],"#),
+            r#"{"id": "v", "offsets": [3, 4, 5], "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
+        );
+        assert!(
+            !report
+                .notes
+                .iter()
+                .any(|n| matches!(n.kind, NoteKind::RuntimeOffset(_))),
+            "{table}: {:?}",
+            notes(&report)
+        );
+        assert_eq!(skin.kind(), skin_model::ScreenKind::Play, "{table}");
+        if table.ends_with("visualizer") {
+            assert!(!visualized(skin, &[40]).is_empty(), "{table}");
+        }
+    }
+}

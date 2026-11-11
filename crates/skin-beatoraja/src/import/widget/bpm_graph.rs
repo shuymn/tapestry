@@ -21,7 +21,7 @@ use skin_model::{BpmColors, BpmGraphDef, MAX_COORD, Rgba8, Source, bpm_columns};
 
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Severity};
-use super::super::{Cx, Dst, Opts};
+use super::super::{Cx, Dst};
 use crate::error::ImportError;
 
 /// The colour fields, in [`colors`]'s order: main, min, max, other, stop,
@@ -98,7 +98,7 @@ impl Cx<'_> {
                 ),
             }
         }
-        let Some(common) = self.common_with(role, &dst, Opts::default())? else {
+        let Some(common) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
         };
         let t = self.graph_track(&common)?;
