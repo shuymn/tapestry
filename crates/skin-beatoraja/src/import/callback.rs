@@ -237,6 +237,9 @@ enum Mapped {
     /// `timer(n)`: its JSON mapping's timer name, or `None` for one never
     /// set, read only against the off value.
     Timer(Option<&'static str>),
+    /// `float_number(n)`, a float no expression holds, read only against
+    /// 0: the field that is non-zero exactly when it is.
+    Zero(&'static str),
 }
 
 /// An emitted subexpression.
@@ -523,6 +526,14 @@ impl Lower<'_> {
                 let src = Self::text(self.an, &["(", v.expr(), ")"])?;
                 Ok(Mapped::Int { src, lo, hi })
             }
+            // The best's rate over the attempt's targets
+            // (`FloatPropertyFactory.java:297-302` at `0.8.9`, `B / 2n` in
+            // `float`), 0 for an unknown best and for a `#RANDOM` chart: a
+            // `float` of a positive EX over at most 10^6 targets is never 0,
+            // and neither is `best.rate_ppm`, so their comparisons with 0
+            // agree. Any other read of it, or another id, is unmapped.
+            "float_number" if play && id == Some(113) => Ok(Mapped::Zero("best.rate_ppm")),
+            "float_number" => Err(unmapped()),
             "judge" => {
                 let n = arg.ok_or_else(unmapped)?;
                 let Some(v) = property::judge_count(n) else {
@@ -740,7 +751,7 @@ impl Lower<'_> {
     }
 
     /// A comparison: `gauge_type()` against a known look, a timer against
-    /// the off value, or integers or booleans.
+    /// the off value, `float_number(n)` against 0, or integers or booleans.
     fn compare(&mut self, res: &Residual, op: Bin, a: u32, b: u32) -> R<V> {
         let an = self.an;
         let eq = op == Bin::Eq;
@@ -759,6 +770,15 @@ impl Lower<'_> {
                         }
                         None => Self::text(an, &[if eq { "false" } else { "true" }])?,
                     }));
+                }
+                // The residual takes the read only as an operand of `==`
+                // or `~=` whose other operand is the literal 0.
+                (Some(Mapped::Zero(field)), Some(_)) => {
+                    let field = *field;
+                    return Ok(V::Bool(Self::text(
+                        an,
+                        &["(", field, " ", symbol(op), " 0)"],
+                    )?));
                 }
                 (Some(Mapped::Timer(t)), Some(Val::OffValue)) => {
                     let t = *t;
@@ -1229,7 +1249,10 @@ impl Leaves for Lower<'_> {
             Node::Cmp(op, a, b) => {
                 let whole = |x: u32| {
                     matches!(res.node(x), Node::Read { .. })
-                        && matches!(self.mapped.get(&x), Some(Mapped::Gauge | Mapped::Timer(_)))
+                        && matches!(
+                            self.mapped.get(&x),
+                            Some(Mapped::Gauge | Mapped::Timer(_) | Mapped::Zero(_))
+                        )
                 };
                 let read = match (whole(a), whole(b)) {
                     (true, _) => a,

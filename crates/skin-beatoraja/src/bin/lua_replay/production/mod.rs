@@ -51,6 +51,30 @@ fn offer(model: &Model) -> skin_model::Continuation<'_> {
     offer
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's best and target for the play: the score figures read
+    /// non-zero values, where a run has neither.
+    pub static SCORE_BASIS: std::cell::Cell<Option<(u32, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The play's best and target: a test's ([`SCORE_BASIS`]), else none.
+fn play_score() -> skin_model::PlayScore<'static> {
+    #[cfg(test)]
+    if let Some((best, target)) = SCORE_BASIS.with(std::cell::Cell::get) {
+        return skin_model::PlayScore {
+            basis: skin_model::ScoreBasis {
+                best,
+                best_known: true,
+                target,
+            },
+            ..skin_model::PlayScore::NONE
+        };
+    }
+    skin_model::PlayScore::NONE
+}
+
 /// The score input's EX-score offset: a test's, else 0.
 fn skew() -> i32 {
     #[cfg(test)]
@@ -355,7 +379,7 @@ pub fn record(
                         bpm_range: None,
                         bpm_whole_change: None,
                         play_level,
-                        score: skin_model::PlayScore::NONE,
+                        score: play_score(),
                     };
                     let carried = model.carried(carry_safe);
                     let mut play = skin

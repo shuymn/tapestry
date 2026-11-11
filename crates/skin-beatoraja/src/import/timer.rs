@@ -18,6 +18,17 @@ const FAILED: i32 = 3;
 /// `ScoreDataProperty.java:64-110`).
 pub(crate) const RANKS: [(i32, i32); 3] = [(348, 18), (349, 21), (350, 24)];
 
+/// The best's and the target's timers (`TIMER_SCORE_BEST`, 351, and
+/// `TIMER_SCORE_TARGET`, 352; `SkinProperty.java:52-53`), on from the
+/// update whose EX score reaches the play's best or target
+/// (`BMSPlayer.java:1043-1044`): `when` conditions on the flags the play
+/// computes, after the three rank timers.
+const REACHED: [(i32, &str); 2] = [(351, "best.reached"), (352, "target.reached")];
+
+/// The `when` timers the importer may add: the rank timers, then the
+/// best's and the target's.
+pub(crate) const WHEN_TIMERS: usize = RANKS.len() + REACHED.len();
+
 /// The per-lane timer blocks (`LaneProperty.java:46-51`): the first id
 /// (offset 0 is the scratch, the model's lane 0) and the model's kind
 /// (`press`, `release`, `bomb`, `hold`, in slot order).
@@ -28,7 +39,8 @@ const LANE_BLOCKS: [(i32, u16); 4] = [(100, 0), (120, 1), (50, 2), (70, 3)];
 pub(crate) enum Timer {
     /// A model built-in.
     Builtin(u16),
-    /// Rank timer `k` of [`RANKS`], a `when` condition.
+    /// `when` timer `k`: rank timer `k` of [`RANKS`], or past them the
+    /// best's or the target's ([`rank_source`]).
     Rank(usize),
     /// Proven never set: never drawn as a destination timer, frame 0
     /// forever as a cycle timer.
@@ -69,6 +81,9 @@ pub(crate) fn builtin(id: i32) -> Timer {
             if let Some(k) = RANKS.iter().position(|&(r, _)| r == id) {
                 return Timer::Rank(k);
             }
+            if let Some(k) = REACHED.iter().position(|&(r, _)| r == id) {
+                return Timer::Rank(RANKS.len() + k);
+            }
             let lane = LANE_BLOCKS.iter().find_map(|&(first, kind)| {
                 let lane = u16::try_from(id.checked_sub(first)?).ok()?;
                 (lane < 8).then(|| timer::LANES + kind * 8 + lane)
@@ -98,6 +113,9 @@ pub(crate) fn builtin(id: i32) -> Timer {
 /// never enters (s7-06s-design.md §2.4). Once the round has a judgment the
 /// EX score is its own, so the guard changes nothing there.
 pub(crate) fn rank_source(k: usize) -> Option<String> {
+    if let Some(&(_, flag)) = k.checked_sub(RANKS.len()).and_then(|j| REACHED.get(j)) {
+        return Some(flag.to_owned());
+    }
     let &(_, i) = RANKS.get(k)?;
     Some(format!(
         "(count.perfect > 0 || count.great > 0 || count.good > 0 || count.bad > 0 \
@@ -211,7 +229,7 @@ impl Custom {
 }
 
 /// The model reference of a mapped timer, given the rank `when` indices.
-pub(crate) fn model_ref(t: Timer, whens: &[Option<u16>; 3]) -> Option<TimerRef> {
+pub(crate) fn model_ref(t: Timer, whens: &[Option<u16>; WHEN_TIMERS]) -> Option<TimerRef> {
     match t {
         Timer::Builtin(slot) => Some(TimerRef::Builtin(slot)),
         Timer::Rank(k) => whens.get(k).copied().flatten().map(TimerRef::When),

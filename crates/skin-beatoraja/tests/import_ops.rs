@@ -156,10 +156,10 @@ fn the_perfect_judgment_needs_no_judge() {
 
 #[test]
 fn known_unsupported_built_ins_drop() {
-    let loaded = image(r#""op": [202]"#);
+    let loaded = image(r#""op": [300]"#);
     let why = NoteKind::UnsupportedProperty {
         kind: PropertyKind::Boolean,
-        id: Some(202),
+        id: Some(300),
     };
     assert!(has(loaded.report(), why));
     assert!(
@@ -169,7 +169,7 @@ fn known_unsupported_built_ins_drop() {
             .iter()
             .any(|n| n.kind == ignored("op"))
     );
-    let e = critical(r#""op": [202]"#).err();
+    let e = critical(r#""op": [300]"#).err();
     assert!(matches!(e, ImportError::Critical { why: w, .. } if w == why));
     // The chart conditions beside the BPM-change pair stay unsupported.
     for id in [172, 1_177] {
@@ -294,11 +294,11 @@ fn gauge_families_read_the_shown_kind() {
         repeated.ok().skin.ops().total(),
         once.ok().skin.ops().total()
     );
-    // The rank conditions stay unsupported.
-    let loaded = image(r#""op": [200]"#);
+    // A built-in past the ranks stays unsupported.
+    let loaded = image(r#""op": [300]"#);
     let why = NoteKind::UnsupportedProperty {
         kind: PropertyKind::Boolean,
-        id: Some(200),
+        id: Some(300),
     };
     assert!(has(loaded.report(), why));
 }
@@ -407,4 +407,49 @@ fn both_signs_of_a_bpm_change_condition_never_draw() {
         let mut d = common::play::Drawn::over_with(skin, &chart, None, fact);
         assert!(d.frame(0, &[]).is_empty(), "{fact:?}");
     }
+}
+
+/// s10-10-design.md C28, through a JSON skin: option 201 holds §8's band,
+/// timer 351 waits for the best and graph 113 is the best's whole rate,
+/// in a play of 7 notes whose best is 11 and target 13.
+#[test]
+fn json_score_figures_read_the_play() {
+    let loaded = import_body(
+        r#""image": [{"id": "i", "src": "a", "w": 64, "h": 64}],
+           "graph": [{"id": "g", "src": "a", "w": 64, "h": 4, "type": 113, "angle": 0}],
+           "destination": [
+             {"id": "g", "dst": [{"x": 0, "y": 0, "w": 140, "h": 4}]},
+             {"id": "i", "op": [201], "dst": [{"x": 0, "y": 100, "w": 11, "h": 10}]},
+             {"id": "i", "timer": 351, "dst": [{"x": 0, "y": 200, "w": 12, "h": 10}]}
+           ]"#,
+    );
+    let mut d = loaded.drawn_over(7);
+    let ctx = skin_model::PlayContext {
+        score: skin_model::PlayScore {
+            basis: skin_model::ScoreBasis {
+                best: 11,
+                best_known: true,
+                target: 13,
+            },
+            ..skin_model::PlayScore::NONE
+        },
+        ..common::play::context()
+    };
+    d.play = d.skin.prepare(&d.chart, &ctx).unwrap();
+    let mut t = common::play::tally(5, 3);
+    t.counts.perfect = 2;
+    t.counts.great = 1;
+    d.tally = t;
+    let widths: Vec<f32> = d.frame(1_000, &[]).iter().map(|q| q.rect[2]).collect();
+    // The bar at 11/14 of 140 and the band's image; the timer's waits.
+    assert_eq!(widths.len(), 2, "{widths:?}");
+    assert!((widths[0] - 110.0).abs() < 1e-3, "{widths:?}");
+    assert!((widths[1] - 11.0).abs() < 1e-3, "{widths:?}");
+    let mut t = common::play::tally(12, 6);
+    t.counts.perfect = 6;
+    d.tally = t;
+    // Rank 201 off (AAA now), the timer's image on.
+    let widths: Vec<f32> = d.frame(1_016, &[]).iter().map(|q| q.rect[2]).collect();
+    assert_eq!(widths.len(), 2, "{widths:?}");
+    assert!((widths[1] - 12.0).abs() < 1e-3, "{widths:?}");
 }

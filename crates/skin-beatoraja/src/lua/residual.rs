@@ -357,6 +357,7 @@ fn reader(api: u16) -> Option<(usize, u8)> {
         ("main_state", "option") => Some((1, BOOL)),
         ("main_state", "text") => Some((1, STR)),
         ("main_state", "gauge_type") => Some((0, INT)),
+        ("main_state", "float_number") => Some((1, FLT)),
         _ => None,
     }
 }
@@ -380,6 +381,23 @@ pub(crate) fn is_text(api: u16) -> bool {
 /// Whether host API `api` is `main_state.timer`.
 pub(crate) fn is_timer(api: u16) -> bool {
     HOST_APIS.get(usize::from(api)) == Some(&("main_state", "timer"))
+}
+
+/// Whether expression `call`, through parentheses, is a call and `other`,
+/// through parentheses, the literal 0 or 0.0.
+fn call_against_zero(ast: &Ast, call: u32, other: u32) -> bool {
+    let bare = |mut e: u32| {
+        while let Expr::Paren(x) = ast.expr(e) {
+            e = x;
+        }
+        ast.expr(e)
+    };
+    matches!(bare(call), Expr::Call { .. })
+        && match bare(other) {
+            Expr::Int(n) => n == 0,
+            Expr::Float(bits) => f64::from_bits(bits) == 0.0,
+            _ => false,
+        }
 }
 
 /// Whether host API `api` is `main_state.time`.
@@ -423,6 +441,10 @@ struct Eval<'a> {
     stack: Vec<u32>,
     /// The consumer is a text's value ([`Conv::Text`]).
     text: bool,
+    /// The call being evaluated is an operand of `==` or `~=` whose other
+    /// operand is a literal 0: the one place a `float_number` read may be
+    /// ([`Self::call`]). Taken by the next call.
+    zero_operand: bool,
     /// The root's slot cells, by declaration of its file, each to its slot.
     cells: &'a [(u32, u16)],
     /// The slot cells' values on the paths that returned, while one may
@@ -450,6 +472,7 @@ pub(crate) fn evaluate(
         depth: 0,
         stack: Vec::new(),
         text: conv == Conv::Text,
+        zero_operand: false,
         cells,
         ret: None,
     };
@@ -1176,6 +1199,7 @@ impl<'a> Eval<'a> {
     }
 
     fn call(&mut self, f: &mut Frame<'a>, callee: u32, args: List) -> R<u32> {
+        let zero_operand = std::mem::take(&mut self.zero_operand);
         let c = self.expr(f, callee)?;
         let args = f.ast.list(args);
         match self.val(c) {
@@ -1193,9 +1217,16 @@ impl<'a> Eval<'a> {
                 self.push(Node::StateUs)
             }
             Some(Val::Host(api)) => {
-                let Some((arity, _)) = reader(api) else {
+                let Some((arity, kind)) = reader(api) else {
                     return refuse(Unsupported::HostApi(api));
                 };
+                // A float no expression holds is read only where it is
+                // compared with a literal 0: anywhere else (truthiness,
+                // `not`, arithmetic, a local, another operand) its use
+                // would fold away or need the float.
+                if kind == FLT && !zero_operand {
+                    return refuse(Unsupported::Type);
+                }
                 charge(self.an, "list:host", units(args.len()))?;
                 did("list:host");
                 let xs = self.values(f, args, args.len())?;
@@ -1397,8 +1428,12 @@ impl<'a> Eval<'a> {
                 }
             }
             _ => {
+                let zero = matches!(op, Bin::Eq | Bin::Ne);
+                self.zero_operand = zero && call_against_zero(f.ast, a, b);
                 let x = self.expr(f, a)?;
+                self.zero_operand = zero && call_against_zero(f.ast, b, a);
                 let y = self.expr(f, b)?;
+                self.zero_operand = false;
                 self.op(op, x, y)
             }
         }

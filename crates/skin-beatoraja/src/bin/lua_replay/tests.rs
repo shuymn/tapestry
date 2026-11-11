@@ -398,7 +398,7 @@ fn a_perturbed_read_is_found() {
 /// reading what it writes.
 const WRITER: &str = "local n\n\
      skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
-       value = function() if ms.float_number(113) ~= 0 then n = 1 else n = 2 end return n end } }\n\
+       value = function() if ms.float_number(114) ~= 0 then n = 1 else n = 2 end return n end } }\n\
      table.insert(skin.destination, { id = \"i\", draw = function() return n ~= nil end,\n\
        dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n\
      table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
@@ -466,7 +466,7 @@ fn a_write_free_entry_passes() {
     let body = dst(
         "\"i\"",
         0,
-        "draw = function() return ms.float_number(113) ~= 0 end,",
+        "draw = function() return ms.float_number(114) ~= 0 end,",
     );
     let bare = run(&body);
     assert!(!bare.passes(), "{}", bare.text(0, true, true));
@@ -791,7 +791,7 @@ fn listed_consumers_join_their_records() {
 fn a_listed_reader_carries_its_evidence() {
     let body = "local n\n\
          skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
-           value = function() if ms.float_number(113) ~= 0 then n = 1 else n = 2 end return n end } }\n\
+           value = function() if ms.float_number(114) ~= 0 then n = 1 else n = 2 end return n end } }\n\
          skin.slider = { { id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 100,\n\
            value = function() return n or 0 end } }\n\
          table.insert(skin.destination, { id = \"sl\", dst = { { x = 0, y = 0, w = 8, h = 8 } } })\n\
