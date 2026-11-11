@@ -10,7 +10,7 @@ use game::coord::{JobKind, LoadFailure, OwnedJob, Promotion, Waited};
 
 use super::{ChartLoadError, Progress, cancelled, decode_on_permits};
 use crate::background::Claim;
-use crate::page_jobs::{PageChart, Taken, Terminal, taken};
+use crate::page_jobs::{PageChart, Taken, taken};
 use crate::play::PlayerRig;
 
 /// What a step of the Start came to.
@@ -24,21 +24,11 @@ pub(super) enum Got<T> {
 }
 
 impl PlayerRig<'_> {
-    /// Whether the run is ending or a thread failed: the cause that bounds
-    /// a page job's settle.
-    pub(super) fn page_terminal(&self) -> Option<Terminal> {
-        use game::Rig as _;
-        (self.controls.quitting()
-            || self.input_failure().is_some()
-            || self.audio_failure().is_some())
-        .then_some(Terminal)
-    }
-
     /// A page job of `kind` joined by a Start: promoted (the Start is
     /// responsible for it from here) and waited for while the adjustments
-    /// are served, then settled; what its published outcome means, none
-    /// when it was ending. A quit gives the job back, demoted, for the page
-    /// to keep.
+    /// are served, then settled; what its published outcome means, or, when
+    /// it was ending, what a panic it published during the settle means. A
+    /// quit gives the job back, demoted, for the page to keep.
     fn join_page<T: Clone>(
         &mut self,
         job: OwnedJob<T>,
@@ -63,11 +53,14 @@ impl PlayerRig<'_> {
             Promotion::Published(o) => Some(o),
             Promotion::Ending => None,
         };
-        let terminal = self.page_terminal();
-        if let Some(sel) = &self.selection {
-            sel.page.settle_one(Some(job), &mut || terminal);
-        }
-        Ok(observed.map(|o| taken(kind, &o)))
+        let looks = super::looks!(self);
+        let late = self.selection.as_ref().and_then(|sel| {
+            sel.page
+                .settle_one(kind, Some(job), &mut || looks.terminal())
+        });
+        Ok(observed
+            .map(|o| taken(kind, &o))
+            .or_else(|| late.map(Taken::Fatal)))
     }
 
     /// The page's 1× bank for a Start: the one kept, the page's job joined
@@ -110,7 +103,15 @@ impl PlayerRig<'_> {
                 Ok(Some(Taken::Fatal(f))) => return Ok(Got::Failed(f)),
             }
         }
-        // Nothing to join: the Start decodes it, as a load does.
+        // Nothing to join: the Start decodes it, as a load does, after the
+        // release barrier (a bank of another speed may be installed).
+        self.release_banks(None).map_err(ChartLoadError::Audio)?;
+        if let Some(failure) = self.selection.as_mut().and_then(|s| s.page.take_fatal()) {
+            return Ok(Got::Failed(failure));
+        }
+        if cancelled(self.controls) {
+            return Ok(Got::Cancelled);
+        }
         let got = self.decode_bank((&page.path, &page.chart), audio::Speed::NORMAL, progress)?;
         if let Got::Ready(bank) = &got {
             let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
@@ -140,6 +141,8 @@ impl PlayerRig<'_> {
                     sel.page.put_measure(job);
                     return Ok(Got::Cancelled);
                 }
+                // A failed measurement plays this Start at the headroom; the
+                // next Start measures again.
                 Ok(Some(Taken::Done(Ok(m)))) => {
                     sel.page.keep_measured(&mut sel.shelf, m);
                     return Ok(Got::Ready(()));

@@ -283,6 +283,7 @@ fn the_page_gain_after_hit_miss_refusal_or_cancel() {
         |rig| {
             rig.practice_read(&read).unwrap();
             passes_until_idle(rig);
+            rig.left_chart().unwrap();
             rig.entered_selection();
             rig.practice_read(&read).unwrap();
             until("the bank kept", || {
@@ -687,6 +688,7 @@ fn back_settles_the_page_jobs_in_each_state() {
                             && b.witness.now().1 == 1
                     });
                 }
+                rig.left_chart().unwrap();
                 rig.entered_selection();
                 assert_ne!(b.coord.current(Scope::Choice), choice);
                 let p = &sel(rig).page;
@@ -765,4 +767,306 @@ fn a_start_at_1x_reuses_the_page_bank_until_another_speed_releases_it() {
         "the other speed's, then a fresh 1×"
     );
     assert_eq!(witnessed(&b).1, Vec::<String>::new());
+}
+
+/// What a hook saw of the witness at each decode's start: the decode's
+/// speed, its decodes in flight and the banks alive.
+type AtDecode = Arc<Mutex<Vec<(Speed, usize, usize)>>>;
+
+/// A hook that records, at each decode's start on the Bank job, what the
+/// witness sees, and its record.
+fn at_each_decode(
+    witness: &Arc<Mutex<Option<Arc<crate::bank_witness::BankWitness>>>>,
+) -> (Option<super::Hook>, AtDecode) {
+    let seen = AtDecode::default();
+    let (w, s) = (Arc::clone(witness), Arc::clone(&seen));
+    let hook = hook(move |p, _, _| {
+        if let Probe::Decode(speed) = p
+            && let Some(w) = w.lock().unwrap().as_ref()
+        {
+            let (in_flight, alive) = w.now();
+            s.lock().unwrap().push((speed, in_flight, alive));
+        }
+    });
+    (hook, seen)
+}
+
+/// The returns from another speed decode 1× afresh only once the release
+/// barrier has freed the speed's bank: at each decode's start no bank is
+/// alive. A refused unload at that barrier refuses the Start before any
+/// decode.
+#[test]
+fn a_return_to_1x_releases_the_speed_bank_before_its_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let slot = Arc::new(Mutex::new(None));
+    let (hook, seen) = at_each_decode(&slot);
+    let (mut b, path) = page_bench(
+        dir.path(),
+        "fold3",
+        decodes_with(hook),
+        Spawner::SYSTEM,
+        &page,
+        Arc::new(crate::priority::Unchanged),
+    );
+    *slot.lock().unwrap() = Some(Arc::clone(&b.witness));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            passes_until_idle(rig);
+            for speed in [Speed::FASTEST, Speed::NORMAL] {
+                let start = practiced(dir.path(), &path, speed);
+                assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready, "{speed:?}");
+            }
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [(Speed::FASTEST, 1, 0), (Speed::NORMAL, 1, 0)],
+                "a bank alive at a decode's start"
+            );
+            // A refused unload: no decode.
+            seen.lock().unwrap().clear();
+            let fast = practiced(dir.path(), &path, Speed::FASTEST);
+            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            seen.lock().unwrap().clear();
+            sel(rig).unload_fault = Some(game::AudioLoadError::Busy);
+            let start = practiced(dir.path(), &path, Speed::NORMAL);
+            let got = rig.load_chart(&start);
+            assert!(
+                matches!(
+                    got,
+                    Err(super::ChartLoadError::Audio(game::AudioLoadError::Busy))
+                ),
+                "{got:?}"
+            );
+            assert_eq!(*seen.lock().unwrap(), [], "decoded past a refused unload");
+        },
+    );
+    slot.lock().unwrap().take();
+}
+
+/// The page's sounds replaced after the page measured them: a Start at
+/// another speed finds its bank's key is not the one the gain is of, and
+/// measures the sounds as they are on 1× again before its own decode, so
+/// it plays at their gain, not at the headroom.
+#[test]
+fn sounds_replaced_after_the_page_measured_are_measured_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&order);
+    let decodes = decodes_with(hook(move |p, _, _| {
+        if matches!(p, Probe::BeforeMeasure | Probe::Barrier | Probe::Decode(_)) {
+            seen.lock().unwrap().push(p);
+        }
+    }));
+    let (mut b, path) = page_bench(
+        dir.path(),
+        "fold2",
+        decodes,
+        Spawner::SYSTEM,
+        &page,
+        Arc::new(crate::priority::Unchanged),
+    );
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let hash = hash(dir.path(), &path);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            passes_until_idle(rig);
+            assert!(sel(rig).page.gain_known());
+            assert_eq!(crate::loudness::analyses::of(hash), 1);
+            write_sound(dir.path(), 9_000);
+            order.lock().unwrap().clear();
+            let fast = practiced(dir.path(), &path, Speed::FASTEST);
+            assert_eq!(outcome(rig.load_chart(&fast)), Loading::Ready);
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                2,
+                "the replaced sounds were not measured"
+            );
+            assert_eq!(
+                *order.lock().unwrap(),
+                [
+                    Probe::Barrier,
+                    Probe::Decode(Speed::FASTEST),
+                    Probe::Barrier,
+                    Probe::Decode(Speed::NORMAL),
+                    Probe::BeforeMeasure,
+                    Probe::Barrier,
+                    Probe::Decode(Speed::FASTEST),
+                ],
+                "the speed's bank dropped, then 1×, its measurement, the barrier and the speed again"
+            );
+            assert_ne!(
+                sel(rig).shelf.gain(),
+                audio::Gain::HEADROOM,
+                "played at the headroom"
+            );
+            let (chart, bank) = super::key_now(&read);
+            assert!(
+                sel(rig)
+                    .shelf
+                    .look_up_page(&chart, &bank, "a.bms")
+                    .is_none(),
+                "the new sounds' measurement kept"
+            );
+        },
+    );
+    assert_eq!(witnessed(&b).1, Vec::<String>::new());
+}
+
+/// A failure of the input or audio thread that comes after the leave's
+/// settle began bounds it: a page bank that never stops (held at its
+/// file) is given up within the stop bound on the settle's clock, and the
+/// chart is left.
+#[test]
+fn a_failure_during_the_leave_bounds_its_settle() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "fold1", &page);
+    let (held, go) = page.hold(PageAt::File(0));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            held.recv_timeout(watchdog()).expect("the page's decode");
+            let base = std::time::Instant::now();
+            let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let r = Arc::clone(&reads);
+            sel(rig).page.set_clock(Arc::new(move || {
+                base + std::time::Duration::from_millis(
+                    100 * r.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                )
+            }));
+            let lost = Arc::clone(&rig.audio_lost);
+            let coord = b.coord.clone();
+            let choice = coord.current(Scope::Choice);
+            let returned = std::sync::atomic::AtomicBool::new(false);
+            let bounded = std::thread::scope(|s| {
+                let helper = s.spawn(|| {
+                    until("the leave began", || coord.current(Scope::Choice) != choice);
+                    lost.store(true, std::sync::atomic::Ordering::Release);
+                    let began = std::time::Instant::now();
+                    while !returned.load(std::sync::atomic::Ordering::SeqCst)
+                        && began.elapsed() < watchdog() / 2
+                    {
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                    let bounded = returned.load(std::sync::atomic::Ordering::SeqCst);
+                    // Let the job go either way, so nothing waits for ever.
+                    go.send(()).unwrap();
+                    bounded
+                });
+                let left = rig.left_chart();
+                returned.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(left.is_ok(), "{left:?}");
+                helper.join().unwrap()
+            });
+            assert!(
+                bounded,
+                "the settle was not bounded by the failure that came after it began"
+            );
+            lost.store(false, std::sync::atomic::Ordering::Release);
+        },
+    );
+}
+
+/// A Start's quit leaves the page bank promoted, so the Start is
+/// responsible for it; Back then settles it, and it panics during that
+/// settle: the panic is not dropped with the chart, and the run ends.
+#[test]
+fn a_responsible_panic_during_the_leave_ends_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    let (mut b, path) = plain(dir.path(), "fold4", &page);
+    let (held, go) = page.hold(PageAt::File(0));
+    page.panic_at(PageAt::File(0));
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let start = practiced(dir.path(), &path, Speed::NORMAL);
+    let left = on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            held.recv_timeout(watchdog()).expect("the page's decode");
+            rig.controls.command(game::Command::Quit);
+            assert_eq!(outcome(rig.load_chart(&start)), Loading::Cancelled);
+            while game::Rig::take(rig).is_some() {}
+            assert!(sel(rig).page.decoding(), "kept for the page, unpublished");
+            let coord = b.coord.clone();
+            let choice = coord.current(Scope::Choice);
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    // Published only once the leave has begun.
+                    until("the leave began", || coord.current(Scope::Choice) != choice);
+                    go.send(()).unwrap();
+                });
+                rig.left_chart()
+            })
+        },
+    );
+    assert!(
+        matches!(
+            left,
+            Err(game::LiveError::Load(game::coord::LoadFailure {
+                job: JobKind::Bank,
+                cause: game::coord::Failure::Panicked(_),
+            }))
+        ),
+        "the panic dropped with the chart: {left:?}"
+    );
+}
+
+/// The page's measurement fails (its analysis panics, caught as a
+/// failure): the gain stays unknown and the page does not measure again
+/// on its later passes; the next Start measures it, once, and keeps it.
+#[test]
+fn a_failed_page_measurement_is_measured_again_by_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = Arc::new(Page::default());
+    page.panic_at(PageAt::Block);
+    let (mut b, path) = plain(dir.path(), "fold5", &page);
+    let read = loaded(dir.path(), &path, Speed::NORMAL);
+    let start = practiced(dir.path(), &path, Speed::NORMAL);
+    let hash = hash(dir.path(), &path);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            rig.practice_read(&read).unwrap();
+            passes_until_idle(rig);
+            assert!(!sel(rig).page.gain_known(), "a failure is not a known gain");
+            for _ in 0..3 {
+                rig.poll_page().unwrap();
+                assert!(!sel(rig).page.measuring(), "the page measured again");
+            }
+            assert_eq!(crate::loudness::analyses::of(hash), 1, "one page attempt");
+            assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+            assert_eq!(
+                crate::loudness::analyses::of(hash),
+                2,
+                "the Start did not measure again"
+            );
+            let (chart, bank) = super::key_now(&read);
+            assert!(
+                sel(rig)
+                    .shelf
+                    .look_up_page(&chart, &bank, "a.bms")
+                    .is_none(),
+                "the Start's measurement kept"
+            );
+        },
+    );
 }

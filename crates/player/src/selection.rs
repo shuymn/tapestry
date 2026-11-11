@@ -53,6 +53,54 @@ use crate::shelf::{Shelf, file_name};
 use crate::ui_text::{Label, Message};
 use crate::window::ImeSwitch;
 
+/// The terminal causes a page job's settle looks at, read afresh at every
+/// ask: a close, the input thread's failure and the audio output's.
+pub(crate) struct Looks<'r> {
+    controls: &'r crate::controls::Controls,
+    input: &'r crate::input_side::InputLink,
+    adjust: Option<&'r game::AdjustDriver>,
+    audio: &'r game::AudioControl,
+    gate: Option<&'r crate::start_gate::PlayerGate>,
+    #[cfg(test)]
+    lost: &'r std::sync::atomic::AtomicBool,
+}
+
+impl Looks<'_> {
+    /// Whether the run is ending or a thread failed, now.
+    pub(crate) fn terminal(&self) -> Option<crate::page_jobs::Terminal> {
+        #[cfg(test)]
+        let lost = self.lost.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(test))]
+        let lost = false;
+        let input = self
+            .input
+            .failure()
+            .or_else(|| self.adjust.and_then(game::AdjustDriver::failure));
+        (self.controls.quitting()
+            || input.is_some()
+            || lost
+            || crate::start_gate::output_failure(self.audio, self.gate).is_some())
+        .then_some(crate::page_jobs::Terminal)
+    }
+}
+
+/// The rig's [`Looks`], borrowing only the fields it reads, so the
+/// selection can be borrowed beside it.
+macro_rules! looks {
+    ($rig:ident) => {
+        crate::selection::Looks {
+            controls: $rig.controls,
+            input: &$rig.input,
+            adjust: $rig.adjust.as_ref(),
+            audio: &$rig.audio.control,
+            gate: $rig.gate.as_ref(),
+            #[cfg(test)]
+            lost: &$rig.audio_lost,
+        }
+    };
+}
+pub(crate) use looks;
+
 /// Arrow keys a scripted pick queues at a time: fewer than the queue holds
 /// (dev-tools).
 #[cfg(feature = "dev-tools")]
@@ -1568,12 +1616,9 @@ impl PlayerRig<'_> {
         kept: Option<&Arc<audio::SoundBank>>,
     ) -> Result<(), game::AudioLoadError> {
         self.restorer = None;
-        let terminal = self.page_terminal();
+        let looks = looks!(self);
         if let Some(sel) = &mut self.selection {
-            let controls = self.controls;
-            sel.page.settle(kept.is_some(), &mut || {
-                terminal.or_else(|| controls.quitting().then_some(crate::page_jobs::Terminal))
-            });
+            sel.page.settle(kept.is_some(), &mut || looks.terminal());
         }
         #[cfg(test)]
         {
@@ -2182,53 +2227,72 @@ impl AppRig for PlayerRig<'_> {
             .section()
             .and(self.selection.as_ref())
             .and_then(|s| s.page.chart_of(loaded.path()).cloned());
-        let mut reused = None;
-        // At another speed with the gain known, the 1× bank is not needed.
-        let known = speed != bms_model::Speed::NORMAL
+        // At another speed with the gain known, the 1× bank is not needed;
+        // the speed's bank then shows whether the sounds are still the ones
+        // the gain is of, and when they are not, the 1× graph runs again.
+        let mut known = speed != bms_model::Speed::NORMAL
             && self.selection.as_ref().is_some_and(|s| s.page.gain_known());
-        if let Some(practised) = practised.as_ref().filter(|_| !known) {
-            let bank = match self.page_bank(practised, &progress)? {
-                Got::Ready(bank) => bank,
-                Got::Cancelled => {
-                    println!("load: cancelled");
-                    return Ok(Loading::Cancelled);
+        let mut checked = false;
+        let bank = loop {
+            let mut reused = None;
+            if let Some(practised) = practised.as_ref().filter(|_| !known) {
+                let bank = match self.page_bank(practised, &progress)? {
+                    Got::Ready(bank) => bank,
+                    Got::Cancelled => {
+                        println!("load: cancelled");
+                        return Ok(Loading::Cancelled);
+                    }
+                    Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+                };
+                show_stage(&self.render, page.as_ref(), Stage::Loudness);
+                match self.page_gain(practised, &bank, loaded.source())? {
+                    Got::Ready(()) => {}
+                    Got::Cancelled => {
+                        println!("load: cancelled");
+                        return Ok(Loading::Cancelled);
+                    }
+                    Got::Failed(failure) => return Ok(Loading::Failed(failure)),
                 }
-                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+                if speed == bms_model::Speed::NORMAL {
+                    reused = Some(bank);
+                }
+            }
+            // Every earlier bank's owners go before this decode begins (the
+            // page's kept bank stays when this Start installs it); an unload
+            // the audio thread does not take refuses the load here.
+            self.release_banks(reused.as_ref())
+                .map_err(ChartLoadError::Audio)?;
+            if let Some(failure) = self.selection.as_mut().and_then(|s| s.page.take_fatal()) {
+                return Ok(Loading::Failed(failure));
+            }
+            // A quit or a close during the unload, whose wait reads neither:
+            // nothing is decoded.
+            if cancelled(self.controls) {
+                println!("load: cancelled");
+                return Ok(Loading::Cancelled);
+            }
+            let bank = match reused {
+                Some(bank) => bank,
+                None => match self.decode_bank((loaded.path(), chart), speed, &progress)? {
+                    Got::Ready(bank) => bank,
+                    Got::Cancelled => {
+                        println!("load: cancelled");
+                        return Ok(Loading::Cancelled);
+                    }
+                    Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+                },
             };
-            show_stage(&self.render, page.as_ref(), Stage::Loudness);
-            match self.page_gain(practised, &bank, loaded.source())? {
-                Got::Ready(()) => {}
-                Got::Cancelled => {
-                    println!("load: cancelled");
-                    return Ok(Loading::Cancelled);
-                }
-                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
+            // Sounds replaced since the gain was known: their gain is
+            // measured, once, on 1× again.
+            let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
+            if known && !checked && sel.page.bank_key() != crate::loudness::key(chart, &bank) {
+                println!("load: the sounds changed since their gain was measured");
+                sel.page.forget();
+                (known, checked) = (false, true);
+                drop(bank);
+                continue;
             }
-            if speed == bms_model::Speed::NORMAL {
-                reused = Some(bank);
-            }
-        }
-        // Every earlier bank's owners go before this decode begins (the
-        // page's kept bank stays when this Start installs it); an unload
-        // the audio thread does not take refuses the load here.
-        self.release_banks(reused.as_ref())
-            .map_err(ChartLoadError::Audio)?;
-        // A quit or a close during the unload, whose wait reads neither:
-        // nothing is decoded.
-        if cancelled(self.controls) {
-            println!("load: cancelled");
-            return Ok(Loading::Cancelled);
-        }
-        let bank = match reused {
-            Some(bank) => bank,
-            None => match self.decode_bank((loaded.path(), chart), speed, &progress)? {
-                Got::Ready(bank) => bank,
-                Got::Cancelled => {
-                    println!("load: cancelled");
-                    return Ok(Loading::Cancelled);
-                }
-                Got::Failed(failure) => return Ok(Loading::Failed(failure)),
-            },
+            break bank;
         };
         log_file::warnings("sounds", bank.warnings().iter().map(|w| format!("{w:?}")));
         let decoded = self.clock.now();
@@ -2393,17 +2457,23 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
+    /// The chart is left: the page's jobs of it end and their results go
+    /// nowhere (design.md "Load Pipeline"), but a panic one published
+    /// meanwhile that a Start was responsible for, which ends the run.
+    fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        let looks = looks!(self);
+        let Some(sel) = &mut self.selection else {
+            return Ok(());
+        };
+        sel.coord.advance(game::coord::Scope::Choice);
+        sel.page
+            .leave(Some(&mut sel.shelf), &mut || looks.terminal());
+        sel.page
+            .take_fatal()
+            .map_or(Ok(()), |f| Err(game::LiveError::Load(f)))
+    }
+
     fn entered_selection(&mut self) {
-        // The chart is left: the page's jobs of it end, and their results go
-        // nowhere (design.md "Load Pipeline").
-        let terminal = self.page_terminal();
-        if let Some(sel) = &mut self.selection {
-            sel.coord.advance(game::coord::Scope::Choice);
-            let controls = self.controls;
-            sel.page.leave(Some(&mut sel.shelf), &mut || {
-                terminal.or_else(|| controls.quitting().then_some(crate::page_jobs::Terminal))
-            });
-        }
         // Idle first, so the scene's fence below is answered after it and
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
