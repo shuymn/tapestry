@@ -380,14 +380,26 @@ fn a_start_at_1x_joins_the_bank_in_each_state() {
                 rig.practice_read(&read).unwrap();
                 if queued {
                     assert_eq!(b.coord.held(Class::Speculative), 1, "the lease only");
-                    let coord = b.coord.clone();
+                    let (coord, controls) = (b.coord.clone(), rig.controls);
                     std::thread::scope(|s| {
-                        s.spawn(move || {
-                            held.recv_timeout(watchdog()).expect("admitted");
+                        let admitted = s.spawn(move || {
+                            // Never admitted, the Start is ended with the
+                            // quit key, so the test fails here and does
+                            // not wait for ever.
+                            if held.recv_timeout(watchdog() / 2).is_err() {
+                                controls.command(game::Command::Quit);
+                                return false;
+                            }
                             assert_eq!(coord.held(Class::Speculative), 1, "the lease only");
                             go.send(()).unwrap();
+                            true
                         });
-                        assert_eq!(outcome(rig.load_chart(&start)), Loading::Ready);
+                        let got = outcome(rig.load_chart(&start));
+                        assert!(
+                            admitted.join().unwrap(),
+                            "the queued bank was never admitted by the Start's promotion"
+                        );
+                        assert_eq!(got, Loading::Ready);
                     });
                 } else {
                     held.recv_timeout(watchdog()).expect("running");
