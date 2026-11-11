@@ -70,9 +70,6 @@ pub enum Val {
 pub enum Fail {
     /// A Lua runtime error the source raises too.
     Error,
-    /// Integer arithmetic that would wrap; the compiler proves accepted
-    /// code never reaches it.
-    Overflow,
     /// A read whose availability guard is false: unknown state.
     Unavailable,
 }
@@ -168,7 +165,8 @@ pub enum Insn {
         src: u8,
     },
     /// The frame's state clock, `state_us`: the source's
-    /// `main_state.time()`.
+    /// `main_state.time()`, an integer within ±2^53 and past it the
+    /// double the source holds ([`num::clock`]).
     StateUs {
         dst: u8,
     },

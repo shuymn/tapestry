@@ -55,10 +55,18 @@ pub fn presents() -> Vec<Seed> {
     let mut kind = accepted.to_vec();
     kind[0] |= 0x80;
     kind[16] = 3;
+    // The value a constant: 2^53 (pool 6), accepted; 2^53 + 1 (pool 8),
+    // refused by V3.
+    let mut edge = accepted.to_vec();
+    edge[15..19].copy_from_slice(&[0, 0, 6, 0]);
+    let mut wide = accepted.to_vec();
+    wide[15..19].copy_from_slice(&[0, 0, 8, 0]);
     vec![
         ("accepted", accepted.to_vec()),
         ("jump_back", jump),
         ("enum_read", kind),
+        ("const_edge", edge),
+        ("const_wide", wide),
     ]
 }
 

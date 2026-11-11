@@ -662,15 +662,23 @@ fn integers_follow_the_source_s_double_model() {
             "function() return 9007199254740992 == 9007199254740992 end",
             Lowered,
         ),
-        // A result folded at frame time past 2^53, where LuaJ rounds.
+        // A result folded past 2^53 is the source's double: 2^53 + 1
+        // rounds to 2^53, so the difference is 0; the control rounds up.
         (
             "function() return (9007199254740992 + 1) - 9007199254740992 == 0 end",
-            range,
+            Lowered,
         ),
-        // A host argument folded just past 2^53, and one at it.
+        (
+            "function() return (9007199254740992 + 3) - 9007199254740992 == 4 end",
+            Lowered,
+        ),
+        // A float's floor past 2^53 stays the float, and folds.
+        ("function() return math.floor(1e18) > 0 end", Lowered),
+        // A host argument folded just past 2^53 is a float, which no
+        // host argument is; one at it is an integer.
         (
             "function() return ms.number(4503599627370496 * 2 + 1) > 0 end",
-            range,
+            Replaced(Unsupported::Construct("host arguments")),
         ),
         (
             "function() return ms.number(4503599627370496 * 2) > 0 end",
@@ -681,6 +689,26 @@ fn integers_follow_the_source_s_double_model() {
         ),
     ] {
         assert_eq!(run(&skin("", &image(draw))).callbacks, [want], "{draw}");
+    }
+    // The folded values are the source's: each draw's lowered source, an
+    // exact result's opposite where it rounds.
+    for (draw, shown) in [
+        ("(9007199254740992 + 1) - 9007199254740992 == 0", "true"),
+        ("(9007199254740992 + 1) - 9007199254740992 == 1", "false"),
+        ("(9007199254740992 + 3) - 9007199254740992 == 4", "true"),
+        ("math.floor(1e18) > 0", "true"),
+        (
+            "(2147483647 * 4194305) * 3 == 2.7021604194091008e16",
+            "true",
+        ),
+        (
+            "(2147483647 * 4194305) * 3 == 2.7021604194091004e16",
+            "false",
+        ),
+    ] {
+        let r = run(&skin("", &image(&format!("function() return {draw} end"))));
+        assert_eq!(r.callbacks, [Lowered], "{draw}");
+        assert_eq!(r.lowered, [shown], "{draw}");
     }
     // Captures past 2^53, and off values without their provenance; and
     // the controls with it.
@@ -719,6 +747,133 @@ fn integers_follow_the_source_s_double_model() {
         let entry = skin(&body, &image(draw));
         assert!(closed(&entry), "{body}");
         assert_eq!(run(&entry).callbacks, [want], "{body} / {draw}");
+    }
+}
+
+/// Folding equals evaluation past 2^53: a number's value folded from
+/// literals at import gives what the program gives when it runs the same
+/// operations on reads of those values, each built in the frame from
+/// fields of non-default values (a read is an `i32`, so `n = 2^53` is
+/// `2^27 · 2^26`). The program's side is a verified program built by hand
+/// with the instructions the compiler emits. The value ends in the floor
+/// of `% 2^32`, an integer the expressions hold, so the fold lowers to it;
+/// each pair checks the value, the fold's disposition and the run's
+/// availability, so neither side passes by giving a default 0.
+#[test]
+fn folding_past_2_53_equals_evaluation() {
+    use skin_model::present::{
+        Arith, Bank, CallbackDef, Clock, Conv, Insn, Io, MathFn, OutTy, Present, PresentDef,
+        ReadDef, Val,
+    };
+    let field = |name: &str| PLAY.fields.iter().position(|f| f.name == name).unwrap();
+    let (x, y) = (field("time.elapsed_s"), field("best.rate_ppm"));
+    let read = |name: &str| ReadDef {
+        value: compile(name, &Scope::new(&PLAY), Ty::Int).unwrap(),
+        guard: None,
+    };
+    // Reads `a` and `b`, then `a * b`, then each of `ops` with its
+    // constant, in order, then `math.floor`.
+    let run_program = |a: i32, b: i32, ops: &[(Arith, i64)]| {
+        let mut code = vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Read { dst: 1, read: 1 },
+            Insn::Arith {
+                op: Arith::Mul,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+        ];
+        for (k, &(op, _)) in ops.iter().enumerate() {
+            code.push(Insn::Const {
+                dst: 1,
+                k: u16::try_from(k).unwrap(),
+            });
+            code.push(Insn::Arith {
+                op,
+                dst: 0,
+                a: 0,
+                b: 1,
+            });
+        }
+        code.push(Insn::Math {
+            f: MathFn::Floor,
+            dst: 0,
+            a: 0,
+        });
+        code.push(Insn::Ret { src: 0 });
+        let def = PresentDef {
+            callbacks: vec![CallbackDef {
+                start: 0,
+                len: u16::try_from(code.len()).unwrap(),
+                regs: 2,
+                conv: Conv::Int,
+                gate: None,
+                after: None,
+            }],
+            code,
+            consts: ops.iter().map(|&(_, k)| Val::Int(k)).collect(),
+            reads: vec![read("time.elapsed_s"), read("best.rate_ppm")],
+            signature: vec![OutTy::Int],
+            slots: vec![],
+            domains: vec![],
+        };
+        let p =
+            Present::verify(def, PLAY.fields.len(), &mut skin_model::SkinOps::default()).unwrap();
+        let mut fields = vec![0; PLAY.fields.len()];
+        fields[x] = a;
+        fields[y] = b;
+        let state = State {
+            fields: &fields,
+            timers: &[],
+        };
+        let mut outs = [0; 2];
+        p.run(&mut Io {
+            state: &state,
+            clock: Clock {
+                state_us: 0,
+                now: bms_model::TimeUs(0),
+            },
+            bank: &mut Bank::default(),
+            outs: &mut outs,
+            timers: &mut [],
+            slots: true,
+        });
+        outs
+    };
+    let (mul, add, rem) = (Arith::Mul, Arith::Add, Arith::Mod);
+    let m = 1_i64 << 32;
+    for (folded, a, b, ops, want) in [
+        // A: the product's tie rounds, then the product by 3 again (rounded
+        // once at the end, 2 134 900 732).
+        (
+            "math.floor(2147483647 * 4194305 * 3 % 4294967296)",
+            2_147_483_647,
+            4_194_305,
+            vec![(mul, 3), (rem, m)],
+            2_134_900_736,
+        ),
+        // B: 2^53 + 1 rounds to 2^53, and + 1 again: 0 (exactly, 2).
+        (
+            "math.floor((134217728 * 67108864 + 1 + 1) % 4294967296)",
+            134_217_728,
+            67_108_864,
+            vec![(add, 1), (add, 1), (rem, m)],
+            0,
+        ),
+        // Its control: 2^53 + 2 is exact.
+        (
+            "math.floor((134217728 * 67108864 + 1 + 2) % 4294967296)",
+            134_217_728,
+            67_108_864,
+            vec![(add, 1), (add, 2), (rem, m)],
+            2,
+        ),
+    ] {
+        let r = run(&number("", &format!("function() return {folded} end")));
+        assert_eq!(r.callbacks, [Disposition::Lowered], "{folded}");
+        assert_eq!(r.lowered, [want.to_string()], "{folded}");
+        assert_eq!(run_program(a, b, &ops), [want, 1], "{folded}");
     }
 }
 

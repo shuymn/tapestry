@@ -12,7 +12,10 @@
 //! its end, a rearm and Closing; and
 //! the presentation program's callbacks on every path: the first frame and
 //! later ones, a float result, a caught error, a false gate, a false
-//! guard, a sentinel suppressing the draws after it, and a poisoned play.
+//! guard, a sentinel suppressing the draws after it, and a poisoned play;
+//! and its numerics past ±2^53: integer arithmetic promoted to the
+//! double, a division of it, a float's floor kept a float, negation and
+//! `abs` at ±2^53, and the state clock read past 2^53 µs and negative.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -2187,6 +2190,7 @@ fn build_does_not_allocate() {
     grade_attachments_do_not_allocate(&full);
     large_gauges_do_not_allocate(&full, &views, &descs);
     programs_do_not_allocate(&chart, &full);
+    promoted_numerics_do_not_allocate(&chart, &full);
     slots_do_not_allocate(&chart, &full);
     carried_slots_do_not_allocate(&chart, &full);
     app_readouts_do_not_allocate(&chart, &full, &views, &descs);
@@ -4542,6 +4546,217 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     );
     assert_eq!(first, Err(BuildError::InconsistentTally));
     assert_eq!(after, Err(BuildError::InconsistentTally));
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
+/// The program's numerics past ±2^53 (design.md "Scope of No
+/// Allocation", the program's executor; "beatoraja Lua Skins", numbers):
+/// reads at `i32::MAX` multiplied past ±2^53 and past `i64`, promoted to
+/// the double; that product divided; the floor of 2^60 kept a float;
+/// negation and `abs` of ±2^53; and the state clock read as the source's
+/// double, past 2^53 µs and negative, each converted by `to_int`. Every
+/// frame's outputs are the numerics' own values, so each path ran; with a
+/// positive control.
+fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    use present_support::{Builder, Cb, read, slot};
+    use skin_model::present::num::{arith, clock, math, neg, to_int};
+    use skin_model::present::{Arith, Conv, Insn, MathFn, Val};
+    let max = || read("2147483647", skin_model::Ty::Int, None);
+    let ar = |op, dst, a, b| Insn::Arith { op, dst, a, b };
+    let r = Val::Int(i64::from(i32::MAX));
+    let two_53 = Val::Int(1 << 53);
+    let mut b = Builder::default();
+    let mut want: Vec<Box<dyn Fn(i64) -> i32>> = Vec::new();
+    // r * r * r: past ±2^53, then past `i64`.
+    b.push(Cb::code(
+        vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Read { dst: 1, read: 0 },
+            ar(Arith::Mul, 0, 0, 1),
+            ar(Arith::Mul, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![],
+        vec![max()],
+        Conv::Int,
+    ));
+    let rrr = arith(Arith::Mul, arith(Arith::Mul, r, r).unwrap(), r).unwrap();
+    want.push(Box::new(move |_| to_int(rrr)));
+    // r * r / 7.
+    b.push(Cb::code(
+        vec![
+            Insn::Read { dst: 0, read: 0 },
+            Insn::Read { dst: 1, read: 0 },
+            ar(Arith::Mul, 0, 0, 1),
+            Insn::Const { dst: 1, k: 0 },
+            ar(Arith::Div, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(7)],
+        vec![max()],
+        Conv::Int,
+    ));
+    let rr7 = arith(Arith::Div, arith(Arith::Mul, r, r).unwrap(), Val::Int(7)).unwrap();
+    want.push(Box::new(move |_| to_int(rr7)));
+    // floor(2^60) * r.
+    b.push(Cb::code(
+        vec![
+            Insn::Const { dst: 0, k: 0 },
+            Insn::Math {
+                f: MathFn::Floor,
+                dst: 0,
+                a: 0,
+            },
+            Insn::Read { dst: 1, read: 0 },
+            ar(Arith::Mul, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Float(2.0_f64.powi(60))],
+        vec![max()],
+        Conv::Int,
+    ));
+    let fl = arith(
+        Arith::Mul,
+        math(MathFn::Floor, Val::Float(2.0_f64.powi(60))).unwrap(),
+        r,
+    )
+    .unwrap();
+    want.push(Box::new(move |_| to_int(fl)));
+    // -(2^53) - abs(-(2^53)) - r: past ±2^53 again.
+    b.push(Cb::code(
+        vec![
+            Insn::Const { dst: 0, k: 0 },
+            Insn::Neg { dst: 0, a: 0 },
+            Insn::Const { dst: 1, k: 1 },
+            Insn::Math {
+                f: MathFn::Abs,
+                dst: 1,
+                a: 1,
+            },
+            ar(Arith::Sub, 0, 0, 1),
+            Insn::Read { dst: 1, read: 0 },
+            ar(Arith::Sub, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![two_53, Val::Int(-(1 << 53))],
+        vec![max()],
+        Conv::Int,
+    ));
+    let na = arith(
+        Arith::Sub,
+        arith(
+            Arith::Sub,
+            neg(two_53).unwrap(),
+            math(MathFn::Abs, Val::Int(-(1 << 53))).unwrap(),
+        )
+        .unwrap(),
+        r,
+    )
+    .unwrap();
+    want.push(Box::new(move |_| to_int(na)));
+    // The state clock plus 3.
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            ar(Arith::Add, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(3)],
+        vec![],
+        Conv::Int,
+    ));
+    want.push(Box::new(|us| {
+        to_int(arith(Arith::Add, clock(us), Val::Int(3)).unwrap())
+    }));
+    let sig = b.signature();
+    let n = sig.len();
+    let elements = (0..n)
+        .map(|k| {
+            let mut e = widget(
+                Source::Image(0),
+                track(0, Ease::Linear, End::Hold),
+                TimerRef::Builtin(timer::READY),
+                Place::SCREEN,
+            );
+            e.visible = Some(present_support::expr(
+                &format!("lua.{k}.ok"),
+                &sig,
+                skin_model::Ty::Bool,
+            ));
+            e
+        })
+        .collect();
+    let skin = present_support::load(
+        Some(b.0),
+        Vec::new(),
+        elements,
+        skin_model::WidgetDefs::default(),
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let notes = NoteFacts::default();
+    let layout = SkinLayout::AUTHOR;
+    let t = tally(3);
+    let frame = |now: i64, state_us: i64| SkinFrame {
+        app: skin_model::AppReadouts::LAUNCH,
+        state_us,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &layout,
+        turntable: 0,
+        lanes: play_support::VIEW,
+        readouts: readouts_for(play_support::VIEW),
+        playing: true,
+        closing: None,
+    };
+    let clocks = [-1, -7_000_003, (1 << 53) + 1, (1 << 53) + 2, 1 << 53, 5_000];
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    let mut outs = vec![[0; 2]; n * clocks.len()];
+    TRACK.with(|t| t.set(true));
+    for (i, &us) in clocks.iter().enumerate() {
+        batch.clear();
+        let now = i64::try_from(i).unwrap() * 16 * MS;
+        skin.build(&mut play, &frame(now, us), &uvs, &mut batch)
+            .expect("the frame builds");
+        let f = play.state().fields;
+        for k in 0..n {
+            outs[i * n + k] = [f[slot(k)], f[slot(k) + 1]];
+        }
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "promoted numerics: allocations"
+    );
+    for (i, &us) in clocks.iter().enumerate() {
+        for (k, w) in want.iter().enumerate() {
+            let v = w(us);
+            let ok = i32::from(v != i32::MIN && v != i32::MAX);
+            assert_eq!(outs[i * n + k], [v, ok], "callback {k} at {us} µs");
+        }
+    }
+    // The clock past 2^53 µs and negative ran: -1 + 3 is 2, and 2^53 + 1
+    // µs reads as 2^53, plus 3 rounding to 2^53 + 4.
+    assert_eq!(outs[n - 1], [2, 1]);
+    assert_eq!(outs[2 * n + n - 1], [4, 1]);
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));
