@@ -98,6 +98,7 @@ fn chart() -> ResultChart {
         difficulty: None,
         length: None,
         notes: None,
+        judge_class: None,
     }
 }
 

@@ -11,6 +11,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+use crate::JUDGE_CLASS_MAX;
 use crate::schema::{Export, Field, FieldTy, Schema, TimerDef};
 
 /// The largest magnitude a shown value reads: one inside `i32::MIN` and
@@ -124,6 +125,8 @@ pub static RESULT: Schema = Schema {
         flag("chart.notes_valid"),
         flag("duration.valid"),
         value("duration_10us"),
+        int("chart.judge_class", 0, JUDGE_CLASS_MAX),
+        flag("chart.judge_class_valid"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -224,8 +227,14 @@ pub mod field {
     /// exact within the field's bound for every duration a `u32` of µs
     /// holds, where µs themselves would pass it past about 35 minutes.
     pub const DURATION_10US: u16 = 60;
+    /// The chart's judgment class, 0 the hardest to 4 the easiest, as
+    /// play's `chart.judge_class`; 0 while unknown.
+    pub const CHART_JUDGE_CLASS: u16 = 61;
+    /// Whether [`CHART_JUDGE_CLASS`] is known: the chart's rank is in a
+    /// class.
+    pub const CHART_JUDGE_CLASS_VALID: u16 = 62;
     /// The number of fields.
-    pub const COUNT: usize = 61;
+    pub const COUNT: usize = 63;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -270,6 +279,8 @@ mod tests {
             (field::CHART_LENGTH_VALID, "chart.length_valid"),
             (field::DURATION_VALID, "duration.valid"),
             (field::DURATION_10US, "duration_10us"),
+            (field::CHART_JUDGE_CLASS, "chart.judge_class"),
+            (field::CHART_JUDGE_CLASS_VALID, "chart.judge_class_valid"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }

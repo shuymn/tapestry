@@ -304,6 +304,16 @@ const SONG_NO_BGA: i32 = 170;
 /// chart's own rank (`lua::facts::JudgeClass::of_headers`), whatever rank
 /// the play preset judges with; a chart in no class holds none.
 const CHART_JUDGE: i32 = 180;
+/// The conditions of 180 to 184 by id less 180, on the play and the
+/// result screens alike: 180 under the class's validity, since an unknown
+/// class reads 0.
+pub(crate) const JUDGE_CLASSES: [&str; 5] = [
+    "chart.judge_class_valid && chart.judge_class == 0",
+    "chart.judge_class == 1",
+    "chart.judge_class == 2",
+    "chart.judge_class == 3",
+    "chart.judge_class == 4",
+];
 /// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
 /// source's preload state and its complement: entering READY flips them
 /// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
@@ -460,14 +470,10 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         154 => (Body::Text("chart.difficulty == 4"), false),
         155 => (Body::Text("chart.difficulty == 5"), false),
         SONG_NO_BGA => (Body::Text("chart.bga_valid && !chart.bga"), false),
-        CHART_JUDGE => (
-            Body::Text("chart.judge_class_valid && chart.judge_class == 0"),
+        CHART_JUDGE..=184 => (
+            Body::Text(JUDGE_CLASSES.get(usize::try_from(id - CHART_JUDGE).ok()?)?),
             false,
         ),
-        181 => (Body::Text("chart.judge_class == 1"), false),
-        182 => (Body::Text("chart.judge_class == 2"), false),
-        183 => (Body::Text("chart.judge_class == 3"), false),
-        184 => (Body::Text("chart.judge_class == 4"), false),
         200..=207 => (
             Body::Text(RANK_CURRENT.get(usize::try_from(id - 200).ok()?)?),
             false,
@@ -563,9 +569,9 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// folded. A result option's validity
 /// ([`super::result::profile::option_guard`]) is joined outside the
 /// negation, so neither the option nor its negation holds on a view
-/// without the value. The result's judgment class is a
-/// load-time fact; neither the result nor the decision schema has a
-/// field for it, so a frame condition on it is unsupported.
+/// without the value. The decision's judgment class is a load-time
+/// fact; the decision schema has no field for it, so a frame condition on
+/// it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
     use super::result::profile::{self as result, ResOption};
     let guard = match result::option_guard(id) {
