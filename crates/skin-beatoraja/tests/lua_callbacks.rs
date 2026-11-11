@@ -660,6 +660,62 @@ fn the_rhythm_timer_reads_in_lua() {
     assert_eq!(play.frame(10, &[]).len(), 1);
 }
 
+/// A draw callback reads timer 2, the fade-out, as off in every play
+/// frame (docs/stage3.md D14): READY (a 2 s lead-in), Playing, the audio
+/// tail and Closing. The image at x 0 is drawn while it is off, the one
+/// at 100 while it is on; the one at 200 while the play timer is on, so
+/// the frames reach the play.
+#[test]
+fn a_draw_callback_reads_the_fade_out_timer_off() {
+    use bms_model::TimeUs;
+    use common::play::{MS, context};
+    use skin_model::{Attempt, PlayContext};
+    let d = folder(&skin(&format!(
+        "{}\n{}\n{}",
+        image_at(
+            0,
+            "draw = function() return ms.timer(2) == ms.timer_off_value end,"
+        ),
+        image_at(
+            100,
+            "draw = function() return ms.timer(2) ~= ms.timer_off_value end,"
+        ),
+        image_at(
+            200,
+            "draw = function() return ms.timer(41) ~= ms.timer_off_value end,"
+        ),
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(counts(&i), [3, 0, 0, 0]);
+    assert!(
+        i.imported.report.notes.is_empty(),
+        "{:?}",
+        i.imported.report
+    );
+    let skin = i.imported.skin.clone();
+    let mut p = Drawn::new(skin.clone(), 100);
+    let lead_in = PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(2_000 * MS),
+        },
+        ..context()
+    };
+    p.play = skin.prepare(&p.chart, &lead_in).unwrap();
+    let xs = |p: &mut Drawn, ms: i64| -> Vec<i32> {
+        let mut x: Vec<i32> = p.rects(ms).iter().map(|r| r[0]).collect();
+        x.sort_unstable();
+        x
+    };
+    assert_eq!(xs(&mut p, -1_500), [0], "READY");
+    assert_eq!(xs(&mut p, 1_500), [0, 200], "Playing");
+    p.playing = false;
+    p.complete = true;
+    assert_eq!(xs(&mut p, 3_000), [0, 200], "the tail");
+    p.complete = false;
+    p.closing = Some(TimeUs(3_500 * MS));
+    assert_eq!(xs(&mut p, 4_000), [0, 200], "Closing");
+}
+
 /// A draw callback reading the chart's BPM-change condition lowers, with
 /// one D4 note, and follows the play context's fact.
 #[test]

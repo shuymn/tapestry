@@ -47,6 +47,12 @@ pub(crate) fn builtin(id: i32) -> Timer {
         // 7-key mode has no such lanes, so they are never set and never
         // alias another lane.
         108 | 109 | 128 | 129 => return Timer::Unset,
+        // The fade-out: the source starts it only on an ending without a
+        // failure (`play/BMSPlayer.java:754, 947-967` at `0.8.9`), never on
+        // a failure or a quit with notes left (`:660, 968-970`). The
+        // player plays no fade-out on any ending, so it is never set
+        // (docs/stage3.md D14).
+        2 => return Timer::Unset,
         40 => timer::READY,
         41 => timer::PLAY,
         3 => timer::FAILED,
@@ -233,11 +239,10 @@ mod tests {
                 assert_eq!(builtin(first + i32::from(lane)), Timer::Builtin(want));
             }
         }
-        for id in [108, 109, 128, 129] {
+        for id in [2, 108, 109, 128, 129] {
             assert_eq!(builtin(id), Timer::Unset, "{id}");
         }
         assert_eq!(builtin(58), Timer::Unsupported);
-        assert_eq!(builtin(2), Timer::Unsupported);
         assert_eq!(builtin(140), Timer::Builtin(timer::RHYTHM));
     }
 
@@ -246,7 +251,7 @@ mod tests {
         let c = Custom {
             aliases: BTreeMap::from([
                 (10_000, Some(41)),
-                (10_001, Some(2)),
+                (10_001, Some(2_999)),
                 (10_002, None),
                 (10_003, Some(10_000)),
                 (10_005, Some(0)),
