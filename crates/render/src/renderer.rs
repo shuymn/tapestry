@@ -2692,6 +2692,10 @@ impl Renderer {
                 Ok(table)
             }
             ChartTarget::Staged(token) => match self.pending.as_mut() {
+                // A lost device's staging never commits a drawable table:
+                // the absence is not published, as the committed target's
+                // is not.
+                Some(p) if p.token == token && self.gpu.lost() => Err(RenderError::DeviceLost),
                 Some(p) if p.token == token => {
                     p.chart = Some(ChartTable::ABSENT);
                     Ok(ChartTable::ABSENT)
@@ -5432,6 +5436,32 @@ mod tests {
         assert_eq!(e.chart_outcome(), ChartOutcome::Unavailable);
         assert_eq!(r.installed.as_ref().unwrap().loading().chart_images(), None);
         assert_eq!(r.valid_chart(), None);
+    }
+
+    /// An absence published into a staging once its device is known lost
+    /// is refused as the device's, as the committed target's is, never a
+    /// success its commit could not keep.
+    #[test]
+    fn a_staged_absence_on_a_lost_device_is_refused() {
+        let (mut r, _dir, _side) = chart_renderer();
+        let dir = tempfile::tempdir().unwrap();
+        let look = crate::test_decl::Look {
+            chart: true,
+            ..crate::test_decl::Look::left([0, 0, 255, 255])
+        };
+        let (b, _) = crate::test_decl::bundle(&r, dir.path(), &look);
+        let text = labels("T", "A", "G");
+        let token = stage_labels(&mut r, &b, &text, 2).unwrap();
+        r.gpu.device().destroy();
+        // The device reports its loss at its next poll.
+        let _ = r.gpu.device().poll(wgpu::PollType::wait_indefinitely());
+        assert!(r.gpu.lost());
+        let e = r
+            .publish_chart_absent(ChartTarget::Staged(token))
+            .unwrap_err();
+        assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+        assert_eq!(e.chart_outcome(), ChartOutcome::Unavailable);
+        assert_eq!(r.pending.as_ref().map(|p| p.chart), Some(None));
     }
 
     /// A loss after a publication: every copy of the table stays where it

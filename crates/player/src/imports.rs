@@ -416,6 +416,7 @@ pub struct Summary {
     /// The chart layer given up because the atlas could not hold it
     /// ([`Skin::fit_chart_layer`]): the plan's refusal with it. The chart's
     /// images are then absent with this skin (S10-12 design D-chart-5).
+    /// Logged as a config line before the notes.
     pub chart_layer: Option<String>,
 }
 
@@ -1175,18 +1176,20 @@ fn log_summary(kind: ScreenKind, head: &str, summary: &Summary, log: &dyn log::L
         let candidate = f.candidate.as_deref().unwrap_or("none");
         let _ = write!(head, "{} = {candidate} ({:?})", f.choice, f.rule);
     }
+    // The chart layer given up first, so the log's cap on notes never
+    // hides it.
     let notes = summary
-        .notes
+        .chart_layer
         .iter()
-        .map(|n| {
-            let at =
-                n.at.map_or_else(|| "config".to_owned(), |at| summary.locate(at));
-            format!("{at}: {:?}: {}", n.severity, n.kind)
-        })
-        .chain(summary.chart_layer.iter().map(|why| {
+        .map(|why| {
             format!(
                 "config: Warning: the chart layer does not fit ({why}); the chart's own images are absent"
             )
+        })
+        .chain(summary.notes.iter().map(|n| {
+            let at =
+                n.at.map_or_else(|| "config".to_owned(), |at| summary.locate(at));
+            format!("{at}: {:?}: {}", n.severity, n.kind)
         }))
         .collect::<Vec<_>>();
     log_file::summary_to(
