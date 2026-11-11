@@ -380,6 +380,30 @@ impl Drawn {
         )
     }
 
+    /// `skin` played over `chart` whose BPM range is `bpm_range`, BPM-change
+    /// fact `bpm_whole_change` and whole MAIN tempo `main`: the tempos a
+    /// speed policy's fix reads.
+    #[allow(dead_code, reason = "not every test binary reads the fix's tempos")]
+    pub fn over_tempos(
+        skin: Skin,
+        chart: &bms_model::Chart,
+        bpm_range: Option<BpmRange>,
+        bpm_whole_change: Option<bool>,
+        main: Option<bms_model::Tempo>,
+    ) -> Self {
+        Self::over_context(
+            skin,
+            chart,
+            &PlayContext {
+                score: skin_model::PlayScore {
+                    main,
+                    ..skin_model::PlayScore::NONE
+                },
+                ..context_with(bpm_range, bpm_whole_change)
+            },
+        )
+    }
+
     /// `skin` played over a chart of `notes` notes as a section attempt
     /// (a practice round) over `section`.
     pub fn over_section(skin: Skin, notes: u32, section: &eval::Section) -> Self {

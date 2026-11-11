@@ -100,6 +100,10 @@ pub(crate) const LIMITS: Unsupported = Unsupported::Construct("past the expressi
 /// Value kinds, a node's set of them.
 pub(crate) const NIL: u8 = 1;
 pub(crate) const BOOL: u8 = 2;
+/// An integer, or a float an integer `+ - *` promoted past ±2^53 (which
+/// later operations may bring back within it), and the ±inf or NaN
+/// further `+ - *` of such a float reach: the intervals bound such a node
+/// as one that may hold a double ([`super::compile::intervals`]).
 pub(crate) const INT: u8 = 4;
 pub(crate) const OFF: u8 = 8;
 pub(crate) const STR: u8 = 16;
@@ -348,6 +352,21 @@ impl Residual {
         match self.node(r) {
             Node::Known(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// A residual of `nodes`, each with its kinds, in order (operands
+    /// first), its root the last: what an evaluation could leave, for a
+    /// shape no closed candidate reaches.
+    #[cfg(test)]
+    pub(crate) fn of(nodes: &[(Node, u8)]) -> Self {
+        Self {
+            nodes: nodes.iter().map(|&(n, _)| n).collect(),
+            kinds: nodes.iter().map(|&(_, k)| k).collect(),
+            heights: vec![1; nodes.len()],
+            reads: Vec::new(),
+            root: u32::try_from(nodes.len()).unwrap_or(1).saturating_sub(1),
+            stores: Vec::new(),
         }
     }
 }

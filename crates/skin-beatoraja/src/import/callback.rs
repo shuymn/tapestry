@@ -1652,22 +1652,21 @@ impl Cx<'_> {
                 l.attach(&res)?;
                 // Every reached operation is checked whichever backend takes
                 // the callback, discarded ones included.
-                let ivs = compile::intervals(an, &l, &res)?;
-                let root = ivs.get(res.root as usize).copied().flatten();
+                compile::intervals(an, &l, &res)?;
                 if timer {
                     let mut slots: Vec<Slot> = cells.iter().map(|&(_, s)| s).collect();
                     compile::slots(an, &mut l, &res, &mut slots)?;
-                    return compile::compile(an, &mut l, &res, conv, root, &slots).map(Err);
+                    return compile::compile(an, &mut l, &res, conv, &slots).map(Err);
                 }
                 // A slider's value is a float, which no expression is: the
                 // program takes it (play only, [`Cx::value_slider`]).
                 if conv == Conv::Float {
-                    return compile::compile(an, &mut l, &res, conv, root, &[]).map(Err);
+                    return compile::compile(an, &mut l, &res, conv, &[]).map(Err);
                 }
                 match l.emit_root(&res, conv) {
                     Ok(src) => Ok(Ok(src)),
                     Err(Stop::Unsupported(_)) if program => {
-                        compile::compile(an, &mut l, &res, conv, root, &[]).map(Err)
+                        compile::compile(an, &mut l, &res, conv, &[]).map(Err)
                     }
                     Err(e) => Err(e),
                 }
