@@ -19,9 +19,10 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use audio::OutputError;
 use bms_model::TimeUs;
 use eval::InputStart;
 use game::{AudioControl, HistoryRecorder, InputWaitError, Opening, Rearm as LiveRearm};
@@ -54,8 +55,9 @@ pub struct PlayerGate {
     /// candidate opens: a hold at the opening resumes it.
     loading: bool,
     /// A cancellation the audio thread never acknowledged: its output
-    /// counts as failed, so no candidate opens after it.
-    unacknowledged: bool,
+    /// counts as failed, so no candidate opens after it. Shared with the
+    /// rig's failure state ([`crate::failures::Failures`]).
+    unacknowledged: Arc<AtomicBool>,
     /// How many times [`wait_dropped`] looked for the acknowledgement
     /// (tests).
     #[cfg(test)]
@@ -78,7 +80,7 @@ impl PlayerGate {
             snapshot: 0,
             spare: None,
             loading: false,
-            unacknowledged: false,
+            unacknowledged: Arc::default(),
             #[cfg(test)]
             drop_looks: 0,
         }
@@ -199,8 +201,13 @@ impl PlayerGate {
     /// ([`wait_dropped`]): the output's failure, which ends the attempt
     /// before another candidate opens.
     #[must_use]
-    pub const fn unacknowledged(&self) -> bool {
-        self.unacknowledged
+    pub fn unacknowledged(&self) -> bool {
+        self.unacknowledged.load(Ordering::Acquire)
+    }
+
+    /// The flag [`unacknowledged`](Self::unacknowledged) reads, shared.
+    pub fn stall_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.unacknowledged)
     }
 
     /// The start gate now.
@@ -347,15 +354,6 @@ impl PlayerGate {
     }
 }
 
-/// The audio output's failure: the worker's, or a gated candidate's
-/// cancellation it never acknowledged, which counts as its stall.
-pub fn output_failure(control: &AudioControl, gate: Option<&PlayerGate>) -> Option<OutputError> {
-    control.failure().or_else(|| {
-        gate.is_some_and(PlayerGate::unacknowledged)
-            .then_some(OutputError::Stalled)
-    })
-}
-
 /// Waits, at most [`DROP_TIMEOUT`], until the audio thread acknowledged
 /// dropping candidate `generation`'s transport, or `gate` shows it
 /// committed: no authorization of it is left when the next opens. A worker
@@ -364,7 +362,7 @@ pub fn output_failure(control: &AudioControl, gate: Option<&PlayerGate>) -> Opti
 /// counts as failed from then on.
 pub fn wait_dropped(control: &AudioControl, gate: &mut PlayerGate, generation: u32) {
     // Latched: the output has failed already, and nothing more is waited.
-    if gate.unacknowledged {
+    if gate.unacknowledged() {
         return;
     }
     let counters = control.counters();
@@ -381,7 +379,7 @@ pub fn wait_dropped(control: &AudioControl, gate: &mut PlayerGate, generation: u
             return;
         }
         if begun.elapsed() >= DROP_TIMEOUT {
-            gate.unacknowledged = true;
+            gate.unacknowledged.store(true, Ordering::Release);
             return;
         }
         std::thread::sleep(Duration::from_micros(200));
@@ -398,7 +396,7 @@ mod tests {
     use game::{AudioWorker, RESTORE_AHEAD, Restorer, audio_control, audio_link_at};
     use input::{AdjustmentBindings, QpcClock, TapControl, Waker};
 
-    use super::{PlayerGate, output_failure, wait_dropped};
+    use super::{PlayerGate, wait_dropped};
     use crate::controls::Controls;
     use crate::input_side::{Hook, InputLink, Mode, link};
 
@@ -500,7 +498,7 @@ mod tests {
         ));
         let engine = AudioEngine::with_schedule(bank, Vec::new(), 48_000, 480, 16, 0).unwrap();
         let (mut control, _worker) = audio_control(engine);
-        let (mut gate, _hook, _input) = installed();
+        let (mut gate, _hook, input) = installed();
         gate.gate.arm(1);
         gate.armed = 1;
         let (_sink, queue) = audio_link_at(4, TimeUs(0));
@@ -515,10 +513,17 @@ mod tests {
             .unwrap();
         assert!(!gate.settle(1));
         control.cancel();
-        assert_eq!(output_failure(&control, Some(&gate)), None);
+        // As the rig reads it.
+        let mut failures = crate::failures::Failures::new(
+            input.failure_handle(),
+            control.failure_probe(),
+            Arc::default(),
+        );
+        failures.install(game::InputFailureCell::default(), gate.stall_flag());
+        assert_eq!(failures.output(), None);
         wait_dropped(&control, &mut gate, 1);
         assert_eq!(
-            output_failure(&control, Some(&gate)),
+            failures.output(),
             Some(audio::OutputError::Stalled),
             "the next candidate may open without the acknowledgement"
         );

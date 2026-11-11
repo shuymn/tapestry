@@ -225,6 +225,12 @@ pub enum Event {
     },
     /// The play adjustments' acceptance closes or reopens.
     Acceptance(Acceptance),
+    /// The observations that follow were stamped with the current ingress
+    /// word (`true`) or an older or closed one (design.md "Play
+    /// Lifecycle", the decision screen): while not, presses are discarded
+    /// as while acceptance is closed. Apart from [`Event::Acceptance`],
+    /// which an opening reopens.
+    Ingress(bool),
     /// Observations were lost, or focus was: nothing acts until
     /// [`Event::Resync`].
     Lost,
@@ -468,6 +474,9 @@ pub struct Adjustment {
     scratch: crate::turntable::ScratchInput,
     /// Whether presses act ([`Event::Acceptance`]).
     accepting: bool,
+    /// Whether the observations taken now were stamped with the current
+    /// ingress word ([`Event::Ingress`]).
+    ingress: bool,
     /// Adjustments applied so far ([`Self::accepted`]).
     accepted: u64,
 }
@@ -508,6 +517,7 @@ impl Adjustment {
             opened: None,
             scratch: crate::turntable::ScratchInput::NONE,
             accepting: true,
+            ingress: true,
             accepted: 0,
         };
         a.hispeed = match options.hispeed().mode {
@@ -840,6 +850,10 @@ impl Adjustment {
                 self.close(tempo);
                 self.accepting = a == Acceptance::Open;
             }
+            Event::Ingress(open) => {
+                self.close(tempo);
+                self.ingress = open;
+            }
             Event::Prepare { references, speed } => {
                 let _ = self.prepare(Some(references), speed, tempo);
             }
@@ -905,7 +919,7 @@ impl Adjustment {
             // A press without a release, or one the loss left unverified.
             return;
         }
-        let closed = !self.accepting;
+        let closed = !self.accepting || !self.ingress;
         *hold = if closed {
             // Discarded: no action until released and pressed afresh.
             Hold::Held {
@@ -1076,7 +1090,7 @@ impl Adjustment {
     }
 
     fn repeat(&mut self, control: ControlId, time: TimeUs) {
-        if self.lost || !self.accepting {
+        if self.lost || !self.accepting || !self.ingress {
             return;
         }
         if let Some(&Hold::Held {
@@ -1091,7 +1105,7 @@ impl Adjustment {
     }
 
     fn tick(&mut self, time: TimeUs) {
-        if self.lost || !self.accepting {
+        if self.lost || !self.accepting || !self.ingress {
             return;
         }
         let context = self.context;
@@ -1146,7 +1160,7 @@ impl Adjustment {
     }
 
     fn axis(&mut self, control: ControlId, delta: i64, quantum: AxisQuantum, time: TimeUs) {
-        if self.lost || !self.accepting {
+        if self.lost || !self.accepting || !self.ingress {
             return;
         }
         let context = self.context;

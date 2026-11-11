@@ -232,6 +232,7 @@ fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
                 delta: 7,
                 revolution: 256,
             },
+            ingress: input::Ingress::INITIAL,
         };
         let stepped = |quantum| {
             Some(Observation {
@@ -280,6 +281,7 @@ fn the_scratch_axis_signs_its_movement_and_reversal_flips_it() {
             delta: 7,
             revolution,
         },
+        ingress: input::Ingress::INITIAL,
     };
     assert!(plan.observation(&o(256)).is_some());
     assert_eq!(plan.observation(&o(0)), None);
@@ -370,6 +372,7 @@ fn the_tap_reaches_the_reducer_through_the_plan() {
                 held: 0b101,
                 verified: false,
             },
+            ingress: input::Ingress::INITIAL,
         })
         .map(|o| o.event),
         Some(Event::Resync {

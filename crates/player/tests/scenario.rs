@@ -1216,7 +1216,8 @@ fn practice_after_autoplay_plays_its_log() {
         1,
         "{stdout}"
     );
-    assert_eq!(lines(&stdout, "dev: audio onsets 4:").len(), 1, "{stdout}");
+    // And the decision tone at each of the two choices.
+    assert_eq!(lines(&stdout, "dev: audio onsets 6:").len(), 1, "{stdout}");
 }
 
 /// Skins are imported at startup only: with a Lua play skin configured,
@@ -1453,6 +1454,12 @@ fn onset_peaks(stdout: &str) -> Vec<f64> {
         .collect()
 }
 
+/// [`onset_peaks`] after the decision tones of the run's first `tones`
+/// choices, which sound before any chart's sound.
+fn chart_peaks(stdout: &str, tones: usize) -> Vec<f64> {
+    onset_peaks(stdout).split_off(tones)
+}
+
 /// A practice at 75 % of a quiet chart the library misses measures the
 /// chart once at 1×, on the practice page or during the Start's load
 /// (whichever comes first), before the round's READY state, so its first
@@ -1517,7 +1524,7 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
         !lines(&stdout, "dev: loading frames ").is_empty(),
         "{stdout}"
     );
-    let round = onset_peaks(&stdout);
+    let round = chart_peaks(&stdout, 1);
     assert_eq!(round.len(), 4, "{stdout}");
     // A 1× play in another run: the stored measurement, nothing measured.
     let root = game::DataRoot::new(fx.data());
@@ -1544,7 +1551,7 @@ fn a_practice_at_a_speed_measures_the_charts_1x_gain() {
         1,
         "{played}"
     );
-    let peaks = onset_peaks(&played);
+    let peaks = chart_peaks(&played, 1);
     assert_eq!(peaks.len(), 4, "{played}");
     for p in round {
         assert!(
@@ -1601,7 +1608,7 @@ fn a_middle_measure_round_sounds_its_lead_in_and_draws_its_targets() {
         "{stdout}"
     );
     // The lead-in's four loud sounds, then the four targets' quiet ones.
-    let peaks = onset_peaks(&stdout);
+    let peaks = chart_peaks(&stdout, 1);
     assert_eq!(peaks.len(), 8, "{peaks:?}\n{stdout}");
     let (loud, quiet) = peaks.split_at(4);
     let least_loud = loud.iter().copied().fold(f64::MAX, f64::min);

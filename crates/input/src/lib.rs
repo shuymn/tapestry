@@ -58,7 +58,9 @@ mod win;
 
 use bms_model::TimeUs;
 
-pub use activity::{ActivityRead, ActivityRecord, READ_TRIES, Section, SectionValue, Writing};
+pub use activity::{
+    ActivityRead, ActivityRecord, Ingress, READ_TRIES, Section, SectionValue, Writing,
+};
 pub use adjust::{
     ADJUST_QUEUE, AdjustmentBindings, AdjustmentReceiver, AdjustmentTap, GatePhase, GateState,
     Hold, HoldLatch, MAX_TAPPED, PanelLevel, Panels, PresentationFocus, RESERVED, StartGate,

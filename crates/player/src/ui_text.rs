@@ -105,8 +105,6 @@ pub enum Message<'a> {
     AllChartsRow { charts: u64 },
     /// `player.toml` could not be written, for the reason.
     SaveFailed { why: &'a str },
-    /// A chart being read for the practice page.
-    Reading { name: &'a str },
     /// A non-play kind's skin refused or unconfigured: its built-in screen.
     SkinBuiltIn { screen: Label, why: &'a str },
     /// The play skin refused.
@@ -277,7 +275,6 @@ mod ja {
                 write!(out, "  ▶ {}  ({charts})", label(Label::AllCharts))
             }
             Message::SaveFailed { why } => write!(out, "player.toml を保存できません: {why}"),
-            Message::Reading { name } => write!(out, "読み込み中: {name}"),
             Message::SkinBuiltIn { screen, why } => {
                 write!(
                     out,
@@ -317,7 +314,7 @@ mod tests {
                 Some(())
             }
             // Writes a part, then has no entry after all.
-            Message::Reading { .. } => {
+            Message::SaveFailed { .. } => {
                 out.push_str("READ");
                 None
             }
@@ -345,12 +342,12 @@ mod tests {
         assert_eq!(out, "held PRESET 曲");
         let mut out = "held ".to_owned();
         write_with(
-            &Message::Reading { name: "a.bms" },
+            &Message::SaveFailed { why: "a.bms" },
             &mut out,
             partial_write,
             super::ja::write,
         );
-        assert_eq!(out, "held 読み込み中: a.bms");
+        assert_eq!(out, "held player.toml を保存できません: a.bms");
         let mut out = "held ".to_owned();
         write_with(
             &Message::SkinUnusable { why: "x" },

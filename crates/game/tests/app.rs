@@ -31,10 +31,10 @@ use game::coord::{
 };
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading,
-    LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput,
-    PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError,
-    SessionEvent, SessionEventSink, Settings,
+    Decision, DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal,
+    Loaded, Loading, LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd,
+    PlayReport, PracticeInput, PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig,
+    SessionError, SessionEvent, SessionEventSink, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -417,6 +417,8 @@ struct Headless {
     audio_gone: bool,
     /// The audio output has failed.
     output_failed: bool,
+    /// The audio output fails from this clock time on.
+    output_fails_at: i64,
     /// What fails right after the attempt was prepared.
     fails_after_attempt: Option<AfterAttempt>,
     /// The preparation stops at that failure, as the player's does.
@@ -477,6 +479,50 @@ struct Headless {
     refuse_page_read: bool,
     /// The page's `n`th poll (from 1) fails the run.
     page_fails_at: Option<usize>,
+    /// The decision screen's time in ms; none (every existing test) shows
+    /// none.
+    decision_ms: Option<i64>,
+    /// The clock's advance at each decision look, in ms.
+    decision_step_ms: i64,
+    /// How long a play's load takes while it serves the decision screen,
+    /// in ms (none: as without one).
+    served_load_ms: Option<i64>,
+    /// The chosen chart at each decision screen's entry.
+    decisions: Vec<(usize, i64)>,
+    /// Each recovery of the decision screen: the clock, and how many looks
+    /// came before it (the look that made it is the next one recorded).
+    recovered_decisions: Vec<(i64, usize)>,
+    /// The screen fails this long (ms) after the first decision screen
+    /// begins.
+    screen_fails_in_decision: Option<i64>,
+    /// The input thread fails this long (ms) after the first decision
+    /// screen begins.
+    input_fails_in_decision: Option<i64>,
+    /// The screen fails as the practice page's chart is read, its
+    /// prerequisites waiting: the page's hold finds it.
+    screen_fails_in_jobs: bool,
+    /// The clock at each deadline step.
+    deadline_steps: Vec<i64>,
+    /// The decision screen's epochs closed.
+    closed_epochs: usize,
+    /// Each decision look's origin and clock.
+    decision_looks: Vec<(game::Origin, i64)>,
+    /// Told at the first look of the wait for a late read.
+    waiting_seen: Option<mpsc::Sender<()>>,
+    /// Back pressed whenever the wait for a late read looks.
+    escape_when_waiting: bool,
+    /// Escapes taken.
+    escapes: usize,
+    /// Told at the first decision look that finds the run ending (a close
+    /// or a thread's failure).
+    ending_seen: Option<mpsc::Sender<()>>,
+    /// A play's load finishes at its deadline, its bank refused: a reply
+    /// in hand with the deadline due.
+    refuse_load_at_deadline: bool,
+    /// The clock at each refusal shown.
+    refused_at: Vec<i64>,
+    /// The clock at each entry into the practice page.
+    page_entered_at: Vec<i64>,
     violations: Vec<String>,
     /// Every load with its plays' reports.
     loads: Vec<(usize, Vec<PlayReport>)>,
@@ -634,6 +680,7 @@ impl Headless {
             input_fails_at: i64::MAX,
             audio_gone: false,
             output_failed: false,
+            output_fails_at: i64::MAX,
             fails_after_attempt: None,
             cancel_at_failure: false,
             loading_end_fails: false,
@@ -674,6 +721,24 @@ impl Headless {
             page_polls: Vec::new(),
             refuse_page_read: false,
             page_fails_at: None,
+            decision_ms: None,
+            decision_step_ms: 100,
+            served_load_ms: None,
+            decisions: Vec::new(),
+            recovered_decisions: Vec::new(),
+            screen_fails_in_decision: None,
+            input_fails_in_decision: None,
+            screen_fails_in_jobs: false,
+            deadline_steps: Vec::new(),
+            closed_epochs: 0,
+            decision_looks: Vec::new(),
+            waiting_seen: None,
+            escape_when_waiting: false,
+            escapes: 0,
+            ending_seen: None,
+            refuse_load_at_deadline: false,
+            refused_at: Vec::new(),
+            page_entered_at: Vec::new(),
             edits: Vec::new(),
             presets: Vec::new(),
             chosen_names: Vec::new(),
@@ -1006,7 +1071,8 @@ impl Rig for Headless {
     }
 
     fn audio_failure(&self) -> Option<audio::OutputError> {
-        self.output_failed.then_some(audio::OutputError::DeviceLost)
+        (self.output_failed || self.at() >= self.output_fails_at)
+            .then_some(audio::OutputError::DeviceLost)
     }
 
     fn screen_failed(&self) -> bool {
@@ -1210,7 +1276,42 @@ impl AppRig for Headless {
         })
     }
 
-    fn load_chart(&mut self, loaded: &Loaded) -> Result<Loading, BankLost> {
+    fn load_chart(
+        &mut self,
+        loaded: &Loaded,
+        decision: &mut Decision,
+    ) -> Result<Loading, BankLost> {
+        // A load that serves the decision screen while it runs.
+        if decision.on()
+            && let Some(ms) = self.served_load_ms
+        {
+            let end = self.at() + ms * MS;
+            while self.at() < end {
+                self.clock.advance(TimeUs(self.decision_step_ms * MS));
+                self.tick();
+                let terminal = self.quitting()
+                    || game::Rig::input_failure(self).is_some()
+                    || game::Rig::audio_failure(self).is_some();
+                self.decision_looks.push((game::Origin::Load, self.at()));
+                match decision.classify(game::Origin::Load, self.clock.now(), terminal, false, None)
+                {
+                    game::Verdict::Continue => {}
+                    game::Verdict::Step => game::AppRig::deadline_step(self),
+                    other => {
+                        decision.leave(other);
+                        return Ok(Loading::Cancelled);
+                    }
+                }
+            }
+        }
+        if self.refuse_load_at_deadline
+            && let Some(deadline) = decision.deadline()
+        {
+            // The job finished, refused, before any look; the clock is at
+            // the deadline when the flow looks at it.
+            self.clock.advance(TimeUs((deadline.0 - self.at()).max(0)));
+            return Err(BankLost);
+        }
         let now = self.clock.now();
         if let Some(driver) = &mut self.adjust {
             driver
@@ -1281,6 +1382,7 @@ impl AppRig for Headless {
                 .push(format!("refused {}", refusal.chart.display()));
         }
         self.seen.push(Seen::Refused(self.chosen.unwrap()));
+        self.refused_at.push(self.at());
         let kind = match &refusal.reason {
             Refused::Chart(SessionError::Io { .. }) => "io",
             Refused::Chart(SessionError::Preset(_)) => "preset",
@@ -1348,11 +1450,90 @@ impl AppRig for Headless {
         self.seen.push(Seen::Select);
     }
 
-    fn practice_read(&mut self, _loaded: &game::Loaded) -> Result<Loading, BankLost> {
+    fn practice_read(
+        &mut self,
+        _loaded: &game::Loaded,
+        _decision: &mut Decision,
+    ) -> Result<Loading, BankLost> {
         if self.refuse_page_read {
             return Err(BankLost);
         }
+        // The page's bank waits for its prerequisites: the screen lost
+        // now is found by the page's hold.
+        if std::mem::take(&mut self.screen_fails_in_jobs) {
+            self.screen_fails_at = self.at();
+        }
         Ok(Loading::Ready)
+    }
+
+    fn decision_time(&self) -> Option<TimeUs> {
+        self.decision_ms.map(|ms| TimeUs(ms * MS))
+    }
+
+    fn entered_decision(&mut self, pick: &Pick) {
+        let i = self.chosen.unwrap();
+        self.decisions.push((i, self.at()));
+        if let Some(ms) = self.screen_fails_in_decision.take() {
+            self.screen_fails_at = self.at() + ms * MS;
+        }
+        if let Some(ms) = self.input_fails_in_decision.take() {
+            self.input_fails_at = self.at() + ms * MS;
+        }
+        // The attempt's reset at the choice; the loading state shows at
+        // the deadline.
+        if let Pick::Play(_) = pick {
+            let now = self.clock.now();
+            if let Some(driver) = &mut self.adjust {
+                driver
+                    .enter_attempt(None, &mut Pump(&mut self.sources, now))
+                    .unwrap();
+            }
+            self.loading = Some(i);
+        }
+    }
+
+    fn recovered_decision(&mut self) {
+        let looks = self.decision_looks.len();
+        self.recovered_decisions.push((self.at(), looks));
+    }
+
+    fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
+        // The read's looks move the clock (its wait has no idle wait); the
+        // App's own holds move it in their idle waits.
+        if origin == game::Origin::Read {
+            self.clock.advance(TimeUs(self.decision_step_ms * MS));
+        }
+        self.tick();
+        self.decision_looks.push((origin, self.at()));
+        if (self.quitting()
+            || game::Rig::input_failure(self).is_some()
+            || game::Rig::audio_failure(self).is_some())
+            && let Some(seen) = self.ending_seen.take()
+        {
+            let _ = seen.send(());
+        }
+        Ok(())
+    }
+
+    fn deadline_step(&mut self) {
+        self.deadline_steps.push(self.at());
+        if let Some(i) = self.loading {
+            self.loading_pages.push((i, self.at()));
+        }
+    }
+
+    fn closed_epoch(&mut self) {
+        self.closed_epochs += 1;
+    }
+
+    fn decision_escape(&mut self, _deadline: TimeUs) -> bool {
+        if let Some(seen) = self.waiting_seen.take() {
+            let _ = seen.send(());
+        }
+        if self.escape_when_waiting {
+            self.escapes += 1;
+        }
+        self.escape_when_waiting
     }
 
     fn poll_page(&mut self) -> Result<(), LiveError<SurfaceLost>> {
@@ -1367,6 +1548,7 @@ impl AppRig for Headless {
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
+        self.page_entered_at.push(self.at());
         self.job_left();
         self.loading = None;
         self.seen
@@ -4861,4 +5043,480 @@ fn a_page_job_failure_ends_the_run_at_its_pass() {
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.page_fails_at = Some(3));
     assert!(matches!(ran, Err(LiveError::Load(_))), "{ran:?}");
     assert_eq!(rig.page_polls.len(), 3);
+}
+
+/// The decision screen on, as the player's built-in presentation: 1.5 s.
+fn decided(rig: &mut Headless) {
+    rig.decision_ms = Some(1_500);
+}
+
+/// The choice's clock time on the decision screen of chart `i`.
+fn chosen_at(rig: &Headless, i: usize) -> i64 {
+    let [(c, at)] = rig.decisions[..] else {
+        panic!("{:?}", rig.decisions);
+    };
+    assert_eq!(c, i);
+    at
+}
+
+/// E2: a load done during the decision screen opens only after its
+/// deadline: one step at the deadline, the loading state shown from it,
+/// the opening after it.
+#[test]
+fn a_load_done_in_decision_opens_after_the_deadline() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, decided);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    let [step] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    assert!(
+        step >= choice + 1_500 * MS && step < choice + 1_600 * MS,
+        "{step} from {choice}"
+    );
+    assert_eq!(
+        rig.loading_pages,
+        [(0, step)],
+        "the loading state from the deadline"
+    );
+    assert!(rig.opened_at[0] >= step, "opened before the deadline");
+    assert_eq!(rig.closed_epochs, 0, "a play's epoch ends at its step");
+}
+
+/// E1: the deadline met while the play's load still runs: the step runs
+/// inside the load's wait, once, and the load goes on to its end and opens.
+#[test]
+fn the_deadline_inside_a_load_wait_begins_loading_and_keeps_the_job() {
+    let acts = vec![(0, Act::Choose(0)), (8_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.served_load_ms = Some(3_000);
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    let [step] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    assert!(
+        rig.decision_looks
+            .iter()
+            .any(|&(o, at)| o == game::Origin::Load && at == step),
+        "the step was not taken in the load's wait: {:?}",
+        rig.decision_looks
+    );
+    assert!(step < choice + 3_000 * MS, "the load had ended");
+    assert!(rig.seen.contains(&Seen::Load(0)), "{:?}", rig.seen);
+    assert_eq!(rig.opened_at.len(), 1);
+    assert!(rig.opened_at[0] >= choice + 3_000 * MS);
+}
+
+/// E3: a refusal met during the decision screen (the chart's read, its
+/// bank, the preset shelf) is held to the deadline, then selection shows
+/// it; no loading state, no step.
+#[test]
+fn a_refusal_in_decision_waits_for_the_deadline() {
+    for (refusal, chart) in [
+        (Refusal::Missing, 2),
+        (Refusal::Bank, 2),
+        (Refusal::Preset, 0),
+    ] {
+        let acts = vec![(0, Act::Choose(chart)), (6_000, Act::Close)];
+        let (rig, _events, ran) = run(refusal, acts, decided);
+        ran.unwrap();
+        assert!(
+            rig.violations.is_empty(),
+            "{refusal:?}: {:?}",
+            rig.violations
+        );
+        let choice = chosen_at(&rig, chart);
+        let [refused] = rig.refused_at[..] else {
+            panic!("{refusal:?}: {:?}", rig.refused_at);
+        };
+        assert!(
+            refused >= choice + 1_500 * MS,
+            "{refusal:?}: shown at {refused}, before the deadline from {choice}"
+        );
+        assert!(rig.deadline_steps.is_empty(), "{refusal:?}: stepped");
+        assert!(
+            rig.loading_pages.is_empty(),
+            "{refusal:?}: the loading state shown"
+        );
+        assert_eq!(rig.closed_epochs, 1, "{refusal:?}");
+    }
+}
+
+/// E3b: the bank's refusal in hand with the deadline due at the same look:
+/// selection at once, with no step, no loading state and no attempt
+/// prepared. The positive control, the same refusal before the deadline,
+/// is E3's: held.
+#[test]
+fn a_refusal_at_the_deadline_returns_without_loading() {
+    let acts = vec![(0, Act::Choose(2)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        decided(rig);
+        rig.refuse_load_at_deadline = true;
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 2);
+    assert_eq!(rig.refused_at.len(), 1, "{:?}", rig.seen);
+    assert!(rig.refused_at[0] >= choice + 1_500 * MS);
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+    assert!(rig.loading_pages.is_empty(), "the loading state shown");
+    assert!(rig.attempts.is_empty(), "an attempt prepared");
+}
+
+/// E4: a refusal after the deadline's step (the loading state entered,
+/// the load still running) returns at once, not held.
+#[test]
+fn a_refusal_after_the_deadline_returns_at_once() {
+    let acts = vec![(0, Act::Choose(2)), (8_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        decided(rig);
+        rig.served_load_ms = Some(2_500);
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 2);
+    let [step] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    assert!(step < choice + 1_600 * MS);
+    let [refused] = rig.refused_at[..] else {
+        panic!("{:?}", rig.refused_at);
+    };
+    let load_ended = rig
+        .decision_looks
+        .iter()
+        .rev()
+        .find(|&&(o, _)| o == game::Origin::Load)
+        .map(|&(_, at)| at)
+        .unwrap();
+    assert!(load_ended > step, "the load ended before the step");
+    assert_eq!(
+        refused, load_ended,
+        "held after the step: {refused} from {choice}"
+    );
+}
+
+/// E6: a close during the decision screen ends the run: no step, no
+/// loading state.
+#[test]
+fn a_close_in_decision_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (700, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.served_load_ms = Some(3_000);
+    });
+    ran.unwrap();
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+    assert!(rig.loading_pages.is_empty());
+    assert!(rig.opened_at.is_empty());
+}
+
+/// E7: the input thread's failure during the decision screen ends the run
+/// with it, before the deadline's step.
+#[test]
+fn a_thread_failure_inside_a_decision_load_wait_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.served_load_ms = Some(3_000);
+        rig.input_fails_at = CLOCK_START + 700 * MS;
+    });
+    assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+}
+
+/// Autoplay's P is refused on the select screen, before any decision
+/// screen.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_autoplay_practice_is_refused_before_the_decision_screen() {
+    let acts = vec![(0, Act::Practice(P)), (500, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.autoplay = vec![P];
+    });
+    ran.unwrap();
+    assert!(rig.decisions.is_empty(), "{:?}", rig.decisions);
+    assert_eq!(rig.refusals, ["autoplay"]);
+}
+
+/// W2: a practice read done in time opens the page at the deadline, not
+/// earlier and not later.
+#[test]
+fn a_read_done_in_time_does_not_extend_the_decision_screen() {
+    let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, decided);
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let entered = rig.page_entered_at[0];
+    assert!(
+        entered >= choice + 1_500 * MS && entered < choice + 1_600 * MS,
+        "{entered} from {choice}"
+    );
+    assert_eq!(rig.closed_epochs, 1);
+    assert!(
+        rig.deadline_steps.is_empty(),
+        "practice has no loading step"
+    );
+}
+
+/// A practice run whose read of the chart is held until the decision
+/// screen waits for it past its time; `setup` arms the rest. The read is
+/// let go once the wait is seen, and, with `after_end`, only once the run
+/// is also seen ending.
+fn run_late_read(
+    acts: Vec<(i64, Act)>,
+    after_end: bool,
+    setup: impl FnOnce(&mut Headless),
+) -> ProbedRun {
+    let (started_tx, started) = mpsc::channel();
+    let (open_tx, open) = mpsc::channel();
+    let (waiting_tx, waiting) = mpsc::channel::<()>();
+    let (ending_tx, ending) = mpsc::channel::<()>();
+    let opener = std::thread::spawn(move || {
+        started.recv_timeout(watchdog()).expect("the read started");
+        waiting
+            .recv_timeout(watchdog())
+            .expect("the decision screen waits for the read");
+        if after_end {
+            ending.recv_timeout(watchdog()).expect("the run ends");
+        }
+        let _ = open_tx.send(());
+    });
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |p| p.gated(0, started_tx, open),
+        |rig, _| {
+            decided(rig);
+            rig.waiting_seen = Some(waiting_tx);
+            rig.ending_seen = Some(ending_tx);
+            setup(rig);
+        },
+    );
+    opener.join().unwrap();
+    run
+}
+
+/// W1, W6: the read outlasting the decision screen keeps it: no page and
+/// no epoch's end at the deadline; the read goes on, and the page opens
+/// once it is done, its epoch over then.
+#[test]
+fn a_slow_read_keeps_the_decision_screen_until_it_is_done() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let run = run_late_read(acts, false, |_| {});
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    let choice = chosen_at(rig, P);
+    let waited = rig
+        .decision_looks
+        .iter()
+        .filter(|&&(o, at)| o == game::Origin::Read && at >= choice + 1_500 * MS)
+        .count();
+    assert!(waited > 0, "no look of the read past the deadline");
+    let entered = rig.page_entered_at[0];
+    assert!(entered > choice + 1_500 * MS, "{entered} from {choice}");
+    assert_eq!(rig.closed_epochs, 1);
+    assert_eq!(run.probe.ended(), 1, "the read finished");
+}
+
+/// W3: past the decision screen's time, Back while it waits for the read
+/// cancels the read and returns to selection: no page. Before the time,
+/// the same press does nothing (the escape is asked only while waiting).
+#[test]
+fn quit_or_back_while_waiting_returns_to_selection() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let late = run_late_read(acts, false, |rig| rig.escape_when_waiting = true);
+    late.ran.as_ref().unwrap();
+    let rig = &late.rig;
+    let choice = chosen_at(rig, P);
+    assert_eq!(rig.escapes, 1);
+    assert!(rig.page_entered_at.is_empty(), "the page opened");
+    assert_eq!(rig.closed_epochs, 1, "the epoch ended at the return");
+    let _ = choice;
+    assert_eq!(
+        rig.seen.iter().filter(|s| **s == Seen::Select).count(),
+        2,
+        "{:?}",
+        rig.seen
+    );
+    // The positive control: the same press with the read done in time is
+    // never taken; the page opens at the deadline.
+    let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.escape_when_waiting = true;
+    });
+    ran.unwrap();
+    assert_eq!(rig.escapes, 0, "the escape was taken before the time");
+    assert_eq!(rig.page_entered_at.len(), 1);
+}
+
+/// W4: past the time, the page's read refused: selection with the reason
+/// at once.
+#[test]
+fn a_refusal_while_waiting_returns_at_once() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let run = run_late_read(acts, false, |rig| rig.refuse_page_read = true);
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    assert_eq!(rig.refused_at.len(), 1, "{:?}", rig.seen);
+    assert!(rig.page_entered_at.is_empty());
+    let read_done = rig
+        .decision_looks
+        .iter()
+        .rev()
+        .find(|&&(o, _)| o == game::Origin::Read)
+        .map(|&(_, at)| at)
+        .unwrap();
+    assert!(
+        rig.refused_at[0] <= read_done + 100 * MS,
+        "held: {} after the read's last look {read_done}",
+        rig.refused_at[0]
+    );
+}
+
+/// W5: past the time, while it waits for the read, a close, the input
+/// thread's failure and the audio output's each end the run.
+#[test]
+fn a_failure_while_waiting_ends_the_run() {
+    for what in ["close", "input", "audio"] {
+        let acts = match what {
+            "close" => vec![(0, Act::Practice(P)), (2_000, Act::Close)],
+            _ => vec![(0, Act::Practice(P)), (10_000, Act::Close)],
+        };
+        let run = run_late_read(acts, true, |rig| match what {
+            "input" => rig.input_fails_at = CLOCK_START + 2_000 * MS,
+            "audio" => rig.output_fails_at = CLOCK_START + 2_000 * MS,
+            _ => {}
+        });
+        match what {
+            "close" => {
+                run.ran.as_ref().unwrap();
+            }
+            "input" => assert!(matches!(run.ran, Err(LiveError::Input(_))), "{:?}", run.ran),
+            _ => assert!(
+                matches!(run.ran, Err(LiveError::Output(_))),
+                "{:?}",
+                run.ran
+            ),
+        }
+        assert!(
+            run.rig.page_entered_at.is_empty(),
+            "{what}: the page opened"
+        );
+    }
+}
+
+/// E8, ND1, ND2: the screen lost while practice waits past the deadline
+/// for its read is built again while the read is pending, the look before
+/// the recovery being the read's, its presentation sent again with no
+/// second decision screen (no second tone), and the page opens once the
+/// read is done, after the unchanged deadline.
+#[test]
+fn a_screen_lost_during_a_pending_read_is_rebuilt_with_no_second_tone() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let run = run_late_read(acts, false, |rig| {
+        rig.screen_fails_in_decision = Some(1_500);
+    });
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    let choice = chosen_at(rig, P);
+    let [(recovered, looks)] = rig.recovered_decisions[..] else {
+        panic!("{:?}", rig.recovered_decisions);
+    };
+    // The look the recovery came in is the read's, not the page's hold
+    // after it.
+    assert_eq!(
+        rig.decision_looks.get(looks).map(|&(o, _)| o),
+        Some(game::Origin::Read),
+        "recovered only after the read"
+    );
+    assert!(
+        recovered >= choice + 1_500 * MS,
+        "{recovered} from {choice}"
+    );
+    assert_eq!(rig.decisions.len(), 1, "one decision screen, one tone");
+    let entered = rig.page_entered_at[0];
+    assert!(entered > choice + 1_500 * MS, "{entered} from {choice}");
+    assert!(entered >= recovered, "{entered} {recovered}");
+}
+
+/// A second choice shows a second decision screen (its tone again); a
+/// recovery between them does not.
+#[test]
+fn each_choice_shows_its_own_decision_screen() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (6_000, Act::Back),
+        (8_000, Act::Choose(0)),
+        (14_000, Act::Close),
+    ];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+    });
+    ran.unwrap();
+    assert_eq!(rig.decisions.len(), 2, "{:?}", rig.decisions);
+    assert_eq!(
+        rig.recovered_decisions.len(),
+        1,
+        "{:?}",
+        rig.recovered_decisions
+    );
+}
+
+/// A recovery's rebuild that fails while the input thread failed
+/// meanwhile ends the run with the input thread's failure, not the
+/// screen's; with nothing else failed (the positive control) the screen's
+/// error ends it.
+#[test]
+fn a_failed_recovery_reports_a_thread_failure_first() {
+    for input_failed in [true, false] {
+        let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
+        let (_rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            decided(rig);
+            rig.screen_fails_in_decision = Some(500);
+            rig.input_fails_in_decision = input_failed.then_some(500);
+            rig.prepare_fails_from = 1;
+        });
+        if input_failed {
+            assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
+        } else {
+            assert!(matches!(ran, Err(LiveError::Screen(_))), "{ran:?}");
+        }
+    }
+}
+
+/// The screen lost while the practice page's chart is read and its
+/// prerequisites still wait, held to the deadline: rebuilt during that
+/// hold, its presentation sent again, no second decision screen, and the
+/// page opens after the deadline.
+#[test]
+fn a_screen_lost_while_the_page_waits_is_rebuilt() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_jobs = true;
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let [(recovered, looks)] = rig.recovered_decisions[..] else {
+        panic!("{:?}", rig.recovered_decisions);
+    };
+    assert_eq!(
+        rig.decision_looks.get(looks).map(|&(o, _)| o),
+        Some(game::Origin::Jobs),
+        "recovered in the page's hold"
+    );
+    assert_eq!(rig.decisions.len(), 1);
+    let entered = rig.page_entered_at[0];
+    assert!(entered >= choice + 1_500 * MS, "{entered} from {choice}");
+    assert!(entered >= recovered, "{entered} {recovered}");
 }

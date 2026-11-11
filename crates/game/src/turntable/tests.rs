@@ -48,6 +48,7 @@ fn at(ms: i64, event: TapEvent) -> TapObservation {
         at: TimeUs(ms * MS),
         seq: 0,
         event,
+        ingress: input::Ingress::INITIAL,
     }
 }
 
