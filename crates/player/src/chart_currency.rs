@@ -66,7 +66,8 @@ impl PublicationKey {
     /// - the game thread's [`crate::chart_images::ChartImageWorker::publish`],
     ///   before taking an acknowledgment (the barrier before readiness and
     ///   the loading frames' publication) and before keeping one it asked
-    ///   for;
+    ///   for, and its `Core::publish_selection_now`, before keeping a
+    ///   selection publication it asked for;
     /// - the render thread's `Run::publish_chart` and
     ///   `Run::publish_selection_chart`, before admitting an incoming
     ///   publication into its one target;
@@ -78,18 +79,16 @@ impl PublicationKey {
     ///   selection's (expecting `None`).
     #[must_use]
     pub fn current(&self, now: &ChartNow, request: Option<u64>) -> bool {
-        if let PublishedTo::Selection(k) = self.target {
-            return self.generation == now.cursor_generation
-                && self.request.is_none()
-                && request.is_none()
-                && now.selection == k;
-        }
-        self.generation == now.generation
+        let generation = match self.target {
+            PublishedTo::Selection(_) => now.cursor_generation,
+            PublishedTo::Staged(_) | PublishedTo::Committed(_) => now.generation,
+        };
+        self.generation == generation
             && self.request == request
             && match self.target {
                 PublishedTo::Staged(r) => request == Some(r) && now.staged == Some(r),
                 PublishedTo::Committed(k) => request.is_none() && now.committed == k,
-                PublishedTo::Selection(_) => false,
+                PublishedTo::Selection(k) => request.is_none() && now.selection == k,
             }
     }
 }

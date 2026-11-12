@@ -2807,11 +2807,7 @@ impl Renderer {
         let refuse = std::mem::take(&mut self.result_chart_refuse);
         #[cfg(not(any(test, feature = "dev-tools")))]
         let refuse = false;
-        #[cfg(test)]
-        let fault = self.chart_fault.take();
-        #[cfg(not(test))]
-        let fault = None;
-        let seams = ChartSeams { refuse, fault };
+        let seams = self.chart_seams(refuse);
         let slot = Self::screen(ScreenKind::Result)
             .and_then(|i| self.screens.get_mut(i))
             .and_then(Option::as_mut);
@@ -2895,14 +2891,7 @@ impl Renderer {
             return Err(RenderError::DeviceLost);
         }
         let renderer = self.id;
-        #[cfg(test)]
-        let fault = self.chart_fault.take();
-        #[cfg(not(test))]
-        let fault = None;
-        let seams = ChartSeams {
-            refuse: false,
-            fault,
-        };
+        let seams = self.chart_seams(false);
         let Some(Some(slot)) =
             Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
         else {
@@ -2924,6 +2913,15 @@ impl Renderer {
         #[cfg(not(any(test, feature = "dev-tools")))]
         let _ = wrote;
         Ok(table)
+    }
+
+    /// The seams of a chart write: `refuse`, and the test fault, taken.
+    fn chart_seams(&mut self, refuse: bool) -> ChartSeams {
+        #[cfg(test)]
+        let fault = self.chart_fault.take();
+        #[cfg(not(test))]
+        let fault = None;
+        ChartSeams { refuse, fault }
     }
 
     /// The live key of the selection kind's committed array, as

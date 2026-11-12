@@ -219,16 +219,20 @@ pub fn read_sources(want: &Want, prior: Option<&Sources>, cancel: &dyn Fn() -> b
                 count([1, 0]);
                 Arc::new(chart_image::read_source(&dir, name, &[], cancel, identity))
             }
-            binding => {
-                let image = Err(match &binding {
-                    chart_image::Binding::Unresolved { why, .. } => Absent::Unresolved(*why),
-                    _ => Absent::NoHeader,
-                });
-                Arc::new(Read { binding, image })
-            }
+            binding => absent_read(binding),
         }
     });
     ChartImages::of(reads)
+}
+
+/// The read of an image `binding` leaves unread: absent for its
+/// unresolved name's reason, else as named by no header.
+fn absent_read(binding: chart_image::Binding) -> Arc<Read> {
+    let image = Err(match &binding {
+        chart_image::Binding::Unresolved { why, .. } => Absent::Unresolved(*why),
+        _ => Absent::NoHeader,
+    });
+    Arc::new(Read { binding, image })
 }
 
 /// Whether `read` may be carried past the job that made it (kept for a
@@ -394,6 +398,42 @@ struct Publication {
 }
 
 impl Publication {
+    /// One just sent, of `generation` and `request`, its answer to come on
+    /// `rx`.
+    const fn sent(
+        generation: u64,
+        request: Option<u64>,
+        set: Option<Arc<ChartImages>>,
+        rx: mpsc::Receiver<Ack>,
+        by_job: bool,
+    ) -> Self {
+        Self {
+            generation,
+            request,
+            set,
+            rx: Some(rx),
+            ack: None,
+            by_job,
+            unsent: false,
+            gone: false,
+        }
+    }
+
+    /// Whether it is the job's own publication of `generation`, its set
+    /// not yet taken from the job.
+    fn awaits_job(&self, generation: u64) -> bool {
+        self.by_job && self.generation == generation && self.set.is_none()
+    }
+
+    /// The job that was to send it ended, having sent `sent`, or nothing
+    /// (then the set is published again).
+    fn job_ended(&mut self, sent: Option<&Arc<ChartImages>>) {
+        match sent {
+            Some(set) => self.set = Some(Arc::clone(set)),
+            None => self.unsent = true,
+        }
+    }
+
     /// Takes an answer that came, if any.
     fn poll(&mut self) {
         let Some(rx) = &self.rx else {
@@ -503,19 +543,12 @@ fn read_selection(
     #[cfg(test)]
     hold(cancel);
     let identity: chart_image::Identity<'_> = &file_identity;
-    let absent = |binding: chart_image::Binding| {
-        let image = Err(match &binding {
-            chart_image::Binding::Unresolved { why, .. } => Absent::Unresolved(*why),
-            _ => Absent::NoHeader,
-        });
-        Arc::new(Read { binding, image })
-    };
     let [stage, banner] = &id.names;
     let reads = ChartImage::ALL.map(|which| {
         let name = match which {
             ChartImage::Stage => stage,
             ChartImage::Banner => banner,
-            ChartImage::Back => return absent(chart_image::Binding::NoHeader),
+            ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
         };
         let (binding, name) = match name {
             library::Name::None => (chart_image::Binding::NoHeader, ""),
@@ -538,10 +571,10 @@ fn read_selection(
             }
         }
         let chart_image::Binding::Resolved { .. } = binding else {
-            return absent(binding);
+            return absent_read(binding);
         };
         let Some((_, slot)) = which.slot(id.side) else {
-            return absent(chart_image::Binding::NoHeader);
+            return absent_read(chart_image::Binding::NoHeader);
         };
         #[cfg(test)]
         count([1, 0]);
@@ -590,7 +623,7 @@ enum Output {
 }
 
 /// What a job gives: its sources, and the halves it was asked for.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct JobOut {
     sources: Arc<Sources>,
     /// Whether `sources` were decoded by this job; otherwise they are the
@@ -1247,16 +1280,14 @@ impl ChartImageWorker {
         if !asked {
             c.supersede();
             if c.retiring.is_none() && !c.sel_pending() {
-                c.publication = Some(Publication {
+                let rx = render.publish_chart_images(generation, request, set.clone());
+                c.publication = Some(Publication::sent(
                     generation,
                     request,
-                    set: set.clone(),
-                    rx: Some(render.publish_chart_images(generation, request, set.clone())),
-                    ack: None,
-                    by_job: false,
-                    unsent: false,
-                    gone: false,
-                });
+                    set.clone(),
+                    rx,
+                    false,
+                ));
             }
         }
         let answered = match c.publication.as_mut() {
@@ -1435,12 +1466,8 @@ impl Core {
     /// The selection publication is no longer the one asked for, by the
     /// rule of [`supersede`](Self::supersede).
     fn supersede_selection(&mut self) {
-        if let Some(mut p) = self.sel_publication.take() {
-            p.poll();
-            if p.pending() && self.retiring.is_none() {
-                self.retiring = Some(p);
-            }
-        }
+        let p = self.sel_publication.take();
+        self.retire_publication(p);
     }
 
     /// Whether play's publication is unanswered.
@@ -1476,7 +1503,14 @@ impl Core {
     /// (a publication is sent only while none retires, so the newer one is
     /// its successor and is dropped with its answer).
     fn supersede(&mut self) {
-        if let Some(mut p) = self.publication.take() {
+        let p = self.publication.take();
+        self.retire_publication(p);
+    }
+
+    /// A superseded publication `p`: answered, it goes; unanswered, it
+    /// retires unless one already does.
+    fn retire_publication(&mut self, p: Option<Publication>) {
+        if let Some(mut p) = p {
             p.poll();
             if p.pending() && self.retiring.is_none() {
                 self.retiring = Some(p);
@@ -1689,23 +1723,9 @@ impl Core {
         outcome: Option<Outcome<Arc<Output>>>,
     ) {
         let (out, sent) = match outcome {
-            Some(Outcome::Done(out)) => match Arc::try_unwrap(out) {
-                Ok(Output::Attempt(out)) => (Some(out), true),
-                Err(a) => match &*a {
-                    Output::Attempt(a) => (
-                        Some(JobOut {
-                            sources: Arc::clone(&a.sources),
-                            fresh: a.fresh,
-                            play: a.play.clone(),
-                            result: a.result.clone(),
-                            #[cfg(test)]
-                            counts: a.counts,
-                        }),
-                        true,
-                    ),
-                    Output::Cursor { .. } => (None, false),
-                },
-                Ok(Output::Cursor { .. }) => (None, false),
+            Some(Outcome::Done(out)) => match &*out {
+                Output::Attempt(out) => (Some(out.clone()), true),
+                Output::Cursor { .. } => (None, false),
             },
             Some(Outcome::Panicked(p)) => {
                 log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
@@ -1731,16 +1751,12 @@ impl Core {
             && let Some(p) = self
                 .publication
                 .as_mut()
-                .filter(|p| p.by_job && p.generation == generation && p.set.is_none())
+                .filter(|p| p.awaits_job(generation))
         {
             // The job's own publication is of its play half when the job
             // sent it; a panicked job sent nothing, and its failed set is
             // published by the game thread.
-            if sent && let Some(play) = &out.play {
-                p.set = Some(Arc::clone(play));
-            } else {
-                p.unsent = true;
-            }
+            p.job_ended(out.play.as_ref().filter(|_| sent));
         }
         self.adopt(want, generation, out);
     }
@@ -1784,13 +1800,9 @@ impl Core {
         if let Some(p) = self
             .sel_publication
             .as_mut()
-            .filter(|p| p.by_job && p.generation == cursor_generation && p.set.is_none())
+            .filter(|p| p.awaits_job(cursor_generation))
         {
-            if sent {
-                p.set = Some(Arc::clone(&set));
-            } else {
-                p.unsent = true;
-            }
+            p.job_ended(sent.then_some(&set));
         }
         self.adopt_selection(id, cursor_generation, set);
     }
@@ -1852,7 +1864,7 @@ impl Core {
         if self.job.is_some() || self.obsolete.is_some() {
             return;
         }
-        if self.retiring.is_some() || self.play_pending() || self.sel_pending() {
+        if self.held_back() {
             self.blocked.get_or_insert_with(Instant::now);
             return;
         }
@@ -1904,16 +1916,7 @@ impl Core {
             Ok(job) => {
                 if let Some(rx) = rx {
                     self.supersede();
-                    self.publication = Some(Publication {
-                        generation,
-                        request: None,
-                        set: None,
-                        rx: Some(rx),
-                        ack: None,
-                        by_job: true,
-                        unsent: false,
-                        gone: false,
-                    });
+                    self.publication = Some(Publication::sent(generation, None, None, rx, true));
                 }
                 self.job = Some(Job {
                     target: Target::Attempt {
@@ -1952,7 +1955,7 @@ impl Core {
         spawner: Spawner,
         publish: Option<&crate::render_side::ChartPublisher>,
     ) {
-        if self.cursor.is_none() || self.held_back() {
+        if self.held_back() {
             return;
         }
         let Some(request) = self.cursor.take() else {
@@ -2029,16 +2032,8 @@ impl Core {
                         self.sel_sent += 1;
                     }
                     self.supersede_selection();
-                    self.sel_publication = Some(Publication {
-                        generation: cursor_generation,
-                        request: None,
-                        set: None,
-                        rx: Some(rx),
-                        ack: None,
-                        by_job: true,
-                        unsent: false,
-                        gone: false,
-                    });
+                    self.sel_publication =
+                        Some(Publication::sent(cursor_generation, None, None, rx, true));
                 }
                 self.job = Some(Job {
                     target: Target::Cursor {
@@ -2113,16 +2108,13 @@ impl Core {
         }
         let (reply, rx) = mpsc::sync_channel(1);
         publisher.publish_selection(cursor_generation, Some(Arc::clone(&set)), reply);
-        self.sel_publication = Some(Publication {
-            generation: cursor_generation,
-            request: None,
-            set: Some(set),
-            rx: Some(rx),
-            ack: None,
-            by_job: false,
-            unsent: false,
-            gone: false,
-        });
+        self.sel_publication = Some(Publication::sent(
+            cursor_generation,
+            None,
+            Some(set),
+            rx,
+            false,
+        ));
         true
     }
 
@@ -2152,16 +2144,7 @@ impl Core {
         }
         let (reply, rx) = mpsc::sync_channel(1);
         publisher.publish(generation, None, set.clone(), reply);
-        self.publication = Some(Publication {
-            generation,
-            request: None,
-            set,
-            rx: Some(rx),
-            ack: None,
-            by_job: false,
-            unsent: false,
-            gone: false,
-        });
+        self.publication = Some(Publication::sent(generation, None, set, rx, false));
         true
     }
 

@@ -6040,12 +6040,7 @@ impl Run {
     ) -> crate::chart_images::Ack {
         use crate::chart_images::{Ack, PublicationKey, PublishedTo};
         #[cfg(test)]
-        {
-            let end = Instant::now() + hook_bound();
-            while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        self.chart_held();
         self.sync_chart();
         let now = self.chart_now();
         let key = PublicationKey {
@@ -6105,6 +6100,16 @@ impl Run {
         }
     }
 
+    /// Waits while chart publications are held, at most [`hook_bound`]
+    /// (tests: `RenderLink::hold_chart_publications`).
+    #[cfg(test)]
+    fn chart_held(&self) {
+        let end = Instant::now() + hook_bound();
+        while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Publishes the cursor's chart images `set` (absent when `None`) of
     /// `cursor_generation` into the committed selection installation, and
     /// records the table its frames are given while it stays current
@@ -6120,12 +6125,7 @@ impl Run {
     ) -> crate::chart_images::Ack {
         use crate::chart_images::{Ack, PublicationKey, PublishedTo};
         #[cfg(test)]
-        {
-            let end = Instant::now() + hook_bound();
-            while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        self.chart_held();
         self.sync_chart();
         let now = self.chart_now();
         let key = PublicationKey {
@@ -6153,9 +6153,9 @@ impl Run {
         match &answer {
             Ok(table) => self.selection_table = Some((key, *table)),
             // A refused write leaves the images absent there: the frames
-            // read them so, as for play.
+            // read them so, as for play. The answer carries it; this thread
+            // logs nothing.
             Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
-                eprintln!("render: the selection skin's chart images are absent: {e}");
                 self.selection_table =
                     Some((key, skin_model::chart_image::ChartTable::ABSENT.keyed(live)));
             }

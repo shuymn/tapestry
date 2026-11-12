@@ -450,25 +450,38 @@ pub(crate) struct CursorImages<'a> {
 }
 
 impl Selection {
-    /// The cursor's chart for a selection chart layer of side `side`.
-    fn cursor_chart(&self, side: Option<u32>) -> Option<CursorChart> {
+    /// The cursor's chart for a selection chart layer of side `side`, as
+    /// borrowed from the list: its path and names.
+    fn cursor_chart(
+        &self,
+        side: Option<u32>,
+    ) -> Option<(&std::path::Path, &library::ChartNames, u32)> {
         let side = side?;
         let entry = self.screen.selected()?;
-        Some(CursorChart {
-            path: entry.path.clone(),
-            names: entry.images.clone()?,
-            side,
-        })
+        Some((&entry.path, entry.images.as_ref()?, side))
     }
 
     /// Before an update is sent (SC4): when the cursor's chart changed
     /// (a move, a list read again with other names or another row under
     /// the cursor, a refused chart selected, an entry), the worker's
     /// cursor generation changes and the rest counts from `now`. Compared
-    /// by the chart itself, never by what the update's key holds.
+    /// by the chart itself, never by what the update's key holds, and
+    /// copied only when it changed.
     fn track_cursor(&mut self, images: CursorImages<'_>, now: TimeUs) {
         let chart = self.cursor_chart(images.side);
-        if chart != self.rest.chart {
+        let same = match (chart, &self.rest.chart) {
+            (None, None) => true,
+            (Some((path, names, side)), Some(c)) => {
+                c.path == path && c.names == *names && c.side == side
+            }
+            _ => false,
+        };
+        if !same {
+            let chart = chart.map(|(path, names, side)| CursorChart {
+                path: path.to_owned(),
+                names: names.clone(),
+                side,
+            });
             images.worker.cursor_changed(&self.coord);
             self.rest = CursorRest {
                 chart,
