@@ -380,6 +380,54 @@ fn attempt_pin_survives_loading() {
     assert_eq!(committed, frame(&mut q));
 }
 
+/// A staging on its own resources draws its loading text before its
+/// commit, and the commit moves those lines into the installed loading
+/// lines with the cache they are in: the same resources (the key, which
+/// names them, unchanged),
+/// nothing to install again, the same frame drawn; loading text prepared
+/// after it under pressure evicts none of them.
+#[test]
+fn staged_loading_lines_move_with_the_commit() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let menu = MenuText::new(&r);
+    let a = outline_support::bundle_in(&r, dir.path(), &default_font());
+    common::install(&mut r, &a, 1);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let staged = stage(&mut r, &b, &labels("C", "D"), 2);
+    let on = render::LoadingOn::Staged(staged);
+    let staged_frame = |r: &mut Renderer| {
+        let f = common::loading_frame(1, TimeUs(0), TimeUs(0));
+        let t = r.loading_frame_on(on, &f, &menu).unwrap().unwrap();
+        assert!(t.presented);
+        read_back(r)
+    };
+    // The first staged frame enters the lifetime.
+    staged_frame(&mut r);
+    r.prepare_loading_text_on(on, 1, 1, TextSlots::ALL, &labels("A", "B"))
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    let drawn = staged_frame(&mut r);
+    assert!(
+        lit(&drawn).is_some(),
+        "the staged loading lines drew nothing"
+    );
+    let key = r.loading_text_key_on(on);
+    assert!(key.is_some() && key != r.loading_text_key());
+
+    r.commit(staged).unwrap();
+    assert_eq!(r.loading_text_key(), key);
+    assert_eq!(r.install_staged_loading_text(), Ok(false));
+    assert_eq!(loading_frame(&mut r, &menu), drawn);
+
+    // Under pressure: the attempt's and the loading lines fill the layer.
+    prepare_loading(&mut r, 2, &labels("E", "F"));
+    let report = r.text_report();
+    assert_eq!(report.counts.evictions, 0, "{:?}", report.counts);
+    assert!(report.counts.rounds > 1, "{:?}", report.counts);
+    assert_eq!(loading_frame(&mut r, &menu), drawn);
+}
+
 /// The staged loading text and then the installed loading lines keep
 /// their lines while an attempt is staged under pressure: with the
 /// loading lines filling the layer, the attempt's lines evict none of
