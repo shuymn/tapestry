@@ -906,6 +906,10 @@ pub enum RenderMsg {
     /// message before it, and drawn the frame that followed them, if any.
     #[cfg(test)]
     Fence(mpsc::SyncSender<()>),
+    /// A test's look at the mode the render thread draws after every
+    /// message before it: `idle`, `menu:<its first line>`, or `other`.
+    #[cfg(test)]
+    ModeProbe(mpsc::SyncSender<String>),
     /// Makes the render thread panic (tests: its failure in a play).
     #[cfg(all(test, feature = "dev-tools"))]
     Panic,
@@ -1053,6 +1057,11 @@ impl FrameSink for NoFrames {
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
+    /// The one owner of the screen's rebuild after a loss: none, one under
+    /// way, or the failure no one has reported yet. Every look, recovery
+    /// and preparation goes through [`serve_recovery`]; the render thread
+    /// never locks it.
+    recovery: Mutex<Recovery>,
     /// The chart images' generation, which the game thread's worker
     /// writes ([`crate::chart_images::ChartImageWorker::renew`]) and the
     /// render thread reads before each frame and publication.
@@ -1100,6 +1109,13 @@ struct Shared {
     /// The decision screen's presentations sent (tests).
     #[cfg(test)]
     decisions_sent: AtomicU64,
+    /// The chart loads built again once more after a lost device (tests).
+    #[cfg(test)]
+    chart_rebuilds: AtomicU64,
+    /// The rebuilds asked of the render thread ([`RenderMsg::Prepare`]),
+    /// each counted as it is taken (tests).
+    #[cfg(test)]
+    prepares: AtomicU64,
     /// The end or pause of a loading lifetime waits here before its
     /// answer (tests).
     #[cfg(test)]
@@ -1161,6 +1177,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             failed: AtomicBool::new(false),
+            recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
             chart_targets: Mutex::new((None, None)),
             #[cfg(test)]
@@ -1183,6 +1200,10 @@ impl Shared {
             loading_acked: AtomicU64::new(0),
             #[cfg(test)]
             decisions_sent: AtomicU64::new(0),
+            #[cfg(test)]
+            chart_rebuilds: AtomicU64::new(0),
+            #[cfg(test)]
+            prepares: AtomicU64::new(0),
             #[cfg(test)]
             loading_end_gate: Arc::default(),
             #[cfg(test)]
@@ -1807,6 +1828,15 @@ impl RenderLink {
         rx.recv_timeout(deadline).is_ok()
     }
 
+    /// The mode the render thread draws once it took every message sent
+    /// before this ([`RenderMsg::ModeProbe`]; tests).
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> String {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ModeProbe(tx));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap_or_default()
+    }
+
     /// Makes the render thread read the launch screen's time as `elapsed`
     /// from now on, or from its clock again with `None` (tests).
     #[cfg(test)]
@@ -2011,9 +2041,78 @@ impl RenderLink {
     ///
     /// Why the screen cannot be built.
     pub fn prepare(&self) -> Result<(), ScreenError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::Prepare(tx));
-        self.answer(&rx)
+        let pending = self.begin_prepare();
+        loop {
+            if let Some(answered) = pending.poll(Some(pending.bound), &self.shared) {
+                return answered;
+            }
+        }
+    }
+
+    /// [`prepare`](Self::prepare) begun, not waited for: the rebuild's
+    /// request, its answer's bound fixed now, polled with
+    /// [`serve_recovery`](Self::serve_recovery). Dropped, its late answer goes
+    /// nowhere; the render thread takes the rebuild before any later
+    /// request all the same.
+    pub fn begin_prepare(&self) -> PendingPrepare {
+        begin_prepare(&self.tx, self.answer_timeout)
+    }
+
+    /// Whether the screen needs its rebuild served: the device or the
+    /// surface lost, or the rebuild's holder ([`serve_recovery`]) holds one
+    /// under way or a failure no one reported. The one answer to "is the
+    /// screen to be built again" for every decision of the flow, so a
+    /// failure saved after the device came back is still served.
+    pub fn screen_outstanding(&self) -> bool {
+        self.failed()
+            || !matches!(
+                *self
+                    .shared
+                    .recovery
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                Recovery::Idle
+            )
+    }
+
+    /// The screen's rebuild after a loss, served through its one owner
+    /// ([`serve_recovery`]), waiting until `until` at most (none: not at
+    /// all); `report`: the caller ends the rebuild's story, so its answer,
+    /// or a failure saved earlier, is handed to it and the slot is empty
+    /// again. Every recovery and preparation of the screen comes here.
+    pub fn serve_recovery(&self, until: Option<Instant>, report: bool) -> Recovered {
+        serve_recovery(&self.shared, &self.tx, self.answer_timeout, until, report)
+    }
+
+    /// The rebuilds the render thread took (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn prepares(&self) -> u64 {
+        self.shared.prepares.load(Ordering::Acquire)
+    }
+
+    /// The recovery slot's state, not taken (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn recovery_state(&self) -> &'static str {
+        match &*self
+            .shared
+            .recovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Recovery::Idle => "idle",
+            Recovery::Pending(_) => "pending",
+            Recovery::Failed(_) => "failed",
+        }
+    }
+
+    /// What a look inside a rig's wait serves of the screen
+    /// ([`RecoveryHandle::look`]), from any thread.
+    pub fn recovery_handle(&self) -> RecoveryHandle {
+        RecoveryHandle {
+            tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
+            timeout: self.answer_timeout,
+        }
     }
 
     /// [`prepare_attempt_with`](Self::prepare_attempt_with) the skin in
@@ -2602,14 +2701,6 @@ impl RenderLink {
 
     /// The answer to a preparation or a load, waited for at most
     /// [`LOAD_TIMEOUT`]; a late answer goes nowhere.
-    fn answer(&self, rx: &Receiver<Result<(), RenderError>>) -> Result<(), ScreenError> {
-        match rx.recv_timeout(self.answer_timeout) {
-            Ok(ready) => Ok(ready?),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ScreenError::NoAnswer),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.ended()),
-        }
-    }
-
     /// Whether a frame failed since the last preparation, or the render
     /// thread ended.
     pub fn failed(&self) -> bool {
@@ -3113,7 +3204,7 @@ pub fn spawn(
                 turntable: crate::turntable::Turntable::default(),
                 app: crate::app_clock::AppClock::new(),
                 page_turns: false,
-                decision: false,
+                decision: None,
                 tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
@@ -3329,10 +3420,23 @@ fn pending_presentation(committed: &Committed, specialized_in: Option<u64>, life
 /// loading state; anything else stops.
 impl Run {
     /// What a preparation leaves drawn ([`after_preparing`]), the decision
-    /// screen's page kept too.
+    /// screen's page kept too. A screen lost while the decision screen was
+    /// the latest mode left nothing drawn: built again, it draws that page
+    /// again, the presentation of the state the render thread is in. A
+    /// later mode message has dropped the page by then, so no decision
+    /// frame is drawn after the render thread took one.
     fn after_preparing(&self, mode: Mode) -> Mode {
         match mode {
-            decision @ Mode::Menu { loading: None, .. } if self.decision => decision,
+            decision @ Mode::Menu { loading: None, .. } if self.decision.is_some() => decision,
+            Mode::Idle if self.screen.is_some() => match &self.decision {
+                Some(page) => Mode::Menu {
+                    page: page.clone(),
+                    update: None,
+                    changed: true,
+                    loading: None,
+                },
+                None => Mode::Idle,
+            },
             other => after_preparing(other),
         }
     }
@@ -3354,6 +3458,134 @@ fn after_preparing(mode: Mode) -> Mode {
 /// is latched in `shared` before [`ScreenError::Ended`] is returned, so
 /// a waiter that sees the reply gone sees the failure too, whatever the
 /// order the thread's teardown takes.
+/// A rebuild of the screen asked of the render thread
+/// ([`RenderLink::begin_prepare`]): its reply and its answer's bound.
+#[derive(Debug)]
+pub struct PendingPrepare {
+    rx: Receiver<Result<(), RenderError>>,
+    bound: Instant,
+}
+
+impl PendingPrepare {
+    /// The answer, waited for until `until` at most and in slices of
+    /// [`CANCEL_POLL`] (none: not waited for): `None` while it is not in.
+    fn poll(&self, until: Option<Instant>, shared: &Shared) -> Option<Result<(), ScreenError>> {
+        let now = Instant::now();
+        let wait = until
+            .map_or(Duration::ZERO, |u| u.saturating_duration_since(now))
+            .min(self.bound.saturating_duration_since(now))
+            .min(CANCEL_POLL);
+        match self.rx.recv_timeout(wait) {
+            Ok(ready) => Some(ready.map_err(ScreenError::from)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                (Instant::now() >= self.bound).then_some(Err(ScreenError::NoAnswer))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(ended(shared))),
+        }
+    }
+}
+
+/// The rebuild asked on `tx`, its bound `timeout` from now.
+fn begin_prepare(tx: &Sender<RenderMsg>, timeout: Duration) -> PendingPrepare {
+    let (reply, rx) = mpsc::sync_channel(1);
+    let _ = tx.send(RenderMsg::Prepare(reply));
+    PendingPrepare {
+        rx,
+        bound: Instant::now() + timeout,
+    }
+}
+
+/// What [`serve_recovery`] found of the screen's rebuild.
+#[derive(Debug)]
+pub enum Recovered {
+    /// Nothing to rebuild: the screen is not lost, and no rebuild or
+    /// unreported failure is held.
+    Nothing,
+    /// A rebuild is under way, its answer not in.
+    Running,
+    /// The rebuild answered, or failed (now or earlier): reported here,
+    /// once.
+    Answered(Result<(), ScreenError>),
+}
+
+/// The one way to the screen's rebuild after a loss, through its slot:
+/// held, a saved failure is reported (`report`) or kept; a rebuild under
+/// way is polled until `until` (none: no wait); none, and the screen
+/// lost, one begins. An answer is reported to a `report` caller; for a
+/// look's (`!report`), success empties the slot and a failure stays in it
+/// for the next reporter, so a lost screen is rebuilt once per failure
+/// and nothing that answers is dropped on the way.
+fn serve_recovery(
+    shared: &Shared,
+    tx: &Sender<RenderMsg>,
+    timeout: Duration,
+    until: Option<Instant>,
+    report: bool,
+) -> Recovered {
+    let mut slot = shared
+        .recovery
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if matches!(*slot, Recovery::Idle) {
+        if !shared.failed.load(Ordering::Acquire) {
+            return Recovered::Nothing;
+        }
+        *slot = Recovery::Pending(begin_prepare(tx, timeout));
+    }
+    let answered = match &*slot {
+        Recovery::Idle => return Recovered::Nothing,
+        Recovery::Pending(pending) => match pending.poll(until, shared) {
+            None => return Recovered::Running,
+            Some(answered) => answered,
+        },
+        Recovery::Failed(_) if !report => return Recovered::Running,
+        Recovery::Failed(_) => match std::mem::take(&mut *slot) {
+            Recovery::Failed(e) => return Recovered::Answered(Err(e)),
+            _ => return Recovered::Nothing,
+        },
+    };
+    *slot = match answered {
+        Err(e) if !report => Recovery::Failed(e),
+        _ if !report => Recovery::Idle,
+        answered => {
+            *slot = Recovery::Idle;
+            return Recovered::Answered(answered);
+        }
+    };
+    Recovered::Running
+}
+
+/// The screen's rebuild held by its one owner ([`serve_recovery`]).
+#[derive(Debug, Default)]
+pub enum Recovery {
+    /// None begun, or the last one answered.
+    #[default]
+    Idle,
+    /// Begun, its answer not in.
+    Pending(PendingPrepare),
+    /// It failed, or reached its bound: the flow reports it.
+    Failed(ScreenError),
+}
+
+/// The screen as a look inside a rig's wait serves it
+/// ([`RenderLink::recovery_handle`]).
+pub struct RecoveryHandle {
+    tx: Sender<RenderMsg>,
+    shared: Arc<Shared>,
+    timeout: Duration,
+}
+
+impl RecoveryHandle {
+    /// One look at the screen, waiting for nothing: lost with no rebuild
+    /// under way, its rebuild begins into the slot; under way, its answer
+    /// taken if it came, the slot empty again, or holding its failure for
+    /// the flow. A failure stays until the flow takes it, so a lost screen
+    /// is built at most once per failure.
+    pub fn look(&self) {
+        let _ = serve_recovery(&self.shared, &self.tx, self.timeout, None, false);
+    }
+}
+
 fn ended(shared: &Shared) -> ScreenError {
     shared.failed.store(true, Ordering::Release);
     ScreenError::Ended
@@ -3746,10 +3978,11 @@ struct Run {
     /// Whether the page drawn is the practice page
     /// ([`RenderMsg::PracticePage`]), whose frames tick the turntable.
     page_turns: bool,
-    /// Whether the page drawn is the decision screen's
-    /// ([`RenderMsg::Decision`]), which a chart's load or a preparation
-    /// keeps.
-    decision: bool,
+    /// The decision screen's page while it is the latest mode the render
+    /// thread was told of ([`RenderMsg::Decision`]); every later mode
+    /// message drops it. A chart's load or a preparation keeps its page,
+    /// and a screen built again draws it again ([`Run::after_preparing`]).
+    decision: Option<Box<MenuPage>>,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
@@ -3946,7 +4179,17 @@ impl Run {
                     }
                     self.chart = Some(chart);
                     self.section = section;
-                    let ready = self.prepare();
+                    let mut ready = self.prepare();
+                    // The device or the surface lost while the chart was
+                    // built: the screen is built again once more, with the
+                    // chart, inside the one answer (design.md "Play
+                    // Lifecycle", preparing each attempt). A skin's refusal
+                    // is not built again.
+                    if ready.as_ref().is_err_and(|e| !e.is_refusal()) {
+                        #[cfg(test)]
+                        self.shared.chart_rebuilds.fetch_add(1, Ordering::AcqRel);
+                        ready = self.prepare();
+                    }
                     // A chart the screen cannot draw is refused, and the
                     // screen it dropped is built again without it, for the
                     // select screen; if that fails too, the failure is
@@ -3969,6 +4212,18 @@ impl Run {
                     let _ = reply.send(());
                     continue;
                 }
+                #[cfg(test)]
+                Ok(RenderMsg::ModeProbe(reply)) => {
+                    let _ = reply.send(match &mode {
+                        Mode::Idle => "idle".to_owned(),
+                        Mode::Menu { page, .. } => format!(
+                            "menu:{}",
+                            page.lines.first().map_or("", |l| l.text.as_str())
+                        ),
+                        _ => "other".to_owned(),
+                    });
+                    continue;
+                }
                 Ok(RenderMsg::ParkScripts(reply)) => {
                     if let Some(logic) = self.selection.as_mut().and_then(|s| s.logic.as_mut()) {
                         logic.script.park();
@@ -3983,7 +4238,7 @@ impl Run {
                     // A generic page (a preparation's wait, a notice) is
                     // no play state's presentation: no turntable.
                     self.page_turns = false;
-                    self.decision = false;
+                    self.decision = None;
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::Decision(page)) => {
@@ -3991,25 +4246,26 @@ impl Run {
                     // the turntable is not adopted or ticked (design.md
                     // :732).
                     self.page_turns = false;
-                    self.decision = true;
+                    self.decision = Some(page.clone());
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::PracticePage(page)) => {
                     // The practice page begins or resumes its play
                     // state's presentation.
                     self.page_turns = true;
-                    self.decision = false;
+                    self.decision = None;
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
                     if self.result.is_some() {
+                        self.decision = None;
                         mode = Mode::Result;
                     }
                 }
                 Ok(RenderMsg::SelectionChanged) => {
-                    self.decision = false;
+                    self.decision = None;
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
@@ -4024,7 +4280,7 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
-                    self.decision = false;
+                    self.decision = None;
                     self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing, and neither do the
@@ -4100,6 +4356,8 @@ impl Run {
                     continue;
                 }
                 Ok(RenderMsg::Prepare(reply)) => {
+                    #[cfg(test)]
+                    self.shared.prepares.fetch_add(1, Ordering::AcqRel);
                     let ready = self.recover();
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
@@ -11574,9 +11832,27 @@ pub(crate) mod tests {
         }
         fn load(
             &mut self,
-            _chart: &Chart,
-            _section: Option<&eval::Section>,
+            chart: &Chart,
+            section: Option<&eval::Section>,
         ) -> Result<(), RenderError> {
+            self.shared
+                .chart_loads
+                .lock()
+                .unwrap()
+                .push((std::ptr::from_ref(chart) as usize, section.is_some()));
+            if self
+                .shared
+                .lose_chart_loads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(RenderError::SurfaceLost);
+            }
+            if self.shared.refuse_chart_loads.load(Ordering::Acquire) {
+                return Err(RenderError::Skin(render::SkinError {
+                    reason: "refused".to_owned(),
+                }));
+            }
             if self.shared.hold_load.load(Ordering::Acquire) {
                 self.shared.load_held.store(true, Ordering::Release);
                 while self.shared.hold_load.load(Ordering::Acquire) {
@@ -11870,12 +12146,17 @@ pub(crate) mod tests {
         }
         fn menu(
             &mut self,
-            _page: &crate::menu_screen::MenuPage,
+            page: &crate::menu_screen::MenuPage,
             _changed: bool,
         ) -> Result<FrameTiming, RenderError> {
             if self.shared.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
             }
+            let first = page
+                .lines
+                .first()
+                .map_or_else(String::new, |l| l.text.clone());
+            self.shared.menu_frames.lock().unwrap().push(first);
             Ok(timing(true))
         }
         fn loading(
@@ -11932,6 +12213,24 @@ pub(crate) mod tests {
         pub(crate) fail: Arc<AtomicBool>,
         /// Loading frames drawn, refused ones included.
         pub(crate) loading: Arc<AtomicU32>,
+        /// Each menu frame drawn (a page, the decision screen's included):
+        /// its first line.
+        pub(crate) menu_frames: Arc<std::sync::Mutex<Vec<String>>>,
+        /// This many chart loads fail as a lost surface.
+        pub(crate) lose_chart_loads: Arc<AtomicU32>,
+        /// Every call into the screen builder, failed ones included.
+        pub(crate) build_calls: Arc<AtomicU32>,
+        /// Screen builds wait while set.
+        pub(crate) hold_builds: Arc<AtomicBool>,
+        /// Set while a build waits on `hold_builds`.
+        pub(crate) build_held: Arc<AtomicBool>,
+        /// This many screen builds fail as a lost device.
+        pub(crate) fail_builds: Arc<AtomicU32>,
+        /// Chart loads are refused as a skin refuses them while set.
+        pub(crate) refuse_chart_loads: Arc<AtomicBool>,
+        /// Each chart load: the chart's address and whether a section came
+        /// with it.
+        pub(crate) chart_loads: Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
         /// Loading frames drawn as the pending presentation.
         pending: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
@@ -12066,6 +12365,19 @@ pub(crate) mod tests {
         pub(crate) fn spawn_with(&self, frames: Box<dyn super::FrameSink>) -> super::RenderLink {
             let shared = self.clone();
             let make: MakeScreen = Box::new(move || {
+                shared.build_calls.fetch_add(1, Ordering::AcqRel);
+                while shared.hold_builds.load(Ordering::Acquire) {
+                    shared.build_held.store(true, Ordering::Release);
+                    std::thread::park_timeout(Duration::from_millis(1));
+                }
+                shared.build_held.store(false, Ordering::Release);
+                if shared
+                    .fail_builds
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err(RenderError::SurfaceLost);
+                }
                 let device = u64::from(shared.builds.fetch_add(1, Ordering::SeqCst) + 1);
                 *shared.play.lock().unwrap() = None;
                 *shared.staging.lock().unwrap() = None;
@@ -13571,6 +13883,155 @@ pub(crate) mod tests {
         ));
         assert!(matches!(link.commit_attempt(), Err(ScreenError::Lost)));
         assert_eq!(link.epochs().1, 7, "nothing stamped or committed");
+        link.exit();
+    }
+
+    /// E3, B1: the decision screen's page drawn, then a frame fails: the
+    /// screen is lost and nothing is drawn. Built again with nothing after
+    /// the page (the positive control), it draws the page again, the
+    /// presentation of the state the render thread is in. A mode message
+    /// taken before or after the rebuild replaces it: the loading state
+    /// (sent after the rebuild, or before it), selection, or the practice
+    /// page, and no decision frame is drawn after the render thread took
+    /// that message.
+    #[test]
+    fn the_render_thread_draws_the_latest_mode_after_a_rebuild() {
+        #[derive(Clone, Copy, Debug)]
+        enum Next {
+            Nothing,
+            PrepareThenLoading,
+            LoadingThenPrepare,
+            Selection,
+            Practice,
+        }
+        for next in [
+            Next::Nothing,
+            Next::PrepareThenLoading,
+            Next::LoadingThenPrepare,
+            Next::Selection,
+            Next::Practice,
+        ] {
+            let screens = Installers::default();
+            let link = screens.spawn_bare();
+            let frames = |screens: &Installers| screens.menu_frames.lock().unwrap().clone();
+            let decisions = |from: usize| {
+                frames(&screens)[from..]
+                    .iter()
+                    .filter(|l| *l == "decision")
+                    .count()
+            };
+            link.show_decision(one_line("decision"));
+            assert!(wait_until(|| decisions(0) > 0), "{next:?}: the page drawn");
+            screens.fail.store(true, Ordering::Release);
+            assert!(wait_until(|| link.failed()), "{next:?}");
+            screens.fail.store(false, Ordering::Release);
+            assert!(link.fence(Duration::from_secs(60)));
+            let lost = frames(&screens).len();
+            match next {
+                Next::Nothing => {
+                    link.prepare().unwrap();
+                    assert!(
+                        wait_until(|| decisions(lost) > 0),
+                        "{next:?}: the page not drawn again"
+                    );
+                    link.exit();
+                    continue;
+                }
+                Next::PrepareThenLoading => {
+                    link.prepare().unwrap();
+                    link.loading().show(one_line("loading"));
+                }
+                Next::LoadingThenPrepare => {
+                    link.loading().show(one_line("loading"));
+                    link.prepare().unwrap();
+                }
+                Next::Selection => {
+                    link.send(RenderMsg::SelectionChanged);
+                    link.prepare().unwrap();
+                    // Selection replaced the decision page before the
+                    // rebuild: nothing of it is restored.
+                    assert_eq!(link.mode(), "idle", "{next:?}: the mode after the rebuild");
+                    link.send(RenderMsg::Menu(Box::new(one_line("select"))));
+                }
+                Next::Practice => {
+                    link.send(RenderMsg::PracticePage(Box::new(one_line("page"))));
+                    link.prepare().unwrap();
+                }
+            }
+            // Every message above taken, and the frames after them drawn.
+            assert!(link.fence(Duration::from_secs(60)));
+            let taken = frames(&screens).len();
+            assert!(link.fence(Duration::from_secs(60)));
+            assert!(link.fence(Duration::from_secs(60)));
+            let after = match next {
+                // The decision page may be drawn between the rebuild and
+                // the loading state: none after the render thread took it.
+                Next::PrepareThenLoading => taken,
+                _ => lost,
+            };
+            assert_eq!(
+                decisions(after),
+                0,
+                "{next:?}: a decision frame after the mode's message: {:?}",
+                &frames(&screens)[lost..]
+            );
+            link.exit();
+        }
+    }
+
+    /// E1: the device lost while the chart is built for the screen: the
+    /// screen is built again once more with the same chart, inside the
+    /// load's one answer, and the load succeeds.
+    #[test]
+    fn a_device_loss_in_the_chart_load_is_rebuilt_with_the_chart() {
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        screens.lose_chart_loads.store(1, Ordering::Release);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let at = std::ptr::from_ref(chart.as_ref()) as usize;
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            *screens.chart_loads.lock().unwrap(),
+            [(at, false), (at, false)],
+            "the chart built twice, the same chart"
+        );
+        assert!(!link.failed());
+        link.exit();
+    }
+
+    /// E2 (render): the device lost again in that second build: the load's
+    /// answer is the device's error, not a refusal, after exactly two
+    /// builds of the chart.
+    #[test]
+    fn a_second_device_loss_in_the_chart_load_ends_the_run() {
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        screens.lose_chart_loads.store(2, Ordering::Release);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let got = link.load(chart, None);
+        assert!(
+            matches!(&got, Err(ScreenError::Render(e)) if !e.is_refusal()),
+            "{got:?}"
+        );
+        assert_eq!(screens.chart_loads.lock().unwrap().len(), 2);
+        link.exit();
+    }
+
+    /// E2c: a skin's refusal of the chart, the device healthy: refused as
+    /// before, after exactly one build of the chart (the screen built
+    /// again without it is not a chart build).
+    #[test]
+    fn a_skin_refusal_in_the_chart_load_is_still_refused() {
+        let screens = Installers::default();
+        let link = screens.spawn_bare();
+        screens.refuse_chart_loads.store(true, Ordering::Release);
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let got = link.load(chart, None);
+        assert!(
+            matches!(&got, Err(ScreenError::Render(e)) if e.is_refusal()),
+            "{got:?}"
+        );
+        assert_eq!(screens.chart_loads.lock().unwrap().len(), 1, "built again");
         link.exit();
     }
 
