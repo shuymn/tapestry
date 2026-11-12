@@ -283,6 +283,13 @@ fn report(index: usize, survey: &Survey) -> String {
             e.fadeout.0 / 1_000
         ));
     }
+    if let Some((n, by)) = &survey.play_elements {
+        let timers: Vec<String> = by.iter().map(|(t, c)| format!("{t} {c}")).collect();
+        line(&format!("  elements: {n} (timers: {})", timers.join(", ")));
+    }
+    for a in &survey.play_atlas {
+        line(&format!("  atlas: {a}"));
+    }
     for (segments, motion) in &survey.gauges {
         line(&format!("  gauge segments {segments} motion {motion}"));
     }
@@ -808,6 +815,52 @@ mod tests {
             out.contains("\n  ending: finishmargin 3000 ms, fadeout -250 ms\n"),
             "{out}"
         );
+    }
+
+    /// A play skin's report counts its elements per timer and gives its
+    /// atlas plan under the device's limits in each variant. Timer 2 does
+    /// not map yet, so its destination makes no element.
+    #[test]
+    fn a_play_skins_report_counts_its_timers_and_plans_its_atlas() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             skin.destination = {\n\
+               { id = -110, timer = 3, dst = { { w = 64, h = 64 } } },\n\
+               { id = -110, timer = 3, dst = { { w = 32, h = 32 } } },\n\
+               { id = -110, timer = 2, dst = { { w = 64, h = 64 } } },\n\
+               { id = -110, dst = { { w = 16, h = 16 } } },\n\
+             }\n\
+             return skin\n",
+        )
+        .unwrap();
+        let s = survey_with(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        );
+        let out = report(0, &s);
+        assert!(
+            out.contains("\n  elements: 3 (timers: failed 2, screen 1)\n"),
+            "{out}"
+        );
+        for variant in ["Lo", "Hi"] {
+            let head = format!("\n  atlas: {variant} kept (text false, chart false): side ");
+            let at = out
+                .find(&head)
+                .unwrap_or_else(|| panic!("{variant}: {out}"));
+            let line = out[at + 1..].lines().next().unwrap();
+            assert!(
+                line.ends_with(&format!(" of {}", skin_model::MAX_ATLAS_TEXELS)),
+                "{line}"
+            );
+        }
+        assert!(!out.contains("no chart layer"), "{out}");
     }
 
     #[test]

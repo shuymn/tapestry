@@ -2852,6 +2852,14 @@ impl Skin {
             .is_none_or(crate::present::Present::carry_safe)
     }
 
+    /// Each element's timer slot in draw order (dev-tools): a built-in
+    /// timer's slot, or past the built-in timers a `when` timer's.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn element_timer_slots(&self) -> Vec<usize> {
+        self.elements.iter().map(|e| e.slot).collect()
+    }
+
     /// Each gauge widget's segments and motion, in widget order
     /// (dev-tools): what a report shows a gauge imported as.
     #[cfg(feature = "dev-tools")]
