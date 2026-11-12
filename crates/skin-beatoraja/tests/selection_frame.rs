@@ -94,8 +94,8 @@ fn styles(indices: &[usize]) -> (String, String) {
 }
 
 /// C5: a chart row takes text style 2, else 0; a folder row 4, else 0;
-/// the "all charts" row 9, else 4, else 0, and bar image 5, else 1, else
-/// 0.
+/// the "all charts" row 9, else 4, else 0, and bar image 5; a bar image
+/// past the set's end is image 0, as the source's (`SkinImage.java:133-135`).
 #[test]
 fn row_kinds_take_their_style_chains() {
     let rows = || vec![chart("c"), folder_row("f", 3), all_row(9)];
@@ -128,9 +128,9 @@ fn row_kinds_take_their_style_chains() {
         assert_eq!(s.images(0), [B0, B1, B5], "{indices:?}");
     }
     // Image sets of 2 and of 1 image: the "all charts" row falls back to
-    // image 1, then 0; a folder to 0.
+    // image 0, and a folder in a set of 1.
     for (set, want) in [
-        (r#"["b0", "b1"]"#, [B0, B1, B1]),
+        (r#"["b0", "b1"]"#, [B0, B1, B0]),
         (r#"["b0"]"#, [B0, B0, B0]),
     ] {
         let place = [

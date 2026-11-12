@@ -12,9 +12,11 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 6
+//! version = 8
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
+//! adapter = "hardware"           # optional: "warp" (the default, CI's) or
+//!                                # the system's hardware adapter, local runs
 //!
 //! [library]
 //! roots = ["library"]            # relative to this file
@@ -26,6 +28,9 @@
 //! # state began; or { closing_at = 300, file = … }: ms since its Closing
 //! # began, which no frame is guaranteed to show; or
 //! # { loading = true, file = … }: its loading state's first frame; or
+//! # { loading_at = 1500, file = … }: ms on its loading state's clock,
+//! # since its loading lifetime's origin, the screen clock's (failed if the
+//! # loading state ends first); or
 //! # { result_at = 400, file = … }: ms since the next play's result's first
 //! # presented frame. On the select screen, { select_at = 250, file = … }:
 //! # ms since the first presented selection frame that applied the update
@@ -99,7 +104,7 @@ use crate::measure::{Drawn, ResultId, ScreenKind};
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 6;
+const VERSION: i64 = 8;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -349,6 +354,7 @@ struct File {
     version: i64,
     output: Option<PathBuf>,
     size: Option<[i64; 2]>,
+    adapter: Option<Adapter>,
     library: Library,
     #[serde(default)]
     step: Vec<Step>,
@@ -468,6 +474,7 @@ struct CaptureSpec {
     ready_at: Option<i64>,
     closing_at: Option<i64>,
     loading: Option<bool>,
+    loading_at: Option<i64>,
     select_at: Option<i64>,
     result_at: Option<i64>,
     hold: Option<bool>,
@@ -535,6 +542,98 @@ pub struct Session {
     pub captures: Captures,
     /// The offscreen target's size, when the file gives one.
     pub size: Option<(u32, u32)>,
+    /// What draws the run's screen.
+    pub adapter: Adapter,
+}
+
+/// What draws a scenario's screen (design.md "Shortening Launch-Based
+/// Checks").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Adapter {
+    /// WARP, the software rasterizer: the default, and CI's.
+    Warp,
+    /// The system's high-performance hardware adapter, for local runs; a
+    /// CPU adapter is refused ([`admit`]).
+    Hardware,
+}
+
+impl Adapter {
+    /// The renderer's choice for it.
+    #[must_use]
+    pub const fn choice(self) -> render::AdapterChoice {
+        match self {
+            Self::Warp => render::AdapterChoice::Warp,
+            Self::Hardware => render::AdapterChoice::HighPerformance,
+        }
+    }
+}
+
+/// Whether the adapter `info` a screen was built on serves what was
+/// `asked`: a hardware choice refuses a CPU adapter.
+///
+/// # Errors
+///
+/// [`render::RenderError::CpuAdapter`] naming the adapter.
+pub fn admit(
+    asked: render::AdapterChoice,
+    info: &render::AdapterInfo,
+) -> Result<(), render::RenderError> {
+    if asked != render::AdapterChoice::Warp && info.device_type == render::DeviceType::Cpu {
+        return Err(render::RenderError::CpuAdapter {
+            name: info.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The environment variable of a scenario's injected adapter fault
+/// (tests of recovery): `cpu<N>`, the N-th build of the screen, counted
+/// from 1, reported as a CPU adapter to its line and its admission.
+pub const ADAPTER_FAULTS_ENV: &str = "TAPESTRY_DEV_ADAPTER_FAULTS";
+
+/// The build reported as a CPU adapter ([`ADAPTER_FAULTS_ENV`]); 0 none,
+/// `u64::MAX` not read yet.
+static CPU_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// The screen's builds so far.
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The adapter a build of the screen got, `info`, or the CPU adapter an
+/// injected fault reports for this build ([`ADAPTER_FAULTS_ENV`]).
+#[must_use]
+pub fn built_adapter(info: &render::AdapterInfo) -> std::borrow::Cow<'_, render::AdapterInfo> {
+    use std::sync::atomic::Ordering;
+    if CPU_BUILD.load(Ordering::SeqCst) == u64::MAX {
+        let list = std::env::var(ADAPTER_FAULTS_ENV).unwrap_or_default();
+        let n = list
+            .split(',')
+            .find_map(|f| f.trim().strip_prefix("cpu")?.parse().ok())
+            .unwrap_or(0);
+        CPU_BUILD.store(n, Ordering::SeqCst);
+    }
+    let build = BUILDS.fetch_add(1, Ordering::SeqCst) + 1;
+    if CPU_BUILD.load(Ordering::SeqCst) == build {
+        return std::borrow::Cow::Owned(render::AdapterInfo {
+            name: "injected CPU adapter".to_owned(),
+            ..render::AdapterInfo::new(render::DeviceType::Cpu, info.backend)
+        });
+    }
+    std::borrow::Cow::Borrowed(info)
+}
+
+/// The line each build of a scenario's screen prints: what it asked for
+/// and what it got.
+#[must_use]
+pub fn adapter_line(asked: render::AdapterChoice, info: &render::AdapterInfo) -> String {
+    let asked = match asked {
+        render::AdapterChoice::Warp => "warp",
+        render::AdapterChoice::HighPerformance => "hardware",
+        render::AdapterChoice::LowPower => "low-power",
+    };
+    format!(
+        "dev: adapter asked {asked}, got {} ({:?}, {:?})",
+        info.name, info.device_type, info.backend
+    )
 }
 
 impl fmt::Debug for Session {
@@ -589,6 +688,7 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
         .size
         .map(|[w, h]| super::checked_size(w, h))
         .transpose()?;
+    let adapter = file.adapter.unwrap_or(Adapter::Warp);
     let roots = roots(&file.library.roots, base)?;
     let compiled = compile(&file, base, &roots)?;
     let output = match &file.output {
@@ -618,6 +718,7 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
             logs: compiled.logs,
             captures: Captures(Arc::new(Mutex::new(captures))),
             size,
+            adapter,
         },
     })
 }
@@ -640,18 +741,21 @@ fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
         c.ready_at,
         c.closing_at,
         c.loading,
+        c.loading_at,
         c.select_at,
         c.result_at,
     ) {
-        (Some(at), None, None, None, None, None) => Axis::Chart(ms(at, "at")?),
-        (None, Some(r), None, None, None, None) => Axis::Ready(ms(r, "ready_at")?),
-        (None, None, Some(c), None, None, None) => Axis::Closing(ms(c, "closing_at")?),
-        (None, None, None, Some(true), None, None) => Axis::Loading,
-        (None, None, None, None, Some(s), None) => Axis::Select(ms(s, "select_at")?),
-        (None, None, None, None, None, Some(r)) => Axis::Result(ms(r, "result_at")?),
+        (Some(at), None, None, None, None, None, None) => Axis::Chart(ms(at, "at")?),
+        (None, Some(r), None, None, None, None, None) => Axis::Ready(ms(r, "ready_at")?),
+        (None, None, Some(c), None, None, None, None) => Axis::Closing(ms(c, "closing_at")?),
+        (None, None, None, Some(true), None, None, None) => Axis::Loading,
+        (None, None, None, None, Some(l), None, None) => Axis::LoadingAt(ms(l, "loading_at")?),
+        (None, None, None, None, None, Some(s), None) => Axis::Select(ms(s, "select_at")?),
+        (None, None, None, None, None, None, Some(r)) => Axis::Result(ms(r, "result_at")?),
         _ => {
             return Err(
-                "give one of at, ready_at, closing_at, loading = true, select_at and result_at"
+                "give one of at, ready_at, closing_at, loading = true, loading_at, \
+                 select_at and result_at"
                     .to_owned(),
             );
         }
@@ -1262,6 +1366,11 @@ pub enum Axis {
     Closing(TimeUs),
     /// The first presented frame of its loading state.
     Loading,
+    /// The first presented frame of its loading state at or after this
+    /// time on that state's clock, since its loading lifetime's origin
+    /// (the screen clock's, docs/stage3.md D3): a play frame of its play
+    /// first fails it.
+    LoadingAt(TimeUs),
     /// The first presented selection frame at or after this time since
     /// the first that applied the update its step was armed with.
     Select(TimeUs),
@@ -1277,6 +1386,7 @@ impl Axis {
             Self::Ready(_) => "ready",
             Self::Closing(_) => "closing",
             Self::Loading => "loading",
+            Self::LoadingAt(_) => "loading_at",
             Self::Select(_) => "select",
             Self::Result(_) => "result",
         }
@@ -1287,6 +1397,7 @@ impl Axis {
             Self::Chart(t)
             | Self::Ready(t)
             | Self::Closing(t)
+            | Self::LoadingAt(t)
             | Self::Select(t)
             | Self::Result(t) => t.0,
             Self::Loading => 0,
@@ -1964,7 +2075,7 @@ impl FrameSink for ScenarioFrames {
         let due = due
             .into_iter()
             .map(|(i, path, axis, generation, stamp)| {
-                let side = sidecar(axis, self.frame, drawn, stamp);
+                let side = sidecar(axis, self.frame, drawn, stamp, screen.adapter());
                 (i, path, side, generation)
             })
             .collect();
@@ -2033,6 +2144,22 @@ fn capture_due(
                 CaptureState::Bound(g) if loading => Some(Due::Save(g, Stamp::Play)),
                 _ => None,
             };
+        }
+        // Armed, whether or not its play has started, as `Loading`; its
+        // play's first frame of play ends it.
+        Axis::LoadingAt(since) => {
+            let g = match c.state {
+                CaptureState::Pending => 0,
+                CaptureState::Bound(g) => g,
+                _ => return None,
+            };
+            if drawn.screen != ScreenKind::Loading {
+                let played = drawn.play.is_some() && drawn.generation == Some(g);
+                return (g != 0 && played).then_some(Due::Fail("its loading state ended first"));
+            }
+            let stamp = drawn.loading_stamp?;
+            return (stamp.sampled.0 - stamp.origin.0 >= since.0)
+                .then_some(Due::Save(g, Stamp::Play));
         }
         Axis::Select(since) => {
             let CaptureState::Selecting {
@@ -2107,13 +2234,19 @@ fn capture_due(
             let start = drawn.view?.closing?;
             (t.0 - start.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
         }
-        Axis::Loading | Axis::Select(_) | Axis::Result(_) => None,
+        Axis::Loading | Axis::LoadingAt(_) | Axis::Select(_) | Axis::Result(_) => None,
     }
 }
 
 /// What the capture of `axis` on frame number `frame` was: its PNG's
 /// companion. A frame's play state may lag its time, which the view says.
-fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
+fn sidecar(
+    axis: Axis,
+    frame: u64,
+    drawn: &Drawn<'_>,
+    stamp: Stamp,
+    adapter: Option<&render::AdapterInfo>,
+) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let num = |v: Option<u64>| opt(v.and_then(|v| i64::try_from(v).ok()));
     let view = drawn.view;
@@ -2132,12 +2265,13 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
-        "\"screen\":\"{}\",\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
+        "\"screen\":\"{}\",\"adapter\":{},\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
          \"selection_lifetime\":{},\"selection_revision\":{},\"stamp_revision\":{},\
          \"result_us\":{},\"result_origin_us\":{},\"result_seq\":{},\"result_generation\":{},\
          \"result_drawn\":{},\"result_page\":{},\"result_view\":{},\"stamp_page\":{},\
          \"stamp_view\":{},\"sampled_us\":{},\"result_timer_origin_us\":{}",
         drawn.screen.name(),
+        adapter.map_or_else(|| "null".to_owned(), |a| json_string(&a.name)),
         opt(select_origin.map(|o| at - o)),
         opt(select_origin),
         num(drawn.selection.map(|(l, _)| l)),
@@ -2158,7 +2292,7 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
     format!(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
-         \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"completed_us\":{},\
+         \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"screen_us\":{},\"completed_us\":{},\
          \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen}}}\n",
         axis.name(),
         axis.target(),
@@ -2172,6 +2306,11 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
         opt(loading.map(|l| l.sampled.0 - l.origin.0)),
         opt(loading.map(|l| l.origin.0)),
         loading.map_or_else(|| "null".to_owned(), |l| l.settled.to_string()),
+        // A loading frame runs `screen` from its lifetime's origin, so its
+        // screen clock is its loading clock (`loading_frame_of`).
+        opt(drawn
+            .screen_us
+            .or_else(|| loading.map(|l| l.sampled.0 - l.origin.0))),
         drawn.at.0,
         opt(drawn.generation.and_then(|g| i64::try_from(g).ok())),
         opt(view.and_then(|v| i64::try_from(v.generation).ok())),
@@ -2661,7 +2800,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 6\n".to_owned();
+        let mut text = "version = 8\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -3154,7 +3293,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 6\nstep = [".to_owned();
+        let mut text = "version = 8\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -3202,7 +3341,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 6\n".to_owned();
+        let mut text = "version = 8\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -3222,17 +3361,92 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 6\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 8\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 6"
+            "version 1 is not supported; this build reads version 8"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 6"
+            "no version; this build reads version 8"
         );
+    }
+
+    /// The adapter a file names: WARP unless it says `"hardware"`; any
+    /// other name refused.
+    #[test]
+    fn a_scenario_names_its_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = |line: &str| {
+            let text =
+                format!("version = 8\n{line}[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n");
+            parse(&text, dir.path()).map(|p| p.session.adapter)
+        };
+        assert_eq!(adapter(""), Ok(super::Adapter::Warp));
+        assert_eq!(adapter("adapter = \"warp\"\n"), Ok(super::Adapter::Warp));
+        assert_eq!(
+            adapter("adapter = \"hardware\"\n"),
+            Ok(super::Adapter::Hardware)
+        );
+        for bad in ["adapter = \"cpu\"\n", "adapter = 1\n"] {
+            assert!(adapter(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            super::Adapter::Hardware.choice(),
+            render::AdapterChoice::HighPerformance
+        );
+        assert_eq!(super::Adapter::Warp.choice(), render::AdapterChoice::Warp);
+    }
+
+    /// An adapter of `device_type`, named `name`.
+    fn adapter_info(name: &str, device_type: wgpu::DeviceType) -> render::AdapterInfo {
+        render::AdapterInfo {
+            name: name.to_owned(),
+            ..render::AdapterInfo::new(device_type, wgpu::Backend::Dx12)
+        }
+    }
+
+    /// A hardware choice refuses a CPU adapter, naming it; WARP is one and
+    /// is admitted; the line says what was asked and what came.
+    #[test]
+    fn a_hardware_choice_refuses_a_cpu_adapter() {
+        use render::AdapterChoice::{HighPerformance, Warp};
+        let cpu = adapter_info("Basic Render", wgpu::DeviceType::Cpu);
+        let gpu = adapter_info("Some GPU", wgpu::DeviceType::DiscreteGpu);
+        assert!(super::admit(HighPerformance, &gpu).is_ok());
+        assert!(super::admit(Warp, &cpu).is_ok());
+        let e = super::admit(HighPerformance, &cpu).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "adapter: hardware was asked for, and the adapter is a CPU adapter: Basic Render"
+        );
+        assert_eq!(
+            super::adapter_line(HighPerformance, &gpu),
+            "dev: adapter asked hardware, got Some GPU (DiscreteGpu, Dx12)"
+        );
+        assert_eq!(
+            super::adapter_line(Warp, &cpu),
+            "dev: adapter asked warp, got Basic Render (Cpu, Dx12)"
+        );
+        // The sidecar names the adapter of the screen that drew the frame.
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            1,
+            &drawn(1, 0),
+            super::Stamp::Play,
+            Some(&gpu),
+        );
+        assert!(side.contains("\"adapter\":\"Some GPU\","), "{side}");
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            1,
+            &drawn(1, 0),
+            super::Stamp::Play,
+            None,
+        );
+        assert!(side.contains("\"adapter\":null,"), "{side}");
     }
 
     /// A capture names one axis, READY's from its start; a size is in
@@ -3243,18 +3457,26 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 6\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 8\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
         assert_eq!(capture("at = 5, "), Ok(super::Axis::Chart(TimeUs(5_000))));
         assert_eq!(capture("ready_at = 0, "), Ok(super::Axis::Ready(TimeUs(0))));
         assert_eq!(capture("loading = true, "), Ok(super::Axis::Loading));
+        assert_eq!(
+            capture("loading_at = 1500, "),
+            Ok(super::Axis::LoadingAt(TimeUs(1_500_000)))
+        );
+        let e = capture("loading_at = -1, ").unwrap_err();
+        assert!(e.contains("loading_at must be 0 or more"), "{e}");
         for bad in [
             "",
             "at = 1, ready_at = 1, ",
             "at = 1, loading = true, ",
             "loading = false, ",
+            "loading = true, loading_at = 1, ",
+            "loading_at = 1, ready_at = 1, ",
         ] {
             let e = capture(bad).unwrap_err();
             assert!(e.contains("give one of"), "{bad}: {e}");
@@ -3276,7 +3498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 6\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 8\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
@@ -3298,7 +3520,13 @@ mod tests {
             events: 56,
             ..drawn_view()
         });
-        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 9, &d, super::Stamp::Play);
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            9,
+            &d,
+            super::Stamp::Play,
+            None,
+        );
         assert!(side.contains("\"view_generation\":3,"), "{side}");
         assert!(side.contains("\"finalized_us\":1234,"), "{side}");
         assert!(side.contains("\"events\":56"), "{side}");
@@ -3346,6 +3574,78 @@ mod tests {
         }
     }
 
+    /// A loading frame of the screen at `us` µs since its lifetime's
+    /// origin, 7 s on the clock, of play `generation`.
+    fn loading_drawn(generation: Option<u64>, us: i64) -> crate::measure::Drawn<'static> {
+        let mut d = drawn(1, 0);
+        d.play = None;
+        d.view = None;
+        d.generation = generation;
+        d.screen = crate::measure::ScreenKind::Loading;
+        d.loading_stamp = Some(crate::measure::LoadingStamp {
+            sampled: TimeUs(7_000_000 + us),
+            origin: TimeUs(7_000_000),
+            settled: true,
+        });
+        d
+    }
+
+    /// A `loading_at` capture waits on its loading state's clock, armed
+    /// before its play binds and after; a frame of its play first fails
+    /// it; its sidecar gives the frame's loading and screen clocks, which
+    /// are one.
+    #[test]
+    fn a_loading_at_capture_waits_on_the_loading_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let due = |c: &Captures, d: &crate::measure::Drawn<'_>| {
+            let mut list = c.0.lock().unwrap();
+            super::capture_due(&mut list[0], d, None)
+        };
+        let saves = |c: &Captures, d: &crate::measure::Drawn<'_>, g: u64| matches!(due(c, d), Some(super::Due::Save(s, _)) if s == g);
+        // Pending: no play yet.
+        let c = Captures::of(vec![(TimeUs(0), dir.path().join("a.png"))]);
+        c.set_axis(0, super::Axis::LoadingAt(TimeUs(1_500_000)));
+        c.arm(0);
+        assert!(!saves(&c, &loading_drawn(None, 1_499_999), 0));
+        assert!(saves(&c, &loading_drawn(None, 1_500_000), 0));
+        // A play frame while still pending is not its play's: nothing.
+        assert!(due(&c, &drawn(1, 0)).is_none());
+        // Bound to play 2: not before 1.5 s, then at it and after it.
+        c.bind(2);
+        assert!(!saves(&c, &loading_drawn(Some(2), 1_499_999), 2));
+        assert!(saves(&c, &loading_drawn(Some(2), 1_500_000), 2));
+        assert!(saves(&c, &loading_drawn(Some(2), 1_500_001), 2));
+        // Another play's frame: nothing; its own play's: failed.
+        assert!(due(&c, &drawn(1, 0)).is_none());
+        assert!(matches!(
+            due(&c, &drawn(2, -900)),
+            Some(super::Due::Fail("its loading state ended first"))
+        ));
+        let side = super::sidecar(
+            super::Axis::LoadingAt(TimeUs(1_500_000)),
+            4,
+            &loading_drawn(Some(2), 1_734_000),
+            super::Stamp::Play,
+            None,
+        );
+        assert!(side.contains("\"axis\":\"loading_at\""), "{side}");
+        assert!(side.contains("\"target_us\":1500000,"), "{side}");
+        assert!(side.contains("\"loading_us\":1734000,"), "{side}");
+        assert!(side.contains("\"screen_us\":1734000,"), "{side}");
+        // A play frame gives the screen clock it was built with.
+        let mut d = drawn(2, 500);
+        d.screen_us = Some(3_210_000);
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            5,
+            &d,
+            super::Stamp::Play,
+            None,
+        );
+        assert!(side.contains("\"screen_us\":3210000,"), "{side}");
+        assert!(side.contains("\"loading_us\":null,"), "{side}");
+    }
+
     /// A Closing capture waits for a frame whose view has Closing started,
     /// then for its time since that start; its sidecar and the list's
     /// state line say where Closing started.
@@ -3382,6 +3682,7 @@ mod tests {
             4,
             &closing(5_300, Some(5_000)),
             super::Stamp::Play,
+            None,
         );
         assert!(side.contains("\"closing_us\":300000,"), "{side}");
         assert!(side.contains("\"closing_start_us\":5000000,"), "{side}");
@@ -4014,6 +4315,7 @@ mod tests {
             play: Some(TimeUs(ms * 1_000)),
             view: Some(drawn_view()),
             loading_stamp: None,
+            screen_us: None,
             screen: crate::measure::ScreenKind::Play,
             selection: None,
             result: None,

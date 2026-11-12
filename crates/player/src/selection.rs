@@ -3428,6 +3428,7 @@ pub(crate) mod tests {
             bga,
             summary: None,
             rank: None,
+            images: None,
         }
     }
 

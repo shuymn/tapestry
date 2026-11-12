@@ -1389,6 +1389,7 @@ mod tests {
             bga: false,
             summary: None,
             rank: None,
+            images: None,
         }
     }
 

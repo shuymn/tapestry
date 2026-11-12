@@ -109,6 +109,20 @@ pub(crate) struct State {
 /// The tables of [`State::tables`].
 const TABLES: [&str; 3] = ["imageset", "text", "value"];
 
+/// What an image set's entry gives a placement.
+#[derive(Clone, Copy, Debug)]
+enum SetImage {
+    /// Past the set's end.
+    Past,
+    /// A hole, and why: no image, or a file the source cannot load
+    /// either.
+    Hole(NoteKind),
+    /// The model image it was added as.
+    Drawn(u32),
+    /// Dropped by this importer alone, with its note.
+    Dropped,
+}
+
 impl Cx<'_> {
     /// Charges `charge` against the budget at `at`, then does `work`:
     /// when the charge fails, nothing of the work starts.
@@ -610,12 +624,59 @@ impl Cx<'_> {
         self.named_rec("imageset", Some(id))
     }
 
+    /// Entry `j` of an image set whose image records are `recs`: its
+    /// record when it loads, else why it is a hole, each entry's answer
+    /// kept in `loads`. A hole names no image, or a file the source cannot
+    /// load either: one [`super::widget::Unplaced`] calls `missing`, or one
+    /// admitted whose whole decode fails, as the source's texture fails
+    /// before its rectangle is read (`JsonSelectSkinObjectLoader.java:53`),
+    /// so a rectangle this importer refuses does not spare its file the
+    /// decode. A file only this importer refuses loads for the source and
+    /// is no hole. Each entry's answer is a unit the import's cancellation
+    /// is asked before; a file's decode is run once in the import
+    /// ([`super::asset::Assets::validate`]).
+    fn set_entry_loads(
+        &mut self,
+        role: Role,
+        at: Span,
+        recs: &[Option<u32>],
+        loads: &mut [Option<Result<(), NoteKind>>],
+        j: usize,
+    ) -> Result<Result<u32, NoteKind>, ImportError> {
+        let Some(&Some(r)) = recs.get(j) else {
+            return Ok(Err(NoteKind::UndefinedObject));
+        };
+        let known = loads.get(j).copied().flatten();
+        let loaded = match known {
+            Some(l) => l,
+            None => {
+                self.def.cancelled(|| Some(self.loc(at)))?;
+                let s = self.src_image(r)?;
+                let l = match self.src_rect(role, at, &s, s.div, true)? {
+                    Err(u) if u.missing => Err(u.why),
+                    _ => match self.texture(r, true, at)? {
+                        super::prepare::Load::Absent => Err(NoteKind::MissingAsset),
+                        _ => Ok(()),
+                    },
+                };
+                if let Some(slot) = loads.get_mut(j) {
+                    *slot = Some(l);
+                }
+                l
+            }
+        };
+        Ok(loaded.map(|()| r))
+    }
+
     /// One arm: destination record `rec` drawing image set `set`, each row
-    /// kind's image chosen by the decided chain (chart 0; folder 1, else 0;
-    /// "all charts" 5, else 1, else 0: owner decision O3), every image the
-    /// cycle and timer of the set's first that loads
-    /// (`JsonSelectSkinObjectLoader.java:47-66`). `None` when it is
-    /// dropped as `role` says or never drawn.
+    /// kind's image its own index (chart 0, folder 1, "all charts" 5) or,
+    /// past the set's end or dropped by this importer alone, image 0, as the
+    /// source's (`SkinImage.java:133-135`), a hole inside the set drawing
+    /// that kind with no bar; every image the set's
+    /// timing over the images that load
+    /// (`JsonSelectSkinObjectLoader.java:50-63`). `None` when it is
+    /// dropped as `role` says, never drawn, or its image 0 is a hole
+    /// outside the center's active arm.
     fn placement(
         &mut self,
         role: Role,
@@ -647,22 +708,27 @@ impl Cx<'_> {
                 None => None,
             });
         }
+        // Whether each entry loads, read once when first asked: an entry
+        // naming no image, or one whose file the source cannot load either
+        // (`Unplaced::missing`, or a whole decode that fails), is a hole;
+        // an importer-only refusal (a cap, a glob some file matches, a
+        // rect over a file that decodes) loads for the source and is not
+        // one.
+        let mut loads: Vec<Option<Result<(), NoteKind>>> = vec![None; recs.len()];
         // The set's timing, as the source takes it over the images that
-        // load, in order (`JsonSelectSkinObjectLoader.java:47-66`): the
+        // load, in order (`JsonSelectSkinObjectLoader.java:50-63`): the
         // first timer that is given, and the first cycle other than -1,
-        // each with the record it comes from. An image loads here when its
-        // source resolves; a file missing for the source too is not told
-        // apart.
+        // each with the record it comes from. A hole is passed over.
         let mut timer: Option<(Prop, u32)> = None;
         let mut cycle: Option<(i32, u32)> = None;
-        for &r in recs.iter().flatten() {
+        for j in 0..recs.len() {
             if timer.is_some() && cycle.is_some() {
                 break;
             }
-            let s = self.src_image(r)?;
-            if self.source_rec(s.src_name())?.is_none() {
+            let Ok(r) = self.set_entry_loads(c.role, at, &recs, &mut loads, j)? else {
                 continue;
-            }
+            };
+            let s = self.src_image(r)?;
             // A negative id is no timer: the source's factory makes none
             // of it (`TimerPropertyFactory.java:7-8`), so the search goes
             // on.
@@ -674,13 +740,19 @@ impl Cx<'_> {
                 cycle = Some((s.cycle, r));
             }
         }
-        let mut image = [None; 6];
+        // Images 0, 1 and 5 inside the set: a hole stays one, a loaded
+        // image is added, and one this importer drops is noted as before.
+        let mut image = [SetImage::Past; 6];
         for (j, slot) in image.iter_mut().enumerate() {
-            if ![0, 1, 5].contains(&j) {
+            if ![0, 1, 5].contains(&j) || j >= recs.len() {
                 continue;
             }
-            let Some(&Some(r)) = recs.get(j) else {
-                continue;
+            let r = match self.set_entry_loads(c.role, at, &recs, &mut loads, j)? {
+                Ok(r) => r,
+                Err(why) => {
+                    *slot = SetImage::Hole(why);
+                    continue;
+                }
             };
             let mut s = self.src_image(r)?;
             s.timer = timer.as_ref().map_or(Prop::Null, |(t, _)| t.clone());
@@ -698,12 +770,41 @@ impl Cx<'_> {
             }
             let added = self.add_src_image(&c, r, &s, s.div)?;
             c.role = own;
-            *slot = added.map(|(i, _)| i);
+            *slot = added.map_or(SetImage::Dropped, |(i, _)| SetImage::Drawn(i));
         }
-        let [Some(i0), i1, _, _, _, i5] = image else {
-            self.drop_el(role, at, NoteKind::MissingAsset)?;
-            return Ok(None);
+        let [first, ..] = image;
+        let i0 = match first {
+            SetImage::Drawn(i) => i,
+            // Image 0 a hole: the source draws nothing at the slot
+            // (`SkinImage.java:127-140`, `select/BarRenderer.java:250-290`).
+            // The center's active arm refuses as the selected row; any
+            // other arm never draws, noted.
+            SetImage::Hole(why) => {
+                let center = matches!(role, Role::Essential(EssentialPart::SelectedRow));
+                let role = if center { role } else { Role::Decorative };
+                self.drop_el(role, at, why)?;
+                return Ok(None);
+            }
+            SetImage::Past | SetImage::Dropped => {
+                self.drop_el(role, at, NoteKind::MissingAsset)?;
+                return Ok(None);
+            }
         };
+        // Each row kind takes its own index; one past the set's end takes
+        // image 0, as the source does (`SkinImage.java:133-135`), and so
+        // does one this importer dropped; a hole inside the set draws that
+        // row with no bar (`SkinBar.java:266-274`).
+        for (j, entry) in image.iter().enumerate() {
+            if let (1.., SetImage::Hole(why)) = (j, *entry) {
+                self.drop_el(Role::Decorative, at, why)?;
+            }
+        }
+        let kind = |j: usize| match image.get(j) {
+            Some(SetImage::Drawn(i)) => Some(*i),
+            Some(SetImage::Hole(_)) => None,
+            _ => Some(i0),
+        };
+        let images = [Some(i0), kind(1), kind(5)];
         let Some((rects, _)) = self.baked_rects(&c, [1, 1])? else {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(None);
@@ -718,7 +819,7 @@ impl Cx<'_> {
                 blend: c.blend,
                 pivot: c.pivot,
             },
-            images: [Some(i0), i1.or(Some(i0)), i5.or(i1).or(Some(i0))],
+            images,
         }))
     }
 
