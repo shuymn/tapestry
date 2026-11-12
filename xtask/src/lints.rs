@@ -507,13 +507,12 @@ pub const IN_PLAY: &[Site] = &[
             "strip_sprites",
         ],
     ),
-    // The selection frame's timers, the strip's preset line, the
-    // lifetime check before the frame's build and the live settings.
+    // The selection frame's timers, the lifetime check before the
+    // frame's build and the live settings.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
         &[
             "SelectionEvents::timers",
-            "SelectionEvents::preset_shown",
             "SelectionSlot::current",
             "live_settings",
             "SelectionLogic::apply_settings",
