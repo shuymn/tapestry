@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 7
+//! # Schema version 8
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -14,7 +14,8 @@
 //! - `charts(id, root, path UNIQUE, size, mtime_ns, sha256, md5, title,
 //!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
 //!   norm_text, title_key, artist_key, folder, mode, random, bga, loader,
-//!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max)`: the
+//!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max,
+//!   rank_kind, rank_value)`: the
 //!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
 //!   undeclared; the searched fields normalized and joined ([`Search`]); the
 //!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
@@ -23,7 +24,11 @@
 //!   `#RANDOM`; the flag of a top-level BGA image definition
 //!   ([`bms_parser::Listing::bga`]); the loader version that wrote the row, and a row of another is
 //!   read again; and the seed-0 branch's summary ([`ChartSummary`]), `NULL`
-//!   when the loader refuses it, its tempos 16 big-endian bytes.
+//!   when the loader refuses it, its tempos 16 big-endian bytes; and the
+//!   rank the beatoraja-style header policy reads from that branch
+//!   ([`ChartEntry::rank`]): `rank_kind` `NULL` when the branch is refused,
+//!   0 with no rank header, 1 a `#RANK` as written in `rank_value`, 2 a
+//!   `#DEFEXRANK` in thousandths in `rank_value`.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
 //!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a

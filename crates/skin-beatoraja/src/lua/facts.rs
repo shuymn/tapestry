@@ -133,9 +133,10 @@ impl JudgeClass {
     /// header): its percentage after one validation, as the reference's
     /// song database computes it (`song/SQLiteSongDatabaseAccessor.java:
     /// 866`, `song/SongData.java:150`), then the bands. Without the second
-    /// validation [`of_headers`](Self::of_headers) takes, a `j` of 0 is
-    /// very hard (`#DEFEXRANK 1`) and one below 0 (a `#DEFEXRANK` whose
-    /// product wraps) is in no class.
+    /// validation [`of_headers`](Self::of_headers) takes, every `j` of 0 or
+    /// less differs from it: 0 is very hard (`#DEFEXRANK 1`, and
+    /// `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0), and
+    /// below 0 (a product that wraps negative) is in no class.
     #[must_use]
     pub fn of_listed(rank: Option<JudgeRank>) -> Option<Self> {
         Self::band(Self::percent(rank))
@@ -592,9 +593,11 @@ mod listed_tests {
     use super::JudgeClass::{self, Easy, Normal, VeryEasy, VeryHard};
 
     /// The class a song list shows (one validation) and the one an
-    /// attempt shows (two): the same for every rank but `#DEFEXRANK 1`,
-    /// whose 0 is very hard listed and easy played, and a `#DEFEXRANK`
-    /// whose product wraps negative, in no class listed and easy played.
+    /// attempt shows (two): the same for every rank whose first pass is
+    /// above 0, and different for every one at or below it, which the
+    /// second pass makes 100 (easy): 0 is very hard listed (`#DEFEXRANK 1`,
+    /// and `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0),
+    /// and below 0 (a product that wraps negative) is in no class listed.
     #[test]
     fn a_listed_class_takes_one_validation() {
         let played = |r| {
@@ -606,6 +609,11 @@ mod listed_tests {
             (Some(Rank(0)), Some(VeryHard), Some(VeryHard)),
             (Some(Rank(3)), Some(Easy), Some(Easy)),
             (Some(DefExRankMilli(1_000)), Some(VeryHard), Some(Easy)),
+            (
+                Some(DefExRankMilli(57_266_231_000)),
+                Some(VeryHard),
+                Some(Easy),
+            ),
             (Some(DefExRankMilli(10_000)), None, None),
             (Some(DefExRankMilli(120_000)), Some(Easy), Some(Easy)),
             (Some(DefExRankMilli(30_000_000_000)), None, Some(Easy)),
