@@ -197,6 +197,12 @@ pub trait Rig {
     fn declared_close(&self) -> Option<TimeUs> {
         None
     }
+    /// The play skin's declared ending ([`PlayEnding`]), from the
+    /// attempt's commit. [`PlayEnding::NONE`] by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn declared_ending(&self) -> PlayEnding {
+        PlayEnding::NONE
+    }
     /// A pending result-screen command, taken. By default the in-play
     /// controls stand in for it: retry retries, quit goes back, and a
     /// suspend is ignored.
@@ -784,6 +790,29 @@ impl TailAction {
             Command::Retry | Command::Suspend => Self::Cut(c.cause()),
         }
     }
+}
+
+/// A play skin's declared ending (design.md "Play Lifecycle", Audio
+/// tail), in µs from the skin's `finishmargin` and `fadeout` in ms
+/// (`skin/json/JsonSkin.java:14, 21` at 0.8.9).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayEnding {
+    /// How long the play screen holds past the finish point before its
+    /// fade-out, at least 0: a negative declaration is read as 0.
+    pub finish_margin: TimeUs,
+    /// How long the fade-out lasts, as declared: 0 or less has no
+    /// fade-out, and a negative value also leaves the finish margin out,
+    /// as the source's timer that is off reads 0
+    /// (`play/BMSPlayer.java:756`, `TimerManager.java:37-42` at 0.8.9).
+    pub fadeout: TimeUs,
+}
+
+impl PlayEnding {
+    /// No declaration: no finish margin and no fade-out.
+    pub const NONE: Self = Self {
+        finish_margin: TimeUs(0),
+        fadeout: TimeUs(0),
+    };
 }
 
 /// The shortest Closing (design.md "Play Lifecycle", Closing): the same
