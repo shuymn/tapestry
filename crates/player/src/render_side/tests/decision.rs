@@ -125,8 +125,13 @@ enum Drew {
         now: TimeUs,
         screen: Option<TimeUs>,
     },
-    /// A page: its device and its first line.
-    Page { device: u64, line: String },
+    /// A page: its device, its first line and whether its layout was
+    /// prepared again (`changed`).
+    Page {
+        device: u64,
+        line: String,
+        changed: bool,
+    },
 }
 
 /// What the test sets and reads of the [`Recorder`]s a render thread
@@ -148,6 +153,8 @@ struct Seen {
     refuse_restore: AtomicBool,
     /// The next pinned labels' restore fails as a lost device.
     fail_label_restore: AtomicBool,
+    /// The result kind's restore fails as a lost device while set.
+    fail_result_restore: AtomicBool,
     /// This many chart loads fail as a lost surface.
     lose_loads: AtomicU32,
     /// The decision installation's removals.
@@ -166,6 +173,18 @@ impl Seen {
             .iter()
             .skip(from)
             .filter(|d| matches!(d, Drew::Skin { .. }))
+            .count()
+    }
+
+    /// The pages drawn after the `from`th frame whose layout was prepared
+    /// again.
+    fn relaid(&self, from: usize) -> usize {
+        self.drew
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(from)
+            .filter(|d| matches!(d, Drew::Page { changed: true, .. }))
             .count()
     }
 
@@ -245,6 +264,9 @@ impl Screen for Recorder {
             return Err(RenderError::Skin(render::SkinError {
                 reason: "refused for the test".to_owned(),
             }));
+        }
+        if kind == ScreenKind::Result && self.seen.fail_result_restore.load(Ordering::Acquire) {
+            return Err(RenderError::DeviceLost);
         }
         self.menu.restore(kind, installation)
     }
@@ -353,6 +375,7 @@ impl Screen for Recorder {
         self.seen.drew.lock().unwrap().push(Drew::Page {
             device: self.device,
             line,
+            changed,
         });
         self.menu.menu(page, changed)
     }
@@ -382,9 +405,15 @@ struct Rig {
 
 impl Rig {
     fn new(dir: &TempDir) -> Self {
+        Self::sized(dir, TARGET)
+    }
+
+    /// [`new`](Self::new) whose screens are made at `size`, as the
+    /// production factory makes them at the window's first size.
+    fn sized(dir: &TempDir, size: [u32; 2]) -> Self {
         let turn = crate::warp_turn::take();
         let bundle = {
-            let probe = crate::render_common::offscreen(TARGET[0], TARGET[1]);
+            let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
         let seen = Arc::new(Seen::default());
@@ -392,8 +421,8 @@ impl Rig {
         let make: MakeScreen = Box::new(move || {
             let r = render::Renderer::new(
                 render::Target::Offscreen {
-                    width: TARGET[0],
-                    height: TARGET[1],
+                    width: size[0],
+                    height: size[1],
                 },
                 render::AdapterChoice::Warp,
             )?;
@@ -1568,6 +1597,13 @@ fn ended_resized_decision_draws_the_page_without_refusal() {
     }));
     let from = rig.seen.len();
     assert!(wait_until(|| rig.seen.pages(from, "page") >= 3));
+    // The page mode took the screen: its layout prepared once, not at
+    // each frame.
+    assert!(
+        rig.seen.relaid(from) <= 1,
+        "the page laid out again at each frame: {}",
+        rig.seen.relaid(from)
+    );
     assert_eq!(rig.link.take_decision_refusal(), None, "a refusal noted");
     assert_eq!(rig.link.take_decision_takeover(), None);
     assert_eq!(rig.seen.removed.load(Ordering::Acquire), 0);
@@ -1634,8 +1670,271 @@ fn takeover_published_under_the_lifetime_lock() {
     let free = rig.book.try_lock().is_ok();
     gate.hold(false);
     assert!(!free, "the lifetime could end before the publication");
-    assert!(wait_until(|| gate.passed() == 1));
-    let t = rig.link.take_decision_takeover().expect("a takeover");
+    // Taken once published: the slot is read until it holds the takeover,
+    // never at the gate's pass, which precedes the publication.
+    let taken = Mutex::new(None);
+    assert!(wait_until(|| {
+        let t = rig.link.take_decision_takeover();
+        let some = t.is_some();
+        *taken.lock().unwrap() = t;
+        some
+    }));
+    assert_eq!(gate.passed(), 1);
+    let t = taken.into_inner().unwrap().expect("a takeover");
     assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    rig.link.exit();
+}
+
+/// A producer that refuses every line while `refuse` is set.
+#[derive(Debug)]
+struct Refusing {
+    inner: Arc<dyn render::AttemptText>,
+    refuse: Arc<AtomicBool>,
+}
+
+impl render::AttemptText for Refusing {
+    fn layout(
+        &self,
+        req: &skin_model::TextRequest,
+        em_px: f32,
+        bounds: render::LineBounds,
+    ) -> render::LineFit {
+        self.inner.layout(req, em_px, bounds)
+    }
+
+    fn raster(&self, layout: &render::LineLayout, out: &mut [u8]) -> Result<(), render::SkinError> {
+        if self.refuse.load(Ordering::Acquire) {
+            return Err(render::SkinError {
+                reason: "refused for the test".to_owned(),
+            });
+        }
+        self.inner.raster(layout, out)
+    }
+
+    fn resident(&self) -> render::TextResidency {
+        self.inner.resident()
+    }
+}
+
+/// Supersession: B's job refused by its producer and its refusal queued
+/// on the worker (the worker's wake seen), then the cursor back on A,
+/// whose slot is ready: the boundary reconciles the changed request before
+/// it takes any output, so B's obsolete refusal never reaches it: no
+/// refusal (the kind not disabled), A's slot kept, no job for A.
+#[test]
+fn obsolete_refusal_before_return_to_a_cached_key_is_dropped() {
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let mut r = crate::render_common::offscreen(TARGET[0], TARGET[1]);
+    let b = decision_bundle_in(&r, dir.path(), &default_font());
+    let token = r.install(ScreenKind::Decision, &b, 1).unwrap();
+    r.commit(token).unwrap();
+    let mut screen = Direct {
+        menu: MenuScreen::new(r, None),
+        hold: false,
+        hold_settle: false,
+    };
+    let book = LabelBook::shared(TARGET);
+    let refuse = Arc::new(AtomicBool::new(false));
+    let (stored_tx, stored_rx) = std::sync::mpsc::channel();
+    let stored_tx = Mutex::new(stored_tx);
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = stored_tx.lock().unwrap().send(());
+    });
+    let producer = Arc::new(Refusing {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        refuse: Arc::clone(&refuse),
+    });
+    let worker =
+        render::LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), Some(wake)).unwrap();
+    let mut side = DecisionSide::with_worker(&b, &book, 1, &screen, worker).unwrap();
+    let (a, bw) = (want("a", "A"), want("b", "B"));
+    until(&mut screen, &mut side, a.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    while stored_rx.try_recv().is_ok() {}
+    refuse.store(true, Ordering::Release);
+    let posts = side.posts;
+    quiet(&mut screen, &mut side, bw.as_ref());
+    assert_eq!(side.posts, posts + 1, "B's job posted");
+    stored_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("B's refusal queued");
+    refuse.store(false, Ordering::Release);
+    for _ in 0..3 {
+        let at = side.boundary(&mut screen, a.as_ref());
+        assert!(
+            matches!(at, Boundary::Quiet),
+            "B's obsolete refusal reached the boundary: {at:?}"
+        );
+    }
+    let k = lock(&book);
+    assert!(ready(&k, "a", "A"), "A's preparation lost: {k:?}");
+    assert!(k.healthy());
+    drop(k);
+    assert_eq!(side.posts, posts + 1, "a job posted for A");
+}
+
+/// The target of slot `slot`'s key in `book`.
+fn key_target(book: &LabelBook, slot: usize) -> Option<[u32; 2]> {
+    match book.state(slot) {
+        Some(
+            LabelState::Ready { key, .. }
+            | LabelState::Pinned { key, .. }
+            | LabelState::Cooling { key, .. },
+        ) => Some(key.target),
+        _ => None,
+    }
+}
+
+/// Whether a slot of `book` is ready with `chart` titled `title` under a
+/// key of `target`.
+fn ready_at(book: &LabelBook, chart: &str, title: &str, target: [u32; 2]) -> bool {
+    let revision = labels_revision(&labels(title));
+    (0..render::LABEL_SLOTS).any(|i| {
+        matches!(book.state(i), Some(LabelState::Ready { key, .. })
+            if key.chart == Path::new(chart) && key.revision == revision && key.target == target)
+    })
+}
+
+/// Target identity: a rebuild while the screen is 1280x720, the screen
+/// back at 1920x1080 before the next boundary: the book's target and the
+/// rows follow the screen together, so the next chart is published under
+/// a 1080p key (a 720p row plan under a 1080p book would never publish).
+#[test]
+fn rows_follow_the_target_after_a_rebuild() {
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let a = want("a", "A");
+    until(&mut screen, &mut side, a.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    screen.resize(1_280, 720);
+    assert!(matches!(side.rebuilt(&mut screen), Rebuilt::Restored));
+    screen.resize(TARGET[0], TARGET[1]);
+    let b = want("b", "B");
+    until(&mut screen, &mut side, b.as_ref(), &book, |k| {
+        ready_at(k, "b", "B", TARGET)
+    });
+}
+
+/// Target identity, R4.5: the screen made at its first size (1280x720),
+/// the window resized to 1920x1080 and the pin taken there, then a
+/// recovery: the live size is applied before the restore, so the restored
+/// pin, the book and the rows all name 1080p, and no 720p raster sits
+/// under a 1080p key.
+#[test]
+fn resized_then_recovered_restores_at_the_live_target() {
+    let dir = skin_dir();
+    let rig = Rig::sized(&dir, [1_280, 720]);
+    rig.extent.publish(TARGET[0], TARGET[1]);
+    assert!(wait_until(|| lock(&rig.book).current().0 == TARGET));
+    let shown = rig.drawing("a", "A");
+    let (slot, generation) = shown.slot.unwrap();
+    assert_eq!(key_target(&lock(&rig.book), slot), Some(TARGET));
+    rig.rebuild().unwrap();
+    let from = rig.seen.len();
+    rig.skin_frames(from, 3);
+    let k = lock(&rig.book);
+    assert!(restored_pin(&k, slot, generation, 5), "{k:?}");
+    assert_eq!(
+        key_target(&k, slot),
+        Some(TARGET),
+        "the pin restored at another target: {k:?}"
+    );
+    assert_eq!(k.current().0, TARGET);
+    drop(k);
+    lock(&rig.book).end(5);
+    rig.cursor(2, "b", "B");
+    assert!(
+        wait_until(|| ready_at(&lock(&rig.book), "b", "B", TARGET)),
+        "{:?}",
+        lock(&rig.book)
+    );
+    rig.link.exit();
+}
+
+/// Target identity, R4.5: pinned at T (1080p), restored at U (720p) by a
+/// recovery, the window back at T, then the lifetime's end: the slot's
+/// key names U, the target its lines were rasterized at, so once retired
+/// it is freed, never ready at T; the chart is prepared again at T.
+#[test]
+fn restored_at_another_target_is_never_ready_at_the_first() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let shown = rig.drawing("a", "A");
+    let (slot, generation) = shown.slot.unwrap();
+    rig.extent.publish(1_280, 720);
+    assert!(wait_until(|| lock(&rig.book).current().0 == [1_280, 720]));
+    rig.rebuild().unwrap();
+    let from = rig.seen.len();
+    rig.skin_frames(from, 3);
+    assert_eq!(key_target(&lock(&rig.book), slot), Some([1_280, 720]));
+    rig.extent.publish(TARGET[0], TARGET[1]);
+    assert!(wait_until(|| lock(&rig.book).current().0 == TARGET));
+    lock(&rig.book).end(5);
+    assert!(
+        wait_until(
+            || lock(&rig.book).state(slot).and_then(LabelState::generation) != Some(generation)
+        ),
+        "the 720p raster made ready under 1080p: {:?}",
+        lock(&rig.book)
+    );
+    rig.cursor(2, "a", "A");
+    assert!(
+        wait_until(|| ready_at(&lock(&rig.book), "a", "A", TARGET)),
+        "{:?}",
+        lock(&rig.book)
+    );
+    let k = lock(&rig.book);
+    assert!(
+        (0..render::LABEL_SLOTS)
+            .all(|i| k.state(i).and_then(LabelState::generation) != Some(generation)),
+        "{k:?}"
+    );
+    drop(k);
+    rig.link.exit();
+}
+
+/// R4.5, O8: a recovery with both installations committed, the decision
+/// kind's restore refused and the result kind's failing as the device
+/// fails: the recovery returns the device's error, and the decision
+/// refusal stands for the run (its notice, the kind disabled: nothing
+/// prepared after a later recovery).
+#[test]
+fn recover_refusal_stands_when_the_result_restore_fails() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let (_result_dir, result) = super::result::fixed_skin();
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Result, Some(result))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    rig.drawing("a", "A");
+    rig.seen.refuse_restore.store(true, Ordering::Release);
+    rig.seen.fail_result_restore.store(true, Ordering::Release);
+    let e = rig.rebuild().expect_err("the result's restore failed");
+    assert!(
+        matches!(
+            e,
+            crate::render_side::ScreenError::Render(RenderError::DeviceLost)
+        ),
+        "{e:?}"
+    );
+    let notice = rig.link.take_decision_refusal().expect("the refusal lost");
+    assert!(notice.contains("not restored"), "{notice}");
+    assert!(!lock(&rig.book).healthy());
+    rig.seen.refuse_restore.store(false, Ordering::Release);
+    rig.seen.fail_result_restore.store(false, Ordering::Release);
+    rig.link.prepare().unwrap();
+    lock(&rig.book).end(5);
+    rig.cursor(2, "b", "B");
+    assert!(rig.link.fence(Duration::from_secs(60)));
+    assert!(rig.link.fence(Duration::from_secs(60)));
+    assert!(!ready(&lock(&rig.book), "b", "B"), "the kind not disabled");
     rig.link.exit();
 }

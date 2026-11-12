@@ -4970,6 +4970,9 @@ impl Run {
             let mut presented_at: Option<TimeUs> = None;
             // A skinned decision frame the skin refused, for its takeover.
             let mut decision_refused = None;
+            // A decision frame that drew its page without a refusal (its
+            // lifetime ended): the page mode takes the screen.
+            let mut decision_fallback = false;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -5412,9 +5415,14 @@ impl Run {
                             // Refused on a healthy device: the page draws in
                             // this frame, and the built-in presentation takes
                             // over from now on. A screen whose lifetime ended
-                            // draws the page, refusing nothing.
-                            if let crate::decision_side::DecisionDrawn::Refused(e) = other {
-                                decision_refused = Some(e);
+                            // (or with no slot) draws the page, refusing
+                            // nothing, and the page mode takes it from then
+                            // on: its layout is prepared once, not each frame.
+                            match other {
+                                crate::decision_side::DecisionDrawn::Refused(e) => {
+                                    decision_refused = Some(e);
+                                }
+                                _ => decision_fallback = true,
                             }
                             let Some(page) = &self.decision else {
                                 mode = Mode::Idle;
@@ -5426,10 +5434,19 @@ impl Run {
                 }
                 Mode::End => screen.end(&self.end_page.1).map(|p| (timing_of(p), None)),
             };
-            // The skin refused its decision frame, which drew the page: the
-            // built-in presentation takes over for the rest of the screen.
-            if let Some(e) = decision_refused {
-                self.decision_frame_refused(e, frame_at);
+            // The page drew in place of the skin: the page mode takes the
+            // screen from the next frame, its layout kept (prepared once).
+            // A refusal is the takeover's; an ended lifetime's screen only
+            // stops reading its slot.
+            if decision_fallback || decision_refused.is_some() {
+                if let Some(e) = decision_refused {
+                    self.decision_frame_refused(e, frame_at);
+                } else {
+                    if let Some(shown) = self.decision_shown.as_mut() {
+                        shown.slot = None;
+                    }
+                    self.decision_screen = None;
+                }
                 if matches!(mode, Mode::Decision) {
                     mode = Mode::Menu {
                         page: self.decision.clone().unwrap_or_default(),
@@ -6665,6 +6682,17 @@ impl Run {
     ///
     /// The device's failure while the pinned labels were rebuilt.
     fn decision_rebuilt(&mut self, refused: Option<String>) -> Result<(), RenderError> {
+        // Target identity: the screen built again takes the window's live
+        // size before anything is restored, so the book's target, the rows
+        // and the restored pin's key all name the target its lines are
+        // rasterized at (the factory makes the screen at its first size).
+        if let (Some(screen), Some(size)) = (
+            self.screen.as_deref_mut(),
+            self.extent.as_ref().and_then(|e| e.latest()),
+        ) {
+            screen.resize(size.0, size.1);
+            self.applied = Some(size);
+        }
         let now = self.clock.now();
         if let Some(why) = refused
             && self.decision_skinned()
