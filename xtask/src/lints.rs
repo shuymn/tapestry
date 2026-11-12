@@ -434,6 +434,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/layout.rs"),
     Site::File("crates/skin-model/src/pixmap.rs"),
     Site::File("crates/skin-model/src/place.rs"),
+    // A selection skin's pointer targets, hit tests and hover rects.
+    Site::File("crates/skin-model/src/pointer.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
     Site::File("crates/skin-model/src/widget/bar.rs"),
     Site::File("crates/skin-model/src/widget/bpm_graph.rs"),

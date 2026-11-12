@@ -464,6 +464,7 @@ impl Cx<'_> {
             level,
             lamp,
             label,
+            clickable: Vec::new(),
         };
         // The visibilities each element charges, as the model evaluates
         // them: every arm's, and every style's, a style two row kinds

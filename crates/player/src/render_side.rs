@@ -12309,6 +12309,7 @@ pub(crate) mod tests {
                         layout: &skin_model::Layout::AUTHOR,
                         timers: update.events.timers(),
                         app,
+                        pointer: None,
                     };
                     if skin
                         .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)

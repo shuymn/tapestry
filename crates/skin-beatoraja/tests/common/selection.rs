@@ -247,6 +247,7 @@ impl Sel {
             layout: &Layout::AUTHOR,
             timers: self.timers,
             app: self.app,
+            pointer: None,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)
@@ -287,6 +288,7 @@ pub fn chart(title: &str) -> RowView {
     RowView {
         key: RowKey::Chart(PathBuf::from(format!("{title}.bms"))),
         kind: RowKind::Chart,
+        index: None,
         title: title.to_owned(),
         subtitle: String::new(),
         artist: String::new(),
@@ -381,6 +383,7 @@ pub fn view(
         place: SelectionPlace::Top,
         query: String::new(),
         selected,
+        list_revision: 0,
     }
 }
 

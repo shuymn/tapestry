@@ -582,6 +582,7 @@ impl MenuScreen {
             layout: &skin_model::Layout::AUTHOR,
             timers: u.events.timers(),
             app,
+            pointer: None,
         };
         // The frame's preparation ends here (dev-tools: the S7-07d
         // gate's whole frames).

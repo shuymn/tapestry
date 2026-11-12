@@ -1159,6 +1159,7 @@ impl SelectScreen {
             place,
             query: self.query.clone(),
             selected: self.selected().map(|e| self.selected_chart(e)),
+            list_revision: 0,
         }
     }
 
@@ -1182,6 +1183,7 @@ impl SelectScreen {
         let blank = |key, kind, title| RowView {
             key,
             kind,
+            index: None,
             title,
             subtitle: String::new(),
             artist: String::new(),
@@ -1232,6 +1234,7 @@ impl SelectScreen {
                     RowView {
                         key: RowKey::Chart(e.path.clone()),
                         kind: RowKind::Chart,
+                        index: None,
                         title: text(&h.title),
                         subtitle: text(&h.subtitle),
                         artist: text(&h.artist),

@@ -257,7 +257,7 @@ fn ratio_bars_draw_their_ratios() {
     let _ = BAR;
     let hit = s
         .skin
-        .slider_at(&s.sel, [150.0, 975.0], [1_920, 1_080])
+        .drag_at(&s.sel, [150.0, 975.0], [1_920, 1_080])
         .unwrap();
     assert_eq!(hit.source, skin_model::RatioSource::ListPosition);
     // 150 of the 200 travel from the slider's place: 3/4.

@@ -2158,6 +2158,7 @@ impl<'d> Cx<'d> {
             let widgets = SelectionDefs {
                 song_list: self.sel.list.take(),
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
+                pointer: Vec::new(),
             };
             Skin::new_selection(def, widgets)
         } else if result {
