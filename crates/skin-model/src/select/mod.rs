@@ -396,6 +396,17 @@ impl Selection {
         set(field::SETTINGS_SUDDEN, i32::from(sudden));
         set(field::SETTINGS_LIFT, i32::from(lift));
         set(field::SETTINGS_HIDDEN, i32::from(hidden));
+        set(field::SETTINGS_GAUGE_SHIFT, i32::from(s.play_to_end));
+        set(
+            field::SETTINGS_JUDGE_ALGORITHM,
+            match s.assignment {
+                // The source's `JudgeAlgorithm` order: Combo 0, Duration 1
+                // (`play/JudgeAlgorithm.java:42` at `0.8.9`).
+                Some(rules::Assignment::ComboPriority) => 0,
+                Some(rules::Assignment::NearestTiesEarlier) => 1,
+                None => -1,
+            },
+        );
         self.master_volume = Some(s.master_volume.ratio);
     }
 
