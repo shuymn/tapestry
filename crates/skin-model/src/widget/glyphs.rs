@@ -86,6 +86,11 @@ impl BitmapLines {
         lines_bytes(&self.0)
     }
 
+    /// The lines, one per slot. Allocates nothing.
+    pub(crate) fn lines(&self) -> &[Option<GlyphLine>] {
+        &self.0
+    }
+
     /// Takes `slot`'s line, leaving none.
     pub(crate) fn take(&mut self, slot: u16) -> Option<GlyphLine> {
         self.0.get_mut(usize::from(slot)).and_then(Option::take)

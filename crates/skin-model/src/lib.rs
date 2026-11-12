@@ -124,8 +124,8 @@ pub use atlas::{
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use decision::schema::{DECISION, timer as decision_timer};
 pub use decision::{
-    DecisionError, DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming,
-    MAX_DECISION_PHASE,
+    DecisionError, DecisionFrame, DecisionLabels, DecisionScreen, DecisionStrings, DecisionTimers,
+    DecisionTiming, MAX_DECISION_PHASE,
 };
 #[cfg(feature = "dev-tools")]
 pub use expr::evaluations;
