@@ -670,3 +670,83 @@ fn a_stop_waits_for_the_work_not_the_thread() {
     *gate.0.lock().unwrap() = true;
     gate.1.notify_all();
 }
+
+/// Each chart's rank as the beatoraja-style header policy reads its seed-0
+/// branch: a `#RANK` as written, a `#DEFEXRANK` in thousandths, no header
+/// a known "none", a refused branch unknown; a changed file's rank follows
+/// it, and a row of an unknown kind reads unknown.
+#[test]
+fn the_scan_stores_each_charts_rank() {
+    use rules::JudgeRank::{DefExRankMilli, Rank};
+    let fx = Fixture::new();
+    let body = "#BPM 120\n#00111:01\n";
+    for (name, head) in [
+        ("a-rank0.bms", "#RANK 0\n"),
+        ("b-none.bms", ""),
+        ("c-defex1.bms", "#DEFEXRANK 1\n"),
+        ("d-defex120.bms", "#DEFEXRANK 120.5\n"),
+    ] {
+        fx.write(name, format!("{head}{body}").as_bytes());
+    }
+    fx.write("e-refused.bms", b"#RANK 3\n#BPM 0\n#00138:01\n");
+    let ranks =
+        |lib: &Library| -> Vec<_> { lib.charts().unwrap().into_iter().map(|c| c.rank).collect() };
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(
+        ranks(&lib),
+        [
+            Some(Some(Rank(0))),
+            Some(None),
+            Some(Some(DefExRankMilli(1_000))),
+            Some(Some(DefExRankMilli(120_500))),
+            None,
+        ]
+    );
+    // A changed file (another size): its rank follows it.
+    fx.write(
+        "a-rank0.bms",
+        format!("#RANK 3\n{body}#00112:01\n").as_bytes(),
+    );
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(ranks(&lib)[0], Some(Some(Rank(3))), "the old rank kept");
+    drop(lib);
+    {
+        let db = rusqlite::Connection::open(fx.db()).unwrap();
+        db.execute_batch("UPDATE charts SET rank_kind = 7 WHERE path LIKE '%b-none.bms';")
+            .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Current);
+    assert_eq!(ranks(&lib)[1], None, "an unknown kind");
+}
+
+/// A file of schema 7, the version before the ranks, is rebuilt: its
+/// charts are read again, with their ranks.
+#[test]
+fn schema_7_reads_ranks_again() {
+    let fx = Fixture::new();
+    fx.write("a.bms", b"#RANK 1\n#BPM 120\n#00111:01\n");
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch(
+            "ALTER TABLE charts DROP COLUMN rank_kind;
+             ALTER TABLE charts DROP COLUMN rank_value;
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 7 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    assert_eq!(
+        lib.charts().unwrap()[0].rank,
+        Some(Some(rules::JudgeRank::Rank(1)))
+    );
+}

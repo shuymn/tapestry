@@ -38,7 +38,7 @@ use bms_model::TimeUs;
 use skin_model::{
     Anchor, AngleFollow, Blend, CycleDef, DecisionDefs, DecisionTiming, Ease, ElementDef, Filter,
     Fit, Follow, Grade, KeyDef, LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place,
-    PlayDefs, Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind,
+    PlayDefs, PlayEnding, Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind,
     SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
@@ -2029,6 +2029,27 @@ impl<'d> Cx<'d> {
         Ok(ms.map(|ms| TimeUs(i64::from(ms.max(0)) * 1_000)))
     }
 
+    /// A play skin's declared ending (design.md "Play Lifecycle", Audio
+    /// tail), from the top-level `finishmargin` and `fadeout` in ms
+    /// (`JsonSkin.java:14, 21`, each 0 when absent; a Lua skin's table
+    /// converts to the same fields, `LuaSkinLoader.java:90-91`), in µs
+    /// over the source's whole `int` range, with no cap: a negative
+    /// `finishmargin` is 0, and `fadeout` keeps its sign, since the
+    /// source leaves on a negative one before its finish margin
+    /// (`BMSPlayer.java:756`). `finishmargin` is read whether or not the
+    /// skin defines a note, as `close` is, where the source sets it only
+    /// while loading the note's destination
+    /// (`JsonPlaySkinObjectLoader.java:37-44`). Each is read as every
+    /// integer field is: a value the reader refuses refuses the import.
+    fn play_ending(&mut self) -> Result<PlayEnding, ImportError> {
+        let finish_margin = self.top_int("finishmargin", 0)?;
+        let fadeout = self.top_int("fadeout", 0)?;
+        Ok(PlayEnding {
+            finish_margin: TimeUs(i64::from(finish_margin.max(0)) * 1_000),
+            fadeout: TimeUs(i64::from(fadeout) * 1_000),
+        })
+    }
+
     /// A result skin's declared timing (design.md "State Model", Result),
     /// from the top-level `fadeout`, `input` and `scene` in ms
     /// (`JsonSkin.java:14-16`, each 0 when absent; a Lua skin's table
@@ -2119,10 +2140,15 @@ impl<'d> Cx<'d> {
         } else {
             DecisionTiming::default()
         };
-        let (bomb_up_to, close, loadend) = if selection || result || decision {
-            (None, None, None)
+        let (bomb_up_to, close, loadend, ending) = if selection || result || decision {
+            (None, None, None, PlayEnding::default())
         } else {
-            (self.bomb_up_to()?, self.close()?, self.loadend()?)
+            (
+                self.bomb_up_to()?,
+                self.close()?,
+                self.loadend()?,
+                self.play_ending()?,
+            )
         };
         let assets = std::mem::replace(&mut self.assets, Assets::new(self.def.root()));
         let sheet = assets.finish();
@@ -2179,7 +2205,7 @@ impl<'d> Cx<'d> {
                 timing_visualizers: std::mem::take(&mut self.timing_visualizers),
                 hit_errors: std::mem::take(&mut self.hit_errors),
             };
-            Skin::new_play(def, widgets)
+            Skin::new_play(def, widgets).map(|s| s.with_play_ending(ending))
         };
         let skin = loaded
             .map(|s| s.with_outputs(self.outputs.len()))

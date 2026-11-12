@@ -359,6 +359,10 @@ pub struct SelectedChart {
     /// with another note count, and for one without a summary or preset.
     pub max_ex: Option<u64>,
     pub score: RowScore,
+    /// Its judgment class from its library entry's rank, 0 the hardest to
+    /// 4 the easiest; `None` without one, or for a rank in no class. A
+    /// value above 4 is none.
+    pub judge_class: Option<u8>,
 }
 
 #[cfg(test)]
