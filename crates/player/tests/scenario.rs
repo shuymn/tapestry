@@ -264,7 +264,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 7\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 8\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -673,27 +673,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 8\nwhat_v8_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 9\nwhat_v9_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 8 is not supported; this build reads version 7"),
+        stderr.contains("version 9 is not supported; this build reads version 8"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v8_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v9_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     // The previous version too: its files are refused, never read.
-    let old = scenario(&["quit = {}"]).replacen("version = 7", "version = 6", 1);
+    let old = scenario(&["quit = {}"]).replacen("version = 8", "version = 7", 1);
     let (out, _, stderr) = fx.run(&old);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 6 is not supported; this build reads version 7"),
+        stderr.contains("version 7 is not supported; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 7"),
+        stderr.contains("no version; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1183,6 +1183,136 @@ fn a_loading_at_capture_runs_on_the_loading_clock() {
     let (out, stdout, stderr) = fx.run(&late);
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stderr.contains("its loading state ended first"), "{stderr}");
+}
+
+/// The adapter lines of `stdout`.
+fn adapter_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| l.starts_with("dev: adapter asked "))
+        .collect()
+}
+
+/// A run asking for the hardware adapter builds its screen with that
+/// choice and says what it got: a CPU adapter refuses the run, any other
+/// draws it and names itself in each capture's sidecar. CI has no
+/// hardware GPU, so either outcome is checked as it comes.
+#[test]
+fn a_hardware_scenario_builds_on_the_hardware_adapter() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "capture = { at = 0, file = \"a.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run(&text);
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked hardware, got ")),
+        "{lines:?}"
+    );
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("hardware was asked for, and the adapter is a CPU adapter"),
+            "{stderr}"
+        );
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let name = lines[0]
+        .trim_start_matches("dev: adapter asked hardware, got ")
+        .rsplit_once(" (")
+        .unwrap()
+        .0;
+    assert_eq!(side_value(&side_of(&fx, "a"), "adapter"), name);
+}
+
+/// Every build of the screen is admitted against the file's choice: a
+/// hardware run whose screen, built again after a device loss on the
+/// result, gets a CPU adapter (injected) is refused there, as at startup.
+#[test]
+fn a_rebuilt_screen_s_cpu_adapter_is_refused_on_a_hardware_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&text)
+            .env("TAPESTRY_DEV_RESULT_FAULTS", "lostresult1")
+            .env("TAPESTRY_DEV_ADAPTER_FAULTS", "cpu2"),
+    );
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    let refusal = "hardware was asked for, and the adapter is a CPU adapter";
+    // No hardware GPU (CI): refused at startup, before any loss.
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stderr.contains(refusal), "{stderr}");
+        return;
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].starts_with("dev: adapter asked hardware, got injected CPU adapter (Cpu, "),
+        "{lines:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{refusal}: injected CPU adapter")),
+        "{stderr}"
+    );
+}
+
+/// Every build of the screen takes the file's choice: the one after a
+/// device loss on the result says so again.
+#[test]
+fn a_screen_built_again_keeps_the_adapter_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run_with(
+        &small(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ])
+        .replacen(
+            "size = [640, 360]\n",
+            "size = [640, 360]\nadapter = \"warp\"\n",
+            1,
+        ),
+        "lostresult1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stderr.contains("render: "), "no loss: {stderr}");
+    let lines = adapter_lines(&stdout);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked warp, got ")),
+        "{lines:?}"
+    );
 }
 
 /// A capture whose file is a folder when its frame comes fails the run,

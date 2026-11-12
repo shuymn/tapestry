@@ -406,6 +406,12 @@ pub trait Screen: Send {
     fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
         None
     }
+    /// The adapter it draws on (dev-tools: a scenario's sidecars); none by
+    /// default.
+    #[cfg(feature = "dev-tools")]
+    fn adapter(&self) -> Option<&render::AdapterInfo> {
+        None
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {

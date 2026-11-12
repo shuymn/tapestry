@@ -12,9 +12,11 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 7
+//! version = 8
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
+//! adapter = "hardware"           # optional: "warp" (the default, CI's) or
+//!                                # the system's hardware adapter, local runs
 //!
 //! [library]
 //! roots = ["library"]            # relative to this file
@@ -102,7 +104,7 @@ use crate::measure::{Drawn, ResultId, ScreenKind};
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 7;
+const VERSION: i64 = 8;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -352,6 +354,7 @@ struct File {
     version: i64,
     output: Option<PathBuf>,
     size: Option<[i64; 2]>,
+    adapter: Option<Adapter>,
     library: Library,
     #[serde(default)]
     step: Vec<Step>,
@@ -539,6 +542,98 @@ pub struct Session {
     pub captures: Captures,
     /// The offscreen target's size, when the file gives one.
     pub size: Option<(u32, u32)>,
+    /// What draws the run's screen.
+    pub adapter: Adapter,
+}
+
+/// What draws a scenario's screen (design.md "Shortening Launch-Based
+/// Checks").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Adapter {
+    /// WARP, the software rasterizer: the default, and CI's.
+    Warp,
+    /// The system's high-performance hardware adapter, for local runs; a
+    /// CPU adapter is refused ([`admit`]).
+    Hardware,
+}
+
+impl Adapter {
+    /// The renderer's choice for it.
+    #[must_use]
+    pub const fn choice(self) -> render::AdapterChoice {
+        match self {
+            Self::Warp => render::AdapterChoice::Warp,
+            Self::Hardware => render::AdapterChoice::HighPerformance,
+        }
+    }
+}
+
+/// Whether the adapter `info` a screen was built on serves what was
+/// `asked`: a hardware choice refuses a CPU adapter.
+///
+/// # Errors
+///
+/// [`render::RenderError::CpuAdapter`] naming the adapter.
+pub fn admit(
+    asked: render::AdapterChoice,
+    info: &render::AdapterInfo,
+) -> Result<(), render::RenderError> {
+    if asked != render::AdapterChoice::Warp && info.device_type == render::DeviceType::Cpu {
+        return Err(render::RenderError::CpuAdapter {
+            name: info.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The environment variable of a scenario's injected adapter fault
+/// (tests of recovery): `cpu<N>`, the N-th build of the screen, counted
+/// from 1, reported as a CPU adapter to its line and its admission.
+pub const ADAPTER_FAULTS_ENV: &str = "TAPESTRY_DEV_ADAPTER_FAULTS";
+
+/// The build reported as a CPU adapter ([`ADAPTER_FAULTS_ENV`]); 0 none,
+/// `u64::MAX` not read yet.
+static CPU_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// The screen's builds so far.
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The adapter a build of the screen got, `info`, or the CPU adapter an
+/// injected fault reports for this build ([`ADAPTER_FAULTS_ENV`]).
+#[must_use]
+pub fn built_adapter(info: &render::AdapterInfo) -> std::borrow::Cow<'_, render::AdapterInfo> {
+    use std::sync::atomic::Ordering;
+    if CPU_BUILD.load(Ordering::SeqCst) == u64::MAX {
+        let list = std::env::var(ADAPTER_FAULTS_ENV).unwrap_or_default();
+        let n = list
+            .split(',')
+            .find_map(|f| f.trim().strip_prefix("cpu")?.parse().ok())
+            .unwrap_or(0);
+        CPU_BUILD.store(n, Ordering::SeqCst);
+    }
+    let build = BUILDS.fetch_add(1, Ordering::SeqCst) + 1;
+    if CPU_BUILD.load(Ordering::SeqCst) == build {
+        return std::borrow::Cow::Owned(render::AdapterInfo {
+            name: "injected CPU adapter".to_owned(),
+            ..render::AdapterInfo::new(render::DeviceType::Cpu, info.backend)
+        });
+    }
+    std::borrow::Cow::Borrowed(info)
+}
+
+/// The line each build of a scenario's screen prints: what it asked for
+/// and what it got.
+#[must_use]
+pub fn adapter_line(asked: render::AdapterChoice, info: &render::AdapterInfo) -> String {
+    let asked = match asked {
+        render::AdapterChoice::Warp => "warp",
+        render::AdapterChoice::HighPerformance => "hardware",
+        render::AdapterChoice::LowPower => "low-power",
+    };
+    format!(
+        "dev: adapter asked {asked}, got {} ({:?}, {:?})",
+        info.name, info.device_type, info.backend
+    )
 }
 
 impl fmt::Debug for Session {
@@ -593,6 +688,7 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
         .size
         .map(|[w, h]| super::checked_size(w, h))
         .transpose()?;
+    let adapter = file.adapter.unwrap_or(Adapter::Warp);
     let roots = roots(&file.library.roots, base)?;
     let compiled = compile(&file, base, &roots)?;
     let output = match &file.output {
@@ -622,6 +718,7 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
             logs: compiled.logs,
             captures: Captures(Arc::new(Mutex::new(captures))),
             size,
+            adapter,
         },
     })
 }
@@ -1978,7 +2075,7 @@ impl FrameSink for ScenarioFrames {
         let due = due
             .into_iter()
             .map(|(i, path, axis, generation, stamp)| {
-                let side = sidecar(axis, self.frame, drawn, stamp);
+                let side = sidecar(axis, self.frame, drawn, stamp, screen.adapter());
                 (i, path, side, generation)
             })
             .collect();
@@ -2143,7 +2240,13 @@ fn capture_due(
 
 /// What the capture of `axis` on frame number `frame` was: its PNG's
 /// companion. A frame's play state may lag its time, which the view says.
-fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
+fn sidecar(
+    axis: Axis,
+    frame: u64,
+    drawn: &Drawn<'_>,
+    stamp: Stamp,
+    adapter: Option<&render::AdapterInfo>,
+) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let num = |v: Option<u64>| opt(v.and_then(|v| i64::try_from(v).ok()));
     let view = drawn.view;
@@ -2162,12 +2265,13 @@ fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
-        "\"screen\":\"{}\",\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
+        "\"screen\":\"{}\",\"adapter\":{},\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
          \"selection_lifetime\":{},\"selection_revision\":{},\"stamp_revision\":{},\
          \"result_us\":{},\"result_origin_us\":{},\"result_seq\":{},\"result_generation\":{},\
          \"result_drawn\":{},\"result_page\":{},\"result_view\":{},\"stamp_page\":{},\
          \"stamp_view\":{},\"sampled_us\":{},\"result_timer_origin_us\":{}",
         drawn.screen.name(),
+        adapter.map_or_else(|| "null".to_owned(), |a| json_string(&a.name)),
         opt(select_origin.map(|o| at - o)),
         opt(select_origin),
         num(drawn.selection.map(|(l, _)| l)),
@@ -2696,7 +2800,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 7\n".to_owned();
+        let mut text = "version = 8\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -3189,7 +3293,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 7\nstep = [".to_owned();
+        let mut text = "version = 8\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -3237,7 +3341,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 7\n".to_owned();
+        let mut text = "version = 8\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -3257,17 +3361,92 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 7\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 8\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 7"
+            "version 1 is not supported; this build reads version 8"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 7"
+            "no version; this build reads version 8"
         );
+    }
+
+    /// The adapter a file names: WARP unless it says `"hardware"`; any
+    /// other name refused.
+    #[test]
+    fn a_scenario_names_its_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = |line: &str| {
+            let text =
+                format!("version = 8\n{line}[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n");
+            parse(&text, dir.path()).map(|p| p.session.adapter)
+        };
+        assert_eq!(adapter(""), Ok(super::Adapter::Warp));
+        assert_eq!(adapter("adapter = \"warp\"\n"), Ok(super::Adapter::Warp));
+        assert_eq!(
+            adapter("adapter = \"hardware\"\n"),
+            Ok(super::Adapter::Hardware)
+        );
+        for bad in ["adapter = \"cpu\"\n", "adapter = 1\n"] {
+            assert!(adapter(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            super::Adapter::Hardware.choice(),
+            render::AdapterChoice::HighPerformance
+        );
+        assert_eq!(super::Adapter::Warp.choice(), render::AdapterChoice::Warp);
+    }
+
+    /// An adapter of `device_type`, named `name`.
+    fn adapter_info(name: &str, device_type: wgpu::DeviceType) -> render::AdapterInfo {
+        render::AdapterInfo {
+            name: name.to_owned(),
+            ..render::AdapterInfo::new(device_type, wgpu::Backend::Dx12)
+        }
+    }
+
+    /// A hardware choice refuses a CPU adapter, naming it; WARP is one and
+    /// is admitted; the line says what was asked and what came.
+    #[test]
+    fn a_hardware_choice_refuses_a_cpu_adapter() {
+        use render::AdapterChoice::{HighPerformance, Warp};
+        let cpu = adapter_info("Basic Render", wgpu::DeviceType::Cpu);
+        let gpu = adapter_info("Some GPU", wgpu::DeviceType::DiscreteGpu);
+        assert!(super::admit(HighPerformance, &gpu).is_ok());
+        assert!(super::admit(Warp, &cpu).is_ok());
+        let e = super::admit(HighPerformance, &cpu).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "adapter: hardware was asked for, and the adapter is a CPU adapter: Basic Render"
+        );
+        assert_eq!(
+            super::adapter_line(HighPerformance, &gpu),
+            "dev: adapter asked hardware, got Some GPU (DiscreteGpu, Dx12)"
+        );
+        assert_eq!(
+            super::adapter_line(Warp, &cpu),
+            "dev: adapter asked warp, got Basic Render (Cpu, Dx12)"
+        );
+        // The sidecar names the adapter of the screen that drew the frame.
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            1,
+            &drawn(1, 0),
+            super::Stamp::Play,
+            Some(&gpu),
+        );
+        assert!(side.contains("\"adapter\":\"Some GPU\","), "{side}");
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            1,
+            &drawn(1, 0),
+            super::Stamp::Play,
+            None,
+        );
+        assert!(side.contains("\"adapter\":null,"), "{side}");
     }
 
     /// A capture names one axis, READY's from its start; a size is in
@@ -3278,7 +3457,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 7\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 8\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
@@ -3319,7 +3498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 7\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 8\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
@@ -3341,7 +3520,13 @@ mod tests {
             events: 56,
             ..drawn_view()
         });
-        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 9, &d, super::Stamp::Play);
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            9,
+            &d,
+            super::Stamp::Play,
+            None,
+        );
         assert!(side.contains("\"view_generation\":3,"), "{side}");
         assert!(side.contains("\"finalized_us\":1234,"), "{side}");
         assert!(side.contains("\"events\":56"), "{side}");
@@ -3441,6 +3626,7 @@ mod tests {
             4,
             &loading_drawn(Some(2), 1_734_000),
             super::Stamp::Play,
+            None,
         );
         assert!(side.contains("\"axis\":\"loading_at\""), "{side}");
         assert!(side.contains("\"target_us\":1500000,"), "{side}");
@@ -3449,7 +3635,13 @@ mod tests {
         // A play frame gives the screen clock it was built with.
         let mut d = drawn(2, 500);
         d.screen_us = Some(3_210_000);
-        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 5, &d, super::Stamp::Play);
+        let side = super::sidecar(
+            super::Axis::Chart(TimeUs(0)),
+            5,
+            &d,
+            super::Stamp::Play,
+            None,
+        );
         assert!(side.contains("\"screen_us\":3210000,"), "{side}");
         assert!(side.contains("\"loading_us\":null,"), "{side}");
     }
@@ -3490,6 +3682,7 @@ mod tests {
             4,
             &closing(5_300, Some(5_000)),
             super::Stamp::Play,
+            None,
         );
         assert!(side.contains("\"closing_us\":300000,"), "{side}");
         assert!(side.contains("\"closing_start_us\":5000000,"), "{side}");

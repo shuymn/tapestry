@@ -1065,6 +1065,11 @@ impl Screen for MenuScreen {
         self.renderer.take_upload_timing()
     }
 
+    #[cfg(feature = "dev-tools")]
+    fn adapter(&self) -> Option<&render::AdapterInfo> {
+        Some(self.renderer.gpu().adapter())
+    }
+
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_quads(&self) -> Option<Vec<skin_model::Quad>> {
         self.renderer.result_quads()
