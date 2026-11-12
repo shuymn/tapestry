@@ -240,6 +240,25 @@ fn lamp(k: usize) -> SelOption {
     SelOption::Expr(LAMPS.get(k).copied().unwrap_or("false"))
 }
 
+/// The judgment class conditions of 180 to 184 by id less 180, play's form
+/// over the selected chart's class (`BooleanPropertyFactory.java:
+/// 448-452`, read per frame on this screen, `:219`, `:256`): 180 under its
+/// validity, since a row with no class, or no chart, reads 0.
+const JUDGE_CLASSES: [&str; 5] = [
+    "selected.judge_class_valid && selected.judge_class == 0",
+    "selected.judge_class == 1",
+    "selected.judge_class == 2",
+    "selected.judge_class == 3",
+    "selected.judge_class == 4",
+];
+
+/// The judgment class condition of the source's class offset `k` (0 for
+/// very hard).
+fn judge_class(k: i32) -> SelOption {
+    let k = usize::try_from(k).unwrap_or(usize::MAX);
+    SelOption::Expr(JUDGE_CLASSES.get(k).copied().unwrap_or("false"))
+}
+
 /// The rank condition of the source's rank offset `k` (0 for AAA).
 fn rank(k: i32) -> SelOption {
     let k = usize::try_from(k).unwrap_or(usize::MAX);
@@ -275,13 +294,14 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         161..=164 | 1160 | 1161 => Constant(false),
         176 => Expr("selected.summary && !selected.bpm_change"),
         177 => Expr("selected.bpm_change"),
+        // The selected chart's judgment class, from its library entry.
+        180..=184 => judge_class(id - 180),
         200..=207 => rank(id - 200),
         300..=307 => rank(id - 300),
         // Offline: no IR, no rivals.
         50 | 624 => Constant(true),
         // No grade rows, courses, IR, replays, option-specific clear
-        // history, BGA, `#TEXT`, stage file or STOP facts, and no
-        // judgment class on selection.
+        // history, BGA, `#TEXT`, stage file or STOP facts on selection.
         3
         | 51
         | 60
@@ -290,7 +310,6 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         | 171
         | 174
         | 175
-        | 180..=184
         | 191
         | 197
         | 352..=354
@@ -546,6 +565,7 @@ mod tests {
         (100, 105),
         (160, 164),
         (176, 177),
+        (180, 184),
         (200, 207),
         (300, 307),
         (1100, 1104),
@@ -559,7 +579,6 @@ mod tests {
         (126, 131, false),
         (170, 171, false),
         (174, 175, false),
-        (180, 184, false),
         (191, 191, false),
         (197, 197, false),
         (352, 354, false),
@@ -575,6 +594,30 @@ mod tests {
         (1203, 1203, false),
         (1205, 1208, false),
     ];
+
+    /// The judgment class options read the selected chart's class, play's
+    /// form over `selected.*`: 180 under its validity, 181 to 184 bare.
+    #[test]
+    fn the_judgment_class_options_read_the_selected_chart() {
+        for (id, src) in [
+            (
+                180,
+                "selected.judge_class_valid && selected.judge_class == 0",
+            ),
+            (181, "selected.judge_class == 1"),
+            (182, "selected.judge_class == 2"),
+            (183, "selected.judge_class == 3"),
+            (184, "selected.judge_class == 4"),
+        ] {
+            assert_eq!(
+                option(id),
+                Some(Class::Bridge(SelOption::Expr(src))),
+                "{id}"
+            );
+            let scope = skin_model::Scope::new(&skin_model::SELECTION);
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Bool).is_ok());
+        }
+    }
 
     /// Every id of the profile table gets its class, and no other id in
     /// a wide range has one: the explicit tables are exactly the table.
