@@ -888,8 +888,10 @@ fn the_fade_out_converts_no_press() {
 /// round's 1.5 s nor until its audio's end, and shows no fade-out.
 #[test]
 fn a_full_play_without_a_declaration_holds_five_seconds() {
-    let (rig, _) = ending(all_hits(), 500, PlayEnding::NONE);
+    let (mut rig, _) = ending(all_hits(), 500, PlayEnding::NONE);
     assert!(rig.seen.iter().all(|s| s.fading.is_none()));
+    // Nor the view kept after the tail: no fade-out was ever published.
+    assert_eq!(rig.side.as_mut().unwrap().view().fading, None);
     assert_eq!(rig.shown_at(), Some(T + 5_000 * MS));
 }
 
@@ -897,8 +899,10 @@ fn a_full_play_without_a_declaration_holds_five_seconds() {
 /// source's timer that is off reads 0.
 #[test]
 fn a_negative_fadeout_skips_the_finish_margin() {
-    let (rig, _) = ending(all_hits(), 500, declared(3_000, -1));
+    let (mut rig, _) = ending(all_hits(), 500, declared(3_000, -1));
     assert!(rig.seen.iter().all(|s| s.fading.is_none()));
+    // Nor the view kept after the tail: no fade-out was ever published.
+    assert_eq!(rig.side.as_mut().unwrap().view().fading, None);
     assert_eq!(rig.shown_at(), Some(T + 5_000 * MS));
 }
 
