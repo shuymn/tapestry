@@ -64,11 +64,11 @@ jobs:
           echo "code=$code"
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
-  # The Windows checks run as three jobs in parallel, each building on its
+  # The Windows checks run as five jobs in parallel, each building on its
   # own runner: `windows-test` the workspace's lints and tests,
   # `windows-release` the optimized builds and the production binary, and
-  # `windows-dev-tools` (in parts) the development features and the game on
-  # its threads. `windows` is the required check over the three.
+  # `windows-dev-tools-1` to `-3` the development features and the game on
+  # its threads, in three parts. `windows` is the required check over all.
   windows-test:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -190,25 +190,24 @@ jobs:
           done
       # The player's allocation guards are unit tests of its binary, whose
       # counting allocator exists only with dev-tools; `_alloc` selects them
-      # (`cargo xtask check-alloc-tests`). Last, so the step above reads the
-      # production binary this build replaces.
+      # (`cargo xtask check-alloc-tests`). After the production checks above,
+      # as the one step here that builds with dev-tools.
       - name: Player allocation guards (release)
         run: mise exec -- cargo test --release --locked -p player --features dev-tools --bin tapestry -- _alloc
 
-  # The dev-tools tests take most of this job, bound by the runner's cores,
-  # so each part runs one nextest partition (`slice`, round-robin over the
-  # sorted test list) on its own runner; the first part also runs clippy,
-  # the positive control and the check that the partitions cover every
-  # test exactly once. The parts are numbered by `strategy.job-index`, so
-  # adding a matrix entry adds a partition.
-  windows-dev-tools:
+  # The dev-tools tests, bound by a runner's cores, run as three jobs, each
+  # on its own runner with one nextest partition (`slice`, round-robin over
+  # the sorted test list); `PART` and `PARTS` select it. Separate jobs, not
+  # a matrix, so `windows` sees each one's result: a matrix leg cancelled
+  # before it gets a runner can leave the matrix's result `success`. The
+  # jobs share their steps through the `dev-tools-steps` anchor; the first
+  # alone also runs clippy, the positive control and the check that the
+  # partitions cover every test exactly once, and saves the cache they
+  # share. Adding a part means a job here, `PARTS` in each and a `needs`
+  # entry and result in `windows`.
+  windows-dev-tools-1:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
-    name: windows-dev-tools (${{ matrix.part }}/${{ strategy.job-total }})
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [1, 2, 3]
     runs-on: windows-2025
     timeout-minutes: 45
     permissions:
@@ -220,12 +219,12 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
-      PART: ${{ strategy.job-index }}
-      PARTS: ${{ strategy.job-total }}
+      PART: 1
+      PARTS: 3
     defaults:
       run:
         shell: bash
-    steps:
+    steps: &dev-tools-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -244,20 +243,22 @@ jobs:
       # rust-cache, which hashes .cargo/config.toml into its key.
       - name: Optimize dependencies in debug builds
         run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
-      # The parts share one cache key; the first part builds everything the
-      # others build (and clippy's), so only it saves.
+      # One cache for the parts, under the key the single job used; the
+      # first part builds everything the others build (and clippy's), so
+      # only it saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' && strategy.job-index == 0 }}
+          shared-key: windows-dev-tools
+          save-if: ${{ github.ref == 'refs/heads/main' && env.PART == '1' }}
       - name: Clippy (dev-tools)
-        if: ${{ strategy.job-index == 0 }}
+        if: ${{ env.PART == '1' }}
         run: |
           # shellcheck disable=SC2086 # DEV_TOOLS is split into arguments on purpose
           mise exec -- cargo clippy $DEV_TOOLS --all-targets -- -D warnings
       - name: Development build includes dev-tools (positive control)
-        if: ${{ strategy.job-index == 0 }}
+        if: ${{ env.PART == '1' }}
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
           mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry.exe
@@ -265,7 +266,7 @@ jobs:
       # The partitions together list each test of the unpartitioned run
       # exactly once, so no test leaves CI unnoticed.
       - name: Partitions cover every test (dev-tools)
-        if: ${{ strategy.job-index == 0 }}
+        if: ${{ env.PART == '1' }}
         run: |
           all="$RUNNER_TEMP/all-tests.txt"
           parts="$RUNNER_TEMP/partition-tests.txt"
@@ -282,14 +283,49 @@ jobs:
       - name: Test (dev-tools)
         run: |
           # shellcheck disable=SC2086 # DEV_TOOLS is split into arguments on purpose
-          mise exec -- cargo nextest run $DEV_TOOLS --partition "slice:$((PART + 1))/$PARTS" --no-fail-fast
+          mise exec -- cargo nextest run $DEV_TOOLS --partition "slice:$PART/$PARTS" --no-fail-fast
 
-  # Passes when the three Windows jobs passed, or when `changes` found no
-  # change the build jobs read and they were skipped; anything else
-  # (a failed, cancelled or unexpectedly skipped job) fails it. A matrix
-  # job's result is `success` only when every part succeeded.
+  windows-dev-tools-2:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      PART: 2
+      PARTS: 3
+    defaults:
+      run:
+        shell: bash
+    steps: *dev-tools-steps
+
+  windows-dev-tools-3:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      PART: 3
+      PARTS: 3
+    defaults:
+      run:
+        shell: bash
+    steps: *dev-tools-steps
+
+  # Passes when every Windows job passed, or when `changes` found no change
+  # the build jobs read and they were all skipped; anything else (a failed,
+  # cancelled or unexpectedly skipped job, or a missing result) fails it.
   windows:
-    needs: [changes, windows-test, windows-release, windows-dev-tools]
+    needs: [changes, windows-test, windows-release, windows-dev-tools-1, windows-dev-tools-2, windows-dev-tools-3]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -299,12 +335,15 @@ jobs:
         env:
           CLASSIFIED: ${{ needs.changes.result }}
           CODE: ${{ needs.changes.outputs.code }}
-          RESULTS: ${{ needs.windows-test.result }} ${{ needs.windows-release.result }} ${{ needs.windows-dev-tools.result }}
+          RESULTS: ${{ needs.windows-test.result }} ${{ needs.windows-release.result }} ${{ needs.windows-dev-tools-1.result }} ${{ needs.windows-dev-tools-2.result }} ${{ needs.windows-dev-tools-3.result }}
         run: |
-          echo "changes $CLASSIFIED (code=$CODE); windows-test, windows-release, windows-dev-tools: $RESULTS"
+          echo "changes $CLASSIFIED (code=$CODE); windows-test, windows-release, windows-dev-tools-1..3: $RESULTS"
           allowed=success
           if [ "$CLASSIFIED" = success ] && [ "$CODE" = false ]; then allowed=skipped; fi
-          for result in $RESULTS; do
+          # shellcheck disable=SC2086 # one word per job
+          set -- $RESULTS
+          test "$#" -eq 5
+          for result in "$@"; do
             test "$result" = "$allowed"
           done
 
