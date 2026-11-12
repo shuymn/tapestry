@@ -317,6 +317,14 @@ pub enum RenderError {
         /// The adapters found.
         names: Vec<String>,
     },
+    /// A hardware adapter was asked for, and the one given renders on the
+    /// CPU (dev-tools: a scenario's admission).
+    #[cfg(feature = "dev-tools")]
+    #[error("adapter: hardware was asked for, and the adapter is a CPU adapter: {name}")]
+    CpuAdapter {
+        /// The adapter given.
+        name: String,
+    },
     /// The adapter refused the device.
     #[error("device")]
     Device(#[source] wgpu::RequestDeviceError),
@@ -962,6 +970,10 @@ pub struct Renderer {
     /// this one's device.
     id: u64,
     gpu: Gpu,
+    /// The adapter choice it was built with (dev-tools: a scenario's
+    /// adapter line).
+    #[cfg(feature = "dev-tools")]
+    choice: AdapterChoice,
     output: Output,
     /// The target's size as last applied, never zero.
     size: (u32, u32),
@@ -1129,6 +1141,8 @@ impl Renderer {
     /// Returns an error when no adapter matches `adapter`, the device is
     /// refused, or the window's surface cannot be used.
     pub fn new(target: Target, adapter: AdapterChoice) -> Result<Self, RenderError> {
+        #[cfg(feature = "dev-tools")]
+        let choice = adapter;
         let instance = gpu::instance();
         let (surface, size) = match target {
             Target::Window {
@@ -1185,6 +1199,8 @@ impl Renderer {
         finish_uploads(&gpu)?;
         Ok(Self {
             gpu,
+            #[cfg(feature = "dev-tools")]
+            choice,
             output,
             size,
             minimized: false,
@@ -1472,6 +1488,14 @@ impl Renderer {
     #[must_use]
     pub const fn gpu(&self) -> &Gpu {
         &self.gpu
+    }
+
+    /// The adapter choice it was built with; [`Self::gpu`] says which
+    /// adapter that gave.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn choice(&self) -> AdapterChoice {
+        self.choice
     }
 
     /// A chart was chosen: the play skin takes what it needs of `chart`
@@ -4983,6 +5007,11 @@ mod tests {
             AdapterChoice::Warp,
         )
         .expect("WARP renderer");
+        // It says what it was built with (dev-tools), and WARP renders on
+        // the CPU.
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(r.choice(), AdapterChoice::Warp);
+        assert_eq!(r.gpu().adapter().device_type, wgpu::DeviceType::Cpu);
         r.clear = wgpu::Color::TRANSPARENT;
         let solid = |rect, alpha| Sprite {
             rect,

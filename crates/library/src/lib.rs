@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 8
+//! # Schema version 9
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -15,7 +15,7 @@
 //!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
 //!   norm_text, title_key, artist_key, folder, mode, random, bga, loader,
 //!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max,
-//!   rank_kind, rank_value)`: the
+//!   rank_kind, rank_value, stagefile, banner, image_names)`: the
 //!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
 //!   undeclared; the searched fields normalized and joined ([`Search`]); the
 //!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
@@ -28,7 +28,11 @@
 //!   rank the beatoraja-style header policy reads from that branch
 //!   ([`ChartEntry::rank`]): `rank_kind` `NULL` when the branch is refused,
 //!   0 with no rank header, 1 a `#RANK` as written in `rank_value`, 2 a
-//!   `#DEFEXRANK` in thousandths in `rank_value`.
+//!   `#DEFEXRANK` in thousandths in `rank_value`; and the image names that
+//!   branch declares ([`ChartEntry::images`]): `stagefile` and `banner`,
+//!   `NULL` when undeclared or overlong, and `image_names` `NULL` when the
+//!   branch is refused, else a bitmask of the overlong ones (1 the stage
+//!   file, 2 the banner), never shortened.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
 //!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a
@@ -118,7 +122,7 @@ pub use scan::{
 pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -234,6 +238,61 @@ pub struct ChartEntry {
     /// `Some(None)` with no rank header (read as `#RANK 2`), `None` when
     /// the loader refuses that branch.
     pub rank: Option<Option<rules::JudgeRank>>,
+    /// The image names its seed-0 branch declares; `None` when the loader
+    /// refuses that branch.
+    pub images: Option<ChartNames>,
+}
+
+/// The longest image name the library keeps, in bytes: the chart-image
+/// reader's own name limit (`skin_model::image::MAX_PATH_BYTES`), so a
+/// stored name is one the reader would resolve and a longer one is never
+/// shortened into another file's name (design.md "Loading Limits").
+pub const IMAGE_NAME_BYTES: usize = 1_024;
+
+/// One image name of a chart, as the library keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Name {
+    /// Undeclared, or declared empty.
+    None,
+    /// Declared, as written (trimmed), at most [`IMAGE_NAME_BYTES`] long.
+    Named(String),
+    /// Declared longer than [`IMAGE_NAME_BYTES`]: kept as a fact, never
+    /// shortened, so it resolves to nothing.
+    Overlong,
+}
+
+impl Name {
+    /// The name a label declares.
+    #[must_use]
+    pub fn of(label: &str) -> Self {
+        let name = label.trim();
+        if name.is_empty() {
+            Self::None
+        } else if name.len() > IMAGE_NAME_BYTES {
+            Self::Overlong
+        } else {
+            Self::Named(name.to_owned())
+        }
+    }
+}
+
+/// The image names a chart's seed-0 branch declares (`#STAGEFILE`,
+/// `#BANNER`), which selection reads its images by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChartNames {
+    pub stagefile: Name,
+    pub banner: Name,
+}
+
+impl ChartNames {
+    /// The names of `labels`.
+    #[must_use]
+    pub fn of(labels: &bms_parser::Labels) -> Self {
+        Self {
+            stagefile: Name::of(&labels.stagefile),
+            banner: Name::of(&labels.banner),
+        }
+    }
 }
 
 /// The lock beside a database file, held by its [`Library`] and by the lease

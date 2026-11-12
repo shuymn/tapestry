@@ -2297,6 +2297,80 @@ fn a_frame_of_the_old_lifetime_gives_the_new_one_no_timing() {
     rig.link.exit();
 }
 
+/// An end page the render thread takes while it still holds a view of a
+/// lifetime that ended (a frame of it drawn after the new lifetime began)
+/// draws: the old view does not stand in for it, and its lifetime's check
+/// leaves nothing undrawn.
+#[test]
+fn an_end_page_after_the_lifetime_ended_draws() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let hold = FrameHold::new(&rig.link);
+    assert!(wait_until(|| hold.holding()));
+    rig.link.begin_result();
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    });
+    drop(hold);
+    assert!(rig.until(|d| *d == Drawn::Page(vec!["page".to_owned()])));
+    assert_eq!(rig.link.presented_timing(), None);
+    rig.link.exit();
+}
+
+/// A rig whose render thread draws the decision page `decision` while it
+/// still holds a view of a result lifetime that ended: a frame of it,
+/// held after its lifetime's check, is let go once the result was left
+/// and the page sent, so no frame of it checks again.
+fn decision_over_an_ended_result() -> (tempfile::TempDir, Rig) {
+    let (dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let hold = FrameHold::new(&rig.link);
+    assert!(wait_until(|| hold.holding()));
+    rig.link.end_result();
+    rig.link.show_decision(crate::menu_screen::MenuPage {
+        lines: vec![crate::menu_screen::MenuLine {
+            text: "decision".to_owned(),
+            style: crate::menu_screen::LineStyle::Title,
+        }],
+        caret: None,
+    });
+    drop(hold);
+    assert_eq!(rig.link.mode(), "menu:decision");
+    (dir, rig)
+}
+
+/// The screen's recovery under the decision page draws that page on: the
+/// view of a result lifetime that ended does not take its place (design.md
+/// "Play Lifecycle": a recovery draws the current state's presentation).
+#[test]
+fn a_recovery_keeps_the_decision_page_over_an_ended_result() {
+    let (_dir, rig) = decision_over_an_ended_result();
+    rig.link.prepare().unwrap();
+    assert_eq!(rig.link.mode(), "menu:decision");
+    rig.link.exit();
+}
+
+/// A result signal that takes nothing leaves the mode as it was: the view
+/// of a lifetime that ended does not take the decision page's place.
+#[test]
+fn an_empty_result_signal_keeps_the_decision_page() {
+    let (_dir, rig) = decision_over_an_ended_result();
+    rig.link.send(crate::render_side::RenderMsg::ResultChanged);
+    assert_eq!(rig.link.mode(), "menu:decision");
+    rig.link.exit();
+}
+
 /// A command accepted on a built-in view pins it all the same: a skin view
 /// prepared before the frame's wait never commits after it, and the pin
 /// gives no timing, so the command acts at once (T2).

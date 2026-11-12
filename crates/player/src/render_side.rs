@@ -406,6 +406,12 @@ pub trait Screen: Send {
     fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
         None
     }
+    /// The adapter it draws on (dev-tools: a scenario's sidecars); none by
+    /// default.
+    #[cfg(feature = "dev-tools")]
+    fn adapter(&self) -> Option<&render::AdapterInfo> {
+        None
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {
@@ -4408,7 +4414,7 @@ impl Run {
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
-                    if self.result.is_some() {
+                    if self.current_result().is_some() {
                         self.decision = None;
                         mode = Mode::Result;
                     }
@@ -4526,7 +4532,7 @@ impl Run {
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
                     // A result lifetime draws on from what it presented.
-                    if self.result.as_ref().is_some_and(ResultSide::shows) {
+                    if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
                     }
                     continue;
@@ -4648,6 +4654,7 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    let shows = self.current_result().is_some_and(ResultSide::shows);
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -4656,11 +4663,7 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if self.result.as_ref().is_some_and(ResultSide::shows) {
-                        Mode::Result
-                    } else {
-                        Mode::End
-                    };
+                    mode = if shows { Mode::Result } else { Mode::End };
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -4839,6 +4842,8 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            #[cfg(feature = "dev-tools")]
+            let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it.
             let frame_at = self.clock.now();
@@ -4963,6 +4968,10 @@ impl Run {
                     let now = TimeUs(frame_at.0 - origin.0);
                     let state_us = frame_at.0 - state_origin.0;
                     let screen_us = frame_at.0 - screen_origin.0;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        screen_stamp = Some(screen_us);
+                    }
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -5403,6 +5412,8 @@ impl Run {
                         view: view_stamp,
                         #[cfg(feature = "dev-tools")]
                         loading_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        screen_us: screen_stamp,
                         // The measured play's: none once its figures are
                         // taken, so no frame after a `Finish` is its.
                         #[cfg(feature = "dev-tools")]
@@ -6573,6 +6584,22 @@ impl Run {
         if let Some(side) = &mut self.result {
             side.incoming = Some(p);
         }
+    }
+
+    /// The result side, while its lifetime is current: what a message
+    /// asks before it enters [`Mode::Result`]. One whose lifetime ended
+    /// (left, or another begun) before a frame of it checked is dropped
+    /// here, so the mode the message chooses otherwise stands, not a
+    /// result frame that would only find it gone and draw nothing.
+    fn current_result(&mut self) -> Option<&ResultSide> {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+        {
+            self.drop_result();
+        }
+        self.result.as_ref()
     }
 
     /// The render loop ended (dev-tools): the select and result screens'
