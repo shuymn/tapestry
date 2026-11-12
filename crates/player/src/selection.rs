@@ -2151,6 +2151,16 @@ impl PlayerRig<'_> {
         );
     }
 
+    /// The script whose steps run on the result shown (dev-tools):
+    /// selection's, else the direct play's.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn result_steps(&self) -> Option<&crate::dev::SelectScript> {
+        self.selection
+            .as_ref()
+            .and_then(|s| s.script.as_ref())
+            .or(self.result_script.as_ref())
+    }
+
     /// A result begins (dev-tools): a new identity, numbered after every
     /// earlier one, for the play it follows; one still current is left
     /// first (a result withdrawn before it showed). Its steps run afresh.

@@ -1919,7 +1919,7 @@ impl Rig for PlayerRig<'_> {
     fn quitting(&self) -> bool {
         #[cfg(feature = "dev-tools")]
         if let (Some(after), Some(shown)) = (self.quit_after_end, self.end_shown)
-            && scripted_end_over(after, shown.elapsed(), &self.render)
+            && scripted_end_over(after, shown.elapsed(), &self.render, self.result_steps())
         {
             return true;
         }
@@ -3097,10 +3097,18 @@ mod restore_tests {
 /// `after`, once the page shown last was presented and the frame sink has
 /// seen it, however long the render thread takes on a loaded machine. A
 /// failed screen draws no page, and one that never comes ends the wait at
-/// [`STEP_TIMEOUT`](crate::dev::STEP_TIMEOUT).
+/// [`STEP_TIMEOUT`](crate::dev::STEP_TIMEOUT). Never while `script` still
+/// has steps due on the result: each of them ends by its own deadline, and
+/// one cut off would leave the run's script unplayed with no failure.
 #[cfg(feature = "dev-tools")]
-pub(crate) fn scripted_end_over(after: Duration, shown: Duration, render: &RenderLink) -> bool {
-    shown >= after
+pub(crate) fn scripted_end_over(
+    after: Duration,
+    shown: Duration,
+    render: &RenderLink,
+    script: Option<&crate::dev::SelectScript>,
+) -> bool {
+    !script.is_some_and(crate::dev::SelectScript::holds_result)
+        && shown >= after
         && (render.end_page_drawn() || render.failed() || shown >= crate::dev::STEP_TIMEOUT)
 }
 

@@ -11417,18 +11417,51 @@ pub(crate) mod tests {
         let (link, _, hold, release) = ends();
         link.show_end(page("first", None));
         assert!(link.wait_end_drawn(Duration::from_secs(10)));
-        assert!(!scripted_end_over(after, Duration::from_millis(299), &link));
-        assert!(scripted_end_over(after, after, &link));
+        assert!(!scripted_end_over(
+            after,
+            Duration::from_millis(299),
+            &link,
+            None
+        ));
+        assert!(scripted_end_over(after, after, &link, None));
         // Stuck in the next page's frame: the page after it is not drawn.
         hold.store(true, Ordering::SeqCst);
         link.show_end(page("stuck", None));
         assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
         link.show_end(page("waiting", None));
-        assert!(!scripted_end_over(after, after, &link));
-        assert!(!scripted_end_over(after, STEP_TIMEOUT - after, &link));
-        assert!(scripted_end_over(after, STEP_TIMEOUT, &link));
+        assert!(!scripted_end_over(after, after, &link, None));
+        assert!(!scripted_end_over(after, STEP_TIMEOUT - after, &link, None));
+        assert!(scripted_end_over(after, STEP_TIMEOUT, &link, None));
         release.send(()).unwrap();
-        assert!(wait_until(|| scripted_end_over(after, after, &link)));
+        assert!(wait_until(|| scripted_end_over(after, after, &link, None)));
+        link.exit();
+    }
+
+    /// A scripted run's end screen is not over while the result script
+    /// still has steps due on it, its page drawn and its time passed: on a
+    /// loaded machine the page is drawn after that time, and the step
+    /// waiting on it is sent at the same wake, so ending there would cut
+    /// the script off with no failure. Once its steps are done, or one left
+    /// the result, the end is over.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_scripted_end_waits_for_the_results_steps() {
+        use crate::dev::SelectScript;
+        use crate::play::scripted_end_over;
+        let after = Duration::from_millis(300);
+        let late = Duration::from_secs(5);
+        let (link, _, _, _) = ends();
+        link.show_end(page("first", None));
+        assert!(link.wait_end_drawn(Duration::from_secs(10)));
+        let mut script = SelectScript::parse("next,back").unwrap();
+        assert!(!scripted_end_over(after, late, &link, Some(&script)));
+        script.done();
+        assert!(!scripted_end_over(after, late, &link, Some(&script)));
+        script.left_result = true;
+        assert!(scripted_end_over(after, late, &link, Some(&script)));
+        script.left_result = false;
+        script.done();
+        assert!(scripted_end_over(after, late, &link, Some(&script)));
         link.exit();
     }
 
