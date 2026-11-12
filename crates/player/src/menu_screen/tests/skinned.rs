@@ -366,6 +366,7 @@ fn selection_frame_alloc() {
         Some(game::PlayerSettings::default().options().unwrap()),
         Some(&rules::tapestry()),
         0,
+        game::FailureAction::PlayToEnd,
         s.order_view(),
         &tuning,
     );

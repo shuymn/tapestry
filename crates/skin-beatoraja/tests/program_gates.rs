@@ -820,10 +820,10 @@ fn a_movie_grouped_image_is_not_removed() {
     );
 }
 
-/// A critical slider whose keys start at 1 s is settled to its last key
-/// (D20), but the source reads its value only from 1 s: it refuses.
+/// A critical slider whose keys start at 1 s settles, but the source reads
+/// its value only from 1 s: it refuses.
 #[test]
-fn a_settled_late_start_slider_refuses() {
+fn a_late_start_slider_refuses() {
     let body = "skin.slider = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 1, range = 100,\n\
            value = function() return ms.number(75) / 100 end } }\n\
          table.insert(skin.destination, { id = \"v\", loop = 2000,\n\

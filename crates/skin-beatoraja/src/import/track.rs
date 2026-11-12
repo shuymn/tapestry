@@ -193,16 +193,6 @@ impl Accepted {
     pub(crate) fn fixed_but_alpha(&self) -> bool {
         self.fixed.but_alpha
     }
-
-    /// Leaves one key at 0: the last, whose rect, colour and angle stand
-    /// for the whole track.
-    pub(crate) fn keep_last_from_start(&mut self) {
-        self.keys.drain(..self.keys.len().saturating_sub(1));
-        for k in &mut self.keys {
-            k.at = 0;
-        }
-        self.fixed = Fixed::of(&self.keys);
-    }
 }
 
 /// Sorts `keys` stably by time and accepts them with loop point `l`:

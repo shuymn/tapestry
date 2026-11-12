@@ -938,6 +938,10 @@ pub enum RenderMsg {
     EndLoading {
         /// The lifetime ended.
         lifetime: u64,
+        /// The origin of the lifetime it ended, read before the end
+        /// dropped it; `None` when none was current: offered to the
+        /// play state's screen origin ([`Run::offer_screen_origin`]).
+        origin: Option<TimeUs>,
         /// Where the answer goes.
         reply: mpsc::SyncSender<LoadingEnd>,
     },
@@ -948,12 +952,25 @@ pub enum RenderMsg {
     PauseLoading {
         /// The lifetime paused.
         lifetime: u64,
+        /// The paused lifetime's origin; `None` when none is current:
+        /// offered to the play state's screen origin
+        /// ([`Run::offer_screen_origin`]).
+        origin: Option<TimeUs>,
         /// Where the answer goes.
         reply: mpsc::SyncSender<LoadingEnd>,
     },
     /// Loading lifetime `lifetime`, paused and still current, is drawn
     /// again as it was kept ([`RenderLink::resume_loading`]).
     ResumeLoading(u64),
+    /// A current loading lifetime was cleared ([`RenderLink::clear_loading`])
+    /// with this origin, read before the clear dropped it: offered to the
+    /// play state's screen origin ([`Run::offer_screen_origin`]), so a
+    /// lifetime never paused or ended (a practice Start cancelled or
+    /// refused while loading) still hands it over.
+    ClearLoading {
+        /// The cleared lifetime's origin on the loading clock.
+        origin: TimeUs,
+    },
     /// A play starts: chart time 0 at the measurement's `origin` on the
     /// clock.
     Play {
@@ -1651,11 +1668,35 @@ impl Shared {
         self.loading_slot().lifetime == lifetime
     }
 
+    /// The current loading lifetime's number and its origin, read under
+    /// the producer's lock; `None` for the origin when no lifetime is
+    /// current (not begun, or ended).
+    fn current_origin(&self) -> (u64, Option<TimeUs>) {
+        let producer = self.producer();
+        let lifetime = self.loading_slot().lifetime;
+        let origin = producer
+            .as_ref()
+            .filter(|s| s.lifetime() == lifetime)
+            .map(LifetimeState::origin);
+        (lifetime, origin)
+    }
+
     /// Ends the current loading lifetime: its waiting lines and state are
     /// dropped, and its sinks, signals and frames do nothing from here.
-    fn end_lifetime(&self) {
-        self.loading_slot().end();
-        drop(self.producer().take());
+    /// The number of the lifetime ended and its origin, read before the
+    /// producer is dropped; `None` for the origin when none was current.
+    fn end_lifetime(&self) -> (u64, Option<TimeUs>) {
+        let mut producer = self.producer();
+        let mut slot = self.loading_slot();
+        let lifetime = slot.lifetime;
+        let origin = producer
+            .as_ref()
+            .filter(|s| s.lifetime() == lifetime)
+            .map(LifetimeState::origin);
+        slot.end();
+        drop(slot);
+        drop(producer.take());
+        (lifetime, origin)
     }
 }
 
@@ -2670,9 +2711,12 @@ impl RenderLink {
     /// lines still waiting are dropped, a signal still pending takes
     /// nothing, and the render thread draws no further loading frame of it,
     /// checked after each frame's wait. The next lines shown begin a new
-    /// lifetime's.
+    /// lifetime's. A current lifetime's origin goes to the render thread
+    /// first, for the play state's screen origin.
     pub fn clear_loading(&self) {
-        self.shared.end_lifetime();
+        if let (_, Some(origin)) = self.shared.end_lifetime() {
+            self.send(RenderMsg::ClearLoading { origin });
+        }
     }
 
     /// Loading ended before recording opens: [`clear_loading`](Self::clear_loading),
@@ -2689,10 +2733,15 @@ impl RenderLink {
     /// [`ScreenError::LoadingRefused`] when the skin refused a loading
     /// frame of the lifetime ended: recording must not open.
     pub fn end_loading(&self) -> Result<(), ScreenError> {
-        let lifetime = self.shared.loading_slot().lifetime;
-        self.clear_loading();
+        // The lifetime's origin is read before the end drops it, and goes
+        // with the end alone.
+        let (lifetime, origin) = self.shared.end_lifetime();
         let (reply, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::EndLoading { lifetime, reply });
+        self.send(RenderMsg::EndLoading {
+            lifetime,
+            origin,
+            reply,
+        });
         self.loading_end(&rx)
     }
 
@@ -2708,9 +2757,13 @@ impl RenderLink {
     ///
     /// As [`end_loading`](Self::end_loading).
     pub fn pause_loading(&self) -> Result<(), ScreenError> {
-        let lifetime = self.shared.loading_slot().lifetime;
+        let (lifetime, origin) = self.shared.current_origin();
         let (reply, rx) = mpsc::sync_channel(1);
-        self.send(RenderMsg::PauseLoading { lifetime, reply });
+        self.send(RenderMsg::PauseLoading {
+            lifetime,
+            origin,
+            reply,
+        });
         self.loading_end(&rx)
     }
 
@@ -3230,6 +3283,8 @@ pub fn spawn(
                 specialized_in: None,
                 loading_refused: None,
                 paused: None,
+                screen_pending: None,
+                screen_resolved: None,
                 requested: 0,
                 attempt: None,
                 prepared: None,
@@ -3841,6 +3896,11 @@ enum Mode {
         origin: TimeUs,
         /// Where the play state was entered on the clock, kept by a rearm.
         state_origin: TimeUs,
+        /// The play's screen origin on the clock, a copy of its play
+        /// state's resolved one ([`Run::screen_resolved`]): each frame's
+        /// `screen` runs from it. Never written after the play starts, so
+        /// a rearm, a later play state and its retry leave it.
+        screen_origin: TimeUs,
         side: RenderSide,
         gauge: usize,
         first: bool,
@@ -3990,6 +4050,16 @@ struct Run {
     /// fed what its sinks report, until it is resumed, ended or paused
     /// again.
     paused: Option<Mode>,
+    /// The play state's screen origin while no play has taken it: the
+    /// first loading lifetime's origin a pause, an end or a clear handed
+    /// over in this play state (first wins), cleared by a new play state.
+    screen_pending: Option<TimeUs>,
+    /// The play state's screen origin, resolved by its first play from
+    /// [`screen_pending`](Self::screen_pending) or, with none, anchored
+    /// at the skin's loading minimum before READY opens; kept by every
+    /// later play of the play state (a practice session's rounds and
+    /// Starts), cleared by a new play state.
+    screen_resolved: Option<TimeUs>,
     /// The newest request asked, an attempt's preparation or a
     /// selection: an older one arriving late changes nothing.
     requested: u64,
@@ -4281,7 +4351,7 @@ impl Run {
                 Ok(RenderMsg::Decision(page)) => {
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
-                    // :732).
+                    // "State Model").
                     self.page_turns = false;
                     self.decision = Some(page.clone());
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
@@ -4341,7 +4411,12 @@ impl Run {
                         }
                     }
                 }
-                Ok(RenderMsg::PauseLoading { lifetime, reply }) => {
+                Ok(RenderMsg::PauseLoading {
+                    lifetime,
+                    origin,
+                    reply,
+                }) => {
+                    self.offer_screen_origin(origin);
                     // Between frames, as an end: none of the loading
                     // state is drawn from here, but it is kept.
                     self.paused = None;
@@ -4375,7 +4450,17 @@ impl Run {
                         mode = kept;
                     }
                 }
-                Ok(RenderMsg::EndLoading { lifetime, reply }) => {
+                Ok(RenderMsg::ClearLoading { origin }) => {
+                    // Whatever is drawn: only the origin is taken.
+                    self.offer_screen_origin(Some(origin));
+                    continue;
+                }
+                Ok(RenderMsg::EndLoading {
+                    lifetime,
+                    origin,
+                    reply,
+                }) => {
+                    self.offer_screen_origin(origin);
                     // Between frames: none of the loading state follows.
                     if matches!(
                         mode,
@@ -4417,6 +4502,10 @@ impl Run {
                 }
                 Ok(RenderMsg::PlayState(state)) => {
                     self.turntable.created(state);
+                    // A new play state's screen origin is its own; a play
+                    // still drawing keeps its copy.
+                    self.screen_pending = None;
+                    self.screen_resolved = None;
                     continue;
                 }
                 Ok(RenderMsg::Settled(tally)) => {
@@ -4492,6 +4581,7 @@ impl Run {
                     state_origin,
                 }) => {
                     let origin = measure.origin;
+                    let screen_origin = self.resolve_screen_origin(&measure);
                     // The committed attempt starts, whether or not the
                     // screen still holds its `Play`: its play state's
                     // carry waits for its settlement.
@@ -4502,6 +4592,7 @@ impl Run {
                     mode = Mode::Play {
                         origin,
                         state_origin,
+                        screen_origin,
                         side,
                         gauge,
                         first: true,
@@ -4760,6 +4851,7 @@ impl Run {
                 Mode::Play {
                     origin,
                     state_origin,
+                    screen_origin,
                     side,
                     gauge,
                     first,
@@ -4818,10 +4910,11 @@ impl Run {
                         self.turntable.play_starts();
                     }
                     let origin = view.origin.unwrap_or(*origin);
-                    // The frame's one sample gives the chart time and the
-                    // state clock.
+                    // The frame's one sample gives the chart time, the
+                    // state clock and the screen clock.
                     let now = TimeUs(frame_at.0 - origin.0);
                     let state_us = frame_at.0 - state_origin.0;
+                    let screen_us = frame_at.0 - screen_origin.0;
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -4838,6 +4931,7 @@ impl Run {
                         now,
                         display_offset,
                         state_us,
+                        screen_us,
                         lanes,
                         readouts,
                         view,
@@ -5351,6 +5445,42 @@ impl Run {
                 loading: None,
             },
         }
+    }
+
+    /// A loading lifetime's origin handed over by its pause, end or clear
+    /// (design.md "Timers"): kept as the play state's pending screen origin
+    /// only while it has none and none is resolved, so the first lifetime
+    /// handed over in a play state wins (a later pause of the same
+    /// lifetime, or a later practice Start, changes nothing).
+    fn offer_screen_origin(&mut self, origin: Option<TimeUs>) {
+        if self.screen_pending.is_none() && self.screen_resolved.is_none() {
+            self.screen_pending = origin;
+        }
+    }
+
+    /// The screen origin of a play starting with `measure`: its play
+    /// state's resolved one; the first play of the play state resolves it
+    /// from the pending one or, with none (no loading lifetime), anchors it
+    /// the play skin's loading minimum before READY opens (recording's
+    /// opening, [`PlayMeasure::ready_state_at`]).
+    fn resolve_screen_origin(&mut self, measure: &PlayMeasure) -> TimeUs {
+        if let Some(origin) = self.screen_resolved {
+            return origin;
+        }
+        let origin = self.screen_pending.take().unwrap_or_else(|| {
+            let loadend = self
+                .committed
+                .get(ScreenKind::Play)
+                .and_then(|i| i.bundle().skin().loadend());
+            TimeUs(
+                measure
+                    .ready_state_at
+                    .0
+                    .saturating_sub(game::loading_minimum(loadend).0),
+            )
+        });
+        self.screen_resolved = Some(origin);
+        origin
     }
 
     /// The answer to the end or pause of loading lifetime `lifetime`:
@@ -12196,7 +12326,11 @@ pub(crate) mod tests {
                 refused,
             })
         }
-        fn build(&mut self, _f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+        fn build(&mut self, f: &FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            let mut seen = self.shared.screen_clocks.lock().unwrap();
+            if seen.len() < seen.capacity() {
+                seen.push((f.app.uptime_us, f.screen_us, f.now));
+            }
             Ok(())
         }
         fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -12374,6 +12508,10 @@ pub(crate) mod tests {
         witness: Arc<AtomicBool>,
         /// The best and target of each attempt committed, in order.
         pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
+        /// Each play frame built: its own sample on the clock, its screen
+        /// clock and its chart time; noted only while the vector has room
+        /// (a test reserves it), so noting never allocates.
+        pub(crate) screen_clocks: Arc<std::sync::Mutex<Vec<(i64, i64, TimeUs)>>>,
     }
 
     /// What an attempt was offered: `None` fresh, else the cached score data and
@@ -13683,6 +13821,8 @@ pub(crate) mod tests {
             order: skin_model::SelectionOrder::Title,
             gauge: None,
             covers_on: [false; 3],
+            play_to_end: false,
+            assignment: None,
         };
         for (us, ms) in [
             (-15_600, -15),
@@ -17091,6 +17231,9 @@ pub(crate) mod tests {
     // The select screen's updates through the slot into the skin or the
     // page.
     mod selection;
+    // The play state's screen origin through loading lifetimes, play
+    // states, rearms and practice Starts into each play's frames.
+    mod screen_clock;
     // The chart images' tables: their generation, attempt and target.
     mod chart;
     // The result screen's presentations through the slot, the commit

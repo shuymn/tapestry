@@ -200,12 +200,14 @@ pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSet
 /// The settings a selection skin shows, as the game thread knows them
 /// (docs/stage3.md §3, Selection): the play options in force (`options`,
 /// none before any), the chosen `preset`'s gauge shown for the settings'
-/// `gauge` as an attempt resolves it, the list's `order`, and the volume
-/// and the display offset `tuning` holds now.
+/// `gauge` as an attempt resolves it and its press assignment, the
+/// failure handling `on_failure`, the list's `order`, and the volume and
+/// the display offset `tuning` holds now.
 pub fn settings_of(
     options: Option<game::PlayOptions>,
     preset: Option<&rules::RulePreset>,
     gauge: usize,
+    on_failure: game::FailureAction,
     order: SelectionOrder,
     tuning: &LiveTuning,
 ) -> Option<SelectionSettings> {
@@ -240,6 +242,8 @@ pub fn settings_of(
         order,
         gauge,
         covers_on: [covers.sudden.on, covers.lift.on, covers.hidden.on],
+        play_to_end: on_failure == game::FailureAction::PlayToEnd,
+        assignment: preset.map(|p| p.assignment),
     };
     Some(live_settings(&s, tuning))
 }
@@ -765,6 +769,7 @@ mod tests {
                 Some(options),
                 Some(&preset),
                 gauge,
+                game::FailureAction::Close,
                 SelectionOrder::Title,
                 &tuning,
             )
@@ -782,12 +787,41 @@ mod tests {
             // 53 % plays as the f32 0.53, which the source shows as 52.
             assert_eq!(s.master_volume, MasterVolume::of_gain(0.53));
             assert_eq!(s.master_volume.number, 52);
+            assert!(!s.play_to_end);
+            assert_eq!(s.assignment, Some(rules::Assignment::NearestTiesEarlier));
         }
+        // The failure handling the files hold, and no assignment without a
+        // preset.
+        let s = super::settings_of(
+            Some(options),
+            None,
+            0,
+            game::FailureAction::PlayToEnd,
+            SelectionOrder::Title,
+            &tuning,
+        )
+        .unwrap();
+        assert!(s.play_to_end);
+        assert_eq!(s.assignment, None);
         assert_eq!(
-            super::settings_of(None, Some(&preset), 0, SelectionOrder::Title, &tuning),
+            super::settings_of(
+                None,
+                Some(&preset),
+                0,
+                game::FailureAction::Close,
+                SelectionOrder::Title,
+                &tuning
+            ),
             None
         );
-        let s = super::settings_of(Some(options), None, 0, SelectionOrder::Title, &tuning);
+        let s = super::settings_of(
+            Some(options),
+            None,
+            0,
+            game::FailureAction::Close,
+            SelectionOrder::Title,
+            &tuning,
+        );
         assert_eq!(s.unwrap().gauge, None);
         // The update takes the list's order.
         let mut feed = super::SkinFeed {
