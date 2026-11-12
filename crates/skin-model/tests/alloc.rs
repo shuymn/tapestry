@@ -1824,7 +1824,9 @@ fn stretch(
             // A Closing that starts with the shown survival gauge's
             // failure, drawn while that gauge shows.
             closing: gauges[1].failed_at.filter(|_| shown == 1),
-            fading: None,
+            // A completed play's fade-out from the notes' end, while the
+            // shown gauge never closed the play.
+            fading: (now > last && shown == 0).then_some(TimeUs(last)),
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
