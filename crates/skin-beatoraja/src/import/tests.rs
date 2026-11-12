@@ -670,10 +670,11 @@ fn song_list_charges_come_before_their_work() {
     use Event::{Admit, Charge};
     let (r, trace, admits) = run_selection(&listed(r#""b""#, 1));
     r.unwrap();
-    // The destination, the placements, the selected arm's set, its image
-    // before its file, the unselected arm's set (its image shared), the
-    // title's keys again for the folder and "all charts" rows that share
-    // it, then the element.
+    // The destination, the placements, the selected arm's set, its
+    // entry's file (whether it loads, bounded by its own file attempt),
+    // its image, the unselected arm's set (its file and image shared),
+    // the title's keys again for the folder and "all charts" rows that
+    // share it, then the element.
     assert_eq!(
         trace
             .iter()
@@ -681,7 +682,7 @@ fn song_list_charges_come_before_their_work() {
             .copied()
             .collect::<Vec<_>>(),
         [
-            Charge, Charge, Charge, Charge, Admit, Charge, Charge, Charge, Charge
+            Charge, Charge, Charge, Admit, Charge, Charge, Charge, Charge, Charge
         ]
     );
     assert_eq!(admits, 1);
