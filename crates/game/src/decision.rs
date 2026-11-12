@@ -18,7 +18,8 @@
 
 use bms_model::TimeUs;
 
-/// The built-in presentation's time from the choice (design.md :753).
+/// The built-in presentation's time from the choice (design.md "Play
+/// Lifecycle", the decision screen).
 pub const DECISION_TIME: TimeUs = TimeUs(1_500_000);
 
 /// One decision screen's lifetime: minted by App at the choice, before
