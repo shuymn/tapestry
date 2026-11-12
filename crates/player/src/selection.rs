@@ -1093,8 +1093,9 @@ fn shelf_shown(
 /// and at each wake of the result's wait, never blocking. The step in
 /// flight stays the front until it is over, every wait of it ending at its
 /// one deadline, the render bound: a view command (`next` and `prev`, the
-/// right and left arrows on the window's queue `menu`) until a publication
-/// after it has been drawn; a holding capture written on the result until
+/// right and left arrows on the window's queue `menu`) until the view it
+/// changed to has been published and drawn, whatever else was published
+/// meanwhile; a holding capture written on the result until
 /// it ends; `back`, `retry` and `close` until they are sent, which waits
 /// for the result's holding captures and, but `close`, for its drawn page
 /// (a result never drawn still gets its command at the deadline); `stay`
@@ -1153,12 +1154,12 @@ pub fn script_result(
                     return;
                 }
             }
-            Some(step @ (SelectStep::Next | SelectStep::Prev)) => match script.sent_page {
+            Some(step @ (SelectStep::Next | SelectStep::Prev)) => match script.sent_views {
                 None => {
                     if !may_act(script, captures, at, controls, true) {
                         return;
                     }
-                    script.sent_page = Some(at.page);
+                    script.sent_views = Some(at.views);
                     menu.push(MenuInput::Key(if step == SelectStep::Next {
                         MenuKey::Right
                     } else {
@@ -1166,13 +1167,13 @@ pub fn script_result(
                     }));
                     return;
                 }
-                // Over once a publication after it is drawn: the result's
-                // loop takes the command before it publishes again.
-                Some(sent) if at.page > sent && at.drawn => {}
+                // Over once the view it changed to is published and drawn:
+                // a publication for anything else does not end it.
+                Some(sent) if at.views > sent && at.drawn => {}
                 Some(_) => {
                     if script.hold_expired() {
                         script.fail(
-                            "no view was published and drawn after the command within the render bound"
+                            "the view the command changed to was not published and drawn within the render bound"
                                 .to_owned(),
                         );
                         controls.close();
@@ -1266,6 +1267,8 @@ pub struct ResultAt {
     pub view: Option<u64>,
     /// Whether the end page shown last has been presented.
     pub drawn: bool,
+    /// The views the result has changed to so far.
+    pub views: u64,
     /// Whether a result skin's scene time is in force.
     pub scene: bool,
 }
@@ -2095,6 +2098,10 @@ impl PlayerRig<'_> {
                 log::info!("{line}");
             }
             self.viewed = view;
+            #[cfg(feature = "dev-tools")]
+            {
+                self.views_shown += 1;
+            }
         }
     }
 
@@ -2117,6 +2124,7 @@ impl PlayerRig<'_> {
             page: self.render.end_pages_shown(),
             view: self.presenter.desired_key(),
             drawn: self.render.end_page_drawn(),
+            views: self.views_shown,
             scene: self
                 .presenter
                 .timing(&self.render)
@@ -2148,7 +2156,7 @@ impl PlayerRig<'_> {
         .flatten()
         {
             script.left_result = false;
-            script.sent_page = None;
+            script.sent_views = None;
         }
         self.finish_result(crate::dev::scenario::Leaving::Left);
         let generation = self.generation;
@@ -7565,6 +7573,12 @@ pub(crate) mod tests {
     /// not, with or without a scene time.
     #[cfg(feature = "dev-tools")]
     fn result_at(page: u64, view: u64, drawn: bool, scene: bool) -> super::ResultAt {
+        result_views(page, view, drawn, scene, view)
+    }
+
+    /// [`result_at`] after `views` changes of view.
+    #[cfg(feature = "dev-tools")]
+    fn result_views(page: u64, view: u64, drawn: bool, scene: bool, views: u64) -> super::ResultAt {
         super::ResultAt {
             id: Some(crate::measure::ResultId {
                 seq: 4,
@@ -7574,6 +7588,7 @@ pub(crate) mod tests {
             view: Some(view),
             drawn,
             scene,
+            views,
         }
     }
 
@@ -7632,9 +7647,12 @@ pub(crate) mod tests {
             run(result_at(3, 7, true, false));
             assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
             run(result_at(3, 7, true, false));
-            run(result_at(4, 8, false, false));
+            // A page published and drawn for something else (the strip,
+            // a best arriving) before the loop took the command: not over.
+            run(result_views(4, 7, true, false, 7));
+            run(result_at(5, 8, false, false));
             assert_eq!(controls.take(), None, "back overtook the view command");
-            run(result_at(4, 8, true, false));
+            run(result_at(5, 8, true, false));
             assert_eq!(controls.take(), Some(game::Command::Quit));
             assert!(menu.pop().is_none());
         });

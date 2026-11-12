@@ -388,6 +388,10 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
+    /// The views the result has changed to so far, each printed once
+    /// (dev-tools: a scripted view command is over once its view shows).
+    #[cfg(feature = "dev-tools")]
+    pub views_shown: u64,
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,

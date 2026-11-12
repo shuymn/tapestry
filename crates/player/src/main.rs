@@ -978,6 +978,8 @@ fn rig<'a>(
         result_facts: None,
         result_offset: None,
         result_leaving: false,
+        #[cfg(feature = "dev-tools")]
+        views_shown: 0,
         result_outro: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
