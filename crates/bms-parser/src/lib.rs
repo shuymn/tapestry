@@ -254,6 +254,8 @@ pub struct Labels {
     pub stagefile: String,
     /// `#BACKBMP`: the name of the chart's back image, as `stagefile`.
     pub backbmp: String,
+    /// `#BANNER`: the name of the chart's banner, as `stagefile`.
+    pub banner: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
     /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
@@ -310,6 +312,9 @@ pub struct Scanned {
     /// which a song list reads the chart's rank from; none when the branch
     /// is refused.
     pub judgment_headers: Vec<bms_model::JudgmentHeader>,
+    /// The seed-0 branch's labels, from which a song list keeps the image
+    /// names; none when the branch is refused.
+    pub labels: Option<Labels>,
 }
 
 /// Reads what a song list stores of a chart: [`read_listing`] and
@@ -324,17 +329,22 @@ pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError>
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let text = decode(bytes, &mut Vec::new());
-    let (summary, judgment_headers) = match built_at_1x(&text, limits) {
+    let (summary, judgment_headers, labels) = match built_at_1x(&text, limits) {
         Ok(loaded) => {
             let summary = ChartSummary::of(&loaded.chart);
-            (Ok(summary), loaded.chart.meta.judgment_headers)
+            (
+                Ok(summary),
+                loaded.chart.meta.judgment_headers,
+                Some(loaded.labels),
+            )
         }
-        Err(e) => (Err(e), Vec::new()),
+        Err(e) => (Err(e), Vec::new(), None),
     };
     Ok(Scanned {
         listing: header::listing(&text),
         summary,
         judgment_headers,
+        labels,
     })
 }
 

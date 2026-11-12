@@ -117,6 +117,7 @@ fn the_loaders_labels_come_from_the_taken_branches() {
             genre: String::new(),
             stagefile: String::new(),
             backbmp: String::new(),
+            banner: String::new(),
             playlevel: "9a".to_owned(),
             difficulty: "4".to_owned(),
             bga: false,
@@ -243,4 +244,30 @@ fn the_stage_file_and_back_image_follow_the_branch_taken() {
         (none.labels.stagefile, none.labels.backbmp),
         (String::new(), String::new())
     );
+}
+
+/// `#BANNER` is a label like the stage file: the last declaration in the
+/// branches taken, trimmed and kept as written, read without a warning.
+#[test]
+fn the_banner_follows_the_branch_taken() {
+    let chart = |set: u32| {
+        format!(
+            "#PLAYER 1\n#TITLE t\n#BPM 120\n#BANNER top.jpg\n\
+             #SETRANDOM {set}\n\
+             #IF 2\n#BANNER \u{3000}two\\banner.bmp \t\n#ENDIF\n#ENDRANDOM\n#00111:01\n"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let load = |set| {
+        bms_parser::load_bms(chart(set).as_bytes(), dir.path(), &LoadOptions::default()).unwrap()
+    };
+    let one = load(1);
+    assert_eq!(one.labels.banner, "top.jpg");
+    // Line 4 is the `#BANNER`; the note's undefined sound warns on its own.
+    assert!(
+        one.warnings.iter().all(|w| w.line != Some(4)),
+        "{:?}",
+        one.warnings
+    );
+    assert_eq!(load(2).labels.banner, "two\\banner.bmp");
 }
