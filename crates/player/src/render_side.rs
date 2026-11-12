@@ -1000,9 +1000,10 @@ impl FrameSink for NoFrames {
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
-    /// The screen's rebuild a look inside a rig's wait began during the
-    /// decision screen, or how it failed, until the flow takes it
-    /// ([`RenderLink::take_recovery`]). The render thread never locks it.
+    /// The one owner of the screen's rebuild after a loss: none, one under
+    /// way, or the failure no one has reported yet. Every look, recovery
+    /// and preparation goes through [`serve_recovery`]; the render thread
+    /// never locks it.
     recovery: Mutex<Recovery>,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
@@ -1949,29 +1950,13 @@ impl RenderLink {
         begin_prepare(&self.tx, self.answer_timeout)
     }
 
-    /// The answer of `pending`, waited for until `until` at most (none:
-    /// not waited for): `None` while it is not in; its bound passed,
-    /// [`ScreenError::NoAnswer`]; the render thread gone,
-    /// [`ScreenError::Ended`], latched as the screen's failure.
-    pub fn poll_prepare(
-        &self,
-        pending: &PendingPrepare,
-        until: Option<Instant>,
-    ) -> Option<Result<(), ScreenError>> {
-        pending.poll(until, &self.shared)
-    }
-
-    /// The rebuild a look inside a rig's wait began, or how it failed,
-    /// taken by the flow; the slot is empty again ([`Recovery::Idle`]).
-    pub fn take_recovery(&self) -> Recovery {
-        std::mem::replace(
-            &mut *self
-                .shared
-                .recovery
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-            Recovery::Idle,
-        )
+    /// The screen's rebuild after a loss, served through its one owner
+    /// ([`serve_recovery`]), waiting until `until` at most (none: not at
+    /// all); `report`: the caller ends the rebuild's story, so its answer,
+    /// or a failure saved earlier, is handed to it and the slot is empty
+    /// again. Every recovery and preparation of the screen comes here.
+    pub fn serve_recovery(&self, until: Option<Instant>, report: bool) -> Recovered {
+        serve_recovery(&self.shared, &self.tx, self.answer_timeout, until, report)
     }
 
     /// The rebuilds the render thread took (tests).
@@ -3319,9 +3304,67 @@ fn begin_prepare(tx: &Sender<RenderMsg>, timeout: Duration) -> PendingPrepare {
     }
 }
 
-/// The screen's rebuild a look inside a rig's wait owns during the
-/// decision screen ([`RecoveryHandle::look`]), held for the flow to take
-/// ([`RenderLink::take_recovery`]).
+/// What [`serve_recovery`] found of the screen's rebuild.
+#[derive(Debug)]
+pub enum Recovered {
+    /// Nothing to rebuild: the screen is not lost, and no rebuild or
+    /// unreported failure is held.
+    Nothing,
+    /// A rebuild is under way, its answer not in.
+    Running,
+    /// The rebuild answered, or failed (now or earlier): reported here,
+    /// once.
+    Answered(Result<(), ScreenError>),
+}
+
+/// The one way to the screen's rebuild after a loss, through its slot:
+/// held, a saved failure is reported (`report`) or kept; a rebuild under
+/// way is polled until `until` (none: no wait); none, and the screen
+/// lost, one begins. An answer is reported to a `report` caller; for a
+/// look's (`!report`), success empties the slot and a failure stays in it
+/// for the next reporter, so a lost screen is rebuilt once per failure
+/// and nothing that answers is dropped on the way.
+fn serve_recovery(
+    shared: &Shared,
+    tx: &Sender<RenderMsg>,
+    timeout: Duration,
+    until: Option<Instant>,
+    report: bool,
+) -> Recovered {
+    let mut slot = shared
+        .recovery
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if matches!(*slot, Recovery::Idle) {
+        if !shared.failed.load(Ordering::Acquire) {
+            return Recovered::Nothing;
+        }
+        *slot = Recovery::Pending(begin_prepare(tx, timeout));
+    }
+    let answered = match &*slot {
+        Recovery::Idle => return Recovered::Nothing,
+        Recovery::Pending(pending) => match pending.poll(until, shared) {
+            None => return Recovered::Running,
+            Some(answered) => answered,
+        },
+        Recovery::Failed(_) if !report => return Recovered::Running,
+        Recovery::Failed(_) => match std::mem::take(&mut *slot) {
+            Recovery::Failed(e) => return Recovered::Answered(Err(e)),
+            _ => return Recovered::Nothing,
+        },
+    };
+    *slot = match answered {
+        Err(e) if !report => Recovery::Failed(e),
+        _ if !report => Recovery::Idle,
+        answered => {
+            *slot = Recovery::Idle;
+            return Recovered::Answered(answered);
+        }
+    };
+    Recovered::Running
+}
+
+/// The screen's rebuild held by its one owner ([`serve_recovery`]).
 #[derive(Debug, Default)]
 pub enum Recovery {
     /// None begun, or the last one answered.
@@ -3348,26 +3391,7 @@ impl RecoveryHandle {
     /// the flow. A failure stays until the flow takes it, so a lost screen
     /// is built at most once per failure.
     pub fn look(&self) {
-        let mut slot = self
-            .shared
-            .recovery
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let answered = match &*slot {
-            Recovery::Idle => {
-                if self.shared.failed.load(Ordering::Acquire) {
-                    *slot = Recovery::Pending(begin_prepare(&self.tx, self.timeout));
-                }
-                return;
-            }
-            Recovery::Pending(pending) => pending.poll(None, &self.shared),
-            Recovery::Failed(_) => return,
-        };
-        match answered {
-            None => {}
-            Some(Ok(())) => *slot = Recovery::Idle,
-            Some(Err(e)) => *slot = Recovery::Failed(e),
-        }
+        let _ = serve_recovery(&self.shared, &self.tx, self.timeout, None, false);
     }
 }
 
@@ -13549,6 +13573,10 @@ pub(crate) mod tests {
                 Next::Selection => {
                     link.send(RenderMsg::SelectionChanged);
                     link.prepare().unwrap();
+                    // The rebuild and the frames after it drawn before the
+                    // page that replaces them comes.
+                    assert!(link.fence(Duration::from_secs(60)));
+                    assert!(link.fence(Duration::from_secs(60)));
                     link.send(RenderMsg::Menu(Box::new(one_line("select"))));
                 }
                 Next::Practice => {

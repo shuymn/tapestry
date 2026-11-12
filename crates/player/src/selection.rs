@@ -2266,6 +2266,8 @@ impl PlayerRig<'_> {
     /// [`AppRig::load_chart`]'s load, its waits' stops serving the
     /// decision screen when one is watched.
     fn load_watched(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+        // A cause another load left is not this load's.
+        self.screen_load_failure = None;
         // The chart, speed and section are final: the presentation solves
         // for them once, so what the player adjusts while loading applies
         // to this attempt. A refusal is reported by the play's preparation
@@ -2703,31 +2705,20 @@ impl AppRig for PlayerRig<'_> {
 
     fn begin_recovery(&mut self) {
         self.before_rebuild();
-        // A rebuild a look inside a wait began is adopted, its failure
-        // reported; else one begins here.
-        self.recovering = match self.render.take_recovery() {
-            crate::render_side::Recovery::Idle => {
-                crate::render_side::Recovery::Pending(self.render.begin_prepare())
-            }
-            taken => taken,
-        };
+        // Through the rebuild's one owner: one under way (a look's) is
+        // adopted, a lost screen with none gets one; a failure saved there
+        // is reported by the first poll.
+        let _ = self.render.serve_recovery(None, false);
     }
 
     fn poll_recovery(&mut self, until: TimeUs) -> Option<Result<(), ScreenError>> {
         let left = until.0.saturating_sub(self.clock.now().0).max(0);
         let until = Instant::now() + Duration::from_micros(left.unsigned_abs());
-        let answered = match &self.recovering {
-            crate::render_side::Recovery::Pending(pending) => {
-                self.render.poll_prepare(pending, Some(until))?
-            }
-            crate::render_side::Recovery::Failed(_) => match std::mem::take(&mut self.recovering) {
-                crate::render_side::Recovery::Failed(e) => Err(e),
-                _ => Ok(()),
-            },
-            crate::render_side::Recovery::Idle => Ok(()),
-        };
-        self.recovering = crate::render_side::Recovery::Idle;
-        Some(answered)
+        match self.render.serve_recovery(Some(until), true) {
+            crate::render_side::Recovered::Nothing => Some(Ok(())),
+            crate::render_side::Recovered::Running => None,
+            crate::render_side::Recovered::Answered(answered) => Some(answered),
+        }
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {

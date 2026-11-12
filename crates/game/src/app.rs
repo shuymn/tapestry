@@ -935,10 +935,14 @@ fn start_rounds<R: AppRig>(
     let started = loaded.start_practice(practice);
     *set_up = true;
     started.map_err(|e| Stopped::Notice(e.to_string()))?;
-    match rig
-        .load_chart(loaded, &mut Decision::off())
-        .map_err(|e| notice(&e))?
-    {
+    let load = rig.load_chart(loaded, &mut Decision::off());
+    // A Start's failed load is the page's notice, the screen's failure it
+    // hid included: taken here, so no later load reports it.
+    let lost = rig.screen_load_failed();
+    match load.map_err(|e| {
+        let _ = lost;
+        notice(&e)
+    })? {
         Loading::Ready => {}
         Loading::Cancelled => return cancelled(rig).map_err(Stopped::Run),
         Loading::Failed(failure) => return Err(Stopped::Run(LiveError::Load(failure))),

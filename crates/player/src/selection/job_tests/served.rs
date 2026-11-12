@@ -510,3 +510,82 @@ fn a_device_loss_in_the_chart_load_is_rebuilt_or_ends_the_run() {
         assert_eq!(installers.chart_loads.lock().unwrap().len(), 2, "{lost}");
     }
 }
+
+/// M1: a rebuild a wait's looks began fails after the deadline: the next
+/// preparation of the screen reports that failure, once, and asks no
+/// second rebuild for it.
+#[test]
+fn a_saved_rebuild_failure_is_reported_by_the_next_preparation() {
+    use game::Rig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        screens.fail_builds.store(1, Ordering::Release);
+        until("the rebuild failed", || {
+            let _ = rig.controls.look();
+            rig.render.recovery_state() == "failed"
+        });
+        let _ = rig.controls.unwatch_decision();
+        let got = rig.prepare_screen();
+        assert!(got.is_err(), "the saved failure not reported: {got:?}");
+        assert_eq!(rig.render.prepares(), 1, "a second rebuild for it");
+        assert_eq!(rig.render.recovery_state(), "idle");
+    });
+}
+
+/// M2: the flow begins a rebuild and leaves the decision screen before it
+/// answers: the rebuild stays with its owner, and selection's preparation
+/// takes it over (one rebuild in all) and reports how it ended, a failure
+/// included.
+#[test]
+fn a_rebuild_left_by_the_flow_is_taken_over_by_the_next_screen() {
+    use game::AppRig as _;
+    use game::Rig as _;
+    for fails in [false, true] {
+        let screens = crate::render_side::tests::Installers::default();
+        decision_screen_lost(&screens, |rig| {
+            let _ = rig.controls.unwatch_decision();
+            screens.hold_builds.store(true, Ordering::Release);
+            rig.begin_recovery();
+            until("the rebuild held", || {
+                screens.build_held.load(Ordering::Acquire)
+            });
+            // The flow leaves (a refusal at the deadline, a Back) without
+            // polling it; selection prepares its screen.
+            if fails {
+                screens.fail_builds.store(1, Ordering::Release);
+            }
+            let release = screens.hold_builds.clone();
+            let got = std::thread::scope(|s| {
+                s.spawn(move || release.store(false, Ordering::Release));
+                rig.prepare_screen()
+            });
+            assert_eq!(got.is_err(), fails, "{fails}: {got:?}");
+            assert_eq!(rig.render.prepares(), 1, "{fails}: a second rebuild");
+        });
+    }
+}
+
+/// M3: a screen failure another load left is not this load's: a load that
+/// the skin refuses reports a refusal, with no screen failure for the flow.
+#[test]
+fn a_load_takes_no_screen_failure_another_load_left() {
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let installers = crate::render_side::tests::Installers::default();
+    installers.refuse_chart_loads.store(true, Ordering::Release);
+    super::on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
+        rig.screen_load_failure = Some(crate::render_side::ScreenError::NoAnswer);
+        let got = rig.load_chart(&loaded, &mut game::Decision::off());
+        assert!(
+            matches!(got, Err(super::super::ChartLoadError::Screen(_))),
+            "{got:?}"
+        );
+        assert!(
+            rig.screen_load_failed().is_none(),
+            "the other load's failure"
+        );
+    });
+}

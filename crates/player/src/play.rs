@@ -237,9 +237,6 @@ pub struct PlayerRig<'a> {
     /// The end screen's page while it shows: the summary's lines and the
     /// view's graphs; the settings lines are added each time it is sent.
     pub end_page: Option<EndPage>,
-    /// The decision screen's rebuild the flow polls
-    /// ([`game::AppRig::poll_recovery`]): under way, or how it failed.
-    pub recovering: crate::render_side::Recovery,
     /// The screen's failure a chart's load hid behind
     /// [`crate::selection::ChartLoadError::ScreenFailed`], for the flow
     /// ([`game::AppRig::screen_load_failed`]).
@@ -1763,18 +1760,20 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.before_rebuild();
-        // A rebuild a decision screen's look began and left is taken over,
-        // not asked again; one that failed there is asked again here.
-        match self.render.take_recovery() {
-            crate::render_side::Recovery::Pending(pending) => loop {
-                if let Some(answered) = self.render.poll_prepare(&pending, None) {
-                    return answered;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            },
-            crate::render_side::Recovery::Idle | crate::render_side::Recovery::Failed(_) => {}
+        // The screen's rebuild after a loss goes through its one owner: one
+        // under way (a decision screen's, left) is taken over and waited
+        // for, a failure saved there is reported here, and a lost screen
+        // with neither is built again there. Nothing of it: a preparation.
+        loop {
+            match self.render.serve_recovery(
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(10)),
+                true,
+            ) {
+                crate::render_side::Recovered::Nothing => return self.render.prepare(),
+                crate::render_side::Recovered::Running => {}
+                crate::render_side::Recovered::Answered(answered) => return answered,
+            }
         }
-        self.render.prepare()
     }
 
     /// The attempt's preparation begun (design.md "Play Lifecycle",

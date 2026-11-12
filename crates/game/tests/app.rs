@@ -5718,6 +5718,9 @@ fn a_refusal_in_hand_outranks_a_rebuild_and_the_deadline() {
     let acts = vec![(0, Act::Choose(2)), (6_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
         decided(rig);
+        // The read's looks move no time: the refused load, at the
+        // deadline, comes before anything the clock brings.
+        rig.decision_step_ms = 0;
         rig.refuse_load_at_deadline = true;
         rig.screen_fails_in_decision = Some(500);
     });
@@ -5762,6 +5765,9 @@ fn a_refusal_at_the_deadline_does_not_wait_for_a_rebuild() {
     let acts = vec![(0, Act::Choose(2)), (20_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
         decided(rig);
+        // The read's looks move no time: the refused load comes at the
+        // choice, before the loss and the deadline the holds bring.
+        rig.decision_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
         rig.recovery_polls = 200;
         rig.recovery_poll_ms = 50;
@@ -5824,4 +5830,32 @@ fn a_leaving_look_begins_no_rebuild() {
         rig.decision_looks
     );
     assert!(rig.recoveries.is_empty(), "rebuilt: {:?}", rig.recoveries);
+}
+
+/// A practice Start whose load failed with the screen (the device lost
+/// twice) shows a notice on the page and takes that failure with it: back
+/// on selection, another chart's ordinary refusal stays a refusal, and the
+/// run goes on.
+#[test]
+fn a_practice_screen_failure_is_not_a_later_loads() {
+    let mut acts = vec![(0, Act::Practice(P))];
+    acts.extend(to_start(0));
+    acts.extend([
+        (10, Act::Page(PracticeInput::Confirm)),
+        (100, Act::Page(PracticeInput::Back)),
+        (200, Act::Choose(2)),
+        (6_000, Act::Close),
+    ]);
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        rig.screen_lost_in_load = true;
+    });
+    ran.unwrap();
+    assert!(
+        rig.seen
+            .iter()
+            .any(|s| matches!(s, Seen::Practice(Some(_)))),
+        "no notice on the page: {:?}",
+        rig.seen
+    );
+    assert!(!rig.refused_at.is_empty(), "the refusal: {:?}", rig.seen);
 }
