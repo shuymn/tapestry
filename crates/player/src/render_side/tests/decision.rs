@@ -21,7 +21,7 @@ use skin_model::{
 use tempfile::TempDir;
 
 use super::super::{Extent, MakeScreen, RenderLink, Screen};
-use super::{one_line, preset_attempt, spawn_empty, wait_until};
+use super::{one_line, preset_attempt, spawn_empty_on, wait_until};
 use crate::decision_side::{
     Boundary, DecisionDrawn, DecisionSide, Rebuilt, ShownDecision, Want, decision_build,
     decision_frame_of, labels_revision, update_want,
@@ -154,6 +154,13 @@ struct Seen {
     removed: AtomicU32,
     /// The next skin frame's lit pixels in the title's box are noted.
     probe: AtomicBool,
+    /// A filling slot whose writes were all submitted is not settled
+    /// while set, as if their completion had not come.
+    hold_settle: AtomicBool,
+    /// The settlings `hold_settle` skipped.
+    skipped_settles: AtomicU32,
+    /// Each skin frame's time and its input and fade-out timers' starts.
+    timers: Mutex<Vec<(TimeUs, Option<TimeUs>, Option<TimeUs>)>>,
     lit: Mutex<Vec<(u64, usize)>>,
     drew: Mutex<Vec<Drew>>,
 }
@@ -267,6 +274,12 @@ impl Screen for Recorder {
         if self.seen.refuse_settle.load(Ordering::Acquire) && store.filling().is_some() {
             return Err(RenderError::LabelRegion { needed: 1, band: 0 });
         }
+        if self.seen.hold_settle.load(Ordering::Acquire)
+            && store.progress().is_some_and(|p| p.complete)
+        {
+            self.seen.skipped_settles.fetch_add(1, Ordering::AcqRel);
+            return Ok(render::Settled::Pending);
+        }
         if self.seen.fail_settle.swap(false, Ordering::AcqRel) {
             self.menu.decision_fault(true);
         }
@@ -299,6 +312,11 @@ impl Screen for Recorder {
             self.menu.decision_fault(false);
         }
         self.menu.build_decision(dec, labels, frame)?;
+        self.seen.timers.lock().unwrap().push((
+            frame.now,
+            frame.timers.input,
+            frame.timers.fadeout,
+        ));
         self.seen.drew.lock().unwrap().push(Drew::Skin {
             device: self.device,
             now: frame.now,
@@ -382,11 +400,24 @@ struct Rig {
 
 impl Rig {
     fn new(dir: &TempDir) -> Self {
-        let turn = crate::warp_turn::take();
+        Self::on(dir, input::QpcClock::start())
+    }
+
+    /// [`new`](Self::new) on `clock`.
+    fn on(dir: &TempDir, clock: input::QpcClock) -> Self {
+        let rig = Self::bare(clock);
         let bundle = {
             let probe = crate::render_common::offscreen(TARGET[0], TARGET[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
+        let answer = rig.link.select(ScreenKind::Decision, Some(bundle)).wait();
+        assert_eq!(answer.unwrap(), Preparation::Ready);
+        rig
+    }
+
+    /// A render thread on [`Recorder`]s on `clock`, nothing committed.
+    fn bare(clock: input::QpcClock) -> Self {
+        let turn = crate::warp_turn::take();
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
@@ -404,11 +435,9 @@ impl Rig {
                 seen: Arc::clone(&s),
             }) as Box<dyn Screen>)
         });
-        let link = spawn_empty(make);
+        let link = spawn_empty_on(make, clock);
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
-        let answer = link.select(ScreenKind::Decision, Some(bundle)).wait();
-        assert_eq!(answer.unwrap(), Preparation::Ready);
         let book = link.label_book();
         Self {
             link,
@@ -1347,3 +1376,6 @@ fn selection_frame_during_decision_prep_alloc() {
         "steady {steady}, during {during:?}"
     );
 }
+
+// The decision skin through the player's flow.
+mod flow;

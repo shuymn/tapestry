@@ -1272,6 +1272,13 @@ struct Shared {
     /// The takeovers produced, each counted at its wake (tests).
     #[cfg(test)]
     takeovers_woken: AtomicU64,
+    /// The decision presentation sent last (tests).
+    #[cfg(test)]
+    decision_sent: Mutex<Option<crate::decision_side::ShownDecision>>,
+    /// The render thread waits here before it takes a decision
+    /// presentation (tests).
+    #[cfg(test)]
+    decision_gate: Arc<TestGate>,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1348,6 +1355,10 @@ impl Shared {
             game_wake: GameWake::default(),
             #[cfg(test)]
             takeovers_woken: AtomicU64::new(0),
+            #[cfg(test)]
+            decision_sent: Mutex::new(None),
+            #[cfg(test)]
+            decision_gate: Arc::default(),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -2780,7 +2791,14 @@ impl RenderLink {
         shown: Option<crate::decision_side::ShownDecision>,
     ) {
         #[cfg(test)]
-        self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
+        {
+            self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
+            *self
+                .shared
+                .decision_sent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = shown;
+        }
         self.send(RenderMsg::Decision {
             page: Box::new(page),
             shown,
@@ -2794,14 +2812,63 @@ impl RenderLink {
         Arc::clone(&self.shared.labels)
     }
 
+    /// The choice of `chart`, its labels at `revision`, in decision
+    /// lifetime `lifetime` (design.md "Play Lifecycle", the decision
+    /// screen): the ready label slot holding them pinned and the lifetime
+    /// made the active one in one lock, without waiting for any
+    /// preparation; its slot, generation and the skin's timing. None, with
+    /// nothing changed, when none is ready or the device is not healthy.
+    pub fn pin_decision(
+        &self,
+        chart: &std::path::Path,
+        revision: u64,
+        lifetime: u64,
+    ) -> Option<(usize, render::Gen, skin_model::DecisionTiming)> {
+        render::lock(&self.shared.labels).pin(chart, revision, lifetime)
+    }
+
+    /// Decision lifetime `lifetime` begins with no slot pinned (the
+    /// built-in presentation): the active one, so the render thread's
+    /// takeover and retirement are judged against it.
+    pub fn begin_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).begin(lifetime);
+    }
+
+    /// Decision lifetime `lifetime` ended (its step, the practice page's
+    /// entry, a leave): no lifetime is active if it was, so its pinned
+    /// slot is retired at the render thread's next boundary.
+    pub fn end_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).end(lifetime);
+    }
+
     /// The decision skin of the active lifetime could not draw: its
     /// takeover, once ([`game::Decision::apply_takeover`]).
     pub fn take_decision_takeover(&self) -> Option<game::DecisionTakeover> {
-        self.shared
-            .decision_takeover
+        take_takeover(&self.shared)
+    }
+
+    /// The presentation last sent with [`show_decision`](Self::show_decision)
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_sent(&self) -> Option<crate::decision_side::ShownDecision> {
+        *self
+            .shared
+            .decision_sent
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
+    }
+
+    /// Where the render thread waits before it takes a decision
+    /// presentation while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.decision_gate)
+    }
+
+    /// The takeovers whose producer woke the game thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn takeovers_woken(&self) -> u64 {
+        self.shared.takeovers_woken.load(Ordering::Acquire)
     }
 
     /// Why the decision skin was refused for the run, once: the select
@@ -3804,6 +3871,38 @@ impl RecoveryHandle {
     pub fn look(&self) {
         let _ = serve_recovery(&self.shared, &self.tx, self.timeout, None, false);
     }
+
+    /// The active decision lifetime's takeover, once, for a look inside a
+    /// rig's wait ([`RenderLink::take_decision_takeover`]).
+    pub fn take_decision_takeover(&self) -> Option<game::DecisionTakeover> {
+        take_takeover(&self.shared)
+    }
+
+    /// Decision lifetime `lifetime` ended inside a rig's wait
+    /// ([`RenderLink::end_decision`]).
+    pub fn end_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).end(lifetime);
+    }
+
+    /// A takeover left for the game thread as the render thread leaves
+    /// one (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn leave_takeover(&self, takeover: game::DecisionTakeover) {
+        *self
+            .shared
+            .decision_takeover
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(takeover);
+    }
+}
+
+/// The active decision lifetime's takeover in `shared`, taken.
+fn take_takeover(shared: &Shared) -> Option<game::DecisionTakeover> {
+    shared
+        .decision_takeover
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
 }
 
 fn ended(shared: &Shared) -> ScreenError {
@@ -4492,6 +4591,8 @@ impl Run {
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::Decision { page, shown }) => {
+                    #[cfg(test)]
+                    self.shared.decision_gate.pass();
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
                     // :732).
@@ -6526,8 +6627,6 @@ impl Run {
             at,
             why,
         });
-        #[cfg(test)]
-        self.shared.takeovers_woken.fetch_add(1, Ordering::AcqRel);
         let wake = self
             .shared
             .game_wake
@@ -6536,6 +6635,8 @@ impl Run {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(wake) = wake {
+            #[cfg(test)]
+            self.shared.takeovers_woken.fetch_add(1, Ordering::AcqRel);
             wake();
         }
     }
@@ -9241,7 +9342,11 @@ pub(crate) mod tests {
     /// A render thread on the screens `make` builds, with no chart, no
     /// section and no frame sink.
     pub(crate) fn spawn_empty(make: MakeScreen) -> super::RenderLink {
-        let clock = QpcClock::start();
+        spawn_empty_on(make, QpcClock::start())
+    }
+
+    /// [`spawn_empty`] on `clock`, a game rig's.
+    pub(crate) fn spawn_empty_on(make: MakeScreen, clock: QpcClock) -> super::RenderLink {
         spawn(
             make,
             None,

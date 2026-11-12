@@ -1501,6 +1501,23 @@ fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> Loa
     }
 }
 
+/// The strings a decision skin shows of a chart, from its library
+/// header as the select screen's view gives them
+/// ([`crate::select::SelectScreen`]), so their revision
+/// ([`crate::decision_side::labels_revision`]) is the one its cursor's
+/// preparation was asked for.
+fn decision_labels(h: &library::Header) -> skin_model::ChartLabels {
+    let text = |f: &Option<String>| f.clone().unwrap_or_default();
+    skin_model::ChartLabels {
+        title: text(&h.title),
+        subtitle: text(&h.subtitle),
+        artist: text(&h.artist),
+        subartist: text(&h.subartist),
+        genre: text(&h.genre),
+        ..skin_model::ChartLabels::default()
+    }
+}
+
 /// What a loading frame may show of a chart, from its library entry.
 fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
     let h = &e.header;
@@ -2168,6 +2185,15 @@ enum PageBegin {
 }
 
 impl PlayerRig<'_> {
+    /// The decision lifetime the choice claimed ended (its step, the
+    /// practice page's entry, a leave): the label book is told, so the
+    /// render thread retires its pinned slot at its next boundary.
+    fn end_decision(&mut self) {
+        if let Some(claim) = self.decision_claim.take() {
+            self.render.end_decision(claim.lifetime);
+        }
+    }
+
     /// The page's waiting 1× bank ([`PageJobs::defer`]) begins once its
     /// prerequisites hold, each looked at with no wait, so the decision
     /// screen and the page are served meanwhile and the page opens at its
@@ -2669,13 +2695,55 @@ impl AppRig for PlayerRig<'_> {
         cancelled(self.controls)
     }
 
-    /// The built-in presentation, for every choice.
+    /// The decision skin when the chosen chart's labels are ready in a
+    /// label slot on a healthy device: that slot pinned under `lifetime`,
+    /// without waiting for any preparation, and the skin's scene and
+    /// fade-out; else the built-in presentation, `lifetime` made the
+    /// active one all the same (design.md "Play Lifecycle", the decision
+    /// screen).
     fn decision_shown(
         &mut self,
-        _pick: &Pick,
-        _lifetime: game::DecisionLifetime,
+        pick: &Pick,
+        lifetime: game::DecisionLifetime,
     ) -> Option<game::DecisionShown> {
-        Some(game::DecisionShown::BuiltIn)
+        let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
+        // The chart's labels as the cursor's preparation asked for them.
+        let revision = self
+            .selection
+            .as_ref()
+            .and_then(|s| s.screen.selected())
+            .filter(|e| e.path == *chart)
+            .map(|e| crate::decision_side::labels_revision(&decision_labels(&e.header)));
+        let pinned =
+            revision.and_then(|revision| self.render.pin_decision(chart, revision, lifetime.0));
+        let (slot, shown, timing) = match pinned {
+            Some((slot, generation, timing)) => (
+                Some((slot, generation)),
+                game::DecisionShown::Skin {
+                    slot: u8::try_from(slot).unwrap_or(u8::MAX),
+                    generation,
+                    scene: timing.scene,
+                    fadeout: timing.fadeout,
+                },
+                timing,
+            ),
+            None => {
+                self.render.begin_decision(lifetime.0);
+                (
+                    None,
+                    game::DecisionShown::BuiltIn,
+                    skin_model::DecisionTiming::default(),
+                )
+            }
+        };
+        // Its choice is App's, set at the entry.
+        self.decision_claim = Some(crate::decision_side::ShownDecision {
+            lifetime: lifetime.0,
+            origin: TimeUs(0),
+            timing,
+            slot,
+        });
+        Some(shown)
     }
 
     /// The decision screen begins: the input epoch first, so nothing
@@ -2701,7 +2769,16 @@ impl AppRig for PlayerRig<'_> {
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
         let shown = page.decision();
-        self.render.show_decision(shown.clone(), None);
+        // What the choice claimed for this lifetime, from its choice.
+        let claimed = self
+            .decision_claim
+            .as_mut()
+            .filter(|c| d.lifetime().is_some_and(|l| l.0 == c.lifetime))
+            .map(|c| {
+                c.origin = d.origin();
+                *c
+            });
+        self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         self.audio.control.play_tone();
         if matches!(pick, Pick::Play(_)) {
@@ -2765,6 +2842,7 @@ impl AppRig for PlayerRig<'_> {
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
     fn deadline_step(&mut self) {
+        self.end_decision();
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
         }
@@ -2777,6 +2855,7 @@ impl AppRig for PlayerRig<'_> {
     /// The decision screen is left for the practice page or selection: the
     /// input epoch ends, and the page's jobs are the page's from here.
     fn closed_epoch(&mut self) {
+        self.end_decision();
         self.controls.open_epoch();
         if let Some(sel) = &mut self.selection {
             sel.decision = None;
@@ -4301,6 +4380,71 @@ pub(crate) mod tests {
             assert_eq!(d.left(), None);
             assert!(!rig.controls.ingress().is_open());
         });
+    }
+
+    /// O6 inside a rig's wait: a takeover of the skinned screen's lifetime
+    /// left by the render thread while the choice's own wait (its entry
+    /// fence, held on the input thread) serves the screen is applied
+    /// there, to the decision the wait watches, with no look of App's: it
+    /// comes back with the built-in presentation and the deadline 1,500 ms
+    /// from the original choice.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn takeover_inside_a_rig_wait_reaches_the_watched_decision() {
+        use bms_model::TimeSource as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        let chart = dir.path().join("x.bms");
+        crate::tests::on_rig_hooked(
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            },
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            input::QpcClock::start(),
+            |rig, _, end| {
+                rig.selection = Some(sel);
+                let (thread, _jobs, _waker, _clock) = input_thread(end);
+                let origin = rig.clock.now();
+                let lifetime = game::DecisionLifetime(4);
+                let decision = game::Decision::begin(
+                    origin,
+                    lifetime,
+                    Some(game::DecisionShown::Skin {
+                        slot: 0,
+                        generation: 1,
+                        scene: TimeUs(2_500_000),
+                        fadeout: TimeUs(500_000),
+                    }),
+                    false,
+                );
+                rig.render
+                    .recovery_handle()
+                    .leave_takeover(game::DecisionTakeover {
+                        lifetime,
+                        at: origin,
+                        why: "refused".to_owned(),
+                    });
+                let nothing = |_: &crate::controls::Controls| {};
+                let taken = |c: &crate::controls::Controls| {
+                    c.with_watched(|d| {
+                        d.is_none_or(|d| d.shown() == Some(game::DecisionShown::BuiltIn))
+                    })
+                };
+                let d = entry_held(
+                    rig,
+                    &game::Pick::Play(chart.clone()),
+                    decision,
+                    Some((&nothing, &taken)),
+                );
+                assert_eq!(d.shown(), Some(game::DecisionShown::BuiltIn));
+                assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 1_500_000)));
+                assert_eq!(d.origin(), origin);
+                assert_eq!(d.left(), None);
+                assert_eq!(rig.render.take_decision_takeover(), None, "taken twice");
+                thread.stop().unwrap();
+            },
+        );
     }
 
     /// Finding 10 at the fence (START on E as installed): START pressed

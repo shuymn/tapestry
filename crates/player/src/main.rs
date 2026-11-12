@@ -990,10 +990,13 @@ fn rig<'a>(
         result_offset: None,
         result_leaving: false,
         result_outro: None,
+        decision_claim: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
+        #[cfg(test)]
+        park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
         audio_lost,
         #[cfg(test)]

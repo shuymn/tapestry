@@ -444,6 +444,12 @@ impl Controls {
         }
         let terminal = self.quitting() || w.failures.any();
         let now = self.clock.now();
+        // The decision skin's takeover, as App's look takes it: before the
+        // classification, so the deadline then in force is judged.
+        if let Some(takeover) = w.screen.as_ref().and_then(|s| s.take_decision_takeover()) {
+            let _ = w.decision.apply_takeover(takeover, now);
+        }
+        let lifetime = w.decision.lifetime();
         let seen = w.decision.classify(w.origin, now, terminal, false, None);
         if seen == game::Verdict::Step && !w.decision.practice() {
             // The play's deadline step: the lifetime shown, the loading
@@ -456,7 +462,15 @@ impl Controls {
         }
         if seen.leaves() {
             w.decision.leave(seen);
-        } else if let Some(screen) = &w.screen {
+        }
+        // The step or a leave ended the screen's lifetime: its pinned
+        // label slot is the render thread's to retire.
+        if let (Some(l), None, Some(screen)) = (lifetime, w.decision.lifetime(), &w.screen) {
+            screen.end_decision(l.0);
+        }
+        if !seen.leaves()
+            && let Some(screen) = &w.screen
+        {
             // A screen lost meanwhile is built again from here; the flow
             // takes the rebuild over, or its failure, at its next look.
             screen.look();

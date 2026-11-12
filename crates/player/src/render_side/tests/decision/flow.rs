@@ -1,0 +1,533 @@
+//! The decision skin through the player's flow (design.md "Play
+//! Lifecycle", the decision screen): the choice pins the chart's ready
+//! labels through `PlayerRig::decision_shown` without waiting, the entry
+//! tells the render thread what it claimed, every end of the lifetime
+//! tells the label book, and the built-in presentation takes over when
+//! the skin cannot draw. The game's App is played by the test, one hook at
+//! a time, as `App::run` calls them, on the render thread's clock; every
+//! choice's origin is past the clock's start.
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+use bms_model::{TimeSource as _, TimeUs};
+use game::{
+    AppRig as _, Decision, DecisionLifetime, DecisionShown, Origin, Pick, Rig as _, Verdict,
+};
+use render::{LabelBook, LabelState, lock};
+use tempfile::TempDir;
+
+use super::{Rig, Seen, skin_dir};
+use crate::decision_side::decision_frame_of;
+use crate::play::PlayerRig;
+use crate::render_side::Extent;
+use crate::render_side::tests::wait_until;
+
+const MS: i64 = 1_000;
+
+/// [`skin_dir`]'s skin declaring `scene`, `input` and `fadeout` in ms.
+fn timed(scene: i64, input: i64, fadeout: i64) -> TempDir {
+    let dir = skin_dir();
+    let path = dir.path().join("s.json");
+    let json = std::fs::read_to_string(&path).unwrap();
+    let timing = format!(r#""type": 6, "scene": {scene}, "input": {input}, "fadeout": {fadeout},"#);
+    std::fs::write(&path, json.replacen(r#""type": 6,"#, &timing, 1)).unwrap();
+    dir
+}
+
+/// The 2,500 / 500 / 500 ms skin of stage3's list.
+fn listed() -> TempDir {
+    timed(2_500, 500, 500)
+}
+
+/// What a flow test sees of the render thread and its chart.
+struct Flow {
+    seen: Arc<Seen>,
+    book: Arc<Mutex<LabelBook>>,
+    extent: Arc<Extent>,
+    /// The chart under the cursor, as the library lists it.
+    chart: PathBuf,
+}
+
+impl Flow {
+    /// Waits until the chart's labels are ready in a slot.
+    fn prepared(&self) {
+        assert!(
+            wait_until(|| self.ready().is_some()),
+            "never ready: {:?}",
+            lock(&self.book)
+        );
+    }
+
+    /// The ready slot holding the chart's labels and its generation.
+    fn ready(&self) -> Option<(usize, u64)> {
+        let book = lock(&self.book);
+        (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+            Some(LabelState::Ready {
+                generation, key, ..
+            }) if key.chart == self.chart => Some((i, *generation)),
+            _ => None,
+        })
+    }
+
+    /// The pinned slot, its generation and its lifetime.
+    fn pinned(&self) -> Option<(usize, u64, u64)> {
+        let book = lock(&self.book);
+        (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+            Some(LabelState::Pinned {
+                generation,
+                lifetime,
+                ..
+            }) => Some((i, *generation, *lifetime)),
+            _ => None,
+        })
+    }
+
+    /// The pick of the chart, to play or to practice.
+    fn pick(&self, practice: bool) -> Pick {
+        if practice {
+            Pick::Practice(self.chart.clone())
+        } else {
+            Pick::Play(self.chart.clone())
+        }
+    }
+}
+
+/// `f` on a player rig whose render thread draws on [`Recorder`]s with
+/// the decision skin of `dir` committed, sharing the rig's clock, the
+/// select screen entered with its cursor on one chart.
+///
+/// [`Recorder`]: super::Recorder
+fn flow<R>(dir: &TempDir, f: impl FnOnce(&mut PlayerRig<'_>, &Flow) -> R) -> R {
+    let clock = input::QpcClock::start();
+    let Rig {
+        link,
+        seen,
+        book,
+        extent,
+        _turn: turn,
+    } = Rig::on(dir, clock);
+    let charts = tempfile::tempdir().unwrap();
+    let (mut sel, roots) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);
+    assert!(sel.screen.select_path(&roots[0].join("a.bms")));
+    let chart = sel.screen.selected().unwrap().path.clone();
+    let flow = Flow {
+        seen,
+        book,
+        extent,
+        chart,
+    };
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let (out, _) = crate::tests::on_rig_hooked(settings, link, clock, |rig, _, _| {
+        // No adjustment waits on the input thread, which none serves.
+        rig.adjust = None;
+        rig.controls.quit_leaves();
+        rig.selection = Some(sel);
+        rig.entered_selection();
+        f(rig, &flow)
+    });
+    drop(turn);
+    out
+}
+
+/// The choice of `pick` in `lifetime`, as App makes it: the lifetime
+/// first, the presentation chosen for it, the screen begun from now and
+/// entered.
+fn choose(rig: &mut PlayerRig<'_>, pick: &Pick, lifetime: u64) -> Decision {
+    let now = rig.now();
+    let lifetime = DecisionLifetime(lifetime);
+    let shown = rig.decision_shown(pick, lifetime);
+    let d = Decision::begin(now, lifetime, shown, matches!(pick, Pick::Practice(_)));
+    rig.entered_decision(pick, d)
+}
+
+/// Waits until the rig's clock reads `t`.
+fn until_clock(rig: &PlayerRig<'_>, t: TimeUs) {
+    while rig.clock.now().0 < t.0 {
+        std::thread::yield_now();
+    }
+}
+
+/// The skin's frames drawn after the `from`th frame.
+fn skins_after(seen: &Seen, from: usize) -> usize {
+    seen.skins(from)
+}
+
+/// stage3's list, scene / input / fade-out 2,500 / 500 / 500 ms through
+/// the player: the choice pins the ready slot and its screen lasts
+/// 3,000 ms from the choice; the render thread is told the choice, the
+/// timing and the slot; every skin frame drawn runs its timers from the
+/// choice, timer 1 on only past 500 ms (off at 500,000 µs, on 1 µs later)
+/// and timer 2 from 2,500 ms; the transition comes at 3,000 ms, not
+/// before; the step ends the lifetime and the slot is retired.
+#[test]
+fn skin_decision_timeline_through_the_player() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let (slot, generation) = f.ready().unwrap();
+        let mut d = choose(rig, &f.pick(false), 3);
+        let origin = d.origin();
+        assert!(origin.0 > 0, "a nonzero origin");
+        let at = |us: i64| TimeUs(origin.0 + us);
+        assert_eq!(
+            d.shown(),
+            Some(DecisionShown::Skin {
+                slot: u8::try_from(slot).unwrap(),
+                generation,
+                scene: TimeUs(2_500 * MS),
+                fadeout: TimeUs(500 * MS),
+            })
+        );
+        assert_eq!(d.deadline(), Some(at(3_000 * MS)));
+        assert_eq!(f.pinned(), Some((slot, generation, 3)));
+        let sent = rig.render.decision_sent().expect("a skinned presentation");
+        assert_eq!(
+            (sent.lifetime, sent.origin, sent.slot),
+            (3, origin, Some((slot, generation)))
+        );
+        assert_eq!(sent.timing.input, TimeUs(500 * MS));
+        let input = |us| decision_frame_of(&sent, at(us), [1_920, 1_080]).timers;
+        assert_eq!(input(500 * MS).input, None, "timer 1 at 500,000 µs");
+        assert_eq!(input(500 * MS + 1).input, Some(at(500 * MS)));
+        assert_eq!(input(2_500 * MS - 1).fadeout, None);
+        assert_eq!(input(2_500 * MS).fadeout, Some(at(2_500 * MS)));
+        // The frames drawn through the fade-out run their timers from the
+        // choice.
+        assert!(wait_until(|| {
+            f.seen
+                .timers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|t| t.0.0 > at(2_600 * MS).0)
+        }));
+        for &(now, input, fadeout) in f.seen.timers.lock().unwrap().iter() {
+            let late = now.0 - origin.0;
+            assert_eq!(input, (late > 500 * MS).then_some(at(500 * MS)), "{late}");
+            assert_eq!(fadeout, (late >= 2_500 * MS).then_some(at(2_500 * MS)));
+        }
+        assert_eq!(
+            d.classify(Origin::Ready, at(3_000 * MS - 1), false, false, None),
+            Verdict::Continue
+        );
+        assert_eq!(
+            d.classify(Origin::Ready, at(3_000 * MS), false, false, None),
+            Verdict::Step
+        );
+        rig.deadline_step();
+        assert_eq!(lock(&f.book).active(), None, "the step ended the lifetime");
+        assert!(wait_until(|| f.pinned().is_none()), "never retired");
+    });
+}
+
+/// R3.1 (stage3's list): commands and a settings key pressed at 100 and
+/// 600 ms from the choice, before and after the skin's `input`, through
+/// the controls' queues, are discarded, the looks of the screen at both
+/// times included: nothing taken, nothing pending, no setting stepped.
+#[test]
+fn skin_decision_discards_commands_before_and_after_input() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let d = choose(rig, &f.pick(false), 3);
+        assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+        let origin = d.origin();
+        let values = rig.controls.tuning().snapshot().values;
+        for ms in [100, 600] {
+            until_clock(rig, TimeUs(origin.0 + ms * MS));
+            rig.decision_tick(Origin::Load).unwrap();
+            rig.controls.command(game::Command::Quit);
+            rig.controls.command(game::Command::Retry);
+            rig.controls
+                .settings_key(game::Adjust::VolumeDown, crate::tuning::KeyEvent::Press);
+            rig.controls
+                .settings_key(game::Adjust::VolumeDown, crate::tuning::KeyEvent::Release);
+            rig.decision_tick(Origin::Load).unwrap();
+            assert!(!rig.controls.ingress().is_open(), "{ms} ms: the epoch");
+            assert!(!rig.controls.leaving(), "{ms} ms");
+            assert_eq!(rig.controls.take(), None, "{ms} ms");
+            assert_eq!(rig.controls.tuning().snapshot().values, values, "{ms} ms");
+        }
+        assert!(!rig.controls.quitting());
+    });
+}
+
+/// R3.1 (stage3's list): after the skinned screen's epoch, a press made
+/// in it does nothing: a quit and a retry are gone and a settings key
+/// held through the step steps nothing; fresh presses act.
+#[test]
+fn fresh_press_needed_after_skin_decision_epoch() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let mut d = choose(rig, &f.pick(false), 3);
+        assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+        let values = rig.controls.tuning().snapshot().values;
+        rig.controls.command(game::Command::Quit);
+        rig.controls.command(game::Command::Retry);
+        rig.controls
+            .settings_key(game::Adjust::VolumeDown, crate::tuning::KeyEvent::Press);
+        let end = d.deadline().unwrap();
+        assert_eq!(
+            d.classify(Origin::Ready, end, false, false, None),
+            Verdict::Step
+        );
+        rig.deadline_step();
+        assert!(rig.controls.ingress().is_open());
+        assert_eq!(rig.controls.take(), None, "a press in the epoch acted");
+        rig.controls
+            .settings_key(game::Adjust::VolumeDown, crate::tuning::KeyEvent::Repeat);
+        assert_eq!(rig.controls.tuning().snapshot().values, values);
+        // Fresh presses act.
+        rig.controls
+            .settings_key(game::Adjust::VolumeDown, crate::tuning::KeyEvent::Release);
+        rig.controls.command(game::Command::Quit);
+        assert_eq!(rig.controls.take(), Some(game::Command::Quit));
+    });
+}
+
+/// R4.1, R4.3 (stage3's list): the skin's build refused at 1,000 ms gives
+/// the built-in presentation at once, the deadline at 1,500 ms from the
+/// original choice, no presentation sent again and no second tone; at
+/// 2,000 ms the screen ends at once on its route: the loading state on
+/// the play path, the practice page once its chart is read.
+#[test]
+fn takeover_restarts_no_clock_and_plays_no_tone() {
+    for (refused_ms, practice) in [(1_000, false), (2_000, false), (2_000, true)] {
+        let dir = listed();
+        flow(&dir, |rig, f| {
+            f.prepared();
+            let tones = rig.audio.control.failure_probe();
+            let sent = rig.render.decisions_sent();
+            let mut d = choose(rig, &f.pick(practice), 3);
+            let origin = d.origin();
+            assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+            until_clock(rig, TimeUs(origin.0 + refused_ms * MS));
+            f.seen.refuse_frame.store(true, Ordering::Release);
+            let taken = std::cell::RefCell::new(None);
+            assert!(wait_until(|| {
+                let mut t = taken.borrow_mut();
+                if t.is_none() {
+                    *t = rig.render.take_decision_takeover();
+                }
+                t.is_some()
+            }));
+            // As App's look takes it.
+            let t = taken.into_inner().unwrap();
+            assert_eq!(t.lifetime, DecisionLifetime(3));
+            assert!(t.at.0 >= origin.0 + refused_ms * MS);
+            let now = rig.now();
+            assert!(d.apply_takeover(t, now));
+            assert_eq!(d.origin(), origin, "a clock restarted");
+            assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 1_500 * MS)));
+            assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
+            // The page draws at once.
+            let from = f.seen.len();
+            assert!(wait_until(|| f.seen.len() > from + 2));
+            assert_eq!(skins_after(&f.seen, from), 0);
+            assert_eq!(sent(), 1, "a presentation sent again");
+            assert_eq!(tones.tone_requests(), 1, "a second tone");
+            if refused_ms == 1_000 {
+                let at = |us| TimeUs(origin.0 + us);
+                assert_eq!(
+                    d.classify(Origin::Ready, at(1_500 * MS - 1), false, false, None),
+                    Verdict::Continue
+                );
+                assert_eq!(
+                    d.classify(Origin::Ready, at(1_500 * MS), false, false, None),
+                    Verdict::Step
+                );
+            } else if practice {
+                // Practice past its time waits for its read, then opens.
+                assert_eq!(
+                    d.classify(Origin::Read, now, false, false, None),
+                    Verdict::Continue
+                );
+                assert!(d.waiting());
+                assert_eq!(
+                    d.classify(Origin::Jobs, now, false, false, None),
+                    Verdict::Step
+                );
+            } else {
+                assert_eq!(
+                    d.classify(Origin::Ready, now, false, false, None),
+                    Verdict::Step
+                );
+            }
+        });
+    }
+}
+
+/// O6: the idle wait the game thread parks in is unparked by the takeover's
+/// producer: the skin's build refused on the render thread, after the
+/// test thread parked for 60 s, wakes it long before then, and the
+/// producer's own wake count rose.
+#[test]
+fn takeover_unparks_the_idle_wait() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let d = choose(rig, &f.pick(false), 3);
+        assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+        assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+        rig.controls.set_game(std::thread::current());
+        let game = std::thread::current();
+        rig.render.set_game_wake(Arc::new(move || game.unpark()));
+        let probe = Arc::clone(&rig.park_probe);
+        probe.store(false, Ordering::SeqCst);
+        let far = TimeUs(rig.now().0 + 60_000 * MS);
+        let seen = Arc::clone(&f.seen);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert!(wait_until(|| probe.load(Ordering::SeqCst)));
+                seen.refuse_frame.store(true, Ordering::Release);
+            });
+            // A wake by anything else parks again.
+            while rig.render.takeovers_woken() == 0 && rig.now().0 < far.0 {
+                rig.idle_wait(far);
+            }
+        });
+        assert!(
+            rig.now().0 < far.0,
+            "the park was not ended by the takeover"
+        );
+        assert_eq!(rig.render.takeovers_woken(), 1);
+    });
+}
+
+/// R1.5: a render thread that takes the choice's presentation only after
+/// a short screen's step, with the target changed meanwhile, keeps the
+/// choice: no refusal at its entry, the kind not disabled, and the slot
+/// retired by its lifetime at a later boundary.
+#[test]
+fn delayed_render_short_screen_keeps_its_choice() {
+    let dir = timed(200, 0, 0);
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let gate = rig.render.decision_gate();
+        gate.hold(true);
+        let mut d = choose(rig, &f.pick(false), 3);
+        assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+        assert!(wait_until(|| gate.waiting()));
+        let (slot, generation, _) = f.pinned().unwrap();
+        let end = d.deadline().unwrap();
+        assert_eq!(
+            d.classify(Origin::Ready, end, false, false, None),
+            Verdict::Step
+        );
+        rig.deadline_step();
+        lock(&f.book).invalidate([1_280, 720]);
+        gate.hold(false);
+        assert!(wait_until(|| f.pinned().is_none()), "never retired");
+        assert!(rig.render.fence(std::time::Duration::from_secs(60)));
+        assert_eq!(rig.render.take_decision_refusal(), None, "refused at entry");
+        assert_eq!(rig.render.take_decision_takeover(), None);
+        assert!(
+            matches!(
+                lock(&f.book).state(slot),
+                Some(LabelState::Cooling { generation: g, .. }
+                    | LabelState::Ready { generation: g, .. }) if *g == generation
+            ) || matches!(lock(&f.book).state(slot), Some(LabelState::Free)),
+            "{:?}",
+            lock(&f.book)
+        );
+    });
+}
+
+/// R1.5: a render thread that takes the presentation late, with the target
+/// changed meanwhile, while the lifetime is still active, draws the slot
+/// the choice claimed: skin frames, no takeover, the kind not disabled,
+/// the slot still pinned by the lifetime.
+#[test]
+fn delayed_render_active_lifetime_keeps_its_claim() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let gate = rig.render.decision_gate();
+        gate.hold(true);
+        let d = choose(rig, &f.pick(false), 3);
+        assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+        assert!(wait_until(|| gate.waiting()));
+        let pinned = f.pinned().unwrap();
+        lock(&f.book).invalidate([1_280, 720]);
+        let from = f.seen.len();
+        gate.hold(false);
+        assert!(wait_until(|| skins_after(&f.seen, from) >= 3));
+        assert_eq!(rig.render.take_decision_takeover(), None);
+        assert_eq!(rig.render.take_decision_refusal(), None);
+        assert_eq!(f.pinned(), Some(pinned));
+    });
+}
+
+/// R0.3, R1.4: a choice made while the chart's labels are written but
+/// their completion has not come draws the built-in presentation for
+/// 1,500 ms; the slot is published only after it.
+#[test]
+fn choice_before_prep_completes_draws_builtin_for_1500() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        // The selection was entered before this hold: wait for the hold
+        // to catch the fill, or the labels to be ready already.
+        f.seen.hold_settle.store(true, Ordering::Release);
+        assert!(wait_until(|| f
+            .seen
+            .skipped_settles
+            .load(Ordering::Acquire)
+            > 0
+            || f.ready().is_some()));
+        if f.ready().is_some() {
+            // Published before the hold: ask for the labels again.
+            f.extent.publish(1_280, 720);
+            assert!(wait_until(|| f
+                .seen
+                .skipped_settles
+                .load(Ordering::Acquire)
+                > 0));
+        }
+        assert_eq!(f.ready(), None, "published before its completion");
+        let d = choose(rig, &f.pick(false), 3);
+        assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
+        assert_eq!(d.deadline(), Some(TimeUs(d.origin().0 + 1_500 * MS)));
+        assert_eq!(rig.render.decision_sent().and_then(|s| s.slot), None);
+        assert_eq!(lock(&f.book).active(), Some(3));
+        f.seen.hold_settle.store(false, Ordering::Release);
+        assert!(wait_until(|| f.ready().is_some()));
+    });
+}
+
+/// Repeat: the same chart chosen again after its screen ended, the cursor
+/// not moved, pins the same generation again (the retired slot ready
+/// again at its last frame's completion, its content kept) and the skin
+/// draws.
+#[test]
+fn same_chart_chosen_again_without_cursor_move_draws_skin() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let mut d = choose(rig, &f.pick(false), 3);
+        let first = f.pinned().unwrap();
+        assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+        let end = d.deadline().unwrap();
+        assert_eq!(
+            d.classify(Origin::Ready, end, false, false, None),
+            Verdict::Step
+        );
+        rig.deadline_step();
+        rig.entered_selection();
+        assert!(wait_until(|| f.ready() == Some((first.0, first.1))));
+        let from = f.seen.len();
+        let d = choose(rig, &f.pick(false), 4);
+        assert!(matches!(
+            d.shown(),
+            Some(DecisionShown::Skin { generation, .. }) if generation == first.1
+        ));
+        assert_eq!(f.pinned(), Some((first.0, first.1, 4)));
+        assert!(wait_until(|| skins_after(&f.seen, from) >= 3));
+        assert_eq!(rig.render.take_decision_refusal(), None);
+    });
+}
