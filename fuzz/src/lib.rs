@@ -658,6 +658,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
                     change: Some(TimeUs(0)),
                     panels: [Some(TimeUs(0)), None, None],
                 },
+                app: skin_model::AppReadouts::LAUNCH,
             };
             skin.build_selection(&mut sel, &frame, &uvs, &mut batch)
                 .expect("an imported selection skin builds");
