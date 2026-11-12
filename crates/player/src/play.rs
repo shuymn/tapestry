@@ -393,6 +393,10 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
+    /// The views the result has changed to so far, each printed once
+    /// (dev-tools: a scripted view command is over once its view shows).
+    #[cfg(feature = "dev-tools")]
+    pub views_shown: u64,
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
@@ -1278,6 +1282,13 @@ impl PlayerRig<'_> {
     /// must stay open until the process exits), and what the practice
     /// page's jobs left that the run ends with.
     pub fn shut_down(mut self) -> Shutdown {
+        // The run ends: a result or selection shown is left, and its
+        // captures whose frame was not taken fail (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        {
+            self.finish_result(crate::dev::scenario::Leaving::Ended);
+            self.finish_selection(crate::dev::scenario::Leaving::Ended);
+        }
         // A panic a Start was responsible for ends the run with it, after the
         // rest of the cleanup.
         let page = self.page_at_end();
@@ -1661,6 +1672,12 @@ impl Rig for PlayerRig<'_> {
         // The result's own path, after the adjustments: an offset changed
         // by them reaches the strip's guidance.
         self.present_overlay();
+        // The result's scripted steps, at each wake: one waiting on a
+        // capture is polled (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        if self.end_page.is_some() {
+            self.poll_result_script();
+        }
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -2621,6 +2638,9 @@ impl Rig for PlayerRig<'_> {
             self.viewed = None;
             self.evaluated = 0;
         }
+        // A new result's identity (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        self.result_began();
     }
 
     /// P: the own view's layout, asked for once its best is compared, with
@@ -2700,6 +2720,9 @@ impl Rig for PlayerRig<'_> {
                 self.autoplay,
             ),
             graphs: end_screen::view_graphs(screen),
+            // The result this page is of: what draws from it names it.
+            #[cfg(feature = "dev-tools")]
+            id: self.scenario.as_ref().and_then(|s| s.result_id),
         });
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
@@ -2789,6 +2812,12 @@ impl PlayerRig<'_> {
     pub(crate) fn before_rebuild(&mut self) {
         if self.presenter.current() && !self.result_leaving {
             return;
+        }
+        // A result the flow left (a retry), read before `leave_result`
+        // clears it; a recovery is no leaving (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        if self.result_leaving {
+            self.finish_result(crate::dev::scenario::Leaving::Left);
         }
         self.leave_result();
         self.retry_from = self.pending_retry.take();
