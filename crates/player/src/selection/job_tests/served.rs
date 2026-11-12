@@ -72,7 +72,12 @@ fn barrier_held(event: Event) -> Ended {
         // The choice closed the epoch; its deadline is 1.5 s away.
         controls.close_epoch();
         let now = rig.clock.now();
-        let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), false);
+        let mut decision = game::Decision::begin(
+            now,
+            game::DecisionLifetime(1),
+            Some(game::DecisionShown::BuiltIn),
+            false,
+        );
         let got = std::thread::scope(|s| {
             s.spawn(move || {
                 at_rx.recv_timeout(watchdog()).expect("the barrier reached");
@@ -85,7 +90,7 @@ fn barrier_held(event: Event) -> Ended {
                     Event::Close | Event::AudioFailure => {
                         // Left, or the load already gone with it.
                         until("the screen left", || {
-                            controls.watched().is_none_or(|d| d.left().is_some())
+                            controls.with_watched(|d| d.is_none_or(|d| d.left().is_some()))
                         });
                     }
                     Event::Deadline | Event::DeadlineThenQuit => {
@@ -168,7 +173,12 @@ fn a_close_with_an_audio_failure_in_the_load_reports_the_failure() {
         *lost.lock().unwrap() = Some(Arc::clone(&rig.audio_lost));
         rig.controls.close_epoch();
         let now = rig.clock.now();
-        let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), false);
+        let mut decision = game::Decision::begin(
+            now,
+            game::DecisionLifetime(1),
+            Some(game::DecisionShown::BuiltIn),
+            false,
+        );
         let got = outcome(rig.load_chart(&loaded, &mut decision));
         (got, decision, rig.failures.output().is_some())
     });
@@ -208,7 +218,12 @@ fn the_install_serves_the_decision_screen_while_unsent() {
         let controls: &Controls = rig.controls;
         controls.close_epoch();
         let now = rig.clock.now();
-        let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), false);
+        let mut decision = game::Decision::begin(
+            now,
+            game::DecisionLifetime(1),
+            Some(game::DecisionShown::BuiltIn),
+            false,
+        );
         let got = std::thread::scope(|s| {
             s.spawn(move || {
                 made.recv_timeout(watchdog()).expect("the bank made");
@@ -275,7 +290,12 @@ fn attach_held(
             } else {
                 now
             };
-            let mut decision = game::Decision::begin(begun, Some(game::DECISION_TIME), false);
+            let mut decision = game::Decision::begin(
+                begun,
+                game::DecisionLifetime(1),
+                Some(game::DecisionShown::BuiltIn),
+                false,
+            );
             let got = std::thread::scope(|s| {
                 let go = go_tx.clone();
                 s.spawn(move || {
@@ -318,7 +338,7 @@ fn attach_held(
 /// steps once inside it and the load goes on to install.
 #[test]
 fn the_attach_fence_serves_the_decision_screen() {
-    let left = |c: &Controls| c.watched().is_none_or(|d| d.left().is_some());
+    let left = |c: &Controls| c.with_watched(|d| d.is_none_or(|d| d.left().is_some()));
     let close = |c: &Controls| c.close();
     let ended = attach_held(false, &close, &left);
     assert_eq!(ended.got, Loading::Cancelled);
@@ -375,7 +395,12 @@ fn decision_screen_lost_within(
         screens.fail.store(false, Ordering::Release);
         let now = rig.clock.now();
         rig.controls.watch_decision(crate::controls::DecisionWatch {
-            decision: game::Decision::begin(now, Some(game::DECISION_TIME), false),
+            decision: game::Decision::begin(
+                now,
+                game::DecisionLifetime(1),
+                Some(game::DecisionShown::BuiltIn),
+                false,
+            ),
             origin: game::Origin::Load,
             reveal: Box::new(|| {}),
             failures: rig.failures.clone(),
@@ -674,7 +699,12 @@ fn the_opening_reports_a_saved_rebuild_failure_before_its_preparation() {
         installers.fail_builds.store(1, Ordering::Release);
         let now = rig.clock.now();
         rig.controls.watch_decision(crate::controls::DecisionWatch {
-            decision: game::Decision::begin(now, Some(game::DECISION_TIME), false),
+            decision: game::Decision::begin(
+                now,
+                game::DecisionLifetime(1),
+                Some(game::DecisionShown::BuiltIn),
+                false,
+            ),
             origin: game::Origin::Load,
             reveal: Box::new(|| {}),
             failures: rig.failures.clone(),
