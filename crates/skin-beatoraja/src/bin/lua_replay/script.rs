@@ -107,6 +107,11 @@ pub const LEAD: i64 = 1_000_000;
 const TAIL: i64 = 2_000_000;
 /// Closing's length on the play clock.
 const CLOSING: i64 = 500_000;
+/// The most a full play's replayed ending runs past its last note: the
+/// replay builds and keeps every frame, so a longer declared hold or
+/// fade-out, which the player honours whole, is cut here, and the round's
+/// report says so.
+pub const ENDING_SPAN: i64 = 30_000_000;
 /// The state clock at chart time 0 in a whole-chart script: the play
 /// state began this long before (its loading).
 pub const STATE_AT_ZERO: i64 = 1_500_000;
@@ -318,19 +323,27 @@ impl Round {
         out
     }
 
-    /// The chart time the round's frames run to, and where its fade-out
-    /// starts: a practice round runs [`TAIL`] past the last note with no
-    /// fade-out, whatever the skin declares; a full play, anchored at its
-    /// last note, runs to its hold's end ([`game::hold_until`]) and then,
-    /// when it has one, through its fade-out ([`game::fade_deadline`]).
-    fn last_time(&self, last_note: i64, ending: game::PlayEnding) -> (i64, Option<TimeUs>) {
+    /// The chart time the round's frames run to, where its fade-out
+    /// starts, and whether its ending was cut: a practice round runs
+    /// [`TAIL`] past the last note with no fade-out, whatever the skin
+    /// declares; a full play, anchored at its last note, runs to its hold's
+    /// end ([`game::hold_until`]) and then, when it has one, through its
+    /// fade-out ([`game::fade_deadline`]), but at most [`ENDING_SPAN`] past
+    /// the last note, with a fade-out only if it starts by then.
+    fn last_time(&self, last_note: i64, ending: game::PlayEnding) -> (i64, Option<TimeUs>, bool) {
         if self.section {
-            return (last_note + TAIL, None);
+            return (last_note + TAIL, None, false);
         }
         let held = game::hold_until(TimeUs(last_note), ending);
-        match game::fade_deadline(held, ending.fadeout) {
+        let (end, fade) = match game::fade_deadline(held, ending.fadeout) {
             Some(end) => (end.0, Some(held)),
             None => (held.0, None),
+        };
+        let cap = last_note.saturating_add(ENDING_SPAN);
+        if end <= cap {
+            (end, fade, false)
+        } else {
+            (cap, fade.filter(|f| f.0 <= cap), true)
         }
     }
 
@@ -350,8 +363,8 @@ impl Round {
     }
 
     /// Plays the round over `chart`, calling `frame` once per built frame;
-    /// returns the tally the round settles with and the state time it
-    /// took.
+    /// returns the tally the round settles with, the state time it took,
+    /// and whether its ending was cut at [`ENDING_SPAN`].
     ///
     /// # Errors
     ///
@@ -364,14 +377,14 @@ impl Round {
         (last, shown, ending): (i64, usize, game::PlayEnding),
         judged: &dyn Fn(&Tally),
         mut frame: impl FnMut(&Step<'_, '_>) -> Result<(), String>,
-    ) -> Result<(Tally, i64), String> {
+    ) -> Result<(Tally, i64, bool), String> {
         let device = device();
         let start = InputStart {
             opened_at: TimeUs(-LEAD),
             held: Vec::new(),
         };
         let inputs = self.inputs();
-        let (end, fade) = self.last_time(last, ending);
+        let (end, fade, ending_cut) = self.last_time(last, ending);
         let new_ev = || {
             Evaluator::new(chart, preset, &device, &start, section, inputs.len() + 1)
                 .map_err(|e| format!("evaluator: {e:?}"))
@@ -475,7 +488,7 @@ impl Round {
             judged(ev.tally());
             last_rel = base + end + LEAD;
         }
-        Ok((*ev.tally(), last_rel + STEP))
+        Ok((*ev.tally(), last_rel + STEP, ending_cut))
     }
 }
 

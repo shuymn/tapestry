@@ -216,6 +216,8 @@ pub(in crate::production) struct RoundTrace {
     pub(in crate::production) carried: Carried,
     pub(in crate::production) slots_run: bool,
     pub(in crate::production) terminal: bool,
+    /// Its replayed ending was cut ([`crate::script::ENDING_SPAN`]).
+    pub(in crate::production) ending_cut: bool,
 }
 
 /// What production did, owned and unreadable outside this module.
@@ -482,7 +484,7 @@ pub fn record(
                             );
                         }
                     };
-                    let (tally, took) = r.play(
+                    let (tally, took, ending_cut) = r.play(
                         &chart,
                         &preset,
                         r.section.then_some(&section),
@@ -587,6 +589,7 @@ pub fn record(
                         carried,
                         slots_run: carry.slots_run,
                         terminal: carry.terminal,
+                        ending_cut,
                     });
                     model.settle(&tally, &carry, ctx.empty_poor_counted);
                     slots = play.state().timers.len();

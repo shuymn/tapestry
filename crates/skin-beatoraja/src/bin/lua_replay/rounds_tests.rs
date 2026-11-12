@@ -583,6 +583,42 @@ fn fade_out_frames_start_timer_2() {
     assert!(fade_timers(&failing_inputs).iter().all(|&t| t == -1));
 }
 
+/// The longest declared ending, `finishmargin` and `fadeout` both at
+/// `i32::MAX` ms, which the player honours whole, is replayed only to 30 s
+/// past the last note: the hold's frames, not faded, as many as a 30 s
+/// ending gives, with the round's report saying its ending was cut; a
+/// declared ending that fits is not cut.
+#[test]
+fn the_longest_declared_ending_is_replayed_to_its_cap() {
+    let body = |decl: &str| format!("{decl}{}", dst("\"i\"", 0, ""));
+    let max = "skin.finishmargin = 2147483647\nskin.fadeout = 2147483647\n";
+    let (cut, _, inputs) = pieces(&body(max), Script::full());
+    assert!(cut.passes(), "{}", cut.text(0, true, true));
+    assert!(
+        cut.rounds[0].contains("ending replayed 30 s"),
+        "{:?}",
+        cut.rounds
+    );
+    assert_eq!(cut.kinds.get("fadeout"), None);
+    assert!(fade_timers(&inputs).iter().all(|&t| t == -1));
+    // A 25 s hold and a 5 s fade-out end exactly 30 s past the last note:
+    // the same frame times, the last 5 s faded, and nothing cut.
+    let fits = "skin.finishmargin = 20000\nskin.fadeout = 5000\n";
+    let (whole, _, whole_inputs) = pieces(&body(fits), Script::full());
+    assert!(whole.passes(), "{}", whole.text(0, true, true));
+    assert!(
+        !whole.rounds[0].contains("ending replayed"),
+        "{:?}",
+        whole.rounds
+    );
+    assert!(whole.kinds.get("fadeout").is_some_and(|k| k.0 > 0));
+    let times = |i: &[FrameInputs]| i.iter().map(FrameInputs::state_us).collect::<Vec<_>>();
+    let (cut_times, whole_times) = (times(&inputs), times(&whole_inputs));
+    // The fade-out's start adds one frame time of its own.
+    assert_eq!(cut_times.len() + 1, whole_times.len());
+    assert_eq!(cut_times.last(), whole_times.last());
+}
+
 /// A practice round never fades whatever the skin declares: no frame of
 /// the rounds script has timer 2 on or is labelled `fadeout`, and its
 /// frames are those of the same script with no declaration.
