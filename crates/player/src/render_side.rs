@@ -6966,7 +6966,12 @@ impl Run {
                             side.discard |= v.token.is_some();
                             side.drop_later(v.held);
                         }
-                        ViewCommit::Refused => side.drop_later(v.held),
+                        // Its commit refused: its staging, still pending,
+                        // is discarded after the frame, as an evicted one.
+                        ViewCommit::Refused => {
+                            side.discard |= v.token.is_some();
+                            side.drop_later(v.held);
+                        }
                     }
                 }
                 if let Some(mut h) = committed {
