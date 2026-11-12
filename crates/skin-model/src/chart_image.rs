@@ -488,11 +488,7 @@ pub fn derive(source: &Fitted, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<
         let src = level0.get(at..at + row).ok_or(Absent::Decode)?;
         out.copy_from_slice(src);
     }
-    let texels = if content == source.content {
-        texels
-    } else {
-        area(&texels, source.content, content)?
-    };
+    let texels = downscaled(texels, source.content, content)?;
     finish(source.native, content, texels, MIP_LEVELS, cancel)
 }
 
@@ -674,11 +670,7 @@ fn fit(
         let [r, g, b, a] = *t;
         *t = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
     }
-    let texels = if content == native {
-        texels
-    } else {
-        area(&texels, native, content)?
-    };
+    let texels = downscaled(texels, native, content)?;
     checkpoint(cancel, Site::Fitted)?;
     finish(native, content, texels, levels, cancel)
 }
@@ -712,6 +704,19 @@ fn finish(
         padded,
         levels: levels.into_boxed_slice(),
     })
+}
+
+/// `texels` (premultiplied RGBA8 of `from`) at `to`: itself when `to` is
+/// `from`, else its area downscale, `texels` released before it returns,
+/// so a fit never holds both beside its padded output (the one step every
+/// fit and derivation downscales through).
+fn downscaled(texels: Vec<u8>, from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, Absent> {
+    if to == from {
+        return Ok(texels);
+    }
+    let out = area(&texels, from, to)?;
+    drop(texels);
+    Ok(out)
 }
 
 /// `src`, premultiplied RGBA8 of `from` texels, resampled to `to` (each
